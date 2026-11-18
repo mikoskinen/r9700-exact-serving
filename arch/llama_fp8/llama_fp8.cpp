@@ -405,6 +405,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const int k = sk && *sk ? std::atoi(sk) : 0;
             if (m.pp_rank == 1 && k > 0 && pp.lanes > 1)
                 for (int x = m.pp_h + k; x < m.pp_t && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += k) m.seg_b.push_back(x);
+            /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k on the leader): its head [0, h) and its tail [t, n) in segments of k layers
+             * -- boundaries k, 2k .. below h, and t + k, t + 2k .. below n (none past the drafter's first tap: the taps
+             * and the drafter after the tail must be one segment's) */
+            const char* lk = std::getenv("RADIANCE_PP_LEAD_SEG");
+            const int kl = lk && *lk ? std::atoi(lk) : 0;
+            if (m.pp_rank == 0 && kl > 0 && pp.lanes > 1) {
+                for (int x = kl; x < m.pp_h && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += kl) m.seg_b.push_back(x);
+                for (int x = m.pp_t + kl; x < (int)m.n_main && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += kl)
+                    m.seg_b.push_back(x);
+            }
         }
     }
 
@@ -545,6 +555,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
 
     m.layers.resize((size_t)m.n_main);
+    /* tp8 dev M9: no leader tail boundary past the drafter's first tap (the taps and the drafter after the tail are one
+     * segment's: another lane's tail between two segments would rewrite the tap buffer) */
+    if (m.pp && m.pp_rank == 0 && m.n_taps > 0) {
+        int top = (int)m.n_main;
+        for (int t = 0; t < m.n_taps; ++t) top = std::min(top, m.tap_layer[t]);
+        std::vector<int32_t> keep;
+        for (int32_t x : m.seg_b)
+            if (x < m.pp_h || x <= top) keep.push_back(x);
+        m.seg_b.swap(keep);
+    }
     /* tp8 dev M4: the segment boundaries' parts (as a crossing into layer s carries: the stream, and the delta where s folds
      * it), this rank's ring buffer for them (header + the widest boundary's parts at max_tok rows + the trailer), and each
      * boundary's save (after layer s - 1) and restore (before layer s) in loop mode */
@@ -679,6 +699,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (!m.seg_b.empty()) {
             std::string bs;
             for (int32_t x : m.seg_b) bs += (bs.empty() ? "" : ", ") + std::to_string(x);
+            if (lead)
+                rad_note(b, "two-node pipeline (tp8 dev M9, RADIANCE_PP_LEAD_SEG): a BG lane's head / tail parts may run in "
+                            "segments at layers %s, each boundary's stream saved and restored on this rank (a %lld-byte ring "
+                            "buffer)", bs.c_str(), (long long)m.segring_bytes);
+            else
             rad_note(b, "two-node pipeline (tp8 dev M4, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments "
                         "at layers %s, each boundary's stream saved and restored on this rank (a %lld-byte ring buffer)",
                      bs.c_str(), (long long)m.segring_bytes);
@@ -782,6 +807,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const bool seg = m.pp && m.pp_rank == 1 && ppi.part == RAD_PP_PART_SEG && !m.seg_b.empty();
     const int64_t s0 = seg ? ppi.seg_l0 : m.pp_h, s1 = seg ? ppi.seg_l1 : m.pp_t;
     const bool seg_first = !seg || s0 == m.pp_h;
+    /* tp8 dev M9: a leader segment [l0, l1) of its head / tail part: the lookup only in the head's first, X1 only in its
+     * last, X2 only in the tail's first, the final norm and the head only in its last (RAD_PP_SEG_END), a boundary's restore
+     * / save at its ends */
+    const bool lseg = m.pp && m.pp_rank == 0 && (part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && ppi.seg_l1 > 0 &&
+                      !m.seg_b.empty();
+    const int64_t l0 = lseg ? ppi.seg_l0 : 0, l1 = lseg ? std::min<int64_t>(ppi.seg_l1, m.n_main) : m.n_main;
+    const bool lfirst = !lseg || l0 == (part == RAD_PP_PART_HEAD ? 0 : m.pp_t);
+    const bool llast = !lseg || (part == RAD_PP_PART_HEAD ? l1 == m.pp_h : l1 >= m.n_main);
     auto seg_issue = [&](int64_t at, bool send) {
         for (size_t k = 0; k < m.seg_b.size(); ++k) {
             if (m.seg_b[k] != (int32_t)at) continue;
@@ -818,7 +851,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* tp8 dev D10 round 2: the follower takes X1 (the step's token ids) into its batch before its lookup reads them */
     if (m.x1_ids && m.pp_rank == 1 && seg_first) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
     /* tp8 dev 1a: under m.fe the follower's lookup, the leader's none */
-    if (((!m.pp || m.pp_rank == 0) && run_head && !m.fe) || (m.fe && m.pp_rank == 1 && seg_first)) {
+    if (((!m.pp || m.pp_rank == 0) && run_head && !m.fe && lfirst) || (m.fe && m.pp_rank == 1 && seg_first)) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
@@ -845,7 +878,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             if (m.pp_rank == 0 && (int64_t)li == m.pp_h) {
                 if (run_head && (!m.fe || m.x1_ids)) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
                 if (!run_tail) return;   /* tp8 S5: the head part ends with X1's send */
-                cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+                if (lfirst) cross(m.op_x2, RAD_PP_X2, m.parts_x2);   /* tp8 dev M9: a later tail segment: its restore */
             }
             if (!m.held[li]) continue;
             /* tp8 S5: the tail part starts at X2; the head part ran the layers before h */
@@ -853,12 +886,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
             /* tp8 dev M4: a segment's layers only; its first from the boundary's restore */
             if (seg && ((int64_t)li < s0 || (int64_t)li >= s1)) continue;
             if (seg && (int64_t)li == s0 && !seg_first && !seg_issue(s0, false)) return;
+            /* tp8 dev M9: the same for a leader segment */
+            if (lseg && ((int64_t)li < l0 || (int64_t)li >= l1)) continue;
+            if (lseg && (int64_t)li == l0 && !lfirst && !seg_issue(l0, false)) return;
         }
         m.layers[li].attn.step(c, batch);
         m.layers[li].mlp.step(c, batch);
         /* tp8 dev M4: a segment that ends before t saves the boundary's live set and ends */
         if (seg && (int64_t)li == s1 - 1 && s1 < m.pp_t) {
             seg_issue(s1, true);
+            return;
+        }
+        /* tp8 dev M9: a leader segment that ends at a boundary (not X1's, not the head's end) saves and ends */
+        if (lseg && (int64_t)li == l1 - 1 && !llast) {
+            seg_issue(l1, true);
             return;
         }
         /* The tap, into its column slice. Runs on prefill and decode alike: the drafter

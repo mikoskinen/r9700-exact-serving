@@ -1721,8 +1721,10 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     struct Arm { int lanes; const char* cut; int k; bool split; };
+    /* tp8 dev round 6: + three decode lanes beside one BG lane (--pp-lanes 4, BG_LANE=1: READY 05:57's settings arm) */
     for (const Arm a : { Arm{ 3, "0,2", 1, false }, Arm{ 2, "0,2", 1, false }, Arm{ 3, "1,3", 1, false }, Arm{ 4, "0,2", 2, false },
-                         Arm{ 4, "1,3", 2, false }, Arm{ 4, "0,2", 2, true }, Arm{ 4, "1,3", 2, true } }) {
+                         Arm{ 4, "1,3", 2, false }, Arm{ 4, "0,2", 2, true }, Arm{ 4, "1,3", 2, true }, Arm{ 4, "0,2", 1, false },
+                         Arm{ 4, "1,3", 1, false } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         if (a.split) env.push_back("RADIANCE_PP_BG_SPLIT=1");
@@ -1768,6 +1770,112 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         CHECK(passes > 0);
         if (a.split) CHECK(split > 0);
     }
+}
+
+/* tp8 dev M9: RADIANCE_PP_LEAD_SEG=1 -- a BG lane's step runs its leader head [0, h) and tail [t, n) in one-layer segments with
+ * the other lanes' parts between them, its frame shipped with the head's last segment. Every request's tokens are one process's
+ * at 3 lanes (BG 1) and 4 lanes (BG 1 / BG 2), at cuts with a head boundary (W(2,3): 1), a tail boundary (W(1,2): 3; W(0,2): 3,
+ * where the head is the lookup alone) and beside the follower's own segments (W(0,2) / W(1,2) / W(2,3) at SEG_LAYERS=1: the
+ * follower of W(2,3) holds one layer, its BG passes run whole); the leader counts its BG steps' segments and the other lanes'
+ * tails between them. */
+/* tp8 dev M9b: newcomers arriving together beside decoders (the BG lane takes one, the others are kept home as MIXED steps) */
+std::vector<std::vector<int32_t>> burst_set(int port) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t s : { 41, 42, 43, 44 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 12), 200); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    for (uint64_t s : { 61, 62, 63, 64 }) {
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 400 + 40 * (s - 61)), 12); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
+TEST(lead_segments_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    /* 700 rows a step: a BG lane's inbox holds one of burst_set's 400-520-row newcomers, the next is kept home (a MIXED step) */
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    /* tp8 dev M9b: + RADIANCE_PP_LEAD_SEG_MIXED=1 -- a decode lane's MIXED newcomer step in segments too (one pass on the ring) */
+    struct Arm { int lanes; const char* cut; int k; const char* lead_seg; bool mixed; };
+    long long between_all = 0, msteps_all = 0;
+    for (const Arm a : { Arm{ 3, "2,3", 1, "1", false }, Arm{ 3, "1,2", 1, "1", false }, Arm{ 3, "0,2", 1, "1", false },
+                         Arm{ 4, "2,3", 1, "1", false }, Arm{ 4, "1,2", 2, "1", false }, Arm{ 3, "2,3", 1, "2", false },
+                         Arm{ 3, "2,3", 1, "1", true }, Arm{ 3, "1,2", 1, "1", true }, Arm{ 4, "2,3", 1, "1", true },
+                         Arm{ 2, "2,3", 1, "1", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back(std::string("RADIANCE_PP_LEAD_SEG=") + a.lead_seg);
+        if (a.mixed) env.push_back("RADIANCE_PP_LEAD_SEG_MIXED=1");
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port), got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long bg = -1, steps = -1, parts = -1, between = -1, inside = -1, polls = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld "
+                                                    "other lanes' tails while one was in flight (%lld of them between two of its "
+                                                    "segments), %lld polls", &steps, &parts, &between, &inside, &polls);
+        between_all += std::max(0LL, inside);
+        long long msteps = 0;
+        if (const size_t at = llog.rfind(" MIXED newcomer steps of decode lanes among them"); at != std::string::npos)
+            if (const size_t b = llog.rfind("; ", at); b != std::string::npos) msteps = std::atoll(llog.c_str() + b + 2);
+        msteps_all += msteps;
+        long long kept = -1;
+        if (const size_t at = llog.rfind("the BG lanes' room "); at != std::string::npos) kept = std::atoll(llog.c_str() + at + 19);
+        if (a.mixed) fprintf(stderr, "    + LEAD_SEG_MIXED=1: %lld MIXED newcomer steps of decode lanes in segments (%lld newcomers kept home for "
+                                     "the BG lane's room)\n", msteps, kept);
+        fprintf(stderr, "    LEAD_SEG=%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes; leader: "
+                        "%lld BG steps in %lld segments, %lld other tails in flight (%lld between two segments), %lld polls\n",
+                a.lead_seg, a.k, a.lanes, a.cut, differ, ref.size() + ref_b.size(), bg, steps, parts, between, inside, polls);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("RADIANCE_PP_LEAD_SEG=") != std::string::npos);
+        CHECK(llog.find("is not taken") == std::string::npos || std::strcmp(a.lead_seg, "2") == 0);
+        CHECK(bg > 0);
+        if (std::strcmp(a.lead_seg, "1") == 0) {
+            CHECK(steps > 0);
+            CHECK(parts >= steps);
+        }
+    }
+    fprintf(stderr, "    other lanes' tails between two BG segments, all arms: %lld; MIXED newcomer steps in segments: %lld\n",
+            between_all, msteps_all);
+    CHECK(between_all > 0);
+    CHECK(msteps_all > 0);
 }
 
 /* tp8 dev D10 round 2: steps issued ahead beside the BG lanes' split passes, the best c32 start's form (W(0, t), the follower's

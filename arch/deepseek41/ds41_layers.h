@@ -342,6 +342,75 @@ inline int segment_crossing(const Geo& g, int h, int s, int t, Crossing* out, st
     return 0;
 }
 
+/* tp8 dev M9: a leader segment boundary s of W(h, t) -- in its head (0 < s < h) or its tail (t < s < n). The leader's part
+ * runs [.., s), then other lanes' parts (which rewrite the step's activations), then [s, ..). The segment before s saves (and
+ * the one from s restores) what is read at or after s of what this pass computed before it:
+ *   - what the layers from s to the part's end read of the layers below s -- the residual (the boundary op's inputs), the
+ *     selections and the keep words (needs() of [s, h) or [s, n)); no kv source: this node holds its caches and its copies;
+ *   - a head boundary also what the head's X1 (at h) ships that a layer below s computed (its kv source's new entries: the
+ *     latent / index-key / page planes keep the last source the leader computed until X1's send; its selections, its keep
+ *     words), as segment_crossing does for the follower's X2.
+ * A tail boundary past the first DSpark tap is refused (the drafter reads the taps after the tail: they must be the last
+ * segment's). 0 with *out, or -1 with the reason. */
+inline int lead_segment_crossing(const Geo& g, int h, int s, int t, Crossing* out, std::string* err) {
+    const int n = g.n_layer;
+    const bool head = s > 0 && s < h, tail = s > t && s < n;
+    if (!head && !tail) {
+        *err = "a leader segment boundary " + std::to_string(s) + " outside (0, " + std::to_string(h) + ") and (" +
+               std::to_string(t) + ", " + std::to_string(n) + ")";
+        return -1;
+    }
+    for (int tp : g.taps)
+        if (tail && tp < s) {
+            *err = "a tail boundary " + std::to_string(s) + " past the DSpark tap at layer " + std::to_string(tp) +
+                   " (the drafter reads the taps after the tail)";
+            return -1;
+        }
+    Spec rx;
+    std::string e;
+    const std::string rs = std::to_string(s) + ":" + std::to_string(head ? h : n);
+    if (parse(rs.c_str(), "strict", n, &rx, &e) < 0) {
+        *err = e;
+        return -1;
+    }
+    Crossing c;
+    c.ring = 0;
+    c.at = s;
+    c.residual = true;
+    for (const Dep& d : needs(g, rx, false)) {
+        if (d.kind == Need::Latent || d.kind == Need::IndexKeys || d.kind == Need::Tap) continue;
+        int* slot = d.kind == Need::Sel ? &c.sel : &c.keep;
+        if (*slot >= 0 && *slot != d.from) {
+            *err = "leader segment boundary " + std::to_string(s) + " would save the " + need_name(d.kind) + " of layers " +
+                   std::to_string(*slot) + " and " + std::to_string(d.from);
+            return -1;
+        }
+        *slot = d.from;
+    }
+    if (head) {
+        Crossing whole[2];
+        if (crossings(g, h, t, whole, err) < 0) return -1;
+        const Crossing& x1 = whole[0];
+        if (x1.src >= 0 && x1.src < s) {
+            c.src = x1.src;
+            c.latent = x1.latent;
+            c.index = x1.index;
+        }
+        for (const auto& [mine, theirs, what] : { std::tuple<int*, int, const char*>{ &c.sel, x1.sel, "selections" },
+                                                  std::tuple<int*, int, const char*>{ &c.keep, x1.keep, "keep words" } }) {
+            if (theirs < 0 || theirs >= s) continue;
+            if (*mine >= 0 && *mine != theirs) {
+                *err = "leader segment boundary " + std::to_string(s) + " of W(" + std::to_string(h) + "," + std::to_string(t) +
+                       ") would save the " + what + " of layers " + std::to_string(*mine) + " and " + std::to_string(theirs);
+                return -1;
+            }
+            *mine = theirs;
+        }
+    }
+    *out = c;
+    return 0;
+}
+
 /* tp8 S5 + S6: with lanes the leader issues a lane step's pass in two parts -- its head (layers [0, h), X1) and its tail
  * (X2, layers [t, n)) -- with other lanes' parts between them, which rewrite the step's activations. What its tail reads
  * of its head must then be kv / state (paged per sequence) or cross in X2: a layer >= t that reads the selections of an

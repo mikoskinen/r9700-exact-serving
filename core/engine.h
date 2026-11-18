@@ -479,6 +479,19 @@ private:
     int  lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on,
                          bool model_done);
     int  lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on);
+    /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k, the leader; the plugin declares the boundaries): a BG lane's step's leader parts in
+     * layer segments with other lanes' parts between them -- its head [0, h) as segments [s0, s1) (the first takes the
+     * release, the restores and holds the frame; the last ships it, then X1), its tail [t, n) as model-part segments, the
+     * last one with the sampler, drafter and step end (lane_tail_issue from `tail_seg0_`, RAD_PP_SEG_END). */
+    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last);
+    int  lane_tail_seg(int lane, const RadBatch* b, int s0, int s1);
+    int  tail_seg0_ = 0;
+    /* ... the held frame of the lane's step (pp_ship's bytes, built at its first head segment so it carries that release's
+     * PSK plan and clears), sent at its last head segment */
+    struct PpHeld { bool on = false; int32_t step = 0; std::vector<uint8_t> head, span; };
+    PpHeld pp_held_[RAD_PP_MAX_LANES];
+    int  pp_ship_hold(const RadBatch* b, int lane);
+    int  pp_ship_release(int lane);
     bool tail_ahead_ = false;
     int64_t tail_ahead_n_ = 0;   /* model parts issued ahead */
     int  lanes_init(const std::vector<BatchBuilder::RankIO>& rio);
