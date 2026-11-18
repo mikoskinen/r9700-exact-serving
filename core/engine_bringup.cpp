@@ -1822,6 +1822,31 @@ int Engine::declare() {
  * shadow count it was sized with ("shadow"), and the expert prefetch's ring and buffers ("xpoff").
  * Nothing here is used by the engine. */
 static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels, const Config& cfg) {
+    /* RADIANCE_DEBUG_GRAPH_ALIAS=name[,name...] (a debug aid; unset: nothing here): at every arena level, each named
+     * transient's bytes and the transients of disjoint live range that share them (--debug-graph prints the full plan's;
+     * tp8 loop FINDINGS F43) */
+    if (const char* al = getenv("RADIANCE_DEBUG_GRAPH_ALIAS"); al && *al) {
+        const std::string want = std::string(",") + al + ",";
+        for (const ArenaLevel& lv : levels)
+            for (size_t i = 1; i < P.buffers.size() && i < lv.offset.size(); ++i) {
+                const BufferInfo& a = P.buffers[i];
+                if (want.find("," + a.name + ",") == std::string::npos || lv.offset[i] < 0) continue;
+                const int64_t ao = lv.offset[i], ab = buffer_bytes(lv.decl[i]);
+                std::string o;
+                int n = 0;
+                for (size_t j = 1; j < P.buffers.size() && j < lv.offset.size(); ++j) {
+                    const BufferInfo& b = P.buffers[j];
+                    if (j == i || lv.offset[j] < 0 || b.decl.domain != a.decl.domain) continue;
+                    const int64_t bo = lv.offset[j], bb = buffer_bytes(lv.decl[j]);
+                    if (bo + bb <= ao || ao + ab <= bo) continue;
+                    o += fmt(" %s [%d,%d]", b.name.c_str(), b.first_def, b.last_use);
+                    ++n;
+                }
+                RAD_INFO("alias (RADIANCE_DEBUG_GRAPH_ALIAS) level %lld rows: %s %lld B live [%d,%d] @ %lld shares its bytes "
+                         "with %d:%s", (long long)lv.rows, a.name.c_str(), (long long)ab, a.first_def, a.last_use,
+                         (long long)ao, n, o.c_str());
+            }
+    }
     const char* d = getenv("RADIANCE_DEBUG_VRAM");
     if (!(d && *d && std::strcmp(d, "0") != 0)) return;
     auto top = [&](const ArenaLevel* lv) {
