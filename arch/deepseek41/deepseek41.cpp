@@ -33,6 +33,7 @@
 #include "ds41_layers.h"
 #include "rad_pp.h"        /* tp8 S4: the two-node pipeline (rad_pp_info, the stage crossings) */
 #include "ds41_psk_cone.h"
+#include "ds41_sp_plan.h"   /* tp8 loop P20 round 2: RADIANCE_DS41_SPHC's layers */
 #include "ds41_etp.h"
 #include "ds41_walk_geom.h"
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
@@ -678,6 +679,16 @@ struct Model {
      * all-reduces of a pipelined layer on the second lane too -- bit 1 piece 1's attention all-reduce beside MoE pass 0,
      * bit 2 piece 1's MoE all-reduce beside the next layer's piece-0 per-row work (step_bi, tbo_*); 0 = off */
     int pipe2_tbo = 0;
+    /* tp8 loop P20 round 2 (RADIANCE_DS41_SPHC=N, sphc_env(); read at declare): a lone prefill pass of >= `sphc` rows runs
+     * the mHC stream ops of its uncut layers sequence-parallel -- each rank the per-row ops over its quarter of the rows
+     * between a reduce-scatter (the sublayer's all-reduce's first half) and an all-gather of the normed input (its second
+     * half) -- (step_bi, sp_*). 0 = off: nothing new declared or issued. `sphc_eng`: an Engram layer's lookup / copy / kv GEMM
+     * over the quarter too (RADIANCE_DS41_SPHC_ENGRAM, default on). The ops (fused(): 0 where no library serves them):
+     * reduce-scatters over attn_out and the MoE's delta (act.x), all-gathers of the normed inputs (xn, act.x) and of the
+     * streams (h0, at a non-SP layer after SP ones), all raw, on the all-reduce's instance. */
+    int64_t sphc = 0;
+    bool sphc_eng = false;
+    rad_op sp_rs_a = 0, sp_rs_f = 0, sp_ag_x = 0, sp_ag_f = 0, sp_ag_h = 0;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
@@ -2419,6 +2430,38 @@ static int64_t pipe2_env() {
 }
 static std::atomic<long long> g_pipe2_passes{0}, g_pipe2_layers{0}, g_pipe2_rows{0}, g_pipe2_serial{0};
 static std::atomic<long long> g_pipe2_attn{0};   /* P13b: layer-passes whose attention all-reduce ran in the pieces */
+/* tp8 loop P20 round 2 -- RADIANCE_DS41_SPHC=N (read at declare; unset, empty, 0 or not a number = off, today's declare and
+ * issue byte for byte; "1" = 2048): SEQUENCE-PARALLEL mHC STREAMS in a lone prefill pass of >= N rows (one prefill segment,
+ * no decode row, no media row, not a follower / leader segment). Today every rank runs every mHC op (mhc_post / collapse /
+ * rmsnorm / mhc_mix, their fused forms, Engram's stream_gate_add) over ALL rows of the pass on the replicated 4 x 5120
+ * streams after a full all-reduce. Here an SP layer's sublayer output is REDUCE-SCATTERED by whole rows (rank r keeps rows
+ * [r q, (r + 1) q), q = ceil(T / 4): the all-reduce's first half, the same fp32 ascending-rank fold = the same bytes), the
+ * mHC ops run over the rank's quarter only, and the next sublayer's normed input is ALL-GATHERED raw (the all-reduce's
+ * second half: the same words). The streams stay sharded between sublayers and layers; a later non-SP layer (PSK's cone /
+ * split layers with cone rows, the leader's last layer before X1, a DSpark tap layer, the node's last layer) first
+ * gathers the streams (all_gather_rows of h0, rows of 4 x 5120) and re-mixes its attention coefficients over every row.
+ *
+ * EXACT by construction: the mHC ops are per row (a wave / a workgroup a row; lever BI's r4d_selftest --bicheck holds them
+ * at any row range), so a row's bytes at a quarter launch are its bytes at the whole one; the reduce-scatter + raw gather
+ * is the exact all-reduce's per-element arithmetic (r4d_selftest --case sp_rows_exact); the Engram lookup / copy / kv
+ * GEMM are per row (gemm_nt_ggml's prefill form at >= 512 rows). A layer is SP only where every op that reads the streams
+ * between it and the next gather is an SP op (spv below), so no rank reads a row it did not write. */
+static int64_t sphc_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_SPHC");
+        if (!e || !*e) return (int64_t)0;
+        char* end = nullptr;
+        const long long n = std::strtoll(e, &end, 10);
+        if (!end || *end || n <= 0) return (int64_t)0;
+        return n == 1 ? (int64_t)2048 : std::max<int64_t>((int64_t)n, 512);
+    }();
+    return v;
+}
+static bool sphc_eng_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_SPHC_ENGRAM"); return !(e && e[0] == '0' && !e[1]); }();
+    return on;
+}
+static std::atomic<long long> g_sp_passes{0}, g_sp_layers{0}, g_sp_rows{0}, g_sp_gathers{0}, g_sp_eng{0}, g_sp_lone{0};
 /* tp8 loop P13b -- RADIANCE_DS41_PIPE2_ATTN=1 (read at declare, only with RADIANCE_DS41_PIPE2 on): a pipelined layer's
  * attention output too: the first group projections and the attention mix as today, o_b of piece 0, piece 0's
  * attention all-reduce on the second lane behind lane 0 and beside piece 1's o_a + o_b (no collective), lane 0
@@ -4828,6 +4871,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
         }
     }
+    /* tp8 loop P20 round 2: RADIANCE_DS41_SPHC (sphc_env) where four ranks reduce on the exact wire (the reduce-scatter's
+     * fold is the exact all-reduce's) and every rank attends; a sizing declare (below) takes the real declare's value */
+    if (!ctx->shape_probe && sphc_env() > 0) {
+        const char* why = g.world != 4 ? "not four ranks (the rows collectives are four-rank)"
+                        : !g.wire_exact ? "the all-reduce wire is not exact"
+                        : m.aw != g.world ? "an attention-zero rank"
+                        : m.pipe2 > 0 ? "RADIANCE_DS41_PIPE2 is on (its pieces and the lane-1 all-reduces are another form)"
+                        : g.max_tok < sphc_env() ? "--max-num-batched-tokens is below its rows"
+                        : g.max_tok % 4 ? "--max-num-batched-tokens is not a multiple of four (the streams' gather rides "
+                                          "the all-reduce's instance)"
+                        : (c.n_embd % 32) ? "the hidden width is not a multiple of 32" : nullptr;
+        m.sphc = why ? 0 : sphc_env();
+        m.sphc_eng = m.sphc > 0 && sphc_eng_env();
+        if (ctx->rank == 0) {
+            if (why)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC=%lld off (tp8 loop P20): %s\n", (long long)sphc_env(),
+                        why);
+            else
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC=%lld (tp8 loop P20): a lone prefill pass of >= %lld "
+                                "rows runs its uncut layers' mHC stream ops over each rank's quarter of the rows (reduce-"
+                                "scatter / all-gather raw in place of the all-reduce: the same fold and bytes)%s\n",
+                        (long long)sphc_env(), (long long)m.sphc,
+                        m.sphc_eng ? "; an Engram layer's lookup, copy and kv GEMM over the quarter too"
+                                   : "; Engram lookups whole (RADIANCE_DS41_SPHC_ENGRAM=0)");
+        }
+    }
     if (ctx->shape_probe) {
         m.sized_against = models[ctx->rank].get();   /* lever P: a level declares the dk pair where the real declare did */
         /* A level shrinks only what the step indexes by its own rows T. Everything the step
@@ -4847,6 +4916,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.pipe2_attn = full.pipe2_attn;
         m.pipe2_cone = full.pipe2_cone;
         m.pipe2_tbo = full.pipe2_tbo;   /* P15: the same concurrent buffers as the real declare */
+        m.sphc = full.sphc;             /* tp8 loop P20: the same rows collectives as the real declare */
+        m.sphc_eng = full.sphc_eng;
         /* Lever Z0-A (ds41-z0): the DSpark head's query rows Q (max_seqs x block, capped by max_tok: dsp_config) size
          * FIXED parameters -- the candidates' all_gather numel Q x R x 2, the walk's wseqs = Q / block and its gather --
          * so a level below Q (the 8-row rung at NST 5: Q 8 instead of 40, numel 512 instead of 2560) declared a different
@@ -4972,6 +5043,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.pre1 = op(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
                              RAD_F64("value", 1.0) },
                 {}, {}, { m.pre_f });
+    /* tp8 loop P20 round 2 (RADIANCE_DS41_SPHC): the rows collectives, raw (exact), in place, each over its buffer -- the
+     * attention output's and the MoE delta's reduce-scatter, the normed inputs' all-gathers (row D), the streams' all-gather
+     * (row hc x D, `bound` the all-reduce's T x D: the same instance); none where any does not resolve */
+    if (m.sphc > 0) {
+        const auto rows_op = [&](const char* name, int64_t row, rad_buf bf, bool wide) {
+            std::vector<RadParam> ps = { RAD_INT("world_size", g.world), RAD_RANGE("numel", row, T * row),
+                                         RAD_STR("dtype", "bf16"), RAD_INT("row", row), RAD_INT("raw", 1) };
+            /* `bound` is a plain parameter: a sizing declare (an arena level) names the real declare's, the same instance */
+            if (wide) ps.push_back(RAD_INT("bound", (ctx->shape_probe && m.sized_against ? m.sized_against->g.max_tok : T) * D));
+            const rad_op h = rad_op_declared(b, name) ? rad_decl_op(b, name, ps.data(), (int)ps.size(), nullptr, 0) : 0;
+            if (!h || !rad_op_resolved(b, h)) return (rad_op)0;
+            return rw(b, h, { bf }, { bf });
+        };
+        m.sp_rs_a = rows_op("reduce_scatter_rows", D, m.attn_out, false);
+        m.sp_rs_f = rows_op("reduce_scatter_rows", D, m.act.x, false);
+        m.sp_ag_x = rows_op("all_gather_rows", D, m.xn, false);
+        m.sp_ag_f = rows_op("all_gather_rows", D, m.act.x, false);
+        m.sp_ag_h = rows_op("all_gather_rows", c.hc * D, m.h0, true);
+        if (!m.sp_rs_a || !m.sp_rs_f || !m.sp_ag_x || !m.sp_ag_f || !m.sp_ag_h) {
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC off (tp8 loop P20): the rows collectives do not "
+                                "resolve here (reduce_scatter_rows / all_gather_rows: rs %d %d, ag %d %d %d)\n",
+                        m.sp_rs_a != 0, m.sp_rs_f != 0, m.sp_ag_x != 0, m.sp_ag_f != 0, m.sp_ag_h != 0);
+            m.sphc = 0;
+        }
+    }
     /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the MoE layers' ungated shared gate, a plane of bf16 ones, filled
      * once at the step's start -- the op each layer issues (MoeFP8 op_sgate: fill n 1, value 1, the block's
      * dtype) over the step's rows. Only where this rank has a shared slice (the layers then take it). */
@@ -6815,6 +6912,59 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             "take its piece-0 start in order -- finished at once (the same bytes, no overlap); counted in the "
                             "P13 stats line\n", batch->step, d.l);
     };
+    /* tp8 loop P20 round 2 (RADIANCE_DS41_SPHC, m.sphc): this pass's sequence-parallel layers. The pass: one prefill
+     * segment of the whole step, >= m.sphc rows, no media row, issued whole on this node (not a follower / leader segment),
+     * the tracer off; every rank decides the same from the batch and the declare. Its shard: rows [sp0, sp0 + spn), q =
+     * ceil(T / 4) a rank (the rows collectives' cut). A layer is SP (spv) where it is held in this part, no PSK cut can
+     * reach it (may_cut: decided from the plan before its rows are), it is not a DSpark tap or the layer before this node's
+     * crossing out, its MoE reduces its delta in ONE all-reduce the plugin may take (own_ar false), and the next layer this
+     * part issues is either one whose collapse the previous layer issues (pcn_a: the gathers then make every row whole
+     * again where needed) or SP itself (an Engram layer collapses in its own body from pre_ffn, which an SP layer writes
+     * by shards). h_sh / xn_sh: the streams / xn hold only this rank's rows now (gathered before the next reader). */
+    const auto may_cut = [&](int l) {
+        return psk && (l >= m.psk_first || (l20_on && l == m.psk_l20 && !cr_all) || cr_any);
+    };
+    const bool sp_pass = m.sphc > 0 && T >= m.sphc && (T + 3) / 4 * 4 <= g.max_tok && sg.size() == 1 && !sg[0].dec &&
+                         sg[0].r0 == 0 && sg[0].n == T && !t_seg && !(batch->n_mm_rows > 0 && batch->mm_rows) && !m.bt.on &&
+                         !m.zero && part != RAD_PP_PART_SEG;
+    const int64_t spq = (T + 3) / 4;
+    const int64_t sp0 = std::min<int64_t>((int64_t)rad_rank(x) * spq, T), spn = std::max<int64_t>(0, std::min(spq, T - sp0));
+    static thread_local std::vector<uint8_t> spv;
+    static thread_local std::vector<ds41sp::Layer> spl;
+    spv.assign(m.layers.size(), 0);
+    int sp_n = 0, sp_ga = 0, sp_lo = -1, sp_hi = -1, sp_en = 0;
+    if (sp_pass) {
+        spl.assign(m.layers.size(), ds41sp::Layer{});
+        for (int i = 0; i < (int)m.layers.size(); ++i) {
+            const Layer& L = m.layers[(size_t)i];
+            ds41sp::Layer& d = spl[(size_t)i];
+            d.issued = m.lr.held(L.l) && pp_part_layer(m, part, i) && L.l == i;
+            if (!d.issued) continue;
+            const Layer* nx = next_layer(m, L.l);
+            const int ni = nx ? (int)(nx - m.layers.data()) : -1;
+            if (nx && ni == nx->l && m.lr.held(nx->l) && pp_part_layer(m, part, ni)) {
+                d.next = ni;
+                d.next_pcn_a = nx->pcn_a != 0;
+            }
+            const MoeFP8& mo = L.moe;
+            d.self_ok = L.ar_attn && !L.tap && pp_send_after(m, L.l) < 0 && !may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
+                        !mo.op_shared_ar && !mo.op_combine && !mo.op_add && mo.issues_ar(T, T);
+        }
+        ds41sp::plan(spl, spv);
+    }
+    bool h_sh = false, xn_sh = false;
+    const auto sp_gather_h = [&] {   /* the streams whole again on every rank; the next mix over every row */
+        RAD_ISSUE_N(x, m.sp_ag_h, T * c.hc * D, brows(m.h0, T), RAD_NONE);
+        t_mhc_a.clear();
+        t_mhc_a_l = -1;
+        h_sh = false;
+        ++sp_ga;
+    };
+    const auto sp_gather_x = [&] {   /* xn whole again on every rank (the attention's inputs, the compressor) */
+        if (!xn_sh) return;
+        RAD_ISSUE_N(x, m.sp_ag_x, T * D, brows(m.xn, T), RAD_NONE);
+        xn_sh = false;
+    };
     for (auto& L : m.layers) {
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
@@ -6833,7 +6983,19 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (!pp_cross(x, m, batch, ring, lo, hi)) return;
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
             if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
-            if (L.pcn_a) {
+            const bool sp_rx = held && spv[(size_t)(&L - m.layers.data())] != 0;
+            if (sp_rx && L.pcn_a) {   /* tp8 loop P20: the crossing's rows whole on every rank, this rank's quarter collapsed */
+                with_rows(sp0, spn, [&] { pcn_next(L, true); });
+                h_sh = xn_sh = true;
+            } else if (sp_rx) {
+                with_rows(sp0, spn, [&] {
+                    whole([&](int64_t r0, int64_t n) {
+                        RAD_ISSUE_N(x, pp_post_op(m, ring), n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n),
+                                    R(m.comb, r0, n), R(m.h0, r0, n));
+                    });
+                });
+                h_sh = true;
+            } else if (L.pcn_a) {
                 const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
                 t_mhc_a.clear();
                 t_mhc_a_l = L.l;
@@ -6930,6 +7092,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         if (!held) continue;   /* tp8 S3 / S6: another node's layer: its cut only */
         const std::vector<BiSeg>& sg = *cur;   /* the layer's segments, below */
+        /* tp8 loop P20: this layer SP -- or, where an SP layer left the streams sharded and this one reads them, the streams
+         * gathered first (not the split layer with no cone row: it reads only xn, gathered below) */
+        const bool sp_l = spv[(size_t)(&L - m.layers.data())] != 0;
+        if (h_sh && !sp_l && !(l20 && cut && cur->empty())) sp_gather_h();
+        if (sp_l) {
+            ++sp_n;
+            if (sp_lo < 0) sp_lo = l;
+            sp_hi = l;
+        }
         /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): the attention all-reduce of an uncut layer of a lone prefill pass in
          * the pieces [0, pa) [pa, T) (pa as the MoE's cut below), piece 0's on lane 1 beside piece 1's output projection;
          * decided from the batch and the declare alone, so every rank issues the same collectives */
@@ -6964,7 +7135,43 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const bool tbo_a = (m.pipe2_tbo & 1) && !(m.pipe2_tbo & 4) && pa > 0 && L.pcn_f && !m.bt.on && moe_pc() == pa;
         /* P15 bit 2: a deferral for another layer, or one this layer cannot take in its order (never by design) */
         if (t_tbo.l >= 0 && (t_tbo.l != l || cut || !p2_layer || p0 != t_tbo.p0 || pn != t_tbo.pn)) tbo_flush();
-        if (L.e_ids) {
+        if (L.e_ids && sp_l) {
+            /* tp8 loop P20: an SP Engram layer -- the gate (+ its copy back) over this rank's quarter of the streams; with
+             * m.sphc_eng the lookup, the copy and the kv GEMM over the quarter too (each a row's own: the rows the gate
+             * reads), lever E1's dedup otherwise as today over every row */
+            const int64_t H = c.ple_heads;
+            m.edd_ls.clear();
+            const bool e_gg = gguf_dense(m, L.e_kv);
+            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            const bool edd_ok = !m.sphc_eng && engdd_issue(x, m, L, batch, T, m.edd_ls);
+            if (!edd_ok && m.sphc_eng && spn > 0) {
+                const RadOperand ids = brow_slice(L.ids, sp0, spn, H);
+                if (m.ple_group > 0)
+                    RAD_ISSUE_N(x, L.e_emb, spn * H, ids, RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                                m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, spn));
+                else
+                    RAD_ISSUE_N(x, L.e_emb, spn * H, ids, RAD_W(m.ple_table), brows(m.emb, spn));
+                RAD_ISSUE_N(x, L.e_copy, spn, brows(m.emb, spn), R(m.embd, sp0, spn));
+                with_rows(sp0, spn, [&] {
+                    dense(e_gg, false, [&](int64_t r0, int64_t n) { e2_gemm(x, m, L, n, R(m.embd, r0, n), R(m.ekv, r0, n)); });
+                });
+                ++sp_en;
+            } else if (!edd_ok) {
+                if (m.ple_group > 0)
+                    RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                                m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
+                else
+                    RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
+                RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+                dense(e_gg, false, [&](int64_t r0, int64_t n) { e2_gemm(x, m, L, n, R(m.embd, r0, n), R(m.ekv, r0, n)); });
+            }
+            if (spn > 0) {
+                RAD_ISSUE_N(x, L.e_gate_op, spn, R(m.h0, sp0, spn), C(m.ekv, 0, c.hc * D, sp0, spn),
+                            C(m.ekv, c.hc * D, D, sp0, spn), RAD_W(L.e_gate), R(m.h1, sp0, spn));
+                RAD_ISSUE_N(x, L.e_back, spn, R(m.h1, sp0, spn), R(m.h0, sp0, spn));
+            }
+            h_sh = true;
+        } else if (L.e_ids) {
             const int64_t H = c.ple_heads;
             /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
              * band (the decode segment's pieces and a short prefill segment keep their own launch) */
@@ -7007,17 +7214,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const auto col_a = [&](int64_t r0, int64_t n) {
             RAD_ISSUE_N(x, L.col_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n));
         };
-        if (L.cn_a) {
+        if (L.cn_a && sp_l) {   /* tp8 loop P20: this rank's quarter; xn gathered before the attention reads it */
+            with_rows(sp0, spn, [&] { rows(kBiNorm, cn_a); });
+            h_sh = xn_sh = true;
+        } else if (L.cn_a) {
             if (l20) rows_step(kBiNorm, cn_a);
             else rows(kBiNorm, cn_a);
         } else if (L.col_a) {
             if (l20) whole_step(col_a);
             else whole(col_a);
         }
-        if (!late) mix_a();
+        /* tp8 loop P20: the attention mix over this rank's quarter at an SP layer */
+        const auto mix_a_sp = [&] {
+            if (sp_l) with_rows(sp0, spn, mix_a);
+            else mix_a();
+        };
+        if (!late) mix_a_sp();
         if (m.zero) {
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.attn_fill, n, R(m.attn_out, r0, n)); });
         } else {
+            sp_gather_x();   /* tp8 loop P20: xn whole on every rank before its first reader */
             if (L.norm_a) {
                 const auto norm_a = [&](int64_t r0, int64_t n) {
                     RAD_ISSUE_N(x, L.norm_a, n, R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
@@ -7396,7 +7612,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             } else {
                 dense(oa_gg, false, oa_fn);
                 bt_pt(x, m, m.oa, T, "oa", l);
-                if (late) mix_a();
+                if (late) mix_a_sp();
                 dense(gguf_dense(m, L.wo_b), false, ob_fn);
             }
             bt_pt(x, m, m.attn_out, T, "attn_out", l);
@@ -7418,6 +7634,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             rad_lane_join(x, 1, 0);
             RAD_ISSUE_N(x, L.ar_attn, (pn - pa) * D, R(m.attn_out, p0 + pa, pn - pa), RAD_NONE);
             if (rad_rank(x) == 0) g_pipe2_attn.fetch_add(1, std::memory_order_relaxed);
+        } else if (L.ar_attn && sp_l) {
+            /* tp8 loop P20: the all-reduce's first half -- this rank's quarter of the sum, the same fold */
+            RAD_ISSUE_N(x, m.sp_rs_a, T * D, brows(m.attn_out, T), RAD_NONE);
         } else if (L.ar_attn)
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.ar_attn, n * D, R(m.attn_out, r0, n), RAD_NONE); });
         t_mhc_f.clear();
@@ -7459,7 +7678,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         };
         if (tbo_a) with_rows(p0, pa, pcn_f_issue);   /* P15 bit 1: piece 0 now, piece 1 after MoE pass 0 (below) */
-        else pcn_f_issue();
+        else if (sp_l) {
+            /* tp8 loop P20: post / collapse / norm (+ the ffn mix) over this rank's quarter, the FFN input gathered raw */
+            with_rows(sp0, spn, pcn_f_issue);
+            RAD_ISSUE_N(x, m.sp_ag_f, T * D, brows(m.act.x, T), RAD_NONE);
+            h_sh = true;
+        } else
+            pcn_f_issue();
         bt_pt(x, m, m.h1, T, "h1", l);
         bt_pt(x, m, m.act.x, T, "ffn_in", l);
         /* the MoE: one pass a segment (the router, the experts at the segment's rows, the shared arm, the gather and
@@ -7480,6 +7705,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         };
         if (tbo_a) {
             bsp = nullptr;   /* P15 bit 1: the ffn mix's rest after piece 1's pcn (MoE section), cut or not */
+        } else if (sp_l) {
+            with_rows(sp0, spn, mix_f_rest);   /* tp8 loop P20: this rank's quarter, before the MoE */
+            bsp = nullptr;
         } else if (cut) {
             mix_f_rest();
             bsp = nullptr;
@@ -7597,6 +7825,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                 g_tbo_flush.load(std::memory_order_relaxed), g_tbo_whole.load(std::memory_order_relaxed));
                 }
             }
+        } else if (sp_l) {
+            /* tp8 loop P20: the MoE over every row as the pass issues it (one pass from row 0: router, experts, shared arm,
+             * gather), its all-reduce's first half by the plugin -- this rank's quarter of the delta */
+            L.moe.pass(x, T, 0, T, false, nullptr);
+            RAD_ISSUE_N(x, m.sp_rs_f, T * D, brows(m.act.x, T), RAD_NONE);
+            if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
         } else
         {   /* ds41_bi 2 / 4 / 6: the decode segment in pieces within the EXL3 decode band; 5 / 6 (lever A9): one all-reduce */
             const int biv = g_sw_bi.load(std::memory_order_relaxed);
@@ -7703,6 +7937,17 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * MoE all-reduce on lane 1; that layer issues piece 1's after joining it */
             const TboDefer d = t_tbo;
             with_rows(d.p0, d.pa, [&] { pcn_next(*nx, true); });
+        } else if (nx && nx->pcn_a && sp_l) {
+            with_rows(sp0, spn, [&] { pcn_next(*nx, true); });   /* tp8 loop P20: this rank's quarter */
+            h_sh = xn_sh = true;
+        } else if (nx && !nx->pcn_a && sp_l) {
+            with_rows(sp0, spn, [&] {   /* tp8 loop P20: the post into an Engram layer's streams, this rank's quarter */
+                whole([&](int64_t r0, int64_t n) {
+                    RAD_ISSUE_N(x, L.post_f, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                                R(m.h0, r0, n));
+                });
+            });
+            h_sh = true;
         } else if (nx && nx->pcn_a) {
             /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_a + the next layer's mix_a in one op */
             const int64_t fmin = nx->pcn_mix ? mhc_fuse_min() : 0;
@@ -7734,6 +7979,29 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             });
     }
     tbo_flush();   /* tp8 loop P15: nothing pending after the last layer by design (a deferral names an adjacent layer) */
+    /* tp8 loop P20: what an SP pass left sharded is read by nothing after it (spv's rule; the split layer with no cone row
+     * reads xn alone) -- xn here would be a defect of the plan, gathered so no reader can see a quarter */
+    sp_gather_x();
+    if (sp_pass && rad_rank(x) == 0) {
+        static thread_local int t_sp_step = -1;
+        const long long lone = g_sp_lone.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (sp_n > 0 && batch->step != t_sp_step) {
+            t_sp_step = batch->step;
+            g_sp_layers.fetch_add(sp_n, std::memory_order_relaxed);
+            g_sp_rows.fetch_add(T, std::memory_order_relaxed);
+            g_sp_gathers.fetch_add(sp_ga, std::memory_order_relaxed);
+            g_sp_eng.fetch_add(sp_en, std::memory_order_relaxed);
+            const long long n = g_sp_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || n % 64 == 0)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC (tp8 loop P20): %lld prefill passes ran %lld "
+                                "layer-passes sequence-parallel (%lld rows, the streams gathered %lld times, %lld Engram "
+                                "layer-passes over the quarter) of %lld lone prefill passes of >= %lld rows; this one %lld rows, "
+                                "layers %d..%d SP (%d), %d gathers of the streams, part %d\n",
+                        n, g_sp_layers.load(std::memory_order_relaxed), g_sp_rows.load(std::memory_order_relaxed),
+                        g_sp_gathers.load(std::memory_order_relaxed), g_sp_eng.load(std::memory_order_relaxed), lone,
+                        (long long)m.sphc, (long long)T, sp_lo, sp_hi, sp_n, sp_ga, part);
+        }
+    }
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
         g_psk_cut_passes.fetch_add(1, std::memory_order_relaxed);
         const long long n = g_psk_steps.fetch_add(1, std::memory_order_relaxed) + 1;
