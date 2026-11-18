@@ -16,6 +16,7 @@
 #include <map>
 #include <cstdio>
 #include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14089,6 +14090,151 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     [&] { std::string s; for (int64_t x : ends_1) s += fmt(" %lld", (long long)x); return s; }().c_str(),
                     (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
         }
+    }
+}
+
+/* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS=N with RADIANCE_PP_BG_LANE=1): two newcomers planned beside decode rows in one round (lane
+ * 0's and lane 1's), the BG lane's room (the shared budget 2112 of the DS geometry) for one of them. Without the hold the second
+ * runs whole as a MIXED step of its home (today, M8's 'kept home: the BG lanes' room'); with the hold it is left out of its
+ * home's steps -- which go out with all their decoders -- until the BG lane takes it whole; with a hold that runs out it runs at
+ * home as before. In every arm each newcomer runs as ONE chunk, its whole prompt (the home's own plan: no new cut), and decodes
+ * afterwards. 3 lanes (2 decode + BG), 4 decoders a decode lane, the engine's planning order. */
+TEST(lanes_bg_hold_waits_for_the_bg_lane_instead_of_a_home_mixed_step) {
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_HOLD_MS"); }
+    } env;
+    struct Arm { const char* hold; bool expire; };
+    for (const Arm a : { Arm{ nullptr, false }, Arm{ "60000", false }, Arm{ "1", true } }) {
+        setenv("RADIANCE_PP_BG_LANE", "1", 1);
+        if (a.hold) setenv("RADIANCE_PP_BG_HOLD_MS", a.hold, 1); else unsetenv("RADIANCE_PP_BG_HOLD_MS");
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.stage_rows = 1024;
+        L.seqs = 12;
+        const int lanes = 3;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        REQUIRE_EQ(L.set.bg_lane(), 2);
+        CHECK_EQ(L.set.bg_hold_ms(), a.hold ? (int64_t)std::atoll(a.hold) : 0ll);
+        std::vector<uint64_t> dec[2];
+        for (int i = 0; i < 8; ++i) dec[i % 2].push_back(L.submit(i % 2, 100, 4000, 2000 + 100 * i));
+        /* newcomer 0 (lane 0) keeps the BG lane busy; 1 (lane 0) waits in its inbox; 2 (lane 1) finds no room beside 1 */
+        constexpr int NC = 3;
+        const int64_t len[NC] = { 1000, 1100, 1050 };
+        const int home[NC] = { 0, 0, 1 }, at_round[NC] = { 4, 6, 6 };
+        uint64_t nc[NC] = {};
+        std::vector<int64_t> ends[NC];
+        int home_mixed[NC] = {}, on_bg[NC] = {}, decoded[NC] = {}, short_steps = 0, held_rounds = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        for (int round = 0; round < 3000; ++round) {
+            for (int j = 0; j < NC; ++j)
+                if (round == at_round[j]) nc[j] = L.submit(home[j], (int)len[j], 4, 50000 + 2000 * j);
+            bool done = true;
+            for (int j = 0; j < NC && done; ++j) {
+                const Request* r = nc[j] ? L.req(home[j], nc[j]) : nullptr;
+                done = r && r->n_computed >= len[j] && r->output.size() >= 3;
+            }
+            if (done) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                /* the expiring arm: the BG lane does not take its inbox while a newcomer is held, so the hold runs out */
+                if (a.expire && L.set.is_bg(l) && held_rounds > 0 && L.set.counts().hold_home == 0) continue;
+                std::vector<int> order, idle_after;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                for (int f : fifo) order.push_back(f);
+                const int64_t held0 = L.set.counts().hold_steps;
+                if (!L.plan(l, order)) continue;
+                if (L.set.counts().hold_steps > held0) ++held_rounds;
+                const StepPlan& pl = L.at(l).plan();
+                for (const StepEntry& e : pl.e)
+                    for (int j = 0; j < NC; ++j) {
+                        if (!nc[j] || e.seq != nc[j]) continue;
+                        if (e.is_prefill) {
+                            ends[j].push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (L.set.is_bg(l)) ++on_bg[j];
+                            else if (pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed[j];
+                        } else if (!L.set.is_bg(l)) {
+                            ++decoded[j];
+                        }
+                    }
+                /* a decode lane's step while a newcomer is still prefilling carries all of that lane's decoders */
+                if (!L.set.is_bg(l) && l < 2) {
+                    bool pf = false;
+                    for (int j = 0; j < NC; ++j) {
+                        const Request* r = nc[j] && home[j] == l ? L.req(home[j], nc[j]) : nullptr;
+                        pf = pf || (r && r->n_computed < len[j]);
+                    }
+                    if (pf) {
+                        int rows = 0;
+                        for (const StepEntry& e : pl.e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                }
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+                todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+            }
+            if (fifo.empty()) break;
+            /* the expiring arm: the hold's 1 ms runs out between two rounds */
+            if (a.expire && held_rounds > 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+        }
+        const LaneSet::Counts c = L.set.counts();
+        for (int j = 0; j < NC; ++j) {
+            REQUIRE(nc[j] != 0);
+            REQUIRE(L.req(home[j], nc[j]) != nullptr);
+            CHECK(L.req(home[j], nc[j])->n_computed >= len[j]);
+            CHECK(decoded[j] > 0);
+            /* one chunk, its whole prompt: the home's own plan, wherever it ran */
+            CHECK(ends[j] == std::vector<int64_t>({ len[j] }));
+            CHECK_EQ(on_bg[j] + home_mixed[j], 1);
+        }
+        CHECK(L.set.broken().empty());
+        const int kept = home_mixed[0] + home_mixed[1] + home_mixed[2];
+        if (!a.hold) {
+            /* the room path is taken: one newcomer kept home as a MIXED step, nothing held */
+            CHECK_EQ(kept, 1);
+            CHECK(c.bg_skip[LaneSet::kBgRoom] > 0);
+            CHECK_EQ(c.hold_reqs, 0ll);
+        } else if (!a.expire) {
+            /* held, then lent whole: both newcomers ran on the BG lane, every decode step with all its decoders */
+            CHECK_EQ(kept, 0);
+            CHECK_EQ(on_bg[0] + on_bg[1] + on_bg[2], NC);
+            CHECK(c.hold_reqs >= 1);
+            CHECK(c.hold_steps >= 1);
+            CHECK(c.hold_lent >= 1);
+            CHECK_EQ(c.hold_home, 0ll);
+            CHECK_EQ(short_steps, 0);
+        } else {
+            /* the hold ran out: today's MIXED step at home */
+            CHECK_EQ(kept, 1);
+            CHECK(c.hold_reqs >= 1);
+            CHECK(c.hold_steps >= 1);
+            CHECK(c.hold_home >= 1);
+            CHECK_EQ(c.hold_lent + c.hold_home, c.hold_reqs);
+        }
+        CHECK_EQ(short_steps, 0);
+        fprintf(stderr, "    BG hold %s%s: ends %lld | %lld | %lld, on the BG lane %d / %d / %d, home MIXED %d / %d / %d, short decode "
+                        "steps %d; held %lld newcomers over %lld steps, %lld lent, %lld home after the hold, kept home for room %lld\n",
+                a.hold ? a.hold : "off", a.expire ? " (runs out)" : "", ends[0].empty() ? -1ll : (long long)ends[0].back(),
+                ends[1].empty() ? -1ll : (long long)ends[1].back(), ends[2].empty() ? -1ll : (long long)ends[2].back(),
+                on_bg[0], on_bg[1], on_bg[2], home_mixed[0], home_mixed[1], home_mixed[2], short_steps, (long long)c.hold_reqs, (long long)c.hold_steps, (long long)c.hold_lent, (long long)c.hold_home,
+                (long long)c.bg_skip[LaneSet::kBgRoom]);
     }
 }
 
