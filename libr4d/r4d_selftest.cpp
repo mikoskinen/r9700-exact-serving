@@ -31714,6 +31714,173 @@ static void ar_xpush_perf(const Plugin& pl, const std::vector<int>& devs) {
     sw("ar_xpush", 0);
 }
 
+/* tp8 loop P20: --case sp_rows_exact -- reduce_scatter_rows raw 1 (row sp_rs_rows_4rank_ti8) then all_gather_rows raw 1
+ * (row sp_ag_rows_4rank) at four ranks over whole-row shards, rows x 5120 bf16 (deepseek41's residual width; rows
+ * R4D_SELFTEST_SPROWS, default 4096,2049,2048,1441,1024,512; 2049 / 1441 give an uneven last shard), in place, the input
+ * ar_rough_value (exponents 2^-12..2^12, so only the ascending-rank fp32 fold from 0.0f gives the oracle's bits). Checked,
+ * every rank: after the reduce-scatter its shard rows == the fold, bit for bit, and every other row is its input; after
+ * the all-gather every row == the fold (= what the exact all-reduce leaves). With fn4 ar_xpush 0 then 1 (the raw
+ * reduce-scatter's XPUSH push from RADIANCE_FN4_AR_XPUSH_MIN elements, as this fork's all-reduce). Then (INFO, "info SPR4")
+ * at 2048 / 4096 rows: the slowest rank's us a launch of the reduce-scatter, of the all-gather, and of the exact all-reduce
+ * (row ar_twoshot_4rank_exact) on the same message, 3 warm-ups + 40 launches back to back each. */
+struct SpRowsT {
+    const RadKernelInfo* rs = nullptr;
+    const RadKernelInfo* ag = nullptr;
+    const RadKernelInfo* ar = nullptr;
+    int rank = 0, dev = 0, world = 4;
+    int64_t row = 5120;
+    std::vector<int64_t> rows;
+    StBarrier* bar = nullptr;
+    void* inst_rs = nullptr; void* inst_ag = nullptr; void* inst_ar = nullptr;
+    int rc = RAD_OK;
+    std::vector<std::vector<uint16_t>> after_rs, after_ag;
+    std::vector<double> us_rs, us_ag, us_ar;   /* per timed size */
+};
+static void sp_rows_worker_t(SpRowsT* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
+    int64_t most = 0;
+    for (int64_t r : t->rows) most = r * t->row > most ? r * t->row : most;
+    std::vector<RadParam> prs = { PI("world_size", t->world), PI("numel", most), PS("dtype", "bf16"), PI("row", t->row),
+                                  PI("raw", 1) };
+    std::vector<RadParam> par = { PI("world_size", t->world), PI("numel", most), PS("dtype", "bf16"), PI("exact", 1) };
+    if ((t->rc = t->rs->init(prs.data(), (int)prs.size(), t->rank, t->world, &t->inst_rs)) != RAD_OK) return;
+    if ((t->rc = t->ag->init(prs.data(), (int)prs.size(), t->rank, t->world, &t->inst_ag)) != RAD_OK) return;
+    if (t->ar && (t->rc = t->ar->init(par.data(), (int)par.size(), t->rank, t->world, &t->inst_ar)) != RAD_OK) return;
+    void* buf = nullptr;
+    if (hipMalloc(&buf, (size_t)most * 2) != hipSuccess) { t->rc = RAD_E_NOMEM; return; }
+    std::vector<uint16_t> h((size_t)most);
+    auto args = [&](RadArgs& a, RadTensor* ts, std::vector<RadParam>& ps, void* inst) {
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 1; a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = inst; a.rank = t->rank; a.world_size = t->world;
+    };
+    auto run = [&](const RadKernelInfo* k, void* inst, std::vector<RadParam>& ps, int64_t n) {
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        args(a, ts, ps, inst);
+        const int rc = k->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK && rc != RAD_LINK_ENDED && t->rc == RAD_OK) t->rc = rc;
+        std::vector<uint16_t> got((size_t)n);
+        st_memcpy(got.data(), buf, (size_t)n * 2, hipMemcpyDeviceToHost);
+        return got;
+    };
+    auto timed = [&](const RadKernelInfo* k, void* inst, std::vector<RadParam>& ps, int64_t n) {
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        args(a, ts, ps, inst);
+        t->bar->wait();
+        for (int w = 0; w < 3; ++w) (void)k->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        t->bar->wait();
+        const auto c0 = std::chrono::steady_clock::now();
+        for (int w = 0; w < 40; ++w) (void)k->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - c0).count() / 40.0;
+    };
+    for (int64_t r : t->rows) {
+        const int64_t n = r * t->row;
+        for (int64_t i = 0; i < n; ++i) h[(size_t)i] = h_to_bf16(ar_rough_value(t->rank, i));
+        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        t->after_rs.push_back(run(t->rs, t->inst_rs, prs, n));
+        t->after_ag.push_back(run(t->ag, t->inst_ag, prs, n));
+    }
+    if (t->rc == RAD_OK && t->ar)
+        for (int64_t r : { (int64_t)2048, (int64_t)4096 }) {
+            if (r * t->row > most) continue;
+            const int64_t n = r * t->row;
+            st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);   /* finite values; the timing reads none */
+            t->us_rs.push_back(timed(t->rs, t->inst_rs, prs, n));
+            t->us_ag.push_back(timed(t->ag, t->inst_ag, prs, n));
+            st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+            t->us_ar.push_back(timed(t->ar, t->inst_ar, par, n));
+        }
+    st_free(buf);
+}
+static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
+    const char* nm = "sp_rows_exact";
+    const RadKernelInfo* rs = find(pl, "sp_rs_rows_4rank_ti8");
+    const RadKernelInfo* ag = find(pl, "sp_ag_rows_4rank");
+    const RadKernelInfo* ar = find(pl, "ar_twoshot_4rank_exact");
+    if (!rs || !ag) { ok(nm, false, "row sp_rs_rows_4rank_ti8 / sp_ag_rows_4rank absent"); return; }
+    const int world = 4;
+    if ((int)devs.size() < world) { skip(nm, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, world)) { skip(nm, "no peer path between the cards (device.p2p)"); return; }
+    if (devs[0] == devs[(size_t)world - 1]) { skip(nm, "needs four distinct cards (the ranks spin on each other)"); return; }
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    std::vector<int64_t> rows = { 4096, 2049, 2048, 1441, 1024, 512 };
+    if (const char* e = std::getenv("R4D_SELFTEST_SPROWS")) {
+        rows.clear();
+        for (const char* q = e; *q;) {
+            char* end = nullptr;
+            const long long v = std::strtoll(q, &end, 10);
+            if (end == q || v < 4 || v > 8192) { ok("sp_rows_exact: R4D_SELFTEST_SPROWS is rows 4..8192, comma separated", false, e); return; }
+            rows.push_back(v);
+            q = *end == ',' ? end + 1 : end;
+            if (*end && *end != ',') { ok("sp_rows_exact: R4D_SELFTEST_SPROWS is rows 4..8192, comma separated", false, e); return; }
+        }
+    }
+    const int64_t row = 5120;
+    for (int xp = 0; xp < 2; ++xp) {
+        if (xp == 1 && (!sw || sw("ar_xpush", 1) != 1)) { skip("sp_rows_exact xpush 1", "libr4d serves no fn4 ar_xpush switch"); break; }
+        StBarrier bar(world);
+        std::vector<SpRowsT> t((size_t)world);
+        std::vector<std::thread> th;
+        for (int r = 0; r < world; ++r) {
+            SpRowsT& x = t[(size_t)r];
+            x.rs = rs; x.ag = ag; x.ar = ar; x.rank = r; x.dev = devs[(size_t)r]; x.row = row; x.rows = rows; x.bar = &bar;
+            th.emplace_back(sp_rows_worker_t, &x);
+        }
+        for (std::thread& x : th) x.join();
+        std::string rcs;
+        bool good = true;
+        for (const SpRowsT& a : t) { good = good && a.rc == RAD_OK; rcs += std::to_string(a.rc) + " "; }
+        ok(fmt("sp_rows_exact ar_xpush %d: init + launches", xp).c_str(), good, "rc " + rcs);
+        if (good) {
+            for (size_t k = 0; k < rows.size(); ++k) {
+                const int64_t R = rows[k], n = R * row, q = (R + world - 1) / world;
+                int64_t rs_bad = 0, other_bad = 0, ag_bad = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    float acc = 0.0f;
+                    for (int r = 0; r < world; ++r) acc += h_bf16(h_to_bf16(ar_rough_value(r, i)));
+                    const uint16_t want = h_to_bf16(acc);
+                    const int owner = (int)((i / row) / q);
+                    for (int r = 0; r < world; ++r) {
+                        const uint16_t v = t[(size_t)r].after_rs[k][(size_t)i];
+                        if (r == owner) { if (v != want) ++rs_bad; }
+                        else if (v != h_to_bf16(ar_rough_value(r, i))) ++other_bad;
+                        if (t[(size_t)r].after_ag[k][(size_t)i] != want) ++ag_bad;
+                    }
+                }
+                const std::string w = fmt("sp_rows_exact ar_xpush %d rows %lld x %lld bf16 (shard %lld rows)", xp, (long long)R,
+                                          (long long)row, (long long)q);
+                ok((w + ": the reduce-scatter's shard == the fp32 ascending-rank fold, bit for bit").c_str(), rs_bad == 0,
+                   std::to_string(rs_bad) + " elements wrong");
+                ok((w + ": the reduce-scatter leaves the other rows as they were").c_str(), other_bad == 0,
+                   std::to_string(other_bad) + " elements changed");
+                ok((w + ": after the raw all-gather every row on every rank == the fold (the exact all-reduce's bytes)").c_str(),
+                   ag_bad == 0, std::to_string(ag_bad) + " elements wrong");
+            }
+            const int64_t tr[2] = { 2048, 4096 };
+            for (size_t k = 0; k < t[0].us_rs.size() && k < 2; ++k) {
+                double a = 0, b = 0, c = 0;
+                for (const SpRowsT& x : t) {
+                    a = std::max(a, x.us_rs[k]); b = std::max(b, x.us_ag[k]); c = std::max(c, x.us_ar[k]);
+                }
+                std::printf("  info  SPR4 ar_xpush %d rows %lld x 5120 bf16 (%.2f MB): reduce_scatter_rows %.1f us + all_gather_rows "
+                            "%.1f us = %.1f us vs the exact all-reduce %.1f us a launch (%+.1f %%), the slowest rank, 40 back to back\n",
+                            xp, (long long)tr[k], (double)tr[k] * 5120 * 2 / 1e6, a, b, a + b, c, c > 0 ? 100.0 * ((a + b) / c - 1.0) : 0.0);
+            }
+        }
+        for (SpRowsT& a : t) {
+            if (a.inst_rs && rs->fini) rs->fini(a.inst_rs);
+            if (a.inst_ag && ag->fini) ag->fini(a.inst_ag);
+            if (a.inst_ar && ar && ar->fini) ar->fini(a.inst_ar);
+        }
+    }
+    if (sw) sw("ar_xpush", 0);
+}
+
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
                             int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -37850,6 +38017,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("ar_xpush_perf")) {
         if (!g_case) std::printf("\ncross-rank, XPUSH timed (ar_xpush 0 / 1)\n");
         ar_xpush_perf(pl, devs);
+    }
+    /* tp8 loop P20: --case sp_rows_exact -- reduce_scatter_rows + all_gather_rows raw vs the fold, timed vs the all-reduce */
+    if (sel("sp_rows_exact") || sel("sp_rs_rows_4rank_ti8") || sel("sp_ag_rows_4rank")) {
+        if (!g_case) std::printf("\ncross-rank, whole-row reduce-scatter + all-gather (raw) vs the exact fold\n");
+        sp_rows_exact(pl, devs);
     }
     /* The fused write rows at both widths and both gathers. The `_host` twins take the same
      * calls; they differ only in where the mailbox lives. */
