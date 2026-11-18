@@ -1181,8 +1181,12 @@ int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                 int st = save ? rk->kv.checkpoint_save(q + i + H, ns, ck, rk->ctx.stream(), &win)
                               : rk->kv.checkpoint_restore(q + i + H, ns, ck, rk->ctx.stream(), &win);
-                /* lever TI: the CONV window of a snapshot inside the chunk, from this node's mapped ids */
-                if (st >= 0 && save && first >= 0 && rk->kv.has_conv_state()) {
+                /* lever TI: the CONV window of a snapshot inside the chunk, from this node's mapped ids -- only on a node that
+                 * holds an Engram layer (ti_capable_: the plugin's rad_ckpt_conv_src probe). A node with none keeps the
+                 * CONV group (every group of the published declare) but no layer of it reads the group, so its rows in a
+                 * snapshot are never read here and stay the chunk end's (loop FINDINGS F27: W(15,35)'s follower, behind a
+                 * TI-capable leader, failed the pair at the first such snapshot) */
+                if (st >= 0 && save && first >= 0 && rk->kv.has_conv_state() && ti_capable_) {
                     const void* ids = nullptr;
                     int ctx = 0;
                     if (fn4::ckpt_conv_src(rk->index, &ids, &ctx) <= 0 || !ids || ctx <= 0 || first < ctx) {
