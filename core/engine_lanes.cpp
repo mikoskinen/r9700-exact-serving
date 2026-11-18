@@ -485,11 +485,16 @@ int Engine::step_loop_lanes() {
      * time (the boundary ring buffer is one a rank). Only the order of issue changes, never a step's composition: a segment
      * boundary saves and restores the pass's live set on each rank, as the follower's do (tp8 dev M4). */
     enum { kLsNone = 0, kLsHead, kLsHeadDone, kLsTail };
-    struct LSeg { int st = kLsNone; const RadBatch* b = nullptr; std::vector<std::pair<int, int>> parts; size_t k = 0; };
+    struct LSeg { int st = kLsNone; const RadBatch* b = nullptr; std::vector<std::pair<int, int>> parts; size_t k = 0; bool mixed = false; };
     std::vector<LSeg> lsg((size_t)n_lanes_);
     std::vector<int32_t> lseg_hb, lseg_tb;
     bool lseg = false;
-    int64_t lseg_steps = 0, lseg_parts = 0, lseg_between = 0, lseg_polls = 0, lseg_inside = 0;
+    int64_t lseg_steps = 0, lseg_parts = 0, lseg_between = 0, lseg_polls = 0, lseg_inside = 0, lseg_msteps = 0;
+    /* tp8 dev M9b (RADIANCE_PP_LEAD_SEG_MIXED=1, with LEAD_SEG): a decode lane's MIXED newcomer step (a newcomer kept home while the
+     * BG lane is busy) runs its leader parts in segments too, when it carries and lends no piece; at most one pass holds the
+     * plugin's boundary ring (its head or tail segments in flight) at a time -- a step that finds it held runs that part whole */
+    bool lseg_mixed = false;
+    if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_MIXED"); v && !std::strcmp(v, "1")) lseg_mixed = true;
     /* host tests (RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS): a BG segment goes out no sooner than this after the last one, so the
      * other lanes' tails find their place between them on a backend whose launches finish at issue */
     uint64_t lseg_wait_ns = 0, lseg_last_ns = 0;
@@ -511,8 +516,9 @@ int Engine::step_loop_lanes() {
         for (int32_t x : lseg_hb) hs += fmt("%s%d", hs.empty() ? "" : ", ", (int)x);
         for (int32_t x : lseg_tb) ts += fmt("%s%d", ts.empty() ? "" : ", ", (int)x);
         if (lseg)
-            RAD_INFO("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s -- a BG lane's step of >= %lld rows runs its leader head in segments "
+            RAD_INFO("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s -- a BG lane's step%s of >= %lld rows runs its leader head in segments "
                      "at layers [%s] and its tail at [%s] of W(%d,%d), the other lanes' parts between them (tp8 dev M9)", v,
+                     lseg_mixed ? " and a decode lane's MIXED newcomer step (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)" : "",
                      (long long)rf_rows, hs.empty() ? "none: whole" : hs.c_str(), ts.empty() ? "none: whole" : ts.c_str(),
                      cfg_.pp_cut_h, cfg_.pp_cut_t);
         else
@@ -524,8 +530,16 @@ int Engine::step_loop_lanes() {
     auto lseg_line = [&](const char* when) {
         RAD_INFO("two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld other lanes' tails while one "
                  "was in flight (%lld of them between two of its segments), %lld polls with nothing to issue "
-                 "(RADIANCE_PP_LEAD_SEG, tp8 dev M9)%s", (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
-                 (long long)lseg_inside, (long long)lseg_polls, when);
+                 "(RADIANCE_PP_LEAD_SEG, tp8 dev M9)%s%s", (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
+                 (long long)lseg_inside, (long long)lseg_polls,
+                 lseg_mixed ? fmt("; %lld MIXED newcomer steps of decode lanes among them (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)",
+                                  (long long)lseg_msteps).c_str() : "", when);
+    };
+    /* the boundary ring is held while a pass's head or tail segments are in flight */
+    auto lseg_ring_busy = [&]() {
+        for (const LSeg& q : lsg)
+            if (q.st == kLsHead || q.st == kLsTail) return true;
+        return false;
     };
     auto lseg_busy = [&]() {
         for (const LSeg& s : lsg)
@@ -557,6 +571,14 @@ int Engine::step_loop_lanes() {
     /* a lane step that may go before an older one: decode rows of its own sequences only (they read committed KV; a prompt's
      * chunk may read an earlier chunk's still in flight, a lent piece its home's), and no piece lent to its lane waiting in
      * its inbox (a home lends to the lanes in flight in their commit order, and each takes its piece at its next plan) */
+    /* tp8 dev M9b: a step whose head ran (whole or in segments) and whose X2 has landed waits for the boundary ring for its tail
+     * segments: a new head then runs whole rather than take the ring before it */
+    auto lseg_tail_waits = [&]() {
+        if (lseg_tb.empty()) return false;
+        for (int q = 0; q < n_lanes_; ++q)
+            if (lsg[(size_t)q].st == kLsHeadDone && x2_landed(q)) return true;
+        return false;
+    };
     auto carries_lent = [&](int l) {
         if (sched_of(l).plan().phase != RAD_PHASE_DECODE || lanes_.inbox_n(l) > 0) return true;
         for (const StepEntry& e : sched_of(l).plan().e)
@@ -726,6 +748,10 @@ int Engine::step_loop_lanes() {
                 lanes_.set_planners(std::move(order));
             }
             lane_select(l);
+            /* tp8 dev M9b: the inboxes before this plan (a plan that lends grows one: then its step is not segmented) */
+            std::vector<size_t> inbox0;
+            if (lseg_mixed)
+                for (int m2 = 0; m2 < n_lanes_; ++m2) inbox0.push_back(lanes_.inbox_n(m2));
             const uint64_t p0 = rad_mono_ns();
             const RadBatch* b = lsched().step();
             const uint64_t p1 = rad_mono_ns();
@@ -736,13 +762,22 @@ int Engine::step_loop_lanes() {
             }
             if (!b) continue;
             if (t_on) phase_mark(PH_PLAN);
-            /* tp8 dev M9: a BG lane's step: its head's first segment only (or the whole head where no head boundary is
-             * declared: its tail in segments) */
-            if (lseg && lanes_.is_bg(l) && b->n_tok >= rf_rows && !lseg_busy()) {
+            /* tp8 dev M9: a BG lane's step (M9b, RADIANCE_PP_LEAD_SEG_MIXED=1: also a decode lane's MIXED newcomer step that
+             * carries and lends no piece): its head's first segment only, or its whole head where no head boundary is declared
+             * or another pass holds the boundary ring (then its tail may still run in segments) */
+            bool seg_step = lseg && b->n_tok >= rf_rows && lanes_.is_bg(l);
+            if (lseg && lseg_mixed && !seg_step && b->n_tok >= rf_rows && b->phase == RAD_PHASE_MIXED) {
+                seg_step = true;
+                for (const StepEntry& e : lsched().plan().e) seg_step = seg_step && e.home < 0;
+                for (int m2 = 0; m2 < n_lanes_; ++m2) seg_step = seg_step && lanes_.inbox_n(m2) <= inbox0[(size_t)m2];
+                seg_step = seg_step && lanes_.inbox_n(l) == 0;
+            }
+            if (seg_step) {
                 LSeg& s = lsg[(size_t)l];
                 s = LSeg{};
                 s.b = b;
-                if (!lseg_hb.empty()) {
+                s.mixed = !lanes_.is_bg(l);
+                if (!lseg_hb.empty() && !lseg_ring_busy() && !lseg_tail_waits()) {
                     int a = 0;
                     for (int32_t x : lseg_hb) { s.parts.emplace_back(a, (int)x); a = x; }
                     s.parts.emplace_back(a, cfg_.pp_cut_h);
@@ -758,6 +793,7 @@ int Engine::step_loop_lanes() {
                     s.st = kLsHeadDone;
                 }
                 ++lseg_steps;
+                if (s.mixed) ++lseg_msteps;
             } else if (const int hs = lane_head(l, b); hs < 0) {
                 return fail_loop(hs);
             }
@@ -817,7 +853,7 @@ int Engine::step_loop_lanes() {
                         ++s.k;
                         if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                     }
-                } else if (s.st == kLsHeadDone && !lseg_tb.empty() && x2_landed(l)) {
+                } else if (s.st == kLsHeadDone && !lseg_tb.empty() && x2_landed(l) && !lseg_ring_busy()) {
                     int a = cfg_.pp_cut_t;
                     for (int32_t x : lseg_tb) { s.parts.emplace_back(a, (int)x); a = x; }
                     s.parts.emplace_back(a, RAD_PP_SEG_END);
