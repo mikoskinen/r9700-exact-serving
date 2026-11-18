@@ -368,9 +368,20 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
         r->recv_async[rank] = r->recv_async[rank] + 1;
         return RAD_OK;
     }
+    /* tp8 loop P20 round 4: `shard` -- this rank copies only ITS rows of the masked parts (the rows collectives' cut over
+     * the part's rows; the other parts whole): an SP layer reads no other row of them */
+    const uint32_t shard = !loop ? (uint32_t)rad_param_geti(a->p, a->n_p, "shard", 0) : 0u;
     uint64_t off = 0;
     for (int i = 0; i < n; ++i) {
-        std::memcpy(a->t[1 + i].data, src + off, (size_t)bytes[i]);
+        if ((shard >> i) & 1u) {
+            const uint64_t prow = (uint64_t)a->t[1 + i].shape[0], nr = std::max<uint64_t>(r->n_ranks, 1);
+            if (prow == 0 || bytes[i] % prow) return RAD_E_SHAPE;
+            const uint64_t rb = bytes[i] / prow, q = (prow + nr - 1) / nr;
+            const uint64_t r0 = std::min<uint64_t>((uint64_t)rank * q, prow), r1 = std::min<uint64_t>(r0 + q, prow);
+            if (r1 > r0) std::memcpy(static_cast<char*>(a->t[1 + i].data) + r0 * rb, src + off + r0 * rb, (size_t)((r1 - r0) * rb));
+        } else {
+            std::memcpy(a->t[1 + i].data, src + off, (size_t)bytes[i]);
+        }
         off += rad_pp_align(bytes[i]);
     }
     __atomic_store_n(&r->taken[rank], want, __ATOMIC_RELEASE);

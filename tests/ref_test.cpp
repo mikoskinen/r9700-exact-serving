@@ -6338,6 +6338,48 @@ TEST(op_stage_send_row_shards_world4) {
             uint64_t lay = 0;
             std::memcpy(&lay, pay + o2 + rad_pp_align(b2) + 8, 8);
             CHECK_EQ((unsigned long long)lay, (unsigned long long)rad_pp_layout(bytes, 3));
+            /* round 4: the same payload received with `shard` 3 (each rank its rows of parts 0 / 1, part 2 whole) and without
+             * (every row): rows outside a rank's own keep the receive buffers' sentinel under `shard` */
+            for (int rsh : { 3, 0 }) {
+                r->landed = 1;
+                for (int rk = 0; rk < W; ++rk) r->taken[rk] = 0;
+                std::vector<std::vector<T>> got((size_t)W);
+                for (int rk = 0; rk < W; ++rk) {
+                    got[(size_t)rk].reserve(3);
+                    got[(size_t)rk].emplace_back(RAD_F32, std::vector<int64_t>{ R0, 8 });
+                    got[(size_t)rk].emplace_back(RAD_BF16, std::vector<int64_t>{ R0, 10 });
+                    got[(size_t)rk].emplace_back(RAD_I32, std::vector<int64_t>{ R2, 3 });
+                    for (int64_t i = 0; i < R0 * 8; ++i) got[(size_t)rk][0].set(i, -7.0f);
+                    for (int64_t i = 0; i < R0 * 10; ++i) got[(size_t)rk][1].set(i, -7.0f);
+                }
+                int rs[W] = { 0, 0, 0, 0 };
+                auto rbody = [&](int rk) {
+                    A a;
+                    a.t(ringt).t(got[(size_t)rk][0]).t(got[(size_t)rk][1]).t(got[(size_t)rk][2])
+                        .i("M", R0).i("ring", 0).i("parts", 3);
+                    if (rsh) a.i("shard", rsh);
+                    rs[rk] = run("stage_recv", a, rk, W);
+                };
+                std::vector<std::thread> rt;
+                for (int rk = 0; rk < W; ++rk) rt.emplace_back(rbody, rk);
+                for (std::thread& x : rt) x.join();
+                for (int rk = 0; rk < W; ++rk) {
+                    CHECK_OK(rs[rk]);
+                    int64_t bad = 0;
+                    for (int k = 0; k < 2; ++k) {
+                        const int64_t rb = k == 0 ? 8 : 10;
+                        T one(k == 0 ? RAD_F32 : RAD_BF16, { 1 });
+                        for (int64_t i = 0; i < R0 * rb; ++i) {
+                            const bool mine = !rsh || (i / rb) / q == rk;
+                            one.set(0, mine ? good(k, i) : -7.0f);
+                            bad += got[(size_t)rk][(size_t)k].at(i) != one.at(0);
+                        }
+                    }
+                    CHECK_EQ(bad, (int64_t)0);
+                    CHECK(std::memcmp(got[(size_t)rk][2].mem.data(), want2.data(), b2) == 0);
+                    CHECK_EQ((long long)r->taken[rk], 1LL);
+                }
+            }
         } else {
             CHECK(!p0);   /* the control: rank 0's junk rows */
             CHECK(!p1);

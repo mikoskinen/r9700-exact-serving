@@ -316,8 +316,15 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
     if (ok) {
         const char* src = reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
-        for (int k = 0; k < P.n; ++k) copy_part(src + P.off[k], reinterpret_cast<char*>(P.p[k]), P.bytes[k],
-                                                (P.w16 >> k) & 1u, stride);
+        for (int k = 0; k < P.n; ++k) {
+            if (P.split == 3) {   /* tp8 loop P20 round 4: this rank's rows of a masked part, an unmasked part whole */
+                if (P.phi[k] > P.plo[k])
+                    copy_part(src + P.plo[k], reinterpret_cast<char*>(P.p[k]) + (P.plo[k] - P.off[k]), P.phi[k] - P.plo[k],
+                              (P.w16 >> k) & 1u, stride);
+                continue;
+            }
+            copy_part(src + P.off[k], reinterpret_cast<char*>(P.p[k]), P.bytes[k], (P.w16 >> k) & 1u, stride);
+        }
     }
     __threadfence();
     __syncthreads();
@@ -620,6 +627,35 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
         if (blocks < 1) blocks = 1;
         if (blocks > kMaxBlocks) blocks = kMaxBlocks;
         return R4D_EMIT(stream, stage_send_split_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter, diff);
+    }
+    /* tp8 loop P20 round 4: a receive with `shard` copies this rank's rows of the masked parts, the others whole (never
+     * through the staging buffer: P10b's path keeps whole parts) */
+    if (!send && !loop) {
+        const uint32_t rsh = (uint32_t)r4d_geti_or(a, "shard", 0);
+        if (rsh) {
+            const uint64_t nr = r->n_ranks > 0 ? r->n_ranks : 1;
+            P.split = 3;
+            for (int k = 0; k < P.n; ++k) {
+                P.plo[k] = P.off[k];
+                P.phi[k] = P.off[k] + P.bytes[k];
+                if (!((rsh >> k) & 1u)) continue;
+                const RadTensor* t = r4d_opt(a, 1 + k);
+                const uint64_t rows = t ? (uint64_t)t->shape[0] : 0;
+                if (rows == 0 || P.bytes[k] % rows) return R4D_NO(RAD_E_SHAPE);
+                const uint64_t rb = P.bytes[k] / rows, q = (rows + nr - 1) / nr;
+                if (rb % 4) return R4D_NO(RAD_E_ALIGN);
+                const uint64_t r0 = (uint64_t)a->rank * q < rows ? (uint64_t)a->rank * q : rows;
+                const uint64_t r1 = r0 + q < rows ? r0 + q : rows;
+                P.plo[k] = P.off[k] + r0 * rb;
+                P.phi[k] = P.off[k] + r1 * rb;
+                if (rb % 16) P.w16 &= ~(1u << k);
+            }
+            const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
+            uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
+            if (blocks < 1) blocks = 1;
+            if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+            return R4D_EMIT(stream, stage_recv_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter);
+        }
     }
     /* tp8 loop P10b: a large payload lands through this rank's card staging buffer from a side stream */
     if (!send && !loop && r->recv_rows && P.rows >= r->recv_rows && a->rank >= 0 && a->rank < RAD_PP_MAX_RANKS &&

@@ -36,6 +36,7 @@ struct Pass {
     bool psk = false;           /* lever PSK cuts this pass */
     bool cone = false;          /* ... and the pass holds the prompt's end (cone rows from layer 20) */
     bool x1_sh = false;         /* tp8 loop P20 round 3: X1 leaves row-sharded (each rank its rows of the live set) */
+    bool x1r_sh = false;        /* round 4: X1 lands row-sharded at an SP receiving layer (each rank copies its rows) */
 };
 
 bool engram(int l) { return l == 1 || l == 14; }
@@ -81,8 +82,8 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
         err = std::string(what) + " at layer " + std::to_string(l) + (sp ? " (quarter)" : " (whole)") + " reads " +
               (have == kQ ? "a quarter" : "nothing");
     };
-    if (p.recv) {   /* the crossing's live set: act.x, h1, post, comb, pre_f whole on every rank */
-        s.act = s.h1 = s.mix = s.pre_f = kAll;
+    if (p.recv) {   /* the crossing's live set: act.x, h1, post, comb, pre_f whole on every rank (round 4: the quarter) */
+        s.act = s.h1 = s.mix = s.pre_f = p.x1r_sh && spv[(size_t)p.lo] ? kQ : kAll;
         s.h0 = kNone;
     }
     bool rows_left = true;   /* the layer has rows in this pass (the final norm's) */
@@ -195,6 +196,12 @@ std::vector<Pass> shapes() {
     Pass hs = h;   /* the leader's head at W(10,32) with X1 row-sharded (round 3) */
     hs.x1_sh = true;
     v.push_back(hs);
+    Pass fq = f;   /* the follower at W(10,32), X1 landing row-sharded (round 4), body and cone */
+    fq.x1r_sh = true;
+    fq.cone = false;
+    v.push_back(fq);
+    fq.cone = true;
+    v.push_back(fq);
     Pass f15;   /* W(15,35)'s follower: no Engram layer, X1 in at 15 */
     f15.lo = 15; f15.hi = 35; f15.recv = true; f15.x2 = true; f15.psk = true; f15.cone = true;
     v.push_back(f15);
@@ -230,8 +237,11 @@ TEST(plan_takes_the_layers_it_should) {
     CHECK_EQ(count(plan_of(v[7])), 0);
     /* the leader's head with X1 row-sharded: 0..9 (no gather before X1) */
     CHECK_EQ(count(plan_of(v[8])), 10);
+    /* the follower with X1 landing row-sharded: 10..19 */
+    CHECK_EQ(count(plan_of(v[9])), 10);
+    CHECK_EQ(count(plan_of(v[10])), 10);
     /* W(15,35)'s follower: 15..19 */
-    CHECK_EQ(count(plan_of(v[9])), 5);
+    CHECK_EQ(count(plan_of(v[11])), 5);
 }
 
 TEST(plan_control_without_the_engram_rule_fails) {

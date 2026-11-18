@@ -691,7 +691,8 @@ struct Model {
     rad_op sp_rs_a = 0, sp_rs_f = 0, sp_ag_x = 0, sp_ag_f = 0, sp_ag_h = 0;
     /* tp8 loop P20 round 3 (RADIANCE_DS41_SPHC_X1=1, with sphc, the leader at h > 0): X1's stage_send with its residual parts
      * row-sharded (`shard`: every rank writes its quarter rows, rank 0 the rest) -- the leader's last head layer then SP too,
-     * no gather of the streams before X1 */
+     * no gather of the streams before X1. Round 4, the follower at h > 0: X1's stage_recv with `shard` (each rank copies
+     * only its quarter rows of those parts: its SP layer h reads no other) */
     rad_op pp_x1_sh = 0;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
@@ -4674,10 +4675,11 @@ static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring, bool shard = 
             if (v[i].rows == CutRows::Live && (v[i].b == m.act.x || v[i].b == m.h1 || v[i].b == m.post || v[i].b == m.comb ||
                                                v[i].b == m.pre_f))
                 mask |= (int64_t)1 << i;
-        if (!sends || mask == 0) return 0;
+        if (mask == 0) return 0;
+        const char* nm = sends ? "stage_send" : "stage_recv";   /* round 4: the follower's quarter receive */
         const RadParam ps[] = { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()),
                                 RAD_INT("shard", mask) };
-        h = rad_op_declared(b, "stage_send") ? rad_decl_op(b, "stage_send", ps, 4, nullptr, 0) : 0;
+        h = rad_op_declared(b, nm) ? rad_decl_op(b, nm, ps, 4, nullptr, 0) : 0;
         if (!h || !rad_op_resolved(b, h)) return 0;
     } else {
         h = op(b, sends ? "stage_send" : "stage_recv",
@@ -5264,6 +5266,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const int ring = m.pp_rank == 0 ? RAD_PP_X2 : RAD_PP_X1;
             rad_op& xo = ring == RAD_PP_X2 ? m.pp_x2 : m.pp_x1;
             if (!(xo = pp_stage_op(b, m, ring))) return RAD_E_INVAL;
+            /* tp8 loop P20 round 4: the follower's quarter receive (RADIANCE_DS41_SPHC_X1), for an SP pass's X1 */
+            if (ring == RAD_PP_X1 && m.sphc > 0 && sphc_x1_env()) {
+                m.pp_x1_sh = pp_stage_op(b, m, RAD_PP_X1, true);
+                if (ctx->rank == 0 && !ctx->shape_probe)
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_X1=1 (tp8 loop P20 round 4): %s\n",
+                            m.pp_x1_sh ? "an SP pass's X1 lands row-sharded (each rank copies its quarter rows of act.x / h1 / "
+                                         "post / comb / pre_ffn, the rest whole)"
+                                       : "off -- the row-sharded stage_recv does not resolve here");
+            }
             DS_TRY(pp_copy_declare(b, m, ring));
             m.pp_post = op(b, "mhc_post", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
                            {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
@@ -7082,7 +7093,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (const int ring = held ? pp_recv_at(m, l) : -1; ring >= 0) {
             int64_t lo = 0, hi = 0;
             live_span(&lo, &hi);
-            if (!pp_cross(x, m, batch, ring, lo, hi)) return;
+            /* tp8 loop P20 round 4: X1 into an SP layer lands row-sharded (each rank its quarter of the residual parts) */
+            const bool x1r_sh = ring == RAD_PP_X1 && m.pp && m.pp_rank == 1 && m.pp_x1_sh && held &&
+                                spv[(size_t)(&L - m.layers.data())] != 0 && lo == 0 && hi == T;
+            if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh)) return;
+            if (x1r_sh && rad_rank(x) == 0) g_sp_x1.fetch_add(1, std::memory_order_relaxed);
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
             if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
             const bool sp_rx = held && spv[(size_t)(&L - m.layers.data())] != 0;
