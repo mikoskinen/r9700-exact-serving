@@ -770,6 +770,13 @@ struct Model {
     int band_k = 0;
     ds41layers::Band band{};
     std::vector<char> band_decl;
+    /* round 2b (declare only): each band layer's window-key rows (persist, both nodes), the leader's copies of them out of
+     * window_kv_normed after the layer's key chain (a bf16 cast, byte copy), the band X1 (the leader's send after layer h + k - 1,
+     * the follower's receive before layer h + k) and the follower's window stores of the received rows (window_key_store, the
+     * owner's op, issued into band layer j's window pages) */
+    std::vector<rad_buf> band_key;
+    std::vector<rad_op> band_cp, band_st;
+    rad_op pp_x1b = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -4707,6 +4714,20 @@ static std::vector<CutPart> ds41_cut_liveset_cx(const Model& m, const ds41layers
     }
     return v;
 }
+/* tp8 loop P28 round 2b: a band pass's X1 parts -- X1 of W(h + k, t), the follower's source copy X1 of W(h, t) carries
+ * (where X1 of W(h + k, t) does not carry that source already), then each band layer's window-key rows */
+static std::vector<CutPart> ds41_band_liveset(const Model& m) {
+    const auto& c = m.c;
+    std::vector<CutPart> v = ds41_cut_liveset_cx(m, m.band.x1);
+    if (m.band.copy_src >= 0 && m.band.x1.src < 0) {
+        if (m.band.copy_latent) v.push_back({ m.lat, "lat", c.head_dim * 2, CutRows::Work, c.head_dim });
+        if (m.band.copy_index) v.push_back({ m.ikn, "ikn", c.idim * 2, CutRows::Work, c.idim });
+        if (c.ratio[(size_t)m.band.copy_src] > 1) v.push_back({ m.page, "page", 4, CutRows::Work, 1 });
+    }
+    for (size_t j = 0; j < m.band_key.size(); ++j)
+        v.push_back({ m.band_key[j], "bkey", c.head_dim * 2, CutRows::Live, c.head_dim });
+    return v;
+}
 /* The rows a kv source's entry stores run over in a step of T rows and S sequences (the compressor chain's: ratio > 1
  * the bound on its completed blocks, step()'s `rows`; ratio 1 every row). */
 static int64_t pp_work_rows(const Model& m, int64_t r, int64_t T, int64_t S) {
@@ -4750,6 +4771,21 @@ static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring, bool shard = 
     std::vector<rad_buf> bufs;
     for (const CutPart& p : v)
         if (p.b) bufs.push_back(p.b);   /* tp8 dev D10 round 2: the token ids are the batch's, not a buffer */
+    if (bufs.empty()) return h;
+    if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
+    else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
+    return h;
+}
+
+/* tp8 loop P28 round 2b: crossing `ring`'s stage op over an explicit parts list (the band X1) */
+static rad_op pp_stage_op_v(RadBuilder* b, const Model& m, int ring, const std::vector<CutPart>& v) {
+    const bool sends = (ring == RAD_PP_X1) == (m.pp_rank == 0);
+    rad_op h = op(b, sends ? "stage_send" : "stage_recv",
+                  { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
+    if (!h) return h;
+    std::vector<rad_buf> bufs;
+    for (const CutPart& p : v)
+        if (p.b) bufs.push_back(p.b);
     if (bufs.empty()) return h;
     if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
     else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
@@ -5179,9 +5215,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.pp) {
         /* tp8 S6: at h > 0 X1 is the residual after layer h - 1, declared there (the layer loop below) */
         if (m.pp_h == 0 && !(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1))) return RAD_E_INVAL;
+        /* tp8 loop P28 round 2b: the band's key rows (both nodes) before the ring sizes: a band X1 may be the wider one */
+        if (m.band_k > 0) {
+            for (size_t j = 0; j < m.band.window.size(); ++j)
+                m.band_key.push_back(decl_b(b, nm.f("pp_band_key%zu", j), RAD_BF16, { T, c.head_dim }, RAD_BUF_PERSIST));
+            m.band_cp.assign(m.band_key.size(), 0);
+            m.band_st.assign(m.band_key.size(), 0);
+        }
         for (int ring : { (int)RAD_PP_X1, (int)RAD_PP_X2 }) {
             const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
-            rad_pp_declare_crossing(ring, cut_row_bytes(m, v, ring), (int)v.size());
+            int64_t rb = cut_row_bytes(m, v, ring), np = (int64_t)v.size();
+            if (ring == RAD_PP_X1 && m.band_k > 0) {
+                const std::vector<CutPart> vb = ds41_band_liveset(m);
+                rb = std::max(rb, cut_row_bytes(m, vb, ring));
+                np = std::max<int64_t>(np, (int64_t)vb.size());
+            }
+            rad_pp_declare_crossing(ring, rb, (int)np);
         }
         if (m.pp_ids) rad_pp_declare_x1_ids(1);   /* tp8 dev D10 round 2: X1's token ids, taken first by the follower */
     }
@@ -5391,9 +5440,24 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
             if (!m.pp_post) return RAD_E_INVAL;
         }
+        /* tp8 loop P28 round 2b: the follower takes a band pass's X1 before layer h + k, then stores the band layers' window
+         * keys (the source copy rides pp_cp_lat / pp_cp_idx as X1's does) */
+        if (m.band_k > 0 && m.pp_rank == 1 && l == m.band.at) {
+            if (!(m.pp_x1b = pp_stage_op_v(b, m, RAD_PP_X1, ds41_band_liveset(m)))) return RAD_E_INVAL;
+            for (size_t j = 0; j < m.band_key.size(); ++j)
+                if (!(m.band_st[j] = window_key_store(b, T, c.head_dim, m.w8, m.band_key[j]))) return RAD_E_INVAL;
+        }
         if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
         else if (m.band_k > 0 && m.band_decl[(size_t)l]) DS_TRY(layer(b, m, m.layers[(size_t)l], l));   /* tp8 loop P28: the band */
         else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
+        /* tp8 loop P28 round 2b: the leader's copy of band layer l's key rows, and the band X1 after its last band layer */
+        if (m.band_k > 0 && m.pp_rank == 0 && m.band_decl[(size_t)l]) {
+            const size_t j = (size_t)(l - m.band.h);
+            m.band_cp[j] = op(b, "cast", { RAD_RANGE("M", 1, T), RAD_INT("n", c.head_dim), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
+                              {}, { m.kvn }, { m.band_key[j] });
+            if (!m.band_cp[j]) return RAD_E_INVAL;
+            if (l == m.band.at - 1 && !(m.pp_x1b = pp_stage_op_v(b, m, RAD_PP_X1, ds41_band_liveset(m)))) return RAD_E_INVAL;
+        }
         if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
         for (size_t k = 0; k < m.seg_b.size(); ++k)   /* tp8 dev M4: the save after layer s - 1 */
             if (m.seg_b[k] == l + 1 && !(m.seg_send[k] = pp_seg_stage_op(b, m, k, true))) return RAD_E_INVAL;
