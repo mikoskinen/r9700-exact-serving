@@ -2561,7 +2561,7 @@ static bool sphc_x1_env() {
 static int sphc_seg_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_SPHC_SEG");
-        return e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
+        return e && (e[0] >= '1' && e[0] <= '3') && !e[1] ? e[0] - '0' : 0;
     }();
     return v;
 }
@@ -5729,8 +5729,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "segment of >= %lld rows is SP where the whole follower part's plan is (the next segment issues the "
                         "boundary op over each rank's quarter); %s\n",
                 sphc_seg_env(), (long long)m.sphc,
-                m.sp_seg >= 2 ? "its boundaries saved / restored row-sharded (each rank its quarter rows of act.x / h1 / post / "
-                                "comb / pre_ffn, the rest whole)"
+                m.sp_seg >= 2 ? (m.sp_seg >= 3 ? "its boundaries saved / restored row-sharded (each rank its quarter rows of act.x / "
+                                                 "h1 / post / comb / pre_ffn, the rest whole); P25b: a layer past PSK's first whose "
+                                                 "cone keeps every row of the pass is planned uncut"
+                                               : "its boundaries saved / restored row-sharded (each rank its quarter rows of act.x / h1 / "
+                                                 "post / comb / pre_ffn, the rest whole)")
                 : sphc_seg_env() >= 2 ? "boundaries WHOLE: the row-sharded loop stage ops do not resolve here (as 1)"
                                       : "boundaries saved / restored whole");
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
@@ -7539,6 +7542,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                          !(batch->n_mm_rows > 0 && batch->mm_rows) && !m.bt.on &&
                          !m.zero && !t_band;   /* tp8 loop P28: a band pass runs whole-row forms */
     const auto sp_in_part = [&](int i) { return sp_segp ? i >= pp_he(m) && i < m.pp_t : pp_part_layer(m, part, i); };
+    /* tp8 loop P25b (RADIANCE_DS41_SPHC_SEG=3, a follower segment pass): a layer past m.psk_first whose cone keeps every row
+     * of the pass's one prefill segment (psk_rows over C_l and the plan's `ahead`, as the cut below computes it) runs uncut,
+     * so the plan may take it; the split layer (PSK-L20) and replay chunks stay as may_cut says. The cut below re-checks. */
+    const auto sp_may_cut = [&](int l) {
+        if (!may_cut(l)) return false;
+        if (!(sp_segp && m.sp_seg >= 3) || cr_any || sg.size() != 1 || sg[0].dec || l < m.psk_first) return true;
+        if (l20_on && l == m.psk_l20 && !cr_all) return true;
+        return psk_rows(psk_cone(c.n_layer, c.window, l), psk_ahead(hint, 0), sg[0].n) < sg[0].n;
+    };
     const int64_t spq = (T + 3) / 4;
     const int64_t sp0 =std::min<int64_t>((int64_t)rad_rank(x) * spq, T), spn = std::max<int64_t>(0, std::min(spq, T - sp0));
     static thread_local std::vector<uint8_t> spv;
@@ -7563,7 +7575,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * the follower part's only crossing out (X2 after t - 1), not its segment's boundary */
             const int so = sp_segp ? (L.l == m.pp_t - 1 ? RAD_PP_X2 : -1) : pp_send_after(m, L.l);
             d.out_sharded = so == RAD_PP_X1 && m.pp_x1_sh != 0;
-            d.self_ok = L.ar_attn && !L.tap && (so < 0 || d.out_sharded) && !may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
+            d.self_ok = L.ar_attn && !L.tap && (so < 0 || d.out_sharded) && !sp_may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
                         !mo.op_shared_ar && !mo.op_combine && !mo.op_add && mo.issues_ar(T, T);
         }
         ds41sp::plan(spl, spv);
@@ -7744,6 +7756,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 s.n = n;
                 psk_sg.push_back(s);
             }
+        }
+        if (cut && held && spv[(size_t)(&L - m.layers.data())] != 0) {   /* tp8 loop P25b: the plan took a layer PSK cuts */
+            rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_SEG=3: an SP layer is cut by lever PSK (a plan defect)");
+            return;
         }
         if (cut != (cur != &sg)) {
             cur = cut ? &psk_sg : &sg;

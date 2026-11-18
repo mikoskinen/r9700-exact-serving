@@ -42,6 +42,8 @@ struct Pass {
      * the plan is the whole part's. seg_sh: an SP layer's boundary saved / restored row-sharded (2), else whole (1). */
     int seg = 0;
     bool seg_sh = false;
+    /* P25b (RADIANCE_DS41_SPHC_SEG=3): layers (kL20, open_to) keep every row of the pass (its cone covers the prompt): uncut */
+    int open_to = 0;
 };
 
 bool engram(int l) { return l == 1 || l == 14; }
@@ -49,6 +51,7 @@ bool tap(int l) { return l >= 37 && l <= 39; }
 bool pcn_a(int l) { return l > 0 && !engram(l); }   /* the layer's collapse is issued at the previous layer's end */
 Cut cut_of(const Pass& p, int l) {
     if (!p.psk || l < kL20) return kUncut;
+    if (l > kL20 && l < p.open_to) return kUncut;   /* P25b */
     if (l == kL20) return p.cone ? kCone : kL20None;
     return p.cone ? kCone : kSkipped;
 }
@@ -65,7 +68,7 @@ std::vector<uint8_t> plan_of(const Pass& p, bool engram_rule = true) {
         }
         const bool send_after = (p.send || p.x2) && i == p.hi - 1;
         d.out_sharded = p.send && p.x1_sh && i == p.hi - 1;
-        d.self_ok = !tap(i) && !(send_after && !d.out_sharded) && !(p.psk && i >= kL20);
+        d.self_ok = !tap(i) && !(send_after && !d.out_sharded) && !(p.psk && i >= kL20 && !(i > kL20 && i < p.open_to));
     }
     std::vector<uint8_t> spv;
     ds41sp::plan(L, spv);
@@ -328,6 +331,32 @@ TEST(plan_segment_passes_every_read_valid) {
         f.seg_sh = sh;
         CHECK(!run(f, plan_of(f), true, /*seg_rx_rule=*/false).empty());
     }
+}
+
+/* tp8 loop P25b (RADIANCE_DS41_SPHC_SEG=3): the follower's newcomer pass whose cone keeps every row of layers 21-31 (a ~1.1k
+ * prompt: C_31 = 160 + 8 x 128 = 1,184) or of 21-27 only (a ~1.6k prompt: C_28 = 1,568), in 1- / 2-layer segments, boundaries whole /
+ * sharded, X1 whole / sharded: every read valid; the plan takes 10-19 + 21-30 (20) or 10-19 + 21-27 (17) -- 20 (the split layer)
+ * and 31 (before X2) stay whole. */
+TEST(plan_segment_passes_with_uncut_deep_layers_every_read_valid) {
+    int checked = 0;
+    for (int open_to : { 32, 28 })
+        for (Pass f : { shapes()[5], shapes()[10] })
+            for (int seg : { 1, 2 })
+                for (bool sh : { false, true }) {
+                    f.seg = seg;
+                    f.seg_sh = sh;
+                    f.open_to = open_to;
+                    const std::vector<uint8_t> spv = plan_of(f);
+                    const std::string e = run(f, spv);
+                    if (!e.empty())
+                        std::fprintf(stderr, "open to %d, segments of %d, sh %d x1r %d: %s\n", open_to, seg, sh, f.x1r_sh, e.c_str());
+                    CHECK_EQ(e, std::string(""));
+                    CHECK_EQ(count(spv), open_to == 32 ? 20 : 17);
+                    CHECK_EQ((int)spv[20], 0);
+                    CHECK_EQ((int)spv[31], 0);
+                    ++checked;
+                }
+    CHECK_EQ(checked, 16);
 }
 
 TEST(plan_control_without_the_lazy_gather_fails) {
