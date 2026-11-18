@@ -392,6 +392,11 @@
  *                   Exact: it moves only which depth a step verifies. GET "dcap": cycles it bounded the choice, moves it
  *                   forced.
  *   draft_dcap_n    scheduler (SPB; 75 here, 74 on ds41-etp-spb): the decode rows from which draft_dcap holds, 1 .. 64; starts 8.
+ *   draft_cost_age  scheduler (DCA, ds41-drafter; 81 here, after stage_lone; sched/draft.h DraftController::cost_age): 0 off
+ *                   (today); A = 16 .. 65536: a drafting depth's step-cost key last sampled more than A decode steps of its
+ *                   scheduler ago does not price that depth while a fresh drafting key of the same row class exists (that
+ *                   key by the prior's ratio stands in, as for an unmeasured depth). lq141 c16w: one lane held depth 2 on a
+ *                   depth-3 key measured before drafter_mx 2. Starts 0. Exact: it moves only which depth a step verifies.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -602,7 +607,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

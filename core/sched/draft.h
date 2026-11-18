@@ -341,6 +341,20 @@ public:
     void set_dcap(int d) { dcap_d_ = d < 0 ? 0 : d > 64 ? 64 : d; }
     int  dcap_n() const { return dcap_n_; }
     void set_dcap_n(int n) { dcap_n_ = n < 1 ? 1 : n > 64 ? 64 : n; }
+    /* DCA, a drafting depth's cost key by age (fn4 draft_cost_age; DRAFTER track 18.11.2026, lq141 c16w): 0 off (D7 as
+     * it was). A > 0: a key of depth >= 1 last sampled more than A decode steps of this scheduler ago does not price its
+     * depth while a FRESH drafting key of the same row class exists -- that key scaled by the prior's ratio stands in, as
+     * for an unmeasured depth, until the depth runs again (no fresh key in the class: the stale mean, as before). A key is
+     * sampled only while its depth runs, so without this a depth measured under other conditions (another drafter
+     * kernel, a shorter context) keeps its old price for good: on lq141 lane 1 of c16 ran depth 2 for all 720 full
+     * steps at 0.283 tokens a ms while lane 0 ran depth 3 at 0.335 with the same period (58.5 / 57.6 ms p50); lane 1's
+     * depth-3 key was c16-b1's, measured with the slower drafter. Depth 0 (the plain step) is not aged. Exact: it moves
+     * only which depth a step verifies. */
+    int  cost_age() const { return cost_age_; }
+    void set_cost_age(int a) { cost_age_ = a <= 0 ? 0 : a < 16 ? 16 : a > 65536 ? 65536 : a; }
+    bool cost_stale(int depth, int c) const {
+        return cost_age_ > 0 && depth > 0 && steps_seen_ - cost_at_[depth][c] > (int64_t)cost_age_;
+    }
     /* Cycles whose choice the cap bounded (the deepest stop above D), and moves down it forced. For tests and the report. */
     int64_t dcap_cycles() const { return n_dcap_; }
     int64_t dcap_moves() const { return n_dcap_moves_; }
@@ -501,6 +515,10 @@ private:
     int32_t dcap_n_ = kDcapN;
     int32_t dcap_free_ = 0;                       /* cycles since the cap last bounded a choice */
     int64_t n_dcap_ = 0, n_dcap_moves_ = 0;
+    /* DCA (cost_age()): the switch, the decode steps step_time has seen, each key's step at its last sample. */
+    int32_t cost_age_ = 0;
+    int64_t steps_seen_ = 0;
+    int64_t cost_at_[RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
     /* The ratio class `c` borrows (kBorrowMin, kBorrowDamp), or 0 when no neighbour has one. */
     double  borrowed_ratio(int c) const;
     bool    zero_now() const {

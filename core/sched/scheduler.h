@@ -432,6 +432,9 @@ public:
      * once a cycle plans at least N decode rows (1 .. 64, default 8). Return the values the scheduler now runs. */
     int      set_draft_dcap(int v);
     int      set_draft_dcap_n(int v);
+    /* fn4 draft_cost_age (DCA, DraftController::cost_age): 0 off, else a drafting depth's cost key older than that many
+     * decode steps (16 .. 65536) does not price its depth while a fresh one of its row class exists. Returns the value run. */
+    int      set_draft_cost_age(int v);
     /* Lever PSK design 2 (ds41-psk2): `mode` the deepseek41 plugin's applied fn4 ds41_psk (2 / 3 = anchors; anything
      * else plans nothing), read by the engine at its first release and after every fn4 change; fn4 ds41_psk_k (the
      * scheduler's: 1 .. 4096, default kPskK) the anchor stride over the periodic checkpoint positions. A request takes

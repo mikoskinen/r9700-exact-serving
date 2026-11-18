@@ -62,8 +62,9 @@ int DraftController::configure(const Params& p) {
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) prior_[j] = 0.0f;
     for (int d = 0; d <= RAD_SCHED_MAX_SPEC; ++d) {
         by_depth_[d] = 0;
-        for (int c = 0; c < kCostClasses; ++c) { cost_ms_[d][c] = 0.0; cost_n_[d][c] = 0; }
+        for (int c = 0; c < kCostClasses; ++c) { cost_ms_[d][c] = 0.0; cost_n_[d][c] = 0; cost_at_[d][c] = 0; }
     }
+    steps_seen_ = 0;
     depth0_ = p.depth0;
     forced_ = p.depth0 && p.depth0_forced;
     occ_only_ = p.depth0 && p.depth0_occ && !forced_;
@@ -144,6 +145,7 @@ void DraftController::step_time(int depth, int n_rows, double ms, double tokens,
     if (!adapt_ || depth < (depth0_ ? 0 : 1) || depth > p_.max_depth || n_rows < 1 ||
         !(ms > 0.0) || !std::isfinite(ms))
         return;
+    ++steps_seen_;                    /* DCA: the age of a cost key is counted in these steps */
     lent_seen_ = lend == kLendLent;   /* lever Z0-H: the lend's state at the last step */
     /* A plain step still warming up (kPlainWarm) is no sample. */
     if (depth == 0 && zero_run_ <= 1 + kPlainWarm) return;
@@ -177,12 +179,15 @@ void DraftController::step_time(int depth, int n_rows, double ms, double tokens,
         dms_[c]  = dn_[c] ? dms_[c] + w * (t - dms_[c]) : t;
         ++dn_[c];
     }
+    /* DCA: a key sampled again after it went stale starts over -- its old mean is the other conditions'. */
+    if (cost_stale(depth, c)) cost_n_[depth][c] = 0;
     double&  m = cost_ms_[depth][c];
     int64_t& n = cost_n_[depth][c];
     if (n >= kCostClipAfter && ms > kCostOutlier * m) ms = kCostOutlier * m;
     const double w = settle_weight(kCostHalfLife, n);
     m = n ? m + w * (ms - m) : ms;
     ++n;
+    cost_at_[depth][c] = steps_seen_;
 }
 
 double DraftController::borrowed_ratio(int c) const {
@@ -225,7 +230,18 @@ double DraftController::step_cost(int depth, int n_rows) const {
      * read experts, so it is measured first (a plain probe). */
     if (depth < 0 || depth > RAD_SCHED_MAX_SPEC) return 0.0;
     const int c = n_rows >= 1 ? cost_class(n_rows) : 0;
-    if (cost_n_[depth][c] > 0) return cost_ms_[depth][c];
+    if (cost_n_[depth][c] > 0 && !cost_stale(depth, c)) return cost_ms_[depth][c];
+    if (cost_age_ > 0 && depth > 0) {
+        /* DCA: a stale or unmeasured drafting depth takes the nearest FRESH drafting key of this class (shallower
+         * on a tie) by the prior's ratio; with none fresh here, its own mean if it has one, else the rule below. */
+        int best = -1;
+        for (int d = 1; d <= p_.max_depth; ++d) {
+            if (cost_n_[d][c] <= 0 || cost_stale(d, c)) continue;
+            if (best < 0 || std::abs(d - depth) < std::abs(best - depth)) best = d;
+        }
+        if (best > 0) return cost_ms_[best][c] * cost_prior(depth) / cost_prior(best);
+        if (cost_n_[depth][c] > 0) return cost_ms_[depth][c];
+    }
     /* Nearest measured key: this class first (nearest depth, shallower on a tie), then the
      * nearest class. Only its ratio to the prior is borrowed, so D's comparison across depths in
      * one class follows the prior's shape until those depths are measured. */

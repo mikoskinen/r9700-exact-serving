@@ -168,6 +168,12 @@ int Scheduler::set_draft_dcap_n(int v) {   /* SPB */
     return draft_.dcap_n();
 }
 
+int Scheduler::set_draft_cost_age(int v) {   /* DCA */
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 0 || (v >= 16 && v <= 65536)) draft_.set_cost_age(v);
+    return draft_.cost_age();
+}
+
 int Scheduler::set_psk_mode(int mode) {   /* lever PSK design 2 */
     std::lock_guard<std::mutex> lk(mu_);
     psk_mode_ = mode;
@@ -562,6 +568,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     fn4::note_sched(fn4::kDraftOccK, draft_.occ_k());
     fn4::note_sched(fn4::kDraftDcap, draft_.dcap());     /* SPB */
     fn4::note_sched(fn4::kDraftDcapN, draft_.dcap_n());
+    fn4::note_sched(fn4::kDraftCostAge, draft_.cost_age());   /* DCA */
     fn4::note_sched(fn4::kDs41PskK, psk_k_);            /* lever PSK design 2 */
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
