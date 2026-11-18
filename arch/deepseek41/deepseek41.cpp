@@ -1410,6 +1410,24 @@ static void k1_read_env() {
  * only proposes and the trunk verifies, so the greedy text does not depend on it. `_ok`: a drafter declared the
  * walk. Process-wide, as the switches above. */
 static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_walk_env{-2};   /* env: -2 unread, -1 unset */
+/* Lever DMR (DRAFTER track 18.11.2026 round 6): the DSpark query pass's mHC order. Switch "dspark_mhr" (fn4, default 0 =
+ * today's issue; RADIANCE_DS41_DSPARK_MHR=1 starts at 1): 1 issues each connection's collapse + norm AHEAD of its mix
+ * (col_a, norm_a, then mix_a; col_f, norm_f, then mix_f), so the mix -- read only by the connection's mhc_post, after
+ * the attention / the MoE -- is no longer on the path to q_a / the router (lq146 c16ak, 8 sequences: mix_split +
+ * mix_finish + their launch gaps ~28 us a connection on the critical path, 6 a pass). The same ops on the same
+ * operands (col_a reads pre_f and h0, mix_a writes pre_a / post / comb; col_f reads pre_a and h1, mix_f writes pre_f /
+ * post / comb: no buffer one writes is one the other reads), so the same bytes. Read at issue (a flip re-records). */
+static std::atomic<int> g_sw_dmr{-1};
+static int dmr_now() {
+    int v = g_sw_dmr.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
+        int unread = -1;
+        g_sw_dmr.compare_exchange_strong(unread, e && !std::strcmp(e, "1") ? 1 : 0);
+        v = g_sw_dmr.load(std::memory_order_relaxed);
+    }
+    return v;
+}
 static void walk_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_DSPARK_WALK");
@@ -2081,6 +2099,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "dspark_mhr")) return value == 0 || value == 1 ? 1 : -1;   /* lever DMR */
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
@@ -2115,6 +2134,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
     else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "dspark_walk")) g_sw_walk.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "dspark_mhr")) g_sw_dmr.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_bi")) g_sw_bi.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_psk")) g_sw_psk.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_psk_l20")) g_sw_psk_l20.store(value, std::memory_order_relaxed);
@@ -2180,6 +2200,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "dspark_walk")) {
         *applied = g_sw_walk.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "dspark_mhr")) {
+        *applied = dmr_now();
         return 1;
     }
     if (!std::strcmp(name, "ds41_gq")) {
@@ -6478,15 +6502,21 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, lo ? lo->poff : d.poff_op, T, brows(d.poff, T));
     RAD_ISSUE_N(x, d.apos_op, T, pos, brows(d.poff, T), brows(d.apos, T));
 
+    /* lever DMR (dmr_now): collapse + norm ahead of the connection's mix; the attention-zero rank keeps today's order */
+    const bool dmr = dmr_now() == 1 && !m.zero;
     for (const auto& L : d.st) {
         const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
-        RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
-                    brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
+        const auto mix_a = [&] {
+            RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
+                        brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
+        };
+        if (!dmr) mix_a();
         RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
         } else {
             RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
+            if (dmr) mix_a();
             const bool gqp = gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
             else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
@@ -6521,10 +6551,14 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
         RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
                     brows(d.h1, T));
-        RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
-                    brows(d.pre_f, T), brows(d.post, T), brows(d.comb, T));
+        const auto mix_f = [&] {
+            RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
+                        brows(d.pre_f, T), brows(d.post, T), brows(d.comb, T));
+        };
+        if (!dmr) mix_f();
         RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
         RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        if (dmr) mix_f();
         L.moe.step(x, batch);
         RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
                     brows(d.h0, T));
