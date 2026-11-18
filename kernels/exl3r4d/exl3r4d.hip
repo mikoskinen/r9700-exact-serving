@@ -3709,8 +3709,14 @@ extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp_read(int o
 #if EXL3R4D_ROUTEDUMP && EXL3R4D_NCLS == 2
 #include <cstdlib>
 #include <cstring>
+#ifndef EXL3R4D_ROUTEDUMP_MAX   // tp8 X7 (DeepSeek real-routing replay): records the ring holds (the last ones at exit)
+#define EXL3R4D_ROUTEDUMP_MAX 8192
+#endif
+#ifndef EXL3R4D_ROUTEDUMP_DEV   // tp8 X7: only this device's launches dump (-1: every device's, the P10 form); one rank's
+#define EXL3R4D_ROUTEDUMP_DEV -1  // routing under TP (every rank routes the same rows), and the ring + counter live on it
+#endif
 namespace {
-constexpr unsigned kRdStride = 520, kRdMax = 8192;   // ints a record: n, rows, off[0 .. 512], padding
+constexpr unsigned kRdStride = 520, kRdMax = EXL3R4D_ROUTEDUMP_MAX;   // ints a record: n, rows, off[0 .. 512], padding
 int* g_rd = nullptr;
 unsigned* g_rd_ctr = nullptr;
 __global__ void exl3r4d_routedump_kernel(int* ring, unsigned* ctr, const int* off, int n, int rows) {
@@ -3733,6 +3739,10 @@ void rd_dump() {
 }  // namespace
 extern "C" int exl3r4d_routedump(const void* off, int n, long long rows, void* stream) {
   if (n <= 0 || n > (int)kRdStride - 3) return -1;
+  if (EXL3R4D_ROUTEDUMP_DEV >= 0) {   // tp8 X7: one device's launches only (the first call is then on it: ring + counter there)
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess || dev != EXL3R4D_ROUTEDUMP_DEV) return 0;
+  }
   if (!g_rd) {
     if (hipHostMalloc((void**)&g_rd, sizeof(int) * kRdStride * kRdMax, hipHostMallocDefault) != hipSuccess) {
       g_rd = nullptr;

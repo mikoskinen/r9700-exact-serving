@@ -6,7 +6,8 @@
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
-//           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
+//           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump) [--route-half 0|1 [--route-topk K]
+//            [--route-place contig|mod2]] (tp8 X7: an EP2 node's half of the whole model's experts)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
@@ -167,6 +168,11 @@ struct Opts {
                               // as bf16 numbers -- elements differing, by more than 1 / 2 bf16 ulps, max and rms difference
                               // against the reference's rms (a build of its own reference, e.g. the codebook fold)
     std::string routing;      // --routing FILE: EXL3R4D_ROUTEDUMP records replayed as the layers' routings (P10-K5)
+    int route_half = -1;      // --route-half H (tp8 X7, with --routing): an EP2 node's half of the experts -- records of 2 x E
+                              // experts and M x --route-topk rows, the half's experts (--route-place) kept; a record is used when
+                              // the half got exactly M x top_k rows (top_k = the full top-k / 2: the half's mean)
+    int route_topk = 0;       // --route-topk K: the records' own top-k (default 2 x --topk)
+    std::string route_place = "contig";   // --route-place contig|mod2: half H = experts [H E, (H + 1) E) or those = H mod 2
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     std::string pfstamps;     // --pfstamps FILE: an EXL3R4D_PF_WGSTAMP build's _pf GEMM workgroups of the last layer, CSV
     int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
@@ -341,6 +347,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
         else if (a == "--routing") o.routing = nx();
+        else if (a == "--route-half") o.route_half = std::atoi(nx());
+        else if (a == "--route-topk") o.route_topk = std::atoi(nx());
+        else if (a == "--route-place") o.route_place = nx();
         else if (a == "--no-ids") o.no_ids = true;
         else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
@@ -452,13 +461,47 @@ int main(int argc, char** argv) {
     // layer l taking record l % count; each expert's rows go to tokens round-robin, so every token has top_k rows and no
     // expert sees a token twice (which token a row is matters only for the x row the prep reads).
     std::vector<std::vector<int32_t>> recs;
+    if (o.route_half >= 0 && o.routing.empty()) die("--route-half needs --routing");
+    if (o.route_half > 1 || (o.route_place != "contig" && o.route_place != "mod2")) die("--route-half is 0 or 1, --route-place contig or mod2");
     if (!o.routing.empty()) {
         FILE* f = std::fopen(o.routing.c_str(), "rb");
         if (!f) die("cannot read " + o.routing);
         std::vector<int32_t> rec(520);
-        while (std::fread(rec.data(), 4, 520, f) == 520)
-            if (rec[0] == (int32_t)o.E && rec[1] == (int32_t)(o.M * o.topk)) recs.push_back(rec);
+        // tp8 X7: --route-half H -- the records are the whole model's (2 E experts, M x rtk rows); the half's experts, in their
+        // order, become a record of E experts; only a half with exactly M x top_k rows is kept (counted: the rest are named)
+        const int64_t rtk = o.route_topk > 0 ? o.route_topk : 2 * o.topk;
+        int64_t seen = 0, kept_rows_off = 0, half_rows_sum = 0, half_live_sum = 0;
+        while (std::fread(rec.data(), 4, 520, f) == 520) {
+            if (o.route_half < 0) {
+                if (rec[0] == (int32_t)o.E && rec[1] == (int32_t)(o.M * o.topk)) recs.push_back(rec);
+                continue;
+            }
+            if (rec[0] != (int32_t)(2 * o.E) || rec[1] != (int32_t)(o.M * rtk)) continue;
+            ++seen;
+            std::vector<int32_t> h(520, 0);
+            h[0] = (int32_t)o.E;
+            int32_t acc = 0, live = 0;
+            for (int64_t x = 0; x < o.E; ++x) {
+                const int64_t e = o.route_place == "mod2" ? 2 * x + o.route_half : o.route_half * o.E + x;
+                const int32_t n = rec[(size_t)e + 3] - rec[(size_t)e + 2];
+                h[(size_t)x + 2] = acc;
+                acc += n < 0 ? 0 : n;
+                live += n > 0;
+            }
+            h[(size_t)o.E + 2] = acc;
+            h[1] = acc;
+            half_rows_sum += acc;
+            half_live_sum += live;
+            if (acc == (int32_t)(o.M * o.topk)) recs.push_back(h);
+            else ++kept_rows_off;
+        }
         std::fclose(f);
+        if (o.route_half >= 0)
+            std::printf("perfmoe: --route-half %d (%s): %lld whole-model records of %lld experts and %lld rows, the half's rows %.1f / live "
+                        "experts %.1f a record (mean); %zu with exactly %lld rows kept, %lld not\n", o.route_half,
+                        o.route_place.c_str(), (long long)seen, (long long)(2 * o.E), (long long)(o.M * rtk),
+                        seen ? (double)half_rows_sum / seen : 0.0, seen ? (double)half_live_sum / seen : 0.0, recs.size(),
+                        (long long)(o.M * o.topk), (long long)kept_rows_off);
         if (recs.empty()) die("--routing: no record with n_expert " + std::to_string(o.E) + " and rows " + std::to_string(o.M * o.topk));
         std::printf("perfmoe: --routing %zu engine routings (n_expert %lld, rows %lld)\n", recs.size(), (long long)o.E,
                     (long long)(o.M * o.topk));
