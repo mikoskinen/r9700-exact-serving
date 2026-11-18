@@ -3341,6 +3341,42 @@ TEST(the_short_block_switches_off_at_one_sequence) {
     CHECK(!Scheduler::short_block_on(true, 0, 1));
 }
 
+/* tp8 loop D19: short block tiers (RADIANCE_DRAFT_SHORT_TIERS=12:1,6:3 -- c32's lanes of 16 the 1-row block, c16's lanes
+ * of 8 the 3-row one): the tier of the highest load a step reaches, each tier with the one-tier switch's hysteresis, and
+ * the drafter's own block below them. The parser sorts the tiers from the highest load down and refuses malformed ones. */
+TEST(short_block_tiers_pick_the_highest_load_tier_with_each_ones_hysteresis) {
+    bool on[2] = {};
+    const int64_t from[2] = { 12, 6 };
+    struct { int64_t dec; int want; } seq[] = {
+        { 16, 0 }, { 11, 0 }, { 10, 1 }, { 11, 1 }, { 12, 0 }, { 8, 1 }, { 5, 1 }, { 4, -1 }, { 5, -1 }, { 6, 1 },
+        { 1, -1 }, { 2, -1 }, { 32, 0 }, { 0, -1 },
+    };
+    int bad = 0;
+    for (const auto& s : seq) {
+        const int k = Scheduler::short_tier_pick(on, from, 2, s.dec);
+        if (k != s.want) { ++bad; std::fprintf(stderr, "    decoded %lld: tier %d, want %d\n", (long long)s.dec, k, s.want); }
+    }
+    CHECK_EQ(bad, 0);
+    /* one tier = the one-tier switch */
+    bool o1 = false, o2 = false;
+    for (const int64_t d : { 2, 8, 7, 6, 7, 9, 1 }) {
+        o1 = Scheduler::short_block_on(o1, d, 8);
+        CHECK_EQ(Scheduler::short_tier_pick(&o2, from, 0, d), -1);
+        const int64_t f8 = 8;
+        CHECK_EQ(Scheduler::short_tier_pick(&o2, &f8, 1, d), o1 ? 0 : -1);
+    }
+    std::vector<std::pair<int64_t, int64_t>> t;
+    std::string why;
+    CHECK_OK(Scheduler::parse_short_tiers("6:3,12:1", &t, &why));
+    REQUIRE_EQ(t.size(), (size_t)2);
+    CHECK_EQ(t[0].first, (int64_t)12); CHECK_EQ(t[0].second, (int64_t)1);
+    CHECK_EQ(t[1].first, (int64_t)6);  CHECK_EQ(t[1].second, (int64_t)3);
+    CHECK_OK(Scheduler::parse_short_tiers("12:1", &t, &why));
+    CHECK_EQ(t.size(), (size_t)1);
+    for (const char* b : { "", "12", "12:", ":1", "12:1,", "12:1,12:3", "1:1", "12:0", "12:1;6:3", "a:1", "2:1,3:1,4:1,5:1,6:1" })
+        CHECK_EQ(Scheduler::parse_short_tiers(b, &t, &why), RAD_E_INVAL);
+}
+
 TEST(no_prefix_hit_gives_nothing_back) {
     const RefillRun r = refill_run(1100, 0);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
