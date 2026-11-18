@@ -331,6 +331,47 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     CHECK_EQ(plan_level(full, grew, 256, &lv, &why), RAD_E_STATE);
 }
 
+/* tp8 loop FINDINGS F43: a buffer read AFTER the step (deepseek41's engram_tokens: lever TI patches a snapshot's CONV
+ * window from it behind the pass) must outlive its last declared use. As a transient whose last use comes early (the
+ * pipeline follower's layer 14 at W(10,32)) the packer lays a later-born transient over it at the full plan and at a
+ * smaller level -- the follower's ids were index_score's bytes by the time the patch read them; as PERSIST nothing
+ * shares it. The shapes: ids written at op 1, read at op 2; score born at op 3, live to the step's end (op 5). */
+TEST(a_buffer_read_after_the_step_shares_bytes_unless_it_persists) {
+    auto mk = [](int64_t rows, int ids_kind) {
+        Program p;
+        p.buffers.emplace_back();
+        p.ops.resize(6);
+        auto rowbuf = [&](const char* n, int64_t w, int kind, int32_t lo, int32_t hi) {
+            BufferInfo b = make_buf(n, rows * w, kind, lo, hi);
+            b.decl.rank = 2;
+            b.decl.shape[0] = rows;
+            b.decl.shape[1] = w;
+            return b;
+        };
+        p.buffers.push_back(rowbuf("ids", 4, ids_kind, ids_kind == RAD_BUF_PERSIST ? -1 : 1,
+                                   ids_kind == RAD_BUF_PERSIST ? -1 : 2));
+        p.buffers.push_back(rowbuf("h", 512, RAD_BUF_TRANSIENT, 1, 5));      /* the residual: live all step */
+        p.buffers.push_back(rowbuf("score", 1024, RAD_BUF_TRANSIENT, 3, 5));
+        return p;
+    };
+    auto shares = [](int64_t ao, int64_t ab, int64_t bo, int64_t bb) { return !(bo + bb <= ao || ao + ab <= bo); };
+    for (int kind : { RAD_BUF_TRANSIENT, RAD_BUF_PERSIST }) {
+        Program full = mk(2048, kind);
+        CHECK_OK(plan_buffers(full));
+        const BufferInfo& ids = full.buffers[1];
+        const BufferInfo& score = full.buffers[3];
+        CHECK_EQ(shares(ids.arena_offset, ids.bytes, score.arena_offset, score.bytes), kind == RAD_BUF_TRANSIENT);
+        Program probe = mk(256, kind);
+        ArenaLevel lv;
+        std::string why;
+        CHECK_OK(plan_level(full, probe, 256, &lv, &why));
+        CHECK_EQ(shares(lv.offset[1], buffer_bytes(lv.decl[1]), lv.offset[3], buffer_bytes(lv.decl[3])),
+                 kind == RAD_BUF_TRANSIENT);
+        /* never the residual, which is live beside it either way */
+        CHECK(!shares(ids.arena_offset, ids.bytes, full.buffers[2].arena_offset, full.buffers[2].bytes));
+    }
+}
+
 /* Lever VA "arena" (RADIANCE_DS41_ARENA_DECODE_ROWS): the decode rung below the 256-row floor takes
  * 8 to 64 rows (what deepseek41's kernels were audited at) and only below the ladder's first rung. */
 TEST(the_decode_rung_takes_8_to_64_rows_below_the_first_rung) {

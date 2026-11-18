@@ -2727,7 +2727,16 @@ static int buffers(RadBuilder* b, Model& m) {
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     if (!c.ple.empty() && lr_engram(m)) {   /* (layer ranges: a node that holds an Engram layer) */
-        m.ctok = decl_b(b, nm.f("engram_tokens"), RAD_I32, { T });
+        /* tp8 loop FINDINGS F43: lever TI's snapshot inside a step patches its CONV window from these ids AFTER the pass
+         * (rad_ckpt_conv_src: Engine::save_checkpoints behind the leader's tail part, pp_ck_apply behind the follower's
+         * pass), past the last declared use -- the last held Engram layer's ngram_ids. With layer ranges that use comes
+         * early (W(10,32): op 242 of the follower's 1,529 at layer 14, op 61 of the leader's at layer 1) and the packer
+         * lays later transients over the ids at every arena level (index_score, engram_kv, comp_stage; on the leader
+         * dspark_*), so the patch copied their bytes: a resume from such a snapshot answered differently on the pair. So
+         * a node with layer ranges keeps them for the whole step (PERSIST, T x 4 B = 16.25 KiB). One process (every
+         * layer) keeps the published declare: there no transient shares their bytes at any level (host declare with
+         * RADIANCE_DEBUG_GRAPH_ALIAS=engram_tokens, 18.11.). */
+        m.ctok = decl_b(b, nm.f("engram_tokens"), RAD_I32, { T }, m.lr.on ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT);
         /* The gathered rows are host domain, as rad_block_ple.h's: a host gather (the table on the
          * disk or RAM tier) whose operands are all host-arena buffers joins on the last device op
          * that touched the host arena, where a device-domain operand drains the stream
