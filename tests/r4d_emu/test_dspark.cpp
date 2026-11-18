@@ -33,7 +33,9 @@ static int conf_cases(std::mt19937& rng, int& cases) {
     struct Sh { int M, steps, D, R, V, astr, xpad, opad; float bias; };
     const Sh shapes[] = { { 1, 5, 5120, 256, 900, 5, 0, 0, 0.0f }, { 3, 5, 5120, 256, 900, 5, 8, 3, 0.25f },
                           { 8, 5, 640, 64, 300, 5, 0, 1, -1.5f }, { 2, 1, 300, 32, 50, 1, 4, 0, 0.0f },
-                          { 5, 7, 1000, 300, 77, 7, 2, 2, 0.5f } };
+                          { 5, 7, 1000, 300, 77, 7, 2, 2, 0.5f },
+                          /* tp8 loop D18: DSpark's short block of 1 / 2 rows, the plane at the drafter's own pitch 5 */
+                          { 4, 1, 640, 64, 300, 1, 0, 4, 0.25f }, { 4, 2, 640, 64, 300, 2, 0, 3, 0.0f } };
     std::uniform_int_distribution<int> small(-15, 15), tiny(-7, 7);
     for (const Sh& sh : shapes) {
         const int M = sh.M, S = sh.steps, D = sh.D, R = sh.R, V = sh.V;
