@@ -534,6 +534,14 @@ void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long nthreads, long drain, long acq, long pub, long gate,
                               long gate_ctr);
 void r4d_ar_ti8_dims(int* group, int* group_bytes);  // tiered-int8 wire only
+// tp8 loop P20 (r4d_ar_sp_rows.hip, from fn4 SP-hc): the four-rank two-shot's halves over whole-row shards, in place on
+// `buf` [n_rows][row]; `op` 0 the reduce-scatter (ti8, lossy), 1 the all-gather on the ti8 wire, 2 the all-gather raw, 3 the
+// reduce-scatter raw (the exact all-reduce's fold: fp32 over the ranks in ascending order, one rounding).
+void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
+                          long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
+                          long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
+                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
+                          long xpush = 0);   /* the raw reduce-scatter's pushes interleaved over the peers (XPUSH) */
 
 // ---- GEMM ----------------------------------------------------------------------------------
 // Skinny bf16 GEMM for M up to 64: C[M,N] = A[M,K] @ W[N,K]^T with 16x16x16 WMMA, so a 16-wide K

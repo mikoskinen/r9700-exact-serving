@@ -3051,6 +3051,27 @@ int ref_all_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("all_gather", operand, out);
 }
 
+/* tp8 loop P20: x [rows][row] in place, `y` the optional same buffer */
+int ref_reduce_scatter_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t numel = gi(p, n_p, "numel", 0);
+    if (numel <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { numel });                               /* x, INOUT */
+    o.t(D, { numel });                               /* y (absent or x) */
+    return o.finish("reduce_scatter_rows", operand, out);
+}
+
+int ref_all_gather_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t numel = gi(p, n_p, "numel", 0);
+    if (numel <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { numel });                               /* x, INOUT */
+    o.t(D, { numel });                               /* y (absent or x) */
+    return o.finish("all_gather_rows", operand, out);
+}
+
 /* ================================================================== vocabulary edges */
 
 int ref_embed_lookup_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

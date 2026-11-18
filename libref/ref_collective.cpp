@@ -20,6 +20,7 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -233,4 +234,95 @@ int ref_all_gather(const RadArgs* a, RadStream) {
      * this one's input; the barrier also keeps call sequences paired. */
     if (!barrier(g)) return RAD_E_DEVICE;
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ tp8 loop P20: the two-shot's halves
+ * reduce_scatter_rows / all_gather_rows (docs/OPS.md): x [rows][row] in place (`y` absent or x; a separate y gets x's
+ * words first and the op runs in place on it); rank r owns the whole
+ * rows [r q, (r + 1) q), q = ceil(rows / world_size). The reduce-scatter leaves on each rank the ascending-rank f32 sum
+ * of its own rows -- all_reduce's walk over those rows, so a reduce-scatter followed by the all-gather holds
+ * all_reduce's bytes -- and the other rows as they were; the all-gather copies every owner's rows into the others' x,
+ * word for word. There is no wire on the host: `raw` 0 is served as 1 (as all_reduce serves exact 0), `overlap` is
+ * accepted and ignored. */
+namespace {
+static int rows_args(const RadArgs* a, const RadTensor** x, int64_t* nel, int64_t* rows, int64_t* row, int* world) {
+    if (!have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* in = &a->t[0];
+    const RadTensor* y = t_in(a, 1);
+    *nel = band_rows(numel(in), p_int(a, "numel", 0));
+    *row = p_int(a, "row", 0);
+    *world = (int)p_int(a, "world_size", a->world_size > 0 ? a->world_size : 1);
+    if (*nel <= 0 || *row <= 0 || *nel % *row) return RAD_E_SHAPE;
+    *rows = *nel / *row;
+    if (*world > 1 && *rows < *world) return RAD_E_SHAPE;
+    *x = in;
+    if (y && y->data != in->data) {
+        /* a separate `y` (a generic caller's): the input copied into it, the op then in place on y -- every rank
+         * publishes the buffer that holds its input rows, so the peers read the same words either way */
+        const int64_t esz = rad_dtype_bytes(in->dtype, 1);
+        if (esz <= 0 || y->dtype != in->dtype) return RAD_E_DTYPE;
+        if (numel(y) < *nel) return RAD_E_SHAPE;
+        if (!rad_tensor_is_contiguous(in) || !rad_tensor_is_contiguous(y)) return RAD_E_STRIDE;
+        std::memcpy(y->data, in->data, (size_t)(*nel * esz));
+        *x = y;
+    }
+    return RAD_OK;
+}
+static void shard_of(int r, int64_t rows, int world, int64_t* lo, int64_t* hi) {
+    const int64_t q = (rows + world - 1) / world;
+    *lo = std::min<int64_t>((int64_t)r * q, rows);
+    *hi = std::min<int64_t>(*lo + q, rows);
+}
+}  /* namespace */
+
+int ref_reduce_scatter_rows(const RadArgs* a, RadStream) {
+    const RadTensor* x = nullptr;
+    int64_t nel = 0, rows = 0, row = 0;
+    int world = 1;
+    RAD_REF_TRY(rows_args(a, &x, &nel, &rows, &row, &world));
+    if (world <= 1) return RAD_OK;
+    RAD_REF_TRY(publish(a->rank, world, x, nel));
+    Group& g = group();
+    int64_t lo = 0, hi = 0;
+    shard_of(a->rank, rows, world, &lo, &hi);
+    const int64_t i0 = lo * row, n = (hi - lo) * row;
+    float* acc = staging(a, n > 0 ? n : 1);
+    for (int64_t i = 0; i < n; ++i) {
+        float s = 0.0f;
+        for (int r = 0; r < world; ++r) s += ld_dt(g.dt[r], g.slot[r], i0 + i);
+        acc[i] = s;
+    }
+    /* every rank has read every peer's shard rows before any rank writes its own */
+    if (!barrier(g)) return RAD_E_DEVICE;
+    for (int64_t i = 0; i < n; ++i) stt(x, offlin(x, i0 + i), acc[i]);
+    return RAD_OK;
+}
+
+int ref_all_gather_rows(const RadArgs* a, RadStream) {
+    const RadTensor* x = nullptr;
+    int64_t nel = 0, rows = 0, row = 0;
+    int world = 1;
+    RAD_REF_TRY(rows_args(a, &x, &nel, &rows, &row, &world));
+    if (world <= 1) return RAD_OK;
+    const int64_t esz = rad_dtype_bytes(x->dtype, 1);
+    if (esz <= 0) return RAD_E_DTYPE;
+    RAD_REF_TRY(publish(a->rank, world, x, nel));
+    Group& g = group();
+    /* rank r writes only its peers' rows of its own x, which no peer reads (each reads only the owner's rows) */
+    for (int r = 0; r < world; ++r) {
+        if (r == a->rank) continue;
+        int64_t lo = 0, hi = 0;
+        shard_of(r, rows, world, &lo, &hi);
+        for (int64_t i = lo * row; i < hi * row; ++i)
+            std::memcpy((char*)x->data + offlin(x, i) * esz, (const char*)g.slot[r] + i * esz, (size_t)esz);
+    }
+    if (!barrier(g)) return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
+int64_t ref_reduce_scatter_rows_scratch(const RadArgs* a) {
+    const int64_t ws = p_int(a, "world_size", a->world_size > 0 ? a->world_size : 1);
+    if (ws <= 1) return 0;
+    const int64_t nel = p_int(a, "numel", a->n_t > 0 ? numel(&a->t[0]) : 0);
+    return (nel / ws + p_int(a, "row", 0)) * (int64_t)sizeof(float);   /* the longest shard */
 }

@@ -873,6 +873,20 @@ static const RadOperandSpec oAllReduce[] = {
     { "y", RAD_OPD_OUT,   1 },
 };
 
+/* tp8 loop P20 (fn4 SP-hc, r4d_ar_sp_rows.hip): the two-shot's halves over whole-row shards, in place. */
+static const RadParamSpec pRowsColl[] = {
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "numel",      RAD_P_INT, RAD_REQUIRED },   /* rows x row at the band's top, as all_reduce's */
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    { "row",        RAD_P_INT, RAD_REQUIRED },   /* elements a row: the shard is whole rows */
+    { "raw",        RAD_P_INT, RAD_OPTIONAL },   /* 1 = the exact form (raw payload words, the exact fold) */
+    { "overlap",    RAD_P_INT, RAD_OPTIONAL },   /* as all_reduce's (no lane row here: the wide row serves it) */
+};
+static const RadOperandSpec oRowsColl[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_OUT,   1 },   /* absent or x: in place only */
+};
+
 /* No `exact` and no `hops`: a gather has no lossy wire and no second topology at two ranks.
  * `numel` is this rank's contribution (the output holds world_size times it) and, as for the
  * all-reduce, the bound init sizes the peer scratch from. */
@@ -3722,6 +3736,14 @@ static const RadOpSchema kSchemas[] = {
            "the exact sum is one-shot up to " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements "
            "(at 8 ranks " R4D_XSTR(R4D_AR_8RANK_ONESHOT_MAX_ELEMS) ") and two-shot above, chosen "
            "by the message's band; `hops` is accepted and no row of this plugin reads it."),
+    SCHEMA("reduce_scatter_rows", pRowsColl, oRowsColl,
+           "tp8 loop P20 (fn4 SP-hc): x [rows][row] summed over the ranks, rank r keeping the sum of its shard -- rows "
+           "[r q, (r + 1) q), q = ceil(rows / world) -- in place; other rows unchanged. raw 1: every rank's words folded in "
+           "fp32 in ascending rank and rounded once (the exact all-reduce's arithmetic); raw 0: the ti8 wire (lossy)."),
+    SCHEMA("all_gather_rows", pRowsColl, oRowsColl,
+           "tp8 loop P20 (fn4 SP-hc): rank r's shard rows of x [rows][row] (as reduce_scatter_rows cuts them) to every "
+           "rank, in place. raw 1: the payload words as they are; raw 0: on the ti8 wire, every rank (the owner too) "
+           "storing the decode of the owner's words, so all hold the same bytes."),
     SCHEMA("all_gather", pAllGather, oAllGather,
            "y is [world_size * numel] with rank r's contribution at offset r * numel. The bytes are "
            "moved and never summed: the vocab-parallel sampler's payload is (u32 token id, f32 "
@@ -5011,6 +5033,10 @@ static const RadConstraint cArTi8Ts3[] = {
 static const RadConstraint cArTi8Ts4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
     C_P2P,
+};
+/* tp8 loop P20 (fn4 SP-hc rows: reduce_scatter_rows / all_gather_rows). */
+static const RadConstraint cSpRows4[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16"), C_DIV("row", 32), C_P2P,
 };
 /* The same at `overlap` 1 (tArTs4Lane). */
 static const RadConstraint cArTi8Ts4Lane[] = {
@@ -8735,6 +8761,23 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
+/* tp8 loop P20 (fn4 SP-hc): the two-shot's halves over whole-row shards (r4d_ar_sp_rows.hip). */
+{ "sp_rs_rows_4rank_ti8", "reduce_scatter_rows", "ar",
+  "tp8 loop P20 reduce-scatter over whole-row shards: raw words (raw 1, exact: the exact all-reduce's fold) or the tiered-int8 wire (raw 0, lossy)",
+  "exactly 4 ranks, all peer-accessible; row a multiple of 32, at least 4 rows; in place",
+  "bf16 / fp16 payload; raw 1: fp32 fold in ascending rank order, one rounding",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cSpRows4), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_rs_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+{ "sp_ag_rows_4rank", "all_gather_rows", "ar",
+  "tp8 loop P20 all-gather over whole-row shards: raw words (raw 1) or the tiered-int8 wire (raw 0, lossy)",
+  "exactly 4 ranks, all peer-accessible; row a multiple of 32, at least 4 rows; in place",
+  "bf16 / fp16 payload; on the ti8 wire every rank stores the decode of the owner's words",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cSpRows4), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
 { "ar_twoshot_4rank_ti8", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
   "quant, the owner storing the decode of its own words) -- lossy",
