@@ -2907,3 +2907,121 @@ TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
         CHECK_EQ(wrong, 0);
     }
 }
+
+/* tp8 loop P13 (deepseek41's RADIANCE_DS41_PIPE2, on GLM-5.3's MoE block: the same MoeFP8 with the sigmoid router's
+ * column split over the ranks): a 512-row prefill pass issued as two 256-row pieces -- both pieces' router projections
+ * and their all_gathers first, pass 0 (projected, no all-reduce of its own), its all-reduce on lane 1 behind lane 0,
+ * pass 1 (projected) on lane 0, lane 0 joining lane 1, then pass 1's all-reduce -- issues every op of the whole pass
+ * once a piece, over the piece's rows, and never two collectives on different lanes without a join between them (the
+ * all-reduce's per-block sequence slots then advance in the same order on every rank). */
+TEST(a_moe_pass_in_two_row_pieces_issues_the_whole_pass_ops_and_keeps_its_collectives_ordered) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts", "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 }, { "mtp.blk.45.ffn_down_exps", fp8 },
+               { "ffn_gate_up_exps", mx },             { "ffn_down_exps", mx },
+               { "ffn_gate_up_shexp", mx },            { "ffn_down_shexp", mx },
+               { "ffn_gate_up.weight", fp8 },          { "ffn_down.weight", fp8 } };
+    RadBuildCtx build{};
+    build.rank = 0;
+    build.world_size = 4;
+    build.max_tok = 512;
+    build.max_seqs = 4;
+    build.max_ctx = 4096;
+    build.max_spec = 3;
+    REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+    const auto& m = *glm5next::models[0];
+    const auto& mo = m.layers[3].moe;
+    const int64_t T = 512, pc = 256, n1 = T - pc;
+    REQUIRE(mo.route_splits(T));
+    REQUIRE(mo.route_splits(pc));
+    REQUIRE(mo.route_splits(n1));
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_PREFILL;
+    batch.n_tok = T;
+    batch.n_seq = 1;
+    auto fresh = [&](RadCtx& c) {
+        c.b = &b;
+        c.rank = 0;
+        c.world = 4;
+        c.batch = &batch;
+    };
+    RadCtx whole, pieces;
+    fresh(whole);
+    fresh(pieces);
+    mo.pass(&whole, T, 0, T, true);
+    mo.route_part(&pieces, 0, pc);
+    mo.route_gather(&pieces, 0, pc);
+    mo.route_part(&pieces, pc, n1);
+    mo.route_gather(&pieces, pc, n1);
+    const size_t routed = pieces.issues.size();
+    mo.pass(&pieces, T, 0, pc, false, nullptr, false, true, true);
+    rad_lane_join(&pieces, 0, 1);
+    rad_lane(&pieces, 1);
+    mo.issue_ar(&pieces, 0, pc, true);
+    rad_lane(&pieces, 0);
+    mo.pass(&pieces, T, pc, n1, false, nullptr, false, true, true);
+    rad_lane_join(&pieces, 1, 0);
+    mo.issue_ar(&pieces, pc, n1, false);
+    CHECK(whole.step_fail.empty());
+    CHECK(pieces.step_fail.empty());
+    /* every op of the whole pass, once a piece; a piece op's row count the whole op's at the piece's rows (a sum) or the
+     * same (an op whose count does not follow the rows) */
+    std::map<std::string, int> nw, np;
+    std::map<std::string, int64_t> sw, sp;
+    for (const auto& is : whole.issues)
+        if (const RecOp* o = b.op_of(is.op)) { ++nw[o->op]; sw[o->op] += is.n; }
+    for (const auto& is : pieces.issues)
+        if (const RecOp* o = b.op_of(is.op)) { ++np[o->op]; sp[o->op] += is.n; }
+    CHECK(nw.size() >= 5);
+    CHECK_EQ(nw["all_reduce"], 1);
+    CHECK_EQ(nw["all_gather"], 1);
+    for (const auto& [op, n] : nw) {
+        if (np[op] != 2 * n || (sp[op] != sw[op] && sp[op] != 2 * sw[op]))
+            fprintf(stderr, "    %s: whole %d issues (n %lld), pieces %d (n %lld)\n", op.c_str(), n, (long long)sw[op],
+                    np[op], (long long)sp[op]);
+        CHECK_EQ(np[op], 2 * n);
+        CHECK(sp[op] == sw[op] || sp[op] == 2 * sw[op]);
+    }
+    for (const auto& [op, n] : np) CHECK(nw.count(op) == 1);
+    CHECK_EQ(sp["all_reduce"], sw["all_reduce"]);
+    CHECK_EQ(sp["all_gather"], sw["all_gather"]);
+    /* the routers' projections only ahead of the passes (projected: the passes issue none) */
+    for (size_t i = routed; i < pieces.issues.size(); ++i)
+        CHECK(pieces.issues[i].op != mo.glm_router.split.op_part && pieces.issues[i].op != mo.glm_router.split.op_gather);
+    /* the collectives: one on lane 1 (piece 0's all-reduce), every pair on two lanes ordered by a join between them */
+    std::vector<size_t> coll;
+    for (size_t i = 0; i < pieces.issues.size(); ++i) {
+        const RecOp* o = b.op_of(pieces.issues[i].op);
+        if (o && (o->op == "all_reduce" || o->op == "all_gather" || o->op == "moe_gather_all_reduce")) coll.push_back(i);
+    }
+    CHECK_EQ(coll.size(), (size_t)4);
+    int on1 = 0;
+    for (size_t i : coll) on1 += pieces.issues[i].lane;
+    CHECK_EQ(on1, 1);
+    for (size_t a = 0; a < coll.size(); ++a)
+        for (size_t z = a + 1; z < coll.size(); ++z) {
+            const int la = pieces.issues[coll[a]].lane, lz = pieces.issues[coll[z]].lane;
+            if (la == lz) continue;
+            bool joined = false;
+            for (const RecJoin& j : pieces.joins)
+                joined = joined || (j.from == la && j.to == lz && j.at > coll[a] && j.at <= coll[z]);
+            CHECK(joined);
+        }
+    /* piece 1's pass runs on lane 0 beside the lane-1 all-reduce: nothing of it on lane 1 */
+    size_t ar0 = coll[0];
+    for (size_t i : coll)
+        if (pieces.issues[i].lane == 1) ar0 = i;
+    for (size_t i = ar0 + 1; i < pieces.issues.size(); ++i) CHECK_EQ(pieces.issues[i].lane, 0);
+}

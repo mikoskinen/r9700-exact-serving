@@ -102,6 +102,15 @@ public:
      * (C' 64k / 128k +2.4 / +1.2 %). Every boundary is the span plan's or an interval boundary. Default 0: today's plan. */
     int64_t span_short() const { return span_short_; }
     void set_span_short(int64_t rows) { span_short_ = rows > 0 ? rows : 0; }
+    /* tp8 loop P14 (RADIANCE_PP_SPAN_INNER=1, with RADIANCE_PP_SPAN=0 / SPAN_TAIL / SPAN_SHORT): a span piece that carries a
+     * snapshot inside it (lever TI's tail snapshot of the prompt's last chunk) is cut too, at its first interior interval
+     * boundary that leaves >= kBiMinPiece rows a side AND the snapshot in the later piece; that piece is planned again with
+     * the snapshot inside it (its interval boundary takes the periodic one, as every cut piece's end does). At --prefill-span
+     * 2 a cold prompt's last chunk spans one interval + its tail (no such boundary: 16k / 64k / 128k unchanged); at span 4
+     * it spans up to three intervals + the tail (lq41: 5,537 / 6,258 / 6,209 rows into the drain), which this cuts to
+     * intervals + the tail, the span-2 / interval plan's end. Default off: today's plan. */
+    bool span_inner() const { return span_inner_; }
+    void set_span_inner(bool on) { span_inner_ = on; }
     /* tp8 loop M2 (RADIANCE_PP_LEND_BUSY=0): a chunk is lent only to a lane with no request of its own running or
      * waiting. Lent into a lane that decodes, a whole chunk is planned first in that lane's step (lane_reserve) and its
      * decoders ride a MIXED step of up to 2,048 rows: the stall the 20:58 PROFILE measured, now in the lane that had
@@ -232,6 +241,7 @@ private:
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
     int64_t span_tail_ = 0;                 /* RADIANCE_PP_SPAN_TAIL (span_tail) */
     int64_t span_short_ = 0;                /* RADIANCE_PP_SPAN_SHORT (span_short) */
+    bool    span_inner_ = false;            /* RADIANCE_PP_SPAN_INNER (span_inner, tp8 loop P14) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
     int     bg_ = 0;                        /* RADIANCE_PP_BG_LANE=k (bg_lane, tp8 dev M8) */
