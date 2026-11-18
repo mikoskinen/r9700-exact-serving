@@ -1898,12 +1898,15 @@ TEST(bg_hold_serves_one_process_tokens) {
     }
     struct Arm { int lanes; const char* cut; const char* hold; bool lead_seg; };
     long long held_all = 0, lent_all = 0, home_all = 0;
+    /* + READY 09:06's S-L1 form: ONE decode lane beside the BG lane (--pp-lanes 2), the leader's segments one queued ahead */
     for (const Arm a : { Arm{ 3, "2,3", "60000", false }, Arm{ 3, "0,2", "60000", false }, Arm{ 4, "1,2", "60000", false },
-                         Arm{ 3, "2,3", "60000", true }, Arm{ 3, "1,2", "1", false } }) {
+                         Arm{ 3, "2,3", "60000", true }, Arm{ 3, "1,2", "1", false }, Arm{ 2, "2,3", "1000", true },
+                         Arm{ 2, "1,2", "1000", true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back("RADIANCE_PP_BG_LANE=1");
         env.push_back(std::string("RADIANCE_PP_BG_HOLD_MS=") + a.hold);
         if (a.lead_seg) env.push_back("RADIANCE_PP_LEAD_SEG=1");
+        if (a.lead_seg && a.lanes == 2) env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1");
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -1938,8 +1941,9 @@ TEST(bg_hold_serves_one_process_tokens) {
         held_all += std::max(0LL, held);
         lent_all += std::max(0LL, lent);
         home_all += std::max(0LL, home);
-        fprintf(stderr, "    BG_HOLD_MS=%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lane; held %lld over %lld "
-                        "steps, %lld then lent, %lld home after the hold\n", a.hold, a.lead_seg ? " + LEAD_SEG=1" : "", a.lanes, a.cut,
+        fprintf(stderr, "    BG_HOLD_MS=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lane; held %lld over %lld "
+                        "steps, %lld then lent, %lld home after the hold\n", a.hold, a.lead_seg ? " + LEAD_SEG=1" : "",
+                a.lead_seg && a.lanes == 2 ? " + LEAD_SEG_AHEAD=1 (one decode lane)" : "", a.lanes, a.cut,
                 differ, ref.size() + ref_b.size(), bg, held, steps, lent, home);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
