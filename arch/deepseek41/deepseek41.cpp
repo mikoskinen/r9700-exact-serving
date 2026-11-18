@@ -1375,14 +1375,16 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * operands (col_a reads pre_f and h0, mix_a writes pre_a / post / comb; col_f reads pre_a and h1, mix_f writes pre_f /
  * post / comb: no buffer one writes is one the other reads), so the same bytes. Read at issue (a flip re-records).
  * 2 = 1 + each stage's window key (kv_n, kv_rope, kv_q, kv_st: four launches on the path to the attention) as the trunk's
- * lever K1 fold c, rmsnorm_rope_roundtrip_kv_store (each row at its own position, as kv_rope; the same bytes and slot). */
+ * lever K1 fold c, rmsnorm_rope_roundtrip_kv_store (each row at its own position, as kv_rope; the same bytes and slot),
+ * on the query pass and on the context pass. 3 = 2 + the connections' post + collapse + norm as the trunk's
+ * mhc_post_collapse_rmsnorm (pcn_f; pcn_a = the previous stage's post_f with this stage's col_a + norm_a). */
 static std::atomic<int> g_sw_dmr{-1};
 static int dmr_now() {
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && (!std::strcmp(e, "1") || !std::strcmp(e, "2")) ? e[0] - '0' : 0);
+        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2036,7 +2038,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 2 ? 1 : -1;   /* lever DMR (2: + the key's fold c) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 3 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn) */
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
@@ -3888,6 +3890,18 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
+    /* lever DMR 3 (dspark_mhr 3): the connections' post + collapse + norm as the trunk's one op (mhc_post_collapse_rmsnorm,
+     * post_collapse_norm's operands on the drafter's buffers): pcn_f = post_a + col_f + norm_f; pcn_a (stages past the
+     * first) = the previous stage's post_f + this stage's col_a + norm_a. Every buffer they touch spans the query pass. */
+    if (!m.zero) {
+        const std::vector<RadParam> pcp = { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
+                                            RAD_STR("dtype", "bf16") };
+        L.pcn_f = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.ffn_norm }, { d.attn_out, d.h0, d.post, d.comb, d.pre_a },
+                        { d.h1, d.x, d.act.x });
+        if (l > d.base)
+            L.pcn_a = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.attn_norm }, { d.act.x, d.h1, d.post, d.comb, d.pre_f },
+                            { d.h0, d.x, d.xn });
+    }
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
 
@@ -6121,7 +6135,7 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
     lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
-    const bool kvfold = dmr_now() == 2;   /* lever DMR 2 */
+    const bool kvfold = dmr_now() >= 2;   /* lever DMR 2 */
     for (const auto& L : d.st) {
         lin_issue(x, m, L.d_kv, T, brows(d.cn, T), L.wkv, brows(d.ckv, T));
         if (kvfold && L.d_kvfs) {
@@ -6187,18 +6201,25 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     /* lever DMR (dmr_now): collapse + norm ahead of the connection's mix; the attention-zero rank keeps today's order */
     const int dmrv = m.zero ? 0 : dmr_now();
     const bool dmr = dmrv >= 1;
+    const bool dmr3 = dmrv >= 3;   /* lever DMR 3: the pcn ops */
     for (const auto& L : d.st) {
+        const Layer* nx = &L != &d.st.back() ? &L + 1 : nullptr;
+        const bool pa = dmr3 && L.pcn_a;   /* the previous stage left its post_f to this stage's pcn_a */
         const auto mix_a = [&] {
             RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
                         brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
         };
         if (!dmr) mix_a();
-        const bool kvfold = dmrv == 2 && L.kv_fs;   /* lever DMR 2: the window key as the trunk's fold c */
-        RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
+        const bool kvfold = dmrv >= 2 && L.kv_fs;   /* lever DMR 2: the window key as the trunk's fold c */
+        if (pa)
+            RAD_ISSUE_N(x, L.pcn_a, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T), brows(d.h0, T),
+                        brows(d.pre_f, T), brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
+        else
+            RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
         } else {
-            RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
+            if (!pa) RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
             if (dmr) mix_a();
             const bool gqp = gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
@@ -6237,15 +6258,22 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             lin_issue(x, m, L.o_b, T, brows(d.oa, T), L.wo_b, brows(d.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
-        RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
-                    brows(d.h1, T));
+        const bool pf = dmr3 && L.pcn_f;
+        if (pf)   /* post_a, col_f and norm_f in one (the trunk's pcn_f) */
+            RAD_ISSUE_N(x, L.pcn_f, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T), brows(d.h1, T),
+                        brows(d.pre_a, T), brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        else
+            RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
+                        brows(d.h1, T));
         const auto mix_f = [&] {
             RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
                         brows(d.pre_f, T), brows(d.post, T), brows(d.comb, T));
         };
         if (!dmr) mix_f();
-        RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
-        RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        if (!pf) {
+            RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
+            RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        }
         if (dmr) {
             /* the trunk's own order (step(): col_f, norm_f, then the MoE with mix_f beside its routed gate_up) */
             DspMixBeside mb{ &L, &d, T };
@@ -6256,8 +6284,9 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         } else {
             L.moe.step(x, batch);
         }
-        RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
-                    brows(d.h0, T));
+        if (!(dmr3 && nx && nx->pcn_a))   /* else the next stage's pcn_a runs this post_f */
+            RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
+                        brows(d.h0, T));
     }
 
     RAD_ISSUE_N(x, d.contract, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
