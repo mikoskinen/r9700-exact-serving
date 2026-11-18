@@ -613,7 +613,19 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
                           ? (int)r->send_split : 0;
     if (shard && !split) return R4D_NO(RAD_E_STATE);   /* a sharded payload needs every rank of the node in the ring */
     if (split && (a->rank < 0 || (uint64_t)a->rank >= r->send_ranks)) return R4D_NO(RAD_E_STATE);
-    if (send && !loop && !split && a->rank != sender) return RAD_OK;
+    if (send && !loop && !split && a->rank != sender) {
+        /* tp8 loop P20 (lq93: the 16k cold's first head, the first sharded X1, took 185.2 ms against lq82's 150.4): the counters a
+         * sharded send of this rank takes (counter_for: hipMalloc + hipMemset on first use) are made at its first plain send of the
+         * ring -- the node's first steps -- not inside a cold prompt's first SP pass */
+        if (r->send_ranks >= 2) {
+            int d = 0;
+            if (hipGetDevice(&d) == hipSuccess) {
+                (void)counter_for(d, r, 0);
+                (void)counter_for(d, r, 2);
+            }
+        }
+        return RAD_OK;
+    }
     if (!send && (a->rank < 0 || a->rank >= RAD_PP_MAX_RANKS || (!loop && (uint64_t)a->rank >= r->n_ranks)))
         return R4D_NO(RAD_E_STATE);
     Parts P{};
@@ -631,6 +643,7 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     }
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
+    if (send && !loop && r->send_ranks >= 2) (void)counter_for(dev, r, 2);   /* (the sender's for a sharded send, as above) */
     if (split == 3) {
         P.split = 3;
         P.sender = sender;
