@@ -473,6 +473,7 @@ private:
     bool pp_band_on_ = false;
     int  pp_ship_band_ = 0;      /* the frame pp_frame makes now is a band pass's (flags bit 2) */
     int64_t pp_band_n_ = 0;
+    int64_t pp_band_max_rows_ = 2047;   /* RADIANCE_PP_BAND_MAX_ROWS: a band step's rows at most */
     int  pp_band_step(int lane, const RadBatch* b);
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();

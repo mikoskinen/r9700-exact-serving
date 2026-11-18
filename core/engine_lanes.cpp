@@ -322,7 +322,7 @@ static const StepEntry* pf_entry(const RadBatch* b, const StepPlan& plan) {
 /* tp8 loop P28: a lane step's band k (0: not a band pass) -- a BG lane's step whose prompts are all fresh (no context, no
  * snapshot restore: the leader holds no band layer's prefix) */
 int Engine::pp_band_step(int lane, const RadBatch* b) {
-    if (!pp_band_on_ || !b || !lanes_.is_bg(lane)) return 0;
+    if (!pp_band_on_ || !b || !lanes_.is_bg(lane) || b->n_tok > pp_band_max_rows_) return 0;
     const int k = pp_band_k();
     if (k <= 0) return 0;
     const StepPlan& p = sched_of(lane).plan();
@@ -630,9 +630,12 @@ int Engine::step_loop_lanes() {
     if (const char* bv = std::getenv("RADIANCE_PP_BAND"); bv && !std::strcmp(bv, "1")) {
         if (pp_band_k() > 0 && lanes_.bg_lane() >= 0) {
             pp_band_on_ = true;
+            /* a newcomer's step, not a cold prompt's chunk (those are the cold cells' and run SP: RADIANCE_DS41_SPHC) */
+            pp_band_max_rows_ = 2047;
+            if (const char* mr = std::getenv("RADIANCE_PP_BAND_MAX_ROWS"); mr && *mr) pp_band_max_rows_ = std::max<int64_t>(1, std::atoll(mr));
             RAD_INFO("two-node pipeline: RADIANCE_PP_BAND=1 -- a BG lane's step of fresh prompts runs as a band pass: the head over "
-                     "[0, %d), the follower from %d (the plugin's band %d; tp8 loop P28)", cfg_.pp_cut_h + pp_band_k(),
-                     cfg_.pp_cut_h + pp_band_k(), pp_band_k());
+                     "[0, %d), the follower from %d (the plugin's band %d; steps of <= %lld rows, RADIANCE_PP_BAND_MAX_ROWS; tp8 loop P28)",
+                     cfg_.pp_cut_h + pp_band_k(), cfg_.pp_cut_h + pp_band_k(), pp_band_k(), (long long)pp_band_max_rows_);
         } else {
             RAD_WARN("two-node pipeline: RADIANCE_PP_BAND=1 is not taken: %s (tp8 loop P28)",
                      pp_band_k() <= 0 ? "the plugin declared no band (RADIANCE_DS41_PP_BAND=k on both nodes)"
