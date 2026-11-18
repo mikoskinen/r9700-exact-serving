@@ -1772,6 +1772,76 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* tp8 dev M9: RADIANCE_PP_LEAD_SEG=1 -- a BG lane's step runs its leader head [0, h) and tail [t, n) in one-layer segments with
+ * the other lanes' parts between them, its frame shipped with the head's last segment. Every request's tokens are one process's
+ * at 3 lanes (BG 1) and 4 lanes (BG 1 / BG 2), at cuts with a head boundary (W(2,3): 1), a tail boundary (W(1,2): 3; W(0,2): 3,
+ * where the head is the lookup alone) and beside the follower's own segments (W(0,2) / W(1,2) / W(2,3) at SEG_LAYERS=1: the
+ * follower of W(2,3) holds one layer, its BG passes run whole); the leader counts its BG steps' segments and the other lanes'
+ * tails between them. */
+TEST(lead_segments_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; const char* lead_seg; };
+    long long between_all = 0;
+    for (const Arm a : { Arm{ 3, "2,3", 1, "1" }, Arm{ 3, "1,2", 1, "1" }, Arm{ 3, "0,2", 1, "1" }, Arm{ 4, "2,3", 1, "1" },
+                         Arm{ 4, "1,2", 2, "1" }, Arm{ 3, "2,3", 1, "2" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back(std::string("RADIANCE_PP_LEAD_SEG=") + a.lead_seg);
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long bg = -1, steps = -1, parts = -1, between = -1, inside = -1, polls = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld "
+                                                    "other lanes' tails while one was in flight (%lld of them between two of its "
+                                                    "segments), %lld polls", &steps, &parts, &between, &inside, &polls);
+        between_all += std::max(0LL, inside);
+        fprintf(stderr, "    LEAD_SEG=%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes; leader: "
+                        "%lld BG steps in %lld segments, %lld other tails in flight (%lld between two segments), %lld polls\n",
+                a.lead_seg, a.k, a.lanes, a.cut, differ, ref.size(), bg, steps, parts, between, inside, polls);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("RADIANCE_PP_LEAD_SEG=") != std::string::npos);
+        CHECK(llog.find("is not taken") == std::string::npos || std::strcmp(a.lead_seg, "2") == 0);
+        CHECK(bg > 0);
+        if (std::strcmp(a.lead_seg, "1") == 0) {
+            CHECK(steps > 0);
+            CHECK(parts > steps);
+        }
+    }
+    fprintf(stderr, "    other lanes' tails between two BG segments, all arms: %lld\n", between_all);
+    CHECK(between_all > 0);
+}
+
 /* tp8 dev D10 round 2: steps issued ahead beside the BG lanes' split passes, the best c32 start's form (W(0, t), the follower's
  * own lookup from X1's token ids, BG lanes in one-layer segments, ready-first tails): a frame the leader issued ahead arrives
  * about a leader tail before its X1 and waits between the BG pass's segments until X1 has landed. Tokens = one process at
