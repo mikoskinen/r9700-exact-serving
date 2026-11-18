@@ -86,6 +86,15 @@ enum { RAD_PP_PART_WHOLE = 0, RAD_PP_PART_HEAD = 1, RAD_PP_PART_TAIL = 2, RAD_PP
  * no peer, no host memory). The plugin names its boundaries at declare with rad_pp_segments; an engine that has none
  * never issues RAD_PP_PART_SEG. */
 #define RAD_PP_MAX_SEGS 16
+/* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k on the leader; unset: nothing here): the leader's head / tail part of a BG lane's step
+ * issued in layer segments, with other lanes' parts between them. The part stays RAD_PP_PART_HEAD / _TAIL and seg_l1 > 0
+ * names the segment [seg_l0, seg_l1) (seg_l1 == 0: the whole part, as before):
+ *   HEAD  [0, s1) from the lookup, [s0, s1) from boundary s0's restore; to boundary s1's save, or to X1's send (s1 == h)
+ *   TAIL  [t, s1) from X2's receive, [s0, s1) from the restore; to the save, or (s1 == RAD_PP_SEG_END) to the final norm,
+ *         the gather and the logits
+ * The leader's boundaries are declared with rad_pp_segments as the follower's (layers in (0, h) and in (t, n_layer)); a
+ * plugin that declares none on the leader never sees seg_l1 > 0 in a head / tail part. */
+#define RAD_PP_SEG_END 255
 
 /* One crossing's ring on one node. `ready` is the sender's, `landed` and `taken` the receiver's;
  * a node holds each ring in one role. Every counter is the count of payloads, starting at 0. */

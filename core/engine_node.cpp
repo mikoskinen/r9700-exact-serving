@@ -810,8 +810,10 @@ void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1) {
     PpGlobal& g = pp_g();
     g.lane.store(lane, std::memory_order_relaxed);
     g.part.store(part, std::memory_order_relaxed);
-    g.seg_l0.store(part == RAD_PP_PART_SEG ? seg_l0 : 0, std::memory_order_relaxed);
-    g.seg_l1.store(part == RAD_PP_PART_SEG ? seg_l1 : 0, std::memory_order_relaxed);
+    /* tp8 dev M9: a leader's head / tail part names its segment too (seg_l1 > 0); 0 = the whole part, as before */
+    const bool seg = part == RAD_PP_PART_SEG || ((part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && seg_l1 > 0);
+    g.seg_l0.store(seg ? seg_l0 : 0, std::memory_order_relaxed);
+    g.seg_l1.store(seg ? seg_l1 : 0, std::memory_order_relaxed);
 }
 
 int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n,
@@ -912,6 +914,46 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
         /* Robustness 2: the leader's own stage of this step has begun; its X1 is due. */
         pp_link_->note_released((uint64_t)pp_steps_shipped_);
     }
+    return RAD_OK;
+}
+
+/* tp8 dev M9: pp_ship(b, true, lane) in two halves -- the drafter builds queued and the step's frame made now (at the step's
+ * first head segment: its release's PSK plan, clears and checkpoint list are this step's), the frame sent at its last
+ * head segment, so the follower does not issue the pass (and spin on its card for X1) while the leader's head segments and
+ * the other lanes' parts between them run. */
+int Engine::pp_ship_hold(const RadBatch* b, int lane) {
+    if (!pp_link_) return RAD_OK;
+    if (lane < 0 || lane >= RAD_PP_MAX_LANES) return RAD_E_INVAL;
+    for (auto& [step, dlane, fr] : pp_draft_q_) {
+        (void)dlane;
+        if (const int st = pp_link_->send(net::kStep, (uint64_t)step, 0, fr.data(), (int64_t)fr.size()); st < 0) {
+            pp_draft_q_.clear();
+            return st;
+        }
+        ++pp_builds_shipped_;
+    }
+    pp_draft_q_.clear();
+    PpHeld& h = pp_held_[lane];
+    const char* span = nullptr;
+    int64_t n = 0;
+    RAD_TRY(pp_frame(b, true, &h.head, &span, &n, lane));
+    h.span.assign(span, span + n);
+    h.step = b->step;
+    h.on = true;
+    return RAD_OK;
+}
+
+int Engine::pp_ship_release(int lane) {
+    if (!pp_link_) return RAD_OK;
+    if (lane < 0 || lane >= RAD_PP_MAX_LANES || !pp_held_[lane].on) return RAD_E_STATE;
+    PpHeld& h = pp_held_[lane];
+    h.on = false;
+    const int st = pp_link_->send2(net::kStep, (uint64_t)h.step, 1, h.head.data(), (int64_t)h.head.size(), h.span.data(),
+                                   (int64_t)h.span.size());
+    if (st < 0) return st;
+    ++pp_builds_shipped_;
+    ++pp_steps_shipped_;
+    pp_link_->note_released((uint64_t)pp_steps_shipped_);
     return RAD_OK;
 }
 

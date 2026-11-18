@@ -64,6 +64,7 @@
 namespace rad {
 
 bool pp_x1_ids();   /* engine_node.cpp: the plugin declared X1's token-ids part (tp8 dev D10 round 2) */
+std::vector<int32_t> pp_segments();   /* engine_node.cpp: the boundaries the plugin declared on this node (tp8 dev M4 / M9) */
 
 /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1; FINDINGS F6 22:37): where a lone cold prompt's time goes on the leader. The
  * leader's chunk rhythm on the cards fits rows x 0.078-0.081 ms + a fixed 13-23 ms a chunk (lq18 / lq19), and a prefill
@@ -474,6 +475,56 @@ int Engine::step_loop_lanes() {
                                      : "is not taken with RADIANCE_PP_TAIL_AHEAD=1",
                  ia && ids ? "; X1 carries the step's token ids, which the follower takes before it reads any (round 2)" : "");
     }
+    /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k, the leader; the plugin reads k and declares the boundaries; with RADIANCE_PP_BG_LANE,
+     * not with TAIL_AHEAD): a BG lane's step of >= RADIANCE_PP_SEG_ROWS rows runs its leader parts in layer segments -- the
+     * head [0, h) and the tail [t, n) at the boundaries the plugin declared on this node -- and between two of them the loop
+     * plans, heads and tails the other lanes (a tail once its X2 has landed: a decode step of its own sequences, or the oldest
+     * step in flight), so a newcomer's leader part no longer holds every decode part on the leader's stream behind it (loop
+     * FINDINGS F28: the follower then waits for X1, the stall line names the BG step). The next segment goes out once the
+     * last one ran on rank 0's card; the frame goes to the follower with the head's last segment. One BG step in segments at a
+     * time (the boundary ring buffer is one a rank). Only the order of issue changes, never a step's composition: a segment
+     * boundary saves and restores the pass's live set on each rank, as the follower's do (tp8 dev M4). */
+    enum { kLsNone = 0, kLsHead, kLsHeadDone, kLsTail };
+    struct LSeg { int st = kLsNone; const RadBatch* b = nullptr; std::vector<std::pair<int, int>> parts; size_t k = 0; };
+    std::vector<LSeg> lsg((size_t)n_lanes_);
+    std::vector<int32_t> lseg_hb, lseg_tb;
+    bool lseg = false;
+    int64_t lseg_steps = 0, lseg_parts = 0, lseg_between = 0, lseg_polls = 0, lseg_inside = 0;
+    /* host tests (RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS): a BG segment goes out no sooner than this after the last one, so the
+     * other lanes' tails find their place between them on a backend whose launches finish at issue */
+    uint64_t lseg_wait_ns = 0, lseg_last_ns = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS"); v && *v)
+        lseg_wait_ns = (uint64_t)std::max<int64_t>(0, std::atoll(v)) * 1000000ull;
+    RadEvent lseg_ev = nullptr;
+    struct EvReset { RadEvent* e; ~EvReset() { if (*e) rad_event_destroy(*e); } } lseg_ev_reset{ &lseg_ev };
+    if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG"); v && *v && std::atoi(v) > 0) {
+        for (int32_t x : pp_segments()) {
+            if (x > 0 && x < cfg_.pp_cut_h) lseg_hb.push_back(x);
+            else if (x > cfg_.pp_cut_t && x < RAD_PP_SEG_END) lseg_tb.push_back(x);
+        }
+        lseg = lanes_.bg_lane() >= 0 && !tail_ahead_ && (!lseg_hb.empty() || !lseg_tb.empty());
+        if (lseg && rad_event_create(&lseg_ev) < 0) {
+            RAD_ERR("two-node pipeline: could not create the leader's segment event");
+            return fail_loop(RAD_E_DEVICE);
+        }
+        std::string hs, ts;
+        for (int32_t x : lseg_hb) hs += fmt("%s%d", hs.empty() ? "" : ", ", (int)x);
+        for (int32_t x : lseg_tb) ts += fmt("%s%d", ts.empty() ? "" : ", ", (int)x);
+        if (lseg)
+            RAD_INFO("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s -- a BG lane's step of >= %lld rows runs its leader head in segments "
+                     "at layers [%s] and its tail at [%s] of W(%d,%d), the other lanes' parts between them (tp8 dev M9)", v,
+                     (long long)rf_rows, hs.empty() ? "none: whole" : hs.c_str(), ts.empty() ? "none: whole" : ts.c_str(),
+                     cfg_.pp_cut_h, cfg_.pp_cut_t);
+        else
+            RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s is not taken: %s (tp8 dev M9)", v,
+                     lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : tail_ahead_ ? "not with RADIANCE_PP_TAIL_AHEAD=1"
+                                                                                    : "the plugin declared no boundary on this node");
+    }
+    auto lseg_busy = [&]() {
+        for (const LSeg& s : lsg)
+            if (s.st != kLsNone) return true;
+        return false;
+    };
     auto ia_ok = [&](int l, const RadBatch* bb, bool kv_due_now) {
         if (!ia) return false;
         const int why = kv_due_now ? kIaKv : lanes_.is_bg(l) ? kIaBg : lanes_.inbox_n(l) > 0 ? kIaInbox
@@ -678,7 +729,31 @@ int Engine::step_loop_lanes() {
             }
             if (!b) continue;
             if (t_on) phase_mark(PH_PLAN);
-            if (const int hs = lane_head(l, b); hs < 0) return fail_loop(hs);
+            /* tp8 dev M9: a BG lane's step: its head's first segment only (or the whole head where no head boundary is
+             * declared: its tail in segments) */
+            if (lseg && lanes_.is_bg(l) && b->n_tok >= rf_rows && !lseg_busy()) {
+                LSeg& s = lsg[(size_t)l];
+                s = LSeg{};
+                s.b = b;
+                if (!lseg_hb.empty()) {
+                    int a = 0;
+                    for (int32_t x : lseg_hb) { s.parts.emplace_back(a, (int)x); a = x; }
+                    s.parts.emplace_back(a, cfg_.pp_cut_h);
+                    if (const int hs = lane_head_seg(l, b, s.parts[0].first, s.parts[0].second, true, false); hs < 0)
+                        return fail_loop(hs);
+                    if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                    s.k = 1;
+                    s.st = kLsHead;
+                    ++lseg_parts;
+                    lseg_last_ns = rad_mono_ns();
+                } else {
+                    if (const int hs = lane_head(l, b); hs < 0) return fail_loop(hs);
+                    s.st = kLsHeadDone;
+                }
+                ++lseg_steps;
+            } else if (const int hs = lane_head(l, b); hs < 0) {
+                return fail_loop(hs);
+            }
             gaps.host_head(b, p0, p1, rad_mono_ns());
             gaps.head(fifo.empty(), lane_steps);
             busy[(size_t)l] = 1;
@@ -708,10 +783,87 @@ int Engine::step_loop_lanes() {
             continue;
         }
         idle = 0;
-        if (fifo.size() >= 2) ++rounds_two;
+        const bool two_in_flight = fifo.size() >= 2;
         /* 2. the oldest lane step's tail, its drafter, its commit (tp8 dev M4 ready-first: or a later one's, above) */
         size_t pick = 0;
-        if (ready_first && fifo.size() >= 2 && fifo.front().second->n_tok >= rf_rows && !x2_landed(fifo.front().first)) {
+        bool lseg_last = false;   /* tp8 dev M9: the pick is a BG step's last tail segment (with its sampler) */
+        if (lseg && lseg_busy()) {
+            /* tp8 dev M9: the BG step's next segment once its last one ran; its tail's first once its X2 landed */
+            int adv = 0;
+            for (int l = 0; l < n_lanes_ && adv == 0; ++l) {
+                LSeg& s = lsg[(size_t)l];
+                if (s.st == kLsHead || (s.st == kLsTail && s.k + 1 < s.parts.size())) {
+                    if (rad_event_query(lseg_ev) == 0) continue;
+                    if (lseg_wait_ns && rad_mono_ns() - lseg_last_ns < lseg_wait_ns) continue;
+                    const int s0 = s.parts[s.k].first, s1 = s.parts[s.k].second;
+                    const bool last = s.st == kLsHead && s.k + 1 == s.parts.size();
+                    const int rs = s.st == kLsHead ? lane_head_seg(l, s.b, s0, s1, false, last) : lane_tail_seg(l, s.b, s0, s1);
+                    if (rs < 0) return fail_loop(rs);
+                    ++lseg_parts;
+                    lseg_last_ns = rad_mono_ns();
+                    ++adv;
+                    if (last) {
+                        s.st = kLsHeadDone;
+                        s.parts.clear();
+                        s.k = 0;
+                    } else {
+                        ++s.k;
+                        if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                    }
+                } else if (s.st == kLsHeadDone && !lseg_tb.empty() && x2_landed(l)) {
+                    int a = cfg_.pp_cut_t;
+                    for (int32_t x : lseg_tb) { s.parts.emplace_back(a, (int)x); a = x; }
+                    s.parts.emplace_back(a, RAD_PP_SEG_END);
+                    if (const int rs = lane_tail_seg(l, s.b, s.parts[0].first, s.parts[0].second); rs < 0) return fail_loop(rs);
+                    if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                    s.k = 1;
+                    s.st = kLsTail;
+                    ++lseg_parts;
+                    lseg_last_ns = rad_mono_ns();
+                    ++adv;
+                }
+            }
+            /* the tail to take now: the BG step's last segment (its previous one ran) or its whole tail (no tail boundary,
+             * X2 landed); else the oldest other step whose X2 landed -- past a BG step only a decode step of its own
+             * sequences (ready-first's rule); none: back to the top (plan, the next segment) */
+            size_t want = SIZE_MAX;
+            bool passed = false;
+            for (size_t i = 0; i < fifo.size() && want == SIZE_MAX; ++i) {
+                const int fl = fifo[i].first;
+                const LSeg& s = lsg[(size_t)fl];
+                if (s.st == kLsTail && s.k + 1 == s.parts.size()) {
+                    if (rad_event_query(lseg_ev) != 0) { want = i; lseg_last = true; }
+                    passed = true;
+                    continue;
+                }
+                if (s.st == kLsHeadDone && lseg_tb.empty()) {
+                    if (x2_landed(fl) && !passed) want = i;
+                    passed = true;
+                    continue;
+                }
+                if (s.st != kLsNone) { passed = true; continue; }
+                if (!x2_landed(fl)) {
+                    if (!passed) break;   /* the oldest step: its tail first, once its X2 lands */
+                    continue;
+                }
+                if (!passed || !carries_lent(fl)) want = i;
+            }
+            if (want == SIZE_MAX) {
+                if (adv == 0) {
+                    ++lseg_polls;
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
+                continue;
+            }
+            pick = want;
+            if (lsg[(size_t)fifo[pick].first].st == kLsNone) {
+                ++lseg_between;
+                /* ... and inside a BG part: between two of its segments (not while it waits for its X2) */
+                for (const LSeg& s : lsg)
+                    if (s.st == kLsHead || (s.st == kLsTail && s.k > 0)) { ++lseg_inside; break; }
+            }
+            if (lseg_last) ++lseg_parts;
+        } else if (ready_first && fifo.size() >= 2 && fifo.front().second->n_tok >= rf_rows && !x2_landed(fifo.front().first)) {
             bool waited = false;
             for (;;) {
                 if (x2_landed(fifo.front().first)) break;
@@ -724,8 +876,12 @@ int Engine::step_loop_lanes() {
             if (waited) ++rf_waits;
             if (pick) ++rf_taken;
         }
+        if (two_in_flight) ++rounds_two;
         const auto [lane, b] = fifo[pick];
         fifo.erase(fifo.begin() + (ptrdiff_t)pick);
+        /* tp8 dev M9: a BG step's last tail segment goes out with its sampler (lane_tail_issue reads tail_seg0_) */
+        tail_seg0_ = lseg_last ? lsg[(size_t)lane].parts.back().first : 0;
+        if (lsg[(size_t)lane].st != kLsNone) lsg[(size_t)lane] = LSeg{};
         const uint64_t tt0 = rad_mono_ns();   /* tp8 loop P6: the tail's host time (after a ready-first wait) */
         const RadBatch* nb = nullptr;         /* tp8 dev D10: the lane's next step, issued ahead */
         if (!tail_ahead_ && ia) {
@@ -771,6 +927,7 @@ int Engine::step_loop_lanes() {
             if (const int fs = lane_tail_finish(lane, b, so, t_on); fs < 0) return fail_loop(fs);
             m_out[(size_t)lane] = s_out[(size_t)lane] = 0;
         }
+        tail_seg0_ = 0;
         busy[(size_t)lane] = nb ? 1 : 0;
         gaps.host_tail(b, tt0, rad_mono_ns());
         gaps.tail(lane, b);
@@ -799,6 +956,11 @@ int Engine::step_loop_lanes() {
     if (ready_first)
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
+    if (lseg)
+        RAD_INFO("two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld other lanes' tails while one "
+                 "was in flight (%lld of them between two of its segments), %lld polls with nothing to issue "
+                 "(RADIANCE_PP_LEAD_SEG, tp8 dev M9)", (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
+                 (long long)lseg_inside, (long long)lseg_polls);
     if (ia) ia_line(" over the run");
     return RAD_OK;
 }
@@ -835,6 +997,60 @@ int Engine::lane_tail_model(int lane, const RadBatch* b) {
     const int st = step_status_.load(std::memory_order_acquire);
     if (st < 0) RAD_ERR("lane %d step %d's model part, issued ahead, failed: %s -- the engine cannot continue", lane, b->step,
                         rad_strerror(st));
+    return st;
+}
+
+/* tp8 dev M9: one segment [s0, s1) of a BG lane step's head part. The first takes what lane_head takes before its release
+ * (the fresh states, the release with its switches, the prefix restores) and holds the step's frame; the last ships it
+ * (the follower then issues its pass, which waits on its card for X1 as always) and ends with X1's send. */
+int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last) {
+    lane_select(lane);
+    if (first) {
+        clear_fresh_states();
+        if (const int ps = prepare_release(b); ps < 0) return ps;
+        if (!pp_trunk_pending_[lane]) {
+            RAD_ERR("two-node pipeline: lane %d's step %d was released without its build", lane, b->step);
+            return RAD_E_STATE;
+        }
+        pp_trunk_pending_[lane] = false;
+        RAD_TRY(restore_checkpoints());
+        RAD_TRY(pp_ship_hold(b, lane));
+    } else if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) {
+        return ps;
+    }
+    if (last) RAD_TRY(pp_ship_release(lane));
+    pp_set_pass(lane, RAD_PP_PART_HEAD, s0, s1);
+    issue_what_.store(kIssueModel, std::memory_order_release);
+    step_batch_.store(b, std::memory_order_release);
+    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    barrier_->arrive_and_wait();      /* release the ranks */
+    barrier_->arrive_and_wait();      /* and wait for them */
+    if (pp_ni_) pp_ni_->end();
+    pp_set_pass(lane, RAD_PP_PART_WHOLE);
+    const int st = step_status_.load(std::memory_order_acquire);
+    if (st < 0)
+        RAD_ERR("lane %d step %d's head segment [%d, %d) failed: %s -- the engine cannot continue", lane, b->step, s0, s1,
+                rad_strerror(st));
+    return st;
+}
+
+/* tp8 dev M9: one model-part segment [s0, s1) of a BG lane step's tail (s0 == t: from X2's receive), not the last one (that
+ * one goes with the sampler: lane_tail_issue from tail_seg0_) */
+int Engine::lane_tail_seg(int lane, const RadBatch* b, int s0, int s1) {
+    lane_select(lane);
+    if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
+    pp_set_pass(lane, RAD_PP_PART_TAIL, s0, s1);
+    issue_what_.store(kIssueModel, std::memory_order_release);
+    step_batch_.store(b, std::memory_order_release);
+    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    barrier_->arrive_and_wait();      /* release the ranks */
+    barrier_->arrive_and_wait();      /* and wait for them */
+    if (pp_ni_) pp_ni_->end();
+    pp_set_pass(lane, RAD_PP_PART_WHOLE);
+    const int st = step_status_.load(std::memory_order_acquire);
+    if (st < 0)
+        RAD_ERR("lane %d step %d's tail segment [%d, %d) failed: %s -- the engine cannot continue", lane, b->step, s0, s1,
+                rad_strerror(st));
     return st;
 }
 
@@ -935,7 +1151,8 @@ int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vecto
      * part went ahead (lane_tail_model), so this release issues the sampler alone, at the level that part set. */
     if (!model_done) {
         if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
-        pp_set_pass(lane, RAD_PP_PART_TAIL);
+        /* tp8 dev M9: the last of a BG step's tail segments (from boundary tail_seg0_ to the end) with its sampler */
+        pp_set_pass(lane, RAD_PP_PART_TAIL, tail_seg0_, tail_seg0_ > 0 ? RAD_PP_SEG_END : 0);
         issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
     } else {
         issue_what_.store(kIssueSampler, std::memory_order_release);
