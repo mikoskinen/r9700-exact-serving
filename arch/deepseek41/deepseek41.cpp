@@ -709,6 +709,15 @@ struct Model {
      * no gather of the streams before X1. Round 4, the follower at h > 0: X1's stage_recv with `shard` (each rank copies
      * only its quarter rows of those parts: its SP layer h reads no other) */
     rad_op pp_x1_sh = 0;
+    /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG=1 / 2, with sphc, the follower with segment boundaries; sphc_seg_env()): a
+     * follower SEGMENT pass of one prefill segment (a BG newcomer's body in one-layer segments, other lanes' passes between
+     * them) is SP over the layers the whole follower part's plan makes SP -- every segment computes that plan from the batch
+     * and the declare, so the two sides of a boundary agree: after an SP layer the boundary holds the streams row-sharded,
+     * and the next segment issues its boundary op over this rank's quarter (as a whole pass does at the layer's end). 1: the
+     * boundary saved / restored whole (today's bytes: the quarter is in them); 2: row-sharded (the stage ops' loop mode with
+     * `shard` + `ranks`: each rank its quarter rows of act.x / h1 / post / comb / pre_ffn, the rest whole: seg_*_sh). 0 = off. */
+    int sp_seg = 0;
+    std::vector<rad_op> seg_send_sh, seg_recv_sh;
     /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, with sphc; sphc_attn_env(), read at declare): at an SP layer whose xn no
      * compressor / indexer reads, the attention's unsharded input GEMMs (q_a, kv: every rank holds them whole) over this
      * rank's quarter, then all-gathers of their outputs (qr, kv) in place of xn's -- the gathers raw, on the all-reduce's
@@ -2523,6 +2532,18 @@ static bool sphc_x1_env() {
     static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_SPHC_X1"); return e && e[0] == '1' && !e[1]; }();
     return on;
 }
+/* tp8 loop P25 -- RADIANCE_DS41_SPHC_SEG=1 / 2 (with RADIANCE_DS41_SPHC, the follower, read at declare; Model::sp_seg): SP in a
+ * follower segment pass. EXACT by construction: the same SP ops over the same rows as the whole pass's (a segment boundary is
+ * transparent to the plan, and the next segment issues the boundary op the whole pass issues at the layer's end, over the
+ * same quarter); the boundary's save / restore moves bytes only (2: only the quarter SP layers read). Anything else 0. */
+static int sphc_seg_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_SPHC_SEG");
+        return e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
+    }();
+    return v;
+}
+static std::atomic<long long> g_sp_seg_passes{0}, g_sp_seg_layers{0}, g_sp_seg_sh{0};
 static std::atomic<long long> g_sp_x1{0};
 /* tp8 loop P26 -- RADIANCE_DS41_SPHC_ATTN=1 (with RADIANCE_DS41_SPHC, read at declare; default 0 = round 4's SP layers): the
  * attention's input GEMMs q_a and kv are declared unsharded (every rank holds the whole weight and, today, runs it over every
@@ -4954,11 +4975,28 @@ static rad_op pp_stage_op_v(RadBuilder* b, const Model& m, int ring, const std::
 
 /* tp8 dev M4: segment boundary k's save (`sends`, after layer s - 1) or restore (before layer s): the stage op in loop mode
  * over this rank's ring buffer */
-static rad_op pp_seg_stage_op(RadBuilder* b, const Model& m, size_t k, bool sends) {
+static rad_op pp_seg_stage_op(RadBuilder* b, const Model& m, size_t k, bool sends, bool shard = false) {
     const std::vector<CutPart> v = ds41_cut_liveset_cx(m, m.seg_cx[k]);
-    rad_op h = op(b, sends ? "stage_send" : "stage_recv",
-                  { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", 2), RAD_INT("parts", (int64_t)v.size()), RAD_INT("loop", 1) },
-                  {}, {}, {});
+    rad_op h = 0;
+    if (shard) {
+        /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG=2): the residual parts (the Live rows of act.x / h1 / post / comb / pre_ffn)
+         * row-sharded over the node's ranks, the rest whole -- pp_stage_op's mask, in loop mode */
+        int64_t mask = 0;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].rows == CutRows::Live && (v[i].b == m.act.x || v[i].b == m.h1 || v[i].b == m.post || v[i].b == m.comb ||
+                                               v[i].b == m.pre_f))
+                mask |= (int64_t)1 << i;
+        if (mask == 0) return 0;
+        const char* nm = sends ? "stage_send" : "stage_recv";
+        const RadParam ps[] = { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", 2), RAD_INT("parts", (int64_t)v.size()),
+                                RAD_INT("loop", 1), RAD_INT("shard", mask), RAD_INT("ranks", m.g.world) };
+        h = rad_op_declared(b, nm) ? rad_decl_op(b, nm, ps, 6, nullptr, 0) : 0;
+        if (!h || !rad_op_resolved(b, h)) return 0;
+    } else {
+        h = op(b, sends ? "stage_send" : "stage_recv",
+               { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", 2), RAD_INT("parts", (int64_t)v.size()), RAD_INT("loop", 1) },
+               {}, {}, {});
+    }
     if (!h) return h;
     std::vector<rad_buf> bufs;
     for (const CutPart& p : v) bufs.push_back(p.b);
@@ -5267,6 +5305,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.pipe2_tbo = full.pipe2_tbo;   /* P15: the same concurrent buffers as the real declare */
         m.sphc = full.sphc;             /* tp8 loop P20: the same rows collectives as the real declare */
         m.sphc_eng = full.sphc_eng;
+        m.sp_seg = full.sp_seg;         /* tp8 loop P25: the same segment boundary ops as the real declare */
         /* Lever Z0-A (ds41-z0): the DSpark head's query rows Q (max_seqs x block, capped by max_tok: dsp_config) size
          * FIXED parameters -- the candidates' all_gather numel Q x R x 2, the walk's wseqs = Q / block and its gather --
          * so a level below Q (the 8-row rung at NST 5: Q 8 instead of 40, numel 512 instead of 2560) declared a different
@@ -5467,6 +5506,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                       : "; P26b off -- the f32 gather of the compressor's output does not resolve here");
         }
     }
+    /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG): the follower's segment passes SP; 2's row-sharded boundary ops are declared with
+     * the boundaries below (a library that does not serve them leaves 1) */
+    if (sphc_seg_env() && !ctx->shape_probe) {
+        const char* why = m.sphc <= 0 ? "RADIANCE_DS41_SPHC is off" : !m.pp || m.pp_rank != 1 ? "not a pipeline follower"
+                        : m.seg_b.empty() ? "no segment boundaries (RADIANCE_PP_SEG_LAYERS)" : m.seg_lead ? "leader segments" : nullptr;
+        m.sp_seg = why ? 0 : sphc_seg_env();
+        if (ctx->rank == 0 && why)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=%d off (tp8 loop P25): %s\n", sphc_seg_env(), why);
+    }
     /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the MoE layers' ungated shared gate, a plane of bf16 ones, filled
      * once at the step's start -- the op each layer issues (MoeFP8 op_sgate: fill n 1, value 1, the block's
      * dtype) over the step's rows. Only where this rank has a shared slice (the layers then take it). */
@@ -5574,12 +5622,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.seg_send.assign(m.seg_b.size(), 0);
         m.seg_recv.assign(m.seg_b.size(), 0);
         m.seg_post.assign(m.seg_b.size(), 0);
+        m.seg_send_sh.assign(m.seg_b.size(), 0);   /* tp8 loop P25: 2's row-sharded twins */
+        m.seg_recv_sh.assign(m.seg_b.size(), 0);
     }
     for (int l = 0; l < c.n_layer; ++l) {
         /* tp8 dev M4: a segment boundary at l: the restore and its mhc_post before layer l (as a receiving node's) */
         for (size_t k = 0; k < m.seg_b.size(); ++k) {
             if (m.seg_b[k] != l) continue;
             if (!(m.seg_recv[k] = pp_seg_stage_op(b, m, k, false))) return RAD_E_INVAL;
+            if (m.sp_seg >= 2) m.seg_recv_sh[k] = pp_seg_stage_op(b, m, k, false, true);   /* tp8 loop P25 */
             m.seg_post[k] = op(b, "mhc_post", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
                                {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
             if (!m.seg_post[k]) return RAD_E_INVAL;
@@ -5628,7 +5679,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
         for (size_t k = 0; k < m.seg_b.size(); ++k)   /* tp8 dev M4: the save after layer s - 1 */
-            if (m.seg_b[k] == l + 1 && !(m.seg_send[k] = pp_seg_stage_op(b, m, k, true))) return RAD_E_INVAL;
+            if (m.seg_b[k] == l + 1) {
+                if (!(m.seg_send[k] = pp_seg_stage_op(b, m, k, true))) return RAD_E_INVAL;
+                if (m.sp_seg >= 2) m.seg_send_sh[k] = pp_seg_stage_op(b, m, k, true, true);   /* tp8 loop P25 */
+            }
         if (m.pp && m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1 && !(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1)))
             return RAD_E_INVAL;
         /* tp8 loop P20 round 3: its row-sharded twin (RADIANCE_DS41_SPHC_X1), for an SP pass's X1 */
@@ -5641,6 +5695,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    : "off -- the row-sharded stage_send does not resolve here");
         }
     }
+    /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG): 2 needs every boundary's row-sharded save and restore, else 1 */
+    if (m.sp_seg >= 2)
+        for (size_t k = 0; k < m.seg_b.size(); ++k)
+            if (!m.seg_send_sh[k] || !m.seg_recv_sh[k]) {
+                m.sp_seg = 1;
+                break;
+            }
+    if (sphc_seg_env() && m.sp_seg > 0 && ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=%d (tp8 loop P25): a follower segment pass of one prefill "
+                        "segment of >= %lld rows is SP where the whole follower part's plan is (the next segment issues the "
+                        "boundary op over each rank's quarter); %s\n",
+                sphc_seg_env(), (long long)m.sphc,
+                m.sp_seg >= 2 ? "its boundaries saved / restored row-sharded (each rank its quarter rows of act.x / h1 / post / "
+                                "comb / pre_ffn, the rest whole)"
+                : sphc_seg_env() >= 2 ? "boundaries WHOLE: the row-sharded loop stage ops do not resolve here (as 1)"
+                                      : "boundaries saved / restored whole");
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
      * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
     if (lr_shell(m)) {
@@ -6905,6 +6975,14 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
             rad_step_fail(x, "deepseek41: a segment boundary the follower did not declare");
             return false;
         }
+        /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG=2): the row-sharded twin, over the pass's rows [0, T) (an SP boundary's) */
+        const rad_op sop = !sh ? (send ? m.seg_send[k] : m.seg_recv[k])
+                         : k < m.seg_send_sh.size() ? (send ? m.seg_send_sh[k] : m.seg_recv_sh[k]) : 0;
+        if (!sop || (sh && (lo != 0 || hi != T))) {
+            rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_SEG: a row-sharded segment boundary not declared or not over the "
+                             "pass's rows (a plan defect)");
+            return false;
+        }
         if (hi > T || hi <= lo) {
             lo = std::max<int64_t>(0, std::min(lo, T - 1));
             hi = lo + 1;
@@ -6921,7 +6999,8 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
             else if (p.rows == CutRows::Work) so.push_back(brows(p.b, swr));
             else so.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
         }
-        rad_issue(x, send ? m.seg_send[k] : m.seg_recv[k], so.data(), (int)so.size(), T);
+        rad_issue(x, sop, so.data(), (int)so.size(), T);
+        if (sh && rad_rank(x) == 0) g_sp_seg_sh.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     /* tp8 loop P28 round 2c: a band pass's X1 is the band form (whole: never row-sharded) */
@@ -7429,9 +7508,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     const auto may_cut = [&](int l) {
         return psk && (l >= m.psk_first || (l20_on && l == m.psk_l20 && !cr_all) || cr_any);
     };
+    /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG, m.sp_seg): a follower SEGMENT pass of such a step too -- its plan is the whole
+     * follower part's [h, t), which every segment of the step computes the same (segment boundaries are transparent to it),
+     * so a boundary after an SP layer holds the streams sharded on both its sides */
+    const bool sp_segp = m.sp_seg > 0 && t_seg && part == RAD_PP_PART_SEG && m.pp && m.pp_rank == 1;
     const bool sp_pass = m.sphc > 0 && T >= m.sphc && (T + 3) / 4 * 4 <= g.max_tok && sg.size() == 1 && !sg[0].dec &&
-                         sg[0].r0 == 0 && sg[0].n == T && !t_seg && !(batch->n_mm_rows > 0 && batch->mm_rows) && !m.bt.on &&
-                         !m.zero && part != RAD_PP_PART_SEG && !t_band;   /* tp8 loop P28: a band pass runs whole-row forms */
+                         sg[0].r0 == 0 && sg[0].n == T && (sp_segp || (!t_seg && part != RAD_PP_PART_SEG)) &&
+                         !(batch->n_mm_rows > 0 && batch->mm_rows) && !m.bt.on &&
+                         !m.zero && !t_band;   /* tp8 loop P28: a band pass runs whole-row forms */
+    const auto sp_in_part = [&](int i) { return sp_segp ? i >= pp_he(m) && i < m.pp_t : pp_part_layer(m, part, i); };
     const int64_t spq = (T + 3) / 4;
     const int64_t sp0 =std::min<int64_t>((int64_t)rad_rank(x) * spq, T), spn = std::max<int64_t>(0, std::min(spq, T - sp0));
     static thread_local std::vector<uint8_t> spv;
@@ -7443,17 +7528,18 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         for (int i = 0; i < (int)m.layers.size(); ++i) {
             const Layer& L = m.layers[(size_t)i];
             ds41sp::Layer& d = spl[(size_t)i];
-            d.issued = m.lr.held(L.l) && pp_part_layer(m, part, i) && L.l == i;
+            d.issued = m.lr.held(L.l) && sp_in_part(i) && L.l == i;
             if (!d.issued) continue;
             const Layer* nx = next_layer(m, L.l);
             const int ni = nx ? (int)(nx - m.layers.data()) : -1;
-            if (nx && ni == nx->l && m.lr.held(nx->l) && pp_part_layer(m, part, ni)) {
+            if (nx && ni == nx->l && m.lr.held(nx->l) && sp_in_part(ni)) {
                 d.next = ni;
                 d.next_pcn_a = nx->pcn_a != 0;
             }
             const MoeFP8& mo = L.moe;
-            /* tp8 loop P20 round 3: the leader's layer before X1 where X1 can leave row-sharded */
-            const int so = pp_send_after(m, L.l);
+            /* tp8 loop P20 round 3: the leader's layer before X1 where X1 can leave row-sharded; P25: a segment pass plans
+             * the follower part's only crossing out (X2 after t - 1), not its segment's boundary */
+            const int so = sp_segp ? (L.l == m.pp_t - 1 ? RAD_PP_X2 : -1) : pp_send_after(m, L.l);
             d.out_sharded = so == RAD_PP_X1 && m.pp_x1_sh != 0;
             d.self_ok = L.ar_attn && !L.tap && (so < 0 || d.out_sharded) && !may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
                         !mo.op_shared_ar && !mo.op_combine && !mo.op_add && mo.issues_ar(T, T);
@@ -7465,6 +7551,18 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * lq82 showed no line on either node) -- rank 0, the first and every 64th SP pass */
     const auto sp_report = [&] {
             if (!(sp_pass && rad_rank(x) == 0)) return;
+            if (sp_segp) {   /* tp8 loop P25: a segment pass -- its own line (the first and every 512th), not the lone passes' */
+                const long long sn = g_sp_seg_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+                const long long sl = g_sp_seg_layers.fetch_add(sp_n, std::memory_order_relaxed) + sp_n;
+                if (sn == 1 || sn % 512 == 0)
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=%d (tp8 loop P25): %lld follower segment passes "
+                                    "of one prefill segment ran %lld layer-passes sequence-parallel, %lld boundaries row-sharded "
+                                    "(save + restore); this one step %d, %lld rows, layers [%d, %d), %d SP, %d gathers of the "
+                                    "streams\n",
+                            m.sp_seg, sn, sl, g_sp_seg_sh.load(std::memory_order_relaxed), batch->step, (long long)T, t_seg0,
+                            t_seg1, sp_n, sp_ga);
+                return;
+            }
             static thread_local int t_sp_step = -1;
             const long long lone = g_sp_lone.fetch_add(1, std::memory_order_relaxed) + 1;
             if (sp_n > 0 && batch->step != t_sp_step) {
@@ -7532,12 +7630,22 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* tp8 loop P20 round 4: X1 into an SP layer lands row-sharded (each rank its quarter of the residual parts) */
             const bool x1r_sh = ring == RAD_PP_X1 && m.pp && m.pp_rank == 1 && m.pp_x1_sh && held &&
                                 spv[(size_t)(&L - m.layers.data())] != 0 && lo == 0 && hi == T;
-            if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh)) return;
+            /* tp8 loop P25: a segment boundary after an SP layer (the plan's layer before this one) holds the streams
+             * row-sharded: the boundary op over this rank's quarter, as the whole pass issues it at that layer's end; 2 restores
+             * only the quarter */
+            const int li = (int)(&L - m.layers.data());
+            const bool seg_hsh = ring >= kSegRecv && ring < kSegSend && sp_segp && li > 0 && spv[(size_t)li - 1] != 0;
+            if (seg_hsh && (lo != 0 || hi != T)) {
+                rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_SEG: an SP segment boundary's rows are not the pass's (a plan "
+                                 "defect)");
+                return;
+            }
+            if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh || (seg_hsh && m.sp_seg >= 2))) return;
             if (x1r_sh && rad_rank(x) == 0) g_sp_x1.fetch_add(1, std::memory_order_relaxed);
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
             if (ring == RAD_PP_X1 && !band_store_issue(x, m, batch)) return;   /* tp8 loop P28 round 2c */
             if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
-            const bool sp_rx = held && spv[(size_t)(&L - m.layers.data())] != 0;
+            const bool sp_rx = held && (spv[(size_t)li] != 0 || seg_hsh);
             if (sp_rx && L.pcn_a) {   /* tp8 loop P20: the crossing's rows whole on every rank, this rank's quarter collapsed */
                 with_rows(sp0, spn, [&] { pcn_next(L, true); });
                 h_sh = xn_sh = true;
@@ -8520,11 +8628,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_X1: an SP pass's X1 rows are not the pass's (a plan defect)");
                 return;
             }
-            if (sp_l && !x1_sh) {
+            /* tp8 loop P25: an SP layer before its segment's boundary -- the next segment takes the streams sharded (2 saves
+             * only this rank's quarter; 1 the whole rows, the quarter among them) */
+            const bool seg_sh = sp_l && sp_segp && ring >= kSegSend;
+            if (seg_sh && (lo != 0 || hi != T)) {
+                rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_SEG: an SP segment boundary's rows are not the pass's (a plan "
+                                 "defect)");
+                return;
+            }
+            if (sp_l && !x1_sh && !seg_sh) {
                 rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC: an SP layer before a whole crossing (a plan defect)");
                 return;
             }
-            if (!pp_cross(x, m, batch, ring, lo, hi, x1_sh)) return;
+            if (!pp_cross(x, m, batch, ring, lo, hi, x1_sh || (seg_sh && m.sp_seg >= 2))) return;
+            if (seg_sh) h_sh = false;   /* the segment ends here; the next one restores the quarter */
             if (x1_sh) {
                 h_sh = false;   /* nothing on this node reads the residual parts after X1 (the head part ends; a whole pass
                                  * continues at layer t from X2) */

@@ -37,6 +37,11 @@ struct Pass {
     bool cone = false;          /* ... and the pass holds the prompt's end (cone rows from layer 20) */
     bool x1_sh = false;         /* tp8 loop P20 round 3: X1 leaves row-sharded (each rank its rows of the live set) */
     bool x1r_sh = false;        /* round 4: X1 lands row-sharded at an SP receiving layer (each rank copies its rows) */
+    /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG): the follower's pass in segments of `seg` layers (0: whole), each boundary saved
+     * after its last layer and restored before the next segment's first, other passes between them (every buffer rewritten);
+     * the plan is the whole part's. seg_sh: an SP layer's boundary saved / restored row-sharded (2), else whole (1). */
+    int seg = 0;
+    bool seg_sh = false;
 };
 
 bool engram(int l) { return l == 1 || l == 14; }
@@ -72,9 +77,11 @@ struct State {
     V h0 = kAll, h1 = kNone, mix = kNone, pre_f = kAll, xn = kNone, act = kNone, attn = kNone;
 };
 
-/* the issue's row model; "" = every read valid, else the first bad read */
-std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather = true) {
+/* the issue's row model; "" = every read valid, else the first bad read. seg_rx_rule (P25): a segment's boundary op over
+ * the quarter where the layer before the boundary is SP (step_bi's seg_hsh), not only where this layer is */
+std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather = true, bool seg_rx_rule = true) {
     State s;
+    State saved;   /* P25: what a boundary's save holds (validity of act.x, h1, the mixes, pre_ffn) */
     std::string err;
     const auto need = [&](V have, bool sp, const char* what, int l) {
         if (!err.empty()) return;
@@ -90,6 +97,24 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
     for (int l = p.lo; l < p.hi; ++l) {
         const bool sp = spv[(size_t)l] != 0;
         const Cut ct = cut_of(p, l);
+        if (p.seg > 0 && l > p.lo && (l - p.lo) % p.seg == 0) {   /* P25: the restore, then its boundary op */
+            s = State{};
+            s.h0 = s.xn = s.attn = kNone;
+            s.act = saved.act; s.h1 = saved.h1; s.mix = saved.mix; s.pre_f = saved.pre_f;
+            const bool rx = sp || (seg_rx_rule && spv[(size_t)l - 1] != 0);
+            const Cut cp = cut_of(p, l - 1);
+            if (cp == kSkipped || cp == kL20None) {
+                /* the layer before ran no row past its all-row part: the boundary op has no row (and this layer none) */
+            } else if (pcn_a(l)) {
+                need(s.act, rx, "pcn_a (segment)", l); need(s.h1, rx, "pcn_a (segment)", l);
+                need(s.mix, rx, "pcn_a (segment)", l); need(s.pre_f, rx, "pcn_a (segment)", l);
+                s.h0 = s.xn = rx ? kQ : kAll;
+            } else {
+                need(s.act, rx, "post (segment)", l); need(s.h1, rx, "post (segment)", l);
+                need(s.mix, rx, "post (segment)", l);
+                s.h0 = rx ? kQ : kAll;
+            }
+        }
         if (p.recv && l == p.lo) {   /* the receive's boundary op */
             if (pcn_a(l)) {
                 need(s.act, sp, "pcn_a (crossing)", l); need(s.h1, sp, "pcn_a (crossing)", l);
@@ -101,8 +126,10 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
                 s.h0 = sp ? kQ : kAll;
             }
         }
+        const bool seg_end = p.seg > 0 && l + 1 < p.hi && (l + 1 - p.lo) % p.seg == 0;   /* P25: a boundary after l */
         if (ct == kSkipped) {   /* no row here: the crossing out carries no residual row */
             rows_left = false;
+            if (seg_end) saved = s;   /* P25: its boundary's save, whole (no SP layer is cut) */
             continue;
         }
         /* the lazy gather */
@@ -127,6 +154,7 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
         need(s.xn, false, "attention / compressor (xn)", l);
         if (ct == kL20None) {   /* the split layer with no cone row: its all-row part only */
             rows_left = false;
+            if (seg_end) saved = s;   /* P25: its boundary's save, whole */
             continue;
         }
         s.attn = sp ? kQ : kAll;   /* the reduce-scatter, or the all-reduce */
@@ -147,6 +175,18 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
             need(s.act, false, "X2 act.x", l); need(s.h1, false, "X2 h1", l);
             need(s.mix, false, "X2 post / comb", l); need(s.pre_f, false, "X2 pre_ffn", l);
             return err;
+        }
+        if (seg_end) {
+            /* P25: the boundary's save (the boundary op's inputs, before it), then other passes rewrite every buffer: a
+             * row-sharded save holds only each rank's quarter (it reads that quarter), a whole one what the rows hold */
+            const bool q = p.seg_sh && sp;
+            if (q) {
+                need(s.act, true, "segment save act.x", l); need(s.h1, true, "segment save h1", l);
+                need(s.mix, true, "segment save post / comb", l); need(s.pre_f, true, "segment save pre_ffn", l);
+            }
+            const auto keep = [&](V v) { return q && v != kNone ? kQ : v; };
+            saved.act = keep(s.act); saved.h1 = keep(s.h1); saved.mix = keep(s.mix); saved.pre_f = keep(s.pre_f);
+            continue;
         }
         if (l + 1 < p.hi) {   /* the next layer's collapse (pcn_a) or post */
             need(s.act, sp, "next pcn_a / post", l); need(s.h1, sp, "next pcn_a / post", l);
@@ -259,6 +299,35 @@ TEST(plan_control_without_the_engram_rule_fails) {
     f.lo = 10; f.hi = 15; f.recv = true; f.x2 = true; f.psk = true;
     CHECK_EQ(run(f, plan_of(f)), std::string(""));
     CHECK(!run(f, plan_of(f, false)).empty());
+}
+
+/* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG): the follower at W(10,32) and W(15,35) in one-layer (and two-layer) segments, the
+ * boundaries whole (1) and row-sharded (2), X1 whole and row-sharded, body and cone: every read valid and the whole part's
+ * plan (10 / 5 layers) -- the segmented issue is the whole pass's with a save / restore at each boundary. Control: the
+ * boundary op taken over every row where only the layer before the boundary is SP (19 -> 20 at W(10,32)) reads a quarter. */
+TEST(plan_segment_passes_every_read_valid) {
+    int checked = 0;
+    for (Pass f : { shapes()[4], shapes()[5], shapes()[9], shapes()[10], shapes()[11] })
+        for (int seg : { 1, 2 })
+            for (bool sh : { false, true }) {
+                f.seg = seg;
+                f.seg_sh = sh;
+                const std::vector<uint8_t> spv = plan_of(f);
+                const std::string e = run(f, spv);
+                if (!e.empty())
+                    std::fprintf(stderr, "segments of %d [%d, %d) sh %d x1r %d cone %d: %s\n", seg, f.lo, f.hi, sh, f.x1r_sh,
+                                 f.cone, e.c_str());
+                CHECK_EQ(e, std::string(""));
+                CHECK_EQ(count(spv), f.lo == 15 ? 5 : 10);
+                ++checked;
+            }
+    CHECK_EQ(checked, 20);
+    Pass f = shapes()[4];
+    f.seg = 1;
+    for (bool sh : { false, true }) {
+        f.seg_sh = sh;
+        CHECK(!run(f, plan_of(f), true, /*seg_rx_rule=*/false).empty());
+    }
 }
 
 TEST(plan_control_without_the_lazy_gather_fails) {
