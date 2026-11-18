@@ -393,6 +393,7 @@ struct Layer {
     int tap_col = -1;
     /* A DSpark stage's context pass: its window key from the projected trunk rows. */
     rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
+    rad_op d_kvfs = 0;   /* lever DMR 2: the context key's d_kvn + d_kvrope + d_kvq + d_kvst as the trunk's fold c */
 };
 
 /* The DSpark block drafter (the checkpoint's mtp.0 .. mtp.{n-1}; official inference/model.py DSparkBlock,
@@ -4014,6 +4015,17 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     d.kv_bs = rad_kv_block_size(b, d.kv);
     if (d.kv_bs < 1) return RAD_E_INVAL;
+    /* lever DMR 2 (dspark_mhr 2): each stage's context key chain as the trunk's fold c (rmsnorm_rope_roundtrip_kv_store),
+     * declared once the window group's block size is fixed (as the trunk's kv_fs); 0 where no library serves it */
+    for (auto& L : d.st)
+        if (L.d_kvn)
+            L.d_kvfs = fused(b, "rmsnorm_rope_roundtrip_kv_store",
+                             { RAD_RANGE("M", 1, T), RAD_INT("n", hd), RAD_F64("eps", c.eps), RAD_INT("n_head", 1),
+                               RAD_INT("head_dim", hd), RAD_INT("rot", c.rope), RAD_INT("off", hd - c.rope),
+                               RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
+                               RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
+                               RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", m.w8d ? "fp8_e4m3" : "bf16") },
+                             { L.kv_norm }, { d.ckv, m.cs_a }, { d.ckvn });
     for (const auto& L : d.st) DS_TRY(rad_bind_layer_kv(b, L.l, d.kv));
     if (m.zero) DS_TRY(rad_kv_group_zero(b, d.kv));
 
@@ -6109,8 +6121,14 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
     lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
+    const bool kvfold = dmr_now() == 2;   /* lever DMR 2 */
     for (const auto& L : d.st) {
         lin_issue(x, m, L.d_kv, T, brows(d.cn, T), L.wkv, brows(d.ckv, T));
+        if (kvfold && L.d_kvfs) {
+            RAD_ISSUE_N(x, L.d_kvfs, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos,
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            continue;
+        }
         RAD_ISSUE_N(x, L.d_kvn, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T));
         RAD_ISSUE_N(x, L.d_kvrope, T, brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos);
         if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
