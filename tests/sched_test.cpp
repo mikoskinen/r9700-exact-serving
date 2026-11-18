@@ -14092,6 +14092,68 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
     }
 }
 
+/* tp8 dev D10 (RADIANCE_PP_ISSUE_AHEAD=1): a lane's step issued ahead (step_next, before its step's commit) takes its number from
+ * the lanes' one counter when it is built -- other lanes plan before it is promoted, and a step number names one build on both
+ * nodes -- and promote_next takes no other; the step issued ahead is the one step() plans there (the same rows at the same
+ * positions). Two lanes, two decoders a lane, the engine's order: lane 0 plans, lane 1 plans, lane 0's step ahead, lane 1's
+ * next, lane 0 commits and promotes. */
+TEST(lanes_a_step_issued_ahead_takes_its_number_when_built_and_is_the_step_planned_after_the_commit) {
+    for (const bool ahead : { true, false }) {
+        Lanes L;
+        L.seqs = 8;
+        REQUIRE_EQ(L.start(2), RAD_OK);
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 4; ++i) ids.push_back(L.submit(i % 2, 20, 200, 1000 + 50 * i));
+        /* both lanes through their prompts to decode steps */
+        for (int r = 0; r < 6; ++r)
+            for (int l = 0; l < 2; ++l) {
+                if (!L.plan(l, { 1 - l })) continue;
+                CHECK_OK(L.commit(l, 7));
+            }
+        /* the sampler's answer the engine stages (Request::speculation_fixed: no grammar that decides at commit) */
+        for (uint64_t id : ids)
+            for (int l = 0; l < 2; ++l)
+                if (const Request* rq = L.req(l, id)) const_cast<Request*>(rq)->speculation_fixed = true;
+        std::vector<int> nums;
+        for (int r = 0; r < 20; ++r) {
+            const RadBatch* b0 = L.plan(0, { 1 });
+            REQUIRE(b0 != nullptr);
+            CHECK(b0->phase == RAD_PHASE_DECODE);
+            nums.push_back(b0->step);
+            const RadBatch* n0 = nullptr;
+            std::vector<std::pair<int32_t, int32_t>> want;   /* (slot, ctx) the step after lane 0's commit plans */
+            if (ahead) {
+                n0 = L.at(0).step_next();
+                REQUIRE(n0 != nullptr);
+                nums.push_back(n0->step);
+            }
+            const RadBatch* b1 = L.plan(1, { 0 });
+            REQUIRE(b1 != nullptr);
+            nums.push_back(b1->step);
+            if (ahead) {
+                std::vector<std::pair<int32_t, int32_t>> got;
+                for (const StepEntry& e : L.at(0).plan().e) got.emplace_back(e.slot, e.ctx_len + 1);
+                CHECK_OK(L.commit(0, 7));
+                L.at(0).promote_next();
+                std::vector<std::pair<int32_t, int32_t>> now;
+                for (const StepEntry& e : L.at(0).plan().e) now.emplace_back(e.slot, e.ctx_len);
+                CHECK(now == got);                       /* every row one position on, the same rows */
+                CHECK_EQ(L.at(0).plan().e.size(), (size_t)2);
+                CHECK_OK(L.commit(0, 7));                /* the step issued ahead, committed in its turn */
+            } else {
+                CHECK_OK(L.commit(0, 7));
+            }
+            CHECK_OK(L.commit(1, 7));
+        }
+        std::vector<int> sorted = nums;
+        std::sort(sorted.begin(), sorted.end());
+        CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());   /* no number twice */
+        CHECK(std::is_sorted(nums.begin(), nums.end()));                          /* in the order they were built */
+        fprintf(stderr, "    %s: %zu steps built over two lanes, numbers %d .. %d, none twice, in build order\n",
+                ahead ? "with lane 0's steps issued ahead" : "without", nums.size(), nums.front(), nums.back());
+    }
+}
+
 /* tp8 loop F22 (cards lq46-m8B: M8's decode lanes drafted less; /stats rows_unspec 1,582 in the c16 window vs 0-16 elsewhere): a
  * newcomer the BG lane runs WHOLE has its prompt's drafter context written there (the BG step's context pass mirrors every
  * entry), but its home lane never ran a chunk of it, so before the fix the home's first block_begin found no drafter range and
