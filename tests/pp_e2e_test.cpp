@@ -1769,3 +1769,94 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         if (a.split) CHECK(split > 0);
     }
 }
+
+/* ------------------------------------------------------------------ tp8 dev D10 */
+/* RADIANCE_PP_ISSUE_AHEAD=1 (both nodes): an undrafted decode lane's next step is planned, its head part released and its frame
+ * shipped before the step's collect (Scheduler::step_next + ADV_TRUNK on the leader; the follower reads no token id). Tokens at
+ * two and three lanes, W(0,2) and W(1,3) (alone, every lane in turn, and beside newcomers whose chunks are lent), are one
+ * process's, and steps are issued ahead; with the follower's own embedding the leader does not take it and the tokens are the
+ * same; the KL recordings at two and three lanes are one process's. */
+TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_does) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_ia");
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "6" }));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; bool fe; };
+    for (const Arm a : { Arm{ 2, "0,2", false }, Arm{ 3, "0,2", false }, Arm{ 2, "1,3", false }, Arm{ 3, "1,3", false },
+                         Arm{ 2, "0,2", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_ISSUE_AHEAD=1");
+        if (a.fe) env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+        Serving pp;
+        REQUIRE(pp.start(a.cut, lane_shape(a.lanes), env));
+        const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) {
+                ++differ;
+                if (std::getenv("IA_DEBUG")) {
+                    size_t k = 0;
+                    while (k < ref[i].size() && k < got[i].size() && ref[i][k] == got[i][k]) ++k;
+                    std::string r1, g1;
+                    for (size_t j = k > 2 ? k - 2 : 0; j < k + 4 && j < ref[i].size(); ++j) r1 += std::to_string(ref[i][j]) + " ";
+                    for (size_t j = k > 2 ? k - 2 : 0; j < k + 4 && j < got[i].size(); ++j) g1 += std::to_string(got[i][j]) + " ";
+                    fprintf(stderr, "      prompt %zu: first difference at %zu of %zu / %zu: ref %s| got %s\n", i, k, ref[i].size(),
+                            got[i].size(), r1.c_str(), g1.c_str());
+                }
+            }
+        }
+        long long n_ahead = -1;   /* the last count line's */
+        if (const size_t at = llog.rfind(" lane steps issued ahead of the collect"); at != std::string::npos) {
+            const size_t b = llog.rfind("two-node pipeline: ", at);
+            if (b != std::string::npos) n_ahead = std::atoll(llog.c_str() + b + 19);
+        }
+        fprintf(stderr, "    issue ahead, %d lane(s) W(%s)%s: %d of %zu prompts differ; lane steps issued ahead %lld; pieces lent "
+                        "%lld\n", a.lanes, a.cut, a.fe ? " + follower embeds" : "", differ, ref.size(), n_ahead,
+                log_count(llog, "newcomer split: "));
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 20).c_str());
+        if (!a.fe) {
+            CHECK(llog.find("RADIANCE_PP_ISSUE_AHEAD=1 -- an undrafted decode lane's next step") != std::string::npos);
+            CHECK(flog.find("follower: RADIANCE_PP_ISSUE_AHEAD=1 -- this node's pass reads no token id") != std::string::npos);
+            CHECK(n_ahead > 0);
+        } else {
+            CHECK(llog.find("RADIANCE_PP_ISSUE_AHEAD=1 is not taken with RADIANCE_PP_FOLLOWER_EMBED=1") != std::string::npos);
+            CHECK_EQ(n_ahead, -1ll);
+        }
+    }
+    const std::string rec = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!rec.empty());
+    for (const int lanes : { 2, 3 }) {
+        const std::string out = d / ("pp-" + std::to_string(lanes));
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_ISSUE_AHEAD=1");
+        const PipeRun pr = record_pipeline(out, "1,3", env, lane_shape(lanes), lane_shape(lanes), env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    %d lanes: leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", lanes, pr.leader,
+                    pr.follower, tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        long long n_rec = -1;
+        if (const size_t at = pr.llog.rfind(" lane steps issued ahead of the collect"); at != std::string::npos) {
+            const size_t b = pr.llog.rfind("two-node pipeline: ", at);
+            if (b != std::string::npos) n_rec = std::atoll(pr.llog.c_str() + b + 19);
+        }
+        fprintf(stderr, "    issue ahead, %d lane(s) W(1,3): recording %s; lane steps issued ahead %lld\n", lanes,
+                same ? "identical" : why.c_str(), n_rec);
+        CHECK(same);
+    }
+}
