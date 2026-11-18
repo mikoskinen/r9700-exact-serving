@@ -53,6 +53,8 @@ void usage() {
         "      --quant RULE   'PATTERN=QUANTISER:key=value,...', ahead of the recipe file's rules. Repeatable\n"
         "      --home DIR     $RADIANCE_HOME (its quantizers/)\n"
         "      --plan-only    print what each matched entry becomes, write nothing\n"
+        "      --requant      a matched entry stored quantised (plain or affine planes, e.g. a GGUF block) is decoded\n"
+        "                     to f32 and quantised again by its rule, not refused; rel errors are against those values\n"
         "  -v, --verbose\n"
         "  -h, --help\n"
         "\n"
@@ -87,6 +89,10 @@ int main(int argc, char** argv) {
     std::string in, out, home = rad_home();
     std::vector<std::string> recipe_files, quant_flags;
     bool plan_only = false, verbose = false;
+    /* tp8 loop P30 (b): --requant -- a matched entry the container holds quantised (a GGUF block's planes, any scheme the core
+     * decodes: plain or affine) is decoded to f32 and quantised again by the rule, instead of refused (e.g. the 2.25 file's q6_K /
+     * q5_K / q8_0 dense weights as int8 codes with a bf16 scale a [1 x 128]); the reported rel error is against the decoded values */
+    bool requant = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -102,6 +108,7 @@ int main(int argc, char** argv) {
         else if (a == "--quant") quant_flags.push_back(next("--quant"));
         else if (a == "--home") home = next("--home");
         else if (a == "--plan-only") plan_only = true;
+        else if (a == "--requant") requant = true;
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "rad-sidecar: unrecognised argument '%s'. Try --help.\n", a.c_str());
@@ -163,7 +170,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         const uint32_t dt = se.n_planes == 1 ? se.plane[0].dtype : (uint32_t)RAD_DT_INVALID;
-        if (!rad_enc_is(&se, "plain") || se.n_planes != 1 || (dt != RAD_BF16 && dt != RAD_F16 && dt != RAD_F32)) {
+        const bool plain_float = rad_enc_is(&se, "plain") && se.n_planes == 1 && (dt == RAD_BF16 || dt == RAD_F16 || dt == RAD_F32);
+        if (requant && !plain_float && !rad_enc_is(&se, "affine") && !rad_enc_is(&se, "plain")) {
+            RAD_ERR("%s (%s) matches '%s', which the container holds as %s: --requant decodes plain and affine planes only",
+                    r->origin.c_str(), r->pattern.c_str(), name.c_str(), enc_text(se).c_str());
+            return 2;
+        }
+        if (!requant && !plain_float) {
             RAD_ERR("%s (%s) matches '%s', which the container holds as %s: only plain bf16 / f16 / f32 weights are "
                     "quantised here, not a quantised one again", r->origin.c_str(), r->pattern.c_str(), name.c_str(),
                     enc_text(se).c_str());
@@ -263,10 +276,11 @@ int main(int argc, char** argv) {
     for (Job& j : jobs) {
         const CompiledRule& c = *j.rule;
         const RadEncoding& se = f.encoding(*j.e);
-        const RadFilePlane& sp = f.plane(*j.e, 0);
-        const void* sd = f.data(sp);
+        /* every plane of the source (one for a plain float; a quantised entry's codes / scales under --requant) */
+        const void* sd[RAD_ENC_MAX_PLANES] = {};
+        for (int k = 0; k < se.n_planes && k < RAD_ENC_MAX_PLANES; ++k) sd[k] = f.data(f.plane(*j.e, k));
         EncodedView sv;
-        enc_view(se, j.qw.rows, j.qw.cols, &sd, &sv);
+        enc_view(se, j.qw.rows, j.qw.cols, sd, &sv);
         const int64_t C = j.qw.cols;
         double num = 0, den = 0;
         bool decodes = true;
