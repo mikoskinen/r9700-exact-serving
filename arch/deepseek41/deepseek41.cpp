@@ -3929,8 +3929,10 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                              {}, { d.kvn }, {});
         /* lever DMR 2 (dspark_mhr 2): the window key's norm, rope, round trip and store as ONE op -- the trunk's lever K1
          * fold c (rmsnorm_rope_roundtrip_kv_store, served at ds41_kvfold 1 on the trunk's own window: the same row
-         * positions, the same cache layout and kv_dtype), declared beside the four ops; 0 where no library serves it. */
-        L.kv_fs = fused(b, "rmsnorm_rope_roundtrip_kv_store",
+         * positions, the same cache layout and kv_dtype), declared beside the four ops; 0 where no library serves it.
+         * tp8 loop (DECODE merge, 19.11.): declared only while RADIANCE_DS41_DSPARK_MHR is set (any value; 0 starts the switch at
+         * 0), so an unset start declares the published program; dspark_mhr 2 without the env finds no fold and keeps the four. */
+        L.kv_fs = !std::getenv("RADIANCE_DS41_DSPARK_MHR") ? 0 : fused(b, "rmsnorm_rope_roundtrip_kv_store",
                         { RAD_RANGE("M", 1, Q), RAD_INT("n", hd), RAD_F64("eps", c.eps), RAD_INT("n_head", 1),
                           RAD_INT("head_dim", hd), RAD_INT("rot", c.rope), RAD_INT("off", hd - c.rope),
                           RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
