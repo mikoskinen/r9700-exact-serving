@@ -1938,10 +1938,13 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
      * moved S4's near tie), and the pieces between are whole intervals (exact: S4 hw's tracer, 2048- vs 4096-row chunks
      * row-identical), so two lanes carry two of its intervals at once. A chunk with a snapshot inside it (lever TI) is not
      * cut; the cut chunk's own snapshot is the one a chunk ending there takes (a periodic one on the resume grid). */
+    /* tp8 loop P14 (RADIANCE_PP_SPAN_INNER=1, LaneSet::span_inner): a chunk with a snapshot inside is cut too, before it */
+    const int64_t inner = checkpoint_pos && *checkpoint_pos > n_computed && *checkpoint_pos < n_computed + want
+                              ? *checkpoint_pos : -1;
     if (span_now_ && lane_span_cut(n_computed, n_target) && geo_.checkpoints() && geo_.checkpoint_interval > 0 &&
-        !(checkpoint_pos && *checkpoint_pos > n_computed && *checkpoint_pos < n_computed + want)) {
+        (inner < 0 || (lanes_ && lanes_->span_inner()))) {
         const int64_t I = geo_.checkpoint_interval, end = n_computed + want;
-        for (int64_t e = (n_computed / I + 1) * I; e < end; e += I)
+        for (int64_t e = (n_computed / I + 1) * I; e < end && (inner < 0 || e < inner); e += I)
             if (e - n_computed >= kBiMinPiece && end - e >= kBiMinPiece) {
                 want = e - n_computed;
                 if (checkpoint_pos) {
