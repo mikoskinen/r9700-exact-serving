@@ -181,6 +181,8 @@ struct SchedReq {
     /* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS): when this newcomer was first held out of its home's MIXED step for the BG lanes'
      * room (mono us; 0: not held). Cleared when it is lent to a BG lane or runs at home. */
     int64_t  bg_hold_us = 0;
+    /* tp8 dev D12 (RADIANCE_PP_BG_PIECES): the BG lane that took this newcomer's first piece, which its rest goes to (-1: none) */
+    int8_t   bg_piece_lane = -1;
     /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and
      * fixed while it is prefilled, so every chunk of its prompt computes the same targets -- the anchor stride K over the
      * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
