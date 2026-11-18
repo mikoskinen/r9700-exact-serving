@@ -500,15 +500,20 @@ int Engine::step_loop_lanes() {
     uint64_t lseg_wait_ns = 0, lseg_last_ns = 0;
     if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS"); v && *v)
         lseg_wait_ns = (uint64_t)std::max<int64_t>(0, std::atoll(v)) * 1000000ull;
-    RadEvent lseg_ev = nullptr;
-    struct EvReset { RadEvent* e; ~EvReset() { if (*e) rad_event_destroy(*e); } } lseg_ev_reset{ &lseg_ev };
+    /* rank 0's events after a pass's segments, two in turn; RADIANCE_PP_LEAD_SEG_AHEAD=1 (default 0): a segment goes out once
+     * the one before the last ran (one queued behind the running one, as the follower's SEG_AHEAD), so a newcomer's leader part
+     * does not wait for the host between its segments; 0: once the last one ran */
+    RadEvent lseg_ev[2] = {};
+    struct EvReset { RadEvent* e; ~EvReset() { for (int i = 0; i < 2; ++i) if (e[i]) rad_event_destroy(e[i]); } } lseg_ev_reset{ lseg_ev };
+    int lseg_ahead = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_AHEAD"); v && !std::strcmp(v, "1")) lseg_ahead = 1;
     if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG"); v && *v && std::atoi(v) > 0) {
         for (int32_t x : pp_segments()) {
             if (x > 0 && x < cfg_.pp_cut_h) lseg_hb.push_back(x);
             else if (x > cfg_.pp_cut_t && x < RAD_PP_SEG_END) lseg_tb.push_back(x);
         }
         lseg = lanes_.bg_lane() >= 0 && !tail_ahead_ && (!lseg_hb.empty() || !lseg_tb.empty());
-        if (lseg && rad_event_create(&lseg_ev) < 0) {
+        if (lseg && (rad_event_create(&lseg_ev[0]) < 0 || rad_event_create(&lseg_ev[1]) < 0)) {
             RAD_ERR("two-node pipeline: could not create the leader's segment event");
             return fail_loop(RAD_E_DEVICE);
         }
@@ -517,10 +522,11 @@ int Engine::step_loop_lanes() {
         for (int32_t x : lseg_tb) ts += fmt("%s%d", ts.empty() ? "" : ", ", (int)x);
         if (lseg)
             RAD_INFO("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s -- a BG lane's step%s of >= %lld rows runs its leader head in segments "
-                     "at layers [%s] and its tail at [%s] of W(%d,%d), the other lanes' parts between them (tp8 dev M9)", v,
+                     "at layers [%s] and its tail at [%s] of W(%d,%d), the other lanes' parts between them (tp8 dev M9)%s", v,
                      lseg_mixed ? " and a decode lane's MIXED newcomer step (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)" : "",
                      (long long)rf_rows, hs.empty() ? "none: whole" : hs.c_str(), ts.empty() ? "none: whole" : ts.c_str(),
-                     cfg_.pp_cut_h, cfg_.pp_cut_t);
+                     cfg_.pp_cut_h, cfg_.pp_cut_t,
+                     lseg_ahead ? "; a segment goes out once the one before the last ran (RADIANCE_PP_LEAD_SEG_AHEAD=1)" : "");
         else
             RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s is not taken: %s (tp8 dev M9)", v,
                      lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : tail_ahead_ ? "not with RADIANCE_PP_TAIL_AHEAD=1"
@@ -540,6 +546,11 @@ int Engine::step_loop_lanes() {
         for (const LSeg& q : lsg)
             if (q.st == kLsHead || q.st == kLsTail) return true;
         return false;
+    };
+    /* whether a pass's next segment (index s.k of its part) may go out: the one lseg_ahead before the last has run */
+    auto lseg_seg_ok = [&](const LSeg& q) {
+        const int64_t w = (int64_t)q.k - 1 - lseg_ahead;
+        return w < 0 || rad_event_query(lseg_ev[w & 1]) != 0;
     };
     auto lseg_busy = [&]() {
         for (const LSeg& s : lsg)
@@ -783,7 +794,7 @@ int Engine::step_loop_lanes() {
                     s.parts.emplace_back(a, cfg_.pp_cut_h);
                     if (const int hs = lane_head_seg(l, b, s.parts[0].first, s.parts[0].second, true, false); hs < 0)
                         return fail_loop(hs);
-                    if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                    if (rad_event_record(lseg_ev[0], ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                     s.k = 1;
                     s.st = kLsHead;
                     ++lseg_parts;
@@ -836,7 +847,7 @@ int Engine::step_loop_lanes() {
             for (int l = 0; l < n_lanes_ && adv == 0; ++l) {
                 LSeg& s = lsg[(size_t)l];
                 if (s.st == kLsHead || (s.st == kLsTail && s.k + 1 < s.parts.size())) {
-                    if (rad_event_query(lseg_ev) == 0) continue;
+                    if (!lseg_seg_ok(s)) continue;
                     if (lseg_wait_ns && rad_mono_ns() - lseg_last_ns < lseg_wait_ns) continue;
                     const int s0 = s.parts[s.k].first, s1 = s.parts[s.k].second;
                     const bool last = s.st == kLsHead && s.k + 1 == s.parts.size();
@@ -850,15 +861,15 @@ int Engine::step_loop_lanes() {
                         s.parts.clear();
                         s.k = 0;
                     } else {
+                        if (rad_event_record(lseg_ev[s.k & 1], ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                         ++s.k;
-                        if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                     }
                 } else if (s.st == kLsHeadDone && !lseg_tb.empty() && x2_landed(l) && !lseg_ring_busy()) {
                     int a = cfg_.pp_cut_t;
                     for (int32_t x : lseg_tb) { s.parts.emplace_back(a, (int)x); a = x; }
                     s.parts.emplace_back(a, RAD_PP_SEG_END);
                     if (const int rs = lane_tail_seg(l, s.b, s.parts[0].first, s.parts[0].second); rs < 0) return fail_loop(rs);
-                    if (rad_event_record(lseg_ev, ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                    if (rad_event_record(lseg_ev[0], ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                     s.k = 1;
                     s.st = kLsTail;
                     ++lseg_parts;
@@ -875,7 +886,7 @@ int Engine::step_loop_lanes() {
                 const int fl = fifo[i].first;
                 const LSeg& s = lsg[(size_t)fl];
                 if (s.st == kLsTail && s.k + 1 == s.parts.size()) {
-                    if (rad_event_query(lseg_ev) != 0) { want = i; lseg_last = true; }
+                    if (lseg_seg_ok(s)) { want = i; lseg_last = true; }
                     passed = true;
                     continue;
                 }
