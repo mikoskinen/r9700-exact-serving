@@ -365,6 +365,23 @@ bool mat_s(const RadTensor& t, uint32_t dt, long rows, long cols) {
 }
 long last_stride(const RadTensor& t) { return t.rank ? (long)t.stride[t.rank - 1] : 1; }
 unsigned grid_rows(long rows) { return (unsigned)(rows < 65535 ? rows : 65535); }
+/* Lever WQ (DRAFTER track, 18.11.2026 round 5): the R9700's dispatch window. A launch whose waves end within ~32 below a
+ * multiple of 2048 (the card's wave slots: 32 WGPs x 64) or on it -- 253-256 / 510-512 / 1021-1024 workgroups of 256
+ * threads -- takes ~+19-20 us whatever it does (tools/dbench/wgq, xeon w1-w5: a 2-byte touch kernel 24.5-26.3 us at
+ * 253-256 / 510-512 / 1024 workgroups, 5.4-6.4 at 252 / 257 / 258 / 508 / 513; both xeon cards; on gpu02 in serving
+ * (lq145) the trunk's rope_rt_kernel<32> runs 16-22 us on ~24 % of its calls, 1-6 us on the rest, and the drafter's
+ * o_q quant_group 19-23 us at [16, 8192] = 512 workgroups). For a row-looped kernel (`for (r = blockIdx.y; r < rows;
+ * r += gridDim.y)`) extra y blocks do nothing, so ds_dodge_gy returns the least gy' >= gy outside the window: the
+ * same work, the same bits. */
+std::atomic<int> g_wq_pin{-1};   /* bench pin (abench): 0 = no dodge */
+unsigned ds_dodge_gy(unsigned gx, unsigned gy, unsigned waves_per_wg) {
+    if (g_wq_pin.load(std::memory_order_relaxed) == 0) return gy;
+    for (unsigned g = gy; g < gy + 64u && g < 65535u; ++g) {
+        const unsigned long w = (unsigned long)gx * g * waves_per_wg, r = w % 2048ul;
+        if (r != 0ul && r <= 2048ul - 40ul) return g;
+    }
+    return gy;
+}
 
 /* ==================================================================== token_map */
 
@@ -567,7 +584,8 @@ int rope_rows_body(const RadArgs* a, RadStream stream) {
         rad_tensor_numel(&pos) != M || !lin_step(pos, &ps))
         return R4D_NO(RAD_E_SHAPE);
     const long half = rot / 2, pairs = nh * half;
-    return R4D_EMIT(stream, rope_rows_kernel, dim3((unsigned)((pairs + 255) / 256), grid_rows(M)),
+    const unsigned gxp = (unsigned)((pairs + 255) / 256);   /* lever WQ: y outside the dispatch window */
+    return R4D_EMIT(stream, rope_rows_kernel, dim3(gxp, ds_dodge_gy(gxp, grid_rows(M), 8)),
                     dim3(256), 0, (uint16_t*)x.data, (long)x.stride[0], (const float*)cs.data,
                     (long)cs.stride[0], (long)cs.stride[1], (const int32_t*)pos.data, ps, M,
                     (long)cs.shape[0], (int)hd, (int)half, (int)off, (int)pairs, gptj ? 1 : 0,
@@ -594,6 +612,45 @@ __global__ __launch_bounds__(256) void quant_group_kernel(uint16_t* x, long xp, 
         if (in) row[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
     }
 }
+
+/* Lever QG8 (DRAFTER track, 18.11.2026 round 5): eight consecutive columns a thread (one 16-byte load and
+ * store), a block of B = 8 / 16 / 32 over B / 8 lanes. A value's amax term is quant_group_kernel's (|v|, a NaN as
+ * 0: never negative, never NaN), so the block's maximum is the same number whatever grouping forms it (the
+ * thread's eight by fmaxf, then the lanes' xor maximum), and each value takes the same block_scale and
+ * roundtrip: the same bits. Why: quant_group_kernel's one column a thread makes [M, 8192] at 16 rows 512
+ * workgroups of one value a thread, which measured 22.9 us on the R9700 (xeon abench a4: [8, 8192] 24.2,
+ * [32, 8192] 8.3, [4, 8192] 4.1) -- the drafter's o_q at its 16-row pass, 19-23 us a stage in serving (lq145). */
+template <int B>
+__global__ __launch_bounds__(256) void quant_group8_kernel(uint16_t* x, long xp, int n, long rows,
+                                                           int fmt, int sc) {
+    static_assert(B == 8 || B == 16 || B == 32, "a block of whole 8-column pieces");
+    const int c0 = (blockIdx.x * 256 + threadIdx.x) * 8;
+    const bool in = c0 < n;   /* n % B == 0: a block's lanes are all in or all out */
+    for (long r = blockIdx.y; r < rows; r += gridDim.y) {
+        uint16_t* row = x + r * xp;
+        uint4 w = in ? *(const uint4*)(row + c0) : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t wv[4] = { w.x, w.y, w.z, w.w };
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            v[2 * i] = ds_bf((uint16_t)(wv[i] & 0xffffu));
+            v[2 * i + 1] = ds_bf((uint16_t)(wv[i] >> 16));
+        }
+        float a = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a = fmaxf(a, ds_amax_term(v[i]));
+        const float amax = r4d_xor_max<B / 8>(a);
+        const float s = block_scale(amax, fmt, sc);
+        uint32_t o[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            o[i] = (uint32_t)ds_bf16(roundtrip(v[2 * i], s, fmt)) |
+                   ((uint32_t)ds_bf16(roundtrip(v[2 * i + 1], s, fmt)) << 16);
+        if (in) *(uint4*)(row + c0) = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+/* QG8's bench pin (abench): -1 the rule (QG8 wherever it applies), 0 never. */
+std::atomic<int> g_qg8_pin{-1};
 
 __global__ __launch_bounds__(256) void quant_serial_kernel(uint16_t* x, long xp, int n, int block,
                                                            long rows, int fmt, int sc) {
@@ -631,7 +688,18 @@ int quant_rt_body(const RadArgs* a, RadStream stream) {
     if (!mat(x, RAD_BF16, rows, n)) return R4D_NO(RAD_E_SHAPE);
     uint16_t* xd = (uint16_t*)x.data;
     const long xp = (long)x.stride[0];
-    const dim3 grid((unsigned)((n + 255) / 256), grid_rows(rows));
+    /* lever QG8: eight columns a thread where the rows are 16-byte pieces (the same bits), from 32 x 8192 values (abench a6:
+     * [32 / 48 / 80 / 160, 8192] 8.2 / 9.2 / 11.3 / 13.3 us vs 8.4 / 10.1 / 13.6 / 18.7; below it the one-column kernel is faster) */
+    if ((block == 8 || block == 16 || block == 32) && n % 8 == 0 && xp % 8 == 0 && rows * n >= 262144 &&
+        ((uintptr_t)xd & 15u) == 0 && g_qg8_pin.load(std::memory_order_relaxed) != 0) {
+        const unsigned gx8 = (unsigned)((n / 8 + 255) / 256);
+        const dim3 g8(gx8, ds_dodge_gy(gx8, grid_rows(rows), 8));
+        if (block == 8) return R4D_EMIT(stream, quant_group8_kernel<8>, g8, dim3(256), 0, xd, xp, (int)n, rows, fmt, sc);
+        if (block == 16) return R4D_EMIT(stream, quant_group8_kernel<16>, g8, dim3(256), 0, xd, xp, (int)n, rows, fmt, sc);
+        return R4D_EMIT(stream, quant_group8_kernel<32>, g8, dim3(256), 0, xd, xp, (int)n, rows, fmt, sc);
+    }
+    const unsigned gxq = (unsigned)((n + 255) / 256);
+    const dim3 grid(gxq, ds_dodge_gy(gxq, grid_rows(rows), 8));   /* lever WQ */
 #define QRT_GROUP(B)                                                                               \
     case B:                                                                                        \
         return R4D_EMIT(stream, quant_group_kernel<B>, grid, dim3(256), 0, xd, xp, (int)n, rows,   \
@@ -2542,7 +2610,8 @@ int rope_rt_body(const RadArgs* a, RadStream stream) {
         q.n_p = a->n_p + 1;
         return quant_rt_body(&q, stream);
     }
-    const dim3 grid((unsigned)((n + 255) / 256), grid_rows(M));
+    const unsigned gxr = (unsigned)((n + 255) / 256);
+    const dim3 grid(gxr, ds_dodge_gy(gxr, grid_rows(M), 8));   /* lever WQ */
     uint16_t* xd = (uint16_t*)x.data;
     const long xp = (long)x.stride[0];
 #define FZ_RRT(B)                                                                                  \
@@ -2965,6 +3034,10 @@ extern "C" int r4d_rad_stream_gate_add(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s) { return rope_rows_body(a, s); }
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s) { return quant_rt_body(a, s); }
+/* Lever WQ's bench pin (g_wq_pin: -1 the rule, 0 no dodge). */
+extern "C" void r4d_wq_pin(int v) { g_wq_pin.store(v, std::memory_order_relaxed); }
+/* Lever QG8's bench pin (g_qg8_pin: -1 the rule, 0 the one-column kernel). */
+extern "C" void r4d_qg8_pin(int v) { g_qg8_pin.store(v, std::memory_order_relaxed); }
 extern "C" int r4d_rad_mhc_mix(const RadArgs* a, RadStream s) { return mhc_mix_body(a, s); }
 extern "C" void r4d_ds41_mix_fuse_force(int on) { g_mix_fuse_force.store(on, std::memory_order_relaxed); }
 /* Lever 1U-MX (ds41-int11): the fn4 switch ds41_mix_wv (r4d_ds41_ggml.hip's rad_fn4_*) and its counters. */

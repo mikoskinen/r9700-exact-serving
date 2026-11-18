@@ -3542,6 +3542,11 @@ int nv_gather(RadStream stream, const RadArgs* ra, const A& s, A* g) {
     return RAD_OK;
 }
 
+/* A bench pin (tools/dbench/abench, DRAFTER track): the decode band's form 0-6 for every pass the plain rule
+ * serves (-1: the rule). Every form sums each output in the same order, so a pin moves only the time. */
+std::atomic<int> g_dec_pin{-1};
+std::atomic<int> g_dec_wqa{1};   /* lever WQ-A on (bench: r4d_attn_wqa(0) = the old rule) */
+
 /* ORT (attn_sparse_sink_rope_roundtrip): the same forms with the fused epilogue; the knob's packed-only forms
  * 7-9 are not instantiated with it (the rule serves those requests). */
 template <bool ORT = false>
@@ -3566,6 +3571,17 @@ int attn_dec_emit(RadStream stream, const DsAttnArgsT<ORT>& s) {
         if (rc != RAD_E_UNSUPPORTED) return rc;
     }
     int c = hr <= 32 ? 0 : (hr <= 64 ? 1 : (hr <= 128 ? 2 : (hr <= 256 ? 3 : 4)));
+    /* Lever WQ-A (DRAFTER track, 18.11.2026 round 5): window-only passes (at most 256 keys a row: the DSpark stages'
+     * window + block, the trunk's SWA layers) with several rows a sequence take the 512-thread forms of 2 / 4 heads, one
+     * row a sequence at <= 128 (row, head) pairs the 2-head one -- tools/dbench/abench (xeon, busy card, us): 24 rows x 3
+     * a sequence form 4 77.6 -> form 6 41.2; 32 x 2 70.2 -> form 5 46.6; 32 x 4 78.0 -> 47.8; 40 x 5 82.0 -> 56.2; 48 x 3
+     * 91.5 -> 64.9; 8 x 1 form 2 21.8 -> form 6 19.1; 16 x 1 and 48 x 1 unchanged (form 3 30.2, form 4 59.9 the best).
+     * Every form sums each output in the same order: the same bits (abench: 0 bytes differ at every form and shape). */
+    if (s.nk <= 256 && s.S > 0 && g_dec_wqa.load(std::memory_order_relaxed) != 0) {
+        if ((long)s.M > (long)s.S) c = hr <= 384 ? 6 : 5;
+        else if (hr <= 128) c = 6;
+    }
+    if (const int pin = g_dec_pin.load(std::memory_order_relaxed); pin >= 0 && pin <= 6) c = pin;   /* bench pin */
     static const int next[7] = { -1, 0, 1, 2, 5, 6, 1 };
     while (c >= 0) {
         int rc = RAD_E_UNSUPPORTED;
@@ -4039,6 +4055,9 @@ extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs* a) {
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);
 }
+/* The decode band's form pin for benches (g_dec_pin; -1 = the rule). */
+extern "C" void r4d_attn_dec_pin(int c) { g_dec_pin.store(c, std::memory_order_relaxed); }
+extern "C" void r4d_attn_wqa(int on) { g_dec_wqa.store(on, std::memory_order_relaxed); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs* a, RadStream stream) {
     return attn_ort_body(a, stream);
 }
