@@ -33,6 +33,11 @@ if(EXL3R4D_HIP)
   add_executable(perfmoe ${EXL3_ROOT}/tools/perfmoe.cpp)
   target_link_libraries(perfmoe PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
   target_include_directories(perfmoe PRIVATE ${EXL3_ROOT}/include)   # exl3_positions: the ops' operand order
+  # tools/q2bench.cpp (tp8 loop DECODE R1): two queues in one process on a node's four cards, TP4 with the all-reduces
+  find_package(Threads REQUIRED)
+  add_executable(q2bench ${EXL3_ROOT}/tools/q2bench.cpp)
+  target_link_libraries(q2bench PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS} Threads::Threads)
+  target_include_directories(q2bench PRIVATE ${EXL3_ROOT}/include)
   # the row table, read from the built plugin: every row with a layout hook can produce and give back its form
   add_executable(exl3r4d_rows_static rows_static_test.c)
   set_target_properties(exl3r4d_rows_static PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
