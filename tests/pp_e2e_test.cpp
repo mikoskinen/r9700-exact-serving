@@ -1879,6 +1879,86 @@ TEST(lead_segments_serve_one_process_tokens) {
     CHECK(msteps_all > 0);
 }
 
+/* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS=N -- a newcomer the BG lanes have no room for is held out of its home's step (that step
+ * runs its decoders alone) until a BG lane takes it whole, or runs at home as a MIXED step once N ms ran out. burst_set's four
+ * newcomers arrive together beside four decoders at 700 rows a step (a BG lane's inbox holds one of them): every request's tokens
+ * are one process's with the hold (60 s: never runs out here) at 3 lanes W(2,3) / W(0,2), 4 lanes W(1,2) BG 1, beside the
+ * leader's segments (LEAD_SEG=1) and with a 1 ms hold that runs out; the leader's stop line counts the held newcomers. */
+TEST(bg_hold_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; const char* hold; bool lead_seg; };
+    long long held_all = 0, lent_all = 0, home_all = 0;
+    /* + READY 09:06's S-L1 form: ONE decode lane beside the BG lane (--pp-lanes 2), the leader's segments one queued ahead */
+    for (const Arm a : { Arm{ 3, "2,3", "60000", false }, Arm{ 3, "0,2", "60000", false }, Arm{ 4, "1,2", "60000", false },
+                         Arm{ 3, "2,3", "60000", true }, Arm{ 3, "1,2", "1", false }, Arm{ 2, "2,3", "1000", true },
+                         Arm{ 2, "1,2", "1000", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_BG_LANE=1");
+        env.push_back(std::string("RADIANCE_PP_BG_HOLD_MS=") + a.hold);
+        if (a.lead_seg) env.push_back("RADIANCE_PP_LEAD_SEG=1");
+        if (a.lead_seg && a.lanes == 2) env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1");
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port), got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long bg = -1, held = -1, steps = -1, lent = -1, home = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        const std::string key = std::string("held for the BG lanes' room (RADIANCE_PP_BG_HOLD_MS=") + a.hold + ", tp8 dev D11): ";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            (void)std::sscanf(llog.c_str() + at + key.size(), "%lld newcomers over %lld steps, %lld then lent to a BG lane, %lld ran at "
+                                                                "home", &held, &steps, &lent, &home);
+        held_all += std::max(0LL, held);
+        lent_all += std::max(0LL, lent);
+        home_all += std::max(0LL, home);
+        fprintf(stderr, "    BG_HOLD_MS=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lane; held %lld over %lld "
+                        "steps, %lld then lent, %lld home after the hold\n", a.hold, a.lead_seg ? " + LEAD_SEG=1" : "",
+                a.lead_seg && a.lanes == 2 ? " + LEAD_SEG_AHEAD=1 (one decode lane)" : "", a.lanes, a.cut,
+                differ, ref.size() + ref_b.size(), bg, held, steps, lent, home);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("RADIANCE_PP_BG_HOLD_MS=") != std::string::npos);
+        CHECK(llog.find("RADIANCE_PP_BG_HOLD_MS=" + std::string(a.hold) + " is not taken") == std::string::npos);
+        CHECK(bg > 0);
+        CHECK(held >= 0);
+        if (held > 0) CHECK_EQ(lent + home, held);
+    }
+    fprintf(stderr, "    all arms: %lld newcomers held, %lld then lent to a BG lane, %lld ran at home after the hold\n", held_all,
+            lent_all, home_all);
+    CHECK(held_all > 0);
+    CHECK(lent_all > 0);
+}
+
 /* tp8 dev D10 round 2: steps issued ahead beside the BG lanes' split passes, the best c32 start's form (W(0, t), the follower's
  * own lookup from X1's token ids, BG lanes in one-layer segments, ready-first tails): a frame the leader issued ahead arrives
  * about a leader tail before its X1 and waits between the BG pass's segments until X1 has landed. Tokens = one process at
