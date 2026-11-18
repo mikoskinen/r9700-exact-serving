@@ -411,6 +411,9 @@ private:
     bool       pp_trunk_pending_[RAD_PP_MAX_LANES] = {};
     int64_t    pp_steps_shipped_ = 0, pp_builds_shipped_ = 0;
     bool       pp_closed_ = false;
+    /* tp8 dev D10 round 2: the step being shipped was issued ahead of its lane's collect (its frame's flags bit 1): its X1
+     * lands only after the leader's tail of the step before it, so the follower issues its pass once X1 has landed */
+    bool       pp_ship_ahead_ = false;
     /* The PSK plan psk_release handed the plugin for the step being released, for the follower. */
     bool       psk_last_valid_ = false;
     int64_t    psk_last_dec_ = 0;

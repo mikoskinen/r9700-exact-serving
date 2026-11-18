@@ -65,6 +65,8 @@ struct PpGlobal {
     std::atomic<int>     seg_l0{ 0 }, seg_l1{ 0 };
     std::mutex seg_mu;
     std::vector<int32_t> segs;
+    /* tp8 dev D10 round 2: X1 carries the step's token ids and the receiver takes them before any read (rad_pp_x1_ids) */
+    std::atomic<int>     x1_ids{ 0 };
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
     std::mutex kv_mu;
     std::vector<std::array<int32_t, 3>> kv_copies;
@@ -106,6 +108,8 @@ extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
     for (int i = 0; bounds && i < n && i < RAD_PP_MAX_SEGS; ++i) g.segs.push_back(bounds[i]);
 }
 
+extern "C" void rad_pp_x1_ids(int on) { pp_g().x1_ids.store(on ? 1 : 0, std::memory_order_relaxed); }
+
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
  * head and tail share their batch). RAD_PP_PART_WHOLE on one machine and on one lane. */
@@ -125,6 +129,8 @@ std::vector<int32_t> pp_segments() {
     std::lock_guard<std::mutex> lk(g.seg_mu);
     return g.segs;
 }
+/* tp8 dev D10 round 2: the plugin declared X1's token-ids part (rad_pp_x1_ids) */
+bool pp_x1_ids() { return pp_g().x1_ids.load(std::memory_order_relaxed) != 0; }
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
@@ -160,7 +166,9 @@ struct StepHdr {
     /* tp8 dev M4: bit 0 -- the step keeps its place on the follower: it has prompt rows (a chunk may read the KV of an
      * earlier chunk of its prompt still in flight in another lane: a lent chunk, or a home chunk planned behind one) or a
      * piece of another lane's sequence (StepEntry::home >= 0); 0 -- a decode step of this lane's own sequences, which reads
-     * only committed KV and may run between another step's segments */
+     * only committed KV and may run between another step's segments; tp8 dev D10 round 2: bit 1 -- the leader issued the
+     * step ahead of its lane's collect (RADIANCE_PP_ISSUE_AHEAD=1): its X1 lands only after the leader's tail of the step
+     * before it */
     int32_t  flags = 0;
     /* Review F2 / F3: the leader's switch REQUESTS (fn4::requests), not its applied values: a lever
      * the leader does not declare reads 0 there and must not turn the follower's off. */
@@ -316,7 +324,10 @@ int Engine::pp_connect() {
      * no X1 (the plugins; at h > 0 X1 is a layer's residual and stays) */
     const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
     const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
-    o.no_x1 = fe_on;
+    /* tp8 dev D10 round 2: with RADIANCE_PP_ISSUE_AHEAD=1 at W(0, t) the plugins' X1 carries the step's token ids, so the
+     * leader sends X1 beside the follower's own lookup (read before declare: the plugins decide it from the same switch) */
+    const char* iav = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
+    o.no_x1 = fe_on && !(iav && !std::strcmp(iav, "1"));
     if (fe && !std::strcmp(fe, "1"))
         RAD_INFO("two-node pipeline: RADIANCE_PP_FOLLOWER_EMBED=1 %s", fe_on
                      ? "-- the follower looks the step's embedding up itself; the leader sends no X1 (tp8 dev 1a)"
@@ -818,6 +829,7 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     if (sched_of(lane).plan().phase != RAD_PHASE_DECODE) h.flags |= 1;
     for (const StepEntry& e : sched_of(lane).plan().e)
         if (e.home >= 0) h.flags |= 1;
+    if (run && pp_ship_ahead_) h.flags |= 2;   /* tp8 dev D10 round 2 */
     if (run) {
         h.n_fn4 = fn4::kSwitches;
         fn4::requests(h.fn4_n, h.fn4_v);
@@ -1169,8 +1181,12 @@ int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                 int st = save ? rk->kv.checkpoint_save(q + i + H, ns, ck, rk->ctx.stream(), &win)
                               : rk->kv.checkpoint_restore(q + i + H, ns, ck, rk->ctx.stream(), &win);
-                /* lever TI: the CONV window of a snapshot inside the chunk, from this node's mapped ids */
-                if (st >= 0 && save && first >= 0 && rk->kv.has_conv_state()) {
+                /* lever TI: the CONV window of a snapshot inside the chunk, from this node's mapped ids -- only on a node that
+                 * holds an Engram layer (ti_capable_: the plugin's rad_ckpt_conv_src probe). A node with none keeps the
+                 * CONV group (every group of the published declare) but no layer of it reads the group, so its rows in a
+                 * snapshot are never read here and stay the chunk end's (loop FINDINGS F27: W(15,35)'s follower, behind a
+                 * TI-capable leader, failed the pair at the first such snapshot) */
+                if (st >= 0 && save && first >= 0 && rk->kv.has_conv_state() && ti_capable_) {
                     const void* ids = nullptr;
                     int ctx = 0;
                     if (fn4::ckpt_conv_src(rk->index, &ids, &ctx) <= 0 || !ids || ctx <= 0 || first < ctx) {
@@ -1342,7 +1358,15 @@ int Engine::follower_loop() {
                 break;
             }
         const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
-        if (fe && !std::strcmp(fe, "1")) {
+        const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
+        /* tp8 dev D10 round 2: the plugin's X1 carries the step's token ids (the leader's card's) and this node's pass takes
+         * them first, into its own batch: then it may embed / hash them whatever the frame's host ids were */
+        if (pp_x1_ids()) {
+            RAD_INFO("follower: RADIANCE_PP_ISSUE_AHEAD=1 -- this node's pass takes the step's token ids from X1 (the leader's "
+                     "card's) before it reads any%s%s; the leader may ship a lane's next step before its collect (tp8 dev D10 "
+                     "round 2)", fe_on ? " (it embeds them: RADIANCE_PP_FOLLOWER_EMBED=1)" : "",
+                     why.empty() ? "" : " (an Engram layer here hashes them)");
+        } else if (fe && !std::strcmp(fe, "1")) {
             /* the leader does not take it beside the follower's embedding (engine_lanes.cpp): nothing is shipped early */
             RAD_INFO("follower: RADIANCE_PP_ISSUE_AHEAD=1 is not taken with RADIANCE_PP_FOLLOWER_EMBED=1 (this node embeds the "
                      "step's token ids; the leader issues nothing ahead) (tp8 dev D10)");
@@ -1395,6 +1419,21 @@ int Engine::follower_loop() {
                  seg_bg >= 0 ? fmt("; and every pass of the BG lane(s) %d-%d (RADIANCE_PP_BG_LANE, tp8 dev M8)", seg_bg, n_lanes_ - 1).c_str() : "");
     }
     int64_t seg_passes = 0, seg_parts = 0, seg_between = 0, seg_held = 0;
+    /* tp8 dev D10 round 2: a frame the leader issued ahead of its lane's collect (flags bit 1) arrives about a leader tail
+     * before its X1; between a split pass's segments it waits here, in arrival order with the decode frames behind it, until
+     * its X1 has landed -- so the card runs the split pass's next segments instead of spinning in its X1 receive. `x1_runs`:
+     * the passes issued a lane (each takes one X1 payload), so a frame's payload is number x1_runs + 1 of its lane's ring. */
+    std::deque<net::Msg> ia_pend;
+    int64_t x1_runs[RAD_PP_MAX_LANES] = {};
+    int64_t ia_deferred = 0;
+    auto x1_landed = [&](const net::Msg& mm) -> bool {
+        StepHdr hh;
+        if (mm.body.size() < sizeof hh) return true;
+        std::memcpy(&hh, mm.body.data(), sizeof hh);
+        if (!(hh.flags & 2) || !hh.run || hh.lane < 0 || hh.lane >= n_lanes_ || hh.lane >= RAD_PP_MAX_LANES) return true;
+        const RadPpRing* x1 = pp_recv_[hh.lane * RAD_PP_N_RINGS + RAD_PP_X1];
+        return !x1 || (int64_t)__atomic_load_n(&x1->landed, __ATOMIC_ACQUIRE) > x1_runs[hh.lane];
+    };
     std::deque<net::Msg> held;   /* frames that wait for the split pass to end (and every frame behind them) */
     /* A frame other than a step's: the leader's switch ask, its KV-copy check. */
     auto other_frame = [&](net::Msg& m) -> int {
@@ -1463,6 +1502,7 @@ int Engine::follower_loop() {
         }
         ++builds;
         if (!h.run) return RAD_OK;
+        if (h.lane < RAD_PP_MAX_LANES) ++x1_runs[h.lane];   /* tp8 dev D10 round 2: this pass takes its lane's next X1 */
         /* Review F4: the state slots the leader zeroed before this step (a fresh sequence's), zeroed
          * here on this node's own groups, as Engine::clear_fresh_states does on the leader. */
         for (int k = 0; k < h.n_clears; ++k) {
@@ -1529,6 +1569,15 @@ int Engine::follower_loop() {
         auto between = [&](RadEvent done_ev) -> int {
             const uint64_t t0 = rad_mono_ns();
             for (;;) {
+                /* tp8 dev D10 round 2: the frames issued ahead whose X1 has landed (and the decode frames behind them) */
+                while (!ia_pend.empty() && x1_landed(ia_pend.front())) {
+                    net::Msg mp = std::move(ia_pend.front());
+                    ia_pend.pop_front();
+                    StepHdr hp;
+                    std::memcpy(&hp, mp.body.data(), sizeof hp);
+                    if (const int fs = step_frame(mp, false); fs < 0) return fs;
+                    if (hp.run) { ++seg_between; ++steps; }
+                }
                 const bool dev_done = !done_ev || rad_event_query(done_ev) != 0;
                 const bool waited = (rad_mono_ns() - t0) / 1000000ull >= (uint64_t)seg_wait_ms;
                 net::Msg m2;
@@ -1554,6 +1603,11 @@ int Engine::follower_loop() {
                 if (!held.empty() || m2.body.size() < sizeof h2 || ((h2.flags & 1) && h2.run) || h2.lane == lane) {
                     if (h2.run) ++seg_held;
                     held.push_back(std::move(m2));
+                    continue;
+                }
+                if (!ia_pend.empty() || !x1_landed(m2)) {   /* tp8 dev D10 round 2: its X1 is not here yet */
+                    if (ia_pend.empty()) ++ia_deferred;
+                    ia_pend.push_back(std::move(m2));
                     continue;
                 }
                 if (const int fs = step_frame(m2, false); fs < 0) return fs;
@@ -1590,6 +1644,11 @@ int Engine::follower_loop() {
         }
         pp_set_pass(lane, RAD_PP_PART_WHOLE);
         if (split) ++seg_passes;
+        /* tp8 dev D10 round 2: frames still waiting for their X1 go first after the split pass (they came before any held) */
+        if (split && !ia_pend.empty()) {
+            held.insert(held.begin(), std::make_move_iterator(ia_pend.begin()), std::make_move_iterator(ia_pend.end()));
+            ia_pend.clear();
+        }
         /* tp8 S5: busy from X1's arrival (rank 0 took it) to X2's publish (the host backend notes both) */
         if (pp_stamps_) {
             const RadPpRing* x1 = pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1];
@@ -1652,6 +1711,9 @@ int Engine::follower_loop() {
                         RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, "
                                  "%lld held in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts,
                                  (long long)seg_between, (long long)seg_held);
+                    if (ia_deferred > 0)
+                        RAD_INFO("follower: %lld frames issued ahead waited between a split pass's segments for their X1 "
+                                 "(tp8 dev D10 round 2)", (long long)ia_deferred);
                     return RAD_OK;
                 }
                 RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());

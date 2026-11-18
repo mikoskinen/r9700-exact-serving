@@ -217,6 +217,21 @@ static inline void rad_pp_declare_segments(const int32_t* bounds, int n) {
     if (rad_pp_segments) rad_pp_segments(bounds, n);
 }
 
+/* tp8 dev D10 round 2 (RADIANCE_PP_ISSUE_AHEAD=1; unset: never called): the plugin names, at declare (every rank, every
+ * declare; the last wins), that crossing X1 carries the step's token ids as its last part (RAD_I32, one a row: the
+ * sender's batch token ids on its card) and that the receiving node's pass takes X1 before anything of it reads a token
+ * id, into its own batch's token ids. A step the leader issues ahead of its collect -- whose ids only its card has, behind
+ * the sampler -- may then run on a follower that embeds or hashes them (its frame's ids are the host's, not yet known). on
+ * 0: none (as before). Weak, like rad_pp_info. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_x1_ids(int on);
+
+static inline void rad_pp_declare_x1_ids(int on) {
+    if (rad_pp_x1_ids) rad_pp_x1_ids(on);
+}
+
 /* tp8 S6: the plugin names, at declare (rank 0's real declare; repeats are ignored), each KV cache
  * layer both nodes hold of one source -- the owner its own, the receiver the copy a crossing fills:
  * `group` (the rad_kvgroup), `slot` (the layer's place among the group's bound layers on THIS node, in
