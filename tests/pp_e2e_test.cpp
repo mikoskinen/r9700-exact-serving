@@ -1726,6 +1726,7 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         if (a.split) env.push_back("RADIANCE_PP_BG_SPLIT=1");
+        if (a.k == 2) env.push_back("RADIANCE_PP_SEG_AHEAD=0");   /* READY 01:56's setting: a segment out only after the last one ran */
         for (const char* v : { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
