@@ -31737,6 +31737,10 @@ struct SpRowsT {
     int rc = RAD_OK;
     std::vector<std::vector<uint16_t>> after_rs, after_ag;
     std::vector<double> us_rs, us_ag, us_ar;   /* per timed size */
+    /* tp8 loop P20 round 2: on ONE instance (the all-reduce's bound), interleaved -- a wide-row all-gather (rows of 4 x 5120,
+     * deepseek41's streams, `bound` = the all-reduce's), the exact all-reduce, the reduce-scatter -- counts of wrong elements */
+    int64_t wide_rows = 0, wide_bad = -1, mix_ar_bad = -1, mix_rs_bad = -1;
+    void* inst_wide = nullptr;
 };
 static void sp_rows_worker_t(SpRowsT* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
@@ -31787,9 +31791,62 @@ static void sp_rows_worker_t(SpRowsT* t) {
         t->after_rs.push_back(run(t->rs, t->inst_rs, prs, n));
         t->after_ag.push_back(run(t->ag, t->inst_ag, prs, n));
     }
-    /* every rank decides the same: time only when no rank failed (a rank that skipped would leave the others spinning) */
+    /* tp8 loop P20 round 2: the shared instance, interleaved (every rank the same sequence; skipped by all where one failed) */
     if (t->rc != RAD_OK) t->bad->fetch_add(1);
     t->bar->wait();
+    const int64_t wr = (most / t->row) / 4 * 4;   /* the widest rows count whose shard of 4 x row fits the slot */
+    if (t->bad->load() == 0 && t->ar && wr >= 8) {
+        const int64_t wrow = 4 * t->row, wn = wr * wrow, wq = wr / t->world;
+        std::vector<RadParam> pw = { PI("world_size", t->world), PI("numel", wn), PS("dtype", "bf16"), PI("row", wrow),
+                                     PI("raw", 1), PI("bound", most) };
+        void* wbuf = nullptr;
+        int rc = t->ag->init(pw.data(), (int)pw.size(), t->rank, t->world, &t->inst_wide);
+        if (rc == RAD_OK && hipMalloc(&wbuf, (size_t)wn * 2) != hipSuccess) rc = RAD_E_NOMEM;
+        if (rc == RAD_OK) {
+            t->wide_rows = wr;
+            /* own shard: the owner's values; the other rows this rank's own (wrong unless gathered) */
+            std::vector<uint16_t> hw((size_t)wn);
+            for (int64_t i = 0; i < wn; ++i) {
+                const int owner = (int)((i / wrow) / wq);
+                hw[(size_t)i] = h_to_bf16(ar_rough_value(owner == t->rank ? owner : 7 + t->rank, i));
+            }
+            st_memcpy(wbuf, hw.data(), (size_t)wn * 2, hipMemcpyHostToDevice);
+            RadTensor tw[1] = { T(wbuf, RAD_BF16, { wn }) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = tw; a.n_t = 1; a.p = pw.data(); a.n_p = (int)pw.size();
+            a.instance = t->inst_wide; a.rank = t->rank; a.world_size = t->world;
+            rc = t->ag->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            if (rc == RAD_LINK_ENDED) rc = RAD_OK;
+            /* then the exact all-reduce and the reduce-scatter on the same instance, the AR first */
+            const int64_t n = most;
+            for (int64_t i = 0; i < n; ++i) h[(size_t)i] = h_to_bf16(ar_rough_value(t->rank, i + 3));
+            st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+            const std::vector<uint16_t> g_ar = run(t->ar, t->inst_ar, par, n);
+            st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+            const std::vector<uint16_t> g_rs = run(t->rs, t->inst_rs, prs, n);
+            std::vector<uint16_t> gw((size_t)wn);
+            st_memcpy(gw.data(), wbuf, (size_t)wn * 2, hipMemcpyDeviceToHost);
+            t->wide_bad = 0;
+            for (int64_t i = 0; i < wn; ++i)
+                if (gw[(size_t)i] != h_to_bf16(ar_rough_value((int)((i / wrow) / wq), i))) ++t->wide_bad;
+            t->mix_ar_bad = 0;
+            t->mix_rs_bad = 0;
+            const int64_t q = ((most / t->row) + t->world - 1) / t->world;
+            for (int64_t i = 0; i < n; ++i) {
+                float acc = 0.0f;
+                for (int r = 0; r < t->world; ++r) acc += h_bf16(h_to_bf16(ar_rough_value(r, i + 3)));
+                const uint16_t want = h_to_bf16(acc);
+                if (g_ar[(size_t)i] != want) ++t->mix_ar_bad;
+                if ((int)((i / t->row) / q) == t->rank && g_rs[(size_t)i] != want) ++t->mix_rs_bad;
+            }
+        }
+        if (wbuf) st_free(wbuf);
+        if (rc != RAD_OK && t->rc == RAD_OK) t->rc = rc;
+        if (rc != RAD_OK) t->bad->fetch_add(1);
+        t->bar->wait();
+    }
     if (t->bad->load() == 0 && t->ar)
         for (int64_t r : { (int64_t)2048, (int64_t)4096 }) {
             if (r * t->row > most) continue;
@@ -31868,6 +31925,21 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
                 ok((w + ": after the raw all-gather every row on every rank == the fold (the exact all-reduce's bytes)").c_str(),
                    ag_bad == 0, std::to_string(ag_bad) + " elements wrong");
             }
+            if (t[0].wide_rows > 0) {
+                int64_t wb = 0, ab = 0, rb = 0;
+                bool all = true;
+                for (const SpRowsT& x : t) {
+                    all = all && x.wide_bad >= 0 && x.mix_ar_bad >= 0 && x.mix_rs_bad >= 0;
+                    wb += std::max<int64_t>(x.wide_bad, 0); ab += std::max<int64_t>(x.mix_ar_bad, 0); rb += std::max<int64_t>(x.mix_rs_bad, 0);
+                }
+                const std::string w = fmt("sp_rows_exact ar_xpush %d ONE instance (bound %lld x 5120), interleaved", xp,
+                                          (long long)(t[0].wide_rows));
+                ok((w + ": the wide all-gather (rows of 4 x 5120, deepseek41's streams) moves every owner's words to every rank").c_str(),
+                   all && wb == 0, std::to_string(wb) + " elements wrong");
+                ok((w + ": the exact all-reduce after it == the fold").c_str(), all && ab == 0, std::to_string(ab) + " elements wrong");
+                ok((w + ": the reduce-scatter after that == the fold on the shard").c_str(), all && rb == 0,
+                   std::to_string(rb) + " elements wrong");
+            }
             const int64_t tr[2] = { 2048, 4096 };
             for (size_t k = 0; k < t[0].us_rs.size() && k < 2; ++k) {
                 double a = 0, b = 0, c = 0;
@@ -31883,6 +31955,7 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
             if (a.inst_rs && rs->fini) rs->fini(a.inst_rs);
             if (a.inst_ag && ag->fini) ag->fini(a.inst_ag);
             if (a.inst_ar && ar && ar->fini) ar->fini(a.inst_ar);
+            if (a.inst_wide && ag->fini) ag->fini(a.inst_wide);
         }
     }
     if (sw) sw("ar_xpush", 0);

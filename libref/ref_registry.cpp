@@ -834,7 +834,7 @@ static const RadParamSpec pAllGather[] = { P_INT("world_size"), P_INT("numel"), 
 static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
 /* tp8 loop P20: the two-shot's halves over whole-row shards, in place (docs/OPS.md) */
 static const RadParamSpec pRowsColl[] = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"), P_INT("row"),
-                                          P_INTO("raw"), P_INTO("overlap") };
+                                          P_INTO("raw"), P_INTO("overlap"), P_INTO("bound") };   /* bound: libr4d's instance */
 static const RadOperandSpec oRowsColl[] = { INOUT("x"), OUT_O("y") };
 
 /* ---- vocabulary edges --------------------------------------------------------------------- */

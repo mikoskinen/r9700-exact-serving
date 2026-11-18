@@ -2670,8 +2670,8 @@ or that slice; only the slice needs the token stride carried separately.
 |---|---|---|
 | `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt `overlap`/opt | `x`:inout, `y`:out? |
 | `all_gather` | `world_size` `numel` `dtype` `row`/opt | `x` → `y` |
-| `reduce_scatter_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt | `x`:inout, `y`:out? |
-| `all_gather_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt | `x`:inout, `y`:out? |
+| `reduce_scatter_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt `bound`/opt | `x`:inout, `y`:out? |
+| `all_gather_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt `bound`/opt | `x`:inout, `y`:out? |
 
 `reduce_scatter_rows` / `all_gather_rows` (fn4 SP-hc's kernels; tp8 loop P20 in the two-node DeepSeek fork): the two
 halves of the four-rank two-shot over WHOLE-ROW shards of `x` [rows][row] -- rank r owns rows [r q, (r + 1) q), q =
@@ -2680,7 +2680,9 @@ rank (other rows unchanged); with `raw` 1 it folds every rank's words in fp32 in
 all-reduce's arithmetic, so a reduce-scatter followed by a raw all-gather holds the exact all-reduce's bytes on every rank.
 The all-gather sends each rank's shard rows to every rank, as raw words (`raw` 1) or on the ti8 wire (`raw` 0: every rank,
 the owner too, stores the decode of the owner's words). A sequence-parallel residual runs its per-row ops on the shard
-between them.
+between them. `bound` (elements, default `numel`'s top) is the instance a backend sizes its scratch from: a wide row's gather
+(4 x 5120, deepseek41's streams under RADIANCE_DS41_SPHC) names the all-reduce's bound and rides its instance, the
+launch checking its longest shard against the slot.
 
 `exact` separates the exact sum from a lossy wire, and a caller must state it: a request that does
 not accept a lossy wire gets no kernel rather than the quantised one.

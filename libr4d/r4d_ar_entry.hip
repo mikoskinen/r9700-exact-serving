@@ -660,7 +660,10 @@ static int nb_for_shard(long shard16, int max_nb) {
 /* Shared front half of every all-reduce launch: find the instance, check the message against
  * init's sizing, resolve the tuned point. Every kernel of the family is safe in place (`y` absent
  * or equal to `x`); each entry point says why. */
-static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
+/* `slot_checked` (tp8 loop P20 round 2, reduce_scatter_rows / all_gather_rows): the caller checks its longest shard
+ * against the slot itself, so a message past the instance's bound (a wide row's gather on the all-reduce's instance,
+ * `bound`) is not refused here */
+static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb, bool slot_checked = false) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;                  /* init did not run: a core sequencing bug */
     const RadTensor* x = r4d_opt(a, AR_X);
@@ -675,7 +678,7 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
 
     const long n = (long)r4d_numel(x);
     if (n <= 0) return RAD_E_SHAPE;
-    if (n > in->max_numel) return RAD_E_SHAPE;    /* the peer scratch was sized for max_numel */
+    if (n > in->max_numel && !slot_checked) return RAD_E_SHAPE;    /* the peer scratch was sized for max_numel */
 
     /* The push uses 16-byte vector stores and libr4d throws on a partial word; check it here. */
     if (((long long)n * in->esize) % 16) return RAD_E_ALIGN;
@@ -1339,7 +1342,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
  * fork's all-reduce would (ar_xpush_form: fn4 ar_xpush 1 from RADIANCE_FN4_AR_XPUSH_MIN elements). */
 static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
     ArCall c;
-    int rc = ar_setup(a, &c, 1);
+    int rc = ar_setup(a, &c, 1, true);   /* the longest shard is checked against the slot below */
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     if (c.in->dtype == 2) return RAD_E_DTYPE;
@@ -1368,6 +1371,26 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
                              (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
                              c.pub, early, early ? in->gate_ctr : 0L, xp));
     return early ? RAD_LINK_ENDED : RAD_OK;
+}
+/* tp8 loop P20 round 2: the instance of a rows collective -- the all-reduce's key {rank, world, dtype, bound}, `bound`
+ * the declared bound in elements where given (default numel's top, as ar_init): deepseek41's streams gather (rows of
+ * 4 x 5120) names the all-reduce's bound (rows x 5120) and shares its instance, whose slot holds the gather's longest
+ * shard (ceil(rows / 4) x 4 x 5120 <= rows x 5120 where the rows are a multiple of four: sp_rows checks it a launch). */
+extern "C" int r4d_rad_sp_rows_init(const RadParam* p, int n_p, int rank, int world, void** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
+    if (ws_param != world) return RAD_E_SHAPE;
+    const int dt = r4d_ar_dtype_code(r4d_pgets(p, n_p, "dtype"));
+    if (dt < 0) return RAD_E_DTYPE;
+    const long long numel = pgeti_hi(p, n_p, "numel", 0);
+    const long long bound = pgeti_hi(p, n_p, "bound", numel);
+    if (numel <= 0 || bound <= 0) return RAD_E_INVAL;
+    ArInst* in = nullptr;
+    int rc = acquire(CacheKey{ rank, world, dt, bound, 0 }, &in);
+    if (rc != RAD_OK) return rc;
+    *out = in;
+    return RAD_OK;
 }
 extern "C" int r4d_rad_ar_rs_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 0); }
 extern "C" int r4d_rad_ar_ag_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 1); }

@@ -881,6 +881,10 @@ static const RadParamSpec pRowsColl[] = {
     { "row",        RAD_P_INT, RAD_REQUIRED },   /* elements a row: the shard is whole rows */
     { "raw",        RAD_P_INT, RAD_OPTIONAL },   /* 1 = the exact form (raw payload words, the exact fold) */
     { "overlap",    RAD_P_INT, RAD_OPTIONAL },   /* as all_reduce's (no lane row here: the wide row serves it) */
+    /* tp8 loop P20 round 2: the instance's bound in elements (default: numel's top) -- a wide row's gather (deepseek41's
+     * streams, 4 x 5120 a row) names the all-reduce's bound, so it rides that instance: a shard of ceil(rows / 4) rows
+     * of 4 x 5120 fits a slot sized for rows x 5120; the launch checks the shard against the slot */
+    { "bound",      RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oRowsColl[] = {
     { "x", RAD_OPD_INOUT, 0 },
@@ -8768,7 +8772,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 / fp16 payload; raw 1: fp32 fold in ascending rank order, one rounding",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cSpRows4), ROW(tAr), nullptr,
-  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_rs_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_rad_sp_rows_init, r4d_rad_ar_fini, r4d_rad_ar_rs_rows_4rank, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 { "sp_ag_rows_4rank", "all_gather_rows", "ar",
   "tp8 loop P20 all-gather over whole-row shards: raw words (raw 1) or the tiered-int8 wire (raw 0, lossy)",
@@ -8776,7 +8780,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 / fp16 payload; on the ti8 wire every rank stores the decode of the owner's words",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cSpRows4), ROW(tAr), nullptr,
-  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_rad_sp_rows_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 { "ar_twoshot_4rank_ti8", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
