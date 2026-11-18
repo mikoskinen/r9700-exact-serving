@@ -3688,15 +3688,17 @@ std::atomic<int> g_wmk{-1};
  * 17..48-row codes off). Prefill rows (> 48) take the W prefill table in every mode. */
 /* DRAFTER track 18.11.2026 round 6 (lever WHG): under mode 2 the logits head (f32 out, N >= 16384: the trunk's 32320 x 5120
  * q6_K rank shard, also the DSpark drafter's head) at 17..48 rows takes G2 (bit 21: every row tile in one block, the weight
- * read and decoded once): xeon --perfwmg q6_K, 70724 vs 70724 | G2 at M 24 / 32 / 40 / 48 = 391 / 401 / 580 / 590 vs
- * 356 / 361 / 523 / 531 us (one call of 0.35-0.6 ms: the F7 per-launch cost does not apply). The same bytes (every code
- * computes the part order). g_wmk_whg 0 (bench pin r4d_gg_wmk_whg) = 70724 at every head call as before. */
+ * read and decoded once) at KP 1 (bit 24: one run holds the whole K range, no LDS partials; the f32-out G2 form at KP 1 is
+ * instantiated for q6_K since round 6): xeon --perfwmg q6_K at M 24 / 32 / 40 / 48: 70724 391 / 401 / 580 / 590, G2 KP 4
+ * 356 / 361 / 523 / 531, **G2 KP 1 310 / 314 / 398 / 412 us** (one call of 0.3-0.6 ms: the F7 per-launch cost does not
+ * apply). The same bytes (every code computes the part order; --wmgcheck WMKCROSS head 18945092 == 70724). g_wmk_whg 0
+ * (bench pin r4d_gg_wmk_whg) = 70724 at every head call as before. */
 int g_wmk_whg = 1;
 extern "C" void r4d_gg_wmk_whg(int on) { g_wmk_whg = on ? 1 : 0; }
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
-    if (mode == 2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152;
+    if (mode == 2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
     if (!g_wmk_tab || mode == 2) return kWmkCode;
     if (M <= 16) {
         if (head) return 332872;
