@@ -51,6 +51,7 @@
 #include "util/stallwatch.h"
 #include "device/device.h"   /* tp8 loop P7: card-local events (rad_event_create_local) */
 #include "pp_nodeidle.h"     /* tp8 dev D8 */
+#include "sched/geometry.h"  /* tp8 loop P23: prefill_shared_tok */
 
 #include <algorithm>
 #include <chrono>
@@ -265,6 +266,15 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  lanes_.bg_split() && lanes_.bg_n() >= 2 ? "; not where RADIANCE_PP_BG_SPLIT=1 has two BG lanes: that split first" : "");
     else if (const char* bp = std::getenv("RADIANCE_PP_BG_PIECES"); bp && *bp)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_PIECES=%s is not taken: %s (tp8 dev D12)", bp,
+                 lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 256 .. 65536 rows");
+    if (lanes_.bg_room() > 0)
+        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROOM=%lld -- a BG lane's inbox (its next step) takes lent newcomers up to %lld "
+                 "rows (the shared budget %lld otherwise), so the newcomers that arrive while a BG step runs go to the next one "
+                 "together, each its own BI segment; fn4 ds41_bi 7 (lever PMM) runs their routed MoE as one pass a layer (tp8 loop "
+                 "P23)", (long long)lanes_.bg_room(), (long long)std::min<int64_t>(lanes_.bg_room(), cfg_.max_tok),
+                 (long long)std::min<int64_t>(cfg_.max_tok, prefill_shared_tok(cfg_)));
+    else if (const char* br = std::getenv("RADIANCE_PP_BG_ROOM"); br && *br)
+        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_ROOM=%s is not taken: %s (tp8 loop P23)", br,
                  lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 256 .. 65536 rows");
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); lanes_.bg_hold_ms() <= 0 && bh && *bh)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%s is not taken: %s (tp8 dev D11)", bh,
@@ -566,6 +576,17 @@ int Engine::step_loop_lanes() {
     uint64_t lseg_line_ns = rad_mono_ns();
     /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS's counts (run so far) once a minute, so a cell's window is the difference of two lines */
     uint64_t hold_line_ns = rad_mono_ns();
+    /* tp8 loop P23: the BG lanes' steps (run so far) once a minute under RADIANCE_PP_BG_ROOM, so a cell's window is the difference
+     * of two lines: steps, newcomers, steps with >= 2 newcomers (batched) and their newcomers / rows, >= 3, the widest step */
+    uint64_t bgst_line_ns = rad_mono_ns();
+    auto bgst_line = [&](const char* when) {
+        const LaneSet::Counts c = lanes_.counts();
+        RAD_INFO("two-node pipeline: BG steps%s (RADIANCE_PP_BG_ROOM=%lld, tp8 loop P23): %lld steps with %lld newcomers; %lld steps "
+                 "with >= 2 newcomers (%lld newcomers, %lld rows), %lld with >= 3; the widest %lld rows; kept home for the BG lanes' "
+                 "room %lld", when, (long long)lanes_.bg_room(), (long long)c.bgst_n, (long long)c.bgst_newc, (long long)c.bgst_b2,
+                 (long long)c.bgst_b2_newc, (long long)c.bgst_b2_rows, (long long)c.bgst_b3, (long long)c.bgst_max_rows,
+                 (long long)c.bg_skip[LaneSet::kBgRoom]);
+    };
     auto hold_line = [&]() {
         const LaneSet::Counts c = lanes_.counts();
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%lld so far (tp8 dev D11): %lld newcomers held over %lld steps, %lld "
@@ -1059,6 +1080,13 @@ int Engine::step_loop_lanes() {
                 hold_line_ns = now;
             }
         }
+        if (lanes_.bg_room() > 0) {
+            const uint64_t now = rad_mono_ns();
+            if (now - bgst_line_ns >= 60000000000ull) {
+                bgst_line(" so far");
+                bgst_line_ns = now;
+            }
+        }
         gaps.minute(lane_steps);
         if (pp_ni_) pp_ni_->minute();
     }
@@ -1076,6 +1104,7 @@ int Engine::step_loop_lanes() {
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
     if (lseg) lseg_line("");
+    if (lanes_.bg_room() > 0) bgst_line(" over the run");
     if (ia) ia_line(" over the run");
     return RAD_OK;
 }

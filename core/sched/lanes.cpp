@@ -62,6 +62,11 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
         const long long v = std::strtoll(bp, &end, 10);
         bg_pieces_ = end && !*end && v >= 256 && v <= 65536 ? (int64_t)v : 0;
     }
+    if (const char* br = std::getenv("RADIANCE_PP_BG_ROOM"); br && *br) {   /* tp8 loop P23 */
+        char* end = nullptr;
+        const long long v = std::strtoll(br, &end, 10);
+        bg_room_ = end && !*end && v >= 256 && v <= 65536 ? (int64_t)v : 0;
+    }
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -300,6 +305,15 @@ void Scheduler::lane_take_inbox() {
             RAD_ERR("lane %d: %lld rows of other lanes' pieces (%zu) beside %lld of its own, %lld reserved at the step's "
                     "start, step budget %lld", lane_, (long long)rows, got.size(), (long long)plan_.n_tok,
                     (long long)lane_reserved_, (long long)cfg_.max_tok);
+    }
+    /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
+    if (!got.empty() && lanes_->is_bg(lane_)) {
+        int64_t newc = 0, rows = 0;
+        for (const LaneSet::Piece& p : got) {
+            newc += p.e.produces_token ? 1 : 0;
+            rows += p.e.n_tokens;
+        }
+        lanes_->note_bg_step_locked(newc, rows);
     }
     for (LaneSet::Piece& p : got) {
         if (Scheduler* home = lanes_->lane(p.home)) {
@@ -545,7 +559,9 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     }
     const std::vector<int>& order = lanes_->planners_locked();
     const int64_t n = e.n_tokens;
-    const int64_t cap = geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok;
+    /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N): up to N rows (<= MNBT) in a BG lane's inbox, so newcomers batch into its next step */
+    const int64_t cap = lanes_->bg_room_cap(geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok,
+                                            cfg_.max_tok);
     auto room = [&](int l, int64_t rows) {
         return lanes_->inbox_rows_locked(l) + rows <= cap && (int64_t)lanes_->inbox_n_locked(l) + 1 <= cfg_.max_seqs;
     };
