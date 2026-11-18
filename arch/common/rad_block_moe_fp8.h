@@ -640,7 +640,22 @@ struct MoeFP8 {
      * all-reduce itself (issue_ar), as GdnFP8::step describes. `dk` (lever P; only where dk_takes(rows)): the routed
      * EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk, the decode band's bytes per row. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
-              const Beside* beside = nullptr, bool dk = false) const;
+              const Beside* beside = nullptr, bool dk = false, bool projected = false,
+              bool piece = false) const;
+    /* `projected` true (deepseek41's RADIANCE_DS41_PIPE2): the caller already issued the sigmoid
+     * router's projection of these rows into the logits (route_part + route_gather), so the pass
+     * starts at the selection -- the same ops on the same operands as pass() issues them. `piece`
+     * true: the pass is one of a prefill pass's row pieces, which counts as the whole pass for the
+     * shared arm's lane (shexp_lane 2, lever F4P). */
+    bool route_splits(int64_t rows) const {
+        return c.sigmoid_router && glm_router.split.takes(rows);
+    }
+    void route_part(RadCtx* c_, int64_t r0, int64_t rows) const {
+        glm_router.project_part(c_, r0, rows);
+    }
+    void route_gather(RadCtx* c_, int64_t r0, int64_t rows) const {
+        glm_router.project_gather(c_, rows, r0);
+    }
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -2385,7 +2400,7 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
-                          const Beside* beside, bool dk) const {
+                          const Beside* beside, bool dk, bool projected, bool piece) const {
     /* lever P: the decode-band-bytes ops only where they are declared for this many rows */
     const bool xdk = dk && c.expert_exl3 && dk_takes(rows);
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
@@ -2410,7 +2425,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * beside the router, the sort and the routed experts instead of after each routed stage (a live prefill pass is not
      * recorded, so nothing overlaps them there today). Same ops, same operands, joined in front of the gather as at 1. */
     const int sl_v = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
-    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && r0 == 0 && rows == T &&
+    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && ((r0 == 0 && rows == T) || (piece && sl_v == 2)) &&
                             ((sl_v == 1 && T <= kMoeShexpLaneRows) || (sl_v == 2 && T > kMoeShexpLaneRows));
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
@@ -2466,7 +2481,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
         if (rf_count && g.rank == 0) rf_count[1].fetch_add(1, std::memory_order_relaxed);
     } else if (rsf) {
-        glm_router.project(c_, r0, rows, r0);
+        if (!projected) glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_rs_fused, rows, brow_slice(w.logits, r0, rows, ne_all),
                     RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
                     brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
@@ -2474,7 +2489,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
         if (rf_count && g.rank == 0) rf_count[0].fetch_add(1, std::memory_order_relaxed);
     } else if (sfused) {
-        glm_router.project(c_, r0, rows, r0);
+        if (!projected) glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
                     brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
@@ -2482,7 +2497,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     sigmoid_scatter_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
     } else if (c.sigmoid_router) {
-        glm_router.step(c_, r0, rows, r0);
+        if (projected) glm_router.select(c_, rows, r0);
+        else           glm_router.step(c_, r0, rows, r0);
     } else if (rfused)
         RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
