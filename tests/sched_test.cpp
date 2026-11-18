@@ -13886,14 +13886,17 @@ TEST(lanes_lend_split_cuts_a_whole_mixed_newcomer_on_the_512_grid_and_lends_its_
  * (each lane's idle followers planned right behind it). */
 TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
     struct Env {
-        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); }
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_SPLIT"); }
     } env;
     struct Arm { int64_t len; bool head; };
-    for (const int k : { 1, 2 })
+    for (const int k : { 1, 2, 3 })   /* 3 = two BG lanes with RADIANCE_PP_BG_SPLIT=1 */
     for (const Arm a : { Arm{ 1100, false }, Arm{ 700, false }, Arm{ 2266, false }, Arm{ 1100, true } }) {
+        const bool split = k == 3;
         setenv("RADIANCE_PP_BG_LANE", k == 1 ? "1" : "2", 1);
+        if (split) setenv("RADIANCE_PP_BG_SPLIT", "1", 1); else unsetenv("RADIANCE_PP_BG_SPLIT");
         std::vector<int64_t> ends_1;
-        for (int lanes : { 1, k + 1, k + 2 }) {
+        const int nbg = split ? 2 : k;
+        for (int lanes : { 1, nbg + 1, nbg + 2 }) {
             DstSwitches restore;
             Lanes L;
             L.grid = 2048;
@@ -13906,7 +13909,8 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
             L.set.set_head_state(a.head);
             CHECK(DstSwitches::set("sched_bi_chunk", 3));
             const int bg = L.set.bg_lane(), nd = lanes - L.set.bg_n();
-            CHECK_EQ(bg, lanes > k ? lanes - k : -1);
+            CHECK_EQ(bg, lanes > nbg ? lanes - nbg : -1);
+            std::vector<int> p_lanes;   /* the BG lanes that ran a piece of the newcomer, in run order */
             for (int q = 0; q < 8; ++q) CHECK(!L.set.is_bg(L.set.pick()));
             std::vector<uint64_t> dec[3];
             for (int i = 0; i < 8; ++i) {
@@ -13937,6 +13941,7 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     for (const StepEntry& e : pl.e) {
                         if (p && e.seq == p && e.is_prefill) {
                             ends.push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (L.set.is_bg(l)) p_lanes.push_back(l);
                             if (!L.set.is_bg(l) && pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed_with_p;
                         }
                         if (p && e.seq == p && !e.is_prefill && l == 0) ++p_decoded;
@@ -13982,15 +13987,24 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     CHECK(c.bg > 0);
                 }
                 /* a one-piece newcomer: the one-lane plan's chunk, run by the BG lane; never a MIXED home step with its token */
-                if (a.len <= 2048) {
+                if (a.len <= 2048 && !split) {
                     CHECK(ends == ends_1);
                     CHECK_EQ(home_mixed_with_p, 0);
                 }
+                /* RADIANCE_PP_BG_SPLIT: 512 + the rest, in two BG lanes, the first piece's lane first */
+                if (a.len <= 2048 && split) {
+                    CHECK(ends == std::vector<int64_t>({ 512, a.len }));
+                    CHECK_EQ((int)p_lanes.size(), 2);
+                    if (p_lanes.size() == 2) CHECK(p_lanes[0] != p_lanes[1]);
+                    CHECK(c.bg_split > 0);
+                    CHECK_EQ(home_mixed_with_p, 0);
+                }
+                CHECK(L.set.broken().empty());
             }
             CHECK_EQ(short_steps, 0);
-            fprintf(stderr, "    BG lanes %d, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent whole to a BG lane "
+            fprintf(stderr, "    BG lanes %d%s, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent to BG lanes "
                             "(%lld rows), BG steps %d; home MIXED steps with its token %d; decoders in every step: %s; decoded %d\n",
-                    k, (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
+                    nbg, split ? " + split" : "", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
                     [&] { std::string s; for (int64_t x : ends_1) s += fmt(" %lld", (long long)x); return s; }().c_str(),
                     (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
         }

@@ -1720,10 +1720,12 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; const char* cut; int k; };
-    for (const Arm a : { Arm{ 3, "0,2", 1 }, Arm{ 2, "0,2", 1 }, Arm{ 3, "1,3", 1 }, Arm{ 4, "0,2", 2 }, Arm{ 4, "1,3", 2 } }) {
+    struct Arm { int lanes; const char* cut; int k; bool split; };
+    for (const Arm a : { Arm{ 3, "0,2", 1, false }, Arm{ 2, "0,2", 1, false }, Arm{ 3, "1,3", 1, false }, Arm{ 4, "0,2", 2, false },
+                         Arm{ 4, "1,3", 2, false }, Arm{ 4, "0,2", 2, true }, Arm{ 4, "1,3", 2, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        if (a.split) env.push_back("RADIANCE_PP_BG_SPLIT=1");
         for (const char* v : { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -1750,8 +1752,12 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
             if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos)
                 (void)std::sscanf(flog.c_str() + b, "follower: %lld passes ran in %lld segments, %lld other passes between their "
                                                     "segments, %lld held", &passes, &parts, &between, &held);
-        fprintf(stderr, "    BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers lent whole; follower %lld passes in "
-                        "%lld segments, %lld passes between; pieces lent %lld\n", a.k, a.lanes, a.cut, differ, ref.size(), bg, passes,
+        long long split = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            if (const size_t r = llog.find(" rows; ", at); r != std::string::npos) split = std::atoll(llog.c_str() + r + 7);
+        fprintf(stderr, "    BG lanes %d%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes (%lld split); follower %lld "
+                        "passes in %lld segments, %lld passes between; pieces lent %lld\n", a.k, a.split ? " + split" : "", a.lanes, a.cut,
+                differ, ref.size(), bg, split, passes,
                 parts, between, log_count(llog, "newcomer split: "));
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
@@ -1759,5 +1765,6 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         CHECK(flog.find("and every pass of the BG lane(s)") != std::string::npos);
         CHECK(bg > 0);
         CHECK(passes > 0);
+        if (a.split) CHECK(split > 0);
     }
 }
