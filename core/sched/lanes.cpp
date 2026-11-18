@@ -24,6 +24,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     lanes_ = std::move(lanes);
     mu_ = lanes_.empty() ? nullptr : &lanes_[0]->mu_;
     inbox_.assign(lanes_.size(), {});
+    bgt0_.assign(lanes_.size(), 0);   /* tp8 loop P23b */
+    bgrows_.assign(lanes_.size(), 0);
     order_.clear();
     const char* rr = std::getenv("RADIANCE_PP_PICK");
     pick_rr_ = rr && !std::strcmp(rr, "rr");
@@ -66,6 +68,11 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
         char* end = nullptr;
         const long long v = std::strtoll(br, &end, 10);
         bg_room_ = end && !*end && v >= 256 && v <= 65536 ? (int64_t)v : 0;
+    }
+    if (const char* bj = std::getenv("RADIANCE_PP_BG_JOIN_MS"); bj && *bj) {   /* tp8 loop P23b */
+        char* end = nullptr;
+        const long long v = std::strtoll(bj, &end, 10);
+        bg_join_ms_ = end && !*end && v > 0 && v <= 60000 ? (int64_t)v : 0;
     }
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
@@ -314,6 +321,7 @@ void Scheduler::lane_take_inbox() {
             rows += p.e.n_tokens;
         }
         lanes_->note_bg_step_locked(newc, rows);
+        lanes_->note_bg_take_locked(lane_, rows, mono_us());   /* tp8 loop P23b: the step's plan time, for the BG lane's us a row */
     }
     for (LaneSet::Piece& p : got) {
         if (Scheduler* home = lanes_->lane(p.home)) {
@@ -559,11 +567,19 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     }
     const std::vector<int>& order = lanes_->planners_locked();
     const int64_t n = e.n_tokens;
-    /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N): up to N rows (<= MNBT) in a BG lane's inbox, so newcomers batch into its next step */
-    const int64_t cap = lanes_->bg_room_cap(geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok,
-                                            cfg_.max_tok);
+    /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N): up to N rows (<= MNBT) in a BG lane's inbox, so newcomers batch into its next step;
+     * P23b (RADIANCE_PP_BG_JOIN_MS=N): past today's room (`base`) only while the BG lane's step in flight ends within N ms */
+    const int64_t base = geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok;
+    const int64_t cap = lanes_->bg_room_cap(base, cfg_.max_tok);
+    const int64_t join_us = lanes_->bg_join_ms() * 1000, now_j = join_us > 0 ? mono_us() : 0;
     auto room = [&](int l, int64_t rows) {
-        return lanes_->inbox_rows_locked(l) + rows <= cap && (int64_t)lanes_->inbox_n_locked(l) + 1 <= cfg_.max_seqs;
+        const int64_t in = lanes_->inbox_rows_locked(l);
+        if (in + rows > cap || (int64_t)lanes_->inbox_n_locked(l) + 1 > cfg_.max_seqs) return false;
+        if (join_us <= 0 || in + rows <= base) return true;
+        const int64_t rem = lanes_->bg_remaining_us_locked(l, now_j);
+        const bool ok = rem <= join_us;   /* -1: no measurement yet -> joins */
+        lanes_->note_bg_join_locked(ok);
+        return ok;
     };
     /* the BG lanes in this plan's planning order (the order they take their inboxes in) */
     std::vector<int> bgo;

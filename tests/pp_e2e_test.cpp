@@ -2084,16 +2084,19 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     /* + two forms the cards may stack on it: the leader's BG segments (M9: LEAD_SEG + AHEAD) and the BG hold (D11) */
-    struct Arm { int lanes; const char* cut; const char* bg; const char* room; bool lead_seg = false; bool hold = false; };
+    struct Arm { int lanes; const char* cut; const char* bg; const char* room; bool lead_seg = false; bool hold = false;
+                 const char* join = nullptr; };
     long long b2_all = 0;
     for (const Arm a : { Arm{ 3, "2,3", "1", "2112" }, Arm{ 3, "0,2", "1", "2112" }, Arm{ 4, "1,3", "2", "2112" },
                          Arm{ 3, "2,3", "1", nullptr }, Arm{ 3, "2,3", "1", "2112", true, false },
-                         Arm{ 3, "2,3", "1", "2112", false, true } }) {
+                         Arm{ 3, "2,3", "1", "2112", false, true }, Arm{ 3, "2,3", "1", "2112", false, false, "1" },
+                         Arm{ 3, "0,2", "1", "2112", false, false, "60000" } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + a.bg);
         if (a.room) env.push_back(std::string("RADIANCE_PP_BG_ROOM=") + a.room);
         if (a.lead_seg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1"); }
         if (a.hold) env.push_back("RADIANCE_PP_BG_HOLD_MS=60000");
+        if (a.join) env.push_back(std::string("RADIANCE_PP_BG_JOIN_MS=") + a.join);   /* tp8 loop P23b */
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -2127,11 +2130,12 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         if (a.room) b2_all += std::max(0LL, b2);
         fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; BG steps "
                         "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : "off",
-                a.lead_seg ? " + LEAD_SEG=1 + AHEAD" : "", a.hold ? " + HOLD" : "", a.lanes, a.cut, differ, ref.size(), bg, steps, b2,
-                widest);
+                a.lead_seg ? " + LEAD_SEG=1 + AHEAD" : a.hold ? " + HOLD" : "", a.join ? (std::string(" + JOIN_MS=") + a.join).c_str() : "",
+                a.lanes, a.cut, differ, ref.size(), bg, steps, b2, widest);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK(bg > 0);
+        if (a.join) CHECK(llog.find(std::string("RADIANCE_PP_BG_JOIN_MS=") + a.join + " -- ") != std::string::npos);
         if (a.room) {
             CHECK(llog.find("RADIANCE_PP_BG_ROOM=2112 -- ") != std::string::npos);
             CHECK(steps > 0);

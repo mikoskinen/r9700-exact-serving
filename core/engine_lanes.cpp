@@ -276,6 +276,14 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     else if (const char* br = std::getenv("RADIANCE_PP_BG_ROOM"); br && *br)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_ROOM=%s is not taken: %s (tp8 loop P23)", br,
                  lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 256 .. 65536 rows");
+    if (lanes_.bg_join_ms() > 0)
+        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_JOIN_MS=%lld -- a newcomer past the shared budget's room joins a busy BG lane's "
+                 "inbox only while that lane's step in flight is predicted to commit within %lld ms (its rows x the BG steps' measured "
+                 "us a row); else it runs at home as a MIXED step, as without RADIANCE_PP_BG_ROOM (tp8 loop P23b)",
+                 (long long)lanes_.bg_join_ms(), (long long)lanes_.bg_join_ms());
+    else if (const char* bj = std::getenv("RADIANCE_PP_BG_JOIN_MS"); bj && *bj)
+        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_JOIN_MS=%s is not taken: %s (tp8 loop P23b)", bj,
+                 lanes_.bg_room() <= 0 ? "it needs RADIANCE_PP_BG_ROOM (and RADIANCE_PP_BG_LANE)" : "not 1 .. 60000 ms");
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); lanes_.bg_hold_ms() <= 0 && bh && *bh)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%s is not taken: %s (tp8 dev D11)", bh,
                  lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 1 .. 60000 ms");
@@ -583,9 +591,15 @@ int Engine::step_loop_lanes() {
         const LaneSet::Counts c = lanes_.counts();
         RAD_INFO("two-node pipeline: BG steps%s (RADIANCE_PP_BG_ROOM=%lld, tp8 loop P23): %lld steps with %lld newcomers; %lld steps "
                  "with >= 2 newcomers (%lld newcomers, %lld rows), %lld with >= 3; the widest %lld rows; kept home for the BG lanes' "
-                 "room %lld", when, (long long)lanes_.bg_room(), (long long)c.bgst_n, (long long)c.bgst_newc, (long long)c.bgst_b2,
+                 "room %lld%s", when, (long long)lanes_.bg_room(), (long long)c.bgst_n, (long long)c.bgst_newc, (long long)c.bgst_b2,
                  (long long)c.bgst_b2_newc, (long long)c.bgst_b2_rows, (long long)c.bgst_b3, (long long)c.bgst_max_rows,
-                 (long long)c.bg_skip[LaneSet::kBgRoom]);
+                 (long long)c.bg_skip[LaneSet::kBgRoom],
+                 lanes_.bg_join_ms() > 0
+                     ? fmt("; past the shared room (RADIANCE_PP_BG_JOIN_MS=%lld, P23b): %lld joined a busy BG lane, %lld ran at home "
+                           "(its step in flight not within %lld ms); BG steps %.2f us a row (plan to commit)",
+                           (long long)lanes_.bg_join_ms(), (long long)c.bg_join_yes, (long long)c.bg_join_no,
+                           (long long)lanes_.bg_join_ms(), (double)c.bg_us_row_x100 / 100.0).c_str()
+                     : "");
     };
     auto hold_line = [&]() {
         const LaneSet::Counts c = lanes_.counts();

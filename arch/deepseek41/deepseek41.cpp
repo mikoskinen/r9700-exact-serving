@@ -694,6 +694,11 @@ struct Model {
      * no gather of the streams before X1. Round 4, the follower at h > 0: X1's stage_recv with `shard` (each rank copies
      * only its quarter rows of those parts: its SP layer h reads no other) */
     rad_op pp_x1_sh = 0;
+    /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, with sphc; sphc_attn_env(), read at declare): at an SP layer whose xn no
+     * compressor / indexer reads, the attention's unsharded input GEMMs (q_a, kv: every rank holds them whole) over this
+     * rank's quarter, then all-gathers of their outputs (qr, kv) in place of xn's -- the gathers raw, on the all-reduce's
+     * instance (`bound`). 0 = off: nothing new declared or issued. */
+    rad_op sp_ag_qr = 0, sp_ag_kv = 0;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
@@ -2480,6 +2485,20 @@ static bool sphc_x1_env() {
     return on;
 }
 static std::atomic<long long> g_sp_x1{0};
+/* tp8 loop P26 -- RADIANCE_DS41_SPHC_ATTN=1 (with RADIANCE_DS41_SPHC, read at declare; default 0 = round 4's SP layers): the
+ * attention's input GEMMs q_a and kv are declared unsharded (every rank holds the whole weight and, today, runs it over every
+ * row of an SP layer after the gather of xn: four times the work). Here, at an SP layer where nothing else reads xn (no
+ * compressor chain, no indexer projection: DeepSeek-V4.1-Flash's layers 0-19 but 2 / 8 / 14), each rank runs q_a and kv over
+ * its quarter of the rows and the outputs qr (q_lora a row) and kv (head_dim a row) are all-gathered raw instead of xn
+ * (n_embd a row). The ops after them (q_b's norm + GEMM, the window key's norm / rope / round trip / store, the ropes) read
+ * every row as today. EXACT by construction: a row's gemm_nt_ggml bytes are the same at any M and any place in the launch
+ * above the decode band (lever WMG's byte check: 28 keys, 25,928 rows, 0 differ; lever GPF's forms keep the per-output
+ * order) and a quarter of an SP pass is >= 128 rows (SPHC >= 512); the gathers move the owner's words. */
+static bool sphc_attn_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_SPHC_ATTN"); return e && e[0] == '1' && !e[1]; }();
+    return on;
+}
+static std::atomic<long long> g_sp_attn{0};
 /* tp8 loop P13b -- RADIANCE_DS41_PIPE2_ATTN=1 (read at declare, only with RADIANCE_DS41_PIPE2 on): a pipelined layer's
  * attention output too: the first group projections and the attention mix as today, o_b of piece 0, piece 0's
  * attention all-reduce on the second lane behind lane 0 and beside piece 1's o_a + o_b (no collective), lane 0
@@ -5147,6 +5166,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         m.sp_rs_a != 0, m.sp_rs_f != 0, m.sp_ag_x != 0, m.sp_ag_f != 0, m.sp_ag_h != 0);
             m.sphc = 0;
         }
+        /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1): the gathers of q_a's and kv's outputs (rows of q_lora / head_dim, both
+         * multiples of 32), `bound` the all-reduce's T x D so they ride its instance (its slot holds a longer shard) */
+        if (m.sphc > 0 && sphc_attn_env()) {
+            m.sp_ag_qr = (c.q_lora % 32 || c.head_dim % 32) ? 0 : rows_op("all_gather_rows", c.q_lora, m.qr, true);
+            m.sp_ag_kv = m.sp_ag_qr ? rows_op("all_gather_rows", c.head_dim, m.kv, true) : 0;
+            if (!m.sp_ag_kv) m.sp_ag_qr = 0;
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_ATTN=1 (tp8 loop P26): %s\n",
+                        m.sp_ag_qr ? "an SP layer whose xn no compressor / indexer reads runs q_a and kv over each rank's "
+                                     "quarter and gathers their outputs (qr, kv) in place of xn"
+                                   : "off -- the gathers of qr / kv do not resolve here");
+        }
     }
     /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the MoE layers' ungated shared gate, a plane of bf16 ones, filled
      * once at the step's start -- the op each layer issues (MoeFP8 op_sgate: fill n 1, value 1, the block's
@@ -7051,7 +7082,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     static thread_local std::vector<uint8_t> spv;
     static thread_local std::vector<ds41sp::Layer> spl;
     spv.assign(m.layers.size(), 0);
-    int sp_n = 0, sp_ga = 0, sp_lo = -1, sp_hi = -1, sp_en = 0;
+    int sp_n = 0, sp_ga = 0, sp_lo = -1, sp_hi = -1, sp_en = 0, sp_at = 0;   /* sp_at: P26's layers this pass */
     if (sp_pass) {
         spl.assign(m.layers.size(), ds41sp::Layer{});
         for (int i = 0; i < (int)m.layers.size(); ++i) {
@@ -7087,16 +7118,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 g_sp_rows.fetch_add(T, std::memory_order_relaxed);
                 g_sp_gathers.fetch_add(sp_ga, std::memory_order_relaxed);
                 g_sp_eng.fetch_add(sp_en, std::memory_order_relaxed);
+                const long long at = g_sp_attn.fetch_add(sp_at, std::memory_order_relaxed) + sp_at;
                 const long long n = g_sp_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+                char p26[160] = "";
+                if (m.sp_ag_qr)   /* tp8 loop P26: appended only with RADIANCE_DS41_SPHC_ATTN=1 */
+                    std::snprintf(p26, sizeof p26, "; RADIANCE_DS41_SPHC_ATTN (tp8 loop P26): %lld layer-passes ran q_a / kv "
+                                                   "over the quarter, this one %d", at, sp_at);
                 if (n == 1 || n % 64 == 0)
                     fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC (tp8 loop P20): %lld prefill passes ran %lld "
                                     "layer-passes sequence-parallel (%lld rows, the streams gathered %lld times, %lld Engram "
                                     "layer-passes over the quarter) of %lld lone prefill passes of >= %lld rows, %lld X1s row-sharded; "
-                                    "this one %lld rows, layers %d..%d SP (%d), %d gathers of the streams, part %d\n",
+                                    "this one %lld rows, layers %d..%d SP (%d), %d gathers of the streams, part %d%s\n",
                             n, g_sp_layers.load(std::memory_order_relaxed), g_sp_rows.load(std::memory_order_relaxed),
                             g_sp_gathers.load(std::memory_order_relaxed), g_sp_eng.load(std::memory_order_relaxed), lone,
                             (long long)m.sphc, g_sp_x1.load(std::memory_order_relaxed), (long long)T, sp_lo, sp_hi, sp_n, sp_ga,
-                            part);
+                            part, p26);
             }
     };
     struct SpEnd {
@@ -7387,6 +7423,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (m.zero) {
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.attn_fill, n, R(m.attn_out, r0, n)); });
         } else {
+            /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, m.sp_ag_qr): an SP layer whose xn only q_a and kv read (no compressor
+             * chain: L.src; no indexer projection: L.i_score) runs both over this rank's quarter and gathers their outputs
+             * instead of xn; everything below reads qr / kv over every row as today (a1_cheap skips the two GEMMs) */
+            const bool cheap0 = bi_cheap(g_sw_bi.load(std::memory_order_relaxed));
+            const bool p26 = sp_l && xn_sh && m.sp_ag_qr && m.sp_ag_kv && cheap0 && !L.norm_a && !L.src && !L.i_score &&
+                             L.q_a && L.kv_g && gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv) && !p2_layer && t_tbo.l != l;
+            if (p26) {
+                with_rows(sp0, spn, [&] {
+                    dense(true, true, [&](int64_t r0, int64_t n) {
+                        lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
+                    });
+                    dense(true, true, [&](int64_t r0, int64_t n) {
+                        lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
+                    });
+                });
+                RAD_ISSUE_N(x, m.sp_ag_qr, T * c.q_lora, brows(m.qr, T), RAD_NONE);
+                RAD_ISSUE_N(x, m.sp_ag_kv, T * c.head_dim, brows(m.kv, T), RAD_NONE);
+                xn_sh = false;   /* xn past this rank's quarter is stale; nothing reads it before the next layer writes it */
+                ++sp_at;
+            }
             sp_gather_x();   /* tp8 loop P20: xn whole on every rank before its first reader */
             if (L.norm_a) {
                 const auto norm_a = [&](int64_t r0, int64_t n) {
@@ -7426,7 +7482,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const int qnf = L.q_bf ? g_sw_qnf.load(std::memory_order_relaxed) : 0;
             const bool qfold = qnf == 1 || (qnf == 2 && !L.i_score);
             const bool kvfold = L.kv_fs && g_sw_kvf.load(std::memory_order_relaxed) > 0;
-            const bool cheap = bi_cheap(g_sw_bi.load(std::memory_order_relaxed));
+            const bool cheap = cheap0;   /* tp8 loop P26: read once above */
             /* the fused window-key norm over a segment (decode rows within 32) */
             const auto kvn_seg = [&](const BiSeg& s) {
                 const auto kvn = [&](int64_t a0, int64_t an) {
@@ -7448,6 +7504,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const auto a1_cheap = [&] {
                 /* lever WMK (dense(), ds41_wmk 1): the dense GGUF linears once over a mixed run; off: by segment, as before */
                 const bool qkv_gg = gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv);
+                if (!p26) {   /* tp8 loop P26: issued over the quarter above */
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
                     if (gq_qkv_on(L, n))
                         gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
@@ -7457,6 +7514,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {
                     if (!gq_qkv_on(L, n)) lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                 });
+                }
                 if (L.i_score)
                     dense(gguf_dense(m, L.iproj), true, [&](int64_t r0, int64_t n) {
                         lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
