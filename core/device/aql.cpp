@@ -506,9 +506,21 @@ KernelRec* resolve(Func* fn, int ord) {
     std::string why;
     const ModuleImage* im = nullptr;
     const KernelMeta* meta = module_meta(m, d.isas, &im, sym, &why);
+    /* tp8 loop F24: a module's code object is loaded on a card at the first launch of any of its kernels, which may be in
+     * the middle of serving (a prefill form's first >= 1k-row pass); one that takes long says so (RADIANCE_AQL_PRELOAD=1
+     * loads every module at start instead) */
+    const bool first_load = meta && !m->loaded[ord];
+    const auto t_load = std::chrono::steady_clock::now();
     if (!meta || !module_load(m, ord, *im, &why)) {
         fn->err[ord] = why;
         return nullptr;
+    }
+    if (first_load) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load).count();
+        if (ms >= 1000.0)
+            RAD_WARN("device: card %d: the code object holding kernel %s took %.0f ms to load at that kernel's first launch "
+                     "(the module's first use on this card; RADIANCE_AQL_PRELOAD=1 loads every module at start, tp8 loop F24)",
+                     ord, fn->name.c_str(), ms);
     }
     hsa_executable_symbol_t s;
     if (hsa_executable_get_symbol_by_name(m->exec[ord], sym.c_str(), &d.agent, &s) !=
@@ -4083,6 +4095,47 @@ bool ride_reusable(void* token) {
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
+
+/* tp8 loop F24: every registered fat binary's code object on card `device` now, as its first launch would load it (resolve ->
+ * module_load: the same image choice, the same executable), so that no module is loaded while the engine serves. */
+int aql_code_preload(int device, AqlPreload* out) {
+    using namespace aql;
+    if (out) *out = AqlPreload{};
+    if (!G().ok || device < 0 || (size_t)device >= G().dev.size()) return RAD_E_UNSUPPORTED;
+    std::vector<Module*> mods;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        for (const auto& kv : r.by_handle)
+            if (kv.second && std::find(mods.begin(), mods.end(), kv.second) == mods.end()) mods.push_back(kv.second);
+    }
+    const std::vector<std::string>& isas = G().dev[(size_t)device].isas;
+    if (isas.empty()) return RAD_E_UNSUPPORTED;
+    const auto t0 = std::chrono::steady_clock::now();
+    AqlPreload p;
+    for (Module* m : mods) {
+        std::lock_guard<std::mutex> lk(m->mu);
+        if (m->loaded[device]) { ++p.already; continue; }
+        ModuleImage& im = m->image[isas.front()];
+        if (!im.parsed) {   /* as module_meta parses it */
+            im.parsed = true;
+            if (bundle_code_object(m->bundle, isas, &im.co, &im.size, &im.err)) {
+                std::vector<KernelMeta> ks;
+                if (!code_object_kernels(im.co, im.size, &ks, &im.err)) im.co = nullptr;
+                else for (KernelMeta& k : ks) im.meta.emplace(k.symbol, std::move(k));
+            } else {
+                im.co = nullptr;
+            }
+        }
+        if (!im.co) { ++p.none; continue; }   /* nothing for this card: its first launch reports it, as before */
+        std::string why;
+        if (module_load(m, device, im, &why)) { ++p.loaded; p.bytes += (int64_t)im.size; }
+        else ++p.failed;
+    }
+    p.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (out) *out = p;
+    return RAD_OK;
+}
 
 const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {

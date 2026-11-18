@@ -525,6 +525,15 @@ int64_t aql_pageable_bytes(void);
  * build's exported symbols and see every dlopen'ed plugin's device code, card or not. Serves as
  * the host backend's code_mark in a HIP build. */
 size_t  aql_code_registered(void);
+/* tp8 loop F24 (RADIANCE_AQL_PRELOAD=1, Engine::plan): every registered fat binary's code object loaded on `device` now, as
+ * the first launch of one of its kernels would (the AQL backend otherwise loads a module there, mid-serve if that is when its
+ * first kernel runs). RAD_E_UNSUPPORTED without the AQL backend. */
+struct AqlPreload {
+    int64_t loaded = 0, already = 0, none = 0, failed = 0;   /* modules: loaded now / before / no code for the card / refused */
+    int64_t bytes = 0;                                       /* the code objects' bytes loaded now */
+    double  ms = 0;
+};
+int     aql_code_preload(int device, AqlPreload* out);
 #endif
 
 /* ------------------------------------------------------------------ the error slot */

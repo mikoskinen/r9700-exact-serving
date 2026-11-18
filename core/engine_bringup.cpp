@@ -2093,6 +2093,26 @@ int Engine::plan() {
      *
      * All inputs exist by now: declare() has run (buffer plan, KV groups), and every kernel init
      * has run, so code objects are resident and free VRAM is the steady-state reading. */
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    /* tp8 loop F24 (RADIANCE_AQL_PRELOAD=1): the AQL backend loads a module's code object on a card at the first launch of one
+     * of its kernels, so the modules no init launched (prefill forms, a first >= 1k-row pass's) load while serving and
+     * outside this reading; on the two-node pipeline such a first use stalled both nodes ~46 s (FINDINGS F21 / F24 / F25).
+     * With the switch every module is loaded on every card here, before the budget reads the cards. Default off. */
+    if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && !std::strcmp(pe, "1")) {
+        for (auto& r : ranks_) {
+            AqlPreload p;
+            const int st = aql_code_preload(r->device, &p);
+            if (st == RAD_E_UNSUPPORTED) {
+                RAD_INFO("RADIANCE_AQL_PRELOAD=1: not the AQL backend here; nothing to load");
+                break;
+            }
+            RAD_TRY(st);
+            RAD_INFO("RADIANCE_AQL_PRELOAD=1 (tp8 loop F24): card %d: %lld module(s) loaded now (%s of code objects, %.0f ms), "
+                     "%lld loaded before, %lld with no code for this card, %lld refused", r->device, (long long)p.loaded,
+                     humanb(p.bytes).c_str(), p.ms, (long long)p.already, (long long)p.none, (long long)p.failed);
+        }
+    }
+#endif
     {
         std::vector<VramFacts> facts;
         facts.reserve(ranks_.size());
