@@ -475,7 +475,12 @@ static __device__ __forceinline__ v8h decode_frag_x3d(unsigned w0, unsigned w1, 
 // chains of different windows overlap instead of each pk_mul -> mad -> sad chain stalling on its own latency (the first
 // form's ISA: s_delay_alu before nearly every dependent op, gate_up +30 %). The same instructions and operands as
 // decode_frag_x3d / hash_pair: the same f16 bits.
-template <int NPW>
+// X5 (tp8 loop QUEUE X5, FOLD = true; fn4 exl3_x3d 5): the CODEBOOK FOLD -- the fragment is the integer S = 1024 + bytesum
+// itself (the byte sums into 0x6400 are already its exact f16 bits, 1024 .. 2044), without the per-weight fma
+// w = f16(S kinv + kbias); the GEMM's caller applies the affine map to its f32 sums instead (moe_pass: acc kinv + kbias
+// sum_k x_k, the row sums from one more WMMA against ones). Its own reference (rule B): each weight is no longer rounded
+// to f16, so y moves by about that rounding (~2e-4 of |y|, tp8/dev/x4/fold.py); deterministic and per row as before.
+template <int NPW, bool FOLD = false>
 static __device__ __forceinline__ void decode_frags_x3d(const unsigned (&w0)[NPW], const unsigned (&w1)[NPW],
                                                         const unsigned (&sx)[4], v8h (&out)[NPW]) {
   constexpr int N = 4 * NPW;
@@ -520,11 +525,21 @@ static __device__ __forceinline__ void decode_frags_x3d(const unsigned (&w0)[NPW
     const int slot[4] = {0, 2, 1, 3};
 #pragma unroll
     for (int q = 0; q < 4; q++)
-      x.u[slot[q]] = EXL3R4D_ABLATE_CBFMA ? sm[j][q]   // X4 reading build: the codebook's fma deleted (wrong bytes)
+      x.u[slot[q]] = (EXL3R4D_ABLATE_CBFMA || FOLD) ? sm[j][q]   // X4 reading build (wrong bytes) / X5's fold (S)
                    : __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
                                                                            (v2h){kinv, kinv}, (v2h){kbias, kbias}));
     out[j] = x.f;
   }
+}
+
+// X5: the codebook's affine map as f32 (the exact values of the f16 constants the fma uses), and the all-ones weight
+// fragment whose WMMA against a k-step's activations gives every row's sum of them in each of its 16 columns.
+static __device__ __forceinline__ float x5_kinv() { return (float)__builtin_bit_cast(_Float16, (unsigned short)0x1EEE); }
+static __device__ __forceinline__ float x5_kbias() { return (float)__builtin_bit_cast(_Float16, (unsigned short)0xC931); }
+static __device__ __forceinline__ v8h x5_ones() {
+  union { unsigned u[4]; v8h f; } x;
+  x.u[0] = x.u[1] = x.u[2] = x.u[3] = 0x3C003C00u;   // 1.0 in both halves
+  return x.f;
 }
 
 // libr4d's fragA (two 8-byte groups 16 bytes apart) from a uniform base plus a per-lane byte offset.

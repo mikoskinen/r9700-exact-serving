@@ -737,8 +737,12 @@ static __device__ bool xs_combine(const Exl3r4dGemm& p, v8f (&acc)[NPW], int uni
 }
 // XSM (P10-TP4S L1, the four-class dense gate_up only): this workgroup is slice xsl of xsn of its unit's K; with xsn
 // 2 the two slices' partial sums meet in xs_combine (below) and the second to arrive runs the epilogue.
+// X5 (FOLD, with X3D only; fn4 exl3_x3d 5): the codebook fold -- the K loop multiplies the integer codes S (no per-weight
+// fma, decode_frags_x3d<NPW, true>) and one more WMMA a k-step sums the step's activations against ones (accx: every row's
+// sum_k x_k in each column); before the split-K reduction each sum becomes acc kinv + kbias accx -- the affine codebook
+// applied to the f32 sum instead of each weight's f16 rounding (linear, so a split's partials fold alone and add).
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false, int PFO = 0,
-          bool XSM = false, bool X3D = false, int K25 = K25_OFF>
+          bool XSM = false, bool X3D = false, int K25 = K25_OFF, bool FOLD = false>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
                                                 int wsub = 0, int xsn = 1, int xsl = 0, int xunit = 0) {
@@ -973,6 +977,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   v8f acc[NPW];
 #pragma unroll
   for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+  static_assert(!FOLD || (X3D && !RAW && !APREP && STAGED == 0 && !XSM), "X5: the fold is built for the X3D K loop only");
+  [[maybe_unused]] v8f accx = (v8f)(0.f);   // X5 (FOLD): every row's sum of this split's activations, in each column
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
   if constexpr (EXL3R4D_SVH_EARLY && !RAW) svh_early<NPW, MATS>(w, col_local, lane, cb, svp);
 
@@ -1107,8 +1113,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       _Pragma("unroll") for (int j = 0; j < NPW; j++) { x0_[j] = W_[j][1][0]; x1_[j] = W_[j][1][1]; } \
       v8h wfs_[NPW];                                                                 \
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(x0_, x1_, wfs_);           \
-      else decode_frags_x3d<NPW>(x0_, x1_, x3d_sx, wfs_);                            \
+      else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
+      if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
       break;                                                                         \
     }                                                                                \
     if constexpr (K25 != K25_OFF) { /* K25U: the tiles' windows, their unpacked decode phase by phase, the WMMAs */ \
@@ -1184,6 +1191,13 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   return;
 #endif
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
+  if constexpr (FOLD) {   // X5: sum_k (S kinv + kbias) x_k = kinv (sum_k S x_k) + kbias (sum_k x_k), this split's k-steps
+    const float ki = x5_kinv(), kb = x5_kbias();
+#pragma unroll
+    for (int j = 0; j < NPW; j++)
+#pragma unroll
+      for (int e = 0; e < 8; e++) acc[j][e] = __builtin_fmaf(acc[j][e], ki, kb * accx[e]);
+  }
   if (SK > 1) splitk_reduce<NPW>(acc, lds, col_local, ksplit, SK, lane);
   if constexpr (XSM) {
     if (xsn > 1 && !xs_combine<NPW>(p, acc, xunit, xsl)) return;   // the first slice leaves; the second sums
@@ -1386,7 +1400,8 @@ static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads t
 // G = 1 is the kernel as it was (cbx -1: blockIdx.x).
 template <int G>
 static __device__ __forceinline__ int spb_cb(int g) { return G == 1 ? (int)blockIdx.x : (int)blockIdx.x * G + g; }
-template <int MATS, int G = 1>
+// X5 (FOLD, fn4 exl3_x3d 5): the same kernel with the codebook fold (moe_pass FOLD).
+template <int MATS, int G = 1, bool FOLD = false>
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_kernel(Exl3r4dGemm p) {
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "X3D-F: down's E2 grouping is not ported");
   static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
@@ -1417,7 +1432,8 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
       continue;
     }
     for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
-      moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true>(p, w, rc, run.r1, lds, tk0, G == 1 ? -1 : cb);
+      moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true, K25_OFF, FOLD>(p, w, rc, run.r1, lds, tk0,
+                                                                         G == 1 ? -1 : cb);
   }
 }
 
@@ -3923,7 +3939,7 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     // SPB-P (fn4 exl3_dng 101 / 102 / 104 / 108): the persistent live-units form of the same down kernels
     const int pg = !gate_up && !gscr && dngk == 1 && a->n_expert <= kSpbMaxLive &&
                    (a->dng == 101 || a->dng == 102 || a->dng == 104 || a->dng == 108) ? a->dng - 100 : 0;
-    const bool px = pg > 0 && ((bits == 2 && a->x3d) || (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4));
+    const bool px = pg > 0 && ((bits == 2 && a->x3d && a->x3d != 5) || (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4));
     if (px) {
       const bool k2 = bits == 2;
       const void* pf = pg == 1 ? (k2 ? (const void*)exl3r4d_gemm_pdx_kernel<0, 1> : (const void*)exl3r4d_gemm_pdx_kernel<1, 1>)
@@ -3947,6 +3963,12 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
       return RAD_OK;
     }
     if (bits == 2 && a->x3d && !gscr && dngk == 1) {  // X3D-F (fn4 exl3_x3d): K = 2's one-word-pair decode
+      if (a->x3d == 5)   // X5: the codebook fold (fn4 exl3_x3d 5; fill() sets 5 at K = 2 only)
+        kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2, 1, true>
+           : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2, true>
+           : sg == 4 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 4, true>
+           : sg == 8 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 8, true> : (const void*)exl3r4d_gemm_x3d_kernel<1, 1, true>;
+      else
       kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2>
          : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2>
          : sg == 4 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 4>

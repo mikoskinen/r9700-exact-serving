@@ -23,7 +23,10 @@
  * every other name answers 0 (not mine).
  * K25U (ds41-k25u, 13.11.2026): 2 / 3 / 4 = X3D-F (K = 2, as 1) + K = 2.5's decode with unpacked states (exl3r4d.hip
  * k25_windows / decode_frags_k25; the same f16 weights): gate_up G3 (2), G2D (3) or UB96 (4), down U4 at all three.
- * 0 / 1 are what they were (no K = 2.5 launch changes). */
+ * 0 / 1 are what they were (no K = 2.5 launch changes).
+ * X5 (tp8 loop QUEUE X5, 18.11.2026): 5 = 2 with K = 2's CODEBOOK FOLD in the decode band (exl3r4d.hip moe_pass FOLD: the
+ * integer codes into the WMMA, the affine map on the f32 sums) -- its own reference (rule B): K = 2's decode-band outputs
+ * move by about each weight's f16 rounding; K = 2.5 as at 2; the M > 48 band (prefill) as at 2. */
 static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
 /* SPB-G (ds41-etp-spb-plug, 14.11.2026): fn4 switch "exl3_dng" 0 / 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U) down
@@ -64,7 +67,7 @@ __attribute__((visibility("default"))) int rad_host_pool_ranges(int rank, int n,
  * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
-    if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
+    if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 5 ? 1 : -1;   /* K25U: 2 .. 4; X5: 5 */
     if (!strcmp(name, "exl3_dng"))   /* SPB-G 2 / 4 / 8; SPB-P 101 / 102 / 104 / 108 (the persistent live-units form) */
         return value == 0 || value == 2 || value == 4 || value == 8 || value == 101 || value == 102 || value == 104 ||
                value == 108 ? 1 : -1;

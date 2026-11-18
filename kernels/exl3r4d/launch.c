@@ -245,7 +245,9 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->limit = (float)g->limit;
     {   /* X3D-F: K = 2 at fn4 exl3_x3d >= 1; K25U: K = 2.5 at 2 / 3 / 4 (the gate_up arm; exl3r4d_launch_gemm) */
         const int sw = exl3r4d_fn4_x3d();
-        d->x3d = g->bits == 2 ? (sw >= 1 ? 1 : 0) : (g->bits == EXL3R4D_BITS_H25 && sw >= 2 && sw <= 4) ? sw : 0;
+        /* X5: 5 = the fold at K = 2 (exl3r4d_launch_gemm's x3d kernel FOLD form); K = 2.5 as at 2 */
+        d->x3d = g->bits == 2 ? (sw == 5 ? 5 : sw >= 1 ? 1 : 0)
+               : (g->bits == EXL3R4D_BITS_H25 && sw >= 2 && sw <= 5) ? (sw == 5 ? 2 : sw) : 0;
     }
     /* SPB-G (fn4 exl3_dng, prefill.c): the x3d / k25 down's column blocks a workgroup; exl3r4d_launch_gemm takes 2 / 4 / 8
      * there and ignores it everywhere else. Every output byte is the one-block grid's (exl3r4d.hip, spb_cb). */
