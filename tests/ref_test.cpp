@@ -6457,6 +6457,81 @@ TEST(op_stage_send_row_shards_between_plain_payloads_world4) {
     }
 }
 
+/* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG=2): a segment boundary's save / restore (stage ops in loop mode, each rank its own
+ * buffer) with `shard` + `ranks` -- each rank saves only ITS rows [r q, (r + 1) q) of the masked parts (q = ceil(rows / 4))
+ * and the other parts whole, and the restore writes back exactly those: a masked part's other rows keep what the buffer held
+ * (a pass between the segments rewrote them; an SP layer never reads them), the unmasked part comes back whole. 9 rows of 8
+ * f32 (16-byte rows), 9 rows of 10 bf16 (20-byte rows: the 4-byte path), 5 rows of 3 i32 (unmasked). Control: loop without
+ * `shard` (today's boundary) restores every row. `shard` without `ranks` is refused (no ring header names the node's ranks). */
+TEST(op_stage_loop_row_shards_world4) {
+    const int W = 4;
+    const int64_t R0 = 9, R2 = 5, q = (R0 + W - 1) / W;
+    auto good = [](int rank, int part, int64_t i) { return (float)(rank * 100000 + part * 1000 + i) * 0.25f; };
+    for (int shard : { 3, 0 }) {
+        std::vector<std::vector<uint8_t>> rings((size_t)W, std::vector<uint8_t>((size_t)RAD_PP_RING_HDR + 65536, 0xA5));
+        std::vector<T> ringt;
+        ringt.reserve((size_t)W);
+        std::vector<std::vector<T>> parts((size_t)W);
+        for (int rk = 0; rk < W; ++rk) {
+            ringt.emplace_back(RAD_U8, std::vector<int64_t>{ (int64_t)rings[(size_t)rk].size() });
+            ringt[(size_t)rk].t.data = rings[(size_t)rk].data();
+            parts[(size_t)rk].reserve(3);
+            parts[(size_t)rk].emplace_back(RAD_F32, std::vector<int64_t>{ R0, 8 });
+            parts[(size_t)rk].emplace_back(RAD_BF16, std::vector<int64_t>{ R0, 10 });
+            parts[(size_t)rk].emplace_back(RAD_I32, std::vector<int64_t>{ R2, 3 });
+            for (int k = 0; k < 2; ++k)
+                for (int64_t i = 0; i < R0 * (k == 0 ? 8 : 10); ++i) parts[(size_t)rk][(size_t)k].set(i, good(rk, k, i));
+            for (int64_t i = 0; i < R2 * 3; ++i) st_int(RAD_I32, parts[(size_t)rk][2].t.data, i, (int64_t)(7000 + i + 100 * rk));
+        }
+        auto args = [&](int rk, A& a, bool with_ranks) {
+            a.t(ringt[(size_t)rk]).t(parts[(size_t)rk][0]).t(parts[(size_t)rk][1]).t(parts[(size_t)rk][2])
+                .i("M", R0).i("ring", 2).i("parts", 3).i("loop", 1);
+            if (shard) a.i("shard", shard);
+            if (shard && with_ranks) a.i("ranks", W);
+        };
+        if (shard) {   /* refused without `ranks` */
+            A a;
+            args(0, a, false);
+            CHECK(run("stage_send", a, 0, W) == RAD_E_STATE);
+        }
+        int st[W] = { 0, 0, 0, 0 };
+        auto send = [&](int rk) { A a; args(rk, a, true); st[rk] = run("stage_send", a, rk, W); };
+        std::vector<std::thread> th;
+        for (int rk = 0; rk < W; ++rk) th.emplace_back(send, rk);
+        for (std::thread& x : th) x.join();
+        for (int rk = 0; rk < W; ++rk) CHECK_OK(st[rk]);
+        /* a pass between the segments: every row of every part rewritten */
+        for (int rk = 0; rk < W; ++rk) {
+            for (int k = 0; k < 2; ++k)
+                for (int64_t i = 0; i < R0 * (k == 0 ? 8 : 10); ++i) parts[(size_t)rk][(size_t)k].set(i, -7.0f);
+            for (int64_t i = 0; i < R2 * 3; ++i) st_int(RAD_I32, parts[(size_t)rk][2].t.data, i, (int64_t)-1);
+        }
+        int rs[W] = { 0, 0, 0, 0 };
+        auto recv = [&](int rk) { A a; args(rk, a, true); rs[rk] = run("stage_recv", a, rk, W); };
+        std::vector<std::thread> rt;
+        for (int rk = 0; rk < W; ++rk) rt.emplace_back(recv, rk);
+        for (std::thread& x : rt) x.join();
+        int64_t bad = 0, own = 0;
+        for (int rk = 0; rk < W; ++rk) {
+            CHECK_OK(rs[rk]);
+            for (int k = 0; k < 2; ++k) {
+                const int64_t rb = k == 0 ? 8 : 10;
+                T one(k == 0 ? RAD_F32 : RAD_BF16, { 1 });
+                for (int64_t i = 0; i < R0 * rb; ++i) {
+                    const bool mine = !shard || (i / rb) / q == rk;
+                    own += mine;
+                    one.set(0, mine ? good(rk, k, i) : -7.0f);
+                    bad += parts[(size_t)rk][(size_t)k].at(i) != one.at(0);
+                }
+            }
+            for (int64_t i = 0; i < R2 * 3; ++i) bad += ld_int(RAD_I32, parts[(size_t)rk][2].t.data, i) != (int64_t)(7000 + i + 100 * rk);
+        }
+        fprintf(stderr, "    loop shard %d: %lld words restored a rank's own, %lld wrong\n", shard, (long long)own, (long long)bad);
+        CHECK_EQ(bad, (int64_t)0);
+        CHECK_EQ(own, shard ? (int64_t)(R0 * 18) : (int64_t)(W * R0 * 18));
+    }
+}
+
 TEST(op_rows_collectives_world4) {
     for (uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 })
         for (int64_t rows : { (int64_t)8, (int64_t)9, (int64_t)5, (int64_t)4 }) {

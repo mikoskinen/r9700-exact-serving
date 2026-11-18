@@ -1218,7 +1218,8 @@ static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
  * plugin passes; x0..x11 / y0..y11 are the parts, each [rows, ...] at its own dtype, packed verbatim
  * (tp8 S6: a part's rows are its own; part 0's are the header's). */
 /* `shard` (tp8 loop P20 round 3, stage_send): a mask of the parts every rank sends its rows of (the others rank `sender`) */
-static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop"), P_INTO("shard") };
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop"), P_INTO("shard"),
+                                       P_INTO("ranks") };   /* tp8 loop P25: loop + shard, the node's ranks */
 static const RadOperandSpec oStageSend[] = { OPD("ring"), OPD("x0"), OPD_O("x1"), OPD_O("x2"),
                                              OPD_O("x3"), OPD_O("x4"), OPD_O("x5"), OPD_O("x6"),
                                              OPD_O("x7"), OPD_O("x8"), OPD_O("x9"), OPD_O("x10"),

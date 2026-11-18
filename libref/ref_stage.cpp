@@ -264,6 +264,11 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     /* tp8 loop P8 (RadPpRing::send_split): every rank of the node takes part (1 its share, 2 a check of it) */
     /* tp8 loop P20 round 3: `shard` -- every rank its rows of the masked parts (split 3), whatever send_split says */
     const uint32_t shard = !loop ? (uint32_t)rad_param_geti(a->p, a->n_p, "shard", 0) : 0u;
+    /* tp8 loop P25: a segment boundary's save (loop) with `shard` -- this rank's rows of the masked parts into its own buffer
+     * (q = ceil(rows / ranks), `ranks` the node's), the other parts whole; the layout and the trailer the whole parts' */
+    const uint32_t lshard = loop ? (uint32_t)rad_param_geti(a->p, a->n_p, "shard", 0) : 0u;
+    const int64_t lranks = lshard ? rad_param_geti(a->p, a->n_p, "ranks", 0) : 0;
+    if (lshard && (lranks < 1 || lranks > RAD_PP_MAX_RANKS || a->rank < 0 || a->rank >= lranks)) return RAD_E_STATE;
     const int split = shard && r->send_ranks >= 2 && sender >= 0 && (uint64_t)sender < r->send_ranks ? 3
                     : !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 && sender >= 0 &&
                               (uint64_t)sender < r->send_ranks
@@ -307,7 +312,16 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     char* dst = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
     uint64_t off = 0;
     for (int i = 0; i < n; ++i) {
-        std::memcpy(dst + off, a->t[1 + i].data, (size_t)bytes[i]);
+        if ((lshard >> i) & 1u) {   /* tp8 loop P25: this rank's rows only */
+            const uint64_t prow = (uint64_t)a->t[1 + i].shape[0];
+            if (prow == 0 || bytes[i] % prow) return RAD_E_SHAPE;
+            const uint64_t rb = bytes[i] / prow, q = (prow + (uint64_t)lranks - 1) / (uint64_t)lranks;
+            const uint64_t r0 = std::min<uint64_t>((uint64_t)a->rank * q, prow), r1 = std::min<uint64_t>(r0 + q, prow);
+            if (r1 > r0)
+                std::memcpy(dst + off + r0 * rb, static_cast<const char*>(a->t[1 + i].data) + r0 * rb, (size_t)((r1 - r0) * rb));
+        } else {
+            std::memcpy(dst + off, a->t[1 + i].data, (size_t)bytes[i]);
+        }
         r->part_bytes[i] = bytes[i];
         off += rad_pp_align(bytes[i]);
     }
@@ -386,11 +400,15 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
     }
     /* tp8 loop P20 round 4: `shard` -- this rank copies only ITS rows of the masked parts (the rows collectives' cut over
      * the part's rows; the other parts whole): an SP layer reads no other row of them */
-    const uint32_t shard = !loop ? (uint32_t)rad_param_geti(a->p, a->n_p, "shard", 0) : 0u;
+    /* tp8 loop P25: loop + `shard` -- the save's rows of this rank back (the node's `ranks`) */
+    const uint32_t shard = (uint32_t)rad_param_geti(a->p, a->n_p, "shard", 0);
+    const int64_t lranks = loop && shard ? rad_param_geti(a->p, a->n_p, "ranks", 0) : 0;
+    if (loop && shard && (lranks < 1 || lranks > RAD_PP_MAX_RANKS || rank >= lranks)) return RAD_E_STATE;
     uint64_t off = 0;
     for (int i = 0; i < n; ++i) {
         if ((shard >> i) & 1u) {
-            const uint64_t prow = (uint64_t)a->t[1 + i].shape[0], nr = std::max<uint64_t>(r->n_ranks, 1);
+            const uint64_t prow = (uint64_t)a->t[1 + i].shape[0],
+                           nr = loop ? (uint64_t)lranks : std::max<uint64_t>(r->n_ranks, 1);
             if (prow == 0 || bytes[i] % prow) return RAD_E_SHAPE;
             const uint64_t rb = bytes[i] / prow, q = (prow + nr - 1) / nr;
             const uint64_t r0 = std::min<uint64_t>((uint64_t)rank * q, prow), r1 = std::min<uint64_t>(r0 + q, prow);

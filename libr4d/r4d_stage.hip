@@ -258,8 +258,14 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
     if (ok) {
         char* dst = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
-        for (int k = 0; k < P.n; ++k) copy_part(reinterpret_cast<const char*>(P.p[k]), dst + P.off[k], P.bytes[k],
-                                                (P.w16 >> k) & 1u, stride);
+        for (int k = 0; k < P.n; ++k) {
+            if (P.split == 3 && ((P.smask >> k) & 1u)) {   /* tp8 loop P25: loop + `shard`, this rank's rows of a masked part */
+                const uint64_t rb = P.bytes[k] / P.srows, a = P.srow0 * rb, e = P.srow1 * rb;
+                if (e > a) copy_part(reinterpret_cast<const char*>(P.p[k]) + a, dst + P.off[k] + a, e - a, (P.w16 >> k) & 1u, stride);
+                continue;
+            }
+            copy_part(reinterpret_cast<const char*>(P.p[k]), dst + P.off[k], P.bytes[k], (P.w16 >> k) & 1u, stride);
+        }
     }
     __threadfence_system();
     __syncthreads();
@@ -607,6 +613,12 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     /* tp8 loop P20 round 3: `shard` (a mask of parts) -- every rank of the sending node copies its rows of those parts
      * (split 3), whatever RADIANCE_PP_SEND_SPLIT says */
     const uint32_t shard = send && !loop ? (uint32_t)r4d_geti_or(a, "shard", 0) : 0u;
+    /* tp8 loop P25: a segment boundary's save / restore (loop) with `shard` -- this rank's rows of the masked parts in and out
+     * of its own buffer (the rows collectives' cut over `ranks`, the node's ranks), the other parts whole; the ring's layout
+     * and checks are the whole parts' */
+    const uint32_t lshard = loop ? (uint32_t)r4d_geti_or(a, "shard", 0) : 0u;
+    const int64_t lranks = lshard ? r4d_geti_or(a, "ranks", 0) : 0;
+    if (lshard && (lranks < 1 || lranks > RAD_PP_MAX_RANKS || a->rank < 0 || a->rank >= lranks)) return R4D_NO(RAD_E_STATE);
     const int split = shard && r->send_ranks >= 2 && sender >= 0 && (uint64_t)sender < r->send_ranks ? 3
                     : send && !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 &&
                               sender >= 0 && (uint64_t)sender < r->send_ranks
@@ -680,6 +692,19 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
         if (blocks < 1) blocks = 1;
         if (blocks > kMaxBlocks) blocks = kMaxBlocks;
         return R4D_EMIT(stream, stage_send_split_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter, diff);
+    }
+    if (lshard) {   /* tp8 loop P25: stage_send_kernel / stage_recv_kernel copy only this rank's rows of the masked parts */
+        P.split = 3;
+        P.sender = a->rank;
+        P.nr = (int32_t)lranks;
+        const int st = shard_rows(a, lshard, (uint64_t)lranks, &P);
+        if (st < 0) return R4D_NO(st);
+        const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
+        uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
+        if (blocks < 1) blocks = 1;
+        if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+        return send ? R4D_EMIT(stream, stage_send_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter)
+                    : R4D_EMIT(stream, stage_recv_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter);
     }
     /* tp8 loop P20 round 4: a receive with `shard` copies this rank's rows of the masked parts, the others whole (never
      * through the staging buffer: P10b's path keeps whole parts) */
