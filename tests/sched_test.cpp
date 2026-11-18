@@ -5504,6 +5504,51 @@ TEST(the_depth_hold_sets_the_cap_from_its_rows_where_the_yield_would_choose_less
     CHECK_EQ(hold.dcap_n(), 164);
 }
 
+/* DCA, a drafting depth's cost key by age (draft_cost_age; lq141 c16w): eight sequences (0.8 a position) at 8 rows under
+ * draft_dcap 3. Depth 3 was measured at 90 ms (a slower drafter), then the controller sat at depth 2 (58 ms) and 400
+ * decode steps ran elsewhere (16 rows): with the age off depth 2 stays for good (its key is the only one that moves);
+ * with draft_cost_age 256 depth 3's old key is stale, depth 2's fresh key by the prior's ratio prices it, and the window
+ * goes to 3 past its hold. A key the depth samples again is fresh again; depth 0 is never aged. */
+TEST(a_stale_drafting_cost_key_yields_to_a_fresh_one_under_draft_cost_age) {
+    DraftController d7 = adaptive_controller(5);
+    CHECK_EQ(d7.cost_age(), 0);
+    d7.set_dcap(3);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(d7, 0.8, 0.8); uf[i] = &u[i]; }
+    for (int k = 0; k < 40; ++k) d7.step_time(3, 8, 90.0);
+    for (int k = 0; k < 40; ++k) d7.step_time(2, 8, 58.0);
+    for (int k = 0; k < 400; ++k) d7.step_time(1, 16, 50.0);
+    for (int k = 0; k < 4; ++k) d7.step_time(2, 8, 58.0);
+    DraftController off = d7, on = d7;
+    on.set_cost_age(3);
+    CHECK_EQ(on.cost_age(), 16);       /* clamped (fn4 refuses 3) */
+    on.set_cost_age(256);
+    CHECK_NEAR(off.step_cost(3, 8), 90.0, 1e-6);
+    CHECK_NEAR(on.step_cost(3, 8), 58.0 * 1.18 / 1.12, 1e-6);
+    CHECK_NEAR(on.step_cost(2, 8), 58.0, 1e-6);
+    CHECK_NEAR(on.step_cost(1, 16), 50.0, 1e-6);   /* fresh keys price themselves */
+    int off3 = 0, on3 = 0;
+    for (int t = 0; t < 3 * DraftController::kHold; ++t) {
+        off3 += off.plan_step(uf, 8, 8) == 3 ? 1 : 0;
+        on3 += on.plan_step(uf, 8, 8) == 3 ? 1 : 0;
+    }
+    CHECK_EQ(off3, 0);
+    CHECK(on3 > 0);
+    CHECK_EQ(on.step_depth(), 3);
+    /* Depth 3 sampled again: its key starts over (the old 90 ms is the slower drafter's) and prices it. */
+    on.step_time(3, 8, 57.0);
+    CHECK_NEAR(on.step_cost(3, 8), 57.0, 1e-6);
+    CHECK_EQ(on.cost_samples(3, 8), (int64_t)1);
+    off.step_time(3, 8, 57.0);
+    CHECK(off.step_cost(3, 8) > 85.0);   /* off: the old mean moves by one sample's weight */
+    /* No fresh drafting key in a class: the stale mean, as before. */
+    for (int k = 0; k < 300; ++k) on.step_time(1, 16, 50.0);
+    CHECK_NEAR(on.step_cost(2, 8), 58.0, 1e-6);
+    on.set_cost_age(0);
+    CHECK_EQ(on.cost_age(), 0);
+}
+
 TEST(the_borrow_prices_a_class_never_lent_with_its_nearest_neighbours_lent_ratio) {
     DraftAdapt u[8];
     DraftAdapt* uf[8];
@@ -11217,7 +11262,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12189,7 +12234,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);

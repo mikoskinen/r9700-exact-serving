@@ -978,6 +978,8 @@ void Engine::fn4_apply_changes(const int* sw) {
                 fn4::note_sched(fn4::kDraftDcap, each_lane([&](Scheduler& q) { return q.set_draft_dcap(sw[fn4::kDraftDcap]); }));
             if (sw[fn4::kDraftDcapN] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftDcapN, each_lane([&](Scheduler& q) { return q.set_draft_dcap_n(sw[fn4::kDraftDcapN]); }));
+            if (sw[fn4::kDraftCostAge] != fn4::kNoChange)   /* DCA */
+                fn4::note_sched(fn4::kDraftCostAge, each_lane([&](Scheduler& q) { return q.set_draft_cost_age(sw[fn4::kDraftCostAge]); }));
             /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
