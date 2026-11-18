@@ -2455,7 +2455,7 @@ static int pipe2_tbo_env() {
 }
 /* P15's counters (rank 0): layer-passes with bit 1's order, layer boundaries with bit 2's, fallbacks (a deferral the next
  * layer could not take, finished at once) */
-static std::atomic<long long> g_tbo_attn{0}, g_tbo_xl{0}, g_tbo_flush{0};
+static std::atomic<long long> g_tbo_attn{0}, g_tbo_xl{0}, g_tbo_flush{0}, g_tbo_whole{0};   /* + bit 4: layer-passes whose MoE ran whole */
 /* P15 bit 2: the layer whose piece 0 the previous layer prepared (its pcn_mix over [p0, p0 + pa)), piece 1's MoE all-reduce
  * still on lane 1; -1 = none. Per rank thread, reset at every pass's start. */
 struct TboDefer { int l = -1; int64_t p0 = 0, pa = 0, pn = 0; };
@@ -7467,6 +7467,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                  * the all-reduce over [p0, q1) here on lane 0 and over [q1, p0 + pn) below (lane 1 with bit 2) */
                 L.moe.pass(x, T, p0, pn, false, bsp);
                 L.moe.issue_ar(x, p0, pc, false);
+                if (rad_rank(x) == 0) g_tbo_whole.fetch_add(1, std::memory_order_relaxed);
             } else if (tbo_a && pc == pa) {
                 /* tp8 loop P15 bit 1: piece 0's router (projection + all_gather; lane 1 idle: piece 0's attention
                  * all-reduce was joined above), then lane 1 behind lane 0 (piece 1's o_b rows and the gather) and piece
@@ -7546,12 +7547,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                         "%lld layer-passes of lone prefills ran whole (a piece below %lld rows or a reducing "
                                         "block); attention all-reduces in the pieces (RADIANCE_DS41_PIPE2_ATTN) %lld; "
                                         "RADIANCE_DS41_PIPE2_TBO (P15): piece 1's attention all-reduce beside MoE pass 0 %lld, "
-                                        "piece 1's MoE all-reduce beside the next layer's piece 0 %lld, finished at once %lld\n",
+                                        "piece 1's MoE all-reduce beside the next layer's piece 0 %lld, finished at once %lld; of the layer-passes "
+                                        "above, the MoE ran WHOLE with its all-reduce in two halves (bit 4) %lld\n",
                                 n, g_pipe2_layers.load(std::memory_order_relaxed), g_pipe2_rows.load(std::memory_order_relaxed),
                                 (long long)pn, (long long)pc, (long long)n1, l, g_pipe2_serial.load(std::memory_order_relaxed),
                                 (long long)kPipe2Piece, g_pipe2_attn.load(std::memory_order_relaxed),
                                 g_tbo_attn.load(std::memory_order_relaxed), g_tbo_xl.load(std::memory_order_relaxed),
-                                g_tbo_flush.load(std::memory_order_relaxed));
+                                g_tbo_flush.load(std::memory_order_relaxed), g_tbo_whole.load(std::memory_order_relaxed));
                 }
             }
         } else
