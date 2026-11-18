@@ -4217,6 +4217,10 @@ const RadBatch* Scheduler::step_next_locked() {
     for (size_t i = 0; i < plan_next_.e.size(); ++i)
         reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
     next_open_ = true;
+    /* tp8 dev D10: under lanes the counter is every lane's (lane 0's), and other lanes plan before this one promotes: the
+     * number is taken now, so it names one build on both nodes; promote_next does not take another */
+    next_numbered_ = n_lanes_ > 1;
+    if (next_numbered_) ++step_;
     if (cbh_ahead) cbh_hold(cbh_t);   /* lever CBH: a step issued while the hold stands */
     return b;
 }
@@ -4254,7 +4258,8 @@ void Scheduler::promote_next() {
     for (const StepEntry& e : plan_.e)
         if (e.n_spec == 0) ++m_.decode_rows_unspeculated;
     step_start_ = std::chrono::steady_clock::now();
-    ++step_;
+    if (!next_numbered_) ++step_;
+    next_numbered_ = false;
     step_open_ = true;
     next_open_ = false;
 }

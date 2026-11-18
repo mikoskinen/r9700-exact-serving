@@ -1330,6 +1330,33 @@ int Engine::follower_loop() {
     struct NiReset { Engine* e; ~NiReset() { e->pp_ni_ = nullptr; } } ni_reset{ this };
     pp_node_idle_open(&ni_own);
     std::vector<int32_t> ahead, rows, flags, clears, ckw;
+    /* tp8 dev D10 (RADIANCE_PP_ISSUE_AHEAD=1): the leader ships an undrafted lane's next step before it has that step's token
+     * ids (its card writes them behind the sampler), so this node must read none: refused where its pass computes n-gram ids
+     * from them on the host (deepseek41's Engram layers) or embeds them (RADIANCE_PP_FOLLOWER_EMBED=1). The pass itself waits on
+     * its card for X1 as always. */
+    if (const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD"); ia && !std::strcmp(ia, "1")) {
+        std::string why;
+        for (const OpInfo& o : ranks_[0]->program.ops)
+            if (o.op == "ngram_ids") {
+                why = "its pass computes n-gram ids from the step's token ids on the host (an Engram layer on this node)";
+                break;
+            }
+        const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+        if (fe && !std::strcmp(fe, "1")) {
+            /* the leader does not take it beside the follower's embedding (engine_lanes.cpp): nothing is shipped early */
+            RAD_INFO("follower: RADIANCE_PP_ISSUE_AHEAD=1 is not taken with RADIANCE_PP_FOLLOWER_EMBED=1 (this node embeds the "
+                     "step's token ids; the leader issues nothing ahead) (tp8 dev D10)");
+        } else if (!why.empty()) {
+            RAD_ERR("follower: RADIANCE_PP_ISSUE_AHEAD=1 refused: %s, and a step the leader issues ahead of its collect ships "
+                    "without them -- a cut whose follower holds no such layer (deepseek41: --pp-cut 15,35 keeps both Engram "
+                    "layers on the leader), or unset it (tp8 dev D10)", why.c_str());
+            pp_link_->fail("the follower refused RADIANCE_PP_ISSUE_AHEAD=1");
+            return fail_loop(RAD_E_UNSUPPORTED);
+        } else {
+            RAD_INFO("follower: RADIANCE_PP_ISSUE_AHEAD=1 -- this node's pass reads no token id; the leader may ship a lane's "
+                     "next step before its collect (tp8 dev D10)");
+        }
+    }
     pp_send_fn4_state();
     /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k, read by the plugin, which declares the boundaries; RADIANCE_PP_SEG_ROWS=n, default
      * 512): a pass of >= n rows is issued in layer segments at the declared boundaries, and between two segments every step

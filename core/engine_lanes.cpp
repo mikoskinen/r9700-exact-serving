@@ -438,6 +438,36 @@ int Engine::step_loop_lanes() {
                            "M4)", (long long)rf_rows).c_str()
                      : "is not taken with RADIANCE_PP_TAIL_AHEAD=1");
     }
+    /* tp8 dev D10 (RADIANCE_PP_ISSUE_AHEAD=1, both nodes; not with TAIL_AHEAD, not with FOLLOWER_EMBED): an undrafted lane's
+     * next DECODE step is planned and its head part released BEFORE this step's collect -- one machine's issue-ahead
+     * (Scheduler::step_next: every row one position on, the card's ADV_TRUNK writing its token ids behind this step's
+     * sampler), the frame shipped at once -- so the lane chain is the cards' (sampler -> the head part -> X1 -> the follower's
+     * pass, which waits on its card for X1) and not the leader's host path (collect, commit, plan, build, ship) nor the
+     * follower's start on the frame (PROFILE 20:58: ~2.2 ms of each node's ~2.7 ms idle a 19.0 ms lane step at c32). Only
+     * where the follower reads no token id: the follower refuses the switch where its pass does (deepseek41's Engram layers,
+     * its own embedding). Taken per tail only for a lane step of decode rows alone, none drafted, nothing lent to or from its
+     * lane, its drafter proposing nothing, no KV-copy check due; else the step after it is planned after the commit, as before.
+     * Only the order of issue changes, never a row's step: the step issued ahead is the one step() would plan there. */
+    bool ia = false;
+    int64_t ia_n = 0, ia_skip = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_ISSUE_AHEAD"); v && !std::strcmp(v, "1")) {
+        const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+        const bool fe_on = fe && !std::strcmp(fe, "1");
+        ia = !tail_ahead_ && !fe_on && !embedding_;
+        RAD_INFO("two-node pipeline: RADIANCE_PP_ISSUE_AHEAD=1 %s", ia
+                     ? "-- an undrafted decode lane's next step is planned, its head part released and its frame shipped before "
+                       "this step's collect (tp8 dev D10)"
+                     : fe_on ? "is not taken with RADIANCE_PP_FOLLOWER_EMBED=1 (the follower would embed token ids it does not "
+                               "have yet)"
+                             : "is not taken with RADIANCE_PP_TAIL_AHEAD=1");
+    }
+    auto ia_ok = [&](int l, const RadBatch* bb, bool kv_due_now) {
+        if (!ia || kv_due_now || lanes_.is_bg(l) || lanes_.inbox_n(l) > 0 || bb->phase != RAD_PHASE_DECODE) return false;
+        if (block_rows_ > 0 || (serial_drafting() && serial_rows_ > 0)) return false;
+        for (const StepEntry& e : sched_of(l).plan().e)
+            if (e.home >= 0 || e.is_prefill || e.n_spec > 0 || !e.produces_token) return false;
+        return true;
+    };
     auto x2_landed = [&](int l) {
         const RadPpRing* x2 = pp_recv_[l * RAD_PP_N_RINGS + RAD_PP_X2];
         return x2 && __atomic_load_n(&x2->landed, __ATOMIC_ACQUIRE) > __atomic_load_n(&x2->taken[0], __ATOMIC_ACQUIRE);
@@ -673,7 +703,32 @@ int Engine::step_loop_lanes() {
         const auto [lane, b] = fifo[pick];
         fifo.erase(fifo.begin() + (ptrdiff_t)pick);
         const uint64_t tt0 = rad_mono_ns();   /* tp8 loop P6: the tail's host time (after a ready-first wait) */
-        if (!tail_ahead_) {
+        const RadBatch* nb = nullptr;         /* tp8 dev D10: the lane's next step, issued ahead */
+        if (!tail_ahead_ && ia) {
+            if (const int ts = lane_tail_issue(lane, b, so, cancel, t_on, false); ts < 0) return fail_loop(ts);
+            if (ia_ok(lane, b, kv_due)) {
+                lane_select(lane);
+                /* the card's acceptance of this step, which ADV_TRUNK continues from: a block or serial drafter ran it
+                 * behind the sampler (issue_*_drafter); without a drafter only a pipelining engine does */
+                if (!block_drafting() && !serial_drafting() && !pipelining_)
+                    if (const int ac = advance_all(ADV_ACCEPT, 0, false); ac < 0) return fail_loop(ac);
+                nb = lsched().step_next();
+                if (nb) {
+                    /* its rows' token ids, positions and slots on the card behind this step's sampler (and drafter) */
+                    if (const int as = advance_all(ADV_TRUNK, 0, false); as < 0) return fail_loop(as);
+                    if (const int hs = lane_head(lane, nb); hs < 0) return fail_loop(hs);
+                }
+            }
+            if (!nb) ++ia_skip;
+            if (const int fs = lane_tail_finish(lane, b, so, t_on); fs < 0) return fail_loop(fs);
+            if (nb) {
+                lane_select(lane);
+                lsched().promote_next();
+                gaps.head(false, lane_steps);
+                fifo.emplace_back(lane, nb);
+                ++ia_n;
+            }
+        } else if (!tail_ahead_) {
             if (const int ts = lane_tail(lane, b, so, cancel, t_on); ts < 0) return fail_loop(ts);
         } else {
             if (!s_out[(size_t)lane])
@@ -688,10 +743,15 @@ int Engine::step_loop_lanes() {
             if (const int fs = lane_tail_finish(lane, b, so, t_on); fs < 0) return fail_loop(fs);
             m_out[(size_t)lane] = s_out[(size_t)lane] = 0;
         }
-        busy[(size_t)lane] = 0;
+        busy[(size_t)lane] = nb ? 1 : 0;
         gaps.host_tail(b, tt0, rad_mono_ns());
         gaps.tail(lane, b);
-        if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
+        if (++lane_steps == 1 || lane_steps % 4096 == 0) {
+            lanes_note(lane_steps, rounds_two);
+            if (ia)
+                RAD_INFO("two-node pipeline: %lld lane steps issued ahead of the collect before them, %lld tails without "
+                         "(RADIANCE_PP_ISSUE_AHEAD=1, tp8 dev D10)", (long long)ia_n, (long long)ia_skip);
+        }
         gaps.minute(lane_steps);
         if (pp_ni_) pp_ni_->minute();
     }
@@ -708,6 +768,9 @@ int Engine::step_loop_lanes() {
     if (ready_first)
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
+    if (ia)
+        RAD_INFO("two-node pipeline: %lld lane steps issued ahead of the collect before them, %lld tails without "
+                 "(RADIANCE_PP_ISSUE_AHEAD=1, tp8 dev D10)", (long long)ia_n, (long long)ia_skip);
     return RAD_OK;
 }
 
