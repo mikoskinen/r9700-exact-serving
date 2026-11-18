@@ -39,6 +39,7 @@ extern "C" void r4d_mx_mr_pin(int on, int h, int r, int mt, int wn, int grid);
 extern "C" const char* r4d_mx_mr_last();
 extern "C" void r4d_mx_mr_cap(int tokens);
 extern "C" void r4d_mx_gemv_order(int on);
+extern "C" void r4d_mx_wm_slab(int bytes);
 void r4d_mx_mr_set(int on);
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
@@ -159,6 +160,77 @@ struct Call {          /* one (stage, projection) launch */
 
 struct Form { std::string name; int on, h, r, mt, wn, grid; };
 
+/* ---- value comparison (a rule-B form against the stock bytes) */
+static float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
+struct DiffStats { long long n = 0, ndiff = 0; int maxulp = 0; double maxabs = 0, maxref = 0, sdiff = 0, sref = 0; };
+static void diff_stats(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, DiffStats* d) {
+    const uint16_t* x = (const uint16_t*)a.data(); const uint16_t* y = (const uint16_t*)b.data();
+    for (size_t i = 0; i < a.size() / 2; ++i) {
+        const float fx = bf2f(x[i]), fy = bf2f(y[i]);
+        ++d->n;
+        if (x[i] != y[i]) {
+            ++d->ndiff;
+            auto ord = [](uint16_t v) { return (v & 0x8000) ? -(int)(v & 0x7fff) : (int)v; };
+            d->maxulp = std::max(d->maxulp, std::abs(ord(x[i]) - ord(y[i])));
+        }
+        d->maxabs = std::max(d->maxabs, (double)std::fabs(fx - fy));
+        d->maxref = std::max(d->maxref, (double)std::fabs(fx));
+        d->sdiff += (double)(fx - fy) * (fx - fy); d->sref += (double)fx * fx;
+    }
+}
+
+/* ---- rule B: the form against itself -- (1) the same call again, (2) each expert's rows reversed (every row in another
+ * tile position with other co-rows; for down the activation rows move with their slots), (3) every 3rd live slot dropped:
+ * each surviving row's bytes must equal its row in the first run. */
+static int g_rb = 0;
+static int rule_b_check(Call& c, hipStream_t s, const std::vector<uint8_t>& y0, long long* rows) {
+    const Proj& P = kProj[c.p];
+    const int64_t TR = (int64_t)c.rt.sorted.size(), N = P.N, K = P.K;
+    const bool asort = P.sorted_rows;
+    int fail = 0;
+    auto run = [&](const std::vector<int32_t>& so, const std::vector<uint16_t>* xperm, std::vector<uint8_t>& out) {
+        void* dso = c.ts[2].data; void* dx = c.ts[0].data;
+        void* nso = nullptr; void* nx = nullptr;
+        CK(hipMalloc(&nso, (size_t)TR * 4)); CK(hipMemcpy(nso, so.data(), (size_t)TR * 4, hipMemcpyHostToDevice));
+        c.ts[2].data = nso;
+        if (xperm) { CK(hipMalloc(&nx, xperm->size() * 2)); CK(hipMemcpy(nx, xperm->data(), xperm->size() * 2, hipMemcpyHostToDevice)); c.ts[0].data = nx; }
+        c.a.t = c.ts.data();
+        CK(hipMemsetAsync(c.y, 0xff, c.ybytes, s));
+        c.launch(s); CK(hipStreamSynchronize(s));
+        out.resize(c.ybytes); CK(hipMemcpy(out.data(), c.y, c.ybytes, hipMemcpyDeviceToHost));
+        c.ts[2].data = dso; c.ts[0].data = dx; c.a.t = c.ts.data();
+        hipFree(nso); if (nx) hipFree(nx);
+    };
+    /* (1) repeat */
+    { std::vector<uint8_t> o; run(c.rt.sorted, nullptr, o); if (o != y0) ++fail; *rows += TR; }
+    /* the permutation: reversed within each expert's live rows */
+    std::vector<int64_t> pi((size_t)TR);
+    for (int64_t i = 0; i < TR; ++i) pi[(size_t)i] = i;
+    for (int64_t e = 0; e + 1 < (int64_t)c.rt.off.size(); ++e) {
+        int64_t a = c.rt.off[(size_t)e], b = c.rt.off[(size_t)e + 1];
+        for (int64_t i = a; i < b; ++i) pi[(size_t)i] = a + (b - 1 - i);
+    }
+    std::vector<uint16_t> hx;
+    if (asort) { hx.resize((size_t)(TR * K)); CK(hipMemcpy(hx.data(), c.ts[0].data, hx.size() * 2, hipMemcpyDeviceToHost)); }
+    for (int variant = 0; variant < 2; ++variant) {
+        std::vector<int32_t> so((size_t)TR);
+        std::vector<uint16_t> xp;
+        for (int64_t i = 0; i < TR; ++i) so[(size_t)i] = c.rt.sorted[(size_t)pi[(size_t)i]];
+        if (variant == 1) { int64_t k = 0; for (int64_t i = 0; i < TR; ++i) if (so[(size_t)i] >= 0 && (k++ % 3) == 2) so[(size_t)i] = -1; }
+        if (asort) {
+            xp.resize(hx.size());
+            for (int64_t i = 0; i < TR; ++i) std::memcpy(&xp[(size_t)(i * K)], &hx[(size_t)(pi[(size_t)i] * K)], (size_t)K * 2);
+        }
+        std::vector<uint8_t> o; run(so, asort ? &xp : nullptr, o);
+        for (int64_t i = 0; i < TR; ++i) {
+            if (so[(size_t)i] < 0) continue;
+            ++*rows;
+            if (std::memcmp(&o[(size_t)(i * N * 2)], &y0[(size_t)(pi[(size_t)i] * N * 2)], (size_t)N * 2)) { ++fail; break; }
+        }
+    }
+    return fail;
+}
+
 static std::vector<std::string> split(const std::string& s) {
     std::vector<std::string> v; size_t p = 0;
     while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); if (q > p) v.push_back(s.substr(p, q - p)); p = q + 1; }
@@ -171,6 +243,19 @@ static bool parse_form(const std::string& n0, Form* f) {
     if (size_t q = n.find("_g"); q != std::string::npos) { f->grid = std::atoi(n.c_str() + q + 2); n = n.substr(0, q); }
     if (n == "stock") { f->on = 0; return true; }
     if (n == "rule") { f->on = -1; return true; }
+    if (n == "mx2") { f->on = -2; return true; }   /* the switch drafter_mx 2, no pin */
+    {   /* qNT: the long-run WMMA form (rule B) */
+        int a = 0;
+        if (std::sscanf(n.c_str(), "q%d", &a) == 1) { f->on = 1; f->h = 4096; f->r = 1; f->mt = a; return true; }
+    }
+    {   /* wWRnNT[pPD][wWN]: the WMMA form (rule B) */
+        int a = 0, b = 0, c = 0, d = 0, ab = 0;
+        if (std::sscanf(n.c_str(), "w%dn%dp%da%d", &a, &b, &d, &ab) == 4) { f->on = 1; f->h = 1024 + d + 16 * ab; f->r = a; f->mt = b; return true; }
+        if (std::sscanf(n.c_str(), "w%dn%dp%dw%d", &a, &b, &d, &c) == 4) { f->on = 1; f->h = 1024 + d; f->r = a; f->mt = b; f->wn = c; return true; }
+        if (std::sscanf(n.c_str(), "w%dn%dp%d", &a, &b, &d) == 3) { f->on = 1; f->h = 1024 + d; f->r = a; f->mt = b; return true; }
+        if (std::sscanf(n.c_str(), "w%dn%dw%d", &a, &b, &c) == 3) { f->on = 1; f->h = 1024; f->r = a; f->mt = b; f->wn = c; return true; }
+        if (std::sscanf(n.c_str(), "w%dn%d", &a, &b) == 2) { f->on = 1; f->h = 1024; f->r = a; f->mt = b; return true; }
+    }
     {   /* xRmMT[wWN]: the tiled order's forms with EX (the segment's rows only); dMT[wWN]: the 8-byte-row form */
         int a = 0, b = 0, c = 0;
         if (std::sscanf(n.c_str(), "d%dw%d", &b, &c) == 2) { f->on = 1; f->h = 2; f->r = 1; f->mt = b; f->wn = c; return true; }
@@ -191,6 +276,7 @@ static bool parse_form(const std::string& n0, Form* f) {
 }
 static void apply_form(const Form& f) {
     if (f.on == 0) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); }
+    else if (f.on == -2) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(2); }
     else if (f.on < 0) { r4d_mx_mr_set(1); r4d_mx_mr_pin(-1, 0, 0, 0, 0, 0); }
     else { r4d_mx_mr_set(1); r4d_mx_mr_pin(1, f.h, f.r, f.mt, f.wn, f.grid); }
 }
@@ -212,6 +298,8 @@ int main(int argc, char** argv) {
         else if (a == "--pool") g_pool = std::atoi(nx().c_str());
         else if (a == "--rec-start") g_rec_start = std::atoi(nx().c_str());
         else if (a == "--pin10") g_pin10 = std::atoi(nx().c_str());
+        else if (a == "--rb") g_rb = 1;
+        else if (a == "--wslab") r4d_mx_wm_slab(std::atoi(nx().c_str()));
         else { std::fprintf(stderr, "unknown %s\n", a.c_str()); return 2; }
     }
     std::vector<Form> fl;
@@ -288,6 +376,7 @@ int main(int argc, char** argv) {
             apply_form(f);
             /* correctness: each call once, bytes vs the stock path's */
             bool same = true; std::string formdesc;
+            DiffStats dst; long long rbn = 0; int rb_fail = 0;
             for (size_t i = 0; i < calls.size(); ++i) {
                 CK(hipMemsetAsync(calls[i].y, 0xff, calls[i].ybytes, s));
                 const int rc = calls[i].launch(s);
@@ -298,7 +387,11 @@ int main(int argc, char** argv) {
                 std::vector<uint8_t> got(calls[i].ybytes);
                 CK(hipMemcpy(got.data(), calls[i].y, calls[i].ybytes, hipMemcpyDeviceToHost));
                 if (f.on == 0) ref[i] = got;
-                else if (got != ref[i]) same = false;
+                else if (got != ref[i]) {
+                    same = false;
+                    diff_stats(ref[i], got, &dst);
+                }
+                if (f.on != 0 && g_rb) rb_fail += rule_b_check(calls[i], s, got, &rbn);
             }
             /* timing: passes back to back, an event before each call */
             const size_t nc = calls.size();
@@ -329,6 +422,14 @@ int main(int argc, char** argv) {
             std::printf("  %-10s pass %8.1f us (x%.2f vs stock) %6.0f GB/s of live experts | bytes %s | %s\n", f.name.c_str(), pm,
                         stock_pass > 0 ? stock_pass / pm : 0.0, bytes / (pm * 1e3), f.on == 0 ? "reference" : same ? "IDENTICAL" : "DIFFER",
                         formdesc.c_str());
+            if (!same)
+                std::printf("             vs stock: %lld of %lld values differ, max %d bf16 ulp, max |d| / max |ref| %.3g, rms rel %.3g\n",
+                            dst.ndiff, dst.n, dst.maxulp, dst.maxref > 0 ? dst.maxabs / dst.maxref : 0.0,
+                            dst.n > 0 && dst.sref > 0 ? std::sqrt(dst.sdiff / dst.sref) : 0.0);
+            if (f.on != 0 && g_rb)
+                std::printf("             rule B: %s (repeat + rows reversed within experts + every 3rd slot dropped: %lld rows compared)\n",
+                            rb_fail ? "FAIL" : "deterministic and placement-invariant", rbn);
+            if (rb_fail) ++fails;
             std::printf("             calls us:");
             for (size_t i = 0; i < nc; ++i) {
                 const double m = med(t[i]);
@@ -336,7 +437,7 @@ int main(int argc, char** argv) {
                             (double)calls[i].rt.experts * (double)ebytes[calls[i].p] / (m * 1e3));
             }
             std::printf("\n");
-            if (f.on != 0 && !same) ++fails;
+            if (f.on != 0 && !same && !((f.h >= 1024 || f.on == -2) && g_rb)) ++fails;
             std::fflush(stdout);
         }
         apply_form(fl[0]);
