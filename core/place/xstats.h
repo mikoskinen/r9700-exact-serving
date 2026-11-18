@@ -102,6 +102,10 @@ struct XsSnapshot {
      * which are the counts' sum. */
     std::vector<uint64_t> histograms[kXsKinds], passes[kXsKinds], obs_tokens[kXsKinds],
                           selections[kXsKinds];
+    /* tp8 dev F35: per kind and layer, the experts a histogram selected at least once, summed over the histograms (same rank
+     * ranks summed as `selections`): distinct / histograms is the mean distinct experts a layer-pass, which sets the routed kernels'
+     * weight bytes a pass */
+    std::vector<uint64_t> distinct[kXsKinds];
     std::vector<std::vector<uint64_t>> counts[kXsKinds];   /* [layer][expert] */
     /* Per rank: histograms credited, selections with no model-wide id, histograms whose step had
      * no record (filed as mixed), and the ring's lost histograms (Ctx::route_dropped). */
@@ -158,7 +162,7 @@ private:
     std::vector<Rec> ring_;
     std::vector<size_t> off_;           /* [layer]: offset of the layer's run in a counts plane */
     std::vector<uint64_t> counts_[kXsKinds];
-    std::vector<uint64_t> hist_[kXsKinds], passes_[kXsKinds], tok_[kXsKinds], sel_[kXsKinds];
+    std::vector<uint64_t> hist_[kXsKinds], passes_[kXsKinds], tok_[kXsKinds], sel_[kXsKinds], uniq_[kXsKinds];
     std::vector<int32_t>  top_k_;
     uint64_t steps_[kXsKinds] = {}, tokens_[kXsKinds] = {}, mixed_decode_ = 0;
     uint64_t draft_passes_ = 0, draft_rows_ = 0;

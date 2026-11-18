@@ -177,6 +177,11 @@ TEST(the_tally_files_by_kind_and_merges_the_ranks_slices) {
     CHECK_EQ(s.selections[kXsDraft][1], (uint64_t)4);
     CHECK_EQ(s.passes[kXsDraft][1], (uint64_t)2);
     CHECK_EQ(s.histograms[kXsMixed][0], (uint64_t)2);
+    /* tp8 dev F35: the experts each histogram selected at least once, summed over the histograms and the ranks' slices */
+    CHECK_EQ(s.distinct[kXsPrefill][0], (uint64_t)3);
+    CHECK_EQ(s.distinct[kXsDecode][0], (uint64_t)3);
+    CHECK_EQ(s.distinct[kXsMixed][0], (uint64_t)6);
+    CHECK_EQ(s.distinct[kXsDraft][1], (uint64_t)2);
 
     /* Issued, once (not once a rank). */
     CHECK_EQ(s.steps[kXsPrefill], (uint64_t)1);
