@@ -59,6 +59,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>   /* tp8 loop P20: sp_rows_exact's shared failure count */
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -31731,6 +31732,7 @@ struct SpRowsT {
     int64_t row = 5120;
     std::vector<int64_t> rows;
     StBarrier* bar = nullptr;
+    std::atomic<int>* bad = nullptr;   /* ranks whose checked launches failed: the timing runs only when none did */
     void* inst_rs = nullptr; void* inst_ag = nullptr; void* inst_ar = nullptr;
     int rc = RAD_OK;
     std::vector<std::vector<uint16_t>> after_rs, after_ag;
@@ -31785,7 +31787,10 @@ static void sp_rows_worker_t(SpRowsT* t) {
         t->after_rs.push_back(run(t->rs, t->inst_rs, prs, n));
         t->after_ag.push_back(run(t->ag, t->inst_ag, prs, n));
     }
-    if (t->rc == RAD_OK && t->ar)
+    /* every rank decides the same: time only when no rank failed (a rank that skipped would leave the others spinning) */
+    if (t->rc != RAD_OK) t->bad->fetch_add(1);
+    t->bar->wait();
+    if (t->bad->load() == 0 && t->ar)
         for (int64_t r : { (int64_t)2048, (int64_t)4096 }) {
             if (r * t->row > most) continue;
             const int64_t n = r * t->row;
@@ -31823,12 +31828,14 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
     const int64_t row = 5120;
     for (int xp = 0; xp < 2; ++xp) {
         if (xp == 1 && (!sw || sw("ar_xpush", 1) != 1)) { skip("sp_rows_exact xpush 1", "libr4d serves no fn4 ar_xpush switch"); break; }
+        if (xp == 0 && sw) sw("ar_xpush", 0);
         StBarrier bar(world);
+        std::atomic<int> bad{ 0 };
         std::vector<SpRowsT> t((size_t)world);
         std::vector<std::thread> th;
         for (int r = 0; r < world; ++r) {
             SpRowsT& x = t[(size_t)r];
-            x.rs = rs; x.ag = ag; x.ar = ar; x.rank = r; x.dev = devs[(size_t)r]; x.row = row; x.rows = rows; x.bar = &bar;
+            x.rs = rs; x.ag = ag; x.ar = ar; x.rank = r; x.dev = devs[(size_t)r]; x.row = row; x.rows = rows; x.bar = &bar; x.bad = &bad;
             th.emplace_back(sp_rows_worker_t, &x);
         }
         for (std::thread& x : th) x.join();
