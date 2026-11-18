@@ -2014,9 +2014,11 @@ TEST(band_passes_serve_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; int k; bool fseg; bool lseg; };
+    struct Arm { int lanes; int k; bool fseg; bool lseg; bool skip = false; };
     long long band_all = 0;
-    for (const Arm a : { Arm{ 3, 1, false, false }, Arm{ 3, 1, true, false }, Arm{ 4, 2, true, false }, Arm{ 3, 1, true, true } }) {
+    int skip_differ = 0;
+    for (const Arm a : { Arm{ 3, 1, false, false }, Arm{ 3, 1, true, false }, Arm{ 4, 2, true, false }, Arm{ 3, 1, true, true },
+                         Arm{ 3, 1, false, false, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back("RADIANCE_LLAMA_PP_BAND=1");
@@ -2026,6 +2028,7 @@ TEST(band_passes_serve_one_process_tokens) {
             for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
                 env.push_back(v);
         if (a.lseg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15"); }
+        if (a.skip) env.push_back("RADIANCE_PP_TEST_BAND_SKIP=1");   /* negative control: the follower leaves the band's KV out */
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
         ex.push_back(std::to_string(a.lanes));
@@ -2052,17 +2055,23 @@ TEST(band_passes_serve_one_process_tokens) {
         if (const size_t at = llog.rfind(key); at != std::string::npos)
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
                 band = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
-        fprintf(stderr, "    BAND (llama stand-in, one layer), %d lanes BG %d W(1,3)%s%s: %d of %zu requests differ; %lld lane steps ran as "
-                        "band passes\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.lseg ? " + LEAD_SEG" : "", differ,
-                ref.size() + ref_b.size(), band);
+        fprintf(stderr, "    BAND (llama stand-in, one layer), %d lanes BG %d W(1,3)%s%s%s: %d of %zu requests differ; %lld lane steps ran as "
+                        "band passes\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.lseg ? " + LEAD_SEG" : "",
+                a.skip ? " + the store LEFT OUT (negative control)" : "", differ, ref.size() + ref_b.size(), band);
+        if (a.skip) {
+            skip_differ = differ;
+            CHECK(band > 0);
+            continue;
+        }
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK(llog.find("RADIANCE_PP_BAND=1 -- a BG lane's step of fresh prompts runs as a band pass") != std::string::npos);
         CHECK(band > 0);
         band_all += std::max(0LL, band);
     }
-    fprintf(stderr, "    band passes, all arms: %lld\n", band_all);
+    fprintf(stderr, "    band passes, all arms: %lld; the negative control: %d requests differ\n", band_all, skip_differ);
     CHECK(band_all > 0);
+    CHECK(skip_differ > 0);   /* the test sees a band pass whose KV did not reach the decode owner */
 }
 
 /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS=N -- a newcomer the BG lanes have no room for is held out of its home's step (that step

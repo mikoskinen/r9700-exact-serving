@@ -129,6 +129,7 @@ struct Model {
      * at the batch's slots (the owner's op), then runs [h + 1, t). Every other pass is W(h, t)'s. */
     int      band = 0;
     int      parts_x1b = 0;
+    bool     band_skip = false;   /* RADIANCE_PP_TEST_BAND_SKIP=1 (follower): the store left out -- the test's negative control */
     rad_op   op_x1b = 0, op_band_st = 0;
     /* tp8 dev 1a (RADIANCE_PP_FOLLOWER_EMBED=1 on both nodes, W(0, t) only; unset: nothing here): the follower looks up
      * the step's embedding itself (the same op over the same table, the vocab-sharded rows completed by the same
@@ -708,6 +709,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                       RAD_NOWEIGHTS),
                                   {m.b_qkv}, {});
                 if (m.op_band_st == RAD_NULL_HANDLE) return RAD_E_INVAL;
+                const char* bs = std::getenv("RADIANCE_PP_TEST_BAND_SKIP");
+                m.band_skip = bs && !std::strcmp(bs, "1");
             }
         }
         if (m.kvcopy) {
@@ -916,7 +919,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
      * into its copy, as the leader's layer stored them, at the same slots). */
     if (m.pp && m.pp_rank == 1 && seg_first) {
         if (!m.fe) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
-        if (bnd) {   /* tp8 loop P28 stand-in: layer h's k / v into this node's own cache, the owner's op at the batch's slots */
+        if (bnd && !m.band_skip) {   /* tp8 loop P28 stand-in: layer h's k / v into this node's own cache, the owner's op at the batch's slots */
             const RadKVGroupBatch* kvb = kv_batch(batch, m.kv_full);
             const int64_t q_dim = m.g.q_dim(), kv_dim = m.g.kv_dim();
             RAD_ISSUE(c, m.op_band_st, bcol(m.b_qkv, q_dim, kv_dim, T), bcol(m.b_qkv, q_dim + kv_dim, kv_dim, T),
