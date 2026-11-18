@@ -433,6 +433,9 @@ int Engine::step_loop_lanes() {
         const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
         const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
         tail_ahead_ = fe_on && !embedding_;
+        if (tail_ahead_ && ti_capable_)
+            RAD_INFO("two-node pipeline: RADIANCE_PP_TAIL_AHEAD=1 with lever TI on this node -- a step that saves a snapshot "
+                     "inside its chunk keeps its model part with its sampler (tp8 loop FINDINGS F43)");
         RAD_INFO("two-node pipeline: RADIANCE_PP_TAIL_AHEAD=1 %s", tail_ahead_
                      ? "-- a lane step's model part is issued while the lane before it is collected and committed; its "
                        "sampler and drafter after that commit (tp8 dev 1b)"
@@ -1012,8 +1015,16 @@ int Engine::step_loop_lanes() {
                 if (const int ts = lane_tail_issue(lane, b, so, cancel, t_on, m_out[(size_t)lane] != 0); ts < 0)
                     return fail_loop(ts);
             /* tp8 dev 1b: the next lane step's model part, in head order, behind this one's drafter and step end; its
-             * sampler goes out at the top of the next round, with nothing released between */
-            if (!fifo.empty() && !m_out[(size_t)fifo.front().first]) {
+             * sampler goes out at the top of the next round, with nothing released between. tp8 loop FINDINGS F43: not
+             * for a step whose save patches a snapshot inside its chunk (lever TI): the patch copies the CONV window from
+             * the ids the rank's LAST part mapped, and a model part issued ahead has other lanes' parts after it */
+            auto ti_inside = [&](int l) {
+                if (!ti_capable_) return false;
+                for (const StepEntry& e : sched_of(l).plan().e)
+                    if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) return true;
+                return false;
+            };
+            if (!fifo.empty() && !m_out[(size_t)fifo.front().first] && !ti_inside(fifo.front().first)) {
                 if (const int ms = lane_tail_model(fifo.front().first, fifo.front().second); ms < 0) return fail_loop(ms);
                 m_out[(size_t)fifo.front().first] = 1;
             }
