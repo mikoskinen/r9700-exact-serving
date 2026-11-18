@@ -178,6 +178,9 @@ struct SchedReq {
         int32_t why[9] = {};
         int64_t t0_us = 0;
     } lst;
+    /* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS): when this newcomer was first held out of its home's MIXED step for the BG lanes'
+     * room (mono us; 0: not held). Cleared when it is lent to a BG lane or runs at home. */
+    int64_t  bg_hold_us = 0;
     /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and
      * fixed while it is prefilled, so every chunk of its prompt computes the same targets -- the anchor stride K over the
      * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
@@ -1167,7 +1170,8 @@ private:
     void    lane_take_inbox();
     void    lane_split_own();
     void    lane_split_mixed(StepEntry& e);   /* tp8 dev M5b */
-    bool    lane_split_bg(StepEntry& e);      /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1): e lent whole to the BG lane */
+    bool    lane_split_bg(StepEntry& e, int* why = nullptr);   /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1): e lent whole to the BG lane */
+    bool    lane_bg_hold(StepEntry& e, int why);   /* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS): e left out of this step for the BG lanes */
     void    lane_bg_drop(const std::vector<size_t>& at);
     /* The chunk an idle engine (one process, this prompt alone) plans from position `n` of `r`, and the snapshot its
      * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */

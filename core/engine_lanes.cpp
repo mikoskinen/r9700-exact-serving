@@ -252,6 +252,14 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                      ? "a BG newcomer is cut at the 512-grid point nearest its middle (>= 128 rows a side) and its two pieces go to two "
                        "BG lanes in the planning order (tp8 dev M8)"
                      : "not taken: it needs RADIANCE_PP_BG_LANE=2 or more");
+    if (lanes_.bg_hold_ms() > 0)
+        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%lld -- a newcomer the BG lanes have no room for is left out of its "
+                 "home's step (the step goes out with its decode rows alone) and planned again at the home's next step, for a BG "
+                 "lane to take whole; after %lld ms of holding it runs at home as today's MIXED step (tp8 dev D11)",
+                 (long long)lanes_.bg_hold_ms(), (long long)lanes_.bg_hold_ms());
+    else if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh)
+        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%s is not taken: %s (tp8 dev D11)", bh,
+                 lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 1 .. 60000 ms");
     if (lanes_.bg_lane() == 1)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE leaves ONE decode lane at --pp-lanes %d: decode steps no longer overlap on "
                  "the two nodes (use --pp-lanes %d)", n_lanes_, n_lanes_ + 1);
@@ -368,11 +376,19 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
                  "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "
                  "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld; drafter ranges opened "
-                 "by a lent piece's commit %lld (%s, tp8 loop F22)", lanes_.bg_lane(),
+                 "by a lent piece's commit %lld (%s, tp8 loop F22)%s", lanes_.bg_lane(),
                  (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
                  (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
                  (long long)c.bg_skip[LaneSet::kBgOrder], (long long)c.bg_floor,
-                 lanes_.bg_draft_floor() ? "on" : "off: RADIANCE_PP_BG_DRAFT_FLOOR=0");
+                 lanes_.bg_draft_floor() ? "on" : "off: RADIANCE_PP_BG_DRAFT_FLOOR=0",
+                 lanes_.bg_hold_ms() > 0
+                     ? fmt("; held for the BG lanes' room (RADIANCE_PP_BG_HOLD_MS=%lld, tp8 dev D11): %lld newcomers over %lld "
+                           "steps, %lld then lent to a BG lane, %lld ran at home after the hold ran out, held %.1f ms each on "
+                           "average (the longest %.1f)", (long long)lanes_.bg_hold_ms(), (long long)c.hold_reqs,
+                           (long long)c.hold_steps, (long long)c.hold_lent, (long long)c.hold_home,
+                           c.hold_lent + c.hold_home > 0 ? (double)c.hold_us / 1000.0 / (double)(c.hold_lent + c.hold_home) : 0.0,
+                           (double)c.hold_max_us / 1000.0).c_str()
+                     : "");
 }
 
 int Engine::step_loop_lanes() {
@@ -533,6 +549,17 @@ int Engine::step_loop_lanes() {
                                                                                     : "the plugin declared no boundary on this node");
     }
     uint64_t lseg_line_ns = rad_mono_ns();
+    /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS's counts (run so far) once a minute, so a cell's window is the difference of two lines */
+    uint64_t hold_line_ns = rad_mono_ns();
+    auto hold_line = [&]() {
+        const LaneSet::Counts c = lanes_.counts();
+        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%lld so far (tp8 dev D11): %lld newcomers held over %lld steps, %lld "
+                 "then lent to a BG lane, %lld ran at home after the hold ran out (held %.1f ms in all, the longest %.1f); BG "
+                 "lanes took %lld newcomers, the BG lanes' room kept %lld home or held", (long long)lanes_.bg_hold_ms(),
+                 (long long)c.hold_reqs, (long long)c.hold_steps, (long long)c.hold_lent, (long long)c.hold_home,
+                 (double)c.hold_us / 1000.0, (double)c.hold_max_us / 1000.0, (long long)c.bg,
+                 (long long)c.bg_skip[LaneSet::kBgRoom]);
+    };
     auto lseg_line = [&](const char* when) {
         RAD_INFO("two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld other lanes' tails while one "
                  "was in flight (%lld of them between two of its segments), %lld polls with nothing to issue "
@@ -1000,6 +1027,13 @@ int Engine::step_loop_lanes() {
             if (now - lseg_line_ns >= 60000000000ull) {
                 lseg_line(" so far");
                 lseg_line_ns = now;
+            }
+        }
+        if (lanes_.bg_hold_ms() > 0) {
+            const uint64_t now = rad_mono_ns();
+            if (now - hold_line_ns >= 60000000000ull) {
+                hold_line();
+                hold_line_ns = now;
             }
         }
         gaps.minute(lane_steps);

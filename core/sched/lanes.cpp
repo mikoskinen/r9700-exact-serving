@@ -52,6 +52,11 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     bg_split_ = bs && !std::strcmp(bs, "1");
     const char* bf = std::getenv("RADIANCE_PP_BG_DRAFT_FLOOR");
     bg_floor_ = !(bf && !std::strcmp(bf, "0"));
+    if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh) {
+        char* end = nullptr;
+        const long long v = std::strtoll(bh, &end, 10);
+        bg_hold_ms_ = end && !*end && v > 0 && v <= 60000 ? (int64_t)v : 0;
+    }
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -390,7 +395,8 @@ void Scheduler::lane_split_own() {
         if (bg && !lanes_->is_bg(lane_) && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
             e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->req &&
             !e.cr_replay && e.n_spec == 0 && (e.ckpt_slot < 0 || e.ckpt_tok >= 0)) {
-            if (lane_split_bg(e)) bg_out.push_back(ei);
+            int bwhy = -1;
+            if (lane_split_bg(e, &bwhy) || lane_bg_hold(e, bwhy)) bg_out.push_back(ei);
             continue;
         }
         /* tp8 dev M5b (RADIANCE_PP_LEND_MIXED=2): a newcomer's whole rest beside decode rows, cut on the 512 grid */
@@ -518,12 +524,14 @@ void Scheduler::lane_split_own() {
  * plan's planning order (idle ones first) with room; else e stays (today's MIXED step). True when lent: the caller takes e out of the
  * plan (lane_bg_drop). The piece is e itself -- the rows, the snapshot (lever TI's inner tail: committed by lane_piece_done) --
  * so every boundary is the one this lane's own plan cut. */
-bool Scheduler::lane_split_bg(StepEntry& e) {
+bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     SchedReq& s = *reqs_[(size_t)e.slot];
     Request& r = *s.req;
+    if (why) *why = -1;
     if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold || s.lent_pending > 0 || s.lent > 0) return false;
     if (e.ckpt_restore >= 0) {
         lanes_->note_bg_skip_locked(LaneSet::kBgRestore);
+        if (why) *why = LaneSet::kBgRestore;
         return false;
     }
     const std::vector<int>& order = lanes_->planners_locked();
@@ -563,7 +571,13 @@ bool Scheduler::lane_split_bg(StepEntry& e) {
             if (room(l, n)) { to = l; break; }
     if (to < 0) {
         lanes_->note_bg_skip_locked(!bgo.empty() ? LaneSet::kBgRoom : LaneSet::kBgOrder);
+        if (why) *why = !bgo.empty() ? LaneSet::kBgRoom : LaneSet::kBgOrder;
         return false;
+    }
+    /* tp8 dev D11: a held newcomer's hold ends here, lent */
+    if (s.bg_hold_us > 0) {
+        lanes_->note_hold_end_locked(true, std::max<int64_t>(0, mono_us() - s.bg_hold_us));
+        s.bg_hold_us = 0;
     }
     /* The committed end, below which nothing in flight reads (this step's bump undone): the keep floor, as a lend's */
     int64_t real = r.n_computed;
@@ -613,6 +627,29 @@ bool Scheduler::lane_split_bg(StepEntry& e) {
     s.lent_next = e.ctx_len;
     /* at W(h > 0, t) a lent snapshot holds its sequence until its commit (lane_split_own's rule) -- it is held anyway (lent_tok) */
     if (lanes_->head_state() && pc.e.ckpt_slot >= 0) s.lent_hold = true;
+    return true;
+}
+
+/* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS=N): entry e -- a newcomer's whole rest beside this lane's decoders that lane_split_bg found
+ * no BG lane with room for (`why` kBgRoom) -- is HELD: left out of this step (true: the caller takes it out of the plan with
+ * lane_bg_drop, so the step goes out with its decode rows alone) and planned again at this lane's next step, when a BG lane may
+ * take it whole. Its prompt is untouched (a plan bumps no n_computed; the KV it ensured stays its own; a snapshot it reserved is
+ * released by the next step's begin as any unsaved reservation), so the entry the next plan makes is the one this plan made:
+ * the BG lane, or this lane once the hold has run N ms, runs the same rows at the same cut as today -- exact by construction.
+ * False (today's MIXED step): the switch off, another reason (a prefix restore stays home), or the hold ran out. */
+bool Scheduler::lane_bg_hold(StepEntry& e, int why) {
+    SchedReq& s = *reqs_[(size_t)e.slot];
+    const int64_t ms = lanes_->bg_hold_ms();
+    const int64_t now = mono_us();
+    const bool can = ms > 0 && why == LaneSet::kBgRoom && e.ckpt_restore < 0;
+    if (!can || (s.bg_hold_us > 0 && now - s.bg_hold_us >= ms * 1000)) {
+        if (s.bg_hold_us > 0) lanes_->note_hold_end_locked(false, std::max<int64_t>(0, now - s.bg_hold_us));
+        s.bg_hold_us = 0;
+        return false;
+    }
+    const bool first = s.bg_hold_us <= 0;
+    if (first) s.bg_hold_us = now > 0 ? now : 1;
+    lanes_->note_hold_locked(first);
     return true;
 }
 
