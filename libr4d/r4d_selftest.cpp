@@ -31742,6 +31742,7 @@ struct SpRowsT {
      * deepseek41's streams, `bound` = the all-reduce's), the exact all-reduce, the reduce-scatter -- counts of wrong elements */
     int64_t wide_rows = 0, wide_bad = -1, mix_ar_bad = -1, mix_rs_bad = -1;
     void* inst_wide = nullptr;
+    int64_t narrow_bad = -1;   /* tp8 loop P26: the 1280 / 512-row gathers on that instance (-1: not run or failed) */
 };
 static void sp_rows_worker_t(SpRowsT* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
@@ -31842,6 +31843,37 @@ static void sp_rows_worker_t(SpRowsT* t) {
                 if (g_ar[(size_t)i] != want) ++t->mix_ar_bad;
                 if ((int)((i / t->row) / q) == t->rank && g_rs[(size_t)i] != want) ++t->mix_rs_bad;
             }
+            /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN): NARROW rows on the same instance (`bound` the all-reduce's) -- deepseek41's
+             * gathers of q_a's output (1280 a row) and kv's (512 a row) over the same rows count as the 5120-row message */
+            t->narrow_bad = 0;
+            for (int64_t nrow : { (int64_t)1280, (int64_t)512 }) {
+                const int64_t nr = most / t->row, nn = nr * nrow, nq = (nr + t->world - 1) / t->world;
+                std::vector<RadParam> pn = { PI("world_size", t->world), PI("numel", nn), PS("dtype", "bf16"), PI("row", nrow),
+                                             PI("raw", 1), PI("bound", most) };
+                void* inst_n = nullptr;
+                int rn = t->ag->init(pn.data(), (int)pn.size(), t->rank, t->world, &inst_n);
+                if (rn == RAD_OK) {
+                    for (int64_t i = 0; i < nn; ++i) {
+                        const int owner = (int)((i / nrow) / nq);
+                        h[(size_t)i] = h_to_bf16(ar_rough_value(owner == t->rank ? owner : 11 + t->rank, i + 5));
+                    }
+                    st_memcpy(buf, h.data(), (size_t)nn * 2, hipMemcpyHostToDevice);
+                    RadTensor tn[1] = { T(buf, RAD_BF16, { nn }) };
+                    RadArgs a2;
+                    std::memset(&a2, 0, sizeof(a2));
+                    a2.t = tn; a2.n_t = 1; a2.p = pn.data(); a2.n_p = (int)pn.size();
+                    a2.instance = inst_n; a2.rank = t->rank; a2.world_size = t->world;
+                    rn = t->ag->launch(&a2, nullptr);
+                    st_stream_sync(nullptr);
+                    if (rn == RAD_LINK_ENDED) rn = RAD_OK;
+                    std::vector<uint16_t> gn((size_t)nn);
+                    st_memcpy(gn.data(), buf, (size_t)nn * 2, hipMemcpyDeviceToHost);
+                    for (int64_t i = 0; i < nn; ++i)
+                        if (gn[(size_t)i] != h_to_bf16(ar_rough_value((int)((i / nrow) / nq), i + 5))) ++t->narrow_bad;
+                    if (t->ag->fini) t->ag->fini(inst_n);
+                }
+                if (rn != RAD_OK) { t->narrow_bad = -1; if (rc == RAD_OK) rc = rn; }
+            }
         }
         if (wbuf) st_free(wbuf);
         if (rc != RAD_OK && t->rc == RAD_OK) t->rc = rc;
@@ -31940,6 +31972,12 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
                 ok((w + ": the exact all-reduce after it == the fold").c_str(), all && ab == 0, std::to_string(ab) + " elements wrong");
                 ok((w + ": the reduce-scatter after that == the fold on the shard").c_str(), all && rb == 0,
                    std::to_string(rb) + " elements wrong");
+                int64_t nb = 0;
+                bool nall = true;
+                for (const SpRowsT& x : t) { nall = nall && x.narrow_bad >= 0; nb += std::max<int64_t>(x.narrow_bad, 0); }
+                ok((w + ": then narrow all-gathers (rows of 1280 / 512, deepseek41's qr / kv under RADIANCE_DS41_SPHC_ATTN) "
+                        "move every owner's words to every rank").c_str(),
+                   nall && nb == 0, std::to_string(nb) + " elements wrong");
             }
             const int64_t tr[2] = { 2048, 4096 };
             for (size_t k = 0; k < t[0].us_rs.size() && k < 2; ++k) {
