@@ -990,12 +990,156 @@ int xm_cu_count() {
 #endif
 }
 
+/* ------------------------------------------------------------------ drafter_mx 3: fp8 x fp8 (DRAFTER track 18.11.2026 round 3)
+ * xm_a8_kernel = moe_gemm_mxfp4a8's expert-major form (r4d_moe_mxfp4.hip moe_mxfp4_expert_kernel<4, 256>, the one its body() takes at
+ * these shapes) on the drafter's own 17-byte ggml MXFP4 blocks, the activations quantised inside the kernel as r4d_quant_act_fp8 does
+ * them (E4M3, an f32 scale amax / 448 a (row, 128 of K), clamped to +-448, RNE): the same values and, output by output, the same
+ * operations as that pair of libr4d launches on the canonical planes of the same weights (tools/dbench a8 arm: byte-identical), with
+ * no scratch. Each E2M1 code as its exact E4M3 byte (r4d_mxfp4.h's row-0 magnitude table), a 32-value group's two fp8 WMMAs from 0,
+ * then total += raw x act_scale x 2^(e - 127). Rule B (a row's quantisation and sums are its own: deterministic, batch- and
+ * placement-invariant); NOT the bf16-activation forms' values (rms 2.5 % relative on the drafter's experts, dbench b36): proposals
+ * only, verify keeps the text. A block = 64 weight rows (4 waves x 16) x the expert's rows in 16-row tiles, stages of 256 K: the
+ * weights two threads a row, 17 aligned dwords (4 blocks) each, decoded at the LDS store; the next stage in registers meanwhile. */
+}  // namespace
+#include "r4d_fp8_wmma.h"
+#include "r4d_mxfp4.h"
+namespace {
+constexpr int kA8SK = 256, kA8P = kA8SK + 8, kA8BN = 64, kA8KB = kA8SK / 128;
+__global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) {
+    __shared__ __align__(16) uint8_t aa[16 * kA8P], bb[kA8BN * kA8P];
+    __shared__ uint32_t ss[kA8BN * kA8KB];
+    __shared__ float sa[16 * kA8KB];
+    __shared__ int src[16];
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5, col0 = (int)blockIdx.x * kA8BN, e = (int)blockIdx.y;
+    if (e == A.n_expert) {   /* the dropped slots past the last expert: zero rows */
+        const int r0 = min(max(A.off[A.n_expert], 0), A.T);
+        for (long long i = tid; i < (long long)(A.T - r0) * kA8BN; i += 128) {
+            const int n = col0 + (int)(i % kA8BN);
+            if (n < A.N) A.y[(long long)(r0 + i / kA8BN) * A.y_ld + n] = 0;
+        }
+        return;
+    }
+    const int lo = max(A.off[e], 0), hi = min(A.off[e + 1], A.T);
+    if (lo >= hi) return;
+    const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
+    const int rowbase = (lane >> 4) * 8, mycol = wave * 16 + (lane & 15);
+    const int lr = tid >> 1, lh = tid & 1;                   /* weight loader: row lr, blocks 4 lh .. 4 lh + 3 of a stage */
+    const uint32_t* wsrc = (const uint32_t*)(wb + (long long)min(col0 + lr, A.N - 1) * A.w_ld) + lh * 17;
+    const int ar = tid >> 3, ac = tid & 7;                   /* activation loader: tile row ar, values 32 ac .. 32 ac + 31 */
+    for (int r0 = lo; r0 < hi; r0 += 16) {
+        __syncthreads();
+        if (tid < 16) {
+            const int r = r0 + tid;
+            src[tid] = r < hi ? mx_moe_tok(A.sorted, r, A.top_k, A.a_sorted, A.AR) : -1;
+        }
+        __syncthreads();
+        bool rv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) rv[j] = src[rowbase + j] >= 0;
+        const int arow = src[ar];
+        uint32_t wreg[17];
+        uint4 xreg[4];
+        auto load = [&](int k0) {
+            const uint32_t* p = wsrc + (k0 / 256) * 34;
+#pragma unroll
+            for (int i = 0; i < 17; ++i) wreg[i] = p[i];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) xreg[i] = uint4{ 0u, 0u, 0u, 0u };
+            if (arow >= 0) {
+                const uint4* xp = (const uint4*)(const void*)(A.x + (long long)arow * A.x_ld + k0 + 32 * ac);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) xreg[i] = xp[i];
+            }
+        };
+        auto store = [&]() {
+            uint32_t ex = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {                    /* block 4 lh + i at byte 17 i of my 68 */
+                const int o = 17 * i;
+                ex |= ((wreg[o / 4] >> (8 * (o % 4))) & 0xffu) << (8 * i);
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {                /* qs[4 q .. 4 q + 3]: elements 4 q .. (low nibbles), 16 + 4 q .. (high) */
+                    const int bo = o + 1 + 4 * q, di = bo / 4, sh = bo % 4;
+                    const uint32_t w = sh ? __builtin_amdgcn_alignbyte(wreg[di + 1], wreg[di], sh) : wreg[di];
+                    const uint32_t ev = w & 0x0F0F0F0Fu, od = (w >> 4) & 0x0F0F0F0Fu;
+                    const uint32_t be = __builtin_amdgcn_perm(R4D_MXFP4_MAG0_HI, R4D_MXFP4_MAG0_LO, ev & 0x07070707u) | ((ev & 0x08080808u) << 4);
+                    const uint32_t bo8 = __builtin_amdgcn_perm(R4D_MXFP4_MAG0_HI, R4D_MXFP4_MAG0_LO, od & 0x07070707u) | ((od & 0x08080808u) << 4);
+                    const int kk = 32 * (4 * lh + i) + 4 * q;
+                    *(uint32_t*)(bb + lr * kA8P + kk) = be;
+                    *(uint32_t*)(bb + lr * kA8P + kk + 16) = bo8;
+                }
+            }
+            ss[lr * kA8KB + lh] = ex;
+            /* the activations: r4d_quant_act_fp8's arithmetic on my 32 values of a 128-group (4 threads a group) */
+            float v[32];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t u[4] = { xreg[i].x, xreg[i].y, xreg[i].z, xreg[i].w };
+#pragma unroll
+                for (int t = 0; t < 4; ++t) { v[8 * i + 2 * t] = __uint_as_float(u[t] << 16); v[8 * i + 2 * t + 1] = __uint_as_float(u[t] & 0xffff0000u); }
+            }
+            float m = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 32; ++j) m = fmaxf(m, fabsf(v[j]));
+            m = fmaxf(m, __shfl_xor(m, 1));
+            m = fmaxf(m, __shfl_xor(m, 2));
+            const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            uint32_t pk[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int p = 0;
+                p = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[4 * j] * inv, -448.0f), 448.0f),
+                                                    fminf(fmaxf(v[4 * j + 1] * inv, -448.0f), 448.0f), p, false);
+                p = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[4 * j + 2] * inv, -448.0f), 448.0f),
+                                                    fminf(fmaxf(v[4 * j + 3] * inv, -448.0f), 448.0f), p, true);
+                pk[j] = (uint32_t)p;
+            }
+            uint4* dst = (uint4*)(aa + ar * kA8P + 32 * ac);
+            dst[0] = uint4{ pk[0], pk[1], pk[2], pk[3] };
+            dst[1] = uint4{ pk[4], pk[5], pk[6], pk[7] };
+            if ((ac & 3) == 0) sa[ar * kA8KB + (ac >> 2)] = arow >= 0 ? sc : 0.0f;
+        };
+        auto total = r4d_fp8::acc_zero();
+        load(0);
+        for (int k0 = 0; k0 < A.K; k0 += kA8SK) {
+            store();
+            __syncthreads();
+            if (k0 + kA8SK < A.K) load(k0 + kA8SK);
+#pragma unroll
+            for (int kb = 0; kb < kA8KB; ++kb) {
+                const uint32_t exps = ss[mycol * kA8KB + kb];
+#pragma unroll
+                for (int group = 0; group < 4; ++group) {
+                    auto raw = r4d_fp8::acc_zero();
+#pragma unroll
+                    for (int k = kb * 128 + group * 32; k < kb * 128 + (group + 1) * 32; k += 16)
+                        raw = r4d_fp8::mma(r4d_fp8::frag<kA8SK>(aa, 0, k, lane), r4d_fp8::frag<kA8SK>(bb, wave * 16, k, lane), raw);
+                    const uint32_t exp = (exps >> (8 * group)) & 0xffu;
+                    const float scale = __uint_as_float(exp == 255 ? 0x7fc00000u : exp ? (exp << 23) : 0x00400000u);
+#pragma unroll
+                    for (int row = 0; row < 8; ++row)
+                        if (rv[row]) total[row] += raw[row] * sa[(rowbase + row) * kA8KB + kb] * scale;
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int row = 0; row < 8; ++row) {
+            const int r = r0 + rowbase + row, n = col0 + mycol;
+            if (r < hi && n < A.N) A.y[(long long)r * A.y_ld + n] = f32_to_bf16(total[row]);
+        }
+    }
+}
 /* ------------------------------------------------------------------ the switch, the pin, the rule */
 int env_drafter_mx() {
     const char* v = std::getenv("RADIANCE_DS41_DRAFTER_MX");
-    const int on = (v && (*v == '1' || *v == '2') && !v[1]) ? *v - '0' : 0;
+    const int on = (v && (*v == '1' || *v == '2' || *v == '3') && !v[1]) ? *v - '0' : 0;
     if (v && *v && !on && std::strcmp(v, "0"))
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2: the stock MXFP4 grouped GEMM\n", v);
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3: the stock MXFP4 grouped GEMM\n", v);
+    if (on == 3)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the fp8 x fp8 form at every call (RADIANCE_DS41_DRAFTER_MX=3, "
+                             "the fn4 switch drafter_mx 3: activations quantised to E4M3 a (row, 128), rule B, the drafter's own reference)\n");
     if (on == 1)
         std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the multi-row forms (RADIANCE_DS41_DRAFTER_MX=1, "
                              "the fn4 switch drafter_mx)\n");
@@ -1014,7 +1158,7 @@ int g_xm_wm_slab = 0;                     /* WMMA form: LDS bytes of a slab (0: 
 }  // namespace
 
 int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
-void r4d_mx_mr_set(int on) { g_xm_on = on == 2 ? 2 : (on ? 1 : 0); }
+void r4d_mx_mr_set(int on) { g_xm_on = on == 2 || on == 3 ? on : (on ? 1 : 0); }
 int r4d_mx_mr_get() { return g_xm_on; }
 
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
@@ -1076,6 +1220,21 @@ static int xm_wq_moe(RadStream s, const R4dMxMrCall& c, int NT, int gridcap) {
     return xm_launch_q(s, NT, A, (unsigned)grid, (unsigned)lds);
 }
 
+/* drafter_mx 3's launch (xm_a8_kernel above): 17-byte blocks whose rows are dword-aligned, K a multiple of 256, aligned activations. */
+static int xm_a8_moe(RadStream s, const R4dMxMrCall& c) {
+    if (c.K % kA8SK || !c.x_al || c.x_ld % 8 || c.N < 1 || c.n_expert < 1 || c.n_expert > 65534) return R4D_MX_MR_DECLINE;
+    const long long rb = (long long)(c.K / 32) * 17;
+    if (rb % 4 || (c.w_ld != 0 && c.w_ld % 4)) return R4D_MX_MR_DECLINE;
+    if (!c.wtab && (((uintptr_t)c.w & 3u) || c.w_es % 4)) return R4D_MX_MR_DECLINE;
+    MxMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
+    A.y = c.y; A.y_ld = c.y_ld; A.sorted = c.sorted; A.off = c.off;
+    A.T = c.T; A.N = c.N; A.K = c.K; A.n_expert = c.n_expert; A.top_k = c.top_k; A.a_sorted = c.a_sorted;
+    A.AR = c.AR; A.x_al = c.x_al;
+    std::snprintf(g_xm_last, sizeof g_xm_last, "a8 fp8 x fp8 BN64 SK256 grid %d x %d", (c.N + kA8BN - 1) / kA8BN, c.n_expert + 1);
+    return R4D_EMIT(s, xm_a8_kernel, dim3((unsigned)((c.N + kA8BN - 1) / kA8BN), (unsigned)(c.n_expert + 1)), dim3(128), 0, A);
+}
+
 /* The rule: the gemv band (<= 16 tokens): MT from the call's tokens (an expert's rows in a decode step are few: 4 to 8
  * tokens' worth), H 4 x R 1 in 8-wave blocks (32 weight rows a block), a grid of four blocks a WGP or fewer when the live
  * work is smaller. The tiled order (DRAFTER track 18.11.2026, tools/dbench on one R9700, the drafter's 3 stages x
@@ -1093,7 +1252,12 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
     if (pinned && g_xm_pin_h == 4096) return xm_wq_moe(s, c, g_xm_pin_mt, g_xm_pin_grid);   /* long-run WMMA pin */
     /* drafter_mx 2 (rule B): every call, either band, in the WMMA form (WR 1, NT 1, PD 2, 8 waves), so a sequence's drafter
      * bits do not depend on how many sequences share the call; what it declines takes the exact forms below. */
-    if (!pinned && g_xm_pin == 0 && g_xm_on == 2) {
+    if (!pinned && g_xm_pin == 0 && g_xm_on == 3) {   /* drafter_mx 3: fp8 x fp8 at every call (rule B); a decline takes mx 2 */
+        const int a8 = xm_a8_moe(s, c);
+        if (a8 != R4D_MX_MR_DECLINE) return a8;
+    }
+    if (pinned && g_xm_pin_h == 8192) return xm_a8_moe(s, c);   /* bench pin of the fp8 form */
+    if (!pinned && g_xm_pin == 0 && g_xm_on >= 2) {
         const int wm = xm_wm_moe(s, c, 1, 1, 2, 0, 8, 0);
         if (wm != R4D_MX_MR_DECLINE) return wm;
     }

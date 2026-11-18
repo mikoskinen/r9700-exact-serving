@@ -4403,9 +4403,10 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * rad_fn4_switch applies, called between steps with every rank thread parked: 1 = applied, 0 = not a libr4d switch,
  * < 0 = refused (a value this libr4d does not know). rad_fn4_accepts says the same without applying (the server
  * checks a request with it before queueing), rad_fn4_value what is applied (what /admin/fn4 reports). */
-/* The drafter's kernels (ds41-drk): "drafter_mx" 0 / 1 / 2, moe_gemm_ggml type=mxfp4 in the multi-row forms
+/* The drafter's kernels (ds41-drk): "drafter_mx" 0 / 1 / 2 / 3, moe_gemm_ggml type=mxfp4 in the multi-row forms
  * (r4d_ds41_mxfp4_mr.hip, RADIANCE_DS41_DRAFTER_MX at load; 2 = the WMMA form at every call, rule B: deterministic and
- * batch-invariant against its own reference, not the stock bits -- DRAFTER track 18.11.2026); "drafter_bf" 0 / 1, gemm_nt bf16's decode band in the
+ * batch-invariant against its own reference, not the stock bits; 3 = fp8 x fp8 (xm_a8_kernel, activations quantised to E4M3 a (row, 128),
+ * rule B, values ~2.5 % from the bf16 forms) -- DRAFTER track 18.11.2026); "drafter_bf" 0 / 1, gemm_nt bf16's decode band in the
  * prefetching form (r4d_gemm_bf16_nt_pf.hip, RADIANCE_DS41_DRAFTER_BF). Both keep the stock kernels' bits.
  * Lever GPF: "gg_pf" 0 / 1 / 2 / a form code, gemm_nt_ggml's prefill rows in the WMMA forms of r4d_ds41_ggml_pf.hip (1 its
  * per-shape rule, 2 that rule with lever A11's row-ranged entries, a code that form everywhere; RADIANCE_DS41_GG_PF at
@@ -4458,7 +4459,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_known(value) ? 1 : -1;   /* lever SPD-F */
-    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 2 ? 1 : -1;   /* 2: the WMMA form (rule B) */
+    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 3 ? 1 : -1;   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both) */
     if (!std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
