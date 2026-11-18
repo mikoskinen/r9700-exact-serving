@@ -3722,7 +3722,9 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     if (mode == 2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
     if (mode == 2 && g_wmk_dq8 && !f32out)
         if (const int c = wmk_dq8(ty, Ntot, K, M)) return c;
-    if (!g_wmk_tab || mode == 2) return kWmkCode;
+    /* mode 4 (DRAFTER round 7, an in-process A/B code like F7's 2 / 3): mode 2 WITHOUT the WHG / DQ8 rules above = 70724 at every
+     * decode row count, as BEST's libr4d serves mode 2 (the same bytes as 2) */
+    if (!g_wmk_tab || mode == 2 || mode == 4) return kWmkCode;
     if (M <= 16) {
         if (head) return 332872;
         if (ty == GG_Q6_K && K == 5120 && (Ntot == 1536 || Ntot == 1024 || Ntot == 1792)) return 332872;
@@ -3745,7 +3747,7 @@ int wmk_now() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_WMK");
         int unread = -1;
-        const int want = e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0;   /* 1, or the F7 A/B codes 2 / 3 */
+        const int want = e && e[0] >= '1' && e[0] <= '4' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 / 3 / 4 */
         const bool first = g_wmk.compare_exchange_strong(unread, want);
         v = g_wmk.load(std::memory_order_relaxed);
         if (first && want >= 1) std::fprintf(stderr, "radiance: libr4d: lever WMK (ds41_wmk %d, RADIANCE_DS41_WMK): dense GGUF GEMMs at every row "
@@ -4482,7 +4484,7 @@ void r4d_mix_fin_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 3 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 4 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8 */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
@@ -4505,7 +4507,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) { r4d_ar_xpush_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 3 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 4 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }

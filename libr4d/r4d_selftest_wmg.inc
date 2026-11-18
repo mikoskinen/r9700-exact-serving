@@ -66,7 +66,7 @@ constexpr int kWkEngine = 1048576;
 static void set_wm(const Hk& h) {
     clear(h);
     /* 1048576 / 1048577 / 1048578: the engine's path under ds41_wmk 1 / 2 / 3 (FINDINGS F7: the r6 table / 70724 / r5's table) */
-    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 2) { h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
+    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 3) {   /* + 3: ds41_wmk 4 (DRAFTER r7: 2 without WHG / DQ8) */ h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
     else if (g_wk_cur) h.wk_pin(g_wk_cur);
     else h.wm_pin(1);
 }
