@@ -1774,8 +1774,9 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
 /* RADIANCE_PP_ISSUE_AHEAD=1 (both nodes): an undrafted decode lane's next step is planned, its head part released and its frame
  * shipped before the step's collect (Scheduler::step_next + ADV_TRUNK on the leader; the follower reads no token id). Tokens at
  * two and three lanes, W(0,2) and W(1,3) (alone, every lane in turn, and beside newcomers whose chunks are lent), are one
- * process's, and steps are issued ahead; with the follower's own embedding the leader does not take it and the tokens are the
- * same; the KL recordings at two and three lanes are one process's. */
+ * process's, and steps are issued ahead; round 2: with the follower's own embedding too (X1 carries the step's token ids, the
+ * follower takes them before its lookup), W(0,2) / W(0,3); the KL recordings at two and three lanes are one process's, W(1,3)
+ * and W(0,2) with the follower's lookup. */
 TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_does) {
     REQUIRE(world().ok);
     tiny::TempDir d("pp_ia");
@@ -1788,8 +1789,10 @@ TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_do
         CHECK_EQ(one.lead.finish(60), 0);
     }
     struct Arm { int lanes; const char* cut; bool fe; };
+    /* tp8 dev D10 round 2: beside the follower's own lookup too (X1 carries the step's token ids, the leader's card's, which
+     * the follower takes before its lookup): W(0,2) at two and three lanes, W(0,3) at two */
     for (const Arm a : { Arm{ 2, "0,2", false }, Arm{ 3, "0,2", false }, Arm{ 2, "1,3", false }, Arm{ 3, "1,3", false },
-                         Arm{ 2, "0,2", true } }) {
+                         Arm{ 2, "0,2", true }, Arm{ 3, "0,2", true }, Arm{ 2, "0,3", true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back("RADIANCE_PP_ISSUE_AHEAD=1");
         if (a.fe) env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
@@ -1827,13 +1830,15 @@ TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_do
                 log_count(llog, "newcomer split: "));
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 20).c_str());
+        CHECK(llog.find("RADIANCE_PP_ISSUE_AHEAD=1 -- an undrafted decode lane's next step") != std::string::npos);
+        CHECK(n_ahead > 0);
         if (!a.fe) {
-            CHECK(llog.find("RADIANCE_PP_ISSUE_AHEAD=1 -- an undrafted decode lane's next step") != std::string::npos);
             CHECK(flog.find("follower: RADIANCE_PP_ISSUE_AHEAD=1 -- this node's pass reads no token id") != std::string::npos);
-            CHECK(n_ahead > 0);
         } else {
-            CHECK(llog.find("RADIANCE_PP_ISSUE_AHEAD=1 is not taken with RADIANCE_PP_FOLLOWER_EMBED=1") != std::string::npos);
-            CHECK_EQ(n_ahead, -1ll);
+            CHECK(llog.find("X1 carries the step's token ids, which the follower takes before it reads any (round 2)") !=
+                  std::string::npos);
+            CHECK(flog.find("follower: RADIANCE_PP_ISSUE_AHEAD=1 -- this node's pass takes the step's token ids from X1") !=
+                  std::string::npos);
         }
     }
     const std::string rec = record_single(d / "single", { "--max-num-seqs", "6" });
@@ -1858,5 +1863,25 @@ TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_do
         fprintf(stderr, "    issue ahead, %d lane(s) W(1,3): recording %s; lane steps issued ahead %lld\n", lanes,
                 same ? "identical" : why.c_str(), n_rec);
         CHECK(same);
+    }
+    /* tp8 dev D10 round 2: the recordings with the follower's own lookup from X1's token ids (every pass's X1 carries them,
+     * issued ahead or not) at W(0,2), two and three lanes */
+    for (const int lanes : { 2, 3 }) {
+        const std::string out = d / ("pp-fe-" + std::to_string(lanes));
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_ISSUE_AHEAD=1");
+        env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+        const PipeRun pr = record_pipeline(out, "0,2", env, lane_shape(lanes), lane_shape(lanes), env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    %d lanes FE: leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", lanes, pr.leader,
+                    pr.follower, tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        fprintf(stderr, "    issue ahead + follower embeds, %d lane(s) W(0,2): recording %s\n", lanes,
+                same ? "identical" : why.c_str());
+        CHECK(same);
+        CHECK(pr.flog.find("this node's pass takes the step's token ids from X1") != std::string::npos);
     }
 }
