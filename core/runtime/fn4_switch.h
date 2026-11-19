@@ -414,6 +414,14 @@
  *                   =0 .. 7 declares every read (each weight's first RADIANCE_DS41_PREFETCH_MB, default 8) and starts at
  *                   that value; unset declares nothing and >= 1 is refused (so is it where no library serves `prefetch`:
  *                   the host backend). Exact: the op reads weights and writes nothing a pass reads.
+ *   ds41_attn_dec   libr4d (tp8 loop D26; 84 here, after ds41_prefetch): the decode band's attention form (attn_sparse_sink /
+ *                   _rope_roundtrip and their gathered / unpacked forms, ds41_attn_dec_kernel) at the passes of more than 256
+ *                   keys a row (the compressed layers: window 128 + top-k 512) where the rule takes form 4 (8 heads a
+ *                   workgroup, 512 threads, tiled PV: more than 256 row-head pairs, i.e. c16 / c32's 24 / 48-row passes at 16
+ *                   heads a rank) -- 0 = the rule (today), N = 1 .. 7 = form N - 1 there (0 .. 3 direct PV at 1024 threads
+ *                   with 1 / 2 / 4 / 8 heads a workgroup, 4 .. 6 tiled at 512 threads with 8 / 4 / 2; a form the LDS refuses
+ *                   takes the rule's next form). Every form sums each output in the same order: the same bytes (r4d_emu
+ *                   test_ds41attn's D26 case). RADIANCE_DS41_ATTN_DEC=N starts at N. -1 when no loaded object serves it.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -624,7 +632,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec,
+              kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
