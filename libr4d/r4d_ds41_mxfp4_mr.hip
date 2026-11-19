@@ -787,6 +787,124 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
     }
 }
 
+/* xm_wt_kernel (DRAFTER track 19.11.2026 round 12, lever DTS; tools/dbench/patd.cpp): xm_wm_kernel WR 1 NT 1 with TS row tiles a
+ * wave IN SEQUENCE, for short K (lever DEP's down: K 576 = 18 blocks of 306-byte rows). xm_wm at 18 blocks an item spends its
+ * time in the item's set-up (the live count, the item search, wtab / sorted / activation round trips, two barriers) and its
+ * pipeline fill: patd on the down shape (33 live experts, 51.5 MB) reads the window pattern alone at 540 GB/s (95.7 us) and a
+ * coalesced range at 605 (85.4), while xm_wm's down takes 116-162 us a call (loads-only ablation 119-136). Here an item is
+ * (expert, segment, TS x WN x 16 rows): the activations are staged ONCE an item (the whole K: UK <= SS), the segment's live
+ * rows read once, and the weight loads run PD blocks ahead straight across the tiles' boundaries (one stream of TS x UK
+ * blocks a wave). Tile t's rows: n0 + (t WN + wave) 16 + nl (the block's waves read one contiguous range a tile).
+ * Exactness: each output is xm_wm_kernel's (WR 1 NT 1): blocks in K order, a block's two WMMAs from 0, one fma of its scale,
+ * one rounding -- TS and WN only move which lane computes it and when its words are loaded (the same bytes as drafter_mx 2). */
+template <int PD, int TS>
+__global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
+    using Q = Mx<MX_FP4>;
+    constexpr int MT = 16;
+    R4D_DYN_LDS(r4d_u32x4, xm_lds);
+    uint8_t* const smem = (uint8_t*)xm_lds;
+    __shared__ int s_n, s_items;
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5;
+    const int nl = lane & 15, h = lane >> 4;
+    const int WN = (int)blockDim.x >> 5;
+    __shared__ uint32_t xw_tab[256];
+    uint32_t* const tab = xw_tab;
+    for (int b = (int)threadIdx.x; b < 256; b += (int)blockDim.x)
+        tab[b] = xw_bf(kMxValues[b & 15]) | (xw_bf(kMxValues[b >> 4]) << 16);
+    const XmLive L = xm_live(smem, A);
+    xm_count<MT>(A, L, &s_n, &s_items);
+    __syncthreads();
+    const int nlive = s_n, nitems = s_items;
+    uint8_t* const xs = smem + A.x_off;
+    const int UK = A.UK, NB = TS * UK;
+    for (int it = (int)blockIdx.x; it < nitems; it += (int)gridDim.x) {
+        int e = 0, r0 = 0, r1 = 0, rg = 0;
+        xm_item<MT>(L, nlive, it, &e, &r0, &r1, &rg);
+        const int mc = r1 - r0, n0 = rg * A.RB;
+        const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
+        auto rowp = [&](int t) -> const uint8_t* {
+            return wb + (long long)min(n0 + (t * WN + wave) * 16 + nl, A.N - 1) * A.w_ld;
+        };
+        /* the load cursor (tile tl, block bl) and the first PD blocks in flight before the set-up's round trips */
+        int tl = 0, bl = 0;
+        const uint8_t* lrow = rowp(0);
+        r4d_u32x4 raw[PD];
+        auto load = [&](r4d_u32x4& rw) {
+            if (tl < TS) {
+                const uintptr_t pa = ((uintptr_t)(lrow + (long long)bl * Q::BB) & ~(uintptr_t)3) + 4 * h;
+                const mx_gu32 g = (mx_gu32)(const void*)pa;
+                rw[0] = g[0]; rw[1] = g[1]; rw[2] = g[2]; rw[3] = g[3];
+                if (++bl == UK) { bl = 0; ++tl; lrow = rowp(tl); }
+            }
+        };
+#pragma unroll
+        for (int k = 0; k < PD; ++k) load(raw[k]);
+        /* the segment's live rows (lanes 0..15 one each), this lane's 8 output rows m = 8 h + i as a mask */
+        const bool lv = lane < mc && mx_moe_tok(A.sorted, r0 + lane, A.top_k, A.a_sorted, A.AR) >= 0;
+        const uint32_t bal = __builtin_amdgcn_ballot_w32(lv);
+        const uint32_t lm = (bal >> (8 * h)) & 0xffu;
+        if (bal == 0u) {   /* a segment of dead slots only: zeros (its loads land in registers nobody reads) */
+            xm_zero(A, r0, mc, n0);
+            continue;
+        }
+        lds_barrier();
+        xw_stage<1>(A, xs, r0, mc, 1, 0, UK);
+        lds_barrier();
+        xw_v8f acc;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+        int tc = 0, bc = 0;
+        const uint8_t* crow = rowp(0);
+        const xw_v8f z = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+#pragma unroll 1
+        for (int j0 = 0; j0 < NB; j0 += PD) {
+#pragma unroll
+            for (int k = 0; k < PD; ++k) {
+                if (j0 + k < NB) {
+                    const r4d_u32x4 w = raw[k];
+                    const int sA = (int)(((uintptr_t)crow + 17u * (uintptr_t)bc) & 3u);
+                    const int sh = (sA + 1) & 3;
+                    const bool s3 = sA == 3;
+                    const uint32_t q0 = __builtin_amdgcn_alignbyte(w[1], s3 ? w[1] : w[0], sh);
+                    const uint32_t q1 = __builtin_amdgcn_alignbyte(w[3], s3 ? w[3] : w[2], sh);
+                    const uint32_t e0 = (w[0] >> (8 * sA)) & 0xffu;
+                    const uint32_t e1 = (uint32_t)__builtin_amdgcn_permlanex16((int)e0, (int)e0, 0x76543210, 0xfedcba98, false, false);
+                    const float d = mx_e8m0_half(h ? e1 : e0);
+                    load(raw[k]);
+                    r4d_u32x4 bw0, bw1;
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        bw0[p] = tab[(q0 >> (8 * p)) & 0xffu];
+                        bw1[p] = tab[(q1 >> (8 * p)) & 0xffu];
+                    }
+                    const uint8_t* xb = xs + bc * 1024;
+                    const r4d_u32x4 a0 = *(const r4d_u32x4*)(xb + ((0 * 2 + h) * 16 + nl) * 16);
+                    const r4d_u32x4 a1 = *(const r4d_u32x4*)(xb + ((1 * 2 + h) * 16 + nl) * 16);
+                    xw_v8f P = xw_wmma(a0, bw0, z);
+                    P = xw_wmma(a1, bw1, P);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[i] = __builtin_fmaf(d, P[i], acc[i]);
+                    if (++bc == UK) {
+                        const int n = n0 + (tc * WN + wave) * 16 + nl;
+                        if (n < A.N) {
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) {
+                                const int m = 8 * h + i;
+                                if (m < mc) mx_put(A.y + (long long)(r0 + m) * A.y_ld + n, ((lm >> i) & 1u) ? acc[i] : 0.0f);
+                            }
+                        }
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+                        bc = 0;
+                        ++tc;
+                        crow = rowp(tc);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* xm_wq_kernel (DRAFTER track 18.11.2026; tools/dbench/pat.cpp): the WMMA form with the weight rows read in long runs. A lane
  * half reads its row's half of a 16-block super-step (blocks 8 h .. 8 h + 7: 136 contiguous bytes), so a row is visited 272
  * bytes at a time instead of a 16-byte window a block (pat on the drafter's gate_up rows, 12 live experts: 583 vs 140 GB/s;
@@ -1152,6 +1270,21 @@ int xm_launch_w(RadStream s, int WR, int NT, int PD, int AB, const MxMrArgs& A, 
 #undef XM_W
     return R4D_MX_MR_DECLINE;
 }
+/* sequential-tile form (lever DTS): (PD, TS) */
+#define XM_TFORMS(X) X(2, 1) X(2, 2) X(2, 4) X(2, 8) X(4, 2) X(4, 4) X(4, 8) X(6, 4) X(6, 8) X(9, 2) X(9, 4) X(9, 8) X(12, 2) X(12, 4) X(12, 8) X(14, 4) X(14, 8)
+int xm_launch_t(RadStream s, int PD, int TS, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
+#define XM_T(pd, ts) \
+    if (PD == pd && TS == ts) return R4D_EMIT(s, (xm_wt_kernel<pd, ts>), dim3(grid), dim3(thr), lds, A);
+    XM_TFORMS(XM_T)
+#undef XM_T
+    return R4D_MX_MR_DECLINE;
+}
+bool xm_has_t(int PD, int TS) {
+#define XM_TH(pd, ts) if (PD == pd && TS == ts) return true;
+    XM_TFORMS(XM_TH)
+#undef XM_TH
+    return false;
+}
 bool xm_has_w(int WR, int NT, int PD, int AB) {
 #define XM_WH(wr, nt, pd, ab) if (WR == wr && NT == nt && PD == pd && AB == ab) return true;
     XM_WFORMS(XM_WH)
@@ -1341,9 +1474,13 @@ __global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) {
 /* ------------------------------------------------------------------ the switch, the pin, the rule */
 int env_drafter_mx() {
     const char* v = std::getenv("RADIANCE_DS41_DRAFTER_MX");
-    const int on = (v && (*v == '1' || *v == '2' || *v == '3' || *v == '4') && !v[1]) ? *v - '0' : 0;
+    const int on = (v && (*v == '1' || *v == '2' || *v == '3' || *v == '4' || *v == '5') && !v[1]) ? *v - '0' : 0;
     if (v && *v && !on && std::strcmp(v, "0"))
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3 / 4: the stock MXFP4 grouped GEMM\n", v);
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3 / 4 / 5: the stock MXFP4 grouped GEMM\n", v);
+    if (on == 5)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the WMMA form at every call, 9 blocks in flight a lane at "
+                             "K >= 2048 and 4 row tiles a wave in sequence below (RADIANCE_DS41_DRAFTER_MX=5, the fn4 switch drafter_mx 5: "
+                             "drafter_mx 2's bytes)\n");
     if (on == 4)
         std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the WMMA form at every call with 9 blocks in flight a lane at "
                              "K >= 2048 (RADIANCE_DS41_DRAFTER_MX=4, the fn4 switch drafter_mx 4: drafter_mx 2's bytes)\n");
@@ -1368,7 +1505,7 @@ int g_xm_wm_slab = 0;                     /* WMMA form: LDS bytes of a slab (0: 
 }  // namespace
 
 int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
-void r4d_mx_mr_set(int on) { g_xm_on = on == 2 || on == 3 || on == 4 ? on : (on ? 1 : 0); }
+void r4d_mx_mr_set(int on) { g_xm_on = on == 2 || on == 3 || on == 4 || on == 5 ? on : (on ? 1 : 0); }
 int r4d_mx_mr_get() { return g_xm_on; }
 
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
@@ -1400,6 +1537,33 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
     std::snprintf(g_xm_last, sizeof g_xm_last, "wmma WR%d NT%d PD%d%s WN%d SS%d RB%d grid %lld lds %lld", WR, NT, PD, AB ? " ABL" : "", WN, A.SS,
                   A.RB, grid, lds);
     return xm_launch_w(s, WR, NT, PD, AB, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+}
+
+/* The sequential-tile form's launch (lever DTS; drafter_mx 2's bytes): WN waves, TS 16-row tiles a wave in sequence, segments
+ * of up to 16 rows, the whole K's activations in one slab (declines K above ~60 blocks). */
+static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, int gridcap) {
+    if (!xm_has_t(PD, TS) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
+    MxMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
+    A.y = c.y; A.y_ld = c.y_ld; A.sorted = c.sorted; A.off = c.off;
+    A.T = c.T; A.N = c.N; A.K = c.K; A.n_expert = c.n_expert; A.top_k = c.top_k; A.a_sorted = c.a_sorted;
+    A.AR = c.AR; A.x_al = c.x_al;
+    A.UK = c.K / 32;
+    A.NS = A.UK;
+    A.SS = A.UK;
+    A.RB = WN * 16 * TS;
+    A.nrg = (c.N + A.RB - 1) / A.RB;
+    A.live_cap = c.n_expert < c.T ? c.n_expert : c.T;
+    A.live_off = kXwTab;
+    A.x_off = (int)(kXwTab + (4LL * A.live_cap * 4 + 15) / 16 * 16);
+    const long long lds = A.x_off + (long long)A.UK * 1024;
+    if (lds > 65536) return R4D_MX_MR_DECLINE;
+    const long long est = (long long)A.live_cap * A.nrg;
+    long long grid = gridcap > 0 ? gridcap : 32LL * xm_cu_count();
+    if (grid > est) grid = est;
+    if (grid < 1) grid = 1;
+    std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-seq PD%d TS%d WN%d RB%d grid %lld lds %lld", PD, TS, WN, A.RB, grid, lds);
+    return xm_launch_t(s, PD, TS, A, (unsigned)grid, 32u * WN, (unsigned)lds);
 }
 
 /* The long-run WMMA form's launch (rule B): 8 waves of one 16-row tile, segments of up to 16 NT rows, super-steps of 16 blocks. */
@@ -1496,8 +1660,21 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
          * loaded), 9 blocks in flight a lane at K >= 2048 (gate_up K 5120; EP's down K 2304). tools/dbench --quad on lq125's
          * 40-token records, xeon, in-process: lever DEP's shapes gate_up 165-177 vs 193-210 us a call (-13..-15 %, pass -10 %),
          * its down (K 576) keeps PD 2 (PD 4-14 within +-5 % or slower); EP shapes: down sum -9..-11 %, gate_up -2..-6 %. */
-        const int wm = xm_wm_moe(s, c, 1, 1, g_xm_on == 4 && c.K >= 2048 ? 9 : 2, 0, 8, 0);
+        /* drafter_mx 5 (round 12, lever DTS): 4's forms, and below K 2048 (lever DEP's down, K 576 = 18 blocks) xm_wt_kernel PD 9
+         * TS 4 WN 8: an item = (expert, segment, 512 rows), the activations staged once an item, the loads 9 blocks ahead across
+         * the 4 tiles -- tools/dbench --quad on lq168's records, xeon GPU1, steady state (300 passes): DEP down 422-450 -> 329-343
+         * us a pass (-22..-25 %), pass 1,065-1,129 -> 982-1,031 (-7.8..-9.2 %) at 32 and 40 tokens; bytes IDENTICAL to mx 2. */
+        if (g_xm_on == 5 && c.K < 2048) {
+            const int t = xm_wt_moe(s, c, 9, 4, 8, 0);
+            if (t != R4D_MX_MR_DECLINE) return t;
+        }
+        const int wm = xm_wm_moe(s, c, 1, 1, (g_xm_on == 4 || g_xm_on == 5) && c.K >= 2048 ? 9 : 2, 0, 8, 0);
         if (wm != R4D_MX_MR_DECLINE) return wm;
+    }
+    if (pinned && g_xm_pin_h >= 2048 && g_xm_pin_h < 4096) {   /* sequential-tile pin (lever DTS): h = 2048 + PD + 16 TS */
+        const int t = xm_wt_moe(s, c, g_xm_pin_h & 15, (g_xm_pin_h >> 4) & 15, g_xm_pin_wn > 0 ? g_xm_pin_wn : 8, g_xm_pin_grid);
+        if (t != R4D_MX_MR_DECLINE) return t;
+        return xm_wm_moe(s, c, 1, 1, c.K >= 2048 ? 9 : 2, 0, 8, 0);   /* long K (gate_up): drafter_mx 4's form */
     }
     if (pinned && g_xm_pin_h >= 1024)   /* WMMA pin (any band): h = 1024 + PD + 16 AB */
         return xm_wm_moe(s, c, g_xm_pin_r, g_xm_pin_mt, (g_xm_pin_h & 15) ? (g_xm_pin_h & 15) : 2, (g_xm_pin_h >> 4) & 15,

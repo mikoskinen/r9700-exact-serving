@@ -304,6 +304,7 @@ static bool parse_form(const std::string& n0, Form* f) {
     if (n == "rule") { f->on = -1; return true; }
     if (n == "mx2") { f->on = -2; return true; }   /* the switch drafter_mx 2, no pin */
     if (n == "mx4") { f->on = -7; return true; }   /* the switch drafter_mx 4 (round 10: 2's bytes, PD 9 at K >= 2048) */
+    if (n == "mx5") { f->on = -8; return true; }   /* the switch drafter_mx 5 (round 12, lever DTS: 4 + xm_wt PD 9 TS 4 below K 2048) */
     if (n == "a8") { f->on = -3; return true; }    /* fp8 quant + moe_gemm_mxfp4a8 a call */
     if (n == "mx3") { f->on = -6; return true; }   /* the switch drafter_mx 3 (xm_a8_kernel: fp8 x fp8 on the 17-byte blocks) */
     if (n == "a8g") { f->on = -4; return true; }   /* moe_gemm_mxfp4a8 only (activations quantised before) */
@@ -311,6 +312,11 @@ static bool parse_form(const std::string& n0, Form* f) {
     {   /* lNTpPD: xm_wl (round 10: xm_wm's operations, xm_a8's loader; byte-compared with the first mx2 arm's bytes) */
         int a = 0, d = 0;
         if (std::sscanf(n.c_str(), "l%dp%d", &a, &d) == 2) { f->on = 1; f->h = 16384 + d; f->r = 1; f->mt = a; return true; }
+    }
+    {   /* tTSpPD[wWN]: the sequential-tile WMMA form (round 12, lever DTS: drafter_mx 2's bytes; short K only) */
+        int a = 0, d = 0, c = 0;
+        if (std::sscanf(n.c_str(), "t%dp%dw%d", &a, &d, &c) == 3) { f->on = 1; f->h = 2048 + d + 16 * a; f->r = 1; f->mt = 1; f->wn = c; return true; }
+        if (std::sscanf(n.c_str(), "t%dp%d", &a, &d) == 2) { f->on = 1; f->h = 2048 + d + 16 * a; f->r = 1; f->mt = 1; f->wn = 8; return true; }
     }
     {   /* qNT: the long-run WMMA form (rule B) */
         int a = 0;
@@ -347,6 +353,7 @@ static void apply_form(const Form& f) {
     if (g_a8) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); return; }
     if (f.on == -6) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(3); return; }
     if (f.on == -7) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(4); return; }
+    if (f.on == -8) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(5); return; }
     if (f.on == 0) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); }
     else if (f.on == -2) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(2); }
     else if (f.on < 0) { r4d_mx_mr_set(1); r4d_mx_mr_pin(-1, 0, 0, 0, 0, 0); }
@@ -578,7 +585,7 @@ int main(int argc, char** argv) {
                 CK(hipMemcpy(got.data(), calls[i].y, calls[i].ybytes, hipMemcpyDeviceToHost));
                 if (f.on == -3 && outa8[i].empty()) outa8[i] = got;
                 if (f.on == -2 && outmx2[i].empty()) outmx2[i] = got;
-                if ((f.on == -7 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
+                if ((f.on == -7 || f.on == -8 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
                 if (f.on == -6 && !outa8[i].empty()) {
                     const size_t nv = (size_t)(calls[i].rt.live * kProj[calls[i].p].N) * 2;
                     vs_a8 += std::memcmp(got.data(), outa8[i].data(), std::min(nv, got.size())) ? 1 : 0;
@@ -655,7 +662,7 @@ int main(int argc, char** argv) {
                 }
                 std::printf("             EP (4 ranks' records a stage): critical (slowest rank a stage) %.1f us a pass, mean rank %.1f |%s\n", crit, mean, per.c_str());
             }
-            if (f.on != 0 && !same && !((f.h >= 1024 || f.on == -2 || f.on == -6 || f.on == -7) && g_rb) && f.on > -3) ++fails;
+            if (f.on != 0 && !same && !((f.h >= 1024 || f.on == -2 || f.on == -6 || f.on == -7 || f.on == -8) && g_rb) && f.on > -3) ++fails;
             std::fflush(stdout);
         }
         apply_form(fl[0]);
