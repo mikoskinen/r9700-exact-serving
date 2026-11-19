@@ -3763,9 +3763,13 @@ static int wmk_code64(int ty, long long Ntot, long long K) {
  * (the drafter's) keep DQ8's rule. The same bytes: the three codes d25a-de3b's --wmgcheck proved (M 1..130 vs the row alone,
  * WMKCROSS 48 rows alone: 595012 == 70724, 52499524 == 70724 on every shape). F7 (one-card tables did not carry to the server)
  * is why it is a value of the switch: stk {ds41_wmk 2} vs {ds41_wmk 9} in one start. */
-static int wmk_code48(int ty, long long Ntot, long long K) {
+/* tp8 loop D34 (DECODE round 26; the DRAFTER's FINDINGS note 16:10, NEG-REVIEW #21): mode 10 = mode 9 WITHOUT the two q_b entries -- on
+ * the pair (lq180 stkW) q_b's four-tile G2 (one 64-KiB-LDS block a WGP) starved the kv chain's norm_rope_rt that runs beside it (its
+ * duration sum 738 -> 1,557 us a 48-row lane step, F +0.33 ms in all although the dense calls were -0.475); without q_b's entries the
+ * rest keep their gain (A: F -0.19 ms, L ~0 a 48-row lane step). The same codes as 9 (a subset), the same bytes. */
+static int wmk_code48(int ty, long long Ntot, long long K, bool no_qb = false) {
     const bool kq = ty == GG_Q5_K || ty == GG_Q6_K;
-    if (kq && Ntot == 8192 && K == 1280) return kWmkG2x4;
+    if (kq && Ntot == 8192 && K == 1280) return no_qb ? 0 : kWmkG2x4;
     if (ty == GG_Q6_K && Ntot == 6400 && K == 6144) return kWmkG2x4;
     if (ty == GG_Q5_K && Ntot == 5120 && K == 2048) return kWmkG2x4;
     if (kq && Ntot == 1792 && K == 5120) return kWmkTile;
@@ -3781,8 +3785,8 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
     if (mode >= 5 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;
     if (mode >= 6 && !head && M > 48 && M <= kWmkBand5) return mode == 6 ? kWmkTile : mode == 7 ? kWmkG2x4 : wmk_code64(ty, Ntot, K);
-    if (mode == 9 && !head && M > 32 && M <= 48)
-        if (const int c = wmk_code48(ty, Ntot, K)) return c;
+    if ((mode == 9 || mode == 10) && !head && M > 32 && M <= 48)
+        if (const int c = wmk_code48(ty, Ntot, K, mode == 10)) return c;
     if (m2 && g_wmk_dq8 && !f32out)
         if (const int c = wmk_dq8(ty, Ntot, K, M)) return c;
     /* mode 4 (DRAFTER round 7, an in-process A/B code like F7's 2 / 3): mode 2 WITHOUT the WHG / DQ8 rules above = 70724 at every
@@ -4565,7 +4569,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_tsk")) return r4d_tsk_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 9 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27) */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 10 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34) */
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
@@ -4590,7 +4594,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
     if (!std::strcmp(name, "ds41_tsk")) { r4d_tsk_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 9 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 10 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
