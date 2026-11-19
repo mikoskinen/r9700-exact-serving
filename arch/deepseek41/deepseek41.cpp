@@ -466,6 +466,11 @@ struct Dsp {
     /* lever W1b: the scoring steps again at form 1 (succ staged through LDS as whole lines; the same bits), issued
      * while dspark_walk is 2 (the last merge is wstep's) */
     std::vector<rad_op> wstep2;
+    /* DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT=1, the engine's same env): the W1 walk again at each head
+     * depth H of 1 .. block - 1 (H + 1 ops: steps H, the anchor at the block's pitch), for a query pass at the drafter's
+     * own block whose head the engine cut to the first H rows of each block (n_out = sequences x H); the same keys
+     * planes and gather as wstep, steps 0 .. H - 1 of them. Empty unless asked. */
+    std::vector<std::vector<rad_op>> wcut;
     /* lever SD, sampled drafting (--draft-coupling on; fn4 draft_sample, the engine's): the walk of W1 sampled, a
      * dspark_walk_sample_step a step + the last merge (libr4d r4d_ds41_wsamp.hip). The coupling planes the engine finds
      * by name -- draws [max_seqs, 8] u32 it stages, q_temp [max_seqs, 1] f32 it stages (the request's temperature x the
@@ -4385,6 +4390,25 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 d.wstep2.push_back(w);
             }
             if (!w2ok) d.wstep2.clear();
+            /* lever DHD: the walk at each head depth H < block (form 0, as the short block's walks) */
+            if (const char* hc = std::getenv("RADIANCE_DRAFT_HEAD_CUT"); hc && *hc && std::strcmp(hc, "0")) {
+                bool cok = true;
+                d.wcut.assign((size_t)d.block, {});
+                for (int64_t H = 1; H < d.block && cok; ++H)
+                    for (int64_t l = 0; l <= H; ++l) {
+                        const rad_op w = op(b, "dspark_walk_step",
+                                            { RAD_RANGE("M", 1, d.wseqs), RAD_INT("step", l), RAD_INT("steps", H),
+                                              RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("N", g.n_vocab),
+                                              RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
+                                              RAD_INT("anchor_stride", d.block), RAD_STR("dtype", "f32") },
+                                            { d.mk1, d.mk2 }, { d.logits, d.wgath, d.wkeys }, { d.wkeys, d.tokens });
+                        cok = cok && w && rad_op_resolved(b, w);
+                        d.wcut[(size_t)H].push_back(w);
+                    }
+                if (!cok) d.wcut.clear();
+                rad_note(b, "DSpark lever DHD: the W1 walk %sdeclared at head depths 1 .. %lld (RADIANCE_DRAFT_HEAD_CUT)",
+                         cok ? "" : "NOT ", (long long)(d.block - 1));
+            }
             wok = wok && d.wkeys && d.wgath && d.wfill && d.wag && rad_op_resolved(b, d.wfill) && rad_op_resolved(b, d.wag);
         } else {
             const int64_t tiles = (c.n_vocab + 63) / 64;
@@ -6759,8 +6783,29 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const std::vector<rad_op>& sst = lo ? lo->sstep : d.sstep;
     const bool wdecl = lo ? (!lo->wstep.empty() || lo->wmarkov) : (d.wfill || d.wmarkov);
     const bool sampled = !sst.empty() && ds41_switch("draft_sample") >= 1 && N == S * blk && S <= d.sseqs;
-    const bool walked = sampled || (wdecl && wsw >= 1 && N == S * blk && S <= d.wseqs);
-    if (sampled) {
+    /* lever DHD: the engine cut the head to the first hb rows of each block (n_out = S x hb, hb < blk; never at a short
+     * block or while draft_sample may run): the walk's first hb steps, the merge at hb */
+    const int64_t hb = !lo && S > 0 && N % S == 0 ? N / S : 0;
+    const bool cutw = !sampled && hb >= 1 && hb < blk && (size_t)hb < d.wcut.size() && !d.wcut[(size_t)hb].empty() &&
+                      d.wfill && wsw >= 1 && S <= d.wseqs;
+    const bool walked = sampled || cutw || (wdecl && wsw >= 1 && N == S * blk && S <= d.wseqs);
+    if (cutw) {
+        const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
+        const int64_t WS = d.wseqs, KC = ds41walk::keys_cols(), GW = ds41walk::gath_cols(g.world);
+        const int64_t KR = ds41walk::plane_rows(blk, WS);
+        const std::vector<rad_op>& wst = d.wcut[(size_t)hb];
+        RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
+        for (int64_t l = 0; l < hb; ++l) {
+            const int64_t r0 = ds41walk::step_row(l, WS);
+            RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
+                        l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
+                        RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
+            RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));
+        }
+        RAD_ISSUE_N(x, wst[(size_t)hb], S, brows(d.logits, N), anchor,
+                    brow_slice(d.wgath, ds41walk::step_row(hb - 1, WS), S, GW), RAD_W(d.mk1), RAD_W(d.mk2),
+                    RAD_NONE, brows(d.tokens, S));
+    } else if (sampled) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
         const int64_t SS = d.sseqs, SR = 16, GW = SR * g.world;
         RAD_ISSUE_N(x, d.sfill, blk, brows(d.scnt, blk));

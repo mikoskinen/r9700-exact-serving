@@ -597,6 +597,11 @@ private:
         bool    on = false;
     };
     std::vector<ShortTier> short_tiers_;
+    /* DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT=1, leader env, + fn4 draft_head_cut 1): the query pass at the drafter's own block
+     * reads only the first D rows a block into its head (D = the head depth in force, below the block); the cut passes
+     * and the head rows they left out, for the minute / stop lines (short_block_line). */
+    bool                 head_cut_ = false;
+    int64_t              head_cut_n_ = 0, head_cut_rows_ = 0;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */

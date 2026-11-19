@@ -38,7 +38,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
                                         "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec",
-                                        "exl3_xr", "sched_tail_inner", "stage_lone", "draft_cost_age" };
+                                        "exl3_xr", "sched_tail_inner", "stage_lone", "draft_cost_age", "draft_head_cut" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -857,7 +857,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_head_cut, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -890,6 +890,14 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                 *err = std::string("draft_probe_backoff=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftHeadCut) {   /* DHD (DRAFTER track round 11) */
+        if (v < 0 || v > 1) {
+            if (err) *err = "draft_head_cut takes 0 (off) or 1 (a query pass at the block drafter's own block runs its head on "
+                            "the first D rows of each block; needs RADIANCE_DRAFT_HEAD_CUT=1 at start)";
             return false;
         }
         return true;

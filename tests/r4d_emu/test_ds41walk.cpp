@@ -277,6 +277,33 @@ int main(int argc, char** argv) {
             check(st == 1 ? "short block of 1 row (one step)" : "short block of 2 rows (two steps)", w, { 1, 2, 3, 4 });
         }
 
+    /* ---- DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT): the engine cuts a query pass at the drafter's own
+     * block of 5 to the first H rows of each block -- the head's logits [S x H], the walk declared at steps H with the
+     * anchors still at the block's pitch 5. Its tokens must be the first H of the uncut 5-step walk over the same rows,
+     * byte for byte (the uncut walk's own result, not only the plain walk's). */
+    for (const int H : { 1, 2, 3, 4 })
+        for (const Rnd& c : rnd) {
+            Walk w5;
+            w5.V = c.V; w5.R = c.R; w5.S = c.S; w5.steps = 5; w5.astride = 5;
+            std::vector<uint16_t> w1, w2;
+            fill_random(w5, w1, w2, rng, c.ts, c.ls, c.bad);
+            std::vector<std::vector<int32_t>> full;
+            std::string why;
+            if (!sharded_walk(w5, 4, full, &why)) { std::printf("head cut: the uncut walk refused (%s)\n", why.c_str()); ++g_fails; continue; }
+            Walk wh = w5;
+            wh.steps = H;
+            wh.logits.assign((size_t)w5.S * H * w5.V, 0.0f);
+            for (int s = 0; s < w5.S; ++s)
+                for (int l = 0; l < H; ++l)
+                    std::memcpy(&wh.logits[(size_t)(s * H + l) * w5.V], &w5.logits[(size_t)(s * 5 + l) * w5.V], (size_t)w5.V * 4);
+            std::vector<int32_t> want((size_t)w5.S * H);
+            for (int s = 0; s < w5.S; ++s)
+                for (int l = 0; l < H; ++l) want[(size_t)s * H + l] = full[0][(size_t)s * (5 + 2) + l];
+            char what[96];
+            std::snprintf(what, sizeof what, "lever DHD: head cut to %d of 5 rows = the uncut walk's first %d", H, H);
+            check(what, wh, { 1, 2, 3, 4 }, &want);
+        }
+
     /* ---- forced ties */
     {
         Walk w;

@@ -1052,6 +1052,10 @@ void Engine::block_shape(int* block, int* steps) {
 
 /* tp8 loop D18: the short block's share of the query passes so far (only while one is served). */
 void Engine::short_block_line(const char* when) const {
+    if (head_cut_)   /* DRAFTER track round 11, lever DHD */
+        RAD_INFO("speculation%s: lever DHD: %lld query passes at '%s''s own block ran its head on the first D rows of each "
+                 "block (%lld head rows left out in all) -- RADIANCE_DRAFT_HEAD_CUT", when, (long long)head_cut_n_,
+                 drafter_name_.c_str(), (long long)head_cut_rows_);
     if (drafter_short_ <= 0) return;
     if (!short_tiers_.empty()) {   /* tp8 loop D19: one part a tier */
         std::string t;
@@ -1094,13 +1098,29 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
      * the step issued ahead verifies that many (issue_ahead). */
     int block = 0, steps = 0;
     block_shape(&block, &steps);
+    /* DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT=1 at start + fn4 draft_head_cut 1): at the drafter's own block, a drafter whose every
+     * row proposes runs its head on the first D rows of each block, D = the head depth in force (draft_cycle's choice,
+     * which every sequence's window is capped by: Scheduler::draft_cap). Rows past D propose tokens no verify of the
+     * step issued ahead reads, so the first D proposals are the same tokens (each a row's own head row and the walk's
+     * first D steps) and the verify is unchanged. Not at a short block (its own op set), not while the sampled walk
+     * may run (draft_sample: that walk is declared at the whole block only), not before a depth is chosen. */
+    if (head_cut_ && fn4::get(fn4::kDraftHeadCut) == 1 && !tree_ && block == (int)drafter_.block &&
+        fn4::get(fn4::kDraftSample) < 1) {
+        const int d = lsched().block_head_cap();
+        if (d > 0 && d < steps) {
+            ++head_cut_n_;
+            head_cut_rows_ += steps - d;
+            steps = d;
+        }
+    }
     block_steps_ = steps;
     block_row_.resize((size_t)cfg_.max_seqs);
     /* The head reads the block's draft rows. A tree (rad_drafter_tree; DFlash2's convention, the
      * anchor predicts nothing) reads all block - 1 of them whatever its node count. */
     const int head = tree_ ? block - 1 : steps;
     const int n = lsched().block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
-                                     block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
+                                     block_row_.data(), (int)block_row_.size(), /*on_card=*/true,
+                                     /*front=*/head_cut_ && head < block);
 
     /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). Lever SD: only while
      * draft_sample is >= 1 -- the switch moves only at a step release, so the plugin issuing this cycle's query pass

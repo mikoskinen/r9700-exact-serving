@@ -397,6 +397,11 @@
  *                   scheduler ago does not price that depth while a fresh drafting key of the same row class exists (that
  *                   key by the prior's ratio stands in, as for an unmeasured depth). lq141 c16w: one lane held depth 2 on a
  *                   depth-3 key measured before drafter_mx 2. Starts 0. Exact: it moves only which depth a step verifies.
+ *   draft_head_cut  engine (DHD, ds41-drafter round 11; 82 here, after draft_cost_age; Engine::issue_block_drafter): 0 off (today),
+ *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
+ *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
+ *                   depth in force under the adaptive window; the verify of the step issued ahead reads those D. Starts 0.
+ *                   Exact: the first D proposals are the same tokens (a row's head row and the walk's first D steps).
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -607,7 +612,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftHeadCut, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
