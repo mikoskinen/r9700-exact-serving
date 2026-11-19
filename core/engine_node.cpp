@@ -1595,6 +1595,67 @@ int Engine::follower_loop() {
         if (v < 0) v = fol_reserve;   /* never requested: the start's */
         return v > 0 && v < 63 && ((res_mask >> v) & 1) ? v : 0;
     };
+    /* tp8 loop D33 (fn4 pp_seg_set, the follower's; RADIANCE_PP_SEG_SET=v its start value, unset 0 = every declared boundary):
+     * which declared boundaries inside W(h, t) split a pass -- every s-th (s = v / 64; 0 = 1), then the first n = v % 64 of those
+     * (0: all), and a body reserve's boundary whatever the set. With RADIANCE_PP_SEG_MAX=32 the plugin declares past the old 15
+     * (at W(10,32) SEG_LAYERS=1: 11..31), so one start compares 15 (= 11..25, the end lump [25,32) of the program before D33), 0
+     * (11..31) and 128 (12, 14 .. 30 = SEG_LAYERS=2's set). Only where a pass's segments end changes, never its ops (M4's rule). */
+    std::vector<int32_t> seg_in;
+    for (int32_t x : segs)
+        if (x > cfg_.pp_cut_h && x < cfg_.pp_cut_t) seg_in.push_back(x);
+    fn4::segset_register((int)seg_in.size());
+    auto segset_ok = [](int v) { return v >= 0 && v <= 511 && (v & 63) <= 31; };
+    int segset_start = 0;
+    const char* segset_env = std::getenv("RADIANCE_PP_SEG_SET");
+    if (segset_env && *segset_env) {
+        const int v = std::atoi(segset_env);
+        if (!segset_ok(v) || (v != 0 && seg_in.empty()))
+            RAD_WARN("follower: RADIANCE_PP_SEG_SET=%s is not taken here: %s (tp8 loop D33)", segset_env,
+                     segset_ok(v) ? "no segment boundary declared on this node (RADIANCE_PP_SEG_LAYERS)"
+                                  : "it takes n + 64 x s, n 0 .. 31, s 0 .. 7");
+        else
+            segset_start = v;
+    }
+    auto segset_now = [&]() -> int {
+        int v = fn4::get(fn4::kPpSegSet);
+        if (v < 0) v = segset_start;   /* never requested: the start's */
+        return segset_ok(v) ? v : 0;
+    };
+    /* the boundaries a pass of this set splits at (ascending), with the reserve's boundary res_l (0: none) */
+    auto segset_pick = [&](int sv, int res_l) -> std::vector<int32_t> {
+        if (sv == 0) return seg_in;
+        const int every = std::max(1, sv >> 6), first = sv & 63;
+        std::vector<int32_t> out;
+        int taken = 0;
+        for (size_t j = 0; j < seg_in.size(); ++j) {
+            bool pick = (int)(j + 1) % every == 0 && (first == 0 || taken < first);
+            if (pick) ++taken;
+            if (pick || seg_in[j] == res_l) out.push_back(seg_in[j]);
+        }
+        return out;
+    };
+    /* the D33 line: split passes and their segments by set, and the other passes run at gaps past the old cap's last boundary
+     * (seg_in[14]: the gaps inside the former end lump) -- its target quantity on the follower */
+    const int32_t lump_at = seg_in.size() > 15 ? seg_in[14] : INT32_MAX;
+    const bool d33_line = (std::getenv("RADIANCE_PP_SEG_MAX") && *std::getenv("RADIANCE_PP_SEG_MAX")) || (segset_env && *segset_env);
+    int64_t d33_passes = 0, d33_parts = 0, d33_gaps_past = 0, d33_between_past = 0;
+    int d33_last = -1;
+    if (d33_line && !seg_in.empty()) {
+        std::string b;
+        for (int32_t x : seg_in) b += fmt("%s%d", b.empty() ? "" : ", ", (int)x);
+        RAD_INFO("follower: segment set (tp8 loop D33): %zu declared boundaries inside W(%d,%d) (%s); fn4 pp_seg_set starts at %d "
+                 "(RADIANCE_PP_SEG_SET; 0 = all, n + 64 x s = every s-th then the first n)%s", seg_in.size(), cfg_.pp_cut_h,
+                 cfg_.pp_cut_t, b.c_str(), segset_start,
+                 lump_at != INT32_MAX ? fmt("; gaps past layer %d (the old 15-boundary cap's last) counted apart", (int)lump_at).c_str()
+                                      : "");
+    }
+    auto d33_print = [&](const char* when) {
+        if (!d33_line || seg_in.empty()) return;
+        RAD_INFO("follower: segment set %s (pp_seg_set now %d, tp8 loop D33): %lld split passes in %lld segments (%.2f a pass); "
+                 "%lld gaps past layer %d with %lld other passes run in them", when, segset_now(), (long long)d33_passes,
+                 (long long)d33_parts, d33_passes > 0 ? (double)d33_parts / (double)d33_passes : 0.0, (long long)d33_gaps_past,
+                 lump_at != INT32_MAX ? (int)lump_at : -1, (long long)d33_between_past);
+    };
     int64_t res_n = 0, res_frame = 0, res_time = 0;
     uint64_t res_ns = 0;
     auto reserve_line = [&](const char* when) {
@@ -1766,13 +1827,26 @@ int Engine::follower_loop() {
         const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows &&
                            (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0 || (seg_bg >= 0 && h.lane >= seg_bg));
         if (split) {
+            /* tp8 loop D33: the set's boundaries (0 = every declared one: the program before D33) */
+            const int sv = segset_now();
+            const std::vector<int32_t> pick =
+                segset_pick(sv, seg_bg >= 0 && h.lane >= seg_bg && b->n_tok_decode == 0 ? reserve_now() : 0);
             int a = pass_h;
-            for (int32_t x : segs) {
+            for (int32_t x : pick) {
                 if (x <= a || x >= cfg_.pp_cut_t) continue;
                 parts.emplace_back(a, x);
                 a = x;
             }
             parts.emplace_back(a, cfg_.pp_cut_t);
+            ++d33_passes;
+            d33_parts += (int64_t)parts.size();
+            if ((d33_line || sv != 0) && sv != d33_last) {
+                std::string bs;
+                for (size_t k = 1; k < parts.size(); ++k) bs += fmt("%s%d", bs.empty() ? "" : ", ", parts[k].first);
+                RAD_INFO("follower: pp_seg_set %d (tp8 loop D33): a split pass of W(%d,%d) now ends its segments at %s (%zu segments)",
+                         sv, pass_h, cfg_.pp_cut_t, bs.empty() ? "none" : bs.c_str(), parts.size());
+                d33_last = sv;
+            }
         } else {
             parts.emplace_back(pass_h, cfg_.pp_cut_t);
         }
@@ -1940,6 +2014,7 @@ int Engine::follower_loop() {
                 /* the segment k - 1 - ahead must have run before segment k goes out (ahead 1: one queued behind the
                  * running one), the other lanes' frames issued meanwhile */
                 const int64_t back = (int64_t)k - 1 - seg_ahead;
+                const int64_t between0 = seg_between;   /* tp8 loop D33: the passes run at this gap */
                 if (const int bs = between(back >= 0 ? seg_ev[back & 1] : nullptr); bs != 0) return bs;   /* < 0 failed, 1 stop */
                 /* tp8 loop IDEAS #9: a BG body's reserve -- its parts from RADIANCE_PP_FOL_RESERVE on wait for another BG lane's
                  * frame (held behind this pass: it keeps its place) or the limit; every other frame runs between meanwhile */
@@ -1967,6 +2042,10 @@ int Engine::follower_loop() {
                     if (how == 1) ++res_frame;
                     else ++res_time;
                     res_ns += rad_mono_ns() - r0;
+                }
+                if (parts[k].first > lump_at) {   /* tp8 loop D33: a gap inside the former end lump (a reserve's hold too) */
+                    ++d33_gaps_past;
+                    d33_between_past += seg_between - between0;
                 }
                 /* the pass between may have changed what this pass's issue reads */
                 for (auto& r : ranks_) r->stager.set_layer_end(end);
@@ -2070,6 +2149,7 @@ int Engine::follower_loop() {
                         RAD_INFO("follower: %lld frames issued ahead waited between a split pass's segments for their X1 "
                                  "(tp8 dev D10 round 2)", (long long)ia_deferred);
                     reserve_line("over the run");
+                    d33_print("over the run");
                     if (fol_order && !segs.empty())
                         RAD_INFO("follower: frame order over the run (RADIANCE_PP_FOL_ORDER=%d, tp8 loop D15): %lld decode "
                                  "frames waited between segments for their X1, %lld went before an older waiting frame, %lld "
@@ -2125,6 +2205,21 @@ int Engine::follower_loop() {
                          "passes between them, %lld held", fol_order, (long long)fo_waited, (long long)fo_jumped,
                          (long long)fo_passed, (long long)fo_graced, (long long)seg_passes,
                          (long long)seg_parts, (long long)seg_between, (long long)seg_held);
+            }
+        }
+        /* tp8 loop D33: the segment set's counts a minute (RADIANCE_PP_BGRATE_LINE_S, default 60 s; a cell = two lines' difference) */
+        if (d33_line && !seg_in.empty()) {
+            static uint64_t d33_line_ns = 0;
+            static const uint64_t d33_period_ns = [] {
+                const char* v = std::getenv("RADIANCE_PP_BGRATE_LINE_S");
+                const long long s = v && *v ? std::atoll(v) : 60;
+                return (uint64_t)std::max(1LL, s) * 1000000000ull;
+            }();
+            const uint64_t now = rad_mono_ns();
+            if (d33_line_ns == 0) d33_line_ns = now;
+            if (now - d33_line_ns >= d33_period_ns) {
+                d33_line_ns = now;
+                d33_print("so far");
             }
         }
         /* tp8 loop IDEAS #9: the reserve's counts a minute */
