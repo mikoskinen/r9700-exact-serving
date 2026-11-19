@@ -261,7 +261,7 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     /* tp8 MERGE: fn4 pp_merge starts at RADIANCE_PP_MERGE (0 unset), taken with two decode lanes or more */
     {
         int v = 0;
-        if (const char* pm = std::getenv("RADIANCE_PP_MERGE"); pm && *pm) v = std::max(0, std::min(15, std::atoi(pm)));
+        if (const char* pm = std::getenv("RADIANCE_PP_MERGE"); pm && *pm) v = std::max(0, std::min(31, std::atoi(pm)));
         if (lanes_.decode_n() < 2) v = 0;
         pp_merge_.store(v, std::memory_order_relaxed);
         fn4::note_sched(fn4::kPpMerge, v);
@@ -272,6 +272,14 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                                        : "no merge",
                      (v & 8) ? "; no BG step's leader parts in segments (RADIANCE_PP_LEAD_SEG declared or not)"
                      : (v & 4) ? "; a BG step's leader parts in segments only with the merge on (with RADIANCE_PP_LEAD_SEG)" : "");
+        int ms = 0;
+        if (const char* m = std::getenv("RADIANCE_PP_MERGE_MS"); m && *m) ms = std::max(0, std::min(60000, std::atoi(m)));
+        pp_merge_ms_.store(ms, std::memory_order_relaxed);
+        fn4::note_sched(fn4::kPpMergeMs, ms);
+        if (v && ((v & 16) || ms))
+            RAD_INFO("two-node pipeline: tp8 MERGE -- %s%s", (v & 16) ? "while merged a newcomer the BG lanes have no room for is held for "
+                     "them (RADIANCE_PP_MERGE_HOLD_MS, D11's hold)" : "", ms ? fmt("; the lanes stay merged %d ms after the last BG work "
+                     "(RADIANCE_PP_MERGE_MS, fn4 pp_merge_ms)", ms).c_str() : "");
     }
     if (lanes_.bg_room() > 0)
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROOM=%lld -- a BG lane's inbox (its next step) takes lent newcomers up to %lld "
@@ -903,6 +911,11 @@ int Engine::step_loop_lanes() {
     uint64_t mg_line_ns = rad_mono_ns();
     /* the counts run from the start (pp_merge 0 too), so the start's own split-lane reading is the A of an in-process A / B */
     const bool mg_seen = merge_ok;
+    /* bit 16: D11's hold while merged, this long at most (then the newcomer runs at home as today's MIXED step) */
+    int64_t mg_hold_ms = 1500;
+    if (const char* v = std::getenv("RADIANCE_PP_MERGE_HOLD_MS"); v && *v && std::atoi(v) > 0) mg_hold_ms = std::min(60000, std::atoi(v));
+    uint64_t mg_bg_last = 0;   /* the last round with BG work (pp_merge_ms' clock) */
+    int64_t mg_held_rounds = 0, mg_hyst_rounds = 0;
     int mg_pm_last = pp_merge_.load(std::memory_order_relaxed);
     /* the line's period (RADIANCE_PP_MERGE_LINE_S, default 60 s); it prints at every pp_merge change too, so a switch arm's
      * window is the difference of the lines at its two ends */
@@ -916,13 +929,16 @@ int Engine::step_loop_lanes() {
                  "tokens with a BG step in flight %lld in %.1f s = %.1f tok/s, without %lld in %.1f s = %.1f tok/s, ratio %.3f; "
                  "decode-commit gaps > 100 ms with a BG step in flight %lld (%.0f ms), BG steps committed %lld (%.1f ms a BG step); "
                  "requests moved in %lld / out %lld (+ %lld at later plans), free cards %lld, left behind: lent %lld, kept context rows "
-                 "%lld, in a step %lld", when, pp_merge_.load(std::memory_order_relaxed), (long long)mg.merges,
+                 "%lld, in a step %lld; held for the BG lanes %lld newcomers over %lld steps (%lld lent later, %lld home after the hold), "
+                 "rounds merged by a hold %lld / by pp_merge_ms=%d %lld", when, pp_merge_.load(std::memory_order_relaxed), (long long)mg.merges,
                  (long long)mg.drains, mg.drain_ms, (long long)mg.splits, mg.merged_s, mg.wall_s, (long long)mg.steps_m,
                  (long long)mg.tok_m, (long long)mg.rows_m, (long long)mg.steps_s, (long long)mg.tok_s, (long long)mg.rows_s,
                  (long long)mg.tok_bg, mg.bg_s, r_bg, (long long)mg.tok_nobg, mg.nobg_s, r_no, r_no > 0 ? r_bg / r_no : 0.0,
                  (long long)mg.stops, mg.stop_ms, (long long)mg.bg_commits, mg.bg_commits ? mg.stop_ms / (double)mg.bg_commits : 0.0,
                  (long long)mg.moved_in, (long long)mg.moved_out, (long long)mg.sweeps, (long long)mg.cards, (long long)mg.w_lent,
-                 (long long)mg.w_ctx, (long long)mg.w_other);
+                 (long long)mg.w_ctx, (long long)mg.w_other, (long long)lanes_.counts().hold_reqs, (long long)lanes_.counts().hold_steps,
+                 (long long)lanes_.counts().hold_lent, (long long)lanes_.counts().hold_home, (long long)mg_held_rounds,
+                 pp_merge_ms_.load(std::memory_order_relaxed), (long long)mg_hyst_rounds);
     };
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
@@ -976,7 +992,19 @@ int Engine::step_loop_lanes() {
             }
             mg.last = now;
             mg.last_bg = bg_busy;
-            const bool want = (pm & 2) || ((pm & 1) && bg_busy);
+            /* bit 16: D11's hold acts while merged (LaneSet::bg_hold_ms), and a held newcomer is BG work: the lanes stay merged */
+            lanes_.set_merge_hold_ms((pm & 16) && (pm & 3) ? mg_hold_ms : 0);
+            bool held = false;
+            if ((pm & 16) && (pm & 3) && !bg_busy) {
+                held = lanes_.held_now() > 0;
+                if (held) ++mg_held_rounds;
+            }
+            if (bg_busy || held) mg_bg_last = now;
+            /* pp_merge_ms: merged that long after the last BG work */
+            const uint64_t hyst = (uint64_t)pp_merge_ms_.load(std::memory_order_relaxed) * 1000000ull;
+            const bool lingers = mg.on && !bg_busy && !held && hyst > 0 && mg_bg_last && now - mg_bg_last < hyst;
+            if (lingers) ++mg_hyst_rounds;
+            const bool want = (pm & 2) || ((pm & 1) && (bg_busy || held || lingers));
             bool dec_busy = false;   /* a decode lane has a step in flight */
             for (int l = 0; l < lanes_.decode_n(); ++l) dec_busy = dec_busy || busy[(size_t)l];
             if (want && !mg.on) {

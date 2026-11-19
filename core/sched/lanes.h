@@ -168,7 +168,13 @@ public:
      * left out of its home's step -- the step goes out with its decode rows alone -- and planned again at the home's next step,
      * when a BG lane may take it whole; after N ms of holding it runs at home as today's MIXED step. A held newcomer has no
      * prefix restore planned (those stay home, kBgRestore). 0 (unset): off, today's MIXED step at once. */
-    int64_t bg_hold_ms() const { return bg_lane() >= 0 ? bg_hold_ms_ : 0; }
+    int64_t bg_hold_ms() const {
+        if (bg_lane() < 0) return 0;
+        /* tp8 MERGE (pp_merge bit 16 with the merge on): D11's hold at merge_hold_ms (RADIANCE_PP_MERGE_HOLD_MS) -- a newcomer the
+         * BG lanes have no room for waits for them (the lanes merge for the BG work in flight) instead of a MIXED step */
+        return bg_hold_ms_ > 0 ? bg_hold_ms_ : merge_hold_ms_;
+    }
+    void set_merge_hold_ms(int64_t ms) { merge_hold_ms_ = ms > 0 ? ms : 0; }
     void set_bg_hold_ms(int64_t ms) { bg_hold_ms_ = ms > 0 ? ms : 0; }
     /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N, 256 .. 65536 rows; with BG lanes): a BG lane's inbox -- and so its step -- may hold up to
      * N rows of lent newcomers (capped at --max-num-batched-tokens) instead of the shared budget (min(MNBT, ChunkGeometry::
@@ -250,6 +256,8 @@ public:
     }
     /* requests a parked lane still holds (any state), read under the lock: 0 = nothing left to move */
     int64_t parked_live() const;
+    /* newcomers held out of their decode lane's steps for the BG lanes now (D11's hold: SchedReq::bg_hold_us), read under the lock */
+    int64_t held_now() const;
     int  decode_n() const { return (int)lanes_.size() - bg_n(); }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
@@ -384,6 +392,7 @@ private:
     int64_t why_[kWhyN] = {};
     std::string broken_;
     std::atomic<int> merged_to_{ -1 };      /* tp8 MERGE: the merged decode lane, -1 split */
+    int64_t merge_hold_ms_ = 0;             /* tp8 MERGE bit 16: D11's hold while merged (bg_hold_ms) */
     /* tp8 MERGE: why `q` (in `s`) may not move now (MoveCounts' fields 2..4 as 0 / 1 / 2), -1 movable; and the move itself */
     int  unmovable_locked(const Scheduler& s, const SchedReq& q) const;
     void move_locked(Scheduler& src, int32_t slot, Scheduler& dst);

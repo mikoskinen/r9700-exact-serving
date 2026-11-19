@@ -2703,3 +2703,82 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
         }
     }
 }
+
+/* fn4 pp_merge bit 16 + pp_merge_ms (tp8 MERGE form 2): while merged, a newcomer the BG lanes have no room for is HELD out of the
+ * merged lane's steps (D11's hold, RADIANCE_PP_MERGE_HOLD_MS) instead of turning the one decode lane into a MIXED step, and the lanes
+ * stay merged pp_merge_ms after the last BG work. burst_set's four newcomers arrive together beside four decoders (700 rows a step: a
+ * BG inbox holds one): at 3 lanes BG 1 the BG lane takes one at a time, the rest are held; every request's tokens are one process's. */
+TEST(merge_holds_and_lingers_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        for (auto& v : burst_set(one.port)) ref.push_back(v);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; int merge; int ms; };
+    long long held_all = 0;
+    for (const Arm a : { Arm{ 3, "1,3", 1, 17, 0 }, Arm{ 3, "1,3", 1, 1, 300 }, Arm{ 4, "1,3", 2, 17, 300 }, Arm{ 3, "0,2", 1, 17, 0 } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
+        if (a.ms) env.push_back("RADIANCE_PP_MERGE_MS=" + std::to_string(a.ms));
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        for (auto& v : burst_set(pp.port)) got.push_back(v);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long merges = -1, splits = -1, held = -1, hsteps = -1, hlent = -1, hhome = -1, hold_rounds = -1, hyst_rounds = -1;
+        int pm = -1, ms = -1;
+        if (const size_t at = llog.rfind("two-node pipeline: merge over the run (fn4 pp_merge="); at != std::string::npos) {
+            double d0 = 0, d1 = 0, d2 = 0;
+            long long drains = 0;
+            (void)std::sscanf(llog.c_str() + at, "two-node pipeline: merge over the run (fn4 pp_merge=%d, tp8 MERGE): %lld merges (%lld "
+                                                 "drains, %lf ms), %lld splits, merged %lf s of %lf s", &pm, &merges, &drains, &d0, &splits,
+                              &d1, &d2);
+            if (const size_t h = llog.find("held for the BG lanes ", at); h != std::string::npos)
+                (void)std::sscanf(llog.c_str() + h, "held for the BG lanes %lld newcomers over %lld steps (%lld lent later, %lld home after "
+                                                    "the hold), rounds merged by a hold %lld / by pp_merge_ms=%d %lld", &held, &hsteps,
+                                  &hlent, &hhome, &hold_rounds, &ms, &hyst_rounds);
+        }
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            fprintf(stderr, "    %s\n", llog.substr(at, std::min<size_t>(300, llog.find('\n', at) - at)).c_str());
+        fprintf(stderr, "    pp_merge %d, pp_merge_ms %d, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld merges, %lld splits; "
+                        "held %lld newcomers over %lld steps (%lld lent, %lld home), rounds merged by a hold %lld / by pp_merge_ms %lld\n",
+                a.merge, a.ms, a.k, a.lanes, a.cut, differ, ref.size(), merges, splits, held, hsteps, hlent, hhome, hold_rounds,
+                hyst_rounds);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(pm, a.merge);
+        CHECK_EQ(ms, a.ms);
+        CHECK(merges > 0);
+        if (a.merge & 16) {
+            held_all += std::max(0LL, held);
+            CHECK_EQ(std::max(0LL, held), std::max(0LL, hlent) + std::max(0LL, hhome));
+        } else {
+            CHECK(held <= 0);
+        }
+        if (a.ms) CHECK(hyst_rounds > 0);
+    }
+    fprintf(stderr, "    newcomers held for the BG lanes while merged, all bit-16 arms: %lld\n", held_all);
+    CHECK(held_all > 0);
+}

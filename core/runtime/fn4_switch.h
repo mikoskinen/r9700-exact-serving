@@ -397,9 +397,13 @@
  *                   its inbox (the other decode lanes park; their sequences and free cards move to lane 0 once idle), and split back
  *                   when none; bit 2: merged always; bit 4: with RADIANCE_PP_LEAD_SEG declared, a BG step's leader parts run in
  *                   segments only with the merge on (bit 1 / 2: every BG step then runs beside the merged lane); bit 8: no BG leader segments at all (so ONE start with RADIANCE_PP_LEAD_SEG declared
- *                   compares whole BG parts (8 / 9) with segments while merged (5)). RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
+ *                   compares whole BG parts (8 / 9) with segments while merged (5)); bit 16: while merged a newcomer the BG lanes have
+ *                   no room for is HELD out of the merged lane's step (D11's hold, RADIANCE_PP_MERGE_HOLD_MS, default 1500) instead of
+ *                   a MIXED step of every sequence. RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
  *                   (else 0). The merged lane's occupancy rule (draft_occ) acts at once. Exact: only lane composition and the
  *                   drafting depth change (the build's composition invariance; depth moves only what a step verifies).
+ *   pp_merge_ms     engine, the leader (tp8 MERGE; 83 here): the merge's hysteresis -- the lanes stay merged this many ms after the
+ *                   last BG work ended (0 .. 60000; 0 = split at once); start value RADIANCE_PP_MERGE_MS. Exact (composition only).
  *   draft_cost_age  scheduler (DCA, ds41-drafter; 81 here, after stage_lone; sched/draft.h DraftController::cost_age): 0 off
  *                   (today); A = 16 .. 65536: a drafting depth's step-cost key last sampled more than A decode steps of its
  *                   scheduler ago does not price that depth while a fresh drafting key of the same row class exists (that
@@ -615,7 +619,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kPpMerge, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kPpMerge, kPpMergeMs, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

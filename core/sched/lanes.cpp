@@ -270,6 +270,20 @@ int64_t LaneSet::parked_live() const {
     return n;
 }
 
+int64_t LaneSet::held_now() const {
+    if (lanes_.size() <= 1 || bg_lane() < 0) return 0;
+    std::lock_guard<std::mutex> lk(*mu_);
+    int64_t n = 0;
+    for (int l = 0; l < decode_n(); ++l) {
+        const Scheduler& s = *lanes_[(size_t)l];
+        for (int32_t slot : s.running_) {
+            const SchedReq* q = slot >= 0 && (size_t)slot < s.reqs_.size() ? s.reqs_[(size_t)slot].get() : nullptr;
+            if (q && q->req && q->bg_hold_us > 0) ++n;
+        }
+    }
+    return n;
+}
+
 bool LaneSet::prefill_pending(int l) const {
     if (l < 0 || l >= (int)lanes_.size()) return false;
     std::lock_guard<std::mutex> lk(*mu_);
