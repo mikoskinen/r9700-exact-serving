@@ -992,7 +992,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
 #define GG_WK3_X2(KPV, NMV, NTV)                                                                                         \
         if (kp == KPV && nmt == NMV && nt == NTV) {                                                                       \
             if (f32out) {                                                                                                 \
-                if constexpr (KPV == 4) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float, 0, 2>), grid, dim3(256), lds, A); \
+                if constexpr (KPV == 4 || (KPV == 1 && T == GG_Q6_K)) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float, 0, 2>), grid, dim3(256), lds, A); \
                 return R4D_WK_DECLINE;                                                                                    \
             }                                                                                                             \
             return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, 0, 2>), grid, dim3(256), lds, A);               \

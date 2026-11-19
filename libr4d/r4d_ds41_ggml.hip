@@ -3695,6 +3695,33 @@ std::atomic<int> g_wmk{-1};
  * (bench pin r4d_gg_wmk_whg) = 70724 at every head call as before. */
 int g_wmk_whg = 1;
 extern "C" void r4d_gg_wmk_whg(int on) { g_wmk_whg = on ? 1 : 0; }
+/* DRAFTER track 19.11.2026 round 23 (lever HDP): WHG's head at 17..32 rows (G2 NM 2 NT 2, 127 blocks) with its raw weight words
+ * two slabs ahead (bit 23, DP 2: a ring of three register sets; the f32-out G2 form at KP 1 instantiated for q6_K since this round).
+ * xeon GPU1 r23b (--cold 256 --perfwmg q6_K, code 18945092 -> 27333700, two reps): M 24 302.6 / 303.2 -> 273.4 / 273.6 us, M 32
+ * 306.7 / 307.5 -> 277.5 / 277.9 (-9.6 %); at 33..48 rows (NM 3 NT 1) DP 2 does not move it (324.6-331.6 either way), so the rule
+ * stays as before there. The same bytes: DP only moves when a slab's words are loaded (--wmgcheck q6_K WMKCROSS 27333700 == 70724,
+ * rows = the row alone). Served: the DSpark head at c32's 16 x 2 rows, the trunk's logits at c16's 32-row lanes, DHD's 24-row head.
+ * Under fn4 ds41_wmk 11 only (FINDINGS F7: a one-card table is an in-process arm first); bench pin r4d_gg_wmk_hdp 0 = WHG's code.
+ * Lever TDP (the same round): DP 2 on the trunk's q6_K G1 calls where it measured >= 3 % faster at both reps (r23c, xeon GPU1,
+ * --cold 256 --perfwmg q5_K,q6_K,q8_0 --wmk 70724 vs 8459332 = + bit 23, A B A B, us a call at M 24 / 32 / 40 / 48):
+ *   q_a + kv pair (1792 x 5120)    32.6-33.8 / 34.1 / 43.6 / 43.8 -> 29.7-29.9 / 29.8-30.0 / 40.4-40.5 / 40.5   (17..48 rows)
+ *   o_a pair (2 x 1024 x 4096)     30.6 / 30.8 / 38.4-38.5 / 38.5-38.6 -> 27.6 / 27.6-27.7 / 34.9-35.0 / 35.1   (17..48)
+ *   q_b fold a (8192 x 1280)       33..48 rows 43.7 / 43.8-44.0 -> 39.8-39.9 / 39.9-40.0 (17..32: +2.8 %, left)
+ *   shexp gate_up 1536 (rank 0)    17..32 rows 30.3-31.2 / 32.3 -> 28.5 / 28.6 (33..48: +2.8 %, left)
+ *   shexp gate_up 1024 (ranks 1-3) 33..48 rows 29.3 / 29.4 -> 26.6-26.7 / 26.8 (17..32: -1.3 / -2.4 %, left)
+ * q5_K (+5..+25 %) and q8_0 (+2..+12 %) are slower under DP 2 at every such shape: not touched. The same bytes (DP moves only when
+ * a slab's words are loaded; --wmgcheck q6_K --wmk 70724,8459332). Mode 11 = mode 2 + HDP + TDP (rows > 48 as mode 2). */
+int g_wmk_hdp = 1;
+extern "C" void r4d_gg_wmk_hdp(int on) { g_wmk_hdp = on ? 1 : 0; }
+static int wmk_tdp(int ty, long long Ntot, long long K, long long M) {
+    constexpr int DP2 = kWmkCode | 8388608;   /* 8459332 */
+    if (ty != GG_Q6_K || M <= 16 || M > 48) return 0;
+    if ((K == 5120 && Ntot == 1792) || (K == 4096 && Ntot == 2048)) return DP2;
+    if (K == 1280 && Ntot == 8192 && M > 32) return DP2;
+    if (K == 5120 && Ntot == 1536 && M <= 32) return DP2;
+    if (K == 5120 && Ntot == 1024 && M > 32) return DP2;
+    return 0;
+}
 /* DRAFTER track 19.11.2026 round 7 (lever DQ8): under mode 2 the DSpark drafter's q8_0 dense linears at 17..48 rows take G2
  * (bit 21) with one column tile a wave (bit 22, NT 1), where it measured faster. q8_0 at these shapes is the drafter's alone (the
  * trunk's attention is q5_K / q6_K; its q8_0 is the shared expert, K 5120 x N 1536 / 1024 and K 768 / 512, not touched here).
@@ -3782,9 +3809,11 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
     const bool m2 = mode == 2 || mode >= 5;
-    if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
-    if (mode >= 5 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;
-    if (mode >= 6 && !head && M > 48 && M <= kWmkBand5) return mode == 6 ? kWmkTile : mode == 7 ? kWmkG2x4 : wmk_code64(ty, Ntot, K);
+    if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216 | (mode == 11 && g_wmk_hdp && M <= 32 ? 8388608 : 0);
+    if (mode == 11 && !head)
+        if (const int c = wmk_tdp(ty, Ntot, K, M)) return c;
+    if (mode >= 5 && mode <= 10 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;
+    if (mode >= 6 && mode <= 10 && !head && M > 48 && M <= kWmkBand5) return mode == 6 ? kWmkTile : mode == 7 ? kWmkG2x4 : wmk_code64(ty, Ntot, K);
     if ((mode == 9 || mode == 10) && !head && M > 32 && M <= 48)
         if (const int c = wmk_code48(ty, Ntot, K, mode == 10)) return c;
     if (m2 && g_wmk_dq8 && !f32out)
@@ -3825,7 +3854,7 @@ int wmk_now() {
 /* the switch takes a call of M rows (the bench pin r4d_gg_wk_pin, when set, runs ahead of it at every M) */
 bool wmk_take(long long M) {
     const int v = wmk_now();
-    return v >= 1 && M <= (v >= 5 ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-7: the band to 64 rows (tp8 loop D22 / D25) */
+    return v >= 1 && M <= (v >= 5 && v <= 10 ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-10: the band to 64 rows (tp8 loop D22 / D25); 11: 48 as 2 */
 }
 void wmk_count(long long M) {
     g_wmk_launches.fetch_add(1, std::memory_order_relaxed);
@@ -4525,7 +4554,9 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * fused launch, gemm_nt_f32) in wider forms: 1 both, 2 the router only, 3 gemm_nt_f32 only (RADIANCE_DS41_F32DEC at load);
  * the stock bytes. */
 /* Levers IX-LDSR2 / IX-NI (ds41-int9b, r4d_ds41_sparse.hip): "ix_lds" 0 / 1, index_score's LDS form (keys unpacked once a
- * workgroup, two rows a wave; the stock form's bits); "ix_ni" 0 / 1, no -inf past a row's reach in index_score's plane and
+ * workgroup, two rows a wave; the stock form's bits) -- + 2 (lever IXW, DRAFTER track round 21): the decode band (<= 48 rows)
+ * in the prefill heights' WMMA forms too (rule B: a row's score the same at every pass height; RADIANCE_DS41_IX_LDS=2 / 3 at
+ * load); "ix_ni" 0 / 1, no -inf past a row's reach in index_score's plane and
  * index_candidates reading below it only (the selection's bits). */
 int r4d_ix_lds_get();
 int r4d_ix_ni_get();
@@ -4560,8 +4591,9 @@ void r4d_mix_fin_set(int v);
 extern "C" int r4d_attn_dec_sw_get();
 extern "C" int r4d_attn_dec_sw_set(int v);
 extern "C" int r4d_attn_dec_sw_known(int v);
-/* Lever TSK (DRAFTER track round 15, r4d_ds41_sparse.hip): "ds41_tsk" 0 / 1 -- the compressing layers' decode-band attention in
- * the split-key WMMA form (rule B: its own reference); 1 only with RADIANCE_DS41_TSK=0 / 1 at load (the op's scratch sized). */
+/* Lever TSK (DRAFTER track round 15, r4d_ds41_sparse.hip): "ds41_tsk" 0 / 1 / 2 -- the compressing layers' decode-band attention in
+ * the split-key WMMA form (rule B: its own reference); 1 / 2 only with RADIANCE_DS41_TSK=0 / 1 / 2 at load (the op's scratch sized);
+ * 2 = lever TSKC (round 22): 1 with the merge's grid stepped past the full-card cliff, 1's bytes. */
 bool r4d_tsk_known(int v);
 int r4d_tsk_get();
 void r4d_tsk_set(int v);
@@ -4569,11 +4601,12 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_tsk")) return r4d_tsk_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 10 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34) */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 11 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34), 11: 2 + HDP + TDP (DRAFTER round 23) */
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
-    if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
+    if (!std::strcmp(name, "ix_lds")) return value >= 0 && value <= 3 ? 1 : -1;   /* bit 0 IX-LDSR2, bit 1 IXW (the decode band in the WMMA forms, rule B) */
+    if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_arcoded")) return value >= 0 && value <= 1048576 ? 1 : -1;
     if (!std::strcmp(name, "ar_xpush")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
@@ -4594,7 +4627,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
     if (!std::strcmp(name, "ds41_tsk")) { r4d_tsk_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 10 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 11 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
