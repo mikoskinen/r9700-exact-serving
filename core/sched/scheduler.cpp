@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <string>
 
@@ -256,6 +257,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
+        const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
+        plan_reserved_ = e && !std::strcmp(e, "1");
+    }
     {   /* lever BI's chunking: RADIANCE_SCHED_BI_CHUNK's start line once a process; the value is the fn4 switch
          * sched_bi_chunk's, read at every step planned (step()) */
         static const int bi = bi_chunk_env();
@@ -1596,7 +1601,7 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
     if (G > 0)
         for (int64_t e = (n / G + 1) * G; e < pe; e += G)
             if (e - n >= kBiMinPiece && pe - e >= kBiMinPiece) { emin = e; break; }
-    if (emin - n > cfg_.max_tok - plan_.n_tok) return 0;
+    if (emin - n > cfg_.max_tok - room_taken()) return 0;   /* tp8 loop F71: the inbox rows set aside count when set */
     if (emin == pe) return whole();
     s.bi_beg = pb;
     s.bi_end = pe;
@@ -1635,7 +1640,7 @@ int64_t Scheduler::lane_d_piece(const SchedReq& s, int64_t p, int64_t* ckpt) con
 int64_t Scheduler::noa_room() const {
     if (!noa_step_ || (noa_mode_ == 1 && noa_pieces_now_ > 0)) return 0;
     for (const StepEntry& e : plan_.e)
-        if (e.is_prefill) return std::max<int64_t>(0, cfg_.max_tok - plan_.n_tok);
+        if (e.is_prefill) return std::max<int64_t>(0, cfg_.max_tok - room_taken());   /* tp8 loop F71: + the inbox rows when set */
     return 0;
 }
 

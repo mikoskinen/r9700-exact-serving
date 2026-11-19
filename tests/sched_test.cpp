@@ -14306,6 +14306,92 @@ TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_la
     }
 }
 
+/* tp8 loop F71 (RADIANCE_PP_PLAN_RESERVED=1): a lane holding another lane's lent 2048-row piece (lane_reserve set it aside) plans its own
+ * newcomers -- 1,200 rows whole by option D's over-budget first-prefill rule, then 1,000 whole by lever NOA's room -- and both rules read
+ * the step's room as max_tok less the lane's OWN plan, so own (2,204) + the piece (2,048) = 4,252 went past max_tok 4,160 (lq187 / lq191 /
+ * lq192's 'E lane N: 2048 rows of other lanes' pieces (1) beside M of its own ... step budget 4160'). Unset: named, the build refuses it,
+ * the lane re-plans the same plan -- with no BG lane to take the newcomers it makes no step at all. With the env the inbox rows count:
+ * NOA's newcomer waits a step, every step stays within max_tok, nothing is named, every prompt completes. Planning only (which step a
+ * newcomer rides), never a pass's arithmetic. */
+TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
+    int named_off = -1, named_on = -1;
+    for (int on : { 0, 1 }) {
+        if (on) setenv("RADIANCE_PP_PLAN_RESERVED", "1", 1);
+        else unsetenv("RADIANCE_PP_PLAN_RESERVED");
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.seqs = 12;
+        REQUIRE_EQ(L.start(2), RAD_OK);
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        CHECK(DstSwitches::set("sched_noa", 2));
+        std::vector<uint64_t> dec;
+        for (int i = 0; i < 4; ++i) dec.push_back(L.submit(1, 100, 4000, 2000 + 100 * i));
+        for (int k = 0; k < 3; ++k) {   /* lane 1's decoders prefill and decode */
+            REQUIRE(L.plan(1, { 0 }) != nullptr);
+            CHECK_OK(L.commit(1, 5));
+        }
+        int over = 0, refused = 0, steps = 0, lent_seen = 0;
+        int64_t most = 0;
+        uint64_t big = 0, q = 0, q2 = 0;
+        const std::string err = stderr_of([&]() {
+            big = L.submit(0, 4096, 4, 7000);
+            REQUIRE(L.plan(0, { 1 }) != nullptr);     /* [0, 2048) at home, [2048, 4096) lent to lane 1 */
+            CHECK_OK(L.commit(0, 5));
+            q = L.submit(1, 1200, 4, 15000);          /* under the 2048 grid: D plans it whole over the budget (the step's first prefill) */
+            q2 = L.submit(1, 1000, 4, 25000);         /* and lever NOA this one whole in the max_tok room left */
+            for (int round = 0; round < 400; ++round) {
+                const Request* rb = L.req(0, big);
+                const Request* rq = L.req(1, q);
+                const Request* rq2 = L.req(1, q2);
+                if ((!rb || rb->n_computed >= 4096) && (!rq || rq->n_computed >= 1200) && (!rq2 || rq2->n_computed >= 1000)) break;
+                for (int l : { 1, 0 }) {
+                    const int64_t inbox = L.set.inbox_rows_locked(l);
+                    const RadBatch* b = L.plan(l, { 1 - l });
+                    if (!b) { ++refused; continue; }
+                    ++steps;
+                    const int64_t n = L.at(l).plan().n_tok;
+                    most = std::max(most, n);
+                    if (n > L.max_tok) ++over;
+                    if (inbox > 0) ++lent_seen;
+                    CHECK_OK(L.commit(l, 5));
+                }
+            }
+        });
+        int named = 0;
+        for (size_t at = err.find("rows of other lanes' pieces"); at != std::string::npos; at = err.find("rows of other lanes' pieces", at + 1)) ++named;
+        (on ? named_on : named_off) = named;
+        const Request* rb = L.req(0, big);
+        const Request* rq = L.req(1, q);
+        fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=%s: %d steps, %d plans refused, %d over max_tok (most %lld rows), %d steps with a lent piece, %d "
+                        "'rows of other lanes' pieces' lines; big %lld / 4096, newcomers %lld / 1200, %lld / 1000 computed\n", on ? "1" : "unset", steps, refused,
+                over, (long long)most, lent_seen, named, rb ? (long long)rb->n_computed : -1LL, rq ? (long long)rq->n_computed : -1LL,
+                L.req(1, q2) ? (long long)L.req(1, q2)->n_computed : -1LL);
+        CHECK_EQ(over, 0);   /* a plan over max_tok is never built (BatchBuilder refuses it) */
+        if (!on) {
+            /* as before: the lane's plan (4 decoders + 1,200 by D's over-budget rule + 1,000 by NOA = 2,204 of its own) beside the
+             * 2,048 set aside = 4,252 > 4,160 -- named, refused, re-planned the same, refused again: with no BG lane to take the
+             * newcomers (lq187 / lq192 had one) the lane makes no step */
+            CHECK(named > 0);
+            CHECK(refused > 0);
+            continue;
+        }
+        CHECK(lent_seen > 0);
+        CHECK(rb && rb->n_computed >= 4096);
+        CHECK(rq && rq->n_computed >= 1200);
+        CHECK(L.req(1, q2) && L.req(1, q2)->n_computed >= 1000);
+        CHECK_EQ(named, 0);
+        CHECK_EQ(refused, 0);
+        CHECK(most <= L.max_tok);
+    }
+    CHECK(named_off > 0);   /* the case the env fixes is there without it */
+    CHECK_EQ(named_on, 0);
+    unsetenv("RADIANCE_PP_PLAN_RESERVED");
+}
+
 /* tp8 dev M5 (RADIANCE_PP_LEND_MIXED=1): a newcomer that option D cuts beside decode rows (sched_bi_chunk 3, lever DST's
  * sched_mixed_tok 576 -> the 512 grid; and the 2048 grid at the published 2112) lends the pieces one process cuts after its
  * home step's piece to the other lane, whose decoders keep running beside it: the newcomer's piece ends are one lane's to

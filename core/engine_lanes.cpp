@@ -349,6 +349,30 @@ int Engine::pp_band_step(int lane, const RadBatch* b) {
     return k;
 }
 
+/* tp8 loop D35: a decode step shipped -- the gap since its lane's last decode collect (D10's issue-ahead ships before that
+ * collect: those steps find no collect time and are not counted) */
+void Engine::dch_note_head(int lane, const RadBatch* b) {
+    if (!pp_link_ || lane < 0 || lane >= RAD_PP_MAX_LANES || !dch_collect_ns_[lane]) return;
+    if (b->phase != RAD_PHASE_DECODE) { dch_collect_ns_[lane] = 0; return; }   /* a prompt step between: not a decode chain */
+    const double g = (double)(rad_mono_ns() - dch_collect_ns_[lane]) / 1e6;
+    dch_collect_ns_[lane] = 0;
+    ++dch_n_;
+    dch_ms_ += g;
+    dch_max_ms_ = std::max(dch_max_ms_, g);
+    ++dch_hist_[std::min<size_t>(511, (size_t)(g * 10.0))];
+}
+std::string Engine::dch_text() const {
+    double p50 = 0;
+    int64_t acc = 0;
+    for (size_t i = 0; i < 512; ++i) {
+        acc += dch_hist_[i];
+        if (dch_n_ > 0 && 2 * acc >= dch_n_) { p50 = (double)i / 10.0 + 0.05; break; }
+    }
+    return fmt("%lld decode steps of the lanes: their collect -> the lane's next decode step shipped p50 %.2f / mean %.2f ms (max %.1f); the "
+               "collect's wait for the card mean %.2f ms over %lld collects", (long long)dch_n_, p50, dch_n_ ? dch_ms_ / (double)dch_n_ : 0.0,
+               dch_max_ms_, dch_wait_n_ ? dch_wait_ms_ / (double)dch_wait_n_ : 0.0, (long long)dch_wait_n_);
+}
+
 int Engine::lane_head(int lane, const RadBatch* b) {
     lane_select(lane);
     /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1): this chunk's head, bracketed on rank 0's stream */
@@ -369,6 +393,7 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     const int ss = pp_ship(b, true, lane);
     pp_ship_band_ = 0;
     if (ss < 0) return ss;
+    dch_note_head(lane, b);   /* tp8 loop D35 */
     if (band) ++pp_band_n_;
     pp_set_pass(lane, RAD_PP_PART_HEAD, 0, 0, band);
     issue_what_.store(kIssueModel, std::memory_order_release);
@@ -961,7 +986,7 @@ int Engine::step_loop_lanes() {
         int64_t tok_bg = 0, tok_nobg = 0, stops = 0, bg_commits = 0;
     } bgr;
     const bool bgr_on = lanes_.bg_lane() >= 0;
-    uint64_t bgr_every = 60000000000ull, bgr_line_ns = rad_mono_ns();
+    uint64_t bgr_every = 60000000000ull, bgr_line_ns = rad_mono_ns(), dch_line_ns = 0;
     if (const char* v = std::getenv("RADIANCE_PP_BGRATE_LINE_S"); v && *v && std::atoi(v) > 0) bgr_every = (uint64_t)std::atoi(v) * 1000000000ull;
     auto bgr_line = [&](const char* when) {
         const double r_bg = bgr.bg_s > 0 ? (double)bgr.tok_bg / bgr.bg_s : 0.0, r_no = bgr.nobg_s > 0 ? (double)bgr.tok_nobg / bgr.nobg_s : 0.0;
@@ -1359,6 +1384,14 @@ int Engine::step_loop_lanes() {
                 bgr_line_ns = now;
             }
         }
+        if (pp_link_ && dch_n_ > 0) {   /* tp8 loop D35: the decode chain's host part, at the D32 line's period */
+            const uint64_t now = rad_mono_ns();
+            if (!dch_line_ns) dch_line_ns = now;
+            if (now - dch_line_ns >= bgr_every) {
+                RAD_INFO("two-node pipeline: decode chain on the leader host so far (tp8 loop D35): %s", dch_text().c_str());
+                dch_line_ns = now;
+            }
+        }
         gaps.host_tail(b, tt0, rad_mono_ns());
         gaps.tail(lane, b);
         if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
@@ -1418,6 +1451,8 @@ int Engine::step_loop_lanes() {
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
     if (lseg) lseg_line("");
     if (bgr_on) bgr_line(" over the run");   /* tp8 loop D32 */
+    if (pp_link_ && dch_n_ > 0)                /* tp8 loop D35 */
+        RAD_INFO("two-node pipeline: decode chain on the leader host over the run (tp8 loop D35): %s", dch_text().c_str());
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);
@@ -1689,9 +1724,16 @@ int Engine::lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on
     /* tp8 loop P7: whether this is a timeline chunk, and the one with its prompt's first token */
     const uint64_t pff0 = pf_tl_ ? rad_mono_ns() : 0;
     const bool pf_tok = pf_tl_ && pf_entry(b, plan) && plan.e[0].produces_token;
+    const uint64_t dcw0 = rad_mono_ns();   /* tp8 loop D35: the collect's wait */
     int st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
     if (t_on) phase_mark(PH_COLLECT);
     if (st < 0) return st;
+    if (pp_link_ && b->phase == RAD_PHASE_DECODE && lane >= 0 && lane < RAD_PP_MAX_LANES) {
+        const uint64_t now = rad_mono_ns();
+        dch_wait_ms_ += (double)(now - dcw0) / 1e6;
+        ++dch_wait_n_;
+        dch_collect_ns_[lane] = now;
+    }
     if (pp_link_)
         for (int k = 0; k < n_lanes_ * RAD_PP_N_RINGS; ++k)
             for (RadPpRing* q : { pp_send_[k], pp_recv_[k] })

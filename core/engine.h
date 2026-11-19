@@ -410,6 +410,15 @@ private:
      * switches and the PSK plan prepare_release applied). One a lane (tp8 S5); [0] on one lane. */
     bool       pp_trunk_pending_[RAD_PP_MAX_LANES] = {};
     int64_t    pp_steps_shipped_ = 0, pp_builds_shipped_ = 0;
+    /* tp8 loop D35 (DECODE round 26; counters only): the leader host's part of a decode lane's chain -- a decode step's collect
+     * returned -> the lane's next decode step shipped (commit, drafter finish, plan, release, head issue: the time no part of
+     * this lane's chain is on either card), and the collect's own wait for the card; a 0.1-ms histogram for the p50 */
+    uint64_t   dch_collect_ns_[RAD_PP_MAX_LANES] = {};
+    int64_t    dch_n_ = 0, dch_wait_n_ = 0;
+    double     dch_ms_ = 0, dch_max_ms_ = 0, dch_wait_ms_ = 0;
+    uint32_t   dch_hist_[512] = {};
+    void       dch_note_head(int lane, const RadBatch* b);
+    std::string dch_text() const;
     bool       pp_closed_ = false;
     /* tp8 dev D10 round 2: the step being shipped was issued ahead of its lane's collect (its frame's flags bit 1): its X1
      * lands only after the leader's tail of the step before it, so the follower issues its pass once X1 has landed */
