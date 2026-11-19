@@ -2122,7 +2122,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             }
         }
         if (rad_op_declared(b, "router_gemm_f32_scored_topk_scatter")) {
-            rgs_fused_rows = sort_rows < 48 ? sort_rows : 48;
+            /* 48 rows (lever FUSE-R's band); RADIANCE_RGS_ROWS=64 at load (lever RGP, DRAFTER track round 17: a library whose
+             * fused router takes 64 rows) declares it to 64, so a 49..64-row pass is one launch instead of the projection +
+             * router_scored_topk_scatter pair. Any other value: 48. */
+            const char* rgs_env = std::getenv("RADIANCE_RGS_ROWS");
+            const int64_t rgs_cap = rgs_env && std::atoi(rgs_env) == 64 ? 64 : 48;
+            rgs_fused_rows = sort_rows < rgs_cap ? sort_rows : rgs_cap;
             const RadParam fp[] = {
                 RAD_RANGE("M", 1, rgs_fused_rows), RAD_INT("K", glm_router.g.n_embd), RAD_INT("n_expert", c.n_expert_all),
                 RAD_INT("n_local", c.n_expert), RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),
