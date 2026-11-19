@@ -3045,6 +3045,52 @@ TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_do
     }
 }
 
+/* tp8 loop F73 (lq189: a card could not back the KV pool made again right after freeing it -> startup stopped): the remake is
+ * retried for ~2 s, then the pool is kept at its old size (a WARN; that card's headroom stays short by the unseen part) instead of
+ * stopping the start. RADIANCE_KV_PLACED_TEST_FAIL=N refuses the first N tries: 3 -> made after the retries (given back as
+ * before), 400 -> kept on every rank of both nodes; the pair serves one process's greedy tokens at 2 lanes W(1,3) either way. */
+TEST(kv_placed_remake_retries_then_keeps_the_pool) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> big = { "--max-model-len", "262144" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", cat({ "--max-num-seqs", "6" }, big)));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    for (const char* fail : { "3", "400" }) {
+        const std::vector<std::string> kvp = { "RADIANCE_KV_PLACED=1", "RADIANCE_KV_PLACED_TEST_MIB=48",
+                                               std::string("RADIANCE_KV_PLACED_TEST_FAIL=") + fail };
+        Serving pp;
+        REQUIRE(pp.start("1,3", cat(lane_shape(2), big), cat(kSplitEnv, kvp)));
+        const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) if (ref[i] != got[i]) ++differ;
+        int kept = 0, gave = 0;
+        for (const std::string* log : { &llog, &flog }) {
+            if (log->find("-- kept at ") != std::string::npos && log->find("(tp8 loop F73)") != std::string::npos) ++kept;
+            if (log->find("RADIANCE_KV_PLACED=1: the KV pool gave back") != std::string::npos) ++gave;
+        }
+        fprintf(stderr, "    TEST_FAIL=%s, 2 lanes W(1,3), RADIANCE_KV_PLACED=1: %d of %zu prompts differ; kept on %d node(s), gave back on %d\n",
+                fail, differ, ref.size(), kept, gave);
+        CHECK_EQ(differ, 0);
+        if (std::strcmp(fail, "3") == 0) {
+            CHECK_EQ(gave, 2);
+        } else {
+            CHECK_EQ(kept, 2);
+        }
+        if (differ || (std::strcmp(fail, "3") == 0 ? gave != 2 : kept != 2))
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 40).c_str());
+    }
+}
+
 /* tp8 loop F66 (lever KVP): RADIANCE_KV_PLACED=1 on both nodes with RADIANCE_KV_PLACED_TEST_MIB=48 (48 MiB a card
  * "lost beside the budget", the host backend's stand-in for the page tables a card's mapped host memory costs):
  * each KV pool gives it back before the count, the node that pages more returns its pages past the agreed count,
