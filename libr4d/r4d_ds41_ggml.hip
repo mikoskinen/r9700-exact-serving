@@ -3739,13 +3739,50 @@ constexpr long long kWmkBand5 = 64;
  * 52499524 on one card). One start A/Bs 5 / 6 / 7 in process (a switch flip bumps the epoch: recorded passes re-record). */
 constexpr int kWmkG2x4 = kWmkCode | 2097152 | 16777216 | 33554432;   /* 52499524 */
 constexpr int kWmkTile = 595012;                                     /* 70724 | bit 19 */
+/* tp8 loop D25 step 2b (DECODE round 21): mode 8 = mode 5 + a per-shape code at 49..64 rows from the one-card run d25a-de3b (TEST
+ * 08:50, gpu03 card c4:00, --perfwmg 48,56,64 under 70724 / 595012 / 52499524, us a call at 64 rows): wide-N short-K calls take the
+ * four-tile G2 (q6_K o_b 52.17 -> 46.06, q_b fold a 53.55 -> 37.30, engram_kv 180.79 -> 138.49; q5_K o_b 52.31 -> 38.41, q_b 45.13 ->
+ * 32.33; q8_0 shexp down 21.17 -> 18.37), the q8_0 shared-expert gate_up the per-tile rule (39.16 -> 33.36), every other shape 70724
+ * (the o_a / q_a + kv pairs and q6_K shexp gate_up / down are fastest there). Rank-0 dense a 64-row step (the bench's TP4 call counts):
+ * mode 5 10.29 ms, mode 8 9.14 ms (-11.2 %; the per-shape best 9.12). The same bytes as every mode (the part order; d25a-de3b's
+ * --wmgcheck 70724 / 595012 / 52499524: 81,654 rows vs the row alone, 0 differ). */
+static int wmk_code64(int ty, long long Ntot, long long K) {
+    if (Ntot >= 5120 && K >= 1280) return kWmkG2x4;
+    if (ty == GG_Q8_0 && Ntot == 5120 && (K == 768 || K == 512)) return kWmkG2x4;
+    if (ty == GG_Q8_0 && K == 5120 && (Ntot == 1536 || Ntot == 1024)) return kWmkTile;
+    return kWmkCode;
+}
+/* tp8 loop D27 (DECODE round 22): mode 9 = mode 8 + a per-shape code for the trunk's non-head dense calls of 33..48 rows (c32's
+ * 48-row lanes at depth 2: stk / BEST), from the same one-card run's 48-row column (d25a-de3b, us a call, 70724 -> the winner, kept
+ * where >= 3 % faster): q_b fold a (8192 x 1280) the four-tile G2 (q5_K 38.32 -> 26.78, q6_K 45.70 -> 31.32), engram_kv (q6_K 6400 x
+ * 6144) G2 (141.25 -> 109.20), q5_K o_b (5120 x 2048) G2 (35.28 -> 33.86); the per-tile rule 595012 for the q_a + kv pair (1792 x
+ * 5120: q5_K 46.63 -> 39.59, q6_K 40.27 -> 38.93), the q5_K o_a pair (2048 x 4096: 39.05 -> 33.19), the shared expert's gate_up
+ * at 1024 (q6_K 25.94 -> 24.61, q8_0 26.23 -> 23.53) and the q8_0 one at 1536 (37.62 -> 34.10); everything else 70724 (q6_K o_b /
+ * o_a, q6_K gate_up 1536, every shexp down: 70724 fastest or within 1 %). Rank-0 dense a 48-row step by the bench (q6_K layer:
+ * q_b + pair + o_b + o_a + gate_up + down) ~212 -> ~196 us; q5_K attention ops 159.3 -> 133.4 us (-16 %). q8_0 attention shapes
+ * (the drafter's) keep DQ8's rule. The same bytes: the three codes d25a-de3b's --wmgcheck proved (M 1..130 vs the row alone,
+ * WMKCROSS 48 rows alone: 595012 == 70724, 52499524 == 70724 on every shape). F7 (one-card tables did not carry to the server)
+ * is why it is a value of the switch: stk {ds41_wmk 2} vs {ds41_wmk 9} in one start. */
+static int wmk_code48(int ty, long long Ntot, long long K) {
+    const bool kq = ty == GG_Q5_K || ty == GG_Q6_K;
+    if (kq && Ntot == 8192 && K == 1280) return kWmkG2x4;
+    if (ty == GG_Q6_K && Ntot == 6400 && K == 6144) return kWmkG2x4;
+    if (ty == GG_Q5_K && Ntot == 5120 && K == 2048) return kWmkG2x4;
+    if (kq && Ntot == 1792 && K == 5120) return kWmkTile;
+    if (ty == GG_Q5_K && Ntot == 2048 && K == 4096) return kWmkTile;
+    if ((ty == GG_Q6_K || ty == GG_Q8_0) && Ntot == 1024 && K == 5120) return kWmkTile;
+    if (ty == GG_Q8_0 && Ntot == 1536 && K == 5120) return kWmkTile;
+    return 0;
+}
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
     const bool m2 = mode == 2 || mode >= 5;
     if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
     if (mode >= 5 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;
-    if (mode >= 6 && !head && M > 48 && M <= kWmkBand5) return mode == 6 ? kWmkTile : kWmkG2x4;
+    if (mode >= 6 && !head && M > 48 && M <= kWmkBand5) return mode == 6 ? kWmkTile : mode == 7 ? kWmkG2x4 : wmk_code64(ty, Ntot, K);
+    if (mode == 9 && !head && M > 32 && M <= 48)
+        if (const int c = wmk_code48(ty, Ntot, K)) return c;
     if (m2 && g_wmk_dq8 && !f32out)
         if (const int c = wmk_dq8(ty, Ntot, K, M)) return c;
     /* mode 4 (DRAFTER round 7, an in-process A/B code like F7's 2 / 3): mode 2 WITHOUT the WHG / DQ8 rules above = 70724 at every
@@ -3773,7 +3810,7 @@ int wmk_now() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_WMK");
         int unread = -1;
-        const int want = e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 / 3 / 4 / 5 / 6 / 7 */
+        const int want = e && e[0] >= '1' && e[0] <= '9' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 .. 9 */
         const bool first = g_wmk.compare_exchange_strong(unread, want);
         v = g_wmk.load(std::memory_order_relaxed);
         if (first && want >= 1) std::fprintf(stderr, "radiance: libr4d: lever WMK (ds41_wmk %d, RADIANCE_DS41_WMK): dense GGUF GEMMs at every row "
@@ -4514,10 +4551,15 @@ void r4d_mix_wv_set(int v);
  * RADIANCE_DS41_MIX_FIN=1 at load. */
 int r4d_mix_fin_get();
 void r4d_mix_fin_set(int v);
+/* tp8 loop D26 (r4d_ds41_sparse.hip): "ds41_attn_dec" 0 .. 7 -- the decode band's attention form at > 256 keys a row where the
+ * rule takes form 4 (0 = the rule, N = form N - 1); every form the same bytes. RADIANCE_DS41_ATTN_DEC=N at load. */
+extern "C" int r4d_attn_dec_sw_get();
+extern "C" int r4d_attn_dec_sw_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 7 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code (D25) */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 9 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27) */
+    if (!std::strcmp(name, "ds41_attn_dec")) return value >= 0 && value <= 7 ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
@@ -4540,7 +4582,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) { r4d_ar_xpush_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 7 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 9 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
@@ -4564,6 +4607,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ds41_mix_wv")) { *applied = r4d_mix_wv_get(); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { *applied = r4d_mix_fin_get(); return 1; }
     if (!std::strcmp(name, "ds41_wmk")) { *applied = wmk_now(); return 1; }
+    if (!std::strcmp(name, "ds41_attn_dec")) { *applied = r4d_attn_dec_sw_get(); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { *applied = r4d_gg_mr_m16_get(); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }

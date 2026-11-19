@@ -188,7 +188,7 @@ TEST(the_sp_route_switches_are_deepseek41s_and_a_followers) {
     CHECK_EQ(fn4::switch_index("ds41_sphc"), (int)fn4::kDs41Sphc);
     CHECK_EQ(fn4::switch_index("ds41_sphc_attn"), (int)fn4::kDs41SphcAttn);
     CHECK_EQ(fn4::switch_index("ds41_sphc_seg"), (int)fn4::kDs41SphcSeg);
-    CHECK_EQ((int)fn4::kDs41Sphc, (int)fn4::kDs41Prefetch + 1);   /* after DECODE's D23 draft_short_blk (82) and D24 ds41_prefetch (83) since the 19.11. merges */
+    CHECK_EQ((int)fn4::kDs41Sphc, (int)fn4::kDs41AttnDec + 1);   /* after DECODE's D23 draft_short_blk (82), D24 ds41_prefetch (83) and D26 ds41_attn_dec (84) since the 19.11. merges */
     CHECK_EQ((int)fn4::kPpBgRoom, (int)fn4::kDs41SphcSeg + 1);   /* tp8 loop P23s after them: the leader's own */
     CHECK_EQ(fn4::switch_index("pp_bg_room"), (int)fn4::kPpBgRoom);
     CHECK_EQ(fn4::switch_index("pp_bg_join_ms"), (int)fn4::kPpBgJoinMs);

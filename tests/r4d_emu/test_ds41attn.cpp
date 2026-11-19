@@ -28,6 +28,9 @@
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs*, RadStream);
 extern "C" int r4d_ds41_entry_store_nv4(const RadArgs*, RadStream);
 extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs*);
+extern "C" int r4d_attn_dec_sw_set(int v);
+extern "C" int r4d_attn_dec_sw_get();
+extern "C" long long r4d_attn_dec_sw_calls();
 
 namespace {
 
@@ -329,6 +332,56 @@ void run_case(const char* name, const Fix& f, int64_t q_pitch, const Ref& ref) {
                 (long long)dkr, (long long)no, dg, wr, ds);
 }
 
+/* tp8 loop D26 (DECODE round 22): fn4 ds41_attn_dec (r4d_attn_dec_sw_set here; libr4d's rad_fn4_* on the engine) -- at a pass of
+ * more than 256 keys a row and more than 256 row-head pairs (the rule's form 4) every value 1 .. 7 (form 0 .. 6) gives the rule's
+ * bytes over the bf16 cache, the packed one and lever NVG's gathered rows (the trunk's served DKV-G path: the plain kernel over
+ * unpacked selections); the launches it moves are counted (none at value 5 = form 4, none at 0); a pass of <= 256 row-head
+ * pairs or <= 256 keys a row stays on the rule's form (the counter does not move). Values outside 0 .. 7 are refused. */
+void d26_case(const char* name, const Fix& f, bool moved_expected) {
+    std::vector<uint16_t> pk((size_t)(f.ncblk * kSlots), 0x7777);
+    expect(store_nv4(r4d_ds41_entry_store_nv4, f, pk.data()) == RAD_OK, name, "entry_store nvfp4");
+    const size_t no = (size_t)f.M * f.H * kD;
+    const int64_t need = gather_scratch(f, true, 4160);
+    std::vector<uint16_t> scr((size_t)(need / 2 + 8), 0x4444);
+    uint16_t* sp = (uint16_t*)(((uintptr_t)scr.data() + 15) & ~(uintptr_t)15);
+    std::vector<uint16_t> base[3];
+    long long bad = 0, moved_bad = 0;
+    for (int v = 0; v <= 7; ++v) {
+        expect(r4d_attn_dec_sw_set(v) == 1 && r4d_attn_dec_sw_get() == v, name, "ds41_attn_dec not applied", v, 0);
+        for (int path = 0; path < 3; ++path) {
+            std::vector<uint16_t> o(no, (uint16_t)(0x1357 + v));
+            const long long c0 = r4d_attn_dec_sw_calls();
+            const int rc = path == 0 ? attn(r4d_rad_ds41_attn_sparse_sink, f, nullptr, o.data(), 0, f.q.data())
+                         : path == 1 ? attn(r4d_rad_ds41_attn_sparse_sink, f, pk.data(), o.data(), 0, f.q.data())
+                                     : attn(r4d_rad_ds41_attn_sparse_sink, f, pk.data(), o.data(), 0, f.q.data(), sp, need);
+            expect(rc == RAD_OK, name, "attn", v, path);
+            const long long dc = r4d_attn_dec_sw_calls() - c0;
+            const bool want = moved_expected && v >= 1 && v != 5;
+            if ((dc > 0) != want) ++moved_bad;
+            if (v == 0) {
+                base[path] = o;
+                if (path > 0) {
+                    long long d = 0;
+                    for (size_t i = 0; i < no; ++i) d += o[i] != base[0][i];
+                    expect(d == 0, name, "the rule: packed / gathered output differs from the bf16 cache's", d, path);
+                }
+                continue;
+            }
+            long long d = 0;
+            for (size_t i = 0; i < no; ++i) d += o[i] != base[path][i];
+            if (d) std::printf("  D26 %s: value %d path %d: %lld of %zu outputs differ from the rule's\n", name, v, path, d, no);
+            bad += d != 0;
+        }
+    }
+    expect(bad == 0, name, "a ds41_attn_dec value changed the bytes", bad, 0);
+    expect(moved_bad == 0, name, "ds41_attn_dec moved a launch it must not (or did not move one it must)", moved_bad, 0);
+    expect(r4d_attn_dec_sw_set(8) < 0 && r4d_attn_dec_sw_set(-1) < 0 && r4d_attn_dec_sw_get() == 7, name,
+           "ds41_attn_dec 8 / -1 not refused", r4d_attn_dec_sw_get(), 7);
+    r4d_attn_dec_sw_set(0);
+    std::printf("%-46s rows %d heads %d keys %d+%d: ds41_attn_dec 1 .. 7 x (bf16, nvfp4, NVG gathered) vs the rule: %lld value-path(s) "
+                "differ; launches moved as expected (%s)\n", name, f.M, f.H, f.win, f.topk, bad, moved_expected ? "moved" : "none");
+}
+
 }  // namespace
 
 int main() {
@@ -364,6 +417,17 @@ int main() {
     /* WMMA prefill: 64 rows, 16 heads, ratio 1 and 2 */
     run_case("WMMA, 64 rows", make(34, 16, 1, { { 64, 2047 } }), 0, ref);
     run_case("WMMA, 64 rows, ratio 2", make(35, 16, 2, { { 64, 3071 } }), 0, ref);
+    /* tp8 loop D26: the decode attention's form switch (the model's ratio 4, 16 heads a rank): 24 rows of 8 sequences x 3 (c16's
+     * lanes at depth 2) over window 128 + 192 selections (320 keys) -> moved; 17 rows of one sequence -> moved (272 row-heads);
+     * 16 rows (256 row-heads, the rule's form 3) and a 24-row pass at 128 + 64 keys (192 <= 256) -> not moved */
+    {
+        std::vector<std::pair<int, int>> c16;
+        for (int s = 0; s < 8; ++s) c16.push_back({ 3, 2400 + 97 * s });
+        d26_case("D26 ds41_attn_dec, 24 rows (8 x 3), 320 keys", make(51, 16, 4, c16, 192), true);
+        d26_case("D26 ds41_attn_dec, 17 rows, 320 keys", make(52, 16, 4, { { 17, 3100 } }, 192), true);
+        d26_case("D26 ds41_attn_dec, 16 rows (256 row-heads)", make(53, 16, 4, { { 16, 3100 } }, 192), false);
+        d26_case("D26 ds41_attn_dec, 24 rows, 192 keys", make(54, 16, 4, c16, 64), false);
+    }
     std::printf("ds41 packed latent: %d checks, %d failure(s)\n", g_check, g_fail);
     return g_fail ? 1 : 0;
 }
