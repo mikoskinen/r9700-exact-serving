@@ -18,7 +18,7 @@
  *     3. INFO: the GEMM at the newcomer's eight rank-0 shapes (run-p30a.sh's list and weights) + the release's shared expert at
  *        TP4 (shexp_gate_up_rel 1152 x 5120, shexp_down_rel 5120 x 576) x M 16 / 1100 / 4096 -- rows
  *        gemm_fp8a8e8_b32_first (byte staging, tile 16), gemm_fp8a8e8_b32 (16-byte staging, tile 16), _mt32 / _mt64 (16-byte, tile 32 / 64;
- *        above 16 rows), and the SAS forms gemm_fp8a8e8_b32s / _mt32s / _mt64s -- us a call over 10 timed launches after 2 warm ones, as `P30W name NxK M=m wW row us us` lines that
+ *        above 16 rows), and the SAS forms gemm_fp8a8e8_b32s / _mt32s / _mt64s / _mt128s -- us a call over 10 timed launches after 2 warm ones, as `P30W name NxK M=m wW row us us` lines that
  *        tp8/devpf/scripts/p30read.py reads beside run-p30a.sh's (published B5SUM 101.16 / 356.15 ms at M 1100 / 4096).
  */
 
@@ -204,13 +204,13 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
     const std::vector<uint8_t> got = g.y.down();
     /* the other forms over the same operands into a re-poisoned y: every byte (padding included) = the first form's --
      * 16-byte staging at tile 16 / 32 / 64, then (SAS, PREFILL round 24) the same three with the scales through LDS */
-    int64_t mtdiff[6] = { 0, 0, 0, 0, 0, 0 };
-    const int nforms = has_sas ? 6 : 3;
+    int64_t mtdiff[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    const int nforms = has_sas ? 7 : 3;
     for (int t = 0; t < nforms; ++t) {
         st_memcpy(g.y.d, g.y.b.data(), g.y.b.size(), hipMemcpyHostToDevice);
         pin_ld(pl, 16);
-        pin_mt(pl, 16 << (t % 3));   /* 16, 32, 64 */
-        pin_sas(pl, t / 3);
+        pin_mt(pl, t == 6 ? 128 : 16 << (t % 3));   /* 16, 32, 64 (+ SAS); 6: MT 128 with SAS */
+        pin_sas(pl, t >= 3 ? 1 : 0);
         run_case(row, dt, ps);
         const std::vector<uint8_t> g2 = g.y.down();
         for (size_t i = 0; i < got.size(); ++i) mtdiff[t] += g2[i] != got[i];
@@ -245,16 +245,17 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
            worst, guards ? "" : "; PADDING / GUARDS TOUCHED").c_str(),
        orc == RAD_OK && diff == 0 && nonfin == 0 && guards, orc == RAD_OK ? "" : "oracle rc " + std::to_string(orc));
     ok(fmt("gemm_fp8a8e8_b32 16-byte staging at M tile 16 / 32 / 64 (+ SAS: the same three, scales through LDS) = the first form "
-           "byte for byte, M %lld N %lld K %lld%s: %lld / %lld / %lld (SAS %s%lld / %lld / %lld) bytes differ", (long long)M, (long long)N,
-           (long long)K, pitched ? " (pitched)" : "", (long long)mtdiff[0], (long long)mtdiff[1], (long long)mtdiff[2],
-           has_sas ? "" : "not in this libr4d: ", (long long)mtdiff[3], (long long)mtdiff[4], (long long)mtdiff[5]).c_str(),
-       mtdiff[0] == 0 && mtdiff[1] == 0 && mtdiff[2] == 0 && mtdiff[3] == 0 && mtdiff[4] == 0 && mtdiff[5] == 0);
+           "byte for byte, M %lld N %lld K %lld%s: %lld / %lld / %lld (SAS %s%lld / %lld / %lld / MT 128 %lld) bytes differ", (long long)M,
+           (long long)N, (long long)K, pitched ? " (pitched)" : "", (long long)mtdiff[0], (long long)mtdiff[1], (long long)mtdiff[2],
+           has_sas ? "" : "not in this libr4d: ", (long long)mtdiff[3], (long long)mtdiff[4], (long long)mtdiff[5], (long long)mtdiff[6]).c_str(),
+       mtdiff[0] == 0 && mtdiff[1] == 0 && mtdiff[2] == 0 && mtdiff[3] == 0 && mtdiff[4] == 0 && mtdiff[5] == 0 && mtdiff[6] == 0);
     dfree_all();
 }
 
 static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* name, int64_t N, int64_t K, int64_t M, int w, int mt,
                       int ld, int sas = 0) {
     const char* rn = ld == 4      ? "gemm_fp8a8e8_b32_first"
+                     : mt == 128 ? "gemm_fp8a8e8_b32_mt128s"
                      : mt == 64  ? (sas ? "gemm_fp8a8e8_b32_mt64s" : "gemm_fp8a8e8_b32_mt64")
                      : mt == 32  ? (sas ? "gemm_fp8a8e8_b32_mt32s" : "gemm_fp8a8e8_b32_mt32")
                                  : (sas ? "gemm_fp8a8e8_b32s" : "gemm_fp8a8e8_b32");
@@ -333,11 +334,12 @@ static void p30o_cases(const Plugin& pl) {
                           { "shexp_gate_up_rel", 1152, 5120, 0 }, { "shexp_down_rel", 5120, 576, 0 } };
     const bool has_sas = pin_sas(pl, 0);
     for (int64_t M : { 16, 1100, 4096 })
-        for (int f = 0; f < (has_sas ? 7 : 4); ++f) {   /* the first form (byte staging, tile 16), 16-byte staging at tile 16, 32, 64;
-                                                         * f 4-6: the same three with SAS (PREFILL round 24) */
+        for (int f = 0; f < (has_sas ? 8 : 4); ++f) {   /* the first form (byte staging, tile 16), 16-byte staging at tile 16, 32, 64;
+                                                         * f 4-6: the same three with SAS, f 7: MT 128 with SAS (PREFILL round 24) */
             const int fm = f >= 4 ? f - 3 : f;
             if (M <= 16 && fm >= 2) continue;   /* a launch of <= 16 rows is one 16-row tile at any pin */
-            for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, fm == 3 ? 64 : fm == 2 ? 32 : 16, fm == 0 ? 4 : 16, f >= 4);
+            for (const Sh& s : shapes)
+                gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, fm == 4 ? 128 : fm == 3 ? 64 : fm == 2 ? 32 : 16, fm == 0 ? 4 : 16, f >= 4);
         }
     pin_sas(pl, -1);
     dlclose(ref);
