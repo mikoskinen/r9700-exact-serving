@@ -1772,6 +1772,10 @@ static const RadOpSchema kSchemas[] = {
   "WEIGHT TABLE of n_expert entries, each read as gemm_nt_ggml reads its weight (native blocks, or "
   "the float [N, K] logical form), so each output row equals gemm_nt_ggml's for its row and "
   "expert." },
+{ "moe_gemm_mxil", ARR(pMoeGemmGgml), ARR(oMoeGemmGgml),
+  "moe_gemm_ggml at type=mxfp4 with each expert's native blocks stored tile-interleaved (libr4d's lever WIL, tag "
+  "r4d_mxfp4_il16: 16-row x 1-block tiles of 272 bytes, the native blocks' bytes moved): the same values, so each "
+  "output row equals moe_gemm_ggml's for its row and expert." },
 { "logits_gemm_ggml", ARR(pLogitsGgml), ARR(oLogitsGgml),
   "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`, read as gemm_nt_ggml reads its "
   "weight: logits[M, n_vocab] (f32) = x[M, n_embd] . lm_head^T." },
@@ -2512,6 +2516,11 @@ extern "C" int ref_ggml_relayout(const RadParam*, int, int, const RadEncoding*, 
                                  const RadTensor*, int, void*, int64_t);
 extern "C" int ref_ggml_unrelayout(const RadParam*, int, int, const RadEncoding*, const int*,
                                    const void*, int64_t, const RadTensor*, int);
+extern "C" int ref_mxil_layout(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int, RadLayout*);
+extern "C" int ref_mxil_relayout(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int, void*,
+                                 int64_t);
+extern "C" int ref_mxil_unrelayout(const RadParam*, int, int, const RadEncoding*, const int*, const void*, int64_t,
+                                   const RadTensor*, int);
 /* A GEMM over llama.cpp's native blocks (ref_ggml.cpp): the hooks relayout the type's planes into
  * its blocks, and the kernel checks its own operands (the weight is u8 blocks or a float logical
  * form, which the generic dtype check does not describe). */
@@ -2902,6 +2911,9 @@ SIMPLE("ref_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated w
 #ifdef REF_HAVE_GGML
 ROW_GGML("ref_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT, ref_gemm_nt_ggml),
 ROW_GGML("ref_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.cpp native-block experts", DT_FLOAT, ref_moe_gemm_ggml),
+{ "ref_moe_gemm_mxil", "moe_gemm_mxil", "moe", "grouped GEMM over tile-interleaved MXFP4 experts (moved back, then ref_moe_gemm_ggml)",
+  SHAPE_ANY, DT_FLOAT, RAD_DOMAIN_HOST, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, ref_moe_gemm_mxil,
+  nullptr, ref_mxil_layout, ref_mxil_relayout, ref_moe_gemm_mxil_shape, ref_mxil_unrelayout },
 ROW_GGML("ref_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llama.cpp native blocks", DT_FLOAT, ref_logits_gemm_ggml),
 ROW_GGML("ref_embed_lookup_ggml", "embed_lookup_ggml", "vocab", "embedding gather from llama.cpp native blocks", DT_FLOAT, ref_embed_lookup_ggml),
 #endif
