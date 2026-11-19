@@ -47,6 +47,29 @@ inline int64_t rows(int64_t C, int32_t ahead, int64_t n) {
     return std::min(n, std::max(C - (int64_t)ahead, kBase));
 }
 
+/* tp8 loop P30t-psk: the int8 twin's GEMM (libr4d gemm_nt_q at dtype i8a8 / i8a8h) has two bands: M <= kTwinNarrowM runs the
+ * narrow tile (gemm_i8a8_nt_m16), whose K split follows M (narrow_ksplit) -- a row's bytes depend on the launch's rows there;
+ * above it every M runs the 128 x 128 prefill tile (gemm_i8a8_tiled, gemm_iqr_tiled: no K split, each output folds its own
+ * row's 128-K blocks in K order) -- a row's bytes are its own (tests/r4d_emu test_ds41tw). A cut segment runs rows(C, ahead, n)
+ * in {0, n} or in [kBase, n): with kBase above the narrow band a cut launch stays in its uncut launch's band, and with the twin's
+ * row floor (RADIANCE_DS41_TWIN_ROWS) at most kBase the cut launch takes the twin exactly when the uncut one does, so the cut
+ * changes no computed row's bytes -- the same argument lever PSK makes for the GGUF forms' bands (fused norms > 120). */
+constexpr int64_t kTwinNarrowM = 64;
+/* 0: the narrow band (rows depend on M), 1: the tiled band (row-invariant) */
+inline int twin_band(int64_t m) { return m <= kTwinNarrowM ? 0 : 1; }
+/* the twin may act at a cut layer: every cut keeps the band and the twin choice of the uncut launch */
+inline bool twin_cut_safe(int64_t twin_rows) { return kBase > kTwinNarrowM && twin_rows >= 1 && twin_rows <= kBase; }
+/* tp8 loop P30t-psk bit 128: an SP pass (RADIANCE_DS41_SPHC: a lone prompt segment of T >= the threshold rows) issues P26's q_a /
+ * kv and the SP Engram's kv over each rank's quarter, rows [r q, r q + q) with q = ceil(T / 4); the same prompt beside others runs
+ * them over its whole segment. Both launches are in the tiled band, and both take the twin, when every quarter of every T at or
+ * above the threshold has more than kTwinNarrowM rows (the last rank's T - 3 q is the least: T = 4k + 1 gives k - 2) and the
+ * twin's row floor is at most kTwinNarrowM + 1. */
+inline int64_t sp_quarter_min(int64_t T) { return T - 3 * ((T + 3) / 4); }
+constexpr int64_t kTwinSubMinT = 4 * (kTwinNarrowM + 3) + 1;   /* 269: the least threshold whose every T keeps all quarters > 64 */
+inline bool twin_sub_safe(int64_t sp_thr, int64_t twin_rows) {
+    return sp_thr >= kTwinSubMinT && twin_rows >= 1 && twin_rows <= kTwinNarrowM + 1;
+}
+
 /* The first layer in [from, n_layer) at which none of the n planned prefill sequences runs a row (`ahead[i]` already
  * resolved: a plan's value, or the unplanned default), n_layer when every layer runs one. The cones shrink with l, so
  * every layer after it runs no row either. */

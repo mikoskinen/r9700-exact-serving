@@ -36,8 +36,8 @@ extern "C" int r4d_rad_quant_act_fp8_ue8m0(const RadArgs*, RadStream);
 extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs*, RadStream);
 extern "C" void r4d_fp8e8_pin_mt(int);
 extern "C" void r4d_fp8e8_pin_ld(int);
-/* fp8_ops checks the library's block against R4D_FP8_BLOCK; r4d_gemm_fp8a8.hip (not in this build) defines it */
-extern "C" int r4d_gemm_fp8a8_block(void) { return R4D_FP8_BLOCK; }
+/* fp8_ops checks the library's block against R4D_FP8_BLOCK: r4d_gemm_fp8a8.hip defines it (in the emulator's build since tp8
+ * loop P30t-psk, for test_ds41tw) */
 
 namespace {
 
