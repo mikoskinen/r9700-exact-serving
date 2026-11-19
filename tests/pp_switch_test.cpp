@@ -182,13 +182,13 @@ TEST(the_leader_takes_a_plugin_switch_the_follower_serves_and_refuses_one_neithe
 
 /* tp8 loop P25s: the SP route's in-process switches (ds41_sphc, ds41_sphc_attn, ds41_sphc_seg) are deepseek41's -- plugin
  * switches that act on a follower's passes (the follower takes them from the leader's record), appended after
- * draft_cost_age; with no plugin here serving them a request is refused and nothing is queued, and GET reports -1 (none
+ * draft_short_blk (DECODE's D23, which took 82 first); with no plugin here serving them a request is refused and nothing is queued, and GET reports -1 (none
  * serves them); the follower's record of them is taken (marked) and named as skipped, never a failure. */
 TEST(the_sp_route_switches_are_deepseek41s_and_a_followers) {
     CHECK_EQ(fn4::switch_index("ds41_sphc"), (int)fn4::kDs41Sphc);
     CHECK_EQ(fn4::switch_index("ds41_sphc_attn"), (int)fn4::kDs41SphcAttn);
     CHECK_EQ(fn4::switch_index("ds41_sphc_seg"), (int)fn4::kDs41SphcSeg);
-    CHECK_EQ((int)fn4::kDs41Sphc, (int)fn4::kDraftCostAge + 1);
+    CHECK_EQ((int)fn4::kDs41Sphc, (int)fn4::kDraftShortBlk + 1);   /* after DECODE's D23 draft_short_blk (82) since the 19.11. merge */
     CHECK_EQ((int)fn4::kPpBgRoom, (int)fn4::kDs41SphcSeg + 1);   /* tp8 loop P23s after them: the leader's own */
     CHECK_EQ(fn4::switch_index("pp_bg_room"), (int)fn4::kPpBgRoom);
     CHECK_EQ(fn4::switch_index("pp_bg_join_ms"), (int)fn4::kPpBgJoinMs);

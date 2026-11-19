@@ -38,8 +38,9 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
                                         "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec",
-                                        "exl3_xr", "sched_tail_inner", "stage_lone", "draft_cost_age", "ds41_sphc", "ds41_sphc_attn",
-                                        "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms" };
+                                        "exl3_xr", "sched_tail_inner", "stage_lone", "draft_cost_age",
+                                        "draft_short_blk", "ds41_sphc", "ds41_sphc_attn", "ds41_sphc_seg", "pp_bg_room",
+                                        "pp_bg_join_ms" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -129,6 +130,10 @@ struct State {
     std::atomic<int> sp_capable{-1};                        /* lever SP: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sp[kSahbRanks][kSpN];              /* note_sp */
     std::atomic<int> sp_ranks{0};
+    /* tp8 loop D23 (draft_short_blk): the short block lengths the drafter declared (bit N = N rows), 0 = none served;
+     * -1 until an engine registered; and the query passes the switch moved, their rows */
+    std::atomic<int64_t> short_mask{-1};
+    std::atomic<int64_t> shb[2];
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -155,6 +160,7 @@ struct State {
         }
         for (auto& c : cnt) c.store(0, std::memory_order_relaxed);
         for (auto& c : dcap) c.store(0, std::memory_order_relaxed);
+        for (auto& c : shb) c.store(0, std::memory_order_relaxed);
         for (auto& c : lend) c.store(0, std::memory_order_relaxed);
         for (auto& c : acc) c.store(0, std::memory_order_relaxed);
         for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
@@ -354,8 +360,9 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
-    if (i == kStageShort || i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick || i == kStageLone) {
-        /* lever SA / HB / SP / SAL: set, else 0 (off) */
+    if (i == kStageShort || i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick || i == kStageLone ||
+        i == kDraftShortBlk) {
+        /* lever SA / HB / SP / SAL, D23: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
     }
@@ -389,6 +396,7 @@ bool sched_switch(int i) {
            i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100 ||   /* ds41-swl: the engine's, as place_lf */
            i == kDraftDcap || i == kDraftDcapN ||   /* SPB */
            i == kDraftCostAge ||                    /* DCA */
+           i == kDraftShortBlk ||                   /* tp8 loop D23: the engine's (block_shape) */
            i == kStageLone ||                       /* SAL (ds41-pf2): the engine's, as stage_short */
            i == kPpBgRoom || i == kPpBgJoinMs;      /* tp8 loop P23s: the leader's lanes, as stage_short */
 }
@@ -542,6 +550,15 @@ void note_draft_dcap(int64_t cycles, int64_t moves) {   /* SPB */
 }
 
 void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std::memory_order_release); }
+
+void short_register(uint64_t mask) {   /* tp8 loop D23 */
+    st().short_mask.store((int64_t)(mask & ~1ull & 0x7fffffffffffffffull), std::memory_order_release);
+}
+void note_short_blk(int64_t rows) {
+    State& s = st();
+    s.shb[0].fetch_add(1, std::memory_order_relaxed);
+    s.shb[1].fetch_add(rows, std::memory_order_relaxed);
+}
 
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted) {
     State& s = st();
@@ -860,7 +877,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -922,6 +939,26 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                 *err = std::string("draft_cost_age=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftShortBlk) {   /* tp8 loop D23 */
+        if (v < 0 || v > 63) {
+            if (err) *err = "draft_short_blk takes 0 (the start's short block) or 1 .. 63 (the declared short block of that many rows a sequence)";
+            return false;
+        }
+        if (v == 0) return true;
+        const int64_t m = s.short_mask.load(std::memory_order_acquire);
+        if (m <= 0 || !((m >> v) & 1)) {
+            std::string have;
+            for (int k = 1; m > 0 && k < 63; ++k)
+                if ((m >> k) & 1) have += (have.empty() ? "" : ", ") + std::to_string(k);
+            if (err)
+                *err = std::string("draft_short_blk=") + std::to_string(v) + " refused: " +
+                       (m < 0  ? "no engine has registered its drafter's short blocks"
+                        : m == 0 ? "this deployment serves no short block (no block drafter, --draft-short-from 0 or none declared)"
+                                 : "the drafter declared no short block of " + std::to_string(v) + " rows (declared: " + have + ")");
             return false;
         }
         return true;
@@ -1539,7 +1576,7 @@ bool apply_pending(int step, int* sched) {
             if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
-                i == kStageLone)
+                i == kStageLone || i == kDraftShortBlk)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -1804,6 +1841,12 @@ std::string state_json() {
              ", \"from_rows\": " + std::to_string(reported(s, kDraftDcapN)) +
              ", \"cycles\": " + std::to_string((long long)s.dcap[0].load(std::memory_order_relaxed)) +
              ", \"moves\": " + std::to_string((long long)s.dcap[1].load(std::memory_order_relaxed)) + "}";
+    /* tp8 loop D23 (draft_short_blk): the declared short block lengths, the value in force, the query passes it moved */
+    if (const int64_t m = s.short_mask.load(std::memory_order_acquire); m >= 0)
+        o += ", \"short_blk\": {\"declared_mask\": " + std::to_string((long long)m) +
+             ", \"in_force\": " + std::to_string(reported(s, kDraftShortBlk)) +
+             ", \"passes\": " + std::to_string((long long)s.shb[0].load(std::memory_order_relaxed)) +
+             ", \"rows\": " + std::to_string((long long)s.shb[1].load(std::memory_order_relaxed)) + "}";
     o += "}";
     return o;
 }

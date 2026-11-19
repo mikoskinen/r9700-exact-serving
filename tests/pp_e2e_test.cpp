@@ -564,6 +564,15 @@ TEST(a_switch_request_reaches_the_follower_and_the_pair_serves_on) {
     if (!both) fprintf(stderr, "    POST gg_gemv 7: %d %s\n", st, out.c_str());
     CHECK(both);
     CHECK(complete(pp.port, p, 16) == ref);
+    /* tp8 loop D23: draft_short_blk is the leader's alone; with no short block served (the tiny model drafts nothing) it is
+     * refused by name, never asked of the follower, and the pair serves on */
+    Call c3;
+    st = c3.send(pp.port, "/admin/fn4", json{ { "draft_short_blk", 2 } }.dump()) ? c3.read(&out) : -1;
+    CHECK_EQ(st, 400);
+    const bool none = out.find("serves no short block") != std::string::npos;
+    if (!none) fprintf(stderr, "    POST draft_short_blk 2: %d %s\n", st, out.c_str());
+    CHECK(none);
+    CHECK(complete(pp.port, p, 16) == ref);
     /* GET: the leader's values and the follower's. */
     Call g;
     bool got = false;
