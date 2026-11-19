@@ -66,6 +66,9 @@ static const Shape kShapes[] = {
     { "dsp_o_a g0+g1(pair)", 1024, 1024, 4096, "q8_0", false, 0, 0 },
     { "dsp_o_b", 5120, 0, 2048, "q8_0", false, 0, 0 },
     { "dsp_main_proj", 5120, 0, 15360, "q8_0", false, 0, 0 },
+    /* DRAFTER track 19.11. round 26 (lever FCS): one rank's column part of main_proj at TP4 (rows [r 1280, (r + 1) 1280) of the
+     * replicated weight), the call each rank issues before the row-interleaved all_gather */
+    { "dsp_main_proj_r4", 1280, 0, 15360, "q8_0", false, 0, 0 },
 };
 
 /* --mrcheck16's pair part: gemm_nt_ggml_pair under every A4 pin and the switch vs the two stock launches (gg_gemv 0). */
