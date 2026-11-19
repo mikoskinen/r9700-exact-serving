@@ -3377,6 +3377,91 @@ TEST(short_block_tiers_pick_the_highest_load_tier_with_each_ones_hysteresis) {
         CHECK_EQ(Scheduler::parse_short_tiers(b, &t, &why), RAD_E_INVAL);
 }
 
+/* tp8 loop D23 (fn4 draft_short_blk): the switch runs a declared short block in place of the TOP choice only -- the
+ * one-tier --draft-short-from choice, or tier 0 of RADIANCE_DRAFT_SHORT_TIERS -- and never where the start runs the
+ * drafter's own block or a lower tier; 0 is the start's choice. With DSpark declared at 2 and 3 rows (SHORT=2,3) and
+ * --draft-short-from 12, lanes of 16 run 2 (stk) or 3 (depth 3) by the switch, lanes of 8 their own block either way. */
+TEST(draft_short_blk_moves_only_the_top_short_block_choice) {
+    /* the pure rule */
+    CHECK_EQ(Scheduler::short_block_forced(2, true, 0), (int64_t)2);
+    CHECK_EQ(Scheduler::short_block_forced(2, true, 3), (int64_t)3);
+    CHECK_EQ(Scheduler::short_block_forced(0, false, 3), (int64_t)0);   /* own block: stays */
+    CHECK_EQ(Scheduler::short_block_forced(3, false, 1), (int64_t)3);   /* a lower tier: stays */
+    CHECK_EQ(Scheduler::short_block_forced(0, true, 3), (int64_t)0);    /* no short block chosen: stays */
+    /* with the one-tier switch from 12 decoding sequences: the load sequence a c32 / c16 / c24 run walks */
+    bool on = false;
+    int bad = 0;
+    struct { int64_t dec, forced, want; } seq[] = {
+        { 16, 0, 2 }, { 16, 3, 3 }, { 8, 3, 0 }, { 11, 3, 0 }, { 12, 3, 3 }, { 11, 3, 3 }, { 10, 3, 0 }, { 16, 0, 2 },
+        { 16, 2, 2 }, { 12, 3, 3 }, { 2, 3, 0 },
+    };
+    for (const auto& q : seq) {
+        on = Scheduler::short_block_on(on, q.dec, 12);
+        const int64_t got = Scheduler::short_block_forced(on ? 2 : 0, on, q.forced);
+        if (got != q.want) {
+            ++bad;
+            std::fprintf(stderr, "    decoded %lld, forced %lld: block %lld, want %lld\n", (long long)q.dec,
+                         (long long)q.forced, (long long)got, (long long)q.want);
+        }
+    }
+    CHECK_EQ(bad, 0);
+    /* with tiers 12:2,6:3: tier 0 (lanes of >= 12) takes the switch, tier 1 (lanes of 6 .. 11) keeps its 3 */
+    bool ton[2] = {};
+    const int64_t from[2] = { 12, 6 };
+    const int64_t blk[2] = { 2, 3 };
+    struct { int64_t dec, forced, want; } tseq[] = { { 16, 1, 1 }, { 8, 1, 3 }, { 4, 1, 0 }, { 16, 0, 2 }, { 6, 2, 3 } };
+    for (const auto& q : tseq) {
+        const int k = Scheduler::short_tier_pick(ton, from, 2, q.dec);
+        const int64_t got = Scheduler::short_block_forced(k >= 0 ? blk[k] : 0, k == 0, q.forced);
+        if (got != q.want) {
+            ++bad;
+            std::fprintf(stderr, "    tiers: decoded %lld, forced %lld: block %lld, want %lld\n", (long long)q.dec,
+                         (long long)q.forced, (long long)got, (long long)q.want);
+        }
+    }
+    CHECK_EQ(bad, 0);
+}
+
+/* tp8 loop D23: fn4 refuses draft_short_blk N > 0 before an engine registered, where no short block is served, and for a
+ * length the drafter did not declare (naming the declared ones); 0 always; a request reaches the engine at the step
+ * release (a scheduler-side switch: apply_pending hands it over), and GET reports it. */
+TEST(draft_short_blk_takes_only_a_declared_short_block) {
+    std::string err;
+    const int i = fn4::switch_index("draft_short_blk");
+    REQUIRE(i == (int)fn4::kDraftShortBlk);
+    CHECK(fn4::sched_switch(i));
+    CHECK(!fn4::follower_switch(i));   /* the leader's alone: the follower runs no drafter */
+    CHECK(fn4::check("draft_short_blk", 0, &err));
+    CHECK(!fn4::check("draft_short_blk", 64, &err));
+    CHECK(!fn4::check("draft_short_blk", -1, &err));
+    fn4::short_register(0);
+    CHECK(!fn4::check("draft_short_blk", 3, &err));
+    CHECK(err.find("serves no short block") != std::string::npos);
+    fn4::short_register((1ull << 2) | (1ull << 3));
+    CHECK(fn4::check("draft_short_blk", 2, &err));
+    CHECK(fn4::check("draft_short_blk", 3, &err));
+    err.clear();
+    CHECK(!fn4::check("draft_short_blk", 4, &err));
+    CHECK(err.find("declared: 2, 3") != std::string::npos);
+    if (err.find("declared: 2, 3") == std::string::npos) std::fprintf(stderr, "    %s\n", err.c_str());
+    CHECK_EQ(fn4::value(i), 0);   /* unset: the start's */
+    int sw[fn4::kSwitches];
+    REQUIRE(fn4::request("draft_short_blk", 3, &err));
+    CHECK(fn4::apply_pending(0, sw));
+    CHECK_EQ(sw[i], 3);
+    fn4::note_sched(i, 3);
+    CHECK_EQ(fn4::value(i), 3);
+    fn4::note_short_blk(48);
+    const std::string j = fn4::state_json();
+    CHECK(j.find("\"draft_short_blk\": 3") != std::string::npos);
+    CHECK(j.find("\"short_blk\": {\"declared_mask\": 12, \"in_force\": 3, \"passes\": 1, \"rows\": 48}") != std::string::npos);
+    REQUIRE(fn4::request("draft_short_blk", 0, &err));
+    CHECK(fn4::apply_pending(1, sw));
+    CHECK_EQ(sw[i], 0);
+    fn4::note_sched(i, 0);
+    CHECK_EQ(fn4::value(i), 0);
+}
+
 TEST(no_prefix_hit_gives_nothing_back) {
     const RefillRun r = refill_run(1100, 0);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
@@ -11262,7 +11347,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12234,7 +12319,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);

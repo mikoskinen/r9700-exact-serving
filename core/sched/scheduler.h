@@ -644,6 +644,13 @@ public:
         }
         return pick;
     }
+    /* tp8 loop D23 (fn4 draft_short_blk): the short block a drafter cycle runs -- `sb` as the start's choice picked it
+     * (0 = the drafter's own block), `top` whether that is the choice for the highest load (--draft-short-from's tier or
+     * tier 0), `forced` the switch's declared length (0 = off): the top choice runs `forced` instead; every other choice,
+     * and the drafter's own block, stays. fn4 refuses an undeclared length, so `forced` is always one the drafter has. */
+    static int64_t short_block_forced(int64_t sb, bool top, int64_t forced) {
+        return sb > 0 && top && forced > 0 ? forced : sb;
+    }
     /* tp8 loop D19: "N:S[,N:S...]" -> (from N >= 2, block S >= 1) pairs sorted by N from the highest down, at most 4,
      * distinct N; RAD_E_INVAL with `why` on anything else. */
     static int parse_short_tiers(const char* s, std::vector<std::pair<int64_t, int64_t>>* out, std::string* why);

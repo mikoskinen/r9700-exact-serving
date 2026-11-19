@@ -597,6 +597,10 @@ private:
         bool    on = false;
     };
     std::vector<ShortTier> short_tiers_;
+    /* tp8 loop D23 (fn4 draft_short_blk, leader): the short block of this many rows a sequence runs wherever the top choice
+     * (--draft-short-from's tier, or the highest-load tier) would run its own; 0 = the start's. Query passes at it counted. */
+    std::atomic<int>     short_blk_{0};
+    int64_t              forced_q_n_ = 0, forced_q_rows_ = 0;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */

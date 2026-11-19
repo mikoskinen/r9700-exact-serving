@@ -1041,6 +1041,12 @@ void Engine::fn4_apply_changes(const int* sw) {
                 fn4::note_sched(fn4::kStagePick, stage_pick_.load(std::memory_order_relaxed));
             }
             /* Lever SAL (ds41-pf2): stage_short only on a step with no decode rows; read by the next arena_step. */
+            /* tp8 loop D23: the engine's own, read by the next drafter cycle's block_shape (fn4 refuses a length the
+             * drafter did not declare) */
+            if (sw[fn4::kDraftShortBlk] != fn4::kNoChange) {
+                short_blk_.store(sw[fn4::kDraftShortBlk] > 0 ? sw[fn4::kDraftShortBlk] : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kDraftShortBlk, short_blk_.load(std::memory_order_relaxed));
+            }
             if (sw[fn4::kStageLone] != fn4::kNoChange) {
                 stage_lone_.store(sw[fn4::kStageLone] == 1 ? 1 : 0, std::memory_order_relaxed);
                 fn4::note_sched(fn4::kStageLone, stage_lone_.load(std::memory_order_relaxed));

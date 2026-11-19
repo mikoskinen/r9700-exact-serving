@@ -1027,6 +1027,7 @@ void Engine::block_shape(int* block, int* steps) {
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
     if (drafter_short_ <= 0) return;
     int64_t sb = 0;
+    bool top = false;   /* tp8 loop D23: the choice for the highest load (--draft-short-from's one tier, or tier 0) */
     if (!short_tiers_.empty()) {
         /* tp8 loop D19: the tier of the highest load this step reaches */
         bool on[4] = {};
@@ -1035,11 +1036,13 @@ void Engine::block_shape(int* block, int* steps) {
         for (int i = 0; i < n; ++i) { on[i] = short_tiers_[(size_t)i].on; from[i] = short_tiers_[(size_t)i].from; }
         const int k = Scheduler::short_tier_pick(on, from, n, lsched().decoded_seqs());
         for (int i = 0; i < n; ++i) short_tiers_[(size_t)i].on = on[i];
-        if (k >= 0) sb = short_tiers_[(size_t)k].block;
+        if (k >= 0) { sb = short_tiers_[(size_t)k].block; top = k == 0; }
     } else {
         short_on_ = Scheduler::short_block_on(short_on_, lsched().decoded_seqs(), short_from_);
-        if (short_on_) sb = drafter_short_;
+        if (short_on_) { sb = drafter_short_; top = true; }
     }
+    /* tp8 loop D23 (fn4 draft_short_blk): in process, the top choice runs the switch's declared block instead */
+    sb = Scheduler::short_block_forced(sb, top, short_blk_.load(std::memory_order_relaxed));
     if (sb > 0) {
         /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
          * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
@@ -1053,6 +1056,11 @@ void Engine::block_shape(int* block, int* steps) {
 /* tp8 loop D18: the short block's share of the query passes so far (only while one is served). */
 void Engine::short_block_line(const char* when) const {
     if (drafter_short_ <= 0) return;
+    if (forced_q_n_ > 0 || short_blk_.load(std::memory_order_relaxed) > 0)   /* tp8 loop D23 */
+        RAD_INFO("speculation%s: %lld query passes ran fn4 draft_short_blk's block (now %d; %lld rows, %.2f a pass) -- the "
+                 "line below counts them under their block too (tp8 loop D23)", when, (long long)forced_q_n_,
+                 short_blk_.load(std::memory_order_relaxed), (long long)forced_q_rows_,
+                 forced_q_n_ ? (double)forced_q_rows_ / (double)forced_q_n_ : 0.0);
     if (!short_tiers_.empty()) {   /* tp8 loop D19: one part a tier */
         std::string t;
         for (const ShortTier& z : short_tiers_)
@@ -1123,6 +1131,12 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
     if (drafter_short_ > 0) {   /* tp8 loop D18: which block this query pass ran (D19: which tier's) */
+        /* tp8 loop D23: a pass at draft_short_blk's block is counted there too (GET "short_blk", the minute line) */
+        if (const int fb = short_blk_.load(std::memory_order_relaxed); fb > 0 && block == fb) {
+            ++forced_q_n_;
+            forced_q_rows_ += qb->n_tok;
+            fn4::note_short_blk(qb->n_tok);
+        }
         bool tier = false;
         for (ShortTier& t : short_tiers_)
             if (block == (int)t.block) { ++t.q_n; t.q_rows += qb->n_tok; tier = true; break; }

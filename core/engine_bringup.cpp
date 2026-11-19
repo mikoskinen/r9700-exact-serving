@@ -1815,6 +1815,25 @@ int Engine::declare() {
             }
         }
     }
+    /* tp8 loop D23 (fn4 draft_short_blk): the short block lengths the switch may pick -- the drafter's declared ones, only
+     * while a short block is served at all (a tier, or --draft-short-from); none otherwise, so every N > 0 is refused */
+    {
+        uint64_t m = 0;
+        if (drafter_short_ > 0) {
+            for (const int64_t sb : p0.drafter_short_blocks)
+                if (sb >= 1 && sb < 63) m |= 1ull << sb;
+            if (drafter_short_ < 63) m |= 1ull << drafter_short_;
+        }
+        fn4::short_register(m);
+        if (m) {
+            std::string l;
+            for (int k = 1; k < 63; ++k)
+                if ((m >> k) & 1) l += fmt("%s%d", l.empty() ? "" : ", ", k);
+            RAD_INFO("speculation: fn4 draft_short_blk may run '%s''s short block of %s row(s) a sequence in place of the "
+                     "start's %lld (tp8 loop D23; 0 = the start's)", drafter_name_.c_str(), l.c_str(),
+                     (long long)drafter_short_);
+        }
+    }
     if (tree_)
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",

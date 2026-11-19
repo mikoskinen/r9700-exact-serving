@@ -397,6 +397,14 @@
  *                   scheduler ago does not price that depth while a fresh drafting key of the same row class exists (that
  *                   key by the prior's ratio stands in, as for an unmeasured depth). lq141 c16w: one lane held depth 2 on a
  *                   depth-3 key measured before drafter_mx 2. Starts 0. Exact: it moves only which depth a step verifies.
+ *   draft_short_blk the engine (tp8 loop D23; 82 here, after draft_cost_age; Engine::block_shape): 0 (today) = the short block the
+ *                   start chose (--draft-short-from's tier = the first block the drafter declared, or each
+ *                   RADIANCE_DRAFT_SHORT_TIERS tier's); N >= 1 = the short block of N rows a sequence wherever --draft-short-from's
+ *                   tier (or the TOP tier: the one for the highest load) would run its short block -- refused unless the
+ *                   drafter declared N (deepseek41: RADIANCE_DS41_DSPARK_SHORT=2,3 declares 2 and 3) and a short block is
+ *                   served at all. So one start runs depth 2 (2-row block) and depth 3 (3-row block) at lanes of 16 in
+ *                   process. Starts 0. Exact: it moves only which declared block a drafter cycle runs (D18 / D19's rule);
+ *                   the trunk verifies what it proposes. GET "short_blk": the declared lengths (mask), query passes at it.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -607,7 +615,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -628,6 +636,11 @@ void note_rco(int64_t copies, int64_t freed);
 
 /* The scheduler, at its init: whether its drafter can run the adaptive window, and whether it does. */
 void draft_register(bool capable, bool adaptive);
+/* tp8 loop D23 (draft_short_blk): the engine, once its short block is resolved at bring-up -- bit N set for each short
+ * block of N rows (1 .. 63) the drafter declared, 0 when no short block is served (no drafter, --draft-short-from 0, no
+ * declared block); and each query pass the switch moved (its rows). */
+void short_register(uint64_t mask);
+void note_short_blk(int64_t rows);
 /* The scheduler, at its init: whether its drafter can run the hybrid (a head drafting chains beside prompt lookup). */
 void hybrid_register(bool capable);
 /* The scheduler thread, after it applied a draft_adaptive change: the window the scheduler now runs. */

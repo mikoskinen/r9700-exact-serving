@@ -2119,6 +2119,68 @@ TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
     }
 }
 
+/* tp8 loop D23 (fn4 draft_short_blk) on a live server: the tiny 31B's DFlash2 (block 8) declares no short block, so the
+ * server registers none and refuses every length by name (the switch then stays 0), and the text stays the plain greedy
+ * one with four requests in flight before and after the refusals; 0 is always taken. (DSpark on deepseek41 declares 2
+ * and 3 under RADIANCE_DS41_DSPARK_SHORT=2,3 -- the positive path's rule is sched_test's draft_short_blk cases; on cards
+ * the start line names the lengths and GET "short_blk" counts the passes.) */
+TEST(draft_short_blk_is_refused_where_no_short_block_is_served_and_the_text_stays) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(311 + i, 80 + 19 * i));
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const auto& p : prompts) plain.push_back(tokens_of(post(s.port, "/completion", completion(p, 40))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4",
+                                       "--draft-short-from", "1" }));
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    auto four = [&](const char* what) {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 40).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != plain[(size_t)i])
+                fprintf(stderr, "    %s, prompt %d\n    plain %s\n    got   %s\n", what, i, show(plain[(size_t)i]).c_str(),
+                        show(t).c_str());
+            CHECK(t == plain[(size_t)i]);
+        }
+    };
+    const json g0 = fn4get();
+    CHECK_EQ(g0["switches"].value("draft_short_blk", -9), 0);
+    CHECK_EQ(g0["short_blk"].value("declared_mask", (int64_t)-9), (int64_t)0);
+    four("before");
+    for (const int v : { 4, 2, 3 }) {
+        int st = 0;
+        const json r = post(s.port, "/admin/fn4", json{ { "draft_short_blk", v } }, &st);
+        CHECK_EQ(st, 400);
+        const bool named = r.dump().find("serves no short block") != std::string::npos;
+        if (!named) fprintf(stderr, "    POST draft_short_blk %d: %d %s\n", v, st, r.dump().c_str());
+        CHECK(named);
+    }
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "draft_short_blk", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    four("after the refusals");
+    const json g1 = fn4get();
+    CHECK_EQ(g1["switches"].value("draft_short_blk", -9), 0);
+    CHECK_EQ(g1["short_blk"].value("passes", (int64_t)-1), (int64_t)0);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(!has(s.output(), "fn4 draft_short_blk may run"));
+}
+
 /* The verify-path harness beside a draft head (DFlash2's block drafter here; DSpark's block of 5 on
  * deepseek41, where --spec-ngram is refused beside the head): the harness's ids, a plain greedy run's
  * reply with 30% of the drafts corrupted, replace each proposal the head publishes, at the head's own
