@@ -232,4 +232,26 @@ TEST(control_todays_issue_leaves_the_band_and_absolute_cu_misplaces_rows) {
     CHECK(wrong >= 28);
 }
 
+TEST(d22_the_dense_band_follows_ds41_wmk_and_a_64_row_run_is_one_launch) {
+    /* tp8 loop D22 (DECODE round 18): off WMK the decode band whatever the env; ds41_wmk 1 .. 4 the env's band; ds41_wmk 5
+     * (libr4d's decode band to 64 rows) 64 whatever the env */
+    for (int64_t env : { (int64_t)48, (int64_t)56, (int64_t)64 }) {
+        CHECK_EQ(ds41_dense_band(0, env, kBand), kBand);
+        CHECK_EQ(ds41_dense_band(-1, env, kBand), kBand);
+        for (int w = 1; w <= 4; ++w) CHECK_EQ(ds41_dense_band(w, env, kBand), env);
+        CHECK_EQ(ds41_dense_band(5, env, kBand), (int64_t)64);
+    }
+    /* at the band of 64 every decode-only run of 1 .. 64 rows is ONE launch over all its rows; at 48 a run of 49 .. 64 is
+     * 48 + the rest (today's two weight reads); past 64 the 64 band cuts at 64 */
+    std::vector<std::pair<int64_t, int64_t>> c;
+    for (int64_t n = 1; n <= 64; ++n) {
+        CHECK_EQ(ds41_band_cuts(n, ds41_dense_band(5, kBand, kBand), c), (int64_t)1);
+        CHECK(c[0].first == 0 && c[0].second == n);
+        CHECK_EQ(ds41_band_cuts(n, ds41_dense_band(2, kBand, kBand), c), n > kBand ? (int64_t)2 : (int64_t)1);
+        if (n > kBand) CHECK(c[0].second == kBand && c[1].first == kBand && c[1].second == n - kBand);
+    }
+    CHECK_EQ(ds41_band_cuts(100, 64, c), (int64_t)2);
+    CHECK(c[1].first == 64 && c[1].second == 36);
+}
+
 RAD_TEST_MAIN()
