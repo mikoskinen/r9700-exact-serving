@@ -876,7 +876,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
                       !m.seg_b.empty();
     const int64_t l0 = lseg ? ppi.seg_l0 : 0, l1 = lseg ? std::min<int64_t>(ppi.seg_l1, m.n_main) : m.n_main;
     const bool lfirst = !lseg || l0 == (part == RAD_PP_PART_HEAD ? 0 : m.pp_t);
-    const bool llast = !lseg || (part == RAD_PP_PART_HEAD ? l1 == m.pp_h : l1 >= m.n_main);
+    /* tp8 loop D36: a band pass's head ends at h + 1 (its last segment [s, h + 1), RADIANCE_PP_LEAD_SEG_BAND=1) */
+    const bool llast = !lseg || (part == RAD_PP_PART_HEAD ? l1 == he : l1 >= m.n_main);
     /* tp8 loop D32: the leader's ring of the pass's lane (lane % 2 with two rings; the engine pairs them the same way) */
     const rad_buf sring = m.b_segring2 && (ppi.lane & 1) ? m.b_segring2 : m.b_segring;
     auto seg_issue = [&](int64_t at, bool send) {
