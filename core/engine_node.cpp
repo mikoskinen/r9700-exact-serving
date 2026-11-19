@@ -1583,13 +1583,25 @@ int Engine::follower_loop() {
                      "IDEAS #9)", fol_reserve, fol_reserve, cfg_.pp_cut_t - 1, (unsigned long long)(fol_reserve_ns / 1000000ull));
         }
     }
+    /* fn4 pp_fol_reserve (93, the follower's; its check takes these boundaries): the start value is the env's, the leader's
+     * request moves it in process (0 = off) */
+    uint64_t res_mask = 0;
+    if (seg_bg >= 0)
+        for (int32_t x : segs)
+            if (x > cfg_.pp_cut_h && x < cfg_.pp_cut_t && x < 63) res_mask |= 1ull << x;
+    fn4::reserve_register(res_mask);
+    auto reserve_now = [&]() -> int {
+        int v = fn4::get(fn4::kPpFolReserve);
+        if (v < 0) v = fol_reserve;   /* never requested: the start's */
+        return v > 0 && v < 63 && ((res_mask >> v) & 1) ? v : 0;
+    };
     int64_t res_n = 0, res_frame = 0, res_time = 0;
     uint64_t res_ns = 0;
     auto reserve_line = [&](const char* when) {
-        if (fol_reserve > 0)
-            RAD_INFO("follower: body reserve %s (RADIANCE_PP_FOL_RESERVE=%d, tp8 loop IDEAS #9): %lld BG bodies held their layers "
-                     "%d..%d, %lld released by another BG lane's frame, %lld by the %llu-ms limit; held %.1f ms in all (%.1f a "
-                     "body)", when, fol_reserve, (long long)res_n, fol_reserve, cfg_.pp_cut_t - 1, (long long)res_frame,
+        if (fol_reserve > 0 || res_n > 0)
+            RAD_INFO("follower: body reserve %s (RADIANCE_PP_FOL_RESERVE=%d, now %d, tp8 loop IDEAS #9): %lld BG bodies held their "
+                     "layers L..%d, %lld released by another BG lane's frame, %lld by the %llu-ms limit; held %.1f ms in all (%.1f "
+                     "a body)", when, fol_reserve, reserve_now(), (long long)res_n, cfg_.pp_cut_t - 1, (long long)res_frame,
                      (long long)res_time, (unsigned long long)(fol_reserve_ns / 1000000ull), (double)res_ns / 1e6,
                      res_n > 0 ? (double)res_ns / 1e6 / (double)res_n : 0.0);
     };
@@ -1931,8 +1943,8 @@ int Engine::follower_loop() {
                 if (const int bs = between(back >= 0 ? seg_ev[back & 1] : nullptr); bs != 0) return bs;   /* < 0 failed, 1 stop */
                 /* tp8 loop IDEAS #9: a BG body's reserve -- its parts from RADIANCE_PP_FOL_RESERVE on wait for another BG lane's
                  * frame (held behind this pass: it keeps its place) or the limit; every other frame runs between meanwhile */
-                if (fol_reserve > 0 && split && seg_bg >= 0 && lane >= seg_bg && b->n_tok_decode == 0 &&
-                    parts[k].first == fol_reserve) {
+                if (const int res_l = split && seg_bg >= 0 && lane >= seg_bg && b->n_tok_decode == 0 ? reserve_now() : 0;
+                    res_l > 0 && parts[k].first == res_l) {
                     auto other_bg = [&]() -> bool {
                         for (const net::Msg& mm : held) {
                             StepHdr hh;
@@ -2116,7 +2128,7 @@ int Engine::follower_loop() {
             }
         }
         /* tp8 loop IDEAS #9: the reserve's counts a minute */
-        if (fol_reserve > 0) {
+        if (fol_reserve > 0 || res_n > 0) {
             static uint64_t res_line_ns = 0;
             const uint64_t now = rad_mono_ns();
             if (res_line_ns == 0) res_line_ns = now;

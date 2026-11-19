@@ -446,6 +446,12 @@
  *                   RADIANCE_DS41_TSK=0 / 1 at load (the op's scratch sized; 1 starts it on). Rule B: deterministic and
  *                   batch-invariant against its own reference, not the decode band's bits. Where it serves a pass, ds41_attn_dec's
  *                   form choice does not apply (the decode band's forms are not issued).
+ *   pp_fol_reserve  engine, the two-node FOLLOWER (tp8 loop IDEAS #9; 93 here, after draft_head_cut): 0 off, L = 1 .. 63 -- a BG
+ *                   newcomer's body (a BG lane's split pass, RADIANCE_PP_BG_LANE) holds its parts from layer L until another BG
+ *                   lane's frame arrives or RADIANCE_PP_FOL_RESERVE_MS (default 300) pass, every other frame running meanwhile.
+ *                   RADIANCE_PP_FOL_RESERVE=L on the follower starts it at L; the follower takes the leader's request (its own
+ *                   check: L a declared segment boundary inside W(h, t), a BG lane there; the leader checks the range only).
+ *                   Order only: a pass's later segments go later, never another pass (rule A, as M4's segment gaps).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
@@ -662,7 +668,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
-              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut, kSwitches };
+              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
+              kPpFolReserve, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -687,6 +694,10 @@ void draft_register(bool capable, bool adaptive);
  * block of N rows (1 .. 63) the drafter declared, 0 when no short block is served (no drafter, --draft-short-from 0, no
  * declared block); and each query pass the switch moved (its rows). */
 void short_register(uint64_t mask);
+/* tp8 loop IDEAS #9 (pp_fol_reserve): the follower, at its loop's start -- bit L set for each layer L the body reserve may
+ * start at (its declared segment boundaries inside W(h, t)), 0 when it has no BG lane / no segments; -1 until registered (the
+ * leader never registers: it checks the range, the follower's verdict decides). */
+void reserve_register(uint64_t mask);
 void note_short_blk(int64_t rows);
 /* The scheduler, at its init: whether its drafter can run the hybrid (a head drafting chains beside prompt lookup). */
 void hybrid_register(bool capable);
