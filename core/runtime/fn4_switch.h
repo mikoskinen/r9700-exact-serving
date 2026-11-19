@@ -402,6 +402,11 @@
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
  *                   depth in force under the adaptive window; the verify of the step issued ahead reads those D. Starts 0.
  *                   Exact: the first D proposals are the same tokens (a row's head row and the walk's first D steps).
+ *   ds41_tsk        libr4d (lever TSK, ds41-drafter round 15; 83 here, after draft_head_cut; r4d_ds41_sparse.hip): 0 off (today), 1 the
+ *                   compressing layers' decode-band attention (<= 48 rows) in the split-key WMMA form -- chunks of 4 key tiles fixed
+ *                   by key index, a merge in ascending order with the o rope + fp8 round trip in it. Needs RADIANCE_DS41_TSK=0 / 1 at
+ *                   load (the op's scratch sized; 1 starts it on). Rule B: deterministic and batch-invariant against its own
+ *                   reference, not the decode band's bits.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -612,7 +617,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftHeadCut, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftHeadCut, kDs41Tsk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
