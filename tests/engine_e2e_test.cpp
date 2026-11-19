@@ -4025,6 +4025,34 @@ TEST(lever_dlw_weight_sidecar) {
                                  rule }, engine_env(), &slog);
     CHECK(st10 != 0);
     CHECK(has(slog, "--keep-only without --keep"));
+    /* --keep repeatable, no rule: only.rad narrowed to output.weight + none.rad's blk.0.attn_qkv (the same rule as both.rad's,
+     * so the same bytes) -> two.rad holds both.rad's two entries and the engine serves llama_i8head.rad's recording again; a
+     * name two kept files hold is refused */
+    const int st11 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "two.rad", "--keep", d / "only.rad", "--keep-only",
+                                 "output.*", "--keep", d / "none.rad" }, engine_env(), &slog);
+    if (st11 != 0) fprintf(stderr, "    rad-sidecar --keep x2 exited %d:\n%s\n", st11, tail(slog).c_str());
+    REQUIRE_EQ(st11, 0);
+    CHECK(has(slog, "2 entries kept from only.rad,none.rad"));
+    {
+        rad::RadFile tf;
+        REQUIRE_EQ(tf.open((d / "two.rad").c_str()), 0);
+        CHECK_EQ(tf.entry_count(), (int64_t)2);
+        CHECK(tf.find("output.weight") != nullptr);
+        CHECK(tf.find("blk.0.attn_qkv.weight") != nullptr);
+    }
+    a[1] = d / "s11";
+    Ran s11 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "two.rad") });
+    REQUIRE_RAN(s11);
+    {
+        std::string why11;
+        const bool same11 = same_recording(ref, d / "s11", &why11);
+        if (!same11) fprintf(stderr, "    --keep only.rad (output.*) + --keep none.rad vs llama_i8head.rad: %s\n", why11.c_str());
+        CHECK(same11);
+    }
+    const int st12 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad5.rad", "--keep", d / "only.rad", "--keep",
+                                 d / "none.rad" }, engine_env(), &slog);
+    CHECK(st12 != 0);
+    CHECK(has(slog, "an entry is kept once"));
 }
 
 /* ================================================================== lever G: the tail grid (ds41-tailgrid) */

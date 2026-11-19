@@ -59,8 +59,9 @@ void usage() {
         "      --keep FILE    a sidecar rad-sidecar wrote from the same container: its entries are copied into the\n"
         "                     output as they are (encoding and planes byte for byte), beside the rules' new ones --\n"
         "                     the engine opens one sidecar, so a second set of entries joins the first this way\n"
-        "      --keep-only GLOB  with --keep: copy only the kept entries whose name matches GLOB (fnmatch; repeatable,\n"
-        "                     any match keeps it) -- e.g. a block-FP8 sidecar without its shared-expert entries\n"
+        "                     Repeatable: several sidecars join (an entry kept once); with --keep alone no rule is needed\n"
+        "      --keep-only GLOB  narrows the --keep before it to the entries whose name matches GLOB (fnmatch;\n"
+        "                     repeatable, any match keeps it) -- e.g. a block-FP8 sidecar without its shared expert\n"
         "  -v, --verbose\n"
         "  -h, --help\n"
         "\n"
@@ -102,8 +103,10 @@ int main(int argc, char** argv) {
     /* tp8 loop P30 (b): --keep FILE -- the engine opens ONE sidecar (RADIANCE_WEIGHT_SIDECAR), and the pair already serves the
      * drafter's DLW sidecar there; a new set of entries joins it here: FILE's entries are copied verbatim (encoding, provenance,
      * planes) into the output beside the rules' jobs, so the served bytes of the kept entries do not change */
-    std::string keep_path;
-    std::vector<std::string> keep_only;   /* tp8 loop P30o: --keep-only GLOB (none = every kept entry) */
+    /* tp8 loop P30o: --keep is repeatable (the official block-FP8 entries and the drafter's DLW, both verbatim), and each
+     * --keep-only GLOB narrows the --keep given before it (none = every entry of that file) */
+    struct KeepSpec { std::string path; std::vector<std::string> only; };
+    std::vector<KeepSpec> keeps;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -120,8 +123,15 @@ int main(int argc, char** argv) {
         else if (a == "--home") home = next("--home");
         else if (a == "--plan-only") plan_only = true;
         else if (a == "--requant") requant = true;
-        else if (a == "--keep") keep_path = next("--keep");
-        else if (a == "--keep-only") keep_only.push_back(next("--keep-only"));   /* tp8 loop P30o */
+        else if (a == "--keep") keeps.push_back({ next("--keep"), {} });
+        else if (a == "--keep-only") {   /* tp8 loop P30o */
+            const char* g = next("--keep-only");
+            if (keeps.empty()) {
+                std::fprintf(stderr, "rad-sidecar: --keep-only without --keep (it narrows the --keep before it)\n");
+                return 2;
+            }
+            keeps.back().only.push_back(g);
+        }
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "rad-sidecar: unrecognised argument '%s'. Try --help.\n", a.c_str());
@@ -129,7 +139,7 @@ int main(int argc, char** argv) {
         } else if (in.empty()) in = a;
         else { std::fprintf(stderr, "rad-sidecar: more than one input given\n"); return 2; }
     }
-    if (in.empty() || (out.empty() && !plan_only) || (recipe_files.empty() && quant_flags.empty())) {
+    if (in.empty() || (out.empty() && !plan_only) || (recipe_files.empty() && quant_flags.empty() && keeps.empty())) {
         usage();
         return 2;
     }
@@ -234,13 +244,15 @@ int main(int argc, char** argv) {
     for (Job& j : jobs) j.qw.name = j.name.c_str();
     /* --keep: the kept sidecar must come from this container (the engine checks the same two facts at open), and no entry may
      * be both kept and made here */
-    RadFile kf;
-    std::vector<const RadFileEntry*> kept;
-    if (!keep_only.empty() && keep_path.empty()) {
-        RAD_ERR("--keep-only without --keep");
-        return 2;
-    }
-    if (!keep_path.empty()) {
+    std::deque<RadFile> kfs;
+    struct KeptE { const RadFileEntry* e; RadFile* f; const std::string* path; };
+    std::vector<KeptE> kept;
+    std::string kept_names;   /* the kept files' basenames, comma-separated (sidecar.kept) */
+    for (const KeepSpec& ks : keeps) {
+        const std::string& keep_path = ks.path;
+        const std::vector<std::string>& keep_only = ks.only;
+        RadFile& kf = kfs.emplace_back();
+        kept_names += (kept_names.empty() ? "" : ",") + basename_of(keep_path);
         RAD_TRY(kf.open(keep_path.c_str()));
         int64_t of_bytes = -1;
         if (!kf.get_i("sidecar.container_bytes", &of_bytes) || of_bytes != f.size()) {
@@ -267,10 +279,16 @@ int main(int argc, char** argv) {
                             keep_path.c_str(), name.c_str());
                     return 2;
                 }
-            kept.push_back(&e);
+            for (const KeptE& k : kept)
+                if (name == k.f->str(k.e->name)) {
+                    RAD_ERR("--keep %s holds '%s', which --keep %s holds too: an entry is kept once", keep_path.c_str(),
+                            name.c_str(), k.path->c_str());
+                    return 2;
+                }
+            kept.push_back({ &e, &kf, &ks.path });
         }
     }
-    if (jobs.empty()) {
+    if (jobs.empty() && kept.empty()) {
         RAD_ERR("no entry of %s is matched by a rule its quantiser takes (%lld declined): nothing to write", in.c_str(),
                 (long long)declined);
         return 2;
@@ -293,10 +311,10 @@ int main(int argc, char** argv) {
                         (long long)b, j.rule->q->name);
         }
         int64_t kb = 0;
-        for (const RadFileEntry* e : kept) {
-            std::printf("%-52s %-24s kept from %s, %12lld bytes\n", kf.str(e->name), enc_text(kf.encoding(*e)).c_str(),
-                        basename_of(keep_path).c_str(), (long long)e->bytes);
-            kb += (int64_t)e->bytes;
+        for (const KeptE& k : kept) {
+            std::printf("%-52s %-24s kept from %s, %12lld bytes\n", k.f->str(k.e->name), enc_text(k.f->encoding(*k.e)).c_str(),
+                        basename_of(*k.path).c_str(), (long long)k.e->bytes);
+            kb += (int64_t)k.e->bytes;
         }
         std::printf("plan: %zu entries, %lld -> %lld bytes (%.3f); %lld declined; %zu kept (%lld bytes)\n", jobs.size(),
                     (long long)src_bytes, (long long)nb, src_bytes ? (double)nb / (double)src_bytes : 0.0,
@@ -310,23 +328,30 @@ int main(int argc, char** argv) {
     w.set_arch(f.str(f.header().arch_id));
     w.set_model_name(std::string(f.str(f.header().model_name)) + " (weight sidecar)");
     w.set_quant("sidecar");
-    w.set_recipe(kept.empty() ? recipe.text()
-                              : std::string(kf.str(kf.header().recipe)) + "\n# --keep " + basename_of(keep_path) + ": " +
-                                    std::to_string(kept.size()) + " entries copied as they are\n" + recipe.text());
+    {
+        std::string rt;
+        for (size_t i = 0; i < keeps.size(); ++i) {
+            int64_t n = 0;
+            for (const KeptE& k : kept) n += k.f == &kfs[i] ? 1 : 0;
+            rt += std::string(kfs[i].str(kfs[i].header().recipe)) + "\n# --keep " + basename_of(keeps[i].path) + ": " +
+                  std::to_string(n) + " entries copied as they are\n";
+        }
+        w.set_recipe(kept.empty() ? recipe.text() : rt + recipe.text());
+    }
     w.set_created_by("rad-sidecar");
     w.meta_i("sidecar.container_bytes", f.size());
     w.meta_i("sidecar.container_entries", f.entry_count());
     w.meta_s("sidecar.container", basename_of(in));
-    if (!kept.empty()) w.meta_s("sidecar.kept", basename_of(keep_path));
+    if (!kept.empty()) w.meta_s("sidecar.kept", kept_names);
     /* the jobs and the kept entries in one movement-unit order (model-level weights, then each layer's, by name) */
-    struct Item { int32_t layer; std::string name; Job* j; const RadFileEntry* k; };
+    struct Item { int32_t layer; std::string name; Job* j; const KeptE* k; };
     std::vector<Item> items;
     for (Job& j : jobs) items.push_back({ j.e->layer < 0 ? -1 : j.e->layer, j.name, &j, nullptr });
-    for (const RadFileEntry* e : kept) items.push_back({ e->layer < 0 ? -1 : e->layer, kf.str(e->name), nullptr, e });
+    for (const KeptE& k : kept) items.push_back({ k.e->layer < 0 ? -1 : k.e->layer, k.f->str(k.e->name), nullptr, &k });
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
         return std::tie(a.layer, a.name) < std::tie(b.layer, b.name);
     });
-    std::vector<std::pair<const RadFileEntry*, int64_t>> kept_idx;
+    std::vector<std::pair<const KeptE*, int64_t>> kept_idx;
     for (Item& it : items) {
         RadWriter::Weight ww;
         ww.name = it.name;
@@ -344,7 +369,8 @@ int main(int argc, char** argv) {
             if (j.idx < 0) { w.abort(); return 1; }
             continue;
         }
-        const RadFileEntry& e = *it.k;
+        const RadFileEntry& e = *it.k->e;
+        RadFile& kf = *it.k->f;
         ww.quantizer = kf.str(e.quantizer);
         ww.options = kf.str(e.options);
         ww.enc = kf.encoding(e);
@@ -355,12 +381,15 @@ int main(int argc, char** argv) {
         ww.slot = e.slot;
         const int64_t idx = w.add_weight(ww);
         if (idx < 0) { w.abort(); return 1; }
-        kept_idx.push_back({ &e, idx });
+        kept_idx.push_back({ it.k, idx });
     }
     if (w.seal() < 0) { w.abort(); return 1; }
     int64_t written = 0, kept_bytes = 0;
     /* the kept entries' planes, byte for byte */
-    for (const auto& [e, idx] : kept_idx) {
+    for (const auto& [kk, idx] : kept_idx) {
+        const RadFileEntry* e = kk->e;
+        RadFile& kf = *kk->f;
+        const std::string& keep_path = *kk->path;
         const RadEncoding& ke = kf.encoding(*e);
         for (int k = 0; k < ke.n_planes; ++k) {
             const RadFilePlane& p = kf.plane(*e, k);
@@ -436,7 +465,7 @@ int main(int argc, char** argv) {
                 "%lld declined (left in the container)%s\n", out.c_str(), jobs.size(), basename_of(in).c_str(),
                 (long long)src_bytes, (long long)written, src_bytes ? (double)written / (double)src_bytes : 0.0, worst,
                 (long long)declined,
-                kept.empty() ? "" : fmt("; %zu entries kept from %s (%lld bytes of planes)", kept.size(), basename_of(keep_path).c_str(),
+                kept.empty() ? "" : fmt("; %zu entries kept from %s (%lld bytes of planes)", kept.size(), kept_names.c_str(),
                                          (long long)kept_bytes).c_str());
     return 0;
 }
