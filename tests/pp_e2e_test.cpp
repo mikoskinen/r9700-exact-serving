@@ -2708,6 +2708,22 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
  * merged lane's steps (D11's hold, RADIANCE_PP_MERGE_HOLD_MS) instead of turning the one decode lane into a MIXED step, and the lanes
  * stay merged pp_merge_ms after the last BG work. burst_set's four newcomers arrive together beside four decoders (700 rows a step: a
  * BG inbox holds one): at 3 lanes BG 1 the BG lane takes one at a time, the rest are held; every request's tokens are one process's. */
+/* four decoders, then six ~600-row newcomers at once: a BG inbox holds one (700 rows a step), so beside a busy BG lane the rest have
+ * no room -- held under bit 16, MIXED steps of the merged lane without it */
+std::vector<std::vector<int32_t>> hold_burst_set(int port) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t s : { 41, 42, 43, 44 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 12), 160); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    for (uint64_t s : { 91, 92, 93, 94, 95, 96 }) {
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 560 + 20 * (s - 91)), 10); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
 TEST(merge_holds_and_lingers_serve_one_process_tokens) {
     REQUIRE(world().ok);
     const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
@@ -2716,7 +2732,7 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         Serving one;
         REQUIRE(one.start("", ext));
         ref = split_set(one.port);
-        for (auto& v : burst_set(one.port)) ref.push_back(v);
+        for (auto& v : hold_burst_set(one.port)) ref.push_back(v);
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
@@ -2728,7 +2744,7 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
         if (a.ms) env.push_back("RADIANCE_PP_MERGE_MS=" + std::to_string(a.ms));
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
-                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=40", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
@@ -2736,7 +2752,7 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         Serving pp;
         REQUIRE(pp.start(a.cut, ex, env));
         std::vector<std::vector<int32_t>> got = split_set(pp.port);
-        for (auto& v : burst_set(pp.port)) got.push_back(v);
+        for (auto& v : hold_burst_set(pp.port)) got.push_back(v);
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -2781,4 +2797,67 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
     }
     fprintf(stderr, "    newcomers held for the BG lanes while merged, all bit-16 arms: %lld\n", held_all);
     CHECK(held_all > 0);
+}
+
+/* fn4 pp_merge bit 32 (tp8 MERGE form 3, the relay lane): while merged, a parked decode lane with nothing of its own takes whole
+ * newcomers as a BG lane does (after the idle BG lanes in the planning order), its frames flagged so the follower runs them in
+ * segments. split_set + burst_set (newcomers in a burst beside decoders): every request's tokens are one process's at 3 lanes BG 1
+ * and 4 lanes BG 2, with and without the hold (bit 16); the relay lane ran BG steps in at least one arm. */
+TEST(relay_lane_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        for (auto& v : burst_set(one.port)) ref.push_back(v);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; int merge; };
+    long long relay_all = 0;
+    for (const Arm a : { Arm{ 3, "1,3", 1, 33 }, Arm{ 4, "1,3", 2, 33 }, Arm{ 3, "0,2", 1, 49 }, Arm{ 4, "1,3", 1, 33 } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        for (auto& v : burst_set(pp.port)) got.push_back(v);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long merges = -1, relay = -1, passes = -1, parts = -1;
+        if (const size_t at = llog.rfind("two-node pipeline: merge over the run (fn4 pp_merge="); at != std::string::npos) {
+            if (const size_t m = llog.find("): ", at); m != std::string::npos) merges = std::atoll(llog.c_str() + m + 3);
+            if (const size_t r = llog.find("relay lane BG steps ", at); r != std::string::npos)
+                relay = std::atoll(llog.c_str() + r + std::strlen("relay lane BG steps "));
+        }
+        if (const size_t at = flog.rfind(" passes ran in "); at != std::string::npos)
+            if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "follower: %lld passes ran in %lld segments", &passes, &parts);
+        relay_all += std::max(0LL, relay);
+        fprintf(stderr, "    pp_merge %d, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld merges; relay lane BG steps %lld; follower "
+                        "%lld passes in %lld segments\n", a.merge, a.k, a.lanes, a.cut, differ, ref.size(), merges, relay, passes, parts);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 30).c_str());
+        CHECK(merges > 0);
+        CHECK(relay >= 0);
+    }
+    fprintf(stderr, "    relay lane BG steps, all arms: %lld\n", relay_all);
+    CHECK(relay_all > 0);
 }

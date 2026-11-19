@@ -256,6 +256,13 @@ public:
     }
     /* requests a parked lane still holds (any state), read under the lock: 0 = nothing left to move */
     int64_t parked_live() const;
+    /* lane l's live requests (running + waiting), under the lock */
+    int64_t live(int l) const;
+    /* tp8 MERGE bit 32 (the relay lane): while merged a PARKED decode lane with no request of its own takes whole newcomers as a
+     * BG lane does (lane_split_bg names it after the idle BG lanes), so a third newcomer's head can start beside the other two's
+     * parts instead of waiting for a BG lane's commit; never a cold prompt's chunk */
+    void set_relay(bool on) { relay_ = on; }
+    bool relay_bg(int l) const { return relay_ && parked(l); }
     /* newcomers held out of their decode lane's steps for the BG lanes now (D11's hold: SchedReq::bg_hold_us), read under the lock */
     int64_t held_now() const;
     int  decode_n() const { return (int)lanes_.size() - bg_n(); }
@@ -393,6 +400,7 @@ private:
     std::string broken_;
     std::atomic<int> merged_to_{ -1 };      /* tp8 MERGE: the merged decode lane, -1 split */
     int64_t merge_hold_ms_ = 0;             /* tp8 MERGE bit 16: D11's hold while merged (bg_hold_ms) */
+    bool    relay_ = false;                 /* tp8 MERGE bit 32: parked lanes take whole newcomers (relay_bg) */
     /* tp8 MERGE: why `q` (in `s`) may not move now (MoveCounts' fields 2..4 as 0 / 1 / 2), -1 movable; and the move itself */
     int  unmovable_locked(const Scheduler& s, const SchedReq& q) const;
     void move_locked(Scheduler& src, int32_t slot, Scheduler& dst);

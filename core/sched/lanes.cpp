@@ -270,6 +270,12 @@ int64_t LaneSet::parked_live() const {
     return n;
 }
 
+int64_t LaneSet::live(int l) const {
+    if (l < 0 || l >= (int)lanes_.size()) return 0;
+    std::lock_guard<std::mutex> lk(*mu_);
+    return (int64_t)(lanes_[(size_t)l]->running_.size() + lanes_[(size_t)l]->waiting_.size());
+}
+
 int64_t LaneSet::held_now() const {
     if (lanes_.size() <= 1 || bg_lane() < 0) return 0;
     std::lock_guard<std::mutex> lk(*mu_);
@@ -468,7 +474,7 @@ void Scheduler::lane_take_inbox() {
                     (long long)lane_reserved_, (long long)cfg_.max_tok);
     }
     /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
-    if (!got.empty() && lanes_->is_bg(lane_)) {
+    if (!got.empty() && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) {
         int64_t newc = 0, rows = 0;
         for (const LaneSet::Piece& p : got) {
             newc += p.e.produces_token ? 1 : 0;
@@ -573,7 +579,7 @@ void Scheduler::lane_split_own() {
         }
         /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1): a newcomer's whole rest beside decode rows, lent whole to the BG lane (an inner
          * tail snapshot -- lever TI -- goes with it and commits there, as a lent cold chunk's does) */
-        if (bg && !lanes_->is_bg(lane_) && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
+        if (bg && !lanes_->is_bg(lane_) && !lanes_->relay_bg(lane_) && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
             e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->req &&
             !e.cr_replay && e.n_spec == 0 && (e.ckpt_slot < 0 || e.ckpt_tok >= 0)) {
             int bwhy = -1;
@@ -635,7 +641,7 @@ void Scheduler::lane_split_own() {
         size_t j = 0;
         for (; j < order.size() && p < (dpiece ? s.bi_end : target); ++j) {
             const int to = order[j];
-            if (lanes_->is_bg(to)) continue;   /* tp8 dev M8: a cold prompt's chunks keep to the decode lanes */
+            if (lanes_->is_bg(to) || lanes_->relay_bg(to)) continue;   /* tp8 dev M8: a cold prompt's chunks keep to the decode lanes (tp8 MERGE: and off a relay lane) */
             int64_t ck = -1;
             const int64_t n = dpiece ? lane_d_piece(s, p, &ck) : lane_alone_chunk(s, r, target, p, &ck);
             if (n <= 0) break;
@@ -734,7 +740,7 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     /* the BG lanes in this plan's planning order (the order they take their inboxes in) */
     std::vector<int> bgo;
     for (int l : order)
-        if (lanes_->is_bg(l)) bgo.push_back(l);
+        if (lanes_->is_bg(l) || lanes_->relay_bg(l)) bgo.push_back(l);   /* tp8 MERGE bit 32: a relay lane after the idle BG lanes */
     /* tp8 dev M8 (RADIANCE_PP_BG_SPLIT=1, two BG lanes or more): the entry cut at the 512-grid point nearest its middle (>= 128
      * rows a side: M5b's cut, answer-neutral by the cards' lq21 lid576), the first piece to the first BG lane in the order with
      * room, the rest (its first token, the snapshot when it lies there) to a later one: piece 1's leader tail runs beside piece
