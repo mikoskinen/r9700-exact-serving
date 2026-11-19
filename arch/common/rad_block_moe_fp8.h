@@ -120,6 +120,15 @@ constexpr int64_t kMaxProtected = 8;
  * both arms are GEMM-bound and a recorded pass already overlaps their stages (haz_mark). */
 static const int64_t kMoeShexpLaneRows = 64;
 
+/* tp8 loop D42 (SDF, shared down first): bit 2 of MoeFP8::shexp_lane's word. At a decode-height pass (T <=
+ * kMoeShexpLaneRows) whose shared arm is on lane 0, the arm's down (sh_fold / sh_down / its twin) is issued right behind
+ * the arm's quantiser, AHEAD of the routed down, instead of after the routed down and the protected experts. Both are
+ * unordered behind the last ordered launch before them, so the queue dispatches the second one's blocks only when the
+ * first one's last blocks go: issued second, the shared down (~20 us alone) starts in the routed down's tail and the
+ * ordered gather waits ~10 us past the routed down for it (loop FINDINGS DRAFTER 21:59 addendum, lq198 leader stamps);
+ * issued first it runs at the routed down's start. The same ops over the same operands: the bytes do not move. */
+static const int kMoeSdfBit = 4;
+
 struct MoeFP8 {
     struct Config {
         /* Routed experts this rank owns. Equal to `n_expert_all` unless experts are split across
@@ -487,7 +496,10 @@ struct MoeFP8 {
      * normed input until the gather (the arm's buffers are rad_buf_concurrent, see declare), and the
      * gather combines them exactly as before, so the bytes are the same. Taken only where declare
      * found the arm lane-safe (`shexp_lane_ok`: every op of the arm reads the bf16 input or its own
-     * concurrent buffers, none a quantiser of the block's input). Null: one lane, as before. */
+     * concurrent buffers, none a quantiser of the block's input). Null: one lane, as before.
+     * The word's low two bits are that lane form (0 / 1 / 2, below in pass()); bit 2 (+ 4, tp8 loop D42 SDF) issues
+     * the shared arm's down AHEAD of the routed down at a pass of T <= kMoeShexpLaneRows whose arm stays on lane 0
+     * (kMoeSdfBit): the same ops over the same operands, only their queue order (the hazard marks order them). */
     const std::atomic<int>* shexp_lane = nullptr;
     bool shexp_lane_ok = false;
     /* Optional, set by the architecture with Config::shared_one_external: read at every pass, > 0 =
@@ -2494,7 +2506,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * a prefill-height pass of one segment (more than kMoeShexpLaneRows rows, all of the step's), where the arm runs
      * beside the router, the sort and the routed experts instead of after each routed stage (a live prefill pass is not
      * recorded, so nothing overlaps them there today). Same ops, same operands, joined in front of the gather as at 1. */
-    const int sl_v = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
+    const int sl_w = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
+    const int sl_v = sl_w & 3;   /* tp8 loop D42: bit 2 is SDF (kMoeSdfBit), not a lane form */
     /* tp8 loop P30t: a twin pass's shared arm stays on lane 0 (its int8 quantiser writes the block input's pair) */
     const bool sh_twin = shared && sh_tw && twin_now && twin_now();
     const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && ((r0 == 0 && rows == T) || (piece && sl_v == 2)) &&
@@ -2667,6 +2680,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     else if (!c.expert_exl3)   /* EXL3: inside gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !lane1 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
+    /* The shared arm's down: after the routed down and the protected experts (as before), or with SDF right here
+     * (tp8 loop D42, kMoeSdfBit: a decode-height pass, the arm on lane 0) */
+    const auto sh_down_issue = [&] {
+        if (swf) sh_fold();
+        else if (sh_twin) sh_down_tw.step(c_, sff_tw, w.sout, T, r0, rows);   /* tp8 loop P30t */
+        else sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    };
+    const bool sdf = shared && !lane1 && (sl_w & kMoeSdfBit) && T <= kMoeShexpLaneRows;
+    if (sdf) sh_down_issue();
     if (c.expert_exl3)
         issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_iqr)
@@ -2707,11 +2729,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared && !lane1) {
-        if (swf) sh_fold();
-        else if (sh_twin) sh_down_tw.step(c_, sff_tw, w.sout, T, r0, rows);   /* tp8 loop P30t */
-        else sh_down.step(c_, w.sff, w.sout, T, r0, rows);
-    }
+    if (shared && !lane1 && !sdf) sh_down_issue();
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {

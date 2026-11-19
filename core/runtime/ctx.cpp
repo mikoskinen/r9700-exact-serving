@@ -1494,13 +1494,44 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
     return true;
 }
 
+/* tp8 loop D41 (RADIANCE_PP_HEAD_PHASES=N, > 0; read once; unset / 0 = nothing timed): rank 0 of a pipeline leader times each
+ * whole decode HEAD part's run_step by phase -- the stager + residency sync, kvstream_enter, the pass key + tape lookup, the
+ * host steps a play runs before its first recorded stretch, that stretch's play, the rest of the pass, the joins / flush
+ * after it -- and every N heads prints their means (N 1 = 2048). Why (loop FINDINGS DECODE note 21:2x): lq198's stamps put
+ * the head's first kernel 0.68-0.73 ms (p50) after its release and only 9-16 us before run_step returned: the card waits for
+ * host time that comes before the first packet. Timing only: no issue, argument or byte changes. */
+static const uint64_t g_head_phases = [] {
+    const char* e = std::getenv("RADIANCE_PP_HEAD_PHASES");
+    const long long v = e && *e ? std::atoll(e) : 0;
+    return (uint64_t)(v <= 0 ? 0 : v == 1 ? 2048 : v);
+}();
+static inline uint64_t ph_now() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void Ctx::head_phase_line() {
+    const double n = (double)std::max<uint64_t>(1, ph_n_);
+    auto us = [&](int i) { return (double)ph_ns_[i] / n / 1e3; };
+    std::fprintf(stderr, "radiance: rank 0 decode head issue by phase (RADIANCE_PP_HEAD_PHASES, tp8 loop D41): %llu heads (%llu played, "
+                         "%llu issued live), mean us: stager + residency %.1f, kvstream %.1f, key + lookup %.1f, host steps before the "
+                         "first recorded stretch %.1f, that stretch's play %.1f (%.0f packets), the rest of the pass %.1f, joins + flush "
+                         "%.1f; run_step %.1f; %llu heads over 1 ms\n",
+                 (unsigned long long)ph_n_, (unsigned long long)ph_played_, (unsigned long long)(ph_n_ - ph_played_), us(0), us(1),
+                 us(2), us(3), us(4), (double)ph_pk_ / (double)std::max<uint64_t>(1, ph_played_), us(5), us(6), us(7),
+                 (unsigned long long)ph_slow_);
+    ph_n_ = ph_played_ = ph_slow_ = ph_pk_ = 0;
+    for (uint64_t& x : ph_ns_) x = 0;
+}
+
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
+    bool ph_first = ph_on_;   /* tp8 loop D41: the first recorded stretch of a timed head */
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
         switch (st.kind) {
         case kTapePlay:
+            if (ph_first) { ph_t_[3] = ph_now(); ph_pk_ += (uint64_t)std::max(0, st.b - st.a); }
             rc = tape_play(t.dev, st.a, st.b);
+            if (ph_first) { ph_t_[4] = ph_now(); ph_first = false; }
             if (rc < 0) step_fail_ = fmt("a recorded pass could not be submitted: %s",
                                          rad_dev_last_error());
             break;
@@ -1597,6 +1628,7 @@ int Ctx::run_pass(const RadBatch* b) {
         bump(pc_played_);
         pc_dispatched_.fetch_add(t->dispatches, std::memory_order_relaxed);
         pc_unordered_.fetch_add(t->unordered, std::memory_order_relaxed);
+        if (ph_on_) { ph_t_[2] = ph_now(); ++ph_played_; }   /* tp8 loop D41: key + lookup done */
         return play_pass(*t);
     }
 
@@ -1651,6 +1683,7 @@ int Ctx::run_pass(const RadBatch* b) {
 
 int Ctx::run_step(const RadBatch* b) {
     if (!b) return RAD_E_INVAL;
+    ph_entry_ns_ = g_head_phases > 0 ? ph_now() : 0;   /* tp8 loop D41 */
     if (!arch_step_) {
         RAD_WARN("Ctx::run_step: no architecture step function was installed");
         return RAD_E_STATE;
@@ -1675,11 +1708,21 @@ int Ctx::run_step(const RadBatch* b) {
         slow_res_ns_ = 0;
         slow_max_op_ = -1;
     }
+    /* tp8 loop D41: a whole decode head on a pipeline leader's rank 0 (the stager + residency sync above are in phase 0) */
+    ph_on_ = g_head_phases > 0 && rank_ == 0 && pp_pass_part() == 1 /* RAD_PP_PART_HEAD */ && pp_pass_seg() == 0 &&
+             b->phase == RAD_PHASE_DECODE && b->draft_pass == 0;
+    if (ph_on_) {
+        ph_t_[0] = ph_entry_ns_;
+        ph_t_[1] = ph_now();
+        ph_t_[2] = ph_t_[3] = ph_t_[4] = 0;
+    }
     kvstream_enter(this, b);
+    if (ph_on_) ph_t_[5] = ph_now();
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
+    if (ph_on_) ph_t_[6] = ph_now();
 
     /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the
      * compute stream, so work left on lane 1 could be read by the sampler or freed while in
@@ -1703,6 +1746,16 @@ int Ctx::run_step(const RadBatch* b) {
 
     if (profiling_) profile_collect();
     flush_issued();
+    if (ph_on_) {   /* tp8 loop D41: 0 entry, 1 after the stager + residency, 5 after kvstream, 2 key + lookup, 3 / 4 the first
+                     * stretch, 6 run_pass's return, now the end; a live / recorded pass has no 2 / 3 / 4: all of it in 'the rest' */
+        const uint64_t t7 = ph_now(), t0 = ph_t_[0], t1 = ph_t_[1], t5 = ph_t_[5], t6 = ph_t_[6];
+        const uint64_t t2 = ph_t_[2] ? ph_t_[2] : t5, t3 = ph_t_[3] ? ph_t_[3] : t2, t4 = ph_t_[4] ? ph_t_[4] : t3;
+        ph_ns_[0] += t1 - t0; ph_ns_[1] += t5 - t1; ph_ns_[2] += t2 - t5; ph_ns_[3] += t3 - t2; ph_ns_[4] += t4 - t3;
+        ph_ns_[5] += t6 - t4; ph_ns_[6] += t7 - t6; ph_ns_[7] += t7 - t0;
+        if (t7 - t0 > 1000000) ++ph_slow_;
+        if (++ph_n_ >= g_head_phases) head_phase_line();
+        ph_on_ = false;
+    }
     if (slow_ms > 0) {
         const double wall =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slow_t0).count();

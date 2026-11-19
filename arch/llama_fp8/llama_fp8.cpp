@@ -96,6 +96,9 @@ struct Model {
     Dspark::Wire dsw{};
     rad_kvgroup  kv_draft = 0;
     bool         have_ds = false;
+    /* tp8 loop D38a: a pipeline follower beside the leader's drafter: no taps, no drafter, the drafter's KV group declared
+     * zeroed (deepseek41's pp_dspark_zero: the nodes' groups stay one list) */
+    bool         pp_draft_zero = false;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
@@ -492,6 +495,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const char* ids = rad_meta_gets(meta, "draft.target_layer_ids", nullptr);
             if (!ids) ids = rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr);
             m.n_taps = parse_layer_ids(ids, m.n_main, m.tap_layer, Model::MAX_TAPS);
+            /* tp8 loop D38a: in a two-node pipeline the drafter is the leader's -- its context pass reads the taps after the
+             * tail, so every tap must be a leader layer ([0, h) or [t, n)); the follower declares no tap and no drafter,
+             * only the drafter's KV group, zeroed (below, where the leader declares the drafter) */
+            if (m.pp && m.n_taps > 0) {
+                for (int t = 0; t < m.n_taps; ++t)
+                    if (m.tap_layer[t] >= m.pp_h && m.tap_layer[t] < m.pp_t) {
+                        fprintf(stderr, "radiance: llama: the drafter reads trunk layer %d, which W(%d,%d) gives the follower; "
+                                        "in a two-node pipeline every tap must be a leader layer\n",
+                                m.tap_layer[t], m.pp_h, m.pp_t);
+                        return RAD_E_UNSUPPORTED;
+                    }
+                if (m.pp_rank == 1) {
+                    m.n_taps = 0;
+                    m.pp_draft_zero = true;
+                }
+            }
             if (m.n_taps > 0) {
                 m.b_dfsrc = decl_b(b, nm.f("draft_src"), g.act_dtype,
                                    {g.max_tok, (int64_t)m.n_taps * g.n_embd});
@@ -501,7 +520,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                              RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
                                   RAD_NOWEIGHTS),
                               {m.b_x}, {m.b_dfsrc});
-            } else {
+            } else if (!m.pp_draft_zero) {
                 fprintf(stderr, "radiance: llama: the container carries a '%s' drafter but names "
                                 "no trunk layer this model has; it is paired with a different "
                                 "target\n", da);
@@ -510,11 +529,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
-    if (m.pp && m.n_taps > 0) {
-        fprintf(stderr, "radiance: llama: a drafter's taps in a two-node pipeline are not supported in "
-                        "this build; serve without --num-speculative-tokens or the drafter\n");
-        return RAD_E_UNSUPPORTED;
-    }
     const bool shell = !m.pp || m.pp_rank == 0;   /* embedding, head and logits: the leader's */
     /* tp8 dev 1a: the follower's own lookup -- the table, the op and its all-reduce, declared where one process
      * declares them (before the layers), nothing of the head */
@@ -804,6 +818,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * size, because sharding changes buffer sizes and so the packer's offsets. */
     if (m.n_taps > 0)
         RAD_ARCH_TRY(declare_dspark(b, meta, ctx, m, (int)m.n_main));
+    if (m.pp_draft_zero) {   /* tp8 loop D38a: the follower's zeroed copy of the leader's drafter KV group */
+        Geom dg{};
+        RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DSpark"));
+        const int64_t win = rad_meta_geti(meta, "draft.use_sliding_window", 0) ? rad_meta_geti(meta, "draft.sliding_window", 0) : 0;
+        RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, win, (int)m.n_main, &m.kv_draft));
+        /* its block size off a store declared right after it, never issued (deepseek41's window_key_store) */
+        const int64_t kvd = dg.n_head_kv * dg.head_dim;
+        const rad_buf kz = decl_b(b, nm.f("pp_draft_kz"), dg.act_dtype, {g.max_tok, kvd});
+        const rad_op st = rw(b, RAD_OP(b, "kv_store",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", dg.head_dim),
+                                           RAD_INT("n_head_kv", dg.n_head_kv), RAD_INT("block_size", RAD_KV_BLOCK),
+                                           RAD_STR("kv_dtype", dg.kv_dtype)),
+                                RAD_NOWEIGHTS),
+                             {kz, kz}, {});
+        if (!st || rad_kv_block_size(b, m.kv_draft) < 1 || rad_kv_group_zero(b, m.kv_draft) < 0) return RAD_E_INVAL;
+    }
 
     rad_note(b, "rank %d/%d: %lld layers, all full attention; n_head=%lld n_head_kv=%lld "
                 "head_dim=%lld rot=%lld n_ff=%lld vocab=[%lld,%lld)",

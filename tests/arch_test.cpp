@@ -852,6 +852,91 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
     CHECK(lint.empty());
 }
 
+/* tp8 loop D42 (SDF, rad_block_moe_fp8.h kMoeSdfBit): bit 2 of MoeFP8::shexp_lane's word moves the shared arm's down
+ * ahead of the routed down at a pass of T <= kMoeShexpLaneRows and changes nothing else -- the same issues (op, n,
+ * lane, every operand) with one block moved, so the same kernels over the same operands (the bytes cannot move); at a
+ * wider pass and with the bit clear the issue list is today's. Control: the block really moved (the lists differ). */
+TEST(sdf_moves_only_the_shared_down_ahead_of_the_routed_down) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    RadBuildCtx ctx = build_ctx();
+    RadBuilder b;
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_fp8::probe(&meta, &probe));
+    const int rc = hyv3_fp8::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    auto& moe = hyv3_fp8::models[0].layers[1].moe;
+    REQUIRE(moe.op_sgate != 0 && moe.op_dn != 0 && moe.sh_down.op != 0);
+    static std::atomic<int> word{0};
+    const std::atomic<int>* const keep = moe.shexp_lane;
+    moe.shexp_lane = &word;
+    auto run = [&](int v, RadBatch batch) {
+        word.store(v);
+        RadCtx c{};
+        c.b = &b;
+        c.batch = &batch;
+        hyv3_fp8::step(&c, &batch);
+        return c.issues;
+    };
+    auto same = [](const RecIssue& x, const RecIssue& y) {
+        if (x.op != y.op || x.n != y.n || x.lane != y.lane || x.opd.size() != y.opd.size()) return false;
+        for (size_t i = 0; i < x.opd.size(); ++i) {
+            const RadOperand &p = x.opd[i], &q = y.opd[i];
+            if (p.kind != q.kind || p.dtype != q.dtype || p.handle != q.handle || p.raw != q.raw || p.offset != q.offset ||
+                p.rows != q.rows || p.cols != q.cols)
+                return false;
+        }
+        return true;
+    };
+    auto same_list = [&](const std::vector<RecIssue>& x, const std::vector<RecIssue>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); ++i)
+            if (!same(x[i], y[i])) return false;
+        return true;
+    };
+    auto first_of = [](const std::vector<RecIssue>& v, rad_op h) {
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].op == h) return (int)i;
+        return -1;
+    };
+    const rad_op gather = moe.op_gar ? moe.op_gar : moe.op_gather;
+    for (const RadBatch& batch : { decode_batch(), prefill_batch() }) {   /* 4 and 64 rows: both in the band */
+        const std::vector<RecIssue> a = run(0, batch), b4 = run(4, batch), a2 = run(2, batch), b6 = run(6, batch);
+        CHECK(!a.empty());
+        /* today's order: ... routed down, the shared down's launches, the gather */
+        const int dn = first_of(a, moe.op_dn), g = first_of(a, gather), sd = first_of(a, moe.sh_down.op);
+        CHECK(dn >= 0 && g > dn && sd > dn && sd < g);
+        if (!(dn >= 0 && g > dn && sd > dn && sd < g)) continue;
+        /* the expected list: the block (dn, g) moved in front of the routed down */
+        std::vector<RecIssue> want(a.begin(), a.begin() + dn);
+        want.insert(want.end(), a.begin() + dn + 1, a.begin() + g);
+        want.push_back(a[(size_t)dn]);
+        want.insert(want.end(), a.begin() + g, a.end());
+        CHECK(same_list(b4, want));
+        CHECK(!same_list(b4, a));   /* control: the bit did move it */
+        const int sd4 = first_of(b4, moe.sh_down.op), dn4 = first_of(b4, moe.op_dn);
+        CHECK(sd4 >= 0 && dn4 > sd4);
+        /* the lane form's own bits keep their meaning: 2 (F4P, prefill-height only) at these heights = 0, and 6 = 4 */
+        CHECK(same_list(a2, a));
+        CHECK(same_list(b6, b4));
+    }
+    /* a pass above the band (128 rows): the bit changes nothing */
+    RadBatch wide = prefill_batch();
+    wide.n_tok = 128;
+    wide.n_seq = 2;
+    wide.max_q_len = 64;
+    wide.max_ctx_len = 64;
+    static const int32_t kWideOut[] = { 63, 127 };
+    wide.out_ids = kWideOut;
+    {
+        const std::vector<RecIssue> a = run(0, wide), b4 = run(4, wide);
+        CHECK(!a.empty());
+        CHECK(same_list(b4, a));
+    }
+    word.store(0);
+    moe.shexp_lane = keep;
+}
+
 TEST(hyv3_fp8_tensor_parallel_partitions_experts_and_shared_width) {
     RadModelMeta meta = hyv3_fp8_test_meta();
     for (int rank = 0; rank < 2; ++rank) {

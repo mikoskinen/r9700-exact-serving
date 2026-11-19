@@ -204,6 +204,36 @@ struct World6 {
 };
 World6& world6() { static World6 w; return w; }
 
+/* tp8 loop D38a: the four-layer llama with a DSpark block drafter merged (rad-convert --draft-model), its one tap at layer
+ * 3 -- inside the leader's tail [t, 4) at every cut t <= 3 -- and a block of 3 (the depth it serves): the host fixture for
+ * a DRAFTED decode lane (D38's issue-ahead of drafted lanes needs one to prove its tokens). */
+struct WorldDs {
+    tiny::TempDir dir{ "pp_e2eds" };
+    std::string llama, draft, llama_rad, log;
+    bool ok = false;
+    WorldDs() {
+        if (!dir.ok()) return;
+        llama = dir / "llama";
+        draft = dir / "dspark";
+        llama_rad = dir / "llama.rad";
+        if (mkdir(llama.c_str(), 0755) != 0 || mkdir(draft.c_str(), 0755) != 0) return;
+        tiny::Llama s;
+        s.layers = 4;
+        s.ctx = 65536;
+        s.branch = 0.1f;   /* near-bigram: the drafter's anchor row can match it (tiny::DsparkDraft) */
+        tiny::DsparkDraft d;
+        if (!tiny::write_llama(llama, s) || !tiny::write_dspark(draft, d) ||
+            !tiny::write_text(dir / "llama.recipe", tiny::kLlamaDsparkRecipe))
+            return;
+        const int st = tiny::run({ RAD_E2E_CONVERT, llama, "-o", llama_rad, "--recipe", dir / "llama.recipe", "--draft-model",
+                                   draft, "--max-spec", "3" },
+                                 engine_env(), &log);
+        if (st != 0) { fprintf(stderr, "    rad-convert (DSpark) exited %d:\n%s\n", st, tail(log).c_str()); return; }
+        ok = true;
+    }
+};
+WorldDs& worldds() { static WorldDs w; return w; }
+
 /* The common shape of every run here: two sequences, 64-token steps (so a document prefills in
  * several chunks, with decode rows beside them), the cache small enough to matter. */
 std::vector<std::string> shape() {
@@ -390,6 +420,36 @@ struct Serving {
     }
 };
 
+/* tp8 loop D38a: /completion's greedy tokens with its draft counts (timings.draft_n / draft_n_accepted; 0 when none) */
+struct Drafted { std::vector<int32_t> tok; long long drafted = 0, accepted = 0; };
+Drafted complete_drafted(int port, const std::vector<int32_t>& prompt, int n) {
+    const json b = { { "prompt", prompt }, { "n_predict", n }, { "temperature", 0.0 }, { "ignore_eos", true },
+                     { "return_tokens", true } };
+    Call c;
+    std::string out;
+    Drafted d;
+    if (!(c.send(port, "/completion", b.dump()) && c.read(&out) == 200)) return d;
+    const json j = json::parse(out, nullptr, false);
+    if (!j.is_object() || !j.contains("tokens")) return d;
+    d.tok = j["tokens"].get<std::vector<int32_t>>();
+    d.drafted = j.value(json::json_pointer("/timings/draft_n"), (long long)0);
+    d.accepted = j.value(json::json_pointer("/timings/draft_n_accepted"), (long long)0);
+    return d;
+}
+/* Six prompts: two alone (one repetitive, which a drafter can follow), then four at once. */
+std::vector<Drafted> drafted_set(int port) {
+    std::vector<Drafted> out;
+    std::vector<int32_t> rep;
+    for (int k = 0; k < 6; ++k) for (int32_t t : prompt_ids(21, 24)) rep.push_back(t);
+    out.push_back(complete_drafted(port, rep, 32));
+    out.push_back(complete_drafted(port, prompt_ids(22, 90), 28));
+    std::vector<std::future<Drafted>> f;
+    for (uint64_t s : { 23, 24, 25, 26 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete_drafted(port, prompt_ids(s, 40 + 9 * s), 24); }));
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
 /* Five prompts: three alone, then four at once. */
 std::vector<std::vector<int32_t>> greedy_set(int port) {
     std::vector<std::vector<int32_t>> out;
@@ -452,6 +512,35 @@ TEST(a_pipeline_serves_the_greedy_tokens_one_process_serves) {
         if (ref[i] != got[i]) fprintf(stderr, "    prompt %zu: the pipeline's tokens differ\n", i);
         CHECK(ref[i] == got[i]);
     }
+}
+
+/* tp8 loop D38a: the DSpark fixture on one process -- a drafted run (--num-speculative-tokens 3, the block it serves)
+ * returns the plain greedy tokens and drafts (some accepted, some not: the check means something). */
+TEST(d38a_a_dspark_drafted_process_serves_the_plain_greedy_tokens) {
+    REQUIRE(worldds().ok);
+    std::vector<Drafted> plain, spec;
+    for (int k = 0; k < 2; ++k) {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", { "--num-speculative-tokens", k ? "3" : "0" }));
+        (k ? spec : plain) = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    REQUIRE_EQ(plain.size(), spec.size());
+    long long drafted = 0, accepted = 0;
+    for (size_t i = 0; i < plain.size(); ++i) {
+        CHECK(!plain[i].tok.empty());
+        if (plain[i].tok != spec[i].tok) fprintf(stderr, "    prompt %zu: the drafted run's tokens differ\n", i);
+        CHECK(plain[i].tok == spec[i].tok);
+        CHECK_EQ(plain[i].drafted, 0);
+        drafted += spec[i].drafted;
+        accepted += spec[i].accepted;
+    }
+    fprintf(stderr, "    one process, DSpark block 3: %lld drafted, %lld accepted over %zu prompts\n", drafted, accepted,
+            spec.size());
+    CHECK(drafted > accepted);
+    CHECK(accepted > 0);
 }
 
 TEST(a_killed_follower_fails_the_leaders_requests_and_a_new_pair_serves_again) {
@@ -804,7 +893,9 @@ TEST(lanes_keep_both_stages_busy_at_once) {
     for (int lanes : { 1, 2 }) {
         const std::string prefix = d / ("st" + std::to_string(lanes));
         Serving pp;
-        REQUIRE(pp.start("0,2", lane_shape(lanes), { "RADIANCE_PP_SPLIT_MIN=16", "RADIANCE_PP_STAMPS=" + prefix }));
+        /* tp8 loop D41: RADIANCE_PP_HEAD_PHASES=16 -- rank 0 times every 16 whole decode heads by phase (timing only) */
+        REQUIRE(pp.start("0,2", lane_shape(lanes), { "RADIANCE_PP_SPLIT_MIN=16", "RADIANCE_PP_STAMPS=" + prefix,
+                                                     "RADIANCE_PP_HEAD_PHASES=16" }));
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<std::future<std::vector<int32_t>>> f;
         for (uint64_t s = 0; s < 12; ++s)
@@ -843,6 +934,27 @@ TEST(lanes_keep_both_stages_busy_at_once) {
             CHECK(heads > 0);
             CHECK_EQ(hiss, lanes > 1 ? heads : 0LL);   /* one lane runs engine.cpp's step loop: no 'hiss' there */
             CHECK_EQ(bad, 0LL);
+            /* tp8 loop D41: with lanes, rank 0's head-phase lines (every 16 decode heads); one lane issues no head part */
+            const std::string llog = pp.lead.output();
+            const char* key = "radiance: rank 0 decode head issue by phase (RADIANCE_PP_HEAD_PHASES, tp8 loop D41): ";
+            long long lines = 0, n = -1, played = -1, live = -1;
+            for (size_t at = llog.find(key); at != std::string::npos; at = llog.find(key, at + 1)) {
+                ++lines;
+                (void)std::sscanf(llog.c_str() + at + std::strlen(key), "%lld heads (%lld played, %lld issued live)", &n, &played, &live);
+            }
+            fprintf(stderr, "    %d lane(s): %lld head-phase lines (tp8 loop D41), the last: %lld heads, %lld played, %lld live\n", lanes,
+                    lines, n, played, live);
+            if (lanes > 1) {
+                CHECK(lines > 0);
+                CHECK_EQ(n, 16LL);
+                CHECK(played >= 0 && live >= 0 && played + live == 16);   /* the host backend records no tapes: every head live */
+                if (lines > 0) {
+                    const size_t at = llog.rfind(key);
+                    fprintf(stderr, "      %s\n", llog.substr(at, llog.find('\n', at) - at).c_str());
+                }
+            } else {
+                CHECK_EQ(lines, 0LL);
+            }
         }
     }
     CHECK(got[1].both < 0.02);          /* one lane: the nodes take turns */
@@ -3717,5 +3829,59 @@ TEST(kv_placed_pools_serve_and_record_what_one_process_does) {
         CHECK(same);
         if (!same) fprintf(stderr, "    leader:\n%s\n", tail(pr.llog, 30).c_str());
         check_logs(pr.llog, pr.flog, cut, true);
+    }
+}
+
+/* tp8 loop D38a: the DSpark drafter on a pipeline's leader (its tap, layer 3, in the leader's tail at W(0,2) / W(1,3) /
+ * W(0,3)), at one lane, two and three: the drafted pair serves the drafted one process's tokens (= the plain greedy
+ * tokens) and drafts, some accepted -- the host arm D38 (issue-ahead of drafted lanes) is proved against. A tap given to
+ * the follower is refused by name. */
+TEST(d38a_a_drafted_pipeline_serves_one_process_tokens_at_one_two_and_three_lanes) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    std::vector<Drafted> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    for (const auto& [lanes, cut] : { std::pair<int, const char*>{ 1, "0,2" }, { 2, "1,3" }, { 3, "0,3" }, { 2, "0,2" } }) {
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(cut, cat(spec, lane_shape(lanes)), kSplitEnv));
+        const std::vector<Drafted> got = drafted_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        REQUIRE_EQ(ref.size(), got.size());
+        long long drafted = 0, accepted = 0;
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!got[i].tok.empty());
+            if (ref[i].tok != got[i].tok) ++differ;
+            drafted += got[i].drafted;
+            accepted += got[i].accepted;
+        }
+        fprintf(stderr, "    %d lane(s) W(%s): %d of %zu prompts differ; %lld drafted, %lld accepted\n", lanes, cut, differ,
+                ref.size(), drafted, accepted);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(pp.lead.output()).c_str(),
+                            tail(pp.fol.output()).c_str());
+        CHECK_EQ(differ, 0);
+        CHECK(drafted > accepted);
+        CHECK(accepted > 0);
+    }
+    /* W(2,4): the tap (layer 3) is the follower's -- refused by name, the pair does not start */
+    {
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        const bool up = pp.start("2,4", cat(spec, lane_shape(2)), kSplitEnv);
+        CHECK(!up);
+        const std::string f = pp.fol.output() + pp.lead.output();
+        const bool named = f.find("every tap must be a leader layer") != std::string::npos;
+        if (!named) fprintf(stderr, "    W(2,4):\n%s\n", tail(f).c_str());
+        CHECK(named);
     }
 }
