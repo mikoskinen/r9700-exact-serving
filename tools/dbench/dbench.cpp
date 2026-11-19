@@ -303,10 +303,15 @@ static bool parse_form(const std::string& n0, Form* f) {
     if (n == "stock") { f->on = 0; return true; }
     if (n == "rule") { f->on = -1; return true; }
     if (n == "mx2") { f->on = -2; return true; }   /* the switch drafter_mx 2, no pin */
+    if (n == "mx4") { f->on = -7; return true; }   /* the switch drafter_mx 4 (round 10: 2's bytes, PD 9 at K >= 2048) */
     if (n == "a8") { f->on = -3; return true; }    /* fp8 quant + moe_gemm_mxfp4a8 a call */
     if (n == "mx3") { f->on = -6; return true; }   /* the switch drafter_mx 3 (xm_a8_kernel: fp8 x fp8 on the 17-byte blocks) */
     if (n == "a8g") { f->on = -4; return true; }   /* moe_gemm_mxfp4a8 only (activations quantised before) */
     if (n == "a8q") { f->on = -5; return true; }   /* the fp8 quant only */
+    {   /* lNTpPD: xm_wl (round 10: xm_wm's operations, xm_a8's loader; byte-compared with the first mx2 arm's bytes) */
+        int a = 0, d = 0;
+        if (std::sscanf(n.c_str(), "l%dp%d", &a, &d) == 2) { f->on = 1; f->h = 16384 + d; f->r = 1; f->mt = a; return true; }
+    }
     {   /* qNT: the long-run WMMA form (rule B) */
         int a = 0;
         if (std::sscanf(n.c_str(), "q%d", &a) == 1) { f->on = 1; f->h = 4096; f->r = 1; f->mt = a; return true; }
@@ -341,6 +346,7 @@ static void apply_form(const Form& f) {
     g_a8 = f.on == -3 ? 1 : f.on == -4 ? 2 : f.on == -5 ? 3 : 0;
     if (g_a8) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); return; }
     if (f.on == -6) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(3); return; }
+    if (f.on == -7) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(4); return; }
     if (f.on == 0) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); }
     else if (f.on == -2) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(2); }
     else if (f.on < 0) { r4d_mx_mr_set(1); r4d_mx_mr_pin(-1, 0, 0, 0, 0, 0); }
@@ -402,7 +408,7 @@ int main(int argc, char** argv) {
     hipStream_t s; CK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
 
     bool want_a8 = false;
-    for (auto& f : fl) want_a8 |= f.on <= -3;
+    for (auto& f : fl) want_a8 |= f.on <= -3 && f.on >= -6;
     /* weights: stage x projection, 32 experts each, a pointer table; for the a8 arms also the canonical planes (E2M1 codes,
      * element 2i in the low nibble of byte i, [N, K/2]; E8M0 [N, K/32]) of the same values, even / odd experts' tables */
     void* wtab[12][2]; size_t ebytes[2];
@@ -550,13 +556,13 @@ int main(int argc, char** argv) {
         else std::printf("== tokens %lld (%lld sequences x 5):", (long long)tk, (long long)(tk / 5));
         for (int st = 0; st < stages; ++st) std::printf(" stage %d live %lld experts, %lld slots, run max %lld;", st, (long long)rts[(size_t)st].experts, (long long)rts[(size_t)st].live, (long long)rts[(size_t)st].rmax);
         std::printf("\n");
-        std::vector<std::vector<uint8_t>> ref(calls.size()), outa8(calls.size());
+        std::vector<std::vector<uint8_t>> ref(calls.size()), outa8(calls.size()), outmx2(calls.size());
         double stock_pass = 0;
         for (const Form& f : fl) {
             apply_form(f);
             /* correctness: each call once, bytes vs the stock path's */
             bool same = true; std::string formdesc;
-            DiffStats dst; long long rbn = 0; int rb_fail = 0, vs_a8 = 0, vs_a8_n = 0;
+            DiffStats dst; long long rbn = 0; int rb_fail = 0, vs_a8 = 0, vs_a8_n = 0, vs_m2 = 0, vs_m2_n = 0;
             for (size_t i = 0; i < calls.size(); ++i) {
                 CK(hipMemsetAsync(calls[i].y, 0xff, calls[i].ybytes, s));
                 const int rc = calls[i].launch(s);
@@ -571,6 +577,8 @@ int main(int argc, char** argv) {
                 std::vector<uint8_t> got(calls[i].ybytes);
                 CK(hipMemcpy(got.data(), calls[i].y, calls[i].ybytes, hipMemcpyDeviceToHost));
                 if (f.on == -3 && outa8[i].empty()) outa8[i] = got;
+                if (f.on == -2 && outmx2[i].empty()) outmx2[i] = got;
+                if ((f.on == -7 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
                 if (f.on == -6 && !outa8[i].empty()) {
                     const size_t nv = (size_t)(calls[i].rt.live * kProj[calls[i].p].N) * 2;
                     vs_a8 += std::memcmp(got.data(), outa8[i].data(), std::min(nv, got.size())) ? 1 : 0;
@@ -622,6 +630,9 @@ int main(int argc, char** argv) {
             if (vs_a8_n) std::printf("             vs the a8 arm (quant_act_fp8 + moe_gemm_mxfp4a8 on the canonical planes): %s (%d of %d calls differ in live rows)\n",
                                      vs_a8 ? "DIFFER" : "IDENTICAL", vs_a8, vs_a8_n);
             if (vs_a8) ++fails;
+            if (vs_m2_n) std::printf("             vs the first mx2 arm (xm_wm WR1 NT1 PD2), every output byte: %s (%d of %d calls differ)\n",
+                                     vs_m2 ? "DIFFER" : "IDENTICAL", vs_m2, vs_m2_n);
+            if (vs_m2) ++fails;
             if (f.on != 0 && g_rb)
                 std::printf("             rule B: %s (repeat + rows reversed within experts + every 3rd slot dropped: %lld rows compared)\n",
                             rb_fail ? "FAIL" : "deterministic and placement-invariant", rbn);
@@ -644,7 +655,7 @@ int main(int argc, char** argv) {
                 }
                 std::printf("             EP (4 ranks' records a stage): critical (slowest rank a stage) %.1f us a pass, mean rank %.1f |%s\n", crit, mean, per.c_str());
             }
-            if (f.on != 0 && !same && !((f.h >= 1024 || f.on == -2 || f.on == -6) && g_rb) && f.on > -3) ++fails;
+            if (f.on != 0 && !same && !((f.h >= 1024 || f.on == -2 || f.on == -6 || f.on == -7) && g_rb) && f.on > -3) ++fails;
             std::fflush(stdout);
         }
         apply_form(fl[0]);
