@@ -10,6 +10,8 @@
 #include "fn4_switch.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -1664,6 +1666,15 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS): this pass's issue, timed on this rank's thread */
+    const double slow_ms = slow_issue_ms();
+    const auto slow_t0 = slow_ms > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (slow_ms > 0) {
+        slow_in_ms_ = slow_max_ms_ = 0;
+        slow_n_ = slow_res_n_ = 0;
+        slow_res_ns_ = 0;
+        slow_max_op_ = -1;
+    }
     kvstream_enter(this, b);
     {
         const int rc = run_pass(b);
@@ -1692,6 +1703,24 @@ int Ctx::run_step(const RadBatch* b) {
 
     if (profiling_) profile_collect();
     flush_issued();
+    if (slow_ms > 0) {
+        const double wall =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slow_t0).count();
+        if (wall >= std::max(10.0, 5.0 * slow_ms) && b->n_tok >= slow_issue_rows()) {
+            const int k = slow_pass_line_take();
+            if (k < 64) {
+                const OpInfo* oi = slow_max_op_ >= 0 && (size_t)slow_max_op_ < plans_.size()
+                                       ? plans_[(size_t)slow_max_op_].info : nullptr;
+                std::fprintf(stderr, "radiance: slow pass issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card %d rank %d step %d "
+                                     "(%lld rows) issued in %.2f ms: %lld issue(s) %.2f ms (the slowest '%s' %.2f ms), the rest %.2f ms "
+                                     "(the plugin's code between issues, lane joins, the stager), %lld first-launch resolve(s) "
+                                     "%.2f ms%s\n",
+                             device_, rank_, b->step, (long long)b->n_tok, wall, (long long)slow_n_, slow_in_ms_,
+                             oi ? oi->op.c_str() : "-", slow_max_ms_, wall - slow_in_ms_, (long long)slow_res_n_,
+                             (double)slow_res_ns_ / 1e6, k == 63 ? " (the 64th: no more pass lines)" : "");
+            }
+        }
+    }
     return step_status_;
 }
 

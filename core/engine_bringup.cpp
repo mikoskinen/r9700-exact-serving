@@ -2164,18 +2164,29 @@ int Engine::plan() {
      * of its kernels, so the modules no init launched (prefill forms, a first >= 1k-row pass's) load while serving and
      * outside this reading; on the two-node pipeline such a first use stalled both nodes ~46 s (FINDINGS F21 / F24 / F25).
      * With the switch every module is loaded on every card here, before the budget reads the cards. Default off. */
-    if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && !std::strcmp(pe, "1")) {
+    /* tp8 loop P31: RADIANCE_AQL_PRELOAD=2 = 1 + every registered kernel resolved on every card here (its first launch's
+     * symbol lookup and argument layout), so a first >= 1k-row pass resolves nothing while it issues. */
+    if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && (!std::strcmp(pe, "1") || !std::strcmp(pe, "2"))) {
+        const bool all = !std::strcmp(pe, "2");
         for (auto& r : ranks_) {
             AqlPreload p;
             const int st = aql_code_preload(r->device, &p);
             if (st == RAD_E_UNSUPPORTED) {
-                RAD_INFO("RADIANCE_AQL_PRELOAD=1: not the AQL backend here; nothing to load");
+                RAD_INFO("RADIANCE_AQL_PRELOAD=%s: not the AQL backend here; nothing to load", pe);
                 break;
             }
             RAD_TRY(st);
-            RAD_INFO("RADIANCE_AQL_PRELOAD=1 (tp8 loop F24): card %d: %lld module(s) loaded now (%s of code objects, %.0f ms), "
-                     "%lld loaded before, %lld with no code for this card, %lld refused", r->device, (long long)p.loaded,
+            RAD_INFO("RADIANCE_AQL_PRELOAD=%s (tp8 loop F24): card %d: %lld module(s) loaded now (%s of code objects, %.0f ms), "
+                     "%lld loaded before, %lld with no code for this card, %lld refused", pe, r->device, (long long)p.loaded,
                      humanb(p.bytes).c_str(), p.ms, (long long)p.already, (long long)p.none, (long long)p.failed);
+            if (all) {
+                int64_t ok = 0, no = 0;
+                double ms = 0;
+                RAD_TRY(aql_code_resolve_all(r->device, &ok, &no, &ms));
+                RAD_INFO("RADIANCE_AQL_PRELOAD=2 (tp8 loop P31): card %d: %lld kernel(s) resolved now (%.0f ms), %lld without "
+                         "code for this card (their first launch reports it, as before)", r->device, (long long)ok, ms,
+                         (long long)no);
+            }
         }
     }
 #endif

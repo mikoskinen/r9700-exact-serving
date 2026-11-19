@@ -494,8 +494,22 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
 std::mutex g_names_mu;
 std::unordered_map<uint64_t, std::string> g_names;
 
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS, core/runtime/issue.cpp): this thread's time in a kernel's first-launch resolve on a
+ * card (the module lock's wait included), and how many; the issue path reads and clears them around a launch. */
+thread_local uint64_t t_resolve_ns = 0, t_resolve_n = 0;
+
+struct ResolveClock {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~ResolveClock() {
+        t_resolve_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++t_resolve_n;
+    }
+};
+
 KernelRec* resolve(Func* fn, int ord) {
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
+    const ResolveClock rclk;   /* tp8 loop P31: from here on this is a first launch on the card (or a refused kernel) */
     Module* m = fn->mod;
     std::lock_guard<std::mutex> lk(m->mu);
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
@@ -4135,6 +4149,44 @@ int aql_code_preload(int device, AqlPreload* out) {
     p.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (out) *out = p;
     return RAD_OK;
+}
+
+/* tp8 loop P31 (RADIANCE_AQL_PRELOAD=2): every registered kernel resolved on card `device` now, as its first launch there
+ * would (resolve: the module's code object, its symbol, the argument layout), so no first launch resolves while serving.
+ * A kernel that cannot resolve keeps the reason its first launch reports, as before. */
+int aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms) {
+    using namespace aql;
+    if (resolved) *resolved = 0;
+    if (refused) *refused = 0;
+    if (ms) *ms = 0;
+    if (!G().ok || device < 0 || (size_t)device >= G().dev.size()) return RAD_E_UNSUPPORTED;
+    std::vector<Func*> fns;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        fns.reserve(r.by_stub.size());
+        for (const auto& kv : r.by_stub)
+            if (kv.second) fns.push_back(kv.second);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t ok = 0, no = 0;
+    for (Func* fn : fns) {
+        if (fn->rec[device].load(std::memory_order_acquire)) continue;
+        if (resolve(fn, device)) ++ok;
+        else ++no;
+    }
+    t_resolve_ns = t_resolve_n = 0;   /* bring-up's, not an issue's */
+    if (resolved) *resolved = ok;
+    if (refused) *refused = no;
+    if (ms) *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return RAD_OK;
+}
+
+/* tp8 loop P31: this thread's first-launch resolve time and count since the last call (RADIANCE_SLOW_ISSUE_MS) */
+void aql_resolves_take(uint64_t* ns, uint64_t* n) {
+    if (ns) *ns = aql::t_resolve_ns;
+    if (n) *n = aql::t_resolve_n;
+    aql::t_resolve_ns = aql::t_resolve_n = 0;
 }
 
 const DeviceBackend* aql_backend_if_present(void) {

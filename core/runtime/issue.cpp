@@ -10,6 +10,7 @@
  * the host. See ctx.h for the cost budget (spec §3.2).
  */
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -251,6 +252,30 @@ int Ctx::bind_weight_tables() {
 }
 
 static const bool g_dbg_issue = std::getenv("RADIANCE_DEBUG_ISSUE") != nullptr;
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS=X, > 0; read once): every rank times each issue (own = issue_body up to the launch,
+ * launch = the kernel's host launch or a host-site op's run) and its first-launch kernel resolves on the card (the AQL
+ * backend's); an issue of >= X ms prints one line, and run_step one line a pass whose issue took >= max(10, 5 X) ms (its
+ * issues' sum, the rest = the plugin's own code between issues, the slowest issue), at most 64 lines of each a process.
+ * Timing only: the issue order, arguments and bytes are unchanged. Unset / 0: nothing timed. */
+static const double g_slow_issue_ms = [] {
+    const char* e = std::getenv("RADIANCE_SLOW_ISSUE_MS");
+    const double v = e && *e ? std::atof(e) : 0.0;
+    if (v > 0)
+        std::fprintf(stderr, "radiance: RADIANCE_SLOW_ISSUE_MS=%g (tp8 loop P31): an issue of >= %g ms and a pass issue of >= "
+                             "%g ms print a line (at most 64 each) in passes of >= RADIANCE_SLOW_ISSUE_ROWS rows\n", v, v,
+                     std::max(10.0, 5.0 * v));
+    return v > 0 ? v : 0.0;
+}();
+/* RADIANCE_SLOW_ISSUE_ROWS=N (default 512): only passes of >= N rows print (the first big passes, not a1's decode recordings) */
+static const int64_t g_slow_issue_rows = [] {
+    const char* e = std::getenv("RADIANCE_SLOW_ISSUE_ROWS");
+    const long long v = e && *e ? std::atoll(e) : 512;
+    return (int64_t)(v > 0 ? v : 1);
+}();
+static std::atomic<int> g_slow_issue_lines{0}, g_slow_pass_lines{0};
+double slow_issue_ms() { return g_slow_issue_ms; }
+int64_t slow_issue_rows() { return g_slow_issue_rows; }
+int slow_pass_line_take() { return g_slow_pass_lines.fetch_add(1, std::memory_order_relaxed); }
 /* RADIANCE_DEBUG_ISSUE: entries walked and wall time spent in weight-table refreshes, reported
  * separately from the rest of `own`. */
 static double g_wtab_us = 0.0, g_wtab_us_p = 0.0;
@@ -622,8 +647,11 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 }
 
 int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
-    const auto t_iss0 = g_dbg_issue ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
+    const auto t_iss0 = g_dbg_issue || g_slow_issue_ms > 0 ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    if (g_slow_issue_ms > 0) aql_resolves_take(nullptr, nullptr);   /* tp8 loop P31: this issue's resolves only */
+#endif
     /* Step already aborted. rad_arch_step is void and keeps issuing; skip the rest so the first
      * error stays the reported one. */
     if (step_status_ < 0) return step_status_;
@@ -1155,6 +1183,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             g_iss_own_p = g_iss_own;
             g_iss_lau_p = g_iss_lau;
         }
+    } else if (g_slow_issue_ms > 0) {
+        /* tp8 loop P31: the same launch, timed */
+        const auto ta = std::chrono::steady_clock::now();
+        s = ip.launch(la, cur_stream());
+        const auto tb = std::chrono::steady_clock::now();
+        uint64_t rns = 0, rn = 0;
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+        aql_resolves_take(&rns, &rn);
+#endif
+        using msd = std::chrono::duration<double, std::milli>;
+        slow_issue_note(h, b, dom, ip, n, msd(ta - t_iss0).count(), msd(tb - ta).count(), rns, rn);
     } else {
         s = ip.launch(la, cur_stream());
     }
@@ -1271,6 +1310,29 @@ void Ctx::haz_note_route_copy(const void* src, void* dst, int64_t bytes, int rec
 }
 
 /* See "a host launch is a join" in Ctx::issue_body. */
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS): one issue's times into the pass's sums; a slow one gets its line. */
+void Ctx::slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, double own_ms, double launch_ms,
+                          uint64_t res_ns, uint64_t res_n) {
+    const double t = own_ms + launch_ms;
+    slow_in_ms_ += t;
+    ++slow_n_;
+    slow_res_ns_ += res_ns;
+    slow_res_n_ += (int64_t)res_n;
+    if (t > slow_max_ms_) { slow_max_ms_ = t; slow_max_op_ = (int32_t)h; }
+    if (t < g_slow_issue_ms || !batch_ || batch_->n_tok < g_slow_issue_rows) return;
+    const int k = g_slow_issue_lines.fetch_add(1, std::memory_order_relaxed);
+    if (k >= 64) return;
+    const OpInfo* oi = (size_t)h < plans_.size() ? plans_[h].info : nullptr;
+    const char* kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
+    std::fprintf(stderr, "radiance: slow issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card %d rank %d step %lld (%lld rows) "
+                         "lane %d: op '%s' kernel %s (band %d, %s, n %lld): own %.2f ms + launch %.2f ms, %llu first-launch "
+                         "resolve(s) %.2f ms in it%s\n",
+                 device_, rank_, batch_ ? (long long)batch_->step : -1LL, batch_ ? (long long)batch_->n_tok : -1LL, lane_,
+                 oi ? oi->op.c_str() : "<?>", kname, band, dom == RAD_DOMAIN_HOST ? "host" : "device", (long long)n,
+                 own_ms, launch_ms, (unsigned long long)res_n, (double)res_ns / 1e6,
+                 k == 63 ? " (the 64th: no more issue lines)" : "");
+}
+
 int Ctx::host_join(const RadOperand* opd, int n_opd) {
     return host_join_wait(host_join_drains(opd, n_opd));
 }
