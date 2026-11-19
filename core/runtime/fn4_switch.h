@@ -435,6 +435,11 @@
  *                   cap); starts at the env's; taken only with a BG lane (else 0). With ds41_bi 7 (PMM) a batched BG step runs its
  *                   newcomers' routed MoE as one pass a layer. Exact: multi-prefill steps are one process's (lever NOA / P23).
  *   pp_bg_join_ms   engine, the leader (tp8 loop P23s; 89): RADIANCE_PP_BG_JOIN_MS in process, 0 (off) or 1 .. 60000; with pp_bg_room.
+ *   ds41_twin       deepseek41 (tp8 loop P30t; 90, after pp_bg_join_ms): mask + 256 x rows -- the twin classes (1 attn_q_a +
+ *                   attn_kv, 2 attn_q_b, 4 attn_output_a + _b, 8 engram_kv, 16 other) whose IQR twin ('<name>#pf' in the weight
+ *                   sidecar) a PROMPT segment of >= rows rows (0 = RADIANCE_DS41_TWIN_ROWS) issues; decode rows keep the GGUF
+ *                   launch. Starts at RADIANCE_DS41_TWIN; a subset of the env's classes (0 = every row GGUF). The follower takes
+ *                   it with the leader's. Exact class: rule B (a prompt row's bytes are its own segment's).
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -646,7 +651,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
-              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kSwitches };
+              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

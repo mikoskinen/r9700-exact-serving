@@ -62,6 +62,10 @@ void usage() {
         "                     Repeatable: several sidecars join (an entry kept once); with --keep alone no rule is needed\n"
         "      --keep-only GLOB  narrows the --keep before it to the entries whose name matches GLOB (fnmatch;\n"
         "                     repeatable, any match keeps it) -- e.g. a block-FP8 sidecar without its shared expert\n"
+        "      --twin GLOB    an entry written here (made or kept) whose name matches GLOB is written as '<name>#pf': a\n"
+        "                     TWIN the engine serves BESIDE the container's <name> (both resident) instead of in its\n"
+        "                     place; an architecture that knows twins issues it for some rows (deepseek41: prompt rows,\n"
+        "                     RADIANCE_DS41_TWIN). Repeatable, any match twins it; a name already ending '#pf' stays\n"
         "  -v, --verbose\n"
         "  -h, --help\n"
         "\n"
@@ -107,6 +111,16 @@ int main(int argc, char** argv) {
      * --keep-only GLOB narrows the --keep given before it (none = every entry of that file) */
     struct KeepSpec { std::string path; std::vector<std::string> only; };
     std::vector<KeepSpec> keeps;
+    /* tp8 loop P30t: --twin GLOB -- the written name of a matching entry is '<name>#pf' (open_weight_sidecar serves it beside
+     * the container's <name>); the source entry, the rule and the planes are the same */
+    std::vector<std::string> twins;
+    const auto out_name = [&twins](const std::string& n) {
+        static const std::string kSfx = "#pf";
+        if (n.size() > kSfx.size() && n.compare(n.size() - kSfx.size(), kSfx.size(), kSfx) == 0) return n;
+        for (const std::string& g : twins)
+            if (fnmatch(g.c_str(), n.c_str(), 0) == 0) return n + kSfx;
+        return n;
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -132,6 +146,7 @@ int main(int argc, char** argv) {
             }
             keeps.back().only.push_back(g);
         }
+        else if (a == "--twin") twins.push_back(next("--twin"));   /* tp8 loop P30t */
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "rad-sidecar: unrecognised argument '%s'. Try --help.\n", a.c_str());
@@ -274,13 +289,13 @@ int main(int argc, char** argv) {
                 if (!any) continue;
             }
             for (const Job& j : jobs)
-                if (j.name == name) {
+                if (out_name(j.name) == out_name(name)) {
                     RAD_ERR("--keep %s holds '%s', which a rule here makes too: an entry is kept or made, not both",
                             keep_path.c_str(), name.c_str());
                     return 2;
                 }
             for (const KeptE& k : kept)
-                if (name == k.f->str(k.e->name)) {
+                if (out_name(name) == out_name(k.f->str(k.e->name))) {
                     RAD_ERR("--keep %s holds '%s', which --keep %s holds too: an entry is kept once", keep_path.c_str(),
                             name.c_str(), k.path->c_str());
                     return 2;
@@ -306,13 +321,13 @@ int main(int argc, char** argv) {
             int64_t b = 0;
             for (int k = 0; k < j.enc.n_planes; ++k) b += rad_enc_plane_bytes(&j.enc.plane[k], j.qw.rows, j.qw.cols);
             nb += b;
-            std::printf("%-52s %-24s -> %-48s %12lld -> %12lld bytes (%s)\n", j.name.c_str(),
+            std::printf("%-52s %-24s -> %-48s %12lld -> %12lld bytes (%s)\n", out_name(j.name).c_str(),
                         enc_text(f.encoding(*j.e)).c_str(), enc_text(j.enc).c_str(), (long long)j.e->bytes,
                         (long long)b, j.rule->q->name);
         }
         int64_t kb = 0;
         for (const KeptE& k : kept) {
-            std::printf("%-52s %-24s kept from %s, %12lld bytes\n", k.f->str(k.e->name), enc_text(k.f->encoding(*k.e)).c_str(),
+            std::printf("%-52s %-24s kept from %s, %12lld bytes\n", out_name(k.f->str(k.e->name)).c_str(), enc_text(k.f->encoding(*k.e)).c_str(),
                         basename_of(*k.path).c_str(), (long long)k.e->bytes);
             kb += (int64_t)k.e->bytes;
         }
@@ -343,11 +358,16 @@ int main(int argc, char** argv) {
     w.meta_i("sidecar.container_entries", f.entry_count());
     w.meta_s("sidecar.container", basename_of(in));
     if (!kept.empty()) w.meta_s("sidecar.kept", kept_names);
+    if (!twins.empty()) {   /* tp8 loop P30t */
+        std::string tg;
+        for (const std::string& g : twins) tg += (tg.empty() ? "" : ",") + g;
+        w.meta_s("sidecar.twin", tg);
+    }
     /* the jobs and the kept entries in one movement-unit order (model-level weights, then each layer's, by name) */
     struct Item { int32_t layer; std::string name; Job* j; const KeptE* k; };
     std::vector<Item> items;
-    for (Job& j : jobs) items.push_back({ j.e->layer < 0 ? -1 : j.e->layer, j.name, &j, nullptr });
-    for (const KeptE& k : kept) items.push_back({ k.e->layer < 0 ? -1 : k.e->layer, k.f->str(k.e->name), nullptr, &k });
+    for (Job& j : jobs) items.push_back({ j.e->layer < 0 ? -1 : j.e->layer, out_name(j.name), &j, nullptr });
+    for (const KeptE& k : kept) items.push_back({ k.e->layer < 0 ? -1 : k.e->layer, out_name(k.f->str(k.e->name)), nullptr, &k });
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
         return std::tie(a.layer, a.name) < std::tie(b.layer, b.name);
     });
@@ -402,7 +422,7 @@ int main(int argc, char** argv) {
             if (w.write_plane(idx, k, 0, kf.data(p), (int64_t)p.bytes) < 0) { w.abort(); return 1; }
             kept_bytes += (int64_t)p.bytes;
         }
-        std::printf("  %-52s %-22s kept from %s, %11lld bytes\n", kf.str(e->name), enc_text(ke).c_str(),
+        std::printf("  %-52s %-22s kept from %s, %11lld bytes\n", out_name(kf.str(e->name)).c_str(), enc_text(ke).c_str(),
                     basename_of(keep_path).c_str(), (long long)e->bytes);
     }
     for (Job& j : jobs) {
@@ -454,7 +474,7 @@ int main(int argc, char** argv) {
         j.bytes = 0;
         for (int k = 0; k < j.enc.n_planes; ++k) j.bytes += w.plane_bytes(j.idx, k);
         written += j.bytes;
-        std::printf("  %-52s %-22s -> %-40s %11lld -> %11lld bytes  rel %.3e  (%s)\n", j.name.c_str(),
+        std::printf("  %-52s %-22s -> %-40s %11lld -> %11lld bytes  rel %.3e  (%s)\n", out_name(j.name).c_str(),
                     enc_text(se).c_str(), enc_text(j.enc).c_str(), (long long)j.e->bytes, (long long)j.bytes, j.err,
                     c.q->name);
     }

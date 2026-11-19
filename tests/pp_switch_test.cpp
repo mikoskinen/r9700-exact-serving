@@ -226,6 +226,37 @@ TEST(the_sp_route_switches_are_deepseek41s_and_a_followers) {
     CHECK(named);
 }
 
+/* tp8 loop P30t: ds41_twin is switch 90, right after pp_bg_join_ms, deepseek41's (a plugin switch the follower takes with the
+ * leader's, not the scheduler's); with no plugin serving it a request is refused at the step release and nothing is queued,
+ * and GET reports -1; the follower's record of it is taken and named as skipped. */
+TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
+    const int i = fn4::switch_index("ds41_twin");
+    REQUIRE(i == (int)fn4::kDs41Twin);
+    CHECK_EQ(i, (int)fn4::kPpBgJoinMs + 1);
+    CHECK_EQ(i, 90);
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    CHECK(std::string(fn4::switch_name(i)) == "ds41_twin");
+    CHECK_EQ(fn4::value(i), -1);
+    std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
+    std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
+    fn4::requests(n0.data(), v0.data());
+    std::string why;
+    CHECK(!fn4::request("ds41_twin", 0, &why));
+    fn4::requests(n1.data(), v1.data());
+    CHECK_EQ(n1[(size_t)i], n0[(size_t)i]);
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 1;
+    std::vector<std::string> skipped;
+    (void)fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped);
+    CHECK_EQ(taken[(size_t)i], 1u);
+    bool named = false;
+    for (const std::string& s : skipped) named = named || s.rfind("ds41_twin", 0) == 0;
+    CHECK(named);
+}
+
 }  /* namespace */
 
 RAD_TEST_MAIN()

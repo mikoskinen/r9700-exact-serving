@@ -814,9 +814,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
  * is the architecture plugin's answer at declare, not the container's. */
 namespace {
 
+/* tp8 loop P30t: a sidecar entry named '<base>' + this stands beside the container's <base> (open_weight_sidecar) */
+constexpr const char kTwinSuffix[] = "#pf";
+constexpr size_t kTwinSuffixLen = sizeof kTwinSuffix - 1;
+
 /* A container is a file starting with the magic; anything else (a checkpoint directory, a
  * .safetensors, an index, a .gguf) is a checkpoint. A .rad path is always opened as a container,
  * so its reader reports what is wrong with it. */
+
 bool is_container(const std::string& path) {
     if (path.size() > 4 && path.compare(path.size() - 4, 4, ".rad") == 0) return true;
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -879,15 +884,27 @@ int Engine::open_weight_sidecar() {
         RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds no entries", path);
         return RAD_E_FORMAT;
     }
-    int64_t bytes = 0, replaced = 0;
+    int64_t bytes = 0, replaced = 0, twins = 0, twin_bytes = 0;
     std::map<std::string, int> forms;
     for (int64_t i = 0; i < side->entry_count(); ++i) {
         const RadFileEntry& s = side->entry(i);
         const std::string name = side->str(s.name);
-        const RadFileEntry* m = file_->find(name);
+        /* tp8 loop P30t: '<base>#pf' (rad-sidecar --twin) stands BESIDE the container's entry <base> instead of in its place: a
+         * second encoding of the same logical weight, served as its own weight under that name (sources() answers it from here;
+         * nothing else holds the name), checked against <base>'s rank and shape. The container's <base> stays as it is. */
+        const bool twin = name.size() > kTwinSuffixLen &&
+                          name.compare(name.size() - kTwinSuffixLen, kTwinSuffixLen, kTwinSuffix) == 0;
+        const std::string base = twin ? name.substr(0, name.size() - kTwinSuffixLen) : name;
+        const RadFileEntry* m = file_->find(base);
         if (!m) {
-            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is not an entry of %s", path, name.c_str(), cfg_.model.c_str());
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is not an entry of %s%s", path, base.c_str(), cfg_.model.c_str(),
+                    twin ? " (a twin '<name>#pf' stands beside a container entry of that name)" : "");
             return RAD_E_NOTFOUND;
+        }
+        if (twin && side->find(base)) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds both '%s' and its twin '%s': a weight is replaced or twinned, not both",
+                    path, base.c_str(), name.c_str());
+            return RAD_E_INVAL;
         }
         bool same = s.rank == m->rank;
         for (uint32_t k = 0; same && k < s.rank && k < RAD_MAX_RANK; ++k) same = s.shape[k] == m->shape[k];
@@ -910,14 +927,23 @@ int Engine::open_weight_sidecar() {
         char e[160];
         rad_enc_format(&side->encoding(s), e, sizeof e);
         ++forms[e];
+        if (twin) {
+            ++twins;
+            twin_bytes += (int64_t)s.bytes;
+            continue;
+        }
         bytes += (int64_t)s.bytes;
         replaced += (int64_t)m->bytes;
     }
     std::string fl;
     for (const auto& [f, n] : forms) fl += fmt("%s%d x %s", fl.empty() ? "" : ", ", n, f.c_str());
-    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s, read from %s "
+    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s%s, read from %s "
              "(RADIANCE_WEIGHT_SIDECAR): %s", (long long)side->entry_count(), humanb(bytes).c_str(),
-             humanb(replaced).c_str(), path, fl.c_str());
+             humanb(replaced).c_str(),
+             twins ? fmt("; %lld twin(s) '<name>#pf', %s BESIDE the container's entries (tp8 loop P30t)", (long long)twins,
+                         humanb(twin_bytes).c_str()).c_str()
+                   : "",
+             path, fl.c_str());
     side_ = std::move(side);
     return RAD_OK;
 }
