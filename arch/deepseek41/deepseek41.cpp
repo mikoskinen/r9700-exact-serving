@@ -1768,9 +1768,11 @@ static int64_t gather_ar_rows() {
  * lane 0 joins it back in front of the gather (MoeFP8::shexp_lane). Nothing is declared for it; the
  * gather combines the arms as before, so the bytes are the same. Unset or anything else: one lane,
  * as before. The in-process switch ds41_shexp_lane (0 / 1) changes it at a step release. Read at the
- * first declare. */
+ * first declare. tp8 loop D42: 4 / 5 / 6 = 0 / 1 / 2 + SDF (kMoeSdfBit, rad_block_moe_fp8.h: the shared arm's down
+ * issued ahead of the routed down at decode-height passes whose arm is on lane 0; the same bytes). */
 static int shexp_lane_env() {
     const char* e = std::getenv("RADIANCE_DS41_SHEXP_LANE");
+    if (e && (e[0] == '4' || e[0] == '5' || e[0] == '6') && !e[1]) return e[0] - '0';   /* tp8 loop D42: + 4 = SDF */
     return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
 }
 
@@ -2648,8 +2650,13 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (const int r = idx_fn4_accepts(name, value)) return r;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_shexp_lane"))   /* 2: lever F4P (ds41-pf2), prefill-height passes only */
-        return value == 0 || ((value == 1 || value == 2) && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_shexp_lane")) {   /* 2: lever F4P (ds41-pf2), prefill-height passes only */
+        /* tp8 loop D42: + 4 (kMoeSdfBit) = SDF, the shared down ahead of the routed down at decode-height passes whose
+         * arm is on lane 0 (any trunk layer with a shared arm: no lane-safety needed); v & 3 = the lane form as before */
+        const int lf = value & 3;
+        return value >= 0 && value <= 6 && lf != 3 &&
+               (lf == 0 || g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    }
     if (const K1Switch* k = k1_switch(name))
         return value == 0 || (value >= 1 && value <= k->max && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_walk"))
@@ -6737,7 +6744,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
                             "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
     }
-    if (ctx->rank == 0 && !ctx->shape_probe && g_sw_shexp.load(std::memory_order_relaxed) > 0)
+    if (ctx->rank == 0 && !ctx->shape_probe && (g_sw_shexp.load(std::memory_order_relaxed) & kMoeSdfBit))   /* tp8 loop D42 */
+        fprintf(stderr, "radiance: deepseek41: the shared expert's down issued ahead of the routed down at passes of up to "
+                        "%lld rows whose shared arm is on lane 0 (switch ds41_shexp_lane + %d, tp8 loop D42 SDF)\n",
+                (long long)kMoeShexpLaneRows, kMoeSdfBit);
+    if (ctx->rank == 0 && !ctx->shape_probe && (g_sw_shexp.load(std::memory_order_relaxed) & 3) > 0)
         fprintf(stderr, "radiance: deepseek41: the shared expert on the second lane beside the routed experts "
                         "at a decode or verify step of up to %lld rows, joined before the gather "
                         "(RADIANCE_DS41_SHEXP_LANE; switch ds41_shexp_lane): %d of %zu layers lane-safe\n",

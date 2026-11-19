@@ -135,6 +135,8 @@
  *                   refused. -1 when no loaded object serves it.
  *   ds41_shexp_lane deepseek41 (lever F4): 1 the shared expert on the second lane at decode / verify steps, 0 one
  *                   lane (RADIANCE_DS41_SHEXP_LANE at start); 1 is refused where no layer's arm is lane-safe.
+ *                   2 lever F4P (prefill-height passes). + 4 (tp8 loop D42 SDF): the shared arm's down issued ahead
+ *                   of the routed down at decode-height passes whose arm is on lane 0; the same bytes.
  *   ds41_kvfold     deepseek41 (lever K1 fold c): 1 the window key's rmsnorm_rope_roundtrip_kv_store (norm, rope,
  *                   round trip and the cache store in one launch), 0 rmsnorm_rope_roundtrip + kv_store as before.
  *                   RADIANCE_DS41_KVFOLD=1 declares the fold beside the pair (and starts at 1); unset declares
