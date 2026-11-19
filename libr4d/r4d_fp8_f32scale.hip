@@ -706,8 +706,109 @@ int body(const RadArgs* a, RadStream stream, bool grouped) {
 }
 int dense(const RadArgs* a, RadStream stream) { return body(a, stream, false); }
 int grouped(const RadArgs* a, RadStream stream) { return body(a, stream, true); }
+
+/* tp8 loop P30o r2 (WIP, first form): DeepSeek-V4's released block FP8 (gemm_nt_q dtype fp8a8e8) -- E4M3 [N, K] with an E8M0
+ * exponent per 32 x 32 block against quant_act_fp8_ue8m0's pair (an f32 power-of-two scale per row per 32 of K). The legacy
+ * 16 x 64 tile above (LDS staged a dword at a time, any activation pitch, C at its own row pitch) with the release's fold:
+ * per 32 of K a fresh chain of two WMMAs, folded as raw * (activation scale * weight scale) and added (inference/kernel.py
+ * fp8_gemm at block 32: C_accum += C_local * sa * sb; both scales powers of two, so the two products are exact and the
+ * fold's one rounding is the add). A wave's 16 weight rows sit in one 32-row scale block. Correctness form: the narrow /
+ * prefill speed forms are r2 (b). */
+__device__ __forceinline__ float e8m0f(uint32_t e) { return __uint_as_float(e ? e << 23 : 0x00400000u); }
+__global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, const uint8_t* ws, uint16_t* y, Meta m) {
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, n0 = blockIdx.x * 64;
+    __shared__ uint8_t qa[16 * 136], wb[64 * 136];
+    __shared__ int source[16];
+    const int first = (int)blockIdx.y * 16, end = min(first + 16, m.T);
+    if (tid < 16) {
+        const int r = first + tid;
+        source[tid] = r < end ? r : -1;
+    }
+    __syncthreads();
+    auto acc = r4d_fp8::acc_zero();
+    const long wsrow = (long)((n0 + wave * 16) / 32) * m.sr;
+    for (int k0 = 0; k0 < m.K; k0 += 128) {
+        for (int j = tid; j < 16 * 32; j += 128) {
+            const int r = j / 32, c = (j % 32) * 4, src = source[r];
+            uint32_t v = 0;
+            if (src >= 0) {
+                const auto* p = a + (long)src * m.ar + k0 + c;
+                v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            }
+            *(uint32_t*)(qa + r * 136 + c) = v;
+        }
+        for (int j = tid; j < 64 * 32; j += 128) {
+            const int r = j / 32, c = (j % 32) * 4;
+            const auto* p = w + (long)(n0 + r) * m.wr + k0 + c;
+            *(uint32_t*)(wb + r * 136 + c) = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                                             ((uint32_t)p[3] << 24);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 128; kk += 32) {
+            auto raw = r4d_fp8::acc_zero();
+            raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, 0, kk, lane), r4d_fp8::frag<128>(wb, wave * 16, kk, lane), raw);
+            raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, 0, kk + 16, lane),
+                               r4d_fp8::frag<128>(wb, wave * 16, kk + 16, lane), raw);
+            const int kb = (k0 + kk) / 32;
+            const float wsc = e8m0f(ws[wsrow + kb]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int src = source[(lane >> 4) * 8 + j];
+                const float scale = src >= 0 ? as[(long)src * m.asr + kb] * wsc : 0;
+                acc[j] += raw[j] * scale;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int r = first + (lane >> 4) * 8 + j, c = n0 + wave * 16 + (lane & 15);
+        if (r < end) y[(long)r * m.yr + c] = f32_to_bf16(acc[j]);
+    }
+}
+int dense_e8(const RadArgs* a, RadStream stream) {
+    if (!a || !a->t || a->n_t < 5) return RAD_E_INVAL;
+    const auto &x = a->t[0], &xs = a->t[1], &w = a->t[2], &ws = a->t[3], &y = a->t[4];
+    const int64_t N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
+    if (N < 64 || N % 64 || K < 128 || K % 128 || N > INT_MAX || K > INT_MAX || r4d_geti_or(a, "group", 0) != 32 ||
+        r4d_geti_or(a, "pb1", 0) > 0)
+        return R4D_NO(RAD_E_SHAPE);
+    if (x.dtype != RAD_F8E4M3 || xs.dtype != RAD_F32 || w.dtype != RAD_F8E4M3 || ws.dtype != RAD_E8M0 ||
+        y.dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!x.data || !xs.data || !w.data || !ws.data || !y.data || x.rank != 2 || xs.rank != 2 || y.rank != 2 ||
+        w.rank != 2 || ws.rank != 2 || x.shape[1] != K || xs.shape[0] != x.shape[0] || xs.shape[1] != K / 32 ||
+        y.shape[1] != N || w.shape[0] != N || w.shape[1] != K || ws.shape[0] != N / 32 || ws.shape[1] != K / 32 ||
+        x.stride[1] != 1 || xs.stride[1] != 1 || y.stride[1] != 1 || w.stride[1] != 1 || ws.stride[1] != 1 ||
+        y.shape[0] < 1 || y.shape[0] > INT_MAX || x.shape[0] != y.shape[0])
+        return R4D_NO(RAD_E_SHAPE);
+    Meta m{};
+    m.ar = x.stride[0];
+    m.asr = xs.stride[0];
+    m.yr = y.stride[0];
+    m.wr = w.stride[0];
+    m.sr = ws.stride[0];
+    m.T = (int)y.shape[0];
+    m.N = N;
+    m.K = K;
+    return R4D_EMIT(stream, fp8e8_b32, dim3(N / 64, (m.T + 15) / 16), dim3(128), 0, (const uint8_t*)x.data,
+                    (const float*)xs.data, (const uint8_t*)w.data, (const uint8_t*)ws.data, (uint16_t*)y.data, m);
+}
 }
 extern "C" int r4d_rad_fp8_f32scale(const RadArgs* a, RadStream stream) { return dense(a, stream); }
+/* tp8 loop P30o r2 (WIP): gemm_nt_q at dtype fp8a8e8 (the release's block FP8), the first form */
+extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs* a, RadStream stream) { return dense_e8(a, stream); }
+/* Its planes as the release stores them (affine {codes fp8_e4m3, scale e8m0 [32x32]}): read without a relayout. */
+extern "C" int r4d_layout_fp8a8e8(const RadParam*, int, int operand, const RadEncoding* e, const int* sel,
+                                  const RadTensor*, int n, RadLayout*) {
+    if (operand != 2 && operand != 3) return RAD_E_UNSUPPORTED;
+    if (!e || !sel || n != 1 || !rad_enc_is(e, "affine") || e->n_planes != 2 || e->plane[0].dtype != RAD_F8E4M3 ||
+        e->plane[1].dtype != RAD_E8M0 || e->plane[1].block[0] != 32 || e->plane[1].block[1] != 32 ||
+        sel[0] != (operand == 3 ? 1 : 0))
+        return RAD_E_DTYPE;
+    return RAD_E_UNSUPPORTED;
+}
 extern "C" int r4d_rad_moe_fp8_f32scale(const RadArgs* a, RadStream stream) {
     return grouped(a, stream);
 }

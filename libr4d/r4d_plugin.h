@@ -889,6 +889,8 @@ int r4d_rad_dsa_pool(const RadArgs*, RadStream);
 int r4d_shape_dsa_pool(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_dsa_query(const RadArgs*, RadStream);
 int r4d_rad_fp8_f32scale(const RadArgs*, RadStream);
+int r4d_rad_gemm_fp8a8e8(const RadArgs*, RadStream);   /* tp8 loop P30o r2 (WIP) */
+int r4d_layout_fp8a8e8(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int, RadLayout*);
 int r4d_rad_moe_fp8_f32scale(const RadArgs*, RadStream);
 int r4d_layout_fp8_f32scale(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);

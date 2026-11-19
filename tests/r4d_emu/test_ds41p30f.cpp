@@ -33,6 +33,7 @@
 extern "C" int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 extern "C" int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 extern "C" int r4d_rad_quant_act_fp8_ue8m0(const RadArgs*, RadStream);
+extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs*, RadStream);
 /* fp8_ops checks the library's block against R4D_FP8_BLOCK; r4d_gemm_fp8a8.hip (not in this build) defines it */
 extern "C" int r4d_gemm_fp8a8_block(void) { return R4D_FP8_BLOCK; }
 
@@ -277,6 +278,83 @@ void ue8m0_cases(std::mt19937& rng) {
     check(r4d_rad_quant_act_fp8_ue8m0(&a, nullptr) != RAD_OK, "quant_act_fp8_ue8m0 refuses group 128");
 }
 
+/* P30o r2 (WIP): gemm_nt_q at dtype fp8a8e8, the first form (r4d_fp8_f32scale.hip fp8e8_b32), against the release's fp8_gemm
+ * at block 32 restated (per 32 of K a sum of the code products from zero in k order -- the emulator's WMMA order --, then
+ * acc += sum * sa * sb, bf16 once): byte for byte here; on a card the WMMA's own order inside a 32-block (rule B). */
+void gemm_e8_cases(std::mt19937& rng) {
+    struct S { int M, N, K, ap, yp; };
+    const S shapes[] = { { 1, 64, 128, 128, 64 }, { 5, 128, 256, 256, 128 }, { 17, 64, 512, 640, 192 }, { 33, 128, 256, 256, 128 } };
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (const S& sh : shapes) {
+        const int M = sh.M, N = sh.N, K = sh.K, G = 32, kb = K / G, nb = N / G;
+        std::vector<uint16_t> x((size_t)M * K);
+        for (int r = 0; r < M; ++r)
+            for (int c = 0; c < K; ++c) x[(size_t)r * K + c] = bf16_of(nd(rng) * (r % 4 == 1 ? 50.f : 1.f));
+        std::vector<uint8_t> q((size_t)M * sh.ap, 0);
+        std::vector<float> s((size_t)M * kb, 0.f);
+        RadTensor tq[3];
+        mat(tq[0], x.data(), RAD_BF16, M, K, K);
+        mat(tq[1], q.data(), RAD_F8E4M3, M, K, sh.ap);
+        mat(tq[2], s.data(), RAD_F32, M, kb, kb);
+        RadParam pq[4]{};
+        pq[0] = { "M", RAD_P_INT, M };
+        pq[1] = { "n", RAD_P_INT, K };
+        pq[2] = { "group", RAD_P_INT, 32 };
+        pq[3].key = "dtype";
+        pq[3].kind = RAD_P_STR;
+        pq[3].sval = "bf16";
+        RadArgs aq{};
+        aq.t = tq;
+        aq.n_t = 3;
+        aq.p = pq;
+        aq.n_p = 4;
+        const std::string tag = "gemm_nt_q fp8a8e8 M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
+                                std::to_string(K) + " a pitch " + std::to_string(sh.ap) + " y pitch " + std::to_string(sh.yp);
+        check(r4d_rad_quant_act_fp8_ue8m0(&aq, nullptr) == RAD_OK, tag + ": the activation pair");
+        std::vector<uint8_t> w((size_t)N * K), ws((size_t)nb * kb);
+        std::uniform_int_distribution<int> code(0, 255), ex(117, 137);
+        for (auto& c : w) { c = (uint8_t)code(rng); if ((c & 0x7f) == 0x7f) c ^= 1; }
+        for (auto& e : ws) e = (uint8_t)ex(rng);
+        std::vector<uint16_t> y((size_t)M * sh.yp, 0x7e57);
+        RadTensor tg[5];
+        mat(tg[F_A], q.data(), RAD_F8E4M3, M, K, sh.ap);
+        mat(tg[F_ASCALE], s.data(), RAD_F32, M, kb, kb);
+        mat(tg[F_B], w.data(), RAD_F8E4M3, N, K, K);
+        mat(tg[F_BSCALE], ws.data(), RAD_E8M0, nb, kb, kb);
+        mat(tg[F_Y], y.data(), RAD_BF16, M, N, sh.yp);
+        RadParam pg[5]{};
+        pg[0] = { "M", RAD_P_INT, M };
+        pg[1] = { "N", RAD_P_INT, N };
+        pg[2] = { "K", RAD_P_INT, K };
+        pg[3] = { "group", RAD_P_INT, 32 };
+        pg[4].key = "dtype";
+        pg[4].kind = RAD_P_STR;
+        pg[4].sval = "fp8a8e8";
+        RadArgs ag{};
+        ag.t = tg;
+        ag.n_t = 5;
+        ag.p = pg;
+        ag.n_p = 5;
+        check(r4d_rad_gemm_fp8a8e8(&ag, nullptr) == RAD_OK, tag + ": launch");
+        int diff = 0, guard = 0;
+        for (int r = 0; r < M; ++r) {
+            for (int n = 0; n < N; ++n) {
+                float acc = 0.f;
+                for (int b = 0; b < kb; ++b) {
+                    float sub = 0.f;
+                    for (int i = 0; i < G; ++i)
+                        sub += rad_fp8e4m3_to_f32(q[(size_t)r * sh.ap + b * G + i]) * rad_fp8e4m3_to_f32(w[(size_t)n * K + b * G + i]);
+                    acc += sub * s[(size_t)r * kb + b] * std::ldexp(1.0f, (int)ws[(size_t)(n / G) * kb + b] - 127);
+                }
+                diff += y[(size_t)r * sh.yp + n] != bf16_of(acc);
+            }
+            for (int n = N; n < sh.yp; ++n) guard += y[(size_t)r * sh.yp + n] != 0x7e57;
+        }
+        check(diff == 0, tag + ": = the release's fp8_gemm restated (" + std::to_string(diff) + " differ)");
+        check(guard == 0, tag + ": the output's pitch padding untouched");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -284,6 +362,7 @@ int main() {
     split_cases(rng);
     fp8ops_cases();
     ue8m0_cases(rng);
+    gemm_e8_cases(rng);
     std::printf("%d check(s), %d failure(s)\n", g_cases, g_fail);
     return g_fail ? 1 : 0;
 }
