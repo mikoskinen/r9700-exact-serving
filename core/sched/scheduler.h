@@ -1195,6 +1195,11 @@ private:
     /* tp8 prefill P0: the leader's line for a prompt whose chunks went over the lanes, at its first token */
     void lane_prompt_note(SchedReq& s);
     int64_t  lane_reserved_ = 0;   /* the inbox rows lane_reserve set aside this step */
+    /* tp8 loop F71 (RADIANCE_PP_PLAN_RESERVED=1 at init; unset: false = as before): lane_reserved_ counts as planned where a plan may
+     * take the step's max_tok room (lever NOA's room, option D's over-budget first prefill), so the inbox pieces lane_take_inbox
+     * appends never take the step past max_tok. room_taken() = the rows those rules see as planned. */
+    bool     plan_reserved_ = false;
+    int64_t  room_taken() const { return plan_.n_tok + (plan_reserved_ ? lane_reserved_ : 0); }
     void    lane_plan_begin();
     void    lane_plan_end();
     int64_t lane_reserve(int64_t budget);

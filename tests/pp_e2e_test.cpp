@@ -2875,6 +2875,64 @@ TEST(a_bg_bodys_reserve_serves_one_process_tokens) {
     CHECK(time_all > 0);
 }
 
+/* tp8 loop F71 (RADIANCE_PP_PLAN_RESERVED=1 on the leader, DECODE round 26): a lane's inbox rows count where a plan takes the step's
+ * max_tok room (option D's over-budget first prefill, lever NOA's room) -- planning only, so every request's tokens are one process's
+ * at 4 lanes BG 2 (FOL_ORDER 2, the BEST form) and 3 lanes BG 1 with lent pieces in the steps, and nothing names a step over its
+ * budget (sched_test lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill reproduces the overrun without the env). */
+TEST(plan_reserved_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int bg; const char* cut; };
+    long long lent_all = 0;
+    for (const Arm a : { Arm{ 4, 2, "1,3" }, Arm{ 3, 1, "0,2" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
+        for (const char* v : { "RADIANCE_PP_PLAN_RESERVED=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1",
+                               "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) differ += ref[i] != got[i];
+        for (size_t i = 0; i < ref_b.size(); ++i) differ += ref_b[i] != got_b[i];
+        auto occ = [](const std::string& log, const std::string& tag) {
+            long long n = 0;
+            for (size_t at = log.find(tag); at != std::string::npos; at = log.find(tag, at + 1)) ++n;
+            return n;
+        };
+        const long long lent = occ(llog, " lent to other lanes") - occ(llog, " 0 lent to other lanes");
+        const long long named = occ(llog, "rows of other lanes' pieces");
+        fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=1, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld prompts with lent chunks; "
+                        "%lld 'rows of other lanes' pieces' lines\n", a.bg, a.lanes, a.cut, differ, ref.size() + ref_b.size(), lent, named);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(named, 0LL);
+        lent_all += lent;
+    }
+    fprintf(stderr, "    all arms: %lld prompts with lent chunks\n", lent_all);
+    CHECK(lent_all > 0);
+}
+
 /* tp8 loop D33 (DECODE round 26): the follower's segment set -- RADIANCE_PP_SEG_MAX=N declares at most N - 1 boundaries (the
  * bound before D33, 16, left the follower's last segment [25,32) whole at W(10,32): the end lump), fn4 pp_seg_set picks which
  * declared boundaries split a pass (n + 64 x s: every s-th, then the first n; 0 = all). At W(0,3) SEG_LAYERS=1 the follower
