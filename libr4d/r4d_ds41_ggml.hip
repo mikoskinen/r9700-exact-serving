@@ -3716,15 +3716,27 @@ static int wmk_dq8(int ty, long long Ntot, long long K, long long M) {
     if (K == 2048 && Ntot == 5120 && M <= 32) return G2KP1NT1;
     return 0;
 }
+/* tp8 loop D22, DECODE round 18 (19.11.2026): mode 5 = mode 2 (its WHG / DQ8 rules at 17..48 rows included) with the decode band's
+ * part-order launch up to kWmkBand5 = 64 rows (wmk_take): a 49..64-row dense GGUF call (a depth-3 decode step of 16 sequences x 4,
+ * sched_row_cap 64) takes gg_wk_kernel under 70724 -- the form every <= 48-row call takes -- instead of lever GPF's prefill form
+ * (r4d_gg_wkpf_run), and the head (f32 out, N >= 16384) WHG's G2 at KP 1 over four row tiles (bit 25: G2 to 64 rows; a G2 the form
+ * declines runs 70724's rule). lq150's lanecmp (the DRAFTER, drafter/out/lanecmp-lq150-F.txt): at 64 rows the follower's dense ran
+ * gg_pf<2,3,2,8> 3.57 ms + the 16-row remainders at KP 4 (gg_wk<2,4> 2.73, gg_wk<0,4> 2.52 ms) beside the 48-row launches, ~14.9 ms
+ * against ~3.2 ms at 48 rows. The same bytes: every launch code and the GPF form compute the part order (a row's bytes do not depend
+ * on M, its tile place or the geometry: --wmgcheck --wmk's 49 / 64-row launches against the row alone); the plugin's dense band
+ * follows the value (deepseek41: 64 under ds41_wmk 5). */
+constexpr long long kWmkBand5 = 64;
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
-    if (mode == 2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
-    if (mode == 2 && g_wmk_dq8 && !f32out)
+    const bool m2 = mode == 2 || mode == 5;
+    if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
+    if (mode == 5 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkCode | 2097152 | 16777216 | 33554432;
+    if (m2 && g_wmk_dq8 && !f32out)
         if (const int c = wmk_dq8(ty, Ntot, K, M)) return c;
     /* mode 4 (DRAFTER round 7, an in-process A/B code like F7's 2 / 3): mode 2 WITHOUT the WHG / DQ8 rules above = 70724 at every
      * decode row count, as BEST's libr4d serves mode 2 (the same bytes as 2) */
-    if (!g_wmk_tab || mode == 2 || mode == 4) return kWmkCode;
+    if (!g_wmk_tab || m2 || mode == 4) return kWmkCode;
     if (M <= 16) {
         if (head) return 332872;
         if (ty == GG_Q6_K && K == 5120 && (Ntot == 1536 || Ntot == 1024 || Ntot == 1792)) return 332872;
@@ -3747,7 +3759,7 @@ int wmk_now() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_WMK");
         int unread = -1;
-        const int want = e && e[0] >= '1' && e[0] <= '4' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 / 3 / 4 */
+        const int want = e && e[0] >= '1' && e[0] <= '5' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 / 3 / 4 / 5 */
         const bool first = g_wmk.compare_exchange_strong(unread, want);
         v = g_wmk.load(std::memory_order_relaxed);
         if (first && want >= 1) std::fprintf(stderr, "radiance: libr4d: lever WMK (ds41_wmk %d, RADIANCE_DS41_WMK): dense GGUF GEMMs at every row "
@@ -3756,7 +3768,10 @@ int wmk_now() {
     return v;
 }
 /* the switch takes a call of M rows (the bench pin r4d_gg_wk_pin, when set, runs ahead of it at every M) */
-bool wmk_take(long long M) { return M <= kGgDecodeRows && wmk_now() >= 1; }
+bool wmk_take(long long M) {
+    const int v = wmk_now();
+    return v >= 1 && M <= (v == 5 ? kWmkBand5 : (long long)kGgDecodeRows);   /* mode 5: the band to 64 rows (tp8 loop D22) */
+}
 void wmk_count(long long M) {
     g_wmk_launches.fetch_add(1, std::memory_order_relaxed);
     g_wmk_rows.fetch_add(M, std::memory_order_relaxed);
@@ -4209,8 +4224,10 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
                 mult = (float)r4d_getf(a, "mult", 1.0);
     const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
     /* lever WMK (or the bench pin): the part-order form with rmsnorm in its staging (an f32 gain); declined, rmsnorm's own
-     * launch and then gg_gemm_run's part-order GEMM -- the same bytes. D2's in-staging fold is the decode band's. */
-    if (g_gg_wk || wmk_take(M)) {
+     * launch and then gg_gemm_run's part-order GEMM -- the same bytes. D2's in-staging fold is the decode band's. tp8 loop D22
+     * (ds41_wmk 5): at 49..64 rows the fold stays two launches (rmsnorm's own at the call's M, then the part-order GEMM, which
+     * mode 5 serves in the decode band's form) -- the in-staging norm is checked only within 48 rows. */
+    if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
         if (g->dtype == RAD_F32) {
             GgWkFold fo{};
             fo.pro = 1; fo.g = (const float*)g->data; fo.eps = eps; fo.wadd = wadd; fo.mult = mult;
@@ -4265,7 +4282,8 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
     const long long g_ld = M > 1 ? gu->stride[0] : 2 * K;
     if (g_ld < 2 * K || h_ld < K) return R4D_NO(RAD_E_SHAPE);
     const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
-    if (g_gg_wk || wmk_take(M)) {   /* lever WMK (or the bench pin): as fold a, swiglu_clamped in the staging */
+    /* lever WMK (or the bench pin): as fold a, swiglu_clamped in the staging; tp8 loop D22 (ds41_wmk 5): at 49..64 rows two launches */
+    if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
         const uint16_t* gp = (const uint16_t*)gu->data;
         if (gg_al16(gp, g_ld) && gg_al16(gp + K, g_ld)) {
             GgWkFold fo{};
@@ -4484,7 +4502,7 @@ void r4d_mix_fin_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 4 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8 */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 5 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
@@ -4507,7 +4525,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) { r4d_ar_xpush_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 4 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 5 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }

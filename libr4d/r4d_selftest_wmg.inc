@@ -771,7 +771,11 @@ static void route(const Plugin& pl, const char* tlist) {
     if (!wst || !h.wk_pin) { std::printf("--wmkroute: rad_wmk_stats / r4d_gg_wk_pin absent (not the ds41-wmk2 plugin)\n"); ++g_fail; return; }
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
     const int kCode = 70724;
-    const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 64, 97, 130 };
+    /* tp8 loop D22 (DECODE round 18): R4D_WMKROUTE_MODE=5 runs the check under ds41_wmk 5 (the decode band's part-order launch up to
+     * 64 rows: 49..64-row calls in gg_wk_kernel / the head's G2 at four row tiles instead of the GPF prefill form); default 1 */
+    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); return e && e[0] >= '1' && e[0] <= '5' && !e[1] ? e[0] - '0' : 1; }();
+    const int64_t band = rmode == 5 ? 64 : 48;
+    const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 56, 63, 64, 97, 130 };
     const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
     auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
     auto pf_pin = (void (*)(int))dlsym(pl.h, "r4d_gg_pf_pin");
@@ -787,7 +791,7 @@ static void route(const Plugin& pl, const char* tlist) {
         { "head", 1, 32320, 0, 5120, "q6_K", false },
     };
     long long keys = 0, bad_keys = 0, calls = 0;
-    std::printf("WMK route check (fn4 ds41_wmk 1 over int16's decode band; bench pin code %d as the byte reference)\n", kCode);
+    std::printf("WMK route check (fn4 ds41_wmk %d over int16's decode band; bench pin code %d as the byte reference)\n", rmode, kCode);
     for (const MrTy& ty : kMrTypes) {
         if (!mr_in(want.c_str(), ty.name)) continue;
         const bool q32 = ty.qk == 32;
@@ -875,7 +879,7 @@ static void route(const Plugin& pl, const char* tlist) {
                 return std::vector<uint8_t>(o.begin() + M * yrow + m * hrow, o.begin() + M * yrow + (m + 1) * hrow);
             };
             auto stats = [&](long long* v) { for (int i = 0; i < 4; ++i) v[i] = 0; wst(v, 4); };
-            auto wmk_on = [&](int on) { set_dec(h); h.sw("ds41_wmk", on); };
+            auto wmk_on = [&](int on) { set_dec(h); h.sw("ds41_wmk", on ? rmode : 0); };
             std::string fails;
             long long bad = 0, rows_cmp = 0, rows_bad = 0, launch_bad = 0, decl = 0, pin_bad = 0, hoff_bad = 0, off_bad = 0, unf_bad = 0;
             /* a fold's two launches (the producer's row, then the gemm row on its h) under the current switch state */
@@ -920,7 +924,7 @@ static void route(const Plugin& pl, const char* tlist) {
                 const int rc = call(0, M, o);
                 stats(v1);
                 if (rc != RAD_OK) { ++bad; if (fails.size() < 400) fails += fmt(" M=%lld rc %d;", (long long)M, rc); continue; }
-                const long long want_l = M > 48 && op.kind == 2 ? 2 : 1;
+                const long long want_l = M > band && op.kind == 2 ? 2 : 1;   /* a pair: one part-order launch within the band */
                 if (v1[1] - v0[1] != want_l) { ++launch_bad; if (fails.size() < 400) fails += fmt(" M=%lld launches %lld;", (long long)M, v1[1] - v0[1]); }
                 decl += v1[3] - v0[3];
                 long long nb = 0;
