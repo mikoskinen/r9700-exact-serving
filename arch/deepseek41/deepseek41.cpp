@@ -1079,7 +1079,9 @@ static int twin_class(const char* name) {
     if (std::strstr(name, "_shexp.")) return kTwShx;
     return kTwOther;
 }
+static int twin_bi_now();   /* ds41_bi's value (below g_sw_bi): no twin under ds41_bi 0, where step() issues every pass */
 static int twin_mask_now() {
+    if (twin_bi_now() <= 0) return 0;
     const int d = g_twin_decl.load(std::memory_order_relaxed);
     const int v = g_sw_twin.load(std::memory_order_relaxed);
     return (v < 0 ? twin_env() : (v & 255)) & d;
@@ -1848,6 +1850,7 @@ static void walk_read_env() {
  * pass a segment. 0 = one launch over the step (today). RADIANCE_DS41_BI=0 / off declares it and starts at 0, 1 / on
  * at 1; unset declares nothing (the switch takes only 0, step() is today's). `_ok`: a declare had it on. */
 static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2 unread, -1 unset */
+static int twin_bi_now() { return g_sw_bi.load(std::memory_order_relaxed); }   /* tp8 loop P30t */
 static void bi_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_BI");
@@ -9958,6 +9961,20 @@ static void step(RadCtx* x, const RadBatch* batch) {
             static thread_local std::vector<BiSeg> ps(1);
             ps[0] = BiSeg{ 0, batch->n_tok, 0, 1, false, -1 };
             step_bi(x, m, batch, ps, true);
+            return;
+        }
+    }
+    /* tp8 loop P30t: with a twin class on, a lone prompt pass (one prefill sequence, no decode rows) runs through step_bi as its
+     * one segment -- the issue a multi-prompt pass gives the same prompt -- so its rows take the same twin forms alone and beside
+     * other prompts (step() issues no twin); a one-segment step_bi issues step()'s ops on the same rows (lever PSK's route above).
+     * Every twin class off (ds41_twin 0, or ds41_bi 0): step() as today. */
+    if (m.bi_sub && twin_mask_now() && batch->draft_pass == 0 && batch->n_seq == 1) {
+        int64_t Dn = 0, DT = 0;
+        batch_split(batch, &Dn, &DT);
+        if (Dn == 0) {
+            static thread_local std::vector<BiSeg> ps1(1);
+            ps1[0] = BiSeg{ 0, batch->n_tok, 0, 1, false, -1 };
+            step_bi(x, m, batch, ps1, true);
             return;
         }
     }
