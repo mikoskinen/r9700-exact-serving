@@ -2122,15 +2122,19 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     struct Arm { int lanes; const char* cut; int k; const char* lead_seg; const char* form; const char* order; const char* post1;
-                 const char* post2; };
-    long long first_all = 0, parts_all = 0;
+                 const char* post2; bool rings2 = false; };
+    long long first_all = 0, parts_all = 0, both_all = 0;
     for (const Arm a : { Arm{ 4, "2,3", 2, "1", "2", "2", nullptr, nullptr }, Arm{ 4, "1,2", 2, "1", "2", "2", nullptr, nullptr },
                          Arm{ 3, "2,3", 1, "1", "2", nullptr, nullptr, nullptr }, Arm{ 4, "2,3", 2, "1", "34", "2", nullptr, nullptr },
                          Arm{ 4, "2,3", 2, "1", "0", "2", nullptr, nullptr }, Arm{ 4, "2,3", 2, "1", "2", "2", "1", "0" },
-                         Arm{ 4, "2,3", 2, nullptr, nullptr, "2", "2", nullptr } }) {
+                         Arm{ 4, "2,3", 2, nullptr, nullptr, "2", "2", nullptr },
+                         /* tp8 loop D32: two boundary rings -- both BG lanes in segments at once (form 2, M9, a tail boundary only) */
+                         Arm{ 4, "2,3", 2, "1", "2", "2", nullptr, nullptr, true }, Arm{ 4, "2,3", 2, "1", "1", "2", nullptr, nullptr, true },
+                         Arm{ 4, "1,2", 2, "1", "2", "2", nullptr, nullptr, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         if (a.lead_seg) env.push_back(std::string("RADIANCE_PP_LEAD_SEG=") + a.lead_seg);
+        if (a.rings2) env.push_back("RADIANCE_PP_LEAD_SEG_RINGS=2");
         if (a.form) env.push_back(std::string("RADIANCE_PP_LEAD_SEG_FORM=") + a.form);
         if (a.order) env.push_back(std::string("RADIANCE_PP_FOL_ORDER=") + a.order);
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
@@ -2173,8 +2177,8 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
             CHECK(!ref_b[i].empty());
             if (ref_b[i] != got_b[i]) ++differ;
         }
-        long long steps = -1, parts = -1, between = -1, inside = -1, polls = -1, first = -1, whole = -1, wtail = -1;
-        int now = -1;
+        long long steps = -1, parts = -1, between = -1, inside = -1, polls = -1, first = -1, whole = -1, wtail = -1, both = -1;
+        int now = -1, rings = -1;
         if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
                 (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld "
@@ -2182,13 +2186,16 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
                                                     "segments), %lld polls", &steps, &parts, &between, &inside, &polls);
         if (const size_t at = llog.rfind("pp_lead_seg "); at != std::string::npos)
             (void)std::sscanf(llog.c_str() + at, "pp_lead_seg %d now (tp8 loop D32): %lld tails taken first while a BG step was in "
-                                                 "segments, %lld BG steps ran their head whole and %lld", &now, &first, &whole, &wtail);
+                                                 "segments, %lld BG steps ran their head whole and %lld their tail whole with no decode "
+                                                 "lane busy; %d boundary ring(s), %lld BG parts began", &now, &first, &whole, &wtail, &rings,
+                              &both);
         fprintf(stderr, "    LEAD_SEG=%s FORM=%s%s%s, FOL_ORDER=%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; leader: %lld BG "
                         "steps in %lld segments, %lld tails between two segments, %lld taken first, %lld heads / %lld tails whole with no "
-                        "decode lane busy, pp_lead_seg %d at the end\n", a.lead_seg ? a.lead_seg : "unset", a.form ? a.form : "unset",
+                        "decode lane busy, pp_lead_seg %d at the end; %d ring(s), %lld parts began beside another BG step's\n",
+                a.lead_seg ? a.lead_seg : "unset", a.form ? a.form : "unset",
                 a.post1 ? (std::string(" + POST ") + a.post1).c_str() : "", a.post2 ? (std::string(" + POST ") + a.post2).c_str() : "",
                 a.order ? a.order : "unset", a.k, a.lanes, a.cut, differ, ref.size() + ref_b.size(), steps, parts, inside, first, whole,
-                wtail, now);
+                wtail, now, rings, both);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         if (!a.lead_seg) {
@@ -2196,6 +2203,13 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
             continue;
         }
         CHECK(llog.find("fn4 pp_lead_seg starts at ") != std::string::npos);
+        CHECK_EQ(rings, a.rings2 ? 2 : 1);
+        if (a.rings2) {
+            CHECK(llog.find("RADIANCE_PP_LEAD_SEG_RINGS=2 -- two boundary rings") != std::string::npos);
+            both_all += std::max(0LL, both);
+        } else {
+            CHECK_EQ(both, 0LL);
+        }
         CHECK(now == (a.post2 ? std::atoi(a.post2) : std::atoi(a.form)));
         if (std::strcmp(a.form, "0") == 0) {
             CHECK_EQ(parts, 0LL);   /* form 0: every BG part whole */
@@ -2208,8 +2222,10 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
             parts_all += std::max(0LL, parts);
         }
     }
-    fprintf(stderr, "    form 2, all arms: %lld tails taken first while a BG step was in segments, %lld segments\n", first_all, parts_all);
+    fprintf(stderr, "    form 2, all arms: %lld tails taken first while a BG step was in segments, %lld segments; two rings: %lld BG parts "
+                    "began their segments beside another BG step's\n", first_all, parts_all, both_all);
     CHECK(first_all > 0);
+    CHECK(both_all > 0);
     CHECK(parts_all > 0);
 }
 
