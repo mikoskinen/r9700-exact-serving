@@ -252,6 +252,82 @@ Canberra. It officially became the capital in 1913 when the city was formally na
 With `--rope-scaling yarn:2` at 524,288 tokens, Qwen answers "The capital of Australia is Canberra. It
 officially became the capital in 1913 when the city was named and construction began."
 
+## DeepSeek on two machines
+
+Two of these machines, each with four R9700 cards, serve DeepSeek as one server over a 200 Gbit/s
+RDMA link (a ConnectX-6 card in each machine). The model is split by layers: the leader runs layers
+0 to 9 and 32 to 39 and the draft model and serves the API, and the follower runs layers 10 to 31.
+Each machine runs its layers tensor parallel over its own four cards.
+
+Both machines ran at 210 W a card with a -50 mV voltage offset. Values are tok/s summed over all
+concurrent requests, and prefill is prompt tokens divided by the time to first token, which is in
+brackets. The one-machine values are the DeepSeek 210 W column of [Results](#results).
+
+| Measure | Two machines | One machine | Two / one |
+|---|---|---|---|
+| 1 request | 104 prose / 209 code | 103 prose / 177 code | 1.01x / 1.18x |
+| 4 requests | 379 | 227 | 1.67x |
+| 8 requests | 484 | 282 | 1.71x |
+| 16 requests | 620 | 319 | 1.94x |
+| 24 requests | 695 | 342 | 2.03x |
+| 32 requests | 749 | 378 | 1.98x |
+| Prefill 16k | 9,985 (1.58 s) | 4,640 (3.40 s) | 2.15x |
+| Prefill 64k | 12,529 (5.24 s) | 5,800 (11.32 s) | 2.16x |
+| Prefill 128k | 12,920 (10.15 s) | 5,810 (22.58 s) | 2.22x |
+
+Both machines need the [host setup](#host-setup) with `sudo run/power.sh 210`, the files from
+[Model weights](#model-weights) in `MODEL_DIR`, and an address on the RDMA link: `LEADER_IP` on the
+leader and `FOLLOWER_IP` on the follower. Start the follower first:
+
+```bash
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek-fol --init --network host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  --env-file run/deepseek-tp8/follower.env \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-5201ad92 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8091 \
+  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$LEADER_IP":29517 --node-link verbs --pp-rank 1
+```
+
+Then the leader:
+
+```bash
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek --init --network host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  --env-file run/deepseek-tp8/leader.env \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-5201ad92 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8090 \
+  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$FOLLOWER_IP":29517 --node-link verbs --pp-rank 0 \
+  --draft-short-from 12
+run/switches.sh run/deepseek-tp8/switches.json
+```
+
+The pair is ready in about five minutes, and the API is on the leader's port 8090. The switches go
+to the leader, which passes them on to the follower.
+
 ## What exact means
 
 Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
@@ -337,12 +413,14 @@ The `main` branch has:
 - [registry/](registry/): one row per tested change, rejected ones included.
 - [gpu02/](gpu02/): the test scripts, the host tuning scripts and the run summaries.
 - [run/](run/): the power script, the environment files and the runtime switches that
-  [Run it](#run-it) uses.
+  [Run it](#run-it) and [DeepSeek on two machines](#deepseek-on-two-machines) use.
 
 The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
 `deepseek/current` with `exl3/current`, and both Qwen images from `qwen/current` with `exl3/fn4-dual`
-compiled with `-DEXL3R4D_DZ=2`. Every other branch is a single experiment or an earlier build, kept
-for the record.
+compiled with `-DEXL3R4D_DZ=2`. The two-machine image was built from `deepseek/ds41-pp-dev` with
+`exl3/ds41-x7-route` compiled with `-DEXL3R4D_X6_SGB=1 -DEXL3R4D_X5_SUM=3` (HIP) and
+`-DEXL3R4D_DK_MAX=64` (C). Every other branch is a single experiment or an earlier build, kept for
+the record.
 
 ## License
 
