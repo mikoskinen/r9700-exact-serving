@@ -11154,8 +11154,9 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
      * recorded */
     if (deepseek41::psk_hint(b)) return 0;
     /* tp8 loop D39 step 2c: a TAIL band pass (the engine's word, RadPpInfo.reserved[2]) issues other layers / crossings than a
-     * pass of the same batch and part, which no key holds: not recorded (0 on every pass the engine does not mark) */
-    if (deepseek41::g_tband_decl.load(std::memory_order_relaxed) && rad_pp_query().reserved[2] != 0) return 0;
+     * pass of the same batch and part, which no key holds: not recorded (0 on every pass the engine does not mark). A trunk pass
+     * only: the word stays set through the band step's own drafter passes (no pp_set_pass between), which issue as ever. */
+    if (deepseek41::g_tband_decl.load(std::memory_order_relaxed) && b && b->draft_pass == 0 && rad_pp_query().reserved[2] != 0) return 0;
     /* Lever E1: a pass it may deduplicate issues row counts read from the step's ids at issue: not recorded */
     if (deepseek41::engdd_may_act(b)) return 0;
     if (b && b->draft_pass == 0 && deepseek41::g_sw_bi.load(std::memory_order_relaxed) > 0) {
