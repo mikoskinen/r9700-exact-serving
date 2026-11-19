@@ -26,7 +26,8 @@ struct RgsForm { int code, r, c, u, nw, rw = 1; };   /* rw: tp8 loop D28's row g
 static const RgsForm kRgs[] = { { 1, 8, 2, 8, 16 }, { 2, 8, 4, 8, 16 }, { 3, 4, 4, 8, 16 }, { 4, 4, 2, 8, 16 }, { 5, 2, 4, 16, 16 },
                                 { 6, 4, 4, 8, 8 },  { 7, 2, 4, 16, 8 }, { 8, 4, 8, 8, 16 }, { 9, 2, 2, 16, 8 }, { 10, 2, 2, 16, 16 },
                                 { 11, 8, 1, 8, 16 }, { 12, 4, 2, 16, 8 }, { 13, 1, 4, 16, 8 }, { 14, 2, 8, 16, 8 },
-                                { 15, 4, 8, 8, 16, 4 }, { 16, 4, 4, 8, 16, 4 }, { 17, 4, 8, 8, 16, 2 }, { 18, 4, 4, 8, 8, 2 } };
+                                { 15, 4, 8, 8, 16, 4 }, { 16, 4, 4, 8, 16, 4 }, { 17, 4, 8, 8, 16, 2 }, { 18, 4, 4, 8, 8, 2 },
+                                { 19, 4, 4, 8, 8 }, { 20, 4, 4, 16, 8 } };   /* 19 / 20: lever RGP (the selection a row group at a time) */
 static const int kGemm[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
 
 static void rgs_part(const Plugin& pl, void (*pin)(int, int)) {
@@ -55,7 +56,7 @@ static void rgs_part(const Plugin& pl, void (*pin)(int, int)) {
                 wb[i] = bf(wf[i]);
                 if (wbf) { uint32_t u = (uint32_t)wb[i] << 16; std::memcpy(&wf[i], &u, 4); }
             }
-            for (int64_t M : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 20, 24, 28, 32, 33, 36, 40, 44, 47, 48 }) {
+            for (int64_t M : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 20, 24, 28, 32, 33, 36, 40, 44, 47, 48, 49, 56, 63, 64 }) {
                 void* dw = wbf ? up(wb) : up(wf);
                 void* db = up(bias);
                 std::vector<uint16_t> x((size_t)(M * K));
@@ -93,7 +94,7 @@ static void rgs_part(const Plugin& pl, void (*pin)(int, int)) {
                     std::vector<std::vector<uint8_t>> ref(6);
                     for (int j = 0; j < 6; ++j) ref[(size_t)j] = bytes(o[0][j], sz[(size_t)j]);
                     const bool timed = wbf && mode == 0 && lay == 0 &&
-                                       (M == 4 || M == 8 || M == 16 || M == 24 || M == 32 || M == 40 || M == 47 || M == 48);
+                                       (M == 4 || M == 8 || M == 16 || M == 24 || M == 32 || M == 40 || M == 47 || M == 48 || M == 56 || M == 64);
                     double sw = 0, sc = 0;
                     if (timed && r0 == RAD_OK) time2([&]() { return f2->launch(&a0, nullptr); }, 200, &sw, &sc);
                     std::string fails;

@@ -41,7 +41,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_xr", "sched_tail_inner", "stage_lone", "draft_cost_age",
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
-                                        "ds41_tsk" };
+                                        "ds41_tsk", "draft_head_cut", "pp_fol_reserve" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -138,6 +138,7 @@ struct State {
     /* tp8 loop D23 (draft_short_blk): the short block lengths the drafter declared (bit N = N rows), 0 = none served;
      * -1 until an engine registered; and the query passes the switch moved, their rows */
     std::atomic<int64_t> short_mask{-1};
+    std::atomic<int64_t> reserve_mask{-1};   /* tp8 loop IDEAS #9 (pp_fol_reserve): the follower's boundaries, -1 unregistered */
     std::atomic<int64_t> shb[2];
     std::mutex mu;
     int  want[kSwitches];
@@ -556,6 +557,9 @@ void note_draft_dcap(int64_t cycles, int64_t moves) {   /* SPB */
 
 void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std::memory_order_release); }
 
+void reserve_register(uint64_t mask) {   /* tp8 loop IDEAS #9 */
+    st().reserve_mask.store((int64_t)(mask & ~1ull & 0x7fffffffffffffffull), std::memory_order_release);
+}
 void short_register(uint64_t mask) {   /* tp8 loop D23 */
     st().short_mask.store((int64_t)(mask & ~1ull & 0x7fffffffffffffffull), std::memory_order_release);
 }
@@ -882,7 +886,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -929,6 +933,33 @@ static bool check_here(const std::string& name, int v, std::string* err) {
     if (i == kPpBgJoinMs) {   /* tp8 loop P23s */
         if (v < 0 || v > 60000) {
             if (err) *err = "pp_bg_join_ms takes 0 (off) or 1 .. 60000 (ms within which a busy BG lane's step must commit to take more)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kPpFolReserve) {   /* tp8 loop IDEAS #9: the follower's; the leader checks the range */
+        if (v < 0 || v > 63) {
+            if (err) *err = "pp_fol_reserve takes 0 (off) or 1 .. 63 (the layer a BG newcomer's body holds its parts from)";
+            return false;
+        }
+        const int64_t m = s.reserve_mask.load(std::memory_order_acquire);
+        if (v == 0 || m < 0) return true;
+        if (!((m >> v) & 1)) {
+            std::string have;
+            for (int k = 1; m > 0 && k < 63; ++k)
+                if ((m >> k) & 1) have += (have.empty() ? "" : ", ") + std::to_string(k);
+            if (err)
+                *err = std::string("pp_fol_reserve=") + std::to_string(v) + " refused: " +
+                       (m == 0 ? "this node holds no BG lane's segments (RADIANCE_PP_BG_LANE + RADIANCE_PP_SEG_LAYERS)"
+                               : "layer " + std::to_string(v) + " is not a declared segment boundary inside W(h, t) (declared: " + have + ")");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftHeadCut) {   /* DHD (DRAFTER track round 11) */
+        if (v < 0 || v > 1) {
+            if (err) *err = "draft_head_cut takes 0 (off) or 1 (a query pass at the block drafter's own block runs its head on "
+                            "the first D rows of each block; needs RADIANCE_DRAFT_HEAD_CUT=1 at start)";
             return false;
         }
         return true;
@@ -1448,7 +1479,8 @@ PeerCheck& peer_fn() { static PeerCheck f; return f; }
 bool follower_switch(int i) {
     if (i < 0 || i >= kSwitches) return false;
     return plugin_switch(i) || i == kAqlAcq || i == kRouteCopyOv || i == kPlaceLf || i == kPlaceSwapLent ||
-           i == kHeatMinGainX100 || i == kHeatHystX100 || i == kPlaceHb;
+           i == kHeatMinGainX100 || i == kHeatHystX100 || i == kPlaceHb ||
+           i == kPpFolReserve;   /* tp8 loop IDEAS #9: the follower's own loop reads it */
 }
 
 void set_peer_check(PeerCheck f) {
@@ -1467,6 +1499,16 @@ bool check(const std::string& name, int v, std::string* err) {
         peer = peer_fn();
     }
     const int i = switch_index(name);
+    /* tp8 loop IDEAS #9: pp_fol_reserve acts on the follower alone -- its boundaries decide (the leader checks the range) */
+    if (peer && i == kPpFolReserve && here && v > 0) {
+        std::string why;
+        const int r = peer(name, v, &why);
+        if (r > 0) return true;
+        if (err)
+            *err = "pp_fol_reserve=" + std::to_string(v) + (r < 0 ? " refused by the pipeline's follower: " + why
+                                                                 : " not answered by the pipeline's follower: " + why);
+        return false;
+    }
     /* One machine (no peer), the leader's own verdict on a switch only it acts on, or a plugin
      * switch it takes itself: as before. */
     if (!peer || i < 0 || !plugin_switch(i) || here) {

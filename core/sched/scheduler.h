@@ -618,7 +618,13 @@ public:
      * masked query slots embed. Returns how many sequences may draft and fills `out` with them,
      * in the order block_query() emits them. */
     int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
-                    bool on_card = false);
+                    bool on_card = false, bool front = false);
+    /* DRAFTER track round 11, lever DHD: `front` -- the head takes the FIRST `depth` rows of each block (a drafter whose
+     * every row proposes the token after it, its head cut to depth < block: Engine::issue_block_drafter). Without it
+     * the last `depth` rows, as before (the two agree at depth = block). block_head_cap(): the head depth in force
+     * under the adaptive window (DraftController::step_depth, which every sequence's window is capped by), 0 with the
+     * policy off, at depth 0 or before the first choice. */
+    int block_head_cap() const;
     /* How many running sequences the step just run decoded (produced a token for), the load a
      * block drafter's block length is chosen by. Read before block_begin(). */
     int decoded_seqs() const;
@@ -1166,6 +1172,7 @@ private:
     StepPlan           block_plan_;
     int32_t            block_len_ = 0;
     int32_t            block_depth_ = 0;   /* tokens proposed; the head takes the last this many */
+    bool               block_front_ = false;   /* lever DHD: ... the first this many (block_begin's `front`) */
     /* `block` - 1 copies of the drafter's mask token, which a query entry's `draft` points at:
      * token_at() walks prompt ++ output ++ draft, so the mask positions come from the accessor
      * every other pass uses. */

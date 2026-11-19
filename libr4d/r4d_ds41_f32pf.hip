@@ -284,7 +284,7 @@ int f32dec_env() {
     const char* v = std::getenv("RADIANCE_DS41_F32DEC");
     if (!v || !*v) return 0;
     const int x = std::atoi(v);
-    return x >= 0 && x <= 7 ? x : 0;   /* 4 .. 7: tp8 loop D28 */
+    return x >= 0 && x <= 8 ? x : 0;   /* 4 .. 7: tp8 loop D28; 8: lever RGP (DRAFTER round 17) */
 }
 std::atomic<int> g_f32dec{ f32dec_env() };
 std::atomic<int> g_f32dec_pin_rgs{ -1 }, g_f32dec_pin_gemm{ -1 };
@@ -302,7 +302,7 @@ static void f32dec_note(int kind, int rows, int form) {
                  rows);
 }
 
-int r4d_f32dec_known(int v) { return v >= 0 && v <= 7 ? 1 : 0; }   /* 4 .. 7: tp8 loop D28 */
+int r4d_f32dec_known(int v) { return v >= 0 && v <= 8 ? 1 : 0; }   /* 4 .. 7: tp8 loop D28; 8: lever RGP */
 int r4d_f32dec_set(int v) {
     if (!r4d_f32dec_known(v)) return -1;
     g_f32dec.store(v, std::memory_order_relaxed);
@@ -345,7 +345,7 @@ static bool f32dec_rule_load() {
 }
 static const bool g_f32dec_rule_loaded = f32dec_rule_load();
 static int f32dec_band(int rows) { return rows <= 8 ? 0 : rows <= 16 ? 1 : 2; }
-static bool f32dec_rgs_code(int f) { return f >= 0 && f <= 18; }   /* 15 .. 18: tp8 loop D28's 2-D maps */
+static bool f32dec_rgs_code(int f) { return f >= 0 && f <= 20; }   /* 15 .. 18: tp8 loop D28's 2-D maps; 19 / 20: lever RGP */
 static bool f32dec_gemm_code(int f) { return (f >= 0 && f <= 12) || (f >= 20 && f < 20 + kF32NForms); }
 static int r4d_f32dec_rule_gemm(int rows, int n) {
     (void)g_f32dec_rule_loaded;
@@ -379,13 +379,18 @@ int r4d_f32dec_gemm_form(int rows, int n) {
     return f;
 }
 int r4d_f32dec_rgs_form(int rows) {
-    if (rows > 48) return 0;
+    if (rows > 64) return 0;
     const int p = g_f32dec_pin_rgs.load(std::memory_order_relaxed);
+    const int v = g_f32dec.load(std::memory_order_relaxed);
+    /* above 48 rows (only under the core's RADIANCE_RGS_ROWS=64): a pin or lever RGP's value, else the stock form as before */
+    if (rows > 48 && p < 0 && v != 8) return 0;
     int f = 0;
     if (p >= 0) f = p;
     else {
-        const int v = g_f32dec.load(std::memory_order_relaxed);
-        if (v == 1 || v == 2) f = r4d_f32dec_rule_rgs(rows);
+        /* lever RGP (DRAFTER track round 17): 8 = 1 with the router's 17..64 rows in form 19 (the selection a row group at a
+         * time; the stock bytes) */
+        if (v == 8) f = rows > 16 ? 19 : r4d_f32dec_rule_rgs(rows);
+        else if (v == 1 || v == 2) f = r4d_f32dec_rule_rgs(rows);
         /* tp8 loop D28 (DECODE round 22): 4 .. 7 = 1 with the router's 17..48 rows in the 2-D wave map form 15 .. 18 (a workgroup
          * = row groups x expert groups, so each weight row is read by fewer workgroups; the stock bytes) */
         else if (v >= 4 && v <= 7) f = rows > 16 ? 11 + v : r4d_f32dec_rule_rgs(rows);

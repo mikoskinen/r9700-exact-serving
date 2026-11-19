@@ -1823,7 +1823,9 @@ int router_scored_scatter_body(const RadArgs* a, RadStream stream) {
  * So every output -- logits, ids, weights, sorted_tok, expert_offset, expert_count (and the inverse) -- is the bytes the
  * three launches write, at any M: each row's logits and selection are its own (batch-invariant as the stock chain).
  * Decode band only (M <= 48: the forms below), DeepSeek's sqrtsoftplus score, <= 384 experts. */
-constexpr int kRgsMaxRows = 48;
+/* 64 since lever RGP (DRAFTER track round 17): the core declares the fused launch up to 48 rows unless RADIANCE_RGS_ROWS=64 at load
+ * (rad_block_moe_fp8.h), so a 49..64-row pass reaches it only then; every form handles 64 rows (T = 64 x top_k fits the small sort) */
+constexpr int kRgsMaxRows = 64;
 
 /* tp8 loop D28 (DECODE round 22): RW > 1 = a 2-D wave map -- a workgroup's NW waves are RW row groups x NW / RW expert groups
  * (wave w: expert group w % (NW / RW), row group w / (NW / RW)), so a workgroup covers R RW rows x C NW / RW experts and every
@@ -1867,11 +1869,68 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_scored_scatter_kernel(
                                               sl, inv);
 }
 
+/* Lever RGP (DRAFTER track round 17, tp8 loop 19.11.2026; ds41_f32dec 8, forms 19 / 20): the fused router with the SELECTION
+ * spread over the row groups. The stock launch's last arriver selects every row of the pass in one workgroup after the whole
+ * grid's logits (at 48 rows 3 rows a wave in a row, then the sort); here each row group's last arriving workgroup (its own
+ * counter, ctr[1 + y]) selects that group's R rows as soon as the group's logits are in -- router_scored_row a row a wave, the
+ * stock selection's function -- and parks each slot's sort place in `sorted` [r k + j] (the output the sort writes last;
+ * nothing reads it before the launch ends); the last row group (ctr[0]) reads the slot list back into the sort's LDS (after
+ * the acquire fence, as the stock launch reads the logits) and runs scatter_small_place. The GEMM is tile_wave on the 1-D map.
+ * So every output -- logits, ids, weights, sorted_tok, expert_offset, expert_count (and the inverse) -- is the stock launch's
+ * bytes at any M (tools/dbench/rbench r17: the 6 outputs + guard tails byte-identical at 16 .. 64 rows, each launched twice).
+ * One card (xeon GPU1, K 5120, 384 experts, bf16; cold = after a 256 MiB read (TESTING.md rule 2), us a call, stock form 8 ->
+ * form 19 / 20): 16 rows 36.2 -> 30.6 / 29.6, 24 40.4 -> 33.3 / 32.7, 32 41.7 -> 33.8 / 33.6, 40 45.8 -> 39.1 / 38.7, 48 56.2 ->
+ * 44.1 / 42.4, 64 65.1 -> 51.1 / 50.8 (the served 49..64-row pair f32pf + router_scored_scatter: ~80 us in lq177's stamps; the
+ * served 48-row call 61.1 us). Rows <= 16 groups x 4 = 64: ctr needs 17 slots. */
+template <int R, int C, int U, typename WT, int OWN, int SCORE, uint32_t NW, bool INV>
+__global__ __launch_bounds__(NW * 32) void router_gemm_rowsel_kernel(
+    const uint16_t* x, long xp, const WT* wt, long wtp, float* lg, long lp, int m, int ne, int K,
+    const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
+    int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
+    r4d_moesort::Protect prot, unsigned* ctr) {
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int c0 = ((int)blockIdx.x * (int)NW + wave) * C, r0 = (int)blockIdx.y * R;
+    if (c0 < ne && r0 < m) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
+    __shared__ unsigned s_last;
+    __threadfence();   // this workgroup's logits, device-wide, before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned* gc = ctr + 1 + blockIdx.y;
+        const unsigned old = __hip_atomic_fetch_add(gc, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.x ? 1u : 0u;
+        if (s_last) __hip_atomic_store(gc, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // the row group's logits from its other workgroups
+    for (int r = r0 + wave; r < r0 + R && r < m; r += (int)NW) {
+        const int e = router_scored_row<OWN, SCORE>(lg, lp, bias, bp, ids, ip, weights, wp, r, ne, k, norm, factor, lane) -
+                      base;
+        if (lane < k)
+            sorted[r * k + lane] = e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+    }
+    __threadfence();   // this row group's slots (and ids / weights) before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.y ? 1u : 0u;
+        if (s_last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // every row group's slots
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int i = threadIdx.x; i < m * k; i += (int)(NW * 32)) sl.e[i] = sorted[i];
+    lds_barrier();   // the slot list is in LDS before the sort writes `sorted`
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k), (uint32_t)n_local, sl, inv);
+}
+
 /* The op instance's arrival counter (router_gemm_topk_scatter's rule, r4d_moe.hip): taken at init -- once per resolved
  * instance during declare, before the engine measures free VRAM -- never on the launch path; zeroed, and zeroed again by
  * each launch's last arriver. One 64-byte slot an instance (op, band, domain, rank); each routed layer declares its own
  * op, and an instance's launches are ordered (they write the same declared outputs). Never reused while its block lives. */
-constexpr uint32_t kRgsCtrStride = 16, kRgsCtrSlots = 4096;
+constexpr uint32_t kRgsCtrStride = 32, kRgsCtrSlots = 4096;   /* 32 since lever RGP: ctr[0] + 16 row groups at 64 rows */
 struct RgsInst {
     int dev = 0;
     unsigned* ctr = nullptr;
@@ -1911,6 +1970,16 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
              (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
              factor, base, prot, ctr)
 #define RGS_I2(R, C, U, NW, RW) (inv ? RGS_L2(R, C, U, NW, RW, true) : RGS_L2(R, C, U, NW, RW, false))
+    /* lever RGP: router_gemm_rowsel_kernel on the 1-D map (RGS_L's grid and arguments) */
+#define RGP_L(R, C, U, NW, INV)                                                                                   \
+    R4D_EMIT(stream, (router_gemm_rowsel_kernel<R, C, U, WT, 12, SCORE, NW, INV>),                               \
+             dim3((unsigned)((ne + (NW) * (C) - 1) / ((NW) * (C))), (unsigned)((m + (R) - 1) / (R))),             \
+             dim3((NW) * 32), 0, (const uint16_t*)x.data, (long)x.stride[0], (const WT*)w.data, (long)w.stride[0],  \
+             (float*)lg.data, (long)lg.stride[0], m, ne, K, (const float*)bias.data, (long)bias.stride[0],         \
+             (int32_t*)ids.data, (long)ids.stride[0], (float*)wts.data, (long)wts.stride[0], (int32_t*)sorted.data, \
+             (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
+             factor, base, prot, ctr)
+#define RGP_I(R, C, U, NW) (inv ? RGP_L(R, C, U, NW, true) : RGP_L(R, C, U, NW, false))
     /* lever SPD-F (ds41-etp-spd, r4d_ds41_f32pf.h): ds41_f32dec's form -- the tile R x C a wave (U steps of k) and the
      * waves a workgroup NW (the tail's waves too: a row a wave, wrapping; the sort's result does not depend on NW).
      * Which wave of which workgroup forms a logit changes none of its arithmetic: the stock bytes at every form. */
@@ -1936,12 +2005,17 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
         case 16: return RGS_I2(4, 4, 8, 16u, 4);
         case 17: return RGS_I2(4, 8, 8, 16u, 2);
         case 18: return RGS_I2(4, 4, 8, 8u, 2);
+        /* lever RGP (DRAFTER track round 17): form 3's 4 x 4 U8 tile at 8 waves (19) / U 16 (20), the selection a row group at a time */
+        case 19: return RGP_I(4, 4, 8, 8u);
+        case 20: return RGP_I(4, 4, 16, 8u);
         default: break;
     }
     /* the stock gemm_f32_body's tile form for the height (2x2 with 16 steps up to 16 rows, 8x1 with 8 steps below
      * 64); the waves a workgroup router_scored_scatter_emit's (a wave a row up to 16 rows; 16 waves above, the rows
      * wrapping -- 32 would cap the GEMM's registers) */
     return m <= 8 ? RGS_I(2, 2, 16, 8u) : m <= 16 ? RGS_I(2, 2, 16, 16u) : RGS_I(8, 1, 8, 16u);
+#undef RGP_I
+#undef RGP_L
 #undef RGS_I2
 #undef RGS_L2
 #undef RGS_I

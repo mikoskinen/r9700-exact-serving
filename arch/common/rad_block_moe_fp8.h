@@ -1213,9 +1213,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             return RAD_E_INVAL;
         }
     }
+    /* GGUF-block experts (expert_ggml) have no 128 x 128 scale grid: their K's are held to whole GGUF blocks of the type
+     * below (moe_gemm_ggml's own unit), so an even tensor-parallel slice of 576 = 18 MXFP4 blocks is served (deepseek41
+     * lever DEP, the DSpark drafter's experts; DRAFTER track 19.11.2026). Every other format keeps the 128 rule. */
     for (int q = 0; q < ncls; ++q)
-        if (wq[q] % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK ||
-            (split && qlo[q] % RAD_FP8_BLOCK)) {
+        if (!c.expert_ggml && (wq[q] % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK ||
+            (split && qlo[q] % RAD_FP8_BLOCK))) {
             fprintf(stderr, "radiance: an expert is %lldx%lld per rank, which is not a whole number "
                             "of %dx%d scale blocks\n",
                     (long long)wq[q], (long long)g.n_embd, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
@@ -2129,7 +2132,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             }
         }
         if (rad_op_declared(b, "router_gemm_f32_scored_topk_scatter")) {
-            rgs_fused_rows = sort_rows < 48 ? sort_rows : 48;
+            /* 48 rows (lever FUSE-R's band); RADIANCE_RGS_ROWS=64 at load (lever RGP, DRAFTER track round 17: a library whose
+             * fused router takes 64 rows) declares it to 64, so a 49..64-row pass is one launch instead of the projection +
+             * router_scored_topk_scatter pair. Any other value: 48. */
+            const char* rgs_env = std::getenv("RADIANCE_RGS_ROWS");
+            const int64_t rgs_cap = rgs_env && std::atoi(rgs_env) == 64 ? 64 : 48;
+            rgs_fused_rows = sort_rows < rgs_cap ? sort_rows : rgs_cap;
             const RadParam fp[] = {
                 RAD_RANGE("M", 1, rgs_fused_rows), RAD_INT("K", glm_router.g.n_embd), RAD_INT("n_expert", c.n_expert_all),
                 RAD_INT("n_local", c.n_expert), RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),

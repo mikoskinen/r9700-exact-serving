@@ -3869,6 +3869,14 @@ int dec_sw_now() {
     }
     return v;
 }
+/* Lever DAW (DRAFTER track 19.11.2026 round 9): the DSpark query pass's window-only attention (several rows a sequence,
+ * every row at its block's last position, so a sequence's rows read one key set) on the WMMA prefill form below
+ * kWmRows rows too. The op opts in by its int param "wm_from" (deepseek41 declares it on the drafter's stage attention
+ * only, under RADIANCE_DS41_DSPARK_AWM): a pass of at least that many rows takes the WMMA form. Rule B: the WMMA form
+ * is the trunk's prefill kernel (a workgroup a (16-head tile, row): deterministic, batch- and placement-invariant), not
+ * the decode band's bits. Bench hook r4d_attn_wm_from (>= 1: every pass of at least that many rows; 0: the op's
+ * param). */
+std::atomic<int> g_wm_from_pin{0};
 
 /* ORT (attn_sparse_sink_rope_roundtrip): the same forms with the fused epilogue; the knob's packed-only forms
  * 7-9 are not instantiated with it (the rule serves those requests). */
@@ -4142,7 +4150,11 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
     {
         const int nkt = (s.nk + 15) / 16;
         const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes + ((s.cnv || s.wf8) ? kWmNvBytes : 0);
-        if (s.M > band && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
+        /* lever DAW: the op's "wm_from" (or the bench pin) takes the WMMA form from that many rows */
+        const int wpin = g_wm_from_pin.load(std::memory_order_relaxed);
+        const long long wfrom = wpin > 0 ? wpin : r4d_geti_or(a, "wm_from", 0);
+        const bool wlow = wfrom >= 1 && s.M >= wfrom && !s.cnv && !s.wf8 && s.nk == s.win;
+        if ((s.M > band || wlow) && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
             aligned(out.data, 16) && lds <= 65536 && (H + 15) / 16 <= 65535) {
             const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
             const dim3 grid((unsigned)((H + 15) / 16), gy);
@@ -4517,6 +4529,7 @@ extern "C" int r4d_attn_dec_sw_set(int v) {
     return 1;
 }
 extern "C" long long r4d_attn_dec_sw_calls() { return g_dec_sw_calls.load(std::memory_order_relaxed); }
+extern "C" void r4d_attn_wm_from(int rows) { g_wm_from_pin.store(rows > 0 ? rows : 0, std::memory_order_relaxed); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs* a, RadStream stream) {
     return attn_ort_body(a, stream);
 }

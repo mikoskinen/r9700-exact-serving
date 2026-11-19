@@ -93,7 +93,15 @@ static void rf_case(const Plugin& pl) {
     const int irc = f2->init(nullptr, 0, 0, 1, &inst);
     ok("router_gemm_f32_scored_topk_scatter init takes an instance", irc == RAD_OK && inst != nullptr, fmt("rc %d", irc));
     if (irc != RAD_OK || !inst) return;
-    constexpr int64_t K = 5120, NE = 384, TK = 6, NL = 96;
+    /* R4D_RFUSE_SHAPE=NE,TK,NL (DRAFTER track round 9, lever DRF): the DSpark drafter's router instead (128 experts, top 3; NL 32 = EP4,
+     * 128 = lever DEP); unset: DeepSeek-V4.1's trunk router as before */
+    int64_t NE = 384, TK = 6, NL = 96;
+    constexpr int64_t K = 5120;
+    if (const char* e = std::getenv("R4D_RFUSE_SHAPE")) {
+        long long a = 0, b2 = 0, c2 = 0;
+        if (std::sscanf(e, "%lld,%lld,%lld", &a, &b2, &c2) == 3 && a > 0 && b2 > 0 && c2 > 0 && c2 <= a) { NE = a; TK = b2; NL = c2; }
+        std::printf("rfuse: router shape n_expert %lld, top_k %lld, n_local %lld (R4D_RFUSE_SHAPE)\n", (long long)NE, (long long)TK, (long long)NL);
+    }
     const double scale = 1.5;
     struct Out { void *lg, *ids, *w, *so, *off, *cnt; };
     const size_t tail = 64;
@@ -136,7 +144,7 @@ static void rf_case(const Plugin& pl) {
                 }
                 void* dx = up(x);
                 const auto sz = sizes(M);
-                for (int64_t base : { (int64_t)0, (int64_t)96, (int64_t)288 }) {
+                for (int64_t base : { (int64_t)0, NL < NE ? NL : (int64_t)0, NE - NL }) {
                     Out o[3];
                     for (int f = 0; f < 3; ++f) {
                         void** p = &o[f].lg;
@@ -210,7 +218,7 @@ static void rf_case(const Plugin& pl) {
                                 : fmt("form 1: %s, form 2: %s", first1 < 0 ? "same" : kOut[first1],
                                       first2 < 0 ? "same" : kOut[first2]));
                     /* timing: bf16 weights (production, RADIANCE_DS41_ROUTER_BF16), random, base 96 */
-                    if (ran && wbf && mode == 0 && base == 96 && (M == 1 || M == 8 || M == 16 || M == 48)) {
+                    if (ran && wbf && mode == 0 && base == (NL < NE ? NL : (int64_t)0) && (M == 1 || M == 8 || M == 16 || M == 48)) {
                         double w0, k0, w1, k1, w2, k2;
                         time2(chain, 200, &w0, &k0);
                         time2(form1, 200, &w1, &k1);

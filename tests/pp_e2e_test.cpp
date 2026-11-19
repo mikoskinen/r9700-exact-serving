@@ -2632,6 +2632,118 @@ TEST(follower_frame_order_serves_one_process_tokens) {
     CHECK(passed_all > 0);
 }
 
+/* tp8 loop IDEAS #9 (DECODE round 24): RADIANCE_PP_FOL_RESERVE=L (the follower) -- a BG newcomer's body holds its parts from layer L
+ * on until another BG lane's frame arrives or RADIANCE_PP_FOL_RESERVE_MS pass; every other frame runs between meanwhile. Tokens =
+ * one process (the same flags) at 4 lanes BG 2 at the wrap-around cut W(1,3) (L 2) and at W(0,2) (L 1), with FOL_ORDER 2 / 3 and
+ * the BG_ROOM load, and at 3 lanes BG 1 W(1,3) (no other BG lane: every hold ends by the limit, 40 ms); at 2 lanes (no BG lane)
+ * and at a boundary that is not declared (W(1,3), L 3 = t) the reserve is refused by name and the pair serves as without it. */
+TEST(a_bg_bodys_reserve_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext_r = { "--max-num-seqs", "10", "--max-num-batched-tokens", "2112", "--max-model-len", "2048",
+                                             "--prefill-span", "2", "--checkpoint-interval", "1024" };
+    const std::vector<std::string> ext_b = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref_r, ref_s, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext_r));
+        ref_r = bg_room_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    {
+        Serving one;
+        REQUIRE(one.start("", ext_b));
+        ref_s = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { bool room; int lanes; const char* cut; const char* bg; const char* order; const char* res; const char* ms; int taken;
+                 const char* post = nullptr; };
+    long long n_all = 0, frame_all = 0, time_all = 0;
+    for (const Arm a : { Arm{ false, 4, "1,3", "2", "2", "2", "300", 1 }, Arm{ false, 4, "0,2", "2", "3", "1", "300", 1 },
+                         Arm{ true, 4, "1,3", "2", "2", "2", "300", 1 }, Arm{ false, 3, "1,3", "1", "2", "2", "40", 1 },
+                         Arm{ false, 2, "1,3", nullptr, "2", "2", "300", 0 }, Arm{ false, 4, "1,3", "2", "2", "3", "300", 0 },
+                         Arm{ false, 4, "1,3", "2", "2", nullptr, "300", 2, "2" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        if (a.bg) env.push_back(std::string("RADIANCE_PP_BG_LANE=") + a.bg);
+        env.push_back(std::string("RADIANCE_PP_FOL_ORDER=") + a.order);
+        if (a.res) env.push_back(std::string("RADIANCE_PP_FOL_RESERVE=") + a.res);
+        env.push_back(std::string("RADIANCE_PP_FOL_RESERVE_MS=") + a.ms);
+        if (a.room) env.push_back("RADIANCE_PP_BG_ROOM=2112");
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = a.room ? ext_r : ext_b;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        if (a.post) {   /* fn4 pp_fol_reserve: an undeclared boundary is the follower's refusal, then the arm's own value */
+            std::string out;
+            Call c0;
+            int st = c0.send(pp.port, "/admin/fn4", json{ { "pp_fol_reserve", 3 } }.dump()) ? c0.read(&out) : -1;
+            CHECK_EQ(st, 400);
+            const bool named = out.find("is not a declared segment boundary") != std::string::npos;
+            if (!named) fprintf(stderr, "    POST pp_fol_reserve 3: %d %s\n", st, out.c_str());
+            CHECK(named);
+            Call c1;
+            st = c1.send(pp.port, "/admin/fn4", json{ { "pp_fol_reserve", std::atoi(a.post) } }.dump()) ? c1.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_fol_reserve %s: %d %s\n", a.post, st, out.c_str());
+        }
+        std::vector<std::vector<int32_t>> got, ref;
+        if (a.room) {
+            got = bg_room_set(pp.port);
+            ref = ref_r;
+        } else {
+            got = split_set(pp.port);
+            const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+            got.insert(got.end(), got_b.begin(), got_b.end());
+            ref = ref_s;
+            ref.insert(ref.end(), ref_b.begin(), ref_b.end());
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long n = -1, by_frame = -1, by_time = -1;
+        if (const size_t at = flog.rfind("tp8 loop IDEAS #9): "); at != std::string::npos)
+            (void)std::sscanf(flog.c_str() + at, "tp8 loop IDEAS #9): %lld BG bodies held their layers L..%*d, %lld released by "
+                                                 "another BG lane's frame, %lld by the", &n, &by_frame, &by_time);
+        fprintf(stderr, "    RESERVE=%s%s (%s ms), FOL_ORDER=%s, BG lanes %s%s, %d lanes W(%s): %d of %zu requests differ; %lld bodies "
+                        "held, %lld released by another BG frame, %lld by the limit\n", a.res ? a.res : "unset",
+                a.post ? (std::string(" + POST pp_fol_reserve ") + a.post).c_str() : "", a.ms, a.order, a.bg ? a.bg : "none",
+                a.room ? " + BG_ROOM=2112" : "", a.lanes, a.cut, differ, ref.size(), n, by_frame, by_time);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        if (a.taken) {
+            if (a.taken == 1)
+                CHECK(flog.find(std::string("follower: RADIANCE_PP_FOL_RESERVE=") + a.res + " -- a BG newcomer's body holds") !=
+                      std::string::npos);
+            CHECK(n > 0);
+            CHECK_EQ(n, by_frame + by_time);
+            if (a.bg && a.bg[0] == '1') CHECK_EQ(by_frame, 0);   /* one BG lane: no other BG lane's frame */
+            n_all += std::max(0LL, n);
+            frame_all += std::max(0LL, by_frame);
+            time_all += std::max(0LL, by_time);
+        } else {
+            CHECK(flog.find(std::string("follower: RADIANCE_PP_FOL_RESERVE=") + a.res + " is not taken here: ") != std::string::npos);
+            CHECK_EQ(n, -1);   /* no reserve line */
+        }
+    }
+    fprintf(stderr, "    all arms: %lld bodies held, %lld released by another BG lane's frame, %lld by the limit\n", n_all,
+            frame_all, time_all);
+    CHECK(n_all > 0);
+    CHECK(time_all > 0);
+}
+
 /* tp8 dev D10 round 2: steps issued ahead beside the BG lanes' split passes, the best c32 start's form (W(0, t), the follower's
  * own lookup from X1's token ids, BG lanes in one-layer segments, ready-first tails): a frame the leader issued ahead arrives
  * about a leader tail before its X1 and waits between the BG pass's segments until X1 has landed. Tokens = one process at
