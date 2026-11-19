@@ -128,12 +128,14 @@ void mx(int64_t M, const std::vector<int>& wvs) {
         const int rc1 = go(F, wv);
         rad_mx_stats(s1, 2);
         const bool took = s1[0] > s0[0];
+        /* the units act at <= 8 rows (1U-MX), the hundreds at 9 .. 64 (tp8 loop X8) */
+        const bool want = (wv % 100 != 0 && M <= 8) || (wv / 100 != 0 && M > 8 && M <= 64);
         const long long dp = ndiff(R.scr, F.scr), dpre = ndiff(R.pre, F.pre), dpo = ndiff(R.post, F.post),
                         dcb = ndiff(R.comb, F.comb);
-        check(rc0 == RAD_OK && rc1 == RAD_OK && dp + dpre + dpo + dcb == 0 && took == (M <= 8),
+        check(rc0 == RAD_OK && rc1 == RAD_OK && dp + dpre + dpo + dcb == 0 && took == want,
               fmt("mhc_mix ds41_mix_wv %d vs 0, M=%lld (partials, pre, post, comb)", wv, (long long)M),
               fmt("rc %d / %d; differing words: partials %lld pre %lld post %lld comb %lld; wide launches +%lld (want %s)",
-                  rc0, rc1, dp, dpre, dpo, dcb, s1[0] - s0[0], M <= 8 ? "> 0" : "0"));
+                  rc0, rc1, dp, dpre, dpo, dcb, s1[0] - s0[0], want ? "> 0" : "0"));
     }
     r4d_mix_wv_set(0);
 }
@@ -151,6 +153,24 @@ int main(int argc, char** argv) {
     }
     mx(9, { 24 });
     if (!quick) mx(24, { 12 });
+    /* tp8 loop X8 step 1: ds41_mix_wv's hundreds = the 9 .. 64-row split launch's form (16 rows a wave / WV 12 / WV 24 /
+     * 4 rows a wave / TS 8), each the served form's bytes; above 64 rows not taken; 600 and 113 unknown */
+    r4d_mix_wv_set(600);
+    check(r4d_mix_wv_get() == 0, "ds41_mix_wv: an unknown value (600) reads back 0");
+    r4d_mix_wv_set(113);
+    check(r4d_mix_wv_get() == 0, "ds41_mix_wv: an unknown value (113) reads back 0");
+    r4d_mix_wv_set(112);
+    check(r4d_mix_wv_get() == 112, "ds41_mix_wv: 112 (X8 form 1 + the <= 8-row WV 12) reads back 112");
+    r4d_mix_wv_set(0);
+    mx(9, { 100, 200, 300, 400, 500 });
+    mx(48, { 100, 200, 300, 400, 500 });
+    if (!quick) {
+        mx(16, { 100, 300, 500 });
+        mx(40, { 100, 200, 400 });
+        mx(64, { 100, 200, 300, 400, 500 });
+        mx(65, { 100, 500 });
+        mx(6, { 112 });
+    }
     std::printf("%s: %d cases, %d failures\n", g_fail ? "FAIL" : "PASS", g_cases, g_fail);
     return g_fail ? 1 : 0;
 }

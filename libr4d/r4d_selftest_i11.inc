@@ -172,7 +172,7 @@ static void mix_perf_case(const Plugin& pl) {
     for (auto& x : base) x = (float)(gauss() * 0.5);
     for (auto& x : scale) x = (float)(gauss() * 0.1 + 0.5);
     void *dfn = up(fn), *dbase = up(base), *dscale = up(scale);
-    std::string line;
+    std::string line, xl[6];
     for (int64_t M : { 1, 8, 16, 24, 32, 40, 48, 56, 64 }) {
         std::vector<uint16_t> h((size_t)(M * W));
         for (int64_t r = 0; r < M; ++r) {
@@ -201,10 +201,41 @@ static void mix_perf_case(const Plugin& pl) {
         info(fmt("mix_perf mhc_mix M=%lld (n %lld, hc %lld, %lld chunks, served launch form): %.2f us a call%s", (long long)M,
                  (long long)n, (long long)hc, (long long)chunks, u, g_cold > 0 ? fmt(" (cold %lld MiB)", (long long)(g_cold >> 20)).c_str() : " (warm)"));
         line += fmt("%s%lld:%.1f", line.empty() ? "" : " ", (long long)M, u);
+        /* X8 step 1: the 9 .. 64-row forms (ds41_mix_wv 100 x H) byte for byte vs the served one (partials, pre, post, comb), the
+         * launch counted as a wide form, and their times */
+        auto stats = (int (*)(long long*, int))dlsym(pl.h, "rad_mx_stats");
+        if (M > 8 && sw && stats) {
+            void* scr1 = dalloc(bs + 4096);
+            for (int H = 1; H <= 5; ++H) {
+                if (sw("ds41_mix_wv", 100 * H) != 1) { ok(fmt("mix_perf ds41_mix_wv %d taken", 100 * H).c_str(), false, "refused"); continue; }
+                st_memset(pre1, 0xA5, bp);
+                st_memset(post1, 0xA5, bp);
+                st_memset(comb1, 0xA5, bc);
+                st_memset(scr1, 0x5A, bs + 4096);
+                long long q0[2] = { 0, 0 }, q1[2] = { 0, 0 };
+                stats(q0, 2);
+                const int rch = run(rmix, t1, ps, scr1, (int64_t)bs + 4096);
+                stats(q1, 2);
+                const long long dpart = diff32(scr, scr1, bs), dd = diff32(pre0, pre1, bp) + diff32(post0, post1, bp) + diff32(comb0, comb1, bc);
+                ok(fmt("mix_perf ds41_mix_wv %d (X8 form %d) byte for byte vs the served form, M=%lld (partials, pre, post, comb)", 100 * H,
+                       H, (long long)M).c_str(),
+                   rch == RAD_OK && dpart == 0 && dd == 0 && q1[0] > q0[0],
+                   fmt("rc %d, differing words partials %lld outputs %lld, wide launches +%lld", rch, dpart, dd, q1[0] - q0[0]));
+                RadArgs a1 = args(t1, ps, scr1, (int64_t)bs + 4096);
+                const double uh = st_time_us([&](int) { rmix->launch(&a1, nullptr); }, 200, nullptr);
+                xl[H] += fmt("%s%lld:%.1f", xl[H].empty() ? "" : " ", (long long)M, uh);
+                info(fmt("mix_perf mhc_mix M=%lld X8 form %d: %.2f us a call (%+.1f %% vs served)", (long long)M, H, uh,
+                         100.0 * (uh - u) / u));
+            }
+            sw("ds41_mix_wv", 0);
+        }
         dfree_all();
         dfn = up(fn); dbase = up(base); dscale = up(scale);
     }
     std::printf("MIXPERF %s us a call by M (%s)\n", line.c_str(), g_cold > 0 ? "cold" : "warm");
+    for (int H = 1; H <= 5; ++H)
+        if (!xl[H].empty())
+            std::printf("MIXPERF-X8-%d %s us a call by M (%s; ds41_mix_wv %d)\n", H, xl[H].c_str(), g_cold > 0 ? "cold" : "warm", 100 * H);
     dfree_all();
 }
 

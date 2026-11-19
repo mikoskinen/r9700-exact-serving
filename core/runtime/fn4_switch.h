@@ -405,19 +405,28 @@
  *                   served at all. So one start runs depth 2 (2-row block) and depth 3 (3-row block) at lanes of 16 in
  *                   process. Starts 0. Exact: it moves only which declared block a drafter cycle runs (D18 / D19's rule);
  *                   the trunk verifies what it proposes. GET "short_blk": the declared lengths (mask), query passes at it.
- *   ds41_sphc       deepseek41 (tp8 loop P25s; 83 here, after draft_short_blk): the SP route's row threshold in process -- 0
+ *   ds41_prefetch   deepseek41 (tp8 loop D24; 83 here, after draft_short_blk): which weights a decode-only pass of <= 64
+ *                   rows reads into the on-die cache beside its all-reduces (libr4d `prefetch`, rad_arch.h prefetch_beside:
+ *                   the second lane, or the chained form) -- bit 0 the mix fns (hc_f_fn beside the attention all-reduce,
+ *                   the next layer's hc_a_fn beside the MoE all-reduce: the fused post + mix right after each reads it
+ *                   first), bit 1 the router projection + the shared arm's gate_up beside the attention all-reduce, bit 2
+ *                   the next layer's q_a / kv projections beside the MoE all-reduce; 0 = none (today). RADIANCE_DS41_PREFETCH
+ *                   =0 .. 7 declares every read (each weight's first RADIANCE_DS41_PREFETCH_MB, default 8) and starts at
+ *                   that value; unset declares nothing and >= 1 is refused (so is it where no library serves `prefetch`:
+ *                   the host backend). Exact: the op reads weights and writes nothing a pass reads.
+ *   ds41_sphc       deepseek41 (tp8 loop P25s; 84 here, after ds41_prefetch): the SP route's row threshold in process -- 0
  *                   (start) = RADIANCE_DS41_SPHC's; N >= it: a lone prefill pass / a follower segment pass is sequence-
  *                   parallel from N rows (above --max-num-batched-tokens: none). Refused without RADIANCE_DS41_SPHC.
- *   ds41_sphc_attn  deepseek41 (tp8 loop P25s; 84): 0 .. RADIANCE_DS41_SPHC_ATTN (starts at it): 0 = an SP layer's q_a / kv
+ *   ds41_sphc_attn  deepseek41 (tp8 loop P25s; 85): 0 .. RADIANCE_DS41_SPHC_ATTN (starts at it): 0 = an SP layer's q_a / kv
  *                   after xn's gather (P26 off), 1 P26, 2 + P26b.
- *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 85): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
+ *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 86): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
  *                   passes whole (P25 off), 1 / 2 P25, 3 + P25b. Each only takes away what the env declared; exact at every
  *                   value (SP is the replicated pass's fold and bytes; X1 / X2 carry every row whichever side shards).
- *   pp_bg_room      engine, the two-node leader (tp8 loop P23s; 86 here, after ds41_sphc_seg): RADIANCE_PP_BG_ROOM in process --
+ *   pp_bg_room      engine, the two-node leader (tp8 loop P23s; 87 here, after ds41_sphc_seg): RADIANCE_PP_BG_ROOM in process --
  *                   0 = the shared budget (one ~1.1k newcomer a BG step), 256 .. 65536 rows a BG lane's inbox (lane_split_bg's
  *                   cap); starts at the env's; taken only with a BG lane (else 0). With ds41_bi 7 (PMM) a batched BG step runs its
  *                   newcomers' routed MoE as one pass a layer. Exact: multi-prefill steps are one process's (lever NOA / P23).
- *   pp_bg_join_ms   engine, the leader (tp8 loop P23s; 87): RADIANCE_PP_BG_JOIN_MS in process, 0 (off) or 1 .. 60000; with pp_bg_room.
+ *   pp_bg_join_ms   engine, the leader (tp8 loop P23s; 88): RADIANCE_PP_BG_JOIN_MS in process, 0 (off) or 1 .. 60000; with pp_bg_room.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -628,8 +637,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Sphc, kDs41SphcAttn, kDs41SphcSeg,
-              kPpBgRoom, kPpBgJoinMs, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41Sphc, kDs41SphcAttn,
+              kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

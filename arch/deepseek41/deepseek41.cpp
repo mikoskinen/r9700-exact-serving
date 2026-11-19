@@ -37,6 +37,7 @@
 #include "ds41_sp_plan.h"   /* tp8 loop P20 round 2: RADIANCE_DS41_SPHC's layers */
 #include "ds41_etp.h"
 #include "ds41_walk_geom.h"
+#include "ds41_prefetch.h"   /* tp8 loop D24: the weight reads' pass / site rules */
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
 #include <algorithm>
@@ -397,6 +398,11 @@ struct Layer {
      * `tap_col` of the drafter's source rows. */
     rad_op tap = 0;
     int tap_col = -1;
+    /* tp8 loop D24 (RADIANCE_DS41_PREFETCH declared; fn4 ds41_prefetch): libr4d `prefetch` reads of this layer's weights
+     * (each weight's first RADIANCE_DS41_PREFETCH_MB), 0 where not declared: pf_f / pf_r / pf_s = hc_f_fn, the router
+     * projection, the shared arm's gate_up (beside this layer's attention all-reduce); pf_a / pf_c / pf_q / pf_kv =
+     * hc_a_fn, comp_w, wq_a, wkv (beside the previous held layer's MoE all-reduce). */
+    rad_op pf_f = 0, pf_r = 0, pf_s = 0, pf_a = 0, pf_c = 0, pf_q = 0, pf_kv = 0;
     /* A DSpark stage's context pass: its window key from the projected trunk rows. */
     rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
 };
@@ -2120,6 +2126,42 @@ static void p1_read_env() {
 }
 static bool p1_declared() { return g_sw_p1_env.load(std::memory_order_relaxed) >= 0; }
 
+/* tp8 loop D24 (19.11.2026, DECODE round 20): the decode pass's next weights read into the on-die cache beside its
+ * all-reduces -- libr4d's `prefetch` (docs/OPS.md: a weight's first `bytes`, 16 B a lane over 64 workgroups, writes
+ * nothing; device-only) through rad_arch.h's prefetch_beside (the second lane behind a join from lane 0: deepseek41 sets
+ * no chain_pays, so launches do not chain). A decode-height all-reduce leaves the card's memory idle for its round trip;
+ * the op right after each reads a weight cold: the fused post + collapse + norm + mix (mhc_fuse) its connection's mix fn
+ * (24 x 20480 f32, 1.97 MB), then the router / shared arm (after the attention's) or the q / kv projections (after the
+ * MoE's). RADIANCE_DS41_PREFETCH=0 .. 7 declares every read at every held layer and starts fn4 ds41_prefetch at that
+ * value: bit 0 the mix fns (hc_f_fn beside the attention all-reduce, the next layer's hc_a_fn beside the MoE one), bit 1
+ * the router projection + the shared gate_up beside the attention all-reduce, bit 2 the next layer's comp_w (a kv
+ * source) / wq_a / wkv beside the MoE all-reduce. RADIANCE_DS41_PREFETCH_MB=1 .. 64 (default 8): a read's cap a weight.
+ * Only a trunk pass whose every row decodes, of at most kPfRows rows (prompt steps never take the reads: rad_arch.h).
+ * Unset: nothing declared or issued, the switch takes only 0. Exact: the op reads weights and writes nothing. */
+static constexpr int64_t kPfRows = ds41_pf::kRows;
+static std::atomic<int> g_sw_pf{0}, g_sw_pf_ok{0}, g_sw_pf_env{-2}, g_pf_noted{0};
+static std::atomic<int64_t> g_pf_mb{8};
+static std::atomic<long long> g_pf_passes{0}, g_pf_reads{0};
+static void pf_read_env() {
+    int unread = -2;
+    if (g_sw_pf_env.load(std::memory_order_relaxed) != -2) return;
+    const char* mb = std::getenv("RADIANCE_DS41_PREFETCH_MB");
+    if (mb && *mb) {
+        char* end = nullptr;
+        const long long v = std::strtoll(mb, &end, 10);
+        if (end && !*end && v >= 1 && v <= 64) g_pf_mb.store(v, std::memory_order_relaxed);
+        else fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PREFETCH_MB=%s is not 1 .. 64: the reads take 8 MB a weight\n", mb);
+    }
+    const char* e = std::getenv("RADIANCE_DS41_PREFETCH");
+    const int v = !e ? -1 : (e[0] >= '0' && e[0] <= '7' && !e[1]) ? e[0] - '0' : -1;
+    if (g_sw_pf_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_pf.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PREFETCH=%s is not 0 .. 7: lever D24 is not declared\n", e);
+    }
+}
+static bool pf_declared() { return g_sw_pf_env.load(std::memory_order_relaxed) >= 0; }
+
 /* Lever DKV (14.11.2026, the dense (nvfp4) latent without its slowdown; RADIANCE_DS41_LATENT=nvfp4 only, read once at the
  * first declare; unset: nothing declared or issued differently):
  *   RADIANCE_DS41_LATUNPACK=<E> (1..256): Model::lu ([T][E hd] bf16, E entries a row of the step: 32 KiB a row at 32) holds
@@ -2304,6 +2346,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 */
         return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_prefetch"))   /* tp8 loop D24: >= 1 needs the reads declared */
+        return value == 0 || (value >= 1 && value <= 7 && g_sw_pf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_moe1"))   /* lever P: 1 needs the dk ops declared at some trunk layer */
         return value == 0 || (value == 1 && g_sw_p1_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_rfuse"))   /* lever FUSE-R: 1 needs form 1 declared somewhere, 2 form 2 */
@@ -2341,6 +2385,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_e2")) g_sw_e2.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_rfuse")) g_sw_rf.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_moe1")) g_sw_p1.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_prefetch")) g_sw_pf.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc")) g_sw_sphc.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc_attn")) g_sw_spattn.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc_seg")) g_sw_spseg.store(value, std::memory_order_relaxed);
@@ -2417,6 +2462,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_rfuse")) {   /* what the issue reads: 0 where nothing was declared */
         *applied = g_sw_rf_ok.load(std::memory_order_relaxed) ? g_sw_rf.load(std::memory_order_relaxed) : 0;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_prefetch")) {   /* tp8 loop D24: what the issue reads, 0 where nothing was declared */
+        *applied = g_sw_pf_ok.load(std::memory_order_relaxed) ? g_sw_pf.load(std::memory_order_relaxed) : 0;
         return 1;
     }
     /* tp8 loop P25s: what the issue reads (the threshold in rows, 0 where nothing is SP; the levels) */
@@ -4876,6 +4925,7 @@ static void mhc_declare(Model& m, const RadBuildCtx* ctx);                  /* l
 static void i11_declare(Model& m, const RadBuildCtx* ctx);                  /* levers 1U-GQ / 1U-E2, below */
 static void rf_declare(Model& m, const RadBuildCtx* ctx);                   /* lever FUSE-R, below */
 static void p1_declare(Model& m, const RadBuildCtx* ctx);                   /* lever P, below */
+static void pf_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* tp8 loop D24, below */
 
 /* tp8 S3 (ds41_layers.h): RADIANCE_DS41_LAYERS / _MODE read against the model (read_cfg has run). Unset, or every layer:
  * m.lr.on stays false and nothing below this differs from the published declare. Refused where a lever's shape assumes
@@ -5514,6 +5564,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     i11_read_env();
     rf_read_env();
     p1_read_env();
+    pf_read_env();
     dkv_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
@@ -6279,6 +6330,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     i11_declare(m, ctx);
     rf_declare(m, ctx);
     p1_declare(m, ctx);
+    pf_declare(b, m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
     lr_note(b, m, ctx);   /* tp8 S3: the node's line (nothing when RADIANCE_DS41_LAYERS is unset) */
@@ -6507,6 +6559,45 @@ static void p1_declare(Model& m, const RadBuildCtx* ctx) {
             g_sw_p1.load(std::memory_order_relaxed),
             ok ? "declared" : "not declared (no library serves the ops at every layer)", dk, moe, (long long)rows,
             (long long)kBiMoe);
+}
+
+/* tp8 loop D24 at the end of a declare (RADIANCE_DS41_PREFETCH set): a `prefetch` of each read weight at every layer this
+ * node holds, where a library serves the op and the deployment did not turn the reads off (--weight-prefetch off); none
+ * declared (the host backend: libref serves no `prefetch`) -> the switch reads 0 and >= 1 is refused. */
+static void pf_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    if (ctx->shape_probe || !pf_declared()) return;
+    const int64_t cap = g_pf_mb.load(std::memory_order_relaxed) << 20;
+    int n[3] = { 0, 0, 0 }, layers = 0;
+    for (Layer& L : m.layers) {
+        if (!m.lr.held(L.l) || ctx->weight_prefetch_off) continue;
+        const auto d = [&](rad_weight w, int grp) -> rad_op {
+            const rad_op h = w ? decl_prefetch(b, w, cap) : 0;
+            if (h) ++n[grp];
+            return h;
+        };
+        L.pf_f = d(L.hc_f_fn, 0);
+        L.pf_a = d(L.hc_a_fn, 0);
+        if (L.moe.op_router) {
+            L.pf_r = d(L.moe.c.sigmoid_router ? L.moe.glm_router.projection : L.moe.w_router, 1);
+            L.pf_s = d(L.moe.sh_gate_up.w, 1);
+        }
+        if (L.src) L.pf_c = d(L.comp_w, 2);
+        L.pf_q = d(L.wq_a, 2);
+        L.pf_kv = d(L.wkv, 2);
+        if (L.pf_f || L.pf_a || L.pf_r || L.pf_s || L.pf_c || L.pf_q || L.pf_kv) ++layers;
+    }
+    const int ok = n[0] + n[1] + n[2] > 0 ? 1 : 0;
+    g_sw_pf_ok.store(ok, std::memory_order_relaxed);
+    if (!ok) g_sw_pf.store(0, std::memory_order_relaxed);
+    if (ctx->rank != 0 || g_pf_noted.exchange(1, std::memory_order_relaxed)) return;
+    fprintf(stderr, "radiance: deepseek41: tp8 loop D24 (ds41_prefetch, RADIANCE_DS41_PREFETCH, now %d) %s: at %d layers, "
+                    "the first %lld MB of each weight read into the on-die cache beside a decode-only pass's all-reduces "
+                    "(<= %lld rows): bit 0 the mix fns (%d reads), bit 1 the router + shared gate_up (%d), bit 2 the next "
+                    "layer's comp_w / wq_a / wkv (%d)\n",
+            g_sw_pf.load(std::memory_order_relaxed),
+            ok ? "declared" : (ctx->weight_prefetch_off ? "not declared (--weight-prefetch off)"
+                                                         : "not declared (no library serves `prefetch`)"),
+            layers, (long long)(cap >> 20), (long long)kPfRows, n[0], n[1], n[2]);
 }
 
 /* Lever FUSE-R at the end of a declare (RADIANCE_DS41_RFUSE set): the trunk MoE layers that declared each form; a form no
@@ -7599,9 +7690,72 @@ static rad_op pp_post_op(const Model& m, int ring) {
     return ring >= kSegRecv && ring < kSegSend ? m.seg_post[(size_t)(ring - kSegRecv)] : m.pp_post;
 }
 
+/* tp8 loop D24 (fn4 ds41_prefetch): this pass's bits, 0 = no reads -- a trunk pass (no drafter pass, no encoder) whose
+ * every row decodes (batch_split: no prefill sequence), of 1 .. kPfRows rows, with the reads declared. Read at issue, so a
+ * recorded pass keeps what it was recorded with (a switch flip bumps the epoch: the passes re-record). */
+static int pf_bits(const RadBatch* b) {
+    const bool ok = g_sw_pf_ok.load(std::memory_order_relaxed) != 0;
+    const int v = g_sw_pf.load(std::memory_order_relaxed);
+    if (!ok || v <= 0) return 0;
+    int64_t Dn = 0, DT = 0;
+    batch_split(b, &Dn, &DT);
+    return ds41_pf::pass_bits(v, ok, b->draft_pass, b->enc != 0 || b->gen != 0, b->n_tok, b->n_seq, Dn, DT);
+}
+static void pf_read(RadCtx* x, rad_op op, rad_weight w, int& n) {
+    if (!op || !w) return;
+    prefetch_beside(x, op, w, 1);   /* a height of 1: pf_bits decided the pass qualifies (kPfRows, not kPrefetchRows) */
+    ++n;
+}
+static void pf_note(RadCtx* x, int n) {
+    if (n <= 0 || rad_rank(x) != 0) return;
+    g_pf_reads.fetch_add(n, std::memory_order_relaxed);
+}
+/* Beside this layer's attention all-reduce (issued right before it): the FFN side the fused post + mix and the MoE read
+ * first -- hc_f_fn (bit 0), the router projection and the shared arm's gate_up (bit 1). */
+static void pf_attn(RadCtx* x, const Layer& L, int bits) {
+    const unsigned r = ds41_pf::site_reads(bits, 0, L.src, true);
+    int n = 0;
+    if (r & ds41_pf::kMixF) pf_read(x, L.pf_f, L.hc_f_fn, n);
+    if (r & ds41_pf::kRouter) pf_read(x, L.pf_r, L.moe.c.sigmoid_router ? L.moe.glm_router.projection : L.moe.w_router, n);
+    if (r & ds41_pf::kShGu) pf_read(x, L.pf_s, L.moe.sh_gate_up.w, n);
+    pf_note(x, n);
+}
+/* Beside a layer's MoE all-reduce (MoeFP8::Beside::before_ar, right before the pass's gather + all-reduce): the next layer
+ * this pass issues -- its mix fn (bit 0; read by the fused post + collapse + norm + mix right after the reduction), its
+ * comp_w at a kv source, wq_a and wkv (bit 2). Nothing where the layer ends this node's part of the pass (a crossing). */
+struct PfBeside {
+    const Model* m = nullptr;
+    const Layer* L = nullptr;
+    int bits = 0;
+};
+static void pf_moe_beside(RadCtx* x, void* a) {
+    const PfBeside& p = *(const PfBeside*)a;
+    const Model& m = *p.m;
+    const Layer* nx = pp_send_after(m, p.L->l) >= 0 ? nullptr : next_layer(m, p.L->l);
+    const unsigned r = ds41_pf::site_reads(p.bits, 1, nx && nx->src, nx && m.lr.held(nx->l));
+    if (!r) return;
+    int n = 0;
+    if (r & ds41_pf::kMixA) pf_read(x, nx->pf_a, nx->hc_a_fn, n);
+    if (r & ds41_pf::kComp) pf_read(x, nx->pf_c, nx->comp_w, n);
+    if (r & ds41_pf::kQa) pf_read(x, nx->pf_q, nx->wq_a, n);
+    if (r & ds41_pf::kKv) pf_read(x, nx->pf_kv, nx->wkv, n);
+    pf_note(x, n);
+}
+/* one line now and then (rank 0, at issue: a recorded pass counts when it is recorded) */
+static void pf_pass_note(RadCtx* x, const RadBatch* b, int bits) {
+    if (bits <= 0 || rad_rank(x) != 0) return;
+    const long long n = g_pf_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n % 512 == 0)
+        fprintf(stderr, "radiance: deepseek41: tp8 loop D24 (ds41_prefetch %d): %lld decode passes issued %lld weight reads "
+                        "beside their all-reduces (rank 0, issued or recorded; this one %lld rows)\n",
+                bits, n, g_pf_reads.load(std::memory_order_relaxed), (long long)b->n_tok);
+}
+
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start (each part of a lane step's pass too) */
+    const int pfb = pf_bits(batch);   /* tp8 loop D24: 0 = no weight reads beside the all-reduces */
+    pf_pass_note(x, batch, pfb);
     const int part = pp_part(m);       /* tp8 S5 + S6: the leader's head / tail part, or the whole pass */
     const bool run_head = part != RAD_PP_PART_TAIL;
     const auto& c = m.c;
@@ -8854,6 +9008,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
          * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
+        if (L.ar_attn && (pfb & 3)) pf_attn(x, L, pfb);   /* tp8 loop D24: beside the attention all-reduce below */
         if (L.ar_attn && pa > 0 && tbo_a) {
             /* tp8 loop P15 bit 1: lane 0 behind piece 0's all-reduce (lane 1) for piece 0's pcn below; piece 1's
              * all-reduce goes to lane 1 in the MoE section, beside MoE pass 0 (no attention-zero rank under P15) */
@@ -8928,6 +9083,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
+        PfBeside pfm{ &m, &L, pfb };   /* tp8 loop D24: the next layer's reads beside this MoE all-reduce */
+        if (pfb & 5) {
+            bs.before_ar = pf_moe_beside;
+            bs.ar_arg = &pfm;
+        }
         /* lever PSK: a cut layer's ffn mix over its runs, here (the block issues a beside only in a pass from row 0) */
         const MoeFP8::Beside* bsp = &bs;
         const auto mix_f_rest = [&] {
@@ -9141,6 +9301,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (onear) {
+                    if (bsp && bsp->before_ar) bsp->before_ar(x, bsp->ar_arg);   /* tp8 loop D24 */
                     L.moe.issue_ar(x, 0, T, false);
                     if (l == 0) g_bi_onear.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -9354,6 +9515,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
     bt_begin(m);
+    const int pfb = pf_bits(batch);   /* tp8 loop D24: 0 = no weight reads beside the all-reduces */
+    pf_pass_note(x, batch, pfb);
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const auto* wb = kv_batch(batch, m.win);
@@ -9855,6 +10018,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             bt_pt(x, m, m.attn_out, T, "attn_out", l);
         }
         t_mhc_f.clear();   /* lever M1: this layer's ffn mix not fused yet */
+        if ((L.ar_attn || L.ar_pcn_f) && (pfb & 3)) pf_attn(x, L, pfb);   /* tp8 loop D24: beside the all-reduce below */
         if (L.ar_pcn_f && ar_wide_write_exact(m.g, T))   /* the all-reduce, post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.ar_pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
@@ -9900,6 +10064,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
+        PfBeside pfm{ &m, &L, pfb };   /* tp8 loop D24: the next layer's reads beside this MoE all-reduce */
+        if (pfb & 5) {
+            bs.before_ar = pf_moe_beside;
+            bs.ar_arg = &pfm;
+        }
         L.moe.step(x, batch, bs);
         bt_pt(x, m, m.mw.logits, T, "router", l);
         bt_pt(x, m, m.mw.ids, T, "ids", l);
