@@ -821,6 +821,29 @@ TEST(lanes_keep_both_stages_busy_at_once) {
                         "%.3f, both at once %.3f (%zu / %zu intervals)\n", lanes, tok, sec, tps[lanes], got[lanes].window_ms,
                 got[lanes].leader, got[lanes].follower, got[lanes].both, got[lanes].n_l, got[lanes].n_f);
         CHECK(got[lanes].n_l > 0 && got[lanes].n_f > 0);
+        /* tp8 loop D37: with lanes every whole head has its 'hiss' stamp -- rank 0's run_step entry after the head's release,
+         * its return at or after the entry */
+        {
+            std::istringstream in(tiny::read_text(prefix + ".leader"));
+            std::string kind;
+            int lane = 0, step = 0;
+            unsigned long long b0 = 0, e0 = 0;
+            std::map<int, unsigned long long> rel;
+            long long heads = 0, hiss = 0, bad = 0;
+            std::vector<std::tuple<int, unsigned long long, unsigned long long>> hs;
+            while (in >> kind >> lane >> step >> b0 >> e0) {
+                if (kind == "head") { ++heads; rel[step] = b0; }
+                if (kind == "hiss") { ++hiss; hs.emplace_back(step, b0, e0); }
+            }
+            for (const auto& [st, h0, h1] : hs) {
+                const auto it = rel.find(st);
+                if (h0 == 0 || h1 < h0 || it == rel.end() || h0 < it->second) ++bad;
+            }
+            fprintf(stderr, "    %d lane(s): %lld head stamps, %lld 'hiss' stamps (tp8 loop D37), %lld out of order\n", lanes, heads, hiss, bad);
+            CHECK(heads > 0);
+            CHECK_EQ(hiss, lanes > 1 ? heads : 0LL);   /* one lane runs engine.cpp's step loop: no 'hiss' there */
+            CHECK_EQ(bad, 0LL);
+        }
     }
     CHECK(got[1].both < 0.02);          /* one lane: the nodes take turns */
     CHECK(got[2].both > 0.25);          /* two: both busy at once */

@@ -528,6 +528,11 @@ private:
      * on its rank threads, so issue..join is its run. */
     FILE* pp_stamps_ = nullptr;
     uint64_t pp_stamp_n_ = 0;
+    /* tp8 loop D37 (with RADIANCE_PP_STAMPS, the leader): a whole head part's issue on rank 0's thread -- set by lane_head before
+     * the release, the times written by rank 0 (its run_step's entry and return), read after the join (the barrier orders
+     * both); lane_head stamps them as 'hiss LANE STEP entry return' beside the 'head' stamp (release .. X1) */
+    bool hiss_want_ = false;
+    uint64_t hiss_t0_ = 0, hiss_t1_ = 0;
     void  pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1);
     /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1, the leader): a lone prefill's chunks on rank 0's card -- card-local event
      * times around every head and tail part, the host's time a chunk -- one line a prompt at its first token

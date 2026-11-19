@@ -425,9 +425,15 @@ int Engine::lane_head(int lane, const RadBatch* b) {
         pf_tl_->mark(PfTimeline::kA, pfe->seq, pf_ci);
     }
     if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    hiss_want_ = pp_stamps_ != nullptr;   /* tp8 loop D37: rank 0 times its run_step of this head */
+    hiss_t0_ = hiss_t1_ = 0;
     barrier_->arrive_and_wait();      /* release the ranks */
     barrier_->arrive_and_wait();      /* and wait for them */
     if (pp_ni_) pp_ni_->end();
+    if (hiss_want_) {   /* tp8 loop D37: 'hiss' = rank 0's run_step entry .. return (the release is the 'head' stamp's t0) */
+        hiss_want_ = false;
+        pp_stamp("hiss", lane, b->step, hiss_t0_, hiss_t1_);
+    }
     if (pfp) {
         pf_tl_->mark(PfTimeline::kB, pfe->seq, pf_ci);
         const double iss = (double)(rad_mono_ns() - pf1) / 1e6;
