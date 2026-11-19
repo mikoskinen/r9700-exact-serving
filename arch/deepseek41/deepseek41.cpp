@@ -4054,8 +4054,10 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     /* lever DMR 3 (dspark_mhr 3): the connections' post + collapse + norm as the trunk's one op (mhc_post_collapse_rmsnorm,
      * post_collapse_norm's operands on the drafter's buffers): pcn_f = post_a + col_f + norm_f; pcn_a (stages past the
-     * first) = the previous stage's post_f + this stage's col_a + norm_a. Every buffer they touch spans the query pass. */
-    if (!m.zero) {
+     * first) = the previous stage's post_f + this stage's col_a + norm_a. Every buffer they touch spans the query pass.
+     * Declared only while RADIANCE_DS41_DSPARK_MHR is set (DECODE's c254ec9 rule for DMR 2's fold: an unset start declares
+     * the published program). */
+    if (!m.zero && std::getenv("RADIANCE_DS41_DSPARK_MHR")) {
         const std::vector<RadParam> pcp = { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
                                             RAD_STR("dtype", "bf16") };
         L.pcn_f = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.ffn_norm }, { d.attn_out, d.h0, d.post, d.comb, d.pre_a },
@@ -4193,9 +4195,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     d.kv_bs = rad_kv_block_size(b, d.kv);
     if (d.kv_bs < 1) return RAD_E_INVAL;
     /* lever DMR 2 (dspark_mhr 2): each stage's context key chain as the trunk's fold c (rmsnorm_rope_roundtrip_kv_store),
-     * declared once the window group's block size is fixed (as the trunk's kv_fs); 0 where no library serves it */
+     * declared once the window group's block size is fixed (as the trunk's kv_fs); 0 where no library serves it; only
+     * while RADIANCE_DS41_DSPARK_MHR is set (an unset start declares the published program) */
     for (auto& L : d.st)
-        if (L.d_kvn)
+        if (L.d_kvn && std::getenv("RADIANCE_DS41_DSPARK_MHR"))
             L.d_kvfs = fused(b, "rmsnorm_rope_roundtrip_kv_store",
                              { RAD_RANGE("M", 1, T), RAD_INT("n", hd), RAD_F64("eps", c.eps), RAD_INT("n_head", 1),
                                RAD_INT("head_dim", hd), RAD_INT("rot", c.rope), RAD_INT("off", hd - c.rope),
