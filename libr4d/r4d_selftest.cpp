@@ -36544,7 +36544,7 @@ static void device_phase(const Plugin& pl) {
             }
         }
     }
-    /* --- ds41-int9b (r4d_selftest_i9b.inc): --case mhc_pcn_mix / ix_lds / ix_ni (or their rows' names) --- */
+    /* --- ds41-int9b (r4d_selftest_i9b.inc): --case mhc_pcn_mix / ix_lds / ix_ni (or their rows' names) / ixw (lever IXW) --- */
     i9b_cases(pl);
     i11_cases(pl);   /* ds41-int11 (r4d_selftest_i11.inc / _gq.inc): levers 1U-MX and 1U-GQ */
     gq_cases(pl);
