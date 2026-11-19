@@ -1399,6 +1399,12 @@ int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
     ni.s = ranks_[0]->ctx.stream();
     for (int l = 0; l < n_lanes_; ++l)
         if (RadPpRing* r = pp_recv_[l * RAD_PP_N_RINGS + (lead ? RAD_PP_X2 : RAD_PP_X1)]) ni.rings.push_back(r);
+    /* tp8 loop DECODE round 20: the node's cards for the VRAM line (rad_dev_props also opens the driver's counter) */
+    for (const auto& r : ranks_) {
+        RadDeviceProps pr{};
+        ni.devs.push_back(r->device);
+        ni.totals.push_back(rad_dev_props(r->device, &pr) >= 0 && pr.vram_bytes > 0 ? pr.vram_bytes : -1);
+    }
     ni.arm();
     pp_ni_ = own->get();
     RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE=1 -- rank 0's card time in parts, between parts and waiting on the "

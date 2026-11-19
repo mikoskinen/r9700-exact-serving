@@ -1164,6 +1164,18 @@ TEST(the_node_idle_line_times_both_nodes_and_serves_one_process_tokens) {
             CHECK_EQ(idles, 0);   /* one request, no pause */
             CHECK(line.find("events dropped 0, unread 0") != std::string::npos);
             fprintf(stderr, "    W(%s) %s: tokens %s\n    %s\n", cut, who, got == ref ? "identical" : "DIFFERENT", line.c_str());
+            /* tp8 loop DECODE round 20: the node's VRAM line for the run, every rank's card named (four host devices) */
+            const std::string vkey = std::string("two-node pipeline, ") + who + " node VRAM (RADIANCE_PP_NODE_IDLE=1): the least "
+                                     "free a card had over the run, by the driver's counter: ";
+            const size_t vat = log.find(vkey);
+            CHECK(vat != std::string::npos);
+            if (vat != std::string::npos) {
+                const std::string vline = log.substr(vat, log.find('\n', vat) - vat);
+                int cards = 0;
+                for (size_t q = vline.find("card "); q != std::string::npos; q = vline.find("card ", q + 5)) ++cards;
+                CHECK(cards >= 1);
+                fprintf(stderr, "    %s\n", vline.c_str());
+            }
         }
     }
 }
