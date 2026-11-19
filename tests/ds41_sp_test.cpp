@@ -359,6 +359,36 @@ TEST(plan_segment_passes_with_uncut_deep_layers_every_read_valid) {
     CHECK_EQ(checked, 16);
 }
 
+/* tp8 loop P25c (RADIANCE_DS41_SPHC_SEG=4): the same uncut deep layers in the follower's LONE prefill pass (a cold prompt's last
+ * chunk, no segment: X1 in at 10, X2 out after 31), X1 whole / row-sharded: every read valid; 10-19 + 21-30 (20) or 10-19 + 21-27
+ * (17) SP, 20 and 31 whole; control: the same pass with P25c off (open_to 0) takes 10-19 only (P20's lone pass). The 16k cell's
+ * chunk 7 (1,441 rows, the tail snapshot 417 rows before the end): C_l + 417 >= 1,441 through layer 31 -> open to 32. */
+TEST(plan_lone_passes_with_uncut_deep_layers_every_read_valid) {
+    int checked = 0;
+    for (int open_to : { 32, 28 })
+        for (Pass f : { shapes()[5], shapes()[10] }) {
+            f.seg = 0;
+            f.open_to = open_to;
+            const std::vector<uint8_t> spv = plan_of(f);
+            const std::string e = run(f, spv);
+            if (!e.empty()) std::fprintf(stderr, "lone, open to %d, x1r %d: %s\n", open_to, f.x1r_sh, e.c_str());
+            CHECK_EQ(e, std::string(""));
+            CHECK_EQ(count(spv), open_to == 32 ? 20 : 17);
+            CHECK_EQ((int)spv[20], 0);
+            CHECK_EQ((int)spv[31], 0);
+            for (int l = 10; l < 20; ++l) CHECK_EQ((int)spv[(size_t)l], 1);
+            f.open_to = 0;
+            CHECK_EQ(count(plan_of(f)), 10);
+            CHECK_EQ(run(f, plan_of(f)), std::string(""));
+            ++checked;
+        }
+    CHECK_EQ(checked, 4);
+    /* the lone pass without the lazy gather (the streams whole again at the split layer 20 after SP 19, and at 31 after 30) */
+    Pass f = shapes()[5];
+    f.open_to = 32;
+    CHECK(!run(f, plan_of(f), /*lazy_gather=*/false).empty());
+}
+
 TEST(plan_control_without_the_lazy_gather_fails) {
     int failed = 0;
     for (const Pass& p : shapes()) failed += !run(p, plan_of(p), /*lazy_gather=*/false).empty();

@@ -720,8 +720,12 @@ struct Model {
      * and the declare, so the two sides of a boundary agree: after an SP layer the boundary holds the streams row-sharded,
      * and the next segment issues its boundary op over this rank's quarter (as a whole pass does at the layer's end). 1: the
      * boundary saved / restored whole (today's bytes: the quarter is in them); 2: row-sharded (the stage ops' loop mode with
-     * `shard` + `ranks`: each rank its quarter rows of act.x / h1 / post / comb / pre_ffn, the rest whole: seg_*_sh). 0 = off. */
+     * `shard` + `ranks`: each rank its quarter rows of act.x / h1 / post / comb / pre_ffn, the rest whole: seg_*_sh). 0 = off.
+     * 3 (P25b): + a layer past PSK's first whose cone keeps every row of the segment pass is planned uncut. 4 (P25c, PREFILL
+     * round 18): + the same for the follower's LONE prefill passes (a cold prompt's last chunk: no segment, X1 in, X2 out),
+     * which are SP from round 4 only up to PSK's first layer. */
     int sp_seg = 0;
+    bool sp_lone = false;   /* P25c declared here (RADIANCE_DS41_SPHC_SEG=4 on the follower; kept if boundaries fall back to 1) */
     std::vector<rad_op> seg_send_sh, seg_recv_sh;
     /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, with sphc; sphc_attn_env(), read at declare): at an SP layer whose xn no
      * compressor / indexer reads, the attention's unsharded input GEMMs (q_a, kv: every rank holds them whole) over this
@@ -2652,15 +2656,18 @@ static bool sphc_x1_env() {
 /* tp8 loop P25 -- RADIANCE_DS41_SPHC_SEG=1 / 2 (with RADIANCE_DS41_SPHC, the follower, read at declare; Model::sp_seg): SP in a
  * follower segment pass. EXACT by construction: the same SP ops over the same rows as the whole pass's (a segment boundary is
  * transparent to the plan, and the next segment issues the boundary op the whole pass issues at the layer's end, over the
- * same quarter); the boundary's save / restore moves bytes only (2: only the quarter SP layers read). Anything else 0. */
+ * same quarter); the boundary's save / restore moves bytes only (2: only the quarter SP layers read). 3 = P25b, 4 = P25c (Model::
+ * sp_seg). Anything else 0. */
 static int sphc_seg_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_SPHC_SEG");
-        return e && (e[0] >= '1' && e[0] <= '3') && !e[1] ? e[0] - '0' : 0;
+        return e && (e[0] >= '1' && e[0] <= '4') && !e[1] ? e[0] - '0' : 0;
     }();
     return v;
 }
 static std::atomic<long long> g_sp_seg_passes{0}, g_sp_seg_layers{0}, g_sp_seg_sh{0};
+/* tp8 loop P25c: lone follower prefill passes with a layer past PSK's first planned SP, and those layer-passes */
+static std::atomic<long long> g_sp_cone_passes{0}, g_sp_cone_layers{0};
 static std::atomic<long long> g_sp_x1{0};
 /* tp8 loop P26 -- RADIANCE_DS41_SPHC_ATTN=1 (with RADIANCE_DS41_SPHC, read at declare; default 0 = round 4's SP layers): the
  * attention's input GEMMs q_a and kv are declared unsharded (every rank holds the whole weight and, today, runs it over every
@@ -2703,6 +2710,11 @@ static int spattn_now(const Model& m) {
 static int spseg_now(const Model& m) {
     const int v = g_sw_spseg.load(std::memory_order_relaxed);
     return v >= 0 && v < m.sp_seg ? v : m.sp_seg;
+}
+/* tp8 loop P25c: the lone follower passes' uncut deep layers -- declared (RADIANCE_DS41_SPHC_SEG=4) and the switch at 4 */
+static bool splone_now(const Model& m) {
+    const int v = g_sw_spseg.load(std::memory_order_relaxed);
+    return m.sp_lone && (v < 0 || v >= 4);
 }
 /* tp8 loop P13b -- RADIANCE_DS41_PIPE2_ATTN=1 (read at declare, only with RADIANCE_DS41_PIPE2 on): a pipelined layer's
  * attention output too: the first group projections and the attention mix as today, o_b of piece 0, piece 0's
@@ -5665,8 +5677,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const char* why = m.sphc <= 0 ? "RADIANCE_DS41_SPHC is off" : !m.pp || m.pp_rank != 1 ? "not a pipeline follower"
                         : m.seg_b.empty() ? "no segment boundaries (RADIANCE_PP_SEG_LAYERS)" : m.seg_lead ? "leader segments" : nullptr;
         m.sp_seg = why ? 0 : sphc_seg_env();
+        /* P25c: a lone pass needs no segment boundary, only the follower's SP passes */
+        m.sp_lone = sphc_seg_env() >= 4 && m.sphc > 0 && m.pp && m.pp_rank == 1 && !m.seg_lead;
         if (ctx->rank == 0 && why)
-            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=%d off (tp8 loop P25): %s\n", sphc_seg_env(), why);
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=%d off (tp8 loop P25): %s%s\n", sphc_seg_env(), why,
+                    m.sp_lone ? "; P25c (lone follower passes) stays on" : "");
     }
     /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the MoE layers' ungated shared gate, a plane of bf16 ones, filled
      * once at the step's start -- the op each layer issues (MoeFP8 op_sgate: fill n 1, value 1, the block's
@@ -5867,6 +5882,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                                  "post / comb / pre_ffn, the rest whole)")
                 : sphc_seg_env() >= 2 ? "boundaries WHOLE: the row-sharded loop stage ops do not resolve here (as 1)"
                                       : "boundaries saved / restored whole");
+    if (m.sp_lone && ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=4 (tp8 loop P25c): a LONE follower prefill pass of one "
+                        "prefill segment of >= %lld rows (a cold prompt's chunk) plans a layer past PSK's first SP where its cone "
+                        "keeps every row of the pass (P25b's rule; ds41_sphc_seg 3 or lower = off)\n",
+                (long long)m.sphc);
     /* tp8 loop P25s: what the SP route's switches may take away -- this declare's threshold and levels (every rank the same) */
     if (!ctx->shape_probe && m.sphc > 0) {
         sw_atomic_max(g_sw_sphc_decl, (int)m.sphc);
@@ -7834,10 +7854,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     const auto sp_in_part = [&](int i) { return sp_segp ? i >= pp_he(m) && i < m.pp_t : pp_part_layer(m, part, i); };
     /* tp8 loop P25b (RADIANCE_DS41_SPHC_SEG=3, a follower segment pass): a layer past m.psk_first whose cone keeps every row
      * of the pass's one prefill segment (psk_rows over C_l and the plan's `ahead`, as the cut below computes it) runs uncut,
-     * so the plan may take it; the split layer (PSK-L20) and replay chunks stay as may_cut says. The cut below re-checks. */
+     * so the plan may take it; the split layer (PSK-L20) and replay chunks stay as may_cut says. The cut below re-checks.
+     * tp8 loop P25c (RADIANCE_DS41_SPHC_SEG=4): the same rule for the follower's LONE prefill pass (a cold prompt's chunk). */
+    const bool sp_lonep = splone_now(m) && !t_seg && part != RAD_PP_PART_SEG && m.pp && m.pp_rank == 1;
     const auto sp_may_cut = [&](int l) {
         if (!may_cut(l)) return false;
-        if (!(sp_segp && sp_seg >= 3) || cr_any || sg.size() != 1 || sg[0].dec || l < m.psk_first) return true;
+        if (!((sp_segp && sp_seg >= 3) || sp_lonep) || cr_any || sg.size() != 1 || sg[0].dec || l < m.psk_first) return true;
         if (l20_on && l == m.psk_l20 && !cr_all) return true;
         return psk_rows(psk_cone(c.n_layer, c.window, l), psk_ahead(hint, 0), sg[0].n) < sg[0].n;
     };
@@ -7847,6 +7869,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     static thread_local std::vector<ds41sp::Layer> spl;
     spv.assign(m.layers.size(), 0);
     int sp_n = 0, sp_ga = 0, sp_lo = -1, sp_hi = -1, sp_en = 0, sp_at = 0, sp_ac = 0;   /* sp_at / sp_ac: P26's / P26b's layers */
+    int sp_deep = 0;   /* tp8 loop P25c: SP layers past PSK's first */
     if (sp_pass) {
         spl.assign(m.layers.size(), ds41sp::Layer{});
         for (int i = 0; i < (int)m.layers.size(); ++i) {
@@ -7898,6 +7921,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const long long at = g_sp_attn.fetch_add(sp_at, std::memory_order_relaxed) + sp_at;
                 const long long ac = g_sp_comp.fetch_add(sp_ac, std::memory_order_relaxed) + sp_ac;
                 const long long n = g_sp_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (sp_lonep && sp_deep > 0) {   /* tp8 loop P25c: its own line, the first and every 64th such pass */
+                    const long long cn = g_sp_cone_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const long long cl = g_sp_cone_layers.fetch_add(sp_deep, std::memory_order_relaxed) + sp_deep;
+                    if (cn == 1 || cn % 64 == 0)
+                        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_SEG=4 (tp8 loop P25c): %lld lone follower prefill "
+                                        "passes ran %lld layer-passes past PSK's first sequence-parallel (their cones keep every row); "
+                                        "this one step %d, %lld rows, layers %d..%d SP (%d, %d past PSK's first)\n",
+                                cn, cl, batch->step, (long long)T, sp_lo, sp_hi, sp_n, sp_deep);
+                }
                 char p26[256] = "";
                 if (m.sp_ag_qr)   /* tp8 loop P26: appended only with RADIANCE_DS41_SPHC_ATTN=1 / 2 */
                     std::snprintf(p26, sizeof p26, "; RADIANCE_DS41_SPHC_ATTN (tp8 loop P26): %lld layer-passes ran q_a / kv "
@@ -8048,7 +8080,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             }
         }
         if (cut && held && spv[(size_t)(&L - m.layers.data())] != 0) {   /* tp8 loop P25b: the plan took a layer PSK cuts */
-            rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_SEG=3: an SP layer is cut by lever PSK (a plan defect)");
+            rad_step_fail(x, sp_lonep ? "deepseek41: RADIANCE_DS41_SPHC_SEG=4 (P25c): a lone pass's SP layer is cut by lever PSK "
+                                        "(a plan defect)"
+                                      : "deepseek41: RADIANCE_DS41_SPHC_SEG=3: an SP layer is cut by lever PSK (a plan defect)");
             return;
         }
         if (cut != (cur != &sg)) {
@@ -8090,6 +8124,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             ++sp_n;
             if (sp_lo < 0) sp_lo = l;
             sp_hi = l;
+            if (l >= m.psk_first) ++sp_deep;   /* tp8 loop P25b / P25c: a layer PSK could cut, planned SP (uncut) */
         }
         /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): the attention all-reduce of an uncut layer of a lone prefill pass in
          * the pieces [0, pa) [pa, T) (pa as the MoE's cut below), piece 0's on lane 1 beside piece 1's output projection;
