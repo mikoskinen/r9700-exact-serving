@@ -8290,7 +8290,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (!wmkw || !gg) { by_seg(0, T); return; }
         /* tp8 loop P30t: a run holding a prompt segment that takes the twin is issued by segment (its prompt rows on the twin,
          * its decode rows in their own GGUF launches) */
-        const int tw_mk = t_twin_sub ? 0 : twin_mask_now();
+        const int tw_mk = t_twin_sub ? 0 : (twin_mask_now() & ~t_tw_off);   /* this layer's twin classes: no split where none acts */
         const int64_t tw_r = tw_mk ? twin_rows_now() : 0;
         for (const auto& u : runs) {
             int64_t dn = 0, pn = 0;
