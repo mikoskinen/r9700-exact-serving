@@ -3489,6 +3489,30 @@ TEST(ds41_tsk_is_a_follower_plugin_switch_after_ds41_twin) {
     CHECK(std::string(fn4::switch_name(i)) == "ds41_tsk");
 }
 
+/* tp8 loop DECODE round 24 (S2: ds41-drafter merged onto ds41-pp-dev + ds41-pp-dev-pf): the DRAFTER's lever DHD switch
+ * draft_head_cut (82 on ds41-drafter) is 92 here, right after ds41_tsk -- the leader's engine switch (Engine::issue_block_drafter),
+ * not a plugin's, not the scheduler's, not one the follower requests; 0 / 1 taken, anything else refused with its range. */
+TEST(draft_head_cut_is_the_leaders_engine_switch_after_ds41_tsk) {
+    const int i = fn4::switch_index("draft_head_cut");
+    REQUIRE(i == (int)fn4::kDraftHeadCut);
+    CHECK_EQ(i, (int)fn4::kDs41Tsk + 1);
+    CHECK_EQ(i, 92);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(!fn4::sched_switch(i));
+    CHECK(!fn4::follower_switch(i));
+    CHECK(std::string(fn4::switch_name(i)) == "draft_head_cut");
+    std::string err;
+    CHECK(fn4::check("draft_head_cut", 0, &err));
+    CHECK(fn4::check("draft_head_cut", 1, &err));
+    CHECK(!fn4::check("draft_head_cut", 2, &err));
+    CHECK(err.find("draft_head_cut takes 0 (off) or 1") != std::string::npos);
+    CHECK(!fn4::check("draft_head_cut", -1, &err));
+    /* the PREFILL switches kept their numbers through both merges (names cross the branches; these are on cards) */
+    CHECK_EQ(fn4::switch_index("ds41_sphc"), 85);
+    CHECK_EQ(fn4::switch_index("ds41_twin"), 90);
+    CHECK_EQ(fn4::switch_index("ds41_attn_dec"), 84);
+}
+
 TEST(no_prefix_hit_gives_nothing_back) {
     const RefillRun r = refill_run(1100, 0);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
