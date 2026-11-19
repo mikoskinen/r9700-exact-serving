@@ -6,7 +6,7 @@
 /* libref's schemas (libref/ref_registry.cpp), field for field. */
 static const RadParamSpec pDs41AttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
-    P_STRO("window_format") };
+    P_STRO("window_format"), P_INTO("wm_from") };   /* wm_from: lever DAW (attn_body) */
 static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
     { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
