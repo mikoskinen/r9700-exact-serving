@@ -1878,14 +1878,22 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * 2 = 1 + each stage's window key (kv_n, kv_rope, kv_q, kv_st: four launches on the path to the attention) as the trunk's
  * lever K1 fold c, rmsnorm_rope_roundtrip_kv_store (each row at its own position, as kv_rope; the same bytes and slot),
  * on the query pass and on the context pass. 3 = 2 + the connections' post + collapse + norm as the trunk's
- * mhc_post_collapse_rmsnorm (pcn_f; pcn_a = the previous stage's post_f with this stage's col_a + norm_a). */
+ * mhc_post_collapse_rmsnorm (pcn_f; pcn_a = the previous stage's post_f with this stage's col_a + norm_a).
+ * 4 (DRAFTER track 19.11.2026 round 25, lever DML) = 3 + each stage's attention mix LATE, between o_a and o_b, as the
+ * trunk's step() places it (`late`): under 1-3 the mix sits between norm_a and q_a, and its finish launch is ordered
+ * (it reads the split's partials), so q_a -- unordered behind it -- waits for the whole split (lq198 leader stamps,
+ * kit/st/drgap.py: q_a starts 14-24 us after pcn_a / norm_a ends instead of one launch gap). Between o_a and o_b the
+ * split runs beside o_a and o_b goes unordered behind the finish. The same kernels on the same operands: nothing
+ * between norm_a and o_b reads pre_a / post / comb or writes h0 (the mix reads h0, writes pre_a / post / comb, read
+ * first by post_a / pcn_f after the attention's all-reduce), so the same bytes. Start env only (no core switch name):
+ * RADIANCE_DS41_DSPARK_MHR=4. */
 static std::atomic<int> g_sw_dmr{-1};
 static int dmr_now() {
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0);
+        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '4' && !e[1] ? e[0] - '0' : 0);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2647,7 +2655,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 3 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 4 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML) */
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
@@ -7546,6 +7554,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const int dmrv = m.zero ? 0 : dmr_now();
     const bool dmr = dmrv >= 1;
     const bool dmr3 = dmrv >= 3;   /* lever DMR 3: the pcn ops */
+    const bool dml = dmrv >= 4;    /* lever DML (dspark_mhr 4): the attention mix between o_a and o_b */
     for (const auto& L : d.st) {
         const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
         const Layer* nx = &L != &d.st.back() ? &L + 1 : nullptr;
@@ -7565,7 +7574,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
         } else {
             if (!pa) RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
-            if (dmr) mix_a();
+            if (dmr && !dml) mix_a();
             const bool gqp = gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
             else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
@@ -7600,6 +7609,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                 for (int j = 0; j < m.gr; ++j)
                     lin_issue(x, m, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), L.wo_a[(size_t)j],
                               bcol(d.oa, j * c.o_rank, c.o_rank, T));
+            if (dml) mix_a();   /* lever DML: beside o_a, o_b unordered behind its finish (step()'s `late`) */
             lin_issue(x, m, L.o_b, T, brows(d.oa, T), L.wo_b, brows(d.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
