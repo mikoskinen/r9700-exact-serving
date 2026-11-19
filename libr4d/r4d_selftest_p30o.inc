@@ -7,13 +7,15 @@
  *     2. gemm_fp8a8e8_b32 (gemm_nt_q dtype fp8a8e8: E4M3 x E4M3, an E8M0 weight exponent per 32x32 block, a power-of-two
  *        activation scale per (row, 32), folded every 32 of K) against libref's gemm_nt_q at fp8a8e8 (quant_dot: per 32-group
  *        sub-sum ascending, acc += sub x sa x sb, one bf16 rounding): the count of bf16 outputs that differ and the worst
- *        relative error, at M 1 / 16 / 17 / 130 x (N, K) (64, 128) / (512, 1024) / (1280, 5120), plain and with a pitched
+ *        relative error, at M 1 / 16 / 17 / 130 x (N, K) (64, 128) / (512, 1024) / (1280, 5120) / the release's shared expert at
+ *        TP4 (5120, 576) (K % 128 = 64: the last partial 128-K tile) / (1152, 5120), plain and with a pitched
  *        activation (K + 128) and output (N + 64) (padding poisoned, checked untouched). The codes are multiples of 1/16 in
  *        [-4, 4] and the scales powers of two, which keeps every 32-term block sum exact in f32 in any order, so the card's
  *        WMMA order inside a block cannot round differently: PASS = 0 outputs differ;
  *     2b. the forms change no byte: 16-byte staging (r4d_fp8e8_pin_ld 16) at M tile 16 / 32 / 64 (r4d_fp8e8_pin_mt) into a
  *        re-poisoned output = the first form's (byte staging, tile 16), padding included;
- *     3. INFO: the GEMM at the newcomer's eight rank-0 shapes (run-p30a.sh's list and weights) x M 16 / 1100 / 4096 -- rows
+ *     3. INFO: the GEMM at the newcomer's eight rank-0 shapes (run-p30a.sh's list and weights) + the release's shared expert at
+ *        TP4 (shexp_gate_up_rel 1152 x 5120, shexp_down_rel 5120 x 576) x M 16 / 1100 / 4096 -- rows
  *        gemm_fp8a8e8_b32_first (byte staging, tile 16), gemm_fp8a8e8_b32 (16-byte staging, tile 16), _mt32 / _mt64 (16-byte, tile 32 / 64;
  *        above 16 rows) -- us a call over 10 timed launches after 2 warm ones, as `P30W name NxK M=m wW row us us` lines that
  *        tp8/devpf/scripts/p30read.py reads beside run-p30a.sh's (published B5SUM 101.16 / 356.15 ms at M 1100 / 4096).
@@ -300,7 +302,9 @@ static void p30o_cases(const Plugin& pl) {
             for (int64_t M : { 1, 7, 33, 130 }) quant_case(rq, oq, M, K);
     struct NK { int64_t N, K; };
     if (wg)
-        for (const NK s : { NK{ 64, 128 }, NK{ 512, 1024 }, NK{ 1280, 5120 } })
+        /* PREFILL round 24: + the release's shared expert at TP4 (P30o r2 (c)): down 5120 x 576 (K % 128 = 64, fef3fee's last
+         * partial 128-K tile) and gate_up 1152 x 5120 -- the K % 32 path on a card */
+        for (const NK s : { NK{ 64, 128 }, NK{ 512, 1024 }, NK{ 1280, 5120 }, NK{ 5120, 576 }, NK{ 1152, 5120 } })
             for (int64_t M : { 1, 16, 17, 130 })
                 for (bool pitched : { false, true }) gemm_case(pl, rg, og, M, s.N, s.K, pitched);
     if (!all || !g_case) {
@@ -310,7 +314,10 @@ static void p30o_cases(const Plugin& pl) {
     struct Sh { const char* n; int64_t N, K; int w; };
     const Sh shapes[] = { { "q_b", 8192, 1280, 40 }, { "o_b", 5120, 2048, 40 }, { "q_a", 1280, 5120, 40 }, { "o_a", 1024, 4096, 80 },
                           { "kv", 512, 5120, 40 }, { "shexp_gate_up", 1536, 5120, 40 }, { "shexp_down", 5120, 768, 40 },
-                          { "engram_kv", 25600, 6144, 2 } };
+                          { "engram_kv", 25600, 6144, 2 },
+                          /* PREFILL round 24: the release's shared expert at TP4 (its gate_up 4608 / 4, down K 2304 / 4); weight 0 so
+                           * kit p30read.py's weighted step stays the eight GGUF shapes' (B5SUM's), the lines are read alone */
+                          { "shexp_gate_up_rel", 1152, 5120, 0 }, { "shexp_down_rel", 5120, 576, 0 } };
     for (int64_t M : { 16, 1100, 4096 })
         for (int f = 0; f < 4; ++f) {   /* the first form (byte staging, tile 16), 16-byte staging at tile 16, 32, 64 */
             if (M <= 16 && f >= 2) continue;   /* a launch of <= 16 rows is one 16-row tile at any pin */
