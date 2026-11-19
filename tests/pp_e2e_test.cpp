@@ -2589,3 +2589,76 @@ TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_do
         CHECK(pr.flog.find("this node's pass takes the step's token ids from X1") != std::string::npos);
     }
 }
+
+/* tp8 loop F66 (lever KVP): RADIANCE_KV_PLACED=1 on both nodes with RADIANCE_KV_PLACED_TEST_MIB=48 (48 MiB a card
+ * "lost beside the budget", the host backend's stand-in for the page tables a card's mapped host memory costs):
+ * each KV pool gives it back before the count, the node that pages more returns its pages past the agreed count,
+ * and the pair still serves one process's greedy tokens at 1 / 2 / 3 lanes and records one process's KL at a
+ * wrap-around cut. */
+TEST(kv_placed_pools_serve_and_record_what_one_process_does) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> kvp = { "RADIANCE_KV_PLACED=1", "RADIANCE_KV_PLACED_TEST_MIB=48" };
+    /* a context long enough that the cache takes the whole card (6 x 262144 tokens at 1 KiB a token > 512 MiB):
+     * nothing beside the pools absorbs the 48 MiB, as on the cards */
+    const std::vector<std::string> big = { "--max-model-len", "262144" };
+    const auto check_logs = [](const std::string& llog, const std::string& flog, const char* what, bool lead_back) {
+        int gave = 0, back = 0;
+        for (const std::string* log : { &llog, &flog }) {
+            CHECK(log->find("VRAM placed since the budget read the cards that the budget did not count") != std::string::npos);
+            if (log->find("RADIANCE_KV_PLACED=1: the KV pool gave back") != std::string::npos) ++gave;
+            if (log->find("paged more than the agreed") != std::string::npos) ++back;
+        }
+        CHECK_EQ(gave, 2);          /* both nodes gave the 48 MiB a card back before the count */
+        /* the leader on the larger card returned its pages past the follower's count (equal cards: nothing past it) */
+        if (lead_back) CHECK(llog.find("paged more than the agreed") != std::string::npos);
+        else CHECK_EQ(back, 0);
+        const std::string tag = "KV capped on both nodes before the carve at ";
+        const size_t at_l = llog.find(tag), at_f = flog.find(tag);
+        CHECK(at_l != std::string::npos && at_f != std::string::npos);
+        if (at_l != std::string::npos && at_f != std::string::npos)
+            CHECK_EQ(std::atoll(llog.c_str() + at_l + tag.size()), std::atoll(flog.c_str() + at_f + tag.size()));
+        fprintf(stderr, "    %s: gave back on %d node(s), pages past the count returned on %d\n", what, gave, back);
+        if (gave != 2 || (lead_back && back < 1))
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 40).c_str());
+    };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", cat({ "--max-num-seqs", "6" }, big)));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    for (int lanes : { 1, 2, 3 }) {
+        Serving pp;
+        REQUIRE(pp.start("1,3", cat(lane_shape(lanes), big), cat(kSplitEnv, kvp)));
+        const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) if (ref[i] != got[i]) ++differ;
+        fprintf(stderr, "    %d lane(s) W(1,3), RADIANCE_KV_PLACED=1: %d of %zu prompts differ\n", lanes, differ, ref.size());
+        CHECK_EQ(differ, 0);
+        check_logs(pp.lead.output(), pp.fol.output(), lanes == 1 ? "1 lane" : lanes == 2 ? "2 lanes" : "3 lanes", false);
+    }
+    tiny::TempDir d("pp_kvp_rec");
+    const std::string rec = record_single(d / "single", cat({ "--max-num-seqs", "6" }, big));
+    REQUIRE(!rec.empty());
+    for (const char* cut : { "1,3", "0,2" }) {
+        const std::string out = d / (std::string("pp-") + cut);
+        const std::vector<std::string> env = cat(kSplitEnv, kvp);
+        /* the follower on a smaller card binds; RADIANCE_KV_PLACED is each node's own (rendezvous) */
+        const PipeRun pr = record_pipeline(out, cut, cat(env, { "RADIANCE_HOST_VRAM_MIB=384" }), cat(lane_shape(2), big),
+                                           cat(lane_shape(2), big), env);
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        fprintf(stderr, "    2 lanes W(%s), RADIANCE_KV_PLACED=1: recording %s\n", cut, same ? "identical" : why.c_str());
+        CHECK(same);
+        if (!same) fprintf(stderr, "    leader:\n%s\n", tail(pr.llog, 30).c_str());
+        check_logs(pr.llog, pr.flog, cut, true);
+    }
+}

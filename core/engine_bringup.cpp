@@ -2250,6 +2250,15 @@ int Engine::plan() {
             rad_dev_props(r->device, &props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* tp8 loop F66 (lever KVP): this card at the reading, for configure_kv's measurement */
+            {
+                if (kvp_read_.size() < ranks_.size()) kvp_read_.resize(ranks_.size());
+                KvpRead& kr = kvp_read_[(size_t)r->index];
+                kr.free = props.vram_free;
+                rad_dev_ledger_of(r->device, &kr.dev_bytes, &kr.streams);
+                kr.queue_bytes = f.queue_bytes;
+                kvp_least_free_ = kvp_least_free_ < 0 ? kr.free : std::min(kvp_least_free_, kr.free);
+            }
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
              * budget charges it against the one ledger. */
             f.unified     = props.unified != 0;
@@ -2426,6 +2435,7 @@ int Engine::plan() {
                 facts[i].statics -= tower_pin_bytes(wfs[i], cfg_.embedding_resolved);
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
+        kvp_claimable_ = vb.capacity > 0 ? vb.claimable : -1;   /* tp8 loop F66 (lever KVP) */
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
         decide("vram split",
                fmt("weights %s (experts %s of it), KV cache %s, a card", humanb(vb.weights).c_str(),
@@ -4117,6 +4127,120 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     return RAD_OK;
 }
 
+/* tp8 loop F66 (lever KVP): RADIANCE_KV_PLACED=1 sizes the KV pool after what the budget does not see is
+ * placed. Unset (or 0): today's pools; a pipeline node still prints the measurement. */
+static bool kv_placed_on() {
+    const char* e = std::getenv("RADIANCE_KV_PLACED");
+    return e && !std::strcmp(e, "1");
+}
+
+/* The budget (plan) read every card before the pools, the weights, the embedding and the n-gram table
+ * were placed; it counts what the engine allocates, not what the driver backs beside it -- GPU page
+ * tables for the host memory the cards map (about 4 KiB a 2 MiB of it: ~206 MiB a card for a 103 GiB
+ * n-gram table), a plugin's own hipMalloc. Those came out of --gpu-headroom-mib (lq177: 196-208 MiB a
+ * card, 52-60 MiB left of 256 at settle; F64 / F66: a card thrashing or out of memory under load).
+ * Here, before the carve, each card's free-memory drop since the reading, less what the engine placed
+ * there (rad_dev_ledger_of: device bytes, streams x one queue), is that unseen part; under the switch
+ * a KV pool nothing was carved from gives it back (Pool::resize), so the agreed token count and the
+ * card's headroom are both what the budget meant. RADIANCE_KV_PLACED_TEST_MIB=N adds N MiB to every
+ * card's unseen part (the host suites). */
+int Engine::kv_placed_measure() {
+    kvp_unseen_.assign(ranks_.size(), 0);
+    kvp_trim_.assign(ranks_.size(), 0);
+    kvp_back_.assign(ranks_.size(), 0);
+    const bool on = kv_placed_on();
+    if (!on && !pp_on()) return RAD_OK;
+    if (kvp_read_.size() < ranks_.size() || kvp_least_free_ < 0) return RAD_OK;
+    const int64_t MiB = (int64_t)1 << 20;
+    int64_t test = 0;
+    if (const char* t = std::getenv("RADIANCE_KV_PLACED_TEST_MIB"); t && *t) test = std::max<int64_t>(std::atoll(t), 0) * MiB;
+    std::string line;
+    int64_t gave = 0;
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        Rank& r = *ranks_[i];
+        const KvpRead& a = kvp_read_[i];
+        RadDeviceProps p{};
+        if (a.free < 0 || rad_dev_props(r.device, &p) < 0) continue;
+        int64_t db = 0, ns = 0;
+        rad_dev_ledger_of(r.device, &db, &ns);
+        /* Spare before the headroom: what this card had free above the least the split was sized on, and
+         * what the split left beside its two pools (the budget's `unusable`, MiB rounding). */
+        const int64_t pools = (rank_cfg_.size() > i ? rank_cfg_[i].vram_weights_mib + rank_cfg_[i].vram_kv_mib
+                                                    : cfg_.vram_weights_mib + cfg_.vram_kv_mib) * MiB;
+        const int64_t spare = (a.free - kvp_least_free_) + (kvp_claimable_ > pools ? kvp_claimable_ - pools : 0);
+        const KvPlaced k = kv_placed(a.free, p.vram_free, db - a.dev_bytes, ns - a.streams, a.queue_bytes, spare, test);
+        kvp_unseen_[i] = k.unseen;
+        Pool& kp = r.pools.kv();
+        const bool movable = on && k.trim > 0 && kp.used() == 0 && kp.bytes() > k.trim;
+        line += fmt("%scard %d %s (free %s at the read, %s now; the engine placed %s and %+lld stream(s); spare %s)",
+                    line.empty() ? "" : ", ", r.device, humanb(k.unseen).c_str(), humanb(a.free).c_str(),
+                    humanb(p.vram_free).c_str(), humanb(db - a.dev_bytes).c_str(), (long long)(ns - a.streams),
+                    humanb(spare).c_str());
+        if (!movable) continue;
+        RAD_TRY(rad_dev_set(r.device));
+        const int64_t was = kp.bytes();
+        const int st = kp.resize((was - k.trim) / MiB * MiB);
+        if (st < 0) {
+            RAD_ERR("kv: rank %d's KV pool could not be made again at %s to give back the %s its card lost "
+                    "beside the budget (RADIANCE_KV_PLACED=1): %s", r.index, humanb(was - k.trim).c_str(),
+                    humanb(k.trim).c_str(), rad_dev_last_error());
+            return st;
+        }
+        kvp_trim_[i] = was - kp.bytes();
+        gave += kvp_trim_[i];
+        /* The card should show the difference at once (the old backing freed before the new one): say if it
+         * did not, so a driver that keeps freed memory is named, not mistaken for a fix. */
+        RadDeviceProps q{};
+        if (rad_dev_props(r.device, &q) >= 0) {
+            line += fmt(" -> pool %s, card free %s", humanb(kp.bytes()).c_str(), humanb(q.vram_free).c_str());
+            if (q.vram_free < p.vram_free + kvp_trim_[i] / 2)
+                RAD_WARN("kv: card %d's free memory rose by %s when its KV pool gave back %s (RADIANCE_KV_PLACED=1): the "
+                         "driver kept the freed backing, so the headroom is not restored", r.device,
+                         humanb(q.vram_free - p.vram_free).c_str(), humanb(kvp_trim_[i]).c_str());
+        }
+    }
+    if (line.empty()) return RAD_OK;
+    RAD_INFO("VRAM placed since the budget read the cards that the budget did not count (tp8 loop F66: page tables "
+             "of mapped host memory, plugins' own allocations): %s%s", line.c_str(),
+             !on ? "; RADIANCE_KV_PLACED=1 would give it back from the KV pool before the carve"
+                 : gave > 0 ? fmt("; RADIANCE_KV_PLACED=1: the KV pool gave back %s over %zu card(s) before the carve, so "
+                                  "--gpu-headroom-mib stays whole", humanb(gave).c_str(), ranks_.size()).c_str()
+                            : "; RADIANCE_KV_PLACED=1: nothing to give back");
+    return RAD_OK;
+}
+
+/* Under RADIANCE_KV_PLACED=1, after the agreement: a rank whose fixed KV pool pages more than the
+ * agreed `least` tokens (a pipeline node capped by the other's count; a cheaper rank) is made again at
+ * the pool that pages exactly `least` (KVManager::pool_mib_for_tokens + 1 MiB), so the pages it could
+ * never hand out go back to the card. The carve's block counts are the cap's either way. */
+int Engine::kv_placed_return(size_t ri, int64_t least) {
+    if (!kv_placed_on() || least <= 0 || least == KVManager::kUnboundedTokens || ri >= ranks_.size()) return RAD_OK;
+    Rank& r = *ranks_[ri];
+    Pool& kp = r.pools.kv();
+    if (kp.used() != 0 || kp.elastic() || r.kv.stream_cost().groups > 0) return RAD_OK;
+    const int64_t MiB = (int64_t)1 << 20;
+    const int64_t have = kp.bytes() / MiB;
+    if (r.kv.paged_tokens(kp.avail()) <= least) return RAD_OK;
+    const int64_t need = r.kv.pool_mib_for_tokens(least, have);
+    if (need < 0 || need + 2 > have) return RAD_OK;
+    const int64_t was = kp.bytes();
+    RAD_TRY(rad_dev_set(r.device));
+    if (kp.resize((need + 1) * MiB) < 0 || r.kv.paged_tokens(kp.avail()) < least) {
+        /* Not expected (pool_mib_for_tokens is exact): back to the pool it had. */
+        if (const int st = kp.resize(was); st < 0) {
+            RAD_ERR("kv: rank %d's KV pool could not be made again at %s: %s", r.index, humanb(was).c_str(),
+                    rad_dev_last_error());
+            return st;
+        }
+        return RAD_OK;
+    }
+    kvp_back_[ri] = was - kp.bytes();
+    RAD_INFO("kv: rank %d's KV pool paged more than the agreed %lld tokens: made again at %s, %s back to card %d "
+             "(RADIANCE_KV_PLACED=1)", r.index, (long long)least, humanb(kp.bytes()).c_str(),
+             humanb(kvp_back_[ri]).c_str(), r.device);
+    return RAD_OK;
+}
+
 int Engine::configure_kv() {
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
@@ -4140,6 +4264,8 @@ int Engine::configure_kv() {
      * of paged blocks. Under an uneven split the pools differ (more delta-net heads, or zero
      * attention weights), so each rank is planned first and all are capped at the least before
      * any carves. */
+    /* tp8 loop F66 (lever KVP): what the cards lost beside the budget, given back before the count */
+    RAD_TRY(kv_placed_measure());
     int64_t least = -1;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         auto& r = ranks_[i];
@@ -4151,7 +4277,8 @@ int Engine::configure_kv() {
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
         /* A rank plan() re-sized for the common token count must page at least that count (same
          * plan, same bytes); anything less is a broken invariant. */
-        if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_) {
+        if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_ &&
+            !(i < kvp_trim_.size() && kvp_trim_[i] > 0)) {   /* lever KVP gave some back on purpose */
             RAD_ERR("kv: rank %d's KV pool was sized at %lld MiB to page the common %lld tokens "
                     "and pages %lld: the pool and the plan that sized it disagree", r->index,
                     (long long)rank_cfg_[i].vram_kv_mib, (long long)kv_planned_tokens_,
@@ -4191,6 +4318,8 @@ int Engine::configure_kv() {
                 RAD_INFO("kv: rank %d could page %lld tokens and carves %lld, the least rank's, so "
                          "that one block table serves every rank", r->index, (long long)own,
                          (long long)least);
+            /* tp8 loop F66 (lever KVP): the pages past the agreed count go back to the card */
+            RAD_TRY(kv_placed_return((size_t)r->index, least));
             r->kv.cap_paged_tokens(least);
         }
         /* Before the carve, which refuses a streamed plan with no mirror and maps. The maps come out
@@ -5122,6 +5251,13 @@ int Engine::start() {
         } else
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
+        /* tp8 loop F66 (lever KVP): what this card's KV pool gave back, beside the line above */
+        const int64_t kt = ri < kvp_trim_.size() ? kvp_trim_[ri] : 0, kb = ri < kvp_back_.size() ? kvp_back_[ri] : 0;
+        if (kt > 0 || kb > 0)
+            RAD_INFO("card %d: the KV pool gave back %s before the carve for the %s placed beside the budget, and %s "
+                     "past the agreed token count (RADIANCE_KV_PLACED=1); free above is after both",
+                     r->device, humanb(kt).c_str(), humanb(ri < kvp_unseen_.size() ? kvp_unseen_[ri] : 0).c_str(),
+                     humanb(kb).c_str());
     }
     return RAD_OK;
 }
