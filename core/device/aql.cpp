@@ -4154,12 +4154,26 @@ int aql_code_preload(int device, AqlPreload* out) {
 /* tp8 loop P31 (RADIANCE_AQL_PRELOAD=2): every registered kernel resolved on card `device` now, as its first launch there
  * would (resolve: the module's code object, its symbol, the argument layout), so no first launch resolves while serving.
  * A kernel that cannot resolve keeps the reason its first launch reports, as before. */
-int aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms) {
+int aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms, double* alloc_ms) {
     using namespace aql;
     if (resolved) *resolved = 0;
     if (refused) *refused = 0;
     if (ms) *ms = 0;
+    if (alloc_ms) *alloc_ms = -1;
     if (!G().ok || device < 0 || (size_t)device >= G().dev.size()) return RAD_E_UNSUPPORTED;
+    /* HIP's own allocator on this card, used first by a library's first-use block (hipMalloc in libr4d's split_ctr / the stage
+     * ops' counter_for) -- once here, timed, so that first use is not inside a pass */
+    {
+        int prev = -1;
+        (void)hipGetDevice(&prev);
+        if (hipSetDevice(device) == hipSuccess) {
+            const auto a0 = std::chrono::steady_clock::now();
+            void* p = nullptr;
+            if (hipMalloc(&p, 64) == hipSuccess && p) (void)hipFree(p);
+            if (alloc_ms) *alloc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count();
+        }
+        if (prev >= 0) (void)hipSetDevice(prev);
+    }
     std::vector<Func*> fns;
     {
         Registry& r = reg();

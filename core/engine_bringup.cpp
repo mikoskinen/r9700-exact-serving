@@ -2185,11 +2185,11 @@ int Engine::plan() {
                      humanb(p.bytes).c_str(), p.ms, (long long)p.already, (long long)p.none, (long long)p.failed);
             if (all) {
                 int64_t ok = 0, no = 0;
-                double ms = 0;
-                RAD_TRY(aql_code_resolve_all(r->device, &ok, &no, &ms));
+                double ms = 0, ams = -1;
+                RAD_TRY(aql_code_resolve_all(r->device, &ok, &no, &ms, &ams));
                 RAD_INFO("RADIANCE_AQL_PRELOAD=2 (tp8 loop P31): card %d: %lld kernel(s) resolved now (%.0f ms), %lld without "
-                         "code for this card (their first launch reports it, as before)", r->device, (long long)ok, ms,
-                         (long long)no);
+                         "code for this card (their first launch reports it, as before); HIP's allocator's first use here %.1f ms",
+                         r->device, (long long)ok, ms, (long long)no, ams);
             }
         }
     }
