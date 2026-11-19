@@ -244,6 +244,7 @@ TEST(d22_the_dense_band_follows_ds41_wmk_and_a_64_row_run_is_one_launch) {
         CHECK_EQ(ds41_dense_band(6, env, kBand), (int64_t)64);
         CHECK_EQ(ds41_dense_band(7, env, kBand), (int64_t)64);
         CHECK_EQ(ds41_dense_band(8, env, kBand), (int64_t)64);   /* mode 8: 5 + the per-shape 49..64-row table */
+        CHECK_EQ(ds41_dense_band(9, env, kBand), (int64_t)64);   /* mode 9 (D27): 8 + the per-shape 33..48-row table */
     }
     /* at the band of 64 every decode-only run of 1 .. 64 rows is ONE launch over all its rows; at 48 a run of 49 .. 64 is
      * 48 + the rest (today's two weight reads); past 64 the 64 band cuts at 64 */
@@ -251,7 +252,7 @@ TEST(d22_the_dense_band_follows_ds41_wmk_and_a_64_row_run_is_one_launch) {
     for (int64_t n = 1; n <= 64; ++n) {
         CHECK_EQ(ds41_band_cuts(n, ds41_dense_band(5, kBand, kBand), c), (int64_t)1);
         CHECK(c[0].first == 0 && c[0].second == n);
-        for (int w = 6; w <= 8; ++w) {
+        for (int w = 6; w <= 9; ++w) {
             CHECK_EQ(ds41_band_cuts(n, ds41_dense_band(w, kBand, kBand), c), (int64_t)1);
             CHECK(c[0].first == 0 && c[0].second == n);
         }

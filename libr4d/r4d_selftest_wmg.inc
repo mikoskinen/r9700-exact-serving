@@ -776,7 +776,8 @@ static void route(const Plugin& pl, const char* tlist) {
     /* tp8 loop D22 (DECODE round 18): R4D_WMKROUTE_MODE=5 runs the check under ds41_wmk 5 (the decode band's part-order launch up to
      * 64 rows: 49..64-row calls in gg_wk_kernel / the head's G2 at four row tiles instead of the GPF prefill form); default 1 */
     /* tp8 loop D25 step 2 (DECODE round 21): modes 6 / 7 (5 + another 49..64-row launch code) too, the band 64 as 5's */
-    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); return e && e[0] >= '1' && e[0] <= '8' && !e[1] ? e[0] - '0' : 1; }();
+    /* tp8 loop D27 (DECODE round 22): mode 9 (8 + the per-shape 33..48-row table) too */
+    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); return e && e[0] >= '1' && e[0] <= '9' && !e[1] ? e[0] - '0' : 1; }();
     const int64_t band = rmode >= 5 ? 64 : 48;
     const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 56, 63, 64, 97, 130 };
     const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
