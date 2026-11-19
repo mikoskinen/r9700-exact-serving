@@ -39,7 +39,8 @@ extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s);
 extern "C" int r4d_ds41_entry_store_nv4(const RadArgs* a, RadStream s);
 extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs* a);
 extern "C" void r4d_attn_dec_pin(int c);   /* the decode band's form 0-6 (-1: the rule) */
-void r4d_tsk_set(int v);                   /* lever TSK (round 15): the fn4 switch ds41_tsk's setter */
+void r4d_tsk_set(int v);                   /* lever TSK (round 15): the fn4 switch ds41_tsk's setter (2 = TSKC, round 22) */
+void r4d_tsk_bench_nomerge(int v);          /* round 22: ds41_tsk 1 without its merge launch (bench only: prices the merge) */
 int r4d_tsk_get();
 extern "C" long long r4d_tsk_declines();
 
@@ -246,8 +247,17 @@ int main(int argc, char** argv) {
                     diff(t1, t2), diff(t1, t3), diff(t3, t4), diff(h0, h4), diff(t1, h0), t1.size(), 100.0 * diff(t1, h0) / t1.size(), mx,
                     std::sqrt(se / (sr > 0 ? sr : 1)), nan1);
     }
-    {   /* batch invariance: each of sequences 0, S/2, S-1 alone (its bpr rows, its own cu) vs the same rows in the whole pass */
-        r4d_tsk_set(1);
+    {   /* lever TSKC (round 22, ds41_tsk 2): the merge past the full-card cliff must give ds41_tsk 1's bytes */
+        std::vector<uint16_t> f1(ob / 2), f2(ob / 2), f3(ob / 2);
+        r4d_tsk_set(2);
+        const int on2 = r4d_tsk_get();
+        clr(); served(); grab(f1); clr(); served(); grab(f2); clr(); packed(); grab(f3);
+        r4d_tsk_set(0);
+        std::printf("  TSKC (switch %d) hash %016llx: vs TSK two launches %ld differ, repeat %ld, packed vs gathered %ld; declines %lld\n", on2,
+                    (unsigned long long)fnv(f1), diff(f1, t1), diff(f1, f2), diff(f1, f3), r4d_tsk_declines());
+    }
+    for (int sw : { 1, 2 }) {   /* batch invariance: each of sequences 0, S/2, S-1 alone (its bpr rows, its own cu) vs the same rows in the whole pass */
+        r4d_tsk_set(sw);
         long dsum = 0;
         for (int s1 : { 0, S / 2, S - 1 }) {
             const int r0 = s1 * bpr;
@@ -263,11 +273,11 @@ int main(int argc, char** argv) {
             clr(); run(g1, r4d_rad_ds41_latent_gather, "gather1"); run(a1, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered, "attn1");
             std::vector<uint16_t> x(ob / 2); grab(x);
             long d = 0; for (size_t i = (size_t)r0 * HD; i < (size_t)(r0 + bpr) * HD; ++i) d += x[i] != t1[i];
-            std::printf("  TSK batch invariance: sequence %d alone (%d rows) vs in the %d-row pass: %ld of %d differ\n", s1, bpr, M, d, bpr * HD);
+            std::printf("  TSK (switch %d) batch invariance: sequence %d alone (%d rows) vs in the %d-row pass (switch 1): %ld of %d differ\n", sw, s1, bpr, M, d, bpr * HD);
             dsum += d;
         }
         r4d_tsk_set(0);
-        std::printf("  TSK batch invariance total: %ld differ\n", dsum);
+        std::printf("  TSK (switch %d) batch invariance total: %ld differ\n", sw, dsum);
     }
     if (decpins) for (int c = 0; c <= 6; ++c) {   /* the decode band's forms: bytes vs the rule (all the same bits by construction) */
         std::vector<uint16_t> x1(ob / 2);
@@ -304,6 +314,15 @@ int main(int argc, char** argv) {
         timed("TSK: gather + attn gathered (ORT)", served);
         timed("  TSK attn gathered alone (ORT)", attn_only);
         timed("  TSK packed (no gather, ORT)", packed);
+        r4d_tsk_bench_nomerge(1);
+        timed("  TSK attn gathered WITHOUT its merge (bench)", attn_only);
+        r4d_tsk_bench_nomerge(2);
+        timed("  TSK merge ALONE (bench)", attn_only);
+        r4d_tsk_bench_nomerge(0);
+        r4d_tsk_set(2);
+        timed("TSKC: gather + attn gathered (ORT)", served);
+        timed("  TSKC attn gathered alone (ORT)", attn_only);
+        timed("  TSKC packed (no gather, ORT)", packed);
         r4d_tsk_set(0);
     }
     for (void* d : pcu) CK(hipFree(d));

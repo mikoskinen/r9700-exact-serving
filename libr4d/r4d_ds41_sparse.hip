@@ -4123,20 +4123,22 @@ int tsk_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_TSK");
         if (!e || !*e) return -1;
-        if (!std::strcmp(e, "0") || !std::strcmp(e, "1")) {
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "1") || !std::strcmp(e, "2")) {
             std::fprintf(stderr, "radiance: libr4d: lever TSK: the compressing layers' decode-band attention (<= %d rows) in the split-key "
                                  "WMMA form (chunks of %d key tiles fixed by key index; rule B: its own reference) %s (RADIANCE_DS41_TSK=%s; "
-                                 "fn4 ds41_tsk 0 / 1); attn_sparse_sink's scratch sized for it\n",
-                         kWmRows, kTskTpc, *e == '1' ? "ON at start" : "off at start", e);
+                                 "fn4 ds41_tsk 0 / 1 / 2 = 1 with the merge's grid past the full-card cliff, 1's bytes); attn_sparse_sink's "
+                                 "scratch sized for it\n",
+                         kWmRows, kTskTpc, *e == '2' ? "ON at start, merge past the cliff" : *e == '1' ? "ON at start" : "off at start", e);
             return *e - '0';
         }
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_TSK=%s is not 0 / 1: lever TSK not loaded (today's attention)\n", e);
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_TSK=%s is not 0 / 1 / 2: lever TSK not loaded (today's attention)\n", e);
         return -1;
     }();
     return v;
 }
-std::atomic<int> g_tsk{tsk_env() > 0 ? 1 : 0};
+std::atomic<int> g_tsk{tsk_env() > 0 ? tsk_env() : 0};
 std::atomic<long long> g_tsk_decl{0};
+std::atomic<int> g_tsk_bench{0};   /* bench only (r4d_tsk_bench_nomerge): 1 = without the merge launch, 2 = the merge alone */
 /* the chunk partials of M rows: o [M][nch][H][D] f32, then (m, den) [M][nch][H][2] f32 */
 long tsk_chunks(long nk) { return ((nk + 15) / 16 + kTskTpc - 1) / kTskTpc; }
 long tsk_ws_bytes(long M, long H, long nk) { return M * tsk_chunks(nk) * H * (kDsAttnD + 2) * 4 + 256; }
@@ -4178,11 +4180,21 @@ int tsk_emit(RadStream stream, const RadArgs* ra, const DsAttnArgsT<ORT>& s0, co
     const float sl2 = (float)((double)s.scale * 1.4426950408889634);
     const dim3 grid((unsigned)((s.H + 15) / 16), (unsigned)nch, (unsigned)(s.M < 65535 ? s.M : 65535));
     const DsAttnArgs b = s;
-    const int rc = ga ? R4D_EMIT(stream, ds41_attn_tsk_kernel<true>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch)
+    const int bm = g_tsk_bench.load(std::memory_order_relaxed);
+    const int rc = bm == 2 ? RAD_OK
+                 : ga ? R4D_EMIT(stream, ds41_attn_tsk_kernel<true>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch)
                       : R4D_EMIT(stream, ds41_attn_tsk_kernel<false>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch);
-    if (rc != RAD_OK) return rc;
+    if (rc != RAD_OK || bm == 1) return rc;
     const long n = (long)s.M * s.H * (kDsAttnD / 4);
-    return R4D_EMIT(stream, ds41_attn_tsk_merge_kernel<ORT>, dim3((unsigned)((n + 255) / 256)), dim3(256), 0u, s,
+    /* lever TSKC (DRAFTER track 19.11.2026 round 22; fn4 ds41_tsk 2): the merge's grid stepped past the R9700 full-card cliff
+     * (r4d_common.h r4d_cliff_rows). Its 256-thread workgroups are (M x H x 128) / 256 = M x H / 2: at H 16 (64 heads / TP4) a
+     * 32-row pass (c16's lanes of 8 x 4, c32's 16 x 2) launches exactly 256 = 2048 waves and a 64-row pass 512: tbench (xeon
+     * GPU1, the merge alone) 16.8-16.9 us at 32 rows (8 x 4, 16 x 2, 4 x 8, 32 x 1 alike) vs 8.4 at 24, 10.3-10.5 at 40, 11.4-11.5
+     * at 48; served (lq190 stamps) 17.2-17.6 us a call at 32 rows vs 9.1-9.4 at 48 on both nodes. The extra workgroup's threads
+     * have i >= M H 128: they store nothing (tsk_merge's `ok`), so the bytes are value 1's. */
+    unsigned nb = (unsigned)((n + 255) / 256);
+    if (g_tsk.load(std::memory_order_relaxed) == 2) nb = r4d_cliff_rows(nb, 1, 8);
+    return R4D_EMIT(stream, ds41_attn_tsk_merge_kernel<ORT>, dim3(nb), dim3(256), 0u, s,
                     (const float*)wso, (const float*)wsm, (int)nch);
 }
 
@@ -4565,9 +4577,11 @@ extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs* a) {
     return nvg > tsk ? nvg : tsk;
 }
 /* Lever TSK's fn4 switch ds41_tsk (r4d_ds41_ggml.hip's rad_fn4_*): 1 only when RADIANCE_DS41_TSK sized the scratch at load. */
-bool r4d_tsk_known(int v) { return v == 0 || (v == 1 && tsk_env() >= 0); }
+bool r4d_tsk_known(int v) { return v == 0 || ((v == 1 || v == 2) && tsk_env() >= 0); }
 int r4d_tsk_get() { return g_tsk.load(std::memory_order_relaxed); }
-void r4d_tsk_set(int v) { g_tsk.store(v == 1 && tsk_env() >= 0 ? 1 : 0, std::memory_order_relaxed); }
+void r4d_tsk_set(int v) { g_tsk.store((v == 1 || v == 2) && tsk_env() >= 0 ? v : 0, std::memory_order_relaxed); }
+/* bench only (tools/dbench/tbench, round 22): 1 = TSK without its merge launch, 2 = the merge alone (prices the merge) */
+void r4d_tsk_bench_nomerge(int v) { g_tsk_bench.store(v == 1 || v == 2 ? v : 0, std::memory_order_relaxed); }
 extern "C" long long r4d_tsk_declines() { return g_tsk_decl.load(std::memory_order_relaxed); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);
