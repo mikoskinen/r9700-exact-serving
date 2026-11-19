@@ -134,6 +134,23 @@ int Pool::init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocato
     return RAD_OK;
 }
 
+int Pool::resize(int64_t bytes) {
+    if (bytes < 0) return RAD_E_INVAL;
+    if (used_ != 0 || !res_.empty()) return RAD_E_STATE;
+    if (bytes == bytes_) return RAD_OK;
+    if (elastic_) {
+        if (bytes > vm_.size()) return RAD_E_INVAL;
+        bytes_ = bytes;
+        return RAD_OK;
+    }
+    /* Freed before the new allocation, so a smaller pool never needs both at once. */
+    const std::string nm = name_;
+    MemAllocator* a = alloc_;
+    const int kind = kind_;
+    if (!a) { bytes_ = bytes; return RAD_OK; }   /* never backed (a budget of 0) */
+    return init(nm, bytes, kind, a);
+}
+
 int Pool::commit(int64_t off, int64_t bytes) {
     if (!elastic_) {
         /* A fixed pool is backed everywhere inside its range and nowhere outside it. */

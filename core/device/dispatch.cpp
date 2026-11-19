@@ -147,14 +147,22 @@ Ledger g_ledger[4];        /* indexed by RAD_MEM_*; rad_dev_alloc bounds the kin
 /* Each live allocation's size, so rad_dev_free (which has none) takes it back off the ledger's
  * bytes: pinned ranges are freed and taken again during bring-up, and the pin-cap check reads the
  * ledger as what the process holds. Allocations are rare, never per step. */
-struct LiveAlloc { int64_t bytes; int kind; };
+struct LiveAlloc { int64_t bytes; int kind; int dev; };
 std::mutex                           g_ledger_mu;
 std::unordered_map<void*, LiveAlloc> g_ledger_live;
+/* tp8 loop F66 (rad_dev_ledger_of): RAD_MEM_DEVICE bytes and live streams a card, by the device the
+ * allocating / creating thread last selected (rad_dev_set). Bring-up only reads it. */
+constexpr int kLedgerDevs = 64;
+std::atomic<int64_t> g_dev_bytes[kLedgerDevs];
+std::atomic<int64_t> g_dev_streams[kLedgerDevs];
+std::unordered_map<RadStream, int> g_stream_dev;   /* under g_ledger_mu */
 
-void ledger_add(void* p, int64_t bytes, int kind) {
+void ledger_add(void* p, int64_t bytes, int kind, int dev) {
     g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (kind == RAD_MEM_DEVICE && dev >= 0 && dev < kLedgerDevs)
+        g_dev_bytes[dev].fetch_add(bytes, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_ledger_mu);
-    g_ledger_live[p] = LiveAlloc{ bytes, kind };
+    g_ledger_live[p] = LiveAlloc{ bytes, kind, dev };
 }
 void ledger_drop(void* p) {
     if (!p) return;
@@ -162,6 +170,8 @@ void ledger_drop(void* p) {
     const auto it = g_ledger_live.find(p);
     if (it == g_ledger_live.end()) return;
     g_ledger[it->second.kind].bytes.fetch_sub(it->second.bytes, std::memory_order_relaxed);
+    if (it->second.kind == RAD_MEM_DEVICE && it->second.dev >= 0 && it->second.dev < kLedgerDevs)
+        g_dev_bytes[it->second.dev].fetch_sub(it->second.bytes, std::memory_order_relaxed);
     g_ledger_live.erase(it);
 }
 
@@ -223,6 +233,12 @@ const char* kind_name(int kind) {
 }
 
 }  /* namespace */
+
+void rad_dev_ledger_of(int device, int64_t* device_bytes, int64_t* streams) {
+    const bool in = device >= 0 && device < kLedgerDevs;
+    if (device_bytes) *device_bytes = in ? g_dev_bytes[device].load(std::memory_order_relaxed) : 0;
+    if (streams) *streams = in ? g_dev_streams[device].load(std::memory_order_relaxed) : 0;
+}
 
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count) {
     if (kind < 0 || kind >= (int)std::size(g_ledger)) {
@@ -442,7 +458,7 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     thread_local int64_t t_device_ordinal = 0;
     void* p = dev()->alloc(bytes, kind);
     if (p && kind >= 0 && kind < (int)std::size(rad::g_ledger)) {
-        rad::ledger_add(p, bytes, kind);
+        rad::ledger_add(p, bytes, kind, t_device);
         const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
         const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
         const int64_t floor_ = rad::trace_floor();
@@ -474,8 +490,27 @@ void  rad_dev_free(void* p, int kind) {
 void* rad_dev_host_ptr(void* p)                   { return dev()->host_ptr(p); }
 void* rad_dev_device_ptr(void* p)                 { return dev()->device_ptr(p); }
 
-int  rad_stream_create(RadStream* out, int hi)    { return dev()->stream_create(out, hi); }
-void rad_stream_destroy(RadStream s)              { dev()->stream_destroy(s); }
+int  rad_stream_create(RadStream* out, int hi) {
+    const int st = dev()->stream_create(out, hi);
+    /* tp8 loop F66: a live stream a card (rad_dev_ledger_of) */
+    if (st == RAD_OK && out && *out && t_device >= 0 && t_device < rad::kLedgerDevs) {
+        std::lock_guard<std::mutex> lk(rad::g_ledger_mu);
+        rad::g_stream_dev[*out] = t_device;
+        rad::g_dev_streams[t_device].fetch_add(1, std::memory_order_relaxed);
+    }
+    return st;
+}
+void rad_stream_destroy(RadStream s) {
+    if (s) {
+        std::lock_guard<std::mutex> lk(rad::g_ledger_mu);
+        const auto it = rad::g_stream_dev.find(s);
+        if (it != rad::g_stream_dev.end()) {
+            rad::g_dev_streams[it->second].fetch_sub(1, std::memory_order_relaxed);
+            rad::g_stream_dev.erase(it);
+        }
+    }
+    dev()->stream_destroy(s);
+}
 int  rad_stream_sync(RadStream s) {
     rad::g_host_blocks.fetch_add(1, std::memory_order_relaxed);
     return dev()->stream_sync(s);
@@ -688,7 +723,7 @@ void* rad_dev_map_file(int fd, int64_t foff, int64_t bytes) {
     }
     void* p = f(fd, foff, bytes);
     if (p) {
-        rad::ledger_add(p, bytes, RAD_MEM_HOST_MAPPED);
+        rad::ledger_add(p, bytes, RAD_MEM_HOST_MAPPED, -1);
         rad::g_ledger[RAD_MEM_HOST_MAPPED].count.fetch_add(1, std::memory_order_relaxed);
     }
     return p;

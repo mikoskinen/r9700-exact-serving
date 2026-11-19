@@ -248,6 +248,70 @@ TEST(pool_reservation_never_falls_through) {
     CHECK_EQ(p.kv().used(), 512ll << 10);
 }
 
+/* tp8 loop F66 (lever KVP): a pool nothing was carved from is made again at another size (the KV pool
+ * giving back what the cards lost beside the budget, or its pages past the agreed count); once anything
+ * is reserved it refuses, so no offset handed out can outlive its backing. */
+TEST(a_pool_nothing_was_reserved_from_is_made_again_at_another_size) {
+    struct Counts final : MemAllocator {
+        int64_t live = 0, allocs = 0;
+        std::map<void*, int64_t> sz;
+        void* alloc(int64_t b, int k) override {
+            void* p = rad_malloc_allocator().alloc(b, k);
+            if (p) { live += b; ++allocs; sz[p] = b; }
+            return p;
+        }
+        void free(void* p, int k) override { live -= sz[p]; sz.erase(p); rad_malloc_allocator().free(p, k); }
+        const char* name() const override { return "counts"; }
+    } a;
+    constexpr int64_t MiB = 1ll << 20;
+    Config c = small_config();
+    c.vram_kv_mib = 8;
+    Pools p;
+    REQUIRE_EQ(p.configure(c, 0, &a, &a), RAD_OK);
+    CHECK_EQ(p.kv().bytes(), 8 * MiB);
+    const int64_t before = a.live;
+    CHECK_OK(p.kv().resize(5 * MiB));                 /* gives 3 MiB back */
+    CHECK_EQ(p.kv().bytes(), 5 * MiB);
+    CHECK_EQ(p.kv().avail(), 5 * MiB);
+    CHECK_EQ(a.live, before - 3 * MiB);               /* the old backing was freed, not kept beside */
+    CHECK(p.kv().base() != nullptr);
+    CHECK_OK(p.kv().resize(5 * MiB));                 /* the same size: nothing moves */
+    CHECK_EQ(p.kv().resize(-1), RAD_E_INVAL);
+    CHECK(p.kv().reserve("block array", 1 * MiB, RAD_ALIGN_UNIT) != nullptr);
+    CHECK_EQ(p.kv().resize(4 * MiB), RAD_E_STATE);    /* something was carved: refused */
+    CHECK_EQ(p.kv().bytes(), 5 * MiB);
+    CHECK_EQ(p.weights().bytes(), 1 * MiB);           /* the other pool untouched */
+}
+
+/* tp8 loop F66 (lever KVP): the arithmetic of configure_kv's measurement. lq177's leader card 0 in
+ * miniature: 204 MiB more gone than the engine placed, a card that was the least at the read (no slack). */
+TEST(kv_placed_takes_what_the_engine_placed_off_the_cards_drop_and_keeps_the_slack) {
+    constexpr int64_t MiB = 1ll << 20;
+    /* read 30,000 MiB free; now 3,000: the engine placed 26,000 MiB of pools and two streams of 35 MiB */
+    KvPlaced k = kv_placed(30000 * MiB, 3000 * MiB, 26000 * MiB, 2, 35 * MiB, 0, 0);
+    CHECK_EQ(k.unseen, (30000 - 3000 - 26000 - 70) * MiB);
+    CHECK_EQ(k.trim, 930 * MiB);
+    /* a card with 100 MiB more free than the least at the read keeps that much of it */
+    k = kv_placed(30000 * MiB, 3000 * MiB, 26000 * MiB, 2, 35 * MiB, 100 * MiB, 0);
+    CHECK_EQ(k.trim, 830 * MiB);
+    /* nothing unseen, or less than the slack: nothing given back */
+    k = kv_placed(30000 * MiB, 3930 * MiB, 26000 * MiB, 2, 35 * MiB, 0, 0);
+    CHECK_EQ(k.unseen, 0ll);
+    CHECK_EQ(k.trim, 0ll);
+    k = kv_placed(30000 * MiB, 3500 * MiB, 26000 * MiB, 2, 35 * MiB, 600 * MiB, 0);
+    CHECK_EQ(k.trim, 0ll);
+    /* a stream given back since the read raised the free figure as much: not counted as unseen */
+    k = kv_placed(30000 * MiB, 3035 * MiB, 26000 * MiB, -1, 35 * MiB, 0, 0);
+    CHECK_EQ(k.unseen, (30000 - 3035 - 26000 + 35) * MiB);
+    /* whole MiB, rounded up; the test hook adds to the unseen part */
+    k = kv_placed(30000 * MiB, 3000 * MiB - 1, 27000 * MiB, 0, 35 * MiB, 0, 0);
+    CHECK_EQ(k.unseen, 1ll);
+    CHECK_EQ(k.trim, MiB);
+    k = kv_placed(30000 * MiB, 4000 * MiB, 26000 * MiB, 0, 35 * MiB, 0, 64 * MiB);
+    CHECK_EQ(k.unseen, 64 * MiB);
+    CHECK_EQ(k.trim, 64 * MiB);
+}
+
 /* A refused backing allocation is reported as a refusal, with the allocator's reason, not as
  * "0 B available", which would read as a measurement of the card. */
 TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {

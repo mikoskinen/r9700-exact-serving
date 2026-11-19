@@ -419,6 +419,14 @@ constexpr int kTapeOverlapRun = 6;
  * kernel plugin that calls hipMalloc directly; see the ledger in dispatch.cpp. */
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count);
 
+/* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED): per card, what the engine itself has placed there -- the
+ * live RAD_MEM_DEVICE bytes of rad_dev_alloc (charged to the device the allocating thread last selected
+ * with rad_dev_set) and the live streams (hardware queues, whose rings and save areas the driver backs
+ * with VRAM). Engine::configure_kv takes the card's free-memory drop since the budget's reading less
+ * these as what the budget never saw (GPU page tables of mapped host memory, a plugin's own hipMalloc).
+ * 0 / 0 for a device the ledger has not seen. */
+void rad_dev_ledger_of(int device, int64_t* device_bytes, int64_t* streams);
+
 /* Event handles created and not yet destroyed, process-wide. */
 int64_t rad_dev_live_events(void);
 /* Calls to rad_event_sync and rad_stream_sync since process start, from any thread: the host
