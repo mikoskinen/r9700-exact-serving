@@ -7,7 +7,7 @@
  * per-op band, D25 step 3).
  *
  * usage: tabench [--seqs 16] [--rpr 3] [--ctx 3000] [--topk 512] [--ratio 2] [--iters 200] [--k 22] [--cold 0] [--band 0]
- *        [--forms 0,1,2,3,4,5,6]   (rows = seqs x rpr; --k issues back to back between two events = the layers of a pass) */
+ *        [--forms 0,1,2,3,4,5,6,7,8]   (rows = seqs x rpr; --k issues back to back between two events = the layers of a pass) */
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -51,7 +51,7 @@ static std::vector<int> ints(const char* s) { std::vector<int> v; while (s && *s
 
 int main(int argc, char** argv) {
     int seqs = 16, rpr = 3, ctx = 3000, topk = 512, ratio = 2, iters = 200, K = 22, coldmb = 0, band = 0;
-    std::vector<int> forms = { 0, 1, 2, 3, 4, 5, 6 };
+    std::vector<int> forms = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };   /* 7 / 8: the 512-thread direct PV (D26 step 2) */
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         auto nx = [&]() { return i + 1 < argc ? argv[++i] : (char*)""; };

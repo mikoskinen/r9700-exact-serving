@@ -333,10 +333,10 @@ void run_case(const char* name, const Fix& f, int64_t q_pitch, const Ref& ref) {
 }
 
 /* tp8 loop D26 (DECODE round 22): fn4 ds41_attn_dec (r4d_attn_dec_sw_set here; libr4d's rad_fn4_* on the engine) -- at a pass of
- * more than 256 keys a row and more than 256 row-head pairs (the rule's form 4) every value 1 .. 7 (form 0 .. 6) gives the rule's
+ * more than 256 keys a row and more than 256 row-head pairs (the rule's form 4) every value 1 .. 9 (form 0 .. 8) gives the rule's
  * bytes over the bf16 cache, the packed one and lever NVG's gathered rows (the trunk's served DKV-G path: the plain kernel over
  * unpacked selections); the launches it moves are counted (none at value 5 = form 4, none at 0); a pass of <= 256 row-head
- * pairs or <= 256 keys a row stays on the rule's form (the counter does not move). Values outside 0 .. 7 are refused. */
+ * pairs or <= 256 keys a row stays on the rule's form (the counter does not move). Values outside 0 .. 9 are refused. */
 void d26_case(const char* name, const Fix& f, bool moved_expected) {
     std::vector<uint16_t> pk((size_t)(f.ncblk * kSlots), 0x7777);
     expect(store_nv4(r4d_ds41_entry_store_nv4, f, pk.data()) == RAD_OK, name, "entry_store nvfp4");
@@ -346,7 +346,7 @@ void d26_case(const char* name, const Fix& f, bool moved_expected) {
     uint16_t* sp = (uint16_t*)(((uintptr_t)scr.data() + 15) & ~(uintptr_t)15);
     std::vector<uint16_t> base[3];
     long long bad = 0, moved_bad = 0;
-    for (int v = 0; v <= 7; ++v) {
+    for (int v = 0; v <= 9; ++v) {   /* 8 / 9: forms 7 / 8, the 512-thread direct PV (D26 step 2) */
         expect(r4d_attn_dec_sw_set(v) == 1 && r4d_attn_dec_sw_get() == v, name, "ds41_attn_dec not applied", v, 0);
         for (int path = 0; path < 3; ++path) {
             std::vector<uint16_t> o(no, (uint16_t)(0x1357 + v));
@@ -375,10 +375,10 @@ void d26_case(const char* name, const Fix& f, bool moved_expected) {
     }
     expect(bad == 0, name, "a ds41_attn_dec value changed the bytes", bad, 0);
     expect(moved_bad == 0, name, "ds41_attn_dec moved a launch it must not (or did not move one it must)", moved_bad, 0);
-    expect(r4d_attn_dec_sw_set(8) < 0 && r4d_attn_dec_sw_set(-1) < 0 && r4d_attn_dec_sw_get() == 7, name,
-           "ds41_attn_dec 8 / -1 not refused", r4d_attn_dec_sw_get(), 7);
+    expect(r4d_attn_dec_sw_set(10) < 0 && r4d_attn_dec_sw_set(-1) < 0 && r4d_attn_dec_sw_get() == 9, name,
+           "ds41_attn_dec 10 / -1 not refused", r4d_attn_dec_sw_get(), 9);
     r4d_attn_dec_sw_set(0);
-    std::printf("%-46s rows %d heads %d keys %d+%d: ds41_attn_dec 1 .. 7 x (bf16, nvfp4, NVG gathered) vs the rule: %lld value-path(s) "
+    std::printf("%-46s rows %d heads %d keys %d+%d: ds41_attn_dec 1 .. 9 x (bf16, nvfp4, NVG gathered) vs the rule: %lld value-path(s) "
                 "differ; launches moved as expected (%s)\n", name, f.M, f.H, f.win, f.topk, bad, moved_expected ? "moved" : "none");
 }
 
