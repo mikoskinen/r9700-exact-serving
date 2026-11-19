@@ -38,6 +38,7 @@
 #include "ds41_etp.h"
 #include "ds41_walk_geom.h"
 #include "ds41_prefetch.h"   /* tp8 loop D24: the weight reads' pass / site rules */
+#include "ds41_dkv_held.h"   /* tp8 loop D25: the gathered latent rows held a decode band piece */
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
 #include <algorithm>
@@ -616,6 +617,8 @@ struct Model {
      * pass's gathered selections); 0: not declared. */
     rad_buf lu = 0, selkv = 0;
     int64_t lu_e = 0, selkv_rows = 0;
+    /* tp8 loop D25 (RADIANCE_DS41_DKV_GPIECE=1): selkv's rows (each band piece gathers at its own rows); = selkv_rows otherwise */
+    int64_t selkv_cap = 0;
     /* RADIANCE_DS41_KVWIN_FP8=1 (lever KVWIN; "trunk": the trunk's window only): the window caches -- the trunk's
      * kv_window (w8) and the DSpark drafter's kv_dspark (w8d) -- hold each 512-value key packed (528 bytes instead
      * of 1024: e4m3 codes, a scale byte a block of 32; window_store / rmsnorm_rope_roundtrip_kv_store kv_dtype /
@@ -2284,6 +2287,25 @@ struct DkvHeld {
 };
 static thread_local std::vector<DkvHeld> t_dkv_lu;
 static thread_local DkvHeld t_dkv_g;
+/* tp8 loop D25 step 1 (RADIANCE_DS41_DKV_GPIECE=1, read at the first declare; both nodes): the held gathers a band piece
+ * (ds41_dkv_held.h), each at its piece's rows of a selkv of up to kDkvGpRows rows; unset: t_dkv_g as today */
+static thread_local std::vector<Ds41Held> t_dkv_gl;
+static constexpr int64_t kDkvGpRows = 64;
+static std::atomic<int> g_dkv_gp{-1};
+static std::atomic<long long> g_dkv_gp_hit{0}, g_dkv_gp_n{0};
+static bool dkv_gpiece_env() {
+    int v = g_dkv_gp.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_DS41_DKV_GPIECE");
+        const int w = e && e[0] == '1' && !e[1] ? 1 : 0;
+        if (e && !w && std::strcmp(e, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DKV_GPIECE=%s is not 0 or 1: the piece gathers are not declared\n", e);
+        int unread = -1;
+        g_dkv_gp.compare_exchange_strong(unread, w);
+        v = g_dkv_gp.load(std::memory_order_relaxed);
+    }
+    return v > 0;
+}
 /* this rank thread's counts: unpacks, plan hits, gathers, gather hits; rank 0 notes them at its 1st, 10th, 100th ... launch */
 static thread_local long long t_dkv_ct[4] = { 0, 0, 0, 0 };
 static void dkv_note(RadCtx* x, const char* what, int l, int64_t n, int64_t hr0, int64_t hn) {
@@ -2317,6 +2339,7 @@ static void dkv_pass_reset(RadCtx* x = nullptr, int64_t rows = 0) {
     t_dkv_pass[5] = rows;
     t_dkv_lu.clear();
     t_dkv_g = DkvHeld{};
+    t_dkv_gl.clear();
 }
 /* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
 static int64_t mhc_fuse_min() {
@@ -3283,7 +3306,7 @@ static int buffers(RadBuilder* b, Model& m) {
     /* Lever DKV (dkv_read_env): the plan's rows of a prefill pass (E entries a row of the step) and a decode pass's
      * gathered selections, over the packed latent only */
     m.lu = m.selkv = 0;
-    m.lu_e = m.selkv_rows = 0;
+    m.lu_e = m.selkv_rows = m.selkv_cap = 0;
     if (m.lnv && c.head_dim == 512 && c.itopk > 0) {
         if (const int e = g_dkv_lu.load(std::memory_order_relaxed); e > 0) {
             m.lu_e = e;
@@ -3292,7 +3315,10 @@ static int buffers(RadBuilder* b, Model& m) {
         }
         if (g_dkv_g.load(std::memory_order_relaxed) > 0) {
             m.selkv_rows = std::min<int64_t>(T, kBiBand);
-            m.selkv = bf("comp_latent_gathered", { m.selkv_rows, c.itopk * c.head_dim });
+            /* tp8 loop D25: with RADIANCE_DS41_DKV_GPIECE=1 the buffer holds a 64-row segment's pieces side by side; the ops'
+             * row range (selkv_rows) stays the band's, so every launch is the one today issues */
+            m.selkv_cap = dkv_gpiece_env() ? std::min<int64_t>(T, kDkvGpRows) : m.selkv_rows;
+            m.selkv = bf("comp_latent_gathered", { m.selkv_cap, c.itopk * c.head_dim });
         }
     }
     {   /* lever BI: the row pitch of each per-token buffer step_bi slices (its declared width) */
@@ -6356,6 +6382,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     nc, nu, nl, nlr, (long long)m.lu_e,
                     (double)(T * m.lu_e * c.head_dim * 2) / (1024.0 * 1024.0), (long long)T, ng, nga, ngr,
                     (long long)m.selkv_rows, (double)(m.selkv_rows * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0));
+        if (m.lnv && m.selkv && m.selkv_cap > m.selkv_rows)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop D25 (RADIANCE_DS41_DKV_GPIECE=1): the gathered latent holds %lld rows "
+                            "(%.2f MiB): a decode segment's band pieces (F58, above %lld rows) gather at their own rows, each held "
+                            "for the layers of its kv source; every launch stays at <= %lld rows\n",
+                    (long long)m.selkv_cap, (double)(m.selkv_cap * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0),
+                    (long long)kBiBand, (long long)m.selkv_rows);
     }
     /* Lever SPF-IR, only where RADIANCE_DS41_IROWS_MIN moved the floor (unset: no line, as before). */
     if (ctx->rank == 0 && !ctx->shape_probe && ds41_irows_min() != kScoreRunMin)
@@ -7319,7 +7351,38 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
     const int l = L.l;
     if (L.r <= 0 || !m.lnv || a.size() < 11 || (ofold && a.size() < 12)) return false;
     const int src = c.src_of[(size_t)l], idx = c.idx_of[(size_t)l];
-    if (dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 && n <= m.selkv_rows) {
+    /* tp8 loop D25 (selkv_cap > selkv_rows: RADIANCE_DS41_DKV_GPIECE=1): a piece gathers at its own rows `hr0` of the segment
+     * and is held by its key beside the other pieces' (ds41_dkv_held.h); the launches are today's at every row count */
+    const bool gp = m.selkv_cap > m.selkv_rows;
+    if (gp && dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 && n <= m.selkv_rows && hr0 >= 0 &&
+        hr0 + n <= m.selkv_cap) {
+        const RadOperand gv = hr0 == 0 ? brows(m.selkv, n) : brow_slice(m.selkv, hr0, n, c.itopk * c.head_dim);
+        Ds41Held k;
+        k.src = src;
+        k.idx = idx;
+        k.s0 = s0;
+        k.s1 = s1;
+        k.r0 = hr0;
+        k.n = n;
+        if (ds41_held_take(t_dkv_gl, k)) {
+            g_dkv_g_hit.fetch_add(1, std::memory_order_relaxed);
+            if (rad_rank(x) == 0) g_dkv_gp_hit.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[3];
+        } else {
+            const RadOperand go[] = { a[4], a[5], a[6], a[8], gv };
+            rad_issue(x, L.lgath, go, 5, n);
+            g_dkv_g_n.fetch_add(1, std::memory_order_relaxed);
+            if (rad_rank(x) == 0) g_dkv_gp_n.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[2];
+            ++t_dkv_pass[4];
+            dkv_note(x, "gather", l, n, hr0, n);
+        }
+        a.push_back(gv);
+        rad_issue(x, ofold ? L.attn_rtg : L.attn_g, a.data(), (int)a.size(), n);
+        ++t_dkv_pass[1];
+        return true;
+    }
+    if (!gp && dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 && n <= m.selkv_rows) {
         DkvHeld& h = t_dkv_g;
         const RadOperand gv = brows(m.selkv, n);
         if (h.src == src && h.idx == idx && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == n) {

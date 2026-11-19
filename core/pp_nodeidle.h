@@ -46,6 +46,49 @@ struct PpNodeIdle {
     Rec last{ nullptr, false };
     Win win, run;
     int64_t dropped = 0, unread = 0;
+    /* tp8 loop DECODE round 20 (FINDINGS 06:17, lq166: a follower whose cards ran 11-161 MiB from full stopped its queues
+     * under KFD evictions): this node's cards' VRAM by the driver's counter (dev_vram_used: every process's bytes), sampled
+     * at most once a second at the marks; the least free a card had in the window and the run. A card whose counter is not
+     * readable (the host backend) is named so. Read-only: nothing here allocates or waits. */
+    static constexpr int64_t kVramLowMiB = 64;
+    std::vector<int> devs;               /* the node's ranks' devices, rank order */
+    std::vector<int64_t> totals;         /* their VRAM bytes (rad_dev_props), -1 unknown */
+    std::vector<int64_t> wmin, rmin;     /* the least free bytes seen in the window / the run, -1 none read */
+    uint64_t vram_t = 0;
+    void vram_sample(bool force = false) {
+        const uint64_t now = rad_mono_ns();
+        if (devs.empty() || (!force && now - vram_t < 1000000000ull)) return;
+        vram_t = now;
+        if (wmin.size() != devs.size()) { wmin.assign(devs.size(), -1); rmin.assign(devs.size(), -1); }
+        for (size_t i = 0; i < devs.size(); ++i) {
+            int64_t used = 0;
+            if (i >= totals.size() || totals[i] <= 0 || dev_vram_used(devs[i], &used) != RAD_OK) continue;
+            const int64_t fr = totals[i] - used;
+            if (wmin[i] < 0 || fr < wmin[i]) wmin[i] = fr;
+            if (rmin[i] < 0 || fr < rmin[i]) rmin[i] = fr;
+        }
+    }
+    void vram_note(const std::vector<int64_t>& m, const char* what) const {
+        if (devs.empty()) return;
+        std::string per;
+        int low = 0, read = 0;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            const int64_t v = i < m.size() ? m[i] : -1;
+            per += (i ? ", card " : "card ") + std::to_string(devs[i]) + " " +
+                   (v < 0 ? std::string("not readable") : std::to_string(v >> 20) + " MiB");
+            if (v >= 0) {
+                ++read;
+                if ((v >> 20) < kVramLowMiB) ++low;
+            }
+        }
+        RAD_INFO("two-node pipeline, %s node VRAM (RADIANCE_PP_NODE_IDLE=1): the least free a card had over %s, by the driver's "
+                 "counter: %s%s", node, what, per.c_str(),
+                 !read ? " (no card's counter readable here)"
+                       : low ? (std::string(" -- ") + std::to_string(low) + " card(s) under " + std::to_string(kVramLowMiB) +
+                                " MiB: nothing more builds on first use there without the driver evicting (passes not "
+                                "recorded, queues stopped)").c_str()
+                             : "");
+    }
 
     ~PpNodeIdle() {
         for (RadEvent e : pool) rad_event_destroy(e);
@@ -86,6 +129,7 @@ struct PpNodeIdle {
     /* on rank 0's stream, with its rank thread parked (before a release / after the join) */
     void mark(bool begin) {
         drain();
+        vram_sample();
         RadEvent e = take();
         if (!e) { ++dropped; return; }
         if (rad_event_record(e, s) < 0) { pool.push_back(e); ++dropped; return; }
@@ -137,11 +181,16 @@ struct PpNodeIdle {
         if (rad_mono_ns() - win.t0 < 60ull * 1000000000ull) return;
         drain();
         note(win, "the last minute");
+        vram_sample(true);
+        vram_note(wmin, "the last minute");
+        std::fill(wmin.begin(), wmin.end(), (int64_t)-1);
         start(win);
     }
     void stop() {
         drain();
         note(run, "the run");
+        vram_sample(true);
+        vram_note(rmin, "the run");
     }
 };
 
