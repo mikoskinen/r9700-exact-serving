@@ -1500,6 +1500,15 @@ __device__ __forceinline__ void ds_dec_dot(float (&acc)[HS], const uint4 (&r)[8]
     }
 }
 
+/* Lever DXS-Q (DRAFTER track 19.11.2026 round 14): q's words through the constant address space -- q is an input no launch
+ * writes -- so the compiler issues them as scalar loads into SGPRs and splits each bf16 pair on the SALU; through the generic
+ * pointer it issued vector loads (the same 16 bytes in every lane) and one VALU conversion a fma. The same values: the same
+ * fmas, the same bits (tools/dbench/tbench on ds41-drafter-wip-dxs: output hash equal at 1 / 16 / 32 / 40 / 48 / 64 rows). */
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the host has no address spaces */
+typedef const uint32_t* ds_cq;
+#else
+typedef const __attribute__((address_space(4))) uint32_t* ds_cq;
+#endif
 /* The HS-head dot of ds_dec_dot with q read straight from its bf16 row by scalar loads (wave-uniform
  * addresses: qw the row's words at this chunk, ho[h] head h's word offset), so the q values take
  * neither LDS bandwidth nor VGPRs. The same fmas in the same order. */
@@ -1513,7 +1522,7 @@ __device__ __forceinline__ void ds_dec_dot_s(float (&acc)[HS], const uint4 (&r)[
         const uint32_t* qi = qw + z + i * 4;
 #pragma unroll
         for (int h = 0; h < HS; ++h) {
-            const uint32_t* qh = qi + ho[h];
+            const ds_cq qh = (ds_cq)(qi + ho[h]);
             const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
@@ -1545,7 +1554,7 @@ __device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& 
             const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
 #pragma unroll
             for (int h = 0; h < HS; ++h) {
-                const uint32_t* qh = qi + ho[h];
+                const ds_cq qh = (ds_cq)(qi + ho[h]);
                 const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
@@ -1810,7 +1819,7 @@ __device__ __forceinline__ void ds_dec_dot_w8(float (&acc)[HS], const DsW8Raw& r
             const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
 #pragma unroll
             for (int h = 0; h < HS; ++h) {
-                const uint32_t* qh = qi + ho[h];
+                const ds_cq qh = (ds_cq)(qi + ho[h]);
                 const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
@@ -2726,6 +2735,276 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         }
         __syncthreads();
     }
+}
+
+/* ================================================================== lever TSK (DRAFTER track round 15): the decode band's attention
+ * of the COMPRESSING layers as SPLIT-KEY WMMA -- fn4 ds41_tsk 1 (RADIANCE_DS41_TSK=0 / 1 at load sizes the op's scratch and
+ * sets the start value; unset = the stock program, the switch refused). A row's keys (libref's order: the window, then the
+ * selections) are cut into chunks of kTskTpc (20) 16-key tiles FIXED by key index (not by the pass); one workgroup a (16-head
+ * group, chunk, row) runs ds41_attn_sparse_sink_wm_kernel's tile loop (LO: p as bf16 hi + lo, the same WMMAs, the online
+ * exp2 softmax) over its chunk alone and writes its partial (running max, denominator, unnormalised o) to the op's scratch;
+ * ds41_attn_tsk_merge_kernel folds the chunks in ascending order (m = max, each scaled by exp2(m_c - m)), adds the sink,
+ * divides, rounds once to bf16 and (ORT) runs rope_rows_roundtrip's epilogue on the rounded values (ds_ort_quad: the bytes
+ * of the separate launch). A row's bytes depend on its own keys and position only: deterministic, row- and M-invariant.
+ * Rule B: its own reference -- neither the decode band's bits (libref's) nor the prefill WMMA form's (one chunk). GA: the
+ * selections from latent_gather's rows (s.cg, lever DKV-G) instead of the packed cache. */
+#ifndef R4D_TSK_TPC
+#define R4D_TSK_TPC 20   /* a chunk's 16-key tiles: 2 chunks at 640 keys (round 15 sweep, gather + attn us at 1 / 5 / 8 / 16 / 24 / 40 / 48 / 64 rows: tpc 4 27.5 / - / 37.7 / 40.4 / 55.2 / 82.0 / 94.4 / 137.4, 10 28.6 / 25.3 / 36.5 / 36.1 / 46.3 / 67.6 / 77.8 / 121.2, 14 30.4 / 26.6 / 38.4 / 36.0 / 45.5 / 63.2 / 76.9 / 118.9, 20 33.8 / 29.4 / 43.3 / 35.7 / 45.1 / 62.5 / 70.9 / 118.4); the bits follow it (bench builds: -DR4D_TSK_TPC=N) */
+#endif
+constexpr int kTskTpc = R4D_TSK_TPC;
+__host__ __device__ constexpr long ds_tsk_lds() { return ds_wm_sbuf_off(kTskTpc) + kWmSbufBytes + kWmNvBytes; }
+template <bool GA>
+__global__ __launch_bounds__(128) void ds41_attn_tsk_kernel(DsAttnArgs a, float sl2, float* __restrict__ wso,
+                                                            float* __restrict__ wsm, int nch) {
+    constexpr int D = kDsAttnD, TPC = kTskTpc;
+    const int nkt = (a.nk + 15) >> 4;
+    const int ch = (int)blockIdx.y;
+    const int tb = ch * TPC, te = min(tb + TPC, nkt), lt = te - tb;
+    const uint16_t** kp = (const uint16_t**)r4d_ds41_sparse_dyn;
+    uint32_t* vmask = (uint32_t*)(r4d_ds41_sparse_dyn + ds_wm_mask_off(TPC));
+    float4* sbuf = (float4*)(r4d_ds41_sparse_dyn + ds_wm_sbuf_off(TPC));
+    const int tid = threadIdx.x, lane = tid & 31, hf = lane >> 4;
+    const int wave = __builtin_amdgcn_readfirstlane((int)(tid >> 5));
+    const int hl = blockIdx.x * 16 + (lane & 15);
+    const bool hok = hl < a.H;
+    const int c0 = wave * kWmCols;
+    const int kq = lane & 15;
+    const int ptk = a.win / 16;                       /* global tiles [0, ptk) plain (the bf16 window) */
+    for (long m = blockIdx.z; m < a.M; m += gridDim.z) {
+        const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
+        const long p = a.pos[m * a.ps];
+        long lr = (long)a.cu[(long)(s + 1) * a.cs] - 1;
+        lr = lr < 0 ? 0 : (lr >= a.M ? a.M - 1 : lr);
+        const long last = a.pos[lr * a.ps];
+        const long first = last + 1 - (long)a.wused[(long)s * a.wus];
+        if (lt > 0) {
+            const int kb = tb * 16, ke = te * 16;
+            for (int k0 = kb; k0 < ke; k0 += 128) {
+                const int k = k0 + tid;
+                const uint16_t* ptr = nullptr;
+                if (k < a.win) {
+                    const long j = p - a.win + 1 + k, r = j - first;
+                    if (j >= 0 && r >= 0 && r / a.bs < a.nwbt) {
+                        const long blk = a.wbt[(long)s * a.wbtr + (r / a.bs) * a.wbtc];
+                        if (blk >= 0 && blk < a.nwblk) ptr = a.wc + (blk * a.bs + r % a.bs) * (long)D;
+                    }
+                } else if (k < a.nk) {
+                    const long c = a.sel[m * a.selr + (long)(k - a.win) * a.selc];
+                    if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
+                        const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
+                        if (blk >= 0 && blk < a.ncblk)
+                            ptr = GA ? a.cg + m * a.cgr + (long)(k - a.win) * D
+                                     : a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
+                    }
+                }
+                if (k < ke) kp[k - kb] = ptr ? ptr : kDsZeroKey;
+                const uint32_t b = (uint32_t)__builtin_amdgcn_ballot_w32(ptr != nullptr);
+                const int t0 = (k0 - kb + wave * 32) >> 4;
+                if (lane == 0) {
+                    if (t0 < lt) vmask[t0] = b & 0xffffu;
+                    if (t0 + 1 < lt) vmask[t0 + 1] = b >> 16;
+                }
+            }
+        }
+        __syncthreads();
+        uint4 qf[8];
+        {
+            const uint16_t* qp = a.q + m * a.qr + (long)(hok ? hl : 0) * D + c0 + 64 * hf;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                qf[i] = *(const uint4*)(qp + 8 * i);
+                if (!hok) qf[i] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        ds_v8f o[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[j] = (ds_v8f)(0.0f);
+        float mrun = -1e30f, den = 0.0f;
+        uint4 kn[8];
+        DsNv4Raw kr;
+        unsigned char* tw = (unsigned char*)sbuf + kWmSbufBytes + wave * (kWmCols * 16 * 2);
+        auto nvt = [&](int tt) -> bool { return !GA && a.cnv && tb + tt >= ptk; };
+        auto ldk = [&](int tt) {
+            const uint16_t* pk = kp[tt * 16 + kq];
+            if (nvt(tt)) {
+                const unsigned char* b = (const unsigned char*)pk;
+                kr.c0 = *(const uint4*)(b + (c0 + 64 * hf) / 2);
+                kr.c1 = *(const uint4*)(b + (c0 + 64 * hf) / 2 + 16);
+                kr.sc = *(const uint32_t*)(b + D / 2 + (c0 + 64 * hf) / 16);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + c0 + 64 * hf + 8 * i);
+            }
+        };
+        const int ktr = 8 * hf + (lane & 7);
+        const int dtr = c0 + 8 * ((lane >> 3) & 1);
+        if (lt > 0) ldk(0);
+        for (int t = 0; t < lt; ++t) {
+            uint4 kt[8];
+            if (nvt(t)) {
+                ds_nv4_unpack64(kr, kn);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const uint32_t w[4] = { kn[i].x, kn[i].y, kn[i].z, kn[i].w };
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const int col = 64 * hf + 8 * i + e;
+                        *(uint16_t*)(tw + (col * 16 + kq) * 2) = (uint16_t)((e & 1) ? (w[e / 2] >> 16) : (w[e / 2] & 0xffffu));
+                    }
+                }
+                ds_wave_sync();
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = 8 * ((lane >> 3) & 1) + 16 * j + (lane & 7);
+                    kt[j] = *(const uint4*)(tw + (col * 16 + 8 * hf) * 2);
+                }
+                ds_wave_sync();
+            } else {
+                const uint16_t* pt = kp[t * 16 + ktr] + dtr;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) kt[j] = ds_load_tr(pt + 16 * j);
+            }
+            ds_v8f sp = (ds_v8f)(0.0f);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sp = ds_wmma(kn[i], qf[i], sp);
+            if (t + 1 < lt) ldk(t + 1);
+            float4* sb = sbuf + (t & 1) * (kWmWaves * 64);
+            sb[wave * 64 + lane] = make_float4(sp[0], sp[1], sp[2], sp[3]);
+            sb[wave * 64 + 32 + lane] = make_float4(sp[4], sp[5], sp[6], sp[7]);
+            lds_barrier();
+            float x[8];
+            {
+                const float4 l0 = sb[lane], h0 = sb[32 + lane];
+                x[0] = l0.x; x[1] = l0.y; x[2] = l0.z; x[3] = l0.w;
+                x[4] = h0.x; x[5] = h0.y; x[6] = h0.z; x[7] = h0.w;
+#pragma unroll
+                for (int w = 1; w < kWmWaves; ++w) {
+                    const float4 l = sb[w * 64 + lane], h = sb[w * 64 + 32 + lane];
+                    x[0] += l.x; x[1] += l.y; x[2] += l.z; x[3] += l.w;
+                    x[4] += h.x; x[5] += h.y; x[6] += h.z; x[7] += h.w;
+                }
+            }
+            const uint32_t vm = vmask[t] >> (8 * hf);
+            float tmax = -kDsInf;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                x[e] = ((vm >> e) & 1u) ? x[e] * sl2 : -kDsInf;
+                tmax = fmaxf(tmax, x[e]);
+            }
+            tmax = fmaxf(tmax, ds_xor16(tmax));
+            const float mnew = fmaxf(mrun, tmax);
+            const float alpha = ds_ex2(mrun - mnew);
+            float pe[8], ps = 0.0f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                pe[e] = ds_ex2(x[e] - mnew);
+                ps += pe[e];
+            }
+            den = den * alpha + ps;
+            if (__builtin_amdgcn_ballot_w32(alpha != 1.0f)) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] *= alpha;
+            }
+            mrun = mnew;
+            uint32_t hw[4], lw[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float p0 = pe[2 * q], p1 = pe[2 * q + 1];
+                const uint32_t u0 = __float_as_uint(p0) & 0xffff0000u, u1 = __float_as_uint(p1) & 0xffff0000u;
+                hw[q] = __builtin_amdgcn_perm(u1, u0, 0x07060302u);
+                lw[q] = __builtin_amdgcn_perm(ds_rne_hi(p1 - __uint_as_float(u1)), ds_rne_hi(p0 - __uint_as_float(u0)), 0x07060302u);
+            }
+            const uint4 ph = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+            const uint4 pl = make_uint4(lw[0], lw[1], lw[2], lw[3]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[j] = ds_wmma(kt[j], ph, o[j]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[j] = ds_wmma(kt[j], pl, o[j]);
+        }
+        /* the chunk's partial: m and den (both key halves) a head, o [head][512] unnormalised */
+        const float dt = den + ds_xor16(den);
+        if (hok) {
+            const long base = (m * nch + ch) * (long)a.H + hl;
+            if (wave == 0 && hf == 0) { wsm[2 * base] = mrun; wsm[2 * base + 1] = dt; }
+            float* op = wso + base * D + c0 + 8 * hf;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                *(float4*)(op + 16 * j) = make_float4(o[j][0], o[j][1], o[j][2], o[j][3]);
+                *(float4*)(op + 16 * j + 4) = make_float4(o[j][4], o[j][5], o[j][6], o[j][7]);
+            }
+        }
+        __syncthreads();
+    }
+}
+/* rope_rows_roundtrip's epilogue (ds_ort_pair's rules) on one thread's 4 columns c .. c + 3 of a head: two gptj pairs, each
+ * rotated by its own test and angles; the block's amax over its 32 columns = this lane's 4 and those of the 7 other lanes of
+ * its 8-lane group (columns 4 x lane: an aligned group holds one 32-aligned block), every |v| a NaN-free non-negative float,
+ * so the same maximum as quant_group_kernel's butterfly; then block_scale and the round trip of each value, rounded to bf16. */
+__device__ __forceinline__ void ds_ort_quad(uint32_t& w0, uint32_t& w1, bool r0, float c0, float s0, bool r1, float c1,
+                                            float s1, int fmt, int sc) {
+    namespace q = r4d_ds41q;
+    float v0 = q::ds_bf((uint16_t)(w0 & 0xffffu)), v1 = q::ds_bf((uint16_t)(w0 >> 16));
+    float v2 = q::ds_bf((uint16_t)(w1 & 0xffffu)), v3 = q::ds_bf((uint16_t)(w1 >> 16));
+    if (r0) {
+        const float va = v0, vb = v1;
+        v0 = q::ds_bf(q::ds_bf16(va * c0 - vb * s0));
+        v1 = q::ds_bf(q::ds_bf16(va * s0 + vb * c0));
+    }
+    if (r1) {
+        const float va = v2, vb = v3;
+        v2 = q::ds_bf(q::ds_bf16(va * c1 - vb * s1));
+        v3 = q::ds_bf(q::ds_bf16(va * s1 + vb * c1));
+    }
+    const float amax = r4d_xor_max<8>(fmaxf(fmaxf(q::ds_amax_term(v0), q::ds_amax_term(v1)),
+                                            fmaxf(q::ds_amax_term(v2), q::ds_amax_term(v3))));
+    const float bs = q::block_scale(amax, fmt, sc);
+    w0 = (uint32_t)q::ds_bf16(q::roundtrip(v0, bs, fmt)) | ((uint32_t)q::ds_bf16(q::roundtrip(v1, bs, fmt)) << 16);
+    w1 = (uint32_t)q::ds_bf16(q::roundtrip(v2, bs, fmt)) | ((uint32_t)q::ds_bf16(q::roundtrip(v3, bs, fmt)) << 16);
+}
+/* one thread a (row, head, 4 columns): the chunks in ascending order, the sink, one rounding (ORT: + the epilogue). Every lane
+ * runs to the end (the epilogue's 8-lane butterfly); a row x head count is a multiple of 8 quads, so a group is in or out whole. */
+template <bool ORT>
+__global__ __launch_bounds__(256) void ds41_attn_tsk_merge_kernel(DsAttnArgsT<ORT> a, const float* __restrict__ wso,
+                                                                  const float* __restrict__ wsm, int nch) {
+    constexpr int D = kDsAttnD;
+    constexpr float kL2e = 1.4426950408889634f;
+    const long i = (long)blockIdx.x * 256 + threadIdx.x;      /* (row, head, quad) */
+    const long nq = (long)a.H * (D / 4);
+    const bool ok = i < (long)a.M * nq;
+    const long ii = ok ? i : 0;
+    const long m = ii / nq, hq = ii % nq, h = hq / (D / 4), c = (hq % (D / 4)) * 4;
+    float M = -1e30f, den = 0.0f;
+    float4 O = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int ch = 0; ch < nch; ++ch) {
+        const long base = (m * nch + ch) * (long)a.H + h;
+        const float mc = wsm[2 * base], dc = wsm[2 * base + 1];
+        const float mn = fmaxf(M, mc);
+        const float al = ds_ex2(M - mn), be = ds_ex2(mc - mn);
+        const float4 oc = *(const float4*)(wso + base * D + c);
+        O.x = O.x * al + oc.x * be; O.y = O.y * al + oc.y * be; O.z = O.z * al + oc.z * be; O.w = O.w * al + oc.w * be;
+        den = den * al + dc * be;
+        M = mn;
+    }
+    den += ds_ex2(a.sink[h * a.sks] * kL2e - M);
+    uint32_t w0 = ds_bf16_bits(O.x / den) | (ds_bf16_bits(O.y / den) << 16);
+    uint32_t w1 = ds_bf16_bits(O.z / den) | (ds_bf16_bits(O.w / den) << 16);
+    if constexpr (ORT) {   /* rope_rt_kernel's pair test and angles, for this thread's two pairs */
+        const long p = a.pos[m * a.ps];
+        const bool pin = p >= 0 && p < a.o.tab_rows;
+        const int d0 = (int)c - a.o.off, d1 = d0 + 2;
+        const bool r0 = pin && d0 >= 0 && d0 < 2 * a.o.half, r1 = pin && d1 >= 0 && d1 < 2 * a.o.half;
+        float ca = 0.0f, sa = 0.0f, cb = 0.0f, sb = 0.0f;
+        if (r0) {
+            ca = a.o.cs[p * a.o.cp + (long)(d0 >> 1) * a.o.cst];
+            sa = a.o.sign * a.o.cs[p * a.o.cp + (long)(a.o.half + (d0 >> 1)) * a.o.cst];
+        }
+        if (r1) {
+            cb = a.o.cs[p * a.o.cp + (long)(d1 >> 1) * a.o.cst];
+            sb = a.o.sign * a.o.cs[p * a.o.cp + (long)(a.o.half + (d1 >> 1)) * a.o.cst];
+        }
+        ds_ort_quad(w0, w1, r0, ca, sa, r1, cb, sb, a.o.fmt, a.o.sc);
+    }
+    if (ok) *(uint2*)(a.out + m * a.outr + h * D + c) = make_uint2(w0, w1);
 }
 
 /* ================================================================== index_score on WMMA
@@ -3774,6 +4053,76 @@ long dec_band(const RadArgs* a) {
     return b > kWmRows && b <= 64 ? (long)b : (long)kWmRows;
 }
 
+/* Lever TSK's switch (DRAFTER track round 15): RADIANCE_DS41_TSK at load -- unset: never (the scratch hook sizes nothing, fn4
+ * ds41_tsk 1 is refused: the program is today's byte for byte); 0: the scratch sized, off at start (an in-process A/B turns it
+ * on); 1: sized, on at start. fn4 ds41_tsk 0 / 1 (r4d_ds41_ggml.hip's rad_fn4_*). */
+int tsk_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_TSK");
+        if (!e || !*e) return -1;
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "1")) {
+            std::fprintf(stderr, "radiance: libr4d: lever TSK: the compressing layers' decode-band attention (<= %d rows) in the split-key "
+                                 "WMMA form (chunks of %d key tiles fixed by key index; rule B: its own reference) %s (RADIANCE_DS41_TSK=%s; "
+                                 "fn4 ds41_tsk 0 / 1); attn_sparse_sink's scratch sized for it\n",
+                         kWmRows, kTskTpc, *e == '1' ? "ON at start" : "off at start", e);
+            return *e - '0';
+        }
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_TSK=%s is not 0 / 1: lever TSK not loaded (today's attention)\n", e);
+        return -1;
+    }();
+    return v;
+}
+std::atomic<int> g_tsk{tsk_env() > 0 ? 1 : 0};
+std::atomic<long long> g_tsk_decl{0};
+/* the chunk partials of M rows: o [M][nch][H][D] f32, then (m, den) [M][nch][H][2] f32 */
+long tsk_chunks(long nk) { return ((nk + 15) / 16 + kTskTpc - 1) / kTskTpc; }
+long tsk_ws_bytes(long M, long H, long nk) { return M * tsk_chunks(nk) * H * (kDsAttnD + 2) * 4 + 256; }
+/* The TSK launches for a decode-band pass of a compressing layer (s: attn_setup's, ORT's epilogue in so); gth: the gathered
+ * selections when the op has them (lever DKV-G's fold). RAD_E_UNSUPPORTED with nothing launched when the switch is off or
+ * the layer is not one TSK serves; a pass it should serve but cannot (scratch, alignment) is declined LOUDLY: that call runs
+ * the stock form, whose bytes differ (not batch-invariant against the TSK calls). */
+template <bool ORT>
+int tsk_emit(RadStream stream, const RadArgs* ra, const DsAttnArgsT<ORT>& s0, const RadTensor* gth, long band) {
+    if (g_tsk.load(std::memory_order_relaxed) < 1) return RAD_E_UNSUPPORTED;
+    /* tp8 loop DECODE round 23 (merge onto ds41-pp-dev): to the op's decode band (kWmRows, or D25 step 3's 64 under
+     * RADIANCE_DS41_DKV_GPIECE=2), so a 49 .. 64-row depth-3 pass takes TSK as its <= 48-row passes do: one row a workgroup
+     * whatever M (grid z), so its bytes do not depend on the pass height */
+    if (!s0.cc || !s0.sel || s0.wf8 || s0.M < 1 || s0.M > band || s0.nk <= s0.win) return RAD_E_UNSUPPORTED;
+    DsAttnArgsT<ORT> s = s0;
+    bool ga = false;
+    if (gth) {
+        DsAttnArgsT<ORT> g{};
+        if (g_fold(s0, gth, &g, band)) { s = g; ga = true; }
+    }
+    const long nch = tsk_chunks(s.nk);
+    const long need = tsk_ws_bytes(s.M, s.H, s.nk);
+    const char* why = nullptr;
+    if (!ra || !ra->scratch || ra->scratch_bytes < need) why = "the op's scratch is smaller than the chunk partials";
+    else if (!aligned(ra->scratch, 16)) why = "the scratch is not 16-byte aligned";
+    else if (s.qr % 8 || !aligned(s.q, 16)) why = "q rows are not 16-byte aligned";
+    else if (s.outr % 4 || !aligned(s.out, 8)) why = "out rows are not 8-byte aligned";
+    else if ((s.H + 15) / 16 > 65535 || nch > 65535 || ds_tsk_lds() > 65536) why = "the grid / LDS";
+    else if (s.cnv && (s.win % 32)) why = "a packed latent's window is not a multiple of 32";
+    if (why) {
+        if (g_tsk_decl.fetch_add(1, std::memory_order_relaxed) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever TSK DECLINED a decode-band attention (M %d, H %d, %d keys): %s -- that call "
+                                 "runs the stock form (its bytes differ: not batch-invariant against the TSK calls)\n",
+                         s.M, s.H, s.nk, why);
+        return RAD_E_UNSUPPORTED;
+    }
+    float* wso = (float*)ra->scratch;
+    float* wsm = wso + (long)s.M * nch * s.H * kDsAttnD;
+    const float sl2 = (float)((double)s.scale * 1.4426950408889634);
+    const dim3 grid((unsigned)((s.H + 15) / 16), (unsigned)nch, (unsigned)(s.M < 65535 ? s.M : 65535));
+    const DsAttnArgs b = s;
+    const int rc = ga ? R4D_EMIT(stream, ds41_attn_tsk_kernel<true>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch)
+                      : R4D_EMIT(stream, ds41_attn_tsk_kernel<false>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch);
+    if (rc != RAD_OK) return rc;
+    const long n = (long)s.M * s.H * (kDsAttnD / 4);
+    return R4D_EMIT(stream, ds41_attn_tsk_merge_kernel<ORT>, dim3((unsigned)((n + 255) / 256)), dim3(256), 0u, s,
+                    (const float*)wso, (const float*)wsm, (int)nch);
+}
+
 /* lu (lever DKV-U, attn_sparse_sink_unpacked's operand): a WMMA pass over the packed latent reads the plan's rows;
  * gth (lever DKV-G, attn_sparse_sink_gathered's): a decode-band pass over the packed latent reads latent_gather's rows.
  * Either absent, or not usable for the pass: today's launches. */
@@ -3824,6 +4173,10 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
     /* Head group and d split by how many workgroups the rows give. Every choice sums each output
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
+    if (rows <= band) {   /* lever TSK (fn4 ds41_tsk 1): the compressing layers' decode band (to the op's band: D25 step 3's 64) */
+        const int rt = tsk_emit<false>(stream, a, s, gth, band);
+        if (rt != RAD_E_UNSUPPORTED) return rt;
+    }
     if (rows <= band && gth) {   /* lever DKV-G */
         DsAttnArgs g{};
         if (g_fold(s, gth, &g, band)) {
@@ -3914,6 +4267,10 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
         so.o.fmt = fmt;
         so.o.sc = sc;
         so.o.sign = inv ? -1.0f : 1.0f;
+        {   /* lever TSK (fn4 ds41_tsk 1): the compressing layers' decode band, the epilogue in its merge */
+            const int rt = tsk_emit<true>(stream, a, so, gth, band);
+            if (rt != RAD_E_UNSUPPORTED) return rt;
+        }
         DsAttnArgsOrt sg{};
         if (gth && g_fold(so, gth, &sg, band)) {   /* lever DKV-G */
             const int rc4 = attn_dec_emit<true>(stream, sg);
@@ -4115,16 +4472,35 @@ extern "C" int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs* a) {
  * upper bound) x topk unpacked entries of D bf16 when the op reads the packed latent and the knob is on; else none,
  * so unset the arena is today's. */
 extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs* a) {
-    const int cap = ds_nvgather();
-    if (cap < 1) return 0;
-    const char* lf = r4d_gets(a, "latent_format");
-    if (!lf || std::strcmp(lf, "nvfp4") || r4d_geti_or(a, "ratio", 0) < 1) return 0;
-    long long M = r4d_geti_or(a, "M", cap);
-    const long long topk = r4d_geti_or(a, "topk", 0);
-    if (M < 1 || M > cap) M = cap;
-    if (topk < 1 || topk > 2048) return 0;
-    return (int64_t)ds_nvgather_bytes((long)M, (long)topk);
+    const int64_t nvg = [a]() -> int64_t {
+        const int cap = ds_nvgather();
+        if (cap < 1) return 0;
+        const char* lf = r4d_gets(a, "latent_format");
+        if (!lf || std::strcmp(lf, "nvfp4") || r4d_geti_or(a, "ratio", 0) < 1) return 0;
+        long long M = r4d_geti_or(a, "M", cap);
+        const long long topk = r4d_geti_or(a, "topk", 0);
+        if (M < 1 || M > cap) M = cap;
+        if (topk < 1 || topk > 2048) return 0;
+        return (int64_t)ds_nvgather_bytes((long)M, (long)topk);
+    }();
+    /* Lever TSK (RADIANCE_DS41_TSK at load; unset: nothing): the chunk partials of the band's rows (at most kWmRows) on a
+     * compressing layer. TSK's launches do not take NVG's gather (one region, the larger of the two). */
+    int64_t tsk = 0;
+    if (tsk_env() >= 0 && r4d_geti_or(a, "ratio", 0) >= 1) {
+        const long bnd = dec_band(a);   /* the op's decode band: kWmRows, or 64 under D25 step 3 */
+        long long M = r4d_geti_or(a, "M", bnd);
+        if (M < 1 || M > bnd) M = bnd;
+        const long long H = r4d_geti_or(a, "heads", 0), win = r4d_geti_or(a, "window", 0), topk = r4d_geti_or(a, "topk", 0);
+        if (H >= 1 && H <= 4096 && win >= 1 && win <= 1024 && topk >= 1 && topk <= 2048)
+            tsk = (int64_t)tsk_ws_bytes((long)M, (long)H, (long)(win + topk));
+    }
+    return nvg > tsk ? nvg : tsk;
 }
+/* Lever TSK's fn4 switch ds41_tsk (r4d_ds41_ggml.hip's rad_fn4_*): 1 only when RADIANCE_DS41_TSK sized the scratch at load. */
+bool r4d_tsk_known(int v) { return v == 0 || (v == 1 && tsk_env() >= 0); }
+int r4d_tsk_get() { return g_tsk.load(std::memory_order_relaxed); }
+void r4d_tsk_set(int v) { g_tsk.store(v == 1 && tsk_env() >= 0 ? 1 : 0, std::memory_order_relaxed); }
+extern "C" long long r4d_tsk_declines() { return g_tsk_decl.load(std::memory_order_relaxed); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);
 }
