@@ -2477,8 +2477,28 @@ __device__ __forceinline__ void ds_w8_unpack64(const DsW8Raw& r, uint4 (&o)[8]) 
  * running max stays (alpha = exp2(0) = 1, no rescale), p = 0 (den + 0), and its PV adds 0 x the zero row (+0) to each
  * accumulator -- the same bits, tile skipped or not. A newcomer's pass from position 0 has empty tiles at both ends of most
  * rows: the window's below position 127, the selections past reach = (p + 1) / ratio < topk (index_topk's -1 after its
- * ascending picks). The score buffers alternate by the walked tiles' count, so two walked tiles never share one. */
-template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false, bool NL = false>
+ * ascending picks). The score buffers alternate by the walked tiles' count, so two walked tiles never share one.
+ * skp bit 1 (tp8 loop P32b, RADIANCE_DS41_ATTN_SKIP=2 = the skip + this): the rows LONGEST FIRST -- workgroup y takes row M - 1 - y
+ * (and so on by the stride), so a pass's later rows, which hold the most keys (a newcomer's row p walks ~(p + 1) / 16 tiles up
+ * to 40), start first and the short ones fill in at the end, instead of the last wave of workgroups being the 40-tile rows.
+ * Each row's work and bytes are its own whichever workgroup runs it (no cross-row state: the LDS tables are rebuilt each row
+ * after the previous row's closing barrier) -- the same bits.
+ * GL (tp8 loop P32b, RADIANCE_DS41_ATTN_SKIP=3, skp bit 2): the same loads and WMMAs in an order the wait counters can follow.
+ * Without it (one card's ISA of the served plan_full instance) the K row loads are FLAT (the key pointers come from LDS as
+ * generic pointers), so they count on the LDS counter too, and a packed tile's raw row (kr) is loaded into other registers than a
+ * plain tile's K row (kn), which merge at a join: the compiler waits for EVERY outstanding load there (s_wait_loadcnt_dscnt 0 right
+ * after the next tile's K rows are issued) and again for all eight K^T loads before the score WMMAs -- both loads' latency lands on
+ * every tile although the code issues them a stage ahead. GL loads the K rows as global (the same bytes; every key pointer is a
+ * global row or kDsZeroKey), unpacks a packed tile's raw row where it loads it (no raw row carried into the next tile: that
+ * tile waits for its own loads; a plan_full pass has none) and issues a plain tile's K^T loads after its score WMMAs (which
+ * then wait for the older K row loads only; K^T's latency sits under the barrier and the softmax). The same values reach the
+ * same WMMAs in the same order: the same bits. */
+typedef unsigned int ds_u32x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ uint4 ds_gld16(const void* p) {
+    const ds_u32x4 v = *(const __attribute__((address_space(1))) ds_u32x4*)p;
+    return make_uint4(v.x, v.y, v.z, v.w);
+}
+template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false, bool NL = false, bool GL = false>
 __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::conditional_t<UX, DsAttnArgsU, DsAttnArgs> a,
                                                                        float sl2, int skp = 0) {
     static_assert(!UX || (NV && !W8), "the unpacked plan reads the packed latent beside a bf16 window");
@@ -2497,7 +2517,8 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
     const int kq = lane & 15;                        /* S^T's A row: key kq of the tile */
     const int ktr = 8 * hf + (lane & 7);             /* K^T's transposing row: key ktr */
     const int dtr = c0 + 8 * ((lane >> 3) & 1);
-    for (long m = blockIdx.y; m < a.M; m += gridDim.y) {
+    for (long my = blockIdx.y; my < a.M; my += gridDim.y) {
+        const long m = (skp & 2) ? a.M - 1 - my : my;   /* skp bit 1: the rows longest first */
         /* ---- the row's keys in libref's order (the window, then the selections), a null one
          * pointing at a zero row; a 16-bit mask a tile of which are keys */
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
@@ -2596,9 +2617,21 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 kw8.sc = *(const uint16_t*)(b + D + (c0 + 64 * hf) / 32);
             } else if (NV && nvt(tt)) {
                 const unsigned char* b = (const unsigned char*)pk;
-                kr.c0 = *(const uint4*)(b + (c0 + 64 * hf) / 2);
-                kr.c1 = *(const uint4*)(b + (c0 + 64 * hf) / 2 + 16);
-                kr.sc = *(const uint32_t*)(b + D / 2 + (c0 + 64 * hf) / 16);
+                if constexpr (GL) {   /* unpacked here: no raw row (kr) carried to the next tile, so nothing to merge */
+                    DsNv4Raw r;
+                    r.c0 = ds_gld16(b + (c0 + 64 * hf) / 2);
+                    r.c1 = ds_gld16(b + (c0 + 64 * hf) / 2 + 16);
+                    r.sc = *(const __attribute__((address_space(1))) uint32_t*)(b + D / 2 + (c0 + 64 * hf) / 16);
+                    if constexpr (FU) ds_nv4_unpack64_fast(r, kn);
+                    else ds_nv4_unpack64(r, kn);
+                } else {
+                    kr.c0 = *(const uint4*)(b + (c0 + 64 * hf) / 2);
+                    kr.c1 = *(const uint4*)(b + (c0 + 64 * hf) / 2 + 16);
+                    kr.sc = *(const uint32_t*)(b + D / 2 + (c0 + 64 * hf) / 16);
+                }
+            } else if constexpr (GL) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) kn[i] = ds_gld16(pk + c0 + 64 * hf + 8 * i);
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + c0 + 64 * hf + 8 * i);
@@ -2607,7 +2640,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         /* skp: the next tile at or after tt that holds a key (nkt if none). A row whose window and selections reach their
          * slots by position (p >= win - 1, reach >= topk) walks every tile as without skp (no vmask reads: one card at
          * context 8192, 2,048 rows: +0.4..+1.1 % with them) -- an unmapped block there keeps its tile, which is exact too */
-        const bool rsk = skp && !(p >= (long)a.win - 1 && (a.nk == a.win || (a.ratio > 0 && (p + 1) / a.ratio >= (long)(a.nk - a.win))));
+        const bool rsk = (skp & 1) && !(p >= (long)a.win - 1 && (a.nk == a.win || (a.ratio > 0 && (p + 1) / a.ratio >= (long)(a.nk - a.win))));
         auto walk = [&](int tt) -> int {
             if (rsk)
                 while (tt < nkt && ((uint32_t)__builtin_amdgcn_readfirstlane((int)vmask[tt]) & 0xffffu) == 0u) ++tt;
@@ -2620,6 +2653,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
             uint4 kt[8];
             if ((NV && nvt(t)) || (W8 && t < wtk)) {   /* tile-uniform */
                 if (W8 && t < wtk) ds_w8_unpack64(kw8, kn);
+                else if constexpr (GL) { /* ldk unpacked it */ }
                 else if constexpr (FU) ds_nv4_unpack64_fast(kr, kn);
                 else ds_nv4_unpack64(kr, kn);
               if constexpr (NL) {
@@ -2666,7 +2700,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 }
                 ds_wave_sync();                      /* the reads before the next tile's writes */
               }
-            } else {
+            } else if constexpr (!GL) {
                 const uint16_t* pt = kp[t * 16 + ktr] + dtr;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) kt[j] = ds_load_tr(pt + 16 * j);
@@ -2674,6 +2708,13 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
             ds_v8f sp = (ds_v8f)(0.0f);
 #pragma unroll
             for (int i = 0; i < 8; ++i) sp = ds_wmma(kn[i], qf[i], sp);
+            if constexpr (GL) {   /* a plain tile's K^T issued after the score WMMAs: they wait for the K row (older) only */
+                if (!((NV && nvt(t)) || (W8 && t < wtk))) {
+                    const uint16_t* pt = kp[t * 16 + ktr] + dtr;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) kt[j] = ds_load_tr(pt + 16 * j);
+                }
+            }
             if (tn < nkt) ldk(tn);
             float4* sb = sbuf + (wn & 1) * (kWmWaves * 64);   /* skp 0: wn == t */
             ++wn;
@@ -3901,23 +3942,33 @@ std::atomic<int> g_wm_from_pin{0};
  * (ds41_attn_sparse_sink_wm_kernel, every pass above the decode band and lever DAW's) walks only the 16-key tiles that hold a
  * key: the same bits (the kernel's skp note), less work where a row's keys do not fill its 640 slots (a newcomer from position
  * 0: on average ~26 of 40 tiles at ratio 2, ~33 at ratio 1 over 1,150 rows, A). Unset / 0: every tile (the program before).
- * Bench hook r4d_attn_skip_pin (0 / 1; -1 = the env). One stderr line a process when on. */
+ * =2 (tp8 loop P32b, PREFILL round 27): the skip AND the rows longest first (the kernel's skp bit 1: workgroup y runs row
+ * M - 1 - y) -- the same bits; a newcomer's rows hold more keys the later they are, so in row order the last workgroups of a
+ * pass are its 40-tile rows (one card: the newcomer's launch -1.5..-3.0 %). =3: =2 + the kernel's GL form (skp bit 2: the K rows
+ * as global loads, a packed tile unpacked where it is loaded -- the kernel's GL note; the same bits). The kernel's skp: bit 0 skip,
+ * bit 1 rows reversed, bit 2 GL. Bench hook r4d_attn_skip_pin (0 / 1 / 2 / 3; -1 = the env). One stderr line a process when on. */
 int attn_skip_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_ATTN_SKIP");
-        const int on = e && !std::strcmp(e, "1");
-        if (on)
+        const int on = e && !std::strcmp(e, "1") ? 1 : (e && !std::strcmp(e, "2") ? 3 : (e && !std::strcmp(e, "3") ? 7 : 0));
+        if (on == 7)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_ATTN_SKIP=3 (tp8 loop P32 + P32b): the WMMA prefill attention walks only "
+                                 "the key tiles that hold a key, its rows longest first, its K rows as global loads (the same bits)\n");
+        else if (on == 1)
             std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_ATTN_SKIP=1 (tp8 loop P32): the WMMA prefill attention walks only "
                                  "the key tiles that hold a key (the same bits)\n");
-        return on ? 1 : 0;
+        else if (on == 3)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_ATTN_SKIP=2 (tp8 loop P32 + P32b): the WMMA prefill attention walks only "
+                                 "the key tiles that hold a key, its rows longest first (the same bits)\n");
+        return on;
     }();
     return v;
 }
 std::atomic<int> g_attn_skip_pin{-1};
 [[maybe_unused]] const int g_attn_skip_load = attn_skip_env();   /* read (and its line printed) when libr4d loads */
-int attn_skip_now() {
+int attn_skip_now() {   /* the kernel's skp: bit 0 the skip, bit 1 the rows longest first */
     const int p = g_attn_skip_pin.load(std::memory_order_relaxed);
-    return p >= 0 ? (p ? 1 : 0) : attn_skip_env();
+    return p >= 0 ? (p == 0 ? 0 : (p == 2 ? 3 : (p == 3 ? 7 : 1))) : attn_skip_env();
 }
 
 /* ORT (attn_sparse_sink_rope_roundtrip): the same forms with the fused epilogue; the knob's packed-only forms
@@ -4212,9 +4263,16 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
                 static_cast<DsAttnArgs&>(u) = s;
                 u.lu = (uint16_t*)lu->data;
                 u.lucap = cap;
-                if (lu_full || ds_dkv_nolds() > 0)   /* the LDS-free packed tiles: the plain form's LDS */
+                if (lu_full || ds_dkv_nolds() > 0) {   /* the LDS-free packed tiles: the plain form's LDS */
+                    if (skp & 4)   /* tp8 loop P32b: GL */
+                        return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true, true, true>), grid,
+                                        dim3(128), (uint32_t)(ds_wm_sbuf_off(nkt) + kWmSbufBytes), u, sl2, skp);
                     return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true, true>), grid,
                                     dim3(128), (uint32_t)(ds_wm_sbuf_off(nkt) + kWmSbufBytes), u, sl2, skp);
+                }
+                if (skp & 4)
+                    return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true, false, true>), grid,
+                                    dim3(128), (uint32_t)lds, u, sl2, skp);
                 return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true>), grid, dim3(128),
                                 (uint32_t)lds, u, sl2, skp);
             }
@@ -4222,6 +4280,9 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
                 return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true>), grid, dim3(128),
                                 (uint32_t)lds, s, sl2, skp);
             if (s.cnv) return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true>), grid, dim3(128), (uint32_t)lds, s, sl2, skp);
+            if (skp & 4)   /* tp8 loop P32b: GL */
+                return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false, false, false, false, false, true>), grid, dim3(128),
+                                (uint32_t)lds, s, sl2, skp);
             return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false>), grid, dim3(128), (uint32_t)lds, s, sl2, skp);
         }
     }
@@ -4574,7 +4635,7 @@ extern "C" int r4d_attn_dec_sw_set(int v) {
 extern "C" long long r4d_attn_dec_sw_calls() { return g_dec_sw_calls.load(std::memory_order_relaxed); }
 extern "C" void r4d_attn_wm_from(int rows) { g_wm_from_pin.store(rows > 0 ? rows : 0, std::memory_order_relaxed); }
 /* tp8 loop P32: the WMMA prefill attention's empty-tile skip for benches / tests (0 off, 1 on, -1 = RADIANCE_DS41_ATTN_SKIP) */
-extern "C" void r4d_attn_skip_pin(int v) { g_attn_skip_pin.store(v < 0 ? -1 : (v ? 1 : 0), std::memory_order_relaxed); }
+extern "C" void r4d_attn_skip_pin(int v) { g_attn_skip_pin.store(v < 0 ? -1 : (v == 2 || v == 3 ? v : (v ? 1 : 0)), std::memory_order_relaxed); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs* a, RadStream stream) {
     return attn_ort_body(a, stream);
 }
