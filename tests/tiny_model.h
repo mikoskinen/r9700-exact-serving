@@ -585,6 +585,71 @@ inline bool write_dflash2(const std::string& dir, const DFlash2& s) {
            write_safetensors(dir + "/model.safetensors", ts);
 }
 
+/* ------------------------------------------------------------------ DSpark (a llama target's block drafter) */
+
+/* A DSpark drafter as its own repository (MiniCPM5-2B-DSpark's layout, merged by rad-convert --draft-model under
+ * `draft.`, served by llama_fp8's declare_dspark / rad_block_dspark.h): `layers` qwen3 layers reading the target's
+ * residual stream at `taps`, the rank-`rank` vanilla Markov bigram head, a block of `block` (= the depth it serves). The
+ * 2-bit draft head is the target's lm_head under its own name (the recipe makes it u2: kDsparkRecipe). tp8 loop D38a:
+ * the host fixture for a drafted decode lane. */
+struct DsparkDraft {
+    int64_t layers = 1, hidden = 128, heads = 4, kv_heads = 2, head_dim = 64, ffn = 256;
+    int64_t block = 3, rank = 32, top_k = 8, vocab = 320, mask_id = 4;
+    std::vector<int64_t> taps = { 3 };
+    /* The gains of o_proj / down_proj, the q/k norms' centre and the Markov codebooks' amplitude. Small branches and
+     * codebooks make the drafter's anchor row nearly the trunk's own bigram (its embedding through the target's head),
+     * so with a near-bigram target (Llama::branch small) a good share of first drafts is accepted. */
+    float    branch = 0.05f, qk = 1.0f, markov = 0.02f;
+    uint64_t seed = 8;
+};
+
+inline bool write_dspark(const std::string& dir, const DsparkDraft& s) {
+    Rng r(s.seed);
+    const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
+    nlohmann::ordered_json c;
+    c["architectures"] = { "DSparkDraftModel" };
+    c["model_type"] = "qwen3";
+    c["hidden_size"] = H;
+    c["intermediate_size"] = s.ffn;
+    c["num_hidden_layers"] = s.layers;
+    c["num_attention_heads"] = s.heads;
+    c["num_key_value_heads"] = s.kv_heads;
+    c["head_dim"] = s.head_dim;
+    c["rms_norm_eps"] = 1e-6;
+    c["rope_theta"] = 10000.0;
+    c["vocab_size"] = s.vocab;
+    c["target_layer_ids"] = s.taps;
+    c["block_size"] = s.block;
+    c["mask_token_id"] = s.mask_id;
+    c["markov_rank"] = s.rank;
+    c["markov_head_type"] = "vanilla";
+    c["markov_top_k"] = s.top_k;
+    c["is_causal"] = false;
+    c["use_sliding_window"] = false;
+    std::vector<Tensor> ts;
+    ts.push_back(linear("fc.weight", H, (int64_t)s.taps.size() * H, r));
+    ts.push_back(noise("hidden_norm.weight", { H }, r, 0.1f, 1.0f));
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = "layers." + std::to_string(l) + ".";
+        ts.push_back(noise(p + "input_layernorm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "post_attention_layernorm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(linear(p + "self_attn.q_proj.weight", q, H, r));
+        ts.push_back(linear(p + "self_attn.k_proj.weight", kv, H, r));
+        ts.push_back(linear(p + "self_attn.v_proj.weight", kv, H, r));
+        ts.push_back(linear(p + "self_attn.o_proj.weight", H, q, r, s.branch));
+        ts.push_back(noise(p + "self_attn.q_norm.weight", { s.head_dim }, r, 0.1f, s.qk));
+        ts.push_back(noise(p + "self_attn.k_norm.weight", { s.head_dim }, r, 0.1f, s.qk));
+        ts.push_back(linear(p + "mlp.gate_proj.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "mlp.up_proj.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "mlp.down_proj.weight", H, s.ffn, r, s.branch));
+    }
+    ts.push_back(noise("norm.weight", { H }, r, 0.1f, 1.0f));
+    ts.push_back(noise("markov_head.markov_w1.weight", { s.vocab, s.rank }, r, s.markov));
+    ts.push_back(noise("markov_head.markov_w2.weight", { s.vocab, s.rank }, r, s.markov));
+    return write_text(dir + "/config.json", c.dump(2)) &&
+           write_safetensors(dir + "/model.safetensors", ts);
+}
+
 /* ------------------------------------------------------------------ llama: dense attention */
 
 /* LLaMA (`llama`, served by llama_dense_fp8 once rad-convert has made its linears block fp8):
@@ -891,6 +956,22 @@ inline const char* kLlamaFp8Recipe =
     "blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
     "blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
     "blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
+
+/* kLlamaFp8Recipe plus a merged DSpark drafter's lines (minicpm5-2b-dspark.recipe's): its linears block fp8 and its 2-bit
+ * copy of the target's head (tp8 loop D38a). */
+inline const char* kLlamaDsparkRecipe =
+    "blk.*.attn_qkv.weight            rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "blk.*.attn_output.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "blk.*.ffn_gate_up.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "blk.*.ffn_down.weight            rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.draft_head.weight         rtn codes=u2 zero=u8 group=128 scale=f16\n"
+    "dspark.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
+    "dspark.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
 
 /* The same trunk as OCP-MXFP4: e2m1 codes with an E8M0 exponent per 32 of K, read by gemm_nt_q at
  * mxfp4a8 against the E4M3 activation pair scaled per 128. */
