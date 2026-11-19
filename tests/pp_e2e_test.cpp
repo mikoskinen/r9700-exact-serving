@@ -2928,6 +2928,16 @@ TEST(plan_reserved_serves_one_process_tokens) {
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK_EQ(named, 0LL);
         lent_all += lent;
+        /* tp8 loop D35: the leader's decode-chain host line at the run's end */
+        long long dch = -1;
+        double dch_p50 = -1, dch_mean = -1;
+        const char* dkey = "decode chain on the leader host over the run (tp8 loop D35): ";
+        if (const size_t at = llog.rfind(dkey); at != std::string::npos)
+            (void)std::sscanf(llog.c_str() + at + std::strlen(dkey), "%lld decode lane steps, their collect -> the lane's next decode step "
+                                                                    "shipped p50 %lf / mean %lf", &dch, &dch_p50, &dch_mean);
+        fprintf(stderr, "      D35: %lld decode lane steps, collect -> next decode step shipped p50 %.2f / mean %.2f ms\n", dch, dch_p50, dch_mean);
+        CHECK(dch > 0);
+        CHECK(dch_p50 >= 0 && dch_mean >= 0);
     }
     fprintf(stderr, "    all arms: %lld prompts with lent chunks\n", lent_all);
     CHECK(lent_all > 0);
