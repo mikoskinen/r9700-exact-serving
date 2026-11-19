@@ -603,6 +603,9 @@ struct Model {
     int64_t lu_e = 0, selkv_rows = 0;
     /* tp8 loop D25 (RADIANCE_DS41_DKV_GPIECE=1): selkv's rows (each band piece gathers at its own rows); = selkv_rows otherwise */
     int64_t selkv_cap = 0;
+    /* tp8 loop D25 step 3 (RADIANCE_DS41_DKV_GPIECE=2): the gather and its attentions are declared to selkv_cap rows with libr4d's
+     * per-op band 64, so a decode segment of 49 .. 64 rows runs them ONCE instead of in F58's band pieces */
+    bool selkv_one = false;
     /* RADIANCE_DS41_KVWIN_FP8=1 (lever KVWIN; "trunk": the trunk's window only): the window caches -- the trunk's
      * kv_window (w8) and the DSpark drafter's kv_dspark (w8d) -- hold each 512-value key packed (528 bytes instead
      * of 1024: e4m3 codes, a scale byte a block of 32; window_store / rmsnorm_rope_roundtrip_kv_store kv_dtype /
@@ -2062,13 +2065,15 @@ static thread_local std::vector<Ds41Held> t_dkv_gl;
 static constexpr int64_t kDkvGpRows = 64;
 static std::atomic<int> g_dkv_gp{-1};
 static std::atomic<long long> g_dkv_gp_hit{0}, g_dkv_gp_n{0};
+static std::atomic<long long> g_dkv_one{0};   /* step 3: decode segments above the band whose attention ran as one launch (rank 0, a layer) */
 static bool dkv_gpiece_env() {
     int v = g_dkv_gp.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DKV_GPIECE");
-        const int w = e && e[0] == '1' && !e[1] ? 1 : 0;
+        /* 2 (tp8 loop D25 step 3): 1's 64-row gathered latent + the decode segment's gather and attention as one launch */
+        const int w = e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
         if (e && !w && std::strcmp(e, "0"))
-            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DKV_GPIECE=%s is not 0 or 1: the piece gathers are not declared\n", e);
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DKV_GPIECE=%s is not 0, 1 or 2: the piece gathers are not declared\n", e);
         int unread = -1;
         g_dkv_gp.compare_exchange_strong(unread, w);
         v = g_dkv_gp.load(std::memory_order_relaxed);
@@ -3013,6 +3018,7 @@ static int buffers(RadBuilder* b, Model& m) {
             /* tp8 loop D25: with RADIANCE_DS41_DKV_GPIECE=1 the buffer holds a 64-row segment's pieces side by side; the ops'
              * row range (selkv_rows) stays the band's, so every launch is the one today issues */
             m.selkv_cap = dkv_gpiece_env() ? std::min<int64_t>(T, kDkvGpRows) : m.selkv_rows;
+            m.selkv_one = g_dkv_gp.load(std::memory_order_relaxed) == 2 && m.selkv_cap > m.selkv_rows;
             m.selkv = bf("comp_latent_gathered", { m.selkv_cap, c.itopk * c.head_dim });
         }
     }
@@ -3596,7 +3602,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             }
             if (r > 0 && L.attn_rt && m.selkv) {
                 std::vector<RadParam> gf = fp;
-                gf[0] = RAD_RANGE("M", 1, m.selkv_rows);
+                gf[0] = RAD_RANGE("M", 1, m.selkv_one ? m.selkv_cap : m.selkv_rows);
+                if (m.selkv_one) gf.push_back(RAD_INT("band", m.selkv_cap));   /* tp8 loop D25 step 3: libr4d's decode band to 64 */
                 L.attn_rtg = fused(b, "attn_sparse_sink_rope_roundtrip_gathered", gf, { L.sinks },
                                    { m.q, m.sel, cs, m.selkv }, { m.o });
             }
@@ -3615,11 +3622,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         }
         if (r > 0 && m.selkv) {
             L.lgath = fused(b, "latent_gather",
-                            { RAD_RANGE("M", 1, m.selkv_rows), RAD_INT("dim", hd), RAD_INT("ratio", r),
+                            { RAD_RANGE("M", 1, m.selkv_one ? m.selkv_cap : m.selkv_rows), RAD_INT("dim", hd), RAD_INT("ratio", r),
                               RAD_INT("topk", c.itopk), RAD_STR("latent_format", "nvfp4") },
                             {}, { m.sel }, { m.selkv });
             std::vector<RadParam> gp = ap;
-            gp[0] = RAD_RANGE("M", 1, m.selkv_rows);
+            gp[0] = RAD_RANGE("M", 1, m.selkv_one ? m.selkv_cap : m.selkv_rows);
+            if (m.selkv_one) gp.push_back(RAD_INT("band", m.selkv_cap));   /* tp8 loop D25 step 3 */
             L.attn_g = fused(b, "attn_sparse_sink_gathered", gp, { L.sinks }, { m.q, m.sel, m.selkv }, { m.o });
         }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
@@ -5976,12 +5984,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     nc, nu, nl, nlr, (long long)m.lu_e,
                     (double)(T * m.lu_e * c.head_dim * 2) / (1024.0 * 1024.0), (long long)T, ng, nga, ngr,
                     (long long)m.selkv_rows, (double)(m.selkv_rows * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0));
-        if (m.lnv && m.selkv && m.selkv_cap > m.selkv_rows)
+        if (m.lnv && m.selkv && m.selkv_cap > m.selkv_rows && !m.selkv_one)
             fprintf(stderr, "radiance: deepseek41: tp8 loop D25 (RADIANCE_DS41_DKV_GPIECE=1): the gathered latent holds %lld rows "
                             "(%.2f MiB): a decode segment's band pieces (F58, above %lld rows) gather at their own rows, each held "
                             "for the layers of its kv source; every launch stays at <= %lld rows\n",
                     (long long)m.selkv_cap, (double)(m.selkv_cap * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0),
                     (long long)kBiBand, (long long)m.selkv_rows);
+        if (m.lnv && m.selkv && m.selkv_one)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop D25 step 3 (RADIANCE_DS41_DKV_GPIECE=2): the gathered latent holds %lld rows "
+                            "(%.2f MiB) and latent_gather / attn_sparse_sink_gathered (+ its fold d form) are declared to %lld rows "
+                            "with libr4d's band %lld: a decode segment above %lld rows gathers and attends ONCE at a compressed layer "
+                            "(the scalar decode kernels, each row its own bytes); window-only layers keep F58's pieces\n",
+                    (long long)m.selkv_cap, (double)(m.selkv_cap * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0),
+                    (long long)m.selkv_cap, (long long)m.selkv_cap, (long long)kBiBand);
     }
     /* Lever SPF-IR, only where RADIANCE_DS41_IROWS_MIN moved the floor (unset: no line, as before). */
     if (ctx->rank == 0 && !ctx->shape_probe && ds41_irows_min() != kScoreRunMin)
@@ -6948,8 +6963,9 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
     /* tp8 loop D25 (selkv_cap > selkv_rows: RADIANCE_DS41_DKV_GPIECE=1): a piece gathers at its own rows `hr0` of the segment
      * and is held by its key beside the other pieces' (ds41_dkv_held.h); the launches are today's at every row count */
     const bool gp = m.selkv_cap > m.selkv_rows;
-    if (gp && dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 && n <= m.selkv_rows && hr0 >= 0 &&
-        hr0 + n <= m.selkv_cap) {
+    /* step 3 (RADIANCE_DS41_DKV_GPIECE=2): the ops take up to selkv_cap rows in the decode band (libr4d's per-op band) */
+    if (gp && dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 &&
+        n <= (m.selkv_one ? m.selkv_cap : m.selkv_rows) && hr0 >= 0 && hr0 + n <= m.selkv_cap) {
         const RadOperand gv = hr0 == 0 ? brows(m.selkv, n) : brow_slice(m.selkv, hr0, n, c.itopk * c.head_dim);
         Ds41Held k;
         k.src = src;
@@ -7716,6 +7732,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         g_dband_sync.load(std::memory_order_relaxed), g_dband_over.load(std::memory_order_relaxed),
                         g_dband_live.load(std::memory_order_relaxed), g_dband_keyed.load(std::memory_order_relaxed),
                         (long long)dt, (long long)dn, dap.size());
+            if (m.selkv_one && (n == 1 || n % 4096 == 0))
+                fprintf(stderr, "radiance: deepseek41: tp8 loop D25 step 3 (RADIANCE_DS41_DKV_GPIECE=2): %lld decode-segment attentions "
+                                "above %lld rows ran as ONE gather + ONE launch (a layer each, rank 0), the rest in the pieces above\n",
+                        g_dkv_one.load(std::memory_order_relaxed), (long long)kBiBand);
         }
     }
     auto dcu = [&](size_t j) {
@@ -8619,6 +8639,16 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             for (const BiSeg& s : sg) {
                 if (!(s.dec && !dap.empty())) {
                     attn_one(s, segcu(s));
+                    continue;
+                }
+                /* tp8 loop D25 step 3 (RADIANCE_DS41_DKV_GPIECE=2): a decode segment of <= selkv_cap rows at a layer lever DKV-G
+                 * serves (a compressed layer: dkv_attn's gathered branch, whose ops carry libr4d's band 64) runs ONE gather + ONE
+                 * attention over all its rows -- the scalar decode kernels, each row's alone bytes as in a piece; any other layer
+                 * (window-only, or a form DKV-G does not serve) keeps F58's pieces */
+                if (m.selkv_one && r > 0 && m.lnv && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && s.r0 == 0 &&
+                    s.n <= m.selkv_cap) {
+                    attn_one(s, segcu(s));
+                    if (rad_rank(x) == 0) g_dkv_one.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 /* tp8 loop F58: the decode segment above the band in its pieces, each in the decode kernels */
