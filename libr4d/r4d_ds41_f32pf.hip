@@ -370,7 +370,9 @@ int r4d_f32dec_gemm_form(int rows, int n) {
     if (p >= 0) f = p;
     else {
         const int v = g_f32dec.load(std::memory_order_relaxed);
-        if (v == 1 || v == 3 || (v >= 4 && v <= 7)) f = r4d_f32dec_rule_gemm(rows, n);   /* 4 .. 7: 1's gemm rule (D28) */
+        /* 4 .. 7: 1's gemm rule (D28); 8 (lever RGP) too -- F74 (DRAFTER round 20): without it RGP's value sent the compressor's
+         * 17..63-row calls to the stock form (lq190: gemm_nt_f32_tile<8,1,8> 363-500 us vs form 4's 60-87, L +0.31 ms at c16) */
+        if (v == 1 || v == 3 || (v >= 4 && v <= 8)) f = r4d_f32dec_rule_gemm(rows, n);
     }
     if (f > 0) {
         g_f32dec_n[1].fetch_add(1, std::memory_order_relaxed);

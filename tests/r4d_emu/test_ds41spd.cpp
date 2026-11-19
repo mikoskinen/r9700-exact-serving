@@ -29,6 +29,7 @@ extern "C" int r4d_rad_router_gemm_scored_scatter_init(const RadParam*, int, int
 extern "C" void r4d_rad_router_gemm_scored_scatter_fini(void*);
 extern "C" void r4d_f32dec_pin(int rgs_form, int gemm_form);
 int r4d_f32dec_rgs_form(int rows);
+int r4d_f32dec_gemm_form(int rows, int n);
 extern "C" int rad_f32dec_stats(long long* out, int n);
 int r4d_f32dec_set(int v);
 int r4d_f32dec_get();
@@ -230,6 +231,17 @@ int main(int argc, char** argv) {
         r4d_f32dec_set(8);
         const int f17 = r4d_f32dec_rgs_form(17), f48 = r4d_f32dec_rgs_form(48), f64 = r4d_f32dec_rgs_form(64), f16 = r4d_f32dec_rgs_form(16),
                   f8 = r4d_f32dec_rgs_form(8), f65 = r4d_f32dec_rgs_form(65);
+        /* F74 (DRAFTER round 20): 8 keeps 1's gemm_nt_f32 rule (the compressor, N 1024; the drafter's router logits, N 128) */
+        std::string gbad;
+        for (int n : { 1024, 128 })
+            for (int rows : { 1, 8, 9, 16, 17, 32, 48, 63 }) {
+                r4d_f32dec_set(1);
+                const int a = r4d_f32dec_gemm_form(rows, n);
+                r4d_f32dec_set(8);
+                const int b = r4d_f32dec_gemm_form(rows, n);
+                if (a != b) gbad += fmt(" n %d rows %d: 1 -> %d, 8 -> %d", n, rows, a, b);
+            }
+        check(gbad.empty(), "RGP ds41_f32dec 8 keeps 1's gemm_nt_f32 rule at 1..63 rows (F74)", gbad);
         r4d_f32dec_set(0);
         check(f17 == 19 && f48 == 19 && f64 == 19 && f16 == g16 && f8 == g8 && f65 == 0 && g49 == 0 && g64 == 0,
               "RGP ds41_f32dec 8: the router's 17..64 rows take form 19, <= 16 rows 1's rule, 65+ none; 1 keeps the stock form at 49..64",
