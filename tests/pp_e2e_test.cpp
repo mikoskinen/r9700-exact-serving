@@ -1106,6 +1106,90 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
     }
 }
 
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS on both nodes): a cold multi-chunk prompt at 2 and 3 lanes, W(0,2) and W(1,3), with
+ * every issue over the threshold (0.0001 ms, passes of >= 1 row) serves one process's tokens and plan; each node says the switch at start and
+ * prints slow-issue lines (op, kernel, band, own + launch, the first-launch resolves) up to its budget of 64, the 64th
+ * saying so; the leader's prefill timeline names the first chunk's and the longest chunk's head issue. RADIANCE_AQL_PRELOAD=2
+ * on the host backend says it has nothing to load and changes nothing. */
+TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(1013, 1000);
+    std::vector<int32_t> ref;
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        ref = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);
+    for (const char* lanes : { "2", "3" })
+    for (const char* cut : { "0,2", "1,3" }) {
+        Serving sv;
+        REQUIRE(sv.start(cut, { "--max-num-seqs", "6", "--pp-lanes", lanes },
+                         cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_PF_TIMELINE=1", "RADIANCE_SLOW_ISSUE_MS=0.0001",
+                                          "RADIANCE_SLOW_ISSUE_ROWS=1", "RADIANCE_AQL_PRELOAD=2" })));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        const std::string llog = sv.lead.output(), flog = sv.fol.output();
+        CHECK(chunks_of(llog) == ref_plan);
+        CHECK(!ref.empty());
+        CHECK(got == ref);
+        for (const std::string* lg : { &llog, &flog }) {
+            CHECK(lg->find("RADIANCE_SLOW_ISSUE_MS=0.0001 (tp8 loop P31)") != std::string::npos);
+            CHECK(lg->find("RADIANCE_AQL_PRELOAD=2: not the AQL backend here; nothing to load") != std::string::npos);
+            const size_t s0 = lg->find("slow issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card ");
+            CHECK(s0 != std::string::npos);
+            if (s0 == std::string::npos) continue;
+            const std::string sl = lg->substr(s0, lg->find('\n', s0) - s0);
+            CHECK(sl.find(": op '") != std::string::npos);
+            CHECK(sl.find(" kernel ") != std::string::npos);
+            CHECK(sl.find(" ms + launch ") != std::string::npos);
+            CHECK(sl.find("first-launch resolve(s)") != std::string::npos);
+            if (lg == &llog) fprintf(stderr, "    %s\n", sl.c_str());
+            const size_t p0 = lg->find("slow pass issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card ");
+            if (p0 != std::string::npos && lg == &llog)
+                fprintf(stderr, "    %s\n", lg->substr(p0, lg->find('\n', p0) - p0).c_str());
+            /* the budget: 64 lines, the 64th says so, none after it */
+            size_t k = 0, at = 0;
+            while ((at = lg->find("slow issue (RADIANCE_SLOW_ISSUE_MS", at)) != std::string::npos) { ++k; ++at; }
+            CHECK_EQ(k, (size_t)64);
+            CHECK(lg->find("(the 64th: no more issue lines)") != std::string::npos);
+        }
+        const size_t tl = llog.find("prefill timeline (RADIANCE_PP_PF_TIMELINE=1");
+        CHECK(tl != std::string::npos);
+        if (tl == std::string::npos) continue;
+        const std::string line = llog.substr(tl, llog.find('\n', tl) - tl);
+        CHECK(line.find("(the ranks' issue; the first chunk's ") != std::string::npos);
+        CHECK(line.find(", the longest ") != std::string::npos);
+        CHECK(line.find("events dropped 0, unread 0") != std::string::npos);
+        fprintf(stderr, "    %s lanes W(%s): tokens %s, plan %s, pass lines leader %s\n    %s\n", lanes, cut,
+                got == ref ? "identical" : "DIFFERENT", chunks_of(llog) == ref_plan ? "identical" : "DIFFERENT",
+                llog.find("slow pass issue (RADIANCE_SLOW_ISSUE_MS") != std::string::npos ? "yes" : "none >= 10 ms",
+                line.c_str());
+    }
+    /* the default row floor (512): this model's passes are <= 64 rows, so nothing prints, and the tokens are the same */
+    {
+        Serving sv;
+        REQUIRE(sv.start("0,2", { "--max-num-seqs", "6", "--pp-lanes", "2" },
+                         cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_SLOW_ISSUE_MS=0.0001" })));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        CHECK(got == ref);
+        for (const std::string& lg : { sv.lead.output(), sv.fol.output() }) {
+            CHECK(lg.find("RADIANCE_SLOW_ISSUE_MS=0.0001 (tp8 loop P31)") != std::string::npos);
+            CHECK(lg.find("slow issue (RADIANCE_SLOW_ISSUE_MS") == std::string::npos);
+            CHECK(lg.find("slow pass issue (RADIANCE_SLOW_ISSUE_MS") == std::string::npos);
+        }
+    }
+}
+
 /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1 on both nodes): a cold multi-chunk prompt and its decode at 2 lanes, W(0,2) and
  * W(1,3), serve one process's tokens, and each node prints its node-idle line for the run at stop -- parts read from
  * their events (none dropped or unread), rank 0's receives of the other node's crossing counted (the leader's X2, the
