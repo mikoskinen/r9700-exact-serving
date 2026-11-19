@@ -674,6 +674,7 @@ int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
 int     r4d_rad_moe_gemm_iqr(const RadArgs*, RadStream);
 int64_t r4d_rad_moe_gemm_iqr_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
+int r4d_rad_quant_act_fp8_ue8m0(const RadArgs*, RadStream);   /* tp8 loop P30o */
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
@@ -1069,6 +1070,7 @@ int r4d_shape_gated_had_quant_i8 (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_gdn_gated_norm_had_quant_i8(const RadParam*, int, int operand,
                                           RadOpdDesc*);
 int r4d_shape_quant_act_fp8      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_quant_act_fp8_ue8m0(const RadParam*, int, int operand, RadOpdDesc*);   /* tp8 loop P30o */
 int r4d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gated_quant_fp8    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rmsnorm_had_quant_i8g (const RadParam*, int, int operand, RadOpdDesc*);

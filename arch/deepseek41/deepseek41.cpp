@@ -526,6 +526,8 @@ struct IqrQOp {
     std::vector<rad_buf> psrc;
     std::vector<char>    pcol;
     int64_t pk = 0, apitch = 0;
+    /* tp8 loop P30o: the pair's K elements a scale (32 for the release's block FP8, else RAD_FP8_BLOCK) */
+    int64_t grp = RAD_FP8_BLOCK;
 };
 
 /* Lever BI's tracer (RADIANCE_DS41_BITRACE=<dir>, ds41-bi 11.11.2026): a 64-bit fingerprint of every traced row of
@@ -664,6 +666,9 @@ struct Model {
     std::map<rad_weight, const char*>  wdt;
     std::map<rad_weight, uint32_t>     wcod;   /* codes' dtype: RAD_I8/RAD_U5 for IQR, F8E4M3 for fp8 */
     std::map<rad_weight, int64_t>      wrb;
+    /* tp8 loop P30o: an E4M3 weight with an E8M0 exponent per 32 x 32 block (the release's block FP8, a weight sidecar of the
+     * official dense bytes): its scale group along K (32); absent = RAD_FP8_BLOCK */
+    std::map<rad_weight, int64_t>      wgrp;
     /* The quantiser each dense GEMM waits for (linear()): the op and the K its pair was declared at. */
     std::map<rad_op, IqrQOp>           qops;
     rad_buf iqr_q8 = 0, iqr_s8 = 0;   /* [max_tok, widest K] i8; [max_tok, widest K / 128] f32 */
@@ -675,6 +680,11 @@ struct Model {
     /* tp8 loop P30f: the IQR attention_output_a groups' own [max_tok, o_rank] outputs, one a group, shared by the layers */
     std::vector<rad_buf> oa_g;
     int oa_said = 0;
+    /* tp8 loop P30o: the fp8 activation pair the release's block-FP8 linears read (quant_act_fp8_ue8m0: E4M3 codes, a power-of-two
+     * f32 scale per 32 of K) -- [max_tok, the hidden width] and [max_tok, width / 32], declared at the first such linear; a wider
+     * one (the Engram kv) beside it */
+    rad_buf f8_q = 0, f8_s = 0, f8_qw = 0, f8_sw = 0;
+    int64_t f8_qkw = 0;
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
@@ -1011,6 +1021,45 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
     const bool known = weight_enc(b, name, &e);
     const char* ty = known ? ggml_type_of(e, &blk) : nullptr;
     const bool split = m.g.world > 1 && shard != RAD_SHARD_NONE;
+    /* tp8 loop P30o: the release's block FP8 (a sidecar of the official dense bytes: affine {codes fp8_e4m3 [1x1], scale e8m0
+     * [32x32]}, what rad-convert's importer gives DeepSeek-V4's E4M3 linears): the codes as stored and the E8M0 block exponents,
+     * read by gemm_nt_q dtype fp8a8e8 after quant_act_fp8_ue8m0 (the release's act_quant(x, 32, 'ue8m0')). A rank's span must
+     * be whole 32-blocks on the split axis. */
+    if (!ty && known && rad_enc_is(&e, "affine") && e.n_planes == 2 && e.plane[0].dtype == RAD_F8E4M3) {
+        const RadEncPlane* sp = rad_enc_plane(&e, "scale");
+        if (sp && sp->dtype == RAD_E8M0 && sp->block[0] == 32 && sp->block[1] == 32) {
+            const int64_t G = 32;
+            if (n % G || k % G || (split && (lo % G || hi % G))) {
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30o: %s is fp8_e4m3*e8m0[32x32]; this rank reads %lldx%lld%s, "
+                                "which cuts a 32 x 32 scale block\n", name, (long long)n, (long long)k,
+                        split ? " of a slice" : "");
+                return 0;
+            }
+            std::string base(name);
+            if (base.size() > 6 && base.compare(base.size() - 6, 6, ".weight") == 0) base.resize(base.size() - 6);
+            const char* sn = m.nm.f("%s.scale", base.c_str());
+            const rad_weight w = decl_view(b, name, nullptr, "codes", RAD_F8E4M3, { n, k }, access,
+                                           split ? shard : RAD_SHARD_NONE, grp);
+            const rad_weight ws = decl_view(b, sn, name, "scale", RAD_E8M0, { n / G, k / G }, access,
+                                            split ? shard : RAD_SHARD_NONE, grp);
+            if (!w || !ws) {
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30o: block-FP8 weight %s refused\n", name);
+                return 0;
+            }
+            if (split && (rad_weight_shard_span(b, w, lo, hi) != RAD_OK ||
+                          rad_weight_shard_span(b, ws, lo / G, hi / G) != RAD_OK)) {
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30o: %s's span [%lld, %lld) refused\n", name,
+                        (long long)lo, (long long)hi);
+                return 0;
+            }
+            m.wsc[w] = ws;
+            m.wcod[w] = RAD_F8E4M3;
+            m.wdt[w] = "fp8a8e8";
+            m.wrb[w] = 0;
+            m.wgrp[w] = G;
+            return w;
+        }
+    }
     /* A container written in lane order: its bytes are already the GEMM's stored form. */
     if (known && rad_enc_is(&e, "stored")) {
         std::string base(name);
@@ -1123,18 +1172,25 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
 /* y = x . w^T over lw()'s weight: for a GGUF block it is gemm_nt_ggml, for an IQR view gemm_nt_q
  * at the weight's code dtype over a rotated int8 activation pair, otherwise gemm_nt at bf16. */
 /* An IQR linear's quantiser over n columns of x into the pair (q8, s8). */
+static int64_t iqr_grp(const Model& m, rad_weight w) {
+    const auto g = m.wgrp.find(w);
+    return g == m.wgrp.end() ? (int64_t)RAD_FP8_BLOCK : g->second;
+}
+static bool iqr_fp8(const Model& m, rad_weight w) { return std::strcmp(m.wdt.at(w), "fp8a8e8") == 0; }
 static rad_op iqr_quant(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n, rad_buf x,
                         rad_buf q8, rad_buf s8) {
-    const bool rot = std::strcmp(m.wdt.at(w), "i8a8") != 0;
-    return op(b, rot ? "had_quant_act_i8g" : "quant_act_i8g",
-              { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16") },
+    /* tp8 loop P30o: the release's block FP8 reads the release's act_quant */
+    const bool f8 = iqr_fp8(m, w);
+    const bool rot = !f8 && std::strcmp(m.wdt.at(w), "i8a8") != 0;
+    return op(b, f8 ? "quant_act_fp8_ue8m0" : rot ? "had_quant_act_i8g" : "quant_act_i8g",
+              { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("group", iqr_grp(m, w)), RAD_STR("dtype", "bf16") },
               {}, { x }, { q8, s8 });
 }
 /* An IQR linear's GEMM over the pair (q8, s8) into y. */
 static rad_op iqr_gemm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n, int64_t k,
                        rad_buf q8, rad_buf s8, rad_buf y) {
     std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k),
-                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", m.wdt.at(w)) };
+                                 RAD_INT("group", iqr_grp(m, w)), RAD_STR("dtype", m.wdt.at(w)) };
     const int64_t wrb = m.wrb.at(w);
     if (wrb > 1) ps.push_back(RAD_INT("w_rb", wrb));
     std::vector<rad_weight> wts = { w, m.wsc.at(w) };
@@ -1144,7 +1200,29 @@ static rad_op iqr_gemm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w
  * Engram kv: K = ple_heads x ple_dim = 6144 > 5120) its own pair, declared at the first such linear. Before P30f a wider
  * linear sliced k columns out of the hidden-width pair: rows of a [rows, k] view at the pair's pitch overlap (a silent
  * defect, never served: the 2.25 file's dense are GGUF). False: refused. */
-static bool iqr_pair(RadBuilder* b, Model& m, int64_t k, rad_buf* q8, rad_buf* s8) {
+static bool iqr_pair(RadBuilder* b, Model& m, int64_t k, rad_buf* q8, rad_buf* s8, rad_weight w = 0) {
+    if (w && iqr_fp8(m, w)) {   /* tp8 loop P30o: the fp8 pair, at the hidden width or wider */
+        const int64_t G = iqr_grp(m, w);
+        const bool wide = k > m.iqr_qk;
+        rad_buf& q = wide ? m.f8_qw : m.f8_q;
+        rad_buf& s = wide ? m.f8_sw : m.f8_s;
+        if (!q) {
+            const int64_t wk = wide ? k : m.iqr_qk;
+            q = decl_b(b, m.nm.f(wide ? "f8_q_wide" : "f8_q"), RAD_F8E4M3, { m.g.max_tok, wk });
+            s = decl_b(b, m.nm.f(wide ? "f8_s_wide" : "f8_s"), RAD_F32, { m.g.max_tok, (wk + G - 1) / G });
+            if (wide) m.f8_qkw = k;
+            if (m.g.rank == 0)
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30o: the release's block-FP8 linears read an fp8 activation pair "
+                                "%lld wide (E4M3 + a power-of-two scale a %lld)\n", (long long)wk, (long long)G);
+        }
+        if (!q || !s || (wide && k > m.f8_qkw)) {
+            fprintf(stderr, "radiance: deepseek41: tp8 loop P30o: no fp8 activation pair for a linear of K %lld\n", (long long)k);
+            return false;
+        }
+        *q8 = q;
+        *s8 = s;
+        return true;
+    }
     if (k <= m.iqr_qk) {
         *q8 = m.iqr_q8;
         *s8 = m.iqr_s8;
@@ -1172,7 +1250,7 @@ static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_
     const auto s = m.wsc.find(w);
     if (s != m.wsc.end()) {
         rad_buf q8 = 0, s8 = 0;
-        if (!iqr_pair(b, m, k, &q8, &s8)) return 0;
+        if (!iqr_pair(b, m, k, &q8, &s8, w)) return 0;
         const rad_op qop = iqr_quant(b, m, rows, w, k, x, q8, s8);
         const rad_op h = iqr_gemm(b, m, rows, w, n, k, q8, s8, y);
         if (qop && h) {
@@ -1181,6 +1259,7 @@ static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_
             e.K = k;
             e.q8 = q8;
             e.s8 = s8;
+            e.grp = iqr_grp(m, w);
             m.qops[h] = e;
         }
         return h;
@@ -1207,8 +1286,9 @@ static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a,
         const IqrQOp& e = q->second;
         const int64_t K = e.K;
         const rad_buf pq = e.q8 ? e.q8 : m.iqr_q8, ps = e.s8 ? e.s8 : m.iqr_s8;
+        const int64_t G = e.grp > 0 ? e.grp : (int64_t)RAD_FP8_BLOCK;   /* tp8 loop P30o: 32 for the release's block FP8 */
         const RadOperand q8 = bcol(pq, 0, K, rows);
-        const RadOperand s8 = bcol(ps, 0, K / RAD_FP8_BLOCK, rows);
+        const RadOperand s8 = bcol(ps, 0, K / G, rows);
         if (!e.parts.empty()) {
             /* tp8 loop P30f: o_b over IQR attention_output_a groups -- each group's quantiser over its own columns of
              * the pair, at the rows `a` names (a row view of attn_o_lora: the row offset is read off it) */
@@ -1216,12 +1296,12 @@ static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a,
                 rad_step_fail(x, "deepseek41: tp8 loop P30f: o_b's grouped quantiser takes a row view of attn_o_lora");
                 return;
             }
-            const int64_t r0 = a.offset / e.apitch, pk = e.pk, pb = pk / RAD_FP8_BLOCK;
+            const int64_t r0 = a.offset / e.apitch, pk = e.pk, pb = pk / G;
             for (size_t j = 0; j < e.parts.size(); ++j) {
                 const int64_t c0 = (int64_t)j * pk;
                 const RadOperand src = e.pcol[j] ? bcol_at(e.psrc[j], r0, e.apitch, c0, pk, rows)
                                      : r0 ? brow_slice(e.psrc[j], r0, rows, pk) : brows(e.psrc[j], rows);
-                RAD_ISSUE_N(x, e.parts[j], rows, src, bcol(pq, c0, pk, rows), bcol(ps, c0 / RAD_FP8_BLOCK, pb, rows));
+                RAD_ISSUE_N(x, e.parts[j], rows, src, bcol(pq, c0, pk, rows), bcol(ps, c0 / G, pb, rows));
             }
         } else {
             RAD_ISSUE_N(x, e.op, rows, a, q8, s8);
@@ -1246,17 +1326,18 @@ static rad_op linear_oab(RadBuilder* b, Model& m, const Layer& L, int64_t rows, 
                         "attention_output_b is not (it reads the groups' concatenation): give both in the sidecar\n", L.l);
         return 0;
     }
-    if (gk % RAD_FP8_BLOCK || (int64_t)L.oa_dst.size() * gk != k) {
+    if (gk % iqr_grp(m, w) || (int64_t)L.oa_dst.size() * gk != k) {
         fprintf(stderr, "radiance: deepseek41: tp8 loop P30f: layer %d's o_b over %zu groups of %lld columns (K %lld) "
                         "cannot quantise a group at a time\n", L.l, L.oa_dst.size(), (long long)gk, (long long)k);
         return 0;
     }
     rad_buf q8 = 0, s8 = 0;
-    if (!iqr_pair(b, m, k, &q8, &s8)) return 0;
+    if (!iqr_pair(b, m, k, &q8, &s8, w)) return 0;
     IqrQOp e;
     e.K = k;
     e.q8 = q8;
     e.s8 = s8;
+    e.grp = iqr_grp(m, w);
     e.pk = gk;
     e.apitch = k;
     for (size_t j = 0; j < L.oa_dst.size(); ++j) {

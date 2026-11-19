@@ -1984,6 +1984,21 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* tp8 loop P30o: quant_act_fp8_ue8m0 -- the fp8 pair at group 32 (the release's act_quant) */
+extern "C" int r4d_shape_quant_act_fp8_ue8m0(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 32);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g != 32 || n % 32) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, n / g),
+    };
+    R4D_PICK(l);
+}
+
 /* The QSA work list. `M` is the token count and `work` the block bound: two different extents,
  * hence two parameters. */
 extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

@@ -2118,6 +2118,7 @@ TEST(op_vocabulary) {
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
+        "quant_act_fp8_ue8m0",   /* tp8 loop P30o: DeepSeek-V4's released act_quant (ue8m0) */
         "had_quant_act_i8g",
         "gram_accum",
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
@@ -11571,6 +11572,7 @@ std::vector<Geo> geometries() {
         G("quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("quant_act_fp8_ue8m0", "M", 3, a.i("M", R).i("n", 64).i("group", 32).s("dtype", "f32")),   /* tp8 loop P30o */
         G("quant_cols_fp8", "M", 3, a.i("M", R).i("n", 32).s("dtype", "f32")),
         G("had_quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
@@ -12730,4 +12732,85 @@ TEST(op_sam_attn_refuses_malformed_geometry) {
           .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
           .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
     CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
+}
+
+/* tp8 loop P30o: DeepSeek-V4's released dense arithmetic (inference/model.py linear() at fp8_block_size 32, kernel.py act_quant /
+ * fp8_gemm), replicated here from the release's code and held to libref byte for byte:
+ *   act_quant(x, 32, 'ue8m0'): per (row, 32) amax = max(|x|, 1e-4) in f32, s = 2^ceil(log2(amax * f32(1/448))) from the IEEE bits
+ *   (fast_round_scale), q = E4M3(clamp(x / s, +-448));
+ *   fp8_gemm(block 32): per K block of 32 a fresh f32 sum of the code products, C += sum * sa[row] * sb[block], over the blocks in
+ *   order; C rounded to bf16 once.
+ * quant_act_fp8_ue8m0 is the first, gemm_nt_q dtype fp8a8e8 (an E8M0 exponent per 32 x 32 weight block) the second. Shapes: K 256
+ * (8 blocks), N 64 (2 weight-block rows), M 5 with a zero row (the 1e-4 floor), a row of large and one of tiny magnitudes. */
+TEST(op_quant_act_fp8_ue8m0_and_gemm_fp8a8e8_are_the_release_arithmetic) {
+    const int64_t M = 5, K = 256, N = 64, G = 32, KB = K / G, NB = (N + G - 1) / G;
+    auto pow2ceil = [](float v) {   /* kernel.py fast_round_scale: fast_pow2(fast_log2_ceil(v)) */
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        const int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) ? 1 : 0);
+        const uint32_t r = (uint32_t)(e + 127) << 23;
+        float f;
+        std::memcpy(&f, &r, 4);
+        return f;
+    };
+    uint32_t seed = 0x30a0u;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (float)((seed >> 8) & 0xffff) / 65536.0f * 2.0f - 1.0f; };
+    T x(RAD_BF16, {M, K});
+    std::vector<float> xv((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t k = 0; k < K; ++k) {
+            const float mag = m == 2 ? 0.0f : m == 3 ? 900.0f : m == 4 ? 1e-3f : 1.0f;
+            x.set(m * K + k, rnd() * mag);
+            xv[(size_t)(m * K + k)] = x.at(m * K + k);   /* the bf16 value */
+        }
+    T q(RAD_F8E4M3, {M, K}), sc(RAD_F32, {M, KB});
+    A qa; qa.t(x).t(q).t(sc).i("M", M).i("n", K).i("group", G).s("dtype", "bf16");
+    REQUIRE_EQ(run("quant_act_fp8_ue8m0", qa), RAD_OK);
+    int qdiff = 0, sdiff = 0;
+    std::vector<float> sref((size_t)(M * KB));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t b = 0; b < KB; ++b) {
+            float amax = 0.0f;
+            for (int64_t i = 0; i < G; ++i) amax = std::max(amax, std::fabs(xv[(size_t)(m * K + b * G + i)]));
+            amax = std::max(amax, 1e-4f);
+            const float s = pow2ceil(amax * (1.0f / 448.0f));
+            sref[(size_t)(m * KB + b)] = s;
+            sdiff += sc.at(m * KB + b) != s;
+            for (int64_t i = 0; i < G; ++i) {
+                const float v = std::min(std::max(xv[(size_t)(m * K + b * G + i)] / s, -448.0f), 448.0f);
+                qdiff += q.mem[(size_t)(m * K + b * G + i)] != rad_f32_to_fp8e4m3(v);
+            }
+        }
+    CHECK_EQ(qdiff, 0);
+    CHECK_EQ(sdiff, 0);
+    CHECK_EQ(sc.at(2 * KB), pow2ceil(1e-4f * (1.0f / 448.0f)));   /* the zero row: the floor's scale, not 1 */
+    /* the weight: E4M3 codes (no NaN byte) and an E8M0 exponent a 32 x 32 block */
+    T w(RAD_F8E4M3, {N, K}), ws(RAD_E8M0, {NB, KB});
+    for (int64_t i = 0; i < N * K; ++i) {
+        uint8_t c = (uint8_t)(rnd() * 127.0f + 128.0f);
+        if ((c & 0x7f) == 0x7f) c ^= 1;
+        w.mem[(size_t)i] = c;
+    }
+    for (int64_t i = 0; i < NB * KB; ++i) ws.mem[(size_t)i] = (uint8_t)(118 + (i * 7) % 17);   /* 2^-9 .. 2^7 */
+    T y(RAD_BF16, {M, N});
+    A ga; ga.t(q).t(sc).t(w).t(ws).t(y).tnull().tnull()
+            .i("M", M).i("N", N).i("K", K).i("group", G).s("dtype", "fp8a8e8");
+    REQUIRE_EQ(run("gemm_nt_q", ga), RAD_OK);
+    int ydiff = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t b = 0; b < KB; ++b) {
+                float sub = 0.0f;
+                for (int64_t i = 0; i < G; ++i)
+                    sub += rad_fp8e4m3_to_f32(q.mem[(size_t)(m * K + b * G + i)]) *
+                           rad_fp8e4m3_to_f32(w.mem[(size_t)(n * K + b * G + i)]);
+                const float sb = std::ldexp(1.0f, (int)ws.mem[(size_t)((n / G) * KB + b)] - 127);
+                acc += sub * sref[(size_t)(m * KB + b)] * sb;
+            }
+            T one(RAD_BF16, {1});
+            one.set(0, acc);
+            ydiff += std::memcmp(&y.mem[(size_t)((m * N + n) * 2)], one.mem.data(), 2) != 0;
+        }
+    CHECK_EQ(ydiff, 0);
 }

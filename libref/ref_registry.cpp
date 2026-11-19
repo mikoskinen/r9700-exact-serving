@@ -1539,6 +1539,13 @@ static const RadOpSchema kSchemas[] = {
   "scale shaped [M, ceil(n/group)] in f32. An all-zero group gets scale 1, not scale 0: the GEMM "
   "multiplies this scale by the weight's block scale, and a zero here would erase that one. Rows "
   "are dim 0, so a rank-3 activation is one row per token and not one per head." },
+/* tp8 loop P30o: DeepSeek-V4's released activation quantiser (inference/kernel.py act_quant, scale_fmt ue8m0). */
+{ "quant_act_fp8_ue8m0", ARR(pQuant), ARR(oQuantFp8),
+  "E4M3 per group of `group` contiguous elements with a POWER-OF-TWO scale (DeepSeek-V4's released "
+  "act_quant(x, group, 'ue8m0')): amax = max(|x|, 1e-4) in f32, scale = the power of two at or above "
+  "amax * f32(1/448) (ceil(log2) from the product's IEEE bits), q = clamp(x / scale, +-448) rounded "
+  "to nearest even; scale [M, ceil(n/group)] in f32 (the value the release stores as an e8m0 byte). "
+  "Rows are dim 0." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols),
   "E4M3 codes with one scale per column over all M rows: scale[c] = amax_r |x[r, c]| / 448 (1 for "
   "an all-zero column), y = clamp(x / scale, +-448). An attention's values for its fp8 P.V, where "
@@ -2723,6 +2730,9 @@ SIMPLE("ref_quant_act_i8g", "quant_act_i8g", "quant",
        "float in, i8 out, f32 scale", ref_quant_act_i8g),
 SIMPLE("ref_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale", ref_quant_act_fp8),
+SIMPLE("ref_quant_act_fp8_ue8m0", "quant_act_fp8_ue8m0", "quant",
+       "E4M3 quantiser with a power-of-two scale (DeepSeek-V4's released act_quant, ue8m0)",
+       "float in, fp8_e4m3 out, f32 power-of-two scale", ref_quant_act_fp8_ue8m0),
 SIMPLE("ref_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per column",
        "float in, fp8_e4m3 out, f32 scale", ref_quant_cols_fp8),
 /* The fused fp8 forms, so a host-backend run can start on an fp8 model (see ref_quant.cpp). */
