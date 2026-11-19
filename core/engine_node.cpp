@@ -206,9 +206,10 @@ const std::vector<std::string>& node_own_options() {
 
 /* RADIANCE_* settings that are each node's own. */
 bool node_own_env(const std::string& k) {
+    /* tp8 loop F66: RADIANCE_KV_PLACED(_TEST_MIB) sizes this node's own KV pool; the agreement after it is both nodes' */
     static const char* own[] = { "RADIANCE_PP_", "RADIANCE_HOST_DEVICES", "RADIANCE_HOST_VRAM_MIB",
                                  "RADIANCE_HOME", "RADIANCE_IMAGE_ID", "RADIANCE_DUMP_", "RADIANCE_LOG",
-                                 "RADIANCE_PROFILE" };
+                                 "RADIANCE_PROFILE", "RADIANCE_KV_PLACED" };
     for (const char* o : own)
         if (k.rfind(o, 0) == 0) return true;
     /* tp8 loop D20 (loop FINDINGS F57): the leader's drafter knobs, whole keys (the follower declares no drafter: deepseek41

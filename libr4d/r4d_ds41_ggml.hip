@@ -4555,11 +4555,12 @@ void r4d_mix_fin_set(int v);
  * rule takes form 4 (0 = the rule, N = form N - 1); every form the same bytes. RADIANCE_DS41_ATTN_DEC=N at load. */
 extern "C" int r4d_attn_dec_sw_get();
 extern "C" int r4d_attn_dec_sw_set(int v);
+extern "C" int r4d_attn_dec_sw_known(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 9 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27) */
-    if (!std::strcmp(name, "ds41_attn_dec")) return value >= 0 && value <= 7 ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys */
+    if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;

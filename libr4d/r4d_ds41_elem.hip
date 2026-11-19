@@ -1825,15 +1825,21 @@ int router_scored_scatter_body(const RadArgs* a, RadStream stream) {
  * Decode band only (M <= 48: the forms below), DeepSeek's sqrtsoftplus score, <= 384 experts. */
 constexpr int kRgsMaxRows = 48;
 
-template <int R, int C, int U, typename WT, int OWN, int SCORE, uint32_t NW, bool INV>
+/* tp8 loop D28 (DECODE round 22): RW > 1 = a 2-D wave map -- a workgroup's NW waves are RW row groups x NW / RW expert groups
+ * (wave w: expert group w % (NW / RW), row group w / (NW / RW)), so a workgroup covers R RW rows x C NW / RW experts and every
+ * weight row is read by ceil(M / (R RW)) workgroups instead of ceil(M / R) (at 48 rows, R 4: 3 instead of 12). Which wave of
+ * which workgroup forms a logit changes none of its arithmetic (tile_wave's note): the stock bytes. RW 1 = today's map. */
+template <int R, int C, int U, typename WT, int OWN, int SCORE, uint32_t NW, bool INV, int RW = 1>
 __global__ __launch_bounds__(NW * 32) void router_gemm_scored_scatter_kernel(
     const uint16_t* x, long xp, const WT* wt, long wtp, float* lg, long lp, int m, int ne, int K,
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
     r4d_moesort::Protect prot, unsigned* ctr) {
+    static_assert(RW >= 1 && NW % RW == 0, "the 2-D map's row groups divide the waves");
+    constexpr int CW = (int)NW / RW;   /* expert groups a workgroup */
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
-    const int c0 = ((int)blockIdx.x * (int)NW + wave) * C, r0 = (int)blockIdx.y * R;
-    if (c0 < ne) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
+    const int c0 = ((int)blockIdx.x * CW + wave % CW) * C, r0 = ((int)blockIdx.y * RW + wave / CW) * R;
+    if (c0 < ne && r0 < m) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
     __shared__ unsigned s_last;
     __threadfence();   // this workgroup's logits, device-wide, before its arrival
     __syncthreads();
@@ -1894,6 +1900,17 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
              (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
              factor, base, prot, ctr)
 #define RGS_I(R, C, U, NW) (inv ? RGS_L(R, C, U, NW, true) : RGS_L(R, C, U, NW, false))
+    /* tp8 loop D28: the 2-D map's forms (RW row groups a workgroup; RGS_L's arguments, the grid by C NW / RW experts and R RW rows) */
+#define RGS_L2(R, C, U, NW, RW, INV)                                                                              \
+    R4D_EMIT(stream, (router_gemm_scored_scatter_kernel<R, C, U, WT, 12, SCORE, NW, INV, RW>),                   \
+             dim3((unsigned)((ne + ((NW) / (RW)) * (C) - 1) / (((NW) / (RW)) * (C))),                            \
+                  (unsigned)((m + (R) * (RW) - 1) / ((R) * (RW)))),                                               \
+             dim3((NW) * 32), 0, (const uint16_t*)x.data, (long)x.stride[0], (const WT*)w.data, (long)w.stride[0],  \
+             (float*)lg.data, (long)lg.stride[0], m, ne, K, (const float*)bias.data, (long)bias.stride[0],         \
+             (int32_t*)ids.data, (long)ids.stride[0], (float*)wts.data, (long)wts.stride[0], (int32_t*)sorted.data, \
+             (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
+             factor, base, prot, ctr)
+#define RGS_I2(R, C, U, NW, RW) (inv ? RGS_L2(R, C, U, NW, RW, true) : RGS_L2(R, C, U, NW, RW, false))
     /* lever SPD-F (ds41-etp-spd, r4d_ds41_f32pf.h): ds41_f32dec's form -- the tile R x C a wave (U steps of k) and the
      * waves a workgroup NW (the tail's waves too: a row a wave, wrapping; the sort's result does not depend on NW).
      * Which wave of which workgroup forms a logit changes none of its arithmetic: the stock bytes at every form. */
@@ -1912,12 +1929,21 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
         case 12: return RGS_I(4, 2, 16, 8u);
         case 13: return RGS_I(1, 4, 16, 8u);
         case 14: return RGS_I(2, 8, 16, 8u);
+        /* tp8 loop D28: form 8's 4 x 8 U8 tile in 2-D maps -- 15: 4 row groups x 4 expert groups (16 rows x 32 experts a
+         * workgroup), 16: form 3's 4 x 4 U8 at 4 x 4 (16 x 16), 17: 2 x 8 (8 rows x 64 experts), 18: 4 x 4 U8 at 8 waves as 2 x 4
+         * (8 rows x 16 experts) */
+        case 15: return RGS_I2(4, 8, 8, 16u, 4);
+        case 16: return RGS_I2(4, 4, 8, 16u, 4);
+        case 17: return RGS_I2(4, 8, 8, 16u, 2);
+        case 18: return RGS_I2(4, 4, 8, 8u, 2);
         default: break;
     }
     /* the stock gemm_f32_body's tile form for the height (2x2 with 16 steps up to 16 rows, 8x1 with 8 steps below
      * 64); the waves a workgroup router_scored_scatter_emit's (a wave a row up to 16 rows; 16 waves above, the rows
      * wrapping -- 32 would cap the GEMM's registers) */
     return m <= 8 ? RGS_I(2, 2, 16, 8u) : m <= 16 ? RGS_I(2, 2, 16, 16u) : RGS_I(8, 1, 8, 16u);
+#undef RGS_I2
+#undef RGS_L2
 #undef RGS_I
 #undef RGS_L
 }

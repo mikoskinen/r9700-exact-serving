@@ -22,10 +22,11 @@ using fuse::rnd;
 using fuse::time2;
 using fuse::up;
 
-struct RgsForm { int code, r, c, u, nw; };
+struct RgsForm { int code, r, c, u, nw, rw = 1; };   /* rw: tp8 loop D28's row groups a workgroup (the 2-D wave map) */
 static const RgsForm kRgs[] = { { 1, 8, 2, 8, 16 }, { 2, 8, 4, 8, 16 }, { 3, 4, 4, 8, 16 }, { 4, 4, 2, 8, 16 }, { 5, 2, 4, 16, 16 },
                                 { 6, 4, 4, 8, 8 },  { 7, 2, 4, 16, 8 }, { 8, 4, 8, 8, 16 }, { 9, 2, 2, 16, 8 }, { 10, 2, 2, 16, 16 },
-                                { 11, 8, 1, 8, 16 }, { 12, 4, 2, 16, 8 }, { 13, 1, 4, 16, 8 }, { 14, 2, 8, 16, 8 } };
+                                { 11, 8, 1, 8, 16 }, { 12, 4, 2, 16, 8 }, { 13, 1, 4, 16, 8 }, { 14, 2, 8, 16, 8 },
+                                { 15, 4, 8, 8, 16, 4 }, { 16, 4, 4, 8, 16, 4 }, { 17, 4, 8, 8, 16, 2 }, { 18, 4, 4, 8, 8, 2 } };
 static const int kGemm[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
 
 static void rgs_part(const Plugin& pl, void (*pin)(int, int)) {
@@ -115,9 +116,9 @@ static void rgs_part(const Plugin& pl, void (*pin)(int, int)) {
                         if (timed && same) {
                             double w = 0, c = 0;
                             time2([&]() { return f2->launch(&a1, nullptr); }, 200, &w, &c);
-                            std::printf("  SPDPERF rgs M=%lld form %2d (%dx%d U%d NW%d) warm %7.2f cold %7.2f us | stock warm %7.2f "
+                            std::printf("  SPDPERF rgs M=%lld form %2d (%dx%d U%d NW%d RW%d) warm %7.2f cold %7.2f us | stock warm %7.2f "
                                         "cold %7.2f us | %+6.2f / %+6.2f\n",
-                                        (long long)M, fm.code, fm.r, fm.c, fm.u, fm.nw, w, c, sw, sc, w - sw, c - sc);
+                                        (long long)M, fm.code, fm.r, fm.c, fm.u, fm.nw, fm.rw, w, c, sw, sc, w - sw, c - sc);
                         }
                     }
                     pin(-1, -1);

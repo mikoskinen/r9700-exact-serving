@@ -114,6 +114,64 @@ TEST(both_nodes_cap_before_the_carve_and_hold_the_same_blocks_in_every_group) {
     CHECK_EQ(lead.kv.loan_tokens(), 0);   /* no loan: nothing to recall */
 }
 
+/* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED=1), Engine::configure_kv's two moves in miniature: the leader's
+ * pool gives back what its card lost beside the budget before the count (Pool::resize, so it now binds), and
+ * the follower's pool, paging more than the agreed count, is made again at pool_mib_for_tokens(least) + 1 MiB
+ * (Engine::kv_placed_return) -- every group still holds the same blocks on both nodes, and no id the leader
+ * hands out lies past the follower's smaller pool. */
+TEST(a_trimmed_leader_binds_and_the_follower_returns_its_pages_past_the_agreed_count) {
+    constexpr int64_t MiB = 1ll << 20;
+    Node lead, fol;
+    REQUIRE(lead.plan(groups(false, true)) == RAD_OK);
+    REQUIRE(fol.plan(groups(true, false)) == RAD_OK);
+    REQUIRE_EQ(lead.pools.kv().resize(8 * MiB), RAD_OK);
+    REQUIRE_EQ(fol.pools.kv().resize(8 * MiB), RAD_OK);
+    const int64_t tl0 = lead.kv.paged_tokens(lead.pools.kv().avail());
+    const int64_t tf = fol.kv.paged_tokens(fol.pools.kv().avail());
+    CHECK(tf < tl0);                                         /* untrimmed, the follower would bind */
+    /* the leader's card lost 6 MiB beside the budget: its pool gives it back before the count */
+    REQUIRE_EQ(lead.pools.kv().resize(2 * MiB), RAD_OK);
+    const int64_t tl = lead.kv.paged_tokens(lead.pools.kv().avail());
+    fprintf(stderr, "    paged tokens: leader %lld (trimmed from %lld), follower %lld\n", (long long)tl, (long long)tl0,
+            (long long)tf);
+    CHECK(tl < tf);                                          /* now the leader binds */
+    const int64_t least = agree(tl, tf);
+    CHECK_EQ(least, tl);
+    /* the follower's pages past the agreed count go back to its card */
+    const int64_t have = fol.pools.kv().bytes() / MiB;
+    const int64_t need = fol.kv.pool_mib_for_tokens(least, have);
+    REQUIRE(need >= 0);
+    CHECK(need + 2 <= have);
+    REQUIRE_EQ(fol.pools.kv().resize((need + 1) * MiB), RAD_OK);
+    CHECK(fol.kv.paged_tokens(fol.pools.kv().avail()) >= least);
+    fprintf(stderr, "    the follower's pool %lld -> %lld MiB for the agreed %lld tokens\n", (long long)have,
+            (long long)(need + 1), (long long)least);
+    lead.kv.cap_paged_tokens(least);
+    fol.kv.cap_paged_tokens(least);
+    CHECK_OK(lead.kv.carve(lead.pools.kv()));
+    CHECK_OK(fol.kv.carve(fol.pools.kv()));
+    for (int32_t g : { G_R1, G_R2 }) {
+        CHECK_EQ(lead.kv.plan(g)->n_blocks, fol.kv.plan(g)->n_blocks);
+        CHECK(lead.kv.plan(g)->n_blocks > 0);
+    }
+    const int S = (int)lead.cfg.max_seqs;
+    std::vector<int64_t> len((size_t)S, 0);
+    for (int s = 0; s < S; ++s) REQUIRE(lead.kv.add_sequence((uint64_t)(100 + s)) >= 0);
+    int64_t total = 0, max_r2 = -1;
+    for (int round = 0, refused = 0; round < 100000 && refused < S; ++round) {
+        refused = 0;
+        for (int s = 0; s < S; ++s) {
+            const int64_t want = len[(size_t)s] + 129;
+            if (lead.kv.ensure((uint64_t)(100 + s), want) < 0) { ++refused; continue; }
+            total += want - len[(size_t)s];
+            len[(size_t)s] = want;
+            for (int32_t b : lead.kv.block_table((uint64_t)(100 + s), G_R2)) max_r2 = std::max<int64_t>(max_r2, b);
+        }
+    }
+    CHECK(total <= least);
+    CHECK(max_r2 < fol.kv.plan(G_R2)->n_blocks);
+}
+
 TEST(a_node_that_pages_nothing_itself_takes_the_other_nodes_count) {
     CHECK_EQ(agree(-1, 1354), 1354);
     CHECK_EQ(agree(4064, -1), 4064);

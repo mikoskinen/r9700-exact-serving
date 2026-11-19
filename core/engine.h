@@ -913,6 +913,19 @@ private:
      * checked against both. */
     int64_t  late_step_bytes_ = 0;
     int64_t  late_lazy_bytes_ = 0;
+    /* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED=1; core/mem/vram_budget.h kv_placed): each rank's card at
+     * the budget's reading -- its free VRAM, the engine's device bytes and live streams there
+     * (rad_dev_ledger_of), one hardware queue's bytes -- and the least free the split was sized on.
+     * configure_kv measures against it what the budget never saw (kvp_unseen_), and under the switch
+     * each KV pool gives it back before the agreement (kvp_trim_) and returns its pages past the agreed
+     * cap after it (kvp_back_). Unset: measured and printed on a pipeline node only, nothing moved. */
+    struct KvpRead { int64_t free = -1, dev_bytes = 0, streams = 0, queue_bytes = 0; };
+    std::vector<KvpRead> kvp_read_;
+    int64_t kvp_least_free_ = -1;
+    int64_t kvp_claimable_ = -1;   /* the budget's claimable: what the split left beside its pools is spare too */
+    std::vector<int64_t> kvp_unseen_, kvp_trim_, kvp_back_;
+    int kv_placed_measure();
+    int kv_placed_return(size_t ri, int64_t least);
     /* Linear-state snapshot store: pinned host memory, --checkpoint-slots slots, each holding every
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */

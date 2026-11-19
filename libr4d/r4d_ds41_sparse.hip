@@ -3434,6 +3434,20 @@ int attn_dec_go(RadStream stream, const DsAttnArgsT<ORT>& s) {
     return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, false, ORT>), grid, dim3(NT), (uint32_t)lds, s);
 }
 
+/* tp8 loop D26 step 2: a form for the plain latent alone (bf16 window and latent: the trunk's served gathered pass, DKV-G's cnv 0)
+ * -- the packed / fp8-window twins' PV fences take at most four sums a thread (HPT DPT <= 4), so 8 heads at 512 threads (HPT 4)
+ * has none; a pass the form does not take (packed, fp8 window, LDS) falls to the rule's next form. */
+template <int HG, int NT, int DPT, bool PVD, bool ORT = false>
+int attn_dec_go_plain(RadStream stream, const DsAttnArgsT<ORT>& s) {
+    constexpr int P = 4;
+    if (s.cnv || s.wf8) return RAD_E_UNSUPPORTED;
+    const int nkq = (s.nk + 31) / 32 * 32;
+    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT, false).total;
+    if (lds > 65536) return RAD_E_UNSUPPORTED;
+    const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, false, ORT>), grid, dim3(NT), (uint32_t)lds, s);
+}
+
 /* The decode band's kernel. The form by how many (row, head) pairs the pass has, any choice giving
  * the same bits (measured on R9700, 32 heads x 640 keys: one row 17 us, 2 rows 27, 3-4 rows 44,
  * 5-8 rows 73, 48 rows 367; the scalar kernel 129-582). On an LDS refusal (long rows), the next
@@ -3547,7 +3561,9 @@ int nv_gather(RadStream stream, const RadArgs* ra, const A& s, A* g) {
 std::atomic<int> g_dec_pin{-1};
 std::atomic<int> g_dec_wqa{1};   /* lever WQ-A on (bench: r4d_attn_wqa(0) = the old rule) */
 /* tp8 loop D26 (DECODE round 22, 19.11.2026): libr4d's fn4 ds41_attn_dec (RADIANCE_DS41_ATTN_DEC=N at load; -1 = not read
- * yet) -- 0 = the rule; N = 1 .. 7 = form N - 1 at the passes of more than kDecSwKeys keys a row (the trunk's compressed layers:
+ * yet) -- 0 = the rule; N = 1 .. 9 = form N - 1 (7 / 8: the 512-thread direct forms, step 2), or TU = 10 .. 99 = form U - 1 at
+ * <= 32 rows and form T - 1 above (a 0 digit = the rule there; the per-workgroup latency and the workgroup count favour other
+ * forms at c16's 24 rows than at c32's 48: one start A/Bs the split) at the passes of more than kDecSwKeys keys a row (the trunk's compressed layers:
  * window 128 + top-k 512 = 640 keys) where the rule takes form 4 (> 256 row-head pairs: at 16 heads a rank the 24-row lanes of
  * c16 and the 48-row lanes of c32, and the band-64 passes of depth 3). Why (M lq167, follower card 0, c32 48-row full lane step):
  * ds41_attn_dec <8, 512> is 4,376 us = 11 % of the 39.5-ms busy, ~199 us a call over 22 layers, ~4x its bytes floor; form 4 runs
@@ -3561,12 +3577,15 @@ int dec_sw_now() {
     int v = g_dec_sw.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_ATTN_DEC");
-        const int want = e && e[0] >= '0' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0;
+        char* end = nullptr;
+        const long x = e && *e ? std::strtol(e, &end, 10) : 0;
+        const int want = e && *e && end && !*end && x >= 0 && x <= 99 ? (int)x : 0;   /* 0 .. 9, or the height split TU (D26) */
         int unread = -1;
         if (g_dec_sw.compare_exchange_strong(unread, want) && want >= 1)
             std::fprintf(stderr, "radiance: libr4d: tp8 loop D26 (ds41_attn_dec %d, RADIANCE_DS41_ATTN_DEC): the decode band's "
-                                 "attention at > %d keys a row and > 256 row-head pairs in form %d (the rule's 4 elsewhere)\n",
-                         want, kDecSwKeys, want - 1);
+                                 "attention at > %d keys a row and > 256 row-head pairs: form code %d (N <= 9: form N - 1; TU: form U - 1 "
+                                 "at <= 32 rows, T - 1 above, 0 = the rule's 4)\n",
+                         want, kDecSwKeys, want);
         v = g_dec_sw.load(std::memory_order_relaxed);
     }
     return v;
@@ -3607,14 +3626,22 @@ int attn_dec_emit(RadStream stream, const DsAttnArgsT<ORT>& s) {
         else if (hr <= 128) c = 6;
     }
     if (c == 4 && s.nk > kDecSwKeys) {   /* tp8 loop D26: fn4 ds41_attn_dec (0 = the rule) */
+        /* N = 1 .. 9: form N - 1 at every such pass; TU = 10 .. 99 (the height split): form U - 1 at <= 32 rows (c16's 24-row
+         * lanes), form T - 1 above (c32's 48-row lanes, the band-64 depth-3 passes), a 0 digit = the rule's form 4 there */
         const int v = dec_sw_now();
-        if (v >= 1 && v <= 7 && v - 1 != 4) {
-            c = v - 1;
+        const int d = v <= 9 ? v : (s.M <= 32 ? v % 10 : v / 10);
+        if (d >= 1 && d <= 9 && d - 1 != 4) {
+            c = d - 1;
             g_dec_sw_calls.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (const int pin = g_dec_pin.load(std::memory_order_relaxed); pin >= 0 && pin <= 6) c = pin;   /* bench pin */
-    static const int next[7] = { -1, 0, 1, 2, 5, 6, 1 };
+    if (const int pin = g_dec_pin.load(std::memory_order_relaxed); pin >= 0 && pin <= 8) c = pin;   /* bench pin */
+    /* tp8 loop D26 step 2 (DECODE round 22): forms 7 / 8 = the direct PV (keys read from global in the PV, no tile barriers) at 512
+     * threads with 8 / 4 heads a workgroup -- the 1024-thread direct forms take a whole WGP each (32 waves at <= 9 waves a SIMD),
+     * the 512-thread tiled forms walk 80 tiles behind a barrier each at 640 keys; reached only by the bench pin and fn4
+     * ds41_attn_dec 8 / 9, over the plain latent only (attn_dec_go_plain; a packed / fp8-window pass falls to 3 / 2). The same
+     * per-output order as every form (the direct PV's walk = forms 0-3's): the same bytes. */
+    static const int next[9] = { -1, 0, 1, 2, 5, 6, 1, 3, 2 };
     while (c >= 0) {
         int rc = RAD_E_UNSUPPORTED;
         switch (c) {
@@ -3625,6 +3652,8 @@ int attn_dec_emit(RadStream stream, const DsAttnArgsT<ORT>& s) {
             case 4: rc = attn_dec_go<8, 512, 2, false, ORT>(stream, s); break;
             case 5: rc = attn_dec_go<4, 512, 2, false, ORT>(stream, s); break;
             case 6: rc = attn_dec_go<2, 512, 2, false, ORT>(stream, s); break;
+            case 7: rc = attn_dec_go_plain<8, 512, 2, true, ORT>(stream, s); break;
+            case 8: rc = attn_dec_go_plain<4, 512, 2, true, ORT>(stream, s); break;
             default: break;
         }
         if (rc != RAD_E_UNSUPPORTED) return rc;
@@ -4105,8 +4134,9 @@ extern "C" void r4d_attn_wqa(int on) { g_dec_wqa.store(on, std::memory_order_rel
 /* tp8 loop D26: fn4 ds41_attn_dec's state (r4d_ds41_ggml.hip's rad_fn4_*; the r4d_emu test sets it directly) and how many
  * launches it moved off form 4 (cumulative, every rank). */
 extern "C" int r4d_attn_dec_sw_get() { return dec_sw_now(); }
+extern "C" int r4d_attn_dec_sw_known(int v) { return v >= 0 && v <= 99 ? 1 : 0; }   /* 8 / 9: forms 7 / 8 (D26 step 2); 10 .. 99 the height split TU */
 extern "C" int r4d_attn_dec_sw_set(int v) {
-    if (v < 0 || v > 7) return -1;
+    if (!r4d_attn_dec_sw_known(v)) return -1;
     g_dec_sw.store(v, std::memory_order_relaxed);
     return 1;
 }

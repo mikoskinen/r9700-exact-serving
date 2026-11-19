@@ -418,9 +418,9 @@
  *                   _rope_roundtrip and their gathered / unpacked forms, ds41_attn_dec_kernel) at the passes of more than 256
  *                   keys a row (the compressed layers: window 128 + top-k 512) where the rule takes form 4 (8 heads a
  *                   workgroup, 512 threads, tiled PV: more than 256 row-head pairs, i.e. c16 / c32's 24 / 48-row passes at 16
- *                   heads a rank) -- 0 = the rule (today), N = 1 .. 7 = form N - 1 there (0 .. 3 direct PV at 1024 threads
- *                   with 1 / 2 / 4 / 8 heads a workgroup, 4 .. 6 tiled at 512 threads with 8 / 4 / 2; a form the LDS refuses
- *                   takes the rule's next form). Every form sums each output in the same order: the same bytes (r4d_emu
+ *                   heads a rank) -- 0 = the rule (today), N = 1 .. 9 = form N - 1 there (0 .. 3 direct PV at 1024 threads
+ *                   with 1 / 2 / 4 / 8 heads a workgroup, 4 .. 6 tiled at 512 threads with 8 / 4 / 2, 7 / 8 direct PV at 512
+ *                   threads with 8 / 4; a form the LDS refuses takes the rule's next form). Every form sums each output in the same order: the same bytes (r4d_emu
  *                   test_ds41attn's D26 case). RADIANCE_DS41_ATTN_DEC=N starts at N. -1 when no loaded object serves it.
  *   ds41_sphc       deepseek41 (tp8 loop P25s; 85 here, after ds41_attn_dec): the SP route's row threshold in process -- 0
  *                   (start) = RADIANCE_DS41_SPHC's; N >= it: a lone prefill pass / a follower segment pass is sequence-

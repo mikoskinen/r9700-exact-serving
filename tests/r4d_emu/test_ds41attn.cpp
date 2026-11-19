@@ -333,11 +333,14 @@ void run_case(const char* name, const Fix& f, int64_t q_pitch, const Ref& ref) {
 }
 
 /* tp8 loop D26 (DECODE round 22): fn4 ds41_attn_dec (r4d_attn_dec_sw_set here; libr4d's rad_fn4_* on the engine) -- at a pass of
- * more than 256 keys a row and more than 256 row-head pairs (the rule's form 4) every value 1 .. 7 (form 0 .. 6) gives the rule's
+ * more than 256 keys a row and more than 256 row-head pairs (the rule's form 4) every value 1 .. 9 (form 0 .. 8) gives the rule's
  * bytes over the bf16 cache, the packed one and lever NVG's gathered rows (the trunk's served DKV-G path: the plain kernel over
  * unpacked selections); the launches it moves are counted (none at value 5 = form 4, none at 0); a pass of <= 256 row-head
- * pairs or <= 256 keys a row stays on the rule's form (the counter does not move). Values outside 0 .. 7 are refused. */
-void d26_case(const char* name, const Fix& f, bool moved_expected) {
+ * pairs or <= 256 keys a row stays on the rule's form (the counter does not move). Values outside 0 .. 9 are refused. */
+/* the form code a value takes at a pass of M rows (the switch's rule; 0 / 5 = stays on form 4) */
+int d26_digit(int v, int M) { return v <= 9 ? v : (M <= 32 ? v % 10 : v / 10); }
+void d26_case(const char* name, const Fix& f, bool moved_expected,
+              const std::vector<int>& values = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 60, 70, 17 }) {
     std::vector<uint16_t> pk((size_t)(f.ncblk * kSlots), 0x7777);
     expect(store_nv4(r4d_ds41_entry_store_nv4, f, pk.data()) == RAD_OK, name, "entry_store nvfp4");
     const size_t no = (size_t)f.M * f.H * kD;
@@ -346,7 +349,7 @@ void d26_case(const char* name, const Fix& f, bool moved_expected) {
     uint16_t* sp = (uint16_t*)(((uintptr_t)scr.data() + 15) & ~(uintptr_t)15);
     std::vector<uint16_t> base[3];
     long long bad = 0, moved_bad = 0;
-    for (int v = 0; v <= 7; ++v) {
+    for (int v : values) {   /* 8 / 9: forms 7 / 8, the 512-thread direct PV (D26 step 2); TU: the height split */
         expect(r4d_attn_dec_sw_set(v) == 1 && r4d_attn_dec_sw_get() == v, name, "ds41_attn_dec not applied", v, 0);
         for (int path = 0; path < 3; ++path) {
             std::vector<uint16_t> o(no, (uint16_t)(0x1357 + v));
@@ -356,7 +359,8 @@ void d26_case(const char* name, const Fix& f, bool moved_expected) {
                                      : attn(r4d_rad_ds41_attn_sparse_sink, f, pk.data(), o.data(), 0, f.q.data(), sp, need);
             expect(rc == RAD_OK, name, "attn", v, path);
             const long long dc = r4d_attn_dec_sw_calls() - c0;
-            const bool want = moved_expected && v >= 1 && v != 5;
+            const int dg = d26_digit(v, f.M);
+            const bool want = moved_expected && dg >= 1 && dg != 5;
             if ((dc > 0) != want) ++moved_bad;
             if (v == 0) {
                 base[path] = o;
@@ -375,10 +379,11 @@ void d26_case(const char* name, const Fix& f, bool moved_expected) {
     }
     expect(bad == 0, name, "a ds41_attn_dec value changed the bytes", bad, 0);
     expect(moved_bad == 0, name, "ds41_attn_dec moved a launch it must not (or did not move one it must)", moved_bad, 0);
-    expect(r4d_attn_dec_sw_set(8) < 0 && r4d_attn_dec_sw_set(-1) < 0 && r4d_attn_dec_sw_get() == 7, name,
-           "ds41_attn_dec 8 / -1 not refused", r4d_attn_dec_sw_get(), 7);
+    const int last = values.back();
+    expect(r4d_attn_dec_sw_set(100) < 0 && r4d_attn_dec_sw_set(-1) < 0 && r4d_attn_dec_sw_get() == last, name,
+           "ds41_attn_dec 100 / -1 not refused", r4d_attn_dec_sw_get(), last);
     r4d_attn_dec_sw_set(0);
-    std::printf("%-46s rows %d heads %d keys %d+%d: ds41_attn_dec 1 .. 7 x (bf16, nvfp4, NVG gathered) vs the rule: %lld value-path(s) "
+    std::printf("%-46s rows %d heads %d keys %d+%d: ds41_attn_dec 1 .. 9 + splits x (bf16, nvfp4, NVG gathered) vs the rule: %lld value-path(s) "
                 "differ; launches moved as expected (%s)\n", name, f.M, f.H, f.win, f.topk, bad, moved_expected ? "moved" : "none");
 }
 
@@ -427,6 +432,10 @@ int main() {
         d26_case("D26 ds41_attn_dec, 17 rows, 320 keys", make(52, 16, 4, { { 17, 3100 } }, 192), true);
         d26_case("D26 ds41_attn_dec, 16 rows (256 row-heads)", make(53, 16, 4, { { 16, 3100 } }, 192), false);
         d26_case("D26 ds41_attn_dec, 24 rows, 192 keys", make(54, 16, 4, c16, 64), false);
+        /* above 32 rows the split's tens digit (16: form 0 there; 60 / 70: forms 5 / 6; 57: the rule's form 4 above, form 6 at <= 32) */
+        std::vector<std::pair<int, int>> c32;
+        for (int s = 0; s < 8; ++s) c32.push_back({ 5, 2600 + 89 * s });
+        d26_case("D26 ds41_attn_dec, 40 rows (8 x 5), 320 keys", make(55, 16, 4, c32, 192), true, { 0, 6, 16, 60, 70, 57 });
     }
     std::printf("ds41 packed latent: %d checks, %d failure(s)\n", g_check, g_fail);
     return g_fail ? 1 : 0;
