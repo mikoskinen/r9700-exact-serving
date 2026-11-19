@@ -12,7 +12,10 @@
  *   --case ix_ni (= ds41_index_candidates): lever IX-NI, under fn4 ix_ni 1 vs 0 -- index_score's [0, reach) of every row
  *       (WMMA, WMMA with keep, the scalar decode form with and without keep, padded rows), the dead region left as it
  *       was (poisoned beforehand), index_topk's selections and index_candidates' keep words over the two planes;
- *       mutations 4 (the last live entry unwritten) and 5 (candidates reading the full width of an ix_ni plane). */
+ *       mutations 4 (the last live entry unwritten) and 5 (candidates reading the full width of an ix_ni plane).
+ *   --case ixw: lever IXW (DRAFTER track round 21), fn4 ix_lds 2 (bit 1) -- a decode run's rows (<= 48) byte for byte = the same rows
+ *       inside a 64-row run at ix_lds 0 (the WMMA form by height), at 16 x 3 / 8 x 5 / 16 x 1 rows; control: the scalar decode form
+ *       (ix_lds 0 at the decode height) differs from them somewhere (the check sees the form). */
 
 namespace i9b {
 
@@ -516,9 +519,65 @@ static void ni_case(const Plugin& pl) {
     }
 }
 
+/* lever IXW (DRAFTER track round 21): index_score's decode band on the WMMA form under fn4 ix_lds 2 -- a row's score the same at every
+ * pass height (rule B against its own reference). The decode run (R = T rows) and a 64-row run of the same step (rows from T on past
+ * the step) are built from one seed, so their operands are the same bytes; the first T rows of the two planes are compared. */
+static void ixw_case(const Plugin& pl) {
+    IxHooks hk;
+    if (!hk.get(pl)) { ok("ixw hooks", false, "rad_fn4_switch / r4d_i9b_mutate / an index row absent"); return; }
+    if (hk.sw("ix_lds", 2) != 1 || hk.sw("ix_lds", 0) != 1) { ok("ixw switch", false, "ix_lds 2 not taken (a libr4d before lever IXW)"); return; }
+    hk.sw("ix_ni", 0);
+    g_rs = 0x5EED0021ull;
+    std::vector<IxSeq> d16x3, d8x5, d16x1;
+    for (int i = 0; i < 16; ++i) { const int64_t p = 2000 + 3700 * i + (int64_t)(rnd() % 997); d16x3.push_back({ 3, p, p + 1000 }); }
+    for (int i = 0; i < 8; ++i) { const int64_t p = 4000 + 7000 * i + (int64_t)(rnd() % 997); d8x5.push_back({ 5, p, p + 1000 }); }
+    for (int i = 0; i < 16; ++i) { const int64_t p = 1000 + 9000 * i + (int64_t)(rnd() % 997); d16x1.push_back({ 1, p, p + 1000 }); }
+    struct WC { const char* what; int64_t ratio; const std::vector<IxSeq>* sq; };
+    const WC cases[] = { { "16 x 3 decode rows at 2k .. 58k, ratio 1", 1, &d16x3 }, { "8 x 5 decode rows at 4k .. 53k, ratio 2", 2, &d8x5 },
+                         { "16 x 1 decode rows at 1k .. 136k, ratio 1", 1, &d16x1 } };
+    for (const WC& wc : cases) {
+        int64_t T = 0;
+        for (const IxSeq& q : *wc.sq) T += q.rows;
+        IxCase cd, ct;
+        g_rs = 0x5EED0022ull;
+        const bool bd = cd.build(T, wc.ratio, *wc.sq);
+        g_rs = 0x5EED0022ull;
+        const bool bt = ct.build(64, wc.ratio, *wc.sq);
+        if (!bd || !bt || cd.C != ct.C) { ok("ixw alloc", false, "hipMalloc failed or planes differ in width"); dfree_all(); return; }
+        const size_t bd_ = (size_t)(T * cd.C * 4), bt_ = (size_t)(64 * ct.C * 4);
+        void *sw = dalloc(bd_), *ss = dalloc(bd_), *stl = dalloc(bt_);
+        if (!sw || !ss || !stl) { ok("ixw alloc", false, "hipMalloc failed"); dfree_all(); return; }
+        std::vector<RadTensor> tw = cd.score_ts(sw, nullptr, 0), ts = cd.score_ts(ss, nullptr, 0), tt = ct.score_ts(stl, nullptr, 0);
+        std::vector<RadParam> pd = cd.score_ps(0), pt = ct.score_ps(0);
+        st_memset(sw, 0x7F, bd_);
+        st_memset(ss, 0x7F, bd_);
+        st_memset(stl, 0x7F, bt_);
+        hk.sw("ix_lds", 2);
+        const int rcw = run(hk.score, tw, pd);
+        hk.sw("ix_lds", 0);
+        const int rcs = run(hk.score, ts, pd), rct = run(hk.score, tt, pt);
+        const long long d = diff16(sw, stl, bd_), dc = diff16(ss, sw, bd_);
+        ok(fmt("index_score ix_lds 2, %s: byte for byte the same rows in a 64-row WMMA run at ix_lds 0 (%lld x %lld)", wc.what, (long long)T,
+               (long long)cd.C).c_str(),
+           rcw == RAD_OK && rcs == RAD_OK && rct == RAD_OK && d == 0, fmt("rc %d / %d / %d, differing 16-bit words %lld", rcw, rcs, rct, d));
+        ok(fmt("control: the scalar decode form (ix_lds 0) differs from them, %s", wc.what).c_str(), dc > 0,
+           "identical: the check could not see which form ran");
+        RadArgs aw = args(tw, pd), as = args(ts, pd);
+        hk.sw("ix_lds", 0);
+        const double u0 = st_time_us([&](int) { hk.score->launch(&as, nullptr); }, 10, nullptr);
+        hk.sw("ix_lds", 2);
+        const double u1 = st_time_us([&](int) { hk.score->launch(&aw, nullptr); }, 10, nullptr);
+        info(fmt("index_score %s: scalar decode form %.0f us, ix_lds 2 %.0f us (%+.1f %%); %lld of %lld 16-bit words differ from the scalar form",
+                 wc.what, u0, u1, 100.0 * (u1 - u0) / u0, dc, (long long)(bd_ / 2)));
+        hk.sw("ix_lds", 0);
+        dfree_all();
+    }
+}
+
 }  // namespace i9b
 
 static void i9b_cases(const Plugin& pl) {
+    if (sel("ixw")) i9b::ixw_case(pl);
     if (sel("mhc_pcn_mix") || sel("mhc_post_collapse_rmsnorm_mix_bf16")) i9b::m1_case(pl);
     if (sel("ix_lds") || sel("ds41_index_score_d128_bf16")) i9b::lds_case(pl);
     if (sel("ix_ni") || sel("ds41_index_candidates")) i9b::ni_case(pl);
