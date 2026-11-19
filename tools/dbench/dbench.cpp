@@ -49,6 +49,7 @@ static int g_il = 0;
 extern "C" void r4d_mx_tl(int on);
 extern "C" int r4d_mx_tl_reset();
 extern "C" int r4d_mx_tl_read(unsigned long long* out, int max);
+extern "C" void r4d_mx_wpe(int ab, int pd);
 #endif
 static int g_tl = 0;   /* --tl N: N passes of the item timeline after an IL form's timing */
 void r4d_mx_mr_set(int on);
@@ -224,7 +225,7 @@ struct Call {          /* one (stage, projection) launch */
     }
 };
 
-struct Form { std::string name; int on, h, r, mt, wn, grid; int il = 0; int pg = 0; };
+struct Form { std::string name; int on, h, r, mt, wn, grid; int il = 0; int pg = 0; int wab = 0, wpd = 9; };
 
 /* ---- value comparison (a rule-B form against the stock bytes) */
 static float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
@@ -308,8 +309,11 @@ static std::vector<std::string> split(const std::string& s) {
     return v;
 }
 static bool parse_form(const std::string& n0, Form* f) {
-    f->name = n0; f->h = 4; f->r = 1; f->mt = 4; f->wn = 0; f->grid = 0; f->il = 0; f->pg = 0;
+    f->name = n0; f->h = 4; f->r = 1; f->mt = 4; f->wn = 0; f->grid = 0; f->il = 0; f->pg = 0; f->wab = 0; f->wpd = 9;
     std::string n = n0;
+    /* a leading "wpeABpPD-" (bench, -DR4D_XM_TL builds): the IL gate_up's waves-per-EU form AB at PD */
+    { int ab = 0, pd = 0; size_t q = n.find('-');
+      if (n.rfind("wpe", 0) == 0 && q != std::string::npos && std::sscanf(n.c_str(), "wpe%dp%d", &ab, &pd) == 2) { f->wab = ab; f->wpd = pd; n = n.substr(q + 1); } }
     /* a leading "pg-": lever XPG (the IL forms at the resident grid) */
     if (n.rfind("pg-", 0) == 0) { f->pg = 1; n = n.substr(3); }
     /* a leading "il-": the pinned form on lever WIL's tile-interleaved weights */
@@ -325,6 +329,7 @@ static bool parse_form(const std::string& n0, Form* f) {
     if (n == "mx5ilp") { f->on = -9; f->pg = 1; return true; }   /* lever XPG: mx5il at the resident grid */
     if (n == "mx6") { f->on = -11; return true; }    /* the switch drafter_mx 6 (lever XPG: 5's forms at the resident grid) */
     if (n == "mx6il") { f->on = -12; return true; }  /* drafter_mx 6 on the tile-interleaved weights (WIL + XPG) */
+    if (n == "mx7il") { f->on = -13; return true; }  /* drafter_mx 7 on the tile-interleaved weights (WIL + XPG + XWO) */
     if (n == "mx4il") { f->on = -10; return true; }  /* lever WIL: drafter_mx 4's forms on the tile-interleaved weights */   /* the switch drafter_mx 5 (round 12, lever DTS: 4 + xm_wt PD 9 TS 4 below K 2048) */
     if (n == "a8") { f->on = -3; return true; }    /* fp8 quant + moe_gemm_mxfp4a8 a call */
     if (n == "mx3") { f->on = -6; return true; }   /* the switch drafter_mx 3 (xm_a8_kernel: fp8 x fp8 on the 17-byte blocks) */
@@ -370,10 +375,13 @@ static bool parse_form(const std::string& n0, Form* f) {
     return false;
 }
 static void apply_form(const Form& f) {
-    g_il = f.on == -9 || f.on == -10 || f.on == -12 || f.il;
+    g_il = f.on == -9 || f.on == -10 || f.on == -12 || f.on == -13 || f.il;
     r4d_mx_mr_il(g_il);
     r4d_mx_mr_pg(f.pg);
-    if (g_il && !f.il) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(f.on == -9 ? 5 : f.on == -12 ? 6 : 4); g_a8 = 0; return; }
+#ifdef R4D_XM_TL
+    r4d_mx_wpe(f.wab, f.wpd);
+#endif
+    if (g_il && !f.il) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(f.on == -9 ? 5 : f.on == -12 ? 6 : f.on == -13 ? 7 : 4); g_a8 = 0; return; }
     if (f.on == -11) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(6); g_a8 = 0; return; }
     g_a8 = f.on == -3 ? 1 : f.on == -4 ? 2 : f.on == -5 ? 3 : 0;
     if (g_a8) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); return; }
@@ -482,6 +490,9 @@ int main(int argc, char** argv) {
         else if (a == "--route-x7") route_x7 = nx();
         else if (a == "--quad") quad = 1;
         else if (a == "--tl") g_tl = std::atoi(nx().c_str());
+#ifdef R4D_XM_TL
+        else if (a == "--wpe") { const int ab = std::atoi(nx().c_str()); const int pd = std::atoi(nx().c_str()); r4d_mx_wpe(ab, pd); }
+#endif
         else { std::fprintf(stderr, "unknown %s\n", a.c_str()); return 2; }
     }
     if (model == "main") set_main(width);
@@ -709,7 +720,7 @@ int main(int argc, char** argv) {
                 CK(hipMemcpy(got.data(), calls[i].y, calls[i].ybytes, hipMemcpyDeviceToHost));
                 if (f.on == -3 && outa8[i].empty()) outa8[i] = got;
                 if (f.on == -2 && outmx2[i].empty()) outmx2[i] = got;
-                if ((f.on == -7 || f.on == -8 || f.on == -9 || f.on == -10 || f.on == -11 || f.on == -12 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
+                if ((f.on == -7 || f.on == -8 || f.on == -9 || f.on == -10 || f.on == -11 || f.on == -12 || f.on == -13 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
                 if (f.on == -6 && !outa8[i].empty()) {
                     const size_t nv = (size_t)(calls[i].rt.live * kProj[calls[i].p].N) * 2;
                     vs_a8 += std::memcmp(got.data(), outa8[i].data(), std::min(nv, got.size())) ? 1 : 0;
