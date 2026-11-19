@@ -149,8 +149,68 @@ static void mx_case(const Plugin& pl) {
     dfree_all();
 }
 
+/* ======================================================================= tp8 loop X8 step 0 (DECODE round 19)
+ * --case mix_perf: the SERVED mhc_mix (ds41_mix_wv 0, ds41_mix_fin as set: the split + finish launches) alone on one card at
+ * the decode heights M 1 / 8 / 16 / 24 / 32 / 40 / 48 / 56 / 64 (n 5120, hc 4: the trunk's shape), warm (repeated launches) or
+ * cold with --cold MIB (each launch after a flush), us a call as info lines; plus each M's run checked byte for byte against a
+ * second launch (a sanity check of the bench, not of a new form). In serving (lq150 lanecmp, D1 stamps) mix_split runs ~44 us a
+ * call at 48 rows on both nodes (follower 1.95 ms a 48-row lane step = 4.7 % of its busy time): this case says whether that is
+ * the kernel alone (a kernel lever) or what runs beside it / the dispatch window (not one). */
+static void mix_perf_case(const Plugin& pl) {
+    const RadKernelInfo* rmix = find(pl, "mhc_mix_bf16");
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    if (!rmix) {
+        ok("mix_perf", false, "mhc_mix_bf16 absent");
+        return;
+    }
+    if (sw) sw("ds41_mix_wv", 0);
+    constexpr int64_t n = 5120, hc = 4, W = hc * n, MIX = hc * (hc + 2), S = MIX + 1, iters = 20;
+    const int64_t chunks = (W + 1023) / 1024;
+    g_rs = 0x5EED0012ull;
+    std::vector<float> fn((size_t)(MIX * W)), base(MIX), scale(3);
+    for (auto& x : fn) x = (float)(gauss() * 0.01);
+    for (auto& x : base) x = (float)(gauss() * 0.5);
+    for (auto& x : scale) x = (float)(gauss() * 0.1 + 0.5);
+    void *dfn = up(fn), *dbase = up(base), *dscale = up(scale);
+    std::string line;
+    for (int64_t M : { 1, 8, 16, 24, 32, 40, 48, 56, 64 }) {
+        std::vector<uint16_t> h((size_t)(M * W));
+        for (int64_t r = 0; r < M; ++r) {
+            const double rs = std::ldexp(1.0, (int)(rnd() % 5) - 2);
+            for (int64_t i = 0; i < W; ++i) h[(size_t)(r * W + i)] = bf((float)(gauss() * rs));
+        }
+        void* dh = up(h);
+        const size_t bp = (size_t)(M * hc * 4), bc = (size_t)(M * hc * hc * 4), bs = (size_t)(M * S * chunks * 4);
+        void *pre0 = dalloc(bp), *post0 = dalloc(bp), *comb0 = dalloc(bc), *scr = dalloc(bs + 4096);
+        void *pre1 = dalloc(bp), *post1 = dalloc(bp), *comb1 = dalloc(bc);
+        if (!dfn || !dh || !scr || !pre1) { ok("mix_perf alloc", false, "hipMalloc failed"); dfree_all(); return; }
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc), PI("iterations", iters), PF("eps", 1e-6),
+                                     PF("hc_eps", 1e-6), PS("dtype", "bf16") };
+        auto ts = [&](void* pre, void* post, void* comb) {
+            return std::vector<RadTensor>{ T(dh, RAD_BF16, { M, W }), T(dfn, RAD_F32, { MIX, W }), T(dscale, RAD_F32, { 3 }),
+                                           T(dbase, RAD_F32, { MIX }), T(pre, RAD_F32, { M, hc }),
+                                           T(post, RAD_F32, { M, hc }), T(comb, RAD_F32, { M, hc * hc }) };
+        };
+        std::vector<RadTensor> t0 = ts(pre0, post0, comb0), t1 = ts(pre1, post1, comb1);
+        const int rc0 = run(rmix, t0, ps, scr, (int64_t)bs + 4096), rc1 = run(rmix, t1, ps, scr, (int64_t)bs + 4096);
+        const long long d = diff32(pre0, pre1, bp) + diff32(post0, post1, bp) + diff32(comb0, comb1, bc);
+        ok(fmt("mix_perf M=%lld: two launches agree (bench sanity)", (long long)M).c_str(), rc0 == RAD_OK && rc1 == RAD_OK && d == 0,
+           fmt("rc %d / %d, %lld differing words", rc0, rc1, d));
+        RadArgs a0 = args(t0, ps, scr, (int64_t)bs + 4096);
+        const double u = st_time_us([&](int) { rmix->launch(&a0, nullptr); }, 200, nullptr);
+        info(fmt("mix_perf mhc_mix M=%lld (n %lld, hc %lld, %lld chunks, served launch form): %.2f us a call%s", (long long)M,
+                 (long long)n, (long long)hc, (long long)chunks, u, g_cold > 0 ? fmt(" (cold %lld MiB)", (long long)(g_cold >> 20)).c_str() : " (warm)"));
+        line += fmt("%s%lld:%.1f", line.empty() ? "" : " ", (long long)M, u);
+        dfree_all();
+        dfn = up(fn); dbase = up(base); dscale = up(scale);
+    }
+    std::printf("MIXPERF %s us a call by M (%s)\n", line.c_str(), g_cold > 0 ? "cold" : "warm");
+    dfree_all();
+}
+
 }  // namespace i11
 
 static void i11_cases(const Plugin& pl) {
     if (sel("mix_wv") || sel("mhc_mix_bf16")) i11::mx_case(pl);
+    if (sel("mix_perf")) i11::mix_perf_case(pl);
 }
