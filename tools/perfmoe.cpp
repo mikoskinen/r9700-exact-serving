@@ -200,6 +200,7 @@ struct Opts {
     bool chain = false;
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
+    int k2 = 8;               // 2 K (tp8 U14: --bits 2.5 = exl3k2h, DeepSeek's layers 0-5 / 35-39; a record is R C k2 / 16 bytes)
     int a_rot = 0;            // --a-rot 1 (with --chain; or --op gate_up: the GEMM alone over xr): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
@@ -411,7 +412,7 @@ int main(int argc, char** argv) {
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--group") g_group = std::atoll(nx());
         else if (a == "--group-mix") g_group_mix = std::atof(nx());
-        else if (a == "--bits") o.bits = std::atoi(nx());
+        else if (a == "--bits") { const double kb = std::atof(nx()); o.bits = (int)kb; o.k2 = (int)(2 * kb + 0.5); }
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
@@ -432,7 +433,9 @@ int main(int argc, char** argv) {
     if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
     if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
     char kdt[16];
-    std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
+    if (o.k2 != 2 * o.bits && o.k2 != 5) die("--bits is 2..6 or 2.5");
+    if (o.k2 & 1) std::snprintf(kdt, sizeof kdt, "exl3k%dh", o.bits);   // tp8 U14: the half-integer K
+    else std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
     const bool gu = o.op == "gate_up";
     // This rank's widths a class -- the architecture's split (qwen4exp_exl3.cpp): the expert's 128-blocks cut over the
     // ranks, the rank taking an extra block rotating with the class. tp1 every expert whole; tp2 rank 0 holds 3 of 5
@@ -631,7 +634,7 @@ int main(int argc, char** argv) {
             for (int c = 0; c < nc; ++c)
                 for (int64_t e = c; e < o.E; e += nc)
                     if (route[(size_t)l].rows[(size_t)e])
-                        b += exl3 ? (double)(R_[c] * C_[c] * o.bits / 8) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
+                        b += exl3 ? (double)(R_[c] * C_[c] * o.k2 / 16) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
                                   : (double)(R_[c] * C_[c] / 2 + R_[c] * 2 * C_[c] / 128);
             return b;
         };
@@ -701,7 +704,7 @@ int main(int argc, char** argv) {
                 };
                 for (int c = 0; c < nc; ++c) {
                     for (auto& v : nb) v = nullptr;
-                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.bits / 8), cbd = (size_t)(Rd[c] * Cd[c] * o.bits / 8);
+                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.k2 / 16), cbd = (size_t)(Rd[c] * Cd[c] * o.k2 / 16);
                     auto rb = [](size_t b) { return [b](int64_t n) { return random_buf(b * (size_t)n); }; };
                     auto ft = [&](int64_t w, float v, int kind) { return [&f16t, w, v, kind](int64_t n) { return f16t((size_t)(w * n), v, kind); }; };
                     pg[(size_t)q][c][0] = TAB(tab(c, 0, cbg, rb(cbg)), kDtTrellis, { nec[c], Rg[c], Cg[c] });
@@ -862,7 +865,7 @@ int main(int argc, char** argv) {
         std::vector<std::array<std::array<RadTensor, 5>, EXL3_MAX_CLS>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < nc; ++c) {
-                const size_t cb = (size_t)(R[c] * C[c] * o.bits / 8);
+                const size_t cb = (size_t)(R[c] * C[c] * o.k2 / 16);
                 void* codes = random_buf(cb * (size_t)nec[c]);
                 void* suh = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
                 void* suh1 = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
@@ -887,7 +890,7 @@ int main(int argc, char** argv) {
             double bytes = 0;
             for (int c = 0; c < nc; ++c)
                 for (int64_t e = c; e < o.E; e += nc)
-                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.bits / 8) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
+                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.k2 / 16) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
             L.bytes.push_back(bytes);
             std::vector<RadTensor> t((size_t)spos->n_opd);   // the op's schema order (include/exl3_abi.h)
             t[(size_t)spos->x] = T(x, RAD_F16, { xrows, xw });
