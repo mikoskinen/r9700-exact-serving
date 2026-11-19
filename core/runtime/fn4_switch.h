@@ -479,6 +479,12 @@
  *                   from ONE word pair (decode_frags_x3d, the decode band's X3D-F form): the same f16 weights, each output's WMMA
  *                   order unchanged -- the same bytes (Xeon GPU2: y at M 17 / 64 / 1,150 / 4,096 identical to 0). -1 when no loaded
  *                   object serves it (an exl3r4d before 4fd50e4).
+ *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
+ *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
+ *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
+ *                   same in both arms). Needs RADIANCE_PP_TAIL_BAND=1 on the leader at start (its start value; else only 0 is taken)
+ *                   and the plugin's tail band (RADIANCE_DS41_PP_TBAND=1 on both nodes). Read at each BG step's head; never a pass's
+ *                   ops (both forms issue the published ops: rule A, as P28's band).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
@@ -696,7 +702,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -728,6 +734,9 @@ void reserve_register(uint64_t mask);
 /* tp8 loop D32 (pp_lead_seg): the leader's lane loop at its start -- whether it took leader boundaries (RADIANCE_PP_LEAD_SEG
  * with a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). */
 void lead_seg_register(bool capable);
+/* tp8 loop D39 (pp_tband): the leader's lane loop at its start -- whether it took RADIANCE_PP_TAIL_BAND=1 (the plugin's tail band,
+ * a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). */
+void tband_register(bool capable);
 /* tp8 loop D33 (pp_seg_set): the follower, at its loop's start -- how many declared segment boundaries lie inside its W(h, t)
  * (0: none: RADIANCE_PP_SEG_LAYERS unset / one lane); -1 until registered (the leader never registers: it checks the range, the
  * follower's verdict decides). */

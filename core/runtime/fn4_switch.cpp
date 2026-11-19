@@ -42,7 +42,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
-                                        "exl3_x3d_pf" };
+                                        "exl3_x3d_pf", "pp_tband" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -142,6 +142,7 @@ struct State {
     std::atomic<int64_t> short_mask{-1};
     std::atomic<int64_t> reserve_mask{-1};   /* tp8 loop IDEAS #9 (pp_fol_reserve): the follower's boundaries, -1 unregistered */
     std::atomic<int> lseg_capable{-1};       /* tp8 loop D32 (pp_lead_seg): the leader's boundaries taken, -1 unregistered, 0 / 1 */
+    std::atomic<int> tband_capable{-1};      /* tp8 loop D39 (pp_tband): the leader took RADIANCE_PP_TAIL_BAND=1, -1 unregistered, 0 / 1 */
     std::atomic<int> segset_n{-1};           /* tp8 loop D33 (pp_seg_set): the follower's boundaries inside W(h, t), -1 unregistered */
     std::atomic<int64_t> shb[2];
     std::mutex mu;
@@ -564,6 +565,9 @@ void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std:
 void lead_seg_register(bool capable) {   /* tp8 loop D32 */
     st().lseg_capable.store(capable ? 1 : 0, std::memory_order_release);
 }
+void tband_register(bool capable) {   /* tp8 loop D39 */
+    st().tband_capable.store(capable ? 1 : 0, std::memory_order_release);
+}
 void segset_register(int n) {   /* tp8 loop D33 */
     st().segset_n.store(n < 0 ? 0 : n, std::memory_order_release);
 }
@@ -896,7 +900,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -994,6 +998,21 @@ static bool check_here(const std::string& name, int v, std::string* err) {
             if (err)
                 *err = std::string("pp_lead_seg=") + std::to_string(v) + " refused: this node declared no leader boundary (RADIANCE_PP_LEAD_SEG=k "
                        "on the leader at start, with RADIANCE_PP_BG_LANE; not with RADIANCE_PP_TAIL_AHEAD)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kPpTband) {   /* tp8 loop D39: the leader's */
+        if (v < 0 || v > 1) {
+            if (err) *err = "pp_tband takes 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's fresh BG steps run W(h, t)'s, the band layer "
+                            "stays declared) or 1 (they run as tail band passes; tp8 loop D39)";
+            return false;
+        }
+        const int cap = s.tband_capable.load(std::memory_order_acquire);
+        if (v != 0 && cap == 0) {
+            if (err)
+                *err = "pp_tband=1 refused: this node took no tail band (RADIANCE_PP_TAIL_BAND=1 on the leader at start, with the plugin's "
+                       "tail band -- RADIANCE_DS41_PP_TBAND=1 on both nodes -- and RADIANCE_PP_BG_LANE)";
             return false;
         }
         return true;

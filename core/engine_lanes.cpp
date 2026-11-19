@@ -380,7 +380,7 @@ std::string Engine::dch_text() const {
 
 /* tp8 loop D39: a lane step's tail band j (0: not a tail band pass) -- P28's rule (a BG lane's step whose prompts are all fresh,
  * no context, no snapshot restore, no draft rows, <= RADIANCE_PP_BAND_MAX_ROWS rows) and no head band in the same step */
-int Engine::pp_tband_step(int lane, const RadBatch* b) {
+int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
     if (!pp_tband_on_ || !b || !lanes_.is_bg(lane) || b->n_tok > pp_band_max_rows_) return 0;
     const int j = pp_tail_band_k();
     if (j <= 0) return 0;
@@ -388,6 +388,11 @@ int Engine::pp_tband_step(int lane, const RadBatch* b) {
     if (p.e.empty()) return 0;
     for (const StepEntry& e : p.e)
         if (!e.is_prefill || e.ctx_len != 0 || e.ckpt_restore >= 0 || e.n_spec > 0) return 0;
+    /* fn4 pp_tband 0 (step 2c's in-process control): this fresh BG step runs W(h, t)'s; -1 (never requested) = the start's 1 */
+    if (fn4::get(fn4::kPpTband) == 0) {
+        if (count) ++pp_tband_off_n_;
+        return 0;
+    }
     return j;
 }
 
@@ -412,7 +417,7 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     /* tp8 loop P28: the frame says so; the head runs [0, h + k) */
     const int band = band_pre >= 0 ? band_pre : pp_band_step(lane, b);
     /* tp8 loop D39: a tail band (never beside a head band); the frame says so, the lane keeps j for its tail part */
-    const int tband = band > 0 ? 0 : pp_tband_step(lane, b);
+    const int tband = band > 0 ? 0 : pp_tband_step(lane, b, true);
     pp_ship_band_ = band;
     pp_ship_tband_ = tband;
     const int ss = pp_ship(b, true, lane);
@@ -802,6 +807,7 @@ int Engine::step_loop_lanes() {
                                                                                           : "it needs RADIANCE_PP_BG_LANE");
         }
     }
+    fn4::tband_register(pp_tband_on_);   /* tp8 loop D39 step 2c: fn4 pp_tband 1 needs it taken */
     /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader; default unset = a band step's head whole, as P28 built it): a band
      * step's head in LSP's segments too -- [0, b1) .. [b_last, h + k) at the head boundaries the plugin declared, the band word on
      * every segment, the held frame a band frame -- so the k layers a band pass adds to the leader's BG head no longer hold every
@@ -1548,8 +1554,8 @@ int Engine::step_loop_lanes() {
     if (bgr_on) bgr_line(" over the run");   /* tp8 loop D32 */
     if (pp_link_ && dch_n_ > 0)                /* tp8 loop D35 */
         RAD_INFO("two-node pipeline: decode chain on the leader host over the run (tp8 loop D35): %s", dch_text().c_str());
-    if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39)",
-                               (long long)pp_tband_n_);
+    if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39); "
+                               "%lld fresh BG steps ran W(h, t)'s under fn4 pp_tband 0", (long long)pp_tband_n_, (long long)pp_tband_off_n_);
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);

@@ -496,8 +496,9 @@ private:
     bool pp_tband_on_ = false;
     int  pp_ship_tband_ = 0;     /* the frame pp_frame makes now is a tail band pass's (flags bit 3) */
     int64_t pp_tband_n_ = 0;
+    int64_t pp_tband_off_n_ = 0;   /* step 2c: fresh BG steps fn4 pp_tband 0 kept W(h, t)'s */
     std::vector<int> pp_tband_lane_;
-    int  pp_tband_step(int lane, const RadBatch* b);
+    int  pp_tband_step(int lane, const RadBatch* b, bool count = false);
     int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
     int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
