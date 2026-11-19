@@ -1310,6 +1310,23 @@ static int dsp_dep_env() {
     }();
     return v;
 }
+/* Lever DAW (DRAFTER track 19.11.2026 round 9): RADIANCE_DS41_DSPARK_AWM=1 (or on) at start declares the DSpark stages'
+ * attention (the drafter's own block and every short block) with the int param wm_from 1: libr4d then runs every one of
+ * those passes, at any row count, on the WMMA form the trunk's prefill takes (ds41_attn_sparse_sink_wm_kernel, a workgroup
+ * a (16-head tile, row)) instead of the decode band's scalar forms. xeon abench (bf16 window, 16 heads, blocks of 16):
+ * 32 rows x 2 48.3 -> 11.9 us a call, 40 x 5 57.5 -> 13.0, 16 x 1 30.2 -> 11.7. Rule B: the WMMA form's own bits
+ * (q.k summed in WMMA order, exp2 online, p as bf16 hi + lo; rms 1.2e-4 relative from the scalar form, 1 bf16 ulp at most),
+ * deterministic and batch-invariant (a row is its own workgroup's) -- only the drafter's proposals can move on near-ties,
+ * verification keeps the served text. Unset / 0 / off: nothing declared, today's program; anything else refused at start. */
+static int dsp_awm_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_AWM");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
 /* Lever XR (ds41-etp-xr, 14.11.2026): RADIANCE_DS41_XRING=<MiB> (1 .. 1024) at start, with RADIANCE_DS41_ETP, declares
  * each trunk layer's EXL3 gate_up with interface v10's `xring` -- that much copy ring in its prefill scratch. exl3r4d's
  * map form then can (fn4 exl3_xr bit 2) copy the routed experts whose slices sit in the pinned host pool onto the card
@@ -3883,6 +3900,17 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                             "on every rank as width slices of %lld of %lld (expert tensor parallel; EP held %lld a rank)\n",
                     (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff, (long long)(d.n_expert / g.world));
     }
+    if (dsp_awm_env() < 0) {   /* lever DAW */
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_AWM=%s is not 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_DSPARK_AWM"));
+        return RAD_E_INVAL;
+    }
+    if (dsp_awm_env() > 0) {
+        rad_note(b, "DSpark stages' attention on the WMMA form at every row count (lever DAW, RADIANCE_DS41_DSPARK_AWM)");
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever DAW (RADIANCE_DS41_DSPARK_AWM): the DSpark stages' attention takes the "
+                            "WMMA form at every row count (wm_from 1; rule B, the drafter's own reference)\n");
+    }
     d.block = blk;
     d.base = (int)c.n_layer;
     d.n_stage = (int)ns;
@@ -3998,6 +4026,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                                       RAD_INT("window", c.window + d.block), RAD_INT("ratio", 0), RAD_INT("topk", 0),
                                       RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
         if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
+        if (dsp_awm_env() > 0) dap.push_back(RAD_INT("wm_from", 1));   /* lever DAW */
         L.attn = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
         L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
         L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
@@ -4523,6 +4552,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                           RAD_INT("window", c.window + SB), RAD_INT("ratio", 0), RAD_INT("topk", 0),
                                           RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
             if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
+            if (dsp_awm_env() > 0) dap.push_back(RAD_INT("wm_from", 1));   /* lever DAW */
             const rad_op a = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
             if (!a || !rad_op_resolved(b, a)) sbwhy = "no kernel serves attn_sparse_sink at the short block's window";
             z.attn.push_back(a);
