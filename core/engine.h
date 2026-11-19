@@ -484,6 +484,10 @@ private:
     int64_t pp_band_n_ = 0;
     int64_t pp_band_max_rows_ = 2047;   /* RADIANCE_PP_BAND_MAX_ROWS: a band step's rows at most */
     int  pp_band_step(int lane, const RadBatch* b);
+    /* tp8 loop D36: the band the lane loop already chose for the step lane_head releases next (-1: lane_head asks
+     * pp_band_step itself), so a step's band is decided once -- RADIANCE_PP_BAND_MIN_SEQS's count stays one a step */
+    int  pp_band_pre_ = -1;
+    int64_t pp_band_seg_n_ = 0;   /* tp8 loop D36: band steps whose head ran in segments (RADIANCE_PP_LEAD_SEG_BAND=1) */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);
@@ -500,7 +504,7 @@ private:
      * layer segments with other lanes' parts between them -- its head [0, h) as segments [s0, s1) (the first takes the
      * release, the restores and holds the frame; the last ships it, then X1), its tail [t, n) as model-part segments, the
      * last one with the sampler, drafter and step end (lane_tail_issue from `tail_seg0_`, RAD_PP_SEG_END). */
-    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last);
+    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0);
     int  lane_tail_seg(int lane, const RadBatch* b, int s0, int s1);
     int  tail_seg0_ = 0;
     /* ... the held frame of the lane's step (pp_ship's bytes, built at its first head segment so it carries that release's
