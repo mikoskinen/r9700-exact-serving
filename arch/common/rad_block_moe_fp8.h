@@ -1197,9 +1197,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             return RAD_E_INVAL;
         }
     }
+    /* GGUF-block experts (expert_ggml) have no 128 x 128 scale grid: their K's are held to whole GGUF blocks of the type
+     * below (moe_gemm_ggml's own unit), so an even tensor-parallel slice of 576 = 18 MXFP4 blocks is served (deepseek41
+     * lever DEP, the DSpark drafter's experts; DRAFTER track 19.11.2026). Every other format keeps the 128 rule. */
     for (int q = 0; q < ncls; ++q)
-        if (wq[q] % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK ||
-            (split && qlo[q] % RAD_FP8_BLOCK)) {
+        if (!c.expert_ggml && (wq[q] % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK ||
+            (split && qlo[q] % RAD_FP8_BLOCK))) {
             fprintf(stderr, "radiance: an expert is %lldx%lld per rank, which is not a whole number "
                             "of %dx%d scale blocks\n",
                     (long long)wq[q], (long long)g.n_embd, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
