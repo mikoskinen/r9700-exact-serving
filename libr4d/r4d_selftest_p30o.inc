@@ -14,7 +14,7 @@
  *     2b. the forms change no byte: 16-byte staging (r4d_fp8e8_pin_ld 16) at M tile 16 / 32 / 64 (r4d_fp8e8_pin_mt) into a
  *        re-poisoned output = the first form's (byte staging, tile 16), padding included;
  *     3. INFO: the GEMM at the newcomer's eight rank-0 shapes (run-p30a.sh's list and weights) x M 16 / 1100 / 4096 -- rows
- *        gemm_fp8a8e8_b32_first (byte staging, tile 16), gemm_fp8a8e8_b32 (16-byte staging, tile 16), _mt64 (16-byte, tile 64;
+ *        gemm_fp8a8e8_b32_first (byte staging, tile 16), gemm_fp8a8e8_b32 (16-byte staging, tile 16), _mt32 / _mt64 (16-byte, tile 32 / 64;
  *        above 16 rows) -- us a call over 10 timed launches after 2 warm ones, as `P30W name NxK M=m wW row us us` lines that
  *        tp8/devpf/scripts/p30read.py reads beside run-p30a.sh's (published B5SUM 101.16 / 356.15 ms at M 1100 / 4096).
  */
@@ -198,7 +198,7 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
     for (int t = 0; t < 3; ++t) {
         st_memcpy(g.y.d, g.y.b.data(), g.y.b.size(), hipMemcpyHostToDevice);
         pin_ld(pl, 16);
-        pin_mt(pl, t == 0 ? 16 : t == 1 ? 32 : 64);
+        pin_mt(pl, 16 << t);   /* 16, 32, 64 */
         run_case(row, dt, ps);
         const std::vector<uint8_t> g2 = g.y.down();
         for (size_t i = 0; i < got.size(); ++i) mtdiff[t] += g2[i] != got[i];
@@ -240,8 +240,10 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
 
 static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* name, int64_t N, int64_t K, int64_t M, int w, int mt,
                       int ld) {
-    const char* rn = ld == 4 ? "gemm_fp8a8e8_b32_first" : mt == 64 ? "gemm_fp8a8e8_b32_mt64" : mt == 32 ? "gemm_fp8a8e8_b32_mt32"
-                                                                                                    : "gemm_fp8a8e8_b32";
+    const char* rn = ld == 4      ? "gemm_fp8a8e8_b32_first"
+                     : mt == 64  ? "gemm_fp8a8e8_b32_mt64"
+                     : mt == 32  ? "gemm_fp8a8e8_b32_mt32"
+                                 : "gemm_fp8a8e8_b32";
     pin_mt(pl, mt);
     pin_ld(pl, ld);
     GemmIn g;
@@ -310,9 +312,9 @@ static void p30o_cases(const Plugin& pl) {
                           { "kv", 512, 5120, 40 }, { "shexp_gate_up", 1536, 5120, 40 }, { "shexp_down", 5120, 768, 40 },
                           { "engram_kv", 25600, 6144, 2 } };
     for (int64_t M : { 16, 1100, 4096 })
-        for (int f = 0; f < 3; ++f) {   /* the first form (byte staging, tile 16), 16-byte staging at tile 16, at tile 64 */
-            if (M <= 16 && f == 2) continue;   /* a launch of <= 16 rows is one 16-row tile at any pin */
-            for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, f == 2 ? 64 : 16, f == 0 ? 4 : 16);
+        for (int f = 0; f < 4; ++f) {   /* the first form (byte staging, tile 16), 16-byte staging at tile 16, 32, 64 */
+            if (M <= 16 && f >= 2) continue;   /* a launch of <= 16 rows is one 16-row tile at any pin */
+            for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, f == 3 ? 64 : f == 2 ? 32 : 16, f == 0 ? 4 : 16);
         }
     dlclose(ref);
 }

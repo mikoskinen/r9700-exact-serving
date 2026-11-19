@@ -774,7 +774,9 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
         }
         }
         __syncthreads();
-#pragma unroll
+        /* one 32-K block at a time above the first form (MT > 16): unrolled, the wide tiles' live fragments and scale reads
+         * spill (MT 64 ~490 B a lane of scratch, measured by the compiler's resource report); the order is the same */
+#pragma unroll(MT > 16 ? 1 : 4)
         for (int kk = 0; kk < 128; kk += 32) {
             const auto wf0 = r4d_fp8::frag<128>(wb, wave * 16, kk, lane), wf1 = r4d_fp8::frag<128>(wb, wave * 16, kk + 16, lane);
             const int kb = (k0 + kk) / 32;
@@ -802,7 +804,7 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
             if (r < end) y[(long)r * m.yr + c] = f32_to_bf16(acc[f][j]);
         }
 }
-/* the M tile: R4D_FP8E8_MT=16 / 32 / 64 at load (unset: 16, the first form), r4d_fp8e8_pin_mt() in process (selftest, emu);
+/* the M tile: R4D_FP8E8_MT=16 / 32 / 64 at load (128 spills ~630 B a lane: not built) (unset: 16, the first form), r4d_fp8e8_pin_mt() in process (selftest, emu);
  * a launch of at most 16 rows always takes 16 (one tile either way). The staging: R4D_FP8E8_LD=4 at load forces the first form's
  * byte loads, else 16-byte loads wherever the operands allow; r4d_fp8e8_pin_ld(4 / 16 / 0) in process */
 std::atomic<int> g_fp8e8_mt{ -1 }, g_fp8e8_ld{ -1 };
@@ -870,7 +872,9 @@ extern "C" int r4d_rad_fp8_f32scale(const RadArgs* a, RadStream stream) { return
 /* tp8 loop P30o r2 (WIP): gemm_nt_q at dtype fp8a8e8 (the release's block FP8), the first form */
 extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs* a, RadStream stream) { return dense_e8(a, stream); }
 /* PREFILL round 21: the fp8a8e8 form's M tile in process (16 / 32 / 64; anything else back to R4D_FP8E8_MT / 16) -- the same bytes */
-extern "C" void r4d_fp8e8_pin_mt(int mt) { g_fp8e8_mt.store(mt == 16 || mt == 32 || mt == 64 ? mt : -1, std::memory_order_relaxed); }
+extern "C" void r4d_fp8e8_pin_mt(int mt) {
+    g_fp8e8_mt.store(mt == 16 || mt == 32 || mt == 64 ? mt : -1, std::memory_order_relaxed);
+}
 /* ... and its staging (4 = the first form's byte loads, 16 = 16-byte loads where aligned; anything else back to R4D_FP8E8_LD) */
 extern "C" void r4d_fp8e8_pin_ld(int ld) { g_fp8e8_ld.store(ld == 4 || ld == 16 ? ld : -1, std::memory_order_relaxed); }
 /* Its planes as the release stores them (affine {codes fp8_e4m3, scale e8m0 [32x32]}): read without a relayout. */
