@@ -1554,6 +1554,45 @@ int Engine::follower_loop() {
             RAD_INFO("follower: RADIANCE_PP_FOL_ORDER bit 4 -- a segment waits up to %llu ms after a waiting frame arrived for its "
                      "X1 (RADIANCE_PP_FOL_X1_GRACE_MS, tp8 loop D15)", (unsigned long long)(fo_grace_ns / 1000000ull));
     }
+    /* tp8 loop IDEAS #9 (RADIANCE_PP_FOL_RESERVE=L, this node; unset / 0 = off): RELAY by a body's reserve. A BG lane's split
+     * pass (a newcomer's body: prompt rows only, RADIANCE_PP_BG_LANE) issues its segments up to layer L as before and then holds
+     * the rest (its parts from L on) until a step frame of ANOTHER BG lane with prompt rows has arrived -- the leader has issued
+     * the next newcomer's head, whose X1 is about a head's time away -- or RADIANCE_PP_FOL_RESERVE_MS (default 300) have passed
+     * since the hold began; meanwhile every frame runs between as at any segment gap. So the held layers fill this card while
+     * the leader runs the next head (at c32 the follower's whole waiting is that head's shadow: loop FINDINGS DECODE note
+     * 13:51), and the held newcomer's leader tail then runs beside the next body. Only WHEN a pass's later segments are issued
+     * changes, never a pass or its bytes (the M4 segment gaps' rule); its first token comes later by the hold. L must be a
+     * declared segment boundary inside W(h, t); with RADIANCE_PP_FOL_ORDER bit 2 the decode frames behind the next newcomer's
+     * held frame keep running too. */
+    int fol_reserve = 0;
+    uint64_t fol_reserve_ns = 300ull * 1000000ull;
+    if (const char* v = std::getenv("RADIANCE_PP_FOL_RESERVE"); v && *v) fol_reserve = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("RADIANCE_PP_FOL_RESERVE_MS"); v && *v)
+        fol_reserve_ns = (uint64_t)std::max(1LL, std::atoll(v)) * 1000000ull;
+    if (fol_reserve > 0) {
+        const bool at_boundary = std::find(segs.begin(), segs.end(), (int32_t)fol_reserve) != segs.end() &&
+                                 fol_reserve > cfg_.pp_cut_h && fol_reserve < cfg_.pp_cut_t;
+        if (seg_bg < 0 || !at_boundary) {
+            RAD_WARN("follower: RADIANCE_PP_FOL_RESERVE=%d is not taken here: %s (tp8 loop IDEAS #9)", fol_reserve,
+                     seg_bg < 0 ? "no BG lane on this node (RADIANCE_PP_BG_LANE)"
+                                : "it is not one of the declared segment boundaries inside W(h, t) (RADIANCE_PP_SEG_LAYERS)");
+            fol_reserve = 0;
+        } else {
+            RAD_INFO("follower: RADIANCE_PP_FOL_RESERVE=%d -- a BG newcomer's body holds its layers %d..%d until another BG lane's "
+                     "frame arrives or %llu ms pass (RADIANCE_PP_FOL_RESERVE_MS), every other frame running meanwhile (tp8 loop "
+                     "IDEAS #9)", fol_reserve, fol_reserve, cfg_.pp_cut_t - 1, (unsigned long long)(fol_reserve_ns / 1000000ull));
+        }
+    }
+    int64_t res_n = 0, res_frame = 0, res_time = 0;
+    uint64_t res_ns = 0;
+    auto reserve_line = [&](const char* when) {
+        if (fol_reserve > 0)
+            RAD_INFO("follower: body reserve %s (RADIANCE_PP_FOL_RESERVE=%d, tp8 loop IDEAS #9): %lld BG bodies held their layers "
+                     "%d..%d, %lld released by another BG lane's frame, %lld by the %llu-ms limit; held %.1f ms in all (%.1f a "
+                     "body)", when, fol_reserve, (long long)res_n, fol_reserve, cfg_.pp_cut_t - 1, (long long)res_frame,
+                     (long long)res_time, (unsigned long long)(fol_reserve_ns / 1000000ull), (double)res_ns / 1e6,
+                     res_n > 0 ? (double)res_ns / 1e6 / (double)res_n : 0.0);
+    };
     int64_t fo_waited = 0, fo_jumped = 0, fo_passed = 0;
     /* D15: every run frame carries the leader's whole switch-request table; a frame whose table differs from the one that
      * arrived before it changes a switch here (fn4::follow) and so keeps its place, and nothing passes it (its lane, step) */
@@ -1890,6 +1929,33 @@ int Engine::follower_loop() {
                  * running one), the other lanes' frames issued meanwhile */
                 const int64_t back = (int64_t)k - 1 - seg_ahead;
                 if (const int bs = between(back >= 0 ? seg_ev[back & 1] : nullptr); bs != 0) return bs;   /* < 0 failed, 1 stop */
+                /* tp8 loop IDEAS #9: a BG body's reserve -- its parts from RADIANCE_PP_FOL_RESERVE on wait for another BG lane's
+                 * frame (held behind this pass: it keeps its place) or the limit; every other frame runs between meanwhile */
+                if (fol_reserve > 0 && split && seg_bg >= 0 && lane >= seg_bg && b->n_tok_decode == 0 &&
+                    parts[k].first == fol_reserve) {
+                    auto other_bg = [&]() -> bool {
+                        for (const net::Msg& mm : held) {
+                            StepHdr hh;
+                            if (mm.body.size() < sizeof hh) continue;
+                            std::memcpy(&hh, mm.body.data(), sizeof hh);
+                            if (hh.run && (hh.flags & 1) && hh.lane >= seg_bg && hh.lane < n_lanes_ && hh.lane != lane) return true;
+                        }
+                        return false;
+                    };
+                    const uint64_t r0 = rad_mono_ns();
+                    int how = 0;
+                    for (;;) {
+                        if (other_bg()) { how = 1; break; }
+                        if (rad_mono_ns() - r0 >= fol_reserve_ns) { how = 2; break; }
+                        if (const int bs = between(nullptr); bs != 0) return bs;   /* < 0 failed, 1 stop */
+                        if (other_bg()) { how = 1; break; }
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                    ++res_n;
+                    if (how == 1) ++res_frame;
+                    else ++res_time;
+                    res_ns += rad_mono_ns() - r0;
+                }
                 /* the pass between may have changed what this pass's issue reads */
                 for (auto& r : ranks_) r->stager.set_layer_end(end);
             }
@@ -1991,6 +2057,7 @@ int Engine::follower_loop() {
                     if (ia_deferred > 0)
                         RAD_INFO("follower: %lld frames issued ahead waited between a split pass's segments for their X1 "
                                  "(tp8 dev D10 round 2)", (long long)ia_deferred);
+                    reserve_line("over the run");
                     if (fol_order && !segs.empty())
                         RAD_INFO("follower: frame order over the run (RADIANCE_PP_FOL_ORDER=%d, tp8 loop D15): %lld decode "
                                  "frames waited between segments for their X1, %lld went before an older waiting frame, %lld "
@@ -2016,6 +2083,7 @@ int Engine::follower_loop() {
             if (pff) pff->stop();   /* tp8 loop P22 / P22b */
             RAD_INFO("follower: the leader stopped (%s) after %lld steps, during a pass's segments; this node stops too",
                      pp_link_->why().c_str(), (long long)steps);
+            reserve_line("over the run");
             loop_status_.store(RAD_OK, std::memory_order_release);
             stopping_.store(true, std::memory_order_release);
             if (barrier_) barrier_->abort();
@@ -2045,6 +2113,16 @@ int Engine::follower_loop() {
                          "passes between them, %lld held", fol_order, (long long)fo_waited, (long long)fo_jumped,
                          (long long)fo_passed, (long long)fo_graced, (long long)seg_passes,
                          (long long)seg_parts, (long long)seg_between, (long long)seg_held);
+            }
+        }
+        /* tp8 loop IDEAS #9: the reserve's counts a minute */
+        if (fol_reserve > 0) {
+            static uint64_t res_line_ns = 0;
+            const uint64_t now = rad_mono_ns();
+            if (res_line_ns == 0) res_line_ns = now;
+            if (now - res_line_ns >= 60ull * 1000000000ull) {
+                res_line_ns = now;
+                reserve_line("so far");
             }
         }
     }
