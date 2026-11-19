@@ -1226,6 +1226,61 @@ TEST(a_cold_prompt_at_two_lanes_is_one_processes_tokens_and_chunk_plan) {
     }
 }
 
+/* tp8 loop P34 (RADIANCE_PP_SPAN_FIRST=F with RADIANCE_PP_SPAN_SHORT): the switch acts only where the chunk geometry has a
+ * checkpoint interval (a linear state, or a window under a prefix cache: sched_test lanes_span_first_* cuts DeepSeek's plan,
+ * window keys and every row checked); the four-layer llama here has neither, so at 2 lanes W(0,2) / W(1,3) and 3 lanes W(0,3)
+ * with F = 512 / 256 (--prefill-span 2 --checkpoint-interval 1024) the pipeline plans and serves exactly as without it --
+ * one process's tokens, the same plan -- and the leader's start line names the switch. */
+TEST(span_first_changes_nothing_without_a_checkpoint_interval_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "2112", "--max-model-len", "4096",
+                                           "--prefill-span", "2", "--checkpoint-interval", "1024" };
+    for (size_t n : { 3300, 1900 }) {
+        const std::vector<int32_t> p = prompt_ids(77 + n, n);
+        std::vector<int32_t> ref;
+        {
+            Serving one;
+            REQUIRE(one.start("", ext, { "RADIANCE_LOG_STEPS=1" }));
+            ref = complete(one.port, p, 24);
+            kill(one.lead.child.pid, SIGTERM);
+            CHECK_EQ(one.lead.finish(60), 0);
+        }
+        /* arm 0: the pipeline without the switch (its plan is the reference for the arms' plans); then the switch's arms */
+        struct Arm { int lanes; const char* cut; const char* first; };
+        std::vector<std::pair<int, int>> base;
+        for (const Arm a : { Arm{ 2, "0,2", nullptr }, Arm{ 2, "0,2", "512" }, Arm{ 2, "1,3", "256" }, Arm{ 3, "0,3", "512" } }) {
+            std::vector<std::string> ex = ext;
+            ex.push_back("--pp-lanes");
+            ex.push_back(std::to_string(a.lanes));
+            std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_SPAN_SHORT=24576" });
+            if (a.first) env.push_back(std::string("RADIANCE_PP_SPAN_FIRST=") + a.first);
+            Serving pp;
+            REQUIRE(pp.start(a.cut, ex, env));
+            const std::vector<int32_t> got = complete(pp.port, p, 24);
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output();
+            const std::vector<std::pair<int, int>> plan = chunks_of(llog);
+            CHECK(!ref.empty());
+            CHECK(got == ref);
+            if (!a.first) {
+                base = plan;
+                fprintf(stderr, "    %zu-token prompt, %d lanes W(%s), SPAN_SHORT only: %zu chunks, first [0, %d), tokens %s\n", p.size(),
+                        a.lanes, a.cut, plan.size(), plan.empty() ? -1 : plan.front().second, got == ref ? "identical" : "DIFFERENT");
+                continue;
+            }
+            fprintf(stderr, "    %zu-token prompt, %d lanes W(%s), SPAN_FIRST %s: %zu chunks (without it %zu), first [0, %d), plan %s, "
+                            "tokens %s\n", p.size(), a.lanes, a.cut, a.first, plan.size(), base.size(),
+                    plan.empty() ? -1 : plan.front().second, plan == base ? "= without it" : "DIFFERENT",
+                    got == ref ? "identical" : "DIFFERENT");
+            CHECK(!base.empty());
+            CHECK(plan == base);
+            CHECK(llog.find("RADIANCE_PP_SPAN_FIRST, tp8 loop P34") != std::string::npos);
+        }
+    }
+}
+
 /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1 on the leader): a cold multi-chunk prompt at 2 and 3 lanes with the prefill
  * timeline on serves one process's tokens and plan, and the leader prints the prompt's timeline line once its first
  * token is in -- as many chunks as the plan has, every head after the first read from its events (the host backend's

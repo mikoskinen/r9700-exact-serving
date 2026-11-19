@@ -1967,6 +1967,21 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
             }
     }
 
+    /* tp8 loop P34 (RADIANCE_PP_SPAN_FIRST=F, LaneSet::span_first): a lone cold prompt the span cut plans in intervals and
+     * that holds more than two intervals runs its first interval as [0, F) and [F, I) -- the pipeline's fill is an F-row
+     * head. Both pieces >= kBiMinPiece rows, F on the quantum; [0, F) takes no checkpoint (F is off the resume grid; the
+     * interval's end takes the periodic one as the cut plan's does). The second piece plans as any piece from F does (the
+     * interval's end bounds it). Newcomers of a decode cell (~1.1k rows) never hold two intervals: untouched. */
+    if (span_now_ && lanes_ && n_lanes_ > 1 && n_computed == 0 && lanes_->span_first() > 0 &&
+        lane_span_cut(n_computed, n_target) && geo_.checkpoints() && geo_.checkpoint_interval > 0 &&
+        n_target > 2 * geo_.checkpoint_interval && want <= geo_.checkpoint_interval) {
+        const int64_t F = lanes_->span_first(), Q = std::max<int64_t>(geo_.quantum, 1);
+        if (F % Q == 0 && F >= kBiMinPiece && want - F >= kBiMinPiece) {
+            want = F;
+            if (checkpoint_pos) *checkpoint_pos = -1;
+        }
+    }
+
     if (want < remaining) {
         /* A non-final chunk must end on a quantum boundary measured from the sequence origin,
          * or the next chunk hands the linear kernel a partial tile and attention a partial

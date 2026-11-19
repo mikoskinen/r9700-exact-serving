@@ -310,6 +310,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
         RAD_INFO("two-node pipeline: a lone prefill plans --prefill-span %d's span chunks, and one checkpoint interval a "
                  "chunk in its last %lld rows (RADIANCE_PP_SPAN_TAIL, tp8 loop P7): a shorter drain at the prompt's end",
                  cfg_.prefill_span, (long long)lanes_.span_tail());
+    if (lanes_.span_first() > 0)
+        RAD_INFO("two-node pipeline: a lone cold prompt planned one checkpoint interval a chunk, of more than two intervals, runs "
+                 "its first interval as %lld + the rest rows (RADIANCE_PP_SPAN_FIRST, tp8 loop P34): the follower's first pass "
+                 "waits for a %lld-row head%s", (long long)lanes_.span_first(), (long long)lanes_.span_first(),
+                 !lanes_.span_on() || lanes_.span_short() > 0 || lanes_.span_tail() > 0
+                     ? "" : " -- inactive: RADIANCE_PP_SPAN=0, _SPAN_SHORT or _SPAN_TAIL names those prompts");
     if (lanes_.span_inner())
         RAD_INFO("two-node pipeline: a chunk those cuts reach that carries a snapshot inside (lever TI's tail) is cut too, "
                  "before the snapshot, at checkpoint-interval boundaries (RADIANCE_PP_SPAN_INNER=1, tp8 loop P14)%s",

@@ -13970,6 +13970,63 @@ TEST(lanes_span_short_cuts_a_short_prompts_span_pieces_and_leaves_a_long_ones) {
     }
 }
 
+/* tp8 loop P34 (RADIANCE_PP_SPAN_FIRST=F, LaneSet::set_span_first): with SPAN_SHORT 24576 (BEST's start) a cold prompt of
+ * more than two intervals and at most 24,576 rows plans the cut plan with its first interval as [0, F) + [F, 2048) -- every
+ * other piece the cut plan's to the row, the window keys read right (misses 0), every row computed -- at 2 and 3 lanes,
+ * exact plan and nearest; a prompt of two intervals or less (a decode cell's newcomer) and one past SPAN_SHORT keep their
+ * plan; F off the quantum (1000) or under kBiMinPiece (64) changes nothing. */
+TEST(lanes_span_first_cuts_a_cold_prompts_first_interval_and_nothing_else) {
+    for (int ex : { 0, 1 })
+    for (int n_prompt : { 15777, 3000, 4500, 65650 })
+    for (int lanes : { 2, 3 }) {
+        std::vector<std::pair<int, int>> ref;
+        for (int arm = 0; arm < 4; ++arm) {
+            /* 0: SPAN_SHORT 24576 (the reference); 1: + SPAN_FIRST 1024; 2: + SPAN_FIRST 1000 (off the quantum);
+             * 3: + SPAN_FIRST 64 (< kBiMinPiece) */
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.cfg.pp_plan_prefix = ex == 1;
+            L.max_tok = 4160;
+            L.max_ctx = 70000;
+            L.kv_blocks = 8192;
+            L.stage_rows = 1024;
+            L.win = 16;
+            L.seqs = 6;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_span_short(24576);
+            if (arm == 1) L.set.set_span_first(1024);
+            if (arm == 2) L.set.set_span_first(1000);
+            if (arm == 3) L.set.set_span_first(64);
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            const std::vector<std::pair<int, int>> got = run_cold(L, lanes, s, &misses, &failed);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            if (arm == 0) { ref = got; continue; }
+            std::vector<std::pair<int, int>> want = ref;
+            const bool cut = arm == 1 && n_prompt > 2 * 2048 && n_prompt <= 24576;
+            if (cut) {
+                REQUIRE(!want.empty());
+                CHECK(want.front() == std::make_pair(0, 2048));
+                want.front() = { 0, 1024 };
+                want.insert(want.begin() + 1, { 1024, 2048 });
+            }
+            CHECK(got == want);
+            if (arm == 1)
+                fprintf(stderr, "    %s%d tokens, %d lanes, SPAN_SHORT 24576 + SPAN_FIRST 1024: %zu chunks, first %d-%d%s (%s)\n",
+                        ex ? "exact, " : "", n_prompt, lanes, got.size(), got.empty() ? -1 : got.front().first,
+                        got.empty() ? -1 : got.front().second, got.size() > 1 ? (" then " + std::to_string(got[1].first) + "-" +
+                        std::to_string(got[1].second)).c_str() : "", got == want ? (cut ? "= the cut plan, its first interval in two"
+                                                                                        : "= the cut plan") : "DIFFERENT");
+        }
+    }
+}
+
 /* tp8 loop P10 / FINDINGS F14 (the ~22 ms every pass costs on both nodes): --prefill-span 4 with --max-num-batched-tokens
  * 8256 under lanes -- the cold prompt's body in 8,192-row span pieces (one interval first, then 4 intervals a piece), at 2 /
  * 3 lanes the one-lane plan to the row, every boundary on the interval grid or the prompt's end, the window keys read

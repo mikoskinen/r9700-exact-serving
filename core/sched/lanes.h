@@ -103,6 +103,15 @@ public:
      * (C' 64k / 128k +2.4 / +1.2 %). Every boundary is the span plan's or an interval boundary. Default 0: today's plan. */
     int64_t span_short() const { return span_short_; }
     void set_span_short(int64_t rows) { span_short_ = rows > 0 ? rows : 0; }
+    /* tp8 loop P34 (RADIANCE_PP_SPAN_FIRST=F rows, 0 = off): a lone cold prompt the span cut plans in intervals (SPAN=0, or
+     * SPAN_SHORT's prompts) and that holds more than two intervals runs its FIRST interval as two pieces, [0, F) and [F, I),
+     * when both have >= kBiMinPiece rows and F is on the quantum: the follower's first pass waits for an F-row head instead
+     * of an I-row one (the pipeline's fill; BEST lq202b 16k: ~111 ms of its 1.40 s, the follower the bound). Every other
+     * boundary is the cut plan's; F is off the resume grid and takes no checkpoint (the interval's end takes its own, as
+     * before). Exact as every piece of the cut is (option D: no kernel form depends on a piece's rows from kBiMinPiece on).
+     * Default 0: today's plan. */
+    int64_t span_first() const { return span_first_; }
+    void set_span_first(int64_t rows) { span_first_ = rows > 0 ? rows : 0; }
     /* tp8 loop P14 (RADIANCE_PP_SPAN_INNER=1, with RADIANCE_PP_SPAN=0 / SPAN_TAIL / SPAN_SHORT): a span piece that carries a
      * snapshot inside it (lever TI's tail snapshot of the prompt's last chunk) is cut too, at its first interior interval
      * boundary that leaves >= kBiMinPiece rows a side AND the snapshot in the later piece; that piece is planned again with
@@ -339,6 +348,7 @@ private:
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
     int64_t span_tail_ = 0;                 /* RADIANCE_PP_SPAN_TAIL (span_tail) */
     int64_t span_short_ = 0;                /* RADIANCE_PP_SPAN_SHORT (span_short) */
+    int64_t span_first_ = 0;                /* RADIANCE_PP_SPAN_FIRST (span_first, tp8 loop P34) */
     bool    span_inner_ = false;            /* RADIANCE_PP_SPAN_INNER (span_inner, tp8 loop P14) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
