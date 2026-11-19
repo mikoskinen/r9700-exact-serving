@@ -396,7 +396,8 @@
  *                   0 = today; bit 1: the decode lanes run as ONE lane (lane 0) while a BG lane has a step in flight or a newcomer in
  *                   its inbox (the other decode lanes park; their sequences and free cards move to lane 0 once idle), and split back
  *                   when none; bit 2: merged always; bit 4: with RADIANCE_PP_LEAD_SEG declared, a BG step's leader parts run in
- *                   segments only while merged. RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
+ *                   segments only with the merge on (bit 1 / 2: every BG step then runs beside the merged lane); bit 8: no BG leader segments at all (so ONE start with RADIANCE_PP_LEAD_SEG declared
+ *                   compares whole BG parts (8 / 9) with segments while merged (5)). RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
  *                   (else 0). The merged lane's occupancy rule (draft_occ) acts at once. Exact: only lane composition and the
  *                   drafting depth change (the build's composition invariance; depth moves only what a step verifies).
  *   draft_cost_age  scheduler (DCA, ds41-drafter; 81 here, after stage_lone; sched/draft.h DraftController::cost_age): 0 off

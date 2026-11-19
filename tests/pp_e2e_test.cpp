@@ -2607,12 +2607,19 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; const char* cut; int k; int merge; bool post = false; };
+    /* lead_seg: RADIANCE_PP_LEAD_SEG=1 declared (W(2,3): a head boundary at 1, tail whole) -- pp_merge 5 = the merge with the BG steps'
+     * leader parts in segments, 9 = the merge with them whole (bit 8), 4 = no merge and whole (BEST's form beside the declared ring) */
+    struct Arm { int lanes; const char* cut; int k; int merge; bool post = false; bool lead_seg = false; };
     for (const Arm a : { Arm{ 4, "1,3", 2, 1 }, Arm{ 4, "0,2", 2, 1 }, Arm{ 3, "1,3", 1, 1 }, Arm{ 4, "1,3", 1, 1 },
-                         Arm{ 4, "1,3", 2, 2 }, Arm{ 4, "1,3", 2, 1, true } }) {
+                         Arm{ 4, "1,3", 2, 2 }, Arm{ 4, "1,3", 2, 1, true }, Arm{ 4, "2,3", 2, 5, false, true },
+                         Arm{ 4, "2,3", 2, 9, false, true }, Arm{ 4, "2,3", 2, 4, false, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         if (!a.post) env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
+        if (a.lead_seg) {
+            env.push_back("RADIANCE_PP_LEAD_SEG=1");
+            env.push_back("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15");
+        }
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -2661,6 +2668,11 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
         }
         if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
             bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        long long lsteps = -1, lparts = -1;
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments", &lsteps, &lparts);
+        if (a.lead_seg) fprintf(stderr, "    + LEAD_SEG=1: %lld BG steps' leader parts in %lld segments\n", lsteps, lparts);
         fprintf(stderr, "    pp_merge %d%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes; %lld merges "
                         "(%lld drains, %.1f ms), %lld splits, merged %.2f of %.2f s; lane steps merged %lld (%lld tokens, %lld rows) / split "
                         "%lld; moved in %lld / out %lld\n", a.merge, a.post ? " by POST" : "", a.k, a.lanes, a.cut, differ, ref.size(), bg,
@@ -2669,9 +2681,18 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 30).c_str());
         CHECK_EQ(pm, a.merge);
         CHECK(bg > 0);
+        if (a.lead_seg) {   /* 5: every BG step in segments (the merge is on); 9 / 4: none */
+            CHECK(llog.find("RADIANCE_PP_LEAD_SEG=1 -- ") != std::string::npos);
+            if (a.merge == 5) { CHECK(lsteps > 0); CHECK(lparts > lsteps); }
+            else CHECK(lsteps <= 0);
+        }
+        if (a.merge == 4) {   /* no merge bit: the lanes never merge */
+            CHECK(merges <= 0);
+            continue;
+        }
         CHECK(merges > 0);
         CHECK(steps_m > 0);
-        if (a.merge == 1) {
+        if (a.merge & 1) {
             CHECK(moved_in > 0);   /* merged always (2): merged before the first request, every request is lane 0's by pick() */
             CHECK(splits > 0);
             CHECK(moved_out > 0);

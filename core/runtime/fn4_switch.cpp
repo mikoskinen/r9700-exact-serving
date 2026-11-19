@@ -896,9 +896,9 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpMerge) {   /* tp8 MERGE */
-        if (v < 0 || v > 7) {
-            if (err) *err = "pp_merge takes 0 (off) .. 7 (bits: 1 merge the decode lanes while a BG step is in flight, 2 merged always, "
-                            "4 the BG steps' leader segments only while merged)";
+        if (v < 0 || v > 15) {
+            if (err) *err = "pp_merge takes 0 (off) .. 15 (bits: 1 merge the decode lanes while a BG step is in flight, 2 merged always, "
+                            "4 the BG steps' leader segments only with the merge on, 8 no BG leader segments at all)";
             return false;
         }
         return true;

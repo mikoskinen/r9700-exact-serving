@@ -261,7 +261,7 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     /* tp8 MERGE: fn4 pp_merge starts at RADIANCE_PP_MERGE (0 unset), taken with two decode lanes or more */
     {
         int v = 0;
-        if (const char* pm = std::getenv("RADIANCE_PP_MERGE"); pm && *pm) v = std::max(0, std::min(7, std::atoi(pm)));
+        if (const char* pm = std::getenv("RADIANCE_PP_MERGE"); pm && *pm) v = std::max(0, std::min(15, std::atoi(pm)));
         if (lanes_.decode_n() < 2) v = 0;
         pp_merge_.store(v, std::memory_order_relaxed);
         fn4::note_sched(fn4::kPpMerge, v);
@@ -270,7 +270,8 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                      (v & 2) ? "the decode lanes run as ONE lane (lane 0) always"
                              : (v & 1) ? "the decode lanes run as ONE lane (lane 0) while a BG lane has a step in flight, split back when none"
                                        : "no merge",
-                     (v & 4) ? "; a BG step's leader parts in segments only while merged (with RADIANCE_PP_LEAD_SEG)" : "");
+                     (v & 8) ? "; no BG step's leader parts in segments (RADIANCE_PP_LEAD_SEG declared or not)"
+                     : (v & 4) ? "; a BG step's leader parts in segments only with the merge on (with RADIANCE_PP_LEAD_SEG)" : "");
     }
     if (lanes_.bg_room() > 0)
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROOM=%lld -- a BG lane's inbox (its next step) takes lent newcomers up to %lld "
@@ -900,7 +901,8 @@ int Engine::step_loop_lanes() {
     } mg;
     std::vector<char> lane_merged((size_t)n_lanes_, 0);   /* the lane's step in flight was planned merged */
     uint64_t mg_line_ns = rad_mono_ns();
-    bool mg_seen = pp_merge_.load(std::memory_order_relaxed) != 0;
+    /* the counts run from the start (pp_merge 0 too), so the start's own split-lane reading is the A of an in-process A / B */
+    const bool mg_seen = merge_ok;
     int mg_pm_last = pp_merge_.load(std::memory_order_relaxed);
     /* the line's period (RADIANCE_PP_MERGE_LINE_S, default 60 s); it prints at every pp_merge change too, so a switch arm's
      * window is the difference of the lines at its two ends */
@@ -961,8 +963,7 @@ int Engine::step_loop_lanes() {
             mg_pm_last = pm;
             mg_line_ns = rad_mono_ns();
         }
-        if (merge_ok && (pm || mg.on || mg_seen)) {
-            mg_seen = true;
+        if (merge_ok) {
             const uint64_t now = rad_mono_ns();
             bool bg_busy = false;
             for (int l = 0; l < n_lanes_; ++l)
@@ -1071,8 +1072,8 @@ int Engine::step_loop_lanes() {
              * or another pass holds the boundary ring (then its tail may still run in segments) */
             /* tp8 loop P28: a band step's head runs whole (its segments are a later round's) */
             bool seg_step = lseg && b->n_tok >= rf_rows && lanes_.is_bg(l) && pp_band_step(l, b) == 0 &&
-                            (!(pm & 4) || mg.on);   /* tp8 MERGE bit 4: BG leader segments only while merged */
-            if (lseg && lseg_mixed && !seg_step && b->n_tok >= rf_rows && b->phase == RAD_PHASE_MIXED) {
+                            !(pm & 8) && (!(pm & 4) || (pm & 3) != 0);   /* tp8 MERGE bit 8: no BG leader segments; bit 4: only with the merge on (a BG step planned now merges the lanes) */
+            if (lseg && lseg_mixed && !seg_step && !(pm & 8) && b->n_tok >= rf_rows && b->phase == RAD_PHASE_MIXED) {
                 seg_step = true;
                 for (const StepEntry& e : lsched().plan().e) seg_step = seg_step && e.home < 0;
                 for (int m2 = 0; m2 < n_lanes_; ++m2) seg_step = seg_step && lanes_.inbox_n(m2) <= inbox0[(size_t)m2];
