@@ -507,6 +507,13 @@ static void cross_check(const Plugin& pl) {
 /* ================================================================== the device phase */
 /* --cold MIB: bytes read through the caches before every timed launch; see st_time_us. */
 static int64_t g_cold = 0;
+/* --pref MIB (DRAFTER track 19.11. round 8, bench only): in the cold mode, after the flush and before the timed launch, read the
+ * first MIB (-1: all) of that launch's weights through the hierarchy (D2D copies into one 1 MiB scratch), so the launch finds
+ * them in L2 / the 64 MiB last-level cache -- the upper bound of an idle-bandwidth weight prefetch (a perf mode that sets
+ * g_pref_fn; others ignore it). */
+static int64_t g_pref = 0;
+static void (*g_pref_fn)(void* ctx, int i, hipStream_t s) = nullptr;
+static void* g_pref_ctx = nullptr;
 /* --timeline: --perfar8 also records the two-shot's per-block stamps (r4d.h) and prints where each
  * rank's time goes. */
 static bool g_timeline = false;
@@ -619,6 +626,7 @@ static double st_time_us(F&& launch, int iters, hipStream_t s) {
             hip_ck(hipMemcpyAsync(dst, (const char*)src + off,
                                   (size_t)std::min(kColdChunk, g_cold - off),
                                   hipMemcpyDeviceToDevice, s), "hipMemcpyAsync", __LINE__);
+        if (g_pref_fn) g_pref_fn(g_pref_ctx, i, s);
         st_ev_record(ev[2 * (size_t)i], s);
         launch(i);
         st_ev_record(ev[2 * (size_t)i + 1], s);
@@ -38816,6 +38824,8 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--cold")) {
             if (i + 1 >= argc) { usage(); return 2; }
             g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
+        } else if (!std::strcmp(argv[i], "--pref") && i + 1 < argc) {
+            g_pref = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--timeline")) {
             g_timeline = true;
         } else if (!std::strcmp(argv[i], "--perfhyv3moe")) {

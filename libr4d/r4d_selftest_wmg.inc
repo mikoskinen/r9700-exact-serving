@@ -99,6 +99,8 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
     g_wk_cur = g_wk_codes.empty() ? 0 : g_wk_codes[0];
     const bool wk = g_wk_cur != 0;
     if (wk) std::printf("WMK: the W arm is gg_wk_kernel under r4d_gg_wk_pin(%d) (pair shapes ONE launch)\n", g_wk_cur);
+    if (g_pref != 0) std::printf("PREF: %s MiB of each launch's weights read after the flush, before the timed launch%s\n",
+                                 g_pref < 0 ? "all" : fmt("%lld", (long long)g_pref).c_str(), g_cold > 0 ? "" : " (ignored: needs --cold)");
     std::printf("WMG gate timing (%s, %d launches a reading, %d rounds of D W W D): D = int16's decode band (gg_gemv 2 + gg_gemv_m16 1, "
                 "table entries %d; pair shapes one launch), W = the WMMA form at the same M (pair shapes two launches)\n",
                 g_cold > 0 ? fmt("cold, %lld MiB read before each, median", (long long)(g_cold >> 20)).c_str()
@@ -206,6 +208,22 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                     }
                 }
                 std::vector<double> td, tw;
+                /* --pref MIB (cold mode): the launch's weights read through the hierarchy after the flush (st_time_us) */
+                struct PrefCtx { const uint8_t* w; int64_t wbytes; int copies; void* scratch; };
+                static void* pref_scratch = nullptr;
+                if (g_pref != 0 && !pref_scratch && hipMalloc(&pref_scratch, 1u << 20) != hipSuccess) pref_scratch = nullptr;
+                PrefCtx pctx{ (const uint8_t*)d_w, wbytes, copies, pref_scratch };
+                if (g_pref != 0 && g_cold > 0 && pref_scratch) {
+                    g_pref_ctx = &pctx;
+                    g_pref_fn = [](void* c, int i, hipStream_t s) {
+                        const PrefCtx& p = *(const PrefCtx*)c;
+                        const uint8_t* b = p.w + (size_t)(i % p.copies) * (size_t)p.wbytes;
+                        const int64_t n = g_pref < 0 ? p.wbytes : std::min<int64_t>(p.wbytes, g_pref << 20);
+                        for (int64_t off = 0; off < n; off += 1ll << 20)
+                            hip_ck(hipMemcpyAsync(p.scratch, b + off, (size_t)std::min<int64_t>(1ll << 20, n - off), hipMemcpyDeviceToDevice, s),
+                                   "hipMemcpyAsync", __LINE__);
+                    };
+                }
                 if (rc0 == RAD_OK && rcd == RAD_OK && rcw == RAD_OK && wm_ran) {
                     for (int r = 0; r < rounds; ++r)
                         for (int k = 0; k < 4; ++k) {
@@ -216,6 +234,7 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                             (w ? tw : td).push_back(us);
                         }
                 }
+                g_pref_fn = nullptr; g_pref_ctx = nullptr;
                 clear(h);
                 ++nkeys;
                 const bool good = !td.empty() && dec_same;
