@@ -41,7 +41,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_xr", "sched_tail_inner", "stage_lone", "draft_cost_age",
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
-                                        "ds41_tsk", "draft_head_cut", "pp_fol_reserve" };
+                                        "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -139,6 +139,7 @@ struct State {
      * -1 until an engine registered; and the query passes the switch moved, their rows */
     std::atomic<int64_t> short_mask{-1};
     std::atomic<int64_t> reserve_mask{-1};   /* tp8 loop IDEAS #9 (pp_fol_reserve): the follower's boundaries, -1 unregistered */
+    std::atomic<int> lseg_capable{-1};       /* tp8 loop D32 (pp_lead_seg): the leader's boundaries taken, -1 unregistered, 0 / 1 */
     std::atomic<int64_t> shb[2];
     std::mutex mu;
     int  want[kSwitches];
@@ -557,6 +558,9 @@ void note_draft_dcap(int64_t cycles, int64_t moves) {   /* SPB */
 
 void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std::memory_order_release); }
 
+void lead_seg_register(bool capable) {   /* tp8 loop D32 */
+    st().lseg_capable.store(capable ? 1 : 0, std::memory_order_release);
+}
 void reserve_register(uint64_t mask) {   /* tp8 loop IDEAS #9 */
     st().reserve_mask.store((int64_t)(mask & ~1ull & 0x7fffffffffffffffull), std::memory_order_release);
 }
@@ -886,7 +890,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -952,6 +956,21 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                 *err = std::string("pp_fol_reserve=") + std::to_string(v) + " refused: " +
                        (m == 0 ? "this node holds no BG lane's segments (RADIANCE_PP_BG_LANE + RADIANCE_PP_SEG_LAYERS)"
                                : "layer " + std::to_string(v) + " is not a declared segment boundary inside W(h, t) (declared: " + have + ")");
+            return false;
+        }
+        return true;
+    }
+    if (i == kPpLeadSeg) {   /* tp8 loop D32 (LSP): the leader's */
+        if (v < 0 || v > 255 || (v & 15) > 2) {
+            if (err) *err = "pp_lead_seg takes form + 16 x stride: form 0 (a BG step's leader parts whole), 1 (M9 segments as built) or 2 "
+                            "(decode first), stride 0 .. 15 (every s-th declared boundary; 0 = 1)";
+            return false;
+        }
+        const int cap = s.lseg_capable.load(std::memory_order_acquire);
+        if (v != 0 && cap == 0) {
+            if (err)
+                *err = std::string("pp_lead_seg=") + std::to_string(v) + " refused: this node declared no leader boundary (RADIANCE_PP_LEAD_SEG=k "
+                       "on the leader at start, with RADIANCE_PP_BG_LANE; not with RADIANCE_PP_TAIL_AHEAD)";
             return false;
         }
         return true;

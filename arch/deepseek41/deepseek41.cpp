@@ -856,6 +856,9 @@ struct Model {
     std::vector<rad_op> seg_send, seg_recv, seg_post;
     rad_buf seg_ring = 0;
     int64_t seg_ring_bytes = 0;
+    /* tp8 loop D32 (RADIANCE_PP_LEAD_SEG_RINGS=2, the leader): a second ring for the odd lanes' BG segments (the engine pairs a lane
+     * with ring lane % 2), so the two BG lanes run their leader parts in segments at once */
+    rad_buf seg_ring2 = 0;
     /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k on the leader): seg_b / seg_cx are the leader's -- head boundaries in (0, h), tail
      * ones in (t, n) (ds41layers::lead_segment_crossing) -- and a head / tail part with seg_l1 > 0 issues one segment */
     bool seg_lead = false;
@@ -5978,8 +5981,11 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
             if (m.seg_lead)
                 std::snprintf(line, sizeof line,
                               "two-node pipeline (tp8 dev M9, RADIANCE_PP_LEAD_SEG): a BG lane's leader head / tail parts may run in "
-                              "segments at layers %s, each boundary's live set saved and restored on this rank (a %lld-byte ring "
-                              "buffer a card)", sb.c_str(), (long long)m.seg_ring_bytes);
+                              "segments at layers %s, each boundary's live set saved and restored on this rank (%s %lld-byte ring "
+                              "buffer%s a card)", sb.c_str(), std::getenv("RADIANCE_PP_LEAD_SEG_RINGS") &&
+                              !std::strcmp(std::getenv("RADIANCE_PP_LEAD_SEG_RINGS"), "2") ? "two" : "a", (long long)m.seg_ring_bytes,
+                              std::getenv("RADIANCE_PP_LEAD_SEG_RINGS") && !std::strcmp(std::getenv("RADIANCE_PP_LEAD_SEG_RINGS"), "2")
+                                  ? "s (RADIANCE_PP_LEAD_SEG_RINGS=2, tp8 loop D32)" : "");
             else
             std::snprintf(line, sizeof line,
                           "two-node pipeline (tp8 dev M4, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments at "
@@ -6477,6 +6483,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         m.seg_ring_bytes = RAD_PP_RING_HDR + widest + RAD_PP_TRAILER;
         m.seg_ring = decl_b(b, m.nm.f("pp_segring"), RAD_U8, { m.seg_ring_bytes }, RAD_BUF_PERSIST);
+        if (const char* rr = std::getenv("RADIANCE_PP_LEAD_SEG_RINGS"); m.seg_lead && rr && !std::strcmp(rr, "2"))
+            m.seg_ring2 = decl_b(b, m.nm.f("pp_segring2"), RAD_U8, { m.seg_ring_bytes }, RAD_BUF_PERSIST);
         m.seg_send.assign(m.seg_b.size(), 0);
         m.seg_recv.assign(m.seg_b.size(), 0);
         m.seg_post.assign(m.seg_b.size(), 0);
@@ -8117,7 +8125,7 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
         lo = std::max<int64_t>(0, lo);
         static thread_local std::vector<RadOperand> so;
         so.clear();
-        so.push_back(brows(m.seg_ring, m.seg_ring_bytes));
+        so.push_back(brows(m.seg_ring2 && (rad_pp_query().lane & 1) ? m.seg_ring2 : m.seg_ring, m.seg_ring_bytes));   /* tp8 loop D32 */
         /* loop FINDINGS F12: X2's source entries below the boundary over their work rows, as X2 ships them */
         const ds41layers::Crossing& sc = m.seg_cx[k];
         const int64_t swr = sc.src >= 0 ? pp_work_rows(m, m.c.ratio[(size_t)sc.src], T, S) : T;

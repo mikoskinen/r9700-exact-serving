@@ -4192,6 +4192,40 @@ static bool kv_placed_on() {
     return e && !std::strcmp(e, "1");
 }
 
+/* tp8 loop F73 (lq189: the follower's rank 0 could not back 5.86 GiB right after freeing its 6.06 GiB pool -- 'out of memory', the
+ * reason consumed by the pool's shortfall): a KV pool made again at `bytes` is tried for up to ~2 s (a freed backing the driver
+ * releases late), then at the size it had (`was`, the same tries): 0 = made at `bytes`, 1 = kept at `was` (nothing given back), < 0 =
+ * neither (the pool is empty; the caller stops, as at the carve). `why` gets the allocator's last reason. Test hook
+ * RADIANCE_KV_PLACED_TEST_FAIL=N fails the first N tries at `bytes` (the host suites). */
+static int kv_pool_remake(Pool& kp, int64_t bytes, int64_t was, std::string* why) {
+    static int test_fail = -1;
+    if (test_fail < 0) {
+        const char* t = std::getenv("RADIANCE_KV_PLACED_TEST_FAIL");
+        test_fail = t && *t ? std::max(0, std::atoi(t)) : 0;
+    }
+    auto reason = [&]() {
+        const std::vector<Shortfall>& sf = kp.shortfalls();
+        return sf.empty() ? std::string("the allocator gave no reason") : sf.back().str();
+    };
+    for (int t = 0; t < 40; ++t) {
+        if (test_fail > 0) {
+            --test_fail;
+            if (why) *why = "a refusal of the test hook RADIANCE_KV_PLACED_TEST_FAIL";
+        } else if (kp.resize(bytes) >= 0) {
+            return 0;
+        } else if (why) {
+            *why = reason();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    for (int t = 0; t < 40; ++t) {
+        if (kp.resize(was) >= 0) return 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (why) *why += "; at its old size too: " + reason();
+    return RAD_E_NOMEM;
+}
+
 /* The budget (plan) read every card before the pools, the weights, the embedding and the n-gram table
  * were placed; it counts what the engine allocates, not what the driver backs beside it -- GPU page
  * tables for the host memory the cards map (about 4 KiB a 2 MiB of it: ~206 MiB a card for a 103 GiB
@@ -4237,12 +4271,21 @@ int Engine::kv_placed_measure() {
         if (!movable) continue;
         RAD_TRY(rad_dev_set(r.device));
         const int64_t was = kp.bytes();
-        const int st = kp.resize((was - k.trim) / MiB * MiB);
+        std::string why;
+        const int st = kv_pool_remake(kp, (was - k.trim) / MiB * MiB, was, &why);
         if (st < 0) {
             RAD_ERR("kv: rank %d's KV pool could not be made again at %s to give back the %s its card lost "
-                    "beside the budget (RADIANCE_KV_PLACED=1): %s", r.index, humanb(was - k.trim).c_str(),
-                    humanb(k.trim).c_str(), rad_dev_last_error());
+                    "beside the budget (RADIANCE_KV_PLACED=1), nor at its old %s: %s", r.index, humanb(was - k.trim).c_str(),
+                    humanb(k.trim).c_str(), humanb(was).c_str(), why.c_str());
             return st;
+        }
+        if (st == 1) {   /* tp8 loop F73: kept as it was -- this card's headroom stays short by the unseen part */
+            RAD_WARN("kv: rank %d's KV pool could not be made again at %s to give back the %s its card lost beside the "
+                     "budget (RADIANCE_KV_PLACED=1): %s -- kept at %s; this card's --gpu-headroom-mib stays short by that "
+                     "much (tp8 loop F73)", r.index, humanb(was - k.trim).c_str(), humanb(k.trim).c_str(), why.c_str(),
+                     humanb(was).c_str());
+            line += fmt("%scard %d: the pool kept at %s (F73)", line.empty() ? "" : ", ", r.device, humanb(was).c_str());
+            continue;
         }
         kvp_trim_[i] = was - kp.bytes();
         gave += kvp_trim_[i];
@@ -4283,12 +4326,24 @@ int Engine::kv_placed_return(size_t ri, int64_t least) {
     if (need < 0 || need + 2 > have) return RAD_OK;
     const int64_t was = kp.bytes();
     RAD_TRY(rad_dev_set(r.device));
-    if (kp.resize((need + 1) * MiB) < 0 || r.kv.paged_tokens(kp.avail()) < least) {
+    std::string why;
+    const int rs = kv_pool_remake(kp, (need + 1) * MiB, was, &why);   /* tp8 loop F73: retried, else back to `was` */
+    if (rs < 0) {
+        RAD_ERR("kv: rank %d's KV pool could not be made again at %s nor at its old %s: %s", r.index,
+                humanb((need + 1) * MiB).c_str(), humanb(was).c_str(), why.c_str());
+        return rs;
+    }
+    if (rs == 1) {
+        RAD_WARN("kv: rank %d's KV pool could not be made again at %s for the agreed %lld tokens (RADIANCE_KV_PLACED=1): %s -- "
+                 "kept at %s (tp8 loop F73)", r.index, humanb((need + 1) * MiB).c_str(), (long long)least, why.c_str(),
+                 humanb(was).c_str());
+        return RAD_OK;
+    }
+    if (r.kv.paged_tokens(kp.avail()) < least) {
         /* Not expected (pool_mib_for_tokens is exact): back to the pool it had. */
-        if (const int st = kp.resize(was); st < 0) {
-            RAD_ERR("kv: rank %d's KV pool could not be made again at %s: %s", r.index, humanb(was).c_str(),
-                    rad_dev_last_error());
-            return st;
+        if (kv_pool_remake(kp, was, was, &why) < 0) {
+            RAD_ERR("kv: rank %d's KV pool could not be made again at %s: %s", r.index, humanb(was).c_str(), why.c_str());
+            return RAD_E_NOMEM;
         }
         return RAD_OK;
     }

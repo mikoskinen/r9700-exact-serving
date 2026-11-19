@@ -452,6 +452,15 @@
  *                   RADIANCE_PP_FOL_RESERVE=L on the follower starts it at L; the follower takes the leader's request (its own
  *                   check: L a declared segment boundary inside W(h, t), a BG lane there; the leader checks the range only).
  *                   Order only: a pass's later segments go later, never another pass (rule A, as M4's segment gaps).
+ *   pp_lead_seg     engine, the two-node LEADER (tp8 loop D32 = LSP; 94 here, after pp_fol_reserve): form + 16 x stride. Form 0 -- a BG
+ *                   lane's step runs its leader head / tail whole (BEST's program beside the declared boundaries); 1 -- M9 as built
+ *                   (RADIANCE_PP_LEAD_SEG_AHEAD as its env); 2 -- DECODE FIRST: a decode tail whose X2 landed goes before the BG
+ *                   step's next segment (its lane's next head at the round's top, before that segment too), one BG segment in
+ *                   the stream at a time, and a BG step runs its parts whole while no decode lane has a step in flight (a lone
+ *                   prompt: the cold cells). Stride s (1 .. 15; 0 = 1): only every s-th declared boundary splits the part, so one
+ *                   start with RADIANCE_PP_LEAD_SEG=1 compares k = 1 / 2 / 3 / 5 (v = 2, 34, 50, 82). Needs RADIANCE_PP_LEAD_SEG=k
+ *                   on the leader at start (else only 0 is taken); its start value RADIANCE_PP_LEAD_SEG_FORM (default 1 =
+ *                   today's M9 with the env set). Order of issue only, never a step's composition (rule A, as M9).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
@@ -669,7 +678,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -698,6 +707,9 @@ void short_register(uint64_t mask);
  * start at (its declared segment boundaries inside W(h, t)), 0 when it has no BG lane / no segments; -1 until registered (the
  * leader never registers: it checks the range, the follower's verdict decides). */
 void reserve_register(uint64_t mask);
+/* tp8 loop D32 (pp_lead_seg): the leader's lane loop at its start -- whether it took leader boundaries (RADIANCE_PP_LEAD_SEG
+ * with a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). */
+void lead_seg_register(bool capable);
 void note_short_blk(int64_t rows);
 /* The scheduler, at its init: whether its drafter can run the hybrid (a head drafting chains beside prompt lookup). */
 void hybrid_register(bool capable);

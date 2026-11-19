@@ -149,6 +149,7 @@ struct Model {
     std::vector<rad_op>  seg_send, seg_recv;
     std::vector<int>     seg_parts;       /* 1 or 2, per boundary */
     rad_buf  b_segring = 0;
+    rad_buf  b_segring2 = 0;   /* tp8 loop D32 (RADIANCE_PP_LEAD_SEG_RINGS=2, the leader): the odd lanes' BG segments */
     int64_t  segring_bytes = 0;
 };
 
@@ -594,6 +595,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const int64_t part = (g.max_tok * row + RAD_PP_PART_ALIGN - 1) / RAD_PP_PART_ALIGN * RAD_PP_PART_ALIGN;
         m.segring_bytes = RAD_PP_RING_HDR + part * widest + RAD_PP_TRAILER;
         m.b_segring = decl_b(b, nm.f("pp_segring"), RAD_U8, {m.segring_bytes}, RAD_BUF_PERSIST);
+        const char* rr = std::getenv("RADIANCE_PP_LEAD_SEG_RINGS");
+        if (m.pp_rank == 0 && rr && !std::strcmp(rr, "2"))
+            m.b_segring2 = decl_b(b, nm.f("pp_segring2"), RAD_U8, {m.segring_bytes}, RAD_BUF_PERSIST);
     }
     auto seg_op = [&](size_t k, bool send) {
         std::vector<rad_buf> pb = { m.b_x };
@@ -747,8 +751,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             for (int32_t x : m.seg_b) bs += (bs.empty() ? "" : ", ") + std::to_string(x);
             if (lead)
                 rad_note(b, "two-node pipeline (tp8 dev M9, RADIANCE_PP_LEAD_SEG): a BG lane's head / tail parts may run in "
-                            "segments at layers %s, each boundary's stream saved and restored on this rank (a %lld-byte ring "
-                            "buffer)", bs.c_str(), (long long)m.segring_bytes);
+                            "segments at layers %s, each boundary's stream saved and restored on this rank (%s %lld-byte ring "
+                            "buffer%s)", bs.c_str(), m.b_segring2 ? "two" : "a", (long long)m.segring_bytes,
+                         m.b_segring2 ? "s: RADIANCE_PP_LEAD_SEG_RINGS=2, tp8 loop D32" : "");
             else
             rad_note(b, "two-node pipeline (tp8 dev M4, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments "
                         "at layers %s, each boundary's stream saved and restored on this rank (a %lld-byte ring buffer)",
@@ -864,14 +869,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const int64_t l0 = lseg ? ppi.seg_l0 : 0, l1 = lseg ? std::min<int64_t>(ppi.seg_l1, m.n_main) : m.n_main;
     const bool lfirst = !lseg || l0 == (part == RAD_PP_PART_HEAD ? 0 : m.pp_t);
     const bool llast = !lseg || (part == RAD_PP_PART_HEAD ? l1 == m.pp_h : l1 >= m.n_main);
+    /* tp8 loop D32: the leader's ring of the pass's lane (lane % 2 with two rings; the engine pairs them the same way) */
+    const rad_buf sring = m.b_segring2 && (ppi.lane & 1) ? m.b_segring2 : m.b_segring;
     auto seg_issue = [&](int64_t at, bool send) {
         for (size_t k = 0; k < m.seg_b.size(); ++k) {
             if (m.seg_b[k] != (int32_t)at) continue;
             if (m.seg_parts[k] == 2)
-                RAD_ISSUE(c, send ? m.seg_send[k] : m.seg_recv[k], brows(m.b_segring, m.segring_bytes), brows(m.b_x, T),
+                RAD_ISSUE(c, send ? m.seg_send[k] : m.seg_recv[k], brows(sring, m.segring_bytes), brows(m.b_x, T),
                           brows(m.a_h.x, T));
             else
-                RAD_ISSUE(c, send ? m.seg_send[k] : m.seg_recv[k], brows(m.b_segring, m.segring_bytes), brows(m.b_x, T));
+                RAD_ISSUE(c, send ? m.seg_send[k] : m.seg_recv[k], brows(sring, m.segring_bytes), brows(m.b_x, T));
             return true;
         }
         rad_step_fail(c, "llama: a segment boundary the follower did not declare");

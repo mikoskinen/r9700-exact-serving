@@ -441,7 +441,7 @@ static const RadConstraint cDs41PcnMix[] = {
 { "router_gemm_f32_scored_topk_scatter_bf16", "router_gemm_f32_scored_topk_scatter", "moe",
   "the router's f32 projection, router_scored_topk and the stable counting sort in one launch -- the GEMM's last "
   "workgroup ranks and sorts (lever FUSE-R)",
-  "M <= 48, M*top_k <= 1024, n_expert <= 384, top_k <= 32, K <= 16384; the GEMM a wave a tile (8 / 16 waves a "
+  "M <= 64 (48 unless RADIANCE_RGS_ROWS=64 declares more), M*top_k <= 1024, n_expert <= 384, top_k <= 32, K <= 16384; the GEMM a wave a tile (8 / 16 waves a "
   "workgroup), the selection a wave a row",
   "bf16 activation, f32 or bf16 projection, f32 bias; f32 logits and weights, i32 ids, sorted slots, offsets and "
   "counts",
