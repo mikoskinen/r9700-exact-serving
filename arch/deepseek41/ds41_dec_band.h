@@ -95,6 +95,15 @@ inline int64_t ds41_band_cuts(int64_t n, int64_t band, std::vector<std::pair<int
     return (int64_t)out.size();
 }
 
+/* tp8 loop D22 (DECODE round 18): the band step_bi's dense() and the GGUF logits head issue a decode-only run by -- `bi_band`
+ * (kBiBand) off lever WMK (libr4d's fn4 ds41_wmk < 1), 64 under ds41_wmk 5 (libr4d serves its decode band's part-order launch
+ * up to 64 rows there), else `env_band` (RADIANCE_DS41_DENSE_BAND: 49 .. 64, or kBiBand). Under WMK every dense GGUF GEMM is
+ * one part order at every row count, so the band moves launches, never a row's bytes. */
+inline int64_t ds41_dense_band(int wmk, int64_t env_band, int64_t bi_band) {
+    if (wmk < 1) return bi_band;
+    return wmk == 5 ? 64 : env_band;
+}
+
 /* RADIANCE_DS41_BI_DBAND=2: a recorded pass's key for its pieces (rad_arch_pass_key) -- a function of each piece's first
  * row and first sequence (with the core's key, which holds the step's rows and sequences, that is the whole issue the
  * pieces shape); never 0 (0 = not recorded). */

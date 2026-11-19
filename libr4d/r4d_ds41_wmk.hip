@@ -1017,13 +1017,14 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
     }
 #define GG_WK3_X(KPV, NMV, NTV)                                                                                       \
     if (kp == KPV && nmt == NMV && nt == NTV) {                                                                         \
-        if (f32out) {                                                                                                   \
-            if constexpr (KPV == 4) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float>), grid, dim3(256), lds, A); \
+        if (f32out) {   /* DRAFTER round 6 (bench): the head at KP 1 too (bit 24), q6_K only */                       \
+            if constexpr (KPV == 4 || (KPV == 1 && T == GG_Q6_K)) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float>), grid, dim3(256), lds, A); \
             return R4D_WK_DECLINE;                                                                                      \
         }                                                                                                               \
         return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t>), grid, dim3(256), lds, A);                       \
     }
     GG_WK3_X(1, 2, 2) GG_WK3_X(1, 3, 2) GG_WK3_X(1, 2, 1) GG_WK3_X(1, 3, 1)
+    GG_WK3_X(1, 4, 1)   /* tp8 loop D22 (bit 25, 49..64 rows): four row tiles at KP 1 (the head's WHG form under ds41_wmk 5) */
     GG_WK3_X(2, 2, 2) GG_WK3_X(2, 3, 2) GG_WK3_X(2, 2, 1) GG_WK3_X(2, 3, 1)
     GG_WK3_X(4, 2, 2) GG_WK3_X(4, 3, 2) GG_WK3_X(4, 2, 1) GG_WK3_X(4, 3, 1)
 #undef GG_WK3_X
@@ -1035,12 +1036,13 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     const int P = gg_wk_parts(K);
     const int kp = (code & 16777216) || P < 2 ? 1 : P / 2;   /* bit 24: KP 1 (one run holds the running total; no LDS partials) */
     const int nmt = (int)((M + 15) / 16);
-    if (nmt < 2 || nmt > 3 || kp > 4) return R4D_WK_DECLINE;
+    /* tp8 loop D22: four row tiles (49..64 rows, code bit 25) only at KP 1 (KP > 1 at four tiles stages past 64 KiB) */
+    if (nmt < 2 || nmt > ((code & 33554432) ? 4 : 3) || kp > 4 || (nmt == 4 && kp != 1)) return R4D_WK_DECLINE;
     const unsigned xg = Wq<GG_Q6_K>::XG > 0 ? (unsigned)(kWmS / 16 * 16 * nmt * kp * 4) : 0u;   /* the widest group sums (q6_K) */
     const unsigned stage = (unsigned)(kp * 16 * nmt * kWmXP * 2) + xg;
     auto parts_lds = [&](int nt) { return (unsigned)((kp - 1) * (P / kp) * (8 / kp) * 32 * nmt * nt * 8 * 4); };
     /* NT 2 at two row tiles; three tiles take NT 1 (NM 3 x NT 2 spills: 24-212 B of scratch in the 14.11. code object) */
-    int nt = (code & 4194304) || nmt == 3 ? 1 : 2;
+    int nt = (code & 4194304) || nmt >= 3 ? 1 : 2;
     if (nt == 2 && std::max(stage, parts_lds(2)) > 65536u) nt = 1;
     const unsigned lds = std::max(stage, parts_lds(nt));
     if (lds > 65536u) return R4D_WK_DECLINE;
@@ -1091,7 +1093,9 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
         if (!x_al[i]) return R4D_WK_DECLINE;
-    if ((code & 2097152) && M > 16 && M <= 48) {   /* bit 21: G2 (row tiles a block) at 17..48 rows, folds included; declined -> the rule below */
+    /* bit 21: G2 (row tiles a block) at 17..48 rows, folds included; bit 25 (tp8 loop D22, ds41_wmk 5's head): G2 to 64 rows;
+     * declined -> the rule below */
+    if ((code & 2097152) && M > 16 && M <= ((code & 33554432) ? 64 : 48)) {
         const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K, fo);
         if (g2 != R4D_WK_DECLINE) return g2;
     }
@@ -1655,6 +1659,12 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
     if (!g_wkpf_follow) form = g_wkpf_default >= 0 ? g_wkpf_default : wkpf_form_tab(ty, N, K);
+    /* DRAFTER track 18.11.2026 (r4d_selftest --perfwkpf, one card, W us 414 -> 214 at M 56 / 80 / 120): the DSpark drafter's K-heavy q8_0
+     * linears (DLW sidecar: q_a 1280x5120 63.4 / 63.1 / 63.3 -> 45.4 / 45.2 / 45.9, o_a 1024x4096 51.8 / 51.7 / 51.5 -> 36.7 / 37.0 / 36.8,
+     * kv 512x5120 62.8 / 62.4 / 61.8 -> 44.2 / 44.3 / 44.0, shexp 1536x5120 62.2 / 62.4 / 63.0 -> 44.7 / 44.8 / 45.7, 1024x5120 62.5 / 62.8 /
+     * 62.9 -> 44.4 / 44.8 / 44.8) at a drafting lane's 10-32 sequences x 5 rows run one column tile a wave in 16 waves; the same bytes (every
+     * W form computes the part order). Not under a bench pin. */
+    if (!g_wkpf_follow && g_wkpf_default < 0 && ty == GG_Q8_0 && K >= 4096 && N <= 2048 && M >= 49 && M <= 160) form = pf_code(2, 1, 16, 0, 0);
     g_wkpf_last.store(form, std::memory_order_relaxed);
     switch (ty) {
     case GG_Q8_0: return wkpf_launch_t<GG_Q8_0>(s, form, f32out, A);

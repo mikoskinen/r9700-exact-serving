@@ -507,6 +507,13 @@ static void cross_check(const Plugin& pl) {
 /* ================================================================== the device phase */
 /* --cold MIB: bytes read through the caches before every timed launch; see st_time_us. */
 static int64_t g_cold = 0;
+/* --pref MIB (DRAFTER track 19.11. round 8, bench only): in the cold mode, after the flush and before the timed launch, read the
+ * first MIB (-1: all) of that launch's weights through the hierarchy (D2D copies into one 1 MiB scratch), so the launch finds
+ * them in L2 / the 64 MiB last-level cache -- the upper bound of an idle-bandwidth weight prefetch (a perf mode that sets
+ * g_pref_fn; others ignore it). */
+static int64_t g_pref = 0;
+static void (*g_pref_fn)(void* ctx, int i, hipStream_t s) = nullptr;
+static void* g_pref_ctx = nullptr;
 /* --mx-routing FILE (tp8 DECODE D17): --perfmx replays an R4D_MXDUMP capture's records instead of mx_route's draw. */
 static const char* g_mx_routing = nullptr;
 /* --timeline: --perfar8 also records the two-shot's per-block stamps (r4d.h) and prints where each
@@ -621,6 +628,7 @@ static double st_time_us(F&& launch, int iters, hipStream_t s) {
             hip_ck(hipMemcpyAsync(dst, (const char*)src + off,
                                   (size_t)std::min(kColdChunk, g_cold - off),
                                   hipMemcpyDeviceToDevice, s), "hipMemcpyAsync", __LINE__);
+        if (g_pref_fn) g_pref_fn(g_pref_ctx, i, s);
         st_ev_record(ev[2 * (size_t)i], s);
         launch(i);
         st_ev_record(ev[2 * (size_t)i + 1], s);
@@ -21810,12 +21818,15 @@ static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const cha
  * the other two types at every dense shape. */
 struct MrShape { const char* name; int64_t N, K; const char* types; bool logits; };
 static const MrShape kMrShapes[] = {
-    { "attn_q_b", 8192, 1280, "q5_K,q6_K", false },       { "attn_output_b", 5120, 2048, "q5_K,q6_K", false },
-    { "attn_q_a", 1280, 5120, "q5_K,q6_K", false },       { "attn_output_a", 1024, 4096, "q5_K,q6_K", false },
-    { "attn_kv", 512, 5120, "q5_K,q6_K", false },         { "shexp_gate_up", 1536, 5120, "q6_K,q8_0", false },
+    /* q8_0 on the attention shapes too: the DSpark drafter's dense linears at the same TP4 widths (the DLW sidecar,
+     * dspark-dlw-q8_0; DRAFTER track 18.11.2026) */
+    { "attn_q_b", 8192, 1280, "q5_K,q6_K,q8_0", false },  { "attn_output_b", 5120, 2048, "q5_K,q6_K,q8_0", false },
+    { "attn_q_a", 1280, 5120, "q5_K,q6_K,q8_0", false },  { "attn_output_a", 1024, 4096, "q5_K,q6_K,q8_0", false },
+    { "attn_kv", 512, 5120, "q5_K,q6_K,q8_0", false },    { "shexp_gate_up", 1536, 5120, "q6_K,q8_0", false },
     { "shexp_down", 5120, 768, "q6_K,q8_0", false },      { "shexp_gate_up_w512", 1024, 5120, "q6_K,q8_0", false },
     { "shexp_down_w512", 5120, 512, "q6_K,q8_0", false }, { "engram_kv", 25600, 6144, "q6_K", false },
     { "head", 32320, 5120, "q6_K", true },
+    { "dsp_main_proj", 5120, 15360, "q8_0", false },   /* the DSpark context pass's main_proj (DRAFTER track 19.11.) */
 };
 struct MrTy { const char* name; int qk, bb; };
 static const MrTy kMrTypes[] = { { "q5_K", 256, 176 }, { "q6_K", 256, 210 }, { "q8_0", 32, 34 } };
@@ -22514,7 +22525,8 @@ static void ds_gp_perf(const Plugin& pl, const char* mlist, int iters, const cha
     for (const MrTy& ty : kMrTypes) {
         if (!mr_in(want.c_str(), ty.name)) continue;
         for (const MrShape& sh : kMrShapes) {
-            if (sh.logits || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            /* the head (logits_gemm_ggml, f32 out) only when the type list names "head" (DRAFTER track 18.11.2026) */
+            if ((sh.logits && !std::strstr(want.c_str(), "head")) || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
             const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
             std::vector<uint8_t> hw;
             mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
@@ -22524,7 +22536,7 @@ static void ds_gp_perf(const Plugin& pl, const char* mlist, int iters, const cha
                 dfree_all();
                 std::vector<uint16_t> hx;
                 gp_acts(hx, M, sh.K, 0xABCDEFull ^ (uint64_t)M);
-                const size_t mb = (size_t)(M * sh.N) * 2;
+                const size_t mb = (size_t)(M * sh.N) * (sh.logits ? 4 : 2);
                 void* d_x = dalloc((size_t)(M * sh.K) * 2);
                 void* d_w = dalloc((size_t)wbytes * (size_t)copies);
                 void* d_y = dalloc(mb);
@@ -22927,9 +22939,14 @@ static void ds_mx_check(const Plugin& pl) {
     struct P { int on, h, r, mt, wn, grid; };
     const P pins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 4, 1, 2, 0, 0 }, { 1, 4, 1, 4, 0, 0 }, { 1, 4, 1, 8, 0, 0 }, { 1, 4, 1, 16, 0, 0 },
                        { 1, 4, 2, 4, 0, 0 }, { 1, 4, 2, 8, 4, 0 }, { 1, 2, 1, 4, 0, 0 }, { 1, 2, 1, 8, 2, 7 }, { 1, 4, 1, 4, 1, 3 } };
+    /* DRAFTER track 18.11.2026: + the EX forms (h 1: each segment's chains over its own rows only) and the calls past 48
+     * tokens the forms now take (kXmMaxTokens 512: a 16-sequence lane's 80, 24 sequences' 120, ...) */
     const P spins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 0, 1, 2, 0, 0 }, { 1, 0, 1, 4, 0, 0 }, { 1, 0, 1, 8, 0, 0 }, { 1, 0, 2, 2, 0, 0 },
-                        { 1, 0, 2, 4, 8, 0 }, { 1, 0, 2, 8, 0, 0 }, { 1, 0, 1, 4, 1, 5 } };
-    const int64_t toks[] = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 20, 24, 25, 30, 32, 40, 45, 48 };
+                        { 1, 0, 2, 4, 8, 0 }, { 1, 0, 2, 8, 0, 0 }, { 1, 0, 1, 4, 1, 5 },
+                        { 1, 1, 1, 4, 0, 0 }, { 1, 1, 1, 8, 0, 0 }, { 1, 1, 1, 16, 0, 0 }, { 1, 1, 2, 4, 0, 0 }, { 1, 1, 1, 4, 8, 3 },
+                        { 1, 1, 1, 4, 0, 1024 }, { 1, 9, 1, 4, 0, 0 }, { 1, 9, 1, 8, 0, 0 }, { 1, 9, 1, 16, 0, 0 },
+                        { 1, 9, 2, 8, 0, 0 }, { 1, 9, 1, 8, 2, 7 } };
+    const int64_t toks[] = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 20, 24, 25, 30, 32, 40, 45, 48, 50, 60, 64, 79, 80, 96, 120, 160, 240 };
     long long launches = 0, diffs = 0, cases = 0;
     std::printf("drafter_mx byte check: moe_gemm_ggml type=mxfp4, the multi-row forms vs the stock kernels\n");
     for (const MxCase& c : kMxCases) {
@@ -38953,6 +38970,8 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--cold")) {
             if (i + 1 >= argc) { usage(); return 2; }
             g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
+        } else if (!std::strcmp(argv[i], "--pref") && i + 1 < argc) {
+            g_pref = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--mx-routing")) {
             if (i + 1 >= argc) { usage(); return 2; }
             g_mx_routing = argv[++i];

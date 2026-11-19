@@ -7498,8 +7498,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     g_bi_wide.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
         /* tp8 loop D22: its own line beside, once a decode-only dense run above the band went as one launch */
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_dband64_runs.load(std::memory_order_relaxed) > 0)
-            fprintf(stderr, "radiance: deepseek41: tp8 loop D22 (RADIANCE_DS41_DENSE_BAND=%lld): %lld decode-only dense GGUF runs above "
-                            "%lld rows issued as one launch (layer-ops summed)\n", (long long)dense_band_env(),
+            fprintf(stderr, "radiance: deepseek41: tp8 loop D22 (RADIANCE_DS41_DENSE_BAND=%lld, or 64 under ds41_wmk 5): %lld decode-only "
+                            "dense GGUF runs above %lld rows issued as one launch (layer-ops summed)\n", (long long)dense_band_env(),
                     g_dband64_runs.load(std::memory_order_relaxed), (long long)kBiBand);
         /* lever A9 (ds41_bi 5 / 6): its own line beside, once a step took it (the line above stays int12's) */
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_bi_onear.load(std::memory_order_relaxed) > 0)
@@ -7563,8 +7563,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * ONE launch (the decode rows ride it), a decode-only run as rows(kBiBand); off: rows(kBiBand) (`wmkw` false) or the caller's
      * own by-segment issue. `seg`: the caller's per-segment form (q_a / kv / q_b / the indexer's linears: by segment, uncut). */
     const bool wmkw = wmk_whole_on();
-    /* tp8 loop D22 (RADIANCE_DS41_DENSE_BAND): a decode-only run's dense GGUF GEMM band under WMK (kBiBand otherwise) */
-    const int64_t dband = wmkw ? dense_band_env() : kBiBand;
+    /* tp8 loop D22 (RADIANCE_DS41_DENSE_BAND): a decode-only run's dense GGUF GEMM band under WMK (kBiBand otherwise); DECODE
+     * round 18: libr4d's fn4 ds41_wmk 5 (its decode band's part-order launch up to 64 rows) takes the band to 64 in process, so
+     * one start A/Bs ds41_wmk 2 / 5 (a switch flip bumps the epoch: recorded passes re-record) */
+    const int64_t dband = wmkw ? ds41_dense_band(ds41_switch("ds41_wmk"), dense_band_env(), kBiBand) : kBiBand;
     auto dense = [&](bool gg, bool seg, const auto& fn) {
         const int64_t band = gg ? dband : kBiBand;
         const auto by_seg = [&](int64_t a0, int64_t a1) {
