@@ -1125,7 +1125,15 @@ int mix_fin_now() {
  * unfused adds and the same r4d_wave_sum whichever wave forms it, the sum of squares likewise on wave MIX % WV, and the
  * finish reads the same partials. Counters (rad_mx_stats, every rank's launches summed; a recorded pass counts when it is
  * recorded): the launches taken in a wide form and their rows. */
-bool mix_wv_known(int v) { return v == 0 || v == 12 || v == 16 || v == 24; }
+/* tp8 loop X8 step 1 (DECODE round 19): the hundreds of ds41_mix_wv (1 .. 5) pick the 9 .. 64-row split launch's form -- rows a
+ * wave, waves a chunk, column steps a load batch -- beside the units (0 / 12 / 16 / 24, the <= 8-row form as before): 1 = 16 rows
+ * a wave (WV 8, TS 4), 2 = WV 12, 3 = WV 24 (8 rows, TS 4), 4 = 4 rows a wave (WV 8, TS 4), 5 = TS 8 (8 rows, WV 8); 0 = today's
+ * (8 rows, WV 8, TS 4 above 24 rows; 4 rows, TS 4 at 9 .. 24). The same partials by mix_split_kernel's note (any R, WV, TS and
+ * row count), the finish unchanged; not the FIN form. */
+bool mix_wv_known(int v) {
+    const int u = v % 100, hv = v / 100;
+    return v >= 0 && hv <= 5 && (u == 0 || u == 12 || u == 16 || u == 24);
+}
 std::atomic<int> g_mix_wv{-1};
 std::atomic<long long> g_mx_launch{0}, g_mx_rows{0};
 int mix_wv_now() {
@@ -1187,7 +1195,13 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
                     (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,             \
                     (long)fn.stride[0], part, o.width, (int)chunks, rows, (unsigned*)nullptr, o))
         /* lever 1U-MX: the decode heights' launch with more waves a chunk (the same partials; not the FIN form) */
-        const int wv = HC == 4 && rows <= 8 && !ctr ? mix_wv_now() : 0;
+        const int wv = HC == 4 && rows <= 8 && !ctr ? mix_wv_now() % 100 : 0;
+        /* tp8 loop X8 step 1: the 9 .. 64-row launch's form by ds41_mix_wv's hundreds (the same partials; not the FIN form) */
+        const int xv = HC == 4 && rows > 8 && rows <= 64 && !ctr ? mix_wv_now() / 100 : 0;
+#define MIX_X8(RS, WV, TS)                                                                                     \
+    R4D_EMIT(stream, (mix_split_kernel<HC, RS, WV, TS>), dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), \
+             dim3(32 * (WV)), 0, (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,           \
+             (long)fn.stride[0], part, o.width, (int)chunks, rows, (unsigned*)nullptr, o)
 #define MIX_WIDE(WV)                                                                                       \
     R4D_EMIT(stream, (mix_split_kernel<HC, 1, WV, kMixSteps>), dim3((unsigned)chunks, grid_rows(rows)),    \
              dim3(32 * (WV)), 0, (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,       \
@@ -1199,11 +1213,23 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
                 g_mx_launch.fetch_add(1, std::memory_order_relaxed);
                 g_mx_rows.fetch_add(rows, std::memory_order_relaxed);
             }
+        } else if (xv >= 1 && xv <= 5) {
+            if constexpr (HC == 4) {
+                rc = xv == 1 ? MIX_X8(16, 8, 4) : xv == 2 ? MIX_X8(8, 12, 4) : xv == 3 ? MIX_X8(8, 24, 4)
+                   : xv == 4 ? MIX_X8(4, 8, 4) : MIX_X8(8, 8, 8);
+            } else {
+                rc = -1;
+            }
+            if (rc >= 0) {
+                g_mx_launch.fetch_add(1, std::memory_order_relaxed);
+                g_mx_rows.fetch_add(rows, std::memory_order_relaxed);
+            }
         } else {
             rc = rows <= 8 ? MIX_SPLIT(1, kMixSteps)
                  : rows <= 24 ? MIX_SPLIT(RM, 4)
                               : MIX_SPLIT(RB, 4);
         }
+#undef MIX_X8
 #undef MIX_WIDE
 #undef MIX_SPLIT
         if (rc >= 0 && ctr && fin_sw) {

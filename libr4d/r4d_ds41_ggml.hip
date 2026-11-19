@@ -4485,7 +4485,8 @@ void r4d_arc_set(int v);
 int r4d_ar_xpush_get();
 void r4d_ar_xpush_set(int v);
 /* Lever 1U-MX (ds41-int11, r4d_ds41_elem.hip): "ds41_mix_wv" 0 / 12 / 16 / 24 -- mhc_mix's split launch at decode heights
- * with that many waves a chunk (0: the stock 8; the same partials, so the same bytes). */
+ * with that many waves a chunk (0: the stock 8; the same partials, so the same bytes). tp8 loop X8: + 100 x 1 .. 5 = the
+ * 9 .. 64-row launch's form (r4d_ds41_elem.hip mix_wv_known), the same partials too. */
 bool r4d_mix_wv_known(int v);
 int r4d_mix_wv_get();
 void r4d_mix_wv_set(int v);
