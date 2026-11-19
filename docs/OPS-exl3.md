@@ -266,6 +266,23 @@ Checked on the card by `tools/dkcheck.cpp` (not a CMake target; built by the eng
 grouped / one-run-of-M routings, each (token, slot) of the one launch against the same slot of its <= 16-token piece
 through the `_m16` rows -- 608 cases, 35 914 rows of `h` and of `y`, 0 differ (13.11.2026).
 
+## The two-consumer down (tp8 loop U14, ds41-u14-band)
+
+`moe_exl3_down_bd` is `moe_exl3_down` (two-class form) with ONE more operand, last (index 10, `EXL3_BD_BAND`):
+`band`, i32 [M], a value a token of the op. In a launch above the decode band (M > 16: the run-aligned MTX GEMM) a
+token whose entry is non-zero gets the decode band's DOWN arithmetic -- the epilogue sums the 8 staged tiles of the
+output Hadamard as EPIC's paired even / odd sums (`epic_tile`), as the decode kernels do, where the M > 16 kernels take
+the plain sequential sum -- and a token whose entry is 0 gets the M > 16 band's bytes. `moe_exl3_gate_up`'s `h` is the
+same bits in both bands (the `_dk` check above: `h` none), so ONE pass over a step's decode rows and prompt rows -- one
+routing, each live expert's trellis decoded once -- gives a marked row the bytes of its <= 16-token pass and an unmarked
+row the bytes of its own M > 16 pass. `exl3r4d` serves it as `exl3r4d_moe_down_bd` (M > 16, the `_pf` row's hooks;
+the `band` pointer is the last field of the argument block, every earlier field keeps its offset). This is fn4's
+BI-dual of 11.11.2026 (fn4-dsdual 8d738e2: an optional operand of `moe_exl3_down` at interface v13) as a name of its
+own, so the eight shared schemas stay what every library exports; `exl3ref` does not serve it.
+
+Checked on the card by `tools/perfmoe --sub LO:HI [--sub-band ..] [--band LO:HI]` (the tokens [LO, HI) of one
+launch alone against the same (token, slot) pairs inside the whole launch, `h` and `y` byte for byte).
+
 ## The two weight classes
 
 The even experts at `[N, K]` and the odd ones at `[N_odd, K_odd]`, expert `e` at entry `e / 2` of

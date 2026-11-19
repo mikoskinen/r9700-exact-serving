@@ -111,7 +111,8 @@
  * its offset. exl3r4d.hip asserts the same offsets on the device compile. */
 #if !EXL3R4D_SUHC && !EXL3R4D_WGQ
 _Static_assert(offsetof(Exl3r4dGemm, x3d) == offsetof(Exl3r4dGemm, raw_pitch) + sizeof(int64_t), "x3d right after raw_pitch");
-_Static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads the block by 8");
+_Static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 16, "x3d pads the block by 8, U14's band after it");
+_Static_assert(offsetof(Exl3r4dGemm, band) == offsetof(Exl3r4dGemm, x3d) + 8, "U14: band right after x3d / dng");
 _Static_assert(offsetof(Exl3r4dGemm, dng) == offsetof(Exl3r4dGemm, x3d) + 4, "SPB-G: dng in x3d's tail padding");
 #endif
 
@@ -243,6 +244,20 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
     d->limit = (float)g->limit;
+    /* tp8 loop U14 (moe_exl3_down_bd, include/exl3_abi.h): the two-consumer down's token bands -- operand EXL3_BD_BAND, after
+     * moe_exl3_down's ten. Only that op is handed more operands than moe_exl3_down's schema (every caller passes an op's
+     * exl3_positions n_opd: the engine's issue_exl3, the gate_up_down helpers' down view, the tools), and only the M > 16
+     * kernels read it (the decode band computes every row in its own arithmetic already). */
+    d->band = NULL;
+    if (op == EXL3_DOWN && a->n_t > EXL3_BD_BAND) {
+        const RadTensor* bt = rad_arg_in(a, EXL3_BD_BAND);
+        if (bt && bt->data) {
+            if (bt->dtype != RAD_I32) return RAD_E_DTYPE;
+            if (!rad_tensor_is_contiguous(bt)) return RAD_E_STRIDE;
+            if (rad_tensor_numel(bt) < T / g->top_k) return RAD_E_SHAPE;
+            d->band = (const int32_t*)bt->data;
+        }
+    }
     {   /* X3D-F: K = 2 at fn4 exl3_x3d >= 1; K25U: K = 2.5 at 2 / 3 / 4 (the gate_up arm; exl3r4d_launch_gemm) */
         const int sw = exl3r4d_fn4_x3d();
         /* X5: 5 = the fold -- at K = 2 x3d 5 (exl3r4d_launch_gemm's x3d kernel FOLD form), at K = 2.5 x3d 6 (K25U G3 / U4

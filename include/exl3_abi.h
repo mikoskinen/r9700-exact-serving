@@ -673,6 +673,41 @@ static inline const RadOpSchema* exl3_dk_schema_at(int i) {
     return i >= 0 && i < 2 ? &s[i] : 0;
 }
 
+/* tp8 loop U14 (ds41-u14-band, 19.11.2026; = BI-dual of 11.11.2026, fn4-dsdual 8d738e2, which no line past interface v8
+ * carried): THE TWO-CONSUMER DOWN. moe_exl3_down_bd is moe_exl3_down with ONE more operand, last, at EXL3_BD_BAND:
+ * `band`, i32 [M] -- a value a token of the op (pass-relative). In a launch above the decode band (M > 16: exl3r4d's MTX
+ * map / run forms) a token whose entry is non-zero gets the M <= 16 band's DOWN arithmetic: the epilogue sums the 8 staged
+ * tiles of the output Hadamard as EPIC's paired even / odd sums, as the decode kernels do, where the M > 16 kernels take
+ * the plain sequential sum (had_tiles); a token whose entry is 0 gets the M > 16 band's bytes. gate_up's h is the same
+ * bits in both bands at these widths (fn4 177b; lever P's dkcheck: "h 0" against the MTX rows), so ONE pass over a
+ * step's decode rows and prompt rows -- one routing, each live expert's trellis decoded once -- gives a marked row the
+ * bytes of its <= 16-token pass and an unmarked row those of its own M > 16 pass (tools/perfmoe --sub / --band check it
+ * on a card). A launch in the decode band computes every row in that band's arithmetic and reads no band. A name of its
+ * own, as lever P's: the eight schemas above stay what every library exports. Two-class form only. */
+#define EXL3_OP_DOWN_BD "moe_exl3_down_bd"
+#define EXL3_BD_BAND 10   /* the band operand: after moe_exl3_down's ten */
+static inline int exl3_bd_schema_count(void) { return 1; }
+static inline const RadOpSchema* exl3_bd_schema_at(int i) {
+    static RadOpSchema s;
+    static RadOperandSpec opd[EXL3_BD_BAND + 1];
+    static int made = 0;
+    if (!made) {
+        const RadOpSchema* d = exl3_schema_at(1);   /* moe_exl3_down */
+        for (int k = 0; k < EXL3_BD_BAND && k < d->n_operands; ++k) opd[k] = d->operands[k];
+        opd[EXL3_BD_BAND].name = "band";
+        opd[EXL3_BD_BAND].role = RAD_OPD_IN;
+        opd[EXL3_BD_BAND].optional = 0;
+        s = *d;
+        s.op = EXL3_OP_DOWN_BD;
+        s.operands = opd;
+        s.n_operands = EXL3_BD_BAND + 1;
+        s.doc = "moe_exl3_down with a token band (tp8 loop U14): band i32 [M], a token whose entry is non-zero gets the "
+                "M <= 16 band's down arithmetic in a launch of any M, every other token the launch's own. docs/OPS-exl3.md.";
+        made = 1;
+    }
+    return i == 0 ? &s : 0;
+}
+
 /* ===================================================================== THE PLANES
  *
  * A table's entry e is one plane of one expert, exactly as the container holds it (the canonical

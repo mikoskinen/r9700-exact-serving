@@ -92,6 +92,15 @@ static int gu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 static int dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, 0, operand, out);
 }
+/* tp8 loop U14: moe_exl3_down_bd = moe_exl3_down's operands, then the band (the architecture's choice a token, i32 [M]) */
+static int bd_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand != EXL3_BD_BAND) return shape(p, n_p, 0, operand, out);
+    Exl3Geom g;
+    if (!out || exl3_geom_parse(p, n_p, EXL3_DOWN, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_UNSUPPORTED;
+    desc(out, RAD_I32, 1, (int64_t[]){ g.M }, RAD_FILL_INDEX);
+    out->idx_max = 2;
+    return RAD_OK;
+}
 /* v6: the four-class forms */
 static int gu4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, EXL3_GATE_UP4, operand, out);
@@ -510,6 +519,20 @@ static const RadKernelInfo k_rows[] = {
         .launch = dn_launch, .scratch = dn_scratch,
         .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
     },
+    /* ---------------------------------------------------- tp8 loop U14: the two-consumer down (include/exl3_abi.h
+     * EXL3_OP_DOWN_BD) -- the M > 16 band's down with the token band read by fill(); the _pf row's hooks throughout. */
+    {
+        .name = "exl3r4d_moe_down_bd", .op = EXL3_OP_DOWN_BD, .family = "moe",
+        .computes = "EXL3 routed experts, down, bf16 y, M > 16 with a token band: the _pf row's run-aligned MTX GEMM, a "
+                    "marked token's rows with the decode band's epilogue sums (EPIC's paired tile sums), the others the "
+                    "_pf row's",
+        .shape = "M > 16; K % 128, N % 128 (each class); two parity classes in one grid; band i32 [M]",
+        .dtypes = "exl3k2 .. exl3k6, mul1; h f16; y bf16; band i32",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_prefill, .n_constraints = N_PREFILL,
+        .launch = dn_pf_launch, .scratch = dn_pf_scratch,
+        .layout = dn_layout, .relayout = dn_relayout, .opd_shape = bd_shape, .unrelayout = dn_unrelayout,
+    },
     /* ---------------------------------------------------- v6: the four-class forms (tp4's rotation by number mod 4)
      * The rows above over four class tables a plane: the same kernels compiled with four class records in the
      * argument block (exl3r4d_mod4.hip, exl3r4d_prefill_mod4.hip), the same constraints, stored forms and bands. No
@@ -603,10 +626,13 @@ uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 RAD_PLUGIN_ABI_LAYOUT_EXPORT   /* ABI 32+: the layout fingerprint the loader checks */
 const RadPluginInfo* rad_plugin_info(void) { return &k_info; }
 
-/* the eight shared schemas, then lever P's two (exl3r4d alone exports them: include/exl3_abi.h) */
-int                rad_kernel_schema_count(void) { return exl3_schema_count() + exl3_dk_schema_count(); }
+/* the eight shared schemas, then lever P's two and tp8 loop U14's one (exl3r4d alone exports them: include/exl3_abi.h) */
+int                rad_kernel_schema_count(void) {
+    return exl3_schema_count() + exl3_dk_schema_count() + exl3_bd_schema_count();   /* + tp8 loop U14's */
+}
 const RadOpSchema* rad_kernel_schema_at(int i) {
-    return i < exl3_schema_count() ? exl3_schema_at(i) : exl3_dk_schema_at(i - exl3_schema_count());
+    const int n8 = exl3_schema_count(), ndk = exl3_dk_schema_count();
+    return i < n8 ? exl3_schema_at(i) : i < n8 + ndk ? exl3_dk_schema_at(i - n8) : exl3_bd_schema_at(i - n8 - ndk);
 }
 int                rad_kernel_count(void) { return (int)(sizeof k_rows / sizeof k_rows[0]); }
 const RadKernelInfo* rad_kernel_at(int i) {

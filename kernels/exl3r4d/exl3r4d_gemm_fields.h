@@ -45,3 +45,7 @@
     int32_t        dng;      /* SPB-G (ds41-etp-spb-plug; fn4 exl3_dng): the x3d / k25 down's 128-column blocks a
                               * workgroup, 2 / 4 / 8, else 1 (0 = as 1). In x3d's tail padding: the block's size and every
                               * other field's offset are what they were. */
+    const int32_t* band;     /* tp8 loop U14 (moe_exl3_down_bd, include/exl3_abi.h): down in the M > 16 band, [n_tok / top_k]
+                              * a token's band -- non-zero: that token's rows take the M <= 16 band's epilogue (EPIC's paired
+                              * tile sums, epic_tile); null: every row the launch's own. Appended after dng: every earlier
+                              * field keeps its offset. fill() sets it for moe_exl3_down_bd only. */

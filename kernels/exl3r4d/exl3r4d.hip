@@ -1456,7 +1456,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
 // block's x3d is set (fill(): bits 2 and the fn4 switch exl3_x3d), so with the switch off no launch reaches it.
 #if !EXL3R4D_SUHC && !EXL3R4D_WGQ   // the device compile's view of the appended field = the host's (launch.c)
 static_assert(offsetof(Exl3r4dGemm, x3d) == offsetof(Exl3r4dGemm, raw_pitch) + sizeof(int64_t), "x3d right after raw_pitch");
-static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads the block by 8");
+static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 16, "x3d pads the block by 8, U14's band after it");
 #endif
 // SPB-G (ds41-etp-spb-plug, 14.11.2026; fn4 exl3_dng): the down kernel (MATS 1) with G 128-column blocks a workgroup,
 // blocks G blockIdx.x .. G blockIdx.x + G - 1 of the same run one after the other (the generic kernel's E2 loop, ported):
