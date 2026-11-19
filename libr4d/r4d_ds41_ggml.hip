@@ -4615,7 +4615,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_known(value) ? 1 : -1;   /* lever SPD-F */
-    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 5 ? 1 : -1;   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both), 4 / 5: 2's bytes faster */
+    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 6 ? 1 : -1;   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both), 4 / 5 / 6: 2's bytes faster (6: lever XPG) */
     if (!std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
