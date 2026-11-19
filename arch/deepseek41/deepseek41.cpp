@@ -3018,7 +3018,8 @@ static int buffers(RadBuilder* b, Model& m) {
             /* tp8 loop D25: with RADIANCE_DS41_DKV_GPIECE=1 the buffer holds a 64-row segment's pieces side by side; the ops'
              * row range (selkv_rows) stays the band's, so every launch is the one today issues */
             m.selkv_cap = dkv_gpiece_env() ? std::min<int64_t>(T, kDkvGpRows) : m.selkv_rows;
-            m.selkv_one = g_dkv_gp.load(std::memory_order_relaxed) == 2 && m.selkv_cap > m.selkv_rows;
+            /* the env alone (not T): the sizing declare at a smaller max_tok must declare the same parameter lists */
+            m.selkv_one = g_dkv_gp.load(std::memory_order_relaxed) == 2;
             m.selkv = bf("comp_latent_gathered", { m.selkv_cap, c.itopk * c.head_dim });
         }
     }
@@ -3603,7 +3604,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (r > 0 && L.attn_rt && m.selkv) {
                 std::vector<RadParam> gf = fp;
                 gf[0] = RAD_RANGE("M", 1, m.selkv_one ? m.selkv_cap : m.selkv_rows);
-                if (m.selkv_one) gf.push_back(RAD_INT("band", m.selkv_cap));   /* tp8 loop D25 step 3: libr4d's decode band to 64 */
+                if (m.selkv_one) gf.push_back(RAD_INT("band", kDkvGpRows));   /* tp8 loop D25 step 3: libr4d's decode band to 64 */
                 L.attn_rtg = fused(b, "attn_sparse_sink_rope_roundtrip_gathered", gf, { L.sinks },
                                    { m.q, m.sel, cs, m.selkv }, { m.o });
             }
@@ -3627,7 +3628,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                             {}, { m.sel }, { m.selkv });
             std::vector<RadParam> gp = ap;
             gp[0] = RAD_RANGE("M", 1, m.selkv_one ? m.selkv_cap : m.selkv_rows);
-            if (m.selkv_one) gp.push_back(RAD_INT("band", m.selkv_cap));   /* tp8 loop D25 step 3 */
+            if (m.selkv_one) gp.push_back(RAD_INT("band", kDkvGpRows));   /* tp8 loop D25 step 3 */
             L.attn_g = fused(b, "attn_sparse_sink_gathered", gp, { L.sinks }, { m.q, m.sel, m.selkv }, { m.o });
         }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
