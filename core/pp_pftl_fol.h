@@ -52,6 +52,7 @@ struct PfFolTimeline {
     /* tp8 loop P22b: a split lone prefill pass's record */
     struct SegRec {
         int64_t rows = 0;
+        int nseq = 1;                    /* prompts in the pass (a batched BG step: several) */
         bool first = false;              /* at context 0 */
         int lane = -1;
         int32_t ahead = INT32_MIN;
@@ -62,7 +63,7 @@ struct PfFolTimeline {
         int64_t between = 0, gen = 0;    /* passes run between its segments; its lane's pass count at its begin */
         bool issued = false;
     };
-    struct SegStat { double own, x1, s0, btw, span; int64_t rows, between; };
+    struct SegStat { double own, x1, s0, btw, span; int64_t rows, between; int nseq; };
     std::deque<SegRec> sq;
     bool seg_open = false;               /* a split pass's segments are going out (a pass between them is not one) */
     std::vector<int64_t> lane_gen;       /* passes begun a lane (P22's and P22b's) */
@@ -131,9 +132,10 @@ struct PfFolTimeline {
         ++gen_of(lane);
     }
     /* tp8 loop P22b: a split lone prefill pass begins (rank 0's thread parked; its segments follow) */
-    void seg_begin(int64_t rows, bool first, int lane, int32_t ahead, RadPpRing* ring) {
+    void seg_begin(int64_t rows, bool first, int lane, int32_t ahead, RadPpRing* ring, int nseq = 1) {
         SegRec r;
         r.rows = rows;
+        r.nseq = nseq > 0 ? nseq : 1;
         r.first = first;
         r.lane = lane;
         r.ahead = ahead;
@@ -174,21 +176,26 @@ struct PfFolTimeline {
     }
     void seg_summary(const std::vector<SegStat>& v, const char* what) {
         if (v.empty()) return;
-        std::vector<double> own, x1, s0, btw, span, rows, between;
+        std::vector<double> own, x1, s0, btw, span, rows, between, own_b;
         double own_sum = 0, x1_sum = 0;
-        int64_t rsum = 0, nx1 = 0;
+        int64_t rsum = 0, nx1 = 0, newc = 0, nb = 0;
         for (const SegStat& s : v) {
-            own.push_back(s.own); own_sum += s.own; s0.push_back(s.s0); btw.push_back(s.btw); span.push_back(s.span);
-            rows.push_back((double)s.rows); between.push_back((double)s.between); rsum += s.rows;
+            /* a batched pass counts each of its prompts once, at its own ms over them */
+            for (int k = 0; k < s.nseq; ++k) own.push_back(s.own / s.nseq);
+            own_sum += s.own; s0.push_back(s.s0); btw.push_back(s.btw); span.push_back(s.span);
+            rows.push_back((double)s.rows / s.nseq); between.push_back((double)s.between); rsum += s.rows; newc += s.nseq;
+            if (s.nseq >= 2) { ++nb; own_b.push_back(s.own); }
             if (s.x1 >= 0) { x1.push_back(s.x1); x1_sum += s.x1; ++nx1; }
         }
-        RAD_INFO("follower BG bodies (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P22b) %s: %zu newcomers, %lld rows (p50 %.0f); rank 0's "
-                 "card a newcomer: its own segments p50 %.1f / mean %.1f ms (%.2f ms a 1k rows), of which waiting for X1 p50 %.1f / "
-                 "mean %.1f ms (%lld read), segment 0 p50 %.1f ms; other passes between its segments p50 %.0f, the card between "
-                 "them p50 %.1f ms; span p50 %.1f ms; events unread %lld, X1 unread %lld",
-                 what, v.size(), (long long)rsum, p50(rows), p50(own), own_sum / (double)v.size(),
-                 rsum > 0 ? own_sum * 1000.0 / (double)rsum : 0.0, p50(x1), nx1 ? x1_sum / (double)nx1 : -1.0, (long long)nx1,
-                 p50(s0), p50(between), p50(btw), p50(span), (long long)seg_unread_ev, (long long)seg_unread_x1);
+        RAD_INFO("follower BG bodies (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P22b) %s: %lld newcomers in %zu passes (%lld passes of >= 2, "
+                 "their own p50 %.1f ms), %lld rows (p50 %.0f a newcomer); rank 0's card a newcomer: its own segments p50 %.1f / mean "
+                 "%.1f ms (%.2f ms a 1k rows), of which waiting for X1 p50 %.1f / mean %.1f ms a pass (%lld read), segment 0 p50 %.1f "
+                 "ms; other passes between its segments p50 %.0f, the card between them p50 %.1f ms; span p50 %.1f ms; events unread "
+                 "%lld, X1 unread %lld",
+                 what, (long long)newc, v.size(), (long long)nb, p50(own_b), (long long)rsum, p50(rows), p50(own),
+                 newc > 0 ? own_sum / (double)newc : 0.0, rsum > 0 ? own_sum * 1000.0 / (double)rsum : 0.0, p50(x1),
+                 nx1 ? x1_sum / (double)nx1 : -1.0, (long long)nx1, p50(s0), p50(between), p50(btw), p50(span),
+                 (long long)seg_unread_ev, (long long)seg_unread_x1);
     }
     /* read the completed split passes in issue order (`force`: now, whatever is unread -- the stop) */
     void seg_flush(bool force) {
@@ -219,16 +226,16 @@ struct PfFolTimeline {
             if (r.x1 && r.tpms) x1 = (double)(r.w1 - r.w0) / (double)r.tpms;
             else ++seg_unread_x1;
             ++prompts;
-            RAD_INFO("follower prefill timeline (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P22b): prompt %lld, 1 passes, %lld rows (%s) in "
-                     "%zu segments, lane %d, ahead %s; rank 0's card: passes %.1f ms (%d read; %.2f ms a 1k rows) = its own segments, "
+            RAD_INFO("follower prefill timeline (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P22b): prompt %lld, 1 passes, %lld rows (%s) of %d "
+                     "prompt(s) in %zu segments, lane %d, ahead %s; rank 0's card: passes %.1f ms (%d read; %.2f ms a 1k rows) = its own segments, "
                      "of which waiting for X1 %.1f ms (%lld receives on the rings) and segment 0 (the receive + its first layer) "
                      "%.1f ms; %lld other passes ran between its segments, the card %.1f ms between them; span %.1f ms; events "
-                     "dropped %lld", (long long)prompts, (long long)r.rows, r.first ? "context 0" : "a resumed prompt", n, r.lane,
+                     "dropped %lld", (long long)prompts, (long long)r.rows, r.first ? "context 0" : "a resumed prompt", r.nseq, n, r.lane,
                      r.ahead == INT32_MIN ? "-" : std::to_string(r.ahead).c_str(), own, nread,
                      r.rows > 0 ? own * 1000.0 / (double)r.rows : 0.0, x1, r.x1 ? (long long)(r.n1 - r.n0) : -1LL, s0,
                      (long long)r.between, btw, span, (long long)dropped);
             if (nread == (int)n && n > 0) {
-                const SegStat s{ own, x1, s0, btw, span, r.rows, r.between };
+                const SegStat s{ own, x1, s0, btw, span, r.rows, r.between, r.nseq };
                 if (win.empty()) win_t0 = rad_mono_ns();
                 win.push_back(s);
                 all.push_back(s);

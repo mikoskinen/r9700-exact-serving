@@ -2312,8 +2312,9 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         if (a.lead_seg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1"); }
         if (a.hold) env.push_back("RADIANCE_PP_BG_HOLD_MS=60000");
         if (a.join) env.push_back(std::string("RADIANCE_PP_BG_JOIN_MS=") + a.join);   /* tp8 loop P23b */
+        /* tp8 loop P22b: the follower's BG-pass lines, a batched pass's too */
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
-                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_PF_TIMELINE=1" })
             env.push_back(v);
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
@@ -2358,6 +2359,22 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
                 if (const char* w = std::strstr(q, "the widest ")) widest = std::atoll(w + std::strlen("the widest "));
             }
         if (a.room || a.sw) b2_all += std::max(0LL, b2);
+        /* tp8 loop P22b: a batched BG pass is one follower line of its prompts, and the run's summary counts them */
+        long long fb = 0, fnewc = -1, fpass = -1, fbatched = -1;
+        for (size_t at = flog.find("tp8 loop P22b): prompt "); at != std::string::npos; at = flog.find("tp8 loop P22b): prompt ", at + 1)) {
+            const std::string line = flog.substr(at, flog.find('\n', at) - at);
+            if (const size_t o = line.find(") of "); o != std::string::npos && std::atoi(line.c_str() + o + 5) >= 2) ++fb;
+        }
+        if (const size_t at = flog.rfind("tp8 loop P22b) over the run: "); at != std::string::npos)
+            (void)std::sscanf(flog.c_str() + at, "tp8 loop P22b) over the run: %lld newcomers in %lld passes (%lld passes of >= 2", &fnewc,
+                              &fpass, &fbatched);
+        fprintf(stderr, "    follower P22b: %lld batched pass lines; run summary %lld newcomers in %lld passes, %lld of >= 2\n", fb, fnewc,
+                fpass, fbatched);
+        if (b2 > 0 && std::strcmp(a.cut, "2,3") != 0) {   /* W(2,3)'s follower holds one layer: no segments, no split pass */
+            CHECK(fb > 0);
+            CHECK(fbatched > 0);
+            CHECK(fnewc > fpass);
+        }
         fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; BG steps "
                         "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : a.sw ? "2112 by pp_bg_room" : "off",
                 a.lead_seg ? " + LEAD_SEG=1 + AHEAD" : a.hold ? " + HOLD" : "", a.join ? (std::string(" + JOIN_MS=") + a.join).c_str() : "",

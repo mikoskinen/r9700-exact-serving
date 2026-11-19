@@ -1868,12 +1868,13 @@ int Engine::follower_loop() {
          * tp8 loop P22b: a split one (a BG newcomer's body in segments, other lanes' passes between them) by its segments,
          * on its own record -- the passes between neither end nor join the open prompt */
         const bool pfl = pff && b->phase == RAD_PHASE_PREFILL && b->n_seq == 1;
-        const bool pfs = pfl && split && !pff->seg_open;
+        /* (a split prefill pass of several prompts too: a batched BG step, RADIANCE_PP_BG_ROOM / pp_bg_room) */
+        const bool pfs = pff && split && b->phase == RAD_PHASE_PREFILL && b->n_seq >= 1 && !pff->seg_open;
         const int64_t pfs_between0 = seg_between;
         if (pff && !pfl) pff->close();
         if (pfs)
             pff->seg_begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN,
-                           pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1]);
+                           pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1], b->n_seq);
         else if (pfl)
             pff->begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN);
         for (size_t k = 0; k < parts.size(); ++k) {
