@@ -3914,6 +3914,7 @@ int attn_skip_env() {
     return v;
 }
 std::atomic<int> g_attn_skip_pin{-1};
+[[maybe_unused]] const int g_attn_skip_load = attn_skip_env();   /* read (and its line printed) when libr4d loads */
 int attn_skip_now() {
     const int p = g_attn_skip_pin.load(std::memory_order_relaxed);
     return p >= 0 ? (p ? 1 : 0) : attn_skip_env();
