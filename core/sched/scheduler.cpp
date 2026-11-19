@@ -4280,7 +4280,7 @@ int Scheduler::commit(StepResult& res) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
     /* tp8 loop P23b: a BG lane's step commits -- its plan-to-commit time a row (LaneSet::bg_remaining_us_locked) */
-    if (lanes_ && lanes_->is_bg(lane_)) lanes_->note_bg_commit_locked(lane_, mono_us());
+    if (lanes_ && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) lanes_->note_bg_commit_locked(lane_, mono_us());
     /* StepResult's counts describe this step only. */
     step_finished_ = 0;
     last_prefill_ids_.clear();

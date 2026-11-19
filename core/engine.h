@@ -506,6 +506,17 @@ private:
     int  pp_ship_release(int lane);
     bool tail_ahead_ = false;
     int64_t tail_ahead_n_ = 0;   /* model parts issued ahead */
+    /* tp8 MERGE (fn4 pp_merge, the leader's; RADIANCE_PP_MERGE its start value; core/sched/lanes.h merge_into / split_from):
+     * bit 1 the decode lanes run as ONE lane (lane 0) while a BG lane has a step in flight or a newcomer in its inbox, split
+     * back when none; bit 2 merged always; bit 4 with RADIANCE_PP_LEAD_SEG, BG steps run their leader parts in segments only
+     * with the merge on; bit 8 no BG leader segments at all; bit 16 hold kept-home newcomers while merged. 0 = today. Read by step_loop_lanes at the top of every round. */
+    std::atomic<int> pp_merge_{0};
+    /* tp8 MERGE: fn4 pp_merge_ms (RADIANCE_PP_MERGE_MS) -- the lanes stay merged this many ms after the last BG work; bit 16 of
+     * pp_merge: while merged, D11's hold (RADIANCE_PP_MERGE_HOLD_MS, default 1500) for a newcomer the BG lanes have no room for */
+    std::atomic<int> pp_merge_ms_{0};
+    /* tp8 MERGE bit 32: the lanes whose steps run as relay (BG) steps now -- their frames carry StepHdr flags bit 8, and the
+     * follower runs such a pass in segments as a BG lane's */
+    uint32_t pp_relay_mask_ = 0;
     int  lanes_init(const std::vector<BatchBuilder::RankIO>& rio);
     void lanes_note(int64_t lane_steps, int64_t rounds_two);
     /* Stage busy stamps (RADIANCE_PP_STAMPS=path): every pass's host issue-to-done interval on this
