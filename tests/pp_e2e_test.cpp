@@ -2103,6 +2103,116 @@ TEST(lead_segments_serve_one_process_tokens) {
     CHECK(msteps_all > 0);
 }
 
+/* tp8 loop D32 (LSP, DECODE round 25): fn4 pp_lead_seg on the leader -- form 2 (decode first: a decode tail whose X2 landed and its
+ * lane's next head go before the BG step's next segment, one segment in the stream, parts whole while no decode lane is busy), a
+ * stride (every s-th declared boundary), form 0 (whole beside the declared boundaries) and the switch POSTed between the two
+ * request sets (2 -> 1 -> 0 in one process). Every request's tokens are one process's at 4 lanes BG 2 (FOL_ORDER 2, the BEST
+ * form) and 3 lanes BG 1, at a head boundary (W(2,3)) and a tail one only (W(1,2)); a leader with no boundary declared refuses
+ * any form but 0 by name. */
+TEST(lead_seg_decode_first_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; const char* lead_seg; const char* form; const char* order; const char* post1;
+                 const char* post2; };
+    long long first_all = 0, parts_all = 0;
+    for (const Arm a : { Arm{ 4, "2,3", 2, "1", "2", "2", nullptr, nullptr }, Arm{ 4, "1,2", 2, "1", "2", "2", nullptr, nullptr },
+                         Arm{ 3, "2,3", 1, "1", "2", nullptr, nullptr, nullptr }, Arm{ 4, "2,3", 2, "1", "34", "2", nullptr, nullptr },
+                         Arm{ 4, "2,3", 2, "1", "0", "2", nullptr, nullptr }, Arm{ 4, "2,3", 2, "1", "2", "2", "1", "0" },
+                         Arm{ 4, "2,3", 2, nullptr, nullptr, "2", "2", nullptr } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        if (a.lead_seg) env.push_back(std::string("RADIANCE_PP_LEAD_SEG=") + a.lead_seg);
+        if (a.form) env.push_back(std::string("RADIANCE_PP_LEAD_SEG_FORM=") + a.form);
+        if (a.order) env.push_back(std::string("RADIANCE_PP_FOL_ORDER=") + a.order);
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        auto post = [&](const char* v, int want) {
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_lead_seg", std::atoi(v) } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, want);
+            if (st != want) fprintf(stderr, "    POST pp_lead_seg %s: %d %s\n", v, st, out.c_str());
+            if (want == 400) CHECK(out.find("declared no leader boundary") != std::string::npos);
+        };
+        if (a.post1 && !a.lead_seg) post(a.post1, 400);   /* no boundary declared: refused by name */
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        if (a.post1 && a.lead_seg) post(a.post1, 200);
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        if (a.post2) {   /* applied at the next step's release: one short request after it */
+            post(a.post2, 200);
+            CHECK(!complete(pp.port, prompt_ids(7, 12), 4).empty());
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long steps = -1, parts = -1, between = -1, inside = -1, polls = -1, first = -1, whole = -1, wtail = -1;
+        int now = -1;
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld "
+                                                    "other lanes' tails while one was in flight (%lld of them between two of its "
+                                                    "segments), %lld polls", &steps, &parts, &between, &inside, &polls);
+        if (const size_t at = llog.rfind("pp_lead_seg "); at != std::string::npos)
+            (void)std::sscanf(llog.c_str() + at, "pp_lead_seg %d now (tp8 loop D32): %lld tails taken first while a BG step was in "
+                                                 "segments, %lld BG steps ran their head whole and %lld", &now, &first, &whole, &wtail);
+        fprintf(stderr, "    LEAD_SEG=%s FORM=%s%s%s, FOL_ORDER=%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; leader: %lld BG "
+                        "steps in %lld segments, %lld tails between two segments, %lld taken first, %lld heads / %lld tails whole with no "
+                        "decode lane busy, pp_lead_seg %d at the end\n", a.lead_seg ? a.lead_seg : "unset", a.form ? a.form : "unset",
+                a.post1 ? (std::string(" + POST ") + a.post1).c_str() : "", a.post2 ? (std::string(" + POST ") + a.post2).c_str() : "",
+                a.order ? a.order : "unset", a.k, a.lanes, a.cut, differ, ref.size() + ref_b.size(), steps, parts, inside, first, whole,
+                wtail, now);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        if (!a.lead_seg) {
+            CHECK(steps < 0);   /* no M9 line without the boundaries */
+            continue;
+        }
+        CHECK(llog.find("fn4 pp_lead_seg starts at ") != std::string::npos);
+        CHECK(now == (a.post2 ? std::atoi(a.post2) : std::atoi(a.form)));
+        if (std::strcmp(a.form, "0") == 0) {
+            CHECK_EQ(parts, 0LL);   /* form 0: every BG part whole */
+        } else {
+            CHECK(steps > 0);
+            if (std::strcmp(a.cut, "2,3") == 0 && std::strcmp(a.form, "34") != 0) CHECK(parts > steps);
+        }
+        if ((std::atoi(a.form) & 15) == 2) {
+            first_all += std::max(0LL, first);
+            parts_all += std::max(0LL, parts);
+        }
+    }
+    fprintf(stderr, "    form 2, all arms: %lld tails taken first while a BG step was in segments, %lld segments\n", first_all, parts_all);
+    CHECK(first_all > 0);
+    CHECK(parts_all > 0);
+}
+
 /* tp8 loop P27: RADIANCE_PP_LEAD_SEG_SHIP=1 (with LEAD_SEG) -- a segmented head's frame goes to the follower once its last segment
  * has run on rank 0's card, not with that segment's issue; with RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS it is held that long past
  * the last issue too, so the frames the leader issues meanwhile (other lanes' heads) reach the follower AHEAD of it. Every
