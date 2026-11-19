@@ -34,6 +34,7 @@ extern "C" int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 extern "C" int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 extern "C" int r4d_rad_quant_act_fp8_ue8m0(const RadArgs*, RadStream);
 extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs*, RadStream);
+extern "C" void r4d_fp8e8_pin_mt(int);
 /* fp8_ops checks the library's block against R4D_FP8_BLOCK; r4d_gemm_fp8a8.hip (not in this build) defines it */
 extern "C" int r4d_gemm_fp8a8_block(void) { return R4D_FP8_BLOCK; }
 
@@ -281,9 +282,13 @@ void ue8m0_cases(std::mt19937& rng) {
 /* P30o r2 (WIP): gemm_nt_q at dtype fp8a8e8, the first form (r4d_fp8_f32scale.hip fp8e8_b32), against the release's fp8_gemm
  * at block 32 restated (per 32 of K a sum of the code products from zero in k order -- the emulator's WMMA order --, then
  * acc += sum * sa * sb, bf16 once): byte for byte here; on a card the WMMA's own order inside a 32-block (rule B). */
-void gemm_e8_cases(std::mt19937& rng) {
+/* PREFILL round 21: at every M tile (16 = the first form, 32 / 64 = r4d_fp8e8_pin_mt's wider tiles; a launch of <= 16 rows
+ * takes 16 whatever the pin), the same bytes -- M 70 is two 64-row tiles, the second partial */
+void gemm_e8_cases(std::mt19937& rng, int mt) {
+    r4d_fp8e8_pin_mt(mt);
     struct S { int M, N, K, ap, yp; };
-    const S shapes[] = { { 1, 64, 128, 128, 64 }, { 5, 128, 256, 256, 128 }, { 17, 64, 512, 640, 192 }, { 33, 128, 256, 256, 128 } };
+    const S shapes[] = { { 1, 64, 128, 128, 64 }, { 5, 128, 256, 256, 128 }, { 17, 64, 512, 640, 192 }, { 33, 128, 256, 256, 128 },
+                         { 70, 64, 256, 384, 128 } };
     std::normal_distribution<float> nd(0.f, 1.f);
     for (const S& sh : shapes) {
         const int M = sh.M, N = sh.N, K = sh.K, G = 32, kb = K / G, nb = N / G;
@@ -308,7 +313,7 @@ void gemm_e8_cases(std::mt19937& rng) {
         aq.n_t = 3;
         aq.p = pq;
         aq.n_p = 4;
-        const std::string tag = "gemm_nt_q fp8a8e8 M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
+        const std::string tag = "gemm_nt_q fp8a8e8 (M tile " + std::to_string(mt) + ") M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
                                 std::to_string(K) + " a pitch " + std::to_string(sh.ap) + " y pitch " + std::to_string(sh.yp);
         check(r4d_rad_quant_act_fp8_ue8m0(&aq, nullptr) == RAD_OK, tag + ": the activation pair");
         std::vector<uint8_t> w((size_t)N * K), ws((size_t)nb * kb);
@@ -362,7 +367,8 @@ int main() {
     split_cases(rng);
     fp8ops_cases();
     ue8m0_cases(rng);
-    gemm_e8_cases(rng);
+    for (int mt : { 16, 32, 64 }) gemm_e8_cases(rng, mt);
+    r4d_fp8e8_pin_mt(0);
     std::printf("%d check(s), %d failure(s)\n", g_cases, g_fail);
     return g_fail ? 1 : 0;
 }
