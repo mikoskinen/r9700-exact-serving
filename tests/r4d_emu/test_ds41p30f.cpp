@@ -36,6 +36,7 @@ extern "C" int r4d_rad_quant_act_fp8_ue8m0(const RadArgs*, RadStream);
 extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs*, RadStream);
 extern "C" void r4d_fp8e8_pin_mt(int);
 extern "C" void r4d_fp8e8_pin_ld(int);
+extern "C" void r4d_fp8e8_pin_sas(int);   /* PREFILL round 24: SAS, the scales through LDS */
 /* fp8_ops checks the library's block against R4D_FP8_BLOCK: r4d_gemm_fp8a8.hip defines it (in the emulator's build since tp8
  * loop P30t-psk, for test_ds41tw) */
 
@@ -286,9 +287,11 @@ void ue8m0_cases(std::mt19937& rng) {
 /* PREFILL round 21: at every M tile (16 = the first form, 32 / 64 = r4d_fp8e8_pin_mt's wider tiles; a launch of <= 16 rows
  * takes 16 whatever the pin) and either staging (4 = byte loads, 16 = 16-byte loads where the pitches allow: a pitch of 264
  * takes the byte loads), the same bytes -- M 70 is two 64-row tiles, the second partial */
-void gemm_e8_cases(std::mt19937& rng, int mt, int ld) {
+/* PREFILL round 24: and with the activation's scales staged through LDS (SAS 1) or read from global (0) -- the same bytes */
+void gemm_e8_cases(std::mt19937& rng, int mt, int ld, int sas) {
     r4d_fp8e8_pin_mt(mt);
     r4d_fp8e8_pin_ld(ld);
+    r4d_fp8e8_pin_sas(sas);
     struct S { int M, N, K, ap, yp; };
     const S shapes[] = { { 1, 64, 128, 128, 64 }, { 5, 128, 256, 256, 128 }, { 17, 64, 512, 640, 192 }, { 33, 128, 256, 256, 128 },
                          { 70, 64, 256, 384, 128 }, { 9, 64, 256, 264, 64 }, { 130, 64, 128, 128, 64 },   /* 130: three 64-row tiles, the last partial */   /* 264: a pitch off 16 B -> the byte staging */
@@ -318,7 +321,7 @@ void gemm_e8_cases(std::mt19937& rng, int mt, int ld) {
         aq.n_t = 3;
         aq.p = pq;
         aq.n_p = 4;
-        const std::string tag = "gemm_nt_q fp8a8e8 (M tile " + std::to_string(mt) + ", staging " + std::to_string(ld) + ") M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
+        const std::string tag = "gemm_nt_q fp8a8e8 (M tile " + std::to_string(mt) + ", staging " + std::to_string(ld) + ", SAS " + std::to_string(sas) + ") M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
                                 std::to_string(K) + " a pitch " + std::to_string(sh.ap) + " y pitch " + std::to_string(sh.yp);
         check(r4d_rad_quant_act_fp8_ue8m0(&aq, nullptr) == RAD_OK, tag + ": the activation pair");
         std::vector<uint8_t> w((size_t)N * K), ws((size_t)nb * kb);
@@ -372,10 +375,12 @@ int main() {
     split_cases(rng);
     fp8ops_cases();
     ue8m0_cases(rng);
-    for (int ld : { 4, 16 })
-        for (int mt : { 16, 32, 64 }) gemm_e8_cases(rng, mt, ld);
+    for (int sas : { 0, 1 })
+        for (int ld : { 4, 16 })
+            for (int mt : { 16, 32, 64 }) gemm_e8_cases(rng, mt, ld, sas);
     r4d_fp8e8_pin_mt(0);
     r4d_fp8e8_pin_ld(0);
+    r4d_fp8e8_pin_sas(-1);
     std::printf("%d check(s), %d failure(s)\n", g_cases, g_fail);
     return g_fail ? 1 : 0;
 }

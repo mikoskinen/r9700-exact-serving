@@ -725,12 +725,16 @@ __device__ __forceinline__ float e8m0f(uint32_t e) { return __uint_as_float(e ? 
 /* V16 (PREFILL round 21): the operands' rows and pitches 16-byte aligned (the engine's pair, the sidecar's weights) -- each thread
  * stages 16 bytes a load (two 8-byte LDS stores: the 136-byte LDS row keeps 8-byte alignment) instead of four byte loads a dword;
  * the same bytes land in the same LDS places, so nothing else changes */
-template <int MT, bool V16>
+/* SAS (PREFILL round 24, P30o r2 (b)): the activation's scales of the staged 128-K tile (MT rows x four 32-K blocks) are staged into
+ * LDS with the operands, one f32 a (row, block), and the fold reads them there instead of 8 x F scattered global loads a lane a
+ * 32-K block. The same f32 values into the same product and add: the bytes do not depend on SAS. */
+template <int MT, bool V16, bool SAS = false>
 __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, const uint8_t* ws, uint16_t* y, Meta m) {
     constexpr int F = MT / 16;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, n0 = blockIdx.x * 64;
     __shared__ uint8_t qa[MT * 136], wb[64 * 136];
     __shared__ int source[MT];
+    __shared__ float sas[SAS ? MT * 4 : 1];
     const int first = (int)blockIdx.y * MT, end = min(first + MT, m.T);
     if (tid < MT) {
         const int r = first + tid;
@@ -781,6 +785,13 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
                                              ((uint32_t)p[3] << 24);
         }
         }
+        if constexpr (SAS) {
+            /* this tile's activation scales, (row, 32-K block) -> sas[row * 4 + block]; a row past M or a block past K: 0 (never read) */
+            for (int j = tid; j < MT * 4; j += 128) {
+                const int r = j / 4, b = j % 4, src = source[r];
+                sas[j] = (src >= 0 && 32 * b < kw) ? as[(long)src * m.asr + k0 / 32 + b] : 0.f;
+            }
+        }
         __syncthreads();
         /* one 32-K block at a time above the first form (MT > 16): unrolled, the wide tiles' live fragments and scale reads
          * spill (MT 64 ~490 B a lane of scratch, measured by the compiler's resource report); the order is the same */
@@ -798,8 +809,10 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
                 raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, f * 16, kk + 16, lane), wf1, raw);
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const int src = source[f * 16 + (lane >> 4) * 8 + j];
-                    const float scale = src >= 0 ? as[(long)src * m.asr + kb] * wsc : 0;
+                    const int rr = f * 16 + (lane >> 4) * 8 + j, src = source[rr];
+                    float scale;
+                    if constexpr (SAS) scale = src >= 0 ? sas[rr * 4 + kk / 32] * wsc : 0;
+                    else scale = src >= 0 ? as[(long)src * m.asr + kb] * wsc : 0;
                     acc[f][j] += raw[j] * scale;
                 }
             }
@@ -817,7 +830,17 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
 /* the M tile: R4D_FP8E8_MT=16 / 32 / 64 at load (128 spills ~630 B a lane: not built) (unset: 16, the first form), r4d_fp8e8_pin_mt() in process (selftest, emu);
  * a launch of at most 16 rows always takes 16 (one tile either way). The staging: R4D_FP8E8_LD=4 at load forces the first form's
  * byte loads, else 16-byte loads wherever the operands allow; r4d_fp8e8_pin_ld(4 / 16 / 0) in process */
-std::atomic<int> g_fp8e8_mt{ -1 }, g_fp8e8_ld{ -1 };
+std::atomic<int> g_fp8e8_mt{ -1 }, g_fp8e8_ld{ -1 }, g_fp8e8_sas{ -1 };
+/* SAS: R4D_FP8E8_SAS=1 at load stages the activation scales through LDS (unset: today's global reads); r4d_fp8e8_pin_sas(0 / 1) in process */
+int fp8e8_sas() {
+    int v = g_fp8e8_sas.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("R4D_FP8E8_SAS");
+        v = e && !std::strcmp(e, "1") ? 1 : 0;
+        g_fp8e8_sas.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
 int fp8e8_ld() {
     int v = g_fp8e8_ld.load(std::memory_order_relaxed);
     if (v < 0) {
@@ -864,9 +887,11 @@ int dense_e8(const RadArgs* a, RadStream stream) {
     const int mt = m.T <= 16 ? 16 : fp8e8_mt();
     /* 16-byte staging: both operands' bases and row pitches (bytes: E4M3 is a byte a value) on 16 bytes */
     const bool v16 = fp8e8_ld() == 16 && !(((uintptr_t)x.data | (uintptr_t)w.data | (uintptr_t)m.ar | (uintptr_t)m.wr) & 15u);
-#define FP8E8_GO(MT_, V_)                                                                                             \
-    R4D_EMIT(stream, (fp8e8_b32<MT_, V_>), dim3(N / 64, (m.T + MT_ - 1) / MT_), dim3(128), 0, (const uint8_t*)x.data,    \
+#define FP8E8_GO3(MT_, V_, S_)                                                                                        \
+    R4D_EMIT(stream, (fp8e8_b32<MT_, V_, S_>), dim3(N / 64, (m.T + MT_ - 1) / MT_), dim3(128), 0, (const uint8_t*)x.data, \
              (const float*)xs.data, (const uint8_t*)w.data, (const uint8_t*)ws.data, (uint16_t*)y.data, m)
+#define FP8E8_GO(MT_, V_) (sas ? FP8E8_GO3(MT_, V_, true) : FP8E8_GO3(MT_, V_, false))
+    const bool sas = fp8e8_sas() == 1;
     if (v16) {
         if (mt == 64) return FP8E8_GO(64, true);
         if (mt == 32) return FP8E8_GO(32, true);
@@ -876,6 +901,7 @@ int dense_e8(const RadArgs* a, RadStream stream) {
     if (mt == 32) return FP8E8_GO(32, false);
     return FP8E8_GO(16, false);
 #undef FP8E8_GO
+#undef FP8E8_GO3
 }
 }
 extern "C" int r4d_rad_fp8_f32scale(const RadArgs* a, RadStream stream) { return dense(a, stream); }
@@ -887,6 +913,8 @@ extern "C" void r4d_fp8e8_pin_mt(int mt) {
 }
 /* ... and its staging (4 = the first form's byte loads, 16 = 16-byte loads where aligned; anything else back to R4D_FP8E8_LD) */
 extern "C" void r4d_fp8e8_pin_ld(int ld) { g_fp8e8_ld.store(ld == 4 || ld == 16 ? ld : -1, std::memory_order_relaxed); }
+/* PREFILL round 24: ... and the scale staging (1 = SAS, 0 = the global reads; anything else back to R4D_FP8E8_SAS) -- the same bytes */
+extern "C" void r4d_fp8e8_pin_sas(int v) { g_fp8e8_sas.store(v == 0 || v == 1 ? v : -1, std::memory_order_relaxed); }
 /* Its planes as the release stores them (affine {codes fp8_e4m3, scale e8m0 [32x32]}): read without a relayout. */
 extern "C" int r4d_layout_fp8a8e8(const RadParam*, int, int operand, const RadEncoding* e, const int* sel,
                                   const RadTensor*, int n, RadLayout*) {
