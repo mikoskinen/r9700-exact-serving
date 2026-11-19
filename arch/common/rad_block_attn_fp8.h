@@ -73,6 +73,9 @@ struct AttnFP8 {
                  bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* tp8 loop D39 (a pipeline follower's tail band): only the ops step() issues before the attention -- the norm, the q|k|v
+     * projection, rope and the k / v store into the layer's cache -- on the same rows; nothing past the store */
+    void step_kv_only(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
@@ -214,6 +217,19 @@ inline void AttnFP8::step(RadCtx* c, const RadBatch* batch) const {
     if (op_ar && !(ar_out && ar_fused_ok(g, T)))
         RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
     if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+}
+
+inline void AttnFP8::step_kv_only(RadCtx* c, const RadBatch* batch) const {
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot = kvb ? kvb->slot_mapping : nullptr;
+    const int64_t T = batch->n_tok;
+    const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
+    nq_h.step(c, T);
+    qkv.step(c, w.h, w.qkv, T);
+    if (op_rope) RAD_ISSUE(c, op_rope, brows(w.qkv, T), rope_posmc(g, batch, T));
+    RAD_ISSUE(c, op_kv_store,
+              bcol(w.qkv, q_dim, kv_dim, T), bcol(w.qkv, q_dim + kv_dim, kv_dim, T),
+              praw(slot, RAD_I32, T), kv_cache(kv, layer));
 }
 
 }  /* namespace arch */

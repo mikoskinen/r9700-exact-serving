@@ -2804,6 +2804,82 @@ TEST(band_passes_serve_one_process_tokens) {
     CHECK(skip_differ > 0);   /* the test sees a band pass whose KV did not reach the decode owner */
 }
 
+/* tp8 loop D39 (RADIANCE_PP_TAIL_BAND=1 on the leader, RADIANCE_LLAMA_PP_TBAND=1 on both): a BG step of fresh prompts runs as a
+ * TAIL band pass -- the follower over [1, 2) of W(1,3), X2 at 2, then only layer 2's k / v from its own rows into its own cache
+ * (the layer's first ops at the same rows); the leader's tail from 2 (layer 2 declared there too) -- and every request's tokens
+ * are one process's at 3 lanes BG 1 (whole, + follower segments), 4 lanes BG 2 (FOL_ORDER 2); negative control: the follower
+ * leaves the k / v stores out (RADIANCE_PP_TEST_TBAND_SKIP=1) -> requests differ (the decode owner reads keys it never got). */
+TEST(tail_band_passes_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; };
+    long long tb_all = 0;
+    int skip_differ = 0;
+    for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, false, false, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_LLAMA_PP_TBAND=1");
+        env.push_back("RADIANCE_PP_TAIL_BAND=1");
+        env.push_back("RADIANCE_PP_READY_FIRST=1");
+        if (a.fseg)
+            for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
+                env.push_back(v);
+        if (a.fo2) env.push_back("RADIANCE_PP_FOL_ORDER=2");
+        if (a.skip) env.push_back("RADIANCE_PP_TEST_TBAND_SKIP=1");
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start("1,3", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port), got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long tb = -1;
+        const char* key = " lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                tb = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        fprintf(stderr, "    TAIL BAND (llama stand-in, one layer), %d lanes BG %d W(1,3)%s%s%s: %d of %zu requests differ; %lld lane steps "
+                        "ran as tail band passes\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.fo2 ? " + FOL_ORDER 2" : "",
+                a.skip ? " + the k / v stores LEFT OUT (negative control)" : "", differ, ref.size() + ref_b.size(), tb);
+        if (a.skip) {
+            skip_differ = differ;
+            CHECK(tb > 0);
+            continue;
+        }
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(differ, 0);
+        CHECK(llog.find("RADIANCE_PP_TAIL_BAND=1 -- a BG lane's step of fresh prompts runs as a tail band pass") != std::string::npos);
+        CHECK(tb > 0);
+        tb_all += std::max(0LL, tb);
+    }
+    fprintf(stderr, "    tail band passes, all arms: %lld; the negative control: %d requests differ\n", tb_all, skip_differ);
+    CHECK(tb_all > 0);
+    CHECK(skip_differ > 0);
+}
+
 /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader): P28's band steps through LSP's head segments -- a band step's head
  * runs [0, 1) then [1, 3) (the last segment through the band layer 2, X1 at 3), the band word on both, the held frame a band
  * frame; every request's tokens are one process's (the six-layer llama) at W(2,5) with 3 lanes BG 1 and the follower's

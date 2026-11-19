@@ -134,6 +134,15 @@ struct Model {
     int      parts_x1b = 0;
     bool     band_skip = false;   /* RADIANCE_PP_TEST_BAND_SKIP=1 (follower): the store left out -- the test's negative control */
     rad_op   op_x1b = 0, op_band_st = 0;
+    /* tp8 loop D39, a host test of the engine's TAIL band (RADIANCE_LLAMA_PP_TBAND=1 on both nodes, W(h, t), t - 1 > h; unset:
+     * nothing here): the leader also declares layer t - 1 (whose decode owner stays the follower); on a tail band pass
+     * (RadPpInfo.reserved[2] == 1) the follower runs [h, t - 1), sends X2 there, and then only layer t - 1's k / v into its own
+     * cache from its own rows (the layer's norm, q|k|v projection, rope and kv_store: the ops the layer issues first, at the same
+     * rows); the leader's tail runs [t - 1, n). Every other pass is W(h, t)'s. */
+    int      tband = 0;
+    int      parts_x2b = 0;
+    bool     tband_skip = false;  /* RADIANCE_PP_TEST_TBAND_SKIP=1 (follower): the k / v stores left out -- the negative control */
+    rad_op   op_x2b = 0;
     /* tp8 dev 1a (RADIANCE_PP_FOLLOWER_EMBED=1 on both nodes, W(0, t) only; unset: nothing here): the follower looks up
      * the step's embedding itself (the same op over the same table, the vocab-sharded rows completed by the same
      * all-reduce) where it took X1, and the leader's head part issues neither the lookup nor X1: the follower starts a
@@ -425,6 +434,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 m.band = 1;
                 if (m.pp_rank == 0) m.held[(size_t)m.pp_h] = 1;
             }
+            /* tp8 loop D39 test stand-in: the tail band of one layer (layer t - 1 declared on the leader too) */
+            if (const char* tb = std::getenv("RADIANCE_LLAMA_PP_TBAND"); tb && !std::strcmp(tb, "1") && !m.band &&
+                m.pp_t - 1 > m.pp_h && !m.fe && pp.lanes > 1) {
+                m.tband = 1;
+                if (m.pp_rank == 0) m.held[(size_t)m.pp_t - 1] = 1;
+            }
             /* tp8 dev D10 round 2: beside the follower's own lookup, X1 is the step's token ids (the follower reads them) */
             const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
             m.x1_ids = m.fe && ia && !std::strcmp(ia, "1");
@@ -696,7 +711,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         rad_pp_declare_crossing(RAD_PP_X1, x1_row, x1_parts);
         }
-        rad_pp_declare_crossing(RAD_PP_X2, row * m.parts_x2, m.parts_x2);
+        if (m.tband) {   /* tp8 loop D39 stand-in: X2 at t - 1 may be the wider one */
+            m.parts_x2b = parts_at(m.pp_t - 1);
+            rad_pp_declare_crossing(RAD_PP_X2, row * std::max(m.parts_x2, m.parts_x2b), std::max(m.parts_x2, m.parts_x2b));
+            rad_pp_declare_tail_band(1);
+        } else {
+            rad_pp_declare_crossing(RAD_PP_X2, row * m.parts_x2, m.parts_x2);
+        }
         auto stage = [&](const char* op, int ring, int parts, bool send) {
             const bool kv = ring == RAD_PP_X1 && m.kvcopy;
             std::vector<rad_buf> pb = { m.b_x };
@@ -716,6 +737,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const bool lead = m.pp_rank == 0;
         m.op_x1 = stage(lead ? "stage_send" : "stage_recv", RAD_PP_X1, m.parts_x1, lead);
         m.op_x2 = stage(lead ? "stage_recv" : "stage_send", RAD_PP_X2, m.parts_x2, !lead);
+        if (m.tband) {   /* tp8 loop D39 stand-in: the tail band's X2 (the stream (+ the delta) at t - 1) */
+            m.op_x2b = stage(lead ? "stage_recv" : "stage_send", RAD_PP_X2, m.parts_x2b, !lead);
+            if (m.op_x2b == RAD_NULL_HANDLE) return RAD_E_INVAL;
+            const char* ts = std::getenv("RADIANCE_PP_TEST_TBAND_SKIP");
+            m.tband_skip = !lead && ts && !std::strcmp(ts, "1");
+        }
         if (m.band) {   /* tp8 loop P28 stand-in: the band X1 = the stream (+ the delta) at h + 1 + layer h's q|k|v rows */
             std::vector<rad_buf> pb = { m.b_x };
             if (m.parts_x1b == 2) pb.push_back(m.a_h.x);
@@ -894,10 +921,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* tp8 loop P28 stand-in: a band pass crosses at h + 1 */
     const int bnd = m.band && ppi.reserved[0] == m.band ? m.band : 0;
     const int64_t he = m.pp_h + bnd;
+    /* tp8 loop D39 stand-in: a tail band pass crosses at t - 1 (the follower's parts end there) */
+    const int tbd = m.tband && ppi.reserved[2] == m.tband ? m.tband : 0;
+    const int64_t te = m.pp_t - tbd;
     /* tp8 dev M4: a follower segment issues layers [s0, s1) of its [h, t): X1 (or the lookup) only in the first, X2 only in
      * the last, a boundary's restore / save at its ends */
     const bool seg = m.pp && m.pp_rank == 1 && ppi.part == RAD_PP_PART_SEG && !m.seg_b.empty();
-    const int64_t s0 = seg ? ppi.seg_l0 : he, s1 = seg ? ppi.seg_l1 : m.pp_t;
+    const int64_t s0 = seg ? ppi.seg_l0 : he, s1 = seg ? ppi.seg_l1 : te;
     const bool seg_first = !seg || s0 == he;
     /* tp8 dev M9: a leader segment [l0, l1) of its head / tail part: the lookup only in the head's first, X1 only in its
      * last, X2 only in the tail's first, the final norm and the head only in its last (RAD_PP_SEG_END), a boundary's restore
@@ -992,13 +1022,19 @@ static void step(RadCtx* c, const RadBatch* batch) {
             if (m.pp_rank == 0 && (int64_t)li == he) {
                 if (run_head && (!m.fe || m.x1_ids)) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
                 if (!run_tail) return;   /* tp8 S5: the head part ends with X1's send */
-                if (lfirst) cross(m.op_x2, RAD_PP_X2, m.parts_x2);   /* tp8 dev M9: a later tail segment: its restore */
+                if (lfirst) {   /* tp8 dev M9: a later tail segment: its restore; tp8 loop D39: a tail band's X2 at t - 1 */
+                    if (tbd) cross(m.op_x2b, RAD_PP_X2, m.parts_x2b);
+                    else cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+                }
             }
             if (!m.held[li]) continue;
             /* tp8 loop P28 stand-in: the leader's band layer runs only in a band pass's head */
             if (m.band && m.pp_rank == 0 && (int64_t)li >= m.pp_h && (int64_t)li < m.pp_h + m.band && !(bnd && run_head)) continue;
             /* ... and a band pass's follower starts at h + 1 */
             if (bnd && m.pp_rank == 1 && (int64_t)li < he) continue;
+            /* tp8 loop D39 stand-in: the leader's layer t - 1 runs only in a tail band pass's tail; that pass's follower ends at t - 1 */
+            if (m.tband && m.pp_rank == 0 && (int64_t)li == m.pp_t - 1 && !(tbd && run_tail)) continue;
+            if (tbd && m.pp_rank == 1 && (int64_t)li >= te) continue;
             /* tp8 S5: the tail part starts at X2; the head part ran the layers before h */
             if (m.pp_rank == 0 && !run_head && (int64_t)li < m.pp_h) continue;
             /* tp8 dev M4: a segment's layers only; its first from the boundary's restore */
@@ -1011,7 +1047,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         m.layers[li].attn.step(c, batch);
         m.layers[li].mlp.step(c, batch);
         /* tp8 dev M4: a segment that ends before t saves the boundary's live set and ends */
-        if (seg && (int64_t)li == s1 - 1 && s1 < m.pp_t) {
+        if (seg && (int64_t)li == s1 - 1 && s1 < te) {
             seg_issue(s1, true);
             return;
         }
@@ -1030,7 +1066,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     if (m.pp && m.pp_rank == 1) {
-        cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+        if (!tbd) {
+            cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+            return;
+        }
+        /* tp8 loop D39 stand-in: X2 at t - 1, then layer t - 1's k / v from this node's own rows into its own cache (the
+         * owner's ops, as the whole layer issues them first) */
+        cross(m.op_x2b, RAD_PP_X2, m.parts_x2b);
+        if (!m.tband_skip) m.layers[(size_t)te].attn.step_kv_only(c, batch);
         return;
     }
     /* A cut at the last layer: the leader's X2 arrives after the loop. */

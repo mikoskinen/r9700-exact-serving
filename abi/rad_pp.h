@@ -255,6 +255,19 @@ static inline void rad_pp_declare_band(int k) {
     if (rad_pp_band) rad_pp_band(k);
 }
 
+/* tp8 loop D39 (the TAIL band; unset: never called): the plugin names, at declare (every rank; the last wins), the tail band
+ * j it declared on this node -- a TAIL BAND pass runs the follower over [h, t - j) (X2 at t - j, then the band layers' own
+ * KV / window stores from the rows it holds) and the leader's tail from t - j. The engine marks such a pass in
+ * RadPpInfo.reserved[2] (= j; 0 every other pass) on both nodes. j 0: none. Weak. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_tail_band(int j);
+
+static inline void rad_pp_declare_tail_band(int j) {
+    if (rad_pp_tail_band) rad_pp_tail_band(j);
+}
+
 /* tp8 loop D40 (the leader; zero from an engine before it): RadPpInfo.reserved[1]'s bits for the leader's head / tail SEGMENT
  * pass being issued (seg_l1 > 0), 0 on every other pass. RAD_PP_LSEG_SP: the step's segments may run the plugin's
  * sequence-parallel plan of the WHOLE part (fn4 pp_lead_seg + 512): every segment plans the same, the boundary op after an

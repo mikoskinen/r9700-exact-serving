@@ -475,7 +475,7 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0);
     /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
      * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
      * (StepHdr flags bit 2), the follower's parts start at h + k */
@@ -489,6 +489,16 @@ private:
     int  pp_band_pre_ = -1;
     int64_t pp_band_seg_n_ = 0;   /* tp8 loop D36: band steps whose head ran in segments (RADIANCE_PP_LEAD_SEG_BAND=1) */
     bool pp_band_off_ = false;    /* tp8 loop D36: fn4 pp_lead_seg + 256 at the step being planned -- no band pass */
+    /* tp8 loop D39 (RADIANCE_PP_TAIL_BAND=1 on the leader, with the plugin's rad_pp_tail_band j; unset: nothing): the TAIL
+     * band -- a BG lane's step of fresh prompts runs the follower over [h, t - j) (then only the band layers' window / KV
+     * stores from its own last rows) and the leader's tail from t - j; its frame says so (StepHdr flags bit 3). The step's
+     * j is kept by lane for its tail part (pp_tband_lane_). */
+    bool pp_tband_on_ = false;
+    int  pp_ship_tband_ = 0;     /* the frame pp_frame makes now is a tail band pass's (flags bit 3) */
+    int64_t pp_tband_n_ = 0;
+    std::vector<int> pp_tband_lane_;
+    int  pp_tband_step(int lane, const RadBatch* b);
+    int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
     int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
