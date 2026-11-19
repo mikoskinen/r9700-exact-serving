@@ -9,6 +9,16 @@
 //           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump) [--route-half 0|1 [--route-topk K]
 //            [--route-place contig|mod2]] (tp8 X7: an EP2 node's half of the whole model's experts)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
+//           [--gu-bi 1] [--band LO:HI[,LO:HI..]] [--sub LO:HI [--sub-band _m16|_dk|_pf]]
+//
+// tp8 loop U14 (19.11.2026, the two-consumer down): --gu-bi 1 gives gate_up interface v9's `bi` (the engine's ETP issue:
+// one split-K at every token count). --band (with --chain, two classes): the chain's down is moe_exl3_down_bd
+// (exl3r4d_moe_down_bd) with the band operand marking those tokens -- timed like any chain, so a run with and one without
+// give the band's cost. --sub LO:HI (with --chain): after the warm-up, layer 0's chain once over all M tokens and once over
+// tokens [LO, HI) ALONE -- the same x rows, the same experts for each (token, slot), the same weights -- in the rows of
+// --sub-band (default _m16; _dk = lever P's decode-band-bytes rows); then each (token, slot) of the sub call against the
+// same pair in the whole call, h (the class's width) and y, byte for byte: SUBCHECK lines. The question U14 asks: does a
+// decode row inside a prompt's pass get the bytes it gets alone (with --band marking it: it must; without: it need not).
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
@@ -169,6 +179,10 @@ struct Opts {
                               // as bf16 numbers -- elements differing, by more than 1 / 2 bf16 ulps, max and rms difference
                               // against the reference's rms (a build of its own reference, e.g. the codebook fold)
     std::string routing;      // --routing FILE: EXL3R4D_ROUTEDUMP records replayed as the layers' routings (P10-K5)
+    int gu_bi = 0;            // --gu-bi 1 (tp8 U14): gate_up's v9 `bi` parameter (the engine's ETP issue passes bi 1)
+    std::vector<std::pair<int64_t, int64_t>> band;   // --band LO:HI,..: the chain's down as moe_exl3_down_bd, these tokens marked
+    int64_t sub_lo = -1, sub_hi = -1;   // --sub LO:HI: layer 0's tokens [LO, HI) alone against the whole call (SUBCHECK)
+    std::string sub_band = "_m16";      // --sub-band: the rows the sub call takes
     int route_half = -1;      // --route-half H (tp8 X7, with --routing): an EP2 node's half of the experts -- records of 2 x E
                               // experts and M x --route-topk rows, the half's experts (--route-place) kept; a record is used when
                               // the half got exactly M x top_k rows (top_k = the full top-k / 2: the half's mean)
@@ -356,6 +370,24 @@ int main(int argc, char** argv) {
         else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--cmp-y") o.cmp_y = nx();
         else if (a == "--chain-band") o.chain_band = nx();
+        else if (a == "--gu-bi") o.gu_bi = std::atoi(nx());
+        else if (a == "--sub-band") o.sub_band = nx();
+        else if (a == "--sub" || a == "--band") {
+            const char* q = nx();
+            std::vector<std::pair<int64_t, int64_t>> v;
+            while (*q) {
+                char* end = nullptr;
+                const int64_t lo = std::strtoll(q, &end, 10);
+                if (*end != ':') die(a + " takes LO:HI[,LO:HI..]");
+                const int64_t hi = std::strtoll(end + 1, &end, 10);
+                if (hi <= lo || lo < 0) die(a + ": an empty or negative range");
+                v.push_back({ lo, hi });
+                q = *end == ',' ? end + 1 : end;
+            }
+            if (a == "--band") o.band = v;
+            else if (v.size() != 1) die("--sub takes one range");
+            else { o.sub_lo = v[0].first; o.sub_hi = v[0].second; }
+        }
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
         else if (a == "--skip-prep") o.skip_prep = true;
@@ -609,12 +641,25 @@ int main(int argc, char** argv) {
                               dn = std::string("exl3r4d_moe_down") + sfx + o.chain_band,
                               pn = std::string("exl3r4d_moe_prep_gu") + sfx + o.chain_band;
             Lib G{ "exl3r4d gate_up", row_of(o.exl3.c_str(), gn.c_str()), {}, {}, {} };
-            Lib D{ "exl3r4d down", row_of(o.exl3.c_str(), dn.c_str()), {}, {}, {} };
+            if (!o.band.empty() && o.mod4) die("--band is the two-class form");
+            Lib D{ "exl3r4d down", row_of(o.exl3.c_str(), o.band.empty() ? dn.c_str() : "exl3r4d_moe_down_bd"), {}, {}, {} };
+            void* bandd = nullptr;   // tp8 U14: --band's token marks, i32 [M]
+            if (!o.band.empty()) {
+                std::vector<int32_t> bh((size_t)o.M, 0);
+                for (const auto& r : o.band)
+                    for (int64_t t = r.first; t < r.second && t < o.M; ++t) bh[(size_t)t] = 1;
+                bandd = dalloc(bh.size() * 4);
+                put(bandd, bh.data(), bh.size() * 4);
+                int64_t nb = 0;
+                for (int32_t v : bh) nb += v;
+                std::printf("perfmoe: --band: down = exl3r4d_moe_down_bd, %lld of %lld tokens marked\n", (long long)nb, (long long)o.M);
+            }
             G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                     PS("dtype", kdt), PS("codebook", "mul1") };
             cls_params(G.p, Rg, Cg);
             G.p.push_back(PI("h_rot", o.h_rot));
             G.p.push_back(PI("a_rot", o.a_rot));
+            if (o.gu_bi) G.p.push_back(PI("bi", 1));   // tp8 U14: v9's one split-K at every token count (the engine's ETP issue)
             Lib P{ "exl3r4d prep_gu", o.a_rot ? row_of(o.exl3.c_str(), pn.c_str()) : nullptr, {}, {}, {} };
             P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", kdt) };
             prep_params(P.p, Cg);
@@ -675,7 +720,8 @@ int main(int argc, char** argv) {
                 const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
                 const RadTensor xin = o.a_rot ? T(xr, RAD_F16, { Tr, 2 * o.hidden }) : T(x, RAD_F16, { o.M, o.hidden });
                 // the operands in each op's schema order (include/exl3_abi.h exl3_positions)
-                std::vector<RadTensor> gt((size_t)gpos->n_opd), dt((size_t)dpos->n_opd), pt((size_t)ppos->n_opd);
+                std::vector<RadTensor> gt((size_t)gpos->n_opd), dt((size_t)dpos->n_opd + (bandd ? 1 : 0)), pt((size_t)ppos->n_opd);
+                if (bandd) dt[(size_t)EXL3_BD_BAND] = T(bandd, RAD_I32, { o.M });   // tp8 U14
                 gt[(size_t)gpos->x] = xin; gt[(size_t)gpos->sorted] = st; gt[(size_t)gpos->offset] = ot;
                 gt[(size_t)gpos->y] = T(h, RAD_F16, { Tr, wmax });
                 dt[(size_t)dpos->x] = T(h, RAD_F16, { Tr, wmax }); dt[(size_t)dpos->sorted] = st;
@@ -1086,6 +1132,106 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
         std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)\n", dy, g_fu_yb);
         if (dy && !o.gd_nocheck) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
+    }
+    // SUBCHECK (tp8 loop U14, --sub LO:HI with --chain): layer 0's tokens [LO, HI) alone (--sub-band's rows) against the
+    // same (token, slot) pairs inside the whole call (the chain's rows, with --band its marks), h and y byte for byte.
+    if (o.sub_lo >= 0) {
+        if (!o.chain || o.a_rot || o.mod4 || libs.empty() || libs[0].chain.size() != 2) die("--sub needs --chain (a_rot 0, two classes)");
+        if (o.sub_hi > o.M) die("--sub: HI is above --M");
+        Lib& W = libs[0];
+        const Exl3Positions* gpos = exl3_positions(EXL3_GATE_UP);
+        const Exl3Positions* dpos = exl3_positions(EXL3_DOWN);
+        int64_t wmax = 0;
+        for (int c = 0; c < nc; ++c) wmax = std::max(wmax, wq[c]);
+        const size_t hb = (size_t)(Tr * wmax * 2), yb = (size_t)(Tr * o.hidden * 2);
+        // the whole call, layer 0, once more (its own buffers: the chain's h and y)
+        ck(hipMemset(g_fu_h, 0x5a, g_fu_hb), "poison");
+        ck(hipMemset(g_fu_y, 0x5a, g_fu_yb), "poison");
+        if (launch_layer(W, 0) != RAD_OK) die("--sub: the whole call failed");
+        ck(hipStreamSynchronize(stream), "sub (whole)");
+        std::vector<uint16_t> hw(hb / 2), yw(yb / 2);
+        ck(hipMemcpy(hw.data(), g_fu_h, hb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(yw.data(), g_fu_y, yb, hipMemcpyDeviceToHost), "copy");
+        // the sub routing: route[0]'s rows whose token is in [LO, HI), in the same expert order, renumbered
+        const Route& rt = route[0];
+        const int64_t Ms = o.sub_hi - o.sub_lo, Trs = Ms * o.topk;
+        std::vector<int32_t> ssub, osub((size_t)o.E + 1, 0), pos_w((size_t)Tr, -1), own((size_t)Tr, -1);
+        for (int64_t e = 0; e < o.E; ++e) {
+            for (int32_t r = rt.off[(size_t)e]; r < rt.off[(size_t)e + 1]; ++r) {
+                const int32_t sv = rt.sorted[(size_t)r];
+                pos_w[(size_t)sv] = r;   // the whole call's row of pair sv
+                own[(size_t)sv] = (int32_t)e;
+                const int64_t t = sv / o.topk;
+                if (t >= o.sub_lo && t < o.sub_hi) ssub.push_back((int32_t)((t - o.sub_lo) * o.topk + sv % o.topk));
+            }
+            osub[(size_t)e + 1] = (int32_t)ssub.size();
+        }
+        if ((int64_t)ssub.size() != Trs) die("--sub: the sub routing lost rows");
+        void* dss = dalloc((size_t)Trs * 4);
+        void* dos = dalloc(osub.size() * 4);
+        put(dss, ssub.data(), (size_t)Trs * 4);
+        put(dos, osub.data(), osub.size() * 4);
+        void* hs = dalloc((size_t)(Trs * wmax * 2));
+        void* ys = dalloc((size_t)(Trs * o.hidden * 2));
+        const std::string gn = "exl3r4d_moe_gate_up" + o.sub_band, dn = "exl3r4d_moe_down" + o.sub_band;
+        Lib Gs = W.chain[0], Ds = W.chain[1];
+        Gs.name = "exl3r4d gate_up (sub)"; Ds.name = "exl3r4d down (sub)";
+        Gs.row = row_of(o.exl3.c_str(), gn.c_str());
+        Ds.row = row_of(o.exl3.c_str(), dn.c_str());
+        Gs.instance = Ds.instance = nullptr;
+        Gs.scratch = Ds.scratch = nullptr;
+        for (RadParam& q : Gs.p) if (!std::strcmp(q.key, "M")) q = PI("M", Ms);
+        for (RadParam& q : Ds.p) if (!std::strcmp(q.key, "M")) q = PI("M", Ms);
+        std::vector<RadTensor> gt = W.chain[0].t[0], dt = W.chain[1].t[0];
+        dt.resize((size_t)dpos->n_opd);   // the sub call: moe_exl3_down's ten (no band)
+        char* xw = (char*)gt[(size_t)gpos->x].data;
+        gt[(size_t)gpos->x] = T(xw + (size_t)(o.sub_lo * o.hidden * 2), gt[(size_t)gpos->x].dtype, { Ms, o.hidden });
+        gt[(size_t)gpos->sorted] = T(dss, RAD_I32, { Trs });
+        gt[(size_t)gpos->offset] = T(dos, RAD_I32, { o.E + 1 });
+        gt[(size_t)gpos->y] = T(hs, RAD_F16, { Trs, wmax });
+        dt[(size_t)dpos->x] = T(hs, RAD_F16, { Trs, wmax });
+        dt[(size_t)dpos->sorted] = T(dss, RAD_I32, { Trs });
+        dt[(size_t)dpos->offset] = T(dos, RAD_I32, { o.E + 1 });
+        dt[(size_t)dpos->y] = T(ys, RAD_BF16, { Trs, o.hidden });
+        Gs.t = { gt };
+        Ds.t = { dt };
+        setup(Gs);
+        setup(Ds);
+        {
+            RadArgs ag = args_of(Gs, 0), ad = args_of(Ds, 0);
+            ag.instance = Gs.instance;
+            ad.instance = Ds.instance;
+            const int r1 = Gs.row->launch(&ag, (RadStream)stream), r2 = r1 == RAD_OK ? Ds.row->launch(&ad, (RadStream)stream) : r1;
+            if (r1 != RAD_OK || r2 != RAD_OK) die("--sub: the sub call failed rc " + std::to_string(r1) + " / " + std::to_string(r2));
+        }
+        ck(hipStreamSynchronize(stream), "sub (alone)");
+        std::vector<uint16_t> hsv((size_t)(Trs * wmax)), ysv((size_t)(Trs * o.hidden));
+        ck(hipMemcpy(hsv.data(), hs, hsv.size() * 2, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(ysv.data(), ys, ysv.size() * 2, hipMemcpyDeviceToHost), "copy");
+        auto bf = [](uint16_t v) { uint32_t u = (uint32_t)v << 16; float f; std::memcpy(&f, &u, 4); return f; };
+        int64_t hrow = 0, hel = 0, yrow = 0, yel = 0, nh = 0, rows = 0, hcol = 0;
+        double ymax = 0, yref = 0;
+        for (int64_t rs = 0; rs < Trs; ++rs) {
+            const int32_t sv = ssub[(size_t)rs];
+            const int64_t t = sv / o.topk + o.sub_lo, j = sv % o.topk, svw = t * o.topk + j;
+            const int32_t rw = pos_w[(size_t)svw];
+            if (rw < 0) die("--sub: a pair of the sub call is not in the whole call");
+            const int64_t wc = wq[own[(size_t)svw] % nc];
+            ++rows;
+            int64_t dh = 0, dy = 0;
+            for (int64_t c = 0; c < wc; ++c) dh += hsv[(size_t)(rs * wmax + c)] != hw[(size_t)(rw * wmax + c)];
+            for (int64_t c = 0; c < o.hidden; ++c) {
+                const uint16_t a = ysv[(size_t)(rs * o.hidden + c)], b = yw[(size_t)(rw * o.hidden + c)];
+                yref = std::max(yref, (double)std::fabs(bf(b)));
+                if (a != b) { ++dy; ymax = std::max(ymax, (double)std::fabs(bf(a) - bf(b))); }
+            }
+            hrow += dh > 0; hel += dh; yrow += dy > 0; yel += dy; hcol += wc; nh += 0;
+        }
+        std::printf("SUBCHECK tokens [%lld, %lld) of %lld alone (%s rows) vs inside the whole call (%s%s): %lld (token, slot) "
+                    "pairs; h rows differ %lld (elements %lld of %lld); y rows differ %lld (elements %lld of %lld, max |diff| %.3g, "
+                    "max |y| %.3g)\n", (long long)o.sub_lo, (long long)o.sub_hi, (long long)o.M, o.sub_band.c_str(),
+                    o.chain_band.c_str(), o.band.empty() ? "" : ", down_bd with --band", (long long)rows, (long long)hrow,
+                    (long long)hel, (long long)hcol, (long long)yrow, (long long)yel, (long long)(rows * o.hidden), ymax, yref);
     }
     // WARM-CHECK (--chain): layer 0's y from the exl3r4d chain now -- its first launches -- and again after the timed
     // passes, byte for byte; with --gd the v5 row against the serial chain again too. A row that keeps state across
