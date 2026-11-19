@@ -60,6 +60,11 @@ static bool pin_pf(const Plugin& pl, int rows) {
     if (f) f(rows);
     return f != nullptr;
 }
+/* ... and its 64-row form (blocks: the 128-row grid's bound below which it runs; 1 << 30 = always, 0 = never, -1 = R4D_FP8E8_PFH) */
+static void pin_pfh(const Plugin& pl, int blocks) {
+    auto f = (void (*)(int))dlsym(pl.h, "r4d_fp8e8_pin_pfh");
+    if (f) f(blocks);
+}
 static void* open_ref() {
     if (!g_plugin) return nullptr;
     std::string path(g_plugin);
@@ -216,15 +221,16 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
     const std::vector<uint8_t> got = g.y.down();
     /* the other forms over the same operands into a re-poisoned y: every byte (padding included) = the first form's --
      * 16-byte staging at tile 16 / 32 / 64, then (SAS, PREFILL round 24) the same three with the scales through LDS */
-    int64_t mtdiff[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    int64_t mtdiff[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     const bool has_pf = pin_pf(pl, 0);
-    const int nforms = has_sas ? (has_pf ? 8 : 7) : 3;
+    const int nforms = has_sas ? (has_pf ? 9 : 7) : 3;
     for (int t = 0; t < nforms; ++t) {
         st_memcpy(g.y.d, g.y.b.data(), g.y.b.size(), hipMemcpyHostToDevice);
         pin_ld(pl, 16);
         pin_mt(pl, t == 6 ? 128 : 16 << (t % 3));   /* 16, 32, 64 (+ SAS); 6: MT 128 with SAS */
         pin_sas(pl, t >= 3 ? 1 : 0);
-        pin_pf(pl, t == 7 ? 1 : 0);                 /* 7: the prefill tile (P30o r2 (d)) wherever the shape allows */
+        pin_pf(pl, t >= 7 ? 1 : 0);                 /* 7: the prefill tile (P30o r2 (d)) wherever the shape allows; 8: its 64-row form */
+        pin_pfh(pl, t == 8 ? 1 << 30 : 0);
         run_case(row, dt, ps);
         const std::vector<uint8_t> g2 = g.y.down();
         for (size_t i = 0; i < got.size(); ++i) mtdiff[t] += g2[i] != got[i];
@@ -233,6 +239,7 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
     pin_ld(pl, 0);
     pin_sas(pl, -1);
     pin_pf(pl, -1);
+    pin_pfh(pl, -1);
     int64_t diff = 0, nonfin = 0;
     float worst = 0;
     bool guards = true;
@@ -260,12 +267,12 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
            worst, guards ? "" : "; PADDING / GUARDS TOUCHED").c_str(),
        orc == RAD_OK && diff == 0 && nonfin == 0 && guards, orc == RAD_OK ? "" : "oracle rc " + std::to_string(orc));
     ok(fmt("gemm_fp8a8e8_b32 16-byte staging at M tile 16 / 32 / 64 (+ SAS: the same three, scales through LDS) = the first form "
-           "byte for byte, M %lld N %lld K %lld%s: %lld / %lld / %lld (SAS %s%lld / %lld / %lld / MT 128 %lld; prefill tile %s%lld) bytes differ", (long long)M,
+           "byte for byte, M %lld N %lld K %lld%s: %lld / %lld / %lld (SAS %s%lld / %lld / %lld / MT 128 %lld; prefill tile %s%lld / 64-row %lld) bytes differ", (long long)M,
            (long long)N, (long long)K, pitched ? " (pitched)" : "", (long long)mtdiff[0], (long long)mtdiff[1], (long long)mtdiff[2],
            has_sas ? "" : "not in this libr4d: ", (long long)mtdiff[3], (long long)mtdiff[4], (long long)mtdiff[5], (long long)mtdiff[6],
-           has_pf ? "" : "not in this libr4d: ", (long long)mtdiff[7]).c_str(),
+           has_pf ? "" : "not in this libr4d: ", (long long)mtdiff[7], (long long)mtdiff[8]).c_str(),
        mtdiff[0] == 0 && mtdiff[1] == 0 && mtdiff[2] == 0 && mtdiff[3] == 0 && mtdiff[4] == 0 && mtdiff[5] == 0 && mtdiff[6] == 0 &&
-           mtdiff[7] == 0);
+           mtdiff[7] == 0 && mtdiff[8] == 0);
     dfree_all();
 }
 
@@ -293,13 +300,14 @@ static void gemm_full_case(const Plugin& pl, const RadKernelInfo* row, int64_t M
     std::vector<RadParam> ps = gemm_ps(M, N, K);
     if (!g.up()) { ok("gemm_fp8a8e8 full-range allocation", false); return; }
     std::vector<RadTensor> dt = g.dev();
-    std::vector<uint8_t> y[3];
-    for (int f = 0; f < 3; ++f) {   /* 0 the first form, 1 MT 32 + SAS, 2 the prefill tile */
+    std::vector<uint8_t> y[4];
+    for (int f = 0; f < 4; ++f) {   /* 0 the first form, 1 MT 32 + SAS, 2 the prefill tile, 3 its 64-row form */
         st_memcpy(g.y.d, g.y.b.data(), g.y.b.size(), hipMemcpyHostToDevice);
         pin_mt(pl, f == 1 ? 32 : 16);
         pin_ld(pl, f == 0 ? 4 : 16);
         pin_sas(pl, f == 1 ? 1 : 0);
-        pin_pf(pl, f == 2 ? 1 : 0);
+        pin_pf(pl, f >= 2 ? 1 : 0);
+        pin_pfh(pl, f == 3 ? 1 << 30 : 0);
         run_case(row, dt, ps);
         y[f] = g.y.down();
     }
@@ -307,10 +315,12 @@ static void gemm_full_case(const Plugin& pl, const RadKernelInfo* row, int64_t M
     pin_ld(pl, 0);
     pin_sas(pl, -1);
     pin_pf(pl, -1);
-    int64_t d1 = 0, d2 = 0, nonfin = 0;
+    pin_pfh(pl, -1);
+    int64_t d1 = 0, d2 = 0, d3 = 0, nonfin = 0;
     for (size_t i = 0; i < y[0].size(); ++i) {
         d1 += y[1][i] != y[0][i];
         d2 += y[2][i] != y[0][i];
+        d3 += y[3][i] != y[0][i];
     }
     for (int64_t r = 0; r < M; ++r)
         for (int64_t c = 0; c < N; ++c) {
@@ -318,16 +328,16 @@ static void gemm_full_case(const Plugin& pl, const RadKernelInfo* row, int64_t M
             std::memcpy(&v, y[0].data() + 128 + (size_t)(r * g.yp + c) * 2, 2);
             nonfin += !std::isfinite(h_bf16(v));
         }
-    ok(fmt("gemm_fp8a8e8 FULL-RANGE operands, M %lld N %lld K %lld%s: MT 32 + SAS %lld, prefill tile %lld bytes differ from the first "
-           "form (%lld non-finite outputs in it)", (long long)M, (long long)N, (long long)K, pitched ? " (pitched)" : "", (long long)d1,
-           (long long)d2, (long long)nonfin).c_str(),
-       d1 == 0 && d2 == 0);
+    ok(fmt("gemm_fp8a8e8 FULL-RANGE operands, M %lld N %lld K %lld%s: MT 32 + SAS %lld, prefill tile %lld, its 64-row form %lld bytes "
+           "differ from the first form (%lld non-finite outputs in it)", (long long)M, (long long)N, (long long)K, pitched ? " (pitched)" : "",
+           (long long)d1, (long long)d2, (long long)d3, (long long)nonfin).c_str(),
+       d1 == 0 && d2 == 0 && d3 == 0);
     dfree_all();
 }
 
 static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* name, int64_t N, int64_t K, int64_t M, int w, int mt,
-                      int ld, int sas = 0, int pf = 0) {
-    const char* rn = pf > 0       ? "gemm_fp8a8e8_pf"
+                      int ld, int sas = 0, int pf = 0, int pfh = 0) {
+    const char* rn = pf > 0       ? (pfh ? "gemm_fp8a8e8_pf64" : "gemm_fp8a8e8_pf")
                      : ld == 4    ? "gemm_fp8a8e8_b32_first"
                      : mt == 128 ? "gemm_fp8a8e8_b32_mt128s"
                      : mt == 64  ? (sas ? "gemm_fp8a8e8_b32_mt64s" : "gemm_fp8a8e8_b32_mt64")
@@ -337,6 +347,7 @@ static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* na
     pin_ld(pl, ld);
     pin_sas(pl, sas);
     pin_pf(pl, pf);
+    pin_pfh(pl, pfh);
     GemmIn g;
     g.make(M, N, K, K, N, 0x7u);
     std::vector<RadParam> ps = gemm_ps(M, N, K);
@@ -365,6 +376,7 @@ static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* na
     pin_mt(pl, 16);
     pin_ld(pl, 0);
     pin_pf(pl, -1);
+    pin_pfh(pl, -1);
     dfree_all();
 }
 
@@ -398,7 +410,7 @@ static void p30o_cases(const Plugin& pl) {
             for (int64_t M : { 1, 16, 17, 130 })
                 for (bool pitched : { false, true }) gemm_case(pl, rg, og, M, s.N, s.K, pitched);
     if (wg && pin_pf(pl, -1))   /* 2c: the prefill tile over full-range operands (M 130 = two 128-row bands, the second partial; 1100 = nine) */
-        for (const NK s : { NK{ 512, 1024 }, NK{ 1280, 5120 }, NK{ 8192, 1280 }, NK{ 1152, 5120 } })
+        for (const NK s : { NK{ 512, 1024 }, NK{ 1280, 5120 }, NK{ 8192, 1280 }, NK{ 1152, 5120 }, NK{ 5120, 576 } })
             for (int64_t M : { 17, 130, 1100 }) gemm_full_case(pl, rg, M, s.N, s.K, M == 130);
     if (!all || !g_case) {
         dlclose(ref);
@@ -420,9 +432,14 @@ static void p30o_cases(const Plugin& pl) {
             for (const Sh& s : shapes)
                 gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, fm == 4 ? 128 : fm == 3 ? 64 : fm == 2 ? 32 : 16, fm == 0 ? 4 : 16, f >= 4);
         }
-    if (pin_pf(pl, -1))   /* P30o r2 (d): the prefill tile (shapes it cannot take -- K 576 -- run MT 32 + SAS under the same name) */
-        for (int64_t M : { 1100, 4096 })
-            for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, 32, 16, 1, 1);
+    if (pin_pf(pl, -1))   /* P30o r2 (d): the prefill tile and its 64-row form (shapes they cannot take -- K 576 -- run MT 32 + SAS under the
+                           * same name); M 130 / 300 / 600 lines (beside MT 32 + SAS's) choose R4D_FP8E8_PF's row bound and PFH's grid bound */
+        for (int64_t M : { 130, 300, 600, 1100, 4096 })
+            for (int h : { 0, 1 << 30 }) {
+                for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, 32, 16, 1, 1, h);
+                if (M < 1100 && h == 0)
+                    for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, 32, 16, 1, 0);
+            }
     pin_sas(pl, -1);
     dlclose(ref);
 }

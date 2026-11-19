@@ -38,6 +38,7 @@ extern "C" void r4d_fp8e8_pin_mt(int);
 extern "C" void r4d_fp8e8_pin_ld(int);
 extern "C" void r4d_fp8e8_pin_sas(int);   /* PREFILL round 24: SAS, the scales through LDS */
 extern "C" void r4d_fp8e8_pin_pf(int);    /* P30o r2 (d): the 128 x 128 prefill tile from N rows (0 = never) */
+extern "C" void r4d_fp8e8_pin_pfh(int);   /* ... its 64-row form when the 128-row grid has fewer blocks */
 extern const char* emu_last_kernel;        /* the emulator's name of the last launch (R4D_EMIT) */
 /* fp8_ops checks the library's block against R4D_FP8_BLOCK: r4d_gemm_fp8a8.hip defines it (in the emulator's build since tp8
  * loop P30t-psk, for test_ds41tw) */
@@ -292,16 +293,20 @@ void ue8m0_cases(std::mt19937& rng) {
 /* PREFILL round 24: and with the activation's scales staged through LDS (SAS 1) or read from global (0) -- the same bytes */
 /* P30o r2 (d) (loop restart round 1): pf > 0 = the 128 x 128 prefill tile (fp8e8_pf) for launches of >= pf rows where N / K are whole
  * 128-blocks and the pitches aligned; its own shapes: M 1 / 17 / 130 / 1100 (1100: nine activation bands = the raster's group path),
- * K 128 / 256 / 384 (three 128-K blocks: the scale prefetch's clamp at the end), pitched activation / output (16-byte), and two
- * that must fall back to the 16 x 64 forms (a pitch of 264, K 576) -- every one = the release's fp8_gemm restated */
-void gemm_e8_cases(std::mt19937& rng, int mt, int ld, int sas, int pf = 0) {
+ * K 128 / 256 / 384 (three 128-K blocks: the scale prefetch's clamp at the end), K 576 / 64 (a last 64-K stage), pitched activation /
+ * output (16-byte), and two that must fall back to the 16 x 64 forms (a pitch of 264, K 96) -- every one = the release's fp8_gemm
+ * restated */
+void gemm_e8_cases(std::mt19937& rng, int mt, int ld, int sas, int pf = 0, int pfh = 0) {
+    r4d_fp8e8_pin_pfh(pfh);
     r4d_fp8e8_pin_mt(mt);
     r4d_fp8e8_pin_ld(ld);
     r4d_fp8e8_pin_sas(sas);
     r4d_fp8e8_pin_pf(pf);
     struct S { int M, N, K, ap, yp; };
     const S pf_shapes[] = { { 1, 128, 128, 128, 128 }, { 17, 256, 256, 272, 320 }, { 130, 128, 384, 384, 136 }, { 1100, 128, 128, 128, 128 },
-                            { 200, 384, 256, 256, 384 }, { 9, 128, 256, 264, 128 }, { 3, 128, 576, 576, 128 } };
+                            { 200, 384, 256, 256, 384 }, { 9, 128, 256, 264, 128 }, { 3, 128, 576, 576, 128 },
+                            /* K % 128 == 64: the last 128-K block one 64-K stage (the release's shared-expert down at TP4), a 32-K tail falls back */
+                            { 70, 128, 576, 640, 128 }, { 130, 256, 64, 64, 256 }, { 17, 128, 96, 112, 128 } };
     const S b32_shapes[] = { { 1, 64, 128, 128, 64 }, { 5, 128, 256, 256, 128 }, { 17, 64, 512, 640, 192 }, { 33, 128, 256, 256, 128 },
                          { 70, 64, 256, 384, 128 }, { 9, 64, 256, 264, 64 }, { 130, 64, 128, 128, 64 },   /* 130: three 64-row tiles, the last partial (two 128-row) */   /* 264: a pitch off 16 B -> the byte staging */
                          /* P30o r2 (c): K a multiple of 32 only -- the shared expert's down at TP4 (K 576 = 4 x 128 + 64), a tail of 96 / 32 */
@@ -333,7 +338,7 @@ void gemm_e8_cases(std::mt19937& rng, int mt, int ld, int sas, int pf = 0) {
         aq.n_t = 3;
         aq.p = pq;
         aq.n_p = 4;
-        const std::string tag = "gemm_nt_q fp8a8e8 (" + (pf > 0 ? "prefill tile from " + std::to_string(pf) + " rows, " : std::string()) + "M tile " + std::to_string(mt) + ", staging " + std::to_string(ld) + ", SAS " + std::to_string(sas) + ") M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
+        const std::string tag = "gemm_nt_q fp8a8e8 (" + (pf > 0 ? "prefill tile from " + std::to_string(pf) + " rows" + (pfh ? " (64-row form below " + std::to_string(pfh) + " blocks)" : std::string()) + ", " : std::string()) + "M tile " + std::to_string(mt) + ", staging " + std::to_string(ld) + ", SAS " + std::to_string(sas) + ") M " + std::to_string(M) + " N " + std::to_string(N) + " K " +
                                 std::to_string(K) + " a pitch " + std::to_string(sh.ap) + " y pitch " + std::to_string(sh.yp);
         check(r4d_rad_quant_act_fp8_ue8m0(&aq, nullptr) == RAD_OK, tag + ": the activation pair");
         std::vector<uint8_t> w((size_t)N * K), ws((size_t)nb * kb);
@@ -362,8 +367,10 @@ void gemm_e8_cases(std::mt19937& rng, int mt, int ld, int sas, int pf = 0) {
         ag.n_p = 5;
         check(r4d_rad_gemm_fp8a8e8(&ag, nullptr) == RAD_OK, tag + ": launch");
         if (pf > 0) {   /* the tile ran exactly where it may: N / K whole 128-blocks, pitches on 16 bytes, >= pf rows */
-            const bool want = M >= pf && N % 128 == 0 && K % 128 == 0 && sh.ap % 16 == 0 && sh.yp % 8 == 0;
-            check((std::string(emu_last_kernel ? emu_last_kernel : "") == "fp8e8_pf") == want,
+            const bool want = M >= pf && N % 128 == 0 && K % 64 == 0 && sh.ap % 16 == 0 && sh.yp % 8 == 0;
+            const bool h64 = pfh > 0 && (long)((M + 127) / 128) * (N / 128) < pfh;
+            const std::string kn = std::string("(fp8e8_pf<") + (h64 ? "1" : "2") + ", " + (K % 128 || (K / 32) % 4 ? "true" : "false") + ">)";
+            check((std::string(emu_last_kernel ? emu_last_kernel : "") == kn) == want,
                   tag + (want ? ": ran the prefill tile" : ": ran a 16 x 64 form") + " (launched " +
                       (emu_last_kernel ? emu_last_kernel : "?") + ")");
         }
@@ -398,6 +405,9 @@ int main() {
             for (int mt : { 16, 32, 64, 128 }) gemm_e8_cases(rng, mt, ld, sas);   /* 128 without SAS runs 64 */
     gemm_e8_cases(rng, 32, 16, 1, 1);    /* P30o r2 (d): every launch the tile can take */
     gemm_e8_cases(rng, 32, 16, 1, 18);   /* ... from 18 rows: M 1 / 17 / 9 / 3 run MT 32 + SAS beside it */
+    gemm_e8_cases(rng, 32, 16, 1, 1, 1 << 30);   /* the 64-row form everywhere */
+    gemm_e8_cases(rng, 32, 16, 1, 1, 4);         /* ... below 4 blocks of 128 x 128: M 1 / 17 / 130 N 128 / 256 take 64, the rest 128 */
+    r4d_fp8e8_pin_pfh(-1);
     r4d_fp8e8_pin_pf(-1);
     r4d_fp8e8_pin_mt(0);
     r4d_fp8e8_pin_ld(0);
