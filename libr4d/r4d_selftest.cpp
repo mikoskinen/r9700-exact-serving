@@ -3450,9 +3450,14 @@ static void ds41_attn_skip_case(const Plugin& pl) {
     auto pin = (void (*)(int))dlsym(pl.h, "r4d_attn_skip_pin");
     if (!rlu || !rfu || !rfp || !pin) { ok(name, false, "row or r4d_attn_skip_pin absent"); return; }
     const int64_t H = 16, D = 512, n = H * D, win = 128, topk = 512, bs = 64, cbs = 64, rot = 64, E = 16, slots = 144;
-    struct Shape { int64_t M, p0; int ratio; };
+    /* hot (an upper-bound cell, timing only; IDEAS rule 3): 1 = every selection names entry 0 (one cached row), 2 = also every
+     * window block is block 0 -- the kernel with its key loads hitting the nearest cache: what a form that hides or shares
+     * the walked tiles' loads could reach at most */
+    struct Shape { int64_t M, p0; int ratio; int hot = 0; };
     const std::vector<Shape> shapes = { { 1150, 0, 2 }, { 1150, 0, 1 }, { 1150, 0, 0 }, { 2048, 0, 2 }, { 2048, 0, 1 },
-                                        { 4096, 0, 2 }, { 4096, 0, 1 }, { 2048, 8192, 2 }, { 2048, 8192, 1 }, { 600, 0, 2 } };
+                                        { 4096, 0, 2 }, { 4096, 0, 1 }, { 2048, 8192, 2 }, { 2048, 8192, 1 }, { 600, 0, 2 },
+                                        { 1150, 0, 2, 1 }, { 1150, 0, 2, 2 }, { 1150, 0, 1, 1 }, { 1150, 0, 1, 2 }, { 1150, 0, 0, 2 },
+                                        { 2048, 8192, 2, 1 }, { 2048, 8192, 2, 2 }, { 2048, 8192, 1, 2 } };
     std::mt19937 rng(3232);
     std::normal_distribution<float> nd(0.f, 1.f);
     int64_t bad = 0, rc_bad = 0;
@@ -3466,7 +3471,7 @@ static void ds41_attn_skip_case(const Plugin& pl) {
         for (auto& v : q) v = rad_f32_to_bf16(nd(rng) * 0.05f);
         for (auto& v : wc) v = rad_f32_to_bf16(nd(rng));
         std::vector<int32_t> wbt((size_t)nwbt), wu = { (int32_t)maxp }, pos((size_t)M), cu = { 0, (int32_t)M }, cbt((size_t)ncbt);
-        for (int64_t b = 0; b < nwbt; ++b) wbt[(size_t)b] = (int32_t)b;
+        for (int64_t b = 0; b < nwbt; ++b) wbt[(size_t)b] = sh.hot >= 2 ? 0 : (int32_t)b;
         for (int64_t b = 0; b < ncbt; ++b) cbt[(size_t)b] = (int32_t)b;
         for (int64_t m = 0; m < M; ++m) pos[(size_t)m] = (int32_t)(sh.p0 + m);
         /* the packed latent: random codes, e4m3 scale bytes 0x30..0x37 (an entry 288 bytes, cbs / r entries a block) */
@@ -3491,6 +3496,8 @@ static void ds41_attn_skip_case(const Plugin& pl) {
                 for (int64_t t = 0; t < topk; ++t) sl[(size_t)(m * topk + t)] = all[(size_t)t];
             }
         }
+        if (sh.hot >= 1)
+            for (auto& c : sl) if (c >= 0) c = 0;
         for (int64_t m = 0; m < M; ++m) {   /* tiles holding a key (the host's count) */
             const int64_t p = pos[(size_t)m], wk = std::min<int64_t>(win, p + 1);
             const int64_t sk = r ? std::min<int64_t>(topk, (p + 1) / r) : 0;
@@ -3580,10 +3587,12 @@ static void ds41_attn_skip_case(const Plugin& pl) {
         pin(-1);
         const double tu = r ? k1_time_us([&] { unpack(); }) : 0.0;
         const double toff = 0.5 * (t0 + t2), ton = 0.5 * (t1 + t3);
-        if (sh.p0 == 0 && M == 1150) { nc_off[r] = toff; nc_on[r] = ton; }
-        std::printf("  info  P32 M %lld p0 %lld ratio %d%s: skip off %.1f / %.1f us, on %.1f / %.1f us a launch (A B A B) = %+.1f %%; "
+        if (sh.p0 == 0 && M == 1150 && !sh.hot) { nc_off[r] = toff; nc_on[r] = ton; }
+        std::printf("  info  P32 M %lld p0 %lld ratio %d%s%s: skip off %.1f / %.1f us, on %.1f / %.1f us a launch (A B A B) = %+.1f %%; "
                     "tiles walked %lld of %lld (%.1f %%); %lld of %zu outputs differ (%lld non-zero); latent_unpack %.1f us\n",
-                    (long long)M, (long long)sh.p0, sh.ratio, full ? " plan_full" : "", t0, t2, t1, t3, 100.0 * (ton / toff - 1.0),
+                    (long long)M, (long long)sh.p0, sh.ratio, full ? " plan_full" : "",
+                    sh.hot == 1 ? " HOT selections (bound)" : sh.hot == 2 ? " HOT selections + window (bound)" : "", t0, t2, t1, t3,
+                    100.0 * (ton / toff - 1.0),
                     (long long)walked, (long long)(M * nkt), 100.0 * (double)walked / (double)(M * nkt), (long long)d, oa.size(),
                     (long long)nz, tu);
         std::fflush(stdout);
