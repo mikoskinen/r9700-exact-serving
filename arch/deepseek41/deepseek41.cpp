@@ -437,6 +437,8 @@ struct Dsp {
     int base = 0, n_stage = 0;            /* stages at absolute layers base .. base + n_stage - 1 */
     int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
     int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
+    bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
+    int64_t ff_rank = 0;                  /* the routed experts' intermediate width on this rank (DEP: n_ff / world) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
     int64_t kv_bs = 0;
@@ -1284,6 +1286,29 @@ static int etp_env() {
     return v;
 }
 using ds41etp::etp_slice;   /* ds41_etp.h: this rank's slice of an expert of each parity class */
+/* Lever DEP (DRAFTER track 19.11.2026 round 8): RADIANCE_DS41_DSPARK_DEP=1 (or on) at start puts the DSpark drafter's routed
+ * experts (the GGUF MXFP4 sidecar experts, moe_gemm_ggml) in EXPERT TENSOR PARALLEL form: every rank holds a 1 / world width
+ * slice of ALL the drafter's experts (gate_up: rows [r F / w, (r + 1) F / w) of the gate and of the up half; down: the same K
+ * columns; F = 2304 -> 576 = 18 MXFP4 blocks a rank at four ranks: the core's even ROW / COL shard of MoeFP8's GGUF path,
+ * n_expert = n_expert_all) instead of n_expert / world whole ones, and runs every routed slot on its slice. Why: under expert
+ * parallel a stage's MoE ends when its most-loaded rank does (lq146: rank 0's mx 3 gain absorbed by the post-MoE all-reduce's
+ * wait; dbench --quad on lq125's routing, 40 tokens: EP critical 1.37-1.53 ms a pass vs TP 0.91-1.29). Each rank's routed
+ * partial is a K slice of every slot's down, folded by the existing gather and summed by the existing exact all-reduce: no
+ * collective is added and the all-reduce keeps its size; the router is replicated as before.
+ * Exactness: a reference change against expert parallel, once (rule B): gate_up's outputs are whole dot products over K on
+ * one rank (the same), down's K 2304 becomes four partial dot products rounded to bf16 per rank and summed by the all-reduce
+ * (fp32, ascending rank order, one rounding). Deterministic and batch-invariant as EP: every row's arithmetic is its own.
+ * Verification keeps the served text; only the drafter's proposals can move on near-ties.
+ * Unset / 0 / off: expert parallel, today's program and bytes. Anything else is refused at start. */
+static int dsp_dep_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_DEP");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
 /* Lever XR (ds41-etp-xr, 14.11.2026): RADIANCE_DS41_XRING=<MiB> (1 .. 1024) at start, with RADIANCE_DS41_ETP, declares
  * each trunk layer's EXL3 gate_up with interface v10's `xring` -- that much copy ring in its prefill scratch. exl3r4d's
  * map form then can (fn4 exl3_xr bit 2) copy the routed experts whose slices sit in the pinned host pool onto the card
@@ -3830,6 +3855,31 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     if (d.ne_rank * g.world != d.n_expert)
         rad_note(b, "DSpark drafter experts split unevenly: rank %d holds %lld of %lld from %lld", g.rank,
                  (long long)d.ne_rank, (long long)d.n_expert, (long long)d.ne_base);
+    /* Lever DEP (dsp_dep_env): every expert on every rank, this rank's 1 / world width slice (whole 32-value blocks) */
+    d.dep = false;
+    d.ff_rank = c.n_ff;
+    if (dsp_dep_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DEP=%s is not 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_DSPARK_DEP"));
+        return RAD_E_INVAL;
+    }
+    if (dsp_dep_env() > 0 && g.world > 1) {
+        if (c.n_ff % (32 * g.world)) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DEP: the drafter's expert width %lld does not cut into "
+                            "whole 32-value blocks for %d ranks\n", (long long)c.n_ff, g.world);
+            return RAD_E_UNSUPPORTED;
+        }
+        d.dep = true;
+        d.ne_rank = d.n_expert;
+        d.ne_base = 0;
+        d.ff_rank = c.n_ff / g.world;
+        rad_note(b, "DSpark drafter experts tensor parallel (lever DEP, RADIANCE_DS41_DSPARK_DEP): all %lld on every rank, "
+                    "width %lld of %lld", (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff);
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever DEP (RADIANCE_DS41_DSPARK_DEP): the DSpark drafter's %lld routed experts "
+                            "on every rank as width slices of %lld of %lld (expert tensor parallel; EP held %lld a rank)\n",
+                    (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff, (long long)(d.n_expert / g.world));
+    }
     d.block = blk;
     d.base = (int)c.n_layer;
     d.n_stage = (int)ns;
@@ -3973,7 +4023,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.expert_base = d.ne_base;
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = d.top_k;
-    s.cfg.n_ff_exp = c.n_ff;
+    s.cfg.n_ff_exp = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: this rank's slice (MoeFP8's even ROW / COL shard) */
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;
@@ -4046,8 +4096,9 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     mw.eoff = decl_b(b, nm.f("dspark_expert_offsets"), RAD_I32, { d.n_expert + 1 });
     mw.ecnt = decl_b(b, nm.f("dspark_expert_counts"), RAD_I32, { d.n_expert }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("dspark_expert_sorted"), RAD_I32, { Q * d.top_k });
-    mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * c.n_ff });
-    mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, c.n_ff });
+    const int64_t dff = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: the slice's width */
+    mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * dff });
+    mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, dff });
     mw.edn = bf("dspark_expert_down", { Q * d.top_k, D });
     if (g.n_ff > 0) {
         mw.sgu = bf("dspark_shared_gate_up", { Q, 2 * g.n_ff });
