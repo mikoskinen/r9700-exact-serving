@@ -894,7 +894,7 @@ int Engine::step_loop_lanes() {
     struct Merge {
         bool on = false, draining = false;
         uint64_t t_want = 0, t_on = 0, last = 0, last_dec = 0;
-        bool last_bg = false;
+        bool last_bg = false, last_work = false;
         int64_t merges = 0, splits = 0, drains = 0, sweeps = 0;
         double drain_ms = 0, merged_s = 0, wall_s = 0, bg_s = 0, nobg_s = 0, stop_ms = 0;
         int64_t tok_bg = 0, tok_nobg = 0, steps_m = 0, tok_m = 0, rows_m = 0, steps_s = 0, tok_s = 0, rows_s = 0;
@@ -989,7 +989,8 @@ int Engine::step_loop_lanes() {
                 if (lane_relay[(size_t)l] && busy[(size_t)l]) bg_busy = true;   /* bit 32: a relay lane's BG step in flight */
                 if (mg.on && l > 0 && l < lanes_.decode_n() && (pm & 32) && lanes_.inbox_n(l) > 0) bg_busy = true;
             }
-            if (mg.last) {
+            /* only time with work in flight counts (the pipeline idle between cells is neither state) */
+            if (mg.last && mg.last_work) {
                 const double dt = (double)(now - mg.last) / 1e9;
                 mg.wall_s += dt;
                 (mg.last_bg ? mg.bg_s : mg.nobg_s) += dt;
@@ -1164,7 +1165,9 @@ int Engine::step_loop_lanes() {
             /* the idle lanes it may have lent to plan next, in its order */
             todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
         }
+        mg.last_work = !fifo.empty();   /* tp8 MERGE: the next round's time counts only with work in flight */
         if (fifo.empty()) {
+            mg.last_dec = 0;   /* tp8 MERGE: an idle pipeline is no decode stop */
             step_batch_.store(nullptr, std::memory_order_release);
             drain_completed();
             sched_.publish(/*idle=*/true);
