@@ -972,6 +972,28 @@ int Engine::step_loop_lanes() {
         }
         return false;
     };
+    /* tp8 loop D32: the decode rate with a BG step in flight vs without (the quantity LSP / R9 / MERGE move; the MERGE line's
+     * definitions, so the numbers compare across images): a round with work in flight is BG time while a BG lane has a step in
+     * flight or a newcomer in its inbox; a decode lane's commit counts its tokens (each produced row + its accepted drafts) by the
+     * state at the commit; a gap > 100 ms between decode commits with a BG step in flight is a stop. One line a minute
+     * (RADIANCE_PP_BGRATE_LINE_S) and at the run's end, cumulative: a cell = two lines' difference. Only with a BG lane. */
+    struct Bgr {
+        uint64_t last = 0, last_dec = 0;
+        bool last_bg = false;
+        double bg_s = 0, nobg_s = 0, stop_ms = 0;
+        int64_t tok_bg = 0, tok_nobg = 0, stops = 0, bg_commits = 0;
+    } bgr;
+    const bool bgr_on = lanes_.bg_lane() >= 0;
+    uint64_t bgr_every = 60000000000ull, bgr_line_ns = rad_mono_ns();
+    if (const char* v = std::getenv("RADIANCE_PP_BGRATE_LINE_S"); v && *v && std::atoi(v) > 0) bgr_every = (uint64_t)std::atoi(v) * 1000000000ull;
+    auto bgr_line = [&](const char* when) {
+        const double r_bg = bgr.bg_s > 0 ? (double)bgr.tok_bg / bgr.bg_s : 0.0, r_no = bgr.nobg_s > 0 ? (double)bgr.tok_nobg / bgr.nobg_s : 0.0;
+        RAD_INFO("two-node pipeline: decode beside BG steps%s (tp8 loop D32): decode tokens with a BG step in flight %lld in %.1f s = %.1f tok/s, "
+                 "without %lld in %.1f s = %.1f tok/s, ratio %.3f; decode-commit gaps > 100 ms with a BG step in flight %lld (%.0f ms), BG "
+                 "steps committed %lld (%.1f ms a BG step); pp_lead_seg %d", when, (long long)bgr.tok_bg, bgr.bg_s, r_bg,
+                 (long long)bgr.tok_nobg, bgr.nobg_s, r_no, r_no > 0 ? r_bg / r_no : 0.0, (long long)bgr.stops, bgr.stop_ms,
+                 (long long)bgr.bg_commits, bgr.bg_commits ? bgr.stop_ms / (double)bgr.bg_commits : 0.0, lsp_now());
+    };
     int next = 0;   /* the lane planned first on the next round */
     int64_t lane_steps = 0, rounds_two = 0;
     int64_t kv_check_at = 0;   /* tp8 S6: trunk steps shipped at the last KV-copy check */
@@ -1276,6 +1298,7 @@ int Engine::step_loop_lanes() {
         mg.last_work = !fifo.empty();   /* tp8 MERGE: the next round's time counts only with work in flight */
         if (fifo.empty()) {
             mg.last_dec = 0;   /* tp8 MERGE: an idle pipeline is no decode stop */
+            bgr.last = 0;   /* tp8 loop D32: idle time is neither state */
             step_batch_.store(nullptr, std::memory_order_release);
             drain_completed();
             sched_.publish(/*idle=*/true);
@@ -1295,6 +1318,16 @@ int Engine::step_loop_lanes() {
             continue;
         }
         idle = 0;
+        if (bgr_on) {   /* tp8 loop D32: this round's time by the state at its start */
+            const uint64_t now = rad_mono_ns();
+            bool bg_busy = false;
+            for (int q = 0; q < n_lanes_; ++q)
+                if ((lanes_.is_bg(q) && (busy[(size_t)q] || lanes_.inbox_n(q) > 0)) || (lane_relay[(size_t)q] && busy[(size_t)q]))
+                    bg_busy = true;   /* tp8 MERGE: a relay lane's BG step counts as one */
+            if (bgr.last) (bgr.last_bg ? bgr.bg_s : bgr.nobg_s) += (double)(now - bgr.last) / 1e9;
+            bgr.last = now;
+            bgr.last_bg = bg_busy;
+        }
         const bool two_in_flight = fifo.size() >= 2;
         /* 2. the oldest lane step's tail, its drafter, its commit (tp8 dev M4 ready-first: or a later one's, above) */
         size_t pick = 0;
@@ -1492,6 +1525,36 @@ int Engine::step_loop_lanes() {
         }
         tail_seg0_ = 0;
         busy[(size_t)lane] = nb ? 1 : 0;
+        if (bgr_on) {   /* tp8 loop D32: the decode tokens this commit emitted, by the state at the commit (MERGE's relay lane = BG) */
+            const uint64_t now = rad_mono_ns();
+            if (lanes_.is_bg(lane) || lane_relay[(size_t)lane]) {
+                ++bgr.bg_commits;
+            } else {
+                int64_t tok = 0;
+                const StepPlan& pl = sched_of(lane).plan();
+                for (size_t i = 0; i < pl.e.size(); ++i) {
+                    const StepEntry& e = pl.e[i];
+                    if (e.home >= 0 || e.is_prefill || !e.produces_token) continue;
+                    tok += 1 + (i < so.accepted.size() ? std::max<int32_t>(0, so.accepted[i]) : 0);
+                }
+                bool bg_now = false;
+                for (int q = 0; q < n_lanes_; ++q)
+                    if ((lanes_.is_bg(q) && (busy[(size_t)q] || lanes_.inbox_n(q) > 0)) || (lane_relay[(size_t)q] && busy[(size_t)q]))
+                        bg_now = true;
+                (bg_now ? bgr.tok_bg : bgr.tok_nobg) += tok;
+                if (tok > 0) {
+                    if (bgr.last_dec && bg_now && now - bgr.last_dec > 100000000ull) {
+                        ++bgr.stops;
+                        bgr.stop_ms += (double)(now - bgr.last_dec) / 1e6;
+                    }
+                    bgr.last_dec = now;
+                }
+            }
+            if (now - bgr_line_ns >= bgr_every) {
+                bgr_line(" so far");
+                bgr_line_ns = now;
+            }
+        }
         /* tp8 MERGE: the decode tokens this commit emitted (each decode row's sampled token + its accepted drafts), by the state
          * at the commit (a BG step in flight or not) and by the lane form the step ran in; a gap > 100 ms since the last decode
          * commit while a BG step is in flight is a full stop */
@@ -1523,13 +1586,13 @@ int Engine::step_loop_lanes() {
                     mg.last_dec = now;
                 }
             }
-            lane_merged[(size_t)lane] = 0;
-            lane_relay[(size_t)lane] = 0;
             if (now - mg_line_ns >= mg_line_every) {
                 mg_line(" so far");
                 mg_line_ns = now;
             }
         }
+        lane_merged[(size_t)lane] = 0;
+        lane_relay[(size_t)lane] = 0;
         gaps.host_tail(b, tt0, rad_mono_ns());
         gaps.tail(lane, b);
         if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
@@ -1588,6 +1651,7 @@ int Engine::step_loop_lanes() {
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
     if (lseg) lseg_line("");
+    if (bgr_on) bgr_line(" over the run");   /* tp8 loop D32 */
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);
