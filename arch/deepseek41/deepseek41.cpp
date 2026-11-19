@@ -359,6 +359,10 @@ struct Layer {
      * group (a weight sidecar's int8 dense) writes its own [T, o_rank] buffer, since libr4d's int8 GEMMs take C at pitch N
      * only (r4d_fp8_args.h), and o_b's quantiser then reads the groups one by one (IqrQOp::parts) */
     std::vector<rad_buf> oa_dst;
+    /* tp8 loop P30t: every attention_output_a group and attention_output_b have a TWIN (Model::twin) -- the twin groups write
+     * Model::oa_g (as P30f's IQR groups) and o_b's twin quantises them a group at a time; a prompt segment issues the four
+     * together (oa_fn / ob_fn), a decode row the GGUF ops over attn_o_lora as today */
+    bool oa_tw = false;
     /* Lever K1's folds (k1_read_env), 0 where not declared: kv_fs = kv_f + kv_st
      * (rmsnorm_rope_roundtrip_kv_store), attn_rt = attn + o_f, or attn + o_rope + o_q
      * (attn_sparse_sink_rope_roundtrip). Issued for those when their switch is 1. */
@@ -686,6 +690,15 @@ struct Model {
     /* tp8 loop P30f: the IQR attention_output_a groups' own [max_tok, o_rank] outputs, one a group, shared by the layers */
     std::vector<rad_buf> oa_g;
     int oa_said = 0;
+    /* tp8 loop P30t (RADIANCE_DS41_TWIN=mask): a GGUF dense weight's TWIN -- a weight sidecar's '<name>#pf' entry (rad-sidecar
+     * --twin), an IQR form (int8 / the release's block FP8) resident BESIDE the GGUF weight -- and the twin's ops: `twop` maps a
+     * GGUF linear's op to the twin's GEMM (whose quantiser is in `qops`), `twcls` the twin GEMM's class bit (twin_class);
+     * lin_issue takes the twin for a PROMPT segment's rows (t_twin, set by step_bi's by-segment issue), decode rows stay GGUF */
+    std::map<rad_weight, rad_weight> twin;
+    std::map<rad_weight, int>        twwcls;
+    std::map<rad_op, rad_op>         twop;
+    std::map<rad_op, int>            twcls;
+    int twin_mask = 0;                /* the classes some layer here twinned */
     /* tp8 loop P30o: the fp8 activation pair the release's block-FP8 linears read (quant_act_fp8_ue8m0: E4M3 codes, a power-of-two
      * f32 scale per 32 of K) -- [max_tok, the hidden width] and [max_tok, width / 32], declared at the first such linear; a wider
      * one (the Engram kv) beside it */
@@ -1018,9 +1031,106 @@ static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t d
  * read by gemm_nt_ggml, else bf16. A block's values run along k, so k and a column span must cut
  * whole blocks. With `shard` and a world above one, this rank holds [lo, hi) of the split
  * dimension. */
+/* tp8 loop P30t (QUEUE P30t, FINDINGS F65): the int8 / fp8 TWIN -- RADIANCE_DS41_TWIN=mask declares, beside a GGUF dense
+ * linear, the IQR form a weight sidecar holds under '<name>#pf' (rad-sidecar --twin: the engine serves it BESIDE the container's
+ * <name>, both resident), and a PROMPT segment's rows of that linear run on the twin (its quantiser + gemm_nt_q) while decode rows
+ * keep the published GGUF launch (no change to a decode row's bytes by construction). Classes (mask bits): 1 = attn_q_a +
+ * attn_kv, 2 = attn_q_b, 4 = attn_output_a (every group) + attn_output_b, 8 = engram_kv (lever E1's dedup issue keeps GGUF), 16 =
+ * any other dense name. RADIANCE_DS41_TWIN_ROWS=N (default 1): a prompt segment of fewer rows keeps GGUF. In process: fn4
+ * ds41_twin = mask + 256 x rows (rows 0 = the env's), a subset of the env's mask (0 = every row GGUF = the published program).
+ * A prompt row's bytes are then its own segment's (M = the segment's rows, issued by segment; a segment's sub-range -- an SP
+ * quarter, a P13 / P15 piece -- keeps GGUF), so they do not depend on the other rows of the pass: rule B (own reference). */
+static constexpr const char kTwinSfx[] = "#pf";
+enum : int { kTwQkv = 1, kTwQb = 2, kTwOab = 4, kTwEng = 8, kTwOther = 16, kTwAll = 31 };
+static int twin_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_TWIN");
+        if (!e || !*e) return 0;
+        const long x = std::strtol(e, nullptr, 0);
+        return x > 0 && x <= kTwAll ? (int)x : 0;
+    }();
+    return v;
+}
+static int64_t twin_rows_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_TWIN_ROWS");
+        const long long x = e && *e ? std::strtoll(e, nullptr, 10) : 1;
+        return (int64_t)(x >= 1 && x <= 65535 ? x : 1);
+    }();
+    return v;
+}
+static std::atomic<int> g_sw_twin{-1};      /* fn4 ds41_twin's value; -1 = the env's */
+static std::atomic<int> g_twin_decl{0};     /* the classes some declare here twinned */
+static std::atomic<long long> g_tw_launch{0}, g_tw_rows{0};
+static thread_local int t_twin = 0;          /* the twin classes the segment being issued takes (TwinScope) */
+static thread_local bool t_twin_sub = false; /* issuing a sub-range of a segment (step_bi's with_rows): no twin */
+/* the classes the layer being issued keeps on GGUF in every pass (step_bi, at each layer): where a lone pass may issue a class's
+ * GEMM over a SUB-range of its segment (an SP quarter: P26's q_a / kv, the SP Engram kv; a P13 / P15 piece) that class stays
+ * GGUF in every context, so a prompt's bytes do not depend on whether it ran alone or beside other prompts (rule B) */
+static thread_local int t_tw_off = 0;
+static int twin_class(const char* name) {
+    if (!name) return kTwOther;
+    if (std::strstr(name, "indexer.")) return kTwOther;
+    if (std::strstr(name, ".attn_q_a.") || std::strstr(name, ".attn_kv.")) return kTwQkv;
+    if (std::strstr(name, ".attn_q_b.")) return kTwQb;
+    if (std::strstr(name, ".attn_output_a") || std::strstr(name, ".attn_output_b.")) return kTwOab;
+    if (std::strstr(name, ".engram_kv.")) return kTwEng;
+    return kTwOther;
+}
+static int twin_mask_now() {
+    const int d = g_twin_decl.load(std::memory_order_relaxed);
+    const int v = g_sw_twin.load(std::memory_order_relaxed);
+    return (v < 0 ? twin_env() : (v & 255)) & d;
+}
+static int64_t twin_rows_now() {
+    const int v = g_sw_twin.load(std::memory_order_relaxed);
+    const int r = v < 0 ? 0 : (v >> 8);
+    return r > 0 ? r : twin_rows_env();
+}
+/* The twin classes for the rows a by-segment launch issues: a prompt segment (not decode) of at least twin_rows_now() rows,
+ * outside a sub-range; restored at the scope's end so nothing outside a segment's launch takes the twin. */
+struct TwinScope {
+    int prev;
+    TwinScope(bool prompt, int64_t n) : prev(t_twin) {
+        t_twin = 0;
+        if (prompt && !t_twin_sub) {
+            const int mk = twin_mask_now() & ~t_tw_off;
+            if (mk && n >= twin_rows_now()) t_twin = mk;
+        }
+    }
+    ~TwinScope() { t_twin = prev; }
+    TwinScope(const TwinScope&) = delete;
+    TwinScope& operator=(const TwinScope&) = delete;
+};
 static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
-                     bool mapped = false, int access = RAD_ACCESS_PER_TOKEN) {
+                     bool mapped = false, int access = RAD_ACCESS_PER_TOKEN);
+/* A GGUF weight's twin, when the env asks for its class and a sidecar holds '<name>#pf' in an IQR form: declared as its own
+ * weight (lw() over that name) and recorded in Model::twin. False: the twin exists but cannot be served (refused at declare). */
+static bool twin_decl(RadBuilder* b, Model& m, rad_weight w, const char* name, int64_t n, int64_t k, RadWeightGroup grp,
+                      int shard, int64_t lo, int64_t hi, int access) {
+    const int cls = twin_class(name);
+    if (!(twin_env() & cls)) return true;
+    /* the trunk's layers only (the drafter's blk.40+ linears are DLW's, never twinned) */
+    int bl = -1;
+    if (std::sscanf(name, "blk.%d.", &bl) == 1 && (bl < 0 || bl >= (int)m.c.n_layer)) return true;
+    const std::string tn = std::string(name) + kTwinSfx;
+    RadEncoding te{};
+    if (!weight_enc(b, tn.c_str(), &te)) return true;   /* no twin: the GGUF weight alone, as today */
+    const char* tname = m.nm.ckpt("%s", tn.c_str());   /* name is scoped already: no second prefix */
+    const rad_weight tw = lw(b, m, tname, n, k, grp, shard, lo, hi, false, access);
+    if (!tw || !m.wsc.count(tw) || m.wty.count(tw)) {
+        fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: %s's twin %s is not an IQR / block-FP8 form deepseek41 serves\n",
+                name, tname);
+        return false;
+    }
+    m.twin[w] = tw;
+    m.twwcls[tw] = cls;
+    return true;
+}
+static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
+                     RadWeightGroup grp, int shard, int64_t lo, int64_t hi,
+                     bool mapped, int access) {
     if (!mapped && map_copy(b, name, ckpt_name(name)) != RAD_OK) return 0;
     RadEncoding e{};
     int64_t blk = 0;
@@ -1173,6 +1283,7 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
         return 0;
     }
     if (ty) m.wty[w] = ty;
+    if (ty && twin_env() && !twin_decl(b, m, w, name, n, k, grp, shard, lo, hi, access)) return 0;   /* tp8 loop P30t */
     return w;
 }
 /* y = x . w^T over lw()'s weight: for a GGUF block it is gemm_nt_ggml, for an IQR view gemm_nt_q
@@ -1252,7 +1363,7 @@ static bool iqr_pair(RadBuilder* b, Model& m, int64_t k, rad_buf* q8, rad_buf* s
     return true;
 }
 static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_t n,
-                     int64_t k, rad_buf x, rad_buf y) {
+                     int64_t k, rad_buf x, rad_buf y, bool twin_ok = true) {
     const auto s = m.wsc.find(w);
     if (s != m.wsc.end()) {
         rad_buf q8 = 0, s8 = 0;
@@ -1271,11 +1382,22 @@ static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_
         return h;
     }
     const auto t = m.wty.find(w);
-    if (t != m.wty.end())
-        return op(b, "gemm_nt_ggml",
-                  { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("type", t->second),
-                    RAD_STR("dtype", m.g.dtype) },
-                  { w }, { x }, { y });
+    if (t != m.wty.end()) {
+        const rad_op h = op(b, "gemm_nt_ggml",
+                            { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("type", t->second),
+                              RAD_STR("dtype", m.g.dtype) },
+                            { w }, { x }, { y });
+        /* tp8 loop P30t: the twin's quantiser + GEMM beside it, over the same x into the same y (o_a / o_b: their caller) */
+        const auto tw = twin_ok && h ? m.twin.find(w) : m.twin.end();
+        if (tw != m.twin.end()) {
+            const rad_op th = linear(b, m, rows, tw->second, n, k, x, y, false);
+            if (!th) return 0;
+            m.twop[h] = th;
+            m.twcls[th] = m.twwcls.at(tw->second);
+            m.twin_mask |= m.twcls[th];
+        }
+        return h;
+    }
     return op(b, "gemm_nt",
               { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", m.g.dtype) },
               { w }, { x }, { y });
@@ -1285,8 +1407,30 @@ static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_
  * gemm_nt_q's schema is a, a_scale, b, b_scale, y, then optional a_sum and b_ref (7 slots, 5
  * required). Issuing the bf16 list (activation, weight, y) is a step-0 schema refusal. i8a8 and
  * i8a8h do not read the trailing pair; pass them as nulls so a later grid fails closed. */
+/* tp8 loop P30t: whether the launch of GGUF op h for the segment being issued takes its twin (t_twin's classes) */
+static bool tw_take(const Model& m, rad_op h) {
+    if (!t_twin) return false;
+    const auto t = m.twop.find(h);
+    if (t == m.twop.end()) return false;
+    const auto c = m.twcls.find(t->second);
+    return c != m.twcls.end() && (t_twin & c->second);
+}
 static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a, rad_weight w,
                       RadOperand y) {
+    if (t_twin && tw_take(m, h)) {   /* tp8 loop P30t: a prompt segment's rows on the twin */
+        const auto tw = m.twin.find(w);
+        if (tw != m.twin.end()) {
+            h = m.twop.at(h);
+            w = tw->second;
+            if (rad_rank(x) == 0) {
+                const long long nl = g_tw_launch.fetch_add(1, std::memory_order_relaxed) + 1;
+                const long long nr = g_tw_rows.fetch_add(rows, std::memory_order_relaxed) + rows;
+                if (nl == 1 || nl % 16384 == 0)
+                    fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: %lld twin launches (%lld rows) on prompt segments; "
+                                    "ds41_twin mask %d, from %lld rows\n", nl, nr, twin_mask_now(), (long long)twin_rows_now());
+            }
+        }
+    }
     const auto q = m.qops.find(h);
     if (q != m.qops.end()) {
         const IqrQOp& e = q->second;
@@ -1326,15 +1470,17 @@ static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a,
  * byte, and the GEMM reads the pair as linear() declares it. A GGUF group keeps its column slice, read in place. An IQR
  * group in front of a GGUF o_b (which reads the concatenation) is refused here. */
 static rad_op linear_oab(RadBuilder* b, Model& m, const Layer& L, int64_t rows, rad_weight w, int64_t n, int64_t k,
-                         int64_t gk, rad_buf oa, rad_buf y) {
+                         int64_t gk, rad_buf oa, rad_buf y, const std::vector<rad_buf>* groups = nullptr) {
+    /* tp8 loop P30t: `groups` = the twin o_a groups' buffers (Model::oa_g), in place of L.oa_dst */
+    const std::vector<rad_buf>& dst = groups ? *groups : L.oa_dst;
     if (!m.wsc.count(w)) {
         fprintf(stderr, "radiance: deepseek41: tp8 loop P30f: layer %d's attention_output_a groups are IQR but its "
                         "attention_output_b is not (it reads the groups' concatenation): give both in the sidecar\n", L.l);
         return 0;
     }
-    if (gk % iqr_grp(m, w) || (int64_t)L.oa_dst.size() * gk != k) {
+    if (gk % iqr_grp(m, w) || (int64_t)dst.size() * gk != k) {
         fprintf(stderr, "radiance: deepseek41: tp8 loop P30f: layer %d's o_b over %zu groups of %lld columns (K %lld) "
-                        "cannot quantise a group at a time\n", L.l, L.oa_dst.size(), (long long)gk, (long long)k);
+                        "cannot quantise a group at a time\n", L.l, dst.size(), (long long)gk, (long long)k);
         return 0;
     }
     rad_buf q8 = 0, s8 = 0;
@@ -1346,13 +1492,13 @@ static rad_op linear_oab(RadBuilder* b, Model& m, const Layer& L, int64_t rows, 
     e.grp = iqr_grp(m, w);
     e.pk = gk;
     e.apitch = k;
-    for (size_t j = 0; j < L.oa_dst.size(); ++j) {
-        const rad_buf src = L.oa_dst[j] ? L.oa_dst[j] : oa;
+    for (size_t j = 0; j < dst.size(); ++j) {
+        const rad_buf src = dst[j] ? dst[j] : oa;
         const rad_op qj = iqr_quant(b, m, rows, w, gk, src, q8, s8);
         if (!qj) return 0;
         e.parts.push_back(qj);
         e.psrc.push_back(src);
-        e.pcol.push_back(L.oa_dst[j] ? 0 : 1);
+        e.pcol.push_back(dst[j] ? 0 : 1);
     }
     e.op = e.parts[0];
     const rad_op h = iqr_gemm(b, m, rows, w, n, k, q8, s8, y);
@@ -2472,6 +2618,9 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value >= 0 && value <= g_sw_spattn_decl.load(std::memory_order_relaxed) ? 1 : -1;
     if (!std::strcmp(name, "ds41_sphc_seg"))
         return value >= 0 && value <= g_sw_spseg_decl.load(std::memory_order_relaxed) ? 1 : -1;
+    /* tp8 loop P30t: mask + 256 x rows, the mask a subset of RADIANCE_DS41_TWIN's classes (0: every row GGUF) */
+    if (!std::strcmp(name, "ds41_twin"))
+        return value >= 0 && ((value & 255) & ~twin_env()) == 0 && (value >> 8) <= 65535 ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -2498,6 +2647,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_sphc")) g_sw_sphc.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc_attn")) g_sw_spattn.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc_seg")) g_sw_spseg.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_twin")) g_sw_twin.store(value, std::memory_order_relaxed);   /* tp8 loop P30t */
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -2591,6 +2741,11 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ds41_sphc_seg")) {
         const int d = g_sw_spseg_decl.load(std::memory_order_relaxed), v = g_sw_spseg.load(std::memory_order_relaxed);
         *applied = v >= 0 && v < d ? v : d;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_twin")) {   /* tp8 loop P30t: what the issue reads (classes held here) + 256 x the rows set */
+        const int v = g_sw_twin.load(std::memory_order_relaxed);
+        *applied = twin_mask_now() + 256 * (v < 0 ? 0 : (v >> 8));
         return 1;
     }
     return 0;
@@ -3180,7 +3335,7 @@ static int e2_layer(RadBuilder* b, Model& m, Layer& L, int64_t T, int64_t n, int
  * each output keeps gemm_nt_ggml's per-output sequence (the band's forms give a row the same bytes at any N), and the
  * gather moves the parts' bytes into their columns. */
 static void e2_gemm(RadCtx* x, Model& m, const Layer& L, int64_t n, RadOperand a, RadOperand y) {
-    if (L.e_gemm_p && L.e_gath && n >= 1 && n <= m.e2_rows && e2_now()) {
+    if (L.e_gemm_p && L.e_gath && n >= 1 && n <= m.e2_rows && e2_now() && !tw_take(m, L.e_gemm)) {   /* P30t: the twin */
         RadOperand w = RAD_W(L.e_kv);
         w.offset = (int64_t)m.g.rank * m.e2_part * m.e2_rb;   /* u8 elements of the stored rows = bytes */
         w.rows = m.e2_part;
@@ -3958,7 +4113,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 if (L.oa_dst.size() != (size_t)m.gr) L.oa_dst.assign((size_t)m.gr, 0);
                 oy = L.oa_dst[(size_t)j] = m.oa_g[(size_t)j];
             }
-            L.o_a.push_back(linear(b, m, T, L.wo_a.back(), c.o_rank, gd, m.o, oy));
+            L.o_a.push_back(linear(b, m, T, L.wo_a.back(), c.o_rank, gd, m.o, oy, false));   /* P30t: twins below */
         }
         gq_oa(b, m, L, T, gd, m.o, m.oa);   /* lever 1U-GQ: the two groups as one op, beside them */
         const int64_t ok = m.gr * c.o_rank;
@@ -3972,7 +4127,39 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                 "[%lld, %lld] buffers and o_b quantises them a group at a time (libr4d's int8 GEMMs "
                                 "write C at pitch N only)\n", (long long)T, (long long)c.o_rank);
         } else {
-            L.o_b = linear(b, m, T, L.wo_b, D, ok, m.oa, m.attn_out);
+            L.o_b = linear(b, m, T, L.wo_b, D, ok, m.oa, m.attn_out, false);   /* P30t: its twin below */
+        }
+        /* tp8 loop P30t: the output projections' twins, all or none: each twin group writes its own [T, o_rank] buffer
+         * (Model::oa_g: libr4d's int8 / fp8 GEMMs write C at pitch N only), o_b's twin quantises those a group at a time
+         * (P30f's form); a prompt segment issues the four, a decode row the GGUF ops over attn_o_lora */
+        int ntw = m.twin.count(L.wo_b) ? 1 : 0;
+        for (const rad_weight w : L.wo_a) ntw += m.twin.count(w) ? 1 : 0;
+        if (ntw == (int)L.wo_a.size() + 1 && !oa_split(L)) {
+            if (m.oa_g.size() != (size_t)m.gr) {
+                m.oa_g.assign((size_t)m.gr, 0);
+                for (int i = 0; i < m.gr; ++i) {
+                    m.oa_g[(size_t)i] = decl_b(b, nm.f("attn_o_lora_g%d", i), RAD_BF16, { T, c.o_rank });
+                    if (!m.oa_g[(size_t)i]) return RAD_E_INVAL;
+                    m.bp[m.oa_g[(size_t)i]] = c.o_rank;
+                }
+            }
+            for (int j = 0; j < m.gr; ++j) {
+                const rad_weight tw = m.twin.at(L.wo_a[(size_t)j]);
+                const rad_op th = linear(b, m, T, tw, c.o_rank, gd, m.o, m.oa_g[(size_t)j], false);
+                if (!th) return RAD_E_INVAL;
+                m.twop[L.o_a[(size_t)j]] = th;
+                m.twcls[th] = kTwOab;
+            }
+            const rad_op thb = linear_oab(b, m, L, T, m.twin.at(L.wo_b), D, ok, c.o_rank, m.oa, m.attn_out, &m.oa_g);
+            if (!thb) return RAD_E_INVAL;
+            m.twop[L.o_b] = thb;
+            m.twcls[thb] = kTwOab;
+            m.twin_mask |= kTwOab;
+            L.oa_tw = true;
+        } else if (ntw > 0 && m.g.rank == 0) {
+            fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: layer %d holds %d of the %zu output-projection twins (every "
+                            "attention_output_a group + attention_output_b, or none%s): its output projections stay GGUF\n",
+                    L.l, ntw, L.wo_a.size() + 1, oa_split(L) ? "; and its groups are IQR already" : "");
         }
     }
     /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
@@ -6225,6 +6412,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "segment SP at %d at most)\n",
                     (long long)m.sphc, sphc_attn_env(), sphc_seg_env(), m.sp_ag_qr ? (m.sp_ag_kvs ? 2 : 1) : 0, m.sp_seg);
     }
+    /* tp8 loop P30t: the twins this declare holds, and what ds41_twin may take (the env's classes this node twinned) */
+    if (twin_env() && !ctx->shape_probe) {
+        int nw = 0;
+        std::map<int, int> per;
+        for (const auto& [h, th] : m.twop) {
+            (void)h;
+            ++per[m.twcls.at(th)];
+            ++nw;
+        }
+        int cur = g_twin_decl.load(std::memory_order_relaxed);
+        while (!g_twin_decl.compare_exchange_weak(cur, cur | m.twin_mask)) {}
+        if (ctx->rank == 0) {
+            std::string pl;
+            for (const auto& [cl, n] : per) pl += fmt_s("%s%d x class %d", pl.empty() ? "" : ", ", n, cl);
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_TWIN=%d (tp8 loop P30t): %d twin GEMM(s) beside their GGUF "
+                            "linears (%s; %zu twin weights), prompt segments of >= %lld rows take them (RADIANCE_DS41_TWIN_ROWS), "
+                            "decode rows the GGUF launch; switch ds41_twin = mask + 256 x rows, a subset of %d (0 = all GGUF)%s\n",
+                    twin_env(), nw, pl.empty() ? "none: no '<name>#pf' entry of the env's classes" : pl.c_str(), m.twin.size(),
+                    (long long)twin_rows_env(), m.twin_mask,
+                    (twin_env() & kTwEng) ? "; the Engram twin only where lever E1's dedup does not act (ds41_engdd 0)" : "");
+        }
+    }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
      * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
     if (lr_shell(m)) {
@@ -8048,6 +8257,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 if (s.r0 < a0 || s.r0 >= a1) continue;
                 if (seg || !s.dec || s.n <= band) {
                     if (!seg && s.dec && s.n > kBiBand && rad_rank(x) == 0) g_dband64_runs.fetch_add(1, std::memory_order_relaxed);
+                    const TwinScope tws(!s.dec, s.n);   /* tp8 loop P30t: a prompt segment's launch may take its twin */
                     fn(s.r0, s.n);
                     continue;
                 }
@@ -8057,10 +8267,22 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             }
         };
         if (!wmkw || !gg) { by_seg(0, T); return; }
+        /* tp8 loop P30t: a run holding a prompt segment that takes the twin is issued by segment (its prompt rows on the twin,
+         * its decode rows in their own GGUF launches) */
+        const int tw_mk = t_twin_sub ? 0 : twin_mask_now();
+        const int64_t tw_r = tw_mk ? twin_rows_now() : 0;
         for (const auto& u : runs) {
             int64_t dn = 0, pn = 0;
+            bool tw_run = false;
             for (const BiSeg& s : *cur)
-                if (s.r0 >= u.first && s.r0 < u.first + u.second) (s.dec ? dn : pn) += s.n;
+                if (s.r0 >= u.first && s.r0 < u.first + u.second) {
+                    (s.dec ? dn : pn) += s.n;
+                    tw_run = tw_run || (tw_mk && !s.dec && s.n >= tw_r);
+                }
+            if (tw_run) {
+                by_seg(u.first, u.first + u.second);
+                continue;
+            }
             /* a mixed run in one launch where that is the faster geometry: the run fits the decode band (one <= 48-row launch for
              * both), or its prefill rows are past the band already (they run a prefill form anyway; the decode rows add <= their
              * share of it). A short prefill tail next to decode rows (pn <= 48 < dn + pn) keeps two decode-band launches: one
@@ -8267,7 +8489,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         tbo_sg.assign(1, s);
         cur = &tbo_sg;
         set_runs();
+        const bool sub0 = t_twin_sub;
+        t_twin_sub = true;   /* tp8 loop P30t: a sub-range of a segment (SP quarter / piece) keeps GGUF */
         fn();
+        t_twin_sub = sub0;
         cur = keep;
         set_runs();
     };
@@ -8447,6 +8672,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         xn_sh = false;
     };
     for (auto& L : m.layers) {
+        /* tp8 loop P30t: the classes this layer keeps on GGUF (t_tw_off): every class under P13 / P15's pieces; q_a + kv where
+         * P26 may issue them over an SP quarter (its static conditions at this switch level); the Engram kv under the SP Engram */
+        t_tw_off = !m.twin_mask ? 0
+                 : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng ? kTwEng : 0) |
+                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score ? kTwQkv : 0);
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
         /* tp8 S5 + S6: a lane step's leader part issues its own layers; the other part's are as another node's (their
@@ -8822,13 +9052,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const bool qkv_gg = gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv);
                 if (!p26) {   /* tp8 loop P26: issued over the quarter above */
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
-                    if (gq_qkv_on(L, n))
+                    if (!tw_take(m, L.q_a) && gq_qkv_on(L, n))   /* tp8 loop P30t: a twin prompt segment: the twins */
                         gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
                     else
                         lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
                 });
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {
-                    if (!gq_qkv_on(L, n)) lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
+                    if (tw_take(m, L.q_a) || !gq_qkv_on(L, n)) lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                 });
                 }
                 if (L.i_score)
@@ -8837,6 +9067,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     });
                 if (qfold)   /* rmsnorm_gemm_nt_ggml: rmsnorm's row arithmetic is the row's at any width (kR4dSumLanes) */
                     dense(gguf_dense(m, L.wq_b), true, [&](int64_t r0, int64_t n) {
+                        if (tw_take(m, L.q_b)) {   /* tp8 loop P30t: the norm alone (the fold's qrn bytes), then q_b's twin */
+                            RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
+                            lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
+                            return;
+                        }
                         RAD_ISSUE_N(x, L.q_bf, n, R(m.qr, r0, n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, r0, n), R(m.q, r0, n));
                     });
                 else
@@ -8897,14 +9132,16 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             for (const BiSeg& s : sg) {
                 if (cheap) break;
                 const int64_t r0 = s.r0, n = s.n;
-                if (gq_qkv_on(L, n)) {   /* lever 1U-GQ */
+                const TwinScope tws(!s.dec, n);   /* tp8 loop P30t */
+                if (!tw_take(m, L.q_a) && gq_qkv_on(L, n)) {   /* lever 1U-GQ */
                     gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
                 } else {
                     lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
                     lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                 }
                 if (L.i_score) lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
-                if (qfold)
+                const bool qf = qfold && !tw_take(m, L.q_b);   /* tp8 loop P30t: a twin q_b takes the norm alone */
+                if (qf)
                     RAD_ISSUE_N(x, L.q_bf, n, R(m.qr, r0, n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, r0, n), R(m.q, r0, n));
                 else
                     RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
@@ -8925,7 +9162,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 else
                     kvn(r0, n);
                 if (L.i_score) lin_issue(x, m, L.i_q, n, R(m.qrn, r0, n), L.iq_w, R(m.iq, r0, n));
-                if (!qfold) lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
+                if (!qf) lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
                 if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, n, R(m.kvn, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
                 if (!L.src && L.i_score) {
                     if (L.i_f) RAD_ISSUE_N(x, L.i_f, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), P(batch->positions, r0, n));
@@ -9147,6 +9384,14 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             bool oa_gg = true;
             for (int j = 0; j < m.gr; ++j) oa_gg = oa_gg && gguf_dense(m, L.wo_a[(size_t)j]);
             const auto oa_fn = [&](int64_t r0, int64_t n) {
+                /* tp8 loop P30t: a twin prompt segment's groups write Model::oa_g, which o_b's twin reads (ob_fn: lin_issue) */
+                const bool otw = L.oa_tw && tw_take(m, L.o_a[0]);
+                if (otw) {
+                    for (int j = 0; j < m.gr; ++j)
+                        lin_issue(x, m, L.o_a[(size_t)j], n, C(m.o, j * gd, gd, r0, n), L.wo_a[(size_t)j],
+                                  R(m.oa_g[(size_t)j], r0, n));
+                    return;
+                }
                 if (gq_oa_on(L, n)) {   /* lever 1U-GQ: the two groups as one launch */
                     gq_oa_issue(x, m, L, n, C(m.o, 0, gd, r0, n), C(m.o, gd, gd, r0, n), C(m.oa, 0, c.o_rank, r0, n),
                                 C(m.oa, c.o_rank, c.o_rank, r0, n));
