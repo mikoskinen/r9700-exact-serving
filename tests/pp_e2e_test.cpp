@@ -2299,12 +2299,13 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
     }
     /* + two forms the cards may stack on it: the leader's BG segments (M9: LEAD_SEG + AHEAD) and the BG hold (D11) */
     struct Arm { int lanes; const char* cut; const char* bg; const char* room; bool lead_seg = false; bool hold = false;
-                 const char* join = nullptr; };
+                 const char* join = nullptr; int sw = 0; };   /* sw: tp8 loop P23s -- the room by POST /admin/fn4 pp_bg_room */
     long long b2_all = 0;
     for (const Arm a : { Arm{ 3, "2,3", "1", "2112" }, Arm{ 3, "0,2", "1", "2112" }, Arm{ 4, "1,3", "2", "2112" },
                          Arm{ 3, "2,3", "1", nullptr }, Arm{ 3, "2,3", "1", "2112", true, false },
                          Arm{ 3, "2,3", "1", "2112", false, true }, Arm{ 3, "2,3", "1", "2112", false, false, "1" },
-                         Arm{ 3, "0,2", "1", "2112", false, false, "60000" } }) {
+                         Arm{ 3, "0,2", "1", "2112", false, false, "60000" }, Arm{ 3, "2,3", "1", nullptr, false, false, nullptr, 2112 },
+                         Arm{ 4, "1,3", "2", nullptr, false, false, nullptr, 2112 } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + a.bg);
         if (a.room) env.push_back(std::string("RADIANCE_PP_BG_ROOM=") + a.room);
@@ -2319,7 +2320,22 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         ex.push_back(std::to_string(a.lanes));
         Serving pp;
         REQUIRE(pp.start(a.cut, ex, env));
+        if (a.sw) {   /* tp8 loop P23s: the env's room off, the switch's on before the set */
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_bg_room", a.sw } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_bg_room: %d %s\n", st, out.c_str());
+        }
         const std::vector<std::vector<int32_t>> got = bg_room_set(pp.port);
+        if (a.sw) {
+            Call g;
+            std::string out;
+            if (g.send(pp.port, "/admin/fn4", "") && g.read(&out) == 200) {
+                const json j = json::parse(out, nullptr, false);
+                CHECK(j.is_object() && j.contains("switches") && j["switches"].value("pp_bg_room", -9) == a.sw);
+            }
+        }
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -2341,9 +2357,9 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
                 if (const char* w = std::strstr(q, "newcomers; ")) b2 = std::atoll(w + std::strlen("newcomers; "));
                 if (const char* w = std::strstr(q, "the widest ")) widest = std::atoll(w + std::strlen("the widest "));
             }
-        if (a.room) b2_all += std::max(0LL, b2);
+        if (a.room || a.sw) b2_all += std::max(0LL, b2);
         fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; BG steps "
-                        "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : "off",
+                        "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : a.sw ? "2112 by pp_bg_room" : "off",
                 a.lead_seg ? " + LEAD_SEG=1 + AHEAD" : a.hold ? " + HOLD" : "", a.join ? (std::string(" + JOIN_MS=") + a.join).c_str() : "",
                 a.lanes, a.cut, differ, ref.size(), bg, steps, b2, widest);
         CHECK_EQ(differ, 0);
@@ -2353,6 +2369,12 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         if (a.room) {
             CHECK(llog.find("RADIANCE_PP_BG_ROOM=2112 -- ") != std::string::npos);
             CHECK(steps > 0);
+            CHECK(widest <= 2112);
+        } else if (a.sw) {   /* tp8 loop P23s: no env line, the run's BG-steps line at the switch's room, batched steps */
+            CHECK(llog.find("RADIANCE_PP_BG_ROOM=2112 -- ") == std::string::npos);
+            CHECK(llog.find("BG steps over the run (RADIANCE_PP_BG_ROOM=2112") != std::string::npos);
+            CHECK(steps > 0);
+            if (a.lanes == 3) CHECK(b2 > 0);   /* one BG lane batches (the env arm too); two BG lanes rarely need to (the env arm: 0) */
             CHECK(widest <= 2112);
         } else {
             CHECK(llog.find("RADIANCE_PP_BG_ROOM=") == std::string::npos);

@@ -405,6 +405,11 @@
  *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 84): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
  *                   passes whole (P25 off), 1 / 2 P25, 3 + P25b. Each only takes away what the env declared; exact at every
  *                   value (SP is the replicated pass's fold and bytes; X1 / X2 carry every row whichever side shards).
+ *   pp_bg_room      engine, the two-node leader (tp8 loop P23s; 85 here, after ds41_sphc_seg): RADIANCE_PP_BG_ROOM in process --
+ *                   0 = the shared budget (one ~1.1k newcomer a BG step), 256 .. 65536 rows a BG lane's inbox (lane_split_bg's
+ *                   cap); starts at the env's; taken only with a BG lane (else 0). With ds41_bi 7 (PMM) a batched BG step runs its
+ *                   newcomers' routed MoE as one pass a layer. Exact: multi-prefill steps are one process's (lever NOA / P23).
+ *   pp_bg_join_ms   engine, the leader (tp8 loop P23s; 86): RADIANCE_PP_BG_JOIN_MS in process, 0 (off) or 1 .. 60000; with pp_bg_room.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -615,7 +620,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDs41Sphc, kDs41SphcAttn, kDs41SphcSeg, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDs41Sphc, kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

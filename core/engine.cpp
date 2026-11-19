@@ -1045,6 +1045,16 @@ void Engine::fn4_apply_changes(const int* sw) {
                 stage_lone_.store(sw[fn4::kStageLone] == 1 ? 1 : 0, std::memory_order_relaxed);
                 fn4::note_sched(fn4::kStageLone, stage_lone_.load(std::memory_order_relaxed));
             }
+            /* tp8 loop P23s: the BG lanes' inbox room / join window (RADIANCE_PP_BG_ROOM / _JOIN_MS in process), read by the
+             * next plan's lane_split_bg on this thread; only with a BG lane (else 0). The follower plans nothing: leader-only. */
+            if (sw[fn4::kPpBgRoom] != fn4::kNoChange) {
+                if (lanes_.bg_lane() >= 0) lanes_.set_bg_room(sw[fn4::kPpBgRoom]);
+                fn4::note_sched(fn4::kPpBgRoom, (int)lanes_.bg_room());
+            }
+            if (sw[fn4::kPpBgJoinMs] != fn4::kNoChange) {
+                if (lanes_.bg_lane() >= 0) lanes_.set_bg_join_ms(sw[fn4::kPpBgJoinMs]);
+                fn4::note_sched(fn4::kPpBgJoinMs, lanes_.bg_lane() >= 0 ? (int)lanes_.bg_join_ms() : 0);
+            }
             /* Lever SP (ds41-int9): read by the next arena_step (fn4 refuses either > 0 unless set up). */
             if (sw[fn4::kStageFullMin] != fn4::kNoChange) {
                 stage_full_min_.store(sp_capable_ ? std::max(0, sw[fn4::kStageFullMin]) : 0, std::memory_order_relaxed);

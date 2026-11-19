@@ -258,6 +258,9 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  (long long)lanes_.bg_hold_ms(), (long long)lanes_.bg_hold_ms());
     if (const char* bp = std::getenv("RADIANCE_PP_BG_PIECES"); bp && *bp)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_PIECES=%s is ignored: the switch was removed 18.11. (tp8 dev D12, never on cards)", bp);
+    /* tp8 loop P23s: the in-process switches pp_bg_room / pp_bg_join_ms start at the env's values (0 without a BG lane) */
+    fn4::note_sched(fn4::kPpBgRoom, (int)lanes_.bg_room());
+    fn4::note_sched(fn4::kPpBgJoinMs, (int)lanes_.bg_join_ms());
     if (lanes_.bg_room() > 0)
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROOM=%lld -- a BG lane's inbox (its next step) takes lent newcomers up to %lld "
                  "rows (the shared budget %lld otherwise), so the newcomers that arrive while a BG step runs go to the next one "
@@ -667,6 +670,7 @@ int Engine::step_loop_lanes() {
     /* tp8 loop P23: the BG lanes' steps (run so far) once a minute under RADIANCE_PP_BG_ROOM, so a cell's window is the difference
      * of two lines: steps, newcomers, steps with >= 2 newcomers (batched) and their newcomers / rows, >= 3, the widest step */
     uint64_t bgst_line_ns = rad_mono_ns();
+    bool bgst_seen = false;   /* tp8 loop P23s: the room was on at some point (the switch) */
     uint64_t sb_line_ns = bgst_line_ns;   /* tp8 loop D18: the short block's minute line */
     auto bgst_line = [&](const char* when) {
         const LaneSet::Counts c = lanes_.counts();
@@ -1207,7 +1211,8 @@ int Engine::step_loop_lanes() {
                 hold_line_ns = now;
             }
         }
-        if (lanes_.bg_room() > 0) {
+        if (lanes_.bg_room() > 0 || bgst_seen) {   /* tp8 loop P23s: also once pp_bg_room was on */
+            bgst_seen = true;
             const uint64_t now = rad_mono_ns();
             if (now - bgst_line_ns >= 60000000000ull) {
                 bgst_line(" so far");
@@ -1241,7 +1246,7 @@ int Engine::step_loop_lanes() {
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);
-    if (lanes_.bg_room() > 0) bgst_line(" over the run");
+    if (lanes_.bg_room() > 0 || bgst_seen) bgst_line(" over the run");
     if (ia) ia_line(" over the run");
     short_block_line(" over the run");   /* tp8 loop D18 */
     return RAD_OK;
