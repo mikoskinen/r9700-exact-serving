@@ -475,7 +475,7 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0);
     /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
      * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
      * (StepHdr flags bit 2), the follower's parts start at h + k */
@@ -506,7 +506,7 @@ private:
      * layer segments with other lanes' parts between them -- its head [0, h) as segments [s0, s1) (the first takes the
      * release, the restores and holds the frame; the last ships it, then X1), its tail [t, n) as model-part segments, the
      * last one with the sampler, drafter and step end (lane_tail_issue from `tail_seg0_`, RAD_PP_SEG_END). */
-    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0);
+    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0, int lflags = 0);
     int  lane_tail_seg(int lane, const RadBatch* b, int s0, int s1);
     int  tail_seg0_ = 0;
     /* ... the held frame of the lane's step (pp_ship's bytes, built at its first head segment so it carries that release's

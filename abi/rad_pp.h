@@ -255,6 +255,12 @@ static inline void rad_pp_declare_band(int k) {
     if (rad_pp_band) rad_pp_band(k);
 }
 
+/* tp8 loop D40 (the leader; zero from an engine before it): RadPpInfo.reserved[1]'s bits for the leader's head / tail SEGMENT
+ * pass being issued (seg_l1 > 0), 0 on every other pass. RAD_PP_LSEG_SP: the step's segments may run the plugin's
+ * sequence-parallel plan of the WHOLE part (fn4 pp_lead_seg + 512): every segment plans the same, the boundary op after an
+ * SP layer goes over each rank's rows at the next segment's start. A plugin that does not know it ignores it. */
+#define RAD_PP_LSEG_SP 1
+
 /* tp8 S6: the plugin names, at declare (rank 0's real declare; repeats are ignored), each KV cache
  * layer both nodes hold of one source -- the owner its own, the receiver the copy a crossing fills:
  * `group` (the rad_kvgroup), `slot` (the layer's place among the group's bound layers on THIS node, in

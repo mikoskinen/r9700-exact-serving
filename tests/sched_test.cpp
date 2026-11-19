@@ -3558,8 +3558,16 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK(fn4::check("pp_lead_seg", 256, &err));      /* tp8 loop D36: + 256 = no band passes */
     CHECK(fn4::check("pp_lead_seg", 258, &err));
     CHECK(!fn4::check("pp_lead_seg", 259, &err));
-    CHECK(!fn4::check("pp_lead_seg", 512, &err));
     CHECK(err.find("+ 256 = no band passes") != std::string::npos);
+    /* tp8 loop D40: + 8 = the tail whole, + 512 = the SP word on the head's segments; 3 / 11 / 1024 refused */
+    CHECK(fn4::check("pp_lead_seg", 10, &err));       /* decode first, tail whole */
+    CHECK(fn4::check("pp_lead_seg", 74, &err));       /* decode first, every 4th, tail whole */
+    CHECK(fn4::check("pp_lead_seg", 512, &err));
+    CHECK(fn4::check("pp_lead_seg", 546, &err));      /* 34 + 512 */
+    CHECK(fn4::check("pp_lead_seg", 1023 - 5, &err)); /* 1018 = 2 + 8 + 16 x 15 + 256 + 512 */
+    CHECK(!fn4::check("pp_lead_seg", 11, &err));
+    CHECK(!fn4::check("pp_lead_seg", 1024, &err));
+    CHECK(err.find("+ 8 = the tail whole, + 512 = the SP word") != std::string::npos);
     CHECK(!fn4::check("pp_lead_seg", -1, &err));
     fn4::lead_seg_register(false);
     CHECK(fn4::check("pp_lead_seg", 0, &err));

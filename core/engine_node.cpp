@@ -72,6 +72,8 @@ struct PpGlobal {
     std::atomic<int>     x1_ids{ 0 };
     /* tp8 loop P28: the band the plugin declared (rad_pp_band) and the pass being issued's band word (0: not a band pass) */
     std::atomic<int>     band_k{ 0 }, band{ 0 };
+    /* tp8 loop D40: the leader head / tail segment being issued's RAD_PP_LSEG_* bits (0 every other pass) */
+    std::atomic<int>     lflags{ 0 };
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
     std::mutex kv_mu;
     std::vector<std::array<int32_t, 3>> kv_copies;
@@ -103,6 +105,7 @@ extern "C" int rad_pp_info(RadPpInfo* out) {
     out->seg_l0 = g.seg_l0.load();
     out->seg_l1 = g.seg_l1.load();
     out->reserved[0] = g.band.load();   /* tp8 loop P28: the pass's band k (abi/rad_pp.h rad_pp_band) */
+    out->reserved[1] = g.lflags.load();  /* tp8 loop D40: a leader segment's RAD_PP_LSEG_* bits */
     for (int i = 0; i < RAD_PP_N_RINGS; ++i) out->ring[i] = g.ring[lane * RAD_PP_N_RINGS + i].load();
     return 0;
 }
@@ -832,7 +835,7 @@ void Engine::pp_on_build(const RadBatch* b, int lane) {
     pp_draft_q_.emplace_back(b->step, lane, std::move(fr));
 }
 
-void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band) {
+void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band, int lflags) {
     PpGlobal& g = pp_g();
     g.lane.store(lane, std::memory_order_relaxed);
     g.part.store(part, std::memory_order_relaxed);
@@ -841,6 +844,8 @@ void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band) {
     const bool seg = part == RAD_PP_PART_SEG || ((part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && seg_l1 > 0);
     g.seg_l0.store(seg ? seg_l0 : 0, std::memory_order_relaxed);
     g.seg_l1.store(seg ? seg_l1 : 0, std::memory_order_relaxed);
+    /* tp8 loop D40: only a leader head / tail segment carries RAD_PP_LSEG_* bits; every other pass resets them */
+    g.lflags.store(seg && part != RAD_PP_PART_SEG ? lflags : 0, std::memory_order_relaxed);
 }
 
 int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n,

@@ -875,6 +875,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const bool lseg = m.pp && m.pp_rank == 0 && (part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && ppi.seg_l1 > 0 &&
                       !m.seg_b.empty();
     const int64_t l0 = lseg ? ppi.seg_l0 : 0, l1 = lseg ? std::min<int64_t>(ppi.seg_l1, m.n_main) : m.n_main;
+    /* tp8 loop D40 stand-in: the engine's SP word (RadPpInfo.reserved[1], fn4 pp_lead_seg + 512) comes only with a leader HEAD
+     * segment (deepseek41 plans the whole head's SP there); this model has no SP and only checks where it lands */
+    if (m.pp && ppi.reserved[1] != 0 && !(lseg && part == RAD_PP_PART_HEAD)) {
+        rad_step_fail(c, "llama: the engine's SP word (tp8 loop D40) on a pass that is not a leader head segment");
+        return;
+    }
     const bool lfirst = !lseg || l0 == (part == RAD_PP_PART_HEAD ? 0 : m.pp_t);
     /* tp8 loop D36: a band pass's head ends at h + 1 (its last segment [s, h + 1), RADIANCE_PP_LEAD_SEG_BAND=1) */
     const bool llast = !lseg || (part == RAD_PP_PART_HEAD ? l1 == he : l1 >= m.n_main);
