@@ -618,4 +618,53 @@ TEST(layers_p28_band_passes_of_w10_32) {
     CHECK(accepted > 0 && refused_n > 0);
 }
 
+/* tp8 loop D39: the TAIL band of W(10,32) at j = 1 -- the follower stops at 31 (X2 of W(10,31): the residual, source 20's latent +
+ * index keys as W(10,32)'s X2, keep 20, and index 28's selections, which layer 31 reads and W(10,32)'s X2 does not carry: the band's
+ * second X2 form) and the leader's tail runs [31, 40); layer 31 holds no Engram, tap or kv source.
+ * j = 2 is refused (this form), as are bands holding a source (W(10,21): layer 20), Engram (W(0,15): layer 14) or a tap, and
+ * one that leaves the follower no layer; over every cut each accepted band is [t - 1, t) with X2 = W(h, t)'s besides the residual. */
+TEST(layers_d39_tail_band_of_w10_32) {
+    const Geo g = flash1017();
+    TailBand b;
+    std::string err;
+    CHECK_EQ(tail_band_crossing(g, 10, 32, 1, &b, &err), 0);
+    if (!err.empty()) std::fprintf(stderr, "  tail band W(10,32) j 1: %s\n", err.c_str());
+    CHECK_EQ(b.at, 31);
+    CHECK_EQ((int)b.window.size(), 1);
+    CHECK_EQ(b.window.front(), 31);
+    CHECK(b.x2.residual);
+    Crossing c2[2];
+    CHECK_EQ(crossings(g, 10, 32, c2, &err), 0);
+    CHECK_EQ(b.x2.src, c2[1].src);
+    CHECK_EQ(b.x2.latent, c2[1].latent);
+    CHECK_EQ(b.x2.index, c2[1].index);
+    CHECK_EQ(b.x2.sel, 28);   /* the band layer's selections: the second X2 form */
+    CHECK_EQ(c2[1].sel, -1);
+    CHECK_EQ(b.x2.keep, 20);
+    std::fprintf(stderr, "  tail band W(10,32) j 1: X2 of W(10,31) src %d latent %d index %d sel %d keep %d\n", b.x2.src, (int)b.x2.latent,
+                 (int)b.x2.index, b.x2.sel, b.x2.keep);
+    CHECK(tail_band_crossing(g, 10, 32, 2, &b, &err) < 0);    /* this form: j = 1 */
+    CHECK(tail_band_crossing(g, 10, 21, 1, &b, &err) < 0);    /* layer 20 is a kv source */
+    CHECK(err.find("layer 20") != std::string::npos);
+    CHECK(tail_band_crossing(g, 0, 15, 1, &b, &err) < 0);     /* layer 14: Engram + kv source */
+    CHECK(tail_band_crossing(g, 10, 11, 1, &b, &err) < 0);    /* the follower would keep no layer */
+    int accepted = 0, refused_n = 0;
+    for (int h = 0; h < 39; ++h)
+        for (int t = h + 2; t < 40; ++t) {
+            TailBand x;
+            std::string e;
+            if (tail_band_crossing(g, h, t, 1, &x, &e) < 0) { ++refused_n; CHECK(!e.empty()); continue; }
+            ++accepted;
+            const int l = t - 1;
+            CHECK(!(g.is_src[(size_t)l] && g.ratio[(size_t)l] > 0));
+            CHECK(l != 1 && l != 14 && l < 37);
+            CHECK_EQ(x.at, l);
+            Crossing c[2];
+            CHECK_EQ(crossings(g, h, t, c, &e), 0);
+            CHECK_EQ(x.x2.src, c[1].src);
+        }
+    std::fprintf(stderr, "  tail bands over every cut: %d accepted, %d refused\n", accepted, refused_n);
+    CHECK(accepted > 0 && refused_n > 0);
+}
+
 RAD_TEST_MAIN()
