@@ -2612,7 +2612,8 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
     struct Arm { int lanes; const char* cut; int k; int merge; bool post = false; bool lead_seg = false; };
     for (const Arm a : { Arm{ 4, "1,3", 2, 1 }, Arm{ 4, "0,2", 2, 1 }, Arm{ 3, "1,3", 1, 1 }, Arm{ 4, "1,3", 1, 1 },
                          Arm{ 4, "1,3", 2, 2 }, Arm{ 4, "1,3", 2, 1, true }, Arm{ 4, "2,3", 2, 5, false, true },
-                         Arm{ 4, "2,3", 2, 9, false, true }, Arm{ 4, "2,3", 2, 4, false, true } }) {
+                         Arm{ 4, "2,3", 2, 9, false, true }, Arm{ 4, "2,3", 2, 4, false, true }, Arm{ 4, "1,3", 2, 65 },
+                         Arm{ 4, "1,3", 2, 64 }, Arm{ 3, "0,2", 1, 65 } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         if (!a.post) env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
@@ -2686,7 +2687,7 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
             if (a.merge == 5) { CHECK(lsteps > 0); CHECK(lparts > lsteps); }
             else CHECK(lsteps <= 0);
         }
-        if (a.merge == 4) {   /* no merge bit: the lanes never merge */
+        if (!(a.merge & 3)) {   /* no merge bit (4: segments with the merge on only; 64: decode tails first alone): the lanes never merge */
             CHECK(merges <= 0);
             continue;
         }
@@ -2815,12 +2816,17 @@ TEST(relay_lane_serves_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; const char* cut; int k; int merge; };
+    struct Arm { int lanes; const char* cut; int k; int merge; bool lead_seg = false; };
     long long relay_all = 0;
-    for (const Arm a : { Arm{ 3, "1,3", 1, 33 }, Arm{ 4, "1,3", 2, 33 }, Arm{ 3, "0,2", 1, 49 }, Arm{ 4, "1,3", 1, 33 } }) {
+    for (const Arm a : { Arm{ 3, "1,3", 1, 33 }, Arm{ 4, "1,3", 2, 33 }, Arm{ 3, "0,2", 1, 49 }, Arm{ 4, "1,3", 1, 33 },
+                         Arm{ 4, "2,3", 2, 37, true }, Arm{ 3, "2,3", 1, 101, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
+        if (a.lead_seg) {   /* + the BG (and relay) steps' leader parts in segments with the merge on (bit 4) */
+            env.push_back("RADIANCE_PP_LEAD_SEG=1");
+            env.push_back("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15");
+        }
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);

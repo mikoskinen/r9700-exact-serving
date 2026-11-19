@@ -401,7 +401,9 @@
  *                   no room for is HELD out of the merged lane's step (D11's hold, RADIANCE_PP_MERGE_HOLD_MS, default 1500) instead of
  *                   a MIXED step of every sequence; bit 32 (the relay lane): while merged a parked decode lane with nothing of its own
  *                   takes whole newcomers as a third BG lane (after the idle BG lanes), so the next newcomer's head starts beside the
- *                   others' parts; its frames say so (StepHdr flags bit 8) and the follower segments them. RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
+ *                   others' parts; its frames say so (StepHdr flags bit 8) and the follower segments them; bit 64 (decode tails first, with
+ *                   RADIANCE_PP_READY_FIRST=1): a decode-only step whose X2 landed takes its tail before a long pass's even when that pass's X2
+ *                   landed too (works with or without the merge bits). RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
  *                   (else 0). The merged lane's occupancy rule (draft_occ) acts at once. Exact: only lane composition and the
  *                   drafting depth change (the build's composition invariance; depth moves only what a step verifies).
  *   pp_merge_ms     engine, the leader (tp8 MERGE; 83 here): the merge's hysteresis -- the lanes stay merged this many ms after the

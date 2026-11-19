@@ -261,7 +261,7 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     /* tp8 MERGE: fn4 pp_merge starts at RADIANCE_PP_MERGE (0 unset), taken with two decode lanes or more */
     {
         int v = 0;
-        if (const char* pm = std::getenv("RADIANCE_PP_MERGE"); pm && *pm) v = std::max(0, std::min(63, std::atoi(pm)));
+        if (const char* pm = std::getenv("RADIANCE_PP_MERGE"); pm && *pm) v = std::max(0, std::min(127, std::atoi(pm)));
         if (lanes_.decode_n() < 2) v = 0;
         pp_merge_.store(v, std::memory_order_relaxed);
         fn4::note_sched(fn4::kPpMerge, v);
@@ -918,6 +918,7 @@ int Engine::step_loop_lanes() {
     if (const char* v = std::getenv("RADIANCE_PP_MERGE_HOLD_MS"); v && *v && std::atoi(v) > 0) mg_hold_ms = std::min(60000, std::atoi(v));
     uint64_t mg_bg_last = 0;   /* the last round with BG work (pp_merge_ms' clock) */
     int64_t mg_held_rounds = 0, mg_hyst_rounds = 0;
+    int64_t mg_tails_first = 0;   /* bit 64: decode tails taken before a long pass whose X2 had landed */
     int mg_pm_last = pp_merge_.load(std::memory_order_relaxed);
     /* the line's period (RADIANCE_PP_MERGE_LINE_S, default 60 s); it prints at every pp_merge change too, so a switch arm's
      * window is the difference of the lines at its two ends */
@@ -932,7 +933,7 @@ int Engine::step_loop_lanes() {
                  "decode-commit gaps > 100 ms with a BG step in flight %lld (%.0f ms), BG steps committed %lld (%.1f ms a BG step); "
                  "requests moved in %lld / out %lld (+ %lld at later plans), free cards %lld, left behind: lent %lld, kept context rows "
                  "%lld, in a step %lld; held for the BG lanes %lld newcomers over %lld steps (%lld lent later, %lld home after the hold), "
-                 "rounds merged by a hold %lld / by pp_merge_ms=%d %lld; relay lane BG steps %lld", when, pp_merge_.load(std::memory_order_relaxed), (long long)mg.merges,
+                 "rounds merged by a hold %lld / by pp_merge_ms=%d %lld; relay lane BG steps %lld; decode tails before a landed long pass %lld", when, pp_merge_.load(std::memory_order_relaxed), (long long)mg.merges,
                  (long long)mg.drains, mg.drain_ms, (long long)mg.splits, mg.merged_s, mg.wall_s, (long long)mg.steps_m,
                  (long long)mg.tok_m, (long long)mg.rows_m, (long long)mg.steps_s, (long long)mg.tok_s, (long long)mg.rows_s,
                  (long long)mg.tok_bg, mg.bg_s, r_bg, (long long)mg.tok_nobg, mg.nobg_s, r_no, r_no > 0 ? r_bg / r_no : 0.0,
@@ -940,7 +941,7 @@ int Engine::step_loop_lanes() {
                  (long long)mg.moved_in, (long long)mg.moved_out, (long long)mg.sweeps, (long long)mg.cards, (long long)mg.w_lent,
                  (long long)mg.w_ctx, (long long)mg.w_other, (long long)lanes_.counts().hold_reqs, (long long)lanes_.counts().hold_steps,
                  (long long)lanes_.counts().hold_lent, (long long)lanes_.counts().hold_home, (long long)mg_held_rounds,
-                 pp_merge_ms_.load(std::memory_order_relaxed), (long long)mg_hyst_rounds, (long long)mg.relay_steps);
+                 pp_merge_ms_.load(std::memory_order_relaxed), (long long)mg_hyst_rounds, (long long)mg.relay_steps, (long long)mg_tails_first);
     };
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
@@ -1291,13 +1292,20 @@ int Engine::step_loop_lanes() {
                     if (s.st == kLsHead || (s.st == kLsTail && s.k > 0)) { ++lseg_inside; break; }
             }
             if (lseg_last) ++lseg_parts;
-        } else if (ready_first && fifo.size() >= 2 && fifo.front().second->n_tok >= rf_rows && !x2_landed(fifo.front().first)) {
+        } else if (ready_first && fifo.size() >= 2 && fifo.front().second->n_tok >= rf_rows &&
+                   ((pm & 64) || !x2_landed(fifo.front().first))) {
+            /* tp8 MERGE bit 64 (decode tails first): a later decode-only step whose X2 landed goes before the long pass even when the
+             * long pass's X2 landed too -- its tail is a few ms on rank 0's stream where the long pass's tail + collect hold it ~100 ms
+             * (lq187: the merged lane's tail taken 100-600 ms after its head behind BG tails / heads). Only the order of tails changes,
+             * as ready-first's: a decode step of its own sequences reads only committed KV. */
             bool waited = false;
             for (;;) {
-                if (x2_landed(fifo.front().first)) break;
+                if (!(pm & 64) && x2_landed(fifo.front().first)) break;
                 for (size_t i = 1; i < fifo.size() && !pick; ++i)
                     if (x2_landed(fifo[i].first) && !carries_lent(fifo[i].first)) pick = i;
-                if (pick || stopping_.load(std::memory_order_acquire) || (pp_link_ && !pp_link_->alive())) break;
+                if (pick) { if (x2_landed(fifo.front().first)) ++mg_tails_first; break; }
+                if ((pm & 64) && x2_landed(fifo.front().first)) break;
+                if (stopping_.load(std::memory_order_acquire) || (pp_link_ && !pp_link_->alive())) break;
                 waited = true;
                 std::this_thread::sleep_for(std::chrono::microseconds(20));
             }

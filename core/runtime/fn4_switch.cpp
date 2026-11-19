@@ -896,10 +896,10 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpMerge) {   /* tp8 MERGE */
-        if (v < 0 || v > 63) {
+        if (v < 0 || v > 127) {
             if (err) *err = "pp_merge takes 0 (off) .. 31 (bits: 1 merge the decode lanes while a BG step is in flight, 2 merged always, "
                             "4 the BG steps' leader segments only with the merge on, 8 no BG leader segments at all, 16 hold a newcomer "
-                            "the BG lanes have no room for while merged, 32 a parked decode lane takes whole newcomers while merged)";
+                            "the BG lanes have no room for while merged, 32 a parked decode lane takes whole newcomers while merged, 64 decode tails before a long pass whose X2 landed)";
             return false;
         }
         return true;

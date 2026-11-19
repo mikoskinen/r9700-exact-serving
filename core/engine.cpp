@@ -1049,7 +1049,7 @@ void Engine::fn4_apply_changes(const int* sw) {
              * only with two decode lanes or more (else 0). The follower plans nothing: it notes the value and does nothing. */
             if (sw[fn4::kPpMerge] != fn4::kNoChange) {
                 const bool can = n_lanes_ > 1 && n_lanes_ - lanes_.bg_n() >= 2;
-                pp_merge_.store(can ? std::max(0, std::min(63, sw[fn4::kPpMerge])) : 0, std::memory_order_relaxed);
+                pp_merge_.store(can ? std::max(0, std::min(127, sw[fn4::kPpMerge])) : 0, std::memory_order_relaxed);
                 fn4::note_sched(fn4::kPpMerge, pp_merge_.load(std::memory_order_relaxed));
             }
             if (sw[fn4::kPpMergeMs] != fn4::kNoChange) {
