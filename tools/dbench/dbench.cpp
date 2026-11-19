@@ -40,6 +40,8 @@ extern "C" const char* r4d_mx_mr_last();
 extern "C" void r4d_mx_mr_cap(int tokens);
 extern "C" void r4d_mx_gemv_order(int on);
 extern "C" void r4d_mx_wm_slab(int bytes);
+extern "C" void r4d_mx_mr_il(int on);   /* lever WIL (round 27): the weights in the tile-interleaved layout */
+static int g_il = 0;
 void r4d_mx_mr_set(int on);
 /* The a8 arms (COORDINATOR 19:52): libr4d's moe_gemm_mxfp4a8 (r4d_moe_mxfp4.hip body(): canonical planes, E2M1 codes as exact
  * E4M3 bytes, fp8 WMMA, the E8M0 and the activation scales folded in f32 a 32-group) on activations quantised by
@@ -186,6 +188,7 @@ struct Call {          /* one (stage, projection) launch */
     void* y = nullptr;
     Route rt;
     int p = 0, stage = 0;
+    void *wn = nullptr, *wi = nullptr;   /* the expert pointer tables: 17-byte rows / lever WIL's interleaved tiles */
     /* a8: quantised activations, the canonical planes' pointer tables (even / odd experts), its own args */
     void *aq = nullptr, *as = nullptr, *w8[2] = { nullptr, nullptr }, *s8[2] = { nullptr, nullptr };
     int64_t AR = 0, K = 0, N = 0;
@@ -212,7 +215,7 @@ struct Call {          /* one (stage, projection) launch */
     }
 };
 
-struct Form { std::string name; int on, h, r, mt, wn, grid; };
+struct Form { std::string name; int on, h, r, mt, wn, grid; int il = 0; };
 
 /* ---- value comparison (a rule-B form against the stock bytes) */
 static float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
@@ -296,15 +299,19 @@ static std::vector<std::string> split(const std::string& s) {
     return v;
 }
 static bool parse_form(const std::string& n0, Form* f) {
-    f->name = n0; f->h = 4; f->r = 1; f->mt = 4; f->wn = 0; f->grid = 0;
+    f->name = n0; f->h = 4; f->r = 1; f->mt = 4; f->wn = 0; f->grid = 0; f->il = 0;
     std::string n = n0;
+    /* a leading "il-": the pinned form on lever WIL's tile-interleaved weights */
+    if (n.rfind("il-", 0) == 0) { f->il = 1; n = n.substr(3); }
     /* a trailing _gGRID: the grid cap */
     if (size_t q = n.find("_g"); q != std::string::npos) { f->grid = std::atoi(n.c_str() + q + 2); n = n.substr(0, q); }
     if (n == "stock") { f->on = 0; return true; }
     if (n == "rule") { f->on = -1; return true; }
     if (n == "mx2") { f->on = -2; return true; }   /* the switch drafter_mx 2, no pin */
     if (n == "mx4") { f->on = -7; return true; }   /* the switch drafter_mx 4 (round 10: 2's bytes, PD 9 at K >= 2048) */
-    if (n == "mx5") { f->on = -8; return true; }   /* the switch drafter_mx 5 (round 12, lever DTS: 4 + xm_wt PD 9 TS 4 below K 2048) */
+    if (n == "mx5") { f->on = -8; return true; }
+    if (n == "mx5il") { f->on = -9; return true; }   /* lever WIL: drafter_mx 5's forms on the tile-interleaved weights */
+    if (n == "mx4il") { f->on = -10; return true; }  /* lever WIL: drafter_mx 4's forms on the tile-interleaved weights */   /* the switch drafter_mx 5 (round 12, lever DTS: 4 + xm_wt PD 9 TS 4 below K 2048) */
     if (n == "a8") { f->on = -3; return true; }    /* fp8 quant + moe_gemm_mxfp4a8 a call */
     if (n == "mx3") { f->on = -6; return true; }   /* the switch drafter_mx 3 (xm_a8_kernel: fp8 x fp8 on the 17-byte blocks) */
     if (n == "a8g") { f->on = -4; return true; }   /* moe_gemm_mxfp4a8 only (activations quantised before) */
@@ -349,6 +356,9 @@ static bool parse_form(const std::string& n0, Form* f) {
     return false;
 }
 static void apply_form(const Form& f) {
+    g_il = f.on == -9 || f.on == -10 || f.il;
+    r4d_mx_mr_il(g_il);
+    if (g_il && !f.il) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(f.on == -9 ? 5 : 4); g_a8 = 0; return; }
     g_a8 = f.on == -3 ? 1 : f.on == -4 ? 2 : f.on == -5 ? 3 : 0;
     if (g_a8) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); return; }
     if (f.on == -6) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(3); return; }
@@ -419,6 +429,7 @@ int main(int argc, char** argv) {
     /* weights: stage x projection, 32 experts each, a pointer table; for the a8 arms also the canonical planes (E2M1 codes,
      * element 2i in the low nibble of byte i, [N, K/2]; E8M0 [N, K/32]) of the same values, even / odd experts' tables */
     void* wtab[12][2]; size_t ebytes[2];
+    void* wtabil[12][2] = {};   /* lever WIL: the same weights as 16-row x 1-block tiles of 272 bytes (xm_wm_kernel's IL note) */
     void* w8tab[12][2][2] = {}; void* s8tab[12][2][2] = {};
     /* --wfile (mxslice.py's canonical planes of one layer, expert after expert): the same weights at every stage, each stage its
      * own copy in device memory (no stage reads another's bytes from a cache) */
@@ -468,6 +479,30 @@ int main(int argc, char** argv) {
             for (int64_t e = 0; e < kE; ++e) ptrs[(size_t)e] = d + e * (int64_t)ebytes[p];
             CK(hipMalloc(&wtab[st][p], kE * sizeof(void*)));
             CK(hipMemcpy(wtab[st][p], ptrs.data(), kE * sizeof(void*), hipMemcpyHostToDevice));
+            {   /* lever WIL: the tile-interleaved copy (same size): tile (group g, block b) at (g UK + b) 272, lane L = row % 16 + 16 h
+                 * holds qs[4 h .. 4 h + 3], qs[8 + 4 h .. 8 + 4 h + 3] at 8 L, the 16 rows' scales at 256 + row % 16 */
+                const int64_t UK = P.K / 32;
+                std::vector<uint8_t> il(hw.size());
+                for (int64_t e = 0; e < kE; ++e)
+                    for (int64_t n = 0; n < P.N; ++n)
+                        for (int64_t b = 0; b < UK; ++b) {
+                            const uint8_t* q = hw.data() + ((e * P.N + n) * UK + b) * 17;
+                            uint8_t* t = il.data() + (size_t)(e * (int64_t)ebytes[p]) + ((n / 16) * UK + b) * 272;
+                            const int64_t r = n % 16;
+                            for (int h = 0; h < 2; ++h)
+                                for (int i = 0; i < 4; ++i) {
+                                    t[8 * (r + 16 * h) + i] = q[1 + 4 * h + i];
+                                    t[8 * (r + 16 * h) + 4 + i] = q[1 + 8 + 4 * h + i];
+                                }
+                            t[256 + r] = q[0];
+                        }
+                uint8_t* di = nullptr; CK(hipMalloc((void**)&di, il.size()));
+                CK(hipMemcpy(di, il.data(), il.size(), hipMemcpyHostToDevice));
+                std::vector<void*> pi((size_t)kE);
+                for (int64_t e = 0; e < kE; ++e) pi[(size_t)e] = di + e * (int64_t)ebytes[p];
+                CK(hipMalloc(&wtabil[st][p], kE * sizeof(void*)));
+                CK(hipMemcpy(wtabil[st][p], pi.data(), kE * sizeof(void*), hipMemcpyHostToDevice));
+            }
             if (want_a8) {
                 const int64_t nb = P.K / 32, cb = P.N * P.K / 2, sbb = P.N * nb;
                 std::vector<uint8_t> codes((size_t)(kE * cb)), sc((size_t)(kE * sbb));
@@ -531,7 +566,7 @@ int main(int argc, char** argv) {
         for (int st = 0; st < stages; ++st)
             for (int p = 0; p < 2; ++p) {
                 const Proj& P = kProj[p];
-                Call c; c.rt = rts[(size_t)st]; c.p = p; c.stage = st;
+                Call c; c.rt = rts[(size_t)st]; c.p = p; c.stage = st; c.wn = wtab[st][p]; c.wi = wtabil[st][p];
                 const int64_t TR = (int64_t)c.rt.sorted.size(), AR = P.sorted_rows ? TR : tk, rb = P.K / 32 * 17;
                 std::vector<uint16_t> hx((size_t)(AR * P.K));
                 uint64_t rs = 0x777ull + (uint64_t)tk + 7919ull * (uint64_t)(2 * st + p);
@@ -567,6 +602,7 @@ int main(int argc, char** argv) {
         double stock_pass = 0;
         for (const Form& f : fl) {
             apply_form(f);
+            for (auto& c : calls) c.ts[1].data = g_il ? c.wi : c.wn;
             /* correctness: each call once, bytes vs the stock path's */
             bool same = true; std::string formdesc;
             DiffStats dst; long long rbn = 0; int rb_fail = 0, vs_a8 = 0, vs_a8_n = 0, vs_m2 = 0, vs_m2_n = 0;
@@ -585,7 +621,7 @@ int main(int argc, char** argv) {
                 CK(hipMemcpy(got.data(), calls[i].y, calls[i].ybytes, hipMemcpyDeviceToHost));
                 if (f.on == -3 && outa8[i].empty()) outa8[i] = got;
                 if (f.on == -2 && outmx2[i].empty()) outmx2[i] = got;
-                if ((f.on == -7 || f.on == -8 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
+                if ((f.on == -7 || f.on == -8 || f.on == -9 || f.on == -10 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
                 if (f.on == -6 && !outa8[i].empty()) {
                     const size_t nv = (size_t)(calls[i].rt.live * kProj[calls[i].p].N) * 2;
                     vs_a8 += std::memcmp(got.data(), outa8[i].data(), std::min(nv, got.size())) ? 1 : 0;
