@@ -2740,7 +2740,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
 /* ================================================================== lever TSK (DRAFTER track round 15): the decode band's attention
  * of the COMPRESSING layers as SPLIT-KEY WMMA -- fn4 ds41_tsk 1 (RADIANCE_DS41_TSK=0 / 1 at load sizes the op's scratch and
  * sets the start value; unset = the stock program, the switch refused). A row's keys (libref's order: the window, then the
- * selections) are cut into chunks of kTskTpc 16-key tiles FIXED by key index (not by the pass); one workgroup a (16-head
+ * selections) are cut into chunks of kTskTpc (20) 16-key tiles FIXED by key index (not by the pass); one workgroup a (16-head
  * group, chunk, row) runs ds41_attn_sparse_sink_wm_kernel's tile loop (LO: p as bf16 hi + lo, the same WMMAs, the online
  * exp2 softmax) over its chunk alone and writes its partial (running max, denominator, unnormalised o) to the op's scratch;
  * ds41_attn_tsk_merge_kernel folds the chunks in ascending order (m = max, each scaled by exp2(m_c - m)), adds the sink,
@@ -2748,7 +2748,10 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
  * of the separate launch). A row's bytes depend on its own keys and position only: deterministic, row- and M-invariant.
  * Rule B: its own reference -- neither the decode band's bits (libref's) nor the prefill WMMA form's (one chunk). GA: the
  * selections from latent_gather's rows (s.cg, lever DKV-G) instead of the packed cache. */
-constexpr int kTskTpc = 4;
+#ifndef R4D_TSK_TPC
+#define R4D_TSK_TPC 20   /* a chunk's 16-key tiles: 2 chunks at 640 keys (round 15 sweep, gather + attn us at 1 / 5 / 8 / 16 / 24 / 40 / 48 / 64 rows: tpc 4 27.5 / - / 37.7 / 40.4 / 55.2 / 82.0 / 94.4 / 137.4, 10 28.6 / 25.3 / 36.5 / 36.1 / 46.3 / 67.6 / 77.8 / 121.2, 14 30.4 / 26.6 / 38.4 / 36.0 / 45.5 / 63.2 / 76.9 / 118.9, 20 33.8 / 29.4 / 43.3 / 35.7 / 45.1 / 62.5 / 70.9 / 118.4); the bits follow it (bench builds: -DR4D_TSK_TPC=N) */
+#endif
+constexpr int kTskTpc = R4D_TSK_TPC;
 __host__ __device__ constexpr long ds_tsk_lds() { return ds_wm_sbuf_off(kTskTpc) + kWmSbufBytes + kWmNvBytes; }
 template <bool GA>
 __global__ __launch_bounds__(128) void ds41_attn_tsk_kernel(DsAttnArgs a, float sl2, float* __restrict__ wso,

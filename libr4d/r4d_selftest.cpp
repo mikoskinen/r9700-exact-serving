@@ -3063,6 +3063,19 @@ static int k1_launch(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vec
     a.p = ps.data();
     a.n_p = (int)ps.size();
     a.world_size = 1;
+    /* the row's scratch hook's bytes (lever TSK, DRAFTER round 15: attn_sparse_sink's partials when RADIANCE_DS41_TSK is set),
+     * one region reused by every call (one stream, in order); none asked: none, as before */
+    if (r->scratch) {
+        static void* scr = nullptr;
+        static int64_t scr_b = 0;
+        const int64_t need = r->scratch(&a);
+        if (need > scr_b) {   /* outside dalloc: dfree_all runs between shapes */
+            if (scr) (void)hipFree(scr);
+            scr = nullptr;
+            scr_b = hipMalloc(&scr, (size_t)need) == hipSuccess ? need : 0;
+        }
+        if (need > 0 && scr) { a.scratch = scr; a.scratch_bytes = scr_b; }
+    }
     const int rc = r->launch(&a, nullptr);
     if (!g_k1_sync) return rc;
     const hipError_t he = (hipError_t)st_stream_sync(nullptr);
