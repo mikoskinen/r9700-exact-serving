@@ -4527,10 +4527,15 @@ void r4d_mix_wv_set(int v);
  * RADIANCE_DS41_MIX_FIN=1 at load. */
 int r4d_mix_fin_get();
 void r4d_mix_fin_set(int v);
+/* tp8 loop D26 (r4d_ds41_sparse.hip): "ds41_attn_dec" 0 .. 7 -- the decode band's attention form at > 256 keys a row where the
+ * rule takes form 4 (0 = the rule, N = form N - 1); every form the same bytes. RADIANCE_DS41_ATTN_DEC=N at load. */
+extern "C" int r4d_attn_dec_sw_get();
+extern "C" int r4d_attn_dec_sw_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 8 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25) */
+    if (!std::strcmp(name, "ds41_attn_dec")) return value >= 0 && value <= 7 ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
@@ -4554,6 +4559,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
     if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 8 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
@@ -4577,6 +4583,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ds41_mix_wv")) { *applied = r4d_mix_wv_get(); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { *applied = r4d_mix_fin_get(); return 1; }
     if (!std::strcmp(name, "ds41_wmk")) { *applied = wmk_now(); return 1; }
+    if (!std::strcmp(name, "ds41_attn_dec")) { *applied = r4d_attn_dec_sw_get(); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { *applied = r4d_gg_mr_m16_get(); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
