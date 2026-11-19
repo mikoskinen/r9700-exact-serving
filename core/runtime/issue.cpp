@@ -255,14 +255,14 @@ static const bool g_dbg_issue = std::getenv("RADIANCE_DEBUG_ISSUE") != nullptr;
 /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS=X, > 0; read once): every rank times each issue (own = issue_body up to the launch,
  * launch = the kernel's host launch or a host-site op's run) and its first-launch kernel resolves on the card (the AQL
  * backend's); an issue of >= X ms prints one line, and run_step one line a pass whose issue took >= max(10, 5 X) ms (its
- * issues' sum, the rest = the plugin's own code between issues, the slowest issue), at most 64 lines of each a process.
+ * issues' sum, the rest = the plugin's own code between issues, the slowest issue), at most 128 lines of each a process.
  * Timing only: the issue order, arguments and bytes are unchanged. Unset / 0: nothing timed. */
 static const double g_slow_issue_ms = [] {
     const char* e = std::getenv("RADIANCE_SLOW_ISSUE_MS");
     const double v = e && *e ? std::atof(e) : 0.0;
     if (v > 0)
         std::fprintf(stderr, "radiance: RADIANCE_SLOW_ISSUE_MS=%g (tp8 loop P31): an issue of >= %g ms and a pass issue of >= "
-                             "%g ms print a line (at most 64 each) in passes of >= RADIANCE_SLOW_ISSUE_ROWS rows\n", v, v,
+                             "%g ms print a line (at most 128 each) in passes of >= RADIANCE_SLOW_ISSUE_ROWS rows\n", v, v,
                      std::max(10.0, 5.0 * v));
     return v > 0 ? v : 0.0;
 }();
@@ -1321,7 +1321,7 @@ void Ctx::slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int6
     if (t > slow_max_ms_) { slow_max_ms_ = t; slow_max_op_ = (int32_t)h; }
     if (t < g_slow_issue_ms || !batch_ || batch_->n_tok < g_slow_issue_rows) return;
     const int k = g_slow_issue_lines.fetch_add(1, std::memory_order_relaxed);
-    if (k >= 64) return;
+    if (k >= 128) return;
     const OpInfo* oi = (size_t)h < plans_.size() ? plans_[h].info : nullptr;
     const char* kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     std::fprintf(stderr, "radiance: slow issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card %d rank %d step %lld (%lld rows) "
@@ -1330,7 +1330,7 @@ void Ctx::slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int6
                  device_, rank_, batch_ ? (long long)batch_->step : -1LL, batch_ ? (long long)batch_->n_tok : -1LL, lane_,
                  oi ? oi->op.c_str() : "<?>", kname, band, dom == RAD_DOMAIN_HOST ? "host" : "device", (long long)n,
                  own_ms, launch_ms, (unsigned long long)res_n, (double)res_ns / 1e6,
-                 k == 63 ? " (the 64th: no more issue lines)" : "");
+                 k == 127 ? " (the 128th: no more issue lines)" : "");
 }
 
 int Ctx::host_join(const RadOperand* opd, int n_opd) {

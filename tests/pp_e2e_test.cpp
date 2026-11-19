@@ -1108,7 +1108,7 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
 
 /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS on both nodes): a cold multi-chunk prompt at 2 and 3 lanes, W(0,2) and W(1,3), with
  * every issue over the threshold (0.0001 ms, passes of >= 1 row) serves one process's tokens and plan; each node says the switch at start and
- * prints slow-issue lines (op, kernel, band, own + launch, the first-launch resolves) up to its budget of 64, the 64th
+ * prints slow-issue lines (op, kernel, band, own + launch, the first-launch resolves) up to its budget of 128, the 128th
  * saying so; the leader's prefill timeline names the first chunk's and the longest chunk's head issue. RADIANCE_AQL_PRELOAD=2
  * on the host backend says it has nothing to load and changes nothing. */
 TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
@@ -1154,11 +1154,11 @@ TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
             const size_t p0 = lg->find("slow pass issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card ");
             if (p0 != std::string::npos && lg == &llog)
                 fprintf(stderr, "    %s\n", lg->substr(p0, lg->find('\n', p0) - p0).c_str());
-            /* the budget: 64 lines, the 64th says so, none after it */
+            /* the budget: 128 lines, the 128th says so, none after it */
             size_t k = 0, at = 0;
             while ((at = lg->find("slow issue (RADIANCE_SLOW_ISSUE_MS", at)) != std::string::npos) { ++k; ++at; }
-            CHECK_EQ(k, (size_t)64);
-            CHECK(lg->find("(the 64th: no more issue lines)") != std::string::npos);
+            CHECK_EQ(k, (size_t)128);
+            CHECK(lg->find("(the 128th: no more issue lines)") != std::string::npos);
         }
         const size_t tl = llog.find("prefill timeline (RADIANCE_PP_PF_TIMELINE=1");
         CHECK(tl != std::string::npos);

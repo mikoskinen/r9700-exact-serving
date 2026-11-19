@@ -1708,7 +1708,7 @@ int Ctx::run_step(const RadBatch* b) {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slow_t0).count();
         if (wall >= std::max(10.0, 5.0 * slow_ms) && b->n_tok >= slow_issue_rows()) {
             const int k = slow_pass_line_take();
-            if (k < 64) {
+            if (k < 128) {
                 const OpInfo* oi = slow_max_op_ >= 0 && (size_t)slow_max_op_ < plans_.size()
                                        ? plans_[(size_t)slow_max_op_].info : nullptr;
                 std::fprintf(stderr, "radiance: slow pass issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card %d rank %d step %d "
@@ -1717,7 +1717,7 @@ int Ctx::run_step(const RadBatch* b) {
                                      "%.2f ms%s\n",
                              device_, rank_, b->step, (long long)b->n_tok, wall, (long long)slow_n_, slow_in_ms_,
                              oi ? oi->op.c_str() : "-", slow_max_ms_, wall - slow_in_ms_, (long long)slow_res_n_,
-                             (double)slow_res_ns_ / 1e6, k == 63 ? " (the 64th: no more pass lines)" : "");
+                             (double)slow_res_ns_ / 1e6, k == 127 ? " (the 128th: no more pass lines)" : "");
             }
         }
     }
