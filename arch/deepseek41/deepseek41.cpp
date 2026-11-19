@@ -883,6 +883,17 @@ struct Model {
     std::vector<rad_buf> band_key;
     std::vector<rad_op> band_cp, band_st;
     rad_op pp_x1b = 0;
+    /* tp8 loop D39 (RADIANCE_DS41_PP_TBAND=1 on both nodes, --pp-lanes > 1, not beside the band above; unset: nothing here): the
+     * TAIL band -- a fresh BG newcomer's pass runs the follower over [h, t - 1), X2 of W(h, t - 1) (ds41layers::tail_band_crossing:
+     * a second X2 form, e.g. + index 28's selections at W(10,32)), the leader's tail over [t - 1, n); decode passes stay W(h, t)'s
+     * and layer t - 1's window keys the follower's, which it writes from its own rows (QUEUE D39 design). Step 2b (declare only):
+     * the leader declares layer t - 1 (weights, ops, window binding: `tband_decl`), both nodes the band X2's stage ops `pp_x2t`
+     * (the follower's send after layer t - 2, the leader's receive before t - 1) and the ring size for the wider form; no pass
+     * issues the band in this build. */
+    int tband_j = 0;
+    ds41layers::TailBand tband{};
+    std::vector<char> tband_decl;
+    rad_op pp_x2t = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -5604,6 +5615,25 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                     for (int l : m.band.window) m.band_decl[(size_t)l] = 1;
             }
         }
+        /* tp8 loop D39 step 2b: the tail band (both nodes read the same value) */
+        if (const char* tbv = std::getenv("RADIANCE_DS41_PP_TBAND"); tbv && *tbv && std::atoi(tbv) != 0) {
+            const int j = std::atoi(tbv);
+            std::string e3;
+            if (rad_pp_query().lanes <= 1) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND=%d is not taken: a tail band pass is a BG lane's step "
+                                "(--pp-lanes > 1) (tp8 loop D39)\n", j);
+            } else if (m.band_k > 0) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND=%d is not taken beside RADIANCE_DS41_PP_BAND (tp8 loop D39)\n", j);
+            } else if (ds41layers::tail_band_crossing(lr_geo(m), m.pp_h, m.pp_t, j, &m.tband, &e3) < 0) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND=%d is not taken: %s (tp8 loop D39)\n", j, e3.c_str());
+                m.tband = ds41layers::TailBand{};
+            } else {
+                m.tband_j = j;
+                m.tband_decl.assign((size_t)m.c.n_layer, 0);
+                if (m.pp_rank == 0)
+                    for (int l : m.tband.window) m.tband_decl[(size_t)l] = 1;
+            }
+        }
         /* the candidate layer's keep words cross: it is this node's, and its indexer runs unsplit here (every rank then
          * holds every row's keep, so rank 0's crossing carries them all; the split is exact either way) */
         for (const ds41layers::Crossing& cx : m.pp_cx)
@@ -5955,6 +5985,19 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
                   m.lr_deps.empty() ? "" : ds41layers::describe(m.lr_deps).c_str());
     rad_note(b, "%s", line);
     if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+    /* tp8 loop D39 step 2b: the tail band's form and what it costs this node (declare only) */
+    if (m.tband_j > 0 && ctx->rank == 0 && !ctx->shape_probe) {
+        const ds41layers::TailBand& tb = m.tband;
+        const int bmoe = m.layers[(size_t)tb.at].moe.op_router ? 1 : 0;
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND=%d (tp8 loop D39 step 2b, declare only): a tail band pass of W(%d,%d) "
+                        "would run the follower over [%d, %d) and the leader's tail from %d; its X2 = W(%d,%d)'s (the residual%s%s%s); "
+                        "this node %s -- no pass issues the tail band in this build\n",
+                tb.j, m.pp_h, m.pp_t, m.pp_h, tb.at, tb.at, m.pp_h, tb.at, tb.x2.sel >= 0 ? fmt_s(", index %d's selections", tb.x2.sel).c_str() : "",
+                tb.x2.keep >= 0 ? ", keep words" : "", tb.x2.src >= 0 ? fmt_s(", source %d's entries", tb.x2.src).c_str() : "",
+                m.pp_rank == 0 ? fmt_s("declares layer %d too (%d MoE layer: +%lld routed expert units a rank, its window binding)", tb.at, bmoe,
+                                       (long long)bmoe * (m.etp ? c.n_expert : c.n_expert / std::max(m.g.world, 1))).c_str()
+                               : fmt_s("would write layer %d's window keys from its own rows after the band X2", tb.at).c_str());
+    }
     /* tp8 loop P28 round 2a: the band's form and what it costs this node (declare only) */
     if (m.band_k > 0) {
         const ds41layers::Band& bd = m.band;
@@ -6335,6 +6378,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 rb = std::max(rb, cut_row_bytes(m, vb, ring));
                 np = std::max<int64_t>(np, (int64_t)vb.size());
             }
+            if (ring == RAD_PP_X2 && m.tband_j > 0) {   /* tp8 loop D39: the tail band's X2 may be the wider one */
+                const std::vector<CutPart> vt = ds41_cut_liveset_cx(m, m.tband.x2);
+                rb = std::max(rb, cut_row_bytes(m, vt, ring));
+                np = std::max<int64_t>(np, (int64_t)vt.size());
+            }
             rad_pp_declare_crossing(ring, rb, (int)np);
         }
         if (m.pp_ids) rad_pp_declare_x1_ids(1);   /* tp8 dev D10 round 2: X1's token ids, taken first by the follower */
@@ -6346,6 +6394,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 rad_pp_declare_band(m.band_k);   /* tp8 loop P28: the engine may mark band passes */
             }
         }
+        /* tp8 loop D39 step 2b: declare only -- the engine is told no tail band until the passes issue it (step 2c) */
     }
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
@@ -6592,8 +6641,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             for (size_t j = 0; j < m.band_key.size(); ++j)
                 if (!(m.band_st[j] = window_key_store(b, T, c.head_dim, m.w8, m.band_key[j]))) return RAD_E_INVAL;
         }
+        /* tp8 loop D39 step 2b: the leader's receive of the tail band's X2 before layer t - 1 */
+        if (m.tband_j > 0 && m.pp_rank == 0 && l == m.tband.at &&
+            !(m.pp_x2t = pp_stage_op_v(b, m, RAD_PP_X2, ds41_cut_liveset_cx(m, m.tband.x2))))
+            return RAD_E_INVAL;
         if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
         else if (m.band_k > 0 && m.band_decl[(size_t)l]) DS_TRY(layer(b, m, m.layers[(size_t)l], l));   /* tp8 loop P28: the band */
+        else if (m.tband_j > 0 && m.tband_decl[(size_t)l]) DS_TRY(layer(b, m, m.layers[(size_t)l], l));   /* tp8 loop D39: the tail band */
         else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
         /* tp8 loop P28 round 2b: the leader's copy of band layer l's key rows, and the band X1 after its last band layer */
         if (m.band_k > 0 && m.pp_rank == 0 && m.band_decl[(size_t)l]) {
@@ -6604,6 +6658,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (l == m.band.at - 1 && !(m.pp_x1b = pp_stage_op_v(b, m, RAD_PP_X1, ds41_band_liveset(m)))) return RAD_E_INVAL;
         }
         if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
+        /* tp8 loop D39 step 2b: the follower's send of the tail band's X2 after layer t - 2 */
+        if (m.tband_j > 0 && m.pp_rank == 1 && l == m.tband.at - 1 &&
+            !(m.pp_x2t = pp_stage_op_v(b, m, RAD_PP_X2, ds41_cut_liveset_cx(m, m.tband.x2))))
+            return RAD_E_INVAL;
         for (size_t k = 0; k < m.seg_b.size(); ++k)   /* tp8 dev M4: the save after layer s - 1 */
             if (m.seg_b[k] == l + 1) {
                 if (!(m.seg_send[k] = pp_seg_stage_op(b, m, k, true))) return RAD_E_INVAL;
