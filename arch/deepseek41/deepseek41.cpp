@@ -6476,7 +6476,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             for (const auto& [cl, n] : per) pl += fmt_s("%s%d x class %d", pl.empty() ? "" : ", ", n, cl);
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_TWIN=%d (tp8 loop P30t): %d twin GEMM(s) beside their GGUF "
                             "linears (%s; %zu twin weights), prompt segments of >= %lld rows take them (RADIANCE_DS41_TWIN_ROWS), "
-                            "decode rows the GGUF launch; switch ds41_twin = mask + 256 x rows, a subset of %d (0 = all GGUF)%s\n",
+                            "decode rows the GGUF launch; switch ds41_twin = mask + 256 x rows, the mask a subset of %d (0 = all GGUF) plus the env's "
+                            "64 / 128 (P30t-psk) where it carries them%s\n",
                     twin_env(), nw, pl.empty() ? "none: no '<name>#pf' entry of the env's classes" : pl.c_str(), m.twin.size(),
                     (long long)twin_rows_env(), m.twin_mask,
                     (twin_env() & kTwEng) ? "; the Engram twin only where lever E1's dedup does not act (ds41_engdd 0)" : "");
