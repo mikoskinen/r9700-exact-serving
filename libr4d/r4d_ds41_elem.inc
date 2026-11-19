@@ -152,7 +152,7 @@ static const RadOperandSpec oDs41RouterGemmScored[] = {
     { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 }, { "expert_count", RAD_OPD_OUT, 0 },
     { "inverse", RAD_OPD_OUT, 1 } };
 static const RadConstraint cDs41RouterGemmScored[] = {
-    C_GE("M", 1),     C_LE("M", 48),     C_GE("K", 1),   C_LE("K", 16384), C_GE("n_expert", 1), C_LE("n_expert", 384),
+    C_GE("M", 1),     C_LE("M", 64),     C_GE("K", 1),   C_LE("K", 16384), C_GE("n_expert", 1), C_LE("n_expert", 384),   /* F72: 64 = kRgsMaxRows (lever RGP) */
     C_GE("top_k", 1), C_LE("top_k", 32), C_IN("score", "sqrtsoftplus"),    C_IN("dtype", "bf16"),
 };
 

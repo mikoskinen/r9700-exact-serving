@@ -2191,7 +2191,8 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
                 (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld "
                                                     "other lanes' tails while one was in flight (%lld of them between two of its "
                                                     "segments), %lld polls", &steps, &parts, &between, &inside, &polls);
-        if (const size_t at = llog.rfind("pp_lead_seg "); at != std::string::npos)
+        if (const size_t nw = llog.rfind(" now (tp8 loop D32): "); nw != std::string::npos)
+            if (const size_t at = llog.rfind("pp_lead_seg ", nw); at != std::string::npos)
             (void)std::sscanf(llog.c_str() + at, "pp_lead_seg %d now (tp8 loop D32): %lld tails taken first while a BG step was in "
                                                  "segments, %lld BG steps ran their head whole and %lld their tail whole with no decode "
                                                  "lane busy; %d boundary ring(s), %lld BG parts began", &now, &first, &whole, &wtail, &rings,
@@ -2205,6 +2206,17 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
                 wtail, now, rings, both);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        /* tp8 loop D32: the decode rate beside BG steps (every arm has a BG lane): the run's line counts every decode token */
+        {
+            long long tb = -1, tn = -1;
+            double sb = -1, sn = -1;
+            const char* key = "decode beside BG steps over the run (tp8 loop D32): decode tokens with a BG step in flight ";
+            if (const size_t at = llog.rfind(key); at != std::string::npos)
+                (void)std::sscanf(llog.c_str() + at + std::strlen(key), "%lld in %lf s = %*f tok/s, without %lld in %lf s", &tb, &sb, &tn, &sn);
+            fprintf(stderr, "      decode tokens with a BG step in flight %lld in %.2f s, without %lld in %.2f s\n", tb, sb, tn, sn);
+            CHECK(tb >= 0 && tn >= 0 && tb + tn > 0);
+            CHECK(sb >= 0 && sn >= 0 && sb + sn > 0);
+        }
         if (!a.lead_seg) {
             CHECK(steps < 0);   /* no M9 line without the boundaries */
             continue;
