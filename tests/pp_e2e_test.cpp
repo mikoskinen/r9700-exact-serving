@@ -2477,8 +2477,9 @@ TEST(band_heads_in_lead_segments_serve_one_process_tokens) {
     }
     struct Arm { int lanes; int k; bool fseg; bool on; const char* form; bool fol_order = false; };
     long long seg_all = 0;
+    /* form "258" = 2 + 256: pp_lead_seg's no-band control (every fresh BG step W(2,5)'s, the band layer declared) */
     for (const Arm a : { Arm{ 3, 1, true, true, "1" }, Arm{ 4, 2, true, true, "2", true }, Arm{ 3, 1, false, true, "1" },
-                         Arm{ 3, 1, true, false, "1" } }) {
+                         Arm{ 3, 1, true, false, "1" }, Arm{ 4, 2, true, true, "258", true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         for (const char* v : { "RADIANCE_LLAMA_PP_BAND=1", "RADIANCE_PP_BAND=1", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_LEAD_SEG=1",
@@ -2512,7 +2513,11 @@ TEST(band_heads_in_lead_segments_serve_one_process_tokens) {
             CHECK(!ref_b[i].empty());
             if (ref_b[i] != got_b[i]) ++differ;
         }
-        long long band = -1, segd = -1;
+        long long band = -1, segd = -1, off = -1;
+        const char* okey = " fresh BG steps ran W(h, t)'s under pp_lead_seg + 256 (no band passes, tp8 loop D36)";
+        if (const size_t at = llog.rfind(okey); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                off = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
         const char* key = " lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28)";
         if (const size_t at = llog.rfind(key); at != std::string::npos)
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
@@ -2522,13 +2527,19 @@ TEST(band_heads_in_lead_segments_serve_one_process_tokens) {
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
                 segd = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
         fprintf(stderr, "    LEAD_SEG_BAND %s, form %s, %d lanes BG %d W(2,5)%s%s (6-layer llama): %d of %zu requests differ; %lld band "
-                        "passes, %lld of them with the head in segments\n", a.on ? "on" : "unset", a.form, a.lanes, a.k,
-                a.fseg ? " + follower segments" : "", a.fol_order ? " + FOL_ORDER 2" : "", differ, ref.size() + ref_b.size(), band,
-                segd);
+                        "passes, %lld of them with the head in segments; %lld fresh BG steps kept W(2,5)'s by + 256\n",
+                a.on ? "on" : "unset", a.form, a.lanes, a.k, a.fseg ? " + follower segments" : "", a.fol_order ? " + FOL_ORDER 2" : "",
+                differ, ref.size() + ref_b.size(), band, segd, off);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
-        CHECK(band > 0);
         CHECK(llog.find("is not taken") == std::string::npos);
+        if (std::atoi(a.form) & 256) {   /* the no-band control: band passes 0, the steps counted */
+            CHECK_EQ(band, 0LL);
+            CHECK(off > 0);
+            continue;
+        }
+        CHECK(band > 0);
+        CHECK_EQ(off, -1LL);
         if (a.on) {
             CHECK(llog.find("RADIANCE_PP_LEAD_SEG_BAND=1 -- a band step's head runs in segments too, the last one [1, 3)") !=
                   std::string::npos);

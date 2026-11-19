@@ -488,6 +488,8 @@ private:
      * pp_band_step itself), so a step's band is decided once -- RADIANCE_PP_BAND_MIN_SEQS's count stays one a step */
     int  pp_band_pre_ = -1;
     int64_t pp_band_seg_n_ = 0;   /* tp8 loop D36: band steps whose head ran in segments (RADIANCE_PP_LEAD_SEG_BAND=1) */
+    bool pp_band_off_ = false;    /* tp8 loop D36: fn4 pp_lead_seg + 256 at the step being planned -- no band pass */
+    int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);

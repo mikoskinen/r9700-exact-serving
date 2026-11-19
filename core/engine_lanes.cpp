@@ -346,6 +346,10 @@ int Engine::pp_band_step(int lane, const RadBatch* b) {
     if (p.e.empty()) return 0;
     for (const StepEntry& e : p.e)
         if (!e.is_prefill || e.ctx_len != 0 || e.ckpt_restore >= 0 || e.n_spec > 0) return 0;
+    if (pp_band_off_) {   /* tp8 loop D36: fn4 pp_lead_seg + 256 -- this band step runs W(h, t)'s */
+        ++pp_band_off_n_;
+        return 0;
+    }
     return k;
 }
 
@@ -690,7 +694,7 @@ int Engine::step_loop_lanes() {
         lsp_start = 1;
         if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_FORM"); v && *v) {
             const int x = std::atoi(v);
-            if (x >= 0 && x <= 255 && (x & 15) <= 2) lsp_start = x;
+            if (x >= 0 && x <= 511 && (x & 15) <= 2) lsp_start = x;   /* tp8 loop D36: + 256 = no band passes */
             else RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG_FORM=%s is not taken: form + 16 x stride, form 0 / 1 / 2 (tp8 loop "
                           "D32); 1 (M9 as built)", v);
         }
@@ -756,6 +760,8 @@ int Engine::step_loop_lanes() {
      * hold what the band layers and X1 at h + k read below a boundary, ds41layers::band_crossing / lead_segment_crossing). */
     bool lseg_band = false;
     pp_band_seg_n_ = 0;
+    pp_band_off_n_ = 0;
+    pp_band_off_ = false;
     if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_BAND"); v && !std::strcmp(v, "1")) {
         lseg_band = lseg && pp_band_on_ && !lseg_hb.empty();
         if (lseg_band)
@@ -1105,7 +1111,8 @@ int Engine::step_loop_lanes() {
              * or another pass holds the boundary ring (then its tail may still run in segments) */
             /* tp8 loop P28: a band step's head runs whole -- tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1): in segments too, its last
              * one [s, h + k); the step's band is decided here once and handed to lane_head when its head runs whole after all */
-            const int lsv = lsp_now(), lform = lsv & 15, lstride = std::max(1, lsv >> 4);   /* tp8 loop D32 */
+            const int lsv = lsp_now(), lform = lsv & 15, lstride = std::max(1, (lsv >> 4) & 15);   /* tp8 loop D32 */
+            pp_band_off_ = (lsv & 256) != 0;   /* tp8 loop D36: + 256 = no band passes (pp_band_step reads it) */
             bool seg_step = lseg && lform != 0 && b->n_tok >= rf_rows && lanes_.is_bg(l);
             const int sband = seg_step ? pp_band_step(l, b) : -1;
             if (sband > 0 && !lseg_band) seg_step = false;
@@ -1487,6 +1494,9 @@ int Engine::step_loop_lanes() {
                               (long long)g_band_min_seqs);
     if (lseg_band) RAD_INFO("two-node pipeline: %lld band steps ran their head in segments (RADIANCE_PP_LEAD_SEG_BAND=1, tp8 loop D36)",
                             (long long)pp_band_seg_n_);
+    if (pp_band_on_ && pp_band_off_n_ > 0)
+        RAD_INFO("two-node pipeline: %lld fresh BG steps ran W(h, t)'s under pp_lead_seg + 256 (no band passes, tp8 loop D36)",
+                 (long long)pp_band_off_n_);
     if (lanes_.bg_room() > 0 || bgst_seen) bgst_line(" over the run");
     if (ia) ia_line(" over the run");
     short_block_line(" over the run");   /* tp8 loop D18 */
