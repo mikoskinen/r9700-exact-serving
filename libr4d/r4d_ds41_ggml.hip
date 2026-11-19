@@ -3726,12 +3726,26 @@ static int wmk_dq8(int ty, long long Ntot, long long K, long long M) {
  * on M, its tile place or the geometry: --wmgcheck --wmk's 49 / 64-row launches against the row alone); the plugin's dense band
  * follows the value (deepseek41: 64 under ds41_wmk 5). */
 constexpr long long kWmkBand5 = 64;
+/* tp8 loop D25 step 2 (DECODE round 21, 19.11.2026): modes 6 / 7 = mode 5 (its WHG / DQ8 rules, the band to 64 rows, the head's
+ * four-tile G2) with another launch code for every NON-head dense call of 49..64 rows; <= 48 rows and the head as mode 5. Why
+ * (lq167 c32 lanecmp, card 0, 48 vs 64-row full lane steps, tools lanecmp3): the follower's q6_K dense grows 3,772 -> 5,653 us
+ * (x1.50 for x1.33 the rows; q5_K x1.41, q8_0 x1.19), the leader's 2,636 -> 4,054 (x1.54): under 70724 a 64-row call counts
+ * four row tiles' blocks, so the KP rule moves both ways -- o_b (N 5120) KP 1 (60 blocks at 48 rows) -> the cap 4 (320 blocks,
+ * bit 16's > 64 KP-1 blocks), the N 1536 pair KP 2 (36 blocks) -> KP 1 (24 blocks) -- and every 16-row tile re-decodes the
+ * weights. 6 = 595012 (bit 19: the rule counts ONE 16-row tile's blocks, so a 64-row call takes the KP a <= 16-row call takes and
+ * four times its grid); 7 = G2 at KP 1 over four row tiles (bits 21 + 24 + 25: one block row decodes a weight word once for all
+ * 64 rows, the head's D22 form) where the form takes the call, else 70724's rule (the code's other bits). The same bytes in
+ * every mode: every code computes the part order (--wmkroute under R4D_WMKROUTE_MODE 6 / 7, --wmgcheck --wmk 70724,595012,
+ * 52499524 on one card). One start A/Bs 5 / 6 / 7 in process (a switch flip bumps the epoch: recorded passes re-record). */
+constexpr int kWmkG2x4 = kWmkCode | 2097152 | 16777216 | 33554432;   /* 52499524 */
+constexpr int kWmkTile = 595012;                                     /* 70724 | bit 19 */
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
-    const bool m2 = mode == 2 || mode == 5;
+    const bool m2 = mode == 2 || mode >= 5;
     if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
-    if (mode == 5 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkCode | 2097152 | 16777216 | 33554432;
+    if (mode >= 5 && g_wmk_whg && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;
+    if (mode >= 6 && !head && M > 48 && M <= kWmkBand5) return mode == 6 ? kWmkTile : kWmkG2x4;
     if (m2 && g_wmk_dq8 && !f32out)
         if (const int c = wmk_dq8(ty, Ntot, K, M)) return c;
     /* mode 4 (DRAFTER round 7, an in-process A/B code like F7's 2 / 3): mode 2 WITHOUT the WHG / DQ8 rules above = 70724 at every
@@ -3759,7 +3773,7 @@ int wmk_now() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_WMK");
         int unread = -1;
-        const int want = e && e[0] >= '1' && e[0] <= '5' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 / 3 / 4 / 5 */
+        const int want = e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0;   /* 1, or the A/B codes 2 / 3 / 4 / 5 / 6 / 7 */
         const bool first = g_wmk.compare_exchange_strong(unread, want);
         v = g_wmk.load(std::memory_order_relaxed);
         if (first && want >= 1) std::fprintf(stderr, "radiance: libr4d: lever WMK (ds41_wmk %d, RADIANCE_DS41_WMK): dense GGUF GEMMs at every row "
@@ -3770,7 +3784,7 @@ int wmk_now() {
 /* the switch takes a call of M rows (the bench pin r4d_gg_wk_pin, when set, runs ahead of it at every M) */
 bool wmk_take(long long M) {
     const int v = wmk_now();
-    return v >= 1 && M <= (v == 5 ? kWmkBand5 : (long long)kGgDecodeRows);   /* mode 5: the band to 64 rows (tp8 loop D22) */
+    return v >= 1 && M <= (v >= 5 ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-7: the band to 64 rows (tp8 loop D22 / D25) */
 }
 void wmk_count(long long M) {
     g_wmk_launches.fetch_add(1, std::memory_order_relaxed);
@@ -4503,7 +4517,7 @@ void r4d_mix_fin_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 5 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22) */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 7 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code (D25) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
@@ -4526,7 +4540,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) { r4d_ar_xpush_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 5 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 7 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }

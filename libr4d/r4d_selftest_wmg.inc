@@ -123,7 +123,9 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
             if (pair) mr_weights(hwb, ty, sh.N2, sh.K, 0xA4BE0002ull ^ (uint64_t)(sh.N2 * 7 + sh.K));
             const int calls = std::string(ty.name) == std::string(sh.types).substr(0, 4) ? sh.c8_q : sh.c8_o;
             for (int64_t M : Ms) {
-                if (M < 1 || M > 48) continue;
+                /* tp8 loop D25 step 2: under a --wmk pin (the W arm pinned at every M) also 49..64 rows -- the decode band's top under
+                 * ds41_wmk 5-7 (the D arm there is the stock route at that M: information only) */
+                if (M < 1 || M > (wk ? 64 : 48)) continue;
                 dfree_all();
                 std::vector<uint16_t> hx;
                 mr_acts(hx, sh.K, 0xA4ACull ^ (uint64_t)M);
@@ -773,8 +775,9 @@ static void route(const Plugin& pl, const char* tlist) {
     const int kCode = 70724;
     /* tp8 loop D22 (DECODE round 18): R4D_WMKROUTE_MODE=5 runs the check under ds41_wmk 5 (the decode band's part-order launch up to
      * 64 rows: 49..64-row calls in gg_wk_kernel / the head's G2 at four row tiles instead of the GPF prefill form); default 1 */
-    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); return e && e[0] >= '1' && e[0] <= '5' && !e[1] ? e[0] - '0' : 1; }();
-    const int64_t band = rmode == 5 ? 64 : 48;
+    /* tp8 loop D25 step 2 (DECODE round 21): modes 6 / 7 (5 + another 49..64-row launch code) too, the band 64 as 5's */
+    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); return e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 1; }();
+    const int64_t band = rmode >= 5 ? 64 : 48;
     const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 56, 63, 64, 97, 130 };
     const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
     auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
