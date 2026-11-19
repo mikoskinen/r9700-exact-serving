@@ -2568,3 +2568,117 @@ TEST(lane_steps_issued_ahead_of_the_collect_serve_and_record_what_one_process_do
         CHECK(pr.flog.find("this node's pass takes the step's token ids from X1") != std::string::npos);
     }
 }
+
+/* ------------------------------------------------------------------ tp8 MERGE */
+/* Four long decoders, then newcomers in two waves with a pause between: each wave's BG steps merge the decode lanes into lane 0
+ * while they are in flight, the pause splits them back, and the newcomers decode on in whichever lane form comes next. */
+std::vector<std::vector<int32_t>> merge_set(int port) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t s : { 41, 42, 43, 44 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 12), 260); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    for (uint64_t s : { 71, 72 }) {
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 600 + 40 * (s - 71)), 40); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    for (uint64_t s : { 81, 82 }) {
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 640 + 40 * (s - 81)), 40); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
+/* fn4 pp_merge (tp8 MERGE; core/sched/lanes.h merge_into / split_from): bit 1 runs the decode lanes as ONE lane (lane 0) while a BG
+ * lane has a step in flight and splits them back when none; bit 2 keeps them merged. Every request's tokens are one process's --
+ * decoders moved into lane 0 and back in mid-generation, newcomers admitted while merged and split later -- at 4 lanes BG 2 W(1,3) /
+ * W(0,2), 3 lanes BG 1, 4 lanes BG 1 (three decode lanes into one), always merged, and with the switch set by POST /admin/fn4 on a
+ * pair started without it; the leader's merge line counts the merges, splits, merged steps and moved requests. */
+TEST(merged_decode_lanes_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = merge_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; int merge; bool post = false; };
+    for (const Arm a : { Arm{ 4, "1,3", 2, 1 }, Arm{ 4, "0,2", 2, 1 }, Arm{ 3, "1,3", 1, 1 }, Arm{ 4, "1,3", 1, 1 },
+                         Arm{ 4, "1,3", 2, 2 }, Arm{ 4, "1,3", 2, 1, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        if (!a.post) env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        if (a.post) {
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_merge", a.merge } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_merge: %d %s\n", st, out.c_str());
+        }
+        const std::vector<std::vector<int32_t>> got = merge_set(pp.port);
+        if (a.post) {
+            Call g;
+            std::string out;
+            if (g.send(pp.port, "/admin/fn4", "") && g.read(&out) == 200) {
+                const json j = json::parse(out, nullptr, false);
+                CHECK(j.is_object() && j.contains("switches") && j["switches"].value("pp_merge", -9) == a.merge);
+            }
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long merges = -1, drains = -1, splits = -1, steps_m = -1, tok_m = -1, rows_m = -1, steps_s = -1, moved_in = -1,
+                  moved_out = -1, bg = -1;
+        double drain_ms = 0, merged_s = 0, wall_s = 0;
+        int pm = -1;
+        if (const size_t at = llog.rfind("two-node pipeline: merge over the run (fn4 pp_merge="); at != std::string::npos) {
+            (void)std::sscanf(llog.c_str() + at, "two-node pipeline: merge over the run (fn4 pp_merge=%d, tp8 MERGE): %lld merges (%lld "
+                                                 "drains, %lf ms), %lld splits, merged %lf s of %lf s; decode lane steps merged %lld (%lld "
+                                                 "tokens, %lld rows) / split %lld", &pm, &merges, &drains, &drain_ms, &splits, &merged_s,
+                              &wall_s, &steps_m, &tok_m, &rows_m, &steps_s);
+            if (const size_t mi = llog.find("requests moved in ", at); mi != std::string::npos)
+                (void)std::sscanf(llog.c_str() + mi, "requests moved in %lld / out %lld", &moved_in, &moved_out);
+        }
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        fprintf(stderr, "    pp_merge %d%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes; %lld merges "
+                        "(%lld drains, %.1f ms), %lld splits, merged %.2f of %.2f s; lane steps merged %lld (%lld tokens, %lld rows) / split "
+                        "%lld; moved in %lld / out %lld\n", a.merge, a.post ? " by POST" : "", a.k, a.lanes, a.cut, differ, ref.size(), bg,
+                merges, drains, drain_ms, splits, merged_s, wall_s, steps_m, tok_m, rows_m, steps_s, moved_in, moved_out);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(pm, a.merge);
+        CHECK(bg > 0);
+        CHECK(merges > 0);
+        CHECK(steps_m > 0);
+        if (a.merge == 1) {
+            CHECK(moved_in > 0);   /* merged always (2): merged before the first request, every request is lane 0's by pick() */
+            CHECK(splits > 0);
+            CHECK(moved_out > 0);
+            CHECK(steps_s > 0);
+        } else {
+            CHECK_EQ(merges, 1LL);
+            CHECK_EQ(splits, 0LL);
+        }
+    }
+}

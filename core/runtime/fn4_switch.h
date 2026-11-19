@@ -392,6 +392,13 @@
  *                   Exact: it moves only which depth a step verifies. GET "dcap": cycles it bounded the choice, moves it
  *                   forced.
  *   draft_dcap_n    scheduler (SPB; 75 here, 74 on ds41-etp-spb): the decode rows from which draft_dcap holds, 1 .. 64; starts 8.
+ *   pp_merge        engine, the two-node leader (tp8 MERGE; 82 here, after draft_cost_age; core/sched/lanes.h merge_into / split_from):
+ *                   0 = today; bit 1: the decode lanes run as ONE lane (lane 0) while a BG lane has a step in flight or a newcomer in
+ *                   its inbox (the other decode lanes park; their sequences and free cards move to lane 0 once idle), and split back
+ *                   when none; bit 2: merged always; bit 4: with RADIANCE_PP_LEAD_SEG declared, a BG step's leader parts run in
+ *                   segments only while merged. RADIANCE_PP_MERGE is its start value; taken only with two decode lanes or more
+ *                   (else 0). The merged lane's occupancy rule (draft_occ) acts at once. Exact: only lane composition and the
+ *                   drafting depth change (the build's composition invariance; depth moves only what a step verifies).
  *   draft_cost_age  scheduler (DCA, ds41-drafter; 81 here, after stage_lone; sched/draft.h DraftController::cost_age): 0 off
  *                   (today); A = 16 .. 65536: a drafting depth's step-cost key last sampled more than A decode steps of its
  *                   scheduler ago does not price that depth while a fresh drafting key of the same row class exists (that
@@ -607,7 +614,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kPpMerge, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
