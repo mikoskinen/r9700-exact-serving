@@ -10,6 +10,7 @@
 #include "r4d_launch.h"
 #include <atomic>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -1042,6 +1043,11 @@ int fp8e8_pf() {
         const char* e = std::getenv("R4D_FP8E8_PF");
         v = e && std::atoi(e) > 0 ? std::atoi(e) : 0;
         g_fp8e8_pf.store(v, std::memory_order_relaxed);
+        /* one line a process at its first fp8a8e8 launch, so a start's log shows the form is on (the env is load-time only) */
+        if (v > 0)
+            std::fprintf(stderr, "radiance: libr4d: R4D_FP8E8_PF=%d -- gemm_nt_q fp8a8e8 launches of >= %d rows take the 128 x 128 "
+                                 "prefill tile where N %% 128 == 0 and K %% 64 == 0 (R4D_FP8E8_PFH=%s), the 16 x 64 forms below\n",
+                         v, v, std::getenv("R4D_FP8E8_PFH") ? std::getenv("R4D_FP8E8_PFH") : "unset");
     }
     return v;
 }
