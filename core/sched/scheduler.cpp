@@ -4931,11 +4931,12 @@ void Scheduler::serial_end(int rounds_done) {
  * reads it), and the anchor lands somewhere in [that + n_tokens - n_spec, that + n_tokens]
  * depending on acceptance: the gates take the end that binds them, the query rows the furthest. */
 int Scheduler::block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
-                           bool on_card) {
+                           bool on_card, bool front) {
     std::lock_guard<std::mutex> lk(mu_);
     block_.clear();
     block_len_ = 0;
     block_depth_ = 0;
+    block_front_ = front;
     block_may_draft_ = false;
     /* tp8 loop D18: a block of one row is a drafter whose every row proposes (block = depth, DSpark's convention):
      * its anchor alone proposes the next token. A drafter whose anchor predicts nothing has block = depth + 1 >= 2. */
@@ -5169,8 +5170,8 @@ const RadBatch* Scheduler::block_query(int step) {
         e.n_draft    = steps;
         e.produces_token = false;
         /* The last `depth` rows of the block: at block = depth + 1 this skips the anchor; at
-         * block = depth it starts on it. */
-        e.hidden_row = row + block - depth;
+         * block = depth it starts on it. Lever DHD (block_front_): the first `depth` rows, the anchor first. */
+        e.hidden_row = block_front_ ? row : row + block - depth;
         e.hidden_n   = depth;
         /* On the card the anchor, its position and every mask come from the card (ADV_BLOCK),
          * which reads the mask id here; the host staged them at the furthest position. */
@@ -5209,6 +5210,14 @@ void Scheduler::block_end() {
 bool Scheduler::block_head_runs() const {
     std::lock_guard<std::mutex> lk(mu_);
     return block_may_draft_;
+}
+
+/* DRAFTER track round 11, lever DHD (scheduler.h). */
+int Scheduler::block_head_cap() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!draft_.adaptive() || !draft_.head_runs()) return 0;
+    const int d = draft_.step_depth();
+    return d > 0 ? d : 0;
 }
 
 /* ------------------------------------------------------------------ the depth-0 context skip

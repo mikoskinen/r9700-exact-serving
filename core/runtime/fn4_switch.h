@@ -446,6 +446,11 @@
  *                   RADIANCE_DS41_TSK=0 / 1 at load (the op's scratch sized; 1 starts it on). Rule B: deterministic and
  *                   batch-invariant against its own reference, not the decode band's bits. Where it serves a pass, ds41_attn_dec's
  *                   form choice does not apply (the decode band's forms are not issued).
+ *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
+ *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
+ *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
+ *                   depth in force under the adaptive window; the verify of the step issued ahead reads those D. Starts 0.
+ *                   Exact: the first D proposals are the same tokens (a row's head row and the walk's first D steps).
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -657,7 +662,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
-              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kSwitches };
+              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

@@ -7249,6 +7249,38 @@ TEST(a_block_drafter_context_pass_keeps_the_rows_of_a_finished_sequence) {
     f.sch.block_end();
 }
 
+/* DRAFTER track round 11, lever DHD: a drafter whose every row proposes (block = depth, DSpark) cut to D < block rows
+ * reads the FIRST D rows of each block into its head (block_begin's `front`), the anchor first; without `front` the
+ * last D rows, as before; at D = block the two are the same rows. */
+TEST(a_block_query_cut_to_the_first_rows_reads_each_block_from_its_anchor) {
+    for (int mode = 0; mode < 3; ++mode) {   /* 0: front, depth 3 of 5; 1: not front, depth 3; 2: front, depth 5 */
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 5;
+        CHECK_OK(f.start());
+        uint64_t a = f.submit(96, 64);
+        uint64_t b = f.submit(80, 64);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        const int depth = mode == 2 ? 5 : 3;
+        Scheduler::BlockRow rows[4];
+        CHECK_EQ(f.sch.block_begin(/*block=*/5, depth, /*window=*/0, /*mask=*/99, rows, 4, /*on_card=*/false,
+                                   /*front=*/mode != 1), 2);
+        CHECK(rows[0].seq == a);
+        CHECK(rows[1].seq == b);
+        REQUIRE(f.sch.block_context(1) != nullptr);
+        const RadBatch* qb = f.sch.block_query(1);
+        REQUIRE(qb != nullptr);
+        CHECK_EQ(qb->n_seq, 2);
+        CHECK_EQ(qb->n_tok, 10);
+        REQUIRE_EQ(qb->n_out, 2 * depth);
+        for (int s = 0; s < 2; ++s)
+            for (int j = 0; j < depth; ++j)
+                CHECK_EQ(qb->out_ids[s * depth + j], s * 5 + (mode == 1 ? 5 - depth : 0) + j);
+        f.sch.block_end();
+    }
+}
+
 /* A restore the pool cannot hold whole waits one step while a closed sequence still holds blocks
  * until the next commit: its conversation's VRAM may be the room the restore needs. It waits once,
  * and with nothing deferred it is not asked to come back whole. */
@@ -11374,7 +11406,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12346,7 +12378,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);

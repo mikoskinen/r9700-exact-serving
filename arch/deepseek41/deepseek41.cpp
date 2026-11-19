@@ -410,6 +410,7 @@ struct Layer {
     rad_op pf_f = 0, pf_r = 0, pf_s = 0, pf_a = 0, pf_c = 0, pf_q = 0, pf_kv = 0;
     /* A DSpark stage's context pass: its window key from the projected trunk rows. */
     rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
+    rad_op d_kvfs = 0;   /* lever DMR 2: the context key's d_kvn + d_kvrope + d_kvq + d_kvst as the trunk's fold c */
 };
 
 /* The DSpark block drafter (the checkpoint's mtp.0 .. mtp.{n-1}; official inference/model.py DSparkBlock,
@@ -453,6 +454,8 @@ struct Dsp {
     int base = 0, n_stage = 0;            /* stages at absolute layers base .. base + n_stage - 1 */
     int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
     int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
+    bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
+    int64_t ff_rank = 0;                  /* the routed experts' intermediate width on this rank (DEP: n_ff / world) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
     int64_t kv_bs = 0;
@@ -479,6 +482,11 @@ struct Dsp {
     /* lever W1b: the scoring steps again at form 1 (succ staged through LDS as whole lines; the same bits), issued
      * while dspark_walk is 2 (the last merge is wstep's) */
     std::vector<rad_op> wstep2;
+    /* DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT=1, the engine's same env): the W1 walk again at each head
+     * depth H of 1 .. block - 1 (H + 1 ops: steps H, the anchor at the block's pitch), for a query pass at the drafter's
+     * own block whose head the engine cut to the first H rows of each block (n_out = sequences x H); the same keys
+     * planes and gather as wstep, steps 0 .. H - 1 of them. Empty unless asked. */
+    std::vector<std::vector<rad_op>> wcut;
     /* lever SD, sampled drafting (--draft-coupling on; fn4 draft_sample, the engine's): the walk of W1 sampled, a
      * dspark_walk_sample_step a step + the last merge (libr4d r4d_ds41_wsamp.hip). The coupling planes the engine finds
      * by name -- draws [max_seqs, 8] u32 it stages, q_temp [max_seqs, 1] f32 it stages (the request's temperature x the
@@ -1676,6 +1684,46 @@ static int etp_env() {
     return v;
 }
 using ds41etp::etp_slice;   /* ds41_etp.h: this rank's slice of an expert of each parity class */
+/* Lever DEP (DRAFTER track 19.11.2026 round 8): RADIANCE_DS41_DSPARK_DEP=1 (or on) at start puts the DSpark drafter's routed
+ * experts (the GGUF MXFP4 sidecar experts, moe_gemm_ggml) in EXPERT TENSOR PARALLEL form: every rank holds a 1 / world width
+ * slice of ALL the drafter's experts (gate_up: rows [r F / w, (r + 1) F / w) of the gate and of the up half; down: the same K
+ * columns; F = 2304 -> 576 = 18 MXFP4 blocks a rank at four ranks: the core's even ROW / COL shard of MoeFP8's GGUF path,
+ * n_expert = n_expert_all) instead of n_expert / world whole ones, and runs every routed slot on its slice. Why: under expert
+ * parallel a stage's MoE ends when its most-loaded rank does (lq146: rank 0's mx 3 gain absorbed by the post-MoE all-reduce's
+ * wait; dbench --quad on lq125's routing, 40 tokens: EP critical 1.37-1.53 ms a pass vs TP 0.91-1.29). Each rank's routed
+ * partial is a K slice of every slot's down, folded by the existing gather and summed by the existing exact all-reduce: no
+ * collective is added and the all-reduce keeps its size; the router is replicated as before.
+ * Exactness: a reference change against expert parallel, once (rule B): gate_up's outputs are whole dot products over K on
+ * one rank (the same), down's K 2304 becomes four partial dot products rounded to bf16 per rank and summed by the all-reduce
+ * (fp32, ascending rank order, one rounding). Deterministic and batch-invariant as EP: every row's arithmetic is its own.
+ * Verification keeps the served text; only the drafter's proposals can move on near-ties.
+ * Unset / 0 / off: expert parallel, today's program and bytes. Anything else is refused at start. */
+static int dsp_dep_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_DEP");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
+/* Lever DAW (DRAFTER track 19.11.2026 round 9): RADIANCE_DS41_DSPARK_AWM=1 (or on) at start declares the DSpark stages'
+ * attention (the drafter's own block and every short block) with the int param wm_from 1: libr4d then runs every one of
+ * those passes, at any row count, on the WMMA form the trunk's prefill takes (ds41_attn_sparse_sink_wm_kernel, a workgroup
+ * a (16-head tile, row)) instead of the decode band's scalar forms. xeon abench (bf16 window, 16 heads, blocks of 16):
+ * 32 rows x 2 48.3 -> 11.9 us a call, 40 x 5 57.5 -> 13.0, 16 x 1 30.2 -> 11.7. Rule B: the WMMA form's own bits
+ * (q.k summed in WMMA order, exp2 online, p as bf16 hi + lo; rms 1.2e-4 relative from the scalar form, 1 bf16 ulp at most),
+ * deterministic and batch-invariant (a row is its own workgroup's) -- only the drafter's proposals can move on near-ties,
+ * verification keeps the served text. Unset / 0 / off: nothing declared, today's program; anything else refused at start. */
+static int dsp_awm_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_AWM");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
 /* Lever XR (ds41-etp-xr, 14.11.2026): RADIANCE_DS41_XRING=<MiB> (1 .. 1024) at start, with RADIANCE_DS41_ETP, declares
  * each trunk layer's EXL3 gate_up with interface v10's `xring` -- that much copy ring in its prefill scratch. exl3r4d's
  * map form then can (fn4 exl3_xr bit 2) copy the routed experts whose slices sit in the pinned host pool onto the card
@@ -1818,14 +1866,16 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * operands (col_a reads pre_f and h0, mix_a writes pre_a / post / comb; col_f reads pre_a and h1, mix_f writes pre_f /
  * post / comb: no buffer one writes is one the other reads), so the same bytes. Read at issue (a flip re-records).
  * 2 = 1 + each stage's window key (kv_n, kv_rope, kv_q, kv_st: four launches on the path to the attention) as the trunk's
- * lever K1 fold c, rmsnorm_rope_roundtrip_kv_store (each row at its own position, as kv_rope; the same bytes and slot). */
+ * lever K1 fold c, rmsnorm_rope_roundtrip_kv_store (each row at its own position, as kv_rope; the same bytes and slot),
+ * on the query pass and on the context pass. 3 = 2 + the connections' post + collapse + norm as the trunk's
+ * mhc_post_collapse_rmsnorm (pcn_f; pcn_a = the previous stage's post_f with this stage's col_a + norm_a). */
 static std::atomic<int> g_sw_dmr{-1};
 static int dmr_now() {
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && (!std::strcmp(e, "1") || !std::strcmp(e, "2")) ? e[0] - '0' : 0);
+        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2587,7 +2637,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 2 ? 1 : -1;   /* lever DMR (2: + the key's fold c) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 3 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn) */
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
@@ -4472,6 +4522,42 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     if (d.ne_rank * g.world != d.n_expert)
         rad_note(b, "DSpark drafter experts split unevenly: rank %d holds %lld of %lld from %lld", g.rank,
                  (long long)d.ne_rank, (long long)d.n_expert, (long long)d.ne_base);
+    /* Lever DEP (dsp_dep_env): every expert on every rank, this rank's 1 / world width slice (whole 32-value blocks) */
+    d.dep = false;
+    d.ff_rank = c.n_ff;
+    if (dsp_dep_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DEP=%s is not 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_DSPARK_DEP"));
+        return RAD_E_INVAL;
+    }
+    if (dsp_dep_env() > 0 && g.world > 1) {
+        if (c.n_ff % (32 * g.world)) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DEP: the drafter's expert width %lld does not cut into "
+                            "whole 32-value blocks for %d ranks\n", (long long)c.n_ff, g.world);
+            return RAD_E_UNSUPPORTED;
+        }
+        d.dep = true;
+        d.ne_rank = d.n_expert;
+        d.ne_base = 0;
+        d.ff_rank = c.n_ff / g.world;
+        rad_note(b, "DSpark drafter experts tensor parallel (lever DEP, RADIANCE_DS41_DSPARK_DEP): all %lld on every rank, "
+                    "width %lld of %lld", (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff);
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever DEP (RADIANCE_DS41_DSPARK_DEP): the DSpark drafter's %lld routed experts "
+                            "on every rank as width slices of %lld of %lld (expert tensor parallel; EP held %lld a rank)\n",
+                    (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff, (long long)(d.n_expert / g.world));
+    }
+    if (dsp_awm_env() < 0) {   /* lever DAW */
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_AWM=%s is not 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_DSPARK_AWM"));
+        return RAD_E_INVAL;
+    }
+    if (dsp_awm_env() > 0) {
+        rad_note(b, "DSpark stages' attention on the WMMA form at every row count (lever DAW, RADIANCE_DS41_DSPARK_AWM)");
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever DAW (RADIANCE_DS41_DSPARK_AWM): the DSpark stages' attention takes the "
+                            "WMMA form at every row count (wm_from 1; rule B, the drafter's own reference)\n");
+    }
     d.block = blk;
     d.base = (int)c.n_layer;
     d.n_stage = (int)ns;
@@ -4587,6 +4673,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                                       RAD_INT("window", c.window + d.block), RAD_INT("ratio", 0), RAD_INT("topk", 0),
                                       RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
         if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
+        if (dsp_awm_env() > 0) dap.push_back(RAD_INT("wm_from", 1));   /* lever DAW */
         L.attn = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
         L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
         L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
@@ -4622,7 +4709,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.expert_base = d.ne_base;
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = d.top_k;
-    s.cfg.n_ff_exp = c.n_ff;
+    s.cfg.n_ff_exp = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: this rank's slice (MoeFP8's even ROW / COL shard) */
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;
@@ -4648,6 +4735,20 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
+    /* lever DMR 3 (dspark_mhr 3): the connections' post + collapse + norm as the trunk's one op (mhc_post_collapse_rmsnorm,
+     * post_collapse_norm's operands on the drafter's buffers): pcn_f = post_a + col_f + norm_f; pcn_a (stages past the
+     * first) = the previous stage's post_f + this stage's col_a + norm_a. Every buffer they touch spans the query pass.
+     * Declared only while RADIANCE_DS41_DSPARK_MHR is set (DECODE's c254ec9 rule for DMR 2's fold: an unset start declares
+     * the published program). */
+    if (!m.zero && std::getenv("RADIANCE_DS41_DSPARK_MHR")) {
+        const std::vector<RadParam> pcp = { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
+                                            RAD_STR("dtype", "bf16") };
+        L.pcn_f = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.ffn_norm }, { d.attn_out, d.h0, d.post, d.comb, d.pre_a },
+                        { d.h1, d.x, d.act.x });
+        if (l > d.base)
+            L.pcn_a = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.attn_norm }, { d.act.x, d.h1, d.post, d.comb, d.pre_f },
+                            { d.h0, d.x, d.xn });
+    }
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
 
@@ -4695,8 +4796,9 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     mw.eoff = decl_b(b, nm.f("dspark_expert_offsets"), RAD_I32, { d.n_expert + 1 });
     mw.ecnt = decl_b(b, nm.f("dspark_expert_counts"), RAD_I32, { d.n_expert }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("dspark_expert_sorted"), RAD_I32, { Q * d.top_k });
-    mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * c.n_ff });
-    mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, c.n_ff });
+    const int64_t dff = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: the slice's width */
+    mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * dff });
+    mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, dff });
     mw.edn = bf("dspark_expert_down", { Q * d.top_k, D });
     if (g.n_ff > 0) {
         mw.sgu = bf("dspark_shared_gate_up", { Q, 2 * g.n_ff });
@@ -4775,6 +4877,18 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     d.kv_bs = rad_kv_block_size(b, d.kv);
     if (d.kv_bs < 1) return RAD_E_INVAL;
+    /* lever DMR 2 (dspark_mhr 2): each stage's context key chain as the trunk's fold c (rmsnorm_rope_roundtrip_kv_store),
+     * declared once the window group's block size is fixed (as the trunk's kv_fs); 0 where no library serves it; only
+     * while RADIANCE_DS41_DSPARK_MHR is set (an unset start declares the published program) */
+    for (auto& L : d.st)
+        if (L.d_kvn && std::getenv("RADIANCE_DS41_DSPARK_MHR"))
+            L.d_kvfs = fused(b, "rmsnorm_rope_roundtrip_kv_store",
+                             { RAD_RANGE("M", 1, T), RAD_INT("n", hd), RAD_F64("eps", c.eps), RAD_INT("n_head", 1),
+                               RAD_INT("head_dim", hd), RAD_INT("rot", c.rope), RAD_INT("off", hd - c.rope),
+                               RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
+                               RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
+                               RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", m.w8d ? "fp8_e4m3" : "bf16") },
+                             { L.kv_norm }, { d.ckv, m.cs_a }, { d.ckvn });
     for (const auto& L : d.st) DS_TRY(rad_bind_layer_kv(b, L.l, d.kv));
     if (m.zero) DS_TRY(rad_kv_group_zero(b, d.kv));
 
@@ -4925,6 +5039,25 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 d.wstep2.push_back(w);
             }
             if (!w2ok) d.wstep2.clear();
+            /* lever DHD: the walk at each head depth H < block (form 0, as the short block's walks) */
+            if (const char* hc = std::getenv("RADIANCE_DRAFT_HEAD_CUT"); hc && *hc && std::strcmp(hc, "0")) {
+                bool cok = true;
+                d.wcut.assign((size_t)d.block, {});
+                for (int64_t H = 1; H < d.block && cok; ++H)
+                    for (int64_t l = 0; l <= H; ++l) {
+                        const rad_op w = op(b, "dspark_walk_step",
+                                            { RAD_RANGE("M", 1, d.wseqs), RAD_INT("step", l), RAD_INT("steps", H),
+                                              RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("N", g.n_vocab),
+                                              RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
+                                              RAD_INT("anchor_stride", d.block), RAD_STR("dtype", "f32") },
+                                            { d.mk1, d.mk2 }, { d.logits, d.wgath, d.wkeys }, { d.wkeys, d.tokens });
+                        cok = cok && w && rad_op_resolved(b, w);
+                        d.wcut[(size_t)H].push_back(w);
+                    }
+                if (!cok) d.wcut.clear();
+                rad_note(b, "DSpark lever DHD: the W1 walk %sdeclared at head depths 1 .. %lld (RADIANCE_DRAFT_HEAD_CUT)",
+                         cok ? "" : "NOT ", (long long)(d.block - 1));
+            }
             wok = wok && d.wkeys && d.wgath && d.wfill && d.wag && rad_op_resolved(b, d.wfill) && rad_op_resolved(b, d.wag);
         } else {
             const int64_t tiles = (c.n_vocab + 63) / 64;
@@ -5092,6 +5225,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                           RAD_INT("window", c.window + SB), RAD_INT("ratio", 0), RAD_INT("topk", 0),
                                           RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
             if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
+            if (dsp_awm_env() > 0) dap.push_back(RAD_INT("wm_from", 1));   /* lever DAW */
             const rad_op a = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
             if (!a || !rad_op_resolved(b, a)) sbwhy = "no kernel serves attn_sparse_sink at the short block's window";
             z.attn.push_back(a);
@@ -7286,8 +7420,14 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
     lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
+    const bool kvfold = dmr_now() >= 2;   /* lever DMR 2 */
     for (const auto& L : d.st) {
         lin_issue(x, m, L.d_kv, T, brows(d.cn, T), L.wkv, brows(d.ckv, T));
+        if (kvfold && L.d_kvfs) {
+            RAD_ISSUE_N(x, L.d_kvfs, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos,
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            continue;
+        }
         RAD_ISSUE_N(x, L.d_kvn, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T));
         RAD_ISSUE_N(x, L.d_kvrope, T, brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos);
         if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
@@ -7352,19 +7492,26 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     /* lever DMR (dmr_now): collapse + norm ahead of the connection's mix; the attention-zero rank keeps today's order */
     const int dmrv = m.zero ? 0 : dmr_now();
     const bool dmr = dmrv >= 1;
+    const bool dmr3 = dmrv >= 3;   /* lever DMR 3: the pcn ops */
     for (const auto& L : d.st) {
         const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
+        const Layer* nx = &L != &d.st.back() ? &L + 1 : nullptr;
+        const bool pa = dmr3 && L.pcn_a;   /* the previous stage left its post_f to this stage's pcn_a */
         const auto mix_a = [&] {
             RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
                         brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
         };
         if (!dmr) mix_a();
-        const bool kvfold = dmrv == 2 && L.kv_fs;   /* lever DMR 2: the window key as the trunk's fold c */
-        RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
+        const bool kvfold = dmrv >= 2 && L.kv_fs;   /* lever DMR 2: the window key as the trunk's fold c */
+        if (pa)
+            RAD_ISSUE_N(x, L.pcn_a, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T), brows(d.h0, T),
+                        brows(d.pre_f, T), brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
+        else
+            RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
         } else {
-            RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
+            if (!pa) RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
             if (dmr) mix_a();
             const bool gqp = gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
@@ -7403,15 +7550,22 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             lin_issue(x, m, L.o_b, T, brows(d.oa, T), L.wo_b, brows(d.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
-        RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
-                    brows(d.h1, T));
+        const bool pf = dmr3 && L.pcn_f;
+        if (pf)   /* post_a, col_f and norm_f in one (the trunk's pcn_f) */
+            RAD_ISSUE_N(x, L.pcn_f, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T), brows(d.h1, T),
+                        brows(d.pre_a, T), brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        else
+            RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
+                        brows(d.h1, T));
         const auto mix_f = [&] {
             RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
                         brows(d.pre_f, T), brows(d.post, T), brows(d.comb, T));
         };
         if (!dmr) mix_f();
-        RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
-        RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        if (!pf) {
+            RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
+            RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        }
         if (dmr) {
             /* the trunk's own order (step(): col_f, norm_f, then the MoE with mix_f beside its routed gate_up) */
             DspMixBeside mb{ &L, &d, T };
@@ -7422,8 +7576,9 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         } else {
             L.moe.step(x, batch);
         }
-        RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
-                    brows(d.h0, T));
+        if (!(dmr3 && nx && nx->pcn_a))   /* else the next stage's pcn_a runs this post_f */
+            RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
+                        brows(d.h0, T));
     }
 
     RAD_ISSUE_N(x, d.contract, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
@@ -7446,8 +7601,29 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const std::vector<rad_op>& sst = lo ? lo->sstep : d.sstep;
     const bool wdecl = lo ? (!lo->wstep.empty() || lo->wmarkov) : (d.wfill || d.wmarkov);
     const bool sampled = !sst.empty() && ds41_switch("draft_sample") >= 1 && N == S * blk && S <= d.sseqs;
-    const bool walked = sampled || (wdecl && wsw >= 1 && N == S * blk && S <= d.wseqs);
-    if (sampled) {
+    /* lever DHD: the engine cut the head to the first hb rows of each block (n_out = S x hb, hb < blk; never at a short
+     * block or while draft_sample may run): the walk's first hb steps, the merge at hb */
+    const int64_t hb = !lo && S > 0 && N % S == 0 ? N / S : 0;
+    const bool cutw = !sampled && hb >= 1 && hb < blk && (size_t)hb < d.wcut.size() && !d.wcut[(size_t)hb].empty() &&
+                      d.wfill && wsw >= 1 && S <= d.wseqs;
+    const bool walked = sampled || cutw || (wdecl && wsw >= 1 && N == S * blk && S <= d.wseqs);
+    if (cutw) {
+        const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
+        const int64_t WS = d.wseqs, KC = ds41walk::keys_cols(), GW = ds41walk::gath_cols(g.world);
+        const int64_t KR = ds41walk::plane_rows(blk, WS);
+        const std::vector<rad_op>& wst = d.wcut[(size_t)hb];
+        RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
+        for (int64_t l = 0; l < hb; ++l) {
+            const int64_t r0 = ds41walk::step_row(l, WS);
+            RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
+                        l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
+                        RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
+            RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));
+        }
+        RAD_ISSUE_N(x, wst[(size_t)hb], S, brows(d.logits, N), anchor,
+                    brow_slice(d.wgath, ds41walk::step_row(hb - 1, WS), S, GW), RAD_W(d.mk1), RAD_W(d.mk2),
+                    RAD_NONE, brows(d.tokens, S));
+    } else if (sampled) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
         const int64_t SS = d.sseqs, SR = 16, GW = SR * g.world;
         RAD_ISSUE_N(x, d.sfill, blk, brows(d.scnt, blk));

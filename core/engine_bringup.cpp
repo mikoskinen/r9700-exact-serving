@@ -1860,6 +1860,23 @@ int Engine::declare() {
                      (long long)drafter_short_);
         }
     }
+    /* DRAFTER track round 11, lever DHD: RADIANCE_DRAFT_HEAD_CUT=1 -- a chain block drafter whose every row proposes
+     * (block = depth, DSpark's convention) runs its head on the first D rows of each block only, D = the head depth in
+     * force (Engine::issue_block_drafter); unset, nothing here changes. */
+    head_cut_ = false;
+    if (const char* v = std::getenv("RADIANCE_DRAFT_HEAD_CUT"); v && *v && std::strcmp(v, "0")) {
+        if (drafter_.kind != RAD_DRAFT_BLOCK || tree_ || drafter_.block != drafter_.depth)
+            RAD_WARN("RADIANCE_DRAFT_HEAD_CUT=%s: '%s' is not a chain block drafter whose every row proposes (block %lld, "
+                     "depth %lld); ignored (lever DHD)", v, drafter_name_.c_str(), (long long)drafter_.block,
+                     (long long)drafter_.depth);
+        else {
+            head_cut_ = true;
+            RAD_INFO("speculation: lever DHD (RADIANCE_DRAFT_HEAD_CUT): while fn4 draft_head_cut is 1, '%s''s query pass at "
+                     "its own block of %lld runs its head on the first D rows of each block, D = the head depth in force (no "
+                     "cut while draft_sample >= 1, at a short block, or before the first depth is chosen)",
+                     drafter_name_.c_str(), (long long)drafter_.block);
+        }
+    }
     if (tree_)
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",

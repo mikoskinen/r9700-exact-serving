@@ -39,6 +39,7 @@ extern "C" void r4d_attn_dec_pin(int c);
 extern "C" void r4d_qg8_pin(int v);
 extern "C" void r4d_wq_pin(int v);
 extern "C" void r4d_attn_wqa(int on);
+extern "C" void r4d_attn_wm_from(int rows);   /* round 9 lever DAW: the WMMA form from that many rows (0: off) */
 extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s);
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s);
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s);
@@ -181,6 +182,34 @@ int main(int argc, char** argv) {
         run(fold, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip); grab(hx);
         std::printf("  form %d fold d bytes vs attn + orope + oq: %ld differ\n", f, ndiff(hx, hchain));
     }
+    {   /* round 9 lever DAW: the WMMA prefill form at these rows (rule B: not the rule's bits) -- values vs the rule, and its own determinism */
+        r4d_attn_dec_pin(-1); r4d_attn_wm_from(1); run(attn, r4d_rad_ds41_attn_sparse_sink); grab(hx);
+        std::vector<uint16_t> hw2(ob / 2); run(attn, r4d_rad_ds41_attn_sparse_sink); grab(hw2);
+        auto bf = [](uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; };
+        double mx = 0, ma = 0, se = 0, sr = 0; long nn = 0;
+        for (size_t i = 0; i < hx.size(); ++i) { const double r = bf(hat[i]), w = bf(hx[i]); mx = std::max(mx, std::fabs(w - r)); ma = std::max(ma, std::fabs(r)); se += (w - r) * (w - r); sr += r * r; nn += hx[i] != hat[i]; }
+        std::printf("  DAW wmma form vs the rule: %ld of %zu bytes differ, max |d| %.3e (max |ref| %.3e), rms rel %.3e; repeat %ld differ\n", nn, hx.size(), mx, ma, std::sqrt(se / (sr > 0 ? sr : 1)), ndiff(hx, hw2));
+        r4d_attn_wm_from(0);
+        /* the engine's path: the op's own param wm_from 1 (deepseek41 under RADIANCE_DS41_DSPARK_AWM) -- the pin's bytes */
+        Call aw; aw.t = attn_ts(dout); aw.p = ap; aw.p.push_back(PI("wm_from", 1)); aw.fix();
+        run(aw, r4d_rad_ds41_attn_sparse_sink); grab(hw2);
+        std::printf("  DAW op param wm_from 1 vs the pin: %ld differ\n", ndiff(hx, hw2));
+        /* batch invariance: the first sequence's rows as a pass of their own (S 1) -- the same bytes as in the full pass */
+        {
+            const int M1 = bpr;
+            std::vector<int32_t> cu1 = { 0, M1 };
+            void* dcu1; CK(hipMalloc(&dcu1, 8)); CK(hipMemcpy(dcu1, cu1.data(), 8, hipMemcpyHostToDevice));
+            Call a1; a1.t = { T(dq, RAD_BF16, { M1, HD }), T(dc, RAD_BF16, { nblk, 1, bs, D }), T(dbt, RAD_I32, { 1, nwbt }),
+                              T(dwu, RAD_I32, { 1 }), NONE(), NONE(), NONE(), T(dpos, RAD_I32, { M1 }), T(dcu1, RAD_I32, { 2 }),
+                              T(dsink, RAD_F32, { H }), T(dtmp, RAD_BF16, { M1, HD }) };
+            a1.p = ap; a1.p[0] = PI("M", M1); a1.p.push_back(PI("wm_from", 1)); a1.fix();
+            run(a1, r4d_rad_ds41_attn_sparse_sink); CK(hipStreamSynchronize(st));
+            std::vector<uint16_t> h1((size_t)M1 * HD); CK(hipMemcpy(h1.data(), dtmp, h1.size() * 2, hipMemcpyDeviceToHost));
+            long d1 = 0; for (size_t i = 0; i < h1.size(); ++i) d1 += h1[i] != hx[i];
+            std::printf("  DAW batch invariance: sequence 0 alone (%d rows) vs in the %d-row pass: %ld of %zu differ\n", M1, M, d1, h1.size());
+            CK(hipFree(dcu1));
+        }
+    }
     r4d_attn_dec_pin(-1);
     run(fold, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip); grab(hx);
     std::printf("  rule fold d bytes vs attn + orope + oq: %ld differ\n", ndiff(hx, hchain));
@@ -218,6 +247,8 @@ int main(int argc, char** argv) {
     auto RT = [&]() { run(ort, r4d_rad_rope_rows_roundtrip); };
     auto FD = [&]() { run(fold, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip); };
     timed("attn (rule)", -1, A);
+    r4d_attn_wm_from(1); timed("attn DAW wmma form", -1, A); timed("attn DAW wmma + orope + oq", -1, [&]() { A(); R(); Q(); }); r4d_attn_wm_from(0);
+    timed("attn (rule) again", -1, A); timed("attn (rule) + orope + oq", -1, [&]() { A(); R(); Q(); });
     for (int f : forms) { char nm[64]; std::snprintf(nm, sizeof nm, "attn form %d", f); timed(nm, f, A); }
     timed("orope", -1, R);
     r4d_qg8_pin(0); timed("oq (one column a thread)", -1, Q); r4d_qg8_pin(-1);
