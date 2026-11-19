@@ -189,7 +189,17 @@ TEST(the_sp_route_switches_are_deepseek41s_and_a_followers) {
     CHECK_EQ(fn4::switch_index("ds41_sphc_attn"), (int)fn4::kDs41SphcAttn);
     CHECK_EQ(fn4::switch_index("ds41_sphc_seg"), (int)fn4::kDs41SphcSeg);
     CHECK_EQ((int)fn4::kDs41Sphc, (int)fn4::kDraftCostAge + 1);
-    CHECK_EQ((int)fn4::kSwitches, (int)fn4::kDs41SphcSeg + 1);
+    CHECK_EQ((int)fn4::kPpBgRoom, (int)fn4::kDs41SphcSeg + 1);   /* tp8 loop P23s after them: the leader's own */
+    CHECK_EQ(fn4::switch_index("pp_bg_room"), (int)fn4::kPpBgRoom);
+    CHECK_EQ(fn4::switch_index("pp_bg_join_ms"), (int)fn4::kPpBgJoinMs);
+    CHECK(!fn4::follower_switch(fn4::kPpBgRoom));
+    CHECK(!fn4::follower_switch(fn4::kPpBgJoinMs));
+    {
+        std::string e;
+        CHECK(!fn4::check("pp_bg_room", 100, &e));      /* 0 or 256 .. 65536 */
+        CHECK(fn4::check("pp_bg_room", 2600, &e));
+        CHECK(!fn4::check("pp_bg_join_ms", 60001, &e));
+    }
     for (const int i : { (int)fn4::kDs41Sphc, (int)fn4::kDs41SphcAttn, (int)fn4::kDs41SphcSeg }) {
         CHECK(fn4::follower_switch(i));
         CHECK_EQ(fn4::value(i), -1);
