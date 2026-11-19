@@ -3985,6 +3985,46 @@ TEST(lever_dlw_weight_sidecar) {
                                 rule }, engine_env(), &slog);
     CHECK(st7 != 0);
     CHECK(has(slog, "an entry is kept or made, not both"));
+    /* tp8 loop P30o: --keep-only GLOB copies only the kept entries it matches (both.rad holds output.weight +
+     * blk.0.attn_qkv.weight): a glob that matches one keeps one, byte for byte; a glob that matches none keeps none (and the
+     * rule's own entry is written); the filter runs before the kept-or-made check, so a rule may make an entry the
+     * kept file holds when the glob leaves it out; --keep-only without --keep is refused */
+    const int st8 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "only.rad", "--requant", "--keep", d / "both.rad",
+                                "--keep-only", "output.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st8 != 0) fprintf(stderr, "    rad-sidecar --keep-only exited %d:\n%s\n", st8, tail(slog).c_str());
+    REQUIRE_EQ(st8, 0);
+    CHECK(has(slog, "1 entries kept from both.rad"));
+    {
+        rad::RadFile kf, of;
+        REQUIRE_EQ(kf.open((d / "both.rad").c_str()), 0);
+        REQUIRE_EQ(of.open((d / "only.rad").c_str()), 0);
+        CHECK_EQ(of.entry_count(), (int64_t)2);
+        CHECK(of.find("output.weight") != nullptr);
+        CHECK(of.find("blk.0.attn_qkv.weight") != nullptr);   /* made by the rule: the kept copy was filtered out first */
+        const RadFileEntry* ke = kf.find("output.weight");
+        const RadFileEntry* oe = of.find("output.weight");
+        bool same = ke && oe && ke->n_planes == oe->n_planes;
+        for (uint32_t k = 0; same && k < ke->n_planes; ++k) {
+            const RadFilePlane& p = kf.plane(*ke, (int)k);
+            const RadFilePlane& q = of.plane(*oe, (int)k);
+            same = p.bytes == q.bytes && std::memcmp(kf.data(p), of.data(q), (size_t)p.bytes) == 0;
+        }
+        CHECK(same);
+    }
+    const int st9 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "none.rad", "--requant", "--keep", d / "both.rad",
+                                "--keep-only", "nothing.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    REQUIRE_EQ(st9, 0);
+    {
+        rad::RadFile nf;
+        REQUIRE_EQ(nf.open((d / "none.rad").c_str()), 0);
+        CHECK_EQ(nf.entry_count(), (int64_t)1);
+    }
+    const int st10 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad4.rad", "--keep-only", "output.*", "--quant",
+                                 rule }, engine_env(), &slog);
+    CHECK(st10 != 0);
+    CHECK(has(slog, "--keep-only without --keep"));
 }
 
 /* ================================================================== lever G: the tail grid (ds41-tailgrid) */

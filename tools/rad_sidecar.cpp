@@ -23,6 +23,7 @@
 #include "plugin/registry.h"
 #include "rad_quant.h"
 
+#include <fnmatch.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -58,6 +59,8 @@ void usage() {
         "      --keep FILE    a sidecar rad-sidecar wrote from the same container: its entries are copied into the\n"
         "                     output as they are (encoding and planes byte for byte), beside the rules' new ones --\n"
         "                     the engine opens one sidecar, so a second set of entries joins the first this way\n"
+        "      --keep-only GLOB  with --keep: copy only the kept entries whose name matches GLOB (fnmatch; repeatable,\n"
+        "                     any match keeps it) -- e.g. a block-FP8 sidecar without its shared-expert entries\n"
         "  -v, --verbose\n"
         "  -h, --help\n"
         "\n"
@@ -100,6 +103,7 @@ int main(int argc, char** argv) {
      * drafter's DLW sidecar there; a new set of entries joins it here: FILE's entries are copied verbatim (encoding, provenance,
      * planes) into the output beside the rules' jobs, so the served bytes of the kept entries do not change */
     std::string keep_path;
+    std::vector<std::string> keep_only;   /* tp8 loop P30o: --keep-only GLOB (none = every kept entry) */
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -117,6 +121,7 @@ int main(int argc, char** argv) {
         else if (a == "--plan-only") plan_only = true;
         else if (a == "--requant") requant = true;
         else if (a == "--keep") keep_path = next("--keep");
+        else if (a == "--keep-only") keep_only.push_back(next("--keep-only"));   /* tp8 loop P30o */
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "rad-sidecar: unrecognised argument '%s'. Try --help.\n", a.c_str());
@@ -231,6 +236,10 @@ int main(int argc, char** argv) {
      * be both kept and made here */
     RadFile kf;
     std::vector<const RadFileEntry*> kept;
+    if (!keep_only.empty() && keep_path.empty()) {
+        RAD_ERR("--keep-only without --keep");
+        return 2;
+    }
     if (!keep_path.empty()) {
         RAD_TRY(kf.open(keep_path.c_str()));
         int64_t of_bytes = -1;
@@ -247,6 +256,11 @@ int main(int argc, char** argv) {
         for (int64_t i = 0; i < kf.entry_count(); ++i) {
             const RadFileEntry& e = kf.entry(i);
             const std::string name = kf.str(e.name);
+            if (!keep_only.empty()) {
+                bool any = false;
+                for (const std::string& g : keep_only) any = any || fnmatch(g.c_str(), name.c_str(), 0) == 0;
+                if (!any) continue;
+            }
             for (const Job& j : jobs)
                 if (j.name == name) {
                     RAD_ERR("--keep %s holds '%s', which a rule here makes too: an entry is kept or made, not both",
