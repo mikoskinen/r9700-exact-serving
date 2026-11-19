@@ -1500,6 +1500,15 @@ __device__ __forceinline__ void ds_dec_dot(float (&acc)[HS], const uint4 (&r)[8]
     }
 }
 
+/* Lever DXS-Q (DRAFTER track 19.11.2026 round 14): q's words through the constant address space -- q is an input no launch
+ * writes -- so the compiler issues them as scalar loads into SGPRs and splits each bf16 pair on the SALU; through the generic
+ * pointer it issued vector loads (the same 16 bytes in every lane) and one VALU conversion a fma. The same values: the same
+ * fmas, the same bits (tools/dbench/tbench on ds41-drafter-wip-dxs: output hash equal at 1 / 16 / 32 / 40 / 48 / 64 rows). */
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the host has no address spaces */
+typedef const uint32_t* ds_cq;
+#else
+typedef const __attribute__((address_space(4))) uint32_t* ds_cq;
+#endif
 /* The HS-head dot of ds_dec_dot with q read straight from its bf16 row by scalar loads (wave-uniform
  * addresses: qw the row's words at this chunk, ho[h] head h's word offset), so the q values take
  * neither LDS bandwidth nor VGPRs. The same fmas in the same order. */
@@ -1513,7 +1522,7 @@ __device__ __forceinline__ void ds_dec_dot_s(float (&acc)[HS], const uint4 (&r)[
         const uint32_t* qi = qw + z + i * 4;
 #pragma unroll
         for (int h = 0; h < HS; ++h) {
-            const uint32_t* qh = qi + ho[h];
+            const ds_cq qh = (ds_cq)(qi + ho[h]);
             const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
@@ -1545,7 +1554,7 @@ __device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& 
             const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
 #pragma unroll
             for (int h = 0; h < HS; ++h) {
-                const uint32_t* qh = qi + ho[h];
+                const ds_cq qh = (ds_cq)(qi + ho[h]);
                 const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
@@ -1810,7 +1819,7 @@ __device__ __forceinline__ void ds_dec_dot_w8(float (&acc)[HS], const DsW8Raw& r
             const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
 #pragma unroll
             for (int h = 0; h < HS; ++h) {
-                const uint32_t* qh = qi + ho[h];
+                const ds_cq qh = (ds_cq)(qi + ho[h]);
                 const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
