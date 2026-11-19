@@ -181,8 +181,6 @@ struct SchedReq {
     /* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS): when this newcomer was first held out of its home's MIXED step for the BG lanes'
      * room (mono us; 0: not held). Cleared when it is lent to a BG lane or runs at home. */
     int64_t  bg_hold_us = 0;
-    /* tp8 dev D12 (RADIANCE_PP_BG_PIECES): the BG lane that took this newcomer's first piece, which its rest goes to (-1: none) */
-    int8_t   bg_piece_lane = -1;
     /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and
      * fixed while it is prefilled, so every chunk of its prompt computes the same targets -- the anchor stride K over the
      * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
@@ -635,6 +633,20 @@ public:
         if (decoded <= 1 || decoded + 2 <= from) return false;
         return was_on;
     }
+    /* tp8 loop D19, short block tiers (RADIANCE_DRAFT_SHORT_TIERS=N:S,...): `from` sorted from the highest load down, each
+     * tier's `on` kept by short_block_on; returns the first tier that is on (the one for the highest load this step
+     * reaches), -1 for the drafter's own block. Every tier's state moves each step, as one tier's does. */
+    static int short_tier_pick(bool* on, const int64_t* from, int n, int64_t decoded) {
+        int pick = -1;
+        for (int i = 0; i < n; ++i) {
+            on[i] = short_block_on(on[i], decoded, from[i]);
+            if (on[i] && pick < 0) pick = i;
+        }
+        return pick;
+    }
+    /* tp8 loop D19: "N:S[,N:S...]" -> (from N >= 2, block S >= 1) pairs sorted by N from the highest down, at most 4,
+     * distinct N; RAD_E_INVAL with `why` on anything else. */
+    static int parse_short_tiers(const char* s, std::vector<std::pair<int64_t, int64_t>>* out, std::string* why);
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();

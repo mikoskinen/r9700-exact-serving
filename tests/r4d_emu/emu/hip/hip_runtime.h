@@ -112,13 +112,6 @@ inline unsigned emu_perm(unsigned a, unsigned b, unsigned sel) {
     return r;
 }
 #define __builtin_amdgcn_perm(a, b, s) emu_perm((a), (b), (s))
-/* v_alignbyte_b32: the 64-bit {a, b} (b low) shifted right by 8 x (s & 3) bits' bytes, its low 32 bits (the drafter's
- * MXFP4 forms, r4d_ds41_mxfp4_mr.hip) */
-inline unsigned emu_alignbyte(unsigned a, unsigned b, unsigned s) {
-    const unsigned long long d = ((unsigned long long)a << 32) | b;
-    return (unsigned)(d >> (8u * (s & 3u)));
-}
-#define __builtin_amdgcn_alignbyte(a, b, s) emu_alignbyte((a), (b), (s))
 /* HIP's __byte_perm: result byte i is the byte of {y, x} (x low) that the low three bits of
  * nibble i of s name; only the low four nibbles are read */
 inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) {

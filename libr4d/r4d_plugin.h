@@ -512,6 +512,8 @@ int  r4d_rad_ar_twoshot_4rank_ti8  (const RadArgs*, RadStream);
 int  r4d_rad_ar_rs_rows_4rank     (const RadArgs*, RadStream);   /* tp8 loop P20 (fn4 SP-hc) */
 int  r4d_rad_sp_rows_init(const RadParam*, int, int rank, int world, void** out);   /* tp8 loop P20 round 2: `bound` */
 int  r4d_rad_ar_ag_rows_4rank     (const RadArgs*, RadStream);   /* tp8 loop P20 (fn4 SP-hc) */
+int  r4d_rad_sp_rows_f32_init(const RadParam*, int, int rank, int world, void** out);   /* tp8 loop P26b: f32 rows on the bf16 instance */
+int  r4d_rad_ar_ag_rows_4rank_f32 (const RadArgs*, RadStream);   /* tp8 loop P26b: raw all-gather of f32 rows */
 /* The fused all-reduce + norm shares the IPC set, so it shares init/fini. */
 int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_ln_had_quant_i8(const RadArgs*, RadStream);

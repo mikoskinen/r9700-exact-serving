@@ -24,6 +24,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     lanes_ = std::move(lanes);
     mu_ = lanes_.empty() ? nullptr : &lanes_[0]->mu_;
     inbox_.assign(lanes_.size(), {});
+    bgt0_.assign(lanes_.size(), 0);   /* tp8 loop P23b */
+    bgrows_.assign(lanes_.size(), 0);
     order_.clear();
     const char* rr = std::getenv("RADIANCE_PP_PICK");
     pick_rr_ = rr && !std::strcmp(rr, "rr");
@@ -50,17 +52,20 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     bg_ = bg_env();
     const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
     bg_split_ = bs && !std::strcmp(bs, "1");
-    const char* bf = std::getenv("RADIANCE_PP_BG_DRAFT_FLOOR");
-    bg_floor_ = !(bf && !std::strcmp(bf, "0"));
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh) {
         char* end = nullptr;
         const long long v = std::strtoll(bh, &end, 10);
         bg_hold_ms_ = end && !*end && v > 0 && v <= 60000 ? (int64_t)v : 0;
     }
-    if (const char* bp = std::getenv("RADIANCE_PP_BG_PIECES"); bp && *bp) {
+    if (const char* br = std::getenv("RADIANCE_PP_BG_ROOM"); br && *br) {   /* tp8 loop P23 */
         char* end = nullptr;
-        const long long v = std::strtoll(bp, &end, 10);
-        bg_pieces_ = end && !*end && v >= 256 && v <= 65536 ? (int64_t)v : 0;
+        const long long v = std::strtoll(br, &end, 10);
+        bg_room_ = end && !*end && v >= 256 && v <= 65536 ? (int64_t)v : 0;
+    }
+    if (const char* bj = std::getenv("RADIANCE_PP_BG_JOIN_MS"); bj && *bj) {   /* tp8 loop P23b */
+        char* end = nullptr;
+        const long long v = std::strtoll(bj, &end, 10);
+        bg_join_ms_ = end && !*end && v > 0 && v <= 60000 ? (int64_t)v : 0;
     }
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
@@ -301,6 +306,16 @@ void Scheduler::lane_take_inbox() {
                     "start, step budget %lld", lane_, (long long)rows, got.size(), (long long)plan_.n_tok,
                     (long long)lane_reserved_, (long long)cfg_.max_tok);
     }
+    /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
+    if (!got.empty() && lanes_->is_bg(lane_)) {
+        int64_t newc = 0, rows = 0;
+        for (const LaneSet::Piece& p : got) {
+            newc += p.e.produces_token ? 1 : 0;
+            rows += p.e.n_tokens;
+        }
+        lanes_->note_bg_step_locked(newc, rows);
+        lanes_->note_bg_take_locked(lane_, rows, mono_us());   /* tp8 loop P23b: the step's plan time, for the BG lane's us a row */
+    }
     for (LaneSet::Piece& p : got) {
         if (Scheduler* home = lanes_->lane(p.home)) {
             auto it = home->by_id_.find(p.e.seq);
@@ -533,11 +548,7 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     SchedReq& s = *reqs_[(size_t)e.slot];
     Request& r = *s.req;
     if (why) *why = -1;
-    /* tp8 dev D12: the rest of a newcomer whose first piece a BG lane took (in flight, or committed) goes to that lane, whole */
-    const bool rest = s.bg_piece_lane >= 0 && s.lent_pending == 0 && !s.lent_hold && !s.lent_tok;
-    if (!rest) s.bg_piece_lane = -1;
-    if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold || s.lent_pending > 0 || (s.lent > 0 && !rest))
-        return false;
+    if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold || s.lent_pending > 0 || s.lent > 0) return false;
     if (e.ckpt_restore >= 0) {
         lanes_->note_bg_skip_locked(LaneSet::kBgRestore);
         if (why) *why = LaneSet::kBgRestore;
@@ -545,14 +556,24 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     }
     const std::vector<int>& order = lanes_->planners_locked();
     const int64_t n = e.n_tokens;
-    const int64_t cap = geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok;
+    /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N): up to N rows (<= MNBT) in a BG lane's inbox, so newcomers batch into its next step;
+     * P23b (RADIANCE_PP_BG_JOIN_MS=N): past today's room (`base`) only while the BG lane's step in flight ends within N ms */
+    const int64_t base = geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok;
+    const int64_t cap = lanes_->bg_room_cap(base, cfg_.max_tok);
+    const int64_t join_us = lanes_->bg_join_ms() * 1000, now_j = join_us > 0 ? mono_us() : 0;
     auto room = [&](int l, int64_t rows) {
-        return lanes_->inbox_rows_locked(l) + rows <= cap && (int64_t)lanes_->inbox_n_locked(l) + 1 <= cfg_.max_seqs;
+        const int64_t in = lanes_->inbox_rows_locked(l);
+        if (in + rows > cap || (int64_t)lanes_->inbox_n_locked(l) + 1 > cfg_.max_seqs) return false;
+        if (join_us <= 0 || in + rows <= base) return true;
+        const int64_t rem = lanes_->bg_remaining_us_locked(l, now_j);
+        const bool ok = rem <= join_us;   /* -1: no measurement yet -> joins */
+        lanes_->note_bg_join_locked(ok);
+        return ok;
     };
     /* the BG lanes in this plan's planning order (the order they take their inboxes in) */
     std::vector<int> bgo;
     for (int l : order)
-        if (lanes_->is_bg(l) && (!rest || l == s.bg_piece_lane)) bgo.push_back(l);
+        if (lanes_->is_bg(l)) bgo.push_back(l);
     /* tp8 dev M8 (RADIANCE_PP_BG_SPLIT=1, two BG lanes or more): the entry cut at the 512-grid point nearest its middle (>= 128
      * rows a side: M5b's cut, answer-neutral by the cards' lq21 lid576), the first piece to the first BG lane in the order with
      * room, the rest (its first token, the snapshot when it lies there) to a later one: piece 1's leader tail runs beside piece
@@ -574,21 +595,6 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
                 if (room(bgo[k], end - x)) to2 = bgo[k];
             if (to < 0 || to2 < 0) { x = 0; to = to2 = -1; lanes_->note_bg_skip_locked(LaneSet::kBgSplitRoom); }
         }
-    }
-    /* tp8 dev D12 (RADIANCE_PP_BG_PIECES=N): with no BG_SPLIT pair, an entry of >= N rows is cut by the same rule; its first piece
-     * goes to the first BG lane with room for it, the rest stays with the home (planned after that piece's commit, lane_plan_begin) */
-    bool first_only = false;
-    if (!x && !rest && !(lanes_->bg_split() && bgo.size() >= 2) && lanes_->bg_pieces() > 0 && n >= lanes_->bg_pieces()) {
-        constexpr int64_t G = 512, kMin = 128;
-        const int64_t c0 = e.ctx_len, end = c0 + n;
-        int64_t xp = 0;
-        for (int64_t g = (c0 + kMin + G - 1) / G * G; g <= end - kMin; g += G)
-            if (!xp || std::llabs(g - (c0 + end) / 2) < std::llabs(xp - (c0 + end) / 2)) xp = g;
-        if (xp && e.ckpt_slot >= 0 && c0 + e.ckpt_tok + 1 <= xp) xp = 0;   /* a snapshot inside the first piece: whole */
-        if (xp)
-            for (int l : bgo)
-                if (room(l, xp - c0)) { to = l; break; }
-        if (to >= 0) { x = xp; first_only = true; }
     }
     if (!x)
         for (int l : bgo)
@@ -622,26 +628,6 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     pc.e.dev = false;
     pc.e.ckpt_restore = -1;
     pc.e.n_accepted = 1;
-    if (first_only) {   /* tp8 dev D12: [c, x) alone, without a token or a snapshot; [x, end) the home's next plan after its commit */
-        pc.e.n_tokens = (int32_t)(x - e.ctx_len);
-        pc.e.produces_token = false;
-        pc.e.ckpt_slot = -1;
-        pc.e.ckpt_tok = -1;
-        lanes_->lend_locked(to, pc);
-        undo.to.emplace_back(to, pc.e.ctx_len);
-        s.lent += pc.e.n_tokens;
-        ++s.lent_pending;
-        undo.rows = pc.e.n_tokens;
-        undo.tok = false;
-        lane_lent_now_.push_back(std::move(undo));
-        lanes_->note_lent_locked(pc.e.n_tokens, false);
-        lanes_->note_bg_piece_locked();   /* the rest's lend counts the newcomer in note_bg_locked */
-        ++s.lst.lent;
-        s.lent_next = e.ctx_len;
-        s.bg_piece_lane = (int8_t)to;
-        return true;
-    }
-    s.bg_piece_lane = -1;
     if (x) {   /* RADIANCE_PP_BG_SPLIT: [c, x) without a token or a snapshot, then [x, end) with both */
         LaneSet::Piece p1 = pc;
         p1.e.n_tokens = (int32_t)(x - e.ctx_len);

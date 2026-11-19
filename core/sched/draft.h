@@ -339,8 +339,19 @@ public:
     static constexpr int kDcapN = 8;
     int  dcap() const { return dcap_d_; }
     void set_dcap(int d) { dcap_d_ = d < 0 ? 0 : d > 64 ? 64 : d; }
-    int  dcap_n() const { return dcap_n_; }
-    void set_dcap_n(int n) { dcap_n_ = n < 1 ? 1 : n > 64 ? 64 : n; }
+    /* tp8 loop D20 (loop FINDINGS F56 item 7): draft_dcap_n 100 + N (N 1 .. 64) HOLDS the head depth at the cap from N decode
+     * rows: such a cycle verifies min(D, the deepest stop) and makes no yield choice below it -- the two-node pipeline's lane
+     * step wall, which the choice weighs, is not the pair's cost (a cheaper drafter pass made D 2 win half of c16's steps on
+     * lq141, -7.2 % tokens a step for -7.4 % lane step, c16 -2.7 %). (Not a negative value: fn4's kNoChange is -2.) dcap_n()
+     * reads the value as set (100 + N while held). */
+    static constexpr int kDcapHold = 100;
+    int  dcap_n() const { return dcap_hold_ ? kDcapHold + dcap_n_ : dcap_n_; }
+    void set_dcap_n(int n) {
+        dcap_hold_ = n > kDcapHold;
+        const int a = dcap_hold_ ? n - kDcapHold : n;
+        dcap_n_ = a < 1 ? 1 : a > 64 ? 64 : a;
+    }
+    bool dcap_hold() const { return dcap_hold_; }
     /* DCA, a drafting depth's cost key by age (fn4 draft_cost_age; DRAFTER track 18.11.2026, lq141 c16w): 0 off (D7 as
      * it was). A > 0: a key of depth >= 1 last sampled more than A decode steps of this scheduler ago does not price its
      * depth while a FRESH drafting key of the same row class exists -- that key scaled by the prior's ratio stands in, as
@@ -358,6 +369,7 @@ public:
     /* Cycles whose choice the cap bounded (the deepest stop above D), and moves down it forced. For tests and the report. */
     int64_t dcap_cycles() const { return n_dcap_; }
     int64_t dcap_moves() const { return n_dcap_moves_; }
+    int64_t dcap_held_cycles() const { return n_dhold_; }   /* D20: cycles the hold set the depth */
     /* Whether occupancy holds depth 0 now; the cycles it held, and its moves (on and off). For tests and the report. */
     bool    occ_held() const { return occ_on_; }
     int64_t occ_cycles() const { return n_occ_; }
@@ -515,6 +527,8 @@ private:
     int32_t dcap_n_ = kDcapN;
     int32_t dcap_free_ = 0;                       /* cycles since the cap last bounded a choice */
     int64_t n_dcap_ = 0, n_dcap_moves_ = 0;
+    bool    dcap_hold_ = false;                   /* D20: draft_dcap_n 101 .. 164 */
+    int64_t n_dhold_ = 0;
     /* DCA (cost_age()): the switch, the decode steps step_time has seen, each key's step at its last sample. */
     int32_t cost_age_ = 0;
     int64_t steps_seen_ = 0;

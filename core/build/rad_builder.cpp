@@ -2267,7 +2267,12 @@ int Builder::drafter_short_block(int64_t block) {
             (long long)(prog_.drafter_tree ? 2 : lead));
         return RAD_E_INVAL;
     }
-    prog_.drafter_short_block = block;
+    /* tp8 loop D19: a further call declares a further short block (the engine's RADIANCE_DRAFT_SHORT_TIERS picks among
+     * them by load); the first stays drafter_short_block, so a plugin calling once is served as before. */
+    if (prog_.drafter_short_blocks.empty()) prog_.drafter_short_block = block;
+    if (std::find(prog_.drafter_short_blocks.begin(), prog_.drafter_short_blocks.end(), block) ==
+        prog_.drafter_short_blocks.end())
+        prog_.drafter_short_blocks.push_back(block);
     return RAD_OK;
 }
 

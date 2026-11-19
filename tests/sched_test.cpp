@@ -3341,6 +3341,42 @@ TEST(the_short_block_switches_off_at_one_sequence) {
     CHECK(!Scheduler::short_block_on(true, 0, 1));
 }
 
+/* tp8 loop D19: short block tiers (RADIANCE_DRAFT_SHORT_TIERS=12:1,6:3 -- c32's lanes of 16 the 1-row block, c16's lanes
+ * of 8 the 3-row one): the tier of the highest load a step reaches, each tier with the one-tier switch's hysteresis, and
+ * the drafter's own block below them. The parser sorts the tiers from the highest load down and refuses malformed ones. */
+TEST(short_block_tiers_pick_the_highest_load_tier_with_each_ones_hysteresis) {
+    bool on[2] = {};
+    const int64_t from[2] = { 12, 6 };
+    struct { int64_t dec; int want; } seq[] = {
+        { 16, 0 }, { 11, 0 }, { 10, 1 }, { 11, 1 }, { 12, 0 }, { 8, 1 }, { 5, 1 }, { 4, -1 }, { 5, -1 }, { 6, 1 },
+        { 1, -1 }, { 2, -1 }, { 32, 0 }, { 0, -1 },
+    };
+    int bad = 0;
+    for (const auto& s : seq) {
+        const int k = Scheduler::short_tier_pick(on, from, 2, s.dec);
+        if (k != s.want) { ++bad; std::fprintf(stderr, "    decoded %lld: tier %d, want %d\n", (long long)s.dec, k, s.want); }
+    }
+    CHECK_EQ(bad, 0);
+    /* one tier = the one-tier switch */
+    bool o1 = false, o2 = false;
+    for (const int64_t d : { 2, 8, 7, 6, 7, 9, 1 }) {
+        o1 = Scheduler::short_block_on(o1, d, 8);
+        CHECK_EQ(Scheduler::short_tier_pick(&o2, from, 0, d), -1);
+        const int64_t f8 = 8;
+        CHECK_EQ(Scheduler::short_tier_pick(&o2, &f8, 1, d), o1 ? 0 : -1);
+    }
+    std::vector<std::pair<int64_t, int64_t>> t;
+    std::string why;
+    CHECK_OK(Scheduler::parse_short_tiers("6:3,12:1", &t, &why));
+    REQUIRE_EQ(t.size(), (size_t)2);
+    CHECK_EQ(t[0].first, (int64_t)12); CHECK_EQ(t[0].second, (int64_t)1);
+    CHECK_EQ(t[1].first, (int64_t)6);  CHECK_EQ(t[1].second, (int64_t)3);
+    CHECK_OK(Scheduler::parse_short_tiers("12:1", &t, &why));
+    CHECK_EQ(t.size(), (size_t)1);
+    for (const char* b : { "", "12", "12:", ":1", "12:1,", "12:1,12:3", "1:1", "12:0", "12:1;6:3", "a:1", "2:1,3:1,4:1,5:1,6:1" })
+        CHECK_EQ(Scheduler::parse_short_tiers(b, &t, &why), RAD_E_INVAL);
+}
+
 TEST(no_prefix_hit_gives_nothing_back) {
     const RefillRun r = refill_run(1100, 0);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
@@ -5422,6 +5458,50 @@ TEST(the_depth_cap_holds_the_head_depth_from_its_rows_and_hands_back_below_them)
     for (int t = 0; t < 40; ++t) at5 += cap.plan_step(uf, 8, 8) == 5 ? 1 : 0;
     CHECK(at5 > 0);
     CHECK_EQ(cap.dcap_cycles(), (int64_t)21);
+}
+
+/* tp8 loop D20 (loop FINDINGS F56 item 7): draft_dcap_n 100 + N HOLDS the head depth at draft_dcap from N decode rows.
+ * Eight sequences at 0.9 / 0.7 a position, step times that make depth 2 the best yield (30 / 31 / 60 / 70 / 80 ms at depths
+ * 1-5): the cap (draft_dcap 3 from 8 rows) lets the yield choose 2, the hold verifies 3 every cycle from 8 rows; under them
+ * the yield's choice comes back past kHold; 8 again releases the hold. */
+TEST(the_depth_hold_sets_the_cap_from_its_rows_where_the_yield_would_choose_less) {
+    DraftController a = adaptive_controller(5);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(a, 0.9, 0.7); uf[i] = &u[i]; }
+    const double ms[6] = { 0.0, 30.0, 31.0, 60.0, 70.0, 80.0 };
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) {
+            a.step_time(d, 8, ms[d]);
+            a.step_time(d, 6, ms[d]);
+        }
+    DraftController cap = a, hold = a;
+    cap.set_dcap(3);
+    cap.set_dcap_n(8);
+    hold.set_dcap(3);
+    hold.set_dcap_n(108);
+    CHECK(hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 108);   /* reads back as set (fn4 note) */
+    CHECK(!cap.dcap_hold());
+    for (int t = 0; t < 20; ++t) {
+        CHECK_EQ(cap.plan_step(uf, 8, 8), 2);
+        CHECK_EQ(hold.plan_step(uf, 8, 8), 3);
+    }
+    CHECK_EQ(hold.dcap_held_cycles(), (int64_t)20);
+    CHECK_EQ(cap.dcap_held_cycles(), (int64_t)0);
+    int at2 = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at2 += hold.plan_step(uf, 6, 6) == 2 ? 1 : 0;
+    CHECK(at2 > 0);
+    CHECK_EQ(hold.plan_step(uf, 8, 8), 3);   /* back at 8 rows: held at once */
+    hold.set_dcap_n(8);
+    CHECK(!hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 8);
+    int at2b = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at2b += hold.plan_step(uf, 8, 8) == 2 ? 1 : 0;
+    CHECK(at2b > 0);
+    hold.set_dcap_n(164);
+    CHECK(hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 164);
 }
 
 /* DCA, a drafting depth's cost key by age (draft_cost_age; lq141 c16w): eight sequences (0.8 a position) at 8 rows under
@@ -8127,6 +8207,47 @@ TEST(a_block_drafters_short_block_on_the_card_runs_the_passes_the_hosts_driver_r
         CHECK_EQ(b.query[t].bad_slots, 0);
     }
     CHECK(a.out == b.out);
+}
+
+/* tp8 loop D18: DSpark's short block (block = depth: every row proposes, the anchor included), 2 rows and ONE row a
+ * sequence -- the depth-capped lanes' form (deepseek41 RADIANCE_DS41_DSPARK_SHORT + --draft-short-from). The scheduler
+ * refused blocks under 2 rows; one row is the anchor alone at the committed end, proposing the next token. The card's
+ * driver runs the host's passes at each, and a 1-row query pass is one row a drafting sequence. */
+TEST(a_dspark_short_block_of_one_or_two_rows_runs_the_passes_the_hosts_driver_runs) {
+    const int T = 24;
+    for (const int blk : { 5, 2, 1 }) {
+        const BlockRun a = block_reference(T, blk, blk);
+        const BlockRun b = block_pipelined(T, blk, blk);
+        CHECK_EQ(b.ahead, T);
+        CHECK_EQ(b.card_host_disagree, 0);
+        REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
+        REQUIRE_EQ(a.trunk.size(), b.trunk.size());
+        REQUIRE_EQ(a.context.size(), b.context.size());
+        REQUIRE_EQ(a.query.size(), b.query.size());
+        int diff = 0;
+        for (size_t t = 0; t < a.trunk.size(); ++t) {
+            diff += !(a.trunk[t] == b.trunk[t]);
+            CHECK_EQ(b.trunk[t].bad_slots, 0);
+        }
+        for (size_t t = 0; t < a.context.size(); ++t) {
+            BatchRows ca = a.context[t], cb = b.context[t];
+            ca.tok.clear();
+            cb.tok.clear();
+            diff += !(ca == cb) + !(a.query[t] == b.query[t]);
+            CHECK_EQ(a.query[t].bad_slots, 0);
+            CHECK_EQ(b.query[t].bad_slots, 0);
+            /* the query pass: three drafting sequences, `blk` rows each, the anchor first at the committed end */
+            REQUIRE_EQ(b.query[t].q.size(), (size_t)3);
+            for (const int32_t q : b.query[t].q) CHECK_EQ(q, blk);
+            CHECK_EQ(b.query[t].tok.size(), (size_t)(3 * blk));
+            if (blk == 1)
+                for (const int32_t tok : b.query[t].tok) CHECK(tok != kBlkMask);   /* anchors only, no mask row */
+        }
+        CHECK_EQ(diff, 0);
+        CHECK(a.out == b.out);
+        std::fprintf(stderr, "    DSpark block %d (depth %d): %zu trunk steps, %d issued ahead, %d differ\n", blk, blk,
+                     b.trunk.size(), b.ahead, diff);
+    }
 }
 
 /* ================================================================== the token budget per token */
@@ -14137,19 +14258,17 @@ TEST(lanes_lend_split_cuts_a_whole_mixed_newcomer_on_the_512_grid_and_lends_its_
  * (each lane's idle followers planned right behind it). */
 TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
     struct Env {
-        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_SPLIT"); unsetenv("RADIANCE_PP_BG_PIECES"); }
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_SPLIT"); }
     } env;
     struct Arm { int64_t len; bool head; };
-    /* 3 = two BG lanes with RADIANCE_PP_BG_SPLIT=1; 4 = one BG lane with RADIANCE_PP_BG_PIECES=1024 (tp8 dev D12: the same cut, the
-     * two pieces in turn on the one BG lane) */
-    for (const int k : { 1, 2, 3, 4 })
+    /* 3 = two BG lanes with RADIANCE_PP_BG_SPLIT=1 (tp8 dev D12's one-BG-lane form, RADIANCE_PP_BG_PIECES, was removed 18.11.) */
+    for (const int k : { 1, 2, 3 })
     for (const Arm a : { Arm{ 1100, false }, Arm{ 700, false }, Arm{ 2266, false }, Arm{ 1100, true } }) {
-        const bool split = k == 3, pieces = k == 4;
-        setenv("RADIANCE_PP_BG_LANE", k == 1 || k == 4 ? "1" : "2", 1);
+        const bool split = k == 3;
+        setenv("RADIANCE_PP_BG_LANE", k == 1 ? "1" : "2", 1);
         if (split) setenv("RADIANCE_PP_BG_SPLIT", "1", 1); else unsetenv("RADIANCE_PP_BG_SPLIT");
-        if (pieces) setenv("RADIANCE_PP_BG_PIECES", "1024", 1); else unsetenv("RADIANCE_PP_BG_PIECES");
         std::vector<int64_t> ends_1;
-        const int nbg = split ? 2 : pieces ? 1 : k;
+        const int nbg = split ? 2 : k;
         for (int lanes : { 1, nbg + 1, nbg + 2 }) {
             DstSwitches restore;
             Lanes L;
@@ -14241,19 +14360,10 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     CHECK(c.bg > 0);
                 }
                 /* a one-piece newcomer: the one-lane plan's chunk, run by the BG lane; never a MIXED home step with its token */
-                if (a.len <= 2048 && !split && !(pieces && a.len >= 1024)) {
+                if (a.len <= 2048 && !split) {
                     CHECK(ends == ends_1);
                     CHECK_EQ(home_mixed_with_p, 0);
                 }
-                /* RADIANCE_PP_BG_PIECES (one BG lane): 512 + the rest, both run by the BG lane, the first one first */
-                if (a.len <= 2048 && pieces && a.len >= 1024) {
-                    CHECK(ends == std::vector<int64_t>({ 512, a.len }));
-                    CHECK_EQ((int)p_lanes.size(), 2);
-                    if (p_lanes.size() == 2) CHECK(p_lanes[0] == bg && p_lanes[1] == bg);
-                    CHECK(c.bg_pieces > 0);
-                    CHECK_EQ(home_mixed_with_p, 0);
-                }
-                if (pieces && a.len < 1024) CHECK_EQ(c.bg_pieces, 0ll);
                 /* RADIANCE_PP_BG_SPLIT: 512 + the rest, in two BG lanes, the first piece's lane first */
                 if (a.len <= 2048 && split) {
                     CHECK(ends == std::vector<int64_t>({ 512, a.len }));
@@ -14267,7 +14377,7 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
             CHECK_EQ(short_steps, 0);
             fprintf(stderr, "    BG lanes %d%s, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent to BG lanes "
                             "(%lld rows), BG steps %d; home MIXED steps with its token %d; decoders in every step: %s; decoded %d\n",
-                    nbg, split ? " + split" : pieces ? " + pieces" : "", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
+                    nbg, split ? " + split" : "", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
                     [&] { std::string s; for (int64_t x : ends_1) s += fmt(" %lld", (long long)x); return s; }().c_str(),
                     (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
         }
@@ -14419,6 +14529,313 @@ TEST(lanes_bg_hold_waits_for_the_bg_lane_instead_of_a_home_mixed_step) {
     }
 }
 
+/* tp8 loop P23b (RADIANCE_PP_BG_JOIN_MS=N with BG_ROOM): the BG lane's step in flight is predicted to commit at its plan time + its
+ * rows x the BG steps' running us a row (plan to commit); no step in flight -> 0, no measurement yet -> -1 (joins). Then the gate in
+ * the engine's planning order: a 500-row warm-up newcomer whose BG step takes ~30 ms to commit (the test sleeps there) gives ~60 us
+ * a row; newcomer 1 (1000 rows) keeps the BG lane busy (predicted ~60 ms), of 2 / 3 (planned in one round) the first lent waits in its
+ * inbox (within the shared room), the other is past it: JOIN_MS 1 sends that one home (today's MIXED step, kept 1, one 'ran at home' count), JOIN_MS 60000 lets it join (1 + 2 in
+ * one BG step of 2150 rows, one 'joined' count); every newcomer one chunk = its whole prompt, all decoders every step. */
+TEST(lanes_bg_join_ms_sends_a_newcomer_home_when_the_bg_step_in_flight_is_long) {
+    {   /* the prediction alone (a started 3-lane set; nothing submitted) */
+        Lanes L0;
+        L0.grid = 2048;
+        L0.cfg.prefill_span = 2;
+        L0.max_tok = 4160;
+        L0.max_ctx = 60000;
+        L0.seqs = 12;
+        REQUIRE_EQ(L0.start(3), RAD_OK);
+        LaneSet& s = L0.set;
+        CHECK_EQ(s.bg_remaining_us_locked(2, 1000), 0ll);                 /* nothing in flight */
+        s.note_bg_take_locked(2, 1000, 1000000);
+        CHECK_EQ(s.bg_remaining_us_locked(2, 1100000), -1ll);             /* no measurement yet */
+        s.note_bg_commit_locked(2, 1500000);                               /* 500 ms for 1000 rows: 500 us a row */
+        CHECK_EQ(s.bg_remaining_us_locked(2, 1600000), 0ll);              /* committed: none in flight */
+        s.note_bg_take_locked(2, 2000, 2000000);
+        CHECK_EQ(s.bg_remaining_us_locked(2, 2100000), 900000ll);         /* 2000 x 500 us - 100 ms */
+        CHECK_EQ(s.bg_remaining_us_locked(2, 4000000), 0ll);              /* overdue: 0, not negative */
+        s.note_bg_commit_locked(2, 2400000);                               /* 200 us a row: mean 0.8 x 500 + 0.2 x 200 = 440 */
+        s.note_bg_take_locked(2, 1000, 3000000);
+        CHECK_EQ(s.bg_remaining_us_locked(2, 3000000), 440000ll);
+        CHECK_EQ(s.counts().bg_us_row_x100, 44000ll);
+    }
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_ROOM"); unsetenv("RADIANCE_PP_BG_JOIN_MS"); }
+    } env;
+    for (const char* join : { "1", "60000" }) {
+        setenv("RADIANCE_PP_BG_LANE", "1", 1);
+        setenv("RADIANCE_PP_BG_ROOM", "4160", 1);
+        setenv("RADIANCE_PP_BG_JOIN_MS", join, 1);
+        const bool joins = std::atoll(join) >= 1000;
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.stage_rows = 1024;
+        L.seqs = 12;
+        const int lanes = 3;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        REQUIRE_EQ(L.set.bg_lane(), 2);
+        CHECK_EQ(L.set.bg_join_ms(), (int64_t)std::atoll(join));
+        std::vector<uint64_t> dec[2];
+        for (int i = 0; i < 8; ++i) dec[i % 2].push_back(L.submit(i % 2, 100, 4000, 2000 + 100 * i));
+        constexpr int NC = 4;   /* 0 = the warm-up */
+        const int64_t len[NC] = { 500, 1000, 1100, 1050 };
+        /* the warm-up at round 1; 1 / 2 / 3 at rounds r0 / r0 + 2 / r0 + 2, r0 = the round after the warm-up's BG step committed
+         * (D11's 4 / 6 / 6 timeline from there) */
+        const int home[NC] = { 1, 0, 0, 1 };
+        int at_round[NC] = { 1, 1 << 30, 1 << 30, 1 << 30 };
+        uint64_t nc[NC] = {};
+        std::vector<int64_t> ends[NC];
+        int home_mixed[NC] = {}, on_bg[NC] = {}, decoded[NC] = {}, short_steps = 0, bg_two = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        for (int round = 0; round < 3000; ++round) {
+            if (at_round[1] == (1 << 30) && L.set.counts().bg_us_row_x100 > 0) {
+                at_round[1] = round;
+                at_round[2] = at_round[3] = round + 2;
+            }
+            for (int j = 0; j < NC; ++j)
+                if (round == at_round[j]) nc[j] = L.submit(home[j], (int)len[j], 4, 50000 + 2000 * j);
+            bool done = true;
+            for (int j = 0; j < NC && done; ++j) {
+                const Request* r = nc[j] ? L.req(home[j], nc[j]) : nullptr;
+                done = r && r->n_computed >= len[j] && r->output.size() >= 3;
+            }
+            if (done) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                std::vector<int> order, idle_after;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                for (int f : fifo) order.push_back(f);
+                if (!L.plan(l, order)) continue;
+                const StepPlan& pl = L.at(l).plan();
+                int newc_here = 0;
+                for (const StepEntry& e : pl.e)
+                    for (int j = 0; j < NC; ++j) {
+                        if (!nc[j] || e.seq != nc[j]) continue;
+                        if (e.is_prefill) {
+                            ends[j].push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (L.set.is_bg(l)) { ++on_bg[j]; ++newc_here; }
+                            else if (pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed[j];
+                        } else if (!L.set.is_bg(l)) {
+                            ++decoded[j];
+                        }
+                    }
+                if (L.set.is_bg(l)) bg_two += newc_here >= 2;
+                if (!L.set.is_bg(l)) {
+                    bool pf = false;
+                    for (int j = 0; j < NC; ++j) {
+                        const Request* r = nc[j] && home[j] == l ? L.req(home[j], nc[j]) : nullptr;
+                        pf = pf || (r && r->n_computed < len[j]);
+                    }
+                    if (pf) {
+                        int rows = 0;
+                        for (const StepEntry& e : pl.e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                }
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+                todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+            }
+            if (fifo.empty()) break;
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            /* the warm-up's BG step takes ~30 ms from its plan to its commit: the BG steps' measured us a row */
+            if (L.set.is_bg(l) && L.set.counts().bgst_n == 1 && L.set.counts().bg_us_row_x100 == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+        }
+        const LaneSet::Counts c = L.set.counts();
+        for (int j = 0; j < NC; ++j) {
+            REQUIRE(nc[j] != 0);
+            REQUIRE(L.req(home[j], nc[j]) != nullptr);
+            CHECK(L.req(home[j], nc[j])->n_computed >= len[j]);
+            CHECK(decoded[j] > 0);
+            CHECK(ends[j] == std::vector<int64_t>({ len[j] }));
+            CHECK_EQ(on_bg[j] + home_mixed[j], 1);
+        }
+        CHECK(L.set.broken().empty());
+        CHECK(c.bg_us_row_x100 > 0);
+        CHECK_EQ(on_bg[0], 1);   /* the warm-up ran on the BG lane */
+        const int kept = home_mixed[1] + home_mixed[2] + home_mixed[3];
+        if (!joins) {
+            CHECK_EQ(kept, 1);
+            CHECK_EQ(home_mixed[2] + home_mixed[3], 1);   /* the one of the two planned together that was past the shared room */
+            CHECK_EQ(bg_two, 0);
+            CHECK(c.bg_join_no >= 1);
+            CHECK_EQ(c.bg_join_yes, 0ll);
+        } else {
+            CHECK_EQ(kept, 0);
+            CHECK_EQ(bg_two, 1);
+            CHECK(c.bg_join_yes >= 1);
+            CHECK_EQ(c.bg_join_no, 0ll);
+        }
+        CHECK_EQ(short_steps, 0);
+        fprintf(stderr, "    BG_ROOM 4160 + JOIN_MS %s: on the BG lane %d / %d / %d / %d, home MIXED %d / %d / %d; BG steps of two %d; joined %lld, "
+                        "sent home %lld; BG steps %.2f us a row\n", join, on_bg[0], on_bg[1], on_bg[2], on_bg[3], home_mixed[1],
+                home_mixed[2], home_mixed[3], bg_two, (long long)c.bg_join_yes, (long long)c.bg_join_no,
+                (double)c.bg_us_row_x100 / 100.0);
+    }
+}
+
+/* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N with RADIANCE_PP_BG_LANE=1): D11's three newcomers (1000 / 1100 / 1050 rows; 0 keeps the BG
+ * lane busy, 1 and 2 are planned beside decode rows in one round while it runs). Without the switch the BG lane's room (the
+ * shared budget 2112 of the DS geometry) takes 1 and keeps 2 home as a MIXED step (today); with BG_ROOM=4160 (and 3000) both go to
+ * the BG lane's inbox and its next step carries them TOGETHER (2150 rows > the shared 2112, two sequences: the step lever NOA
+ * plans on one machine); 1100 + 1050 > 2112 is what BG_ROOM=2112 still refuses. Every newcomer runs as ONE chunk, its whole
+ * prompt (the home's own plan, no new cut), and decodes in its home afterwards; every decode step carries all its decoders.
+ * 3 lanes (2 decode + BG), 4 decoders a decode lane, the engine's planning order. */
+TEST(lanes_bg_room_lets_the_bg_lane_take_two_newcomers_in_one_step) {
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_ROOM"); }
+    } env;
+    for (const char* room : { (const char*)nullptr, "4160", "3000", "2112", "100" }) {
+        setenv("RADIANCE_PP_BG_LANE", "1", 1);
+        if (room) setenv("RADIANCE_PP_BG_ROOM", room, 1); else unsetenv("RADIANCE_PP_BG_ROOM");
+        /* 100 is out of range (256 .. 65536): not taken, today's room */
+        const bool wide = room && std::atoll(room) >= 2150;
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.stage_rows = 1024;
+        L.seqs = 12;
+        const int lanes = 3;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        REQUIRE_EQ(L.set.bg_lane(), 2);
+        CHECK_EQ(L.set.bg_room(), room && std::atoll(room) >= 256 ? (int64_t)std::atoll(room) : 0ll);
+        std::vector<uint64_t> dec[2];
+        for (int i = 0; i < 8; ++i) dec[i % 2].push_back(L.submit(i % 2, 100, 4000, 2000 + 100 * i));
+        constexpr int NC = 3;
+        const int64_t len[NC] = { 1000, 1100, 1050 };
+        const int home[NC] = { 0, 0, 1 }, at_round[NC] = { 4, 6, 6 };
+        uint64_t nc[NC] = {};
+        std::vector<int64_t> ends[NC];
+        int home_mixed[NC] = {}, on_bg[NC] = {}, decoded[NC] = {}, short_steps = 0, bg_two = 0;
+        int64_t bg_rows_max = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        for (int round = 0; round < 3000; ++round) {
+            for (int j = 0; j < NC; ++j)
+                if (round == at_round[j]) nc[j] = L.submit(home[j], (int)len[j], 4, 50000 + 2000 * j);
+            bool done = true;
+            for (int j = 0; j < NC && done; ++j) {
+                const Request* r = nc[j] ? L.req(home[j], nc[j]) : nullptr;
+                done = r && r->n_computed >= len[j] && r->output.size() >= 3;
+            }
+            if (done) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                std::vector<int> order, idle_after;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                for (int f : fifo) order.push_back(f);
+                if (!L.plan(l, order)) continue;
+                const StepPlan& pl = L.at(l).plan();
+                int newc_here = 0;
+                for (const StepEntry& e : pl.e)
+                    for (int j = 0; j < NC; ++j) {
+                        if (!nc[j] || e.seq != nc[j]) continue;
+                        if (e.is_prefill) {
+                            ends[j].push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (L.set.is_bg(l)) { ++on_bg[j]; ++newc_here; }
+                            else if (pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed[j];
+                        } else if (!L.set.is_bg(l)) {
+                            ++decoded[j];
+                        }
+                    }
+                if (L.set.is_bg(l)) {
+                    CHECK(pl.phase == RAD_PHASE_PREFILL);
+                    CHECK(pl.n_tok <= L.max_tok);
+                    bg_two += newc_here >= 2;
+                    bg_rows_max = std::max<int64_t>(bg_rows_max, pl.n_tok);
+                }
+                if (!L.set.is_bg(l) && l < 2) {
+                    bool pf = false;
+                    for (int j = 0; j < NC; ++j) {
+                        const Request* r = nc[j] && home[j] == l ? L.req(home[j], nc[j]) : nullptr;
+                        pf = pf || (r && r->n_computed < len[j]);
+                    }
+                    if (pf) {
+                        int rows = 0;
+                        for (const StepEntry& e : pl.e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                }
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+                todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+            }
+            if (fifo.empty()) break;
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+        }
+        const LaneSet::Counts c = L.set.counts();
+        for (int j = 0; j < NC; ++j) {
+            REQUIRE(nc[j] != 0);
+            REQUIRE(L.req(home[j], nc[j]) != nullptr);
+            CHECK(L.req(home[j], nc[j])->n_computed >= len[j]);
+            CHECK(decoded[j] > 0);
+            CHECK(ends[j] == std::vector<int64_t>({ len[j] }));   /* one chunk, its whole prompt, wherever it ran */
+            CHECK_EQ(on_bg[j] + home_mixed[j], 1);
+        }
+        CHECK(L.set.broken().empty());
+        const int kept = home_mixed[0] + home_mixed[1] + home_mixed[2];
+        if (!wide) {
+            /* today's room: one newcomer kept home as a MIXED step; no BG step of two */
+            CHECK_EQ(kept, 1);
+            CHECK(c.bg_skip[LaneSet::kBgRoom] > 0);
+            CHECK_EQ(bg_two, 0);
+            CHECK_EQ(c.bgst_b2, 0ll);
+            CHECK(bg_rows_max <= 2112);
+        } else {
+            /* the room raised: all three on the BG lane, 1 and 2 in ONE BG step (2150 rows, over the shared budget) */
+            CHECK_EQ(kept, 0);
+            CHECK_EQ(on_bg[0] + on_bg[1] + on_bg[2], NC);
+            CHECK_EQ(bg_two, 1);
+            CHECK_EQ(c.bgst_b2, 1ll);
+            CHECK_EQ(c.bgst_b2_newc, 2ll);
+            CHECK_EQ(c.bgst_b2_rows, 2150ll);
+            CHECK_EQ(bg_rows_max, 2150);
+            CHECK_EQ(c.bgst_max_rows, 2150ll);
+            CHECK_EQ(c.bg_skip[LaneSet::kBgRoom], 0ll);
+        }
+        CHECK_EQ(c.bgst_newc, (int64_t)(on_bg[0] + on_bg[1] + on_bg[2]));
+        CHECK_EQ(short_steps, 0);
+        fprintf(stderr, "    BG room %s: ends %lld | %lld | %lld, on the BG lane %d / %d / %d, home MIXED %d / %d / %d, short decode "
+                        "steps %d; BG steps %lld with %lld newcomers, %lld with >= 2 (%lld rows), the widest %lld rows; kept home for "
+                        "room %lld\n",
+                room ? room : "off", ends[0].empty() ? -1ll : (long long)ends[0].back(),
+                ends[1].empty() ? -1ll : (long long)ends[1].back(), ends[2].empty() ? -1ll : (long long)ends[2].back(),
+                on_bg[0], on_bg[1], on_bg[2], home_mixed[0], home_mixed[1], home_mixed[2], short_steps, (long long)c.bgst_n,
+                (long long)c.bgst_newc, (long long)c.bgst_b2, (long long)c.bgst_b2_rows, (long long)c.bgst_max_rows,
+                (long long)c.bg_skip[LaneSet::kBgRoom]);
+    }
+}
+
 /* tp8 dev D10 (RADIANCE_PP_ISSUE_AHEAD=1): a lane's step issued ahead (step_next, before its step's commit) takes its number from
  * the lanes' one counter when it is built -- other lanes plan before it is promoted, and a step number names one build on both
  * nodes -- and promote_next takes no other; the step issued ahead is the one step() plans there (the same rows at the same
@@ -14488,18 +14905,18 @@ TEST(lanes_a_step_issued_ahead_takes_its_number_when_built_and_is_the_step_plann
  * not propose until it had decoded the drafter's window of tokens. Now the piece's commit (lane_piece_done) records the range
  * as the home's own block_end would. The engine's order: plan, commit, then the drafter's block_begin over the plan just
  * committed (on_card false: the host form), block_end. DS geometry (interval 2048, MNBT 4160, span 2), a block drafter of
- * window 32, 8 decoders, an 1,100-token newcomer: one lane (the reference: it proposes from its prompt's step), BG at 3 lanes
- * with the fix (from its first home decode step), and RADIANCE_PP_BG_DRAFT_FLOOR=0 (lq46's: not before ~window - 1 steps). */
+ * window 32, 8 decoders, an 1,100-token newcomer: one lane (the reference: it proposes from its prompt's step) and BG at 3 lanes
+ * with the fix (from its first home decode step; lq46's build, before it: not before ~window - 1 steps). The fix's opt-out
+ * RADIANCE_PP_BG_DRAFT_FLOOR=0 and this test's arm of it were removed 18.11. (tp8 loop REPORT rule 7). */
 TEST(lanes_a_newcomer_the_bg_lane_ran_whole_drafts_from_its_first_home_decode_step) {
     struct Env {
-        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_DRAFT_FLOOR"); }
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); }
     } env;
     const int W = 32;
     struct Out { int prefill_offered = -1, first_decode_offer = -1, home_decodes = 0, bg_steps = 0; int64_t floors = 0; };
-    auto run = [&](int lanes, bool floor_on) -> Out {
+    auto run = [&](int lanes) -> Out {
         Out o;
         setenv("RADIANCE_PP_BG_LANE", "1", 1);
-        if (floor_on) unsetenv("RADIANCE_PP_BG_DRAFT_FLOOR"); else setenv("RADIANCE_PP_BG_DRAFT_FLOOR", "0", 1);
         DstSwitches restore;
         Lanes L;
         L.grid = 2048;
@@ -14565,7 +14982,7 @@ TEST(lanes_a_newcomer_the_bg_lane_ran_whole_drafts_from_its_first_home_decode_st
         CHECK(p != 0 && L.req(0, p) && (int)L.req(0, p)->output.size() >= 2 * W);
         return o;
     };
-    const Out one = run(1, true), bg = run(3, true), old = run(3, false);
+    const Out one = run(1), bg = run(3);
     /* one lane: the newcomer's MIXED step is its home's, and its drafter proposes behind it */
     CHECK_EQ(one.prefill_offered, 1);
     CHECK_EQ(one.first_decode_offer, 0);
@@ -14575,15 +14992,9 @@ TEST(lanes_a_newcomer_the_bg_lane_ran_whole_drafts_from_its_first_home_decode_st
     CHECK_EQ(bg.prefill_offered, -1);
     CHECK_EQ(bg.first_decode_offer, 0);
     CHECK_EQ(bg.floors, 1ll);
-    /* RADIANCE_PP_BG_DRAFT_FLOOR=0 (lq46): no drafting row until the window has slid past the prompt's end */
-    CHECK(old.bg_steps > 0);
-    CHECK_EQ(old.prefill_offered, -1);
-    CHECK(old.first_decode_offer >= W - 2);
-    CHECK_EQ(old.floors, 0ll);
     fprintf(stderr, "    a newcomer of 1,100 tokens, drafter window %d: one lane offers it a drafting row at its prompt's step (%d) and "
-                    "home decode step %d; BG lane (fix on) at home decode step %d of %d (%lld range opened, %d BG steps); "
-                    "RADIANCE_PP_BG_DRAFT_FLOOR=0 at %d of %d\n", W, one.prefill_offered, one.first_decode_offer,
-            bg.first_decode_offer, bg.home_decodes, (long long)bg.floors, bg.bg_steps, old.first_decode_offer, old.home_decodes);
+                    "home decode step %d; BG lane at home decode step %d of %d (%lld range opened, %d BG steps)\n", W,
+            one.prefill_offered, one.first_decode_offer, bg.first_decode_offer, bg.home_decodes, (long long)bg.floors, bg.bg_steps);
 }
 
 /* tp8 loop P6 (cards lq12: lent 2048-row chunks every ~282 ms, the two stages overlapping ~15 %): a chunk another lane lent

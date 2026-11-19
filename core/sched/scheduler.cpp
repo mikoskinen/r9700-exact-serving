@@ -162,9 +162,9 @@ int Scheduler::set_draft_dcap(int v) {   /* SPB */
     return draft_.dcap();
 }
 
-int Scheduler::set_draft_dcap_n(int v) {   /* SPB */
+int Scheduler::set_draft_dcap_n(int v) {   /* SPB (tp8 loop D20: 101 .. 164 holds the depth at the cap from v - 100 rows) */
     std::lock_guard<std::mutex> lk(mu_);
-    if (v >= 1 && v <= 64) draft_.set_dcap_n(v);
+    if ((v >= 1 && v <= 64) || (v >= 101 && v <= 164)) draft_.set_dcap_n(v);
     return draft_.dcap_n();
 }
 
@@ -4279,6 +4279,8 @@ void Scheduler::promote_next() {
 int Scheduler::commit(StepResult& res) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
+    /* tp8 loop P23b: a BG lane's step commits -- its plan-to-commit time a row (LaneSet::bg_remaining_us_locked) */
+    if (lanes_ && lanes_->is_bg(lane_)) lanes_->note_bg_commit_locked(lane_, mono_us());
     /* StepResult's counts describe this step only. */
     step_finished_ = 0;
     last_prefill_ids_.clear();
@@ -4935,7 +4937,9 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_len_ = 0;
     block_depth_ = 0;
     block_may_draft_ = false;
-    if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) return 0;
+    /* tp8 loop D18: a block of one row is a drafter whose every row proposes (block = depth, DSpark's convention):
+     * its anchor alone proposes the next token. A drafter whose anchor predicts nothing has block = depth + 1 >= 2. */
+    if (block < 1 || depth <= 0 || depth > block || !out || max <= 0) return 0;
     block_len_   = (int32_t)block;
     block_depth_ = (int32_t)depth;
     block_mask_.assign((size_t)(block - 1), mask);
@@ -5052,6 +5056,32 @@ int Scheduler::decoded_seqs() const {
     return n;
 }
 
+/* tp8 loop D19 (scheduler.h) */
+int Scheduler::parse_short_tiers(const char* s, std::vector<std::pair<int64_t, int64_t>>* out, std::string* why) {
+    out->clear();
+    if (!s || !*s) { if (why) *why = "empty"; return RAD_E_INVAL; }
+    const char* p = s;
+    while (*p) {
+        char* e = nullptr;
+        const long long n = std::strtoll(p, &e, 10);
+        if (e == p || *e != ':') { if (why) *why = "each tier is N:S (decoding sequences : short block rows)"; return RAD_E_INVAL; }
+        p = e + 1;
+        const long long b = std::strtoll(p, &e, 10);
+        if (e == p || (*e && *e != ',')) { if (why) *why = "each tier is N:S (decoding sequences : short block rows)"; return RAD_E_INVAL; }
+        if (n < 2 || b < 1) { if (why) *why = "a tier needs N >= 2 decoding sequences and S >= 1 rows"; return RAD_E_INVAL; }
+        for (const auto& t : *out)
+            if (t.first == n) { if (why) *why = "two tiers at the same N"; return RAD_E_INVAL; }
+        out->emplace_back((int64_t)n, (int64_t)b);
+        if (out->size() > 4) { if (why) *why = "at most 4 tiers"; return RAD_E_INVAL; }
+        p = *e ? e + 1 : e;
+        if (*e && !*p) { if (why) *why = "a trailing comma"; return RAD_E_INVAL; }
+    }
+    std::sort(out->begin(), out->end(), [](const std::pair<int64_t, int64_t>& x, const std::pair<int64_t, int64_t>& y) {
+        return x.first > y.first;
+    });
+    return RAD_OK;
+}
+
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
 const Request* Scheduler::serial_req(const SerialSeq& m) const { return live_req(m.slot, m.seq); }
 
@@ -5110,7 +5140,7 @@ const RadBatch* Scheduler::block_context(int step) {
  * plugin states which. */
 const RadBatch* Scheduler::block_query(int step) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (block_.empty() || block_len_ < 2 || block_depth_ <= 0) return nullptr;
+    if (block_.empty() || block_len_ < 1 || block_depth_ <= 0) return nullptr;   /* tp8 loop D18: one row (block_begin) */
     const int32_t block = block_len_, steps = block - 1, depth = block_depth_;
 
     block_plan_.reset();

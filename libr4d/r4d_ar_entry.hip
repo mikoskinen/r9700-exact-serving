@@ -1395,6 +1395,56 @@ extern "C" int r4d_rad_sp_rows_init(const RadParam* p, int n_p, int rank, int wo
 extern "C" int r4d_rad_ar_rs_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 0); }
 extern "C" int r4d_rad_ar_ag_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 1); }
 
+/* tp8 loop P26b: all_gather_rows raw 1 of an f32 payload (deepseek41's compressor output kvs, f32 [rows][2 x 512]) -- the raw
+ * gather moves 16-byte words whatever they hold, so an f32 row of `row` elements is the bf16 kernel's row of 2 x row words, on
+ * the bf16 instance of twice the declared bound (the f32 declare's `bound` in f32 elements names the all-reduce's T x D bf16
+ * instance as T x D / 2): no instance of its own, the same slot. Exact: the words as they are. */
+extern "C" int r4d_rad_sp_rows_f32_init(const RadParam* p, int n_p, int rank, int world, void** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
+    if (ws_param != world) return RAD_E_SHAPE;
+    if (r4d_ar_dtype_code(r4d_pgets(p, n_p, "dtype")) != 2) return RAD_E_DTYPE;
+    const long long numel = pgeti_hi(p, n_p, "numel", 0);
+    const long long bound = pgeti_hi(p, n_p, "bound", numel);
+    if (numel <= 0 || bound <= 0) return RAD_E_INVAL;
+    ArInst* in = nullptr;
+    int rc = acquire(CacheKey{ rank, world, 0, 2 * bound, 0 }, &in);
+    if (rc != RAD_OK) return rc;
+    *out = in;
+    return RAD_OK;
+}
+extern "C" int r4d_rad_ar_ag_rows_4rank_f32(const RadArgs* a, RadStream s) {
+    ArCall c;
+    int rc = ar_setup(a, &c, 1, true);   /* c.numel counts f32 elements (the tensor's); the slot is checked below in words */
+    if (rc != RAD_OK) return rc;
+    if (c.in->world != 4 || c.in->dtype != 0) return RAD_E_SHAPE;
+    if (c.out != c.inp) return RAD_E_INVAL;
+    const RadTensor* xt = r4d_opt(a, AR_X);
+    if (!xt || xt->dtype != RAD_F32) return RAD_E_DTYPE;
+    long long row = 0, raw = 0;
+    if (!rad_args_geti(a, "row", &row) || row <= 0 || row % 16) return RAD_E_SHAPE;
+    (void)rad_args_geti(a, "raw", &raw);
+    if (!raw) return RAD_E_INVAL;   /* no ti8 wire for f32 */
+    if (c.numel % row) return RAD_E_SHAPE;
+    const long rows = c.numel / (long)row;
+    if (rows < 4) return RAD_E_SHAPE;
+    const long wrow = 2 * (long)row;                         /* bf16 words a row */
+    const long q = (rows + 3) / 4;
+    if (q * wrow * 2 > c.in->slot_bytes) return RAD_E_SCRATCH;
+    if (c.nthreads % 32) return RAD_E_INVAL;
+    const ArInst* in = c.in;
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    R4D_TRY("sp_rows_4rank_f32",
+        r4d_ar_sp_rows_4rank(2, in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                             in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
+                             c.inp, rows, wrow, 0, in->rank,
+                             (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                             c.pub, early, early ? in->gate_ctr : 0L, 0L));
+    return early ? RAD_LINK_ENDED : RAD_OK;
+}
+
 /* ------------------------------------------------------------------ the fused all-reduce + norm */
 
 enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16, AL_WPOST };

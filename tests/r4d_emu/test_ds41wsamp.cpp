@@ -352,6 +352,16 @@ int main(int argc, char** argv) {
                                                                                         : "random", w, { 1, 2, 3, 4 });
         }
 
+    /* ---- tp8 loop D18: DSpark's short block (deepseek41 RADIANCE_DS41_DSPARK_SHORT=1 / 2): 1 / 2 steps at anchor stride 1 / 2 */
+    for (const int st : { 1, 2 })
+        for (const Rnd& c : rnd) {
+            Walk w;
+            w.V = c.V; w.R = c.R; w.S = c.S; w.steps = st; w.astride = st;
+            std::vector<uint16_t> w1, w2;
+            fill_random(w, w1, w2, rng, c.ts, c.ls, c.bad, c.greedy_every, c.qt);
+            check(st == 1 ? "short block of 1 row (one step)" : "short block of 2 rows (two steps)", w, { 1, 2, 3, 4 });
+        }
+
     /* ---- a draw naming another card, and q_temp 0 / -1 / inf / NaN: status -1, the greedy token */
     {
         Walk w;

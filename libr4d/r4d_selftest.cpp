@@ -514,6 +514,8 @@ static int64_t g_cold = 0;
 static int64_t g_pref = 0;
 static void (*g_pref_fn)(void* ctx, int i, hipStream_t s) = nullptr;
 static void* g_pref_ctx = nullptr;
+/* --mx-routing FILE (tp8 DECODE D17): --perfmx replays an R4D_MXDUMP capture's records instead of mx_route's draw. */
+static const char* g_mx_routing = nullptr;
 /* --timeline: --perfar8 also records the two-shot's per-block stamps (r4d.h) and prints where each
  * rank's time goes. */
 static bool g_timeline = false;
@@ -22853,6 +22855,43 @@ static MxRoute mx_route(int64_t tokens, int rank, bool tail, uint64_t seed) {
     return r;
 }
 
+/* tp8 DECODE D17: the records of an R4D_MXDUMP capture (40 ints: n_expert, tokens, T, off[0 .. n_expert]) for `tokens`,
+ * up to `want` of them at a stride over the file, as MxRoutes: an expert's rows go to tokens round-robin (top-3 distinct a
+ * token, as perfmoe replays exl3r4d's), the other slots up to T dropped (-1). Empty when the file has none. */
+static std::vector<MxRoute> mx_routes_file(const char* path, int64_t tokens, int want) {
+    std::vector<std::vector<int32_t>> hit;
+    if (FILE* f = std::fopen(path, "rb")) {
+        std::vector<int32_t> r(40);
+        while (std::fread(r.data(), 4, 40, f) == 40)
+            if (r[0] == 32 && r[1] == (int32_t)tokens && r[2] >= r[3 + 32] && r[2] <= 3 * tokens) hit.push_back(r);
+        std::fclose(f);
+    }
+    std::vector<MxRoute> out;
+    const size_t n = hit.size(), k = n < (size_t)want ? n : (size_t)want;
+    for (size_t i = 0; i < k; ++i) {
+        const std::vector<int32_t>& r = hit[i * n / k];
+        MxRoute m;
+        m.off.assign(33, 0);
+        std::vector<int32_t> used((size_t)tokens, 0);
+        int64_t tok = 0;
+        for (int e = 0; e < 32; ++e) {
+            const int32_t rows = std::max(0, r[(size_t)(3 + e + 1)] - r[(size_t)(3 + e)]);
+            m.off[(size_t)(e + 1)] = m.off[(size_t)e] + rows;
+            for (int32_t j = 0; j < rows; ++j, ++tok) {
+                int64_t t = tok % tokens, guard = 0;
+                while (used[(size_t)t] >= 3 && guard++ < tokens) t = (t + 1) % tokens;
+                m.sorted.push_back((int32_t)(t * 3 + used[(size_t)t]++));
+            }
+            m.experts += rows > 0;
+            m.rmax = std::max<int64_t>(m.rmax, rows);
+        }
+        m.live = (int64_t)m.sorted.size();
+        m.sorted.resize((size_t)r[2], -1);
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
 /* Random MXFP4 blocks (17 bytes: e8m0 then 16 code bytes) with exponents near 127, so products stay finite. */
 static void mx_blocks(std::vector<uint8_t>& w, int64_t rows, int64_t K, uint64_t seed) {
     uint64_t rs = seed;
@@ -23028,8 +23067,19 @@ static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
             st_memcpy(d_tab[k], ptrs.data(), E * sizeof(void*), hipMemcpyHostToDevice);
         }
         for (int64_t tk : toks) {
-            if (tk < 1 || tk > 48) continue;
-            const MxRoute rt = mx_route(tk, 0, true, 0xD5A2Cull + (uint64_t)tk);
+            if (tk < 1 || (tk > 48 && !g_mx_routing)) continue;
+            /* tp8 DECODE D17: --mx-routing replays up to 8 captured records a token count (one MXPERF / MXSUM line each, "rec i/n");
+             * above 48 tokens drafter_mx declines, so its forms time the stock row again */
+            std::vector<MxRoute> rts;
+            if (g_mx_routing) {
+                rts = mx_routes_file(g_mx_routing, tk, 8);
+                if (rts.empty()) { std::printf("MXPERF %s tokens %lld: no record of 32 experts and %lld tokens in %s\n", c.name, (long long)tk, (long long)tk, g_mx_routing); continue; }
+            } else {
+                rts.push_back(mx_route(tk, 0, true, 0xD5A2Cull + (uint64_t)tk));
+            }
+            for (size_t ri = 0; ri < rts.size(); ++ri) {
+            const MxRoute& rt = rts[ri];
+            const std::string rtag = g_mx_routing ? fmt(" rec %zu/%zu", ri + 1, rts.size()) : std::string();
             const int64_t T = (int64_t)rt.sorted.size(), AR = c.sorted_rows ? T : tk;
             std::vector<uint16_t> hx((size_t)(AR * c.K));
             uint64_t rs = 0x777ull + (uint64_t)tk;
@@ -23062,8 +23112,8 @@ static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
             h.mx_pin(0, 0, 0, 0, 0, 0);
             bool s0 = true; std::string f0;
             const double st = timeit("stock", s0, f0);
-            std::string line = fmt("MXPERF %s %lldx%lld tokens %lld (%lld slots on the rank, %lld experts, a run up to %lld) %s: stock %.1f;",
-                                   c.name, (long long)c.N, (long long)c.K, (long long)tk, (long long)rt.live, (long long)rt.experts,
+            std::string line = fmt("MXPERF %s %lldx%lld tokens %lld%s (%lld slots on the rank, %lld experts, a run up to %lld) %s: stock %.1f;",
+                                   c.name, (long long)c.N, (long long)c.K, (long long)tk, rtag.c_str(), (long long)rt.live, (long long)rt.experts,
                                    (long long)rt.rmax, mode, st);
             double best = -1, rule = -1; std::string bestn, bestf; bool alls = true;
             const P* plist = gemv ? gp : sp;
@@ -23083,12 +23133,13 @@ static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
             if (!alls) { ++ndiff; ++g_fail; }
             if (st > 0 && best > 0) {
                 const double mb = (double)rt.experts * (double)ebytes / 1048576.0;
-                std::printf("MXSUM %s tokens %lld %s: stock %.1f us | rule %.1f | best %s %.1f [%s] | x%.2f vs stock | %.0f MiB of live experts, %.0f GB/s | bytes %s\n",
-                            c.name, (long long)tk, mode, st, rule, bestn.c_str(), best, bestf.c_str(), st / best, mb,
+                std::printf("MXSUM %s tokens %lld%s %s: stock %.1f us | rule %.1f | best %s %.1f [%s] | x%.2f vs stock | %.0f MiB of live experts, %.0f GB/s | bytes %s\n",
+                            c.name, (long long)tk, rtag.c_str(), mode, st, rule, bestn.c_str(), best, bestf.c_str(), st / best, mb,
                             mb * 1.048576e6 / (best * 1e3), alls ? "identical" : "DIFFER");
                 lsum += std::log(st / best); ++n;
             }
             std::fflush(stdout);
+            }
         }
     }
     dfree_all();
@@ -31759,6 +31810,9 @@ struct SpRowsT {
      * deepseek41's streams, `bound` = the all-reduce's), the exact all-reduce, the reduce-scatter -- counts of wrong elements */
     int64_t wide_rows = 0, wide_bad = -1, mix_ar_bad = -1, mix_rs_bad = -1;
     void* inst_wide = nullptr;
+    int64_t narrow_bad = -1;   /* tp8 loop P26: the 1280 / 512-row gathers on that instance (-1: not run or failed) */
+    const RadKernelInfo* agf = nullptr;   /* tp8 loop P26b: the f32 row sp_ag_rows_4rank_f32 (absent: skipped) */
+    int64_t f32_bad = -1;
 };
 static void sp_rows_worker_t(SpRowsT* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
@@ -31859,6 +31913,74 @@ static void sp_rows_worker_t(SpRowsT* t) {
                 if (g_ar[(size_t)i] != want) ++t->mix_ar_bad;
                 if ((int)((i / t->row) / q) == t->rank && g_rs[(size_t)i] != want) ++t->mix_rs_bad;
             }
+            /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN): NARROW rows on the same instance (`bound` the all-reduce's) -- deepseek41's
+             * gathers of q_a's output (1280 a row) and kv's (512 a row) over the same rows count as the 5120-row message */
+            t->narrow_bad = 0;
+            for (int64_t nrow : { (int64_t)1280, (int64_t)512 }) {
+                const int64_t nr = most / t->row, nn = nr * nrow, nq = (nr + t->world - 1) / t->world;
+                std::vector<RadParam> pn = { PI("world_size", t->world), PI("numel", nn), PS("dtype", "bf16"), PI("row", nrow),
+                                             PI("raw", 1), PI("bound", most) };
+                void* inst_n = nullptr;
+                int rn = t->ag->init(pn.data(), (int)pn.size(), t->rank, t->world, &inst_n);
+                if (rn == RAD_OK) {
+                    for (int64_t i = 0; i < nn; ++i) {
+                        const int owner = (int)((i / nrow) / nq);
+                        h[(size_t)i] = h_to_bf16(ar_rough_value(owner == t->rank ? owner : 11 + t->rank, i + 5));
+                    }
+                    st_memcpy(buf, h.data(), (size_t)nn * 2, hipMemcpyHostToDevice);
+                    RadTensor tn[1] = { T(buf, RAD_BF16, { nn }) };
+                    RadArgs a2;
+                    std::memset(&a2, 0, sizeof(a2));
+                    a2.t = tn; a2.n_t = 1; a2.p = pn.data(); a2.n_p = (int)pn.size();
+                    a2.instance = inst_n; a2.rank = t->rank; a2.world_size = t->world;
+                    rn = t->ag->launch(&a2, nullptr);
+                    st_stream_sync(nullptr);
+                    if (rn == RAD_LINK_ENDED) rn = RAD_OK;
+                    std::vector<uint16_t> gn((size_t)nn);
+                    st_memcpy(gn.data(), buf, (size_t)nn * 2, hipMemcpyDeviceToHost);
+                    for (int64_t i = 0; i < nn; ++i)
+                        if (gn[(size_t)i] != h_to_bf16(ar_rough_value((int)((i / nrow) / nq), i + 5))) ++t->narrow_bad;
+                    if (t->ag->fini) t->ag->fini(inst_n);
+                }
+                if (rn != RAD_OK) { t->narrow_bad = -1; if (rc == RAD_OK) rc = rn; }
+            }
+            /* tp8 loop P26b: an f32 payload (deepseek41's compressor output, rows of 2 x 512 f32) through the f32 row on the
+             * same instance (its `bound` in f32 elements = half the bf16 bound), the words checked */
+            if (t->agf && t->narrow_bad >= 0) {
+                const int64_t nr = most / t->row, frow = 1024, fn = nr * frow, fq = (nr + t->world - 1) / t->world;
+                std::vector<RadParam> pf = { PI("world_size", t->world), PI("numel", fn), PS("dtype", "f32"), PI("row", frow),
+                                             PI("raw", 1), PI("bound", most / 2) };
+                void* inst_f = nullptr;
+                int rf = t->agf->init(pf.data(), (int)pf.size(), t->rank, t->world, &inst_f);
+                if (rf == RAD_OK) {
+                    std::vector<uint32_t> hf((size_t)fn);
+                    auto fv = [](int owner, int64_t i) {   /* any 32-bit pattern, NaN / denormal words included */
+                        uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ull ^ ((uint64_t)owner + 3) * 0xC2B2AE3D27D4EB4Full;
+                        h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+                        return (uint32_t)h;
+                    };
+                    for (int64_t i = 0; i < fn; ++i) {
+                        const int owner = (int)((i / frow) / fq);
+                        hf[(size_t)i] = fv(owner == t->rank ? owner : 13 + t->rank, i);
+                    }
+                    st_memcpy(buf, hf.data(), (size_t)fn * 4, hipMemcpyHostToDevice);
+                    RadTensor tf[1] = { T(buf, RAD_F32, { fn }) };
+                    RadArgs a3;
+                    std::memset(&a3, 0, sizeof(a3));
+                    a3.t = tf; a3.n_t = 1; a3.p = pf.data(); a3.n_p = (int)pf.size();
+                    a3.instance = inst_f; a3.rank = t->rank; a3.world_size = t->world;
+                    rf = t->agf->launch(&a3, nullptr);
+                    st_stream_sync(nullptr);
+                    if (rf == RAD_LINK_ENDED) rf = RAD_OK;
+                    std::vector<uint32_t> gf((size_t)fn);
+                    st_memcpy(gf.data(), buf, (size_t)fn * 4, hipMemcpyDeviceToHost);
+                    t->f32_bad = 0;
+                    for (int64_t i = 0; i < fn; ++i)
+                        if (gf[(size_t)i] != fv((int)((i / frow) / fq), i)) ++t->f32_bad;
+                    if (t->agf->fini) t->agf->fini(inst_f);
+                }
+                if (rf != RAD_OK) { t->f32_bad = -1; if (rc == RAD_OK) rc = rf; }
+            }
         }
         if (wbuf) st_free(wbuf);
         if (rc != RAD_OK && t->rc == RAD_OK) t->rc = rc;
@@ -31911,6 +32033,7 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
         for (int r = 0; r < world; ++r) {
             SpRowsT& x = t[(size_t)r];
             x.rs = rs; x.ag = ag; x.ar = ar; x.rank = r; x.dev = devs[(size_t)r]; x.row = row; x.rows = rows; x.bar = &bar; x.bad = &bad;
+            x.agf = find(pl, "sp_ag_rows_4rank_f32");
             th.emplace_back(sp_rows_worker_t, &x);
         }
         for (std::thread& x : th) x.join();
@@ -31957,6 +32080,20 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
                 ok((w + ": the exact all-reduce after it == the fold").c_str(), all && ab == 0, std::to_string(ab) + " elements wrong");
                 ok((w + ": the reduce-scatter after that == the fold on the shard").c_str(), all && rb == 0,
                    std::to_string(rb) + " elements wrong");
+                int64_t nb = 0;
+                bool nall = true;
+                for (const SpRowsT& x : t) { nall = nall && x.narrow_bad >= 0; nb += std::max<int64_t>(x.narrow_bad, 0); }
+                ok((w + ": then narrow all-gathers (rows of 1280 / 512, deepseek41's qr / kv under RADIANCE_DS41_SPHC_ATTN) "
+                        "move every owner's words to every rank").c_str(),
+                   nall && nb == 0, std::to_string(nb) + " elements wrong");
+                if (t[0].agf) {
+                    int64_t fb = 0;
+                    bool fall = true;
+                    for (const SpRowsT& x : t) { fall = fall && x.f32_bad >= 0; fb += std::max<int64_t>(x.f32_bad, 0); }
+                    ok((w + ": then an f32 all-gather (rows of 1024 f32 through sp_ag_rows_4rank_f32, deepseek41's compressor "
+                            "output under RADIANCE_DS41_SPHC_ATTN=2) moves every owner's words").c_str(),
+                       fall && fb == 0, std::to_string(fb) + " words wrong");
+                }
             }
             const int64_t tr[2] = { 2048, 4096 };
             for (size_t k = 0; k < t[0].us_rs.size() && k < 2; ++k) {
@@ -38508,7 +38645,10 @@ static void usage(void) {
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --mxcheck / --bfcheck:  ds41-drk: the drafter's MXFP4 grouped GEMM (drafter_mx) / bf16\n"
                 "             skinny GEMM (drafter_bf) forms vs the stock kernels, byte for byte.\n"
-                "  --perfmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes.\n"
+                "  --perfdmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes\n"
+                "             (--perfmx is this form too after --mx-routing, bare, or with a token list a,b,...).\n"
+                "  --mx-routing FILE:  --perfdmx replays an R4D_MXDUMP capture (up to 8 records a token count; any token\n"
+                "             count, the stock row alone above 48) instead of its own draw (tp8 DECODE D17)\n"
                 "  --bicheck [classes] [Ms]:  lever BI: per op, a row alone (M = 1) vs the same row inside\n"
                 "             an M-row launch, byte for byte, DeepSeek-V4.1's TP4 shapes (classes gg,f32,bf16,\n"
                 "             norm,mhc,rope,elem,router or all; Ms a comma list, default 1..64 and 65..4160).\n"
@@ -38704,6 +38844,12 @@ int main(int argc, char** argv) {
     int mf_it = 200;
     long long kda_m = 0, proj_m = 0;
     int kda_it = 50, proj_it = 100;
+    /* `--perfmx` names two benches: GLM's MXFP4 expert GEMM (--perfmx M ...) and ds41-drk's drafter form (--perfmx [tokens]
+     * [iters]); GLM's branch came first and took every --perfmx (tp8 loop FINDINGS F50: D17's bench ran GLM's). The drafter's
+     * form is --perfdmx, or --perfmx after --mx-routing, with no argument, or with a token LIST (a comma). */
+    auto drk_mx_form = [&](int i) {
+        return g_mx_routing != nullptr || i + 1 >= argc || argv[i + 1][0] == 0x2d || std::strchr(argv[i + 1], ',') != nullptr;
+    };
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) {
             if (i + 5 >= argc) { usage(); return 2; }
@@ -38826,6 +38972,9 @@ int main(int argc, char** argv) {
             g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
         } else if (!std::strcmp(argv[i], "--pref") && i + 1 < argc) {
             g_pref = std::strtoll(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--mx-routing")) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            g_mx_routing = argv[++i];
         } else if (!std::strcmp(argv[i], "--timeline")) {
             g_timeline = true;
         } else if (!std::strcmp(argv[i], "--perfhyv3moe")) {
@@ -38914,7 +39063,7 @@ int main(int argc, char** argv) {
             (kda ? kda_m : proj_m) = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d)
                 (kda ? kda_it : proj_it) = (int)std::strtol(argv[++i], nullptr, 0);
-        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfmxf8")) {
+        } else if ((!std::strcmp(argv[i], "--perfmx") && !drk_mx_form(i)) || !std::strcmp(argv[i], "--perfmxf8")) {
             mx_f8 = !std::strcmp(argv[i], "--perfmxf8");
             /* An expert GEMM at GLM's TP8 slices over an M-token chunk: MXFP4, or with
              * --perfmxf8 the FP8 experts with f32 block scales. */
@@ -38928,8 +39077,8 @@ int main(int argc, char** argv) {
             mxc = true;   /* drafter_mx's forms vs the stock MXFP4 grouped GEMM (ds_mx_check) */
         } else if (!std::strcmp(argv[i], "--bfcheck")) {
             bfc = true;   /* drafter_bf's form vs the stock skinny bf16 GEMM (ds_bf_check) */
-        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfbf")) {
-            (argv[i][6] == 'm' ? mxp : bfp) = true;
+        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfdmx") || !std::strcmp(argv[i], "--perfbf")) {
+            (std::strcmp(argv[i], "--perfbf") ? mxp : bfp) = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_l = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--bicheck")) {

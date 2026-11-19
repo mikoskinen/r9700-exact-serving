@@ -466,7 +466,15 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0);
+    /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
+     * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
+     * (StepHdr flags bit 2), the follower's parts start at h + k */
+    bool pp_band_on_ = false;
+    int  pp_ship_band_ = 0;      /* the frame pp_frame makes now is a band pass's (flags bit 2) */
+    int64_t pp_band_n_ = 0;
+    int64_t pp_band_max_rows_ = 2047;   /* RADIANCE_PP_BAND_MAX_ROWS: a band step's rows at most */
+    int  pp_band_step(int lane, const RadBatch* b);
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);
@@ -490,6 +498,10 @@ private:
      * PSK plan and clears), sent at its last head segment */
     struct PpHeld { bool on = false; int32_t step = 0; std::vector<uint8_t> head, span; };
     PpHeld pp_held_[RAD_PP_MAX_LANES];
+    /* tp8 loop P27 (RADIANCE_PP_LEAD_SEG_SHIP=1, with LEAD_SEG): the last head segment does not ship the held frame; the lane
+     * loop ships it once that segment has run on rank 0's card (its X1 sent), so the follower never issues the pass into an X1
+     * that is not sent yet and the decode frames issued between the head's segments reach it first */
+    bool lseg_ship_ = false;
     int  pp_ship_hold(const RadBatch* b, int lane);
     int  pp_ship_release(int lane);
     bool tail_ahead_ = false;
@@ -573,6 +585,18 @@ private:
     bool                 short_on_ = false;     /* the short block runs now (block_shape) */
     /* --draft-short-from resolved at bring-up (auto: 0 for a chain, 2 for a tree). */
     int64_t              short_from_ = 0;
+    /* tp8 loop D18: query passes (and their rows) at the short block and at the drafter's own, counted while a short block
+     * is served (drafter_short_ > 0); the two-node pipeline's minute and stop lines print them. */
+    int64_t              short_q_n_ = 0, short_q_rows_ = 0, long_q_n_ = 0, long_q_rows_ = 0;
+    void                 short_block_line(const char* when) const;
+    /* tp8 loop D19: the short block tiers (RADIANCE_DRAFT_SHORT_TIERS=N:S,..., leader env), from the highest load down: a
+     * step that decoded >= `from` sequences (short_block_on's hysteresis, a state a tier) runs `block`; empty without the
+     * env (then drafter_short_ / short_from_ / short_on_ serve as before). drafter_short_ is the first tier's block. */
+    struct ShortTier {
+        int64_t from = 0, block = 0, q_n = 0, q_rows = 0;
+        bool    on = false;
+    };
+    std::vector<ShortTier> short_tiers_;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
