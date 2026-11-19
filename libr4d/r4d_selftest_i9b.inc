@@ -569,6 +569,40 @@ static void ixw_case(const Plugin& pl) {
         const double u1 = st_time_us([&](int) { hk.score->launch(&aw, nullptr); }, 10, nullptr);
         info(fmt("index_score %s: scalar decode form %.0f us, ix_lds 2 %.0f us (%+.1f %%); %lld of %lld 16-bit words differ from the scalar form",
                  wc.what, u0, u1, 100.0 * (u1 - u0) / u0, dc, (long long)(bd_ / 2)));
+        /* with keep (the candidate restriction, live >= RADIANCE_DS41_KEEP_MIN_LIVE in serving): a quarter of the blocks below reach
+         * + the newest, block 16; ix_lds 2's keep form at the decode height = the same rows of a 64-row keep run at ix_lds 0 */
+        {
+            const int64_t block = 16, kw = kwords(cd.C, block);
+            std::vector<int32_t> kv((size_t)(64 * kw), 0);
+            for (int64_t m = 0; m < T; ++m) {
+                const int64_t nb = (cd.reach(m) + block - 1) / block;
+                for (int64_t b = 0; b < nb; ++b)
+                    if (rnd() % 4 == 0 || b == nb - 1) kv[(size_t)(m * kw + b / 32)] |= (int32_t)(1u << (b % 32));
+            }
+            void *kd = dalloc((size_t)(T * kw * 4)), *kt = dalloc(kv.size() * 4);
+            if (!kd || !kt) { ok("ixw alloc", false, "hipMalloc failed"); dfree_all(); return; }
+            st_memcpy(kd, kv.data(), (size_t)(T * kw * 4), hipMemcpyHostToDevice);
+            st_memcpy(kt, kv.data(), kv.size() * 4, hipMemcpyHostToDevice);
+            std::vector<RadTensor> kw2 = cd.score_ts(sw, kd, kw), ks0 = cd.score_ts(ss, kd, kw), kt0 = ct.score_ts(stl, kt, kw);
+            std::vector<RadParam> pdk = cd.score_ps(block), ptk = ct.score_ps(block);
+            st_memset(sw, 0x7F, bd_);
+            st_memset(ss, 0x7F, bd_);
+            st_memset(stl, 0x7F, bt_);
+            hk.sw("ix_lds", 2);
+            const int r2 = run(hk.score, kw2, pdk);
+            hk.sw("ix_lds", 0);
+            const int r0 = run(hk.score, ks0, pdk), rt = run(hk.score, kt0, ptk);
+            const long long dk = diff16(sw, stl, bd_), dkc = diff16(ss, sw, bd_);
+            ok(fmt("index_score ix_lds 2 WITH keep, %s: byte for byte the same rows in a 64-row WMMA keep run at ix_lds 0", wc.what).c_str(),
+               r2 == RAD_OK && r0 == RAD_OK && rt == RAD_OK && dk == 0, fmt("rc %d / %d / %d, differing 16-bit words %lld", r2, r0, rt, dk));
+            RadArgs ak2 = args(kw2, pdk), ak0 = args(ks0, pdk);
+            hk.sw("ix_lds", 0);
+            const double v0 = st_time_us([&](int) { hk.score->launch(&ak0, nullptr); }, 10, nullptr);
+            hk.sw("ix_lds", 2);
+            const double v1 = st_time_us([&](int) { hk.score->launch(&ak2, nullptr); }, 10, nullptr);
+            info(fmt("index_score WITH keep (1/4 of the 16-blocks), %s: scalar kept form %.0f us, ix_lds 2 keep form %.0f us (%+.1f %%); %lld words differ "
+                     "from the scalar kept form", wc.what, v0, v1, 100.0 * (v1 - v0) / v0, dkc));
+        }
         hk.sw("ix_lds", 0);
         dfree_all();
     }
