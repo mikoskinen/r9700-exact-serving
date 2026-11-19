@@ -3072,6 +3072,17 @@ static int ds41_ar_pcn_mode() {
 }
 static int ds41_ar_pcn() { return ds41_ar_pcn_mode() >= 1; }
 static int ds41_ar_pcn_moe() { return ds41_ar_pcn_mode() == 2; }
+/* tp8 loop D33 (RADIANCE_PP_SEG_MAX=N on a node; unset 16): at most N - 1 segment boundaries on this node (the M4 follower's, the
+ * M9 leader's), 2 <= N <= RAD_PP_MAX_SEGS (32). 16 is the bound before D33: at W(10,32) SEG_LAYERS=1 the follower's boundaries
+ * are 11..25 and its last segment [25,32) runs whole (7 of 22 layers, no decode pass between); 32 gives 11..31. */
+static int pp_seg_cap() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_PP_SEG_MAX");
+        const int n = e && *e ? std::atoi(e) : 16;
+        return std::min(std::max(n, 2), (int)RAD_PP_MAX_SEGS);
+    }();
+    return v;
+}
 
 /* RADIANCE_DS41_ROUTER_FUSE: "1" = the selection and the sort as one launch (router_scored_topk_scatter,
  * where a loaded library declares it and the pass fits the sort's one workgroup; byte-identical to
@@ -5472,7 +5483,7 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         /* tp8 dev M4: the follower's segment boundaries -- every k-th layer after h whose cut W(s, t) the geometry allows */
         if (const char* sk = std::getenv("RADIANCE_PP_SEG_LAYERS"); sk && *sk && m.pp_rank == 1 && rad_pp_query().lanes > 1) {
             const int k = std::atoi(sk);
-            for (int x = m.pp_h + std::max(k, 1); k > 0 && x < m.pp_t && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += k) {
+            for (int x = m.pp_h + std::max(k, 1); k > 0 && x < m.pp_t && (int)m.seg_b.size() < pp_seg_cap() - 1; x += k) {
                 /* loop FINDINGS F12: X1 of W(x, t) without its source, plus what this pass's X2 ships that layers below x
                  * computed (ds41layers::segment_crossing) */
                 ds41layers::Crossing sc;
@@ -5502,7 +5513,7 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 for (int x = k; x < m.pp_h; x += k) xs.push_back(x);
                 for (int x = m.pp_t + k; x <= top; x += k) xs.push_back(x);
                 for (int x : xs) {
-                    if ((int)m.seg_b.size() >= RAD_PP_MAX_SEGS - 1) break;
+                    if ((int)m.seg_b.size() >= pp_seg_cap() - 1) break;
                     ds41layers::Crossing sc;
                     std::string e2;
                     if (ds41layers::lead_segment_crossing(geo, m.pp_h, x, m.pp_t, &sc, &e2) < 0) {
@@ -5958,8 +5969,12 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
             else
             std::snprintf(line, sizeof line,
                           "two-node pipeline (tp8 dev M4, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments at "
-                          "layers %s, each boundary's live set saved and restored on this rank (a %lld-byte ring buffer a card)",
-                          sb.c_str(), (long long)m.seg_ring_bytes);
+                          "layers %s, each boundary's live set saved and restored on this rank (a %lld-byte ring buffer a card)%s",
+                          sb.c_str(), (long long)m.seg_ring_bytes,
+                          std::getenv("RADIANCE_PP_SEG_MAX") && *std::getenv("RADIANCE_PP_SEG_MAX")
+                              ? fmt_s("; at most %d boundaries (RADIANCE_PP_SEG_MAX=%d, tp8 loop D33)", pp_seg_cap() - 1,
+                                      pp_seg_cap()).c_str()
+                              : "");
             rad_note(b, "%s", line);
             if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
             rad_pp_declare_segments(m.seg_b.data(), (int)m.seg_b.size());
