@@ -37,6 +37,7 @@ extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked(const RadAr
 extern "C" int r4d_rad_ds41_attn_sparse_sink_gathered(const RadArgs*, RadStream);
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered(const RadArgs*, RadStream);
 extern "C" void r4d_attn_skip_pin(int v);
+extern "C" void r4d_rope8_pin(int v);
 
 namespace {
 
@@ -499,17 +500,26 @@ void case_skip(const char* name, const Fix& f, const View& v, int64_t per) {
         const RadLaunchFn unp = fold ? r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked : r4d_rad_ds41_attn_sparse_sink_unpacked;
         std::vector<uint16_t> ref;
         for (int form = 0; form < 4; ++form) {   /* bf16 cache, packed (DKV-F), plan rows, plan rows + plan_full */
-            std::vector<uint16_t> o[2] = { std::vector<uint16_t>(no, 0x1111), std::vector<uint16_t>(no, 0x2222) };
-            for (int sk = 0; sk < 2; ++sk) {
-                r4d_attn_skip_pin(sk);
+            /* cfg 0 neither, 1 the skip (P32), 2 the skip + rope_rows_roundtrip eight columns a thread (P32d; fold d only) */
+            std::vector<uint16_t> o[3] = { std::vector<uint16_t>(no, 0x1111), std::vector<uint16_t>(no, 0x2222),
+                                           std::vector<uint16_t>(no, 0x3333) };
+            const int ncfg = fold ? 3 : 2;
+            for (int sk = 0; sk < ncfg; ++sk) {
+                r4d_attn_skip_pin(sk >= 1 ? 1 : 0);
+                r4d_rope8_pin(sk == 2 ? 1 : 0);
                 g_plan_full = form == 3 ? 1 : 0;
                 const int rc = form < 2 ? attn(plain, f, v, form == 1, fold, o[sk].data(), nullptr)
                                         : attn(unp, f, v, true, fold, o[sk].data(), &ut);
                 expect(rc == RAD_OK, name, "attention launch", form, sk);
             }
+            r4d_rope8_pin(-1);
             g_plan_full = 0;
-            const int64_t d = ndiff(o[0], o[1]);
-            expect(d == 0, name, "the skip changed an output", d, form + 4 * fold);
+            int64_t d = 0;
+            for (int sk = 1; sk < ncfg; ++sk) {
+                const int64_t dd = ndiff(o[0], o[sk]);
+                expect(dd == 0, name, sk == 2 ? "rope8 (P32d) changed an output" : "the skip changed an output", dd, form + 4 * fold);
+                d += dd;
+            }
             bad += d;
             if (form == 0) {
                 ref = o[0];
@@ -547,7 +557,7 @@ void case_skip(const char* name, const Fix& f, const View& v, int64_t per) {
             walked += any;
         }
     }
-    std::printf("%-58s rows %d ratio %d topk %d: skip vs all tiles %lld of %zu x 8 differ, forms vs bf16 %lld; tiles walked %lld "
+    std::printf("%-58s rows %d ratio %d topk %d: skip (+ rope8) vs neither %lld of %zu x 12 differ, forms vs bf16 %lld; tiles walked %lld "
                 "of %lld (%.1f %%)\n", name, v.n, f.ratio, f.topk, (long long)bad, no, (long long)vs_bf16, (long long)walked,
                 (long long)v.n * nkt, 100.0 * (double)walked / (double)(v.n * nkt));
 }

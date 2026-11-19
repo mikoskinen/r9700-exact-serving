@@ -3448,7 +3448,10 @@ static void ds41_attn_skip_case(const Plugin& pl) {
     const RadKernelInfo* rfu = find(pl, "ds41_attn_sparse_sink_rope_rt_unpacked_d512_bf16");
     const RadKernelInfo* rfp = find(pl, "ds41_attn_sparse_sink_rope_rt_d512_bf16");
     auto pin = (void (*)(int))dlsym(pl.h, "r4d_attn_skip_pin");
-    if (!rlu || !rfu || !rfp || !pin) { ok(name, false, "row or r4d_attn_skip_pin absent"); return; }
+    auto rpin = (void (*)(int))dlsym(pl.h, "r4d_rope8_pin");   /* tp8 loop P32d */
+    if (!rlu || !rfu || !rfp || !pin || !rpin) { ok(name, false, "row or r4d_attn_skip_pin / r4d_rope8_pin absent"); return; }
+    int64_t rbad = 0;
+    double nc_r8[3] = { 0, 0, 0 };
     const int64_t H = 16, D = 512, n = H * D, win = 128, topk = 512, bs = 64, cbs = 64, rot = 64, E = 16, slots = 144;
     /* hot (an upper-bound cell, timing only; IDEAS rule 3): 1 = every selection names entry 0 (one cached row), 2 = also every
      * window block is block 0 -- the kernel with its key loads hitting the nearest cache: what a form that hides or shares
@@ -3588,6 +3591,31 @@ static void ds41_attn_skip_case(const Plugin& pl) {
         const double tu = r ? k1_time_us([&] { unpack(); }) : 0.0;
         const double toff = 0.5 * (t0 + t2), ton = 0.5 * (t1 + t3);
         if (sh.p0 == 0 && M == 1150 && !sh.hot) { nc_off[r] = toff; nc_on[r] = ton; }
+        {   /* tp8 loop P32d: rope_rows_roundtrip eight columns a thread (skip on both): every output bit, its time */
+            pin(1);
+            rpin(1);
+            st_memset(doA, 0x44, ob);
+            const int r3 = attn(doA);
+            std::vector<uint16_t> o8((size_t)(M * n));
+            st_memcpy(o8.data(), doA, ob, hipMemcpyDeviceToHost);
+            int64_t dd = 0;
+            for (size_t i = 0; i < o8.size(); ++i) dd += o8[i] != obv[i];
+            rbad += dd + (r3 != RAD_OK);
+            const double g1 = k1_time_us([&] { attn(doA); });
+            rpin(0);
+            const double g0 = k1_time_us([&] { attn(doB); });
+            rpin(1);
+            const double g3 = k1_time_us([&] { attn(doA); });
+            rpin(0);
+            const double g2 = k1_time_us([&] { attn(doB); });
+            rpin(-1);
+            pin(-1);
+            if (sh.p0 == 0 && M == 1150 && !sh.hot) nc_r8[r] = 0.5 * (g1 + g3);
+            std::printf("  info  P32d M %lld p0 %lld ratio %d%s: the fold with rope_rows_roundtrip eight columns a thread (skip on): %lld of %zu "
+                        "outputs differ; us a launch one column %.1f / %.1f, eight %.1f / %.1f (B A B A) = %+.1f %%\n", (long long)M,
+                        (long long)sh.p0, sh.ratio, sh.hot ? " HOT" : "", (long long)dd, o8.size(), g0, g2, g1, g3,
+                        100.0 * ((g1 + g3) / (g0 + g2) - 1.0));
+        }
         std::printf("  info  P32 M %lld p0 %lld ratio %d%s%s: skip off %.1f / %.1f us, on %.1f / %.1f us a launch (A B A B) = %+.1f %%; "
                     "tiles walked %lld of %lld (%.1f %%); %lld of %zu outputs differ (%lld non-zero); latent_unpack %.1f us\n",
                     (long long)M, (long long)sh.p0, sh.ratio, full ? " plan_full" : "",
@@ -3604,6 +3632,11 @@ static void ds41_attn_skip_case(const Plugin& pl) {
                 (10 * nc_on[2] + 12 * nc_on[1]) / 1e3, (10 * (nc_on[2] - nc_off[2]) + 12 * (nc_on[1] - nc_off[1])) / 1e3,
                 (2 * nc_off[0] + 8 * nc_off[2] + 8 * nc_off[1]) / 1e3, (2 * nc_on[0] + 8 * nc_on[2] + 8 * nc_on[1]) / 1e3,
                 (2 * (nc_on[0] - nc_off[0]) + 8 * (nc_on[2] - nc_off[2]) + 8 * (nc_on[1] - nc_off[1])) / 1e3);
+    std::printf("P32DNC a newcomer a rank with the skip AND rope8: follower %.2f ms (%+.2f vs neither), leader %.2f ms (%+.2f)\n",
+                (10 * nc_r8[2] + 12 * nc_r8[1]) / 1e3, (10 * (nc_r8[2] - nc_off[2]) + 12 * (nc_r8[1] - nc_off[1])) / 1e3,
+                (2 * nc_r8[0] + 8 * nc_r8[2] + 8 * nc_r8[1]) / 1e3,
+                (2 * (nc_r8[0] - nc_off[0]) + 8 * (nc_r8[2] - nc_off[2]) + 8 * (nc_r8[1] - nc_off[1])) / 1e3);
+    ok("P32d: rope_rows_roundtrip eight columns a thread gives every output bit", rbad == 0, fmt("%lld outputs differ", (long long)rbad));
     ok(name, bad == 0 && rc_bad == 0,
        fmt("%zu shapes: %lld outputs differ skip off vs on, %lld launch failures%s%s", shapes.size(), (long long)bad,
            (long long)rc_bad, first.empty() ? "" : "; first: ", first.c_str()));
