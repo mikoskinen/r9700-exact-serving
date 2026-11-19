@@ -6449,6 +6449,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     twin_env(), nw, pl.empty() ? "none: no '<name>#pf' entry of the env's classes" : pl.c_str(), m.twin.size(),
                     (long long)twin_rows_env(), m.twin_mask,
                     (twin_env() & kTwEng) ? "; the Engram twin only where lever E1's dedup does not act (ds41_engdd 0)" : "");
+            if (psk_declared())
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: lever PSK is declared here (RADIANCE_DS41_PSK): it may cut a prefill "
+                                "segment from its first layer (and its split layer) on, so the twins act below those layers only "
+                                "(and in no pass with a replay segment)\n");
         }
     }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
@@ -8691,10 +8695,17 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     for (auto& L : m.layers) {
         /* tp8 loop P30t: the classes this layer keeps on GGUF (t_tw_off): every class under P13 / P15's pieces; q_a + kv where
          * P26 may issue them over an SP quarter (its static conditions at this switch level); the Engram kv under the SP Engram */
+        /* ... and every class where lever PSK may cut a prefill segment (from m.psk_first, the split layer, a plan's replay
+         * segments at every layer): a cut segment runs fewer rows, and whether a pass is cut / planned can depend on its
+         * company, so an int8 row's bytes would too (GGUF's are M-invariant); lever E1's dedup (ds41_engdd on) likewise for the
+         * Engram kv: whether it acts depends on the pass's rows */
         t_tw_off = !m.twin_mask ? 0
                  : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng ? kTwEng : 0) |
                    (bi_pmm(g_sw_bi.load(std::memory_order_relaxed)) ? kTwShx : 0) |
-                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score ? kTwQkv : 0);
+                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score ? kTwQkv : 0) |
+                   (m.psk_first > 0 && (L.l >= m.psk_first || (m.psk_l20 >= 0 && L.l == m.psk_l20)) ? kTwAll : 0) |
+                   (cr_any ? kTwAll : 0) |
+                   (g_sw_engdd.load(std::memory_order_relaxed) > 0 ? kTwEng : 0);
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
         /* tp8 S5 + S6: a lane step's leader part issues its own layers; the other part's are as another node's (their
