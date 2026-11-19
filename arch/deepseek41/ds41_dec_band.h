@@ -101,7 +101,7 @@ inline int64_t ds41_band_cuts(int64_t n, int64_t band, std::vector<std::pair<int
  * one part order at every row count, so the band moves launches, never a row's bytes. */
 inline int64_t ds41_dense_band(int wmk, int64_t env_band, int64_t bi_band) {
     if (wmk < 1) return bi_band;
-    return wmk == 5 ? 64 : env_band;
+    return wmk >= 5 ? 64 : env_band;   /* tp8 loop D25 step 2: ds41_wmk 6 / 7 = 5 + another 49..64-row launch code, the band 64 too */
 }
 
 /* RADIANCE_DS41_BI_DBAND=2: a recorded pass's key for its pieces (rad_arch_pass_key) -- a function of each piece's first

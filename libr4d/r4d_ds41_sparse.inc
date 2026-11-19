@@ -39,6 +39,15 @@ static const RadParamSpec pDs41AttnSparseSinkRtLu[] = { P_INT("M"), P_INT("heads
     P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
     P_STRO("window_format"), P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"),
     P_STR("format"), P_STR("block_scale"), P_INTO("plan_full") };
+/* tp8 loop D25 step 3: the gathered attentions' parameters = the plain ones + band (optional; 49 .. 64: a pass of at most `band` rows
+ * runs the scalar decode kernels -- each row its alone bytes -- instead of the WMMA form above 48 rows; absent: 48, today) */
+static const RadParamSpec pDs41AttnSparseSinkG[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format"), P_INTO("band") };
+static const RadParamSpec pDs41AttnSparseSinkRtG[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format"), P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"),
+    P_STR("format"), P_STR("block_scale"), P_INTO("band") };
 static const RadParamSpec pDs41LatUnpack[] = { P_INT("M"), P_INT("dim"), P_INT("ratio"), P_STR("latent_format") };
 static const RadOperandSpec oDs41LatUnpack[] = {
     { "comp_cache", RAD_OPD_IN, 0 }, { "comp_bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
@@ -130,7 +139,7 @@ static const RadConstraint cDs41LatUnpack[] = {
     C_GE("M", 1), C_EQ("dim", 512), C_GE("ratio", 1), C_LE("ratio", 64), C_IN("latent_format", "nvfp4"),
 };
 static const RadConstraint cDs41LatGather[] = {
-    C_GE("M", 1), C_LE("M", 48), C_EQ("dim", 512), C_GE("ratio", 1), C_LE("ratio", 64), C_GE("topk", 1),
+    C_GE("M", 1), C_LE("M", 64),   /* tp8 loop D25 step 3: 64 (a depth-3 decode segment of 16 x 4); the kernel takes any height */ C_EQ("dim", 512), C_GE("ratio", 1), C_LE("ratio", 64), C_GE("topk", 1),
     C_LE("topk", 2048), C_IN("latent_format", "nvfp4"),
 };
 static const RadConstraint cDs41AttnSparseSinkLu[] = {
@@ -146,12 +155,12 @@ static const RadConstraint cDs41AttnSparseSinkRtLu[] = {
     C_IN("format", "fp8_e4m3 fp4_e2m1"), C_IN("block_scale", "ue8m0 e4m3 f32"),
 };
 static const RadConstraint cDs41AttnSparseSinkGth[] = {
-    C_GE("M", 1),       C_LE("M", 48),    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("M", 1),       C_LE("M", 64),   /* tp8 loop D25 step 3: to 64 (above 48 rows the decode band only under `band`) */    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
     C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
     C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"),
 };
 static const RadConstraint cDs41AttnSparseSinkRtGth[] = {
-    C_GE("M", 1),       C_LE("M", 48),    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("M", 1),       C_LE("M", 64),   /* tp8 loop D25 step 3 */    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
     C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
     C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"), C_GE("rot", 2), C_DIV("rot", 2), C_GE("off", 0),
     C_GE("inverse", 0), C_LE("inverse", 1), C_IN("mode", "gptj neox"), C_GE("block", 1),
@@ -217,13 +226,15 @@ SCHEMA("attn_sparse_sink_unpacked", pDs41AttnSparseSinkLu, oDs41AttnSparseSinkLu
 SCHEMA("attn_sparse_sink_rope_roundtrip_unpacked", pDs41AttnSparseSinkRtLu, oDs41AttnSparseSinkRtLu,
        "attn_sparse_sink_rope_roundtrip (operands q .. cos_sin, its parameters) with the attention's WMMA passes "
        "reading `unpacked` as attn_sparse_sink_unpacked: the same out. Lever DKV-U (device-only)."),
-SCHEMA("attn_sparse_sink_gathered", pDs41AttnSparseSink, oDs41AttnSparseSinkGth,
+SCHEMA("attn_sparse_sink_gathered", pDs41AttnSparseSinkG, oDs41AttnSparseSinkGth,
        "attn_sparse_sink (operands q .. out, its parameters; latent_format nvfp4) whose decode-band pass reads the "
        "selected entries from `gathered` (latent_gather's rows for the same sel, cache, block table and "
-       "cu_seqlens) instead of unpacking the cache: the same out. Lever DKV-G (device-only)."),
-SCHEMA("attn_sparse_sink_rope_roundtrip_gathered", pDs41AttnSparseSinkRt, oDs41AttnSparseSinkRtGth,
+       "cu_seqlens) instead of unpacking the cache: the same out. band 49 .. 64 (optional): passes of at most band "
+       "rows in the decode band (each row its own bytes, as a pass of <= 48 rows), not attn_sparse_sink's WMMA form "
+       "above 48 rows. Lever DKV-G (device-only)."),
+SCHEMA("attn_sparse_sink_rope_roundtrip_gathered", pDs41AttnSparseSinkRtG, oDs41AttnSparseSinkRtGth,
        "attn_sparse_sink_rope_roundtrip (operands q .. cos_sin, its parameters) with the selected entries read from "
-       "`gathered`, as attn_sparse_sink_gathered: the same out. Lever DKV-G (device-only)."),
+       "`gathered`, as attn_sparse_sink_gathered (band as there): the same out. Lever DKV-G (device-only)."),
 
 #elif defined(R4D_DS41_ROWS)
 

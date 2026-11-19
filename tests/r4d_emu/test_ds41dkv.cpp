@@ -193,7 +193,9 @@ Fix make(uint32_t seed, int H, int ratio, const std::vector<std::pair<int, int>>
 struct View {
     int r0 = 0, n = 0;
     std::vector<int32_t> cu;   /* empty: the fixture's */
+    int s0 = 0;                /* tp8 loop D25 step 3: the view's first sequence (its per-sequence tables start there, as step_bi slices a piece's) */
 };
+long long g_band = 0;          /* tp8 loop D25 step 3: > 0 -> the gathered attentions get libr4d's per-op `band` */
 
 /* the attention operands (11; 12 with cos_sin for the fold), then `extra` (unpacked / gathered) */
 int attn(RadLaunchFn fn, const Fix& f, const View& v, bool packed, bool fold, uint16_t* out, const RadTensor* extra) {
@@ -202,11 +204,11 @@ int attn(RadLaunchFn fn, const Fix& f, const View& v, bool packed, bool fold, ui
     std::vector<RadTensor> t = {
         tens(f.q.data() + (size_t)v.r0 * f.H * kD, RAD_BF16, { v.n, (int64_t)f.H * kD }),
         tens(f.wc.data(), RAD_BF16, { f.nwblk, 1, f.bs, kD }),
-        tens(f.wbt.data(), RAD_I32, { S, f.nwbt }),
-        tens(f.wused.data(), RAD_I32, { S }),
+        tens(f.wbt.data() + (size_t)v.s0 * f.nwbt, RAD_I32, { S, f.nwbt }),
+        tens(f.wused.data() + v.s0, RAD_I32, { S }),
         packed ? tens(f.pk.data(), RAD_BF16, { f.ncblk, 1, f.ratio, kSlots / f.ratio })
                : tens(f.cc.data(), RAD_BF16, { f.ncblk, 1, f.ratio, kD / f.ratio }),
-        tens(f.cbt.data(), RAD_I32, { S, f.ncbt }),
+        tens(f.cbt.data() + (size_t)v.s0 * f.ncbt, RAD_I32, { S, f.ncbt }),
         tens(f.sel.data() + (size_t)v.r0 * f.topk, RAD_I32, { v.n, f.topk }),
         tens(f.pos.data() + v.r0, RAD_I32, { v.n }),
         tens(cu.data(), RAD_I32, { S + 1 }),
@@ -228,6 +230,9 @@ int attn(RadLaunchFn fn, const Fix& f, const View& v, bool packed, bool fold, ui
         p.push_back(pstr("block_scale", "ue8m0"));
     }
     if (extra) t.push_back(*extra);
+    if (extra && g_band > 0 && (fn == r4d_rad_ds41_attn_sparse_sink_gathered ||
+                                fn == r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered))
+        p.push_back(pint("band", g_band));
     if (extra && g_plan_full > 0 && (fn == r4d_rad_ds41_attn_sparse_sink_unpacked ||
                                      fn == r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked))
         p.push_back(pint("plan_full", 1));
@@ -258,7 +263,7 @@ int gather(const Fix& f, const View& v, uint16_t* g, int64_t pitch) {
     const std::vector<int32_t>& cu = v.cu.empty() ? f.cu : v.cu;
     const int S = (int)cu.size() - 1;
     RadTensor t[5] = { tens(f.pk.data(), RAD_BF16, { f.ncblk, 1, f.ratio, kSlots / f.ratio }),
-                       tens(f.cbt.data(), RAD_I32, { S, f.ncbt }),
+                       tens(f.cbt.data() + (size_t)v.s0 * f.ncbt, RAD_I32, { S, f.ncbt }),
                        tens(f.sel.data() + (size_t)v.r0 * f.topk, RAD_I32, { v.n, f.topk }),
                        tens(cu.data(), RAD_I32, { S + 1 }), tens(g, RAD_BF16, { v.n, pitch }) };
     RadParam p[5] = { pint("M", v.n), pint("dim", kD), pint("ratio", f.ratio), pint("topk", f.topk),
@@ -431,6 +436,53 @@ void case_g(const char* name, const Fix& f, const View& v, bool fold, bool mutat
                 mutate ? (dm > 0 ? "; mutation seen" : "; MUTATION NOT SEEN") : "");
 }
 
+/* tp8 loop D25 step 3 (DECODE round 21, RADIANCE_DS41_DKV_GPIECE=2): a decode segment of 49 .. 64 rows (16 sequences x 4 at
+ * depth 3) gathered once and attended in ONE launch under libr4d's per-op band 64 = the same segment in F58's band pieces of
+ * whole sequences (each <= 48 rows, today's issue) and = every sequence alone, bit for bit; without the band the 64-row launch
+ * takes the WMMA form (not those bits: the case shows the band is what keeps them). */
+void case_one(const char* name, const Fix& f, const std::vector<std::pair<int, int>>& pieces, bool fold) {
+    const int M = f.M;
+    const size_t no = (size_t)M * f.H * kD, rw = (size_t)f.H * kD;
+    const RadLaunchFn gat = fold ? r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered : r4d_rad_ds41_attn_sparse_sink_gathered;
+    const int64_t pitch = (int64_t)f.topk * kD;
+    std::vector<uint16_t> gbuf((size_t)(M * pitch + 8), 0x4444);
+    uint16_t* g = (uint16_t*)(((uintptr_t)gbuf.data() + 15) & ~(uintptr_t)15);
+    const View all{ 0, M, {}, 0 };
+    expect(gather(f, all, g, pitch) == RAD_OK, name, "latent_gather 64 rows");
+    const RadTensor gt = tens(g, RAD_BF16, { M, pitch });
+    std::vector<uint16_t> one(no, 0x1111), byp(no, 0x2222), alone(no, 0x3333), wm(no, 0x6666);
+    g_band = 64;
+    expect(attn(gat, f, all, true, fold, one.data(), &gt) == RAD_OK, name, "one launch, band 64");
+    g_band = 0;
+    expect(attn(gat, f, all, true, fold, wm.data(), &gt) == RAD_OK, name, "one launch, no band (the WMMA form)");
+    /* the pieces: whole sequences [s0, s1), each its own gather at its rows and its own launch (today's issue) */
+    for (const auto& pc : pieces) {
+        const int s0 = pc.first, s1 = pc.second, r0 = f.cu[(size_t)s0], n = f.cu[(size_t)s1] - r0;
+        View v{ r0, n, {}, s0 };
+        for (int s = s0; s <= s1; ++s) v.cu.push_back(f.cu[(size_t)s] - r0);
+        std::vector<uint16_t> pb((size_t)(n * pitch + 8), 0x4444);
+        uint16_t* pg = (uint16_t*)(((uintptr_t)pb.data() + 15) & ~(uintptr_t)15);
+        expect(gather(f, v, pg, pitch) == RAD_OK, name, "latent_gather piece");
+        const RadTensor pt = tens(pg, RAD_BF16, { n, pitch });
+        expect(attn(gat, f, v, true, fold, byp.data() + (size_t)r0 * rw, &pt) == RAD_OK, name, "piece launch");
+    }
+    for (int s = 0; s + 1 < (int)f.cu.size(); ++s) {
+        const int r0 = f.cu[(size_t)s], n = f.cu[(size_t)s + 1] - r0;
+        View v{ r0, n, { 0, n }, s };
+        std::vector<uint16_t> sb((size_t)(n * pitch + 8), 0x4444);
+        uint16_t* sg = (uint16_t*)(((uintptr_t)sb.data() + 15) & ~(uintptr_t)15);
+        expect(gather(f, v, sg, pitch) == RAD_OK, name, "latent_gather alone");
+        const RadTensor st = tens(sg, RAD_BF16, { n, pitch });
+        expect(attn(gat, f, v, true, fold, alone.data() + (size_t)r0 * rw, &st) == RAD_OK, name, "sequence alone");
+    }
+    const int64_t dp = ndiff(one, byp), da = ndiff(one, alone), dw = ndiff(wm, byp);
+    expect(dp == 0, name, "the band-64 launch differs from the band pieces", dp, (long long)no);
+    expect(da == 0, name, "the band-64 launch differs from every sequence alone", da, (long long)no);
+    std::printf("%-58s rows %d seqs %d pieces %zu: one launch (band 64) vs pieces %lld / vs alone %lld of %zu differ; "
+                "without the band (WMMA) vs pieces %lld\n", name, M, (int)f.cu.size() - 1, pieces.size(), (long long)dp,
+                (long long)da, no, (long long)dw);
+}
+
 /* every scale byte x every code through latent_unpack's decode (and the WMMA form's v3 decode, via the plan's rows),
  * against the host decode; NaN scale bytes (0x7f, 0xff) reported, not required */
 void case_decode_all() {
@@ -525,6 +577,20 @@ int main() {
         const Fix f = make(56, 16, 1, { { 8, 2600 }, { 32, 3999 } });
         case_g("G: 40 rows, tiled PV", f, { 0, 40, {} }, false, true);
         case_g("G+fold d: 40 rows", f, { 0, 40, {} }, true);
+    }
+    /* tp8 loop D25 step 3: a 64-row decode segment (16 sequences x 4 rows; F58's pieces 8 + 8 sequences) and a 56-row one */
+    {
+        std::vector<std::pair<int, int>> sq;
+        for (int s = 0; s < 16; ++s) sq.push_back({ 4, 1500 + 211 * s });
+        const Fix f = make(57, 16, 1, sq, 512);
+        case_one("ONE: 64 rows = 16 x 4, ratio 1, topk 512", f, { { 0, 8 }, { 8, 16 } }, false);
+        case_one("ONE+fold d: 64 rows = 16 x 4", f, { { 0, 8 }, { 8, 16 } }, true);
+    }
+    {
+        std::vector<std::pair<int, int>> sq;
+        for (int s = 0; s < 14; ++s) sq.push_back({ 4, 2100 + 97 * s });
+        const Fix f = make(58, 16, 2, sq, 256);
+        case_one("ONE: 56 rows = 14 x 4, ratio 2, topk 256", f, { { 0, 7 }, { 7, 14 } }, false);
     }
     std::printf("ds41 DKV: %d checks, %d failure(s)\n", g_check, g_fail);
     return g_fail ? 1 : 0;

@@ -3508,9 +3508,9 @@ bool lu_operand(const RadTensor* u, long* cap) {
  * bf16: row m's selection j at m pitch + j D) -- lever NVG's plain-kernel pass, no gather of its own. false: not
  * that pass (the op runs as without the operand). */
 template <class A>
-bool g_fold(const A& s, const RadTensor* g, A* out) {
+bool g_fold(const A& s, const RadTensor* g, A* out, long band = kWmRows) {
     const long topk = (long)s.nk - s.win;
-    if (!g || !g->data || !s.cnv || s.M > kWmRows || topk < 1 || g->dtype != RAD_BF16 || g->rank != 2 ||
+    if (!g || !g->data || !s.cnv || s.M > band || topk < 1 || g->dtype != RAD_BF16 || g->rank != 2 ||
         g->shape[0] < s.M || g->shape[1] < topk * kDsAttnD || g->stride[1] != 1 || (g->stride[0] % 8) ||
         !aligned(g->data, 16))
         return false;
@@ -3703,6 +3703,16 @@ int attn_setup(const RadArgs* a, DsAttnArgs* res) {
     return RAD_OK;
 }
 
+/* tp8 loop D25 step 3 (DECODE round 21): the op's int `band` (49 .. 64; absent or out of range: kWmRows) moves the top of the
+ * decode band for THIS op -- a pass of at most `band` rows runs the scalar decode kernels (libref's bits: every row its own
+ * chains, so its alone bytes whatever the pass height), above it the WMMA forms as today. Only deepseek41's gathered decode
+ * attentions declare it (RADIANCE_DS41_DKV_ONE=1: a 49 .. 64-row decode segment in ONE launch instead of F58's band pieces);
+ * every other op runs kWmRows as before. */
+long dec_band(const RadArgs* a) {
+    const long long b = a ? r4d_geti_or(a, "band", kWmRows) : kWmRows;
+    return b > kWmRows && b <= 64 ? (long)b : (long)kWmRows;
+}
+
 /* lu (lever DKV-U, attn_sparse_sink_unpacked's operand): a WMMA pass over the packed latent reads the plan's rows;
  * gth (lever DKV-G, attn_sparse_sink_gathered's): a decode-band pass over the packed latent reads latent_gather's rows.
  * Either absent, or not usable for the pass: today's launches. */
@@ -3716,12 +3726,13 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
     const long long H = s.H;
     const float scale = s.scale;
     const RadTensor &q = a->t[0], &out = a->t[10];
+    const long band = dec_band(a);   /* tp8 loop D25 step 3: kWmRows unless the op declares a wider band */
     /* Prefill heights on WMMA (16-byte q and out rows); the decode band on the scalar kernels
      * below (libref's bits). */
     {
         const int nkt = (s.nk + 15) / 16;
         const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes + ((s.cnv || s.wf8) ? kWmNvBytes : 0);
-        if (s.M > kWmRows && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
+        if (s.M > band && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
             aligned(out.data, 16) && lds <= 65536 && (H + 15) / 16 <= 65535) {
             const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
             const dim3 grid((unsigned)((H + 15) / 16), gy);
@@ -3752,14 +3763,14 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
     /* Head group and d split by how many workgroups the rows give. Every choice sums each output
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
-    if (rows <= kWmRows && gth) {   /* lever DKV-G */
+    if (rows <= band && gth) {   /* lever DKV-G */
         DsAttnArgs g{};
-        if (g_fold(s, gth, &g)) {
+        if (g_fold(s, gth, &g, band)) {
             const int rc = attn_dec_emit<false>(stream, g);
             if (rc != RAD_E_UNSUPPORTED) return rc;
         }
     }
-    if (rows <= kWmRows) {
+    if (rows <= band) {
         DsAttnArgs g{};
         const int gr = nv_gather(stream, a, s, &g);   /* lever NVG (off unless RADIANCE_DS41_NVGATHER) */
         if (gr != RAD_OK && gr != RAD_E_UNSUPPORTED) return gr;
@@ -3826,7 +3837,8 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
     if (!cs.data || !pos.data || !out.data || cs.dtype != RAD_F32 || cs.rank != 2 || cs.shape[1] != rot ||
         out.rank != 2)
         return R4D_NO(RAD_E_SHAPE);
-    if (out.shape[0] <= kWmRows && gptj && !(off & 1) && block == 32) {
+    const long band = dec_band(a);   /* tp8 loop D25 step 3 */
+    if (out.shape[0] <= band && gptj && !(off & 1) && block == 32) {
         DsAttnArgs s{};
         const int rc = attn_setup(a, &s);
         if (rc != RAD_OK) return rc;
@@ -3842,7 +3854,7 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
         so.o.sc = sc;
         so.o.sign = inv ? -1.0f : 1.0f;
         DsAttnArgsOrt sg{};
-        if (gth && g_fold(so, gth, &sg)) {   /* lever DKV-G */
+        if (gth && g_fold(so, gth, &sg, band)) {   /* lever DKV-G */
             const int rc4 = attn_dec_emit<true>(stream, sg);
             if (rc4 != RAD_E_UNSUPPORTED) return rc4;
         }
