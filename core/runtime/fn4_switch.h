@@ -474,6 +474,11 @@
  *                   set). A body reserve's boundary (pp_fol_reserve) splits the pass whatever the set. RADIANCE_PP_SEG_SET=v on the
  *                   follower starts it at v; the follower takes the leader's request (its own check: boundaries declared; the
  *                   leader checks the range only). Order only: where a pass's segments end, never a pass's ops (rule A, M4).
+ *   exl3_x3d_pf     exl3r4d (A10, ds41-x3d-pf 12.11.; tp8 loop PX1 on the served plugin line ds41-u14-band 4fd50e4; 96 here, after
+ *                   pp_seg_set): 0 (today) or 1 -- K = 2's prefill-band (M > 16) map-form GEMM decodes a lane's eight trellis states
+ *                   from ONE word pair (decode_frags_x3d, the decode band's X3D-F form): the same f16 weights, each output's WMMA
+ *                   order unchanged -- the same bytes (Xeon GPU2: y at M 17 / 64 / 1,150 / 4,096 identical to 0). -1 when no loaded
+ *                   object serves it (an exl3r4d before 4fd50e4).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
@@ -691,7 +696,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
