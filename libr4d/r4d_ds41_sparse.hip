@@ -25,6 +25,7 @@
 // libref's bits (kbench tolerance): attn_sparse_sink with an online softmax, v_exp_f32 and P as
 // bf16 hi + lo; index_score with only the dot's summation order changed (every rounding after it
 // is libref's). The decode band keeps the exact kernels, so speculative verify reproduces decode.
+// (fn4 ix_lds bit 1, lever IXW: index_score's decode band on the WMMA form too -- every height the same form.)
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -3423,13 +3424,18 @@ int ix_env(const char* name) {
     const char* e = std::getenv(name);
     return e && e[0] == '1' && !e[1] ? 1 : 0;
 }
+/* ix_lds's start value: RADIANCE_DS41_IX_LDS = 1 (as before), 2 or 3 (lever IXW below: bit 1); anything else 0. */
+int ix_lds_env() {
+    const char* e = std::getenv("RADIANCE_DS41_IX_LDS");
+    return e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0;
+}
 std::atomic<int> g_ix_lds{-1}, g_ix_ni{-1}, g_ix_mut{0};
 std::atomic<long long> g_ix_lds_launch{0}, g_ix_lds_rows{0}, g_ix_ni_launch{0}, g_ix_ni_cand{0};
 int ix_lds_on() {
     int v = g_ix_lds.load(std::memory_order_relaxed);
     if (v < 0) {
         int unread = -1;
-        g_ix_lds.compare_exchange_strong(unread, ix_env("RADIANCE_DS41_IX_LDS"));
+        g_ix_lds.compare_exchange_strong(unread, ix_lds_env());
         v = g_ix_lds.load(std::memory_order_relaxed);
     }
     return v;
@@ -3534,11 +3540,18 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     if (s.ni) g_ix_ni_launch.fetch_add(1, std::memory_order_relaxed);
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
      * kernel below (libref's bits). The form is picked by the pass height alone, with or without
-     * keep, so a kept entry's score is the unrestricted op's. */
-    if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
+     * keep, so a kept entry's score is the unrestricted op's.
+     * Lever IXW (DRAFTER track round 21, fn4 ix_lds bit 1 = values 2 / 3): the decode band (<= kWmRows rows: decode,
+     * speculative verify, the 64-row band's pieces) takes the same WMMA forms (a wave a row, only the dot's summation order
+     * differs from libref): rule B -- a row's score is then the one the prefill heights give the same row, whatever the pass
+     * height, the rows beside it or keep (deterministic and batch-invariant against its own reference, not the scalar bits).
+     * One card (tools/dbench/ibench --wm 1, read-cold): 48 rows (16 x 3) at 2.4k positions 179.5 -> 61.3 us, 32 rows 122.4
+     * -> 36.5, 48 rows at 1.2k 105.7 -> 33.5. Bit 0 (the LDS form) stays at prefill heights. */
+    const int ixl = ix_lds_on();
+    if ((s.M > kWmRows || (ixl & 2)) && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
-        /* lever IX-LDSR2 (ix_lds 1): the LDS form, without keep, over MXFP4 keys -- the same bits */
-        if (!keep && s.kmx && ix_lds_on() > 0 && (s.M + 8 * kIwLdsRows - 1) / (8 * kIwLdsRows) <= 65535) {
+        /* lever IX-LDSR2 (ix_lds bit 0): the LDS form, without keep, over MXFP4 keys -- the same bits */
+        if (!keep && s.kmx && (ixl & 1) && s.M > kWmRows && (s.M + 8 * kIwLdsRows - 1) / (8 * kIwLdsRows) <= 65535) {
             g_ix_lds_launch.fetch_add(1, std::memory_order_relaxed);
             g_ix_lds_rows.fetch_add(s.Mv, std::memory_order_relaxed);
             const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 8 * kIwLdsRows - 1) / (8 * kIwLdsRows)));
@@ -4452,7 +4465,7 @@ extern "C" int r4d_rad_ds41_index_score(const RadArgs* a, RadStream stream) {
  * selftest's mutation hook. */
 int r4d_ix_lds_get() { return ix_lds_on(); }
 int r4d_ix_ni_get() { return ix_ni_on(); }
-void r4d_ix_lds_set(int v) { g_ix_lds.store(v ? 1 : 0, std::memory_order_relaxed); }
+void r4d_ix_lds_set(int v) { g_ix_lds.store(v >= 0 && v <= 3 ? v : 0, std::memory_order_relaxed); }   /* bit 0 IX-LDSR2, bit 1 IXW */
 void r4d_ix_ni_set(int v) { g_ix_ni.store(v ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_ix_mutate(int which) { g_ix_mut.store(which, std::memory_order_relaxed); }
 /* out[0] LDS-form launches, [1] their rows (the run rows each launch holds), [2] index_score launches under ix_ni, [3]
