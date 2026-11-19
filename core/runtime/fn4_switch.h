@@ -436,7 +436,7 @@
  *                   newcomers' routed MoE as one pass a layer. Exact: multi-prefill steps are one process's (lever NOA / P23).
  *   pp_bg_join_ms   engine, the leader (tp8 loop P23s; 89): RADIANCE_PP_BG_JOIN_MS in process, 0 (off) or 1 .. 60000; with pp_bg_room.
  *   ds41_twin       deepseek41 (tp8 loop P30t; 90, after pp_bg_join_ms): mask + 256 x rows -- the twin classes (1 attn_q_a +
- *                   attn_kv, 2 attn_q_b, 4 attn_output_a + _b, 8 engram_kv, 16 other) whose IQR twin ('<name>#pf' in the weight
+ *                   attn_kv, 2 attn_q_b, 4 attn_output_a + _b, 8 engram_kv, 16 the shared expert, 32 other) whose IQR twin ('<name>#pf' in the weight
  *                   sidecar) a PROMPT segment of >= rows rows (0 = RADIANCE_DS41_TWIN_ROWS) issues; decode rows keep the GGUF
  *                   launch. Starts at RADIANCE_DS41_TWIN; a subset of the env's classes (0 = every row GGUF). The follower takes
  *                   it with the leader's. Exact class: rule B (a prompt row's bytes are its own segment's).

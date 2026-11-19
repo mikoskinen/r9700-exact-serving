@@ -1036,12 +1036,13 @@ static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t d
  * <name>, both resident), and a PROMPT segment's rows of that linear run on the twin (its quantiser + gemm_nt_q) while decode rows
  * keep the published GGUF launch (no change to a decode row's bytes by construction). Classes (mask bits): 1 = attn_q_a +
  * attn_kv, 2 = attn_q_b, 4 = attn_output_a (every group) + attn_output_b, 8 = engram_kv (lever E1's dedup issue keeps GGUF), 16 =
- * any other dense name. RADIANCE_DS41_TWIN_ROWS=N (default 1): a prompt segment of fewer rows keeps GGUF. In process: fn4
+ * the shared expert's gate_up + down (MoeFP8 Config::shared_twin: plain int8 twins, the arm on lane 0 for a twin pass), 32 = any
+ * other dense name. RADIANCE_DS41_TWIN_ROWS=N (default 1): a prompt segment of fewer rows keeps GGUF. In process: fn4
  * ds41_twin = mask + 256 x rows (rows 0 = the env's), a subset of the env's mask (0 = every row GGUF = the published program).
  * A prompt row's bytes are then its own segment's (M = the segment's rows, issued by segment; a segment's sub-range -- an SP
  * quarter, a P13 / P15 piece -- keeps GGUF), so they do not depend on the other rows of the pass: rule B (own reference). */
 static constexpr const char kTwinSfx[] = "#pf";
-enum : int { kTwQkv = 1, kTwQb = 2, kTwOab = 4, kTwEng = 8, kTwOther = 16, kTwAll = 31 };
+enum : int { kTwQkv = 1, kTwQb = 2, kTwOab = 4, kTwEng = 8, kTwShx = 16, kTwOther = 32, kTwAll = 63 };
 static int twin_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_TWIN");
@@ -1075,6 +1076,7 @@ static int twin_class(const char* name) {
     if (std::strstr(name, ".attn_q_b.")) return kTwQb;
     if (std::strstr(name, ".attn_output_a") || std::strstr(name, ".attn_output_b.")) return kTwOab;
     if (std::strstr(name, ".engram_kv.")) return kTwEng;
+    if (std::strstr(name, "_shexp.")) return kTwShx;
     return kTwOther;
 }
 static int twin_mask_now() {
@@ -1089,6 +1091,8 @@ static int64_t twin_rows_now() {
 }
 /* The twin classes for the rows a by-segment launch issues: a prompt segment (not decode) of at least twin_rows_now() rows,
  * outside a sub-range; restored at the scope's end so nothing outside a segment's launch takes the twin. */
+/* the shared expert's twin for the MoE pass being issued (MoeFP8::twin_now) */
+static bool twin_shx_now() { return (t_twin & kTwShx) != 0; }
 struct TwinScope {
     int prev;
     TwinScope(bool prompt, int64_t n) : prev(t_twin) {
@@ -4253,6 +4257,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.shared_one_external = m.sone && g.n_ff > 0 ? 1 : 0;
     /* Lever K1 fold e: the shared arm's clamped SwiGLU + GGUF down as one op beside the pair (RADIANCE_DS41_SWFOLD). */
     s.cfg.shared_swfold = g_sw_swf_env.load(std::memory_order_relaxed) > 0 && g.n_ff > 0 ? 1 : 0;
+    s.cfg.shared_twin = (twin_env() & kTwShx) && g.n_ff > 0 ? 1 : 0;   /* tp8 loop P30t */
     /* Lever FUSE-R: the router chain's fused forms beside the separate ops (RADIANCE_DS41_RFUSE set) */
     s.cfg.rfuse_decl = rf_declared() ? 1 : 0;
     /* Lever P: the decode-band-bytes EXL3 pair over 17 .. kMoe1Max rows beside gate_up / down (RADIANCE_DS41_MOE1 set) */
@@ -4294,6 +4299,10 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
     L.moe.gar_live = &g_sw_gar;
     L.moe.shexp_lane = &g_sw_shexp;
+    if (L.moe.sh_tw) {   /* tp8 loop P30t: the shared arm's int8 twins */
+        L.moe.twin_now = &twin_shx_now;
+        m.twin_mask |= kTwShx;
+    }
     if (s.cfg.shared_one_external) {
         L.moe.sone_live = &g_sw_one;
         if (L.moe.gfold) g_sw_one_ok.store(1, std::memory_order_relaxed);
@@ -6421,6 +6430,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ++per[m.twcls.at(th)];
             ++nw;
         }
+        for (const Layer& L : m.layers)
+            if (L.moe.sh_tw) {   /* the shared arm's two */
+                per[kTwShx] += 2;
+                nw += 2;
+            }
         int cur = g_twin_decl.load(std::memory_order_relaxed);
         while (!g_twin_decl.compare_exchange_weak(cur, cur | m.twin_mask)) {}
         if (ctx->rank == 0) {
@@ -8676,6 +8690,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
          * P26 may issue them over an SP quarter (its static conditions at this switch level); the Engram kv under the SP Engram */
         t_tw_off = !m.twin_mask ? 0
                  : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng ? kTwEng : 0) |
+                   (bi_pmm(g_sw_bi.load(std::memory_order_relaxed)) ? kTwShx : 0) |
                    (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score ? kTwQkv : 0);
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
@@ -9643,7 +9658,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         } else if (sp_l) {
             /* tp8 loop P20: the MoE over every row as the pass issues it (one pass from row 0: router, experts, shared arm,
              * gather), its all-reduce's first half by the plugin -- this rank's quarter of the delta */
-            L.moe.pass(x, T, 0, T, false, nullptr);
+            {
+                const TwinScope tws(sg.size() == 1 && !sg[0].dec, T);   /* tp8 loop P30t: the lone prompt segment's pass */
+                L.moe.pass(x, T, 0, T, false, nullptr);
+            }
             RAD_ISSUE_N(x, m.sp_rs_f, T * D, brows(m.act.x, T), RAD_NONE);
             if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
         } else
@@ -9673,6 +9691,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             } else if (!bi_onear(biv)) {   /* ds41_bi 1 .. 4: int12's issue, unchanged */
                 for (const BiSeg& s : sg) {
                     if (!s.dec || s.n <= piece) {
+                        const TwinScope tws(!s.dec, s.n);   /* tp8 loop P30t: a prompt segment's shared arm on its twin */
                         L.moe.pass(x, T, s.r0, s.n, true, bsp);
                         if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
                         continue;
@@ -9685,7 +9704,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             } else {
                 /* the passes (first row, rows) in the order 1 .. 4 issue them */
                 static thread_local std::vector<std::pair<int64_t, int64_t>> passes;
+                static thread_local std::vector<int64_t> pass_pf;   /* tp8 loop P30t: a pass that is one whole prompt segment: its rows */
                 passes.clear();
+                pass_pf.clear();
                 /* lever PMM (ds41_bi 7): a prefill segment of >= kPmmMin rows right after the previous one (also of
                  * >= kPmmMin rows) joins its pass */
                 const bool pmm = bi_pmm(biv);
@@ -9695,12 +9716,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     const bool pf = !s.dec && s.n >= kPmmMin;
                     if (pmm && pf && prev_pf && passes.back().first + passes.back().second == s.r0) {
                         passes.back().second += s.n;
+                        pass_pf.back() = 0;
                         ++merged;
                         continue;
                     }
                     prev_pf = pf;
-                    if (!s.dec || s.n <= piece) { passes.emplace_back(s.r0, s.n); continue; }
-                    for (int64_t a = 0; a < s.n; a += piece) passes.emplace_back(s.r0 + a, std::min(piece, s.n - a));
+                    if (!s.dec || s.n <= piece) {
+                        passes.emplace_back(s.r0, s.n);
+                        pass_pf.push_back(s.dec ? 0 : s.n);
+                        continue;
+                    }
+                    for (int64_t a = 0; a < s.n; a += piece) {
+                        passes.emplace_back(s.r0 + a, std::min(piece, s.n - a));
+                        pass_pf.push_back(0);
+                    }
                 }
                 if (merged > 0 && l == 0 && rad_rank(x) == 0) {
                     const long long n = g_pmm_steps.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9716,7 +9745,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const bool onear = passes.size() > 1 && !cut && !L.moe.op_moe_ar && !L.moe.op_shared_ar &&
                                    !L.moe.op_combine && !L.moe.op_add && !L.moe.ar_out && L.moe.issues_ar(T, T) &&
                                    !gather_taken(m.g, T, L.moe.gather_out_rows, L.moe.gather_out_rows6);
-                for (const auto& ps : passes) {
+                for (size_t pi = 0; pi < passes.size(); ++pi) {
+                    const auto& ps = passes[pi];
+                    const TwinScope tws(pass_pf[pi] > 0, pass_pf[pi]);   /* tp8 loop P30t: a whole prompt segment's pass */
                     L.moe.pass(x, T, ps.first, ps.second, !onear, bsp);
                     if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
                 }
