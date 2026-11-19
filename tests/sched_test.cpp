@@ -3580,14 +3580,31 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     fn4::lead_seg_register(false);
 }
 
-/* tp8 loop D33 (DECODE round 26): pp_seg_set is 95, the last, the FOLLOWER's engine switch (requested from the leader's table, not a
+/* tp8 loop D33 (DECODE round 26): pp_seg_set is 95 (the last until PX1's exl3_x3d_pf, 96), the FOLLOWER's engine switch (requested from the leader's table, not a
  * plugin's, not the scheduler's); n + 64 x s with n 0 .. 31, s 0 .. 7; a node that registered nothing (the leader) checks the range
  * only; a follower with no declared boundary takes 0 only and names RADIANCE_PP_SEG_LAYERS; one with boundaries takes every value. */
+/* tp8 loop PX1 (PREFILL round 28): exl3_x3d_pf is 96, the last, the exl3r4d plugin's (A10 / PX2: the prefill band's one-word-pair /
+ * unpacked-state decode) -- not the scheduler's; a pipeline's follower takes it from its leader as every plugin switch; with no
+ * exl3r4d loaded nothing serves it, so a request is refused with a reason (a start with the plugin takes 0 .. 3, its own range). */
+TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
+    const int i = fn4::switch_index("exl3_x3d_pf");
+    REQUIRE(i == (int)fn4::kExl3X3dPf);
+    CHECK_EQ(i, 96);
+    CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
+    CHECK(!fn4::sched_switch(i));
+    CHECK(fn4::follower_switch(i));
+    std::string err;
+    CHECK(!fn4::check("exl3_x3d_pf", 1, &err));
+    CHECK(!err.empty());
+}
+
 TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
@@ -11528,7 +11545,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12500,7 +12517,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
