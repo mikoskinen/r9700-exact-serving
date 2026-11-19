@@ -422,6 +422,12 @@
  *                   with 1 / 2 / 4 / 8 heads a workgroup, 4 .. 6 tiled at 512 threads with 8 / 4 / 2, 7 / 8 direct PV at 512
  *                   threads with 8 / 4; a form the LDS refuses takes the rule's next form). Every form sums each output in the same order: the same bytes (r4d_emu
  *                   test_ds41attn's D26 case). RADIANCE_DS41_ATTN_DEC=N starts at N. -1 when no loaded object serves it.
+ *   ds41_tsk        libr4d (lever TSK, ds41-drafter round 15; 85 here, after ds41_attn_dec; 83 on ds41-drafter; r4d_ds41_sparse.hip):
+ *                   0 off (today), 1 the compressing layers' decode-band attention (<= 48 rows) in the split-key WMMA form --
+ *                   key chunks fixed by key index, a merge in ascending order with the o rope + fp8 round trip in it. Needs
+ *                   RADIANCE_DS41_TSK=0 / 1 at load (the op's scratch sized; 1 starts it on). Rule B: deterministic and
+ *                   batch-invariant against its own reference, not the decode band's bits. Where it serves a pass, ds41_attn_dec's
+ *                   form choice does not apply (the decode band's forms are not issued).
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -633,7 +639,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec,
-              kSwitches };
+              kDs41Tsk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
