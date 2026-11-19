@@ -4525,7 +4525,9 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * fused launch, gemm_nt_f32) in wider forms: 1 both, 2 the router only, 3 gemm_nt_f32 only (RADIANCE_DS41_F32DEC at load);
  * the stock bytes. */
 /* Levers IX-LDSR2 / IX-NI (ds41-int9b, r4d_ds41_sparse.hip): "ix_lds" 0 / 1, index_score's LDS form (keys unpacked once a
- * workgroup, two rows a wave; the stock form's bits); "ix_ni" 0 / 1, no -inf past a row's reach in index_score's plane and
+ * workgroup, two rows a wave; the stock form's bits) -- + 2 (lever IXW, DRAFTER track round 21): the decode band (<= 48 rows)
+ * in the prefill heights' WMMA forms too (rule B: a row's score the same at every pass height; RADIANCE_DS41_IX_LDS=2 / 3 at
+ * load); "ix_ni" 0 / 1, no -inf past a row's reach in index_score's plane and
  * index_candidates reading below it only (the selection's bits). */
 int r4d_ix_lds_get();
 int r4d_ix_ni_get();
@@ -4573,7 +4575,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
-    if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
+    if (!std::strcmp(name, "ix_lds")) return value >= 0 && value <= 3 ? 1 : -1;   /* bit 0 IX-LDSR2, bit 1 IXW (the decode band in the WMMA forms, rule B) */
+    if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_arcoded")) return value >= 0 && value <= 1048576 ? 1 : -1;
     if (!std::strcmp(name, "ar_xpush")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
