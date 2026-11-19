@@ -143,7 +143,9 @@ extern "C" int r4d_shape_router_gemm_f32_scored_topk_scatter(const RadParam* p, 
                                                             RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), K = pi(p, n_p, "K"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
     const int64_t nl = pi(p, n_p, "n_local", ne);
-    if (M < 1 || M > 48 || K < 1 || ne < 1 || ne > 384 || k < 1 || k > ne || k > 32 || M * k > 1024 || nl < 1 ||
+    /* loop FINDINGS F72 (DECODE round 25): 64 = the kernel's own bound since lever RGP (kRgsMaxRows, r4d_ds41_elem.hip), which
+     * the core declares under RADIANCE_RGS_ROWS=64; 48 here refused the device bands of that declare at start */
+    if (M < 1 || M > 64 || K < 1 || ne < 1 || ne > 384 || k < 1 || k > ne || k > 32 || M * k > 1024 || nl < 1 ||
         nl > ne)
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
