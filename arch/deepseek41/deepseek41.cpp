@@ -1327,21 +1327,6 @@ static int dsp_awm_env() {
     }();
     return v;
 }
-/* Lever DRF (DRAFTER track 19.11.2026 round 9): RADIANCE_DS41_DSPARK_RF=1 (or on) at start, with the published
- * RADIANCE_DS41_RFUSE set, declares lever FUSE-R's fused router forms beside the DSpark stages' routers too (MoeFP8
- * Config::rfuse_decl) and lets the trunk's switch ds41_rfuse pick them: form 2 = gemm_nt_f32 + router_scored_topk +
- * moe_scatter in one launch at <= 48 rows (the drafter's passes are 16-40 rows). The lq162 stamps show the drafter's router
- * chain as three dependent launches a stage (gemm_nt_f32_tile 12 + router_scored 3 + scatter_small 2 us + two ~4-us gaps).
- * Exact: every FUSE-R form writes the separate ops' bytes. Unset / 0 / off: nothing declared, today's program. */
-static int dsp_rf_env() {
-    static const int v = [] {
-        const char* e = std::getenv("RADIANCE_DS41_DSPARK_RF");
-        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
-        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
-        return -1;
-    }();
-    return v;
-}
 /* Lever XR (ds41-etp-xr, 14.11.2026): RADIANCE_DS41_XRING=<MiB> (1 .. 1024) at start, with RADIANCE_DS41_ETP, declares
  * each trunk layer's EXL3 gate_up with interface v10's `xring` -- that much copy ring in its prefill scratch. exl3r4d's
  * map form then can (fn4 exl3_xr bit 2) copy the routed experts whose slices sit in the pinned host pool onto the card
@@ -3915,13 +3900,6 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                             "on every rank as width slices of %lld of %lld (expert tensor parallel; EP held %lld a rank)\n",
                     (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff, (long long)(d.n_expert / g.world));
     }
-    if (dsp_rf_env() < 0) {   /* lever DRF */
-        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_RF=%s is not 0 / off or 1 / on\n", std::getenv("RADIANCE_DS41_DSPARK_RF"));
-        return RAD_E_INVAL;
-    }
-    if (dsp_rf_env() > 0 && g.rank == 0 && !ctx->shape_probe)
-        fprintf(stderr, "radiance: deepseek41: lever DRF (RADIANCE_DS41_DSPARK_RF): the DSpark stages' router chains take lever FUSE-R's forms "
-                        "(ds41_rfuse, %s)\n", rf_declared() ? "declared: RADIANCE_DS41_RFUSE is set" : "NOT declared: RADIANCE_DS41_RFUSE is unset");
     if (dsp_awm_env() < 0) {   /* lever DAW */
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_AWM=%s is not 0 / off or 1 / on\n",
                 std::getenv("RADIANCE_DS41_DSPARK_AWM"));
@@ -4091,7 +4069,6 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
-    s.cfg.rfuse_decl = dsp_rf_env() > 0 && rf_declared() ? 1 : 0;   /* lever DRF */
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     /* Lever Z0-A (ds41-z0): the block's sigmoid router refuses rows above its geometry's max_tok
      * (rad_block_glm_router.h, GlmRouter::declare: c.rows > g.max_tok -> RAD_E_INVAL). A sizing declare below Q (the
@@ -4102,7 +4079,6 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     gq.max_tok = std::max<int64_t>(g.max_tok, Q);
     DS_TRY(L.moe.declare(b, nm, gq, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
-    if (s.cfg.rfuse_decl) L.moe.rfuse_live = &g_sw_rf;   /* lever DRF: the trunk's ds41_rfuse value picks the form */
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     /* lever DMR 3 (dspark_mhr 3): the connections' post + collapse + norm as the trunk's one op (mhc_post_collapse_rmsnorm,
