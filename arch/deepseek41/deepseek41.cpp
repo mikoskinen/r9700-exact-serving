@@ -455,6 +455,7 @@ struct Dsp {
     int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
     int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
     bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
+    bool wil = false;                     /* lever WIL (dsp_wil_env): the routed experts as moe_gemm_mxil (tile-interleaved) */
     int64_t ff_rank = 0;                  /* the routed experts' intermediate width on this rank (DEP: n_ff / world) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
@@ -1761,6 +1762,22 @@ using ds41etp::etp_slice;   /* ds41_etp.h: this rank's slice of an expert of eac
 static int dsp_dep_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_DEP");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
+/* Lever WIL (DRAFTER track 19.11.2026 round 27): RADIANCE_DS41_DSPARK_WIL=1 (or on) at start declares the DSpark
+ * drafter's routed MXFP4 experts (gate_up and down, every stage) as moe_gemm_mxil instead of moe_gemm_ggml: libr4d stores
+ * those weights tile-interleaved at load (its relayout hook: 16-row x 1-block tiles of 272 bytes, the native blocks'
+ * bytes moved) and reads them with drafter_mx 5's forms on one 64-bit load a lane a block -- the same operations, so the
+ * outputs are drafter_mx 2 / 4 / 5's byte for byte (exact: no reference change); drafter_mx no longer picks these calls'
+ * form. xeon dbench (lever DEP's shapes, lq168 records, 300 passes): the experts' pass 1,091 -> 1,047 us at 32 tokens,
+ * 902 -> 848 at 40. Unset / 0: moe_gemm_ggml as published. Needs a kernel plugin serving moe_gemm_mxil (libr4d). */
+static int dsp_wil_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_WIL");
         if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
         if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
         return -1;
@@ -4665,6 +4682,23 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                             "on every rank as width slices of %lld of %lld (expert tensor parallel; EP held %lld a rank)\n",
                     (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff, (long long)(d.n_expert / g.world));
     }
+    d.wil = false;
+    if (dsp_wil_env() < 0) {   /* lever WIL */
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WIL=%s is not 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_DSPARK_WIL"));
+        return RAD_E_INVAL;
+    }
+    if (dsp_wil_env() > 0) {
+        if (!rad_op_declared(b, "moe_gemm_mxil")) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WIL: no loaded kernel plugin serves moe_gemm_mxil\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        d.wil = true;
+        rad_note(b, "DSpark drafter routed experts tile-interleaved (lever WIL, RADIANCE_DS41_DSPARK_WIL): moe_gemm_mxil");
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever WIL (RADIANCE_DS41_DSPARK_WIL): the DSpark drafter's routed MXFP4 experts "
+                            "as moe_gemm_mxil (tile-interleaved weights; drafter_mx 5's operations and bytes)\n");
+    }
     if (dsp_awm_env() < 0) {   /* lever DAW */
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_AWM=%s is not 0 / off or 1 / on\n",
                 std::getenv("RADIANCE_DS41_DSPARK_AWM"));
@@ -4828,6 +4862,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = d.top_k;
     s.cfg.n_ff_exp = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: this rank's slice (MoeFP8's even ROW / COL shard) */
+    if (d.wil) s.cfg.expert_ggml_op = "moe_gemm_mxil";   /* lever WIL */
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;

@@ -167,3 +167,81 @@ extern "C" int r4d_ds41_ggml_pair_unrelayout(const RadParam* p, int n_p, int ope
     if (operand != 1 && operand != 3) return RAD_E_DTYPE;
     return r4d_ds41_ggml_unrelayout(p, n_p, 1, enc, sel, src, src_bytes, planes, n_planes);
 }
+
+/* moe_gemm_mxil (lever WIL, DRAFTER track 19.11.2026 round 27): GGUF MXFP4 blocks re-arranged into 16-row x 1-block
+ * tiles of 272 bytes -- tile (row group g, block b) at (g nb + b) 272 holds, for lane L = r + 16 h of the WMMA form
+ * (r the group's row, h 0 / 1), the block's code bytes qs[4 h .. 4 h + 3] and qs[8 + 4 h .. 8 + 4 h + 3] at 8 L, and the
+ * 16 rows' E8M0 exponents at 256 + r (r4d_ds41_mxfp4_mr.hip, xm_wm_kernel's IL note). The same bytes as the native
+ * blocks, moved: the stored size, the planes it is made from and the inverse are the native form's; the rows (an
+ * expert's N, a table entry's weight) must be whole groups of 16. Tagged apart so no reader of native blocks gets it. */
+namespace {
+constexpr int64_t kIlTile = 272;
+void il_pack(const uint8_t* blk, uint8_t* dst, int64_t rows, int64_t nb) {
+    for (int64_t g = 0; g < rows / 16; ++g)
+        for (int64_t b = 0; b < nb; ++b) {
+            uint8_t* t = dst + (g * nb + b) * kIlTile;
+            for (int64_t r = 0; r < 16; ++r) {
+                const uint8_t* q = blk + ((16 * g + r) * nb + b) * 17;
+                for (int h = 0; h < 2; ++h) {
+                    std::memcpy(t + 8 * (r + 16 * h), q + 1 + 4 * h, 4);
+                    std::memcpy(t + 8 * (r + 16 * h) + 4, q + 9 + 4 * h, 4);
+                }
+                t[256 + r] = q[0];
+            }
+        }
+}
+void il_unpack(const uint8_t* src, uint8_t* blk, int64_t rows, int64_t nb) {
+    for (int64_t g = 0; g < rows / 16; ++g)
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint8_t* t = src + (g * nb + b) * kIlTile;
+            for (int64_t r = 0; r < 16; ++r) {
+                uint8_t* q = blk + ((16 * g + r) * nb + b) * 17;
+                for (int h = 0; h < 2; ++h) {
+                    std::memcpy(q + 1 + 4 * h, t + 8 * (r + 16 * h), 4);
+                    std::memcpy(q + 9 + 4 * h, t + 8 * (r + 16 * h) + 4, 4);
+                }
+                q[0] = t[256 + r];
+            }
+        }
+}
+bool il_type_ok(const RadParam* p, int n_p) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    return t && t->kind == RAD_P_STR && t->sval && !std::strcmp(t->sval, "mxfp4");
+}
+}  // namespace
+
+extern "C" int r4d_ds41_mxil_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                    const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (!il_type_ok(p, n_p)) return RAD_E_DTYPE;
+    const int rc = r4d_ds41_ggml_layout(p, n_p, operand, enc, sel, planes, n_planes, out);
+    if (rc != RAD_OK) return rc;
+    if (out->shape[0] % 16) return RAD_E_SHAPE;
+    out->tag = "r4d_mxfp4_il16";
+    return RAD_OK;
+}
+
+extern "C" int r4d_ds41_mxil_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                      const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (!il_type_ok(p, n_p)) return RAD_E_DTYPE;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    if (K <= 0 || K % 32 || rows <= 0 || rows % 16) return RAD_E_SHAPE;
+    const int64_t nb = K / 32;
+    if (dst_bytes < rows * nb * 17) return RAD_E_SHAPE;
+    std::vector<uint8_t> blk((size_t)(rows * nb * 17));
+    const int rc = r4d_ds41_ggml_relayout(p, n_p, operand, enc, sel, planes, n_planes, blk.data(), (int64_t)blk.size());
+    if (rc != RAD_OK) return rc;
+    il_pack(blk.data(), (uint8_t*)dst, rows, nb);
+    return RAD_OK;
+}
+
+extern "C" int r4d_ds41_mxil_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                        const void* src, int64_t src_bytes, const RadTensor* planes, int n_planes) {
+    if (!il_type_ok(p, n_p)) return RAD_E_DTYPE;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    if (K <= 0 || K % 32 || rows <= 0 || rows % 16) return RAD_E_SHAPE;
+    const int64_t nb = K / 32;
+    if (src_bytes < rows * nb * 17) return RAD_E_SHAPE;
+    std::vector<uint8_t> blk((size_t)(rows * nb * 17));
+    il_unpack((const uint8_t*)src, blk.data(), rows, nb);
+    return r4d_ds41_ggml_unrelayout(p, n_p, operand, enc, sel, blk.data(), (int64_t)blk.size(), planes, n_planes);
+}

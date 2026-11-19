@@ -40,6 +40,8 @@ constexpr int R4D_MX_MR_DECLINE = 1;
 int r4d_mx_mr_on();
 /* Launches a form on `s`: RAD_OK, a RAD_E_* launch failure, or R4D_MX_MR_DECLINE. */
 int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c);
+/* Lever WIL: the IL forms only, for weights in moe_gemm_mxil's stored layout (r4d_ds41_mxfp4_mr.hip). */
+int r4d_mx_mr_moe_il(RadStream s, const R4dMxMrCall& c);
 /* The runtime switch (drafter_mx): 0 off, 1 on. */
 void r4d_mx_mr_set(int on);
 int r4d_mx_mr_get();

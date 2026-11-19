@@ -1562,7 +1562,7 @@ void r4d_mx_mr_set(int on) { g_xm_on = on == 2 || on == 3 || on == 4 || on == 5 
 int r4d_mx_mr_get() { return g_xm_on; }
 
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
-static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap) {
+static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap, int il = g_xm_il) {
     if (!xm_has_w(WR, NT, PD, AB) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
     A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
@@ -1589,7 +1589,7 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
     if (grid < 1) grid = 1;
     std::snprintf(g_xm_last, sizeof g_xm_last, "wmma WR%d NT%d PD%d%s WN%d SS%d RB%d grid %lld lds %lld", WR, NT, PD, AB ? " ABL" : "", WN, A.SS,
                   A.RB, grid, lds);
-    if (g_xm_il) {   /* lever WIL: 16-row groups, so N % 16 == 0; WR 1 NT 1 only */
+    if (il) {   /* lever WIL: 16-row groups, so N % 16 == 0; WR 1 NT 1 only */
         if (WR != 1 || NT != 1 || AB != 0 || c.N % 16) return R4D_MX_MR_DECLINE;
         std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-IL WR1 NT1 PD%d WN%d SS%d RB%d grid %lld lds %lld", PD, WN, A.SS, A.RB, grid, lds);
         return xm_launch_wil(s, PD, A, (unsigned)grid, 32u * WN, (unsigned)lds);
@@ -1599,7 +1599,7 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
 
 /* The sequential-tile form's launch (lever DTS; drafter_mx 2's bytes): WN waves, TS 16-row tiles a wave in sequence, segments
  * of up to 16 rows, the whole K's activations in one slab (declines K above ~60 blocks). */
-static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, int gridcap) {
+static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, int gridcap, int il = g_xm_il) {
     if (!xm_has_t(PD, TS) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
     A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
@@ -1621,7 +1621,7 @@ static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, 
     if (grid > est) grid = est;
     if (grid < 1) grid = 1;
     std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-seq PD%d TS%d WN%d RB%d grid %lld lds %lld", PD, TS, WN, A.RB, grid, lds);
-    if (g_xm_il) {
+    if (il) {
         if (c.N % 16) return R4D_MX_MR_DECLINE;
         std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-seq-IL PD%d TS%d WN%d RB%d grid %lld lds %lld", PD, TS, WN, A.RB, grid, lds);
         return xm_launch_til(s, PD, TS, A, (unsigned)grid, 32u * WN, (unsigned)lds);
@@ -1787,6 +1787,20 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
                   c.gemv ? H : 32, R, MT, EX ? " EX" : "", WN, A.SS, A.RB, grid, lds);
     return c.gemv ? xm_launch_g(s, H, R, MT, A, (unsigned)grid, 32u * WN, (unsigned)lds)
                   : xm_launch_s(s, R, MT, EX, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+}
+
+/* Lever WIL's serving entry (moe_gemm_mxil, r4d_ds41_mxfp4.inc): the weights are in the IL layout its row's relayout
+ * writes, so only the IL forms may read them -- drafter_mx 5's forms (and bytes): K below 2048 (lever DEP's down, K 576)
+ * the sequential-tile form PD 9 TS 4, else the WMMA form WR 1 NT 1 PD 9, 8 waves. A decline is the caller's error (no
+ * other kernel reads this layout). Independent of drafter_mx and of the bench pins. */
+int r4d_mx_mr_moe_il(RadStream s, const R4dMxMrCall& c) {
+    if (c.tokens < 1 || c.tokens > kXmMaxTokens || c.T < 1 || c.N < 16 || c.N % 16 || c.K < 32 || c.K % 32 || c.n_expert < 1)
+        return R4D_MX_MR_DECLINE;
+    if (c.K < 2048) {
+        const int t = xm_wt_moe(s, c, 9, 4, 8, 0, 1);
+        if (t != R4D_MX_MR_DECLINE) return t;
+    }
+    return xm_wm_moe(s, c, 1, 1, 9, 0, 8, 0, 1);
 }
 
 /* r4d_mx_mr_pin (bench / test hook, r4d_selftest --mxcheck / --perfmx): on 0 clears the pin (the switch decides),

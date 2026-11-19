@@ -23312,6 +23312,142 @@ static void ds_mx_check(const Plugin& pl) {
                 cases == 0 ? "INCOMPLETE" : diffs ? "FAIL" : "PASS (byte-identical, every form)");
 }
 
+/* --mxilcheck (lever WIL, DRAFTER track 19.11.2026 round 27): moe_gemm_mxil against moe_gemm_ggml type=mxfp4, every byte.
+ * Each expert's OCP-MXFP4 planes are stored through BOTH rows' own hooks (the native blocks, and moe_gemm_mxil's
+ * tile-interleaved form: the latter must be the former's bytes moved -- host check -- carry its own tag and give the planes
+ * back through its inverse); then the grouped GEMM over 32 experts (stacked and as a table), routings with and without the
+ * dropped tail, tokens 1..240, the IL row vs the native row under drafter_mx 2's WMMA pin (xm_wm WR 1 NT 1 PD 2, 8 waves:
+ * the bytes drafter_mx 2 / 4 / 5 serve). DEP's shapes (1152 x 5120, 5120 x 576) and EP's (4608 x 5120, 5120 x 2304).
+ * One MXILCHECK line a (shape, tokens); MXILVERDICT. */
+static void ds_mxil_check(const Plugin& pl) {
+    const DrkHooks h = drk_hooks(pl);
+    const RadKernelInfo* ril = find(pl, "moe_gemm_mxil_wmma");
+    const RadKernelInfo* rgg = find(pl, "moe_gemm_ggml_mxfp4_tiled");
+    if (!ril || !rgg || !h.mx_pin || !ril->layout || !ril->relayout || !ril->unrelayout || !rgg->relayout) {
+        std::printf("--mxilcheck: moe_gemm_mxil_wmma / moe_gemm_ggml_mxfp4_tiled / hooks / r4d_mx_mr_pin absent\n");
+        ++g_fail;
+        return;
+    }
+    const MxCase cs[] = { { "dep_gate_up", 1152, 5120, false }, { "dep_down", 5120, 576, true },
+                          { "ep_gate_up", 4608, 5120, false }, { "ep_down", 5120, 2304, true } };
+    const int64_t toks[] = { 1, 2, 5, 8, 16, 17, 32, 40, 48, 64, 80, 120, 240 };
+    long long cases = 0, diffs = 0, lay_bad = 0;
+    for (const MxCase& c : cs) {
+        dfree_all();
+        const int64_t E = 32, nb = c.K / 32, ebytes = c.N * nb * 17;
+        const std::vector<RadParam> lp = { PI("M", 64), PI("N", c.N), PI("K", c.K), PI("n_expert", E), PI("top_k", 3),
+                                           PS("a_order", c.sorted_rows ? "sorted" : "token"), PS("type", "mxfp4"),
+                                           PS("dtype", "bf16") };
+        std::vector<uint8_t> wg((size_t)(E * ebytes)), wi((size_t)(E * ebytes));
+        bool lok = true;
+        for (int64_t e = 0; e < E && lok; ++e) {
+            if (e >= 4) {   /* four distinct experts' planes, repeated (the hooks are per weight; this keeps the case short) */
+                std::memcpy(wg.data() + e * ebytes, wg.data() + (e % 4) * ebytes, (size_t)ebytes);
+                std::memcpy(wi.data() + e * ebytes, wi.data() + (e % 4) * ebytes, (size_t)ebytes);
+                continue;
+            }
+            Planes p;
+            p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+            p.size(c.N, c.K);
+            const int ic = p.find("codes"), is = p.find("scale");
+            if (ic < 0 || is < 0) { std::printf("  FAIL %s: encoding has no codes / scale plane\n", c.name); lok = false; break; }
+            mxfp4_fill(p, ic, is, c.N, c.K, 0x77u + (uint32_t)e, true);
+            std::vector<uint8_t> bg, bi;
+            RadLayout Lg, Li;
+            const int r1 = stored(rgg, lp, 1, p, { "codes", "scale" }, &bg, &Lg);
+            const int r2 = stored(ril, lp, 1, p, { "codes", "scale" }, &bi, &Li);
+            if (r1 != RAD_OK || r2 != RAD_OK || (int64_t)bg.size() != ebytes || (int64_t)bi.size() != ebytes) {
+                std::printf("  FAIL %s expert %lld: relayout rc %d / %d, bytes %zu / %zu (want %lld)\n", c.name, (long long)e, r1, r2,
+                            bg.size(), bi.size(), (long long)ebytes);
+                lok = false; break;
+            }
+            if (!Li.tag || !Lg.tag || !std::strcmp(Li.tag, Lg.tag)) { std::printf("  FAIL %s: the IL tag is not its own\n", c.name); lok = false; break; }
+            std::vector<uint8_t> il((size_t)ebytes);   /* the host's interleave of the native blocks */
+            for (int64_t g = 0; g < c.N / 16; ++g)
+                for (int64_t b = 0; b < nb; ++b)
+                    for (int64_t r = 0; r < 16; ++r) {
+                        const uint8_t* q = bg.data() + ((16 * g + r) * nb + b) * 17;
+                        uint8_t* t = il.data() + (g * nb + b) * 272;
+                        for (int hh = 0; hh < 2; ++hh)
+                            for (int i = 0; i < 4; ++i) { t[8 * (r + 16 * hh) + i] = q[1 + 4 * hh + i]; t[8 * (r + 16 * hh) + 4 + i] = q[9 + 4 * hh + i]; }
+                        t[256 + r] = q[0];
+                    }
+            if (il != bi) { std::printf("  FAIL %s expert %lld: the IL bytes are not the native blocks moved\n", c.name, (long long)e); lok = false; break; }
+            std::string why;
+            if (!restores(ril, lp, 1, p, { "codes", "scale" }, bi, &why)) { std::printf("  FAIL %s expert %lld: inverse: %s\n", c.name, (long long)e, why.c_str()); lok = false; break; }
+            std::memcpy(wg.data() + e * ebytes, bg.data(), (size_t)ebytes);
+            std::memcpy(wi.data() + e * ebytes, bi.data(), (size_t)ebytes);
+        }
+        if (!lok) { ++lay_bad; ++g_fail; continue; }
+        std::printf("MXILLAYOUT %s %lldx%lld: 4 experts' planes (repeated to 32) -> native %s / IL %s bytes through the rows' hooks; IL = the native "
+                    "blocks moved; the inverse gives the planes back\n", c.name, (long long)c.N, (long long)c.K, "ggml_mxfp4", "r4d_mxfp4_il16");
+        void* d_wg = dalloc(wg.size());
+        void* d_wi = dalloc(wi.size());
+        if (!d_wg || !d_wi) { std::printf("  FAIL %s: alloc\n", c.name); ++g_fail; continue; }
+        st_memcpy(d_wg, wg.data(), wg.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_wi, wi.data(), wi.size(), hipMemcpyHostToDevice);
+        std::vector<void*> pg((size_t)E), pi((size_t)E);
+        for (int64_t e = 0; e < E; ++e) { pg[(size_t)e] = (uint8_t*)d_wg + e * ebytes; pi[(size_t)e] = (uint8_t*)d_wi + e * ebytes; }
+        void* d_tg = dalloc(E * sizeof(void*));
+        void* d_ti = dalloc(E * sizeof(void*));
+        st_memcpy(d_tg, pg.data(), E * sizeof(void*), hipMemcpyHostToDevice);
+        st_memcpy(d_ti, pi.data(), E * sizeof(void*), hipMemcpyHostToDevice);
+        for (int64_t tk : toks)
+            for (int variant = 0; variant < 4; ++variant) {
+                const bool tail = variant & 1, table = variant & 2;
+                const MxRoute rt = mx_route(tk, (int)(tk % 4), tail, 0x3A11ull * (uint64_t)(tk + 1) + (uint64_t)variant);
+                const int64_t T = (int64_t)rt.sorted.size();
+                if (T == 0) continue;
+                const int64_t AR = c.sorted_rows ? T : tk;
+                std::vector<uint16_t> hx((size_t)(AR * c.K));
+                uint64_t rs = 0x4321ull + (uint64_t)tk;
+                for (auto& v : hx) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; v = h_to_bf16((float)((int)(rs % 2001) - 1000) / 250.0f); }
+                void* d_x = dalloc(hx.size() * 2);
+                void* d_so = dalloc((size_t)T * 4);
+                void* d_of = dalloc((size_t)(E + 1) * 4);
+                void* d_y = dalloc((size_t)(T * c.N) * 2);
+                st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(d_so, rt.sorted.data(), (size_t)T * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_of, rt.off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+                MxLaunch Lg, Li;
+                if (!mx_setup(Lg, pl, false, c, tk, AR, T, d_x, table ? d_tg : d_wg, table, d_so, d_of, d_y) ||
+                    !mx_setup(Li, pl, false, c, tk, AR, T, d_x, table ? d_ti : d_wi, table, d_so, d_of, d_y)) {
+                    std::printf("  FAIL %s: setup\n", c.name); ++g_fail; continue;
+                }
+                Li.row = ril;
+                const size_t yb = (size_t)(T * c.N) * 2;
+                std::vector<uint8_t> ref(yb), got(yb);
+                h.mx_pin(1, 1024 + 2, 1, 1, 8, 0);   /* drafter_mx 2's form: xm_wm WR 1 NT 1 PD 2, 8 waves */
+                st_memset(d_y, 0xff, yb);
+                int rc = Lg.row->launch(&Lg.a, nullptr);
+                const bool ok_g = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                st_memcpy(ref.data(), d_y, yb, hipMemcpyDeviceToHost);
+                const std::string fg = h.mx_last ? h.mx_last() : "?";
+                h.mx_pin(0, 0, 0, 0, 0, 0);
+                st_memset(d_y, 0xff, yb);
+                rc = Li.row->launch(&Li.a, nullptr);
+                const bool ok_i = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                const std::string fi = h.mx_last ? h.mx_last() : "?";
+                size_t nd = 0;
+                for (size_t e = 0; e < yb; e += 2) nd += std::memcmp(&got[e], &ref[e], 2) != 0;
+                const bool bad = !ok_g || !ok_i || nd != 0;
+                ++cases;
+                diffs += bad;
+                if (bad) ++g_fail;
+                std::printf("MXILCHECK %s %lldx%lld tokens %lld%s%s: %lld live slots over %lld experts: %s (%zu of %zu differ; ref %s | IL %s)\n",
+                            c.name, (long long)c.N, (long long)c.K, (long long)tk, tail ? ", dropped tail" : "", table ? ", expert table" : "",
+                            (long long)rt.live, (long long)rt.experts, !ok_g || !ok_i ? "LAUNCH FAILED" : nd ? "DIFFERS" : "identical",
+                            nd, yb / 2, fg.c_str(), fi.c_str());
+                std::fflush(stdout);
+            }
+    }
+    dfree_all();
+    if (cases == 0) ++g_fail;
+    std::printf("MXILVERDICT check: %lld cases, %lld differ, %lld layout failures -> %s\n", cases, diffs, lay_bad,
+                cases == 0 || lay_bad ? "INCOMPLETE / FAIL" : diffs ? "FAIL" : "PASS (byte-identical to drafter_mx 2's form)");
+}
+
 /* --perfmx [tokens] [iters]: us a call of the stock grouped GEMM and drafter_mx's rule and pinned forms at the
  * drafter's steps (5 rows a sequence: 1, 2, 4, 6, 8 users), gate_up and down, the experts streaming from DRAM (two
  * rotated copies of the rank's 32, or --cold). MXPERF a (projection, tokens) with every form; MXSUM; MXVERDICT. */
@@ -39115,6 +39251,7 @@ int main(int argc, char** argv) {
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
+    bool mxil = false;   /* lever WIL */
     const char* mx_skew = nullptr;
     int mx_tp = 8;
     bool mx_f8 = false;
@@ -39358,6 +39495,8 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_skew = argv[++i];
         } else if (!std::strcmp(argv[i], "--mxcheck")) {
             mxc = true;   /* drafter_mx's forms vs the stock MXFP4 grouped GEMM (ds_mx_check) */
+        } else if (!std::strcmp(argv[i], "--mxilcheck")) {
+            mxil = true;  /* lever WIL: moe_gemm_mxil vs moe_gemm_ggml under drafter_mx 2's form (ds_mxil_check) */
         } else if (!std::strcmp(argv[i], "--bfcheck")) {
             bfc = true;   /* drafter_bf's form vs the stock skinny bf16 GEMM (ds_bf_check) */
         } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfdmx") || !std::strcmp(argv[i], "--perfbf")) {
@@ -39677,10 +39816,11 @@ int main(int argc, char** argv) {
 #endif
         return 0;
     }
-    if (mxc || mxp || bfc || bfp) {
+    if (mxc || mxp || bfc || bfp || mxil) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (mxc) ds_mx_check(pl);
+        if (mxil) ds_mxil_check(pl);
         if (mxp) ds_mx_perf(pl, drk_l, drk_it);
         if (bfc) ds_bf_check(pl);
         if (bfp) ds_bf_perf(pl, drk_l, drk_it);
