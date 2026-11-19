@@ -742,9 +742,14 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
     for (int f = 0; f < F; ++f) acc[f] = r4d_fp8::acc_zero();
     const long wsrow = (long)((n0 + wave * 16) / 32) * m.sr;
     for (int k0 = 0; k0 < m.K; k0 += 128) {
+        /* P30o r2 (c): K a multiple of 32 -- the last staged tile holds kw = K - k0 < 128 columns (the shared expert's down at
+         * TP4: K 576 = 4 x 128 + 64); its loads stop at kw and its 32-K blocks run in the same order, so every K that is a
+         * multiple of 128 keeps the bytes it had */
+        const int kw = min(128, m.K - k0);
         if constexpr (V16) {
             for (int j = tid; j < MT * 8; j += 128) {
                 const int r = j / 8, c = (j % 8) * 16, src = source[r];
+                if (c >= kw) continue;
                 uint4 v = make_uint4(0u, 0u, 0u, 0u);
                 if (src >= 0) v = *(const uint4*)(a + (long)src * m.ar + k0 + c);
                 *(uint2*)(qa + r * 136 + c) = make_uint2(v.x, v.y);
@@ -752,6 +757,7 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
             }
             for (int j = tid; j < 64 * 8; j += 128) {
                 const int r = j / 8, c = (j % 8) * 16;
+                if (c >= kw) continue;
                 const uint4 v = *(const uint4*)(w + (long)(n0 + r) * m.wr + k0 + c);
                 *(uint2*)(wb + r * 136 + c) = make_uint2(v.x, v.y);
                 *(uint2*)(wb + r * 136 + c + 8) = make_uint2(v.z, v.w);
@@ -759,6 +765,7 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
         } else {
         for (int j = tid; j < MT * 32; j += 128) {
             const int r = j / 32, c = (j % 32) * 4, src = source[r];
+            if (c >= kw) continue;
             uint32_t v = 0;
             if (src >= 0) {
                 const auto* p = a + (long)src * m.ar + k0 + c;
@@ -768,6 +775,7 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
         }
         for (int j = tid; j < 64 * 32; j += 128) {
             const int r = j / 32, c = (j % 32) * 4;
+            if (c >= kw) continue;
             const auto* p = w + (long)(n0 + r) * m.wr + k0 + c;
             *(uint32_t*)(wb + r * 136 + c) = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                                              ((uint32_t)p[3] << 24);
@@ -779,6 +787,7 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
         constexpr int kKU = MT > 16 ? 1 : 4;
 #pragma unroll kKU
         for (int kk = 0; kk < 128; kk += 32) {
+            if (kk >= kw) break;   /* P30o r2 (c): the last tile's blocks only (uniform across the block) */
             const auto wf0 = r4d_fp8::frag<128>(wb, wave * 16, kk, lane), wf1 = r4d_fp8::frag<128>(wb, wave * 16, kk + 16, lane);
             const int kb = (k0 + kk) / 32;
             const float wsc = e8m0f(ws[wsrow + kb]);
@@ -831,7 +840,7 @@ int dense_e8(const RadArgs* a, RadStream stream) {
     if (!a || !a->t || a->n_t < 5) return RAD_E_INVAL;
     const auto &x = a->t[0], &xs = a->t[1], &w = a->t[2], &ws = a->t[3], &y = a->t[4];
     const int64_t N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
-    if (N < 64 || N % 64 || K < 128 || K % 128 || N > INT_MAX || K > INT_MAX || r4d_geti_or(a, "group", 0) != 32 ||
+    if (N < 64 || N % 64 || K < 32 || K % 32 || N > INT_MAX || K > INT_MAX || r4d_geti_or(a, "group", 0) != 32 ||
         r4d_geti_or(a, "pb1", 0) > 0)
         return R4D_NO(RAD_E_SHAPE);
     if (x.dtype != RAD_F8E4M3 || xs.dtype != RAD_F32 || w.dtype != RAD_F8E4M3 || ws.dtype != RAD_E8M0 ||

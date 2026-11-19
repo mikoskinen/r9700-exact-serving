@@ -5203,7 +5203,7 @@ static const RadConstraint cDsaQuery[] = { C_GE("M", 1), C_LE("M", 2147483644), 
                                            C_IN("dtype", "bf16") };
 /* tp8 loop P30o: the release's block FP8 (gemm_nt_q dtype fp8a8e8) */
 static const RadConstraint cFp8A8E8[] = {
-    C_GE("M", 1), C_GE("N", 64), C_DIV("N", 64), C_GE("K", 128), C_DIV("K", 128), C_EQ("group", 32),
+    C_GE("M", 1), C_GE("N", 64), C_DIV("N", 64), C_GE("K", 32), C_DIV("K", 32), C_EQ("group", 32),   /* P30o r2 (c): K 576 */
     C_IN("dtype", "fp8a8e8")
 };
 static const RadConstraint cFp8F32Scale[] = {
@@ -6933,7 +6933,7 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_fp8a8e8_b32", "gemm_nt_q", "gemm",
   "DeepSeek-V4's released block FP8: E4M3 x E4M3 WMMA, an E8M0 weight exponent per 32x32 block and a power-of-two "
   "activation scale per (row, 32), folded every 32 of K (the release's fp8_gemm at block 32) -- the first form (tp8 loop P30o)",
-  "N a multiple of 64, K of 128; pitched activations and output, row-major weights", "E4M3 codes, E8M0 / f32 scales, BF16 output",
+  "N a multiple of 64, K of 32; pitched activations and output, row-major weights", "E4M3 codes, E8M0 / f32 scales, BF16 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cFp8A8E8), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_fp8a8e8, nullptr, r4d_layout_fp8a8e8, nullptr,
   nullptr },

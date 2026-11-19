@@ -291,7 +291,9 @@ void gemm_e8_cases(std::mt19937& rng, int mt, int ld) {
     r4d_fp8e8_pin_ld(ld);
     struct S { int M, N, K, ap, yp; };
     const S shapes[] = { { 1, 64, 128, 128, 64 }, { 5, 128, 256, 256, 128 }, { 17, 64, 512, 640, 192 }, { 33, 128, 256, 256, 128 },
-                         { 70, 64, 256, 384, 128 }, { 9, 64, 256, 264, 64 }, { 130, 64, 128, 128, 64 } };   /* 130: three 64-row tiles, the last partial */   /* 264: a pitch off 16 B -> the byte staging */
+                         { 70, 64, 256, 384, 128 }, { 9, 64, 256, 264, 64 }, { 130, 64, 128, 128, 64 },   /* 130: three 64-row tiles, the last partial */   /* 264: a pitch off 16 B -> the byte staging */
+                         /* P30o r2 (c): K a multiple of 32 only -- the shared expert's down at TP4 (K 576 = 4 x 128 + 64), a tail of 96 / 32 */
+                         { 3, 64, 576, 576, 64 }, { 70, 128, 576, 640, 128 }, { 17, 64, 96, 104, 64 }, { 33, 64, 32, 32, 64 } };
     std::normal_distribution<float> nd(0.f, 1.f);
     for (const S& sh : shapes) {
         const int M = sh.M, N = sh.N, K = sh.K, G = 32, kb = K / G, nb = N / G;
