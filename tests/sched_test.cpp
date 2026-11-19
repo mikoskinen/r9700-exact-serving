@@ -3585,7 +3585,7 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
  * only; a follower with no declared boundary takes 0 only and names RADIANCE_PP_SEG_LAYERS; one with boundaries takes every value. */
 /* tp8 loop PX1 (PREFILL round 28): exl3_x3d_pf is 96, the last, the exl3r4d plugin's (A10 / PX2: the prefill band's one-word-pair /
  * unpacked-state decode) -- not the scheduler's; a pipeline's follower takes it from its leader as every plugin switch; with no
- * exl3r4d loaded nothing serves it, so a request is refused with a reason (a start with the plugin takes 0 .. 3, its own range). */
+ * exl3r4d loaded nothing serves it, so a request is refused with a reason (a start with exl3r4d 4fd50e4 takes 0 / 1, its own range). */
 TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     const int i = fn4::switch_index("exl3_x3d_pf");
     REQUIRE(i == (int)fn4::kExl3X3dPf);
