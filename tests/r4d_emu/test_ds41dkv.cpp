@@ -36,6 +36,7 @@ extern "C" int r4d_rad_ds41_attn_sparse_sink_unpacked(const RadArgs*, RadStream)
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked(const RadArgs*, RadStream);
 extern "C" int r4d_rad_ds41_attn_sparse_sink_gathered(const RadArgs*, RadStream);
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered(const RadArgs*, RadStream);
+extern "C" void r4d_attn_skip_pin(int v);
 
 namespace {
 
@@ -483,6 +484,74 @@ void case_one(const char* name, const Fix& f, const std::vector<std::pair<int, i
                 (long long)da, no, (long long)dw);
 }
 
+/* tp8 loop P32 (RADIANCE_DS41_ATTN_SKIP, bench hook r4d_attn_skip_pin): the WMMA prefill form walking only the key tiles that
+ * hold a key gives every output bit of the form walking all tiles -- the bf16 cache's form, the packed one (DKV-F), the plan's
+ * rows (DKV-U) and its LDS-free form (plan_full), plain and fold d; and all of them the bf16 cache's bits as before. */
+void case_skip(const char* name, const Fix& f, const View& v, int64_t per) {
+    const size_t no = (size_t)v.n * f.H * kD;
+    std::vector<uint16_t> ubuf((size_t)(v.n * per * kD + 8), 0x4444);
+    uint16_t* u = (uint16_t*)(((uintptr_t)ubuf.data() + 15) & ~(uintptr_t)15);
+    expect(unpack(f, v, u, v.n, per * kD) == RAD_OK, name, "latent_unpack");
+    const RadTensor ut = tens(u, RAD_BF16, { v.n, per * kD });
+    int64_t bad = 0, vs_bf16 = 0, nz = 0;
+    for (int fold = 0; fold < 2; ++fold) {
+        const RadLaunchFn plain = fold ? r4d_rad_ds41_attn_sparse_sink_rope_roundtrip : r4d_rad_ds41_attn_sparse_sink;
+        const RadLaunchFn unp = fold ? r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked : r4d_rad_ds41_attn_sparse_sink_unpacked;
+        std::vector<uint16_t> ref;
+        for (int form = 0; form < 4; ++form) {   /* bf16 cache, packed (DKV-F), plan rows, plan rows + plan_full */
+            std::vector<uint16_t> o[2] = { std::vector<uint16_t>(no, 0x1111), std::vector<uint16_t>(no, 0x2222) };
+            for (int sk = 0; sk < 2; ++sk) {
+                r4d_attn_skip_pin(sk);
+                g_plan_full = form == 3 ? 1 : 0;
+                const int rc = form < 2 ? attn(plain, f, v, form == 1, fold, o[sk].data(), nullptr)
+                                        : attn(unp, f, v, true, fold, o[sk].data(), &ut);
+                expect(rc == RAD_OK, name, "attention launch", form, sk);
+            }
+            g_plan_full = 0;
+            const int64_t d = ndiff(o[0], o[1]);
+            expect(d == 0, name, "the skip changed an output", d, form + 4 * fold);
+            bad += d;
+            if (form == 0) {
+                ref = o[0];
+                for (size_t i = 0; i < no; ++i) nz += (ref[i] & 0x7fffu) != 0;
+            } else {
+                const int64_t e = ndiff(ref, o[1]);
+                expect(e == 0, name, "a form with the skip differs from the bf16 cache's", e, form + 4 * fold);
+                vs_bf16 += e;
+            }
+        }
+    }
+    r4d_attn_skip_pin(-1);
+    expect(nz > (int64_t)no / 2, name, "the output is mostly zero", nz, (long long)no);
+    /* the tiles a row walks with the skip (the host's count of tiles holding a key), of nkt */
+    const int nkt = (f.win + f.topk + 15) / 16;
+    int64_t walked = 0;
+    for (int r = 0; r < v.n; ++r) {
+        const int m = v.r0 + r;
+        const std::vector<int32_t>& cu = v.cu.empty() ? f.cu : v.cu;
+        int s = 0;
+        while (s + 1 < (int)cu.size() - 1 && cu[(size_t)s + 1] <= r) ++s;
+        const int64_t p = f.pos[(size_t)m], last = f.pos[(size_t)(v.r0 + cu[(size_t)s + 1] - 1)];
+        const int64_t first = last + 1 - f.wused[(size_t)(v.s0 + s)];
+        for (int t = 0; t < nkt; ++t) {
+            bool any = false;
+            for (int k = 16 * t; k < 16 * t + 16 && !any; ++k) {
+                if (k < f.win) {
+                    const int64_t j = p - f.win + 1 + k, rr = j - first;
+                    any = j >= 0 && rr >= 0 && rr / f.bs < f.nwbt && f.wbt[(size_t)((v.s0 + s) * f.nwbt + rr / f.bs)] >= 0;
+                } else if (k < f.win + f.topk) {
+                    const int32_t c = f.sel[(size_t)m * f.topk + (k - f.win)];
+                    any = c >= 0 && c < f.ncbt && f.cbt[(size_t)((v.s0 + s) * f.ncbt + c)] >= 0;
+                }
+            }
+            walked += any;
+        }
+    }
+    std::printf("%-58s rows %d ratio %d topk %d: skip vs all tiles %lld of %zu x 8 differ, forms vs bf16 %lld; tiles walked %lld "
+                "of %lld (%.1f %%)\n", name, v.n, f.ratio, f.topk, (long long)bad, no, (long long)vs_bf16, (long long)walked,
+                (long long)v.n * nkt, 100.0 * (double)walked / (double)(v.n * nkt));
+}
+
 /* every scale byte x every code through latent_unpack's decode (and the WMMA form's v3 decode, via the plan's rows),
  * against the host decode; NaN scale bytes (0x7f, 0xff) reported, not required */
 void case_decode_all() {
@@ -591,6 +660,22 @@ int main() {
         for (int s = 0; s < 14; ++s) sq.push_back({ 4, 2100 + 97 * s });
         const Fix f = make(58, 16, 2, sq, 256);
         case_one("ONE: 56 rows = 14 x 4, ratio 2, topk 256", f, { { 0, 7 }, { 7, 14 } }, false);
+    }
+    /* tp8 loop P32: the empty-tile skip on newcomer-like passes (rows from position 0: the window's first tiles and the
+     * selections past reach empty), a pass of a newcomer beside a sequence at context, and holes in the middle (60 unmapped
+     * entries: a tile whose selections all fall there holds no key) */
+    {
+        const Fix f = make(61, 16, 2, { { 144, 143 } }, 128);
+        case_skip("SKIP: newcomer 144 rows from 0, ratio 2, topk 128", f, { 0, 144, {} }, 2);
+    }
+    {
+        const Fix f = make(62, 16, 1, { { 96, 95 }, { 32, 700 } }, 64);
+        case_skip("SKIP: 96 rows from 0 + 32 rows at 669..700, ratio 1", f, { 0, 128, {} }, 8);
+    }
+    {
+        Fix f = make(63, 16, 1, { { 64, 400 } }, 128);
+        for (int64_t c = 100; c < 160 && c < f.ncbt; ++c) f.cbt[(size_t)c] = -1;
+        case_skip("SKIP: 64 rows at 337..400, entries 100..159 unmapped", f, { 0, 64, {} }, 8);
     }
     std::printf("ds41 DKV: %d checks, %d failure(s)\n", g_check, g_fail);
     return g_fail ? 1 : 0;

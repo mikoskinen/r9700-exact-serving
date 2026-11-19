@@ -3432,6 +3432,174 @@ static void ds41_ofold_case(const Plugin& pl) {
            (long long)changed, first.empty() ? "" : "; first: ", first.c_str()));
 }
 
+/* ---- tp8 loop P32 (PREFILL round 26; COORDINATOR 16:45 / IDEAS #12): the WMMA prefill attention walking only the key tiles
+ * that hold a key (RADIANCE_DS41_ATTN_SKIP=1, bench hook r4d_attn_skip_pin) -- the served newcomer form on one card: one
+ * sequence of M rows from position p0, 16 heads (a TP4 rank), window 128 (bf16, blocks of 64), 512 selections over the
+ * packed nvfp4 latent (blocks of 64 positions) as index_topk gives them (all of [0, reach) ascending then -1 when reach <=
+ * 512, else 512 distinct ascending), latent_unpack's plan (16 entries a row = RADIANCE_DS41_LATUNPACK=16) and fold d with
+ * plan_full where the plan holds the pass (attn_sparse_sink_rope_roundtrip_unpacked; deepseek41's newcomer issue), window-only
+ * layers by attn_sparse_sink_rope_roundtrip. Every output bit skip off vs on; us a launch off / on (warm, back to back), and
+ * the tiles a row walks. --case ds41_attn_skip. */
+static void ds41_attn_skip_case(const Plugin& pl) {
+    const char* row = "ds41_attn_skip";
+    if (!sel(row)) return;
+    const char* name = "P32: the WMMA prefill attention's empty-tile skip gives every output bit, and its time";
+    const RadKernelInfo* rlu = find(pl, "ds41_latent_unpack_d512");
+    const RadKernelInfo* rfu = find(pl, "ds41_attn_sparse_sink_rope_rt_unpacked_d512_bf16");
+    const RadKernelInfo* rfp = find(pl, "ds41_attn_sparse_sink_rope_rt_d512_bf16");
+    auto pin = (void (*)(int))dlsym(pl.h, "r4d_attn_skip_pin");
+    if (!rlu || !rfu || !rfp || !pin) { ok(name, false, "row or r4d_attn_skip_pin absent"); return; }
+    const int64_t H = 16, D = 512, n = H * D, win = 128, topk = 512, bs = 64, cbs = 64, rot = 64, E = 16, slots = 144;
+    struct Shape { int64_t M, p0; int ratio; };
+    const std::vector<Shape> shapes = { { 1150, 0, 2 }, { 1150, 0, 1 }, { 1150, 0, 0 }, { 2048, 0, 2 }, { 2048, 0, 1 },
+                                        { 4096, 0, 2 }, { 4096, 0, 1 }, { 2048, 8192, 2 }, { 2048, 8192, 1 }, { 600, 0, 2 } };
+    std::mt19937 rng(3232);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    int64_t bad = 0, rc_bad = 0;
+    double nc_off[3] = { 0, 0, 0 }, nc_on[3] = { 0, 0, 0 };   /* the newcomer shape's us a launch at ratio 0 / 1 / 2 */
+    std::string first;
+    for (const Shape& sh : shapes) {
+        const int64_t M = sh.M, maxp = sh.p0 + M, r = sh.ratio;
+        const int64_t nwbt = (maxp + bs - 1) / bs + 1, nwblk = nwbt + 2;
+        const int64_t ncbt = r ? (maxp + cbs - 1) / cbs + 1 : 1, ncblk = ncbt + 2;
+        std::vector<uint16_t> q((size_t)(M * n)), wc((size_t)(nwblk * bs * D));
+        for (auto& v : q) v = rad_f32_to_bf16(nd(rng) * 0.05f);
+        for (auto& v : wc) v = rad_f32_to_bf16(nd(rng));
+        std::vector<int32_t> wbt((size_t)nwbt), wu = { (int32_t)maxp }, pos((size_t)M), cu = { 0, (int32_t)M }, cbt((size_t)ncbt);
+        for (int64_t b = 0; b < nwbt; ++b) wbt[(size_t)b] = (int32_t)b;
+        for (int64_t b = 0; b < ncbt; ++b) cbt[(size_t)b] = (int32_t)b;
+        for (int64_t m = 0; m < M; ++m) pos[(size_t)m] = (int32_t)(sh.p0 + m);
+        /* the packed latent: random codes, e4m3 scale bytes 0x30..0x37 (an entry 288 bytes, cbs / r entries a block) */
+        std::vector<uint8_t> cc(r ? (size_t)(ncblk * cbs * (slots / r) * 2) : 16);
+        for (size_t i = 0; i < cc.size(); ++i) cc[i] = (uint8_t)(rng() & 0xff);
+        if (r)
+            for (size_t e = 0; e + 288 <= cc.size(); e += 288)
+                for (int b = 0; b < 32; ++b) cc[e + 256 + b] = (uint8_t)(0x30 + (rng() & 7));
+        std::vector<int32_t> sl(r ? (size_t)(M * topk) : 1, -1);
+        int64_t walked = 0;
+        const int64_t nkt = (win + (r ? topk : 0) + 15) / 16;
+        for (int64_t m = 0; m < M && r; ++m) {
+            const int64_t reach = (pos[(size_t)m] + 1) / r;
+            if (reach <= topk) {
+                for (int64_t t = 0; t < reach; ++t) sl[(size_t)(m * topk + t)] = (int32_t)t;
+            } else {   /* 512 distinct ascending: every entry of a random 512-subset (a stride walk with random gaps) */
+                std::vector<int32_t> all((size_t)reach);
+                for (int64_t t = 0; t < reach; ++t) all[(size_t)t] = (int32_t)t;
+                std::shuffle(all.begin(), all.end(), rng);
+                all.resize((size_t)topk);
+                std::sort(all.begin(), all.end());
+                for (int64_t t = 0; t < topk; ++t) sl[(size_t)(m * topk + t)] = all[(size_t)t];
+            }
+        }
+        for (int64_t m = 0; m < M; ++m) {   /* tiles holding a key (the host's count) */
+            const int64_t p = pos[(size_t)m], wk = std::min<int64_t>(win, p + 1);
+            const int64_t sk = r ? std::min<int64_t>(topk, (p + 1) / r) : 0;
+            walked += win / 16 - (win - wk) / 16;   /* window tiles from the first holding a key */
+            walked += (sk + 15) / 16;
+        }
+        std::vector<float> sink((size_t)H), cs((size_t)((maxp + 1) * rot));
+        for (auto& v : sink) v = nd(rng);
+        for (auto& v : cs) v = std::cos(nd(rng));
+        auto up = [&](const void* h, size_t b) {
+            void* d = dalloc(b);
+            if (d && b) st_memcpy(d, h, b, hipMemcpyHostToDevice);
+            return d;
+        };
+        void* dq = up(q.data(), q.size() * 2);
+        void* dwc = up(wc.data(), wc.size() * 2);
+        void* dwbt = up(wbt.data(), wbt.size() * 4);
+        void* dwu = up(wu.data(), 4);
+        void* dpos = up(pos.data(), pos.size() * 4);
+        void* dcu = up(cu.data(), 8);
+        void* dsk = up(sink.data(), sink.size() * 4);
+        void* dcs = up(cs.data(), cs.size() * 4);
+        void* dcc = up(cc.data(), cc.size());
+        void* dcbt = up(cbt.data(), cbt.size() * 4);
+        void* dsel = up(sl.data(), sl.size() * 4);
+        void* dlu = r ? dalloc((size_t)(M * E * D * 2)) : nullptr;
+        const size_t ob = (size_t)(M * n * 2);
+        void* doA = dalloc(ob); void* doB = dalloc(ob);
+        if (!dq || !dwc || !dcc || !doA || !doB || (r && !dlu)) { ok(name, false, "hipMalloc failed"); return; }
+        std::vector<RadParam> pa = { PI("M", M), PI("heads", H), PI("dim", D), PI("window", win), PI("ratio", r),
+                                     PI("topk", r ? topk : 0), PF("scale", 1.0 / std::sqrt((double)D)), PS("dtype", "bf16") };
+        if (r) pa.push_back(PS("latent_format", "nvfp4"));
+        for (const RadParam& p : { PI("rot", rot), PI("off", D - rot), PS("mode", "gptj"), PI("inverse", 1), PI("block", 32),
+                                   PS("format", "fp8_e4m3"), PS("block_scale", "ue8m0") })
+            pa.push_back(p);
+        const bool full = r && (maxp + 0) / r <= E * M;   /* deepseek41: (last + 1) / ratio <= lu_e x rows */
+        if (full) pa.push_back(PI("plan_full", 1));
+        auto ops = [&](void* o) {
+            std::vector<RadTensor> ts = {
+                T(dq, RAD_BF16, { M, n }), T(dwc, RAD_BF16, { nwblk, 1, bs, D }), T(dwbt, RAD_I32, { 1, nwbt }),
+                T(dwu, RAD_I32, { 1 }),
+                r ? T(dcc, RAD_BF16, { ncblk, 1, cbs, slots / r }) : RadTensor{},
+                r ? T(dcbt, RAD_I32, { 1, ncbt }) : RadTensor{},
+                r ? T(dsel, RAD_I32, { M, topk }) : RadTensor{},
+                T(dpos, RAD_I32, { M }), T(dcu, RAD_I32, { 2 }), T(dsk, RAD_F32, { H }), T(o, RAD_BF16, { M, n }),
+                T(dcs, RAD_F32, { maxp + 1, rot }) };
+            if (r) ts.push_back(T(dlu, RAD_BF16, { M, E * D }));
+            return ts;
+        };
+        auto unpack = [&]() {
+            return k1_launch(rlu, { T(dcc, RAD_BF16, { ncblk, 1, cbs, slots / r }), T(dcbt, RAD_I32, { 1, ncbt }),
+                                    T(dpos, RAD_I32, { M }), T(dcu, RAD_I32, { 2 }), T(dlu, RAD_BF16, { M, E * D }) },
+                             { PI("M", M), PI("dim", D), PI("ratio", r), PS("latent_format", "nvfp4") });
+        };
+        auto attn = [&](void* o) { return k1_launch(r ? rfu : rfp, ops(o), pa); };
+        int rc = r ? unpack() : RAD_OK;
+        st_memset(doA, 0x11, ob);
+        st_memset(doB, 0x22, ob);
+        pin(0);
+        const int r1 = rc == RAD_OK ? attn(doA) : rc;
+        pin(1);
+        const int r2 = rc == RAD_OK ? attn(doB) : rc;
+        if (r1 != RAD_OK || r2 != RAD_OK) {
+            ++rc_bad;
+            if (first.empty()) first = fmt("M=%lld p0 %lld ratio %d: rc %d / %d", (long long)M, (long long)sh.p0, sh.ratio, r1, r2);
+            pin(-1);
+            dfree_all();
+            continue;
+        }
+        std::vector<uint16_t> oa((size_t)(M * n)), obv((size_t)(M * n));
+        st_memcpy(oa.data(), doA, ob, hipMemcpyDeviceToHost);
+        st_memcpy(obv.data(), doB, ob, hipMemcpyDeviceToHost);
+        int64_t d = 0, nz = 0;
+        for (size_t i = 0; i < oa.size(); ++i) { d += oa[i] != obv[i]; nz += (oa[i] & 0x7fff) != 0; }
+        bad += d;
+        if (d && first.empty())
+            first = fmt("M=%lld p0 %lld ratio %d: %lld of %zu outputs differ", (long long)M, (long long)sh.p0, sh.ratio,
+                        (long long)d, oa.size());
+        pin(0);
+        const double t0 = k1_time_us([&] { attn(doA); });
+        pin(1);
+        const double t1 = k1_time_us([&] { attn(doB); });
+        pin(0);
+        const double t2 = k1_time_us([&] { attn(doA); });
+        pin(1);
+        const double t3 = k1_time_us([&] { attn(doB); });
+        pin(-1);
+        const double tu = r ? k1_time_us([&] { unpack(); }) : 0.0;
+        const double toff = 0.5 * (t0 + t2), ton = 0.5 * (t1 + t3);
+        if (sh.p0 == 0 && M == 1150) { nc_off[r] = toff; nc_on[r] = ton; }
+        std::printf("  info  P32 M %lld p0 %lld ratio %d%s: skip off %.1f / %.1f us, on %.1f / %.1f us a launch (A B A B) = %+.1f %%; "
+                    "tiles walked %lld of %lld (%.1f %%); %lld of %zu outputs differ (%lld non-zero); latent_unpack %.1f us\n",
+                    (long long)M, (long long)sh.p0, sh.ratio, full ? " plan_full" : "", t0, t2, t1, t3, 100.0 * (ton / toff - 1.0),
+                    (long long)walked, (long long)(M * nkt), 100.0 * (double)walked / (double)(M * nkt), (long long)d, oa.size(),
+                    (long long)nz, tu);
+        std::fflush(stdout);
+        dfree_all();
+    }
+    /* W(10,32): the follower holds layers 10-19 (ratio 2) and 20-31 (ratio 1); the leader 0-1 (window only), 2-9 (2), 32-39 (1) */
+    std::printf("P32NC a newcomer (1,150 rows from 0) a rank: follower 10 x r2 + 12 x r1 = %.2f -> %.2f ms (%+.2f), leader 2 x r0 + "
+                "8 x r2 + 8 x r1 = %.2f -> %.2f ms (%+.2f)\n", (10 * nc_off[2] + 12 * nc_off[1]) / 1e3,
+                (10 * nc_on[2] + 12 * nc_on[1]) / 1e3, (10 * (nc_on[2] - nc_off[2]) + 12 * (nc_on[1] - nc_off[1])) / 1e3,
+                (2 * nc_off[0] + 8 * nc_off[2] + 8 * nc_off[1]) / 1e3, (2 * nc_on[0] + 8 * nc_on[2] + 8 * nc_on[1]) / 1e3,
+                (2 * (nc_on[0] - nc_off[0]) + 8 * (nc_on[2] - nc_off[2]) + 8 * (nc_on[1] - nc_off[1])) / 1e3);
+    ok(name, bad == 0 && rc_bad == 0,
+       fmt("%zu shapes: %lld outputs differ skip off vs on, %lld launch failures%s%s", shapes.size(), (long long)bad,
+           (long long)rc_bad, first.empty() ? "" : "; first: ", first.c_str()));
+}
+
 /* ---- lever KVWIN (10.11.2026): DeepSeek-V4.1's window keys as the fp8 window slot (r4d_ds41_qrt.h ds_w8_*:
  * 512 e4m3 codes and 16 scale bytes, 528 bytes instead of 1024), on the card, byte for byte:
  *   window_store_fp8_bf16 over quant_roundtrip_fp8_bf16's rows (the window key's round trip, ue8m0, blocks of 32;
@@ -37377,6 +37545,7 @@ static void device_phase(const Plugin& pl) {
         qk_kv_fold_case(pl, false, 2);
         ds41_kvfold_case(pl);
         ds41_ofold_case(pl);
+        ds41_attn_skip_case(pl);   /* tp8 loop P32 */
         ds41_ggfold_case(pl, "rmsnorm_gemm_nt_ggml_qk256", 1);
         ds41_ggfold_case(pl, "rmsnorm_gemm_nt_ggml_qk32", 1);
         ds41_ggfold_case(pl, "swiglu_clamped_gemm_nt_ggml_qk256", 2);
