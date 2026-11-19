@@ -1373,7 +1373,7 @@ int Engine::step_loop_lanes() {
         /* tp8 dev M9: the counts (run so far) once a minute, as D10's */
         if (lseg) {
             const uint64_t now = rad_mono_ns();
-            if (now - lseg_line_ns >= 60000000000ull) {
+            if (now - lseg_line_ns >= bgr_every) {   /* tp8 loop D32: RADIANCE_PP_BGRATE_LINE_S's period (default 60 s, as before) */
                 lseg_line(" so far");
                 lseg_line_ns = now;
             }
