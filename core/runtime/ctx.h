@@ -906,6 +906,12 @@ private:
     void slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, double own_ms,
                          double launch_ms, uint64_t res_ns, uint64_t res_n);
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
+    /* tp8 loop D41 (RADIANCE_PP_HEAD_PHASES=N, a pipeline leader's rank 0; ctx.cpp): a decode HEAD part's run_step by phase,
+     * summed over N heads, then one line. ph_on_: this pass is one; ph_t_: the phase marks run_pass / play_pass set. */
+    bool     ph_on_ = false;
+    uint64_t ph_t_[8] = {};
+    uint64_t ph_ns_[8] = {}, ph_n_ = 0, ph_played_ = 0, ph_slow_ = 0, ph_pk_ = 0, ph_entry_ns_ = 0;
+    void head_phase_line();
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};
     std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0};

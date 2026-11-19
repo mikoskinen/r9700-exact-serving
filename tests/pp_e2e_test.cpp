@@ -804,7 +804,9 @@ TEST(lanes_keep_both_stages_busy_at_once) {
     for (int lanes : { 1, 2 }) {
         const std::string prefix = d / ("st" + std::to_string(lanes));
         Serving pp;
-        REQUIRE(pp.start("0,2", lane_shape(lanes), { "RADIANCE_PP_SPLIT_MIN=16", "RADIANCE_PP_STAMPS=" + prefix }));
+        /* tp8 loop D41: RADIANCE_PP_HEAD_PHASES=16 -- rank 0 times every 16 whole decode heads by phase (timing only) */
+        REQUIRE(pp.start("0,2", lane_shape(lanes), { "RADIANCE_PP_SPLIT_MIN=16", "RADIANCE_PP_STAMPS=" + prefix,
+                                                     "RADIANCE_PP_HEAD_PHASES=16" }));
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<std::future<std::vector<int32_t>>> f;
         for (uint64_t s = 0; s < 12; ++s)
@@ -843,6 +845,27 @@ TEST(lanes_keep_both_stages_busy_at_once) {
             CHECK(heads > 0);
             CHECK_EQ(hiss, lanes > 1 ? heads : 0LL);   /* one lane runs engine.cpp's step loop: no 'hiss' there */
             CHECK_EQ(bad, 0LL);
+            /* tp8 loop D41: with lanes, rank 0's head-phase lines (every 16 decode heads); one lane issues no head part */
+            const std::string llog = pp.lead.output();
+            const char* key = "radiance: rank 0 decode head issue by phase (RADIANCE_PP_HEAD_PHASES, tp8 loop D41): ";
+            long long lines = 0, n = -1, played = -1, live = -1;
+            for (size_t at = llog.find(key); at != std::string::npos; at = llog.find(key, at + 1)) {
+                ++lines;
+                (void)std::sscanf(llog.c_str() + at + std::strlen(key), "%lld heads (%lld played, %lld issued live)", &n, &played, &live);
+            }
+            fprintf(stderr, "    %d lane(s): %lld head-phase lines (tp8 loop D41), the last: %lld heads, %lld played, %lld live\n", lanes,
+                    lines, n, played, live);
+            if (lanes > 1) {
+                CHECK(lines > 0);
+                CHECK_EQ(n, 16LL);
+                CHECK(played >= 0 && live >= 0 && played + live == 16);   /* the host backend records no tapes: every head live */
+                if (lines > 0) {
+                    const size_t at = llog.rfind(key);
+                    fprintf(stderr, "      %s\n", llog.substr(at, llog.find('\n', at) - at).c_str());
+                }
+            } else {
+                CHECK_EQ(lines, 0LL);
+            }
         }
     }
     CHECK(got[1].both < 0.02);          /* one lane: the nodes take turns */
