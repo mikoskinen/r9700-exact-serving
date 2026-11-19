@@ -405,6 +405,15 @@
  *                   served at all. So one start runs depth 2 (2-row block) and depth 3 (3-row block) at lanes of 16 in
  *                   process. Starts 0. Exact: it moves only which declared block a drafter cycle runs (D18 / D19's rule);
  *                   the trunk verifies what it proposes. GET "short_blk": the declared lengths (mask), query passes at it.
+ *   ds41_prefetch   deepseek41 (tp8 loop D24; 83 here, after draft_short_blk): which weights a decode-only pass of <= 64
+ *                   rows reads into the on-die cache beside its all-reduces (libr4d `prefetch`, rad_arch.h prefetch_beside:
+ *                   the second lane, or the chained form) -- bit 0 the mix fns (hc_f_fn beside the attention all-reduce,
+ *                   the next layer's hc_a_fn beside the MoE all-reduce: the fused post + mix right after each reads it
+ *                   first), bit 1 the router projection + the shared arm's gate_up beside the attention all-reduce, bit 2
+ *                   the next layer's q_a / kv projections beside the MoE all-reduce; 0 = none (today). RADIANCE_DS41_PREFETCH
+ *                   =0 .. 7 declares every read (each weight's first RADIANCE_DS41_PREFETCH_MB, default 8) and starts at
+ *                   that value; unset declares nothing and >= 1 is refused (so is it where no library serves `prefetch`:
+ *                   the host backend). Exact: the op reads weights and writes nothing a pass reads.
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -615,7 +624,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
