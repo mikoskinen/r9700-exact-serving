@@ -944,6 +944,15 @@ TEST(lanes_keep_both_stages_busy_at_once) {
             }
             fprintf(stderr, "    %d lane(s): %lld head-phase lines (tp8 loop D41), the last: %lld heads, %lld played, %lld live\n", lanes,
                     lines, n, played, live);
+            /* tp8 loop D41b: each head-phase line has its parts line (phase 0 split, pre-stretch host steps by kind) */
+            const char* keyb = "radiance: rank 0 decode head issue, the parts (RADIANCE_PP_HEAD_PHASES, tp8 loop D41b): stager begin_pass ";
+            long long lines_b = 0;
+            for (size_t at = llog.find(keyb); at != std::string::npos; at = llog.find(keyb, at + 1)) ++lines_b;
+            CHECK_EQ(lines_b, lines);
+            if (lines_b > 0) {
+                const size_t at = llog.rfind(keyb);
+                fprintf(stderr, "      %s\n", llog.substr(at, llog.find('\n', at) - at).c_str());
+            }
             if (lanes > 1) {
                 CHECK(lines > 0);
                 CHECK_EQ(n, 16LL);

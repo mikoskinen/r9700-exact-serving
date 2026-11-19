@@ -911,6 +911,10 @@ private:
     bool     ph_on_ = false;
     uint64_t ph_t_[8] = {};
     uint64_t ph_ns_[8] = {}, ph_n_ = 0, ph_played_ = 0, ph_slow_ = 0, ph_pk_ = 0, ph_entry_ns_ = 0;
+    /* tp8 loop D41b: phase 0 split (the stager's begin_pass / the residency sync) and the host steps a play runs before
+     * its first recorded stretch by kind (0 table refresh, 1 host op, 2 route report, 3 expert prefetch, 4 KV stage):
+     * summed time and count over the same N heads */
+    uint64_t ph_stager_ns_ = 0, ph_sg_ns_ = 0, ph_k_ns_[5] = {}, ph_k_n_[5] = {};
     void head_phase_line();
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};

@@ -1518,8 +1518,18 @@ void Ctx::head_phase_line() {
                  (unsigned long long)ph_n_, (unsigned long long)ph_played_, (unsigned long long)(ph_n_ - ph_played_), us(0), us(1),
                  us(2), us(3), us(4), (double)ph_pk_ / (double)std::max<uint64_t>(1, ph_played_), us(5), us(6), us(7),
                  (unsigned long long)ph_slow_);
+    /* tp8 loop D41b: the same heads' phase 0 split and pre-stretch host steps by kind (us a head; steps a head) */
+    auto kus = [&](uint64_t ns) { return (double)ns / n / 1e3; };
+    auto kn = [&](int k) { return (double)ph_k_n_[k] / n; };
+    std::fprintf(stderr, "radiance: rank 0 decode head issue, the parts (RADIANCE_PP_HEAD_PHASES, tp8 loop D41b): stager begin_pass %.1f + "
+                         "residency sync %.1f us; host steps before the first stretch: table refresh %.1f us (%.2f), host op %.1f (%.2f), "
+                         "route report %.1f (%.2f), expert prefetch %.1f (%.2f), KV stage %.1f (%.2f) a head\n",
+                 kus(ph_sg_ns_), us(0) - kus(ph_sg_ns_), kus(ph_k_ns_[0]), kn(0), kus(ph_k_ns_[1]), kn(1), kus(ph_k_ns_[2]), kn(2),
+                 kus(ph_k_ns_[3]), kn(3), kus(ph_k_ns_[4]), kn(4));
     ph_n_ = ph_played_ = ph_slow_ = ph_pk_ = 0;
     for (uint64_t& x : ph_ns_) x = 0;
+    ph_sg_ns_ = 0;
+    for (int k = 0; k < 5; ++k) ph_k_ns_[k] = ph_k_n_[k] = 0;
 }
 
 int Ctx::play_pass(PassTape& t) {
@@ -1527,6 +1537,11 @@ int Ctx::play_pass(PassTape& t) {
     bool ph_first = ph_on_;   /* tp8 loop D41: the first recorded stretch of a timed head */
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
+        /* tp8 loop D41b: a host step before the first recorded stretch of a timed head, timed by kind */
+        const int pk = !ph_first || st.kind == kTapePlay ? -1
+                       : st.kind == kTapeTable ? 0 : st.kind == kTapeHost ? 1 : st.kind == kTapeRoute ? 2
+                       : (st.kind == kTapeXp || st.kind == kTapeXpMark || st.kind == kTapeXpStep) ? 3 : 4;
+        const uint64_t pk0 = pk >= 0 ? ph_now() : 0;
         switch (st.kind) {
         case kTapePlay:
             if (ph_first) { ph_t_[3] = ph_now(); ph_pk_ += (uint64_t)std::max(0, st.b - st.a); }
@@ -1591,6 +1606,7 @@ int Ctx::play_pass(PassTape& t) {
             lane_ = l0;
             break;
         }
+        if (pk >= 0) { ph_k_ns_[pk] += ph_now() - pk0; ++ph_k_n_[pk]; }   /* tp8 loop D41b */
         if (rc < 0) {
             if (step_status_ >= 0) step_status_ = rc;
             return rc;
@@ -1692,6 +1708,7 @@ int Ctx::run_step(const RadBatch* b) {
     /* Before the residency sync, which carries any weights a declining stager gave back into the
      * tables (runtime/stager.h). */
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
+    ph_stager_ns_ = g_head_phases > 0 ? ph_now() : 0;   /* tp8 loop D41b: the stager's part of phase 0 */
 
     sync_residency();
 
@@ -1715,6 +1732,7 @@ int Ctx::run_step(const RadBatch* b) {
         ph_t_[0] = ph_entry_ns_;
         ph_t_[1] = ph_now();
         ph_t_[2] = ph_t_[3] = ph_t_[4] = 0;
+        ph_sg_ns_ += ph_stager_ns_ - ph_entry_ns_;   /* tp8 loop D41b */
     }
     kvstream_enter(this, b);
     if (ph_on_) ph_t_[5] = ph_now();
