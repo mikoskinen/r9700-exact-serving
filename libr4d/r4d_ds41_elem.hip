@@ -2399,6 +2399,70 @@ __global__ __launch_bounds__(256) void rope_rt_kernel(uint16_t* x, long xp, int 
     }
 }
 
+/* tp8 loop P32d (PREFILL round 26; RADIANCE_DS41_ROPE8=1): rope_rt_kernel<32>'s work a thread EIGHT columns (one 16-byte load and
+ * store) instead of one: a gptj pair is two adjacent columns of the thread (off and hd even), a block of 32 is four threads
+ * (r4d_xor_max<4> of their 8-column maxima = the 32-lane butterfly's maximum: fmaxf of NaN-free non-negative values in any
+ * grouping), every value the same expressions -- the same bytes. One card (P32's cell, the attention's fold at prefill heights):
+ * the one-column form moved ~260 GB/s. Taken for blocks of 32 with n, the row pitch and the plane on 8 bf16. */
+__global__ __launch_bounds__(256) void rope_rt8_kernel(uint16_t* x, long xp, int n, long rows, FzRope r, int fmt, int sc) {
+    const int c8 = (blockIdx.x * 256 + threadIdx.x) * 8;
+    const bool in = c8 < n;
+    const int hh = c8 / r.hd, d8 = c8 - hh * r.hd - r.off;
+    for (long m = blockIdx.y; m < rows; m += gridDim.y) {
+        uint16_t* row = x + m * xp;
+        const uint4 w = in ? *(const uint4*)(row + c8) : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t ww[4] = { w.x, w.y, w.z, w.w };
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            v[2 * e] = ds_bf((uint16_t)(ww[e] & 0xffffu));
+            v[2 * e + 1] = ds_bf((uint16_t)(ww[e] >> 16));
+        }
+        const long p = r.pos[m * r.ps];
+        if (p >= 0 && p < r.tab_rows) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int d = d8 + 2 * e;
+                if (in && d >= 0 && d < 2 * r.half) {
+                    const int i = d >> 1;
+                    const float c = r.cs[p * r.cp + (long)i * r.cst];
+                    const float sn = r.sign * r.cs[p * r.cp + (long)(r.half + i) * r.cst];
+                    const float va = v[2 * e], vb = v[2 * e + 1];
+                    v[2 * e] = ds_bf(ds_bf16(va * c - vb * sn));
+                    v[2 * e + 1] = ds_bf(ds_bf16(va * sn + vb * c));
+                }
+            }
+        }
+        float a = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float t = fabsf(v[e]);
+            t = t == t ? t : 0.0f;
+            a = fmaxf(a, t);
+        }
+        const float amax = r4d_xor_max<4>(a);
+        const float bs = block_scale(amax, fmt, sc);
+        uint32_t o[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            o[e] = (uint32_t)ds_bf16(roundtrip(v[2 * e], bs, fmt)) | ((uint32_t)ds_bf16(roundtrip(v[2 * e + 1], bs, fmt)) << 16);
+        if (in) *(uint4*)(row + c8) = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+int rope8_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_ROPE8");
+        const int on = e && !std::strcmp(e, "1");
+        if (on)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_ROPE8=1 (tp8 loop P32d): rope_rows_roundtrip at blocks of 32 runs "
+                                 "eight columns a thread (the same bytes)\n");
+        return on ? 1 : 0;
+    }();
+    return v;
+}
+std::atomic<int> g_rope8_pin{-1};
+[[maybe_unused]] const int g_rope8_load = rope8_env();
+
 /* mhc_collapse_rmsnorm: rmsnorm's grid and width. A thread owns columns i = tid + k*THR (the norm's
  * own split), collapses each (the streams from zero in order, collapse_kernel's sum), stores it and
  * folds the stored bf16 into the sum of squares in that order. Loads go out a batch of kFzCols
@@ -2730,10 +2794,19 @@ int rope_rt_body(const RadArgs* a, RadStream stream) {
         q.n_p = a->n_p + 1;
         return quant_rt_body(&q, stream);
     }
-    const unsigned gxr = (unsigned)((n + 255) / 256);
-    const dim3 grid(gxr, ds_dodge_gy(gxr, grid_rows(M), 8));   /* lever WQ */
     uint16_t* xd = (uint16_t*)x.data;
     const long xp = (long)x.stride[0];
+    {   /* tp8 loop P32d */
+        const int pin = g_rope8_pin.load(std::memory_order_relaxed);
+        if ((pin >= 0 ? pin : rope8_env()) > 0 && block == 32 && n % 8 == 0 && r.hd % 8 == 0 && xp % 8 == 0 && x.stride[1] == 1 &&
+            ((uintptr_t)xd & 15u) == 0) {
+            const unsigned gx8 = (unsigned)((n / 8 + 255) / 256);
+            const dim3 g8(gx8, ds_dodge_gy(gx8, grid_rows(M), 8));
+            return R4D_EMIT(stream, rope_rt8_kernel, g8, dim3(256), 0, xd, xp, (int)n, M, r, fmt, sc);
+        }
+    }
+    const unsigned gxr = (unsigned)((n + 255) / 256);
+    const dim3 grid(gxr, ds_dodge_gy(gxr, grid_rows(M), 8));   /* lever WQ */
 #define FZ_RRT(B)                                                                                  \
     case B:                                                                                        \
         return R4D_EMIT(stream, rope_rt_kernel<B>, grid, dim3(256), 0, xd, xp, (int)n, M, r, fmt, sc)
@@ -3275,6 +3348,8 @@ extern "C" int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kv_store(const RadArgs* a, RadStream s) {
     return norm_rope_rt_kv_body(a, s);
 }
+/* tp8 loop P32d: rope_rows_roundtrip's eight-columns-a-thread form (0 off, 1 on, -1 = RADIANCE_DS41_ROPE8) */
+extern "C" void r4d_rope8_pin(int v) { g_rope8_pin.store(v < 0 ? -1 : (v ? 1 : 0), std::memory_order_relaxed); }
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
     return rope_rt_body(a, s);
 }

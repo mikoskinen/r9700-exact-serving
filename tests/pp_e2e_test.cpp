@@ -1213,6 +1213,13 @@ TEST(a_cold_prompt_at_two_lanes_is_one_processes_tokens_and_chunk_plan) {
             const size_t gl = llog.find("lane-step stalls over the run");
             CHECK(pl != std::string::npos);
             CHECK(gl != std::string::npos);
+            /* tp8 loop F68: the request's wait at the scheduler before its first plan, stamped (>= 0) */
+            if (pl != std::string::npos) {
+                const std::string ln = llog.substr(pl, llog.find('\n', pl) - pl);
+                const size_t at = ln.find("; at the scheduler ");
+                CHECK(at != std::string::npos);
+                if (at != std::string::npos) CHECK(ln.compare(at + 19, 1, "-") != 0);
+            }
             if (pl != std::string::npos) fprintf(stderr, "    %s\n", llog.substr(pl, llog.find('\n', pl) - pl).c_str());
             if (gl != std::string::npos) fprintf(stderr, "    %s\n", llog.substr(gl, llog.find('\n', gl) - gl).c_str());
         }

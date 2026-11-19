@@ -1940,19 +1940,29 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const char* dst = nm.ckpt("%s.weight#pf", down_base);
             RadEncoding e1{}, e2{};
             if (weight_enc(b, gst, &e1) && weight_enc(b, dst, &e2)) {
-                if (!linear_is_w8(e1) || !linear_is_w8(e2)) {
-                    fprintf(stderr, "radiance: layer %d's shared-expert twins %s / %s are not plain int8 (i8*bf16[1x128])\n",
-                            l, gst, dst);
+                /* tp8 loop P30o r2 (c): or the release's block FP8 (fp8_e4m3*e8m0[32x32]), each linear over its own E4M3 pair
+                 * from the bf16 plane (LinearFP8 e8) */
+                const auto e8of = [](const RadEncoding& e) {
+                    const RadEncPlane* sp = rad_enc_plane(&e, "scale");
+                    return rad_enc_is(&e, "affine") && e.n_planes == 2 && e.plane[0].dtype == RAD_F8E4M3 && sp &&
+                           sp->dtype == RAD_E8M0 && sp->block[0] == 32 && sp->block[1] == 32;
+                };
+                const bool tw8 = linear_is_w8(e1) && linear_is_w8(e2), twe8 = e8of(e1) && e8of(e2);
+                if (!tw8 && !twe8) {
+                    fprintf(stderr, "radiance: layer %d's shared-expert twins %s / %s are not plain int8 (i8*bf16[1x128]) nor "
+                                    "the release's block FP8 (fp8_e4m3*e8m0[32x32]), both alike\n", l, gst, dst);
                     return RAD_E_DTYPE;
                 }
                 const int64_t n = c.n_ff_shared, m = c.rows > 0 ? c.rows : g.max_tok;
                 sff_tw = ActFP8{};
                 sff_tw.x = w.sff.x;
-                sff_tw.q8 = decl_b(b, nm.f("blk.%d.shared_ff_tw.q8", l), RAD_I8, { m, n });
-                sff_tw.s8 = decl_b(b, nm.f("blk.%d.shared_ff_tw.s8", l), RAD_F32, { m, fp8_blocks(n) });
-                if (!sff_tw.q8 || !sff_tw.s8) return RAD_E_INVAL;
-                RAD_ARCH_TRY(rad_buf_concurrent(b, sff_tw.q8));
-                RAD_ARCH_TRY(rad_buf_concurrent(b, sff_tw.s8));
+                if (tw8) {
+                    sff_tw.q8 = decl_b(b, nm.f("blk.%d.shared_ff_tw.q8", l), RAD_I8, { m, n });
+                    sff_tw.s8 = decl_b(b, nm.f("blk.%d.shared_ff_tw.s8", l), RAD_F32, { m, fp8_blocks(n) });
+                    if (!sff_tw.q8 || !sff_tw.s8) return RAD_E_INVAL;
+                    RAD_ARCH_TRY(rad_buf_concurrent(b, sff_tw.q8));
+                    RAD_ARCH_TRY(rad_buf_concurrent(b, sff_tw.s8));
+                }
                 sh_gate_up_tw.stored = gst;
                 sh_down_tw.stored = dst;
                 RAD_ARCH_TRY(sh_gate_up_tw.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up_shexp_tw", l),
@@ -1964,7 +1974,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                                 g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
                                                 { dst }, sff_tw, w.sout, c.rows, {},
                                                 c.shared_lo, c.shared_hi));
-                sh_tw = sh_gate_up_tw.i8 && sh_down_tw.i8;
+                sh_tw = (sh_gate_up_tw.i8 && sh_down_tw.i8) || (sh_gate_up_tw.e8 && sh_down_tw.e8);
                 if (!sh_tw) return RAD_E_DTYPE;
             }
         }

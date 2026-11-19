@@ -687,6 +687,82 @@ TEST(cone_rows_and_cones_are_design_2s) {
         }
 }
 
+/* tp8 loop P30t-psk: a cut segment's launch stays in its uncut launch's int8 band (the tiled band above 64 rows is row-invariant,
+ * r4d_emu test_ds41tw) and takes the twin exactly when the uncut one does, at every rows floor twin_cut_safe allows; controls: a
+ * cut floor inside the narrow band, and a rows floor above lever PSK's 160, each break it */
+TEST(cone_cut_keeps_the_int8_twins_band_and_choice) {
+    CHECK(ds41cone::twin_cut_safe(1));
+    CHECK(ds41cone::twin_cut_safe(160));
+    CHECK(!ds41cone::twin_cut_safe(161));
+    CHECK(!ds41cone::twin_cut_safe(0));
+    CHECK_EQ(ds41cone::twin_band(64), 0);
+    CHECK_EQ(ds41cone::twin_band(65), 1);
+    long long cases = 0, cut = 0;
+    std::vector<int32_t> ahs = { 0, 1, 2, 63, 64, 65, 159, 160, 161, ds41cone::kNoHint };
+    for (int32_t ah = 0; ah <= 6000; ah += 101) ahs.push_back(ah);
+    for (int32_t ah = 2300; ah <= 2600; ah += 3) ahs.push_back(ah);   /* C_20 / C_21 edges */
+    for (int64_t n = 1; n <= 4160; ++n)
+        for (int32_t ah : ahs)
+            for (int l = 0; l < kNL; ++l) {   /* layers 0..20 too: lever PSK-CR's replays cut there */
+                const int64_t r = ds41cone::rows(ds41cone::cone(kNL, kW, l), ah, n);
+                ++cases;
+                if (r == 0 || r == n) continue;
+                ++cut;
+                CHECK(r >= ds41cone::kBase && r < n);
+                CHECK_EQ(ds41cone::twin_band(r), ds41cone::twin_band(n));
+                for (int64_t tr : { 1, 2, 16, 64, 65, 100, 160 }) CHECK_EQ(r >= tr, n >= tr);
+            }
+    CHECK(cut > 100000);   /* the sweep cuts */
+    CHECK(cases > 1000000);
+    /* control 1: a cut floor of 48 (inside the narrow band) moves some n > 64 into it */
+    int moved = 0;
+    for (int64_t n = 65; n <= 4160 && !moved; ++n)
+        for (int32_t ah : ahs) {
+            if (ah == ds41cone::kNoHint) continue;
+            const int64_t C = ds41cone::cone(kNL, kW, 39);
+            if ((int64_t)ah >= C) continue;
+            const int64_t r = std::min(n, std::max(C - (int64_t)ah, (int64_t)48));
+            moved += ds41cone::twin_band(r) != ds41cone::twin_band(n);
+        }
+    CHECK(moved > 0);
+    /* control 2: a rows floor of 161 lets a 160-row cut keep GGUF while its uncut segment takes the twin */
+    int flipped = 0;
+    for (int64_t n = 161; n <= 4160 && !flipped; ++n)
+        for (int32_t ah : ahs) {
+            const int64_t r = ds41cone::rows(ds41cone::cone(kNL, kW, 39), ah, n);
+            flipped += r > 0 && (r >= 161) != (n >= 161);
+        }
+    CHECK(flipped > 0);
+}
+
+/* tp8 loop P30t-psk bit 128: at every SP threshold twin_sub_safe allows, every T at or above it cuts four quarters of more than
+ * 64 rows (the tiled band), each taking the twin as the whole segment does (269 = 4 x 67 + 1 -> 68 / 68 / 68 / 65); control:
+ * below 269 some T leaves its last quarter in the narrow band (265 -> 67 / 67 / 67 / 64) */
+TEST(cone_sp_quarters_keep_the_int8_twins_band) {
+    CHECK_EQ(ds41cone::kTwinSubMinT, (int64_t)269);
+    CHECK_EQ(ds41cone::sp_quarter_min(265), (int64_t)64);
+    CHECK_EQ(ds41cone::sp_quarter_min(269), (int64_t)65);
+    CHECK(ds41cone::twin_sub_safe(1024, 1));
+    CHECK(ds41cone::twin_sub_safe(269, 65));
+    CHECK(!ds41cone::twin_sub_safe(268, 1));
+    CHECK(!ds41cone::twin_sub_safe(1024, 66));
+    for (int64_t thr : { 269, 300, 512, 1024, 2048 })
+        for (int64_t T = thr; T <= 16384; ++T) {
+            const int64_t q = (T + 3) / 4;
+            int64_t least = INT64_MAX;
+            for (int r = 0; r < 4; ++r) {
+                const int64_t r0 = std::min<int64_t>(r * q, T), n = std::max<int64_t>(0, std::min(q, T - r0));
+                least = std::min(least, n);
+            }
+            CHECK_EQ(least, ds41cone::sp_quarter_min(T));
+            CHECK_EQ(ds41cone::twin_band(least), 1);
+            for (int64_t tr : { 1, 16, 65 }) CHECK_EQ(least >= tr, T >= tr);
+        }
+    int narrow = 0;   /* control: below the least safe threshold some T leaves a quarter in the narrow band */
+    for (int64_t T = 260; T < ds41cone::kTwinSubMinT; ++T) narrow += ds41cone::twin_band(ds41cone::sp_quarter_min(T)) == 0;
+    CHECK(narrow > 0);
+}
+
 TEST(cone_plan_end_starts_at_the_split_layer) {
     const int32_t rw[1] = { 4096 };
     struct C { int32_t ah; int from21, from20; };

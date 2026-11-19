@@ -164,7 +164,7 @@ emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
 typedef int emu_v2i __attribute__((ext_vector_type(2)));
 emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c);
 #define __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c) emu_wmma_fp8((a), (b), (c))
-/* v_wmma_i32_16x16x16_iu8: not emulated; reported when reached */
+/* v_wmma_i32_16x16x16_iu8 (gfx12): the fp8 form's layout, exact int32 sums (emu.cpp) */
 typedef int emu_v8i __attribute__((ext_vector_type(8)));
 emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool clamp);
 #define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, cl) \

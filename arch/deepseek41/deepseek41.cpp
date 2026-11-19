@@ -1058,15 +1058,22 @@ static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t d
  * other dense name. RADIANCE_DS41_TWIN_ROWS=N (default 1): a prompt segment of fewer rows keeps GGUF. In process: fn4
  * ds41_twin = mask + 256 x rows (rows 0 = the env's), a subset of the env's mask (0 = every row GGUF = the published program).
  * A prompt row's bytes are then its own segment's (M = the segment's rows, issued by segment; a segment's sub-range -- an SP
- * quarter, a P13 / P15 piece -- keeps GGUF), so they do not depend on the other rows of the pass: rule B (own reference). */
+ * quarter, a P13 / P15 piece -- keeps GGUF), so they do not depend on the other rows of the pass: rule B (own reference).
+ * Bit 64 (kTwPsk, tp8 loop P30t-psk; not a class): the twins also act at lever PSK's layers (from its first / split layer on)
+ * and in passes holding a replay segment (lever PSK-CR), which every class otherwise keeps GGUF -- exact because a cut keeps
+ * the int8 GEMM's row-invariant band (ds41cone::twin_cut_safe: kBase 160 > the narrow band's 64, TWIN_ROWS <= 160); the env
+ * declares it (RADIANCE_DS41_TWIN=mask + 64), ds41_twin's value carries it in process (mask + 64 + 256 x rows).
+ * Bit 128 (kTwSub, the same round): the twins also act on an SP pass's quarters (P26's q_a / kv, the SP Engram's kv: each rank's
+ * rows [r q, r q + q) of a lone prompt of T >= ds41_sphc rows), which those classes otherwise keep GGUF in every pass -- exact
+ * while every quarter stays in the tiled band (ds41cone::twin_sub_safe: ds41_sphc >= 269, TWIN_ROWS <= 65). */
 static constexpr const char kTwinSfx[] = "#pf";
-enum : int { kTwQkv = 1, kTwQb = 2, kTwOab = 4, kTwEng = 8, kTwShx = 16, kTwOther = 32, kTwAll = 63 };
+enum : int { kTwQkv = 1, kTwQb = 2, kTwOab = 4, kTwEng = 8, kTwShx = 16, kTwOther = 32, kTwAll = 63, kTwPsk = 64, kTwSub = 128 };
 static int twin_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_TWIN");
         if (!e || !*e) return 0;
         const long x = std::strtol(e, nullptr, 0);
-        return x > 0 && x <= kTwAll ? (int)x : 0;
+        return x > 0 && x <= (kTwAll | kTwPsk | kTwSub) && (x & kTwAll) ? (int)x : 0;
     }();
     return v;
 }
@@ -1109,6 +1116,25 @@ static int64_t twin_rows_now() {
     const int r = v < 0 ? 0 : (v >> 8);
     return r > 0 ? r : twin_rows_env();
 }
+/* tp8 loop P30t-psk: kTwPsk asked (the env, or ds41_twin's value in process), some class twinned here, and every cut keeps the
+ * int8 GEMM's band and the twin choice (ds41cone::twin_cut_safe at the rows floor in force) */
+static bool twin_psk_now() {
+    if (!twin_mask_now()) return false;
+    const int v = g_sw_twin.load(std::memory_order_relaxed);
+    return ((v < 0 ? twin_env() : (v & 255)) & kTwPsk) != 0 && ds41cone::twin_cut_safe(twin_rows_now());
+}
+/* kTwSub asked and some class twinned here (the SP threshold's half of twin_sub_safe is the pass's: step_bi) */
+static bool twin_sub_asked() {
+    if (!twin_mask_now()) return false;
+    const int v = g_sw_twin.load(std::memory_order_relaxed);
+    return ((v < 0 ? twin_env() : (v & 255)) & kTwSub) != 0;
+}
+/* a sub-range launch (with_rows) may take the twin: an SP pass's quarter under kTwSub (step_bi sets it a pass) */
+static thread_local bool t_twin_sub_ok = false;
+/* the layer being issued is one lever PSK may cut and kTwPsk lets its twins act (step_bi, per layer): the launch counter's
+ * second figure */
+static thread_local bool t_tw_psk_l = false;
+static std::atomic<long long> g_tw_psk_launch{0};
 /* The twin classes for the rows a by-segment launch issues: a prompt segment (not decode) of at least twin_rows_now() rows,
  * outside a sub-range; restored at the scope's end so nothing outside a segment's launch takes the twin. */
 /* the shared expert's twin for the MoE pass being issued (MoeFP8::twin_now) */
@@ -1117,7 +1143,7 @@ struct TwinScope {
     int prev;
     TwinScope(bool prompt, int64_t n) : prev(t_twin) {
         t_twin = 0;
-        if (prompt && !t_twin_sub) {
+        if (prompt && (!t_twin_sub || t_twin_sub_ok)) {
             const int mk = twin_mask_now() & ~t_tw_off;
             if (mk && n >= twin_rows_now()) t_twin = mk;
         }
@@ -1449,9 +1475,13 @@ static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a,
             if (rad_rank(x) == 0) {
                 const long long nl = g_tw_launch.fetch_add(1, std::memory_order_relaxed) + 1;
                 const long long nr = g_tw_rows.fetch_add(rows, std::memory_order_relaxed) + rows;
-                if (nl == 1 || nl % 16384 == 0)
-                    fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: %lld twin launches (%lld rows) on prompt segments; "
-                                    "ds41_twin mask %d, from %lld rows\n", nl, nr, twin_mask_now(), (long long)twin_rows_now());
+                const long long np = g_tw_psk_launch.fetch_add(t_tw_psk_l ? 1 : 0, std::memory_order_relaxed) +
+                                     (t_tw_psk_l ? 1 : 0);
+                if (nl == 1 || nl % 16384 == 0 || (t_tw_psk_l && np == 1))
+                    fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: %lld twin launches (%lld rows) on prompt segments, %lld "
+                                    "of them at lever PSK's layers (P30t-psk); ds41_twin mask %d%s, from %lld rows\n",
+                            nl, nr, np, twin_mask_now(), twin_psk_now() ? " + 64 (PSK's layers too)" : "",
+                            (long long)twin_rows_now());
             }
         }
     }
@@ -2827,7 +2857,8 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_twin")) {   /* tp8 loop P30t: what the issue reads (classes held here) + 256 x the rows set */
         const int v = g_sw_twin.load(std::memory_order_relaxed);
-        *applied = twin_mask_now() + 256 * (v < 0 ? 0 : (v >> 8));
+        *applied = twin_mask_now() + (twin_psk_now() ? kTwPsk : 0) +
+                   (twin_sub_asked() && twin_rows_now() <= ds41cone::kTwinNarrowM + 1 ? kTwSub : 0) + 256 * (v < 0 ? 0 : (v >> 8));
         return 1;
     }
     return 0;
@@ -6647,14 +6678,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             for (const auto& [cl, n] : per) pl += fmt_s("%s%d x class %d", pl.empty() ? "" : ", ", n, cl);
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_TWIN=%d (tp8 loop P30t): %d twin GEMM(s) beside their GGUF "
                             "linears (%s; %zu twin weights), prompt segments of >= %lld rows take them (RADIANCE_DS41_TWIN_ROWS), "
-                            "decode rows the GGUF launch; switch ds41_twin = mask + 256 x rows, a subset of %d (0 = all GGUF)%s\n",
+                            "decode rows the GGUF launch; switch ds41_twin = mask + 256 x rows, the mask a subset of %d (0 = all GGUF) plus the env's "
+                            "64 / 128 (P30t-psk) where it carries them%s\n",
                     twin_env(), nw, pl.empty() ? "none: no '<name>#pf' entry of the env's classes" : pl.c_str(), m.twin.size(),
                     (long long)twin_rows_env(), m.twin_mask,
                     (twin_env() & kTwEng) ? "; the Engram twin only where lever E1's dedup does not act (ds41_engdd 0)" : "");
-            if (psk_declared())
+            if (twin_env() & kTwSub)
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30t-psk: RADIANCE_DS41_TWIN carries 128: an SP pass's quarters (P26's q_a "
+                                "/ kv, the SP Engram's kv) take the twins too, while ds41_sphc >= %lld (every quarter > %lld rows: the "
+                                "int8 GEMM's row-invariant band) and TWIN_ROWS <= %lld -- this start: SP threshold %lld, TWIN_ROWS %lld "
+                                "(%s); ds41_twin without 128 in process = those launches GGUF in every pass\n",
+                        (long long)ds41cone::kTwinSubMinT, (long long)ds41cone::kTwinNarrowM,
+                        (long long)ds41cone::kTwinNarrowM + 1, (long long)m.sphc, (long long)twin_rows_env(),
+                        m.sphc <= 0 || ds41cone::twin_sub_safe(m.sphc, twin_rows_env()) ? "taken" : "NOT taken");
+            if (psk_declared() && (twin_env() & kTwPsk) && ds41cone::twin_cut_safe(twin_rows_env()))
+                fprintf(stderr, "radiance: deepseek41: tp8 loop P30t-psk: lever PSK is declared here (RADIANCE_DS41_PSK) and "
+                                "RADIANCE_DS41_TWIN carries 64: the twins act at its layers and in replay passes too (a cut segment "
+                                "runs 0, all or >= %lld of its rows, so its int8 launch stays above the narrow band's %lld rows, "
+                                "where a row's bytes are its own); ds41_twin without 64 in process = below those layers only\n",
+                        (long long)ds41cone::kBase, (long long)ds41cone::kTwinNarrowM);
+            else if (psk_declared())
                 fprintf(stderr, "radiance: deepseek41: tp8 loop P30t: lever PSK is declared here (RADIANCE_DS41_PSK): it may cut a prefill "
                                 "segment from its first layer (and its split layer) on, so the twins act below those layers only "
-                                "(and in no pass with a replay segment)\n");
+                                "(and in no pass with a replay segment)%s\n",
+                        (twin_env() & kTwPsk) ? fmt_s("; RADIANCE_DS41_TWIN's 64 is NOT taken: RADIANCE_DS41_TWIN_ROWS %lld is above "
+                                                      "lever PSK's %lld-row cut floor", (long long)twin_rows_env(),
+                                                      (long long)ds41cone::kBase).c_str() : "");
         }
     }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
@@ -8960,19 +9009,39 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         RAD_ISSUE_N(x, m.sp_ag_x, T * D, brows(m.xn, T), RAD_NONE);
         xn_sh = false;
     };
+    /* tp8 loop P30t-psk: read once a pass, so every layer of it takes the same answer. tw_sub (bit 128): an SP pass's quarters
+     * take the twin where its whole segment would -- every quarter in the tiled band at the SP threshold in force (no SP
+     * declared: no quarter, nothing to keep GGUF for) */
+    const bool tw_psk = m.twin_mask && twin_psk_now();
+    const bool tw_sub = m.twin_mask && twin_sub_asked() &&
+                        (m.sphc <= 0 ? twin_rows_now() <= ds41cone::kTwinNarrowM + 1
+                                     : ds41cone::twin_sub_safe(sp_thr, twin_rows_now()));
+    struct TwPskEnd {
+        bool sub0;
+        ~TwPskEnd() {
+            t_tw_psk_l = false;
+            t_twin_sub_ok = sub0;
+        }
+    } tw_psk_end{ t_twin_sub_ok };
+    t_twin_sub_ok = tw_sub;
     for (auto& L : m.layers) {
         /* tp8 loop P30t: the classes this layer keeps on GGUF (t_tw_off): every class under P13 / P15's pieces; q_a + kv where
          * P26 may issue them over an SP quarter (its static conditions at this switch level); the Engram kv under the SP Engram */
         /* ... and every class where lever PSK may cut a prefill segment (from m.psk_first, the split layer, a plan's replay
          * segments at every layer): a cut segment runs fewer rows, and whether a pass is cut / planned can depend on its
-         * company, so an int8 row's bytes would too (GGUF's are M-invariant); lever E1's dedup (ds41_engdd on) likewise for the
-         * Engram kv: whether it acts depends on the pass's rows */
+         * company; lever E1's dedup (ds41_engdd on) likewise for the Engram kv: whether it acts depends on the pass's rows.
+         * tp8 loop P30t-psk (kTwPsk, tw_psk): a cut is no reason to keep GGUF -- a cut segment runs rows(C, ahead, n) in {0, n}
+         * or in [160, n), so its launch stays in the int8 GEMM's band (above 64 rows every launch is the prefill tile, whose rows
+         * are their own: r4d_emu test_ds41tw) and takes the twin exactly when the uncut one does (TWIN_ROWS <= 160:
+         * ds41cone::twin_cut_safe) -- whatever cut or plan the pass's company gives it, a computed row's bytes are the same */
+        const bool psk_l = m.psk_first > 0 && (L.l >= m.psk_first || (m.psk_l20 >= 0 && L.l == m.psk_l20));
+        t_tw_psk_l = tw_psk && (psk_l || cr_any);
         t_tw_off = !m.twin_mask ? 0
-                 : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng ? kTwEng : 0) |
+                 : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng && !tw_sub ? kTwEng : 0) |
                    (bi_pmm(g_sw_bi.load(std::memory_order_relaxed)) ? kTwShx : 0) |
-                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score ? kTwQkv : 0) |
-                   (m.psk_first > 0 && (L.l >= m.psk_first || (m.psk_l20 >= 0 && L.l == m.psk_l20)) ? kTwAll : 0) |
-                   (cr_any ? kTwAll : 0) |
+                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score && !tw_sub ? kTwQkv : 0) |
+                   (psk_l && !tw_psk ? kTwAll : 0) |
+                   (cr_any && !tw_psk ? kTwAll : 0) |
                    (g_sw_engdd.load(std::memory_order_relaxed) > 0 ? kTwEng : 0);
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */

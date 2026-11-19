@@ -244,9 +244,28 @@ emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     std::memcpy(pb.v, &b, 8);
     return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return rad_fp8e4m3_to_f32(v); });
 }
-emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
-    std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
-    std::abort();
+/* v_wmma_i32_16x16x16_iu8 (gfx12, wave32; tp8 loop P30t-psk): the fp8 form's operand layout -- eight bytes a lane, A row
+ * M at lane M + 16 * (K / 8), element K % 8, B the same by column -- each byte signed when its flag says so, exact int32 sums
+ * onto C (no clamp: a 128-K block of int8 products stays far inside int32, as libr4d's tiles rely on). */
+emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool) {
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    std::memcpy(g_qa[w][par][l], &a, 8);
+    std::memcpy(g_qb[w][par][l], &b, 8);
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    emu_v8i d;
+    for (int e = 0; e < 8; ++e) {
+        const int M = 8 * h + e;
+        int acc = c[e];
+        for (int k = 0; k < 16; ++k) {
+            const uint8_t xa = g_qa[w][par][M + 16 * (k >> 3)][k & 7], xb = g_qb[w][par][N + 16 * (k >> 3)][k & 7];
+            acc += (sa ? (int)(int8_t)xa : (int)xa) * (sb ? (int)(int8_t)xb : (int)xb);
+        }
+        d[e] = acc;
+    }
+    return d;
 }
 unsigned emu_ballot(bool p) {
     int l;

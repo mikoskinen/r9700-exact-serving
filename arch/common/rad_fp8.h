@@ -806,6 +806,10 @@ struct LinearFP8 {
     bool       w4 = false;
     int64_t    w4_split = 0;
     rad_buf    a8q = 0, a8s = 0;
+    /* tp8 loop P30o r2 (c): DeepSeek-V4's released block FP8 (`fp8_e4m3*e8m0[32x32]`: E4M3 codes, an E8M0 exponent per 32 x 32
+     * block), read by `gemm_nt_q` at dtype fp8a8e8 against this linear's own E4M3 pair (`a8q`, `a8s`: an f32 power-of-two scale
+     * per (row, 32)), which `op_q` (quant_act_fp8_ue8m0, the release's act_quant) writes from the input's bf16 plane. */
+    bool       e8 = false;
     /* Prefill band for z-lab's int4 and the int5: above `rot_split` rows the f16 skinny kernel is
      * bound by the slow f16 matrix instruction, so a second chain runs: the same rotation to int8
      * with a scale per (row, 128) into `rot_q2`/`rot_s2`, then the int8 tiled GEMM (`w4a8i8_asym` /
@@ -1254,7 +1258,12 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                        enc.plane[0].dtype == RAD_BF16;
     /* A quantised linear inside a model that also holds bf16 linears (DeepSeek's mixed trunk)
      * takes its own form; only an unquantised weight is read at bf16. */
-    const bool quant = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
+    /* tp8 loop P30o r2 (c): the release's block FP8 (E8M0 per 32 x 32), a quantised form too */
+    const RadEncPlane* sc8 = known ? rad_enc_plane(&enc, "scale") : nullptr;
+    const bool e8enc = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
+                       enc.plane[0].dtype == RAD_F8E4M3 && sc8 && sc8->dtype == RAD_E8M0 && sc8->block[0] == 32 &&
+                       sc8->block[1] == 32;
+    const bool quant = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc) || e8enc);
 
     /* ---- A GGUF weight, imported as its type's planes: `gemm_nt_ggml` over `a.x`, the planes
      * relayouted into llama.cpp's native blocks at load (docs/OPS.md). Ahead of the bf16 branch,
@@ -1582,6 +1591,47 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         return RAD_OK;
     }
 
+    /* ---- tp8 loop P30o r2 (c): the release's block FP8 (E8M0 per 32 x 32) over this linear's own pair from the bf16 plane. */
+    e8 = e8enc;
+    if (e8) {
+        constexpr int64_t G = 32;
+        if (!a.x) {
+            fprintf(stderr, "radiance: '%s' is fp8_e4m3*e8m0[32x32] and its input has no bf16 plane to quantise\n", wn);
+            return RAD_E_DTYPE;
+        }
+        if (N % 64 || K % G) {
+            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a block-FP8 (e8m0 [32x32]) weight takes rows in 64s and K in "
+                            "whole 32-column blocks\n", base, (long long)N, (long long)K);
+            return RAD_E_INVAL;
+        }
+        RowParts rp;
+        RAD_ARCH_TRY(rp.set(row_parts, G, G, base, "32-row scale blocks"));
+        const char* ssrc = stored ? stored : wn;
+        w  = decl_view(b, wn, stored, "codes", RAD_F8E4M3, { N, K }, access, shard, grp, rp.w, rp.n);
+        ws = decl_view(b, nm.f("%s.scale", base), ssrc, "scale", RAD_E8M0, { N / G, K / G }, access, shard, grp, rp.s,
+                       rp.n);
+        if (!w || !ws) return RAD_E_INVAL;
+        if (span_hi > 0) {
+            if (span_lo % G || span_hi % G) {
+                fprintf(stderr, "radiance: '%s' is sliced [%lld, %lld) on this rank, which cuts a 32 x 32 scale block\n", base,
+                        (long long)span_lo, (long long)span_hi);
+                return RAD_E_INVAL;
+            }
+            RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, ws, span_lo / G, span_hi / G));
+        }
+        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
+        a8q = decl_b(b, nm.f("%s.e8q", base), RAD_F8E4M3, { hi, K });
+        a8s = decl_b(b, nm.f("%s.e8s", base), RAD_F32, { hi, K / G });
+        if (!a8q || !a8s) return RAD_E_INVAL;
+        op_q = rw(b, RAD_OP(b, "quant_act_fp8_ue8m0",
+                            RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K), RAD_INT("group", G), RAD_STR("dtype", "bf16")),
+                            RAD_NOWEIGHTS),
+                  { a.x }, { a8q, a8s });
+        op = decl_gemm_q(b, 1, hi, G, "fp8a8e8", 0, 0, { w, ws }, { a8q, a8s }, y);
+        return op_q && op ? RAD_OK : RAD_E_INVAL;
+    }
+
     /* The remaining formats read the E4M3 pair, which an int8-fed input lacks (a trunk mixing
      * formats that the model's probe did not detect). */
     if (a.q8_fed) {
@@ -1768,6 +1818,13 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    /* tp8 loop P30o r2 (c): the block-FP8 (e8m0) weight's own pair, from its first row (it lives only between these two ops) */
+    if (e8) {
+        RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a8q, 0, rows, K), brow_slice(a8s, 0, rows, K / 32));
+        RAD_ISSUE_N(c, op, rows, brow_slice(a8q, 0, rows, K), brow_slice(a8s, 0, rows, K / 32), RAD_W(w), RAD_W(ws),
+                    brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     /* The 4-bit weight's copies of the input start at their buffers' first row: they live only

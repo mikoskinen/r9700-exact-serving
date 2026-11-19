@@ -898,11 +898,17 @@ void Scheduler::lane_prompt_note(SchedReq& s) {
     std::string why;
     for (int k = 0; k < LaneSet::kWhyN; ++k)
         if (s.lst.why[k]) why += fmt("%s%s %d", why.empty() ? "" : ", ", LaneSet::why_name(k), (int)s.lst.why[k]);
+    /* tp8 loop F68 (PREFILL round 23): the request's wait at the scheduler before its first chunk's plan (from its submit,
+     * when the server handed it over after tokenising; its admission inside that), so a cold cell's TTFT splits into the
+     * HTTP / tokeniser part (the client's TTFT less both figures), this wait and the prompt's own time on the line */
+    const double wait_ms = s.arrived_us > 0 && s.lst.t0_us >= s.arrived_us ? (double)(s.lst.t0_us - s.arrived_us) / 1000.0 : -1.0;
+    const double adm_ms = s.arrived_us > 0 && s.admitted_us >= s.arrived_us ? (double)(s.admitted_us - s.arrived_us) / 1000.0 : -1.0;
     RAD_INFO("lanes: request %llu's prompt of %lld tokens: %d chunk(s) planned by its lane %d, %d lent to other lanes; "
-             "%s; first chunk's plan to its first token %.1f ms", (unsigned long long)s.req->id,
+             "%s; first chunk's plan to its first token %.1f ms; at the scheduler %.1f ms before that plan (admitted after %.1f "
+             "ms; -1 = not stamped)", (unsigned long long)s.req->id,
              (long long)s.req->prompt.size(), (int)s.lst.home, lane_, (int)s.lst.lent,
              why.empty() ? "every chunk after a home chunk lent" : why.c_str(),
-             (double)(mono_us() - s.lst.t0_us) / 1000.0);
+             (double)(mono_us() - s.lst.t0_us) / 1000.0, wait_ms, adm_ms);
     s.lst.t0_us = 0;
 }
 
