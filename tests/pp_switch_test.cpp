@@ -180,6 +180,42 @@ TEST(the_leader_takes_a_plugin_switch_the_follower_serves_and_refuses_one_neithe
     CHECK(!fn4::check("ds41_e2", 1, &why));
 }
 
+/* tp8 loop P25s: the SP route's in-process switches (ds41_sphc, ds41_sphc_attn, ds41_sphc_seg) are deepseek41's -- plugin
+ * switches that act on a follower's passes (the follower takes them from the leader's record), appended after
+ * draft_cost_age; with no plugin here serving them a request is refused and nothing is queued, and GET reports -1 (none
+ * serves them); the follower's record of them is taken (marked) and named as skipped, never a failure. */
+TEST(the_sp_route_switches_are_deepseek41s_and_a_followers) {
+    CHECK_EQ(fn4::switch_index("ds41_sphc"), (int)fn4::kDs41Sphc);
+    CHECK_EQ(fn4::switch_index("ds41_sphc_attn"), (int)fn4::kDs41SphcAttn);
+    CHECK_EQ(fn4::switch_index("ds41_sphc_seg"), (int)fn4::kDs41SphcSeg);
+    CHECK_EQ((int)fn4::kDs41Sphc, (int)fn4::kDraftCostAge + 1);
+    CHECK_EQ((int)fn4::kSwitches, (int)fn4::kDs41SphcSeg + 1);
+    for (const int i : { (int)fn4::kDs41Sphc, (int)fn4::kDs41SphcAttn, (int)fn4::kDs41SphcSeg }) {
+        CHECK(fn4::follower_switch(i));
+        CHECK_EQ(fn4::value(i), -1);
+    }
+    std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
+    std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
+    fn4::requests(n0.data(), v0.data());
+    std::string why;
+    CHECK(!fn4::request("ds41_sphc", 2048, &why));
+    CHECK(!fn4::request("ds41_sphc_seg", 0, &why));
+    fn4::requests(n1.data(), v1.data());
+    CHECK_EQ(n1[(size_t)fn4::kDs41Sphc], n0[(size_t)fn4::kDs41Sphc]);
+    CHECK_EQ(n1[(size_t)fn4::kDs41SphcSeg], n0[(size_t)fn4::kDs41SphcSeg]);
+    CHECK(fn4::state_json().find("\"ds41_sphc\": -1, \"ds41_sphc_attn\": -1, \"ds41_sphc_seg\": -1") != std::string::npos);
+    /* the follower's side: the leader's record asks ds41_sphc_seg 0 -- taken (marked), skipped here (no plugin) */
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    count[(size_t)fn4::kDs41SphcSeg] = 1;
+    std::vector<std::string> skipped;
+    (void)fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped);
+    CHECK_EQ(taken[(size_t)fn4::kDs41SphcSeg], 1u);
+    bool named = false;
+    for (const std::string& s : skipped) named = named || s.rfind("ds41_sphc_seg", 0) == 0;
+    CHECK(named);
+}
+
 }  /* namespace */
 
 RAD_TEST_MAIN()

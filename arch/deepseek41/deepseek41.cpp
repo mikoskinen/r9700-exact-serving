@@ -1346,6 +1346,14 @@ static int shexp_lane_env() {
  * with every rank thread parked; the core's epoch then re-records every pass. Process-wide: every
  * rank's blocks read the same words. */
 static std::atomic<int> g_sw_gar{-1};          /* -1: the declared bound */
+/* tp8 loop P25s: the SP route's switches (ds41_sphc / ds41_sphc_attn / ds41_sphc_seg; below sphc_attn_env) */
+static std::atomic<int> g_sw_sphc{0}, g_sw_sphc_decl{0};
+static std::atomic<int> g_sw_spattn{-1}, g_sw_spattn_decl{0};
+static std::atomic<int> g_sw_spseg{-1}, g_sw_spseg_decl{0};
+static void sw_atomic_max(std::atomic<int>& a, int v) {
+    int cur = a.load(std::memory_order_relaxed);
+    while (cur < v && !a.compare_exchange_weak(cur, v)) {}
+}
 static std::atomic<int> g_sw_gar_decl{0};      /* the largest bound a layer declared */
 static std::atomic<int> g_sw_shexp{0};
 static std::atomic<int> g_sw_shexp_ok{0};      /* a trunk layer's shared arm is lane-safe */
@@ -2168,6 +2176,16 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_rfuse"))   /* lever FUSE-R: 1 needs form 1 declared somewhere, 2 form 2 */
         return value == 0 || (value == 1 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 1)) ||
                (value == 2 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 2)) ? 1 : -1;
+    /* tp8 loop P25s: the SP route's switches take away only what the env declared (0 = as declared for ds41_sphc) */
+    if (!std::strcmp(name, "ds41_sphc"))
+        return value == 0 || (g_sw_sphc_decl.load(std::memory_order_relaxed) > 0 &&
+                              value >= g_sw_sphc_decl.load(std::memory_order_relaxed) && value <= (1 << 24)) ? 1 : -1;
+    /* the levels: 0 .. the env's (both nodes carry the same env; a node whose declare holds less -- the leader has no
+     * segment passes -- takes the value and issues what it holds) */
+    if (!std::strcmp(name, "ds41_sphc_attn"))
+        return value >= 0 && value <= g_sw_spattn_decl.load(std::memory_order_relaxed) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_sphc_seg"))
+        return value >= 0 && value <= g_sw_spseg_decl.load(std::memory_order_relaxed) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -2190,6 +2208,9 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_e2")) g_sw_e2.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_rfuse")) g_sw_rf.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_moe1")) g_sw_p1.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_sphc")) g_sw_sphc.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_sphc_attn")) g_sw_spattn.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_sphc_seg")) g_sw_spseg.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -2263,6 +2284,22 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_rfuse")) {   /* what the issue reads: 0 where nothing was declared */
         *applied = g_sw_rf_ok.load(std::memory_order_relaxed) ? g_sw_rf.load(std::memory_order_relaxed) : 0;
+        return 1;
+    }
+    /* tp8 loop P25s: what the issue reads (the threshold in rows, 0 where nothing is SP; the levels) */
+    if (!std::strcmp(name, "ds41_sphc")) {
+        const int d = g_sw_sphc_decl.load(std::memory_order_relaxed), v = g_sw_sphc.load(std::memory_order_relaxed);
+        *applied = d > 0 && v > d ? v : d;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_sphc_attn")) {
+        const int d = g_sw_spattn_decl.load(std::memory_order_relaxed), v = g_sw_spattn.load(std::memory_order_relaxed);
+        *applied = v >= 0 && v < d ? v : d;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_sphc_seg")) {
+        const int d = g_sw_spseg_decl.load(std::memory_order_relaxed), v = g_sw_spseg.load(std::memory_order_relaxed);
+        *applied = v >= 0 && v < d ? v : d;
         return 1;
     }
     return 0;
@@ -2643,6 +2680,30 @@ static int sphc_attn_env() {
     return v;
 }
 static std::atomic<long long> g_sp_attn{0}, g_sp_comp{0};
+/* tp8 loop P25s (PREFILL round 17) -- the SP route's in-process switches, so ONE start serves both arms of an A / B (TESTQUEUE
+ * 2b: the control beside RADIANCE_DS41_SPHC=1024 SPHC_ATTN=1 SPHC_SEG=3) on the same image, cards and load. Each only takes
+ * away what the start's env declared, and its default is that env's (a start that sets none of them is today's):
+ *   ds41_sphc       0 = the declared threshold (RADIANCE_DS41_SPHC); N >= it = a pass is SP from N rows (N above
+ *                   --max-num-batched-tokens: no pass is) -- 2048 at a 1024 declare = BEST's SP passes (the cold chunks)
+ *   ds41_sphc_attn  0 .. the declared level (P26 1, P26b 2): 0 = q_a / kv after xn's gather, as a start without it
+ *   ds41_sphc_seg   0 .. the declared level (P25 1 / 2, P25b 3): 0 = the follower's segment passes whole, as without it
+ * EXACT whatever the values: SP is the same fold and bytes as the replicated pass (P20), X1 / X2 carry every row whichever side
+ * shards (a sharded send's payload is the whole send's; a whole receive copies every row), and a segment boundary's form is one
+ * pass's own (a switch change keeps its place in the follower's frame order, never between a pass's segments). Applied between
+ * steps like every switch; both nodes take it from the leader's switch frame. */
+/* what a pass issues with: the declare's, less what the switch takes away */
+static int64_t sphc_now(const Model& m) {
+    const int v = g_sw_sphc.load(std::memory_order_relaxed);
+    return m.sphc > 0 && v > m.sphc ? (int64_t)v : m.sphc;
+}
+static int spattn_now(const Model& m) {
+    const int d = m.sp_ag_qr ? (m.sp_ag_kvs ? 2 : 1) : 0, v = g_sw_spattn.load(std::memory_order_relaxed);
+    return v >= 0 && v < d ? v : d;
+}
+static int spseg_now(const Model& m) {
+    const int v = g_sw_spseg.load(std::memory_order_relaxed);
+    return v >= 0 && v < m.sp_seg ? v : m.sp_seg;
+}
 /* tp8 loop P13b -- RADIANCE_DS41_PIPE2_ATTN=1 (read at declare, only with RADIANCE_DS41_PIPE2 on): a pipelined layer's
  * attention output too: the first group projections and the attention mix as today, o_b of piece 0, piece 0's
  * attention all-reduce on the second lane behind lane 0 and beside piece 1's o_a + o_b (no collective), lane 0
@@ -5806,6 +5867,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                                  "post / comb / pre_ffn, the rest whole)")
                 : sphc_seg_env() >= 2 ? "boundaries WHOLE: the row-sharded loop stage ops do not resolve here (as 1)"
                                       : "boundaries saved / restored whole");
+    /* tp8 loop P25s: what the SP route's switches may take away -- this declare's threshold and levels (every rank the same) */
+    if (!ctx->shape_probe && m.sphc > 0) {
+        sw_atomic_max(g_sw_sphc_decl, (int)m.sphc);
+        sw_atomic_max(g_sw_spattn_decl, sphc_attn_env());   /* the env's levels: the same on both nodes */
+        sw_atomic_max(g_sw_spseg_decl, sphc_seg_env());
+        if (ctx->rank == 0)
+            fprintf(stderr, "radiance: deepseek41: the SP route's switches (tp8 loop P25s): ds41_sphc %lld (a pass SP from that "
+                            "many rows; up to 16777216 = none), ds41_sphc_attn 0..%d, ds41_sphc_seg 0..%d -- each at this "
+                            "start's env, and lower only takes away what the env declared (this node issues P26 at %d, "
+                            "segment SP at %d at most)\n",
+                    (long long)m.sphc, sphc_attn_env(), sphc_seg_env(), m.sp_ag_qr ? (m.sp_ag_kvs ? 2 : 1) : 0, m.sp_seg);
+    }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
      * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
     if (lr_shell(m)) {
@@ -7750,8 +7823,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG, m.sp_seg): a follower SEGMENT pass of such a step too -- its plan is the whole
      * follower part's [h, t), which every segment of the step computes the same (segment boundaries are transparent to it),
      * so a boundary after an SP layer holds the streams sharded on both its sides */
-    const bool sp_segp = m.sp_seg > 0 && t_seg && part == RAD_PP_PART_SEG && m.pp && m.pp_rank == 1;
-    const bool sp_pass = m.sphc > 0 && T >= m.sphc && (T + 3) / 4 * 4 <= g.max_tok && sg.size() == 1 && !sg[0].dec &&
+    const int sp_seg = spseg_now(m);   /* tp8 loop P25s: the switch's level (<= the declare's) */
+    const int sp_attn = spattn_now(m);
+    const int64_t sp_thr = sphc_now(m);
+    const bool sp_segp = sp_seg > 0 && t_seg && part == RAD_PP_PART_SEG && m.pp && m.pp_rank == 1;
+    const bool sp_pass = m.sphc > 0 && T >= sp_thr && (T + 3) / 4 * 4 <= g.max_tok && sg.size() == 1 && !sg[0].dec &&
                          sg[0].r0 == 0 && sg[0].n == T && (sp_segp || (!t_seg && part != RAD_PP_PART_SEG)) &&
                          !(batch->n_mm_rows > 0 && batch->mm_rows) && !m.bt.on &&
                          !m.zero && !t_band;   /* tp8 loop P28: a band pass runs whole-row forms */
@@ -7761,7 +7837,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * so the plan may take it; the split layer (PSK-L20) and replay chunks stay as may_cut says. The cut below re-checks. */
     const auto sp_may_cut = [&](int l) {
         if (!may_cut(l)) return false;
-        if (!(sp_segp && m.sp_seg >= 3) || cr_any || sg.size() != 1 || sg[0].dec || l < m.psk_first) return true;
+        if (!(sp_segp && sp_seg >= 3) || cr_any || sg.size() != 1 || sg[0].dec || l < m.psk_first) return true;
         if (l20_on && l == m.psk_l20 && !cr_all) return true;
         return psk_rows(psk_cone(c.n_layer, c.window, l), psk_ahead(hint, 0), sg[0].n) < sg[0].n;
     };
@@ -7807,7 +7883,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                     "of one prefill segment ran %lld layer-passes sequence-parallel, %lld boundaries row-sharded "
                                     "(save + restore); this one step %d, %lld rows, layers [%d, %d), %d SP, %d gathers of the "
                                     "streams\n",
-                            m.sp_seg, sn, sl, g_sp_seg_sh.load(std::memory_order_relaxed), batch->step, (long long)T, t_seg0,
+                            sp_seg, sn, sl, g_sp_seg_sh.load(std::memory_order_relaxed), batch->step, (long long)T, t_seg0,
                             t_seg1, sp_n, sp_ga);
                 return;
             }
@@ -7838,7 +7914,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                     "this one %lld rows, layers %d..%d SP (%d), %d gathers of the streams, part %d%s\n",
                             n, g_sp_layers.load(std::memory_order_relaxed), g_sp_rows.load(std::memory_order_relaxed),
                             g_sp_gathers.load(std::memory_order_relaxed), g_sp_eng.load(std::memory_order_relaxed), lone,
-                            (long long)m.sphc, g_sp_x1.load(std::memory_order_relaxed), (long long)T, sp_lo, sp_hi, sp_n, sp_ga,
+                            (long long)sp_thr, g_sp_x1.load(std::memory_order_relaxed), (long long)T, sp_lo, sp_hi, sp_n, sp_ga,
                             part, p26);
             }
     };
@@ -7888,7 +7964,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                  "defect)");
                 return;
             }
-            if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh || (seg_hsh && m.sp_seg >= 2))) return;
+            if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh || (seg_hsh && sp_seg >= 2))) return;
             if (x1r_sh && rad_rank(x) == 0) g_sp_x1.fetch_add(1, std::memory_order_relaxed);
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
             if (ring == RAD_PP_X1 && !band_store_issue(x, m, batch)) return;   /* tp8 loop P28 round 2c */
@@ -8151,7 +8227,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * chain: L.src; no indexer projection: L.i_score) runs both over this rank's quarter and gathers their outputs
              * instead of xn; everything below reads qr / kv over every row as today (a1_cheap skips the two GEMMs) */
             const bool cheap0 = bi_cheap(g_sw_bi.load(std::memory_order_relaxed));
-            const bool p26 = sp_l && xn_sh && m.sp_ag_qr && m.sp_ag_kv && cheap0 && !L.norm_a && !L.src && !L.i_score &&
+            const bool p26 = sp_l && xn_sh && m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && cheap0 && !L.norm_a && !L.src &&
+                             !L.i_score &&
                              L.q_a && L.kv_g && gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv) && !p2_layer && t_tbo.l != l;
             if (p26) {
                 with_rows(sp0, spn, [&] {
@@ -8359,7 +8436,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* tp8 loop P26b (RADIANCE_DS41_SPHC_ATTN=2, m.sp_ag_kvs): at an SP kv-source layer the compressor's kv | gate
              * GEMM (unsharded gemm_nt_f32: every form the stock per-output fmaf chains, so a row's bytes at any M) over this
              * rank's quarter of the gathered xn, then its f32 output gathered raw before the chain reads every row */
-            if (chain && ctail && sp_l && m.sp_ag_kvs) {
+            if (chain && ctail && sp_l && m.sp_ag_kvs && sp_attn >= 2) {   /* P25s: the switch's level */
                 if (spn > 0) RAD_ISSUE_N(x, L.c_gemm, spn, R(m.xn, sp0, spn), RAD_W(L.comp_w), R(m.kvs, sp0, spn));
                 RAD_ISSUE_N(x, m.sp_ag_kvs, T * 2 * hd, brows(m.kvs, T), RAD_NONE);
                 ++sp_ac;
@@ -8909,7 +8986,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC: an SP layer before a whole crossing (a plan defect)");
                 return;
             }
-            if (!pp_cross(x, m, batch, ring, lo, hi, x1_sh || (seg_sh && m.sp_seg >= 2))) return;
+            if (!pp_cross(x, m, batch, ring, lo, hi, x1_sh || (seg_sh && sp_seg >= 2))) return;
             if (seg_sh) h_sh = false;   /* the segment ends here; the next one restores the quarter */
             if (x1_sh) {
                 h_sh = false;   /* nothing on this node reads the residual parts after X1 (the head part ends; a whole pass

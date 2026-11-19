@@ -397,6 +397,14 @@
  *                   scheduler ago does not price that depth while a fresh drafting key of the same row class exists (that
  *                   key by the prior's ratio stands in, as for an unmeasured depth). lq141 c16w: one lane held depth 2 on a
  *                   depth-3 key measured before drafter_mx 2. Starts 0. Exact: it moves only which depth a step verifies.
+ *   ds41_sphc       deepseek41 (tp8 loop P25s; 82 here, after draft_cost_age): the SP route's row threshold in process -- 0
+ *                   (start) = RADIANCE_DS41_SPHC's; N >= it: a lone prefill pass / a follower segment pass is sequence-
+ *                   parallel from N rows (above --max-num-batched-tokens: none). Refused without RADIANCE_DS41_SPHC.
+ *   ds41_sphc_attn  deepseek41 (tp8 loop P25s; 83): 0 .. RADIANCE_DS41_SPHC_ATTN (starts at it): 0 = an SP layer's q_a / kv
+ *                   after xn's gather (P26 off), 1 P26, 2 + P26b.
+ *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 84): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
+ *                   passes whole (P25 off), 1 / 2 P25, 3 + P25b. Each only takes away what the env declared; exact at every
+ *                   value (SP is the replicated pass's fold and bytes; X1 / X2 carry every row whichever side shards).
  *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
  *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
  *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
@@ -607,7 +615,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDs41Sphc, kDs41SphcAttn, kDs41SphcSeg, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
