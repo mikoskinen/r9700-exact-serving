@@ -631,6 +631,11 @@ struct MoeFP8 {
     struct Beside {
         void (*fn)(RadCtx*, void*) = nullptr;
         void* arg = nullptr;
+        /* Opt-in too (deepseek41, tp8 loop D24): work the caller issues right before the gather and the all-reduce of the
+         * pass that reduces the step's last rows itself (own_ar, r0 + rows == T, issues_ar) -- a weight read on the second
+         * lane beside the collective. It must touch nothing the block reads or writes. */
+        void (*before_ar)(RadCtx*, void*) = nullptr;
+        void* ar_arg = nullptr;
     };
     void step(RadCtx* c, const RadBatch* batch, const Beside& beside) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
@@ -2695,6 +2700,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * the block's delta into `h.x`. With Config::gather_ar_rows a single-pass step this short
      * gathers and reduces in one kernel, byte for byte the two it replaces. */
     if (lane1) rad_lane_join(c_, 1, 0);
+    if (beside && beside->before_ar && own_ar && r0 + rows == T && issues_ar(T, rows)) beside->before_ar(c_, beside->ar_arg);
     int64_t gar_lim = gar_rows;
     if (gar_live) {
         const int lv = gar_live->load(std::memory_order_relaxed);
