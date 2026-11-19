@@ -368,7 +368,7 @@ std::string Engine::dch_text() const {
         acc += dch_hist_[i];
         if (dch_n_ > 0 && 2 * acc >= dch_n_) { p50 = (double)i / 10.0 + 0.05; break; }
     }
-    return fmt("%lld decode lane steps, their collect -> the lane's next decode step shipped p50 %.2f / mean %.2f ms (max %.1f); the "
+    return fmt("%lld decode steps of the lanes: their collect -> the lane's next decode step shipped p50 %.2f / mean %.2f ms (max %.1f); the "
                "collect's wait for the card mean %.2f ms over %lld collects", (long long)dch_n_, p50, dch_n_ ? dch_ms_ / (double)dch_n_ : 0.0,
                dch_max_ms_, dch_wait_n_ ? dch_wait_ms_ / (double)dch_wait_n_ : 0.0, (long long)dch_wait_n_);
 }

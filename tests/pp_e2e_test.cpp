@@ -2933,8 +2933,8 @@ TEST(plan_reserved_serves_one_process_tokens) {
         double dch_p50 = -1, dch_mean = -1;
         const char* dkey = "decode chain on the leader host over the run (tp8 loop D35): ";
         if (const size_t at = llog.rfind(dkey); at != std::string::npos)
-            (void)std::sscanf(llog.c_str() + at + std::strlen(dkey), "%lld decode lane steps, their collect -> the lane's next decode step "
-                                                                    "shipped p50 %lf / mean %lf", &dch, &dch_p50, &dch_mean);
+            (void)std::sscanf(llog.c_str() + at + std::strlen(dkey), "%lld decode steps of the lanes: their collect -> the lane's next decode "
+                                                                    "step shipped p50 %lf / mean %lf", &dch, &dch_p50, &dch_mean);
         fprintf(stderr, "      D35: %lld decode lane steps, collect -> next decode step shipped p50 %.2f / mean %.2f ms\n", dch, dch_p50, dch_mean);
         CHECK(dch > 0);
         CHECK(dch_p50 >= 0 && dch_mean >= 0);
