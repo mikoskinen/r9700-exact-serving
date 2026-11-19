@@ -1017,8 +1017,8 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
     }
 #define GG_WK3_X(KPV, NMV, NTV)                                                                                       \
     if (kp == KPV && nmt == NMV && nt == NTV) {                                                                         \
-        if (f32out) {                                                                                                   \
-            if constexpr (KPV == 4) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float>), grid, dim3(256), lds, A); \
+        if (f32out) {   /* DRAFTER round 6 (bench): the head at KP 1 too (bit 24), q6_K only */                       \
+            if constexpr (KPV == 4 || (KPV == 1 && T == GG_Q6_K)) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float>), grid, dim3(256), lds, A); \
             return R4D_WK_DECLINE;                                                                                      \
         }                                                                                                               \
         return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t>), grid, dim3(256), lds, A);                       \
@@ -1653,6 +1653,12 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
     if (!g_wkpf_follow) form = g_wkpf_default >= 0 ? g_wkpf_default : wkpf_form_tab(ty, N, K);
+    /* DRAFTER track 18.11.2026 (r4d_selftest --perfwkpf, one card, W us 414 -> 214 at M 56 / 80 / 120): the DSpark drafter's K-heavy q8_0
+     * linears (DLW sidecar: q_a 1280x5120 63.4 / 63.1 / 63.3 -> 45.4 / 45.2 / 45.9, o_a 1024x4096 51.8 / 51.7 / 51.5 -> 36.7 / 37.0 / 36.8,
+     * kv 512x5120 62.8 / 62.4 / 61.8 -> 44.2 / 44.3 / 44.0, shexp 1536x5120 62.2 / 62.4 / 63.0 -> 44.7 / 44.8 / 45.7, 1024x5120 62.5 / 62.8 /
+     * 62.9 -> 44.4 / 44.8 / 44.8) at a drafting lane's 10-32 sequences x 5 rows run one column tile a wave in 16 waves; the same bytes (every
+     * W form computes the part order). Not under a bench pin. */
+    if (!g_wkpf_follow && g_wkpf_default < 0 && ty == GG_Q8_0 && K >= 4096 && N <= 2048 && M >= 49 && M <= 160) form = pf_code(2, 1, 16, 0, 0);
     g_wkpf_last.store(form, std::memory_order_relaxed);
     switch (ty) {
     case GG_Q8_0: return wkpf_launch_t<GG_Q8_0>(s, form, f32out, A);

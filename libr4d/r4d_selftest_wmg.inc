@@ -66,7 +66,7 @@ constexpr int kWkEngine = 1048576;
 static void set_wm(const Hk& h) {
     clear(h);
     /* 1048576 / 1048577 / 1048578: the engine's path under ds41_wmk 1 / 2 / 3 (FINDINGS F7: the r6 table / 70724 / r5's table) */
-    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 2) { h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
+    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 3) {   /* + 3: ds41_wmk 4 (DRAFTER r7: 2 without WHG / DQ8) */ h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
     else if (g_wk_cur) h.wk_pin(g_wk_cur);
     else h.wm_pin(1);
 }
@@ -99,6 +99,8 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
     g_wk_cur = g_wk_codes.empty() ? 0 : g_wk_codes[0];
     const bool wk = g_wk_cur != 0;
     if (wk) std::printf("WMK: the W arm is gg_wk_kernel under r4d_gg_wk_pin(%d) (pair shapes ONE launch)\n", g_wk_cur);
+    if (g_pref != 0) std::printf("PREF: %s MiB of each launch's weights read after the flush, before the timed launch%s\n",
+                                 g_pref < 0 ? "all" : fmt("%lld", (long long)g_pref).c_str(), g_cold > 0 ? "" : " (ignored: needs --cold)");
     std::printf("WMG gate timing (%s, %d launches a reading, %d rounds of D W W D): D = int16's decode band (gg_gemv 2 + gg_gemv_m16 1, "
                 "table entries %d; pair shapes one launch), W = the WMMA form at the same M (pair shapes two launches)\n",
                 g_cold > 0 ? fmt("cold, %lld MiB read before each, median", (long long)(g_cold >> 20)).c_str()
@@ -206,6 +208,22 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                     }
                 }
                 std::vector<double> td, tw;
+                /* --pref MIB (cold mode): the launch's weights read through the hierarchy after the flush (st_time_us) */
+                struct PrefCtx { const uint8_t* w; int64_t wbytes; int copies; void* scratch; };
+                static void* pref_scratch = nullptr;
+                if (g_pref != 0 && !pref_scratch && hipMalloc(&pref_scratch, 1u << 20) != hipSuccess) pref_scratch = nullptr;
+                PrefCtx pctx{ (const uint8_t*)d_w, wbytes, copies, pref_scratch };
+                if (g_pref != 0 && g_cold > 0 && pref_scratch) {
+                    g_pref_ctx = &pctx;
+                    g_pref_fn = [](void* c, int i, hipStream_t s) {
+                        const PrefCtx& p = *(const PrefCtx*)c;
+                        const uint8_t* b = p.w + (size_t)(i % p.copies) * (size_t)p.wbytes;
+                        const int64_t n = g_pref < 0 ? p.wbytes : std::min<int64_t>(p.wbytes, g_pref << 20);
+                        for (int64_t off = 0; off < n; off += 1ll << 20)
+                            hip_ck(hipMemcpyAsync(p.scratch, b + off, (size_t)std::min<int64_t>(1ll << 20, n - off), hipMemcpyDeviceToDevice, s),
+                                   "hipMemcpyAsync", __LINE__);
+                    };
+                }
                 if (rc0 == RAD_OK && rcd == RAD_OK && rcw == RAD_OK && wm_ran) {
                     for (int r = 0; r < rounds; ++r)
                         for (int k = 0; k < 4; ++k) {
@@ -216,6 +234,7 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                             (w ? tw : td).push_back(us);
                         }
                 }
+                g_pref_fn = nullptr; g_pref_ctx = nullptr;
                 clear(h);
                 ++nkeys;
                 const bool good = !td.empty() && dec_same;
@@ -1268,7 +1287,8 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     for (const MrTy& ty : kMrTypes) {
         if (!mr_in(want.c_str(), ty.name)) continue;
         for (const MrShape& sh : kMrShapes) {
-            if (sh.logits || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            /* the head (logits_gemm_ggml, f32 out) only when the type list names "head" (DRAFTER track 18.11.2026) */
+            if ((sh.logits && !std::strstr(want.c_str(), "head")) || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
             const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
             std::vector<uint8_t> hw;
             mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
@@ -1278,7 +1298,7 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                 dfree_all();
                 std::vector<uint16_t> hx;
                 gp_acts(hx, M, sh.K, 0xABCDEFull ^ (uint64_t)M);
-                const size_t mb = (size_t)(M * sh.N) * 2;
+                const size_t mb = (size_t)(M * sh.N) * (sh.logits ? 4 : 2);
                 void* d_x = dalloc((size_t)(M * sh.K) * 2);
                 void* d_w = dalloc((size_t)wbytes * (size_t)copies);
                 void* d_y = dalloc(mb);

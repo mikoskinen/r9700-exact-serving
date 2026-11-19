@@ -53,7 +53,9 @@
 namespace {
 
 constexpr int kXmThreads = 256;          /* WN <= 8 waves a block */
-constexpr int kXmMaxTokens = 48;         /* the forms serve the decode band's row counts */
+/* The forms serve the drafter's query passes: 5 rows a drafting sequence (DSpark's whole block), so up to ~100 sequences
+ * (DRAFTER track 18.11.2026: was 48 tokens, which sent a 16-sequence lane's 80-token calls to the stock tiled kernel). */
+constexpr int kXmMaxTokens = 512;
 
 struct MxMrArgs {
     const uint16_t* x;
@@ -337,12 +339,13 @@ __global__ __launch_bounds__(kXmThreads) void xm_gemv_kernel(MxMrArgs A) {
 /* ------------------------------------------------------------------ the tiled kernel's order */
 /* Blocks [b0, b1) of the segment's MT rows into the slab, [block][row][32] f32 in K order (zeros past mc and for a
  * dead slot): every lane reads the same values, LDS broadcasts. */
-template <int MT>
+template <int MT, int EX = 0>
 __device__ __forceinline__ void xm_stage_s(const MxMrArgs& A, float* xs, int r0, int mc, int b0, int b1) {
     const int np = (b1 - b0) * MT * 4;
     for (int idx = (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
         const int q = idx & 3, rest = idx >> 2;
         const int m = rest % MT, bb = rest / MT;
+        if (EX && m >= mc) continue;   /* EX reads rows < mc only */
         const int k = (b0 + bb) * 32 + 8 * q;
         const int tok = m < mc ? mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) : -1;
         float v[8];
@@ -358,7 +361,7 @@ __device__ __forceinline__ void xm_stage_s(const MxMrArgs& A, float* xs, int r0,
     }
 }
 
-template <int T, int R, int MT>
+template <int T, int R, int MT, int EX>
 __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
     using Q = Mx<T>;
     constexpr int PD = MT * R >= 16 ? 2 : 4;
@@ -382,6 +385,9 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
             xm_zero(A, r0, mc, n0);
             continue;
         }
+        /* EX (DRAFTER track 18.11.2026): the chains run over the segment's mc rows only (block-uniform, read into an
+         * SGPR), not MT: rows past mc are never written, so the outputs are the same operations as before. */
+        const int mcu = EX ? __builtin_amdgcn_readfirstlane(mc) : MT;
         const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         const int nb = n0 + wave * 32 * R + lane;          /* rows nb + 32 r */
         const uint8_t* wr[R];
@@ -403,16 +409,69 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
         for (int k = 0; k < PD; ++k) load(k, raw[k]);
         /* one block: its 32 values once, then each row's chain over them in K order */
         auto block = [&](int b, const float* xb, uint32_t (&rw)[R][Q::NR]) {
-            float w[R][32];
+            if constexpr ((EX & 8) != 0) {
+                /* EX 9 (DRAFTER track): the block's raw words copied out and the next load issued first, then group by
+                 * group (8 values decoded at a time) each row's chain over the group's values: a row's chain still runs
+                 * the block's 32 values in K order, with 8 decoded weights a row live instead of 32.
+                 * EX bit 16 (EX 25): each step as one fma. The product of a bf16 activation (8 significant bits) and an MXFP4
+                 * value (kv * 2^(e - 128), kv of at most 2 significant bits) has at most 10 significant bits, so the stock
+                 * x * w is exact and fma(x, w, acc) rounds the same sum once: the same bits, one VALU op a MAC instead of 2
+                 * (unless the product falls below f32's normal range, ~2^-126, where the separate product could round). */
+                uint32_t cur[R][Q::NR];
 #pragma unroll
-            for (int r = 0; r < R; ++r)
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int i = 0; i < Q::NR; ++i) cur[r][i] = rw[r][i];
+                load(b + PD, rw);
                 mx_for<4>([&](auto gi) {
                     constexpr int G = decltype(gi)::value;
-                    Q::template dec<G>(rw[r], tab, &w[r][8 * G]);
+                    float w8[R][8];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) Q::template dec<G>(cur[r], tab, w8[r]);
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        if (m >= mcu) break;
+                        const float* xp = xb + m * 32 + 8 * G;
+                        const float4 a = *(const float4*)xp;
+                        const float4 c = *(const float4*)(xp + 4);
+                        const float xv[8] = { a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w };
+#pragma unroll
+                        for (int r = 0; r < R; ++r)
+#pragma unroll
+                            for (int t = 0; t < 8; ++t) {
+                                if constexpr ((EX & 16) != 0)
+                                    acc[r][m] = __builtin_fmaf(xv[t], w8[r][t], acc[r][m]);
+                                else
+                                    acc[r][m] += xv[t] * w8[r][t];
+                            }
+                    }
                 });
+                return;
+            }
+            float w[R][32];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if constexpr ((EX & 4) != 0) {   /* bench ablation: no decode (the raw words as values; output differs) */
+#pragma unroll
+                    for (int t = 0; t < 32; ++t) w[r][t] = __uint_as_float(rw[r][t % 5] ^ (uint32_t)t);
+                } else {
+                    mx_for<4>([&](auto gi) {
+                        constexpr int G = decltype(gi)::value;
+                        Q::template dec<G>(rw[r], tab, &w[r][8 * G]);
+                    });
+                }
+            }
             load(b + PD, rw);
+            if constexpr ((EX & 2) != 0) {   /* bench ablation: no products (one add a value; output differs) */
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int t = 0; t < 32; ++t) acc[r][0] += w[r][t];
+                return;
+            }
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
+                if (EX && m >= mcu) break;
                 const float* xp = xb + m * 32;
 #pragma unroll
                 for (int h = 0; h < 8; ++h) {
@@ -428,7 +487,7 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
         for (int b0 = 0; b0 < A.UK; b0 += A.SS) {
             const int b1 = min(b0 + A.SS, A.UK);
             lds_barrier();
-            xm_stage_s<MT>(A, xs, r0, mc, b0, b1);
+            xm_stage_s<MT, EX>(A, xs, r0, mc, b0, b1);
             lds_barrier();
 #pragma unroll 1
             for (int bb = b0 - b0 % PD; bb < b1; bb += PD) {
@@ -448,10 +507,419 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
     }
 }
 
+/* ------------------------------------------------------------------ the WMMA form (rule B; DRAFTER track 18.11.2026)
+ * xm_wm_kernel: the tiled band's calls on v_wmma_f32_16x16x16_bf16. Not the stock order: rule B (deterministic and
+ * batch-invariant against its own reference), r4d_selftest / dbench compare it with itself across row placements.
+ *  - A item is (live expert, RB = WN x WR x 16 weight rows, a segment of up to 16 NT of the expert's sorted rows): the weight
+ *    blocks are read and decoded once for all of the segment's rows (an expert's rows are one segment up to 16 NT).
+ *  - Operands: A = 16 activation rows (a token tile), B = 16 weight rows; lane L is row / column L % 16 and K slots 8 (L / 16)
+ *    .. + 7. A block's 32 values are two WMMAs; slot pair (2 p, 2 p + 1) of lane half h in WMMA j holds the two nibbles of
+ *    qs[8 j + 4 h + p] (values q and q + 16), so one LDS read of a 256-entry table turns a byte into its two bf16 values
+ *    (kv unscaled: integers <= 12, exact) and the staged activations carry the same interleave.
+ *  - The scale is factored out: P = the block's 32 products summed by the two WMMAs from 0 (the products are exact: bf16 x
+ *    an integer <= 12), then acc = fma(2^(e - 128), P, acc) in the lane that owns the weight row (D lane L is column L % 16,
+ *    rows 8 (L / 16) + i). Each output: blocks in K order, each block's partial by the hardware's WMMA sum, one fma a block,
+ *    one rounding to bf16 at the end -- the same operations whatever the other rows of the tile are (a dead or absent row is
+ *    a zero column of A and never mixes into another row's sum).
+ *  - The activations are staged in LDS a slab of SS blocks at a time as [block][tile][j][h][row][8 bf16] (a lane's fragment
+ *    is 16 contiguous bytes; a half-wave reads 256 contiguous bytes). */
+typedef __bf16 xw_v8bf __attribute__((ext_vector_type(8)));
+typedef float xw_v8f __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ xw_v8f xw_wmma(r4d_u32x4 a, r4d_u32x4 b, xw_v8f c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(xw_v8bf, a), __builtin_bit_cast(xw_v8bf, b), c);
+}
+__device__ __forceinline__ uint32_t xw_bf(float v) { return __float_as_uint(v) >> 16; }   /* exact for kv */
+
+constexpr int kXwTab = 0;                /* the byte -> bf16 pair table is static LDS (xw_tab), none in the dynamic part */
+
+/* Blocks [b0, b1) of the segment's rows (nt tiles) into the slab. */
+template <int NT>
+__device__ __forceinline__ void xw_stage(const MxMrArgs& A, uint8_t* xs, int r0, int mc, int nt, int b0, int b1) {
+    const int np = (b1 - b0) * nt * 64;
+    for (int idx = (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
+        const int n = idx & 15, jh = (idx >> 4) & 3, rest = idx >> 6;
+        const int t = rest % nt, bb = rest / nt;
+        const int m = 16 * t + n;
+        const int tok = m < mc ? mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) : -1;
+        r4d_u32x4 o = { 0u, 0u, 0u, 0u };
+        if (tok >= 0) {
+            const int q = 8 * (jh >> 1) + 4 * (jh & 1);
+            const uint16_t* p = A.x + (long long)tok * A.x_ld + (long long)(b0 + bb) * 32 + q;
+            uint32_t d0, d1, e0, e1;
+            if (A.x_al) {
+                const uint2 a = *(const uint2*)(const void*)p;
+                const uint2 c = *(const uint2*)(const void*)(p + 16);
+                d0 = a.x; d1 = a.y; e0 = c.x; e1 = c.y;
+            } else {
+                d0 = ldg_u16(p) | (ldg_u16(p + 1) << 16); d1 = ldg_u16(p + 2) | (ldg_u16(p + 3) << 16);
+                e0 = ldg_u16(p + 16) | (ldg_u16(p + 17) << 16); e1 = ldg_u16(p + 18) | (ldg_u16(p + 19) << 16);
+            }
+            o[0] = (d0 & 0xffffu) | (e0 << 16);
+            o[1] = (d0 >> 16) | (e0 & 0xffff0000u);
+            o[2] = (d1 & 0xffffu) | (e1 << 16);
+            o[3] = (d1 >> 16) | (e1 & 0xffff0000u);
+        }
+        *(r4d_u32x4*)(xs + ((((bb * NT + t) * 2 + (jh >> 1)) * 2 + (jh & 1)) * 16 + n) * 16) = o;
+    }
+}
+
+/* xw_stage split in two (DRAFTER track, xm_wq AB 16): the slab's units into registers (global / L2 loads in flight while the
+ * current slab is computed), then into LDS. UPT units a thread at 256 threads (16 blocks x NT tiles x 64 units). */
+template <int NT>
+__device__ __forceinline__ void xw_stage_ld(const MxMrArgs& A, int r0, int mc, int nt, int b0, int b1, r4d_u32x4 (&rg)[4 * NT]) {
+    const int np = (b1 - b0) * nt * 64;
+#pragma unroll
+    for (int k = 0; k < 4 * NT; ++k) {
+        const int idx = (int)threadIdx.x + 256 * k;
+        r4d_u32x4 o = { 0u, 0u, 0u, 0u };
+        if (idx < np) {
+            const int n = idx & 15, jh = (idx >> 4) & 3, rest = idx >> 6;
+            const int t = rest % nt, bb = rest / nt;
+            const int m = 16 * t + n;
+            const int tok = m < mc ? mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) : -1;
+            if (tok >= 0) {
+                const int q = 8 * (jh >> 1) + 4 * (jh & 1);
+                const uint16_t* p = A.x + (long long)tok * A.x_ld + (long long)(b0 + bb) * 32 + q;
+                uint32_t d0, d1, e0, e1;
+                if (A.x_al) {
+                    const uint2 a = *(const uint2*)(const void*)p;
+                    const uint2 c = *(const uint2*)(const void*)(p + 16);
+                    d0 = a.x; d1 = a.y; e0 = c.x; e1 = c.y;
+                } else {
+                    d0 = ldg_u16(p) | (ldg_u16(p + 1) << 16); d1 = ldg_u16(p + 2) | (ldg_u16(p + 3) << 16);
+                    e0 = ldg_u16(p + 16) | (ldg_u16(p + 17) << 16); e1 = ldg_u16(p + 18) | (ldg_u16(p + 19) << 16);
+                }
+                o[0] = (d0 & 0xffffu) | (e0 << 16);
+                o[1] = (d0 >> 16) | (e0 & 0xffff0000u);
+                o[2] = (d1 & 0xffffu) | (e1 << 16);
+                o[3] = (d1 >> 16) | (e1 & 0xffff0000u);
+            }
+        }
+        rg[k] = o;
+    }
+}
+template <int NT>
+__device__ __forceinline__ void xw_stage_st(uint8_t* xs, int nt, int b0, int b1, const r4d_u32x4 (&rg)[4 * NT]) {
+    const int np = (b1 - b0) * nt * 64;
+#pragma unroll
+    for (int k = 0; k < 4 * NT; ++k) {
+        const int idx = (int)threadIdx.x + 256 * k;
+        if (idx < np) {
+            const int n = idx & 15, jh = (idx >> 4) & 3, rest = idx >> 6;
+            const int t = rest % nt, bb = rest / nt;
+            *(r4d_u32x4*)(xs + ((((bb * NT + t) * 2 + (jh >> 1)) * 2 + (jh & 1)) * 16 + n) * 16) = rg[k];
+        }
+    }
+}
+
+template <int WR, int NT, int PD, int AB = 0>   /* AB: bench ablations (outputs differ): 1 no WMMA / fma, 2 no decode, 4 no staging */
+__global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
+    using Q = Mx<MX_FP4>;
+    constexpr int MT = 16 * NT;
+    R4D_DYN_LDS(r4d_u32x4, xm_lds);
+    uint8_t* const smem = (uint8_t*)xm_lds;
+    __shared__ int s_n, s_items;
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5;
+    const int nl = lane & 15, h = lane >> 4;
+    __shared__ uint32_t xw_tab[256];            /* static: its address folds into the ds_load offset */
+    uint32_t* const tab = xw_tab;
+    for (int b = (int)threadIdx.x; b < 256; b += (int)blockDim.x)
+        tab[b] = xw_bf(kMxValues[b & 15]) | (xw_bf(kMxValues[b >> 4]) << 16);
+    const XmLive L = xm_live(smem, A);
+    xm_count<MT>(A, L, &s_n, &s_items);
+    __syncthreads();
+    const int nlive = s_n, nitems = s_items;
+    uint8_t* const xs = smem + A.x_off;
+    for (int it = (int)blockIdx.x; it < nitems; it += (int)gridDim.x) {
+        int e = 0, r0 = 0, r1 = 0, rg = 0;
+        xm_item<MT>(L, nlive, it, &e, &r0, &r1, &rg);
+        const int mc = r1 - r0, n0 = rg * A.RB;
+        /* rows past the segment's last live row (the dropped tail opened to T) take no tile: zeros only */
+        int ml = 0;
+        for (int m0 = 0; m0 < mc; m0 += 32) {
+            const int m = m0 + lane;
+            const bool lv = m < mc && mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) >= 0;
+            const uint32_t bal = __builtin_amdgcn_ballot_w32(lv);
+            if (bal) ml = m0 + 32 - __builtin_clz(bal);
+        }
+        ml = __builtin_amdgcn_readfirstlane(ml);
+        if (ml == 0) {
+            xm_zero(A, r0, mc, n0);
+            continue;
+        }
+        const int nt = (ml + 15) >> 4;
+        const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
+        const int nw = n0 + wave * 16 * WR + nl;          /* this lane's weight rows nw + 16 r */
+        const uint8_t* wr[WR];
+#pragma unroll
+        for (int r = 0; r < WR; ++r) wr[r] = wb + (long long)min(nw + 16 * r, A.N - 1) * A.w_ld;
+        xw_v8f acc[WR][NT];
+#pragma unroll
+        for (int r = 0; r < WR; ++r)
+#pragma unroll
+            for (int t = 0; t < NT; ++t)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[r][t][i] = 0.0f;
+        /* In flight: each row's block as the 16 raw bytes of the dword window at (block & ~3) + 4 h -- lane half 0 holds e
+         * and qs[0..3], qs[8..11], half 1 qs[4..7], qs[12..15] at the same window offsets -- decoded only when used. */
+        int sb[WR];
+#pragma unroll
+        for (int r = 0; r < WR; ++r) sb[r] = (int)((uintptr_t)wr[r] & 3u);
+        r4d_u32x4 raw[PD][WR];
+        auto load = [&](int b, r4d_u32x4 (&rw)[WR]) {
+            if (b < A.UK) {
+#pragma unroll
+                for (int r = 0; r < WR; ++r) {
+                    const uintptr_t pa = ((uintptr_t)(wr[r] + (long long)b * Q::BB) & ~(uintptr_t)3) + 4 * h;
+                    const mx_gu32 g = (mx_gu32)(const void*)pa;
+                    rw[r][0] = g[0]; rw[r][1] = g[1]; rw[r][2] = g[2]; rw[r][3] = g[3];
+                }
+            }
+        };
+#pragma unroll
+        for (int k = 0; k < PD; ++k) load(k, raw[k]);
+        auto block = [&](int b, const uint8_t* xb, r4d_u32x4 (&rw)[WR]) {
+            uint32_t q0[WR], q1[WR];
+            float d[WR];
+#pragma unroll
+            for (int r = 0; r < WR; ++r) {
+                const r4d_u32x4 w = rw[r];
+                const int sA = (sb[r] + b) & 3;           /* the block's byte offset in its window (17 b = b mod 4) */
+                const int sh = (sA + 1) & 3;
+                const bool s3 = sA == 3;
+                q0[r] = __builtin_amdgcn_alignbyte(w[1], s3 ? w[1] : w[0], sh);
+                q1[r] = __builtin_amdgcn_alignbyte(w[3], s3 ? w[3] : w[2], sh);
+                const uint32_t e0 = (w[0] >> (8 * sA)) & 0xffu;
+                const uint32_t e1 = (uint32_t)__builtin_amdgcn_permlanex16((int)e0, (int)e0, 0x76543210, 0xfedcba98, false, false);
+                d[r] = mx_e8m0_half(h ? e1 : e0);
+            }
+            load(b + PD, rw);
+            r4d_u32x4 bw[WR][2];
+#pragma unroll
+            for (int r = 0; r < WR; ++r) {
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    if constexpr ((AB & 2) != 0) {
+                        bw[r][0][p] = q0[r] ^ (uint32_t)p;
+                        bw[r][1][p] = q1[r] ^ (uint32_t)p;
+                    } else {
+                        bw[r][0][p] = tab[(q0[r] >> (8 * p)) & 0xffu];
+                        bw[r][1][p] = tab[(q1[r] >> (8 * p)) & 0xffu];
+                    }
+                }
+            }
+            if constexpr ((AB & 1) != 0) {
+#pragma unroll
+                for (int r = 0; r < WR; ++r)
+#pragma unroll
+                    for (int p = 0; p < 4; ++p)
+                        acc[r][0][p] += __uint_as_float((bw[r][0][p] ^ bw[r][1][p]) & 0x3fffffffu) * d[r];
+                return;
+            }
+            const xw_v8f z = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                if (t >= nt) break;
+                const r4d_u32x4 a0 = *(const r4d_u32x4*)(xb + (((t * 2 + 0) * 2 + h) * 16 + nl) * 16);
+                const r4d_u32x4 a1 = *(const r4d_u32x4*)(xb + (((t * 2 + 1) * 2 + h) * 16 + nl) * 16);
+#pragma unroll
+                for (int r = 0; r < WR; ++r) {
+                    xw_v8f P = xw_wmma(a0, bw[r][0], z);
+                    P = xw_wmma(a1, bw[r][1], P);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[r][t][i] = __builtin_fmaf(d[r], P[i], acc[r][t][i]);
+                }
+            }
+        };
+        for (int b0 = 0; b0 < A.UK; b0 += A.SS) {
+            const int b1 = min(b0 + A.SS, A.UK);
+            if constexpr ((AB & 4) == 0) {
+                lds_barrier();
+                xw_stage<NT>(A, xs, r0, mc, nt, b0, b1);
+                lds_barrier();
+            }
+#pragma unroll 1
+            for (int bb = b0 - b0 % PD; bb < b1; bb += PD) {
+#pragma unroll
+                for (int k = 0; k < PD; ++k)
+                    if (bb + k >= b0 && bb + k < b1) block(bb + k, xs + (bb + k - b0) * NT * 1024, raw[k]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < WR; ++r) {
+            const int n = nw + 16 * r;
+            if (n >= A.N) continue;
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int m = 16 * t + 8 * h + i;
+                    if (m < mc) {
+                        const bool live = mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) >= 0;
+                        mx_put(A.y + (long long)(r0 + m) * A.y_ld + n, live ? acc[r][t][i] : 0.0f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* xm_wq_kernel (DRAFTER track 18.11.2026; tools/dbench/pat.cpp): the WMMA form with the weight rows read in long runs. A lane
+ * half reads its row's half of a 16-block super-step (blocks 8 h .. 8 h + 7: 136 contiguous bytes), so a row is visited 272
+ * bytes at a time instead of a 16-byte window a block (pat on the drafter's gate_up rows, 12 live experts: 583 vs 140 GB/s;
+ * linear 627), and the two halves of a row trade the pieces the other needs (v_permlanex16). One 16-row tile a wave, 8 waves
+ * (128 rows) a block, the next super-step's 34 words loaded while the current one is computed. Per output: the blocks in the
+ * order 0, 8, 1, 9, .., 7, 15 of each super-step, each block's partial by its two WMMAs from 0 and one fma -- a fixed order
+ * (rule B), otherwise xm_wm_kernel's operations. Needs UK % 8 == 0 (the drafter's K 5120 / 2304: 160 / 72 blocks). */
+constexpr int kWqWords = 34;             /* 136 bytes: a lane half of a super-step */
+
+template <int NT, int AB = 0>   /* AB (bench ablations, outputs differ): 1 no decode / WMMA / fma (a xor of the words), 4 no staging */
+__global__ __launch_bounds__(256) void xm_wq_kernel(MxMrArgs A) {
+    constexpr int MT = 16 * NT;
+    R4D_DYN_LDS(r4d_u32x4, xm_lds);
+    uint8_t* const smem = (uint8_t*)xm_lds;
+    __shared__ int s_n, s_items;
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5;
+    const int nl = lane & 15, h = lane >> 4;
+    __shared__ uint32_t xw_tab[256];            /* static: its address folds into the ds_load offset */
+    uint32_t* const tab = xw_tab;
+    for (int b = (int)threadIdx.x; b < 256; b += (int)blockDim.x)
+        tab[b] = xw_bf(kMxValues[b & 15]) | (xw_bf(kMxValues[b >> 4]) << 16);
+    const XmLive L = xm_live(smem, A);
+    xm_count<MT>(A, L, &s_n, &s_items);
+    __syncthreads();
+    const int nlive = s_n, nitems = s_items;
+    uint8_t* const xs = smem + A.x_off;
+    const int NSS = (A.UK + 15) >> 4;
+    for (int it = (int)blockIdx.x; it < nitems; it += (int)gridDim.x) {
+        int e = 0, r0 = 0, r1 = 0, rg = 0;
+        xm_item<MT>(L, nlive, it, &e, &r0, &r1, &rg);
+        const int mc = r1 - r0, n0 = rg * A.RB;
+        int ml = 0;
+        for (int m0 = 0; m0 < mc; m0 += 32) {
+            const int m = m0 + lane;
+            const bool lv = m < mc && mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) >= 0;
+            const uint32_t bal = __builtin_amdgcn_ballot_w32(lv);
+            if (bal) ml = m0 + 32 - __builtin_clz(bal);
+        }
+        ml = __builtin_amdgcn_readfirstlane(ml);
+        if (ml == 0) {
+            xm_zero(A, r0, mc, n0);
+            continue;
+        }
+        const int nt = (ml + 15) >> 4;
+        const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
+        const int nw = n0 + wave * 16 + nl;
+        const uint8_t* row = wb + (long long)min(nw, A.N - 1) * A.w_ld;
+        xw_v8f acc[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[t][i] = 0.0f;
+        auto load = [&](int ss, uint32_t (&d)[kWqWords]) {
+            if (ss < NSS) {
+                const int hb = 16 * ss + 8 * h;
+                const mx_gu32 g = (mx_gu32)(const void*)(row + (hb < A.UK ? (long long)hb * 17 : 0));
+#pragma unroll
+                for (int i = 0; i < kWqWords; ++i) d[i] = g[i];
+            }
+        };
+        const xw_v8f z = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        auto blk = [&](const uint8_t* xb, uint32_t q0, uint32_t q1, uint32_t ex) {
+            if constexpr ((AB & 1) != 0) {
+                acc[0][0] += __uint_as_float((q0 ^ q1 ^ ex) & 0x3fffffffu);
+                return;
+            }
+            r4d_u32x4 bw0, bw1;
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                bw0[p] = tab[(q0 >> (8 * p)) & 0xffu];
+                bw1[p] = tab[(q1 >> (8 * p)) & 0xffu];
+            }
+            const float d = mx_e8m0_half(ex);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                if (t >= nt) break;
+                const r4d_u32x4 a0 = *(const r4d_u32x4*)(xb + (((t * 2 + 0) * 2 + h) * 16 + nl) * 16);
+                const r4d_u32x4 a1 = *(const r4d_u32x4*)(xb + (((t * 2 + 1) * 2 + h) * 16 + nl) * 16);
+                xw_v8f P = xw_wmma(a0, bw0, z);
+                P = xw_wmma(a1, bw1, P);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[t][i] = __builtin_fmaf(d, P[i], acc[t][i]);
+            }
+        };
+        constexpr bool DB = (AB & 16) != 0;   /* the activations double-buffered: slab ss + 1 loaded while ss is computed */
+        r4d_u32x4 xr[4 * NT];
+        if constexpr (DB) {
+            lds_barrier();
+            xw_stage_ld<NT>(A, r0, mc, nt, 0, min(16, A.UK), xr);
+            xw_stage_st<NT>(xs, nt, 0, min(16, A.UK), xr);
+            lds_barrier();
+        }
+        auto step = [&](int ss, uint32_t (&cur)[kWqWords], uint32_t (&nxt)[kWqWords]) {
+            load(ss + 1, nxt);
+            const int b0 = 16 * ss, b1 = min(b0 + 16, A.UK);
+            uint8_t* xcur = xs;
+            if constexpr (DB) {
+                xcur = xs + (ss & 1) * NT * 16384;
+                if (ss + 1 < NSS) xw_stage_ld<NT>(A, r0, mc, nt, b0 + 16, min(b0 + 32, A.UK), xr);
+            } else if constexpr ((AB & 4) == 0) {
+                lds_barrier();
+                xw_stage<NT>(A, xs, r0, mc, nt, b0, b1);
+                lds_barrier();
+            }
+            const bool hi = b0 + 8 < A.UK;
+            mx_for<8>([&](auto jj) {
+                constexpr int j = decltype(jj)::value, o = 17 * j;
+                auto dw = [&](auto oc) {
+                    constexpr int q = decltype(oc)::value;
+                    if constexpr ((q & 3) == 0) return cur[q >> 2];
+                    else return (uint32_t)__builtin_amdgcn_alignbyte(cur[(q >> 2) + 1], cur[q >> 2], q & 3);
+                };
+                const uint32_t pA0 = dw(std::integral_constant<int, o + 1>{}), pB0 = dw(std::integral_constant<int, o + 5>{});
+                const uint32_t pA1 = dw(std::integral_constant<int, o + 9>{}), pB1 = dw(std::integral_constant<int, o + 13>{});
+                const uint32_t E = (cur[o >> 2] >> (8 * (o & 3))) & 0xffu;
+                const uint32_t s0 = h ? pA0 : pB0, s1 = h ? pA1 : pB1;
+                const uint32_t v0 = (uint32_t)__builtin_amdgcn_permlanex16((int)s0, (int)s0, 0x76543210, 0xfedcba98, false, false);
+                const uint32_t v1 = (uint32_t)__builtin_amdgcn_permlanex16((int)s1, (int)s1, 0x76543210, 0xfedcba98, false, false);
+                const uint32_t Ep = (uint32_t)__builtin_amdgcn_permlanex16((int)E, (int)E, 0x76543210, 0xfedcba98, false, false);
+                /* block j (lane half 0's run) and block j + 8 (half 1's) */
+                blk(xcur + j * NT * 1024, h ? v0 : pA0, h ? v1 : pA1, h ? Ep : E);
+                if (hi) blk(xcur + (j + 8) * NT * 1024, h ? pB0 : v0, h ? pB1 : v1, h ? E : Ep);
+            });
+            if constexpr (DB) {
+                if (ss + 1 < NSS) xw_stage_st<NT>(xs + ((ss + 1) & 1) * NT * 16384, nt, b0 + 16, min(b0 + 32, A.UK), xr);
+                lds_barrier();
+            }
+        };
+        uint32_t bufA[kWqWords], bufB[kWqWords];
+        load(0, bufA);
+#pragma unroll 1
+        for (int ss = 0; ss < NSS; ss += 2) {
+            step(ss, bufA, bufB);
+            if (ss + 1 < NSS) step(ss + 1, bufB, bufA);
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int m = 16 * t + 8 * h + i;
+                if (m < mc && nw < A.N) {
+                    const bool live = mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) >= 0;
+                    mx_put(A.y + (long long)(r0 + m) * A.y_ld + nw, live ? acc[t][i] : 0.0f);
+                }
+            }
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ forms */
 /* gemv band: (H, R, MT); tiled order: (R, MT). */
 #define XM_GFORMS(X) X(4, 1, 2) X(4, 1, 4) X(4, 1, 8) X(4, 1, 16) X(4, 2, 2) X(4, 2, 4) X(4, 2, 8) X(2, 1, 4) X(2, 1, 8)
-#define XM_SFORMS(X) X(1, 2) X(1, 4) X(1, 8) X(2, 2) X(2, 4) X(2, 8)
+#define XM_SFORMS(X) X(1, 2, 0) X(1, 4, 0) X(1, 8, 0) X(2, 2, 0) X(2, 4, 0) X(2, 8, 0) \
+    X(1, 4, 1) X(1, 8, 1) X(1, 16, 1) X(2, 4, 1) X(2, 8, 1) X(2, 16, 1) X(1, 4, 3) X(1, 4, 5) X(1, 4, 7) \
+    X(1, 4, 9) X(1, 8, 9) X(1, 16, 9) X(2, 8, 9) X(1, 4, 25) X(1, 8, 25) X(1, 16, 25) X(2, 8, 25)
 
 int xm_launch_g(RadStream s, int H, int R, int MT, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
 #define XM_G(h, r, mt) \
@@ -460,11 +928,37 @@ int xm_launch_g(RadStream s, int H, int R, int MT, const MxMrArgs& A, unsigned g
 #undef XM_G
     return R4D_MX_MR_DECLINE;
 }
-int xm_launch_s(RadStream s, int R, int MT, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
-#define XM_S(r, mt) \
-    if (R == r && MT == mt) return R4D_EMIT(s, (xm_seq_kernel<MX_FP4, r, mt>), dim3(grid), dim3(thr), lds, A);
+int xm_launch_s(RadStream s, int R, int MT, int EX, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
+#define XM_S(r, mt, ex) \
+    if (R == r && MT == mt && EX == ex) return R4D_EMIT(s, (xm_seq_kernel<MX_FP4, r, mt, ex>), dim3(grid), dim3(thr), lds, A);
     XM_SFORMS(XM_S)
 #undef XM_S
+    return R4D_MX_MR_DECLINE;
+}
+/* WMMA form: (WR, NT, PD, AB). */
+#define XM_WFORMS(X) X(1, 1, 2, 0) X(1, 1, 4, 0) X(1, 2, 4, 0) X(1, 4, 2, 0) X(2, 1, 2, 0) X(2, 1, 4, 0) X(2, 1, 6, 0) X(2, 2, 2, 0) \
+    X(2, 2, 4, 0) X(2, 4, 2, 0) X(4, 1, 2, 0) X(2, 1, 2, 1) X(2, 1, 2, 2) X(2, 1, 2, 4) X(2, 1, 2, 3) X(2, 1, 2, 7) X(2, 1, 2, 5)
+int xm_launch_w(RadStream s, int WR, int NT, int PD, int AB, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
+#define XM_W(wr, nt, pd, ab) \
+    if (WR == wr && NT == nt && PD == pd && AB == ab) return R4D_EMIT(s, (xm_wm_kernel<wr, nt, pd, ab>), dim3(grid), dim3(thr), lds, A);
+    XM_WFORMS(XM_W)
+#undef XM_W
+    return R4D_MX_MR_DECLINE;
+}
+bool xm_has_w(int WR, int NT, int PD, int AB) {
+#define XM_WH(wr, nt, pd, ab) if (WR == wr && NT == nt && PD == pd && AB == ab) return true;
+    XM_WFORMS(XM_WH)
+#undef XM_WH
+    return false;
+}
+int xm_launch_q(RadStream s, int NT, const MxMrArgs& A, unsigned grid, unsigned lds) {
+    if (NT == 1) return R4D_EMIT(s, (xm_wq_kernel<1>), dim3(grid), dim3(256), lds, A);
+    if (NT == 2) return R4D_EMIT(s, (xm_wq_kernel<2>), dim3(grid), dim3(256), lds, A);
+    if (NT == 101) return R4D_EMIT(s, (xm_wq_kernel<1, 1>), dim3(grid), dim3(256), lds, A);   /* bench: q101 = no decode / WMMA */
+    if (NT == 105) return R4D_EMIT(s, (xm_wq_kernel<1, 5>), dim3(grid), dim3(256), lds, A);   /* bench: q105 = loads only */
+    if (NT == 104) return R4D_EMIT(s, (xm_wq_kernel<1, 4>), dim3(grid), dim3(256), lds, A);   /* bench: q104 = no staging */
+    if (NT == 116) return R4D_EMIT(s, (xm_wq_kernel<1, 16>), dim3(grid), dim3(256), lds, A);  /* q116: activations double-buffered */
+    if (NT == 216) return R4D_EMIT(s, (xm_wq_kernel<2, 16>), dim3(grid), dim3(256), lds, A);
     return R4D_MX_MR_DECLINE;
 }
 bool xm_has_g(int H, int R, int MT) {
@@ -473,8 +967,8 @@ bool xm_has_g(int H, int R, int MT) {
 #undef XM_GH
     return false;
 }
-bool xm_has_s(int R, int MT) {
-#define XM_SH(r, mt) if (R == r && MT == mt) return true;
+bool xm_has_s(int R, int MT, int EX) {
+#define XM_SH(r, mt, ex) if (R == r && MT == mt && EX == ex) return true;
     XM_SFORMS(XM_SH)
 #undef XM_SH
     return false;
@@ -496,38 +990,286 @@ int xm_cu_count() {
 #endif
 }
 
+/* ------------------------------------------------------------------ drafter_mx 3: fp8 x fp8 (DRAFTER track 18.11.2026 round 3)
+ * xm_a8_kernel = moe_gemm_mxfp4a8's expert-major form (r4d_moe_mxfp4.hip moe_mxfp4_expert_kernel<4, 256>, the one its body() takes at
+ * these shapes) on the drafter's own 17-byte ggml MXFP4 blocks, the activations quantised inside the kernel as r4d_quant_act_fp8 does
+ * them (E4M3, an f32 scale amax / 448 a (row, 128 of K), clamped to +-448, RNE): the same values and, output by output, the same
+ * operations as that pair of libr4d launches on the canonical planes of the same weights (tools/dbench a8 arm: byte-identical), with
+ * no scratch. Each E2M1 code as its exact E4M3 byte (r4d_mxfp4.h's row-0 magnitude table), a 32-value group's two fp8 WMMAs from 0,
+ * then total += raw x act_scale x 2^(e - 127). Rule B (a row's quantisation and sums are its own: deterministic, batch- and
+ * placement-invariant); NOT the bf16-activation forms' values (rms 2.5 % relative on the drafter's experts, dbench b36): proposals
+ * only, verify keeps the text. A block = 64 weight rows (4 waves x 16) x the expert's rows in 16-row tiles, stages of 256 K: the
+ * weights two threads a row, 17 aligned dwords (4 blocks) each, decoded at the LDS store; the next stage in registers meanwhile. */
+}  // namespace
+#include "r4d_fp8_wmma.h"
+#include "r4d_mxfp4.h"
+namespace {
+constexpr int kA8SK = 256, kA8P = kA8SK + 8, kA8BN = 64, kA8KB = kA8SK / 128;
+__global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) {
+    __shared__ __align__(16) uint8_t aa[16 * kA8P], bb[kA8BN * kA8P];
+    __shared__ uint32_t ss[kA8BN * kA8KB];
+    __shared__ float sa[16 * kA8KB];
+    __shared__ int src[16];
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5, col0 = (int)blockIdx.x * kA8BN, e = (int)blockIdx.y;
+    if (e == A.n_expert) {   /* the dropped slots past the last expert: zero rows */
+        const int r0 = min(max(A.off[A.n_expert], 0), A.T);
+        for (long long i = tid; i < (long long)(A.T - r0) * kA8BN; i += 128) {
+            const int n = col0 + (int)(i % kA8BN);
+            if (n < A.N) A.y[(long long)(r0 + i / kA8BN) * A.y_ld + n] = 0;
+        }
+        return;
+    }
+    const int lo = max(A.off[e], 0), hi = min(A.off[e + 1], A.T);
+    if (lo >= hi) return;
+    const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
+    const int rowbase = (lane >> 4) * 8, mycol = wave * 16 + (lane & 15);
+    const int lr = tid >> 1, lh = tid & 1;                   /* weight loader: row lr, blocks 4 lh .. 4 lh + 3 of a stage */
+    const uint32_t* wsrc = (const uint32_t*)(wb + (long long)min(col0 + lr, A.N - 1) * A.w_ld) + lh * 17;
+    const int ar = tid >> 3, ac = tid & 7;                   /* activation loader: tile row ar, values 32 ac .. 32 ac + 31 */
+    for (int r0 = lo; r0 < hi; r0 += 16) {
+        __syncthreads();
+        if (tid < 16) {
+            const int r = r0 + tid;
+            src[tid] = r < hi ? mx_moe_tok(A.sorted, r, A.top_k, A.a_sorted, A.AR) : -1;
+        }
+        __syncthreads();
+        bool rv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) rv[j] = src[rowbase + j] >= 0;
+        const int arow = src[ar];
+        uint32_t wreg[17];
+        uint4 xreg[4];
+        auto load = [&](int k0) {
+            const uint32_t* p = wsrc + (k0 / 256) * 34;
+#pragma unroll
+            for (int i = 0; i < 17; ++i) wreg[i] = p[i];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) xreg[i] = uint4{ 0u, 0u, 0u, 0u };
+            if (arow >= 0) {
+                const uint4* xp = (const uint4*)(const void*)(A.x + (long long)arow * A.x_ld + k0 + 32 * ac);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) xreg[i] = xp[i];
+            }
+        };
+        auto store = [&]() {
+            uint32_t ex = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {                    /* block 4 lh + i at byte 17 i of my 68 */
+                const int o = 17 * i;
+                ex |= ((wreg[o / 4] >> (8 * (o % 4))) & 0xffu) << (8 * i);
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {                /* qs[4 q .. 4 q + 3]: elements 4 q .. (low nibbles), 16 + 4 q .. (high) */
+                    const int bo = o + 1 + 4 * q, di = bo / 4, sh = bo % 4;
+                    const uint32_t w = sh ? __builtin_amdgcn_alignbyte(wreg[di + 1], wreg[di], sh) : wreg[di];
+                    const uint32_t ev = w & 0x0F0F0F0Fu, od = (w >> 4) & 0x0F0F0F0Fu;
+                    const uint32_t be = __builtin_amdgcn_perm(R4D_MXFP4_MAG0_HI, R4D_MXFP4_MAG0_LO, ev & 0x07070707u) | ((ev & 0x08080808u) << 4);
+                    const uint32_t bo8 = __builtin_amdgcn_perm(R4D_MXFP4_MAG0_HI, R4D_MXFP4_MAG0_LO, od & 0x07070707u) | ((od & 0x08080808u) << 4);
+                    const int kk = 32 * (4 * lh + i) + 4 * q;
+                    *(uint32_t*)(bb + lr * kA8P + kk) = be;
+                    *(uint32_t*)(bb + lr * kA8P + kk + 16) = bo8;
+                }
+            }
+            ss[lr * kA8KB + lh] = ex;
+            /* the activations: r4d_quant_act_fp8's arithmetic on my 32 values of a 128-group (4 threads a group) */
+            float v[32];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t u[4] = { xreg[i].x, xreg[i].y, xreg[i].z, xreg[i].w };
+#pragma unroll
+                for (int t = 0; t < 4; ++t) { v[8 * i + 2 * t] = __uint_as_float(u[t] << 16); v[8 * i + 2 * t + 1] = __uint_as_float(u[t] & 0xffff0000u); }
+            }
+            float m = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 32; ++j) m = fmaxf(m, fabsf(v[j]));
+            m = fmaxf(m, __shfl_xor(m, 1));
+            m = fmaxf(m, __shfl_xor(m, 2));
+            const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            uint32_t pk[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int p = 0;
+                p = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[4 * j] * inv, -448.0f), 448.0f),
+                                                    fminf(fmaxf(v[4 * j + 1] * inv, -448.0f), 448.0f), p, false);
+                p = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[4 * j + 2] * inv, -448.0f), 448.0f),
+                                                    fminf(fmaxf(v[4 * j + 3] * inv, -448.0f), 448.0f), p, true);
+                pk[j] = (uint32_t)p;
+            }
+            uint4* dst = (uint4*)(aa + ar * kA8P + 32 * ac);
+            dst[0] = uint4{ pk[0], pk[1], pk[2], pk[3] };
+            dst[1] = uint4{ pk[4], pk[5], pk[6], pk[7] };
+            if ((ac & 3) == 0) sa[ar * kA8KB + (ac >> 2)] = arow >= 0 ? sc : 0.0f;
+        };
+        auto total = r4d_fp8::acc_zero();
+        load(0);
+        for (int k0 = 0; k0 < A.K; k0 += kA8SK) {
+            store();
+            __syncthreads();
+            if (k0 + kA8SK < A.K) load(k0 + kA8SK);
+#pragma unroll
+            for (int kb = 0; kb < kA8KB; ++kb) {
+                const uint32_t exps = ss[mycol * kA8KB + kb];
+#pragma unroll
+                for (int group = 0; group < 4; ++group) {
+                    auto raw = r4d_fp8::acc_zero();
+#pragma unroll
+                    for (int k = kb * 128 + group * 32; k < kb * 128 + (group + 1) * 32; k += 16)
+                        raw = r4d_fp8::mma(r4d_fp8::frag<kA8SK>(aa, 0, k, lane), r4d_fp8::frag<kA8SK>(bb, wave * 16, k, lane), raw);
+                    const uint32_t exp = (exps >> (8 * group)) & 0xffu;
+                    const float scale = __uint_as_float(exp == 255 ? 0x7fc00000u : exp ? (exp << 23) : 0x00400000u);
+#pragma unroll
+                    for (int row = 0; row < 8; ++row)
+                        if (rv[row]) total[row] += raw[row] * sa[(rowbase + row) * kA8KB + kb] * scale;
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int row = 0; row < 8; ++row) {
+            const int r = r0 + rowbase + row, n = col0 + mycol;
+            if (r < hi && n < A.N) A.y[(long long)r * A.y_ld + n] = f32_to_bf16(total[row]);
+        }
+    }
+}
 /* ------------------------------------------------------------------ the switch, the pin, the rule */
 int env_drafter_mx() {
     const char* v = std::getenv("RADIANCE_DS41_DRAFTER_MX");
-    const int on = (v && *v == '1' && !v[1]) ? 1 : 0;
+    const int on = (v && (*v == '1' || *v == '2' || *v == '3') && !v[1]) ? *v - '0' : 0;
     if (v && *v && !on && std::strcmp(v, "0"))
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1: the stock MXFP4 grouped GEMM\n", v);
-    if (on)
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3: the stock MXFP4 grouped GEMM\n", v);
+    if (on == 3)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the fp8 x fp8 form at every call (RADIANCE_DS41_DRAFTER_MX=3, "
+                             "the fn4 switch drafter_mx 3: activations quantised to E4M3 a (row, 128), rule B, the drafter's own reference)\n");
+    if (on == 1)
         std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the multi-row forms (RADIANCE_DS41_DRAFTER_MX=1, "
                              "the fn4 switch drafter_mx)\n");
+    if (on == 2)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the WMMA form at every call (RADIANCE_DS41_DRAFTER_MX=2, "
+                             "the fn4 switch drafter_mx 2: rule B, the drafter's own reference)\n");
     return on;
 }
 int g_xm_on = env_drafter_mx();
 int g_xm_pin = 0;                         /* 0 none, -1 the rule forced, 1 a pinned form */
 int g_xm_pin_h = 4, g_xm_pin_r = 1, g_xm_pin_mt = 4, g_xm_pin_wn = 0, g_xm_pin_grid = 0;
+int g_xm_cap = kXmMaxTokens;              /* the forms' token bound (bench hook r4d_mx_mr_cap) */
 char g_xm_last[160];
+int g_xm_wm_slab = 0;                     /* WMMA form: LDS bytes of a slab (0: 16 KiB; bench hook) */
 
 }  // namespace
 
 int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
-void r4d_mx_mr_set(int on) { g_xm_on = on ? 1 : 0; }
+void r4d_mx_mr_set(int on) { g_xm_on = on == 2 || on == 3 ? on : (on ? 1 : 0); }
 int r4d_mx_mr_get() { return g_xm_on; }
 
-/* The rule: MT from the call's tokens (an expert's rows in a decode step are few: 4 to 8 tokens' worth), the gemv
- * band's form H 4 x R 1 in 8-wave blocks (32 weight rows a block), the tiled order's R 1 in 4-wave blocks (128
- * rows), slabs of 16 KiB; a grid of two blocks a CU or fewer when the live work is smaller. */
+/* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
+static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap) {
+    if (!xm_has_w(WR, NT, PD, AB) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
+    MxMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
+    A.y = c.y; A.y_ld = c.y_ld; A.sorted = c.sorted; A.off = c.off;
+    A.T = c.T; A.N = c.N; A.K = c.K; A.n_expert = c.n_expert; A.top_k = c.top_k; A.a_sorted = c.a_sorted;
+    A.AR = c.AR; A.x_al = c.x_al;
+    A.UK = c.K / 32;
+    A.NS = A.UK;
+    A.RB = WN * 16 * WR;
+    A.nrg = (c.N + A.RB - 1) / A.RB;
+    const long long sb = (long long)NT * 1024;   /* bytes a block of the segment's tiles */
+    long long SS = (g_xm_wm_slab > 0 ? g_xm_wm_slab : 16384) / sb;
+    if (SS < 1) SS = 1;
+    if (SS > A.NS) SS = A.NS;
+    A.SS = (int)SS;
+    A.live_cap = c.n_expert < c.T ? c.n_expert : c.T;
+    A.live_off = kXwTab;
+    A.x_off = (int)(kXwTab + (4LL * A.live_cap * 4 + 15) / 16 * 16);
+    const long long lds = A.x_off + SS * sb;
+    if (lds > 65536) return R4D_MX_MR_DECLINE;
+    const long long est = (long long)A.live_cap * A.nrg;
+    long long grid = gridcap > 0 ? gridcap : 32LL * xm_cu_count();
+    if (grid > est) grid = est;
+    if (grid < 1) grid = 1;
+    std::snprintf(g_xm_last, sizeof g_xm_last, "wmma WR%d NT%d PD%d%s WN%d SS%d RB%d grid %lld lds %lld", WR, NT, PD, AB ? " ABL" : "", WN, A.SS,
+                  A.RB, grid, lds);
+    return xm_launch_w(s, WR, NT, PD, AB, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+}
+
+/* The long-run WMMA form's launch (rule B): 8 waves of one 16-row tile, segments of up to 16 NT rows, super-steps of 16 blocks. */
+static int xm_wq_moe(RadStream s, const R4dMxMrCall& c, int NT, int gridcap) {
+    const int NTL = NT > 200 ? 2 : (NT > 100 ? 1 : NT);   /* 101 / 104 / 105: bench ablations of NT 1; 116 / 216: double-buffered */
+    const int DBF = NT == 116 || NT == 216 ? 2 : 1;
+    if ((NTL != 1 && NTL != 2) || (c.K / 32) % 8 != 0) return R4D_MX_MR_DECLINE;
+    MxMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
+    A.y = c.y; A.y_ld = c.y_ld; A.sorted = c.sorted; A.off = c.off;
+    A.T = c.T; A.N = c.N; A.K = c.K; A.n_expert = c.n_expert; A.top_k = c.top_k; A.a_sorted = c.a_sorted;
+    A.AR = c.AR; A.x_al = c.x_al;
+    A.UK = c.K / 32;
+    A.NS = A.UK;
+    A.RB = 8 * 16;
+    A.nrg = (c.N + A.RB - 1) / A.RB;
+    A.SS = 16;
+    A.live_cap = c.n_expert < c.T ? c.n_expert : c.T;
+    A.live_off = kXwTab;
+    A.x_off = (int)(kXwTab + (4LL * A.live_cap * 4 + 15) / 16 * 16);
+    const long long lds = A.x_off + 16LL * NTL * 1024 * DBF;
+    if (lds > 65536) return R4D_MX_MR_DECLINE;
+    const long long est = (long long)A.live_cap * A.nrg;
+    long long grid = gridcap > 0 ? gridcap : 32LL * xm_cu_count();
+    if (grid > est) grid = est;
+    if (grid < 1) grid = 1;
+    std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-run NT%d WN8 SS16 RB128 grid %lld lds %lld", NT, grid, lds);
+    return xm_launch_q(s, NT, A, (unsigned)grid, (unsigned)lds);
+}
+
+/* drafter_mx 3's launch (xm_a8_kernel above): 17-byte blocks whose rows are dword-aligned, K a multiple of 256, aligned activations. */
+static int xm_a8_moe(RadStream s, const R4dMxMrCall& c) {
+    if (c.K % kA8SK || !c.x_al || c.x_ld % 8 || c.N < 1 || c.n_expert < 1 || c.n_expert > 65534) return R4D_MX_MR_DECLINE;
+    const long long rb = (long long)(c.K / 32) * 17;
+    if (rb % 4 || (c.w_ld != 0 && c.w_ld % 4)) return R4D_MX_MR_DECLINE;
+    if (!c.wtab && (((uintptr_t)c.w & 3u) || c.w_es % 4)) return R4D_MX_MR_DECLINE;
+    MxMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
+    A.y = c.y; A.y_ld = c.y_ld; A.sorted = c.sorted; A.off = c.off;
+    A.T = c.T; A.N = c.N; A.K = c.K; A.n_expert = c.n_expert; A.top_k = c.top_k; A.a_sorted = c.a_sorted;
+    A.AR = c.AR; A.x_al = c.x_al;
+    std::snprintf(g_xm_last, sizeof g_xm_last, "a8 fp8 x fp8 BN64 SK256 grid %d x %d", (c.N + kA8BN - 1) / kA8BN, c.n_expert + 1);
+    return R4D_EMIT(s, xm_a8_kernel, dim3((unsigned)((c.N + kA8BN - 1) / kA8BN), (unsigned)(c.n_expert + 1)), dim3(128), 0, A);
+}
+
+/* The rule: the gemv band (<= 16 tokens): MT from the call's tokens (an expert's rows in a decode step are few: 4 to 8
+ * tokens' worth), H 4 x R 1 in 8-wave blocks (32 weight rows a block), a grid of four blocks a WGP or fewer when the live
+ * work is smaller. The tiled order (DRAFTER track 18.11.2026, tools/dbench on one R9700, the drafter's 3 stages x
+ * (gate_up + down)): R 1 x MT 8 with EX 25 (each segment's chains over its own rows only, decoded a group of 8 values at a
+ * time, each step one fma: the same bits, the product being exact) in 4-wave blocks (128 rows), slabs of 16 KiB, a grid of 32
+ * blocks a WGP. drafter_mx 2 takes every call (both bands) to the WMMA form instead (xm_wm_kernel WR 1 NT 1 PD 2, 8 waves; rule B;
+ * lq125 real routing, one card: 80 tokens 1.26-1.53 ms vs EX 25's 2.68-3.42, 40 tokens 0.85-1.18 vs 1.20-2.15). Synthetic routing (pool 6, 7 in 10): 80
+ * tokens 4.18 ms a pass vs the stock tiled kernel's 18.62 (x4.46), 40 tokens 2.94 vs the previous rule's (MT 8, no EX, 4
+ * blocks a WGP) 5.99; routing where a sequence's 5 rows share 3 experts (pool 3, all picks; its stock time 11.56 ms is
+ * within 8 % of the served 12.48): 80 tokens 3.15 vs 11.56, 40 tokens 2.18 vs 6.91. The same bytes (the stock chain order). */
 int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
-    if (c.tokens < 1 || c.tokens > kXmMaxTokens || c.T < 1 || c.N < 1 || c.K < 32 || c.K % 32 || c.n_expert < 1)
+    if (c.tokens < 1 || c.tokens > g_xm_cap || c.T < 1 || c.N < 1 || c.K < 32 || c.K % 32 || c.n_expert < 1)
         return R4D_MX_MR_DECLINE;
     const bool pinned = g_xm_pin > 0;
+    if (pinned && g_xm_pin_h == 4096) return xm_wq_moe(s, c, g_xm_pin_mt, g_xm_pin_grid);   /* long-run WMMA pin */
+    /* drafter_mx 2 (rule B): every call, either band, in the WMMA form (WR 1, NT 1, PD 2, 8 waves), so a sequence's drafter
+     * bits do not depend on how many sequences share the call; what it declines takes the exact forms below. */
+    if (!pinned && g_xm_pin == 0 && g_xm_on == 3) {   /* drafter_mx 3: fp8 x fp8 at every call (rule B); a decline takes mx 2 */
+        const int a8 = xm_a8_moe(s, c);
+        if (a8 != R4D_MX_MR_DECLINE) return a8;
+    }
+    if (pinned && g_xm_pin_h == 8192) return xm_a8_moe(s, c);   /* bench pin of the fp8 form */
+    if (!pinned && g_xm_pin == 0 && g_xm_on >= 2) {
+        const int wm = xm_wm_moe(s, c, 1, 1, 2, 0, 8, 0);
+        if (wm != R4D_MX_MR_DECLINE) return wm;
+    }
+    if (pinned && g_xm_pin_h >= 1024)   /* WMMA pin (any band): h = 1024 + PD + 16 AB */
+        return xm_wm_moe(s, c, g_xm_pin_r, g_xm_pin_mt, (g_xm_pin_h & 15) ? (g_xm_pin_h & 15) : 2, (g_xm_pin_h >> 4) & 15,
+                         g_xm_pin_wn > 0 ? g_xm_pin_wn : 4, g_xm_pin_grid);
     int H = 4, R = 1, MT = c.tokens <= 2 ? 2 : (c.tokens <= 8 ? 4 : 8), WN = 0;
     if (pinned) { H = g_xm_pin_h; R = g_xm_pin_r; MT = g_xm_pin_mt; WN = g_xm_pin_wn; }
-    if (c.gemv ? !xm_has_g(H, R, MT) : !xm_has_s(R, MT)) return R4D_MX_MR_DECLINE;
+    /* a seq pin's h: 1 = EX (the segment's rows only) */
+    int EX = pinned && !c.gemv ? (g_xm_pin_h & 1 ? g_xm_pin_h : 0) : 0;   /* 3 / 5 / 7: bench ablations */
+    if (!pinned && !c.gemv) { MT = 8; EX = 25; }
+    if (c.gemv ? !xm_has_g(H, R, MT) : !xm_has_s(R, MT, EX)) return R4D_MX_MR_DECLINE;
     if (WN <= 0) WN = c.gemv ? 8 : 4;
     if (WN != 1 && WN != 2 && WN != 4 && WN != 8) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
@@ -560,13 +1302,13 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
     if (lds > 65536) return R4D_MX_MR_DECLINE;
     /* items: at most min(n_expert, T) experts live, each one segment or more */
     const long long est = (long long)A.live_cap * A.nrg;
-    long long grid = g_xm_pin_grid > 0 && pinned ? g_xm_pin_grid : 4LL * xm_cu_count();
+    long long grid = g_xm_pin_grid > 0 && pinned ? g_xm_pin_grid : (c.gemv ? 4LL : 32LL) * xm_cu_count();
     if (grid > est) grid = est;
     if (grid < 1) grid = 1;
-    std::snprintf(g_xm_last, sizeof g_xm_last, "%s H%d R%d MT%d WN%d SS%d RB%d grid %lld lds %lld", c.gemv ? "gemv" : "seq",
-                  c.gemv ? H : 32, R, MT, WN, A.SS, A.RB, grid, lds);
+    std::snprintf(g_xm_last, sizeof g_xm_last, "%s H%d R%d MT%d%s WN%d SS%d RB%d grid %lld lds %lld", c.gemv ? "gemv" : "seq",
+                  c.gemv ? H : 32, R, MT, EX ? " EX" : "", WN, A.SS, A.RB, grid, lds);
     return c.gemv ? xm_launch_g(s, H, R, MT, A, (unsigned)grid, 32u * WN, (unsigned)lds)
-                  : xm_launch_s(s, R, MT, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+                  : xm_launch_s(s, R, MT, EX, A, (unsigned)grid, 32u * WN, (unsigned)lds);
 }
 
 /* r4d_mx_mr_pin (bench / test hook, r4d_selftest --mxcheck / --perfmx): on 0 clears the pin (the switch decides),
@@ -577,6 +1319,10 @@ extern "C" void r4d_mx_mr_pin(int on, int h, int r, int mt, int wn, int grid) {
     g_xm_pin_grid = grid > 0 ? grid : 0;
 }
 extern "C" const char* r4d_mx_mr_last() { return g_xm_last; }
+/* r4d_mx_mr_cap (bench hook, DRAFTER track): the forms' token bound (<= 0: the shipped kXmMaxTokens). */
+extern "C" void r4d_mx_mr_cap(int tokens) { g_xm_cap = tokens > 0 ? tokens : kXmMaxTokens; }
+/* r4d_mx_wm_slab (bench hook, DRAFTER track): the WMMA form's slab in LDS bytes (<= 0: 16 KiB). */
+extern "C" void r4d_mx_wm_slab(int bytes) { g_xm_wm_slab = bytes > 0 ? bytes : 0; }
 
 #ifdef R4D_EMU_HOST
 /* tests/r4d_emu (ds41mx): the stock grouped GEMM's launches as mx_moe issues them (gemv band or tiled), from this

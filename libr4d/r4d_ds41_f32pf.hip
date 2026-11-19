@@ -348,8 +348,14 @@ static int f32dec_band(int rows) { return rows <= 8 ? 0 : rows <= 16 ? 1 : 2; }
 static bool f32dec_rgs_code(int f) { return f >= 0 && f <= 14; }
 static bool f32dec_gemm_code(int f) { return (f >= 0 && f <= 12) || (f >= 20 && f < 20 + kF32NForms); }
 static int r4d_f32dec_rule_gemm(int rows, int n) {
-    (void)n;
     (void)g_f32dec_rule_loaded;
+    /* Lever WQ-R (DRAFTER track, 18.11.2026 round 5): the table's forms were measured at the compressor's N 1024; a narrow
+     * projection (N <= 128: the DSpark drafter's router logits, 128 experts) gets 8 / 4-40 workgroups from them. There the
+     * 2x2 tile with 16 steps (form 9, the stock rule's own form up to 16 rows) is the fastest at every height to 48
+     * (tools/dbench/fbench, xeon f1, busy card, N 128 K 5120 f32 weight, us): M 8 / 16 / 24 / 40 / 48 form 9 5.9 / 7.9 /
+     * 9.5 / 13.8 / 16.9 vs the table's 26 / 30 / 4 / 4 / 4: 16.5-20.7 (form 30 at 16 rows 20.5 = lq145's served f32pf
+     * 20.6-21.0 a stage). Every form the stock bytes (fbench: all 25 forms identical at every M). */
+    if (n <= 128 && rows <= 48) return 9;
     const int f = g_f32dec_rule[3 + f32dec_band(rows)];
     return f32dec_gemm_code(f) ? f : 0;
 }
