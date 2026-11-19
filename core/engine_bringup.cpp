@@ -2164,6 +2164,10 @@ int Engine::plan() {
      * of its kernels, so the modules no init launched (prefill forms, a first >= 1k-row pass's) load while serving and
      * outside this reading; on the two-node pipeline such a first use stalled both nodes ~46 s (FINDINGS F21 / F24 / F25).
      * With the switch every module is loaded on every card here, before the budget reads the cards. Default off. */
+    /* tp8 loop P31: RADIANCE_AQL_MEMSET_OWNQ=1 (aql.cpp hipMemset) -- said once here */
+    if (const char* mo = std::getenv("RADIANCE_AQL_MEMSET_OWNQ"); mo && !std::strcmp(mo, "1"))
+        RAD_INFO("RADIANCE_AQL_MEMSET_OWNQ=1 (tp8 loop P31): a library's synchronous hipMemset fills on a queue made for the call and "
+                 "waits for that queue only, not for a rank's compute stream (the same bytes, complete on return)");
     /* tp8 loop P31: RADIANCE_AQL_PRELOAD=2 = 1 + every registered kernel resolved on every card here (its first launch's
      * symbol lookup and argument layout), so a first >= 1k-row pass resolves nothing while it issues. */
     if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && (!std::strcmp(pe, "1") || !std::strcmp(pe, "2"))) {

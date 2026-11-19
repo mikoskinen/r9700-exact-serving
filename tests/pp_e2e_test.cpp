@@ -1110,7 +1110,8 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
  * every issue over the threshold (0.0001 ms, passes of >= 1 row) serves one process's tokens and plan; each node says the switch at start and
  * prints slow-issue lines (op, kernel, band, own + launch, the first-launch resolves) up to its budget of 128, the 128th
  * saying so; the leader's prefill timeline names the first chunk's and the longest chunk's head issue. RADIANCE_AQL_PRELOAD=2
- * on the host backend says it has nothing to load and changes nothing. */
+ * on the host backend says it has nothing to load and changes nothing; RADIANCE_AQL_MEMSET_OWNQ=1 says itself (the AQL
+ * backend's hipMemset is a card's; the host backend never takes it) and changes nothing. */
 TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
     REQUIRE(world().ok);
     const std::vector<int32_t> p = prompt_ids(1013, 1000);
@@ -1130,7 +1131,8 @@ TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
         Serving sv;
         REQUIRE(sv.start(cut, { "--max-num-seqs", "6", "--pp-lanes", lanes },
                          cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_PF_TIMELINE=1", "RADIANCE_SLOW_ISSUE_MS=0.0001",
-                                          "RADIANCE_SLOW_ISSUE_ROWS=1", "RADIANCE_AQL_PRELOAD=2" })));
+                                          "RADIANCE_SLOW_ISSUE_ROWS=1", "RADIANCE_AQL_PRELOAD=2",
+                                          "RADIANCE_AQL_MEMSET_OWNQ=1" })));
         const std::vector<int32_t> got = complete(sv.port, p, 24);
         kill(sv.lead.child.pid, SIGTERM);
         CHECK_EQ(sv.lead.finish(60), 0);
@@ -1142,6 +1144,7 @@ TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
         for (const std::string* lg : { &llog, &flog }) {
             CHECK(lg->find("RADIANCE_SLOW_ISSUE_MS=0.0001 (tp8 loop P31)") != std::string::npos);
             CHECK(lg->find("RADIANCE_AQL_PRELOAD=2: not the AQL backend here; nothing to load") != std::string::npos);
+            CHECK(lg->find("RADIANCE_AQL_MEMSET_OWNQ=1 (tp8 loop P31)") != std::string::npos);
             const size_t s0 = lg->find("slow issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card ");
             CHECK(s0 != std::string::npos);
             if (s0 == std::string::npos) continue;

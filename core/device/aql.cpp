@@ -4409,12 +4409,26 @@ hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t st) {
  * The fill runs on the first queue this process made on the device (the owning rank's compute
  * stream) and is waited for. A device with no queue yet (a peer's buffers set up before its rank
  * starts) gets a temporary one for the call. Never recorded into a tape: it runs once. */
+/* tp8 loop P31: RADIANCE_AQL_MEMSET_OWNQ=1 runs every such fill on a queue of its own made for the call (as a device with no
+ * queue gets today) and waits for that queue only: the same bytes, complete when it returns, without waiting for the compute
+ * stream's backlog -- a library's first-use zeroing inside a launch (libr4d split_ctr / the stage ops' counter_for) otherwise
+ * waits there for every part already issued on the card. With RADIANCE_SLOW_ISSUE_MS=X a fill that took >= X ms says so. */
+static const bool g_memset_ownq = [] {
+    const char* e = std::getenv("RADIANCE_AQL_MEMSET_OWNQ");
+    return e && e[0] == '1' && !e[1];
+}();
+static std::atomic<int> g_memset_lines{0};
+}  // extern "C"
+namespace rad { double slow_issue_ms(); }
+extern "C" {
+
 hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (!G().ok) return real().memset_sync ? real().memset_sync(dst, value, bytes) : hipErrorNotSupported;
     int dev = -1;
     if (hipGetDevice(&dev) != hipSuccess) return ret(hipErrorInvalidDevice);
+    const auto t0 = std::chrono::steady_clock::now();
     Stream* s = nullptr;
-    {
+    if (!g_memset_ownq) {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         for (Stream* x : G().streams)
             if (x->ord == dev) { s = x; break; }
@@ -4429,6 +4443,20 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (rc >= 0) rc = stream_drain(s);
     --t_tape_pause;
     if (own) rad_stream_destroy(own);
+    const double sl = rad::slow_issue_ms();
+    if (sl > 0) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms >= sl) {
+            const int k = g_memset_lines.fetch_add(1, std::memory_order_relaxed);
+            if (k < 128)
+                std::fprintf(stderr, "radiance: aql: a synchronous hipMemset of %zu bytes on card %d took %.2f ms (%s; RADIANCE_SLOW_ISSUE_MS, "
+                                     "tp8 loop P31)%s\n", bytes, dev, ms,
+                             g_memset_ownq ? "on a queue of its own, RADIANCE_AQL_MEMSET_OWNQ=1"
+                                           : own ? "on a queue made for the call"
+                                                 : "on the card's first queue = a rank's compute stream: its backlog waited for",
+                             k == 127 ? " (the 128th: no more memset lines)" : "");
+        }
+    }
     return ret(rc < 0 ? hipErrorInvalidValue : hipSuccess);
 }
 
