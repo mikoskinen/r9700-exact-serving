@@ -155,6 +155,14 @@ struct Model {
 
 static Model g_model[MAX_RANKS];
 
+/* tp8 loop D33 (RADIANCE_PP_SEG_MAX=N, as deepseek41's; unset 16 = the bound before D33): at most N - 1 segment boundaries on
+ * this node, 2 <= N <= RAD_PP_MAX_SEGS -- the host tests' stand-in for the follower's end lump */
+static int pp_seg_cap() {
+    const char* e = std::getenv("RADIANCE_PP_SEG_MAX");
+    const int n = e && *e ? std::atoi(e) : 16;
+    return std::min(std::max(n, 2), (int)RAD_PP_MAX_SEGS);
+}
+
 /* The quantisation descriptor is the selection key but is checked anyway: `--arch` can override
  * the architecture id at convert time, and a plugin handed the wrong checkpoint should say which
  * half disagrees rather than fail at a name map. */
@@ -420,15 +428,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const char* sk = std::getenv("RADIANCE_PP_SEG_LAYERS");
             const int k = sk && *sk ? std::atoi(sk) : 0;
             if (m.pp_rank == 1 && k > 0 && pp.lanes > 1)
-                for (int x = m.pp_h + k; x < m.pp_t && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += k) m.seg_b.push_back(x);
+                for (int x = m.pp_h + k; x < m.pp_t && (int)m.seg_b.size() < pp_seg_cap() - 1; x += k) m.seg_b.push_back(x);
             /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k on the leader): its head [0, h) and its tail [t, n) in segments of k layers
              * -- boundaries k, 2k .. below h, and t + k, t + 2k .. below n (none past the drafter's first tap: the taps
              * and the drafter after the tail must be one segment's) */
             const char* lk = std::getenv("RADIANCE_PP_LEAD_SEG");
             const int kl = lk && *lk ? std::atoi(lk) : 0;
             if (m.pp_rank == 0 && kl > 0 && pp.lanes > 1) {
-                for (int x = kl; x < m.pp_h && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += kl) m.seg_b.push_back(x);
-                for (int x = m.pp_t + kl; x < (int)m.n_main && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += kl)
+                for (int x = kl; x < m.pp_h && (int)m.seg_b.size() < pp_seg_cap() - 1; x += kl) m.seg_b.push_back(x);
+                for (int x = m.pp_t + kl; x < (int)m.n_main && (int)m.seg_b.size() < pp_seg_cap() - 1; x += kl)
                     m.seg_b.push_back(x);
             }
         }

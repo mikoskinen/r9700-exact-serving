@@ -84,8 +84,10 @@ enum { RAD_PP_PART_WHOLE = 0, RAD_PP_PART_HEAD = 1, RAD_PP_PART_TAIL = 2, RAD_PP
  * from it restores those bytes, each rank its own, through the stage ops in loop mode (`loop` 1: the ring operand is a
  * buffer of this rank, the plugin's, which the send fills and publishes to itself and the receive copies back: no link,
  * no peer, no host memory). The plugin names its boundaries at declare with rad_pp_segments; an engine that has none
- * never issues RAD_PP_PART_SEG. */
-#define RAD_PP_MAX_SEGS 16
+ * never issues RAD_PP_PART_SEG.
+ * tp8 loop D33: the bound is 32 segments (31 boundaries); a plugin declares at most RADIANCE_PP_SEG_MAX - 1 boundaries on a node
+ * (2 <= N <= RAD_PP_MAX_SEGS; unset 16 = 15 boundaries, the bound before D33), so an unset start declares what it did. */
+#define RAD_PP_MAX_SEGS 32
 /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k on the leader; unset: nothing here): the leader's head / tail part of a BG lane's step
  * issued in layer segments, with other lanes' parts between them. The part stays RAD_PP_PART_HEAD / _TAIL and seg_l1 > 0
  * names the segment [seg_l0, seg_l1) (seg_l1 == 0: the whole part, as before):

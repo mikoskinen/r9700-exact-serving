@@ -461,6 +461,14 @@
  *                   start with RADIANCE_PP_LEAD_SEG=1 compares k = 1 / 2 / 3 / 5 (v = 2, 34, 50, 82). Needs RADIANCE_PP_LEAD_SEG=k
  *                   on the leader at start (else only 0 is taken); its start value RADIANCE_PP_LEAD_SEG_FORM (default 1 =
  *                   today's M9 with the env set). Order of issue only, never a step's composition (rule A, as M9).
+ *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
+ *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
+ *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all
+ *                   of them). 0 = every declared boundary (the start's program). With RADIANCE_PP_SEG_MAX=32 and SEG_LAYERS=1 at
+ *                   W(10,32): 15 = 11..25 (the program before D33: [25,32) whole), 0 = 11..31, 128 = 12, 14 .. 30 (= SEG_LAYERS=2's
+ *                   set). A body reserve's boundary (pp_fol_reserve) splits the pass whatever the set. RADIANCE_PP_SEG_SET=v on the
+ *                   follower starts it at v; the follower takes the leader's request (its own check: boundaries declared; the
+ *                   leader checks the range only). Order only: where a pass's segments end, never a pass's ops (rule A, M4).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
@@ -678,7 +686,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -710,6 +718,10 @@ void reserve_register(uint64_t mask);
 /* tp8 loop D32 (pp_lead_seg): the leader's lane loop at its start -- whether it took leader boundaries (RADIANCE_PP_LEAD_SEG
  * with a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). */
 void lead_seg_register(bool capable);
+/* tp8 loop D33 (pp_seg_set): the follower, at its loop's start -- how many declared segment boundaries lie inside its W(h, t)
+ * (0: none: RADIANCE_PP_SEG_LAYERS unset / one lane); -1 until registered (the leader never registers: it checks the range, the
+ * follower's verdict decides). */
+void segset_register(int n);
 void note_short_blk(int64_t rows);
 /* The scheduler, at its init: whether its drafter can run the hybrid (a head drafting chains beside prompt lookup). */
 void hybrid_register(bool capable);

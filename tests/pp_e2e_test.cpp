@@ -2882,6 +2882,133 @@ TEST(a_bg_bodys_reserve_serves_one_process_tokens) {
     CHECK(time_all > 0);
 }
 
+/* tp8 loop D33 (DECODE round 26): the follower's segment set -- RADIANCE_PP_SEG_MAX=N declares at most N - 1 boundaries (the
+ * bound before D33, 16, left the follower's last segment [25,32) whole at W(10,32): the end lump), fn4 pp_seg_set picks which
+ * declared boundaries split a pass (n + 64 x s: every s-th, then the first n; 0 = all). At W(0,3) SEG_LAYERS=1 the follower
+ * declares 1, 2: SEG_MAX=2 declares 1 only ([1,3) whole: the lump's stand-in); in process 128 = {2}, 1 = {1}, 0 = {1, 2}, POSTed
+ * between request sets, and RADIANCE_PP_SEG_SET its start value. Every request's tokens are one process's at 4 lanes BG 2
+ * (FOL_ORDER 2, the BEST form) and 3 lanes BG 1, and with a body reserve at 2 beside the set {1} (the reserve's boundary splits
+ * whatever the set: bodies are held); a value out of range and a follower with no boundary are refused by name. */
+TEST(follower_segment_set_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int bg; bool seg; const char* seg_max; const char* seg_set; const char* res; const char* post1; const char* post2;
+                 const char* bounds; };
+    long long split_all = 0, held_all = 0;
+    for (const Arm a : { Arm{ 4, 2, true, nullptr, nullptr, nullptr, "128", "1", "1, 2" },
+                         Arm{ 4, 2, true, "2", nullptr, nullptr, nullptr, nullptr, "1" },
+                         Arm{ 3, 1, true, "32", "128", nullptr, nullptr, "0", "1, 2" },
+                         Arm{ 4, 2, true, nullptr, "1", "2", nullptr, nullptr, "1, 2" },
+                         Arm{ 4, 2, false, nullptr, nullptr, nullptr, "1", nullptr, nullptr } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
+        env.push_back("RADIANCE_PP_FOL_ORDER=2");
+        if (a.seg_max) env.push_back(std::string("RADIANCE_PP_SEG_MAX=") + a.seg_max);
+        if (a.seg_set) env.push_back(std::string("RADIANCE_PP_SEG_SET=") + a.seg_set);
+        if (a.res) env.push_back(std::string("RADIANCE_PP_FOL_RESERVE=") + a.res);
+        if (a.seg) env.push_back("RADIANCE_PP_SEG_LAYERS=1");
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start("0,3", ex, env));
+        auto post = [&](int v, int want, const char* named) {
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_seg_set", v } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, want);
+            if (st != want) fprintf(stderr, "    POST pp_seg_set %d: %d %s\n", v, st, out.c_str());
+            if (named) {
+                const bool has = out.find(named) != std::string::npos;
+                if (!has) fprintf(stderr, "    POST pp_seg_set %d: %s\n", v, out.c_str());
+                CHECK(has);
+            }
+        };
+        if (a.seg) post(32, 400, "pp_seg_set takes n + 64 x s");
+        if (a.post1 && !a.seg) post(std::atoi(a.post1), 400, "declared no segment boundary");
+        if (a.post1 && a.seg) post(std::atoi(a.post1), 200, nullptr);
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        if (a.post2) post(std::atoi(a.post2), 200, nullptr);
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long passes = -1, segs = -1, held = -1;
+        if (const size_t at = flog.rfind(" passes ran in "); at != std::string::npos)
+            if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "follower: %lld passes ran in %lld segments", &passes, &segs);
+        if (const size_t at = flog.rfind("tp8 loop IDEAS #9): "); at != std::string::npos)
+            (void)std::sscanf(flog.c_str() + at, "tp8 loop IDEAS #9): %lld BG bodies held", &held);
+        std::string sets;
+        for (size_t at = flog.find("follower: pp_seg_set "); at != std::string::npos; at = flog.find("follower: pp_seg_set ", at + 1)) {
+            const size_t e = flog.find('\n', at);
+            const std::string ln = flog.substr(at, e == std::string::npos ? std::string::npos : e - at);
+            if (const size_t p = ln.find("now ends its segments at "); p != std::string::npos)
+                sets += (sets.empty() ? "" : " | ") + ln.substr(10, ln.find(' ', 21) - 10) + ": " + ln.substr(p + 25);
+        }
+        fprintf(stderr, "    SEG_LAYERS=%s SEG_MAX=%s SEG_SET=%s RESERVE=%s%s%s, BG lanes %d, %d lanes W(0,3): %d of %zu requests differ; "
+                        "follower: %lld passes in %lld segments, %lld bodies held; sets [%s]\n", a.seg ? "1" : "unset",
+                a.seg_max ? a.seg_max : "unset", a.seg_set ? a.seg_set : "unset", a.res ? a.res : "unset",
+                a.post1 ? (std::string(" + POST ") + a.post1).c_str() : "", a.post2 ? (std::string(" + POST ") + a.post2).c_str() : "",
+                a.bg, a.lanes, differ, ref.size() + ref_b.size(), passes, segs, held, sets.c_str());
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        if (!a.seg) {
+            CHECK(flog.find("tp8 loop D33") == std::string::npos);   /* nothing of D33 without boundaries */
+            continue;
+        }
+        CHECK(flog.find(std::string("in layer segments at the boundaries ") + a.bounds + " of W(0,3)") != std::string::npos);
+        CHECK(passes > 0);
+        split_all += std::max(0LL, passes);
+        if (a.seg_max || a.seg_set)
+            CHECK(flog.find("follower: segment set (tp8 loop D33): ") != std::string::npos);
+        else
+            CHECK(flog.find("follower: segment set (tp8 loop D33): ") == std::string::npos);
+        if (a.post1) CHECK(flog.find(std::string("follower: pp_seg_set ") + a.post1 + " (tp8 loop D33)") != std::string::npos);
+        if (a.post2) CHECK(flog.find(std::string("follower: pp_seg_set ") + a.post2 + " (tp8 loop D33)") != std::string::npos);
+        if (a.post1 && std::strcmp(a.post1, "128") == 0)
+            CHECK(flog.find("follower: pp_seg_set 128 (tp8 loop D33): a split pass of W(0,3) now ends its segments at 2 (2 segments)") !=
+                  std::string::npos);
+        if (a.post2 && std::strcmp(a.post2, "1") == 0)
+            CHECK(flog.find("follower: pp_seg_set 1 (tp8 loop D33): a split pass of W(0,3) now ends its segments at 1 (2 segments)") !=
+                  std::string::npos);
+        if (a.seg_set && std::strcmp(a.seg_set, "128") == 0)
+            CHECK(flog.find("follower: pp_seg_set 128 (tp8 loop D33): a split pass of W(0,3) now ends its segments at 2 (2 segments)") !=
+                  std::string::npos);
+        if (a.res) {
+            CHECK(held > 0);   /* the reserve's boundary 2 split the bodies under the set {1} */
+            held_all += std::max(0LL, held);
+        }
+    }
+    fprintf(stderr, "    all arms: %lld split passes, %lld bodies held under pp_seg_set 1 + reserve 2\n", split_all, held_all);
+    CHECK(split_all > 0);
+    CHECK(held_all > 0);
+}
+
 /* tp8 dev D10 round 2: steps issued ahead beside the BG lanes' split passes, the best c32 start's form (W(0, t), the follower's
  * own lookup from X1's token ids, BG lanes in one-layer segments, ready-first tails): a frame the leader issued ahead arrives
  * about a leader tail before its X1 and waits between the BG pass's segments until X1 has landed. Tokens = one process at
