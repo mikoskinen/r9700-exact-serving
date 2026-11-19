@@ -776,7 +776,8 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
         __syncthreads();
         /* one 32-K block at a time above the first form (MT > 16): unrolled, the wide tiles' live fragments and scale reads
          * spill (MT 64 ~490 B a lane of scratch, measured by the compiler's resource report); the order is the same */
-#pragma unroll(MT > 16 ? 1 : 4)
+        constexpr int kKU = MT > 16 ? 1 : 4;
+#pragma unroll kKU
         for (int kk = 0; kk < 128; kk += 32) {
             const auto wf0 = r4d_fp8::frag<128>(wb, wave * 16, kk, lane), wf1 = r4d_fp8::frag<128>(wb, wave * 16, kk + 16, lane);
             const int kb = (k0 + kk) / 32;
