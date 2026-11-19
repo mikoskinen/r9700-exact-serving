@@ -11,12 +11,12 @@
  *        activation (K + 128) and output (N + 64) (padding poisoned, checked untouched). The codes are multiples of 1/16 in
  *        [-4, 4] and the scales powers of two, which keeps every 32-term block sum exact in f32 in any order, so the card's
  *        WMMA order inside a block cannot round differently: PASS = 0 outputs differ;
- *     2b. the M tile (r4d_fp8e8_pin_mt: 16 = the first form, 32 / 64 = the wide tiles) changes no byte: the same launches at
- *        M tile 32 and 64 into a re-poisoned output = M tile 16's, padding included;
- *     3. INFO: the GEMM at the newcomer's eight rank-0 shapes (run-p30a.sh's list and weights) x M 16 / 1100 / 4096 (M tile 16,
- *        and 64 above 16 rows), us a call over 10 timed launches after 2 warm ones, as `P30W name NxK M=m wW
- *        gemm_fp8a8e8_b32[_mt64] us us` lines that tp8/devpf/scripts/p30read.py reads beside run-p30a.sh's (published B5SUM
- *        101.16 / 356.15 ms at M 1100 / 4096).
+ *     2b. the forms change no byte: 16-byte staging (r4d_fp8e8_pin_ld 16) at M tile 16 / 32 / 64 (r4d_fp8e8_pin_mt) into a
+ *        re-poisoned output = the first form's (byte staging, tile 16), padding included;
+ *     3. INFO: the GEMM at the newcomer's eight rank-0 shapes (run-p30a.sh's list and weights) x M 16 / 1100 / 4096 -- rows
+ *        gemm_fp8a8e8_b32_first (byte staging, tile 16), gemm_fp8a8e8_b32 (16-byte staging, tile 16), _mt64 (16-byte, tile 64;
+ *        above 16 rows) -- us a call over 10 timed launches after 2 warm ones, as `P30W name NxK M=m wW row us us` lines that
+ *        tp8/devpf/scripts/p30read.py reads beside run-p30a.sh's (published B5SUM 101.16 / 356.15 ms at M 1100 / 4096).
  */
 
 namespace p30ost {
@@ -25,6 +25,11 @@ namespace p30ost {
 static void pin_mt(const Plugin& pl, int mt) {
     auto f = (void (*)(int))dlsym(pl.h, "r4d_fp8e8_pin_mt");
     if (f) f(mt);
+}
+/* ... and its staging (4 = the first form's byte loads, 16 = 16-byte loads where aligned) */
+static void pin_ld(const Plugin& pl, int ld) {
+    auto f = (void (*)(int))dlsym(pl.h, "r4d_fp8e8_pin_ld");
+    if (f) f(ld);
 }
 
 static const RadKernelInfo* oracle_of(void* ref, const char* op) {
@@ -184,18 +189,22 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
     if (!g.up()) { ok("gemm_fp8a8e8_b32 allocation", false); return; }
     std::vector<RadTensor> dt = g.dev();
     pin_mt(pl, 16);
+    pin_ld(pl, 4);   /* the first form exactly: byte staging, 16-row tile */
     run_case(row, dt, ps);
     const std::vector<uint8_t> got = g.y.down();
-    /* the wide tiles over the same operands into a re-poisoned y: every byte (padding included) = the first form's */
-    int64_t mtdiff[2] = { 0, 0 };
-    for (int t = 0; t < 2; ++t) {
+    /* the other forms over the same operands into a re-poisoned y: every byte (padding included) = the first form's --
+     * 16-byte staging at tile 16 / 32 / 64 */
+    int64_t mtdiff[3] = { 0, 0, 0 };
+    for (int t = 0; t < 3; ++t) {
         st_memcpy(g.y.d, g.y.b.data(), g.y.b.size(), hipMemcpyHostToDevice);
-        pin_mt(pl, t ? 64 : 32);
+        pin_ld(pl, 16);
+        pin_mt(pl, t == 0 ? 16 : t == 1 ? 32 : 64);
         run_case(row, dt, ps);
         const std::vector<uint8_t> g2 = g.y.down();
         for (size_t i = 0; i < got.size(); ++i) mtdiff[t] += g2[i] != got[i];
     }
     pin_mt(pl, 16);
+    pin_ld(pl, 0);
     int64_t diff = 0, nonfin = 0;
     float worst = 0;
     bool guards = true;
@@ -222,15 +231,19 @@ static void gemm_case(const Plugin& pl, const RadKernelInfo* row, const RadKerne
            (long long)M, (long long)N, (long long)K, pitched ? " (pitched a / y)" : "", (long long)diff, (long long)(M * N),
            worst, guards ? "" : "; PADDING / GUARDS TOUCHED").c_str(),
        orc == RAD_OK && diff == 0 && nonfin == 0 && guards, orc == RAD_OK ? "" : "oracle rc " + std::to_string(orc));
-    ok(fmt("gemm_fp8a8e8_b32 M tile 32 / 64 = M tile 16 byte for byte, M %lld N %lld K %lld%s: %lld / %lld bytes differ", (long long)M,
-           (long long)N, (long long)K, pitched ? " (pitched)" : "", (long long)mtdiff[0], (long long)mtdiff[1]).c_str(),
-       mtdiff[0] == 0 && mtdiff[1] == 0);
+    ok(fmt("gemm_fp8a8e8_b32 16-byte staging at M tile 16 / 32 / 64 = the first form byte for byte, M %lld N %lld K %lld%s: "
+           "%lld / %lld / %lld bytes differ", (long long)M, (long long)N, (long long)K, pitched ? " (pitched)" : "",
+           (long long)mtdiff[0], (long long)mtdiff[1], (long long)mtdiff[2]).c_str(),
+       mtdiff[0] == 0 && mtdiff[1] == 0 && mtdiff[2] == 0);
     dfree_all();
 }
 
-static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* name, int64_t N, int64_t K, int64_t M, int w, int mt) {
-    const char* rn = mt == 64 ? "gemm_fp8a8e8_b32_mt64" : mt == 32 ? "gemm_fp8a8e8_b32_mt32" : "gemm_fp8a8e8_b32";
+static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* name, int64_t N, int64_t K, int64_t M, int w, int mt,
+                      int ld) {
+    const char* rn = ld == 4 ? "gemm_fp8a8e8_b32_first" : mt == 64 ? "gemm_fp8a8e8_b32_mt64" : mt == 32 ? "gemm_fp8a8e8_b32_mt32"
+                                                                                                    : "gemm_fp8a8e8_b32";
     pin_mt(pl, mt);
+    pin_ld(pl, ld);
     GemmIn g;
     g.make(M, N, K, K, N, 0x7u);
     std::vector<RadParam> ps = gemm_ps(M, N, K);
@@ -257,6 +270,7 @@ static void gemm_time(const Plugin& pl, const RadKernelInfo* row, const char* na
     else
         std::printf("  P30W %s %lldx%lld M=%lld w%d %s NA us (rc %d)\n", name, (long long)N, (long long)K, (long long)M, w, rn, rc);
     pin_mt(pl, 16);
+    pin_ld(pl, 0);
     dfree_all();
 }
 
@@ -296,9 +310,9 @@ static void p30o_cases(const Plugin& pl) {
                           { "kv", 512, 5120, 40 }, { "shexp_gate_up", 1536, 5120, 40 }, { "shexp_down", 5120, 768, 40 },
                           { "engram_kv", 25600, 6144, 2 } };
     for (int64_t M : { 16, 1100, 4096 })
-        for (int mt : { 16, 64 }) {
-            if (M <= 16 && mt != 16) continue;   /* a launch of <= 16 rows is one 16-row tile at any pin */
-            for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, mt);
+        for (int f = 0; f < 3; ++f) {   /* the first form (byte staging, tile 16), 16-byte staging at tile 16, at tile 64 */
+            if (M <= 16 && f == 2) continue;   /* a launch of <= 16 rows is one 16-row tile at any pin */
+            for (const Sh& s : shapes) gemm_time(pl, rg, s.n, s.N, s.K, M, s.w, f == 2 ? 64 : 16, f == 0 ? 4 : 16);
         }
     dlclose(ref);
 }

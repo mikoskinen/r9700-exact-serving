@@ -722,7 +722,10 @@ __device__ __forceinline__ float e8m0f(uint32_t e) { return __uint_as_float(e ? 
  * T / 16 times: at M 1100 the dense is weight-read bound), and each wave reuses its weight fragments over MT / 16 accumulator
  * tiles. Every output's arithmetic is the first form's (the same two-WMMA chain a 32-K block over the same 16 K halves, the same
  * fold in the same block order), so the bytes do not depend on MT. */
-template <int MT>
+/* V16 (PREFILL round 21): the operands' rows and pitches 16-byte aligned (the engine's pair, the sidecar's weights) -- each thread
+ * stages 16 bytes a load (two 8-byte LDS stores: the 136-byte LDS row keeps 8-byte alignment) instead of four byte loads a dword;
+ * the same bytes land in the same LDS places, so nothing else changes */
+template <int MT, bool V16>
 __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, const uint8_t* ws, uint16_t* y, Meta m) {
     constexpr int F = MT / 16;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, n0 = blockIdx.x * 64;
@@ -739,6 +742,21 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
     for (int f = 0; f < F; ++f) acc[f] = r4d_fp8::acc_zero();
     const long wsrow = (long)((n0 + wave * 16) / 32) * m.sr;
     for (int k0 = 0; k0 < m.K; k0 += 128) {
+        if constexpr (V16) {
+            for (int j = tid; j < MT * 8; j += 128) {
+                const int r = j / 8, c = (j % 8) * 16, src = source[r];
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (src >= 0) v = *(const uint4*)(a + (long)src * m.ar + k0 + c);
+                *(uint2*)(qa + r * 136 + c) = make_uint2(v.x, v.y);
+                *(uint2*)(qa + r * 136 + c + 8) = make_uint2(v.z, v.w);
+            }
+            for (int j = tid; j < 64 * 8; j += 128) {
+                const int r = j / 8, c = (j % 8) * 16;
+                const uint4 v = *(const uint4*)(w + (long)(n0 + r) * m.wr + k0 + c);
+                *(uint2*)(wb + r * 136 + c) = make_uint2(v.x, v.y);
+                *(uint2*)(wb + r * 136 + c + 8) = make_uint2(v.z, v.w);
+            }
+        } else {
         for (int j = tid; j < MT * 32; j += 128) {
             const int r = j / 32, c = (j % 32) * 4, src = source[r];
             uint32_t v = 0;
@@ -753,6 +771,7 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
             const auto* p = w + (long)(n0 + r) * m.wr + k0 + c;
             *(uint32_t*)(wb + r * 136 + c) = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                                              ((uint32_t)p[3] << 24);
+        }
         }
         __syncthreads();
 #pragma unroll
@@ -784,8 +803,18 @@ __global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, c
         }
 }
 /* the M tile: R4D_FP8E8_MT=16 / 32 / 64 at load (unset: 16, the first form), r4d_fp8e8_pin_mt() in process (selftest, emu);
- * a launch of at most 16 rows always takes 16 (one tile either way) */
-std::atomic<int> g_fp8e8_mt{ -1 };
+ * a launch of at most 16 rows always takes 16 (one tile either way). The staging: R4D_FP8E8_LD=4 at load forces the first form's
+ * byte loads, else 16-byte loads wherever the operands allow; r4d_fp8e8_pin_ld(4 / 16 / 0) in process */
+std::atomic<int> g_fp8e8_mt{ -1 }, g_fp8e8_ld{ -1 };
+int fp8e8_ld() {
+    int v = g_fp8e8_ld.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("R4D_FP8E8_LD");
+        v = e && !std::strcmp(e, "4") ? 4 : 16;
+        g_fp8e8_ld.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
 int fp8e8_mt() {
     int v = g_fp8e8_mt.load(std::memory_order_relaxed);
     if (v < 0) {
@@ -821,12 +850,19 @@ int dense_e8(const RadArgs* a, RadStream stream) {
     m.N = N;
     m.K = K;
     const int mt = m.T <= 16 ? 16 : fp8e8_mt();
-#define FP8E8_GO(MT_)                                                                                                 \
-    R4D_EMIT(stream, fp8e8_b32<MT_>, dim3(N / 64, (m.T + MT_ - 1) / MT_), dim3(128), 0, (const uint8_t*)x.data,            \
+    /* 16-byte staging: both operands' bases and row pitches (bytes: E4M3 is a byte a value) on 16 bytes */
+    const bool v16 = fp8e8_ld() == 16 && !(((uintptr_t)x.data | (uintptr_t)w.data | (uintptr_t)m.ar | (uintptr_t)m.wr) & 15u);
+#define FP8E8_GO(MT_, V_)                                                                                             \
+    R4D_EMIT(stream, (fp8e8_b32<MT_, V_>), dim3(N / 64, (m.T + MT_ - 1) / MT_), dim3(128), 0, (const uint8_t*)x.data,    \
              (const float*)xs.data, (const uint8_t*)w.data, (const uint8_t*)ws.data, (uint16_t*)y.data, m)
-    if (mt == 64) return FP8E8_GO(64);
-    if (mt == 32) return FP8E8_GO(32);
-    return FP8E8_GO(16);
+    if (v16) {
+        if (mt == 64) return FP8E8_GO(64, true);
+        if (mt == 32) return FP8E8_GO(32, true);
+        return FP8E8_GO(16, true);
+    }
+    if (mt == 64) return FP8E8_GO(64, false);
+    if (mt == 32) return FP8E8_GO(32, false);
+    return FP8E8_GO(16, false);
 #undef FP8E8_GO
 }
 }
@@ -835,6 +871,8 @@ extern "C" int r4d_rad_fp8_f32scale(const RadArgs* a, RadStream stream) { return
 extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs* a, RadStream stream) { return dense_e8(a, stream); }
 /* PREFILL round 21: the fp8a8e8 form's M tile in process (16 / 32 / 64; anything else back to R4D_FP8E8_MT / 16) -- the same bytes */
 extern "C" void r4d_fp8e8_pin_mt(int mt) { g_fp8e8_mt.store(mt == 16 || mt == 32 || mt == 64 ? mt : -1, std::memory_order_relaxed); }
+/* ... and its staging (4 = the first form's byte loads, 16 = 16-byte loads where aligned; anything else back to R4D_FP8E8_LD) */
+extern "C" void r4d_fp8e8_pin_ld(int ld) { g_fp8e8_ld.store(ld == 4 || ld == 16 ? ld : -1, std::memory_order_relaxed); }
 /* Its planes as the release stores them (affine {codes fp8_e4m3, scale e8m0 [32x32]}): read without a relayout. */
 extern "C" int r4d_layout_fp8a8e8(const RadParam*, int, int operand, const RadEncoding* e, const int* sel,
                                   const RadTensor*, int n, RadLayout*) {
