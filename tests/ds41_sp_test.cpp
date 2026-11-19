@@ -333,6 +333,34 @@ TEST(plan_segment_passes_every_read_valid) {
     }
 }
 
+/* tp8 loop D40 (RADIANCE_DS41_SPHC_LSEG=1, fn4 pp_lead_seg + 512): the LEADER's head at W(10,32) in LSP's segments -- every 1 / 2 /
+ * 4 / 5 layers (pp_lead_seg strides 1, 2, 4 and 5 over the declared boundaries 1..9), the boundaries saved / restored whole, X1
+ * whole and row-sharded: every read valid and the whole head's plan (9 / 10 layers) in every form -- the segmented issue is the
+ * whole head's with a save / restore at each boundary (P25's rule on the leader). Control: the boundary op taken over every row
+ * where only the layer before the boundary is SP (X1 whole: boundary 9) reads a quarter. */
+TEST(plan_leader_head_segment_passes_every_read_valid) {
+    int checked = 0;
+    for (Pass h : { shapes()[3], shapes()[8] })
+        for (int seg : { 1, 2, 4, 5 }) {
+            h.seg = seg;
+            h.seg_sh = false;
+            const std::vector<uint8_t> spv = plan_of(h);
+            const std::string e = run(h, spv);
+            if (!e.empty()) std::fprintf(stderr, "leader head in segments of %d, x1_sh %d: %s\n", seg, h.x1_sh, e.c_str());
+            CHECK_EQ(e, std::string(""));
+            CHECK_EQ(count(spv), h.x1_sh ? 10 : 9);
+            ++checked;
+        }
+    CHECK_EQ(checked, 8);
+    /* the control needs a boundary whose layer is whole after an SP one: X1 whole, boundary 9 (stride 1; layer 9 sends X1) */
+    Pass h = shapes()[3];
+    h.seg = 1;
+    CHECK(!run(h, plan_of(h), true, /*seg_rx_rule=*/false).empty());
+    h = shapes()[8];   /* X1 row-sharded: every head layer SP, the rule changes nothing */
+    h.seg = 2;
+    CHECK(run(h, plan_of(h), true, /*seg_rx_rule=*/false).empty());
+}
+
 /* tp8 loop P25b (RADIANCE_DS41_SPHC_SEG=3): the follower's newcomer pass whose cone keeps every row of layers 21-31 (a ~1.1k
  * prompt: C_31 = 160 + 8 x 128 = 1,184) or of 21-27 only (a ~1.6k prompt: C_28 = 1,568), in 1- / 2-layer segments, boundaries whole /
  * sharded, X1 whole / sharded: every read valid; the plan takes 10-19 + 21-30 (20) or 10-19 + 21-27 (17) -- 20 (the split layer)
