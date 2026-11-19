@@ -1115,6 +1115,93 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
     }
 }
 
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS on both nodes): a cold multi-chunk prompt at 2 and 3 lanes, W(0,2) and W(1,3), with
+ * every issue over the threshold (0.0001 ms, passes of >= 1 row) serves one process's tokens and plan; each node says the switch at start and
+ * prints slow-issue lines (op, kernel, band, own + launch, the first-launch resolves) up to its budget of 128, the 128th
+ * saying so; the leader's prefill timeline names the first chunk's and the longest chunk's head issue. RADIANCE_AQL_PRELOAD=2
+ * on the host backend says it has nothing to load and changes nothing; RADIANCE_AQL_MEMSET_OWNQ=1 says itself (the AQL
+ * backend's hipMemset is a card's; the host backend never takes it) and changes nothing. */
+TEST(a_slow_issue_line_names_the_issues_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(1013, 1000);
+    std::vector<int32_t> ref;
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        ref = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);
+    for (const char* lanes : { "2", "3" })
+    for (const char* cut : { "0,2", "1,3" }) {
+        Serving sv;
+        REQUIRE(sv.start(cut, { "--max-num-seqs", "6", "--pp-lanes", lanes },
+                         cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_PF_TIMELINE=1", "RADIANCE_SLOW_ISSUE_MS=0.0001",
+                                          "RADIANCE_SLOW_ISSUE_ROWS=1", "RADIANCE_AQL_PRELOAD=2",
+                                          "RADIANCE_AQL_MEMSET_OWNQ=1" })));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        const std::string llog = sv.lead.output(), flog = sv.fol.output();
+        CHECK(chunks_of(llog) == ref_plan);
+        CHECK(!ref.empty());
+        CHECK(got == ref);
+        for (const std::string* lg : { &llog, &flog }) {
+            CHECK(lg->find("RADIANCE_SLOW_ISSUE_MS=0.0001 (tp8 loop P31)") != std::string::npos);
+            CHECK(lg->find("RADIANCE_AQL_PRELOAD=2: not the AQL backend here; nothing to load") != std::string::npos);
+            CHECK(lg->find("RADIANCE_AQL_MEMSET_OWNQ=1 (tp8 loop P31)") != std::string::npos);
+            const size_t s0 = lg->find("slow issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card ");
+            CHECK(s0 != std::string::npos);
+            if (s0 == std::string::npos) continue;
+            const std::string sl = lg->substr(s0, lg->find('\n', s0) - s0);
+            CHECK(sl.find(": op '") != std::string::npos);
+            CHECK(sl.find(" kernel ") != std::string::npos);
+            CHECK(sl.find(" ms + launch ") != std::string::npos);
+            CHECK(sl.find("first-launch resolve(s)") != std::string::npos);
+            if (lg == &llog) fprintf(stderr, "    %s\n", sl.c_str());
+            const size_t p0 = lg->find("slow pass issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card ");
+            if (p0 != std::string::npos && lg == &llog)
+                fprintf(stderr, "    %s\n", lg->substr(p0, lg->find('\n', p0) - p0).c_str());
+            /* the budget: 128 lines, the 128th says so, none after it */
+            size_t k = 0, at = 0;
+            while ((at = lg->find("slow issue (RADIANCE_SLOW_ISSUE_MS", at)) != std::string::npos) { ++k; ++at; }
+            CHECK_EQ(k, (size_t)128);
+            CHECK(lg->find("(the 128th: no more issue lines)") != std::string::npos);
+        }
+        const size_t tl = llog.find("prefill timeline (RADIANCE_PP_PF_TIMELINE=1");
+        CHECK(tl != std::string::npos);
+        if (tl == std::string::npos) continue;
+        const std::string line = llog.substr(tl, llog.find('\n', tl) - tl);
+        CHECK(line.find("(the ranks' issue; the first chunk's ") != std::string::npos);
+        CHECK(line.find(", the longest ") != std::string::npos);
+        CHECK(line.find("events dropped 0, unread 0") != std::string::npos);
+        fprintf(stderr, "    %s lanes W(%s): tokens %s, plan %s, pass lines leader %s\n    %s\n", lanes, cut,
+                got == ref ? "identical" : "DIFFERENT", chunks_of(llog) == ref_plan ? "identical" : "DIFFERENT",
+                llog.find("slow pass issue (RADIANCE_SLOW_ISSUE_MS") != std::string::npos ? "yes" : "none >= 10 ms",
+                line.c_str());
+    }
+    /* the default row floor (512): this model's passes are <= 64 rows, so nothing prints, and the tokens are the same */
+    {
+        Serving sv;
+        REQUIRE(sv.start("0,2", { "--max-num-seqs", "6", "--pp-lanes", "2" },
+                         cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_SLOW_ISSUE_MS=0.0001" })));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        CHECK(got == ref);
+        for (const std::string& lg : { sv.lead.output(), sv.fol.output() }) {
+            CHECK(lg.find("RADIANCE_SLOW_ISSUE_MS=0.0001 (tp8 loop P31)") != std::string::npos);
+            CHECK(lg.find("slow issue (RADIANCE_SLOW_ISSUE_MS") == std::string::npos);
+            CHECK(lg.find("slow pass issue (RADIANCE_SLOW_ISSUE_MS") == std::string::npos);
+        }
+    }
+}
+
 /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1 on both nodes): a cold multi-chunk prompt and its decode at 2 lanes, W(0,2) and
  * W(1,3), serve one process's tokens, and each node prints its node-idle line for the run at stop -- parts read from
  * their events (none dropped or unread), rank 0's receives of the other node's crossing counted (the leader's X2, the
@@ -1818,6 +1905,97 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* tp8 loop P22b (RADIANCE_PP_PF_TIMELINE=1 on the follower): a BG newcomer's body in one-layer segments with decode passes
+ * between them is read on its own record -- one line a newcomer, every segment read ("(S read;" = its segments), its own
+ * lane's X1 wait read, the passes between its segments counted -- and the follower prints the run's BG-body summary at stop
+ * with every newcomer of those lines; no split pass reaches P22's prompt lines (none of them unread). Tokens are one
+ * process's at 3 lanes BG 1 W(0,2) / W(1,3) and 4 lanes BG 2 at SEG_AHEAD 0 and 1. */
+TEST(the_follower_times_a_bg_newcomers_segments_on_its_own_line_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; const char* ahead; };
+    for (const Arm a : { Arm{ 3, "0,2", 1, "1" }, Arm{ 3, "1,3", 1, "0" }, Arm{ 4, "0,2", 2, "0" }, Arm{ 4, "1,3", 2, "1" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back(std::string("RADIANCE_PP_SEG_AHEAD=") + a.ahead);
+        for (const char* v : { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_PF_TIMELINE=1", "RADIANCE_PP_NODE_IDLE=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        CHECK_EQ(differ, 0);
+        /* the newcomers' own lines */
+        int lines = 0, whole = 0, x1_read = 0, between = 0, segs_min = 1 << 30;
+        double own_sum = 0;
+        for (size_t at = flog.find("tp8 loop P22b): prompt "); at != std::string::npos;
+             at = flog.find("tp8 loop P22b): prompt ", at + 1)) {
+            const std::string line = flog.substr(at, flog.find('\n', at) - at);
+            ++lines;
+            unsigned long segs = 0;
+            int nread = -1;
+            double own = -1, x1 = -2;
+            long long btw = -1;
+            if (const size_t s = line.find(" in "); s != std::string::npos) segs = std::strtoul(line.c_str() + s + 4, nullptr, 10);
+            if (const size_t c = line.find("rank 0's card: passes "); c != std::string::npos)
+                (void)std::sscanf(line.c_str() + c, "rank 0's card: passes %lf ms (%d read;", &own, &nread);
+            if (const size_t s = line.find("waiting for X1 "); s != std::string::npos) x1 = std::atof(line.c_str() + s + 15);
+            if (const size_t s = line.find("; ", line.find("segment 0 (")); s != std::string::npos) btw = std::atoll(line.c_str() + s + 2);
+            if (segs >= 2 && nread == (int)segs && own >= 0) ++whole;
+            if (x1 >= 0) ++x1_read;
+            if (btw > 0) ++between;
+            if ((int)segs < segs_min) segs_min = (int)segs;
+            own_sum += own;
+            if (lines == 1) fprintf(stderr, "    %s\n", line.c_str());
+        }
+        long long run_n = -1, x1_unread = -1;
+        if (const size_t at = flog.rfind("tp8 loop P22b) over the run: "); at != std::string::npos) {
+            run_n = std::atoll(flog.c_str() + at + std::strlen("tp8 loop P22b) over the run: "));
+            if (const size_t u = flog.find("X1 unread ", at); u != std::string::npos) x1_unread = std::atoll(flog.c_str() + u + 10);
+        }
+        /* P22's prompt lines (the decode lanes' lone passes): none unread now that no split pass is one of them */
+        int p22 = 0, p22_unread = 0;
+        for (size_t at = flog.find("tp8 loop P22): prompt "); at != std::string::npos; at = flog.find("tp8 loop P22): prompt ", at + 1)) {
+            const std::string line = flog.substr(at, flog.find('\n', at) - at);
+            ++p22;
+            if (line.find(", unread 0") == std::string::npos) ++p22_unread;
+        }
+        fprintf(stderr, "    %d lanes BG %d W(%s) SEG_AHEAD %s: %d of %zu requests differ; %d BG-body lines (%d with every segment "
+                        "read, >= %d segments, X1 read %d, passes between %d, own %.1f ms in all), run summary %lld newcomers, X1 "
+                        "unread %lld; P22 prompt lines %d (%d not all read)\n", a.lanes, a.k, a.cut, a.ahead, differ, ref.size(),
+                lines, whole, segs_min, x1_read, between, own_sum, run_n, x1_unread, p22, p22_unread);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(lines > 0);
+        CHECK_EQ(whole, lines);
+        CHECK_EQ(x1_read, lines);
+        CHECK(between > 0);          /* decode passes ran between some newcomer's segments */
+        CHECK_EQ(run_n, (long long)lines);
+        CHECK_EQ(x1_unread, 0LL);
+        CHECK_EQ(p22_unread, 0);
+    }
+}
+
 /* tp8 dev M9: RADIANCE_PP_LEAD_SEG=1 -- a BG lane's step runs its leader head [0, h) and tail [t, n) in one-layer segments with
  * the other lanes' parts between them, its frame shipped with the head's last segment. Every request's tokens are one process's
  * at 3 lanes (BG 1) and 4 lanes (BG 1 / BG 2), at cuts with a head boundary (W(2,3): 1), a tail boundary (W(1,2): 3; W(0,2): 3,
@@ -2229,27 +2407,44 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
     }
     /* + two forms the cards may stack on it: the leader's BG segments (M9: LEAD_SEG + AHEAD) and the BG hold (D11) */
     struct Arm { int lanes; const char* cut; const char* bg; const char* room; bool lead_seg = false; bool hold = false;
-                 const char* join = nullptr; };
+                 const char* join = nullptr; int sw = 0; };   /* sw: tp8 loop P23s -- the room by POST /admin/fn4 pp_bg_room */
     long long b2_all = 0;
     for (const Arm a : { Arm{ 3, "2,3", "1", "2112" }, Arm{ 3, "0,2", "1", "2112" }, Arm{ 4, "1,3", "2", "2112" },
                          Arm{ 3, "2,3", "1", nullptr }, Arm{ 3, "2,3", "1", "2112", true, false },
                          Arm{ 3, "2,3", "1", "2112", false, true }, Arm{ 3, "2,3", "1", "2112", false, false, "1" },
-                         Arm{ 3, "0,2", "1", "2112", false, false, "60000" } }) {
+                         Arm{ 3, "0,2", "1", "2112", false, false, "60000" }, Arm{ 3, "2,3", "1", nullptr, false, false, nullptr, 2112 },
+                         Arm{ 4, "1,3", "2", nullptr, false, false, nullptr, 2112 } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + a.bg);
         if (a.room) env.push_back(std::string("RADIANCE_PP_BG_ROOM=") + a.room);
         if (a.lead_seg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1"); }
         if (a.hold) env.push_back("RADIANCE_PP_BG_HOLD_MS=60000");
         if (a.join) env.push_back(std::string("RADIANCE_PP_BG_JOIN_MS=") + a.join);   /* tp8 loop P23b */
+        /* tp8 loop P22b: the follower's BG-pass lines, a batched pass's too */
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
-                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_PF_TIMELINE=1" })
             env.push_back(v);
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
         ex.push_back(std::to_string(a.lanes));
         Serving pp;
         REQUIRE(pp.start(a.cut, ex, env));
+        if (a.sw) {   /* tp8 loop P23s: the env's room off, the switch's on before the set */
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_bg_room", a.sw } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_bg_room: %d %s\n", st, out.c_str());
+        }
         const std::vector<std::vector<int32_t>> got = bg_room_set(pp.port);
+        if (a.sw) {
+            Call g;
+            std::string out;
+            if (g.send(pp.port, "/admin/fn4", "") && g.read(&out) == 200) {
+                const json j = json::parse(out, nullptr, false);
+                CHECK(j.is_object() && j.contains("switches") && j["switches"].value("pp_bg_room", -9) == a.sw);
+            }
+        }
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -2271,9 +2466,25 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
                 if (const char* w = std::strstr(q, "newcomers; ")) b2 = std::atoll(w + std::strlen("newcomers; "));
                 if (const char* w = std::strstr(q, "the widest ")) widest = std::atoll(w + std::strlen("the widest "));
             }
-        if (a.room) b2_all += std::max(0LL, b2);
+        if (a.room || a.sw) b2_all += std::max(0LL, b2);
+        /* tp8 loop P22b: a batched BG pass is one follower line of its prompts, and the run's summary counts them */
+        long long fb = 0, fnewc = -1, fpass = -1, fbatched = -1;
+        for (size_t at = flog.find("tp8 loop P22b): prompt "); at != std::string::npos; at = flog.find("tp8 loop P22b): prompt ", at + 1)) {
+            const std::string line = flog.substr(at, flog.find('\n', at) - at);
+            if (const size_t o = line.find(") of "); o != std::string::npos && std::atoi(line.c_str() + o + 5) >= 2) ++fb;
+        }
+        if (const size_t at = flog.rfind("tp8 loop P22b) over the run: "); at != std::string::npos)
+            (void)std::sscanf(flog.c_str() + at, "tp8 loop P22b) over the run: %lld newcomers in %lld passes (%lld passes of >= 2", &fnewc,
+                              &fpass, &fbatched);
+        fprintf(stderr, "    follower P22b: %lld batched pass lines; run summary %lld newcomers in %lld passes, %lld of >= 2\n", fb, fnewc,
+                fpass, fbatched);
+        if (b2 > 0 && std::strcmp(a.cut, "2,3") != 0) {   /* W(2,3)'s follower holds one layer: no segments, no split pass */
+            CHECK(fb > 0);
+            CHECK(fbatched > 0);
+            CHECK(fnewc > fpass);
+        }
         fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; BG steps "
-                        "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : "off",
+                        "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : a.sw ? "2112 by pp_bg_room" : "off",
                 a.lead_seg ? " + LEAD_SEG=1 + AHEAD" : a.hold ? " + HOLD" : "", a.join ? (std::string(" + JOIN_MS=") + a.join).c_str() : "",
                 a.lanes, a.cut, differ, ref.size(), bg, steps, b2, widest);
         CHECK_EQ(differ, 0);
@@ -2283,6 +2494,12 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         if (a.room) {
             CHECK(llog.find("RADIANCE_PP_BG_ROOM=2112 -- ") != std::string::npos);
             CHECK(steps > 0);
+            CHECK(widest <= 2112);
+        } else if (a.sw) {   /* tp8 loop P23s: no env line, the run's BG-steps line at the switch's room, batched steps */
+            CHECK(llog.find("RADIANCE_PP_BG_ROOM=2112 -- ") == std::string::npos);
+            CHECK(llog.find("BG steps over the run (RADIANCE_PP_BG_ROOM=2112") != std::string::npos);
+            CHECK(steps > 0);
+            if (a.lanes == 3) CHECK(b2 > 0);   /* one BG lane batches (the env arm too); two BG lanes rarely need to (the env arm: 0) */
             CHECK(widest <= 2112);
         } else {
             CHECK(llog.find("RADIANCE_PP_BG_ROOM=") == std::string::npos);

@@ -542,6 +542,12 @@ struct AqlPreload {
     double  ms = 0;
 };
 int     aql_code_preload(int device, AqlPreload* out);
+/* tp8 loop P31 (RADIANCE_AQL_PRELOAD=2): every registered kernel resolved on `device` now (its first launch's lookup:
+ * symbol, argument layout), after aql_code_preload, and HIP's allocator used once there (`alloc_ms`: its time, -1 = not
+ * reached). RAD_E_UNSUPPORTED without the AQL backend. */
+int     aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms, double* alloc_ms);
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS): the calling thread's first-launch resolve time (ns) and count since its last call. */
+void    aql_resolves_take(uint64_t* ns, uint64_t* n);
 #endif
 
 /* ------------------------------------------------------------------ the error slot */

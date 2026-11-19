@@ -136,6 +136,7 @@ int ref_quant_act_i8       (const RadArgs*, RadStream);
 int ref_quant_act_i8g      (const RadArgs*, RadStream);
 int ref_had_quant_act_i8   (const RadArgs*, RadStream);
 int ref_quant_act_fp8      (const RadArgs*, RadStream);
+int ref_quant_act_fp8_ue8m0(const RadArgs*, RadStream);   /* tp8 loop P30o */
 int ref_quant_cols_fp8     (const RadArgs*, RadStream);
 int ref_had_quant_act_fp8  (const RadArgs*, RadStream);
 int ref_had_quant_act_i8g  (const RadArgs*, RadStream);
@@ -462,6 +463,7 @@ REF_SHAPE_FN(ref_quant_act_i8);
 REF_SHAPE_FN(ref_quant_act_i8g);
 REF_SHAPE_FN(ref_had_quant_act_i8);
 REF_SHAPE_FN(ref_quant_act_fp8);
+REF_SHAPE_FN(ref_quant_act_fp8_ue8m0);
 REF_SHAPE_FN(ref_quant_cols_fp8);
 REF_SHAPE_FN(ref_had_quant_act_fp8);
 REF_SHAPE_FN(ref_had_quant_act_i8g);

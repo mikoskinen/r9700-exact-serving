@@ -2118,6 +2118,7 @@ TEST(op_vocabulary) {
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
+        "quant_act_fp8_ue8m0",   /* tp8 loop P30o: DeepSeek-V4's released act_quant (ue8m0) */
         "had_quant_act_i8g",
         "gram_accum",
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
@@ -6454,6 +6455,81 @@ TEST(op_stage_send_row_shards_between_plain_payloads_world4) {
         CHECK_EQ((long long)r->ready, (long long)seq);
         CHECK_EQ((long long)trailer, (long long)seq);
         CHECK_EQ(bad, (int64_t)0);
+    }
+}
+
+/* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG=2): a segment boundary's save / restore (stage ops in loop mode, each rank its own
+ * buffer) with `shard` + `ranks` -- each rank saves only ITS rows [r q, (r + 1) q) of the masked parts (q = ceil(rows / 4))
+ * and the other parts whole, and the restore writes back exactly those: a masked part's other rows keep what the buffer held
+ * (a pass between the segments rewrote them; an SP layer never reads them), the unmasked part comes back whole. 9 rows of 8
+ * f32 (16-byte rows), 9 rows of 10 bf16 (20-byte rows: the 4-byte path), 5 rows of 3 i32 (unmasked). Control: loop without
+ * `shard` (today's boundary) restores every row. `shard` without `ranks` is refused (no ring header names the node's ranks). */
+TEST(op_stage_loop_row_shards_world4) {
+    const int W = 4;
+    const int64_t R0 = 9, R2 = 5, q = (R0 + W - 1) / W;
+    auto good = [](int rank, int part, int64_t i) { return (float)(rank * 100000 + part * 1000 + i) * 0.25f; };
+    for (int shard : { 3, 0 }) {
+        std::vector<std::vector<uint8_t>> rings((size_t)W, std::vector<uint8_t>((size_t)RAD_PP_RING_HDR + 65536, 0xA5));
+        std::vector<T> ringt;
+        ringt.reserve((size_t)W);
+        std::vector<std::vector<T>> parts((size_t)W);
+        for (int rk = 0; rk < W; ++rk) {
+            ringt.emplace_back(RAD_U8, std::vector<int64_t>{ (int64_t)rings[(size_t)rk].size() });
+            ringt[(size_t)rk].t.data = rings[(size_t)rk].data();
+            parts[(size_t)rk].reserve(3);
+            parts[(size_t)rk].emplace_back(RAD_F32, std::vector<int64_t>{ R0, 8 });
+            parts[(size_t)rk].emplace_back(RAD_BF16, std::vector<int64_t>{ R0, 10 });
+            parts[(size_t)rk].emplace_back(RAD_I32, std::vector<int64_t>{ R2, 3 });
+            for (int k = 0; k < 2; ++k)
+                for (int64_t i = 0; i < R0 * (k == 0 ? 8 : 10); ++i) parts[(size_t)rk][(size_t)k].set(i, good(rk, k, i));
+            for (int64_t i = 0; i < R2 * 3; ++i) st_int(RAD_I32, parts[(size_t)rk][2].t.data, i, (int64_t)(7000 + i + 100 * rk));
+        }
+        auto args = [&](int rk, A& a, bool with_ranks) {
+            a.t(ringt[(size_t)rk]).t(parts[(size_t)rk][0]).t(parts[(size_t)rk][1]).t(parts[(size_t)rk][2])
+                .i("M", R0).i("ring", 2).i("parts", 3).i("loop", 1);
+            if (shard) a.i("shard", shard);
+            if (shard && with_ranks) a.i("ranks", W);
+        };
+        if (shard) {   /* refused without `ranks` */
+            A a;
+            args(0, a, false);
+            CHECK(run("stage_send", a, 0, W) == RAD_E_STATE);
+        }
+        int st[W] = { 0, 0, 0, 0 };
+        auto send = [&](int rk) { A a; args(rk, a, true); st[rk] = run("stage_send", a, rk, W); };
+        std::vector<std::thread> th;
+        for (int rk = 0; rk < W; ++rk) th.emplace_back(send, rk);
+        for (std::thread& x : th) x.join();
+        for (int rk = 0; rk < W; ++rk) CHECK_OK(st[rk]);
+        /* a pass between the segments: every row of every part rewritten */
+        for (int rk = 0; rk < W; ++rk) {
+            for (int k = 0; k < 2; ++k)
+                for (int64_t i = 0; i < R0 * (k == 0 ? 8 : 10); ++i) parts[(size_t)rk][(size_t)k].set(i, -7.0f);
+            for (int64_t i = 0; i < R2 * 3; ++i) st_int(RAD_I32, parts[(size_t)rk][2].t.data, i, (int64_t)-1);
+        }
+        int rs[W] = { 0, 0, 0, 0 };
+        auto recv = [&](int rk) { A a; args(rk, a, true); rs[rk] = run("stage_recv", a, rk, W); };
+        std::vector<std::thread> rt;
+        for (int rk = 0; rk < W; ++rk) rt.emplace_back(recv, rk);
+        for (std::thread& x : rt) x.join();
+        int64_t bad = 0, own = 0;
+        for (int rk = 0; rk < W; ++rk) {
+            CHECK_OK(rs[rk]);
+            for (int k = 0; k < 2; ++k) {
+                const int64_t rb = k == 0 ? 8 : 10;
+                T one(k == 0 ? RAD_F32 : RAD_BF16, { 1 });
+                for (int64_t i = 0; i < R0 * rb; ++i) {
+                    const bool mine = !shard || (i / rb) / q == rk;
+                    own += mine;
+                    one.set(0, mine ? good(rk, k, i) : -7.0f);
+                    bad += parts[(size_t)rk][(size_t)k].at(i) != one.at(0);
+                }
+            }
+            for (int64_t i = 0; i < R2 * 3; ++i) bad += ld_int(RAD_I32, parts[(size_t)rk][2].t.data, i) != (int64_t)(7000 + i + 100 * rk);
+        }
+        fprintf(stderr, "    loop shard %d: %lld words restored a rank's own, %lld wrong\n", shard, (long long)own, (long long)bad);
+        CHECK_EQ(bad, (int64_t)0);
+        CHECK_EQ(own, shard ? (int64_t)(R0 * 18) : (int64_t)(W * R0 * 18));
     }
 }
 
@@ -11496,6 +11572,7 @@ std::vector<Geo> geometries() {
         G("quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("quant_act_fp8_ue8m0", "M", 3, a.i("M", R).i("n", 64).i("group", 32).s("dtype", "f32")),   /* tp8 loop P30o */
         G("quant_cols_fp8", "M", 3, a.i("M", R).i("n", 32).s("dtype", "f32")),
         G("had_quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
@@ -12655,4 +12732,85 @@ TEST(op_sam_attn_refuses_malformed_geometry) {
           .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
           .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
     CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
+}
+
+/* tp8 loop P30o: DeepSeek-V4's released dense arithmetic (inference/model.py linear() at fp8_block_size 32, kernel.py act_quant /
+ * fp8_gemm), replicated here from the release's code and held to libref byte for byte:
+ *   act_quant(x, 32, 'ue8m0'): per (row, 32) amax = max(|x|, 1e-4) in f32, s = 2^ceil(log2(amax * f32(1/448))) from the IEEE bits
+ *   (fast_round_scale), q = E4M3(clamp(x / s, +-448));
+ *   fp8_gemm(block 32): per K block of 32 a fresh f32 sum of the code products, C += sum * sa[row] * sb[block], over the blocks in
+ *   order; C rounded to bf16 once.
+ * quant_act_fp8_ue8m0 is the first, gemm_nt_q dtype fp8a8e8 (an E8M0 exponent per 32 x 32 weight block) the second. Shapes: K 256
+ * (8 blocks), N 64 (2 weight-block rows), M 5 with a zero row (the 1e-4 floor), a row of large and one of tiny magnitudes. */
+TEST(op_quant_act_fp8_ue8m0_and_gemm_fp8a8e8_are_the_release_arithmetic) {
+    const int64_t M = 5, K = 256, N = 64, G = 32, KB = K / G, NB = (N + G - 1) / G;
+    auto pow2ceil = [](float v) {   /* kernel.py fast_round_scale: fast_pow2(fast_log2_ceil(v)) */
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        const int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) ? 1 : 0);
+        const uint32_t r = (uint32_t)(e + 127) << 23;
+        float f;
+        std::memcpy(&f, &r, 4);
+        return f;
+    };
+    uint32_t seed = 0x30a0u;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (float)((seed >> 8) & 0xffff) / 65536.0f * 2.0f - 1.0f; };
+    T x(RAD_BF16, {M, K});
+    std::vector<float> xv((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t k = 0; k < K; ++k) {
+            const float mag = m == 2 ? 0.0f : m == 3 ? 900.0f : m == 4 ? 1e-3f : 1.0f;
+            x.set(m * K + k, rnd() * mag);
+            xv[(size_t)(m * K + k)] = x.at(m * K + k);   /* the bf16 value */
+        }
+    T q(RAD_F8E4M3, {M, K}), sc(RAD_F32, {M, KB});
+    A qa; qa.t(x).t(q).t(sc).i("M", M).i("n", K).i("group", G).s("dtype", "bf16");
+    REQUIRE_EQ(run("quant_act_fp8_ue8m0", qa), RAD_OK);
+    int qdiff = 0, sdiff = 0;
+    std::vector<float> sref((size_t)(M * KB));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t b = 0; b < KB; ++b) {
+            float amax = 0.0f;
+            for (int64_t i = 0; i < G; ++i) amax = std::max(amax, std::fabs(xv[(size_t)(m * K + b * G + i)]));
+            amax = std::max(amax, 1e-4f);
+            const float s = pow2ceil(amax * (1.0f / 448.0f));
+            sref[(size_t)(m * KB + b)] = s;
+            sdiff += sc.at(m * KB + b) != s;
+            for (int64_t i = 0; i < G; ++i) {
+                const float v = std::min(std::max(xv[(size_t)(m * K + b * G + i)] / s, -448.0f), 448.0f);
+                qdiff += q.mem[(size_t)(m * K + b * G + i)] != rad_f32_to_fp8e4m3(v);
+            }
+        }
+    CHECK_EQ(qdiff, 0);
+    CHECK_EQ(sdiff, 0);
+    CHECK_EQ(sc.at(2 * KB), pow2ceil(1e-4f * (1.0f / 448.0f)));   /* the zero row: the floor's scale, not 1 */
+    /* the weight: E4M3 codes (no NaN byte) and an E8M0 exponent a 32 x 32 block */
+    T w(RAD_F8E4M3, {N, K}), ws(RAD_E8M0, {NB, KB});
+    for (int64_t i = 0; i < N * K; ++i) {
+        uint8_t c = (uint8_t)(rnd() * 127.0f + 128.0f);
+        if ((c & 0x7f) == 0x7f) c ^= 1;
+        w.mem[(size_t)i] = c;
+    }
+    for (int64_t i = 0; i < NB * KB; ++i) ws.mem[(size_t)i] = (uint8_t)(118 + (i * 7) % 17);   /* 2^-9 .. 2^7 */
+    T y(RAD_BF16, {M, N});
+    A ga; ga.t(q).t(sc).t(w).t(ws).t(y).tnull().tnull()
+            .i("M", M).i("N", N).i("K", K).i("group", G).s("dtype", "fp8a8e8");
+    REQUIRE_EQ(run("gemm_nt_q", ga), RAD_OK);
+    int ydiff = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t b = 0; b < KB; ++b) {
+                float sub = 0.0f;
+                for (int64_t i = 0; i < G; ++i)
+                    sub += rad_fp8e4m3_to_f32(q.mem[(size_t)(m * K + b * G + i)]) *
+                           rad_fp8e4m3_to_f32(w.mem[(size_t)(n * K + b * G + i)]);
+                const float sb = std::ldexp(1.0f, (int)ws.mem[(size_t)((n / G) * KB + b)] - 127);
+                acc += sub * sref[(size_t)(m * KB + b)] * sb;
+            }
+            T one(RAD_BF16, {1});
+            one.set(0, acc);
+            ydiff += std::memcmp(&y.mem[(size_t)((m * N + n) * 2)], one.mem.data(), 2) != 0;
+        }
+    CHECK_EQ(ydiff, 0);
 }

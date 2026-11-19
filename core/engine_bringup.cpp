@@ -814,9 +814,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
  * is the architecture plugin's answer at declare, not the container's. */
 namespace {
 
+/* tp8 loop P30t: a sidecar entry named '<base>' + this stands beside the container's <base> (open_weight_sidecar) */
+constexpr const char kTwinSuffix[] = "#pf";
+constexpr size_t kTwinSuffixLen = sizeof kTwinSuffix - 1;
+
 /* A container is a file starting with the magic; anything else (a checkpoint directory, a
  * .safetensors, an index, a .gguf) is a checkpoint. A .rad path is always opened as a container,
  * so its reader reports what is wrong with it. */
+
 bool is_container(const std::string& path) {
     if (path.size() > 4 && path.compare(path.size() - 4, 4, ".rad") == 0) return true;
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -879,15 +884,27 @@ int Engine::open_weight_sidecar() {
         RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds no entries", path);
         return RAD_E_FORMAT;
     }
-    int64_t bytes = 0, replaced = 0;
+    int64_t bytes = 0, replaced = 0, twins = 0, twin_bytes = 0;
     std::map<std::string, int> forms;
     for (int64_t i = 0; i < side->entry_count(); ++i) {
         const RadFileEntry& s = side->entry(i);
         const std::string name = side->str(s.name);
-        const RadFileEntry* m = file_->find(name);
+        /* tp8 loop P30t: '<base>#pf' (rad-sidecar --twin) stands BESIDE the container's entry <base> instead of in its place: a
+         * second encoding of the same logical weight, served as its own weight under that name (sources() answers it from here;
+         * nothing else holds the name), checked against <base>'s rank and shape. The container's <base> stays as it is. */
+        const bool twin = name.size() > kTwinSuffixLen &&
+                          name.compare(name.size() - kTwinSuffixLen, kTwinSuffixLen, kTwinSuffix) == 0;
+        const std::string base = twin ? name.substr(0, name.size() - kTwinSuffixLen) : name;
+        const RadFileEntry* m = file_->find(base);
         if (!m) {
-            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is not an entry of %s", path, name.c_str(), cfg_.model.c_str());
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is not an entry of %s%s", path, base.c_str(), cfg_.model.c_str(),
+                    twin ? " (a twin '<name>#pf' stands beside a container entry of that name)" : "");
             return RAD_E_NOTFOUND;
+        }
+        if (twin && side->find(base)) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds both '%s' and its twin '%s': a weight is replaced or twinned, not both",
+                    path, base.c_str(), name.c_str());
+            return RAD_E_INVAL;
         }
         bool same = s.rank == m->rank;
         for (uint32_t k = 0; same && k < s.rank && k < RAD_MAX_RANK; ++k) same = s.shape[k] == m->shape[k];
@@ -910,14 +927,23 @@ int Engine::open_weight_sidecar() {
         char e[160];
         rad_enc_format(&side->encoding(s), e, sizeof e);
         ++forms[e];
+        if (twin) {
+            ++twins;
+            twin_bytes += (int64_t)s.bytes;
+            continue;
+        }
         bytes += (int64_t)s.bytes;
         replaced += (int64_t)m->bytes;
     }
     std::string fl;
     for (const auto& [f, n] : forms) fl += fmt("%s%d x %s", fl.empty() ? "" : ", ", n, f.c_str());
-    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s, read from %s "
+    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s%s, read from %s "
              "(RADIANCE_WEIGHT_SIDECAR): %s", (long long)side->entry_count(), humanb(bytes).c_str(),
-             humanb(replaced).c_str(), path, fl.c_str());
+             humanb(replaced).c_str(),
+             twins ? fmt("; %lld twin(s) '<name>#pf', %s BESIDE the container's entries (tp8 loop P30t)", (long long)twins,
+                         humanb(twin_bytes).c_str()).c_str()
+                   : "",
+             path, fl.c_str());
     side_ = std::move(side);
     return RAD_OK;
 }
@@ -2183,18 +2209,33 @@ int Engine::plan() {
      * of its kernels, so the modules no init launched (prefill forms, a first >= 1k-row pass's) load while serving and
      * outside this reading; on the two-node pipeline such a first use stalled both nodes ~46 s (FINDINGS F21 / F24 / F25).
      * With the switch every module is loaded on every card here, before the budget reads the cards. Default off. */
-    if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && !std::strcmp(pe, "1")) {
+    /* tp8 loop P31: RADIANCE_AQL_MEMSET_OWNQ=1 (aql.cpp hipMemset) -- said once here */
+    if (const char* mo = std::getenv("RADIANCE_AQL_MEMSET_OWNQ"); mo && !std::strcmp(mo, "1"))
+        RAD_INFO("RADIANCE_AQL_MEMSET_OWNQ=1 (tp8 loop P31): a library's synchronous hipMemset fills on a queue made for the call and "
+                 "waits for that queue only, not for a rank's compute stream (the same bytes, complete on return)");
+    /* tp8 loop P31: RADIANCE_AQL_PRELOAD=2 = 1 + every registered kernel resolved on every card here (its first launch's
+     * symbol lookup and argument layout), so a first >= 1k-row pass resolves nothing while it issues. */
+    if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && (!std::strcmp(pe, "1") || !std::strcmp(pe, "2"))) {
+        const bool all = !std::strcmp(pe, "2");
         for (auto& r : ranks_) {
             AqlPreload p;
             const int st = aql_code_preload(r->device, &p);
             if (st == RAD_E_UNSUPPORTED) {
-                RAD_INFO("RADIANCE_AQL_PRELOAD=1: not the AQL backend here; nothing to load");
+                RAD_INFO("RADIANCE_AQL_PRELOAD=%s: not the AQL backend here; nothing to load", pe);
                 break;
             }
             RAD_TRY(st);
-            RAD_INFO("RADIANCE_AQL_PRELOAD=1 (tp8 loop F24): card %d: %lld module(s) loaded now (%s of code objects, %.0f ms), "
-                     "%lld loaded before, %lld with no code for this card, %lld refused", r->device, (long long)p.loaded,
+            RAD_INFO("RADIANCE_AQL_PRELOAD=%s (tp8 loop F24): card %d: %lld module(s) loaded now (%s of code objects, %.0f ms), "
+                     "%lld loaded before, %lld with no code for this card, %lld refused", pe, r->device, (long long)p.loaded,
                      humanb(p.bytes).c_str(), p.ms, (long long)p.already, (long long)p.none, (long long)p.failed);
+            if (all) {
+                int64_t ok = 0, no = 0;
+                double ms = 0, ams = -1;
+                RAD_TRY(aql_code_resolve_all(r->device, &ok, &no, &ms, &ams));
+                RAD_INFO("RADIANCE_AQL_PRELOAD=2 (tp8 loop P31): card %d: %lld kernel(s) resolved now (%.0f ms), %lld without "
+                         "code for this card (their first launch reports it, as before); HIP's allocator's first use here %.1f ms",
+                         r->device, (long long)ok, ms, (long long)no, ams);
+            }
         }
     }
 #endif

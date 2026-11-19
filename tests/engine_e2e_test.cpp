@@ -3869,6 +3869,26 @@ TEST(lever_dlw_weight_sidecar) {
                                 "blk.0.attn_qkv.weight=rtn:codes=i8,group=128,scale=bf16" }, engine_env(), &slog);
     CHECK(st2 != 0);
     CHECK(has(slog, "not a quantised one again"));
+    /* tp8 loop P30 (b): under --requant the same entry (E4M3 codes, a bf16 scale a 128x128 block: affine planes) is decoded and
+     * quantised again by the rule -- here the rule it was converted with, so the sidecar holds the container's own codes and scales
+     * and the engine serves llama.rad's numbers exactly (a decode -> re-encode round trip at the same grid) */
+    const int st2r = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "requant.rad", "--requant", "--quant",
+                                 "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" }, engine_env(), &slog);
+    if (st2r != 0) fprintf(stderr, "    rad-sidecar --requant exited %d:\n%s\n", st2r, tail(slog).c_str());
+    CHECK_EQ(st2r, 0);
+    CHECK(has(slog, "1 entries of llama.rad"));
+    a[1] = d / "s1r";
+    Ran s1r = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "requant.rad") });
+    REQUIRE_RAN(s1r);
+    CHECK(has(s1r.log, "weight sidecar: 1 entries"));
+    {
+        const std::string refq = w.reference(w.llama_rad, w.corpus_short, &rlog);
+        REQUIRE(!refq.empty());
+        std::string whyq;
+        const bool sameq = same_recording(refq, d / "s1r", &whyq);
+        if (!sameq) fprintf(stderr, "    --requant round trip vs llama.rad: %s\n", whyq.c_str());
+        CHECK(sameq);
+    }
     /* a sidecar written from another container (llama_mxfp4.rad's plain head) */
     const int st3 = tiny::run({ RAD_E2E_SIDECAR, w.llama_mxfp4, "-o", d / "other.rad", "--quant", rule }, engine_env(),
                               &slog);
@@ -3908,6 +3928,235 @@ TEST(lever_dlw_weight_sidecar) {
     Ran s4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "reshape.rad") });
     CHECK(s4.status != 0);
     CHECK(has(s4.log, "it does not reshape it"));
+
+    /* tp8 loop P30 (b): --keep -- the engine opens ONE sidecar, and the pair already serves the drafter's DLW sidecar; a second
+     * set joins it as one file. head_i8.rad kept + the --requant round trip of blk.0.attn_qkv made beside it: the kept entry's
+     * planes are head_i8.rad's byte for byte, the made one is the container's own codes (the round trip above), so the engine
+     * serves exactly llama_i8head.rad's recording -- what head_i8.rad alone serves. */
+    const int st5 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "both.rad", "--requant", "--keep", d / "head_i8.rad",
+                                "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st5 != 0) fprintf(stderr, "    rad-sidecar --keep exited %d:\n%s\n", st5, tail(slog).c_str());
+    REQUIRE_EQ(st5, 0);
+    CHECK(has(slog, "1 entries kept from head_i8.rad"));
+    {
+        rad::RadFile kf, bf;
+        REQUIRE_EQ(kf.open((d / "head_i8.rad").c_str()), 0);
+        REQUIRE_EQ(bf.open((d / "both.rad").c_str()), 0);
+        CHECK_EQ(bf.entry_count(), (int64_t)2);
+        const RadFileEntry* ke = kf.find("output.weight");
+        const RadFileEntry* be = bf.find("output.weight");
+        REQUIRE(ke != nullptr);
+        REQUIRE(be != nullptr);
+        CHECK(bf.find("blk.0.attn_qkv.weight") != nullptr);
+        char e1[160], e2[160];
+        rad_enc_format(&kf.encoding(*ke), e1, sizeof e1);
+        rad_enc_format(&bf.encoding(*be), e2, sizeof e2);
+        CHECK_EQ(std::string(e1), std::string(e2));
+        CHECK_EQ(std::string(kf.str(ke->quantizer)), std::string(bf.str(be->quantizer)));
+        bool planes_same = ke->n_planes == be->n_planes;
+        for (uint32_t k = 0; planes_same && k < ke->n_planes; ++k) {
+            const RadFilePlane& p = kf.plane(*ke, (int)k);
+            const RadFilePlane& q = bf.plane(*be, (int)k);
+            planes_same = p.bytes == q.bytes && std::memcmp(kf.data(p), bf.data(q), (size_t)p.bytes) == 0;
+        }
+        CHECK(planes_same);
+        int64_t cb = -1;
+        CHECK(bf.get_i("sidecar.container_bytes", &cb));
+        CHECK_EQ(cb, (int64_t)f.size());
+    }
+    a[1] = d / "s5";
+    Ran s5 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both.rad") });
+    REQUIRE_RAN(s5);
+    CHECK(has(s5.log, "weight sidecar: 2 entries"));
+    {
+        std::string why5;
+        const bool same5 = same_recording(ref, d / "s5", &why5);
+        if (!same5) fprintf(stderr, "    --keep head_i8.rad + the qkv round trip vs llama_i8head.rad: %s\n", why5.c_str());
+        CHECK(same5);
+    }
+    /* refused: a kept sidecar of another container; an entry both kept and made */
+    const int st6 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad2.rad", "--requant", "--keep", d / "other.rad",
+                                "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    CHECK(st6 != 0);
+    CHECK(has(slog, "a kept sidecar must come from the container read here"));
+    const int st7 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad3.rad", "--keep", d / "head_i8.rad", "--quant",
+                                rule }, engine_env(), &slog);
+    CHECK(st7 != 0);
+    CHECK(has(slog, "an entry is kept or made, not both"));
+    /* tp8 loop P30o: --keep-only GLOB copies only the kept entries it matches (both.rad holds output.weight +
+     * blk.0.attn_qkv.weight): a glob that matches one keeps one, byte for byte; a glob that matches none keeps none (and the
+     * rule's own entry is written); the filter runs before the kept-or-made check, so a rule may make an entry the
+     * kept file holds when the glob leaves it out; --keep-only without --keep is refused */
+    const int st8 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "only.rad", "--requant", "--keep", d / "both.rad",
+                                "--keep-only", "output.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st8 != 0) fprintf(stderr, "    rad-sidecar --keep-only exited %d:\n%s\n", st8, tail(slog).c_str());
+    REQUIRE_EQ(st8, 0);
+    CHECK(has(slog, "1 entries kept from both.rad"));
+    {
+        rad::RadFile kf, of;
+        REQUIRE_EQ(kf.open((d / "both.rad").c_str()), 0);
+        REQUIRE_EQ(of.open((d / "only.rad").c_str()), 0);
+        CHECK_EQ(of.entry_count(), (int64_t)2);
+        CHECK(of.find("output.weight") != nullptr);
+        CHECK(of.find("blk.0.attn_qkv.weight") != nullptr);   /* made by the rule: the kept copy was filtered out first */
+        const RadFileEntry* ke = kf.find("output.weight");
+        const RadFileEntry* oe = of.find("output.weight");
+        bool same = ke && oe && ke->n_planes == oe->n_planes;
+        for (uint32_t k = 0; same && k < ke->n_planes; ++k) {
+            const RadFilePlane& p = kf.plane(*ke, (int)k);
+            const RadFilePlane& q = of.plane(*oe, (int)k);
+            same = p.bytes == q.bytes && std::memcmp(kf.data(p), of.data(q), (size_t)p.bytes) == 0;
+        }
+        CHECK(same);
+    }
+    const int st9 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "none.rad", "--requant", "--keep", d / "both.rad",
+                                "--keep-only", "nothing.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    REQUIRE_EQ(st9, 0);
+    {
+        rad::RadFile nf;
+        REQUIRE_EQ(nf.open((d / "none.rad").c_str()), 0);
+        CHECK_EQ(nf.entry_count(), (int64_t)1);
+    }
+    const int st10 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad4.rad", "--keep-only", "output.*", "--quant",
+                                 rule }, engine_env(), &slog);
+    CHECK(st10 != 0);
+    CHECK(has(slog, "--keep-only without --keep"));
+    /* --keep repeatable, no rule: only.rad narrowed to output.weight + none.rad's blk.0.attn_qkv (the same rule as both.rad's,
+     * so the same bytes) -> two.rad holds both.rad's two entries and the engine serves llama_i8head.rad's recording again; a
+     * name two kept files hold is refused */
+    const int st11 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "two.rad", "--keep", d / "only.rad", "--keep-only",
+                                 "output.*", "--keep", d / "none.rad" }, engine_env(), &slog);
+    if (st11 != 0) fprintf(stderr, "    rad-sidecar --keep x2 exited %d:\n%s\n", st11, tail(slog).c_str());
+    REQUIRE_EQ(st11, 0);
+    CHECK(has(slog, "2 entries kept from only.rad,none.rad"));
+    {
+        rad::RadFile tf;
+        REQUIRE_EQ(tf.open((d / "two.rad").c_str()), 0);
+        CHECK_EQ(tf.entry_count(), (int64_t)2);
+        CHECK(tf.find("output.weight") != nullptr);
+        CHECK(tf.find("blk.0.attn_qkv.weight") != nullptr);
+    }
+    a[1] = d / "s11";
+    Ran s11 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "two.rad") });
+    REQUIRE_RAN(s11);
+    {
+        std::string why11;
+        const bool same11 = same_recording(ref, d / "s11", &why11);
+        if (!same11) fprintf(stderr, "    --keep only.rad (output.*) + --keep none.rad vs llama_i8head.rad: %s\n", why11.c_str());
+        CHECK(same11);
+    }
+    const int st12 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad5.rad", "--keep", d / "only.rad", "--keep",
+                                 d / "none.rad" }, engine_env(), &slog);
+    CHECK(st12 != 0);
+    CHECK(has(slog, "an entry is kept once"));
+}
+
+/* tp8 loop P30t: a TWIN entry -- rad-sidecar --twin GLOB writes a matching entry (made or kept) as '<name>#pf', and the engine
+ * opens it BESIDE the container's <name> instead of in its place (checked against <name>'s rank and shape; both resident, an
+ * architecture that knows twins declares it as its own weight -- deepseek41 under RADIANCE_DS41_TWIN). The llama plugin
+ * declares no twin, so a twin sidecar leaves llama.rad's recording as it is; a made entry beside a kept twin is served as
+ * before. Refused: a twin whose base the container does not hold, a sidecar holding a name and its twin both. */
+TEST(p30t_twin_sidecar_entries_stand_beside_the_container) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_twin");
+    REQUIRE(d.ok());
+    const std::string rule = "output.weight=rtn:codes=i8,group=128,scale=bf16,clamp=sym";
+    std::string slog, rlog;
+    const int st = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "twin.rad", "--quant", rule, "--twin", "output.*" },
+                             engine_env(), &slog);
+    if (st != 0) fprintf(stderr, "    rad-sidecar --twin exited %d:\n%s\n", st, tail(slog).c_str());
+    REQUIRE_EQ(st, 0);
+    CHECK(has(slog, "output.weight#pf"));
+    rad::RadFile f;
+    REQUIRE_EQ(f.open(w.llama_rad.c_str()), 0);
+    const RadFileEntry* head = f.find("output.weight");
+    REQUIRE(head != nullptr);
+    {
+        rad::RadFile tf;
+        REQUIRE_EQ(tf.open((d / "twin.rad").c_str()), 0);
+        CHECK_EQ(tf.entry_count(), (int64_t)1);
+        CHECK(tf.find("output.weight") == nullptr);
+        const RadFileEntry* te = tf.find("output.weight#pf");
+        REQUIRE(te != nullptr);
+        CHECK_EQ(te->rank, head->rank);
+        CHECK_EQ(te->shape[0], head->shape[0]);
+        CHECK_EQ(te->shape[1], head->shape[1]);
+        CHECK_EQ(std::string(tf.encoding(*te).scheme), std::string("affine"));
+        CHECK_EQ(std::string(tf.get_s("sidecar.twin", "")), std::string("output.*"));
+    }
+    const std::string ref0 = w.reference(w.llama_rad, w.corpus_short, &rlog);
+    REQUIRE(!ref0.empty());
+    std::vector<std::string> a = { "--kld-record", d / "t1", "--kld-corpus", w.corpus_short, "--max-num-batched-tokens",
+                                   "512", "--max-num-seqs", "1" };
+    Ran t1 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "twin.rad") });
+    REQUIRE_RAN(t1);
+    CHECK(has(t1.log, "1 twin(s) '<name>#pf'"));
+    {
+        std::string why;
+        const bool same = same_recording(ref0, d / "t1", &why);
+        if (!same) fprintf(stderr, "    a twin sidecar (unused by llama) vs llama.rad: %s\n", why.c_str());
+        CHECK(same);
+    }
+    /* a kept entry twinned (twin.rad's verbatim, the name kept) beside a made entry in its place: the made one is the --requant
+     * round trip of blk.0.attn_qkv (the container's own codes), so the engine serves llama.rad's numbers */
+    const int st2 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "mix.rad", "--requant", "--keep", d / "twin.rad",
+                                "--twin", "output.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st2 != 0) fprintf(stderr, "    rad-sidecar --keep --twin exited %d:\n%s\n", st2, tail(slog).c_str());
+    REQUIRE_EQ(st2, 0);
+    {
+        rad::RadFile mf;
+        REQUIRE_EQ(mf.open((d / "mix.rad").c_str()), 0);
+        CHECK_EQ(mf.entry_count(), (int64_t)2);
+        CHECK(mf.find("output.weight#pf") != nullptr);
+        CHECK(mf.find("output.weight") == nullptr);
+        CHECK(mf.find("blk.0.attn_qkv.weight") != nullptr);
+    }
+    a[1] = d / "t2";
+    Ran t2 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "mix.rad") });
+    REQUIRE_RAN(t2);
+    CHECK(has(t2.log, "weight sidecar: 2 entries"));
+    CHECK(has(t2.log, "1 twin(s) '<name>#pf'"));
+    {
+        std::string why;
+        const bool same = same_recording(ref0, d / "t2", &why);
+        if (!same) fprintf(stderr, "    a kept twin + the qkv round trip vs llama.rad: %s\n", why.c_str());
+        CHECK(same);
+    }
+    /* refused at open: a twin of a name the container does not hold; a name and its twin both */
+    auto handmade = [&](const std::string& path, const std::vector<std::string>& names) {
+        rad::RadWriter wr;
+        if (wr.begin(path.c_str()) != 0) return false;
+        wr.set_arch(f.str(f.header().arch_id));
+        wr.meta_i("sidecar.container_bytes", f.size());
+        std::vector<uint8_t> zeros((size_t)(head->shape[0] * head->shape[1] * 2), 0);
+        for (const std::string& n : names) {
+            rad::RadWriter::Weight ww;
+            ww.name = n;
+            ww.enc = rad_enc_plain(RAD_BF16);
+            ww.rank = 2;
+            ww.shape[0] = head->shape[0];
+            ww.shape[1] = head->shape[1];
+            const void* pl[1] = { zeros.data() };
+            if (wr.add_weight(ww, pl) < 0) { wr.abort(); return false; }
+        }
+        return wr.finish() == 0;
+    };
+    REQUIRE(handmade(d / "nobase.rad", { "no.such.weight#pf" }));
+    a[1] = d / "t3";
+    Ran t3 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "nobase.rad") });
+    CHECK(t3.status != 0);
+    CHECK(has(t3.log, "'no.such.weight' is not an entry of"));
+    REQUIRE(handmade(d / "both.rad", { "output.weight", "output.weight#pf" }));
+    a[1] = d / "t4";
+    Ran t4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both.rad") });
+    CHECK(t4.status != 0);
+    CHECK(has(t4.log, "a weight is replaced or twinned, not both"));
 }
 
 /* ================================================================== lever G: the tail grid (ds41-tailgrid) */

@@ -422,7 +422,25 @@
  *                   with 1 / 2 / 4 / 8 heads a workgroup, 4 .. 6 tiled at 512 threads with 8 / 4 / 2, 7 / 8 direct PV at 512
  *                   threads with 8 / 4; a form the LDS refuses takes the rule's next form). Every form sums each output in the same order: the same bytes (r4d_emu
  *                   test_ds41attn's D26 case). RADIANCE_DS41_ATTN_DEC=N starts at N. -1 when no loaded object serves it.
- *   ds41_tsk        libr4d (lever TSK, ds41-drafter round 15; 85 here, after ds41_attn_dec; 83 on ds41-drafter; r4d_ds41_sparse.hip):
+ *   ds41_sphc       deepseek41 (tp8 loop P25s; 85 here, after ds41_attn_dec): the SP route's row threshold in process -- 0
+ *                   (start) = RADIANCE_DS41_SPHC's; N >= it: a lone prefill pass / a follower segment pass is sequence-
+ *                   parallel from N rows (above --max-num-batched-tokens: none). Refused without RADIANCE_DS41_SPHC.
+ *   ds41_sphc_attn  deepseek41 (tp8 loop P25s; 86): 0 .. RADIANCE_DS41_SPHC_ATTN (starts at it): 0 = an SP layer's q_a / kv
+ *                   after xn's gather (P26 off), 1 P26, 2 + P26b.
+ *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 87): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
+ *                   passes whole (P25 off), 1 / 2 P25, 3 + P25b. Each only takes away what the env declared; exact at every
+ *                   value (SP is the replicated pass's fold and bytes; X1 / X2 carry every row whichever side shards).
+ *   pp_bg_room      engine, the two-node leader (tp8 loop P23s; 88 here, after ds41_sphc_seg): RADIANCE_PP_BG_ROOM in process --
+ *                   0 = the shared budget (one ~1.1k newcomer a BG step), 256 .. 65536 rows a BG lane's inbox (lane_split_bg's
+ *                   cap); starts at the env's; taken only with a BG lane (else 0). With ds41_bi 7 (PMM) a batched BG step runs its
+ *                   newcomers' routed MoE as one pass a layer. Exact: multi-prefill steps are one process's (lever NOA / P23).
+ *   pp_bg_join_ms   engine, the leader (tp8 loop P23s; 89): RADIANCE_PP_BG_JOIN_MS in process, 0 (off) or 1 .. 60000; with pp_bg_room.
+ *   ds41_twin       deepseek41 (tp8 loop P30t; 90, after pp_bg_join_ms): mask + 256 x rows -- the twin classes (1 attn_q_a +
+ *                   attn_kv, 2 attn_q_b, 4 attn_output_a + _b, 8 engram_kv, 16 the shared expert, 32 other) whose IQR twin ('<name>#pf' in the weight
+ *                   sidecar) a PROMPT segment of >= rows rows (0 = RADIANCE_DS41_TWIN_ROWS) issues; decode rows keep the GGUF
+ *                   launch. Starts at RADIANCE_DS41_TWIN; a subset of the env's classes (0 = every row GGUF). The follower takes
+ *                   it with the leader's. Exact class: rule B (a prompt row's bytes are its own segment's).
+ *   ds41_tsk        libr4d (lever TSK, ds41-drafter round 15; 91 here, after ds41_twin (85 before the merge of PREFILL's 85-90); 83 on ds41-drafter; r4d_ds41_sparse.hip):
  *                   0 off (today), 1 the compressing layers' decode-band attention (<= 48 rows) in the split-key WMMA form --
  *                   key chunks fixed by key index, a merge in ascending order with the o rope + fp8 round trip in it. Needs
  *                   RADIANCE_DS41_TSK=0 / 1 at load (the op's scratch sized; 1 starts it on). Rule B: deterministic and
@@ -638,8 +656,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec,
-              kDs41Tsk, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
+              kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

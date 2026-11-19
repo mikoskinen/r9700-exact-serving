@@ -8,7 +8,9 @@
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_launch.h"
+#include <atomic>
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -706,8 +708,186 @@ int body(const RadArgs* a, RadStream stream, bool grouped) {
 }
 int dense(const RadArgs* a, RadStream stream) { return body(a, stream, false); }
 int grouped(const RadArgs* a, RadStream stream) { return body(a, stream, true); }
+
+/* tp8 loop P30o r2 (WIP, first form): DeepSeek-V4's released block FP8 (gemm_nt_q dtype fp8a8e8) -- E4M3 [N, K] with an E8M0
+ * exponent per 32 x 32 block against quant_act_fp8_ue8m0's pair (an f32 power-of-two scale per row per 32 of K). The legacy
+ * 16 x 64 tile above (LDS staged a dword at a time, any activation pitch, C at its own row pitch) with the release's fold:
+ * per 32 of K a fresh chain of two WMMAs, folded as raw * (activation scale * weight scale) and added (inference/kernel.py
+ * fp8_gemm at block 32: C_accum += C_local * sa * sb; both scales powers of two, so the two products are exact and the
+ * fold's one rounding is the add). A wave's 16 weight rows sit in one 32-row scale block. Correctness form: the narrow /
+ * prefill speed forms are r2 (b). */
+__device__ __forceinline__ float e8m0f(uint32_t e) { return __uint_as_float(e ? e << 23 : 0x00400000u); }
+/* MT activation rows a block (PREFILL round 21, P30o r2 (b) step 1): 16 = the first form; 32 / 64 stage MT rows of the activation
+ * beside the same 64 weight rows, so a block reads its weights once for MT rows instead of 16 (the first form re-reads every weight
+ * T / 16 times: at M 1100 the dense is weight-read bound), and each wave reuses its weight fragments over MT / 16 accumulator
+ * tiles. Every output's arithmetic is the first form's (the same two-WMMA chain a 32-K block over the same 16 K halves, the same
+ * fold in the same block order), so the bytes do not depend on MT. */
+/* V16 (PREFILL round 21): the operands' rows and pitches 16-byte aligned (the engine's pair, the sidecar's weights) -- each thread
+ * stages 16 bytes a load (two 8-byte LDS stores: the 136-byte LDS row keeps 8-byte alignment) instead of four byte loads a dword;
+ * the same bytes land in the same LDS places, so nothing else changes */
+template <int MT, bool V16>
+__global__ void fp8e8_b32(const uint8_t* a, const float* as, const uint8_t* w, const uint8_t* ws, uint16_t* y, Meta m) {
+    constexpr int F = MT / 16;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, n0 = blockIdx.x * 64;
+    __shared__ uint8_t qa[MT * 136], wb[64 * 136];
+    __shared__ int source[MT];
+    const int first = (int)blockIdx.y * MT, end = min(first + MT, m.T);
+    if (tid < MT) {
+        const int r = first + tid;
+        source[tid] = r < end ? r : -1;
+    }
+    __syncthreads();
+    decltype(r4d_fp8::acc_zero()) acc[F];
+#pragma unroll
+    for (int f = 0; f < F; ++f) acc[f] = r4d_fp8::acc_zero();
+    const long wsrow = (long)((n0 + wave * 16) / 32) * m.sr;
+    for (int k0 = 0; k0 < m.K; k0 += 128) {
+        if constexpr (V16) {
+            for (int j = tid; j < MT * 8; j += 128) {
+                const int r = j / 8, c = (j % 8) * 16, src = source[r];
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (src >= 0) v = *(const uint4*)(a + (long)src * m.ar + k0 + c);
+                *(uint2*)(qa + r * 136 + c) = make_uint2(v.x, v.y);
+                *(uint2*)(qa + r * 136 + c + 8) = make_uint2(v.z, v.w);
+            }
+            for (int j = tid; j < 64 * 8; j += 128) {
+                const int r = j / 8, c = (j % 8) * 16;
+                const uint4 v = *(const uint4*)(w + (long)(n0 + r) * m.wr + k0 + c);
+                *(uint2*)(wb + r * 136 + c) = make_uint2(v.x, v.y);
+                *(uint2*)(wb + r * 136 + c + 8) = make_uint2(v.z, v.w);
+            }
+        } else {
+        for (int j = tid; j < MT * 32; j += 128) {
+            const int r = j / 32, c = (j % 32) * 4, src = source[r];
+            uint32_t v = 0;
+            if (src >= 0) {
+                const auto* p = a + (long)src * m.ar + k0 + c;
+                v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            }
+            *(uint32_t*)(qa + r * 136 + c) = v;
+        }
+        for (int j = tid; j < 64 * 32; j += 128) {
+            const int r = j / 32, c = (j % 32) * 4;
+            const auto* p = w + (long)(n0 + r) * m.wr + k0 + c;
+            *(uint32_t*)(wb + r * 136 + c) = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                                             ((uint32_t)p[3] << 24);
+        }
+        }
+        __syncthreads();
+        /* one 32-K block at a time above the first form (MT > 16): unrolled, the wide tiles' live fragments and scale reads
+         * spill (MT 64 ~490 B a lane of scratch, measured by the compiler's resource report); the order is the same */
+        constexpr int kKU = MT > 16 ? 1 : 4;
+#pragma unroll kKU
+        for (int kk = 0; kk < 128; kk += 32) {
+            const auto wf0 = r4d_fp8::frag<128>(wb, wave * 16, kk, lane), wf1 = r4d_fp8::frag<128>(wb, wave * 16, kk + 16, lane);
+            const int kb = (k0 + kk) / 32;
+            const float wsc = e8m0f(ws[wsrow + kb]);
+#pragma unroll
+            for (int f = 0; f < F; ++f) {
+                auto raw = r4d_fp8::acc_zero();
+                raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, f * 16, kk, lane), wf0, raw);
+                raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, f * 16, kk + 16, lane), wf1, raw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int src = source[f * 16 + (lane >> 4) * 8 + j];
+                    const float scale = src >= 0 ? as[(long)src * m.asr + kb] * wsc : 0;
+                    acc[f][j] += raw[j] * scale;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int f = 0; f < F; ++f)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int r = first + f * 16 + (lane >> 4) * 8 + j, c = n0 + wave * 16 + (lane & 15);
+            if (r < end) y[(long)r * m.yr + c] = f32_to_bf16(acc[f][j]);
+        }
+}
+/* the M tile: R4D_FP8E8_MT=16 / 32 / 64 at load (128 spills ~630 B a lane: not built) (unset: 16, the first form), r4d_fp8e8_pin_mt() in process (selftest, emu);
+ * a launch of at most 16 rows always takes 16 (one tile either way). The staging: R4D_FP8E8_LD=4 at load forces the first form's
+ * byte loads, else 16-byte loads wherever the operands allow; r4d_fp8e8_pin_ld(4 / 16 / 0) in process */
+std::atomic<int> g_fp8e8_mt{ -1 }, g_fp8e8_ld{ -1 };
+int fp8e8_ld() {
+    int v = g_fp8e8_ld.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("R4D_FP8E8_LD");
+        v = e && !std::strcmp(e, "4") ? 4 : 16;
+        g_fp8e8_ld.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+int fp8e8_mt() {
+    int v = g_fp8e8_mt.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("R4D_FP8E8_MT");
+        v = e && (!std::strcmp(e, "32") || !std::strcmp(e, "64")) ? std::atoi(e) : 16;
+        g_fp8e8_mt.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+int dense_e8(const RadArgs* a, RadStream stream) {
+    if (!a || !a->t || a->n_t < 5) return RAD_E_INVAL;
+    const auto &x = a->t[0], &xs = a->t[1], &w = a->t[2], &ws = a->t[3], &y = a->t[4];
+    const int64_t N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
+    if (N < 64 || N % 64 || K < 128 || K % 128 || N > INT_MAX || K > INT_MAX || r4d_geti_or(a, "group", 0) != 32 ||
+        r4d_geti_or(a, "pb1", 0) > 0)
+        return R4D_NO(RAD_E_SHAPE);
+    if (x.dtype != RAD_F8E4M3 || xs.dtype != RAD_F32 || w.dtype != RAD_F8E4M3 || ws.dtype != RAD_E8M0 ||
+        y.dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!x.data || !xs.data || !w.data || !ws.data || !y.data || x.rank != 2 || xs.rank != 2 || y.rank != 2 ||
+        w.rank != 2 || ws.rank != 2 || x.shape[1] != K || xs.shape[0] != x.shape[0] || xs.shape[1] != K / 32 ||
+        y.shape[1] != N || w.shape[0] != N || w.shape[1] != K || ws.shape[0] != N / 32 || ws.shape[1] != K / 32 ||
+        x.stride[1] != 1 || xs.stride[1] != 1 || y.stride[1] != 1 || w.stride[1] != 1 || ws.stride[1] != 1 ||
+        y.shape[0] < 1 || y.shape[0] > INT_MAX || x.shape[0] != y.shape[0])
+        return R4D_NO(RAD_E_SHAPE);
+    Meta m{};
+    m.ar = x.stride[0];
+    m.asr = xs.stride[0];
+    m.yr = y.stride[0];
+    m.wr = w.stride[0];
+    m.sr = ws.stride[0];
+    m.T = (int)y.shape[0];
+    m.N = N;
+    m.K = K;
+    const int mt = m.T <= 16 ? 16 : fp8e8_mt();
+    /* 16-byte staging: both operands' bases and row pitches (bytes: E4M3 is a byte a value) on 16 bytes */
+    const bool v16 = fp8e8_ld() == 16 && !(((uintptr_t)x.data | (uintptr_t)w.data | (uintptr_t)m.ar | (uintptr_t)m.wr) & 15u);
+#define FP8E8_GO(MT_, V_)                                                                                             \
+    R4D_EMIT(stream, (fp8e8_b32<MT_, V_>), dim3(N / 64, (m.T + MT_ - 1) / MT_), dim3(128), 0, (const uint8_t*)x.data,    \
+             (const float*)xs.data, (const uint8_t*)w.data, (const uint8_t*)ws.data, (uint16_t*)y.data, m)
+    if (v16) {
+        if (mt == 64) return FP8E8_GO(64, true);
+        if (mt == 32) return FP8E8_GO(32, true);
+        return FP8E8_GO(16, true);
+    }
+    if (mt == 64) return FP8E8_GO(64, false);
+    if (mt == 32) return FP8E8_GO(32, false);
+    return FP8E8_GO(16, false);
+#undef FP8E8_GO
+}
 }
 extern "C" int r4d_rad_fp8_f32scale(const RadArgs* a, RadStream stream) { return dense(a, stream); }
+/* tp8 loop P30o r2 (WIP): gemm_nt_q at dtype fp8a8e8 (the release's block FP8), the first form */
+extern "C" int r4d_rad_gemm_fp8a8e8(const RadArgs* a, RadStream stream) { return dense_e8(a, stream); }
+/* PREFILL round 21: the fp8a8e8 form's M tile in process (16 / 32 / 64; anything else back to R4D_FP8E8_MT / 16) -- the same bytes */
+extern "C" void r4d_fp8e8_pin_mt(int mt) {
+    g_fp8e8_mt.store(mt == 16 || mt == 32 || mt == 64 ? mt : -1, std::memory_order_relaxed);
+}
+/* ... and its staging (4 = the first form's byte loads, 16 = 16-byte loads where aligned; anything else back to R4D_FP8E8_LD) */
+extern "C" void r4d_fp8e8_pin_ld(int ld) { g_fp8e8_ld.store(ld == 4 || ld == 16 ? ld : -1, std::memory_order_relaxed); }
+/* Its planes as the release stores them (affine {codes fp8_e4m3, scale e8m0 [32x32]}): read without a relayout. */
+extern "C" int r4d_layout_fp8a8e8(const RadParam*, int, int operand, const RadEncoding* e, const int* sel,
+                                  const RadTensor*, int n, RadLayout*) {
+    if (operand != 2 && operand != 3) return RAD_E_UNSUPPORTED;
+    if (!e || !sel || n != 1 || !rad_enc_is(e, "affine") || e->n_planes != 2 || e->plane[0].dtype != RAD_F8E4M3 ||
+        e->plane[1].dtype != RAD_E8M0 || e->plane[1].block[0] != 32 || e->plane[1].block[1] != 32 ||
+        sel[0] != (operand == 3 ? 1 : 0))
+        return RAD_E_DTYPE;
+    return RAD_E_UNSUPPORTED;
+}
 extern "C" int r4d_rad_moe_fp8_f32scale(const RadArgs* a, RadStream stream) {
     return grouped(a, stream);
 }

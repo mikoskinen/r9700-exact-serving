@@ -2241,7 +2241,8 @@ static const RadOperandSpec oGather[] = {
 extern "C" int r4d_rad_stage_send(const RadArgs*, RadStream);
 extern "C" int r4d_rad_stage_recv(const RadArgs*, RadStream);
 /* `shard` (tp8 loop P20 round 3, stage_send): a mask of the parts every rank sends its rows of (the others rank `sender`) */
-static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop"), P_INTO("shard") };
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop"), P_INTO("shard"),
+                                       P_INTO("ranks") };   /* tp8 loop P25: loop + shard, the node's ranks */
 static const RadOperandSpec oStageSend[] = {
     { "ring", RAD_OPD_IN, 0 }, { "x0", RAD_OPD_IN, 0 }, { "x1", RAD_OPD_IN, 1 }, { "x2", RAD_OPD_IN, 1 },
     { "x3", RAD_OPD_IN, 1 }, { "x4", RAD_OPD_IN, 1 }, { "x5", RAD_OPD_IN, 1 }, { "x6", RAD_OPD_IN, 1 },
@@ -3956,6 +3957,11 @@ static const RadOpSchema kSchemas[] = {
            "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
            "amax/448 -- a DEQUANT multiplier, the same sense as the checkpoint's "
            "weight_scale_inv, so the fp8 GEMMs multiply both scales and never divide."),
+    SCHEMA("quant_act_fp8_ue8m0", pQuantActFp8, oQuantActFp8,
+           "E4M3 per (row, `group`-column) block with a POWER-OF-TWO scale (DeepSeek-V4's released "
+           "act_quant(x, group, 'ue8m0')): amax = max(|x|, 1e-4), the scale the power of two at or above "
+           "amax * f32(1/448), q = clamp(x / scale, +-448) rounded to nearest even, PLAIN ROW-MAJOR; the "
+           "scale [M, n/group] in f32. What the block-FP8 GEMMs at dtype fp8a8e8 read (tp8 loop P30o)."),
     SCHEMA("quant_act_i8g", pQuantActFp8, oQuantActFp8,
            "quant_act_fp8 at INT8 codes: per-(row, `group`-column) symmetric int8, PLAIN ROW-MAJOR, "
            "the scale amax/127 and a code the value over it rounded to nearest-even. What the int8 "
@@ -5195,6 +5201,11 @@ static const RadConstraint cDsaPool[] = { C_GE("M", 1), C_EQ("n", 128), C_EQ("ra
                                           C_IN("dtype", "bf16") };
 static const RadConstraint cDsaQuery[] = { C_GE("M", 1), C_LE("M", 2147483644), C_EQ("n", 128),
                                            C_IN("dtype", "bf16") };
+/* tp8 loop P30o: the release's block FP8 (gemm_nt_q dtype fp8a8e8) */
+static const RadConstraint cFp8A8E8[] = {
+    C_GE("M", 1), C_GE("N", 64), C_DIV("N", 64), C_GE("K", 128), C_DIV("K", 128), C_EQ("group", 32),
+    C_IN("dtype", "fp8a8e8")
+};
 static const RadConstraint cFp8F32Scale[] = {
     C_GE("M", 1),    C_GE("N", 128),     C_DIV("N", 128),          C_GE("K", 128),
     C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "fp8a8f32")
@@ -5496,6 +5507,10 @@ static const RadConstraint cMoeGemmIqr[] = {
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
 static const RadConstraint cQuantActFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+/* tp8 loop P30o: the release's act_quant (ue8m0) at its block of 32 */
+static const RadConstraint cQuantActFp8Ue8m0[] = {
+    C_DIV("n", 32), C_EQ("group", 32), C_IN("dtype", "bf16"),
 };
 /* The rotated form needs n divisible by the group, not just by 4: a rotation block cannot
  * straddle the end of a row (a zero-padded ragged tail would mix real values and padding in one
@@ -6914,6 +6929,13 @@ static const RadKernelInfo kKernels[] = {
   "N and K multiples of 128; pitched activations and row-major weights", "E4M3 codes, F32 scales, BF16 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cFp8F32Scale), NOTUNE,
   nullptr, nullptr, r4d_rad_fp8_f32scale, nullptr, r4d_layout_fp8_f32scale, nullptr,
+  nullptr },
+{ "gemm_fp8a8e8_b32", "gemm_nt_q", "gemm",
+  "DeepSeek-V4's released block FP8: E4M3 x E4M3 WMMA, an E8M0 weight exponent per 32x32 block and a power-of-two "
+  "activation scale per (row, 32), folded every 32 of K (the release's fp8_gemm at block 32) -- the first form (tp8 loop P30o)",
+  "N a multiple of 64, K of 128; pitched activations and output, row-major weights", "E4M3 codes, E8M0 / f32 scales, BF16 output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cFp8A8E8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_fp8a8e8, nullptr, r4d_layout_fp8a8e8, nullptr,
   nullptr },
 { "moe_gemm_fp8a8_f32scale", "moe_gemm_q", "moe", "grouped FP8 WMMA with canonical F32 block scales",
   "equal parity widths; token/sorted activations; canonical pointer tables", "E4M3 codes, F32 scales, BF16 output",
@@ -9678,6 +9700,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cHadQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_givens_rotate, nullptr, r4d_rad_layout_givens_pairs,
   r4d_rad_relayout_givens_pairs, nullptr, r4d_rad_unrelayout_givens_pairs },
+
+{ "quant_act_fp8_ue8m0", "quant_act_fp8_ue8m0", "quant",
+  "per-(row, 32-column) E4M3 quantisation with a power-of-two scale (DeepSeek-V4's released act_quant, ue8m0)",
+  "n a multiple of 32 (the release asserts it), group 32; a lane four columns, a group eight lanes",
+  "bf16 in, E4M3 out in PLAIN ROW-MAJOR order with an f32 power-of-two scale per (row, 32 columns)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQuantActFp8Ue8m0), NOTUNE,
+  nullptr, nullptr, r4d_rad_quant_act_fp8_ue8m0, nullptr, nullptr, nullptr,
+  r4d_shape_quant_act_fp8_ue8m0 },
 
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",

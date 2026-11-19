@@ -35262,6 +35262,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 #include "r4d_selftest_spd.inc"   /* ds41-etp-spd: lever SPD-F, the decode band's f32 projection forms byte for byte + per-call times (--case spdf32) */
 #include "r4d_selftest_a4.inc"    /* ds41-a4: lever A4, the gg_gemv_m16 forms (--mrcheck16, --perfm16) */
 #include "r4d_selftest_wmg.inc"   /* ds41-wmgate (bench): the WMMA form at decode heights (--perfwmg, --wmgcheck) */
+#include "r4d_selftest_p30o.inc"  /* tp8 loop P30o: the release's block FP8 (quant_act_fp8_ue8m0, gemm_fp8a8e8_b32) vs libref + times (--case fp8a8e8) */
 
 static void device_phase(const Plugin& pl) {
     int n = 0;
@@ -36549,6 +36550,7 @@ static void device_phase(const Plugin& pl) {
     gq_cases(pl);
     fuse_cases(pl);   /* ds41-fuse (r4d_selftest_fuse.inc): levers FUSE-R and FUSE-M */
     spd_cases(pl);    /* ds41-etp-spd (r4d_selftest_spd.inc): lever SPD-F (only when named: --case spdf32) */
+    p30o_cases(pl);   /* tp8 loop P30o (r4d_selftest_p30o.inc): the release's block FP8 on one card (--case fp8a8e8) */
     /* --- byte rows: the KV tier's transfer pair --- */
     /* Pack and unpack a pool, the real layout in miniature: a "layer" is `rows` blocks of `n`
      * bytes, a session's blocks are scattered through it, and exactly those blocks must come back.

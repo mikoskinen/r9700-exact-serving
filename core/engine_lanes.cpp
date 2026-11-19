@@ -82,7 +82,7 @@ struct PfTimeline {
     enum Kind : uint8_t { kA, kB, kC, kD };
     static constexpr size_t kCap = 2048;
     struct Rec { RadEvent ev; uint8_t kind; uint64_t seq; int ci; };
-    struct Chunk { int64_t rows = 0, ctx = 0; float gap_a = -1, head = -1, gap_c = -1, tail = -1; };
+    struct Chunk { int64_t rows = 0, ctx = 0; float gap_a = -1, head = -1, gap_c = -1, tail = -1, issue = -1; };   /* issue: tp8 loop P31 */
     struct Prompt {
         std::vector<Chunk> ch;
         double plan = 0, rel = 0, issue = 0, tissue = 0, fin = 0;
@@ -155,9 +155,12 @@ static void pf_finish(PfTimeline* tl, const RadBatch* b, uint64_t t0, bool tok) 
     int nga = 0, ngc = 0, nhead = 0, ntail = 0;
     size_t gmax_at = 0;
     bool gmax_head = true;
+    double imax = -1;   /* tp8 loop P31: the longest head issue and where */
+    size_t imax_at = 0;
     for (size_t k = 0; k < n; ++k) {
         const PfTimeline::Chunk& c = P.ch[k];
         rows += c.rows;
+        if (c.issue > imax) { imax = c.issue; imax_at = k; }
         if (c.head >= 0) { head += c.head; ++nhead; }
         if (c.tail >= 0 && k + 1 < n) { tail += c.tail; ++ntail; }
         if (c.gap_a >= 0) {
@@ -176,11 +179,12 @@ static void pf_finish(PfTimeline* tl, const RadBatch* b, uint64_t t0, bool tok) 
              "for its X2), the last tail %.1f ms (its X2 = the follower's last chunk + its cone part, then layers t.. + head + "
              "sampler + drafter), idle or other work between parts %.1f ms (before heads %.1f in %d, before tails %.1f in %d; "
              "the longest %.1f before chunk %zu's %s); host a chunk: plan %.2f + head release %.2f (prepare, restores, ship) + "
-             "head issue %.2f (the ranks' issue) ms, tail issue %.2f, collect + commit + drafter finish %.2f ms; events "
-             "dropped %lld, unread %lld", (unsigned long long)seq, n, (long long)rows, head, nhead,
-             rows > 0 ? head * 1000.0 / (double)rows : 0.0, tail, ntail, (double)last, ga + gc, ga, nga, gc, ngc,
+             "head issue %.2f (the ranks' issue; the first chunk's %.2f, the longest %.2f at chunk %zu) ms, tail issue %.2f, collect + "
+             "commit + drafter finish %.2f ms; events dropped %lld, unread %lld", (unsigned long long)seq, n, (long long)rows, head,
+             nhead, rows > 0 ? head * 1000.0 / (double)rows : 0.0, tail, ntail, (double)last, ga + gc, ga, nga, gc, ngc,
              gmax < 0 ? 0.0 : gmax, gmax_at, gmax_head ? "head" : "tail", P.plan / nh, P.rel / nh, P.issue / nh,
-             P.tissue / nt, P.fin / nt, (long long)tl->dropped, (long long)tl->unread);
+             n ? (double)P.ch[0].issue : -1.0, imax, imax_at, P.tissue / nt, P.fin / nt, (long long)tl->dropped,
+             (long long)tl->unread);
     /* every chunk, 16 a line: index rows@context: idle before | head ms, idle before | tail ms */
     for (size_t k0 = 0; k0 < n; k0 += 16) {
         std::string t;
@@ -258,6 +262,9 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  (long long)lanes_.bg_hold_ms(), (long long)lanes_.bg_hold_ms());
     if (const char* bp = std::getenv("RADIANCE_PP_BG_PIECES"); bp && *bp)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_PIECES=%s is ignored: the switch was removed 18.11. (tp8 dev D12, never on cards)", bp);
+    /* tp8 loop P23s: the in-process switches pp_bg_room / pp_bg_join_ms start at the env's values (0 without a BG lane) */
+    fn4::note_sched(fn4::kPpBgRoom, (int)lanes_.bg_room());
+    fn4::note_sched(fn4::kPpBgJoinMs, (int)lanes_.bg_join_ms());
     if (lanes_.bg_room() > 0)
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROOM=%lld -- a BG lane's inbox (its next step) takes lent newcomers up to %lld "
                  "rows (the shared budget %lld otherwise), so the newcomers that arrive while a BG step runs go to the next one "
@@ -390,7 +397,9 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     if (pp_ni_) pp_ni_->end();
     if (pfp) {
         pf_tl_->mark(PfTimeline::kB, pfe->seq, pf_ci);
-        pfp->issue += (double)(rad_mono_ns() - pf1) / 1e6;
+        const double iss = (double)(rad_mono_ns() - pf1) / 1e6;
+        pfp->issue += iss;
+        if (pf_ci >= 0 && (size_t)pf_ci < pfp->ch.size()) pfp->ch[(size_t)pf_ci].issue = (float)iss;   /* tp8 loop P31 */
         ++pfp->nh;
     }
     /* busy from the release to X1's publish (the host backend notes it; a card leaves it 0) */
@@ -667,6 +676,7 @@ int Engine::step_loop_lanes() {
     /* tp8 loop P23: the BG lanes' steps (run so far) once a minute under RADIANCE_PP_BG_ROOM, so a cell's window is the difference
      * of two lines: steps, newcomers, steps with >= 2 newcomers (batched) and their newcomers / rows, >= 3, the widest step */
     uint64_t bgst_line_ns = rad_mono_ns();
+    bool bgst_seen = false;   /* tp8 loop P23s: the room was on at some point (the switch) */
     uint64_t sb_line_ns = bgst_line_ns;   /* tp8 loop D18: the short block's minute line */
     auto bgst_line = [&](const char* when) {
         const LaneSet::Counts c = lanes_.counts();
@@ -1207,7 +1217,8 @@ int Engine::step_loop_lanes() {
                 hold_line_ns = now;
             }
         }
-        if (lanes_.bg_room() > 0) {
+        if (lanes_.bg_room() > 0 || bgst_seen) {   /* tp8 loop P23s: also once pp_bg_room was on */
+            bgst_seen = true;
             const uint64_t now = rad_mono_ns();
             if (now - bgst_line_ns >= 60000000000ull) {
                 bgst_line(" so far");
@@ -1241,7 +1252,7 @@ int Engine::step_loop_lanes() {
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);
-    if (lanes_.bg_room() > 0) bgst_line(" over the run");
+    if (lanes_.bg_room() > 0 || bgst_seen) bgst_line(" over the run");
     if (ia) ia_line(" over the run");
     short_block_line(" over the run");   /* tp8 loop D18 */
     return RAD_OK;

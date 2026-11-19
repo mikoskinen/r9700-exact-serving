@@ -225,6 +225,11 @@ struct MoeFP8 {
          * also as one op (swiglu_clamped_gemm_nt_ggml, `op_swfold`) where a library serves it, issued in their
          * place while `swfold_live` > 0. 0 (every other caller): nothing more declared. */
         int     shared_swfold = 0;
+        /* tp8 loop P30t (DeepSeek-V4.1, RADIANCE_DS41_TWIN bit 16): declare the shared arm's int8 TWIN where a weight sidecar
+         * holds '<gate_up>.weight#pf' and '<down>.weight#pf' (plain int8, beside the GGUF weights): sh_gate_up_tw / sh_down_tw
+         * over the same input / swiglu plane / output, issued in place of the GGUF pair for a pass `twin_now` answers true
+         * (the architecture's: a prompt segment's rows). 0 (every other caller): nothing more declared. */
+        int     shared_twin = 0;
         /* DeepSeek-V4.1's lever FUSE-R (ds41-fuse): with `sigmoid_router` and a named score, declare the router chain's
          * fused forms beside the separate ops -- router_scored_topk_scatter without a gate (the selection and the sort,
          * `op_rs_fused`) and router_gemm_f32_scored_topk_scatter (the projection too, `op_rgs_fused`) -- where a library
@@ -429,6 +434,12 @@ struct MoeFP8 {
     GateQuantFP8 gq_iqr{};
     rad_op op_aq = 0;
     LinearFP8    sh_gate_up{}, sh_down{};
+    /* Config::shared_twin: the arm's int8 twins (sh_tw: both declared), the twin down's own int8 pair over the swiglu's bf16
+     * plane (sff_tw), and the architecture's per-pass answer (null: never) */
+    LinearFP8    sh_gate_up_tw{}, sh_down_tw{};
+    ActFP8       sff_tw{};
+    bool         sh_tw = false;
+    bool       (*twin_now)() = nullptr;
     rad_op op_router = 0, op_topk = 0, op_scatter = 0;
     /* `op_scatter` is moe_scatter_inv and `op_gather` moe_gather_inv: the sort writes `w.inv` and
      * the gather reads it (Wire::inv). */
@@ -1907,6 +1918,41 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                      { shared_down },
                                      w.sff, w.sout, c.rows, {},
                                      c.shared_lo, c.shared_hi));
+        /* tp8 loop P30t: the twins, both or neither; the GGUF arm's swiglu writes the bf16 plane the twin down quantises */
+        sh_tw = false;
+        if (c.shared_twin && !sh_gate_up.i8 && !sh_down.i8 && w.sff.x && w.h.x && w.h.q8 && w.h.s8 && !w.h.q8_fed) {
+            const char* gst = nm.ckpt("%s.weight#pf", nm.f("blk.%d.ffn_gate_up_shexp", l));
+            const char* dst = nm.ckpt("%s.weight#pf", down_base);
+            RadEncoding e1{}, e2{};
+            if (weight_enc(b, gst, &e1) && weight_enc(b, dst, &e2)) {
+                if (!linear_is_w8(e1) || !linear_is_w8(e2)) {
+                    fprintf(stderr, "radiance: layer %d's shared-expert twins %s / %s are not plain int8 (i8*bf16[1x128])\n",
+                            l, gst, dst);
+                    return RAD_E_DTYPE;
+                }
+                const int64_t n = c.n_ff_shared, m = c.rows > 0 ? c.rows : g.max_tok;
+                sff_tw = ActFP8{};
+                sff_tw.x = w.sff.x;
+                sff_tw.q8 = decl_b(b, nm.f("blk.%d.shared_ff_tw.q8", l), RAD_I8, { m, n });
+                sff_tw.s8 = decl_b(b, nm.f("blk.%d.shared_ff_tw.s8", l), RAD_F32, { m, fp8_blocks(n) });
+                if (!sff_tw.q8 || !sff_tw.s8) return RAD_E_INVAL;
+                RAD_ARCH_TRY(rad_buf_concurrent(b, sff_tw.q8));
+                RAD_ARCH_TRY(rad_buf_concurrent(b, sff_tw.s8));
+                sh_gate_up_tw.stored = gst;
+                sh_down_tw.stored = dst;
+                RAD_ARCH_TRY(sh_gate_up_tw.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up_shexp_tw", l),
+                                                   2 * c.n_ff_shared, g.n_embd, RAD_SHARD_ROW, grp_layer(l),
+                                                   { gst }, w.h, w.sgu, c.rows,
+                                                   { c.n_ff_shared, c.n_ff_shared },
+                                                   c.shared_lo, c.shared_hi));
+                RAD_ARCH_TRY(sh_down_tw.declare(b, nm, g, nm.f("blk.%d.ffn_down_shexp_tw", l),
+                                                g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
+                                                { dst }, sff_tw, w.sout, c.rows, {},
+                                                c.shared_lo, c.shared_hi));
+                sh_tw = sh_gate_up_tw.i8 && sh_down_tw.i8;
+                if (!sh_tw) return RAD_E_DTYPE;
+            }
+        }
         /* Fold e: the clamped SwiGLU (its bf16 product alone, no quantiser) and a GGUF down over it, as one op. */
         op_swfold = 0;
         if (c.shared_swfold && sh_down.ggml && gq_sh.clipped && !c.swiglu_step && gq_sh.op && !gq_sh.op_quant &&
@@ -2383,6 +2429,7 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
  * buffers are step-tall, so the pass offset applies as in an MlpFP8 slice. */
 inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                               bool gate_done) const {
+    const bool tw = sh_tw && twin_now && twin_now();   /* tp8 loop P30t */
     /* `gate_done`: the fused router already wrote this pass's gate. A separate FP32 combine
      * reads no ones plane. At TP1 an ungated folded gather does, unless the caller prepared the
      * whole step's ones plane once (shared_one_external). */
@@ -2395,7 +2442,7 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
         RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),
                     brow_slice(w.sgate, r0, rows, 1));
     }
-    sh_gate_up.step(c_, w.h, w.sgu, T, r0, rows);
+    (tw ? sh_gate_up_tw : sh_gate_up).step(c_, w.h, w.sgu, T, r0, rows);
 }
 
 /* One pass of at most `c.rows` tokens. Every op is per row (norm and quantiser within a row,
@@ -2430,8 +2477,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * beside the router, the sort and the routed experts instead of after each routed stage (a live prefill pass is not
      * recorded, so nothing overlaps them there today). Same ops, same operands, joined in front of the gather as at 1. */
     const int sl_v = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
+    /* tp8 loop P30t: a twin pass's shared arm stays on lane 0 (its int8 quantiser writes the block input's pair) */
+    const bool sh_twin = shared && sh_tw && twin_now && twin_now();
     const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && ((r0 == 0 && rows == T) || (piece && sl_v == 2)) &&
-                            ((sl_v == 1 && T <= kMoeShexpLaneRows) || (sl_v == 2 && T > kMoeShexpLaneRows));
+                            ((sl_v == 1 && T <= kMoeShexpLaneRows) || (sl_v == 2 && T > kMoeShexpLaneRows)) && !sh_twin;
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
 
@@ -2443,7 +2492,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool lane1 = want_lane1 && rad_lane_join(c_, 0, 1) == RAD_OK && rad_lane(c_, 1) == RAD_OK;
     /* Fold e (Config::shared_swfold, switched by swfold_live): the activation and the down as op_swfold, at the
      * down's point; nothing at the activation's. */
-    const bool swf = shared && op_swfold && swfold_live && swfold_live->load(std::memory_order_relaxed) > 0;
+    const bool swf = shared && op_swfold && swfold_live && swfold_live->load(std::memory_order_relaxed) > 0 && !sh_twin;
     const auto sh_fold = [&] {
         RAD_ISSUE_N(c_, op_swfold, rows, brow_slice(w.sgu, r0, rows, 2 * gq_sh.n), RAD_W(sh_down.w),
                     brow_slice(w.sff.x, r0, rows, gq_sh.n), brow_slice(w.sout, r0, rows, sh_down.N));
@@ -2642,6 +2691,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     }
     if (shared && !lane1) {
         if (swf) sh_fold();
+        else if (sh_twin) sh_down_tw.step(c_, sff_tw, w.sout, T, r0, rows);   /* tp8 loop P30t */
         else sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     }
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not

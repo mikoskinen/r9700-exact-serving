@@ -494,8 +494,22 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
 std::mutex g_names_mu;
 std::unordered_map<uint64_t, std::string> g_names;
 
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS, core/runtime/issue.cpp): this thread's time in a kernel's first-launch resolve on a
+ * card (the module lock's wait included), and how many; the issue path reads and clears them around a launch. */
+thread_local uint64_t t_resolve_ns = 0, t_resolve_n = 0;
+
+struct ResolveClock {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~ResolveClock() {
+        t_resolve_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++t_resolve_n;
+    }
+};
+
 KernelRec* resolve(Func* fn, int ord) {
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
+    const ResolveClock rclk;   /* tp8 loop P31: from here on this is a first launch on the card (or a refused kernel) */
     Module* m = fn->mod;
     std::lock_guard<std::mutex> lk(m->mu);
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
@@ -4137,6 +4151,58 @@ int aql_code_preload(int device, AqlPreload* out) {
     return RAD_OK;
 }
 
+/* tp8 loop P31 (RADIANCE_AQL_PRELOAD=2): every registered kernel resolved on card `device` now, as its first launch there
+ * would (resolve: the module's code object, its symbol, the argument layout), so no first launch resolves while serving.
+ * A kernel that cannot resolve keeps the reason its first launch reports, as before. */
+int aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms, double* alloc_ms) {
+    using namespace aql;
+    if (resolved) *resolved = 0;
+    if (refused) *refused = 0;
+    if (ms) *ms = 0;
+    if (alloc_ms) *alloc_ms = -1;
+    if (!G().ok || device < 0 || (size_t)device >= G().dev.size()) return RAD_E_UNSUPPORTED;
+    /* HIP's own allocator on this card, used first by a library's first-use block (hipMalloc in libr4d's split_ctr / the stage
+     * ops' counter_for) -- once here, timed, so that first use is not inside a pass */
+    {
+        int prev = -1;
+        (void)hipGetDevice(&prev);
+        if (hipSetDevice(device) == hipSuccess) {
+            const auto a0 = std::chrono::steady_clock::now();
+            void* p = nullptr;
+            if (hipMalloc(&p, 64) == hipSuccess && p) (void)hipFree(p);
+            if (alloc_ms) *alloc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count();
+        }
+        if (prev >= 0) (void)hipSetDevice(prev);
+    }
+    std::vector<Func*> fns;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        fns.reserve(r.by_stub.size());
+        for (const auto& kv : r.by_stub)
+            if (kv.second) fns.push_back(kv.second);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t ok = 0, no = 0;
+    for (Func* fn : fns) {
+        if (fn->rec[device].load(std::memory_order_acquire)) continue;
+        if (resolve(fn, device)) ++ok;
+        else ++no;
+    }
+    t_resolve_ns = t_resolve_n = 0;   /* bring-up's, not an issue's */
+    if (resolved) *resolved = ok;
+    if (refused) *refused = no;
+    if (ms) *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return RAD_OK;
+}
+
+/* tp8 loop P31: this thread's first-launch resolve time and count since the last call (RADIANCE_SLOW_ISSUE_MS) */
+void aql_resolves_take(uint64_t* ns, uint64_t* n) {
+    if (ns) *ns = aql::t_resolve_ns;
+    if (n) *n = aql::t_resolve_n;
+    aql::t_resolve_ns = aql::t_resolve_n = 0;
+}
+
 const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {
         const DeviceBackend* hip = hip_backend_if_present();
@@ -4357,12 +4423,26 @@ hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t st) {
  * The fill runs on the first queue this process made on the device (the owning rank's compute
  * stream) and is waited for. A device with no queue yet (a peer's buffers set up before its rank
  * starts) gets a temporary one for the call. Never recorded into a tape: it runs once. */
+/* tp8 loop P31: RADIANCE_AQL_MEMSET_OWNQ=1 runs every such fill on a queue of its own made for the call (as a device with no
+ * queue gets today) and waits for that queue only: the same bytes, complete when it returns, without waiting for the compute
+ * stream's backlog -- a library's first-use zeroing inside a launch (libr4d split_ctr / the stage ops' counter_for) otherwise
+ * waits there for every part already issued on the card. With RADIANCE_SLOW_ISSUE_MS=X a fill that took >= X ms says so. */
+static const bool g_memset_ownq = [] {
+    const char* e = std::getenv("RADIANCE_AQL_MEMSET_OWNQ");
+    return e && e[0] == '1' && !e[1];
+}();
+static std::atomic<int> g_memset_lines{0};
+}  // extern "C"
+namespace rad { double slow_issue_ms(); }
+extern "C" {
+
 hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (!G().ok) return real().memset_sync ? real().memset_sync(dst, value, bytes) : hipErrorNotSupported;
     int dev = -1;
     if (hipGetDevice(&dev) != hipSuccess) return ret(hipErrorInvalidDevice);
+    const auto t0 = std::chrono::steady_clock::now();
     Stream* s = nullptr;
-    {
+    if (!g_memset_ownq) {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         for (Stream* x : G().streams)
             if (x->ord == dev) { s = x; break; }
@@ -4377,6 +4457,20 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (rc >= 0) rc = stream_drain(s);
     --t_tape_pause;
     if (own) rad_stream_destroy(own);
+    const double sl = rad::slow_issue_ms();
+    if (sl > 0) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms >= sl) {
+            const int k = g_memset_lines.fetch_add(1, std::memory_order_relaxed);
+            if (k < 128)
+                std::fprintf(stderr, "radiance: aql: a synchronous hipMemset of %zu bytes on card %d took %.2f ms (%s; RADIANCE_SLOW_ISSUE_MS, "
+                                     "tp8 loop P31)%s\n", bytes, dev, ms,
+                             g_memset_ownq ? "on a queue of its own, RADIANCE_AQL_MEMSET_OWNQ=1"
+                                           : own ? "on a queue made for the call"
+                                                 : "on the card's first queue = a rank's compute stream: its backlog waited for",
+                             k == 127 ? " (the 128th: no more memset lines)" : "");
+        }
+    }
     return ret(rc < 0 ? hipErrorInvalidValue : hipSuccess);
 }
 

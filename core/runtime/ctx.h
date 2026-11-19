@@ -219,6 +219,11 @@ struct CtxDesc {
     Registry*       registry    = nullptr;
 };
 
+/* tp8 loop P31 (issue.cpp): RADIANCE_SLOW_ISSUE_MS's value (0 = off), and the process's pass-line budget (the count so far) */
+double  slow_issue_ms();
+int64_t slow_issue_rows();   /* RADIANCE_SLOW_ISSUE_ROWS: the smallest pass that prints (default 512) */
+int     slow_pass_line_take();
+
 /* ------------------------------------------------------------------ Ctx */
 class Ctx : public RadCtx {
 public:
@@ -892,6 +897,14 @@ private:
     int64_t n_stream_waits_ = 0;
     int64_t n_host_syncs_ = 0;
     int64_t n_host_drains_ = 0;
+    /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS, issue.cpp): this pass's issue_body time, issues, first-launch resolves and the
+     * slowest issue's op, summed by issue_body and read by run_step */
+    double   slow_in_ms_ = 0, slow_max_ms_ = 0;
+    int64_t  slow_n_ = 0, slow_res_n_ = 0;
+    uint64_t slow_res_ns_ = 0;
+    int32_t  slow_max_op_ = -1;
+    void slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, double own_ms,
+                         double launch_ms, uint64_t res_ns, uint64_t res_n);
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};

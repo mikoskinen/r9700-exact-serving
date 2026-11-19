@@ -1258,6 +1258,18 @@ int ref_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return o.finish("quant_act_fp8", operand, out);
 }
 
+/* tp8 loop P30o: the release's act_quant (ue8m0): the fp8 quantiser's operands, its scale a power of two */
+int ref_quant_act_fp8_ue8m0_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    Opd o;
+    o.t(D, { M, n });                       /* x */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });    /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });      /* scale, a power of two */
+    return o.finish("quant_act_fp8_ue8m0", operand, out);
+}
+
 int ref_quant_cols_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -1438,7 +1450,10 @@ static int gemm_q_shape(const RadParam* p, int n_p, int operand, bool bias, RadO
     const char* q = gs(p, n_p, "dtype");
     auto is = [&](const char* s) { return q && std::strcmp(q, s) == 0; };
     const bool f32s = is("fp8a8f32");
-    const bool a8 = is("fp8a8") || f32s, a16 = is("fp8a16"), w4 = is("w4a8"), w8 = is("w8a8");
+    /* tp8 loop P30o: fp8a8e8 = DeepSeek-V4's released block FP8 -- an E8M0 exponent per `group` x `group` weight block
+     * (32 there) against quant_act_fp8_ue8m0's pair (a power-of-two f32 scale per row per `group` of K) */
+    const bool e8 = is("fp8a8e8");
+    const bool a8 = is("fp8a8") || f32s || e8, a16 = is("fp8a16"), w4 = is("w4a8"), w8 = is("w8a8");
     /* i8a8h is i8a8's operands; its rotation is in the values. */
     const bool i8 = is("i8a8") || is("i8a8h"), mx = is("mxfp4a8");
     if ((!a8 && !a16 && !w4 && !w8 && !i8 && !mx) || N <= 0 || K <= 0 || group <= 0)
@@ -1482,8 +1497,9 @@ static int gemm_q_shape(const RadParam* p, int n_p, int operand, bool bias, RadO
             o.skip();                               /* a_scale */
         }
         o.t((uint32_t)RAD_F8E4M3, { N, K });        /* b -- the checkpoint's own bytes */
-        /* b_scale -- weight_scale_inv, per 128x128; f32 at fp8a8f32 */
-        o.t(f32s ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16, { nb, kb });
+        /* b_scale -- weight_scale_inv, per 128x128; f32 at fp8a8f32; e8m0 exponents per group x group at fp8a8e8 */
+        if (e8) o.t((uint32_t)RAD_E8M0, { nb, kb });
+        else    o.t(f32s ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16, { nb, kb });
     }
     if (bias) {
         o.t((uint32_t)RAD_BF16, { N });             /* bias */

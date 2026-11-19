@@ -44,6 +44,7 @@ anchor, because a largest-loop search finds the epilogue, a long unrolled store 
 | `blockcopy.hip` | contiguous versus scattered device-to-host copy, at KV-block granularity |
 | `wmmapeak.hip` | sustained fp8, iu8 and bf16 WMMA TFLOP/s at the card's clock and power limit, with the sclk, power and temperature it ran at |
 | `wmmamix.hip` | what a VALU instruction, an LDS read and an LDS write cost next to fp8 WMMA, and LDS bandwidth per CU |
+| `wmmabf.hip` | the mix oracle of a bf16 WMMA K loop (the dense k-quant prefill forms' VALU slots, LDS bytes, barriers and scale fold a WMMA) at random operands and the card's power limit, in TFLOP/s and clocks a WMMA; `s` mode samples the sclk while another process runs |
 
 Each script's header states its traps and how to read its output. The microbenchmarks are built by
 hand: `clang++ -x hip -O3 -std=c++17 --offload-arch=gfx1201 <name>.hip -o <name>` for `isarate`,

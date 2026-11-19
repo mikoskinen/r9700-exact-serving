@@ -1871,10 +1871,19 @@ int Engine::follower_loop() {
                 if (h2.run) { ++seg_between; ++steps; }
             }
         };
-        /* tp8 loop P22: a lone prefill pass is timed (its parts together); any other run pass ends the open prompt */
+        /* tp8 loop P22: a lone prefill pass is timed (its parts together); any other run pass ends the open prompt.
+         * tp8 loop P22b: a split one (a BG newcomer's body in segments, other lanes' passes between them) by its segments,
+         * on its own record -- the passes between neither end nor join the open prompt */
         const bool pfl = pff && b->phase == RAD_PHASE_PREFILL && b->n_seq == 1;
+        /* (a split prefill pass of several prompts too: a batched BG step, RADIANCE_PP_BG_ROOM / pp_bg_room) */
+        const bool pfs = pff && split && b->phase == RAD_PHASE_PREFILL && b->n_seq >= 1 && !pff->seg_open;
+        const int64_t pfs_between0 = seg_between;
         if (pff && !pfl) pff->close();
-        if (pfl) pff->begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN);
+        if (pfs)
+            pff->seg_begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN,
+                           pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1], b->n_seq);
+        else if (pfl)
+            pff->begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN);
         for (size_t k = 0; k < parts.size(); ++k) {
             if (k > 0) {
                 /* the segment k - 1 - ahead must have run before segment k goes out (ahead 1: one queued behind the
@@ -1890,8 +1899,10 @@ int Engine::follower_loop() {
             issue_what_.store(kIssueFollower, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the ranks are parked, rank 0's stream is this thread's */
+            if (pfs) pff->seg_a();            /* tp8 loop P22b */
             barrier_->arrive_and_wait();      /* release the ranks */
             barrier_->arrive_and_wait();      /* and wait for them */
+            if (pfs) pff->seg_b();
             if (pp_ni_) pp_ni_->end();
             if (split) {
                 ++seg_parts;
@@ -1905,7 +1916,8 @@ int Engine::follower_loop() {
         }
         pp_set_pass(lane, RAD_PP_PART_WHOLE);
         if (split) ++seg_passes;
-        if (pfl) pff->end();
+        if (pfs) pff->seg_end(seg_between - pfs_between0);
+        if (pfl && !pfs) pff->end();
         else if (pff) pff->flush(false);
         /* tp8 dev D10 round 2: frames still waiting for their X1 go first after the split pass (they came before any held) */
         if (split && !ia_pend.empty()) {
@@ -1949,7 +1961,7 @@ int Engine::follower_loop() {
             RAD_INFO("follower: stopping on a signal after %lld steps: the leader is told (kBye) and goes down "
                      "with it", (long long)steps);
             if (pp_ni_) pp_ni_->stop();
-            if (pff) { pff->close(); pff->flush(true); }
+            if (pff) pff->stop();   /* tp8 loop P22 / P22b */
             loop_status_.store(RAD_OK, std::memory_order_release);
             stopping_.store(true, std::memory_order_release);
             if (barrier_) barrier_->abort();
@@ -1968,7 +1980,7 @@ int Engine::follower_loop() {
                     RAD_INFO("follower: the leader stopped (%s) after %lld steps; this node stops too",
                              pp_link_->why().c_str(), (long long)steps);
                     if (pp_ni_) pp_ni_->stop();
-                    if (pff) { pff->close(); pff->flush(true); }
+                    if (pff) pff->stop();   /* tp8 loop P22 / P22b */
                     loop_status_.store(RAD_OK, std::memory_order_release);
                     stopping_.store(true, std::memory_order_release);
                     if (barrier_) barrier_->abort();
@@ -2001,7 +2013,7 @@ int Engine::follower_loop() {
         if (fs < 0) return fs;
         if (fs == 1) {   /* tp8 dev M4: the leader stopped while a split pass waited between its segments */
             if (pp_ni_) pp_ni_->stop();
-            if (pff) { pff->close(); pff->flush(true); }
+            if (pff) pff->stop();   /* tp8 loop P22 / P22b */
             RAD_INFO("follower: the leader stopped (%s) after %lld steps, during a pass's segments; this node stops too",
                      pp_link_->why().c_str(), (long long)steps);
             loop_status_.store(RAD_OK, std::memory_order_release);
