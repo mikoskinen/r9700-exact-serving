@@ -181,6 +181,29 @@ struct World {
 };
 World& world() { static World w; return w; }
 
+/* tp8 loop D36: the same tiny llama with six layers, for a cut whose head holds a boundary AND a band layer -- W(2,5): the
+ * leader's head [0, 2) with LEAD_SEG=1's boundary 1, the band layer 2 (RADIANCE_LLAMA_PP_BAND=1), the follower [2, 5) */
+struct World6 {
+    tiny::TempDir dir{ "pp_e2e6" };
+    std::string llama, llama_rad, log;
+    bool ok = false;
+    World6() {
+        if (!dir.ok()) return;
+        llama = dir / "llama";
+        llama_rad = dir / "llama.rad";
+        if (mkdir(llama.c_str(), 0755) != 0) return;
+        tiny::Llama s;
+        s.layers = 6;
+        s.ctx = 65536;
+        if (!tiny::write_llama(llama, s) || !tiny::write_text(dir / "llama.recipe", tiny::kLlamaFp8Recipe)) return;
+        const int st = tiny::run({ RAD_E2E_CONVERT, llama, "-o", llama_rad, "--recipe", dir / "llama.recipe" },
+                                 engine_env(), &log);
+        if (st != 0) { fprintf(stderr, "    rad-convert (6 layers) exited %d:\n%s\n", st, tail(log).c_str()); return; }
+        ok = true;
+    }
+};
+World6& world6() { static World6 w; return w; }
+
 /* The common shape of every run here: two sequences, 64-token steps (so a document prefills in
  * several chunks, with decode rows beside them), the cache small enough to matter. */
 std::vector<std::string> shape() {
@@ -341,18 +364,20 @@ std::vector<int32_t> prompt_ids(uint64_t seed, size_t n) {
 struct Serving {
     Proc fol, lead;
     int port = 0, pp_port = 0;
+    std::string model;   /* tp8 loop D36: another model file (empty: world()'s four-layer llama) */
     bool start(const std::string& cut, const std::vector<std::string>& extra = {},
                const std::vector<std::string>& env = {}) {
         World& w = world();
+        const std::string& mp = model.empty() ? w.llama_rad : model;
         std::vector<std::string> a = cat({ "--host", "127.0.0.1", "--port", "0", "--http-threads", "8" }, shape());
         a = cat(a, extra);
         if (!cut.empty()) {
             pp_port = free_port();
-            if (!fol.start(engine_argv(w.llama_rad, cat(a, pp_args(1, pp_port, cut))), engine_env(env))) return false;
+            if (!fol.start(engine_argv(mp, cat(a, pp_args(1, pp_port, cut))), engine_env(env))) return false;
             if (!fol.wait_for("waiting on", 60)) return false;
             a = cat(a, pp_args(0, pp_port, cut));
         }
-        if (!lead.start(engine_argv(w.llama_rad, a), engine_env(env))) return false;
+        if (!lead.start(engine_argv(mp, a), engine_env(env))) return false;
         static const std::string kTag = "listening on http://127.0.0.1:";
         if (!lead.wait_for(kTag, 120)) {
             fprintf(stderr, "    the leader did not start:\n%s\n    follower:\n%s\n", tail(lead.output()).c_str(),
@@ -796,6 +821,29 @@ TEST(lanes_keep_both_stages_busy_at_once) {
                         "%.3f, both at once %.3f (%zu / %zu intervals)\n", lanes, tok, sec, tps[lanes], got[lanes].window_ms,
                 got[lanes].leader, got[lanes].follower, got[lanes].both, got[lanes].n_l, got[lanes].n_f);
         CHECK(got[lanes].n_l > 0 && got[lanes].n_f > 0);
+        /* tp8 loop D37: with lanes every whole head has its 'hiss' stamp -- rank 0's run_step entry after the head's release,
+         * its return at or after the entry */
+        {
+            std::istringstream in(tiny::read_text(prefix + ".leader"));
+            std::string kind;
+            int lane = 0, step = 0;
+            unsigned long long b0 = 0, e0 = 0;
+            std::map<int, unsigned long long> rel;
+            long long heads = 0, hiss = 0, bad = 0;
+            std::vector<std::tuple<int, unsigned long long, unsigned long long>> hs;
+            while (in >> kind >> lane >> step >> b0 >> e0) {
+                if (kind == "head") { ++heads; rel[step] = b0; }
+                if (kind == "hiss") { ++hiss; hs.emplace_back(step, b0, e0); }
+            }
+            for (const auto& [st, h0, h1] : hs) {
+                const auto it = rel.find(st);
+                if (h0 == 0 || h1 < h0 || it == rel.end() || h0 < it->second) ++bad;
+            }
+            fprintf(stderr, "    %d lane(s): %lld head stamps, %lld 'hiss' stamps (tp8 loop D37), %lld out of order\n", lanes, heads, hiss, bad);
+            CHECK(heads > 0);
+            CHECK_EQ(hiss, lanes > 1 ? heads : 0LL);   /* one lane runs engine.cpp's step loop: no 'hiss' there */
+            CHECK_EQ(bad, 0LL);
+        }
     }
     CHECK(got[1].both < 0.02);          /* one lane: the nodes take turns */
     CHECK(got[2].both > 0.25);          /* two: both busy at once */
@@ -2248,6 +2296,90 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
     CHECK(parts_all > 0);
 }
 
+/* tp8 loop D40 (DECODE round 28): fn4 pp_lead_seg + 8 (a BG step's tail whole: no tail boundary kept) and + 512 (the engine's
+ * SP word, RadPpInfo.reserved[1] = RAD_PP_LSEG_SP, on the step's HEAD segments only -- the llama stand-in fails any other pass
+ * that carries it). Every request's tokens are one process's at 4 lanes BG 2 (FOL_ORDER 2) W(2,3) (a head boundary, no tail one)
+ * with form 2 + 8, 2 + 512, 2 + 8 + 512 POSTed to 2 between the request sets, and at W(1,2) (tail boundaries, no head one) with
+ * 2 + 512 (no head segment: no word) and 2 + 8 (every tail whole: no segment at all). */
+TEST(lead_seg_tail_whole_and_sp_word_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { const char* cut; const char* form; const char* post; };
+    long long spseg_all = 0, tw8_all = 0;
+    for (const Arm a : { Arm{ "2,3", "10", nullptr }, Arm{ "2,3", "514", nullptr }, Arm{ "2,3", "522", "2" },
+                         Arm{ "1,2", "514", nullptr }, Arm{ "1,2", "10", nullptr } }) {
+        std::vector<std::string> env = kSplitEnv;
+        for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_LEAD_SEG=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0",
+                               "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        env.push_back(std::string("RADIANCE_PP_LEAD_SEG_FORM=") + a.form);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back("4");
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        if (a.post) {
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_lead_seg", std::atoi(a.post) } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+        }
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) differ += ref[i] != got[i];
+        for (size_t i = 0; i < ref_b.size(); ++i) differ += ref_b[i] != got_b[i];
+        long long steps = -1, parts = -1, spseg = -1, tw8 = -1;
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments", &steps,
+                                  &parts);
+        const char* key = " head segments carried the SP word (+ 512), ";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("; ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "; %lld head segments carried the SP word (+ 512), %lld BG steps kept", &spseg, &tw8);
+        const bool tail_b = llog.find("and its tail at [none: whole]") == std::string::npos;
+        fprintf(stderr, "    W(%s) pp_lead_seg %s%s: %d of %zu requests differ; leader: %lld BG steps in %lld segments, %lld head segments "
+                        "with the SP word, %lld tails kept whole by + 8 (tail boundary declared: %d)\n",
+                a.cut, a.form, a.post ? (std::string(" + POST ") + a.post).c_str() : "", differ, ref.size() + ref_b.size(), steps,
+                parts, spseg, tw8, (int)tail_b);
+        CHECK_EQ(differ, 0);
+        if (differ || spseg < 0) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("llama: the engine's SP word") == std::string::npos);
+        CHECK(flog.find("llama: the engine's SP word") == std::string::npos);
+        CHECK(spseg >= 0 && tw8 >= 0);
+        CHECK(steps > 0);
+        const int f = std::atoi(a.form);
+        if (std::strcmp(a.cut, "1,2") == 0) CHECK_EQ(spseg, 0LL);   /* no head boundary: no head segment carries it */
+        else if (f & 512) CHECK(spseg > 0);
+        else CHECK_EQ(spseg, 0LL);
+        if (!(f & 8)) CHECK_EQ(tw8, 0LL);
+        else if (tail_b) CHECK(tw8 > 0);
+        if (std::strcmp(a.cut, "1,2") == 0 && (f & 8)) CHECK_EQ(parts, 0LL);   /* no head boundary, the tail whole: no segment */
+        spseg_all += std::max(0LL, spseg);
+        tw8_all += std::max(0LL, tw8);
+    }
+    fprintf(stderr, "    all arms: %lld head segments with the SP word, %lld tails kept whole by + 8\n", spseg_all, tw8_all);
+    CHECK(spseg_all > 0);
+    CHECK(tw8_all > 0);
+}
+
 /* tp8 loop P27: RADIANCE_PP_LEAD_SEG_SHIP=1 (with LEAD_SEG) -- a segmented head's frame goes to the follower once its last segment
  * has run on rank 0's card, not with that segment's issue; with RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS it is held that long past
  * the last issue too, so the frames the leader issues meanwhile (other lanes' heads) reach the follower AHEAD of it. Every
@@ -2436,6 +2568,103 @@ TEST(band_passes_serve_one_process_tokens) {
     fprintf(stderr, "    band passes, all arms: %lld; the negative control: %d requests differ\n", band_all, skip_differ);
     CHECK(band_all > 0);
     CHECK(skip_differ > 0);   /* the test sees a band pass whose KV did not reach the decode owner */
+}
+
+/* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader): P28's band steps through LSP's head segments -- a band step's head
+ * runs [0, 1) then [1, 3) (the last segment through the band layer 2, X1 at 3), the band word on both, the held frame a band
+ * frame; every request's tokens are one process's (the six-layer llama) at W(2,5) with 3 lanes BG 1 and the follower's
+ * segments, 4 lanes BG 2 with FOL_ORDER 2 and pp_lead_seg form 2 (the BEST form), 3 lanes BG 1 without follower segments,
+ * and the switch unset (band heads whole, as P28 built it: 0 heads in segments). */
+TEST(band_heads_in_lead_segments_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(world6().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        one.model = world6().llama_rad;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int k; bool fseg; bool on; const char* form; bool fol_order = false; };
+    long long seg_all = 0;
+    /* form "258" = 2 + 256: pp_lead_seg's no-band control (every fresh BG step W(2,5)'s, the band layer declared) */
+    for (const Arm a : { Arm{ 3, 1, true, true, "1" }, Arm{ 4, 2, true, true, "2", true }, Arm{ 3, 1, false, true, "1" },
+                         Arm{ 3, 1, true, false, "1" }, Arm{ 4, 2, true, true, "258", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        for (const char* v : { "RADIANCE_LLAMA_PP_BAND=1", "RADIANCE_PP_BAND=1", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_LEAD_SEG=1",
+                               "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_SEG_ROWS=16" })
+            env.push_back(v);
+        env.push_back(std::string("RADIANCE_PP_LEAD_SEG_FORM=") + a.form);
+        if (a.on) env.push_back("RADIANCE_PP_LEAD_SEG_BAND=1");
+        if (a.fol_order) env.push_back("RADIANCE_PP_FOL_ORDER=2");
+        if (a.fseg)
+            for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
+                env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        pp.model = world6().llama_rad;
+        REQUIRE(pp.start("2,5", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port), got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long band = -1, segd = -1, off = -1;
+        const char* okey = " fresh BG steps ran W(h, t)'s under pp_lead_seg + 256 (no band passes, tp8 loop D36)";
+        if (const size_t at = llog.rfind(okey); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                off = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        const char* key = " lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                band = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        const char* skey = " band steps ran their head in segments (RADIANCE_PP_LEAD_SEG_BAND=1, tp8 loop D36)";
+        if (const size_t at = llog.rfind(skey); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                segd = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        fprintf(stderr, "    LEAD_SEG_BAND %s, form %s, %d lanes BG %d W(2,5)%s%s (6-layer llama): %d of %zu requests differ; %lld band "
+                        "passes, %lld of them with the head in segments; %lld fresh BG steps kept W(2,5)'s by + 256\n",
+                a.on ? "on" : "unset", a.form, a.lanes, a.k, a.fseg ? " + follower segments" : "", a.fol_order ? " + FOL_ORDER 2" : "",
+                differ, ref.size() + ref_b.size(), band, segd, off);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("is not taken") == std::string::npos);
+        if (std::atoi(a.form) & 256) {   /* the no-band control: band passes 0, the steps counted */
+            CHECK_EQ(band, 0LL);
+            CHECK(off > 0);
+            continue;
+        }
+        CHECK(band > 0);
+        CHECK_EQ(off, -1LL);
+        if (a.on) {
+            CHECK(llog.find("RADIANCE_PP_LEAD_SEG_BAND=1 -- a band step's head runs in segments too, the last one [1, 3)") !=
+                  std::string::npos);
+            CHECK(segd > 0);
+            seg_all += std::max(0LL, segd);
+        } else {
+            CHECK_EQ(segd, -1LL);   /* the switch unset: no line, every band head whole */
+        }
+    }
+    fprintf(stderr, "    band heads in segments, all arms: %lld\n", seg_all);
+    CHECK(seg_all > 0);
 }
 
 /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS=N -- a newcomer the BG lanes have no room for is held out of its home's step (that step

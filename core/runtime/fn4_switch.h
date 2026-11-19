@@ -461,6 +461,9 @@
  *                   start with RADIANCE_PP_LEAD_SEG=1 compares k = 1 / 2 / 3 / 5 (v = 2, 34, 50, 82). Needs RADIANCE_PP_LEAD_SEG=k
  *                   on the leader at start (else only 0 is taken); its start value RADIANCE_PP_LEAD_SEG_FORM (default 1 =
  *                   today's M9 with the env set). Order of issue only, never a step's composition (rule A, as M9).
+ *                   + 256 (tp8 loop D36): no band passes -- under RADIANCE_PP_BAND=1 a fresh BG step runs W(h, t)'s (the band layers
+ *                   stay declared), so one start compares P28's band (with RADIANCE_PP_LEAD_SEG_BAND=1: its head in these segments)
+ *                   with none: v = 2 vs 258, 0 vs 256.
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all

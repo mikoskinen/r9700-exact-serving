@@ -840,7 +840,10 @@ void Engine::rank_loop(int index) {
              * between passes on this thread, so they are the ones run_step resolves. */
             const bool ml_pass = ml && what != kIssueSampler && b->enc == 0;
             if (ml_pass) missl_issued(r, *ml, *b);
+            const bool hiss = index == 0 && hiss_want_ && what != kIssueSampler;   /* tp8 loop D37 */
+            if (hiss) hiss_t0_ = rad_mono_ns();
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if (hiss) hiss_t1_ = rad_mono_ns();
             if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());

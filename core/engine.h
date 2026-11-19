@@ -475,7 +475,7 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0);
     /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
      * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
      * (StepHdr flags bit 2), the follower's parts start at h + k */
@@ -484,6 +484,12 @@ private:
     int64_t pp_band_n_ = 0;
     int64_t pp_band_max_rows_ = 2047;   /* RADIANCE_PP_BAND_MAX_ROWS: a band step's rows at most */
     int  pp_band_step(int lane, const RadBatch* b);
+    /* tp8 loop D36: the band the lane loop already chose for the step lane_head releases next (-1: lane_head asks
+     * pp_band_step itself), so a step's band is decided once -- RADIANCE_PP_BAND_MIN_SEQS's count stays one a step */
+    int  pp_band_pre_ = -1;
+    int64_t pp_band_seg_n_ = 0;   /* tp8 loop D36: band steps whose head ran in segments (RADIANCE_PP_LEAD_SEG_BAND=1) */
+    bool pp_band_off_ = false;    /* tp8 loop D36: fn4 pp_lead_seg + 256 at the step being planned -- no band pass */
+    int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);
@@ -500,7 +506,7 @@ private:
      * layer segments with other lanes' parts between them -- its head [0, h) as segments [s0, s1) (the first takes the
      * release, the restores and holds the frame; the last ships it, then X1), its tail [t, n) as model-part segments, the
      * last one with the sampler, drafter and step end (lane_tail_issue from `tail_seg0_`, RAD_PP_SEG_END). */
-    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last);
+    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0, int lflags = 0);
     int  lane_tail_seg(int lane, const RadBatch* b, int s0, int s1);
     int  tail_seg0_ = 0;
     /* ... the held frame of the lane's step (pp_ship's bytes, built at its first head segment so it carries that release's
@@ -522,6 +528,11 @@ private:
      * on its rank threads, so issue..join is its run. */
     FILE* pp_stamps_ = nullptr;
     uint64_t pp_stamp_n_ = 0;
+    /* tp8 loop D37 (with RADIANCE_PP_STAMPS, the leader): a whole head part's issue on rank 0's thread -- set by lane_head before
+     * the release, the times written by rank 0 (its run_step's entry and return), read after the join (the barrier orders
+     * both); lane_head stamps them as 'hiss LANE STEP entry return' beside the 'head' stamp (release .. X1) */
+    bool hiss_want_ = false;
+    uint64_t hiss_t0_ = 0, hiss_t1_ = 0;
     void  pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1);
     /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1, the leader): a lone prefill's chunks on rank 0's card -- card-local event
      * times around every head and tail part, the host's time a chunk -- one line a prompt at its first token

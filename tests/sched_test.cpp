@@ -3540,7 +3540,7 @@ TEST(pp_fol_reserve_is_the_followers_switch_checked_against_its_boundaries) {
 }
 
 /* tp8 loop D32 (DECODE round 25): pp_lead_seg is 94, the last, the LEADER's engine switch (not the follower's, not a plugin's, not
- * the scheduler's); form + 16 x stride with form 0 / 1 / 2; any value on a node that registered nothing; a leader that took no
+ * the scheduler's); form + 16 x stride with form 0 / 1 / 2 (+ 256: no band passes, tp8 loop D36); any value on a node that registered nothing; a leader that took no
  * boundary (registered 0) takes 0 only and names RADIANCE_PP_LEAD_SEG; one that took them takes every form and stride. */
 TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     const int i = fn4::switch_index("pp_lead_seg");
@@ -3555,7 +3555,19 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK(fn4::check("pp_lead_seg", 34, &err));       /* decode first, every 2nd boundary */
     CHECK(!fn4::check("pp_lead_seg", 3, &err));
     CHECK(err.find("pp_lead_seg takes form + 16 x stride") != std::string::npos);
-    CHECK(!fn4::check("pp_lead_seg", 256, &err));
+    CHECK(fn4::check("pp_lead_seg", 256, &err));      /* tp8 loop D36: + 256 = no band passes */
+    CHECK(fn4::check("pp_lead_seg", 258, &err));
+    CHECK(!fn4::check("pp_lead_seg", 259, &err));
+    CHECK(err.find("+ 256 = no band passes") != std::string::npos);
+    /* tp8 loop D40: + 8 = the tail whole, + 512 = the SP word on the head's segments; 3 / 11 / 1024 refused */
+    CHECK(fn4::check("pp_lead_seg", 10, &err));       /* decode first, tail whole */
+    CHECK(fn4::check("pp_lead_seg", 74, &err));       /* decode first, every 4th, tail whole */
+    CHECK(fn4::check("pp_lead_seg", 512, &err));
+    CHECK(fn4::check("pp_lead_seg", 546, &err));      /* 34 + 512 */
+    CHECK(fn4::check("pp_lead_seg", 1023 - 5, &err)); /* 1018 = 2 + 8 + 16 x 15 + 256 + 512 */
+    CHECK(!fn4::check("pp_lead_seg", 11, &err));
+    CHECK(!fn4::check("pp_lead_seg", 1024, &err));
+    CHECK(err.find("+ 8 = the tail whole, + 512 = the SP word") != std::string::npos);
     CHECK(!fn4::check("pp_lead_seg", -1, &err));
     fn4::lead_seg_register(false);
     CHECK(fn4::check("pp_lead_seg", 0, &err));
