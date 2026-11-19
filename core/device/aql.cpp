@@ -61,6 +61,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -2158,9 +2159,16 @@ struct Stamps {
     size_t       made = 0;
     std::deque<StampRow> rows;       /* issued, times not read yet */
     std::unordered_map<uint64_t, std::string> names;
+    /* tp8 loop D43 (RADIANCE_AQL_STAMP_DRAIN=1): a thread of its own reads the signals and writes the lines; the plays on
+     * card 0 then only take signals. Unset: a play reads them (as before), on the issuing rank thread, before its first
+     * packet. With the thread, `names` and `out` are the thread's alone until stamps_at_exit has joined it. */
+    bool         drain_th = false;
+    std::atomic<bool> th_stop{ false };
+    std::thread  th;
 };
 
 void stamps_at_exit();
+void stamps_drain_loop(Stamps* st);
 
 Stamps& stamps() {
     static Stamps* st = [] {
@@ -2172,6 +2180,14 @@ Stamps& stamps() {
         if (x->every) {
             RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card 0, "
                      "into %s", x->every, x->path.c_str());
+            /* tp8 loop D43: the reading off the plays' thread (the thread never calls stamps(): it is given x) */
+            const char* d = std::getenv("RADIANCE_AQL_STAMP_DRAIN");
+            x->drain_th = d && std::atoi(d) > 0;
+            if (x->drain_th) {
+                x->th = std::thread(stamps_drain_loop, x);
+                RAD_WARN("device: RADIANCE_AQL_STAMP_DRAIN=1 -- a thread of its own reads the stamps' signals and writes the "
+                         "lines; card 0's plays only take signals (tp8 loop D43)");
+            }
             std::atexit(stamps_at_exit);
         }
         return x;
@@ -2247,8 +2263,61 @@ void stamps_read(Stamps& st, bool wait) {
     if (wrote) std::fflush(st.out);
 }
 
+/* tp8 loop D43 (RADIANCE_AQL_STAMP_DRAIN=1): stamps_read's work on a thread of its own, every ~0.5 ms. Why (loop FINDINGS
+ * DECODE note 23:5x 19.11.): under the lock, a play's StampRun::begin read every signal that had reached 0 since the last
+ * play on card 0 -- a profiling-time call, a kernel-name lookup and a CSV line each -- on the rank thread that was about to
+ * write its first packet, so a pass that followed a few hundred stamped dispatches (a decode head after the tail, the
+ * drafter and the query pass) started on the card only after that read: the stamped runs' 'release -> the head's first
+ * kernel' (0.68-0.73 ms p50, lq198) is most likely that read (H: RADIANCE_PP_HEAD_PHASES's line in a stamped and an
+ * unstamped start tells), not the engine's issue. Here the lock is held only to take the
+ * finished rows off the queue and to give their signals back; the times are read and the lines written outside it.
+ * The same rows, in the same order, the same line format. */
+void stamps_drain_loop(Stamps* sp) {
+    Stamps& st = *sp;
+    std::vector<StampRow> got;
+    while (!st.th_stop.load(std::memory_order_acquire)) {
+        got.clear();
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            while (!st.rows.empty() && hsa_signal_load_scacquire(st.rows.front().h) == 0) {
+                got.push_back(st.rows.front());
+                st.rows.pop_front();
+            }
+        }
+        if (got.empty()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            continue;
+        }
+        /* Out of the pool until handed back below, so no play can reuse a signal before its times are read. */
+        const bool file = stamps_file(st);
+        for (const StampRow& w : got) {
+            hsa_amd_profiling_dispatch_time_t t{};
+            const bool timed = hsa_amd_profiling_get_dispatch_time(G().dev[0].agent, w.h, &t) ==
+                               HSA_STATUS_SUCCESS;
+            if (!file) continue;
+            std::fprintf(st.out, "%" PRIu64 ",%d,%u,%s,%d,%d,", w.pass, w.seq, w.queue,
+                         stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
+            if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
+            else std::fputc(',', st.out);
+            std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+        }
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            for (const StampRow& w : got)
+                if (w.own) st.free.push_back(w.h);
+        }
+        for (const StampRow& w : got)
+            if (!w.own) stamp_hold(w.h, false);
+        if (file) std::fflush(st.out);
+    }
+}
+
 void stamps_at_exit() {
     Stamps& st = stamps();
+    if (st.th.joinable()) {   /* tp8 loop D43: the thread's last lines first; then the rest as before */
+        st.th_stop.store(true, std::memory_order_release);
+        st.th.join();
+    }
     std::lock_guard<std::mutex> lk(st.mu);
     stamps_read(st, true);
     if (st.out) std::fclose(st.out);
@@ -2271,7 +2340,7 @@ struct StampRun {
         Stamps& st = stamps();
         if (!st.every || from >= to || t->rec[(size_t)from].s->ord != 0) return;
         std::lock_guard<std::mutex> lk(st.mu);
-        stamps_read(st, false);
+        if (!st.drain_th) stamps_read(st, false);   /* tp8 loop D43: with the drain thread, the thread reads them */
         if (from == 0) {
             st.tape = ++st.passes % (uint64_t)st.every == 0 ? t : nullptr;
             st.play = 0;
