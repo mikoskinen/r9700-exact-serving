@@ -930,6 +930,7 @@ struct Model {
     rad_buf rband_key = 0;
     rad_op rband_cp = 0, rband_st = 0, pp_x1r = 0, pp_x1k = 0;
     rad_op pp_x1k_sh = 0;   /* WIP step 3: pp_x1k row-sharded (an SP pass's X1 under RADIANCE_DS41_SPHC_X1) */
+    rad_op pp_x1r_sh = 0;   /* step 4: pp_x1r row-sharded (a reverse pass whose layer h - 2 / h - 1 is SP) */
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -956,6 +957,10 @@ static thread_local bool t_lsp = false;
  * RadPpInfo.reserved[2]: the declared j, 0 none) -- the follower's layers end at t - j (X2 of W(h, t - j), then layer t - j's
  * key chain only), the leader's tail starts at t - j */
 static thread_local bool t_tband = false;
+/* tp8 loop P41 step 4: the pass being issued is a REVERSE pass (pp_part reads the engine's word, RadPpInfo.reserved[3]: the
+ * declared band layer l = h - 1, 0 none) -- the leader's head ends at l (X1 of W(l, t) after l - 1, then layer l's key chain
+ * only), the follower runs from l */
+static thread_local bool t_rrev = false;
 static const Layer* next_layer(const Model& m, int l) {
     if (!m.lr.on) return l + 1 < m.c.n_layer ? &m.layers[(size_t)l + 1] : nullptr;
     /* tp8 loop P28 round 2c: a band pass's leader runs [h - 1, h + k - 1) into the band's next layer, as one process */
@@ -5793,9 +5798,9 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         /* tp8 loop P41 WIP step 2: the head band on the follower (both nodes read the same value; declare only) */
         if (const char* rv = std::getenv("RADIANCE_DS41_PP_RBAND"); rv && !std::strcmp(rv, "1")) {
             std::string e4;
-            if (m.band_k > 0 || m.tband_j > 0) {
+            if (m.band_k > 0 || m.tband_j > 0 || m.pp_ids) {
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 is not taken beside RADIANCE_DS41_PP_BAND / "
-                                "RADIANCE_DS41_PP_TBAND (tp8 loop P41)\n");
+                                "RADIANCE_DS41_PP_TBAND / RADIANCE_PP_ISSUE_AHEAD's X1 ids (tp8 loop P41)\n");
             } else if (ds41layers::head_rband_crossing(lr_geo(m), m.pp_h, m.pp_t, &m.rb, &e4) < 0) {
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 is not taken: %s (tp8 loop P41)\n", e4.c_str());
                 m.rb = ds41layers::RBand{};
@@ -6030,6 +6035,7 @@ static bool pp_rbandk_pass(const Model& m, const RadBatch* b) {
     return DT < b->n_tok;
 }
 static std::atomic<long long> g_rbk_passes{0}, g_rbk_rows{0};
+static std::atomic<long long> g_rrev_kvo{0}, g_rrev_rows{0}, g_rrev_fol{0};   /* tp8 loop P41 step 4 */
 /* ... and whether a pass crosses in it: no tail band pass, every row a decode row (both nodes decide from the same batch) */
 static bool pp_tcopy_pass(const Model& m, const RadBatch* b, bool tband_pass) {
     if (!m.tcopy || tband_pass || !b || b->n_tok <= 0) return false;
@@ -6646,6 +6652,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * window + max_spec positions came over decode-only passes' X2 (or band passes) */
             if (m.tcopy) rad_pp_declare_tail_copy((int)(c.window + m.g.max_spec));
         }
+        /* tp8 loop P41 step 4: the engine may mark reverse passes (fn4 pp_rband / RADIANCE_PP_RBAND_EVERY on the leader; both nodes
+         * declare the same layer from the same env; unset: never called) */
+        if (m.rband) rad_pp_declare_rband(m.rb.l);
     }
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
@@ -6899,9 +6908,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         /* tp8 loop P41 WIP step 2: the follower's receive of a reverse pass's X1 before layer h - 1, and of a normal prompt pass's
          * X1 before layer h with the store of layer h - 1's key rows into its own window pages of that layer */
-        if (m.rband && m.pp_rank == 1 && l == m.rb.l &&
-            !(m.pp_x1r = pp_stage_op_v(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r))))
-            return RAD_E_INVAL;
+        if (m.rband && m.pp_rank == 1 && l == m.rb.l) {
+            if (!(m.pp_x1r = pp_stage_op_v(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r)))) return RAD_E_INVAL;
+            if (m.sphc > 0 && sphc_x1_env()) m.pp_x1r_sh = pp_stage_op_vs(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r));   /* step 4 */
+        }
         if (m.rband && m.pp_rank == 1 && l == m.pp_h) {
             if (!(m.pp_x1k = pp_stage_op_v(b, m, RAD_PP_X1, ds41_rbandk_liveset(m)))) return RAD_E_INVAL;
             if (!(m.rband_st = window_key_store(b, T, c.head_dim, m.w8, m.rband_key))) return RAD_E_INVAL;
@@ -6926,9 +6936,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         /* tp8 loop P41 WIP step 2: the leader's reverse X1 after layer h - 2 (layer h - 1's key chain issued before it), and after
          * layer h - 1 its copy of the layer's key rows + a normal prompt pass's X1 (W(h, t)'s + those rows) */
-        if (m.rband && m.pp_rank == 0 && l == m.rb.l - 1 &&
-            !(m.pp_x1r = pp_stage_op_v(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r))))
-            return RAD_E_INVAL;
+        if (m.rband && m.pp_rank == 0 && l == m.rb.l - 1) {
+            if (!(m.pp_x1r = pp_stage_op_v(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r)))) return RAD_E_INVAL;
+            if (m.sphc > 0 && sphc_x1_env()) m.pp_x1r_sh = pp_stage_op_vs(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r));   /* step 4 */
+        }
         if (m.rband && m.pp_rank == 0 && l == m.rb.l) {
             m.rband_cp = op(b, "cast", { RAD_RANGE("M", 1, T), RAD_INT("n", c.head_dim), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
                             {}, { m.kvn }, { m.rband_key });
@@ -8591,13 +8602,20 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
     /* tp8 loop P41 WIP step 3: a pass with prompt rows under RADIANCE_DS41_PP_RBAND crosses X1 in the keys form -- W(h, t)'s
      * parts + layer h - 1's window-key rows (the leader's m.kvn after that layer: never cut, whole after SP's kv gather) --
      * row-sharded where the pass's X1 is; the follower stores the key rows into its own window pages of layer h - 1 */
-    const bool rk = ring == RAD_PP_X1 && !bx && pp_rbandk_pass(m, batch);
+    /* tp8 loop P41 step 4: a reverse pass's X1 is W(l, t)'s (l = h - 1: layer l's input rows), row-sharded where the pass's is */
+    const bool rr = ring == RAD_PP_X1 && t_rrev;
+    if (rr && (bx || !(sh ? m.pp_x1r_sh : m.pp_x1r))) {
+        rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_RBAND: a reverse pass's X1 is not declared (or not row-sharded where the pass's "
+                         "X1 is)");
+        return false;
+    }
+    const bool rk = ring == RAD_PP_X1 && !bx && !rr && pp_rbandk_pass(m, batch);
     if (rk && (!(sh ? m.pp_x1k_sh : m.pp_x1k) || (m.pp_rank == 0 ? !m.rband_cp : !m.rband_st))) {
         rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_RBAND: X1's keys form is not declared (or not row-sharded where the pass's "
                          "X1 is)");
         return false;
     }
-    const rad_op op_ = bx ? m.pp_x1b : rk ? (sh ? m.pp_x1k_sh : m.pp_x1k) : bt2 ? m.pp_x2t : tc ? m.pp_x2c
+    const rad_op op_ = bx ? m.pp_x1b : rr ? (sh ? m.pp_x1r_sh : m.pp_x1r) : rk ? (sh ? m.pp_x1k_sh : m.pp_x1k) : bt2 ? m.pp_x2t : tc ? m.pp_x2c
                      : ring == RAD_PP_X1 ? (sh && m.pp_x1_sh ? m.pp_x1_sh : m.pp_x1)
                                          : (sh && m.pp_x2_sh ? m.pp_x2_sh : m.pp_x2);   /* P20 r3 / P36: `sh` */
     /* the ring read at every issue (tp8 S5: each lane has its own) */
@@ -8622,7 +8640,8 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
     /* tp8 loop D46 step 2: the follower's layer t - 1 window keys (m.kvn, every row: a decode pass is never cut) into tkey first */
     if (tc && m.pp_rank == 1) RAD_ISSUE_N(x, m.tcopy_cp, T, brows(m.kvn, T), brows(m.tkey, T));
     if (rk && m.pp_rank == 0) RAD_ISSUE_N(x, m.rband_cp, T, brows(m.kvn, T), brows(m.rband_key, T));   /* tp8 loop P41 */
-    for (const CutPart& p : bx ? ds41_band_liveset(m) : rk ? ds41_rbandk_liveset(m) : bt2 ? ds41_cut_liveset_cx(m, m.tband.x2)
+    for (const CutPart& p : bx ? ds41_band_liveset(m) : rr ? ds41_cut_liveset_cx(m, m.rb.x1r) : rk ? ds41_rbandk_liveset(m)
+                            : bt2 ? ds41_cut_liveset_cx(m, m.tband.x2)
                             : tc ? ds41_tcopy_liveset(m) : ds41_cut_liveset(m, ring)) {
         if (p.rows == CutRows::Ids) o.push_back(praw(batch->token_ids, RAD_I32, T));   /* tp8 dev D10 round 2 */
         else if (p.rows == CutRows::Step) o.push_back(brows(p.b, T));
@@ -8725,7 +8744,7 @@ static bool band_store_issue(RadCtx* x, Model& m, const RadBatch* batch) {
 static thread_local bool t_seg = false;
 static thread_local int t_seg0 = 0, t_seg1 = 0;
 /* tp8 loop P28 round 2c: where X1 crosses in the pass being issued: h, or h + k on a band pass */
-static int pp_he(const Model& m) { return m.pp_h + (t_band ? m.band_k : 0); }
+static int pp_he(const Model& m) { return m.pp_h + (t_band ? m.band_k : 0) - (t_rrev ? 1 : 0); }   /* tp8 loop P41: h - 1 */
 /* tp8 loop D39 step 2c: where X2 crosses in the pass being issued: t, or t - j on a tail band pass */
 static int pp_te(const Model& m) { return m.pp_t - (t_tband ? m.tband_j : 0); }
 static int seg_index(const Model& m, int s) {
@@ -8784,8 +8803,11 @@ static int pp_part(const Model& m) {
     t_band = false;
     t_lsp = false;
     t_tband = false;
+    t_rrev = false;
     if (!m.pp) return RAD_PP_PART_WHOLE;
     const RadPpInfo p = rad_pp_query();
+    /* tp8 loop P41 step 4: the engine's reverse band word (0 from an engine before P41, and on every pass not marked) */
+    t_rrev = m.rband && m.rb.l > 0 && p.reserved[3] == m.rb.l;
     /* tp8 loop P28 round 2c: the engine's band word (0 from an engine before P28: never a band pass) */
     t_band = m.band_k > 0 && p.reserved[0] == m.band_k;
     /* tp8 loop D39 step 2c: the engine's tail band word (0 from an engine before D39, and on every pass not marked) */
@@ -8821,6 +8843,9 @@ static bool pp_part_layer(const Model& m, int part, int l) {
  * at t - j (the whole pass, or its last segment) issues layer t - j after X2 up to its window-key store (the decode owner's
  * keys from its own rows: the ops and launches the whole layer issues first, over the same rows); -1 every other part */
 static int pp_kvo_layer(const Model& m, int part) {
+    /* tp8 loop P41 step 4: a reverse pass's leader head (whole: the engine never reverses a segmented head) issues layer l's key
+     * chain after X1 of W(l, t) left */
+    if (t_rrev && m.pp_rank == 0) return part == RAD_PP_PART_HEAD && !t_seg ? m.rb.l : -1;
     if (!t_tband || m.pp_rank != 1) return -1;
     if (part == RAD_PP_PART_SEG ? t_seg1 != pp_te(m) : part != RAD_PP_PART_WHOLE) return -1;
     return pp_te(m);
@@ -9502,11 +9527,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         for (int i = 0; i < (int)m.layers.size(); ++i) {
             const Layer& L = m.layers[(size_t)i];
             ds41sp::Layer& d = spl[(size_t)i];
-            d.issued = m.lr.held(L.l) && sp_in_part(i) && L.l == i;
+            d.issued = (m.lr.held(L.l) || (t_rrev && m.pp_rank == 1 && m.rband_decl[(size_t)i])) && sp_in_part(i) && L.l == i;   /* P41 */
             if (!d.issued) continue;
             const Layer* nx = next_layer(m, L.l);
             const int ni = nx ? (int)(nx - m.layers.data()) : -1;
-            if (nx && ni == nx->l && m.lr.held(nx->l) && sp_in_part(ni)) {
+            if (nx && ni == nx->l && (m.lr.held(nx->l) || (t_rrev && m.pp_rank == 1 && m.rband_decl[(size_t)ni])) && sp_in_part(ni)) {
                 d.next = ni;
                 d.next_pcn_a = nx->pcn_a != 0;
             }
@@ -9516,12 +9541,16 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const int so = sp_segp    ? (L.l == pp_te(m) - 1 ? RAD_PP_X2 : -1)   /* tp8 loop D39: t - j - 1 on a tail band pass */
                            : sp_lsegp ? (m.pp_h > 0 && L.l == pp_he(m) - 1 ? RAD_PP_X1 : -1)   /* D40: the whole head's X1 */
                                       : pp_send_after(m, L.l);
-            d.out_sharded = (so == RAD_PP_X1 && m.pp_x1_sh != 0) ||
+            d.out_sharded = (so == RAD_PP_X1 && (t_rrev ? m.pp_x1r_sh : m.pp_x1_sh) != 0) ||   /* tp8 loop P41: X1r's */
                             (so == RAD_PP_X2 && m.pp_x2_sh != 0 && !t_tband);   /* tp8 loop P36: X2 row-sharded */
             d.self_ok = L.ar_attn && !L.tap && (so < 0 || d.out_sharded) && !sp_may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
                         !mo.op_shared_ar && !mo.op_combine && !mo.op_add && mo.issues_ar(T, T);
         }
         ds41sp::plan(spl, spv);
+        /* tp8 loop P41 step 4: a reverse pass's leader key-chain layer l after an SP layer l - 1 whose X1 left row-sharded: its
+         * collapse + norm over this rank's quarter (issued at l - 1's end as the plan has it), q_a / kv over the quarter and
+         * gathered (P26) or xn gathered, then the window keys over every row -- no stream's gather */
+        if (t_rrev && m.pp_rank == 0 && m.rb.l > 0 && spv[(size_t)m.rb.l - 1] != 0 && m.lr.held(m.rb.l)) spv[(size_t)m.rb.l] = 1;
     }
     bool h_sh = false, xn_sh = false;
     /* tp8 loop P20: the SP line at the pass's every exit (a pipeline part returns at its crossing out, before the loop's end:
@@ -9651,8 +9680,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
          * layer t - j's key chain only (kvo) */
         const int li_ = (int)(&L - m.layers.data());
         const bool tband_l = t_tband && m.pp_rank == 0 && m.tband_j > 0 && m.tband_decl[(size_t)li_];
+        /* tp8 loop P41 step 4: a reverse pass's follower issues the band layer l too */
+        const bool rband_l = t_rrev && m.pp_rank == 1 && m.rband_decl[(size_t)li_];
         const bool kvo = li_ == kvo_l && m.lr.held(li_);
-        const bool held = (m.lr.held(L.l) || band_l || tband_l) && (pp_part_layer(m, part, li_) || kvo);
+        const bool held = (m.lr.held(L.l) || band_l || tband_l || rband_l) && (pp_part_layer(m, part, li_) || kvo);
         const int l = held ? L.l : (int)(&L - m.layers.data());
         const int64_t r = held ? L.r : c.ratio[(size_t)l];
         if (held) pfl.layer(l);   /* tp8 loop P42: this layer's start on rank 0's stream (a receive is split off below) */
@@ -9664,8 +9695,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             int64_t lo = 0, hi = 0;
             live_span(&lo, &hi);
             /* tp8 loop P20 round 4: X1 into an SP layer lands row-sharded (each rank its quarter of the residual parts) */
-            const bool x1r_sh = ring == RAD_PP_X1 && m.pp && m.pp_rank == 1 && m.pp_x1_sh && held &&
-                                spv[(size_t)(&L - m.layers.data())] != 0 && lo == 0 && hi == T;
+            const bool x1r_sh = ring == RAD_PP_X1 && m.pp && m.pp_rank == 1 && (t_rrev ? m.pp_x1r_sh : m.pp_x1_sh) && held &&
+                                spv[(size_t)(&L - m.layers.data())] != 0 && lo == 0 && hi == T;   /* tp8 loop P41: X1r's */
             /* tp8 loop P25: a segment boundary after an SP layer (the plan's layer before this one) holds the streams
              * row-sharded: the boundary op over this rank's quarter, as the whole pass issues it at that layer's end; 2 restores
              * only the quarter */
@@ -9679,6 +9710,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh || (seg_hsh && sp_segp && sp_seg >= 2))) return;   /* D40: whole */
             if (x1r_sh && rad_rank(x) == 0) g_sp_x1.fetch_add(1, std::memory_order_relaxed);
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
+            if (ring == RAD_PP_X1 && t_rrev && rad_rank(x) == 0) {   /* tp8 loop P41 step 4: the follower from layer l */
+                const long long n = g_rrev_fol.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n == 1 || n % 64 == 0)
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 (tp8 loop P41): %lld reverse passes ran this follower "
+                                    "from layer %d (X1 of W(%d,%d)); this one step %d, %lld rows%s%s\n", n, l, l, m.pp_t, batch->step,
+                            (long long)T, x1r_sh ? ", X1 row-sharded" : "", t_seg ? ", in segments" : "");
+            }
             pfl.layer(ds41pfl::kRx + l);   /* tp8 loop P42: the receive's end (its wait + copy in = "rx<l>", the layer's ops after it) */
             if (ring == RAD_PP_X2 && t_tband && rad_rank(x) == 0) {   /* tp8 loop D39 step 2c: the leader's tail from t - j */
                 const long long n = g_tband_tail.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -10179,7 +10217,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_TBAND: a key-chain layer that is a kv source (a declare defect)");
                     return;
                 }
-                if (rad_rank(x) == 0) {
+                if (rad_rank(x) == 0 && t_rrev) {   /* tp8 loop P41 step 4: the leader's key chain of a reverse pass */
+                    const long long n = g_rrev_kvo.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const long long rr = g_rrev_rows.fetch_add(T, std::memory_order_relaxed) + T;
+                    if (n == 1 || n % 64 == 0)
+                        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 (tp8 loop P41): %lld reverse passes' heads ended on "
+                                        "this leader after X1 of W(%d,%d) with layer %d's key chain (its window keys from its own rows), %lld "
+                                        "rows; this one step %d, %lld rows%s\n", n, l, m.pp_t, l, rr, batch->step, (long long)T,
+                                sp_l ? ", the key chain sequence-parallel" : "");
+                } else if (rad_rank(x) == 0) {
                     const long long n = g_tband_kvo.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (n == 1 || n % 256 == 0)
                         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND=%d (tp8 loop D39): %lld tail band passes ended on this "
@@ -10776,7 +10822,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             live_span(&lo, &hi);
             /* tp8 loop P20 round 3: an SP layer's X1 leaves row-sharded (its rows are the pass's [0, T): the shard's rows);
              * tp8 loop P36: so does the follower's X2 (the plan took t - 1 only where it resolved, never on a tail band pass) */
-            const bool x1_sh = sp_l && ((ring == RAD_PP_X1 && m.pp_x1_sh) || (ring == RAD_PP_X2 && m.pp_x2_sh && !t_tband));
+            const bool x1_sh = sp_l && ((ring == RAD_PP_X1 && (t_rrev ? m.pp_x1r_sh : m.pp_x1_sh)) ||   /* tp8 loop P41: X1r's */
+                                        (ring == RAD_PP_X2 && m.pp_x2_sh && !t_tband));
             if (x1_sh && (lo != 0 || hi != T)) {
                 rad_step_fail(x, ring == RAD_PP_X1 ? "deepseek41: RADIANCE_DS41_SPHC_X1: an SP pass's X1 rows are not the pass's (a plan defect)"
                                                    : "deepseek41: RADIANCE_DS41_SPHC_X2: an SP pass's X2 rows are not the pass's (a plan defect)");
@@ -10812,7 +10859,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* tp8 loop D39 step 2c: a tail band pass's follower goes on past X2 of W(h, t - j) into layer t - j's key chain: the
              * end-of-layer op below (the next layer's fused post + collapse + norm over this layer's rows) is the one the whole
              * pass issues here, and it reads what X2 has already packed */
-            if (!(ring == RAD_PP_X2 && kvo_l >= 0 && kvo_l == L.l + 1)) {
+            /* tp8 loop P41 step 4: a reverse pass's leader head goes on past X1 of W(l, t) into layer l's key chain likewise */
+            if (!((ring == RAD_PP_X2 || (ring == RAD_PP_X1 && t_rrev && m.pp_rank == 0)) && kvo_l >= 0 && kvo_l == L.l + 1)) {
                 bt_flush(x, m, batch);
                 return;
             }
@@ -10999,6 +11047,17 @@ static void step(RadCtx* x, const RadBatch* batch) {
             return;
         }
     }
+    /* tp8 loop P41 step 4: a REVERSE pass (the engine's word: a lone prompt chunk) is step_bi's too, as its one segment */
+    if (m.rband && m.pp && batch->draft_pass == 0 && batch->n_seq == 1 && rad_pp_query().reserved[3] == m.rb.l) {
+        int64_t Dn = 0, DT = 0;
+        batch_split(batch, &Dn, &DT);
+        if (Dn == 0) {
+            static thread_local std::vector<BiSeg> ps3(1);
+            ps3[0] = BiSeg{ 0, batch->n_tok, 0, 1, false, -1 };
+            step_bi(x, m, batch, ps3, true);
+            return;
+        }
+    }
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
@@ -11022,6 +11081,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * send -- or its tail -- the prologue's per-step tables again, X2's receive at layer t and everything after. One lane,
      * the follower, one machine: the whole pass. */
     const int part = pp_part(m);
+    if (t_rrev) {   /* tp8 loop P41 step 4: routed to step_bi above (a lone prompt); anything else is a plan defect */
+        rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_RBAND: a reverse pass reached the unsegmented step (not a lone prompt chunk)");
+        return;
+    }
     if (t_band) {   /* tp8 loop P28 round 2c: the band's crossing and casts are step_bi's (lever BI / PSK route every band pass there) */
         rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_BAND: a band pass reached the unsegmented step (ds41_bi 0 and no PSK plan)");
         return;
