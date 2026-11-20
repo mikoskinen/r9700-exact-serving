@@ -4715,6 +4715,92 @@ static void router_gemm_fused_case(const Plugin& pl) {
     rg->fini(inst);
 }
 
+/* qfn-on-ds (Qwen loop round 2, 20.11.2026): --perfrg M [iters] -- the Qwen tp4 decode router at M token rows, timed in its
+ * parts. The engine runs router_gemm_topk_scatter_inv (one launch: the router GEMM over every block, the shared gate as one
+ * more block, then the selection and sort in the last-arriving block) at 14.4 / 19.0 / 47.2 us a call at 32 / 64 / 128 rows
+ * (gpu02 card-0 stamps, prof1s): this prints, at Qwen's rank shape (512 experts, K 2560, top 10, this rank's 128 experts,
+ * the shared gate), the fused launch, the router GEMM alone (gemm_bf16_nt_m64, the unfused launch the fused GEMM part
+ * reproduces, at <= 64 rows; above, the fused op's own GEMM has no unfused twin and the line says so), the gate GEMM alone,
+ * and the selection + sort alone (router_topk_scatter), each warm (back to back, mean) or --cold. Nothing is compared. */
+static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
+    if (iters <= 0) iters = 200;
+    const RadKernelInfo* rgi = find(pl, "router_gemm_topk_scatter_inv_bf16");
+    const RadKernelInfo* m16 = find(pl, "gemm_bf16_nt_m16");
+    const RadKernelInfo* m64 = find(pl, "gemm_bf16_nt_m64");
+    const RadKernelInfo* rf  = find(pl, "router_topk_scatter_bf16");
+    if (!rgi || !m16 || !m64 || !rf) { std::printf("--perfrg: a row is absent\n"); return; }
+    if (M < 1 || M > 128) { std::printf("--perfrg: 1 <= M <= 128\n"); return; }
+    const int64_t ne = 512, K = 2560, k = 10, nl = 128, NS = M * k;
+    uint64_t rs64 = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { rs64 ^= rs64 << 13; rs64 ^= rs64 >> 7; rs64 ^= rs64 << 17; return rs64; };
+    auto uni = [&](float lo, float hi) {
+        return lo + (hi - lo) * (float)((rnd() >> 40) & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    };
+    std::vector<uint16_t> ha((size_t)(M * K)), hw((size_t)(ne * K)), hwg((size_t)K);
+    for (auto& v : ha)  v = h_to_bf16(uni(-2.0f, 2.0f));
+    for (auto& v : hw)  v = h_to_bf16(uni(-0.06f, 0.06f));
+    for (auto& v : hwg) v = h_to_bf16(uni(-0.06f, 0.06f));
+    void* d_a = dalloc(ha.size() * 2); void* d_w = dalloc(hw.size() * 2); void* d_wg = dalloc(hwg.size() * 2);
+    void* d_lg = dalloc((size_t)(M * ne * 2)); void* d_g = dalloc((size_t)(M * 2));
+    void* d_id = dalloc((size_t)(NS * 4)); void* d_ew = dalloc((size_t)(NS * 2)); void* d_so = dalloc((size_t)(NS * 4));
+    void* d_of = dalloc((size_t)((nl + 1) * 4)); void* d_cn = dalloc((size_t)(nl * 4)); void* d_inv = dalloc((size_t)(NS * 4));
+    if (!d_a || !d_w || !d_wg || !d_lg || !d_g || !d_id || !d_ew || !d_so || !d_of || !d_cn || !d_inv) {
+        std::printf("--perfrg: hipMalloc failed\n"); return;
+    }
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_wg, hwg.data(), hwg.size() * 2, hipMemcpyHostToDevice);
+    void* inst = nullptr;
+    {
+        std::vector<RadParam> ip = { PI("M", 128), PI("K", K), PI("n_expert", ne), PI("top_k", k), PI("norm", 1),
+                                     PS("dtype", "bf16") };
+        if (!rgi->init || !rgi->fini || rgi->init(ip.data(), (int)ip.size(), 0, 1, &inst) != RAD_OK || !inst) {
+            std::printf("--perfrg: no instance\n"); return;
+        }
+    }
+    /* one RadArgs a launch form, built once; launch() is timed */
+    struct L { const char* what; const RadKernelInfo* r; std::vector<RadTensor> ts; std::vector<RadParam> ps; void* inst; };
+    std::vector<L> ls;
+    ls.push_back({ "fused (router_gemm_topk_scatter_inv)", rgi,
+                   { T(d_a, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { ne, K }), T(d_wg, RAD_BF16, { 1, K }),
+                     T(d_lg, RAD_BF16, { M, ne }), T(d_id, RAD_I32, { M, k }), T(d_ew, RAD_BF16, { M, k }),
+                     T(d_so, RAD_I32, { NS }), T(d_of, RAD_I32, { nl + 1 }), T(d_cn, RAD_I32, { nl }),
+                     T(d_g, RAD_BF16, { M, 1 }), T(d_inv, RAD_I32, { NS }) },
+                   { PI("M", M), PI("K", K), PI("n_expert", ne), PI("n_local", nl), PI("top_k", k), PI("norm", 1),
+                     PS("dtype", "bf16"), PI("expert_base", 0) }, inst });
+    const RadKernelInfo* gr = M <= 16 ? m16 : m64;
+    ls.push_back({ M <= 64 ? "router GEMM alone (gemm_bf16_nt_m16 / m64)" : "router GEMM alone (m64 past 64 rows: the line says if refused)",
+                   gr, { T(d_a, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { ne, K }), T(d_lg, RAD_BF16, { M, ne }) },
+                   { PI("M", M), PI("N", ne), PI("K", K), PS("dtype", "bf16") }, nullptr });
+    ls.push_back({ "shared gate GEMM alone (N 1)", gr,
+                   { T(d_a, RAD_BF16, { M, K }), T(d_wg, RAD_BF16, { 1, K }), T(d_g, RAD_BF16, { M, 1 }) },
+                   { PI("M", M), PI("N", 1), PI("K", K), PS("dtype", "bf16") }, nullptr });
+    ls.push_back({ "selection + sort alone (router_topk_scatter)", rf,
+                   { T(d_lg, RAD_BF16, { M, ne }), T(d_id, RAD_I32, { M, k }), T(d_ew, RAD_BF16, { M, k }),
+                     T(d_so, RAD_I32, { NS }), T(d_of, RAD_I32, { nl + 1 }), T(d_cn, RAD_I32, { nl }) },
+                   { PI("M", M), PI("n_expert", ne), PI("n_local", nl), PI("top_k", k), PI("norm", 1), PS("dtype", "bf16"),
+                     PI("expert_base", 0) }, nullptr });
+    std::printf("router at Qwen tp4's rank shape, M=%lld (512 experts, K 2560, top 10, 128 local, shared gate), %s, %d launches\n",
+                (long long)M, g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str()
+                                         : "warm (back to back, mean)", iters);
+    for (L& l : ls) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = l.ts.data(); a.n_t = (int)l.ts.size(); a.p = l.ps.data(); a.n_p = (int)l.ps.size();
+        a.world_size = 1; a.instance = l.inst;
+        if (l.r->scratch) {
+            const int64_t need = l.r->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        int rc = l.r->launch(&a, nullptr);
+        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+        if (rc != RAD_OK) { std::printf("  %-62s refused (rc %d)\n", l.what, rc); continue; }
+        const double us = st_time_us([&](int) { l.r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("  %-62s %8.1f us\n", l.what, us);
+    }
+    rgi->fini(inst);
+}
+
 /* Protected experts are sorted last, checked against a host stable sort. Their rows must follow
  * every other expert's, in the listed order, with the rest closed up and every run stable. Both
  * standalone sort forms run (450 slots: one workgroup; 3000: three passes), with the first, a
@@ -42607,6 +42693,8 @@ static void usage(void) {
                 "             pinned (r4d_moe_mxfp4_pin_small), their outputs compared byte for byte.\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
                 "             mhc_post at GLM's shape, 16-byte rows against pitched ones.\n"
+                "  --perfrg M [iters]:  the Qwen tp4 decode router (router_gemm_topk_scatter_inv at 512\n"
+                "             experts, K 2560, top 10, 128 local, shared gate) against its parts alone, timed.\n"
                 "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
                 "             the wave-per-row select timed.\n"
                 "  --perfmoefuse M [iters]:  GLM's decode fusions of the MoE block at M token\n"
@@ -42736,6 +42824,8 @@ int main(int argc, char** argv) {
     int mhc_it = 200;
     long long rt_m = 0;
     int rt_it = 200;
+    long long rg_m = 0;   /* --perfrg */
+    int rg_it = 200;
     long long mf_m = 0;
     int mf_it = 200;
     long long kda_m = 0, proj_m = 0;
@@ -42963,6 +43053,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             mhc_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mhc_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfrg")) {
+            /* qfn-on-ds: the Qwen tp4 decode router's parts at M rows (router_rg_perf) */
+            if (i + 1 >= argc) { usage(); return 2; }
+            rg_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) rg_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfrouter")) {
             if (i + 1 >= argc) { usage(); return 2; }
             rt_m = std::strtoll(argv[++i], nullptr, 0);
@@ -43390,6 +43485,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("mhc timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (rg_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        router_rg_perf(pl, rg_m, rg_it);
+        dfree_all();
+#else
+        skip("router timing", "built without HIP");
 #endif
         return 0;
     }
