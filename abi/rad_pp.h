@@ -268,6 +268,19 @@ static inline void rad_pp_declare_tail_band(int j) {
     if (rad_pp_tail_band) rad_pp_tail_band(j);
 }
 
+/* tp8 loop P41 (the HEAD band on the FOLLOWER; unset: never called): the plugin names, at declare (every rank; the last wins), the
+ * layer l = h - 1 it declared on BOTH nodes for it -- a REVERSE pass runs the leader's head over [0, l) (+ layer l's key chain only)
+ * and the follower from l (X1 of W(l, t)); every other pass is W(h, t)'s. The engine marks such a pass in RadPpInfo.reserved[3]
+ * (= l; 0 every other pass) on both nodes. l 0: none. Weak. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_rband(int l);
+
+static inline void rad_pp_declare_rband(int l) {
+    if (rad_pp_rband) rad_pp_rband(l);
+}
+
 /* tp8 loop D46 (the tail band's COPY; unset: never called): beside rad_pp_tail_band, the plugin names (every rank; the last wins)
  * how the leader comes to hold the tail band layers' per-sequence state, so a decode lane's step too may run as a tail band pass
  * (fn4 pp_tband 3; core/sched/tcopy.h keeps which sequences are held). form 0: no copy (only fresh prompts' steps may); 1: every

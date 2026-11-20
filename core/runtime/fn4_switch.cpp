@@ -42,7 +42,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
-                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms" };
+                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -901,7 +901,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1017,6 +1017,16 @@ static bool check_here(const std::string& name, int v, std::string* err) {
             if (err)
                 *err = std::string("pp_lead_seg=") + std::to_string(v) + " refused: this node declared no leader boundary (RADIANCE_PP_LEAD_SEG=k "
                        "on the leader at start, with RADIANCE_PP_BG_LANE; not with RADIANCE_PP_TAIL_AHEAD)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kPpRband) {   /* tp8 loop P41: the leader's; -1 = the start's RADIANCE_PP_RBAND_EVERY (the kit's undo) */
+        if (v == -1) return true;
+        if (v < 0 || v > 511 || ((v & 15) == 0 && v != 0)) {
+            if (err) *err = "pp_rband takes -1 (back to the start's RADIANCE_PP_RBAND_EVERY), 0 (no reverse pass) or p + 16 x phase (+ 256) "
+                            "with p = 1 .. 15 (a lone prompt chunk i with i % p == phase runs as a reverse pass: the follower from layer "
+                            "h - 1; + 256 never the chunk before the last; tp8 loop P41)";
             return false;
         }
         return true;
