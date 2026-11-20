@@ -1406,6 +1406,35 @@ TEST(a_kv_check_deferred_past_a_cold_prompt_keeps_one_process_tokens_and_the_kv_
             CHECK_EQ(deferred, 0);
         }
     }
+    /* Under load (the recording: requests alone, then eight at once of different lengths = prompt rows beside decode rows
+     * most rounds) with the check due every 4 trunk steps (deferred at most 4 more), at 2 lanes and at 3 lanes with a BG
+     * lane: one process's recording, every check equal, and checks due with prompt rows in flight seen (deferred, or
+     * drained at the bound). (At N = 1 the bound is one step: every such check drains there, as without the env.) */
+    tiny::TempDir d("pp_p37");
+    const std::string rec = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!rec.empty());
+    struct Load { int lanes; const char* bg; };
+    for (const Load a : { Load{ 2, nullptr }, Load{ 3, "RADIANCE_PP_BG_LANE=1" } }) {
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=4", "RADIANCE_PP_KV_CHECK_DEFER=1" });
+        if (a.bg) env.push_back(a.bg);
+        const std::string out = d / ("load-" + std::to_string(a.lanes));
+        const PipeRun pr = record_pipeline(out, "1,3", env, lane_shape(a.lanes), lane_shape(a.lanes), env);
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        long long eq = 0, dfr = 0, drn = 0;
+        for (size_t at = pr.flog.find("on both nodes ("); at != std::string::npos; at = pr.flog.find("on both nodes (", at + 1)) ++eq;
+        for (size_t at = pr.llog.find("deferred while prompt rows"); at != std::string::npos; at = pr.llog.find("deferred while prompt rows", at + 1)) ++dfr;
+        for (size_t at = pr.llog.find("at the deferral's bound"); at != std::string::npos; at = pr.llog.find("at the deferral's bound", at + 1)) ++drn;
+        fprintf(stderr, "    load, %d lanes%s W(1,3), KV check every 4 + defer: recording %s; checks equal %lld, deferred %lld, drained at "
+                        "the bound %lld\n", a.lanes, a.bg ? " + BG lane" : "", same ? "identical" : why.c_str(), eq, dfr, drn);
+        CHECK(same);
+        CHECK(eq >= 2);
+        CHECK(dfr + drn >= 1);
+        CHECK(pr.flog.find("NOT the owner's bytes") == std::string::npos);
+        CHECK(pr.llog.find("RADIANCE_PP_KV_CHECK_DEFER=1 (tp8 loop P37)") != std::string::npos);
+    }
 }
 
 /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS on both nodes): a cold multi-chunk prompt at 2 and 3 lanes, W(0,2) and W(1,3), with
