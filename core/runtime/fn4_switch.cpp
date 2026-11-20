@@ -73,7 +73,7 @@ int env_val(const char* k) {
 int qwen_hi(int i) {
     return i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
          : i == kHcReadV ? 2047 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
-         : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 4 : i == kBiSeg ? 2
+         : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 5 : i == kBiSeg ? 3
          : i == kArwRows ? 4096 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3
          : i == kArFence ? 7 : i == kSpRoute ? 63 : 1;
 }
