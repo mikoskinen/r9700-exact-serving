@@ -1085,13 +1085,15 @@ bool Scheduler::pub_holds(const SchedReq& s, bool walk) const {
     auto holds_on = [&](const SchedReq* o, int64_t bumped) {
         if (!o || o == &s || !o->req || o->req->embed || o->req->state != ReqState::Running) return false;
         const std::vector<int32_t>& q = o->req->prompt;
+        /* available: the whole prompt published (D55), or with per-chunk publishing its computed end past the head. tp8 loop D57
+         * (bit 2): the committed end -- the planning lane's lane_plan_begin bumps n_computed past the rows lent to other lanes.
+         * Asked before the shared head is measured (tp8 loop D57: the same answer, but a decoder -- its prompt published or
+         * computed -- costs no token compare; a walk asked 10 held siblings x 31 decoders x a 20,000-token head before) */
+        const int64_t done = (int64_t)o->req->n_computed - bumped;
+        if (o->pub_prompt || done >= (int64_t)q.size()) return false;
         const size_t n = std::min(p.size(), q.size());
         const int64_t common = (int64_t)(std::mismatch(p.begin(), p.begin() + (long)n, q.begin()).first - p.begin());
         if (common < kPubHoldMin) return false;
-        /* available: the whole prompt published (D55), or with per-chunk publishing its computed end past the head. tp8 loop D57
-         * (bit 2): the committed end -- the planning lane's lane_plan_begin bumps n_computed past the rows lent to other lanes */
-        const int64_t done = (int64_t)o->req->n_computed - bumped;
-        if (o->pub_prompt || done >= (int64_t)q.size()) return false;
         if (pub_mode_ >= 2 && done >= std::min<int64_t>(common, (int64_t)p.size() - 1)) return false;
         return true;
     };
