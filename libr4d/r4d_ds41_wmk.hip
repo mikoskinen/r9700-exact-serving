@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <type_traits>
+#include <vector>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -601,6 +602,57 @@ std::atomic<int> g_gg_wk_last{0};
  * PRO 1 / 2 (stage 2, r5): lever K1's folds a / e in the staging exactly as gg_wk_kernel's (the producer's bf16 octet of each staged
  * chunk, rmsnorm's row scales from a block prologue in mr_norm_scales' order; grid row 0 also stores h) -- the same bytes as the
  * producer's launch then the GEMM. */
+/* Round 42 (bench, AB bit 128): the q6_K weight in a TILE-INTERLEAVED copy -- for 16-row tile T and slab s (half a block, 128 K
+ * values) the 16 rows' slab pieces are 1,696 contiguous bytes, row r at 106 r: its 64 ql bytes (block offset 64 c), its 32 qh bytes
+ * (128 + 32 c), its 8 scales (192 + 8 c) and d (208, both slabs carry it). A lane loads the same words into the same registers as
+ * Wq<GG_Q6_K>::load / reload, so the decode, WMMA and scale fma (bfrag / scale, inherited) and every output byte are unchanged. */
+constexpr int kIl6 = 1696, kIl6R = 106;
+struct Wq6Il : Wq<GG_Q6_K> {
+    __device__ static __forceinline__ void lql(const uint8_t* b, int h, int i, uint32_t* r) {
+        const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 32 * (i >> 1) + 16 * (i & 1) + 8 * h);
+        r[2 * i] = q.x;
+        r[2 * i + 1] = q.y;
+    }
+    __device__ static __forceinline__ void lqh(const uint8_t* b, int h, int i, uint32_t* r) {
+        const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 64 + 16 * i + 8 * h);
+        r[8 + 2 * i] = q.x;
+        r[9 + 2 * i] = q.y;
+    }
+    __device__ static __forceinline__ void load(const uint8_t* row, int s, int h, uint32_t* r) {
+        const uint8_t* b = row + (long long)s * kIl6;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) lql(b, h, i, r);
+        lqh(b, h, 0, r);
+        lqh(b, h, 1, r);
+        const gg_u32x2 sc = *(gg_gu64a2)(const void*)(b + 96);
+        r[12] = sc.x;
+        r[13] = sc.y;
+        r[14] = gg_u16(b + 104);
+    }
+    template <int J>
+    __device__ static __forceinline__ void reload(const uint8_t* row, int s, int h, uint32_t* r) {
+        const uint8_t* b = row + (long long)s * kIl6;
+        if constexpr (J >= 4) lql(b, h, J - 4, r);
+        if constexpr (J == 3) r[12] = *(gg_gu32a2)(const void*)(b + 96);
+        if constexpr (J == 7) r[13] = *(gg_gu32a2)(const void*)(b + 100);
+    }
+};
+__global__ __launch_bounds__(256) void gg_il6_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;   /* (tile, slab, row) */
+    const long long tiles = (N + 15) / 16;
+    if (i >= tiles * S * 16) return;
+    const int r = (int)(i & 15), sl = (int)((i >> 4) % S);
+    const long long t = (i >> 4) / S;
+    const long long n = std::min(t * 16 + r, N - 1);
+    const uint8_t* b = src + n * w_ld + (long long)(sl >> 1) * 210;
+    const int c = sl & 1;
+    uint8_t* d = dst + (t * S + sl) * kIl6 + r * kIl6R;
+    for (int k = 0; k < 64; ++k) d[k] = b[64 * c + k];
+    for (int k = 0; k < 32; ++k) d[64 + k] = b[128 + 32 * c + k];
+    for (int k = 0; k < 8; ++k) d[96 + k] = b[192 + 8 * c + k];
+    d[104] = b[208];
+    d[105] = b[209];
+}
 /* AB (DRAFTER track 20.11.2026 round 30, BENCH ablation only, env R4D_WK3_AB; outputs are NOT the part order under AB != 0): which
  * part of a slab costs the call -- bit 1 no weight loads in the K loop (the prologue's words reused), bit 2 no per-slab activation
  * staging (the two block barriers, the LDS store and the next slab's global load: slab 0's staging reused), bit 4 no math (no A
@@ -608,7 +660,7 @@ std::atomic<int> g_gg_wk_last{0};
 template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1, int AB = 0>   /* DP: as gg_wk_kernel's */
 __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
     const Wk3Tl wtl;
-    using W = Wq<T>;
+    using W = std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>;   /* round 42 bench: the tile-interleaved q6_K copy */
     using Pf = typename W::Pf;
     static_assert(W::TB == 0 && !W::PIPE || W::TB == 0, "gg_wk3_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
@@ -635,7 +687,9 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
         const int n = n0 + (ns * NT + nt) * 16 + c16;
-        wr[nt] = wb + (long long)(n < N ? n : N - 1) * A.w_ld;
+        const long long nn = n < N ? n : N - 1;
+        if constexpr ((AB & 128) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6 + (nn & 15) * kIl6R;
+        else wr[nt] = wb + nn * A.w_ld;
     }
     /* chunk i = run (i / NM) at its slab, tile row (i % NM) * 16 + (tid >> 4), values 8 (tid & 15); a row past M stages the last */
     const uint16_t* xsrc[NX];
@@ -1131,7 +1185,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
      * (DP 1, bf16) and the head's q6_K (KP 1, f32; DP 2 at NM 2 NT 2, DP 1 at NM 3 NT 1) */
     static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); const int v = e ? std::atoi(e) : 0;
                                if (v) std::fprintf(stderr, "libr4d: gg_wk3 ABLATION %d (bench only)\n", v); return v; }();
-    if (ab > 0 && ab < 128 && !pro) {
+    if (ab > 0 && ab < 256 && !pro) {
 #define GG_WK3_AB(KPV, NMV, NTV, OTV, DPV)                                                                                \
         if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2 && f32out == std::is_same<OTV, float>::value) {     \
             switch (ab) {                                                                                                  \
@@ -1161,6 +1215,8 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
             case 83: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 83>), grid, dim3(256), lds, A);     \
             case 99: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 99>), grid, dim3(256), lds, A);     \
             case 123: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 123>), grid, dim3(256), lds, A);   \
+            case 128: if constexpr (T == GG_Q6_K) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 128>), grid, dim3(256), lds, A); break; \
+            case 134: if constexpr (T == GG_Q6_K) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 134>), grid, dim3(256), lds, A); break; \
             default: break;                                                                                                \
             }                                                                                                              \
         }
@@ -1269,6 +1325,30 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     const dim3 grid(gx, (unsigned)gy);
     static const int tl = [] { const char* e = std::getenv("R4D_WK3_TL"); return e && e[0] == '1' ? 1 : 0; }();
     static const int tlab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+    if ((tlab & 128) && ty == GG_Q6_K && !fo) {   /* round 42 bench: the weights' tile-interleaved copies (cached by pointer + 8 KiB check) */
+        struct Il { const void* src; long long N, K, ld; std::vector<uint8_t> chk; uint8_t* dst; };
+        static std::vector<Il> cache;
+        for (int i = 0; i < nm; ++i) {
+            const long long N_ = Nv[i], S_ = K / kWmS, bytes = N_ * w_ld;
+            std::vector<uint8_t> chk(8192);
+            (void)hipMemcpy(chk.data(), wd[i], 4096, hipMemcpyDeviceToHost);
+            (void)hipMemcpy(chk.data() + 4096, (const uint8_t*)wd[i] + bytes - 4096, 4096, hipMemcpyDeviceToHost);
+            uint8_t* dst = nullptr;
+            for (auto& c : cache)
+                if (c.src == wd[i] && c.N == N_ && c.K == K && c.ld == w_ld && c.chk == chk) dst = c.dst;
+            if (!dst) {
+                if (cache.size() >= 6) { (void)hipFree(cache.front().dst); cache.erase(cache.begin()); }
+                const long long tiles = (N_ + 15) / 16;
+                if (hipMalloc((void**)&dst, (size_t)(tiles * S_ * kIl6)) != hipSuccess) return R4D_WK_DECLINE;
+                const long long th = tiles * S_ * 16;
+                hipLaunchKernelGGL(gg_il6_pack_kernel, dim3((unsigned)((th + 255) / 256)), dim3(256), 0, 0, (const uint8_t*)wd[i], w_ld, dst, N_, (int)S_);
+                (void)hipDeviceSynchronize();
+                cache.push_back(Il{ wd[i], N_, K, w_ld, chk, dst });
+            }
+            A.w[i] = dst;
+            if (nm == 1) A.w[1] = dst;
+        }
+    }
     if (tl) {
         A.tl = 1;
         const unsigned long long z[5] = { ~0ull, 0ull, 0ull, 0ull, 0ull };
