@@ -15,7 +15,9 @@
  *       mutations 4 (the last live entry unwritten) and 5 (candidates reading the full width of an ix_ni plane).
  *   --case ixw: lever IXW (DRAFTER track round 21), fn4 ix_lds 2 (bit 1) -- a decode run's rows (<= 48) byte for byte = the same rows
  *       inside a 64-row run at ix_lds 0 (the WMMA form by height), at 16 x 3 / 8 x 5 / 16 x 1 rows; control: the scalar decode form
- *       (ix_lds 0 at the decode height) differs from them somewhere (the check sees the form). */
+ *       (ix_lds 0 at the decode height) differs from them somewhere (the check sees the form).
+ *   --case ixbfr: lever BFR (tp8 loop P38), fn4 ix_lds 6 (bit 2) vs 2 -- the WMMA forms' roundings as selects, byte for byte at the
+ *       served shapes (bf16 keys, 16k / 64k / 128k, keep, the decode band, MXFP4), special values + mutation 6; times A B A B. */
 
 namespace i9b {
 
@@ -223,7 +225,11 @@ struct IxCase {
     int64_t R = 0, T = 0, C = 0, ratio = 1, S = 0, nblk = 0, nbt = 0;
     void *q = nullptr, *w = nullptr, *kc = nullptr, *bt = nullptr, *pos = nullptr, *cu = nullptr;
     std::vector<int32_t> hpos;
-    bool build(int64_t R_, int64_t ratio_, const std::vector<IxSeq>& sq) {
+    bool kbf = false;   /* tp8 loop P38: bf16 keys (key_format unset: the served index caches, 256 bytes an entry) */
+    /* bf16keys: the cache as bf16 values over 30 binades; specials: the non-finite path (some rows' q huge -> dots overflow
+     * to +-inf, NaN words with payloads in q / w, +-inf and signed-zero weights) -- tp8 loop P38's byte checks */
+    bool build(int64_t R_, int64_t ratio_, const std::vector<IxSeq>& sq, bool bf16keys = false, bool specials = false) {
+        kbf = bf16keys;
         R = R_;
         ratio = ratio_;
         S = (int64_t)sq.size();
@@ -254,18 +260,39 @@ struct IxCase {
         /* the block table points into a shuffled cache: entry j of sequence s -> block (b0 + j) * 7919 % nblk */
         for (auto& v : btv)
             if (v >= 0) v = (int32_t)(((int64_t)v * 7919) % nblk);
-        std::vector<uint8_t> kb((size_t)(nblk * kKeyB), 0);
-        for (int64_t e = 0; e < nblk; ++e) {
-            uint8_t* p = &kb[(size_t)(e * kKeyB)];
-            for (int i = 0; i < 64; ++i) p[i] = (uint8_t)rnd();
-            for (int i = 0; i < 4; ++i) p[64 + i] = (uint8_t)(110 + rnd() % 31);   /* 2^-17 .. 2^13: sums that round */
-        }
+        std::vector<uint8_t> kb((size_t)(nblk * (kbf ? kD * 2 : kKeyB)), 0);
+        if (kbf) {
+            uint16_t* k16 = (uint16_t*)kb.data();
+            for (int64_t i = 0; i < nblk * kD; ++i) k16[i] = bf((float)(gauss() * std::ldexp(1.0, (int)(rnd() % 30) - 15)));
+        } else
+            for (int64_t e = 0; e < nblk; ++e) {
+                uint8_t* p = &kb[(size_t)(e * kKeyB)];
+                for (int i = 0; i < 64; ++i) p[i] = (uint8_t)rnd();
+                for (int i = 0; i < 4; ++i) p[64 + i] = (uint8_t)(110 + rnd() % 31);   /* 2^-17 .. 2^13: sums that round */
+            }
         std::vector<uint16_t> qv((size_t)(T * kH * kD)), wv((size_t)(T * kH));
         /* q: full bf16 mantissas over a few binades (stress, as kbench2's: the engine's q is the fp4 round trip's grid, whose
          * dots against MXFP4 keys are nearly always exact in f32 whatever the order -- data on which a reordered dot would
          * pass; these round, so the mutation control below must see a reordered chain) */
         for (auto& x : qv) x = bf((float)(gauss() * std::ldexp(1.0, (int)(rnd() % 7) - 3)));
         for (auto& x : wv) x = bf((float)(gauss() * 0.5));
+        if (specials)
+            for (int64_t m = 0; m < T; ++m) {
+                const uint64_t r = rnd() % 5;
+                uint16_t* qm = &qv[(size_t)(m * kH * kD)];
+                if (r == 1)
+                    for (int64_t i = 0; i < kH * kD; i += 1 + (int64_t)(rnd() % 3))
+                        qm[i] = (uint16_t)((0x7e00u + rnd() % 0x80u) | (rnd() & 1 ? 0x8000u : 0u));
+                if (r == 2) qm[rnd() % (uint64_t)(kH * kD)] = (uint16_t)(0x7f81u + rnd() % 0x7eu);
+                uint16_t* wm = &wv[(size_t)(m * kH)];
+                for (int64_t h = 0; h < kH; ++h) {
+                    const uint64_t x = rnd() % 16;
+                    if (x == 0) wm[h] = 0x7f80u;
+                    if (x == 1) wm[h] = 0xff80u;
+                    if (x == 2) wm[h] = (uint16_t)(rnd() & 1 ? 0x8000u : 0u);
+                    if (x == 3 && r == 3) wm[h] = 0x7fc1u;
+                }
+            }
         q = up(qv);
         w = up(wv);
         kc = up(kb);
@@ -277,7 +304,7 @@ struct IxCase {
     int64_t reach(int64_t m) const { return m < T && m < R ? ((int64_t)hpos[(size_t)m] + 1) / ratio : 0; }
     std::vector<RadTensor> score_ts(void* sc, void* keep, int64_t kw) const {
         std::vector<RadTensor> t = { T_(q, RAD_BF16, { T, kH * kD }), T_(w, RAD_BF16, { T, kH }),
-                                     T_(kc, RAD_BF16, { nblk, 1, ratio, kKeyB / 2 / ratio }), T_(bt, RAD_I32, { S, nbt }),
+                                     T_(kc, RAD_BF16, { nblk, 1, ratio, (kbf ? kD : kKeyB / 2) / ratio }), T_(bt, RAD_I32, { S, nbt }),
                                      T_(pos, RAD_I32, { T }), T_(cu, RAD_I32, { S + 1 }), T_(sc, RAD_F32, { R, C }) };
         if (keep) t.push_back(T_(keep, RAD_I32, { R, kw }));
         return t;
@@ -285,7 +312,8 @@ struct IxCase {
     std::vector<RadParam> score_ps(int64_t block) const {
         std::vector<RadParam> p = { PI("M", R), PI("heads", kH), PI("dim", kD), PI("ratio", ratio), PI("width", C),
                                     PF("wscale", 1.0 / std::sqrt((double)kD * (double)kH)), PS("dtype", "bf16"),
-                                    PI("row_part", 0), PS("key_format", "mxfp4") };
+                                    PI("row_part", 0) };
+        if (!kbf) p.push_back(PS("key_format", "mxfp4"));
         if (block > 0) p.push_back(PI("block", block));
         return p;
     }
@@ -608,10 +636,127 @@ static void ixw_case(const Plugin& pl) {
     }
 }
 
+/* tp8 loop P38 (lever BFR): fn4 ix_lds bit 2 -- index_score's WMMA forms with every rounding a select (ds_round_bf16_sel) --
+ * byte for byte against ix_lds 2 (BEST's: IXW) on the whole plane, at the served shapes: 256-row runs of a 4,096-row chunk at
+ * 16k / 64k / 128k, bf16 keys, ratio 2 (layers 2 / 8 / 14) and ratio 1 with keep (24 .. 36), the decode band (IXW, 16 x 3
+ * rows), MXFP4 keys; and index_topk's selections over both planes. Special values (the non-finite path): every finite and
+ * infinite score byte for byte and a NaN a NaN in both (WHICH NaN is the f32 add's / multiply's operand order, clang's per
+ * instantiation: the host emulator keeps another payload / sign in 2-43 % of the NaN words; no reader tells NaNs apart, so
+ * the selections stay byte for byte), with mutation 6 (an infinity rounded as a NaN) caught as a non-NaN difference; the
+ * stock / BFR times as info lines (us a launch, A B A B). */
+static void nan_cmp(const void* a, const void* b, size_t words, long long* other, long long* nanpay) {
+    std::vector<uint32_t> x = down<uint32_t>(a, words), y = down<uint32_t>(b, words);
+    *other = *nanpay = 0;
+    for (size_t i = 0; i < words; ++i)
+        if (x[i] != y[i]) {
+            if ((x[i] & 0x7fffffffu) > 0x7f800000u && (y[i] & 0x7fffffffu) > 0x7f800000u) ++*nanpay;
+            else ++*other;
+        }
+}
+static void bfr_case(const Plugin& pl) {
+    IxHooks hk;
+    if (!hk.get(pl)) { ok("ixbfr hooks", false, "rad_fn4_switch / r4d_i9b_mutate / an index row absent"); return; }
+    if (hk.sw("ix_lds", 6) != 1 || hk.sw("ix_lds", 2) != 1) { ok("ixbfr switch", false, "ix_lds 6 not taken (a libr4d before lever BFR)"); return; }
+    hk.sw("ix_ni", 0);
+    g_rs = 0x5EED0038ull;
+    struct BC { const char* what; int64_t ratio, R; std::vector<IxSeq> sq; bool kbf, keep, sp, mut, timed; };
+    auto run7 = [](int64_t ctx, int64_t ratio) { return std::vector<IxSeq>{ { 256, ctx - 4096 + 7 * 256, ctx / ratio + 16 } }; };
+    std::vector<IxSeq> dec;   /* 16 sequences x 3 rows at ~2.4k positions: IXW's decode band on the WMMA form */
+    for (int i = 0; i < 16; ++i) dec.push_back({ 3, 2300 + (int64_t)(rnd() % 200), 2600 });
+    const BC cases[] = {
+        { "bf16 keys, ctx 16384, ratio 2", 2, 256, run7(16384, 2), true, false, false, false, true },
+        { "bf16 keys, ctx 65536, ratio 2", 2, 256, run7(65536, 2), true, false, false, false, true },
+        { "bf16 keys, ctx 131072, ratio 2", 2, 256, run7(131072, 2), true, false, false, false, true },
+        { "bf16 keys WITH keep (1/4 of the 8-blocks), ctx 131072, ratio 1", 1, 256, run7(131072, 1), true, true, false, false, true },
+        { "bf16 keys, ctx 65536, ratio 2, special values", 2, 256, run7(65536, 2), true, false, true, true, false },
+        { "bf16 keys WITH keep, ctx 65536, ratio 1, special values", 1, 256, run7(65536, 1), true, true, true, true, false },
+        { "the decode band on the WMMA form (IXW), 16 x 3 rows at ~2.4k, bf16 keys", 1, 48, dec, true, false, false, false, true },
+        { "MXFP4 keys, ctx 65536, ratio 2", 2, 256, run7(65536, 2), false, false, false, false, true },
+    };
+    for (const BC& bc : cases) {
+        IxCase c;
+        if (!c.build(bc.R, bc.ratio, bc.sq, bc.kbf, bc.sp)) { ok("ixbfr alloc", false, "hipMalloc failed"); dfree_all(); return; }
+        const int64_t block = 8, kw = kwords(c.C, block), rows = std::min(c.T, c.R);
+        void* kp = nullptr;
+        if (bc.keep) {
+            std::vector<int32_t> kv((size_t)(c.R * kw), 0);
+            for (int64_t m = 0; m < rows; ++m) {
+                const int64_t nb = (c.reach(m) + block - 1) / block;
+                for (int64_t b = 0; b < nb; ++b)
+                    if (rnd() % 4 == 0 || b == nb - 1) kv[(size_t)(m * kw + b / 32)] |= (int32_t)(1u << (b % 32));
+            }
+            kp = up(kv);
+        }
+        const size_t bytes = (size_t)(c.R * c.C * 4);
+        const int64_t topk = 512;
+        void *s0 = dalloc(bytes), *s1 = dalloc(bytes);
+        void *e0 = dalloc((size_t)(rows * topk * 4)), *e1 = dalloc((size_t)(rows * topk * 4));
+        if (!s0 || !s1 || !e0 || !e1 || (bc.keep && !kp)) { ok("ixbfr alloc", false, "hipMalloc failed"); dfree_all(); return; }
+        std::vector<RadTensor> t0 = c.score_ts(s0, kp, kw), t1 = c.score_ts(s1, kp, kw);
+        std::vector<RadParam> ps = c.score_ps(bc.keep ? block : 0);
+        st_memset(s0, 0x7F, bytes);
+        st_memset(s1, 0x7F, bytes);
+        hk.sw("ix_lds", 2);
+        const int rc0 = run(hk.score, t0, ps);
+        hk.sw("ix_lds", 6);
+        const int rc1 = run(hk.score, t1, ps);
+        long long other = 0, nanpay = 0;
+        nan_cmp(s0, s1, (size_t)(c.R * c.C), &other, &nanpay);
+        ok(fmt("index_score ix_lds 6 (BFR) vs 2, %s: %s (the whole %lld x %lld plane)", bc.what,
+               bc.sp ? "every non-NaN score byte for byte, a NaN a NaN in both" : "byte for byte", (long long)c.R, (long long)c.C).c_str(),
+           rc0 == RAD_OK && rc1 == RAD_OK && other == 0 && (bc.sp || nanpay == 0),
+           fmt("rc %d / %d, differing words %lld; NaN words of another payload / sign %lld", rc0, rc1, other, nanpay));
+        if (bc.sp) info(fmt("index_score %s: NaN words of another payload / sign between the forms %lld (0 = the card picks the same NaN)",
+                            bc.what, nanpay));
+        auto topk_on = [&](void* sc, void* sel) {
+            std::vector<RadTensor> t = { T(sc, RAD_F32, { rows, c.C }), T(kp, RAD_I32, { rows, kw }), T(c.pos, RAD_I32, { rows }),
+                                         T(sel, RAD_I32, { rows, topk }) };
+            if (!kp) absent(t[1]);
+            t[0].stride[0] = c.C;
+            std::vector<RadParam> p = { PI("M", rows), PI("width", c.C), PI("topk", topk), PI("ratio", c.ratio) };
+            if (kp) p.push_back(PI("block", block));
+            int64_t sb = 0;
+            void* scr = scratch_for(hk.topk, t, p, &sb);
+            return run(hk.topk, t, p, scr, sb);
+        };
+        const int rt0 = topk_on(s0, e0), rt1 = topk_on(s1, e1);
+        const long long dsel = diff16(e0, e1, (size_t)(rows * topk * 4));
+        ok(fmt("index_topk's selections byte for byte over both planes, %s", bc.what).c_str(),
+           rt0 == RAD_OK && rt1 == RAD_OK && dsel == 0, fmt("rc %d / %d, differing words %lld", rt0, rt1, dsel));
+        if (bc.mut) {
+            hk.mutate(6);
+            st_memset(s1, 0x7F, bytes);
+            run(hk.score, t1, ps);
+            hk.mutate(0);
+            long long mo = 0, mn = 0;
+            nan_cmp(s0, s1, (size_t)(c.R * c.C), &mo, &mn);
+            ok(fmt("mutation 6 (an infinity rounded as a NaN) caught as a non-NaN difference, %s", bc.what).c_str(), mo > 0,
+               "no non-NaN difference: the special values do not reach the non-finite path");
+        }
+        if (bc.timed) {
+            RadArgs a0 = args(t0, ps), a1 = args(t1, ps);
+            hk.sw("ix_lds", 2);
+            const double u0 = st_time_us([&](int) { hk.score->launch(&a0, nullptr); }, 10, nullptr);
+            hk.sw("ix_lds", 6);
+            const double u1 = st_time_us([&](int) { hk.score->launch(&a1, nullptr); }, 10, nullptr);
+            hk.sw("ix_lds", 2);
+            const double v0 = st_time_us([&](int) { hk.score->launch(&a0, nullptr); }, 10, nullptr);
+            hk.sw("ix_lds", 6);
+            const double v1 = st_time_us([&](int) { hk.score->launch(&a1, nullptr); }, 10, nullptr);
+            info(fmt("index_score %s, %lld-row run: ix_lds 2 %.1f / %.1f us, ix_lds 6 (BFR) %.1f / %.1f us (A B A B; %+.1f %%)", bc.what,
+                     (long long)c.R, u0, v0, u1, v1, 100.0 * ((u1 + v1) - (u0 + v0)) / (u0 + v0)));
+        }
+        hk.sw("ix_lds", 2);
+        dfree_all();
+    }
+    hk.sw("ix_lds", 0);
+}
+
 }  // namespace i9b
 
 static void i9b_cases(const Plugin& pl) {
     if (sel("ixw")) i9b::ixw_case(pl);
+    if (sel("ixbfr")) i9b::bfr_case(pl);
     if (sel("mhc_pcn_mix") || sel("mhc_post_collapse_rmsnorm_mix_bf16")) i9b::m1_case(pl);
     if (sel("ix_lds") || sel("ds41_index_score_d128_bf16")) i9b::lds_case(pl);
     if (sel("ix_ni") || sel("ds41_index_candidates")) i9b::ni_case(pl);
