@@ -635,6 +635,50 @@ int Engine::pp_serve_setup() {
                  pp_leader() ? "X2" : "X1", (long long)rrows, humanb(rb).c_str(), st.size(), rings,
                  (long long)g_pp_live_rows.load(std::memory_order_relaxed));
     }
+    /* ---- tp8 loop P46: RADIANCE_PP_SEND_ASH -- a card staging buffer on every rank of this node for its share of a row-sharded
+     * payload, kept by the budget beside the step staging; every send ring names them, fn4 pp_send_ash turns the path on / off */
+    if (const int64_t hrows = pp_send_ash_rows(); hrows > 0) {
+        const int64_t hb = pp_send_ash_bytes();
+        if (hb <= 0) {
+            RAD_ERR("two-node pipeline: RADIANCE_PP_SEND_ASH=%lld but this node's crossing has no row bytes", (long long)hrows);
+            return RAD_E_STATE;
+        }
+        if ((int)ranks_.size() > RAD_PP_MAX_RANKS) {
+            RAD_ERR("two-node pipeline: RADIANCE_PP_SEND_ASH: more ranks than a ring names (%d)", RAD_PP_MAX_RANKS);
+            return RAD_E_UNSUPPORTED;
+        }
+        std::vector<void*> st(ranks_.size(), nullptr);
+        for (size_t q = 0; q < ranks_.size(); ++q) {
+            RAD_TRY(rad_dev_set(ranks_[q]->device));
+            st[q] = rad_dev_alloc(hb, RAD_MEM_DEVICE);
+            if (!st[q]) {
+                RAD_ERR("two-node pipeline: RADIANCE_PP_SEND_ASH: no device memory for the %s staging buffer on card %d "
+                        "(raise --gpu-headroom-mib by %lld, or unset the switch)", humanb(hb).c_str(), ranks_[q]->device,
+                        (long long)((hb + (1 << 20) - 1) >> 20));
+                (void)rad_dev_set(ranks_[0]->device);
+                return RAD_E_NOMEM;
+            }
+        }
+        (void)rad_dev_set(ranks_[0]->device);
+        int rings = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix) {
+            RadPpRing* r = pp_send_[ix];
+            if (!r) continue;
+            for (size_t q = 0; q < st.size(); ++q) r->send_stage[q] = (uint64_t)(uintptr_t)st[q];
+            r->send_stage_cap = (uint64_t)hb;
+            r->ash_rows = (uint64_t)hrows;
+            ++rings;
+        }
+        pp_ash_apply();
+        const int64_t prev = g_pp_live_rows.load(std::memory_order_relaxed);
+        g_pp_live_rows.store(prev > 0 ? std::min(prev, hrows) : hrows, std::memory_order_relaxed);
+        RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_ASH=%lld -- a row-sharded %s payload of >= %lld rows: every one of the %zu ranks "
+                 "packs its share into its own %s staging buffer on the pass's stream and a side stream of its card copies it into "
+                 "the send ring (the split send's handshake unchanged), so the pass's stream goes on with the next pass (%d send "
+                 "ring(s); fn4 pp_send_ash %d); passes of >= %lld rows are issued live, never recorded (tp8 loop P46)",
+                 (long long)hrows, pp_leader() ? "X1" : "X2", (long long)hrows, st.size(), humanb(hb).c_str(), rings,
+                 fn4::pp_send_ash(), (long long)g_pp_live_rows.load(std::memory_order_relaxed));
+    }
     /* ---- rendezvous 2: what both carved and laid out */
     net::Facts f;
     {
@@ -1147,8 +1191,82 @@ int64_t Engine::pp_recv_async_bytes() const {
     return rb * cfg_.max_tok + (int64_t)parts * RAD_PP_PART_ALIGN + RAD_PP_TRAILER;
 }
 
+/* tp8 loop P46: RADIANCE_PP_SEND_ASH=N (rows; unset / 0 = off): a row-sharded share of a payload of >= N rows crosses from its
+ * card's side stream through the rank's staging buffer (abi/rad_pp.h RadPpRing::ash_rows); every pass of >= N rows is issued
+ * live. Read once. */
+int64_t Engine::pp_send_ash_rows() {
+    static const int64_t rows = [] {
+        const char* v = std::getenv("RADIANCE_PP_SEND_ASH");
+        if (!v || !*v) return (int64_t)0;
+        char* end = nullptr;
+        const long long n = std::strtoll(v, &end, 10);
+        if (!end || *end || n < 0) {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_SEND_ASH=%s is not a row count: every share on the pass's stream", v);
+            return (int64_t)0;
+        }
+        return (int64_t)n;
+    }();
+    return rows;
+}
+
+/* The staging buffer RADIANCE_PP_SEND_ASH needs on every rank of this node: a rank's rows of the masked parts are at most
+ * ceil(--max-num-batched-tokens / ranks) rows of the crossing's row bytes, and rank `sender`'s whole other parts (a
+ * crossing's kv-source / keep words, a small share of its row bytes) fit the sixteenth on top; a share over it takes the pass's
+ * stream (counted: RadPpRing::ash_over). 0 when off or before the crossings are declared. */
+int64_t Engine::pp_send_ash_bytes() const {
+    if (!pp_on() || pp_send_ash_rows() <= 0) return 0;
+    const PpGlobal& g = pp_g();
+    const int id = pp_leader() ? RAD_PP_X1 : RAD_PP_X2;
+    const int64_t rb = g.row_bytes[id].load();
+    const int parts = std::max(1, g.parts[id].load());
+    if (rb <= 0) return 0;
+    const int64_t tp = std::max(1, cfg_.tp);
+    const int64_t q = (cfg_.max_tok + tp - 1) / tp;
+    return rb * q + rb * cfg_.max_tok / 16 + (int64_t)parts * RAD_PP_PART_ALIGN;
+}
+
+/* fn4 pp_send_ash's value into this node's send rings (every rank thread parked: setup, or a switch change between steps) */
+void Engine::pp_ash_apply() {
+    if (pp_send_ash_rows() <= 0) return;
+    const int v = fn4::pp_send_ash() == 1 ? 1 : 0;
+    for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix)
+        if (RadPpRing* r = pp_send_[ix]) r->ash_on = (uint64_t)v;
+    if (pp_ash_on_ >= 0 && pp_ash_on_ != v) {
+        uint64_t sends = 0, over = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix)
+            if (const RadPpRing* r = pp_send_[ix])
+                for (int q = 0; q < RAD_PP_MAX_RANKS; ++q) {
+                    sends += __atomic_load_n(&r->ash_sends[q], __ATOMIC_ACQUIRE);
+                    over += __atomic_load_n(&r->ash_over[q], __ATOMIC_ACQUIRE);
+                }
+        RAD_INFO("two-node pipeline: fn4 pp_send_ash %d -> %d on this node's send rings (%llu shares from the side streams so far, "
+                 "%llu over the buffer; tp8 loop P46)", pp_ash_on_, v, (unsigned long long)sends, (unsigned long long)over);
+    }
+    pp_ash_on_ = v;
+}
+
 /* tp8 loop P8: what RADIANCE_PP_SEND_SPLIT=2's other ranks compared, summed over the lanes' send rings, a line a crossing. */
 void Engine::pp_split_note() {
+    /* tp8 loop P46: how many row-sharded shares crossed from the side streams, by rank */
+    if (pp_send_ash_rows() > 0) {
+        uint64_t all = 0, sends[RAD_PP_MAX_RANKS] = {}, over = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix) {
+            const RadPpRing* r = pp_send_[ix];
+            if (!r) continue;
+            all += __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+            for (int q = 0; q < RAD_PP_MAX_RANKS; ++q) {
+                sends[q] += __atomic_load_n(&r->ash_sends[q], __ATOMIC_ACQUIRE);
+                over += __atomic_load_n(&r->ash_over[q], __ATOMIC_ACQUIRE);
+            }
+        }
+        std::string by;
+        for (int q = 0; q < RAD_PP_MAX_RANKS && q < (int)ranks_.size(); ++q)
+            by += fmt("%s%llu", q ? " / " : "", (unsigned long long)sends[q]);
+        RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_ASH=%lld -- of this node's %llu %s payloads, shares from the side streams by "
+                 "rank %s, %llu share(s) over the staging buffer on the pass's stream (fn4 pp_send_ash %d; tp8 loop P46)",
+                 (long long)pp_send_ash_rows(), (unsigned long long)all, pp_leader() ? "X1" : "X2", by.c_str(),
+                 (unsigned long long)over, fn4::pp_send_ash());
+    }
     /* tp8 loop P10: how many payloads crossed from the side stream */
     if (pp_send_async_rows() > 0) {
         uint64_t all = 0, async = 0;

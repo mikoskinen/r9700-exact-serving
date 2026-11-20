@@ -2418,6 +2418,7 @@ int Engine::plan() {
              * allocates it after the carve, so the check below keeps it for later there). 0 when unset. */
             if (r->index == 0) f.staging += pp_send_async_bytes();
             f.staging += pp_recv_async_bytes();   /* tp8 loop P10b: every rank's (0 when unset) */
+            f.staging += pp_send_ash_bytes();     /* tp8 loop P46: every rank's (0 when unset) */
             /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP): allocated at start beside the step
              * state (ctxskip_setup), so in the budget and not kept for later. 0 when unset. */
             f.staging += ctxskip_bytes(r->program);
@@ -5328,7 +5329,7 @@ int Engine::start() {
         /* Both the headroom and the later allocations are still free here: serve() allocates
          * the step staging; the KV tiers' staging and a second lane are built on first use. */
         const int64_t late = late_step_bytes_ + late_lazy_bytes_ + (r->index == 0 ? pp_send_async_bytes() : 0) +
-                             pp_recv_async_bytes();
+                             pp_recv_async_bytes() + pp_send_ash_bytes();
         const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
         const int64_t room = got - late;

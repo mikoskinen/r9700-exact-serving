@@ -941,6 +941,7 @@ int Engine::prepare_release(const RadBatch* b, bool switches) {
  * scheduler's setters, the engine's own levers, every rank's mover and heat engine. Every rank thread
  * is parked. A pipeline's follower runs the same (tp8 S4: its placement levers). */
 void Engine::fn4_apply_changes(const int* sw) {
+    pp_ash_apply();   /* tp8 loop P46: fn4 pp_send_ash into this node's send rings (nothing unless RADIANCE_PP_SEND_ASH) */
     /* tp8 S5: a scheduler switch reaches every lane's scheduler; the value noted is lane 0's (each
      * lane runs the same setter on the same value). One lane: the call below is sched_'s alone. */
     const auto each_lane = [this](const auto& set) {

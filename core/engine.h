@@ -637,6 +637,13 @@ private:
      * stream (0 = off), and the staging buffer every rank of this node needs for it (0 when off) */
     static int64_t pp_recv_async_rows();
     int64_t pp_recv_async_bytes() const;
+    /* tp8 loop P46 (RADIANCE_PP_SEND_ASH): the row floor of a row-sharded share that crosses from a side stream through its
+     * rank's card staging buffer (0 = off), that buffer's bytes (every rank of this node; 0 when off), and fn4 pp_send_ash's
+     * value written into this node's send rings (between steps) */
+    static int64_t pp_send_ash_rows();
+    int64_t pp_send_ash_bytes() const;
+    void pp_ash_apply();
+    int pp_ash_on_ = -1;
     void pp_split_note();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy

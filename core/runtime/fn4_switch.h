@@ -537,6 +537,13 @@
  *                   at load on BOTH nodes (keep's pitch padded to 16-byte words, X2's keep part with it; the follower declares the
  *                   part + gather), which starts it at 1; without the env 1 is refused. Exact either way (lever I1's split + a word
  *                   gather). The follower takes it with the leader's; the leader holds nothing it changes.
+ *   pp_send_ash     engine, BOTH nodes (tp8 loop P46; 105 here, after sched_lane_room): 1 -- a row-sharded payload (an SP pass's X1
+ *                   on the leader, X2 on the follower under RADIANCE_DS41_SPHC_X2) of >= N rows: every rank packs its share into its
+ *                   own card staging buffer on the pass's stream and a side stream of the card copies it into the send ring (the
+ *                   split send's handshake unchanged), so the pass's stream goes on with the next pass while the share crosses PCIe;
+ *                   0 -- every share on the pass's stream, as before. The ring's bytes are the same either way (a copy's order only).
+ *                   Needs RADIANCE_PP_SEND_ASH=N at start (the staging buffers, kept by the budget on every rank; passes of >= N
+ *                   rows issued live), which starts it at 1; without the env 1 is refused. The follower takes the leader's request.
  *   sched_lane_room scheduler (tp8 loop D56; 104 here, after ds41_csplit): 0 -- a lane's admission room gates (a fresh prompt's whole
  *                   rest, a preempted request's whole recompute, beside every runner's rest of prompt + a block each) count the asking
  *                   lane's running requests, as before; 1 -- they count every lane's (each lane's running set and the ones its plan left
@@ -780,7 +787,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -908,6 +915,9 @@ int  sched_srf();
 int  sched_lane_room();
 /* tp8 loop U1 (aql_hdp): the switch once set, else RADIANCE_AQL_HDP_FLUSH at start (0 = off); read at every doorbell. */
 int  aql_hdp();
+/* tp8 loop P46 (pp_send_ash): the switch once set, else 1 where RADIANCE_PP_SEND_ASH=N allocated the staging buffers (0 = off); the
+ * engine writes it into this node's send rings (RadPpRing::ash_on) whenever a switch changes. */
+int  pp_send_ash();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
