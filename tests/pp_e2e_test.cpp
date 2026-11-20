@@ -6976,3 +6976,576 @@ TEST(d57_the_scheduler_levers_together_serve_one_process_tokens) {
     fprintf(stderr, "    D57 2 lanes: wall %.2f s with D57, %.2f s with D57=0 (the hold's bound 15 s)\n", wall_d57_2, wall_neg);
     CHECK(wall_d57_2 >= 0 && wall_neg >= 0);
 }
+
+/* tp8 loop D58: CHAT AND ANTHROPIC ENDPOINTS WITH TOOLS through the lanes -- the production client's request form (Claude Code and
+ * oh-my-pi send /v1/messages or /v1/chat/completions with the whole tools list every turn; every case above sends /completion). The
+ * tiny llama serves the Qwen3.6 chat template (--override-chat-template; its byte tokenizer carries ChatML's specials), so the reply
+ * format is the template's analysed one: a thinking block, <tool_call> / <function=..> / <parameter=..> calls, the whole-reply
+ * tool-call grammar of a forced call (tool_choice required / any / a named function) and the lazy one of auto. Tools: oh-my-pi
+ * 18.6.0's eleven as the client sends them (tests/data/chat) + ping (no arguments: a forced call to it is the grammar's one fully
+ * bounded call, so it completes inside its budget -- the control that the grammar acted and the parser read a call) + mode (one enum
+ * argument; string-typed and undeclared arguments are free text in the grammar, so its forced calls run to max_tokens). Seventeen forms
+ * -- chat (logprobs on, top 2): auto (thinking on) / required / named ping / named mode / required seeded T0.9 / named ping and named
+ * mode streamed / a tool result turn (thinking on) and the same streamed with thinking off; messages: auto / any / tool ping / tool
+ * mode / tool ping and tool mode streamed / a tool_result turn streamed / the same turn in Claude Code's spelling (system blocks and
+ * cache_control, metadata.user_id, adaptive thinking). The set: both endpoints' first form alone (the system + tools head, ~6,100
+ * tokens, rendered alike by both, then cached), all seventeen at once, two alone again. Compared with one process serving each
+ * form alone: every reply's view (text, thinking, the calls' names and arguments / the tool_use blocks' names and inputs, finish /
+ * stop reason, prompt and completion tokens) and, where a form asks logprobs, its token ids with their log-probabilities and top
+ * alternatives; at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (the KV copy checked), BEST's shape with the morning candidate's
+ * scheduler levers (SRF 2 + PUB_PROMPT 2 + HOLD + LANE_ROOM), and the DSpark-drafted fixture at BEST's shape: 0 differ, all 200, KV copy 0 differ, 0 E lines, the head
+ * attention-cached. In one process: every form answered, a streamed form's tokens = its non-streamed sibling's (and its whole view
+ * when the reply ended on its own), the forced ping calls complete. Ids (call_*, toolu_*) are minted at random per reply and are not
+ * compared. ~5-6 min alone (the ~6,100-token head is prefilled once a process; the forms alone in one process ~50-60 s a fixture). */
+namespace {
+using ojson = nlohmann::ordered_json;
+
+/* The tools in the order the Anthropic adapter writes them ({type, function: {name, parameters, description}}), so both endpoints
+ * render one head and the second warms from the first. */
+ojson d58_tools() {
+    const ojson f = ojson::parse(tiny::read_text(std::string(RAD_CHAT_FIXTURES) + "/oh-my-pi-18.6.0-tools.json"), nullptr, false);
+    ojson t = ojson::array();
+    if (!f.is_array()) return t;
+    auto add = [&t](const ojson& name, const ojson& params, const ojson& desc) {
+        ojson fn = ojson::object();
+        fn["name"] = name;
+        fn["parameters"] = params;
+        fn["description"] = desc;
+        ojson x = ojson::object();
+        x["type"] = "function";
+        x["function"] = std::move(fn);
+        t.push_back(std::move(x));
+    };
+    for (const ojson& x : f) add(x["function"]["name"], x["function"]["parameters"], x["function"].value("description", std::string()));
+    ojson none = ojson::object();
+    none["type"] = "object";
+    none["properties"] = ojson::object();
+    add("ping", none, "Takes no arguments.");
+    ojson mode = ojson::object();
+    mode["type"] = "object";
+    ojson m = ojson::object();
+    m["type"] = "string";
+    m["enum"] = ojson::array({ "fast", "safe" });
+    mode["properties"] = ojson::object();
+    mode["properties"]["m"] = std::move(m);
+    mode["required"] = ojson::array({ "m" });
+    mode["additionalProperties"] = false;
+    add("mode", mode, "Set the mode.");
+    return t;
+}
+ojson d58_tools_anthropic(const ojson& oai) {
+    ojson a = ojson::array();
+    for (const ojson& t : oai) {
+        ojson x = ojson::object();
+        x["name"] = t["function"]["name"];
+        x["description"] = t["function"]["description"];
+        x["input_schema"] = t["function"]["parameters"];
+        a.push_back(std::move(x));
+    }
+    return a;
+}
+
+struct D58Form { const char* name; const char* path; ojson body; int sibling; };
+constexpr const char* kD58Chat = "/v1/chat/completions";
+constexpr const char* kD58Msgs = "/v1/messages";
+constexpr size_t kD58HeadChat = 0, kD58HeadMsgs = 9;
+const size_t kD58Again[] = { 2, 14 };
+
+std::vector<D58Form> d58_forms() {
+    const ojson tools = d58_tools(), atools = d58_tools_anthropic(tools);
+    const std::string sys = "You are a coding agent in /work. Use the tools.";
+    const std::string ask = "Read /work/a.py, then run its tests.";
+    auto msg = [](const char* role, const ojson& content) {
+        ojson m = ojson::object();
+        m["role"] = role;
+        m["content"] = content;
+        return m;
+    };
+    auto named = [](const char* name) {
+        ojson c = ojson::object();
+        c["type"] = "function";
+        c["function"] = ojson::object();
+        c["function"]["name"] = name;
+        return c;
+    };
+    auto off = [] {
+        ojson k = ojson::object();
+        k["enable_thinking"] = false;
+        return k;
+    };
+    auto chat = [&](const ojson& messages, const ojson& tc, int n) {
+        ojson q = ojson::object();
+        q["model"] = "tiny";
+        q["messages"] = messages;
+        q["tools"] = tools;
+        q["tool_choice"] = tc;
+        q["max_tokens"] = n;
+        q["temperature"] = 0.0;
+        q["logprobs"] = true;
+        q["top_logprobs"] = 2;
+        return q;
+    };
+    const ojson first = ojson::array({ msg("system", sys), msg("user", ask) });
+    std::vector<D58Form> f;
+    ojson b;
+    b = chat(first, "auto", 40); f.push_back({ "chat auto", kD58Chat, b, -1 });
+    b = chat(first, "required", 64); b["chat_template_kwargs"] = off(); f.push_back({ "chat required", kD58Chat, b, -1 });
+    b = chat(first, named("ping"), 160); b["chat_template_kwargs"] = off(); b["parallel_tool_calls"] = false;
+    f.push_back({ "chat named ping", kD58Chat, b, -1 });
+    b = chat(first, named("mode"), 64); b["chat_template_kwargs"] = off(); b["parallel_tool_calls"] = false;
+    f.push_back({ "chat named mode", kD58Chat, b, -1 });
+    b = chat(first, "required", 64); b["chat_template_kwargs"] = off(); b["temperature"] = 0.9; b["top_p"] = 0.95; b["seed"] = 3001;
+    f.push_back({ "chat required seeded T0.9", kD58Chat, b, -1 });
+    ojson so = ojson::object();
+    so["include_usage"] = true;
+    b = f[2].body; b["stream"] = true; b["stream_options"] = so; f.push_back({ "chat named ping streamed", kD58Chat, b, 2 });
+    b = f[3].body; b["stream"] = true; b["stream_options"] = so; f.push_back({ "chat named mode streamed", kD58Chat, b, 3 });
+    {
+        ojson call = ojson::object();
+        call["id"] = "call_0";
+        call["type"] = "function";
+        call["function"] = ojson::object();
+        call["function"]["name"] = "read";
+        call["function"]["arguments"] = "{\"path\": \"/work/a.py\", \"i\": \"read the file\"}";
+        ojson am = msg("assistant", "");
+        am["tool_calls"] = ojson::array({ call });
+        ojson tm = msg("tool", "print('ok')\n");
+        tm["tool_call_id"] = "call_0";
+        const ojson turn = ojson::array({ msg("system", sys), msg("user", ask), am, tm });
+        b = chat(turn, "auto", 40); f.push_back({ "chat tool result", kD58Chat, b, -1 });
+        b["chat_template_kwargs"] = off(); b["stream"] = true; b["stream_options"] = so;
+        f.push_back({ "chat tool result streamed, thinking off", kD58Chat, b, -1 });
+    }
+    auto msgs = [&](const ojson& messages, const ojson& tc, int n, bool think_off) {
+        ojson q = ojson::object();
+        q["model"] = "tiny";
+        q["system"] = sys;
+        q["messages"] = messages;
+        q["tools"] = atools;
+        q["tool_choice"] = tc;
+        q["max_tokens"] = n;
+        q["temperature"] = 0.0;
+        if (think_off) {
+            q["thinking"] = ojson::object();
+            q["thinking"]["type"] = "disabled";
+        }
+        return q;
+    };
+    auto choice = [](const char* type, const char* name) {
+        ojson c = ojson::object();
+        c["type"] = type;
+        if (name) { c["name"] = name; c["disable_parallel_tool_use"] = true; }
+        return c;
+    };
+    const ojson mfirst = ojson::array({ msg("user", ask) });
+    b = msgs(mfirst, choice("auto", nullptr), 40, false); f.push_back({ "messages auto", kD58Msgs, b, -1 });
+    b = msgs(mfirst, choice("any", nullptr), 64, true); f.push_back({ "messages any", kD58Msgs, b, -1 });
+    b = msgs(mfirst, choice("tool", "ping"), 160, true); f.push_back({ "messages tool ping", kD58Msgs, b, -1 });
+    b = msgs(mfirst, choice("tool", "mode"), 64, true); f.push_back({ "messages tool mode", kD58Msgs, b, -1 });
+    b = f[11].body; b["stream"] = true; f.push_back({ "messages tool ping streamed", kD58Msgs, b, 11 });
+    b = f[12].body; b["stream"] = true; f.push_back({ "messages tool mode streamed", kD58Msgs, b, 12 });
+    {
+        ojson use = ojson::object();
+        use["type"] = "tool_use";
+        use["id"] = "toolu_01";
+        use["name"] = "read";
+        use["input"] = ojson::object();
+        use["input"]["path"] = "/work/a.py";
+        use["input"]["i"] = "read the file";
+        ojson res = ojson::object();
+        res["type"] = "tool_result";
+        res["tool_use_id"] = "toolu_01";
+        res["content"] = "print('ok')\n";
+        const ojson turn = ojson::array({ msg("user", ask), msg("assistant", ojson::array({ use })), msg("user", ojson::array({ res })) });
+        b = msgs(turn, choice("auto", nullptr), 40, true); b["stream"] = true;
+        f.push_back({ "messages tool_result streamed", kD58Msgs, b, -1 });
+        /* Claude Code's own spelling of a turn: the system as text blocks (its billing stamp first, held to f's by the server) with
+         * cache_control, cache_control on the last tool and on the last user block, metadata.user_id (the server's session label),
+         * adaptive thinking, streamed */
+        ojson cc = ojson::object();
+        cc["type"] = "ephemeral";
+        ojson sb = ojson::object();
+        sb["type"] = "text";
+        sb["text"] = sys;
+        sb["cache_control"] = cc;
+        ojson stamp = ojson::object();
+        stamp["type"] = "text";
+        stamp["text"] = "x-anthropic-billing-header: cc_version=2.1.0.d58; cc_entrypoint=cli; cch=3a9f1;";
+        b = msgs(turn, choice("auto", nullptr), 40, false);
+        b["system"] = ojson::array({ stamp, sb });
+        b["tools"].back()["cache_control"] = cc;
+        b["messages"].back()["content"].back()["cache_control"] = cc;
+        b["metadata"] = ojson::object();
+        b["metadata"]["user_id"] = "user_d58_account__session_5f1c8a2e-0b7d-4c55-9a43-d58d58d58d58";
+        b["thinking"] = ojson::object();
+        b["thinking"]["type"] = "adaptive";
+        b["stream"] = true;
+        f.push_back({ "messages, Claude Code's spelling", kD58Msgs, b, -1 });
+    }
+    return f;
+}
+
+/* One reply as a view that holds everything the client reads except the minted ids; `ids` the token ids its logprobs named. */
+struct D58Reply { int status = -1; std::string why; json view; std::vector<int32_t> ids; };
+
+std::vector<json> d58_events(const std::string& out) {
+    std::vector<json> ev;
+    for (size_t at = 0; (at = out.find("data: ", at)) != std::string::npos;) {
+        const size_t e = out.find('\n', at);
+        const std::string p = out.substr(at + 6, e == std::string::npos ? std::string::npos : e - at - 6);
+        at = e == std::string::npos ? out.size() : e;
+        if (p == "[DONE]") { ev.push_back(json("[DONE]")); continue; }
+        const json j = json::parse(p, nullptr, false);
+        if (!j.is_discarded()) ev.push_back(j);
+    }
+    return ev;
+}
+
+D58Reply d58_ask(int port, const D58Form& f) {
+    D58Reply r;
+    std::string hd, out;
+    r.status = post_raw(port, f.path, f.body.dump(), &hd, &out);
+    if (r.status != 200) { r.why = "HTTP " + std::to_string(r.status) + ": " + out.substr(0, 300); return r; }
+    const bool stream = f.body.value("stream", false), anth = std::strcmp(f.path, kD58Msgs) == 0;
+    json lp = json::array();
+    auto lp_add = [&lp](const json& c) {
+        if (c.is_array()) for (const json& e : c) lp.push_back(e);
+    };
+    json v = json::object();
+    if (!anth) {
+        std::string content, reasoning, finish;
+        json calls = json::array();
+        long long pt = -1, ct = -1;
+        auto usage = [&](const json& u) {
+            if (!u.is_object()) return;
+            pt = u.value("prompt_tokens", -1LL);
+            ct = u.value("completion_tokens", -1LL);
+        };
+        if (!stream) {
+            const json j = json::parse(out, nullptr, false);
+            if (!j.is_object() || !j.contains("choices") || !j["choices"].is_array() || j["choices"].empty()) {
+                r.why = "no choices in " + out.substr(0, 200);
+                return r;
+            }
+            const json& c = j["choices"][0];
+            const json& m = c["message"];
+            if (m.contains("content") && m["content"].is_string()) content = m["content"].get<std::string>();
+            if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) reasoning = m["reasoning_content"].get<std::string>();
+            if (m.contains("tool_calls") && m["tool_calls"].is_array())
+                for (const json& tc : m["tool_calls"])
+                    calls.push_back({ { "name", tc["function"].value("name", std::string()) },
+                                      { "arguments", tc["function"].value("arguments", std::string()) } });
+            if (c.contains("finish_reason") && c["finish_reason"].is_string()) finish = c["finish_reason"].get<std::string>();
+            if (c.contains("logprobs") && c["logprobs"].is_object() && c["logprobs"].contains("content")) lp_add(c["logprobs"]["content"]);
+            if (j.contains("usage")) usage(j["usage"]);
+        } else {
+            bool done = false;
+            for (const json& j : d58_events(out)) {
+                if (j.is_string()) { done = true; continue; }
+                if (j.contains("error")) { r.why = "an error event: " + j["error"].dump().substr(0, 200); continue; }
+                if (j.contains("usage") && j["usage"].is_object()) usage(j["usage"]);
+                if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty()) continue;
+                const json& c = j["choices"][0];
+                if (c.contains("delta") && c["delta"].is_object()) {
+                    const json& d = c["delta"];
+                    if (d.contains("content") && d["content"].is_string()) content += d["content"].get<std::string>();
+                    if (d.contains("reasoning_content") && d["reasoning_content"].is_string()) reasoning += d["reasoning_content"].get<std::string>();
+                    if (d.contains("tool_calls") && d["tool_calls"].is_array())
+                        for (const json& tc : d["tool_calls"]) {
+                            const size_t k = tc.value("index", (size_t)0);
+                            while (calls.size() <= k) calls.push_back({ { "name", "" }, { "arguments", "" } });
+                            if (tc.contains("function") && tc["function"].is_object()) {
+                                const json& fn = tc["function"];
+                                if (fn.contains("name") && fn["name"].is_string())
+                                    calls[k]["name"] = calls[k]["name"].get<std::string>() + fn["name"].get<std::string>();
+                                if (fn.contains("arguments") && fn["arguments"].is_string())
+                                    calls[k]["arguments"] = calls[k]["arguments"].get<std::string>() + fn["arguments"].get<std::string>();
+                            }
+                        }
+                }
+                if (c.contains("finish_reason") && c["finish_reason"].is_string()) finish = c["finish_reason"].get<std::string>();
+                if (c.contains("logprobs") && c["logprobs"].is_object() && c["logprobs"].contains("content")) lp_add(c["logprobs"]["content"]);
+            }
+            if (!done && r.why.empty()) r.why = "the stream ended without [DONE]";
+        }
+        v = { { "content", content }, { "reasoning", reasoning }, { "calls", calls }, { "finish", finish },
+              { "prompt_tokens", pt }, { "completion_tokens", ct } };
+    } else {
+        json blocks = json::array();
+        std::string stop;
+        long long in = -1, ot = -1;
+        auto block_of = [](const json& b) {
+            const std::string t = b.value("type", std::string());
+            if (t == "text") return json{ { "type", t }, { "text", b.value("text", std::string()) } };
+            if (t == "thinking") return json{ { "type", t }, { "thinking", b.value("thinking", std::string()) } };
+            if (t == "tool_use") return json{ { "type", t }, { "name", b.value("name", std::string()) }, { "input", b.value("input", json::object()) } };
+            return json{ { "type", t } };
+        };
+        if (!stream) {
+            const json j = json::parse(out, nullptr, false);
+            if (!j.is_object() || j.value("type", std::string()) != "message" || !j.contains("content")) {
+                r.why = "not a message: " + out.substr(0, 200);
+                return r;
+            }
+            for (const json& b : j["content"]) blocks.push_back(block_of(b));
+            if (j.contains("stop_reason") && j["stop_reason"].is_string()) stop = j["stop_reason"].get<std::string>();
+            if (j.contains("usage") && j["usage"].is_object()) {
+                in = j["usage"].value("input_tokens", 0LL) + j["usage"].value("cache_read_input_tokens", 0LL);
+                ot = j["usage"].value("output_tokens", -1LL);
+            }
+        } else {
+            std::vector<std::string> partial;
+            bool done = false;
+            for (const json& j : d58_events(out)) {
+                if (!j.is_object()) continue;
+                const std::string t = j.value("type", std::string());
+                if (t == "error") { r.why = "an error event: " + j.dump().substr(0, 200); continue; }
+                if (t == "message_start" && j.contains("message") && j["message"].contains("usage"))
+                    in = j["message"]["usage"].value("input_tokens", -1LL);
+                const size_t k = j.value("index", (size_t)0);
+                if (t == "content_block_start" && j.contains("content_block")) {
+                    while (blocks.size() <= k) { blocks.push_back(json::object()); partial.emplace_back(); }
+                    blocks[k] = block_of(j["content_block"]);
+                } else if (t == "content_block_delta" && k < blocks.size() && j.contains("delta")) {
+                    const json& d = j["delta"];
+                    const std::string dt = d.value("type", std::string());
+                    if (dt == "text_delta") blocks[k]["text"] = blocks[k].value("text", std::string()) + d.value("text", std::string());
+                    else if (dt == "thinking_delta")
+                        blocks[k]["thinking"] = blocks[k].value("thinking", std::string()) + d.value("thinking", std::string());
+                    else if (dt == "input_json_delta") partial[k] += d.value("partial_json", std::string());
+                } else if (t == "content_block_stop" && k < blocks.size() && blocks[k].value("type", std::string()) == "tool_use") {
+                    const json in_obj = partial[k].empty() ? json::object() : json::parse(partial[k], nullptr, false);
+                    blocks[k]["input"] = in_obj.is_object() ? in_obj : json::object();
+                } else if (t == "message_delta") {
+                    if (j.contains("delta") && j["delta"].contains("stop_reason") && j["delta"]["stop_reason"].is_string())
+                        stop = j["delta"]["stop_reason"].get<std::string>();
+                    if (j.contains("usage") && j["usage"].is_object()) ot = j["usage"].value("output_tokens", -1LL);
+                } else if (t == "message_stop") {
+                    done = true;
+                }
+            }
+            if (!done && r.why.empty()) r.why = "the stream ended without message_stop";
+        }
+        v = { { "content", blocks }, { "stop_reason", stop }, { "prompt_tokens", in }, { "output_tokens", ot } };
+    }
+    json lpv = json::array();
+    for (const json& e : lp) {
+        const int32_t id = e.value("id", (int32_t)-1);
+        r.ids.push_back(id);
+        json top = json::array();
+        if (e.contains("top_logprobs") && e["top_logprobs"].is_array())
+            for (const json& a : e["top_logprobs"]) top.push_back({ a.value("id", -1), a.value("logprob", 0.0) });
+        lpv.push_back({ id, e.value("logprob", 0.0), top });
+    }
+    if (!lpv.empty()) v["logprobs"] = lpv;
+    r.view = std::move(v);
+    return r;
+}
+
+/* The calls a reply made: (name, arguments as JSON) -- chat's tool_calls or messages' tool_use blocks. */
+std::vector<std::pair<std::string, json>> d58_calls(const D58Reply& r) {
+    std::vector<std::pair<std::string, json>> c;
+    if (r.view.contains("calls"))
+        for (const json& x : r.view["calls"]) {
+            const json a = json::parse(x.value("arguments", std::string()), nullptr, false);
+            c.emplace_back(x.value("name", std::string()), a.is_discarded() ? json() : a);
+        }
+    if (r.view.contains("content") && r.view["content"].is_array())
+        for (const json& b : r.view["content"])
+            if (b.value("type", std::string()) == "tool_use") c.emplace_back(b.value("name", std::string()), b.value("input", json::object()));
+    return c;
+}
+std::string d58_finish(const D58Reply& r) {
+    return r.view.value("finish", r.view.value("stop_reason", std::string()));
+}
+
+/* Both heads alone, all fifteen at once, two alone again: [0] form 0, [1] form 9, [2 + i] form i, then kD58Again. */
+std::vector<D58Reply> d58_set(int port, const std::vector<D58Form>& f) {
+    std::vector<D58Reply> out;
+    out.push_back(d58_ask(port, f[kD58HeadChat]));
+    out.push_back(d58_ask(port, f[kD58HeadMsgs]));
+    std::vector<std::future<D58Reply>> fu;
+    for (const D58Form& x : f) fu.push_back(std::async(std::launch::async, [port, &x] { return d58_ask(port, x); }));
+    for (auto& x : fu) out.push_back(x.get());
+    for (size_t i : kD58Again) out.push_back(d58_ask(port, f[i]));
+    return out;
+}
+size_t d58_form_of(size_t slot, size_t n) {
+    if (slot == 0) return kD58HeadChat;
+    if (slot == 1) return kD58HeadMsgs;
+    if (slot < 2 + n) return slot - 2;
+    return kD58Again[slot - 2 - n];
+}
+std::string d58_brief(const D58Reply& r) {
+    json v = r.view;
+    v.erase("logprobs");   /* the ids, below */
+    std::string s = v.dump(-1, ' ', false, json::error_handler_t::replace);
+    if (s.size() > 420) s = s.substr(0, 420) + "...";
+    std::string ids;
+    for (size_t i = 0; i < r.ids.size() && i < 24; ++i) ids += (i ? "," : "") + std::to_string(r.ids[i]);
+    return s + (r.ids.empty() ? "" : " ids[" + std::to_string(r.ids.size()) + "] " + ids + (r.ids.size() > 24 ? ",..." : ""));
+}
+}  /* namespace */
+
+TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<D58Form> forms = d58_forms();
+    REQUIRE_EQ(forms.size(), (size_t)17);
+    REQUIRE_EQ(forms[kD58HeadChat].body["tools"].size(), (size_t)13);
+    const std::vector<std::string> ext = { "--max-num-seqs", "16", "--max-num-batched-tokens", "512", "--max-model-len", "16384",
+                                           "--override-chat-template", std::string(RAD_CHAT_FIXTURES) + "/qwen3.6/chat_template.jinja" };
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> kSched = { "RADIANCE_SCHED_SRF=2", "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=5000",
+                                              "RADIANCE_SCHED_LANE_ROOM=1" };
+    const bool dump = std::getenv("PP_E2E_D58_DUMP") != nullptr;
+    const char* only = std::getenv("PP_E2E_D58_ARM");   /* a debugging aid: the arms whose name holds this text */
+    auto same = [](const D58Reply& x, const D58Reply& y) { return x.view == y.view && x.ids == y.ids; };
+    std::map<int, std::vector<D58Reply>> refs;   /* 0: the plain fixture, 1: the drafted one; each form alone in one process */
+    for (int ds = 0; ds < 2; ++ds) {
+        const char* fx = ds ? "drafted" : "plain";
+        Serving one;
+        if (ds) one.model = worldds().llama_rad;
+        REQUIRE(one.start("", ds ? cat(ext, spec) : ext));
+        std::vector<D58Reply>& alone = refs[ds];
+        const auto t0 = std::chrono::steady_clock::now();
+        for (const D58Form& f : forms) alone.push_back(d58_ask(one.port, f));
+        const double t_alone = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double hit = metric(get(one.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        int bad = 0, cut_read = 0;
+        for (size_t i = 0; i < forms.size(); ++i) {
+            const D58Reply& a = alone[i];
+            if (dump) fprintf(stderr, "    D58 one process (%s) form %zu '%s': %s\n", fx, i, forms[i].name, d58_brief(a).c_str());
+            if (a.status != 200 || !a.why.empty()) {
+                ++bad;
+                fprintf(stderr, "    D58 one process (%s) form %zu '%s': %s\n", fx, i, forms[i].name, a.why.c_str());
+                continue;
+            }
+            if (forms[i].sibling >= 0) {
+                /* streamed = its non-streamed sibling: the tokens, their count and the finish always; the whole view when the reply
+                 * ended on its own. A reply cut by max_tokens inside a call is read differently by the two paths by design
+                 * (core/server/server.cpp: the buffered reply turns a half-finished call into content so no tool runs on truncated
+                 * arguments; the stream has announced the call already) -- printed as a reading */
+                const D58Reply& sb = alone[(size_t)forms[i].sibling];
+                const std::string fin = d58_finish(a);
+                const bool cut = fin == "length" || fin == "max_tokens";
+                const bool tok_same = a.ids == sb.ids && fin == d58_finish(sb) &&
+                                      a.view.value("completion_tokens", -2LL) == sb.view.value("completion_tokens", -2LL) &&
+                                      a.view.value("output_tokens", -2LL) == sb.view.value("output_tokens", -2LL);
+                if (!tok_same || (!cut && !same(a, sb))) {
+                    ++bad;
+                    fprintf(stderr, "    D58 one process (%s) form %zu '%s' streamed differs from its sibling %d:\n      %s\n      %s\n", fx,
+                            i, forms[i].name, forms[i].sibling, d58_brief(a).c_str(), d58_brief(sb).c_str());
+                } else if (!same(a, sb)) {
+                    ++cut_read;
+                    fprintf(stderr, "    D58 one process (%s) form %zu '%s' (cut by max_tokens): streamed %s / non-streamed %s\n", fx, i,
+                            forms[i].name, d58_brief(a).c_str(), d58_brief(sb).c_str());
+                }
+            }
+        }
+        /* the controls: a forced call to ping (no arguments: the grammar's only fully bounded call -- string-typed and undeclared
+         * arguments are free text, whitespace runs are bounded) completes inside its budget: the grammar acted, the parser read a
+         * call, the finish is the call's; mode's forced calls are printed */
+        int forced = 0, forced_ok = 0, calls = 0;
+        for (size_t i = 0; i < forms.size(); ++i) {
+            const auto c = d58_calls(alone[i]);
+            calls += (int)c.size();
+            const std::string nm = forms[i].name;
+            const bool ping = nm.find("ping") != std::string::npos, mode = nm.find("mode") != std::string::npos;
+            if (!ping && !mode) continue;
+            forced += ping;
+            const std::string fin = d58_finish(alone[i]);
+            if (mode) {
+                fprintf(stderr, "    D58 one process (%s) form %zu '%s' (a reading): finish '%s', %zu call(s)%s%s\n", fx, i, forms[i].name,
+                        fin.c_str(), c.size(), c.empty() ? "" : ", the first ", c.empty() ? "" : c[0].first.c_str());
+                continue;
+            }
+            const bool ok = c.size() == 1 && c[0].first == "ping" && (fin == "tool_calls" || fin == "tool_use") && c[0].second.is_object() &&
+                            c[0].second.empty();
+            forced_ok += ok;
+            if (!ok) fprintf(stderr, "    D58 one process (%s) form %zu '%s': the forced call did not complete: %s\n", fx, i, forms[i].name,
+                             d58_brief(alone[i]).c_str());
+        }
+        long long ptok = -1;
+        if (alone[0].view.contains("prompt_tokens")) ptok = alone[0].view["prompt_tokens"].get<long long>();
+        fprintf(stderr, "    D58 one process (%s): %zu forms alone in %.1f s, the head form's prompt %lld tokens; %d not as claimed; %d calls read "
+                        "over the forms; forced ping calls complete %d of %d; cut streamed / non-streamed views differ %d; attention-cached %.0f\n",
+                fx, forms.size(), t_alone, ptok, bad, calls, forced_ok, forced, cut_read, hit);
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(forced_ok, forced);
+        CHECK(forced == 4);
+        CHECK(ptok > 4000);
+        CHECK(hit > 4000);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv; };
+    /* "one process" (the set in one process against its forms alone) runs only when PP_E2E_D58_ARM names it: a debugging aid for a
+     * lane arm that differs */
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, false, true },
+                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true, true } }) {
+        if ((only && !std::strstr(a.name, only)) || (!a.lanes && !only)) continue;
+        std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        if (a.sched) env = cat(env, kSched);
+        Serving pp;
+        if (a.ds) pp.model = worldds().llama_rad;
+        std::vector<std::string> ex = a.ds ? cat(ext, spec) : ext;
+        if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
+        REQUIRE(pp.start(a.cut, ex, env));
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<D58Reply> got = d58_set(pp.port, forms);
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+        const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = a.lanes ? pp.fol.output() : std::string();
+        const std::vector<D58Reply>& want = refs[a.ds ? 1 : 0];
+        int differ = 0, failed = 0, calls = 0;
+        for (size_t s = 0; s < got.size(); ++s) {
+            const size_t i = d58_form_of(s, forms.size());
+            calls += (int)d58_calls(got[s]).size();
+            if (got[s].status != 200 || !got[s].why.empty()) {
+                ++failed;
+                fprintf(stderr, "    D58 %s slot %zu form %zu '%s': HTTP %d %s\n", a.name, s, i, forms[i].name, got[s].status, got[s].why.c_str());
+                continue;
+            }
+            if (same(got[s], want[i])) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < got[s].ids.size() && j < want[i].ids.size() && got[s].ids[j] == want[i].ids[j]) ++j;
+            fprintf(stderr, "    D58 %s slot %zu form %zu '%s' differs (token ids %zu vs %zu, the first difference at %zu):\n      %s\n      %s\n",
+                    a.name, s, i, forms[i].name, got[s].ids.size(), want[i].ids.size(), j, d58_brief(got[s]).c_str(),
+                    d58_brief(want[i]).c_str());
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        if (const char* dd = std::getenv("PP_E2E_D58_LOGS")) {
+            const std::string base = std::string(dd) + "/d58-" + std::to_string(a.lanes) + (a.best ? "-best" : "") + (a.sched ? "-sched" : "") +
+                                     (a.ds ? "-ds" : "");
+            tiny::write_text(base + "-leader.log", llog);
+            tiny::write_text(base + "-follower.log", flog);
+        }
+        fprintf(stderr, "    D58 %-36s W(%s): %d of %zu replies differ from one process alone, %d not served; %d calls read; wall %.1f s; "
+                        "attention-cached %.0f; KV-copy checks %lld, %lld differ; %zu E lines\n",
+                a.name, a.cut, differ, got.size(), failed, calls, wall, hit, checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(failed, 0);
+        CHECK_EQ(elines, (size_t)0);
+        CHECK(hit > 4000);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (differ || failed || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
