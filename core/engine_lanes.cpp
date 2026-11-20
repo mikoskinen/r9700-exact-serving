@@ -453,6 +453,7 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
     if (sv >= 3 && !lanes_.is_bg(lane)) {
         if (!pp_tband_copy_) return 0;
         bool on = pp_tband_bg_;
+        if (sv == 5) on = pp_tband_by_bound(count);   /* tp8 loop D51: the measured bound decides, in every stretch */
         if (!on && sv == 4) {
             if (tload == 0) {
                 on = true;
@@ -497,6 +498,43 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
     }
     if (count && later) ++pp_tband_cont_n_;
     return j;
+}
+
+/* tp8 loop D51 (fn4 pp_tband 5): whether this decode step bands by the measured bound -- the follower's recent card working share
+ * (its last heartbeat load report, at most 4 windows old) against the leader's own over the same window (RADIANCE_PP_TBAND_BOUND_MS,
+ * default 200): the follower busier by more than RADIANCE_PP_TBAND_BOUND_H permille (default 20) -> band (the layer to the leader),
+ * the leader busier by as much -> no band (the layer on the follower), in between the last decision. Either share missing (no
+ * RADIANCE_PP_NODE_IDLE here, no RADIANCE_PP_LOAD_REPORT_MS on the follower, too little covered yet) -> 3's rule (a BG step in
+ * flight). Order of where the band layer runs only: both forms are D50's (rule A). */
+bool Engine::pp_tband_by_bound(bool count) {
+    int age = -1, lpm = -1;
+    const int fpm = pp_link_ ? pp_link_->peer_load(&age) : -1;
+    if (pp_ni_) {
+        if (!pp_ni_->recent_keep_ns) pp_ni_->recent_keep_ns = 4ull * (uint64_t)pp_bound_ms_ * 1000000ull;
+        lpm = pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull);
+    }
+    if (fpm < 0 || lpm < 0 || age < 0 || age > 4 * pp_bound_ms_) {
+        if (count) ++pp_t5_fb_;
+        return pp_tband_bg_;
+    }
+    if (fpm > lpm + pp_bound_h_) pp_t5_on_ = true;
+    else if (lpm > fpm + pp_bound_h_) pp_t5_on_ = false;
+    if (count) {
+        ++(pp_t5_on_ ? pp_t5_band_ : pp_t5_keep_);
+        pp_t5_lsum_ += lpm;
+        pp_t5_fsum_ += fpm;
+    }
+    return pp_t5_on_;
+}
+
+std::string Engine::t5_text(const char* when) const {
+    const int64_t n = pp_t5_band_ + pp_t5_keep_;
+    return fmt("two-node pipeline: the tail band by the measured bound%s (fn4 pp_tband 5, tp8 loop D51): %lld decode lanes' steps judged "
+               "by it, %lld banded (the follower busier), %lld kept the band layer on the follower (the leader busier), %lld fell back to "
+               "3's rule (no fresh load report); mean recent card working leader %.1f %% / follower %.1f %% over %d ms windows, hysteresis "
+               "%d permille; %llu load reports came", when, (long long)n, (long long)pp_t5_band_, (long long)pp_t5_keep_,
+               (long long)pp_t5_fb_, n ? pp_t5_lsum_ / (double)n / 10.0 : 0.0, n ? pp_t5_fsum_ / (double)n / 10.0 : 0.0, pp_bound_ms_,
+               pp_bound_h_, pp_link_ ? (unsigned long long)pp_link_->load_reports_in() : 0ull);
 }
 
 /* tp8 loop D50: the tail band's counters, cumulative (a cell = two lines' difference; kit d50cell.py), at the D32 line's period
@@ -998,7 +1036,7 @@ int Engine::step_loop_lanes() {
         for (const char* c = v; *c; ++c)
             if (*c < '0' || *c > '9') return false;
         const long x = std::strtol(v, nullptr, 10);
-        return (x >= 1 && x <= 4) || (x > 1024 && x <= 4 + 1024 * 63 && (x & 1023) == 4);
+        return (x >= 1 && x <= 5) || (x > 1024 && x <= 4 + 1024 * 63 && (x & 1023) == 4);   /* tp8 loop D51: 5 */
     };
     if (const char* tv = std::getenv("RADIANCE_PP_TAIL_BAND"); tband_env_ok(tv)) {
         pp_tband_start_ = std::atoi(tv);   /* tp8 loop D39b: 2 = the later chunks of an all-band prompt too; D46: 3 = + decode lanes */
@@ -1027,6 +1065,17 @@ int Engine::step_loop_lanes() {
                          "leader for such a step, on the follower for the others (tp8 loop D50)%s", cfg_.pp_cut_t - pp_tail_band_k(),
                          (pp_tband_start_ & 1023) == 4 ? fmt(" -- RADIANCE_PP_TAIL_BAND=%d from the start (N = %d)", pp_tband_start_,
                                                              (pp_tband_start_ >> 10) & 63).c_str() : "");
+            /* tp8 loop D51: fn4 pp_tband 5's window and hysteresis (the leader's; the follower reads the window for its report) */
+            pp_bound_ms_ = 200;
+            pp_bound_h_ = 20;
+            if (const char* v = std::getenv("RADIANCE_PP_TBAND_BOUND_MS"); v && *v) pp_bound_ms_ = std::min(5000, std::max(20, std::atoi(v)));
+            if (const char* v = std::getenv("RADIANCE_PP_TBAND_BOUND_H"); v && *v) pp_bound_h_ = std::min(500, std::max(0, std::atoi(v)));
+            if (pp_tband_copy_)
+                RAD_INFO("two-node pipeline: fn4 pp_tband 5 runs a held decode lane's step as a tail band pass while the FOLLOWER's card "
+                         "worked more than the leader's by > %d permille over the last %d ms (its load report: RADIANCE_PP_LOAD_REPORT_MS "
+                         "on the follower, RADIANCE_PP_NODE_IDLE on both), keeps layer %d on the follower while the leader's did, else as "
+                         "the last step; no fresh report -> 3's rule (tp8 loop D51; RADIANCE_PP_TBAND_BOUND_MS / _H)%s", pp_bound_h_,
+                         pp_bound_ms_, cfg_.pp_cut_t - pp_tail_band_k(), pp_tband_start_ == 5 ? " -- RADIANCE_PP_TAIL_BAND=5 from the start" : "");
             if ((pp_tband_start_ & 1023) >= 3 && !pp_tband_copy_) {
                 RAD_WARN("two-node pipeline: RADIANCE_PP_TAIL_BAND=%d runs as 1: the plugin declared no tail band copy (tp8 loop D46: "
                          "RADIANCE_DS41_PP_TBAND_COPY=1 / RADIANCE_LLAMA_PP_TBAND_COPY=1 on both nodes)", pp_tband_start_);
@@ -1985,6 +2034,7 @@ int Engine::step_loop_lanes() {
             if (now - bgr_line_ns >= bgr_every) {
                 bgr_line(" so far");
                 if (pp_tband_copy_) RAD_INFO("%s", tband_text(" so far").c_str());   /* tp8 loop D50: the tail band by cell */
+                if (pp_t5_band_ + pp_t5_keep_ + pp_t5_fb_ > 0) RAD_INFO("%s", t5_text(" so far").c_str());   /* tp8 loop D51 */
                 bgr_line_ns = now;
             }
         }
@@ -2094,6 +2144,7 @@ int Engine::step_loop_lanes() {
     if (lseg) lseg_line("");
     if (bgr_on) bgr_line(" over the run");   /* tp8 loop D32 */
     if (bgr_on && pp_tband_copy_) RAD_INFO("%s", tband_text(" over the run").c_str());   /* tp8 loop D50 */
+    if (pp_t5_band_ + pp_t5_keep_ + pp_t5_fb_ > 0) RAD_INFO("%s", t5_text(" over the run").c_str());   /* tp8 loop D51 */
     if (pp_link_ && dch_n_ > 0)                /* tp8 loop D35 */
         RAD_INFO("two-node pipeline: decode chain on the leader host over the run (tp8 loop D35): %s", dch_text().c_str());
     if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39); "

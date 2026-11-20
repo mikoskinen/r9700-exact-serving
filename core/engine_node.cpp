@@ -1474,6 +1474,24 @@ int Engine::follower_loop() {
     std::unique_ptr<PpNodeIdle> ni_own;   /* tp8 dev D8 */
     struct NiReset { Engine* e; ~NiReset() { e->pp_ni_ = nullptr; } } ni_reset{ this };
     pp_node_idle_open(&ni_own);
+    /* tp8 loop D51 (RADIANCE_PP_LOAD_REPORT_MS=N, 1 .. 1000, with RADIANCE_PP_NODE_IDLE): this follower's recent card working share
+     * over RADIANCE_PP_TBAND_BOUND_MS (default 200) goes to the leader every N ms in a heartbeat's aux (fn4 pp_tband 5 reads it) */
+    pp_load_ms_ = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_LOAD_REPORT_MS"); v && *v && pp_link_) {
+        const int n = std::atoi(v);
+        if (n >= 1 && n <= 1000 && pp_ni_) {
+            pp_load_ms_ = n;
+            pp_bound_ms_ = 200;
+            if (const char* w = std::getenv("RADIANCE_PP_TBAND_BOUND_MS"); w && *w) pp_bound_ms_ = std::min(5000, std::max(20, std::atoi(w)));
+            pp_ni_->recent_keep_ns = 4ull * (uint64_t)pp_bound_ms_ * 1000000ull;
+            pp_link_->set_load_period(n);
+            RAD_INFO("follower: RADIANCE_PP_LOAD_REPORT_MS=%d -- this node's card working share over the last %d ms goes to the leader "
+                     "every %d ms (a heartbeat's aux; fn4 pp_tband 5 there, tp8 loop D51)", n, pp_bound_ms_, n);
+        } else {
+            RAD_WARN("follower: RADIANCE_PP_LOAD_REPORT_MS=%s is not taken: %s (tp8 loop D51)", v,
+                     pp_ni_ ? "1 .. 1000 ms" : "it needs RADIANCE_PP_NODE_IDLE=1 / 2 on this node");
+        }
+    }
     /* tp8 loop P22 (RADIANCE_PP_PF_TIMELINE=1, the leader's switch, on this node too): the follower's side of a lone cold
      * prompt's timeline (core/pp_pftl_fol.h) */
     std::unique_ptr<PfFolTimeline> pff;
@@ -2269,6 +2287,7 @@ int Engine::follower_loop() {
         if (steps == 1 || steps % 1024 == 0)
             RAD_INFO("follower: %lld steps run, %lld builds replayed", (long long)steps, (long long)builds);
         if (pp_ni_) pp_ni_->minute();
+        if (pp_load_ms_ > 0 && pp_ni_) pp_link_->set_load(pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull));   /* tp8 loop D51 */
         if (!segs.empty() && seg_passes > 0 && (seg_passes == 1 || seg_passes % 256 == 0) && steps % 64 == 0)
             RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, %lld held "
                      "in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts, (long long)seg_between,
