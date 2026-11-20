@@ -376,19 +376,20 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                 if (!d.empty()) { ++bad; fails += fmt(" M %lld %s: %s;", (long long)M, al ? "16-byte loads" : "element loads", d.c_str()); }
             }
         }
-        for (int64_t c0 : { (int64_t)0, (int64_t)96, (int64_t)192, (int64_t)288 })
+        /* glm_router's TP4 column split (rad_glm_tp.h, from 256 rows): 4 slices of NE / 4 columns (96 at 384, 32 at 128) */
+        const int64_t SC = NE / 4;
+        for (int64_t c0 : { (int64_t)0, SC, 2 * SC, 3 * SC })
             for (int64_t M : { (int64_t)16, (int64_t)48, (int64_t)64, (int64_t)256, MR }) {
-                if (NE != 384) break;   /* glm_router's 96-column split: the trunk's shape only */
-                void* y = dalloc((size_t)(M * 96 * 4) + tail);
+                void* y = dalloc((size_t)(M * SC * 4) + tail);
                 if (!y) { fails += " alloc;"; break; }
-                st_memset(y, 0xA5, (size_t)(M * 96 * 4) + tail);
-                const int r = gemm(dx, K, M, (const uint16_t*)dw + c0 * K, 96, y);
+                st_memset(y, 0xA5, (size_t)(M * SC * 4) + tail);
+                const int r = gemm(dx, K, M, (const uint16_t*)dw + c0 * K, SC, y);
                 st_stream_sync(nullptr);
-                const std::string d = r != RAD_OK ? fmt("rc %d", r) : same_rows(y, M, 96, c0);
+                const std::string d = r != RAD_OK ? fmt("rc %d", r) : same_rows(y, M, SC, c0);
                 ++checks;
                 if (!d.empty()) { ++bad; fails += fmt(" split cols %lld.. M %lld: %s;", (long long)c0, (long long)M, d.c_str()); }
             }
-        ok(fmt("spdf32 rgm gemm code 40 batch-invariant: rows of M 1..1000 (16-byte and element loads) and the 96-column split's 4 slices "
+        ok(fmt("spdf32 rgm gemm code 40 batch-invariant: rows of M 1..1000 (16-byte and element loads) and the column split's 4 slices "
                "(M 16..2112) = the 2112-row call's bytes (%d calls)", checks).c_str(),
            fails.empty(), fails);
     }

@@ -449,9 +449,10 @@ int r4d_rgm_route(RadStream s, const R4dF32PfCall& c) {
     /* 10: the router (N 384 / its 96-column split); 11 (lever RGC, round 40, RULE B too): + the ratio > 1 compressors' fused kv | gate
      * projection (N 1024, K 5120, bf16 under ROUTER_BF16) at every M -- its prefill rows and its decode-band calls alike; 12 (lever RGD,
      * DRAFTER round 41, RULE B for the drafter's proposals only): 11 + the DSpark drafter's router (N 128, K 5120, bf16 under ROUTER_BF16:
-     * its query pass's chain and its context pass's projection alike; no other gemm_nt_f32 of DeepSeek-V4.1 has N 128) */
+     * its query pass's chain and its context pass's projection alike) and its TP4 column split (N 32, rad_glm_tp.h from 256 rows: the
+     * context pass's prompt chunks); no other gemm_nt_f32 of DeepSeek-V4.1 has N 128 or 32 (host declare: 1024 / 384 / 128 / 96 / 32) */
     if (p >= 0 || (v != 10 && v != 11 && v != 12) ||
-        (c.N != 384 && c.N != 96 && !(v >= 11 && c.N == 1024) && !(v == 12 && c.N == 128)))
+        (c.N != 384 && c.N != 96 && !(v >= 11 && c.N == 1024) && !(v == 12 && (c.N == 128 || c.N == 32))))
         return R4D_F32PF_DECLINE;
     const int rc = r4d_rgm_gemm(s, c);
     if (rc != R4D_F32PF_DECLINE) {
