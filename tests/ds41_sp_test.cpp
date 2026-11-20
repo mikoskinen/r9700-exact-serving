@@ -621,4 +621,86 @@ TEST(p47_keep_pitch_pads_to_whole_16_byte_words_only_when_asked) {
     CHECK(!ds41_idx_run_skipped(100, 0, 51, 150));
 }
 
+/* ---- tp8 loop P26c (RADIANCE_DS41_SPHC_ATTN=3): an SP kv / index source layer (ratio > 1: layers 2 / 8 / 14) without xn's gather.
+ * A row-validity model of the layer's attention inputs per rank (xn after the collapse holds the rank's SP quarter only): today's
+ * level 2 (P26b) gathers xn, runs q_a / kv / the indexer's projection over every row and the compressor's GEMM over the quarter
+ * (kvs gathered); level 3 runs q_a / kv / the projection over the quarter too and gathers qr / kv / iw instead of xn. The readers:
+ * q_b's norm + GEMM (qr, every row), the window key's ops (kv, every row), the compressor chain (kvs, every row), each index run
+ * (iw at the run's rows under the indexer's deal -- not the SP quarter: the balanced deal's blocks drift from it). Checked for
+ * pass heights 768 .. 4160 (SPHC 768 up), irows 96 / 256, plain / balanced: every read valid at levels 2 and 3. Controls that must
+ * fail: level 3 without iw's gather (an index run reads another rank's quarter), and a ratio-1 source's compressor GEMM over
+ * every row (xn past the quarter) -- why P26c takes ratio > 1 sources only. */
+namespace p26c {
+
+struct Rows { std::vector<uint8_t> v; explicit Rows(int64_t T) : v((size_t)T, 0) {} };
+
+/* level: 2 or 3; iw_gather / quarter_comp: the controls' knobs. Returns the number of invalid reads over the four ranks. */
+int64_t bad_reads(int64_t T, int64_t irows, bool balance, int level, bool iw_gather, bool quarter_comp) {
+    constexpr int W = 4;
+    const int64_t q = (T + W - 1) / W;
+    int64_t bad = 0;
+    for (int r = 0; r < W; ++r) {
+        const int64_t s0 = std::min<int64_t>((int64_t)r * q, T), sn = std::max<int64_t>(0, std::min(q, T - s0));
+        Rows xn(T), qr(T), kv(T), iw(T), kvs(T);
+        for (int64_t t = s0; t < s0 + sn; ++t) xn.v[(size_t)t] = 1;   /* the collapse over the quarter */
+        const auto over = [&](Rows& out, int64_t a, int64_t n, const Rows& in) {   /* a per-row op reads `in` at its rows */
+            for (int64_t t = a; t < a + n; ++t) {
+                bad += !in.v[(size_t)t];
+                out.v[(size_t)t] = in.v[(size_t)t];
+            }
+        };
+        const auto gather = [&](Rows& b) {   /* all_gather_rows: every rank's quarter is valid on its owner -> every row */
+            for (int64_t t = 0; t < T; ++t) b.v[(size_t)t] = 1;
+        };
+        if (level == 2) {
+            gather(xn);
+            over(qr, 0, T, xn);
+            over(kv, 0, T, xn);
+            over(iw, 0, T, xn);
+        } else {
+            over(qr, s0, sn, xn);
+            over(kv, s0, sn, xn);
+            over(iw, s0, sn, xn);
+            gather(qr);
+            gather(kv);
+            if (iw_gather) gather(iw);
+        }
+        if (quarter_comp) over(kvs, s0, sn, xn);
+        else over(kvs, 0, T, xn);
+        gather(kvs);
+        Rows sink(T);
+        over(sink, 0, T, qr);    /* q_b's norm + GEMM */
+        over(sink, 0, T, kv);    /* the window key */
+        over(sink, 0, T, kvs);   /* the compressor chain */
+        const Ds41IdxRuns ru = ds41_idx_runs(T, irows, 70000, W, r, true, kDs41SplitMinLive, balance, (4160 + irows - 1) / irows);
+        for (int64_t p = ru.p0; p < ru.p1; ++p) {
+            const int64_t q0 = p * ru.R, qn = std::min(ru.R, T - q0);
+            over(sink, q0, qn, iw);   /* index_score of run p */
+        }
+    }
+    return bad;
+}
+
+}   // namespace p26c
+
+TEST(p26c_source_layer_without_the_xn_gather_every_read_valid) {
+    long long cases = 0;
+    int ctrl_iw = 0, ctrl_comp = 0, ctrl_n = 0;
+    for (const int64_t irows : { 96, 256 })
+        for (const bool balance : { false, true })
+            for (int64_t T = 768; T <= 4160; T += 97) {
+                CHECK_EQ(p26c::bad_reads(T, irows, balance, 2, true, true), 0);
+                CHECK_EQ(p26c::bad_reads(T, irows, balance, 3, true, true), 0);
+                ctrl_iw += p26c::bad_reads(T, irows, balance, 3, false, true) > 0;
+                ctrl_comp += p26c::bad_reads(T, irows, balance, 3, true, false) > 0;
+                ++ctrl_n;
+                ++cases;
+            }
+    CHECK(cases > 100);
+    CHECK(ctrl_iw > ctrl_n / 2);    /* the deal's rows leave the SP quarter at most heights */
+    CHECK_EQ(ctrl_comp, ctrl_n);    /* a whole-row compressor GEMM always reads past the quarter */
+    fprintf(stderr, "p26c: %lld cases, controls failed %d / %d (no iw gather), %d / %d (whole-row compressor)\n", cases,
+            ctrl_iw, ctrl_n, ctrl_comp, ctrl_n);
+}
+
 RAD_TEST_MAIN()
