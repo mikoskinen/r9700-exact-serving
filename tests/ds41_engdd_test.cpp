@@ -17,7 +17,12 @@
  *     repeats -> kLowShare (the 1/16 boundary both sides), no launch above the band -> kNone; nothing planned then;
  *   - MUTATIONS: the same check fails for a scatter that is wrong -- a map entry pointing at another unique row, a gather
  *     run shifted by one row, a compact row taking another step row's ids, a kept launch written one row off -- so a
- *     broken scatter cannot pass this test. */
+ *     broken scatter cannot pass this test;
+ *   - tp8 loop P48b (ds41_engdd 2, the dedup on the Engram's int8 twin): with a GEMM whose row bytes depend on the launch's
+ *     rows up to 64 (the twin's narrow band: a stand-in that changes a row's low bits by M there) the plan at floor 64 keeps
+ *     every launch of <= 64 rows, pools only wider ones, refuses a pool of <= 64 unique rows, and the pass equals the
+ *     by-launch pass byte for byte; at today's floor 48 the same launches differ (a 49..64-row launch pooled, a pool of
+ *     49..64 unique rows run in the narrow band) -- the negative controls; pool_twin: all / none / split. */
 #include "rad_test.h"
 
 #include "../arch/deepseek41/ds41_engram_dedup.h"
@@ -295,6 +300,110 @@ TEST(engdd_mutations_of_the_scatter_are_caught) {
         q.uniq = kFormRows;
         CHECK(!plan_ok(q, ids, ls));
     }
+}
+
+namespace {
+
+/* tp8 loop P48b: the int8 twin's GEMM stand-in -- M <= 64 (the narrow band, gemm_i8a8_nt_m16: K split by M) changes a row's
+ * bytes by M (here its low bits), above 64 every row is its own (the tiled band) */
+constexpr int64_t kNarrow = 64;
+void row_m(const RowFn& f, const int32_t* ids, uint16_t* out, int64_t M) {
+    f(ids, out);
+    if (M <= kNarrow)
+        for (int64_t n = 0; n < kW; ++n) out[n] ^= (uint16_t)(1 + (M & 7));
+}
+/* the by-launch pass: every launch's rows at that launch's M */
+std::vector<uint16_t> reference_m(const std::vector<int32_t>& ids, const std::vector<Launch>& ls, int64_t T, const RowFn& f) {
+    std::vector<uint16_t> kv((size_t)(T * kW), 0);
+    for (const Launch& l : ls)
+        for (int64_t r = l.r0; r < l.r0 + l.n; ++r) row_m(f, ids.data() + r * f.H, kv.data() + r * kW, l.n);
+    return kv;
+}
+/* the deduplicated pass with M: a kept launch at its own rows, the unique rows' GEMM at M = uniq, the pooled rows gathered */
+bool same_pass_m(const Plan& p, const std::vector<int32_t>& ids, const RowFn& f, const std::vector<uint16_t>& ref) {
+    std::vector<uint16_t> kv((size_t)(p.T * kW), 0xdead);
+    std::vector<int32_t> cids((size_t)(p.rows * p.H));
+    compact_ids(p, ids.data(), cids.data());
+    for (const Kept& k : p.kept)
+        for (int64_t i = 0; i < k.n; ++i) row_m(f, cids.data() + (k.c0 + i) * p.H, kv.data() + (k.r0 + i) * kW, k.n);
+    std::vector<uint16_t> ku((size_t)(p.uniq * kW), 0);
+    for (int64_t u = 0; u < p.uniq; ++u) row_m(f, cids.data() + (p.u0 + u) * p.H, ku.data() + u * kW, p.uniq);
+    for (const auto& run : p.runs)
+        for (int64_t i = 0; i < run.second; ++i) {
+            const int32_t s = p.map[(size_t)(run.first + i)];
+            if (s < 0 || s >= p.uniq) return false;
+            std::memcpy(kv.data() + (run.first + i) * kW, ku.data() + (int64_t)s * kW, (size_t)kW * 2);
+        }
+    return std::memcmp(kv.data(), ref.data(), kv.size() * 2) == 0;
+}
+
+}  // namespace
+
+TEST(engdd_p48b_twin_floor_keeps_the_narrow_band_and_dedups_the_tiled_launches_exactly) {
+    /* BI's launches at an Engram layer with the twin: decode pieces 48 + 12, prompt segments 30, 60 (inside 49..64), 1000,
+     * 64 (the band's edge), 900, 65 (just above it) */
+    const int64_t H = 24;
+    const std::vector<Launch> ls = { { 0, 48 }, { 48, 12 }, { 60, 30 }, { 90, 60 }, { 150, 1000 }, { 1150, 64 }, { 1214, 900 },
+                                     { 2114, 65 } };
+    const int64_t T = 2179;
+    const RowFn f(H);
+    const std::vector<int32_t> ids = make_ids(T, H, 500, 48);
+    const std::vector<uint16_t> ref = reference_m(ids, ls, T, f);
+    Plan p;
+    REQUIRE(plan(ids.data(), T, H, ls.data(), ls.size(), p, kMinShareDiv, kNarrow) == kDedup);
+    CHECK_EQ(p.kept.size(), (size_t)5);                 /* 48, 12, 30, 60, 64 */
+    for (const Kept& k : p.kept) CHECK(k.n <= kNarrow);
+    CHECK_EQ(p.pooled, (int64_t)(1000 + 900 + 65));
+    CHECK(p.uniq > kNarrow);
+    CHECK(same_pass_m(p, ids, f, ref));
+    /* negative control: today's floor 48 pools the 60- and 64-row launches into the tiled unique GEMM */
+    Plan q;
+    REQUIRE(plan(ids.data(), T, H, ls.data(), ls.size(), q) == kDedup);
+    CHECK_EQ(q.pooled, (int64_t)(60 + 1000 + 64 + 900 + 65));
+    CHECK(!same_pass_m(q, ids, f, ref));
+}
+
+TEST(engdd_p48b_twin_floor_refuses_a_pool_of_64_unique_rows) {
+    const int64_t H = 4, T = 1000;
+    const std::vector<Launch> one = { { 0, T } };
+    auto rows_of = [&](int64_t distinct) {
+        std::vector<int32_t> ids((size_t)(T * H));
+        for (int64_t r = 0; r < T; ++r)
+            for (int64_t h = 0; h < H; ++h) ids[(size_t)(r * H + h)] = (int32_t)((r % distinct) * 10 + h);
+        return ids;
+    };
+    const RowFn f(H);
+    Plan p;
+    for (const int64_t u : { 49, 60, 64 }) {
+        const std::vector<int32_t> ids = rows_of(u);
+        CHECK(plan(ids.data(), T, H, one.data(), one.size(), p, kMinShareDiv, kNarrow) == kGuard);
+        CHECK(p.src.empty() && p.kept.empty() && p.rows == 0);
+        /* negative control: at floor 48 these pools dedup, and their unique GEMM runs in the narrow band */
+        Plan q;
+        REQUIRE(plan(ids.data(), T, H, one.data(), one.size(), q) == kDedup);
+        CHECK(!same_pass_m(q, ids, f, reference_m(ids, one, T, f)));
+    }
+    const std::vector<int32_t> ids = rows_of(65);
+    REQUIRE(plan(ids.data(), T, H, one.data(), one.size(), p, kMinShareDiv, kNarrow) == kDedup);
+    CHECK_EQ(p.uniq, (int64_t)65);
+    CHECK(same_pass_m(p, ids, f, reference_m(ids, one, T, f)));
+}
+
+TEST(engdd_p48b_the_unique_gemm_takes_the_twin_only_when_every_pooled_launch_does) {
+    const std::vector<Launch> ls = { { 0, 48 }, { 48, 60 }, { 108, 1000 }, { 1108, 70 }, { 1178, 900 } };
+    const int64_t T = 2078;
+    const int kEng = 8;
+    /* decode piece 0, a short prompt segment with the twin, the pooled prompt segments with the twin: all -> the class */
+    { const int tw[] = { 0, 8, 8 | 1, 8, 8 | 4 }; CHECK_EQ(pool_twin(ls.data(), tw, ls.size(), T, kEng, kNarrow), kEng); }
+    /* no pooled launch takes it (only the kept 60-row one): none */
+    { const int tw[] = { 0, 8, 1, 0, 4 }; CHECK_EQ(pool_twin(ls.data(), tw, ls.size(), T, kEng, kNarrow), 0); }
+    /* the pooled launches split (the 70-row one below a twin row floor): -1, the pass keeps its by-launch issue */
+    { const int tw[] = { 0, 8, 8, 0, 8 }; CHECK_EQ(pool_twin(ls.data(), tw, ls.size(), T, kEng, kNarrow), -1); }
+    /* at floor 48 the 60-row launch is pooled too: its class counts */
+    { const int tw[] = { 0, 0, 8, 8, 8 }; CHECK_EQ(pool_twin(ls.data(), tw, ls.size(), T, kEng, kFormRows), -1); }
+    /* a launch out of range is not pooled */
+    { const std::vector<Launch> bad = { { 0, 100 }, { 2000, 500 } }; const int tw[] = { 8, 0 };
+      CHECK_EQ(pool_twin(bad.data(), tw, bad.size(), 2100, kEng, kNarrow), kEng); }
 }
 
 TEST(engdd_compact_ids_are_the_source_rows) {
