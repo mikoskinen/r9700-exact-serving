@@ -918,6 +918,17 @@ struct Model {
     bool tcopy = false;
     rad_buf tkey = 0;
     rad_op tcopy_cp = 0, tcopy_st = 0, pp_x2c = 0;
+    /* tp8 loop P41 (RADIANCE_DS41_PP_RBAND=1 on both nodes; unset: nothing here; ds41layers::head_rband_crossing): the head band
+     * on the FOLLOWER -- a REVERSE pass (a lone cold prompt's body chunk, the engine's choice) runs layer l = h - 1 on the follower
+     * (X1 of W(l, t): pp_x1r, the leader's head [0, l) + layer l's key chain only); every other PROMPT pass crosses X1 of W(h, t) +
+     * layer l's window-key rows (pp_x1k; rband_key: the leader's copy of them after layer l's key chain, rband_cp; rband_st: the
+     * follower's store into its own layer-l window pages); decode passes as before. WIP step 2 (declare only): the follower
+     * declares layer l (weights, ops, window binding: rband_decl), both nodes the two X1 forms; no pass issues them yet. */
+    bool rband = false;
+    ds41layers::RBand rb{};
+    std::vector<char> rband_decl;
+    rad_buf rband_key = 0;
+    rad_op rband_cp = 0, rband_st = 0, pp_x1r = 0, pp_x1k = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -5778,6 +5789,21 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 }
             }
         }
+        /* tp8 loop P41 WIP step 2: the head band on the follower (both nodes read the same value; declare only) */
+        if (const char* rv = std::getenv("RADIANCE_DS41_PP_RBAND"); rv && !std::strcmp(rv, "1")) {
+            std::string e4;
+            if (m.band_k > 0 || m.tband_j > 0) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 is not taken beside RADIANCE_DS41_PP_BAND / "
+                                "RADIANCE_DS41_PP_TBAND (tp8 loop P41)\n");
+            } else if (ds41layers::head_rband_crossing(lr_geo(m), m.pp_h, m.pp_t, &m.rb, &e4) < 0) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 is not taken: %s (tp8 loop P41)\n", e4.c_str());
+                m.rb = ds41layers::RBand{};
+            } else {
+                m.rband = true;
+                m.rband_decl.assign((size_t)m.c.n_layer, 0);
+                if (m.pp_rank == 1) m.rband_decl[(size_t)m.rb.l] = 1;
+            }
+        }
         /* the candidate layer's keep words cross: it is this node's, and its indexer runs unsplit here (every rank then
          * holds every row's keep, so rank 0's crossing carries them all; the split is exact either way) */
         for (const ds41layers::Crossing& cx : m.pp_cx)
@@ -5985,6 +6011,13 @@ static std::vector<CutPart> ds41_band_liveset(const Model& m) {
 static std::vector<CutPart> ds41_tcopy_liveset(const Model& m) {
     std::vector<CutPart> v = ds41_cut_liveset(m, RAD_PP_X2);
     v.push_back({ m.tkey, "tkey", m.c.head_dim * 2, CutRows::Step, m.c.head_dim });
+    return v;
+}
+/* tp8 loop P41: a normal prompt pass's X1 under RADIANCE_DS41_PP_RBAND -- W(h, t)'s parts (its source copy rides them: the
+ * reverse form's source is the same, head_rband_crossing), then layer h - 1's window-key rows */
+static std::vector<CutPart> ds41_rbandk_liveset(const Model& m) {
+    std::vector<CutPart> v = ds41_cut_liveset_cx(m, m.rb.x1k.x1);
+    v.push_back({ m.rband_key, "rkey", m.c.head_dim * 2, CutRows::Live, m.c.head_dim });
     return v;
 }
 /* ... and whether a pass crosses in it: no tail band pass, every row a decode row (both nodes decide from the same batch) */
@@ -6530,6 +6563,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.band_cp.assign(m.band_key.size(), 0);
             m.band_st.assign(m.band_key.size(), 0);
         }
+        /* tp8 loop P41: layer h - 1's window-key rows of a normal prompt pass's X1 (both nodes) before the ring sizes */
+        if (m.rband && !(m.rband_key = decl_b(b, nm.f("pp_rband_key"), RAD_BF16, { T, c.head_dim }, RAD_BUF_PERSIST))) return RAD_E_INVAL;
         /* tp8 loop D46 step 2: layer t - 1's window-key rows of X2's copy form (both nodes) before the ring sizes */
         if (m.tcopy && !(m.tkey = decl_b(b, nm.f("pp_tcopy_key"), RAD_BF16, { T, c.head_dim }, RAD_BUF_PERSIST))) return RAD_E_INVAL;
         for (int ring : { (int)RAD_PP_X1, (int)RAD_PP_X2 }) {
@@ -6539,6 +6574,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 const std::vector<CutPart> vb = ds41_band_liveset(m);
                 rb = std::max(rb, cut_row_bytes(m, vb, ring));
                 np = std::max<int64_t>(np, (int64_t)vb.size());
+            }
+            if (ring == RAD_PP_X1 && m.rband) {   /* tp8 loop P41: either X1 form may be the wider one */
+                for (const std::vector<CutPart>& vr : { ds41_rbandk_liveset(m), ds41_cut_liveset_cx(m, m.rb.x1r) }) {
+                    rb = std::max(rb, cut_row_bytes(m, vr, ring));
+                    np = std::max<int64_t>(np, (int64_t)vr.size());
+                }
             }
             if (ring == RAD_PP_X2 && m.tband_j > 0) {   /* tp8 loop D39: the tail band's X2 may be the wider one */
                 const std::vector<CutPart> vt = ds41_cut_liveset_cx(m, m.tband.x2);
@@ -6821,6 +6862,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             for (size_t j = 0; j < m.band_key.size(); ++j)
                 if (!(m.band_st[j] = window_key_store(b, T, c.head_dim, m.w8, m.band_key[j]))) return RAD_E_INVAL;
         }
+        /* tp8 loop P41 WIP step 2: the follower's receive of a reverse pass's X1 before layer h - 1, and of a normal prompt pass's
+         * X1 before layer h with the store of layer h - 1's key rows into its own window pages of that layer */
+        if (m.rband && m.pp_rank == 1 && l == m.rb.l &&
+            !(m.pp_x1r = pp_stage_op_v(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r))))
+            return RAD_E_INVAL;
+        if (m.rband && m.pp_rank == 1 && l == m.pp_h) {
+            if (!(m.pp_x1k = pp_stage_op_v(b, m, RAD_PP_X1, ds41_rbandk_liveset(m)))) return RAD_E_INVAL;
+            if (!(m.rband_st = window_key_store(b, T, c.head_dim, m.w8, m.rband_key))) return RAD_E_INVAL;
+        }
         /* tp8 loop D39 step 2b: the leader's receive of the tail band's X2 before layer t - 1 */
         if (m.tband_j > 0 && m.pp_rank == 0 && l == m.tband.at &&
             !(m.pp_x2t = pp_stage_op_v(b, m, RAD_PP_X2, ds41_cut_liveset_cx(m, m.tband.x2))))
@@ -6828,6 +6878,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
         else if (m.band_k > 0 && m.band_decl[(size_t)l]) DS_TRY(layer(b, m, m.layers[(size_t)l], l));   /* tp8 loop P28: the band */
         else if (m.tband_j > 0 && m.tband_decl[(size_t)l]) DS_TRY(layer(b, m, m.layers[(size_t)l], l));   /* tp8 loop D39: the tail band */
+        else if (m.rband && m.rband_decl[(size_t)l]) DS_TRY(layer(b, m, m.layers[(size_t)l], l));   /* tp8 loop P41: the follower's band layer */
         else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
         /* tp8 loop P28 round 2b: the leader's copy of band layer l's key rows, and the band X1 after its last band layer */
         if (m.band_k > 0 && m.pp_rank == 0 && m.band_decl[(size_t)l]) {
@@ -6836,6 +6887,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               {}, { m.kvn }, { m.band_key[j] });
             if (!m.band_cp[j]) return RAD_E_INVAL;
             if (l == m.band.at - 1 && !(m.pp_x1b = pp_stage_op_v(b, m, RAD_PP_X1, ds41_band_liveset(m)))) return RAD_E_INVAL;
+        }
+        /* tp8 loop P41 WIP step 2: the leader's reverse X1 after layer h - 2 (layer h - 1's key chain issued before it), and after
+         * layer h - 1 its copy of the layer's key rows + a normal prompt pass's X1 (W(h, t)'s + those rows) */
+        if (m.rband && m.pp_rank == 0 && l == m.rb.l - 1 &&
+            !(m.pp_x1r = pp_stage_op_v(b, m, RAD_PP_X1, ds41_cut_liveset_cx(m, m.rb.x1r))))
+            return RAD_E_INVAL;
+        if (m.rband && m.pp_rank == 0 && l == m.rb.l) {
+            m.rband_cp = op(b, "cast", { RAD_RANGE("M", 1, T), RAD_INT("n", c.head_dim), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
+                            {}, { m.kvn }, { m.rband_key });
+            if (!m.rband_cp || !(m.pp_x1k = pp_stage_op_v(b, m, RAD_PP_X1, ds41_rbandk_liveset(m)))) return RAD_E_INVAL;
         }
         /* tp8 loop D46 step 2: the follower's copy of layer t - 1's window-key rows and the copy-form send, beside W(h, t)'s */
         if (m.tcopy && m.pp_rank == 1 && l == m.pp_t - 1) {
