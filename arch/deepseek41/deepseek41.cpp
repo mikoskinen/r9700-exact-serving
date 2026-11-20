@@ -8592,6 +8592,8 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
     const int64_t floor_rows = tw_or ? ds41cone::kTwinNarrowM : kFormRows;
     if (tw_or) {
         tw_u = pool_twin(ls.data(), m.edd_tw.data(), ls.size(), T, kTwEng, floor_rows);
+        /* the unique rows' GEMM can take the twin exactly where a launch's GEMM can (both twin ops declared, or neither) */
+        if (tw_u > 0 && m.twop.count(L.e_gemm) != m.twop.count(L.e_gemm_u)) tw_u = -1;
         if (tw_u < 0) {
             if (r0) g_edd_twmix.fetch_add(1, std::memory_order_relaxed);
             return false;
