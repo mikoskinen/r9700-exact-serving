@@ -520,13 +520,13 @@ private:
      * in X2 and the leader stores them), so a DECODE lane's step runs as a tail band pass too while a BG step is in flight
      * (pp_tband_bg_, set by the lane loop before each plan's head: a BG lane busy or holding a newcomer, D32 / D45's stretch) --
      * the follower's decode passes one band lighter in the follower-bound stretches, W(h, t)'s in the leader-bound clean ones.
-     * pp_tcopy_seq_ = the sequences (KV keys) whose band state the leader holds from their first row (seen fresh at ctx 0, no
-     * snapshot restore, no cone replay since); a decode lane's step runs as such a band pass only when all of its do. */
-    bool pp_tband_copy_ = false;
+     * pp_tcopy_seq_ = per sequence (KV key) its last row NOT written on the leader (core/sched/tcopy.h: -1 none; a snapshot
+     * restore / cone replay is one); a decode lane's step runs as such a band pass only when every sequence of it is held. */
+    int  pp_tband_copy_ = 0;         /* the plugin's copy form (rad_pp_tail_copy): 0 none, 1 every pass, R >= 2 a window */
     bool pp_tband_bg_ = false;
     int64_t pp_tband_dec_n_ = 0;     /* decode lanes' steps that ran as tail band passes (pp_tband 3) */
     int64_t pp_tband_dec_skip_ = 0;  /* ... and those a BG step was in flight for that a sequence of kept W(h, t)'s */
-    std::unordered_map<uint64_t, uint8_t> pp_tcopy_seq_;
+    std::unordered_map<uint64_t, int64_t> pp_tcopy_seq_;   /* core/sched/tcopy.h Gap: -1 all written, p the last gap */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);

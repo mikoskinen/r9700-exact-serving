@@ -904,6 +904,17 @@ struct Model {
     ds41layers::TailBand tband{};
     std::vector<char> tband_decl;
     rad_op pp_x2t = 0;
+    /* tp8 loop D46 step 2 (RADIANCE_DS41_PP_TBAND_COPY=1 on both nodes beside RADIANCE_DS41_PP_TBAND=1; unset: nothing here): the tail
+     * band's COPY in its window form (abi/rad_pp.h rad_pp_tail_copy(window + max_spec), core/sched/tcopy.h) -- a pass that is no
+     * tail band pass and whose every row is a decode row crosses X2 as pp_x2c = W(h, t)'s parts + layer t - 1's window-key rows
+     * (tkey: the follower's m.kvn after that layer, cast), and the leader stores them into its own window pages of layer t - 1
+     * (tcopy_st: the owner's store op form over the batch's window slots). A decode pass is never row-cut (PSK's cone, SP take no
+     * decode row), so every row's key is the one the follower stored. With window + max_spec positions written that way since a
+     * sequence's last uncopied row, the leader holds that layer's window of it and the engine may run its decode steps as tail
+     * band passes (fn4 pp_tband 3). */
+    bool tcopy = false;
+    rad_buf tkey = 0;
+    rad_op tcopy_cp = 0, tcopy_st = 0, pp_x2c = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -5755,6 +5766,13 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 m.tband_decl.assign((size_t)m.c.n_layer, 0);
                 if (m.pp_rank == 0)
                     for (int l : m.tband.window) m.tband_decl[(size_t)l] = 1;
+                /* tp8 loop D46 step 2: the copy (j = 1, every rank holding attention: no zeroed window group to store into) */
+                if (const char* tc = std::getenv("RADIANCE_DS41_PP_TBAND_COPY"); tc && !std::strcmp(tc, "1")) {
+                    m.tcopy = j == 1 && m.aw == m.g.world;
+                    if (!m.tcopy)
+                        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND_COPY=1 is not taken: %s (tp8 loop D46)\n",
+                                j != 1 ? "it needs a tail band of one layer" : "a rank of this node holds no attention");
+                }
             }
         }
         /* the candidate layer's keep words cross: it is this node's, and its indexer runs unsplit here (every rank then
@@ -5959,6 +5977,22 @@ static std::vector<CutPart> ds41_band_liveset(const Model& m) {
         v.push_back({ m.band_key[j], "bkey", c.head_dim * 2, CutRows::Live, c.head_dim });
     return v;
 }
+/* tp8 loop D46 step 2: X2's copy form -- W(h, t)'s parts, then layer t - 1's window-key rows (every row of the pass: a decode-only
+ * pass's rows are all live) */
+static std::vector<CutPart> ds41_tcopy_liveset(const Model& m) {
+    std::vector<CutPart> v = ds41_cut_liveset(m, RAD_PP_X2);
+    v.push_back({ m.tkey, "tkey", m.c.head_dim * 2, CutRows::Step, m.c.head_dim });
+    return v;
+}
+/* ... and whether a pass crosses in it: no tail band pass, every row a decode row (both nodes decide from the same batch) */
+static bool pp_tcopy_pass(const Model& m, const RadBatch* b, bool tband_pass) {
+    if (!m.tcopy || tband_pass || !b || b->n_tok <= 0) return false;
+    int64_t Dn = 0, DT = 0;
+    batch_split(b, &Dn, &DT);
+    return DT == b->n_tok;
+}
+static std::atomic<long long> g_tcopy_passes{0}, g_tcopy_rows{0};
+
 /* The rows a kv source's entry stores run over in a step of T rows and S sequences (the compressor chain's: ratio > 1
  * the bound on its completed blocks, step()'s `rows`; ratio 1 every row). */
 static int64_t pp_work_rows(const Model& m, int64_t r, int64_t T, int64_t S) {
@@ -6493,6 +6527,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.band_cp.assign(m.band_key.size(), 0);
             m.band_st.assign(m.band_key.size(), 0);
         }
+        /* tp8 loop D46 step 2: layer t - 1's window-key rows of X2's copy form (both nodes) before the ring sizes */
+        if (m.tcopy && !(m.tkey = decl_b(b, nm.f("pp_tcopy_key"), RAD_BF16, { T, c.head_dim }, RAD_BUF_PERSIST))) return RAD_E_INVAL;
         for (int ring : { (int)RAD_PP_X1, (int)RAD_PP_X2 }) {
             const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
             int64_t rb = cut_row_bytes(m, v, ring), np = (int64_t)v.size();
@@ -6505,6 +6541,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 const std::vector<CutPart> vt = ds41_cut_liveset_cx(m, m.tband.x2);
                 rb = std::max(rb, cut_row_bytes(m, vt, ring));
                 np = std::max<int64_t>(np, (int64_t)vt.size());
+            }
+            if (ring == RAD_PP_X2 && m.tcopy) {   /* tp8 loop D46 step 2: ... and so may the copy form */
+                const std::vector<CutPart> vc = ds41_tcopy_liveset(m);
+                rb = std::max(rb, cut_row_bytes(m, vc, ring));
+                np = std::max<int64_t>(np, (int64_t)vc.size());
             }
             rad_pp_declare_crossing(ring, rb, (int)np);
         }
@@ -6522,6 +6563,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.tband_j > 0) {
             rad_pp_declare_tail_band(m.tband_j);
             if (!ctx->shape_probe) g_tband_decl.store(1, std::memory_order_relaxed);
+            /* tp8 loop D46 step 2: the copy's window form -- a sequence's band layer is held on the leader once its last
+             * window + max_spec positions came over decode-only passes' X2 (or band passes) */
+            if (m.tcopy) rad_pp_declare_tail_copy((int)(c.window + m.g.max_spec));
         }
     }
     m.expand = op(b, "cast",
@@ -6748,6 +6792,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const int ring = m.pp_rank == 0 ? RAD_PP_X2 : RAD_PP_X1;
             rad_op& xo = ring == RAD_PP_X2 ? m.pp_x2 : m.pp_x1;
             if (!(xo = pp_stage_op(b, m, ring))) return RAD_E_INVAL;
+            /* tp8 loop D46 step 2: the leader's copy-form receive and its store of layer t - 1's window keys (the owner's op form) */
+            if (ring == RAD_PP_X2 && m.tcopy) {
+                if (!(m.pp_x2c = pp_stage_op_v(b, m, RAD_PP_X2, ds41_tcopy_liveset(m)))) return RAD_E_INVAL;
+                if (!(m.tcopy_st = window_key_store(b, T, c.head_dim, m.w8, m.tkey))) return RAD_E_INVAL;
+            }
             /* tp8 loop P20 round 4: the follower's quarter receive (RADIANCE_DS41_SPHC_X1), for an SP pass's X1 */
             if (ring == RAD_PP_X1 && m.sphc > 0 && sphc_x1_env()) {
                 m.pp_x1_sh = pp_stage_op(b, m, RAD_PP_X1, true);
@@ -6784,6 +6833,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               {}, { m.kvn }, { m.band_key[j] });
             if (!m.band_cp[j]) return RAD_E_INVAL;
             if (l == m.band.at - 1 && !(m.pp_x1b = pp_stage_op_v(b, m, RAD_PP_X1, ds41_band_liveset(m)))) return RAD_E_INVAL;
+        }
+        /* tp8 loop D46 step 2: the follower's copy of layer t - 1's window-key rows and the copy-form send, beside W(h, t)'s */
+        if (m.tcopy && m.pp_rank == 1 && l == m.pp_t - 1) {
+            m.tcopy_cp = op(b, "cast", { RAD_RANGE("M", 1, T), RAD_INT("n", c.head_dim), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
+                            {}, { m.kvn }, { m.tkey });
+            if (!m.tcopy_cp || !(m.pp_x2c = pp_stage_op_v(b, m, RAD_PP_X2, ds41_tcopy_liveset(m)))) return RAD_E_INVAL;
         }
         if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
         /* tp8 loop P36: its row-sharded twin (RADIANCE_DS41_SPHC_X2), for a pass SP up to layer t - 1 */
@@ -8425,8 +8480,16 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
         rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_TBAND: a tail band pass's X2 is not declared or not whole (a plan defect)");
         return false;
     }
-    const rad_op op_ = bx ? m.pp_x1b : bt2 ? m.pp_x2t : ring == RAD_PP_X1 ? (sh && m.pp_x1_sh ? m.pp_x1_sh : m.pp_x1)
-                                                       : (sh && m.pp_x2_sh ? m.pp_x2_sh : m.pp_x2);   /* P20 r3 / P36: `sh` */
+    /* tp8 loop D46 step 2: a decode-only pass that is no tail band pass crosses X2 in the copy form (whole: never row-sharded;
+     * P36's row-sharded X2 is a pass whose layer t - 1 is SP, >= SPHC rows: never a decode-only pass) */
+    const bool tc = ring == RAD_PP_X2 && !bt2 && pp_tcopy_pass(m, batch, t_tband);
+    if (tc && (sh || !m.pp_x2c || (m.pp_rank == 1 ? !m.tcopy_cp : !m.tcopy_st))) {
+        rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_TBAND_COPY: X2's copy form is not declared or not whole (a plan defect)");
+        return false;
+    }
+    const rad_op op_ = bx ? m.pp_x1b : bt2 ? m.pp_x2t : tc ? m.pp_x2c
+                     : ring == RAD_PP_X1 ? (sh && m.pp_x1_sh ? m.pp_x1_sh : m.pp_x1)
+                                         : (sh && m.pp_x2_sh ? m.pp_x2_sh : m.pp_x2);   /* P20 r3 / P36: `sh` */
     /* the ring read at every issue (tp8 S5: each lane has its own) */
     m.pp_ring[ring] = rad_pp_query().ring[ring];
     if (!m.pp_ring[ring] || !op_) {
@@ -8446,13 +8509,37 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
     static thread_local std::vector<RadOperand> o;
     o.clear();
     o.push_back(praw(m.pp_ring[ring], RAD_U8, 1));
-    for (const CutPart& p : bx ? ds41_band_liveset(m) : bt2 ? ds41_cut_liveset_cx(m, m.tband.x2) : ds41_cut_liveset(m, ring)) {
+    /* tp8 loop D46 step 2: the follower's layer t - 1 window keys (m.kvn, every row: a decode pass is never cut) into tkey first */
+    if (tc && m.pp_rank == 1) RAD_ISSUE_N(x, m.tcopy_cp, T, brows(m.kvn, T), brows(m.tkey, T));
+    for (const CutPart& p : bx ? ds41_band_liveset(m) : bt2 ? ds41_cut_liveset_cx(m, m.tband.x2)
+                            : tc ? ds41_tcopy_liveset(m) : ds41_cut_liveset(m, ring)) {
         if (p.rows == CutRows::Ids) o.push_back(praw(batch->token_ids, RAD_I32, T));   /* tp8 dev D10 round 2 */
         else if (p.rows == CutRows::Step) o.push_back(brows(p.b, T));
         else if (p.rows == CutRows::Work) o.push_back(brows(p.b, wr));
         else o.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
     }
     rad_issue(x, op_, o.data(), (int)o.size(), T);
+    if (tc && m.pp_rank == 0) {   /* tp8 loop D46 step 2: the leader's copy of layer t - 1's window keys, the owner's store form */
+        const auto* wb = kv_batch(batch, m.win);
+        if (!wb || !wb->slot_mapping) {
+            rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_TBAND_COPY: the window group has no slot mapping");
+            return false;
+        }
+        const int64_t hd = m.c.head_dim;
+        if (m.w8)
+            RAD_ISSUE_N(x, m.tcopy_st, T, brows(m.tkey, T), praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, m.pp_t - 1));
+        else
+            RAD_ISSUE_N(x, m.tcopy_st, T, bcol(m.tkey, 0, hd / 2, T), bcol(m.tkey, hd / 2, hd / 2, T),
+                        praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, m.pp_t - 1));
+        if (rad_rank(x) == 0) {
+            const long long n = g_tcopy_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+            const long long r = g_tcopy_rows.fetch_add(T, std::memory_order_relaxed) + T;
+            if (n == 1 || n % 4096 == 0)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_TBAND_COPY=1 (tp8 loop D46): %lld decode-only passes crossed X2 with "
+                                "layer %d's window keys, %lld rows, stored into this leader's window pages of it (this one step %d)\n", n,
+                        m.pp_t - 1, r, batch->step);
+        }
+    }
     return true;
 }
 /* The receiver's copy stores of the crossing into it (pp_copy_declare): the owner's entry stores over the same rows at

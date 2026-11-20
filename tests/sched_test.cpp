@@ -7,6 +7,7 @@
 #include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
 #include "sched/lanes.h"
+#include "sched/tcopy.h"
 #include "runtime/fn4_switch.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -3643,6 +3644,57 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     CHECK(fn4::check("pp_tband", -1, &err));
     CHECK(!fn4::check("pp_tband", 4, &err));
     fn4::tband_register(false);
+}
+
+/* tp8 loop D46: which sequences' tail band state the leader holds (core/sched/tcopy.h). Form 1 (every pass that is no tail band
+ * pass carries the copy): a sequence seen fresh is held from its first row; a snapshot restore / cone replay makes it a gap for
+ * good. Form R (a window of R positions; only decode-only passes carry the copy): a fresh prompt in a MIXED pass that is no band
+ * pass is a gap at its end, decode-only passes write, and the sequence is held again R positions later; a fresh prompt's band
+ * pass writes it; a sequence never seen is not held (a fresh prompt row of the step itself is); form 0 holds nothing. */
+TEST(tcopy_holds_a_sequence_once_its_band_state_was_written_on_the_leader) {
+    using namespace rad;
+    auto pre = [](uint64_t s, int32_t ctx, int32_t n) { StepEntry e; e.seq = s; e.ctx_len = ctx; e.n_tokens = n; e.is_prefill = true; return e; };
+    auto dec = [](uint64_t s, int32_t ctx, int32_t n) { StepEntry e; e.seq = s; e.ctx_len = ctx; e.n_tokens = n; return e; };
+    tcopy::Gap g;
+    /* form 1 */
+    tcopy::note(g, 1, false, { pre(1, 0, 700), dec(9, 50, 3) });   /* 9 never seen fresh: first seen with context -> a gap at 50 */
+    CHECK_EQ(g[1], (int64_t)-1);
+    CHECK_EQ(g[9], (int64_t)50);
+    CHECK(tcopy::held(g, 1, { dec(1, 700, 3) }));
+    CHECK(!tcopy::held(g, 1, { dec(9, 53, 3) }));
+    CHECK(!tcopy::held(g, 1, { dec(1, 700, 3), dec(9, 53, 3) }));
+    CHECK(tcopy::held(g, 1, { dec(1, 703, 3), pre(2, 0, 400) }));   /* a fresh prompt row of the step itself */
+    CHECK(!tcopy::held(g, 1, { dec(3, 10, 1) }));                   /* never seen */
+    StepEntry r = pre(4, 512, 188);
+    r.ckpt_restore = 7;
+    CHECK(!tcopy::held(g, 1, { r }));
+    tcopy::note(g, 1, false, { r });
+    CHECK_EQ(g[4], (int64_t)512);
+    CHECK(!tcopy::held(g, 1, { dec(4, 900, 1) }));
+    CHECK(!tcopy::held(g, 0, { dec(1, 700, 3) }));
+    /* form R = 133 */
+    tcopy::Gap w;
+    CHECK(!tcopy::written(133, false, { dec(5, 0, 1), pre(6, 0, 600) }));
+    CHECK(tcopy::written(133, false, { dec(5, 10, 3), dec(6, 20, 2) }));
+    CHECK(tcopy::written(133, true, { pre(6, 0, 600) }));
+    tcopy::note(w, 133, false, { pre(6, 0, 600), dec(5, 0, 1) });   /* a MIXED pass, no band: both a gap at their ends */
+    CHECK_EQ(w[6], (int64_t)600);
+    CHECK_EQ(w[5], (int64_t)1);
+    for (int32_t c = 600; c < 733; c += 3) {
+        CHECK(!tcopy::held(w, 133, { dec(6, c, 3) }));
+        tcopy::note(w, 133, false, { dec(6, c, 3) });   /* decode-only: written, the gap stays */
+    }
+    CHECK_EQ(w[6], (int64_t)600);
+    CHECK(tcopy::held(w, 133, { dec(6, 733, 3) }));
+    tcopy::note(w, 133, false, { dec(6, 733, 3), pre(7, 0, 300) });   /* a prompt beside it, no band: a new gap */
+    CHECK_EQ(w[6], (int64_t)736);
+    CHECK(!tcopy::held(w, 133, { dec(6, 736, 3) }));
+    tcopy::note(w, 133, true, { pre(8, 0, 900) });   /* a fresh prompt's band pass */
+    CHECK_EQ(w[8], (int64_t)-1);
+    CHECK(tcopy::held(w, 133, { dec(8, 900, 3) }));
+    tcopy::note(w, 133, true, { pre(8, 900, 900) });   /* its later chunk as a band pass: still all written */
+    CHECK_EQ(w[8], (int64_t)-1);
+    CHECK(!tcopy::held(w, 0, { dec(8, 1800, 1) }));
 }
 
 TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
