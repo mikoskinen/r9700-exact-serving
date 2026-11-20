@@ -1966,6 +1966,30 @@ int a_event_record(RadEvent re, RadStream rs) {
     return RAD_OK;
 }
 
+/* Lever WAITK (DRAFTER track 21.11.2026 round 49; RADIANCE_AQL_WAITK, read once: 0 / unset = off, 1 = event waits, 2 = + ride waits):
+ * a wait whose signal is not yet 0 when it is enqueued gets a one-wave wait kernel (aql_blit.hip aql_wait_signal) on the same stream
+ * AHEAD of its barrier-AND, which then stays exactly as without the lever (packet, acquire scope, `waiters`): the barrier is processed
+ * after the kernel completes, so its dependency is already met. Why: a barrier-AND whose dependency is pending slows every packet of the
+ * other queues on its CP pipe by ~+40 us (FINDINGS DRAFTER note 00:18 21.11.; drafter/kit/mes). Not while a tape is captured (the
+ * recorded wait kernel would poll a retired signal at play; a played tape calls a_event_wait, which adds it then), not when a ride is
+ * pending on the stream (the kernel would carry it). Scheduling only: every kernel's bytes are unchanged. */
+int waitk_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_AQL_WAITK");
+        const int v = e ? std::atoi(e) : 0;
+        if (v > 0) std::fprintf(stderr, "aql: wait-ahead kernels on (RADIANCE_AQL_WAITK=%d)\n", v);
+        return v > 0 ? v : 0;
+    }();
+    return m;
+}
+std::atomic<long long> g_waitk_count{0};
+void wait_ahead(Stream* s, hsa_signal_t h, int need) {
+    if (waitk_mode() < need || !h.handle || capturing() || s->ride.handle) return;
+    if (hsa_signal_load_relaxed(h) == 0) return;
+    const void* v = (const void*)&reinterpret_cast<const amd_signal_t*>(h.handle)->value;
+    if (rad_aql_blit_wait(v, s) == 0) g_waitk_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 /* The event lock is held across the enqueue so the signal cannot retire before this wait is
  * noted against it. */
 int a_event_wait(RadStream rs, RadEvent re) {
@@ -1986,6 +2010,7 @@ int a_event_wait(RadStream rs, RadEvent re) {
      * or the host needs system scope. */
     const int acq = e->cur->agent.handle == s->agent.handle ? HSA_FENCE_SCOPE_AGENT
                                                             : HSA_FENCE_SCOPE_SYSTEM;
+    wait_ahead(s, e->cur->h, 1);   /* lever WAITK */
     RAD_TRY(barrier(s, e->cur->h, hsa_signal_t{0}, acq, HSA_FENCE_SCOPE_NONE, &idx));
     e->cur->waiters.emplace_back(s->id, idx);
     return RAD_OK;
@@ -3143,6 +3168,7 @@ int a_ride_wait(RadStream rs, void* token) {
     Sig* g = (Sig*)token;
     if (!s || !g) return RAD_E_INVAL;
     uint64_t idx = 0;
+    wait_ahead(s, g->h, 2);   /* lever WAITK */
     const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_NONE, &idx);
     if (rc == RAD_OK) g->waiters.emplace_back(s->id, idx);
     sig_retire(g);

@@ -87,6 +87,8 @@ int rad_aql_blit_copy(void* dst, const void* src, uint64_t bytes, void* stream, 
 int rad_aql_blit_copy2d(void* dst, uint64_t dpitch, const void* src, uint64_t spitch,
                         uint64_t width, uint64_t height, void* stream);
 int rad_aql_blit_fill(void* dst, int value, uint64_t bytes, void* stream);
+/* Lever WAITK: one wave polls the int64 at `value` (an amd_signal_t's value) until it reads 0. */
+int rad_aql_blit_wait(const void* value, void* stream);
 /* rad_memcpy_ranges_async's kernel: `prefix` a multiple of 16, both bases 16-byte aligned. */
 int rad_aql_blit_ranges(void* dst, const void* src, uint64_t prefix, const RadCopyRange* ranges,
                         int n, void* stream);
