@@ -13976,6 +13976,7 @@ TEST(lanes_span_short_cuts_a_short_prompts_span_pieces_and_leaves_a_long_ones) {
  * exact plan and nearest; a prompt of two intervals or less (a decode cell's newcomer) and one past SPAN_SHORT keep their
  * plan; F off the quantum (1000) or under kBiMinPiece (64) changes nothing. */
 TEST(lanes_span_first_cuts_a_cold_prompts_first_interval_and_nothing_else) {
+    for (int cards : { 0, 1 })   /* 1: BEST's start besides: SPAN_TAIL 8192, lever G 256 + TI 1 */
     for (int ex : { 0, 1 })
     for (int n_prompt : { 15777, 3000, 4500, 65650 })
     for (int lanes : { 2, 3 }) {
@@ -13983,6 +13984,12 @@ TEST(lanes_span_first_cuts_a_cold_prompts_first_interval_and_nothing_else) {
         for (int arm = 0; arm < 4; ++arm) {
             /* 0: SPAN_SHORT 24576 (the reference); 1: + SPAN_FIRST 1024; 2: + SPAN_FIRST 1000 (off the quantum);
              * 3: + SPAN_FIRST 64 (< kBiMinPiece) */
+            std::unique_ptr<TgSwitch> tg;
+            std::unique_ptr<TiSwitch> ti;
+            if (cards) {
+                tg = std::make_unique<TgSwitch>(256);
+                ti = std::make_unique<TiSwitch>(1);
+            }
             Lanes L;
             L.grid = 2048;
             L.cfg.prefill_span = 2;
@@ -13995,6 +14002,10 @@ TEST(lanes_span_first_cuts_a_cold_prompts_first_interval_and_nothing_else) {
             L.seqs = 6;
             REQUIRE_EQ(L.start(lanes), RAD_OK);
             L.set.set_span_short(24576);
+            if (cards) {
+                L.set.set_span_tail(8192);
+                for (int l = 0; l < lanes; ++l) L.at(l).set_tail_inner_capable(true);
+            }
             if (arm == 1) L.set.set_span_first(1024);
             if (arm == 2) L.set.set_span_first(1000);
             if (arm == 3) L.set.set_span_first(64);
@@ -14018,8 +14029,8 @@ TEST(lanes_span_first_cuts_a_cold_prompts_first_interval_and_nothing_else) {
             }
             CHECK(got == want);
             if (arm == 1)
-                fprintf(stderr, "    %s%d tokens, %d lanes, SPAN_SHORT 24576 + SPAN_FIRST 1024: %zu chunks, first %d-%d%s (%s)\n",
-                        ex ? "exact, " : "", n_prompt, lanes, got.size(), got.empty() ? -1 : got.front().first,
+                fprintf(stderr, "    %s%s%d tokens, %d lanes, SPAN_SHORT 24576 + SPAN_FIRST 1024: %zu chunks, first %d-%d%s (%s)\n",
+                        cards ? "SPAN_TAIL 8192 + G 256 + TI, " : "", ex ? "exact, " : "", n_prompt, lanes, got.size(), got.empty() ? -1 : got.front().first,
                         got.empty() ? -1 : got.front().second, got.size() > 1 ? (" then " + std::to_string(got[1].first) + "-" +
                         std::to_string(got[1].second)).c_str() : "", got == want ? (cut ? "= the cut plan, its first interval in two"
                                                                                         : "= the cut plan") : "DIFFERENT");
