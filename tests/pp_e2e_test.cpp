@@ -6266,7 +6266,10 @@ TEST(subagents_sharing_a_cold_prefix_at_once_serve_one_process_tokens) {
         std::vector<std::string> env = kSplitEnv;
         if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
         if (a.best) env = cat(env, kBest);
-        if (const char* xe = std::getenv("PP_E2E_SUB_ENV"); xe && *xe) env.push_back(xe);   /* a debugging aid: one more env */
+        if (const char* xe = std::getenv("PP_E2E_SUB_ENV"); xe && *xe) {   /* a debugging aid: more env, space-separated */
+            std::istringstream is(xe);
+            for (std::string w; is >> w;) env.push_back(w);
+        }
         Serving pp;
         if (a.ds) pp.model = worldds().llama_rad;
         REQUIRE(pp.start(a.cut, cat(a.ds ? cat(spec, seqs) : seqs, { "--pp-lanes", std::to_string(a.lanes) }), env));
@@ -6307,4 +6310,154 @@ TEST(subagents_sharing_a_cold_prefix_at_once_serve_one_process_tokens) {
         if (differ || elines)
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
     }
+}
+
+/* tp8 loop D55 (RADIANCE_SCHED_PUB_PROMPT=1): a prompt published into the prefix cache when its last chunk commits, not only
+ * at its close. A long streamed request A over a 500-byte head; once its first token is out (its prompt computed, 400 tokens
+ * still to decode) three siblings over the same head arrive at once. Off (today): A is running, so its blocks are not in the
+ * cache and every sibling computes the head again (0 attention-cached tokens); on: every sibling hits A's head. Each request's
+ * tokens = one process's for it alone, on and off, in one process, at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (the
+ * llama KV copy checked: a sibling's pass reads blocks A's passes wrote on the follower) and the drafted fixture at BEST's
+ * shape; both nodes exit 0, no E line. */
+namespace {
+json sibling_body(int k) {
+    std::vector<int32_t> p = prompt_ids(400, 500);
+    const std::vector<int32_t> own = prompt_ids(410 + (uint64_t)k, 30 + 11 * (size_t)k);
+    p.insert(p.end(), own.begin(), own.end());
+    json b = { { "prompt", p }, { "n_predict", k == 0 ? 400 : 24 }, { "ignore_eos", true }, { "return_tokens", true },
+               { "temperature", 0.0 } };
+    if (k == 2) { b["temperature"] = 0.8; b["seed"] = 4002; }
+    if (k == 0) b["stream"] = true;
+    return b;
+}
+/* A streamed and read up to its first event, B / C / D at once, then the rest of A; the tokens in request order. */
+std::vector<std::vector<int32_t>> siblings(int port, bool alone) {
+    std::vector<std::vector<int32_t>> out(4);
+    if (alone) {
+        for (int k = 0; k < 4; ++k) {
+            const Reply r = ask(port, sibling_body(k));
+            if (!r.why.empty()) fprintf(stderr, "    sibling %d alone: %s\n", k, r.why.c_str());
+            if (r.tok.size() == 1) out[(size_t)k] = r.tok[0];
+        }
+        return out;
+    }
+    Call a;
+    if (!a.send(port, "/completion", sibling_body(0).dump())) return out;
+    std::string raw;
+    char buf[16384];
+    for (;;) {   /* the first event: the prompt is computed (its first token is out) */
+        const ssize_t n = ::recv(a.fd, buf, sizeof buf, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        raw.append(buf, (size_t)n);
+        const size_t h = raw.find("\r\n\r\n");
+        if (h != std::string::npos && raw.find("data: ", h) != std::string::npos) break;
+    }
+    std::vector<std::future<Reply>> f;
+    for (int k = 1; k < 4; ++k) f.push_back(std::async(std::launch::async, [port, k] { return ask(port, sibling_body(k)); }));
+    for (int k = 1; k < 4; ++k) {
+        const Reply r = f[(size_t)k - 1].get();
+        if (!r.why.empty()) fprintf(stderr, "    sibling %d: %s\n", k, r.why.c_str());
+        if (r.tok.size() == 1) out[(size_t)k] = r.tok[0];
+    }
+    for (;;) {
+        const ssize_t n = ::recv(a.fd, buf, sizeof buf, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        raw.append(buf, (size_t)n);
+    }
+    /* de-chunk and assemble A's events as ask() does */
+    const size_t h = raw.find("\r\n\r\n");
+    if (h == std::string::npos) return out;
+    std::string b = raw.substr(h + 4), d;
+    for (size_t at = 0;;) {
+        const size_t eol = b.find("\r\n", at);
+        if (eol == std::string::npos) break;
+        const size_t len = std::strtoul(b.c_str() + at, nullptr, 16);
+        if (len == 0 || eol + 2 + len > b.size()) break;
+        d += b.substr(eol + 2, len);
+        at = eol + 2 + len + 2;
+    }
+    for (size_t at = 0; (at = d.find("data: ", at)) != std::string::npos;) {
+        const size_t e = d.find("\n", at);
+        const json j = json::parse(d.substr(at + 6, e == std::string::npos ? std::string::npos : e - at - 6), nullptr, false);
+        at = e == std::string::npos ? d.size() : e;
+        if (j.is_object() && !j.value("stop", false))
+            for (int32_t t : j.value("tokens", std::vector<int32_t>{})) out[0].push_back(t);
+    }
+    return out;
+}
+}  /* namespace */
+
+TEST(d55_a_prompt_published_at_its_last_chunk_serves_its_siblings_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "8" };
+    std::map<int, std::vector<std::vector<int32_t>>> refs;
+    for (int ds = 0; ds < 2; ++ds) {
+        Serving one;
+        if (ds) one.model = worldds().llama_rad;
+        REQUIRE(one.start("", ds ? cat(spec, seqs) : seqs));
+        refs[ds] = siblings(one.port, true);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        for (const auto& t : refs[ds]) CHECK(!t.empty());
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, ds, kv; };
+    int armed = 0;
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true },
+                         Arm{ "drafted, one process", "", 0, false, true, false },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, true, true } }) {
+        for (int on = 0; on < 2; ++on) {
+            std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+            if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+            if (a.best) env = cat(env, kBest);
+            if (on) env.push_back("RADIANCE_SCHED_PUB_PROMPT=1");
+            Serving pp;
+            if (a.ds) pp.model = worldds().llama_rad;
+            std::vector<std::string> ex = a.ds ? cat(spec, seqs) : seqs;
+            if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
+            REQUIRE(pp.start(a.cut, ex, env));
+            const std::vector<std::vector<int32_t>> got = siblings(pp.port, false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+            const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output(), flog = pp.fol.output();
+            const auto& ref = refs[a.ds ? 1 : 0];
+            int differ = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                if (got[i] == ref[i]) continue;
+                ++differ;
+                size_t j = 0;
+                while (j < got[i].size() && j < ref[i].size() && got[i][j] == ref[i][j]) ++j;
+                fprintf(stderr, "    %s D55 %s sibling %zu: %zu tokens vs one process alone %zu, the first difference at token %zu\n", a.name,
+                        on ? "on" : "off", i, got[i].size(), ref[i].size(), j);
+            }
+            long long checks = -1, kdiff = -1;
+            if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+                if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                    (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+            const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+            const bool said = llog.find("RADIANCE_SCHED_PUB_PROMPT=1 (tp8 loop D55)") != std::string::npos;
+            fprintf(stderr, "    D55 %-34s %s: %d of 4 differ from one process alone; attention-cached prompt tokens %.0f; KV-copy checks %lld, "
+                            "%lld differ; %zu E lines%s\n",
+                    a.name, on ? "on " : "off", differ, hit, checks, kdiff, elines, on && !said ? "; the start line is MISSING" : "");
+            CHECK_EQ(differ, 0);
+            CHECK_EQ(elines, (size_t)0);
+            CHECK_EQ(said, on == 1);
+            if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+            if (on) CHECK(hit >= 3 * 448);   /* each sibling at least the head's whole 64-token chunks below 500: 448 */
+            else CHECK_EQ(hit, 0.0);
+            if (on && hit > 0) ++armed;
+            if (differ || elines)
+                fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        }
+    }
+    CHECK_EQ(armed, 6);
 }
