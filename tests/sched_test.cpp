@@ -16697,6 +16697,65 @@ TEST(d57_srf_2_beside_the_d55b_hold_chooses_the_running_sibling_not_the_held_one
     }
 }
 
+/* tp8 loop D57 (a cost reading, printed, no bound): what the D55b hold's scan costs a plan beside decoders. One process, 31 decoders
+ * whose prompts share a HEAD-token head with everyone (their prompts published: D55), a prompt A computing past that head in 512-token
+ * steps beside them, and 10 fresh siblings over A's head the hold keeps waiting: each admission walk asks the hold for each of the 10
+ * against every running prompt. Printed: us a step() while they are held (the mean over the held steps), HEAD 3,000 and 20,000. */
+TEST(d57_reading_the_holds_scan_beside_decoders) {
+    for (int head : { 3000, 20000 }) {
+        Fixture f;
+        const int64_t blocks = ((int64_t)31 * (head + 1100) + (head + 2000) + 10 * (int64_t)head) / 16 + 8192;
+        f.build(blocks, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/head + 4096, false, /*linear=*/false);
+        f.prog.meta.n_ctx_train = head + 4096;
+        f.cfg.max_seqs = 48;
+        setenv("RADIANCE_SCHED_PUB_PROMPT", "2", 1);
+        setenv("RADIANCE_SCHED_PUB_HOLD_MS", "600000", 1);
+        CHECK_OK(f.start());
+        unsetenv("RADIANCE_SCHED_PUB_PROMPT");
+        unsetenv("RADIANCE_SCHED_PUB_HOLD_MS");
+        std::vector<uint64_t> dec;
+        for (int k = 0; k < 31; ++k) dec.push_back(f.submit(head + 1000, 1000000, 0, true));
+        int steps = 0;
+        auto decoding = [&] {
+            for (uint64_t d : dec) {
+                const Request* r = f.sch.find(d);
+                if (!r || r->n_computed < (int64_t)r->prompt.size()) return false;
+            }
+            return true;
+        };
+        while (!decoding() && steps < 200000) {
+            if (!f.sch.step()) break;
+            f.commit_plain();
+            ++steps;
+        }
+        CHECK(decoding());
+        const uint64_t a = f.submit(head + 2000, 8, 0, true);
+        REQUIRE(f.sch.step() != nullptr);   /* A admitted beside the decoders */
+        f.commit_plain();
+        std::vector<uint64_t> sib;
+        for (int k = 0; k < 10; ++k) sib.push_back(f.submit(head, 8, 0, true));
+        int held = 0;
+        double us = 0;
+        for (int k = 0; k < 400; ++k) {
+            const Request* ra = f.sch.find(a);
+            if (!ra || ra->n_computed >= head - 1) break;
+            const auto t0 = std::chrono::steady_clock::now();
+            const RadBatch* b = f.sch.step();
+            us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (!b) break;
+            bool in = false;
+            for (const StepEntry& e : f.sch.plan().e)
+                for (uint64_t s2 : sib) in = in || e.seq == s2;
+            CHECK(!in);   /* the hold keeps every sibling out until A's committed end passes the head */
+            ++held;
+            f.commit_plain();
+        }
+        fprintf(stderr, "    HEAD %d: %d held step(s) beside 31 decoders + A, %.1f us a step() (the mean), %d steps to decode\n", head, held,
+                held ? us / held : -1.0, steps);
+        CHECK(held > 0);
+    }
+}
+
 /* tp8 loop D56: fn4 sched_lane_room 1 (RADIANCE_SCHED_LANE_ROOM=1 at start) -- the admission room gate counts the running
  * requests of EVERY lane. Two 200-token
  * prompts over a 24-block pool (384 tokens: one prompt + its 20 tokens = 14 blocks fits, two do not), one a lane, B arriving

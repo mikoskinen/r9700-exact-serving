@@ -6577,7 +6577,8 @@ TEST(d55b_siblings_at_the_same_moment_wait_for_the_head_and_serve_one_process_to
  * llama KV copy checked), each with and without START F's publishing envs (RADIANCE_SCHED_PUB_PROMPT=2 +
  * RADIANCE_SCHED_PUB_HOLD_MS=5000: a held sibling and chunk-by-chunk entries under KV pressure); every request answered (200),
  * within kLongWallS; both nodes exit 0, no E line, the KV-copy check 0 differ. Printed per arm: pool, preemptions, wall,
- * attention-cached tokens -- the lanes' preemption count against one process's at its small pool is the thrash reading. */
+ * attention-cached tokens -- the lanes' preemption count against one process's at its small pool is the thrash reading. tp8 loop D57:
+ * + a form in every arm with the morning candidate's scheduler levers together (room + pub2 + hold + RADIANCE_SCHED_SRF=2), the same checks. */
 namespace {
 constexpr long long kLongLo = 2000, kLongHi = 4200;
 constexpr double kLongWallS = 240;
@@ -6645,7 +6646,7 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
     }
     struct Arm { const char* name; const char* cut; int lanes; bool best, kv; };
     const char* only = std::getenv("PP_E2E_D56_ARM");   /* a debugging aid: the arms whose name holds this text */
-    long long pre_all = 0, pre_form[5] = { 0, 0, 0, 0, 0 };
+    long long pre_all = 0, pre_form[6] = { 0, 0, 0, 0, 0, 0 };
     for (const Arm a : { Arm{ "one process", "", 0, false, false }, Arm{ "2 lanes", "0,2", 2, false, false },
                          Arm{ "3 lanes, wrap-around", "1,3", 3, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, true } }) {
         if (only && !std::strstr(a.name, only)) continue;
@@ -6674,13 +6675,17 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
         }
         if (phi >= kLongHi) fprintf(stderr, "    D56 %s: the smallest pool >= %lld is %lld tokens (%d MiB)\n", a.name, kLongLo, phi, hi);
         REQUIRE(phi < kLongHi);
-        /* form 4 (lane arms): fn4 sched_lane_room 1 POSTed in process on a start without the env (the card A/B's form) */
-        for (int form = 0; form < (a.lanes ? 5 : 4); ++form) {
-            const bool posted = form == 4, pub = (form & 1) && !posted, room = (form & 2) && !posted;
+        /* form 4 (lane arms): fn4 sched_lane_room 1 POSTed in process on a start without the env (the card A/B's form); form 5 (tp8 loop
+         * D57, every arm): the morning candidate's scheduler levers together -- room + pub2 + hold + RADIANCE_SCHED_SRF=2 */
+        for (int form = 0; form < 6; ++form) {
+            if (form == 4 && !a.lanes) continue;
+            const bool posted = form == 4, all = form == 5, pub = ((form & 1) && !posted) || all, room = ((form & 2) && !posted) || all;
             std::vector<std::string> fenv = env;
             if (pub) fenv = cat(fenv, kPub);
             if (room) fenv.push_back("RADIANCE_SCHED_LANE_ROOM=1");
-            const char* fname = form == 0 ? "default  " : form == 1 ? "pub2+hold" : form == 2 ? "lane-room" : form == 3 ? "room+pub " : "posted 1 ";
+            if (all) fenv.push_back("RADIANCE_SCHED_SRF=2");
+            const char* fname = form == 0 ? "default  " : form == 1 ? "pub2+hold" : form == 2 ? "lane-room" : form == 3 ? "room+pub " :
+                                form == 4 ? "posted 1 " : "all+srf2 ";
             Serving pp;
             REQUIRE(pp.start(a.cut, ex, cat(fenv, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(hi) })));
             if (posted) {
@@ -6746,7 +6751,7 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
         }
     }
     fprintf(stderr, "    D56 preemptions, all arms: %lld; the lane arms by form: default %lld, pub2+hold %lld, lane-room %lld, room+pub %lld, "
-                    "posted 1 %lld\n", pre_all, pre_form[0], pre_form[1], pre_form[2], pre_form[3], pre_form[4]);
+                    "posted 1 %lld, all+srf2 %lld\n", pre_all, pre_form[0], pre_form[1], pre_form[2], pre_form[3], pre_form[4], pre_form[5]);
     /* the lever's own quantity, over the three lane arms: four runs read default + pub 13 / 19 / 27 vs lane-room + room+pub 6 / 8 / 7 */
     if (!only) {
         CHECK(pre_form[2] + pre_form[3] < pre_form[0] + pre_form[1]);
