@@ -13,7 +13,7 @@ constexpr int R4D_WK_DECLINE = -77001;
 
 /* The fold operands r4d_gg_wk_run takes for PRO 1 / 2 (lever WMK's folds). */
 struct GgWkFold {
-    int pro;
+    int pro;   /* 1 fold a, 2 fold e, 3 fold a with lever FPP's prologue (its rows' loads together; the same bytes as 1) */
     const float* g;
     float eps, wadd, mult;
     int nw;

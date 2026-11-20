@@ -3870,10 +3870,10 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
     const bool m2 = mode == 2 || mode >= 5;
-    const bool dmx = mode == 13 || mode == 14;
+    const bool dmx = mode == 13 || mode == 14 || mode == 15;   /* 15 = 14's codes (lever FPP: fold a's prologue) */
     if (dmx && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;   /* lever DMX: the head's four-tile G2 (D22) */
-    if (dmx && !head)   /* lever DMX (14: + q_b's plain GEMM in G2) */
-        if (const int c = wmk_code13(ty, Ntot, K, M, mode == 14)) return c;
+    if (dmx && !head)   /* lever DMX (14 / 15: + q_b's plain GEMM in G2) */
+        if (const int c = wmk_code13(ty, Ntot, K, M, mode >= 14)) return c;
     if ((mode == 12 || dmx) && g_wmk_hrs && head && M > 16 && M <= 48) return M <= 32 ? kWmkHrs32 : kWmkHrs48;   /* lever HRS */
     if (m2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216 | (mode == 11 && g_wmk_hdp && M <= 32 ? 8388608 : 0);
     if ((mode == 11 || mode == 12 || dmx) && !head)
@@ -3920,7 +3920,7 @@ int wmk_now() {
 /* the switch takes a call of M rows (the bench pin r4d_gg_wk_pin, when set, runs ahead of it at every M) */
 bool wmk_take(long long M) {
     const int v = wmk_now();
-    return v >= 1 && M <= ((v >= 5 && v <= 10) || v == 13 || v == 14 ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-10, 13 / 14: the band to 64 rows (tp8 loop D22 / D25; DRAFTER r32 DMX); 11 / 12: 48 as 2 */
+    return v >= 1 && M <= ((v >= 5 && v <= 10) || (v >= 13 && v <= 15) ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-10, 13..15: the band to 64 rows (tp8 loop D22 / D25; DRAFTER r32 DMX, r33 FPP); 11 / 12: 48 as 2 */
 }
 void wmk_count(long long M) {
     g_wmk_launches.fetch_add(1, std::memory_order_relaxed);
@@ -4383,13 +4383,23 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
      * the fold at 40 / 48 rows 66.7-75.2 / 67.4-70.1 (every G1 code; G2 84-94) vs the plain GEMM 40.0 / 39.6 (r32b) + rmsnorm's
      * launch (~3-5 us: the two-launch form at 56 / 64 rows is 42.8 / 39.1 with the G2 GEMM 37.7 / 34.1); served lq190 c32 F: the fold
      * 62.3 / 60.4 us a call (22 a lane step). */
-    const bool dmx_two = !g_gg_wk && M > 16 && M <= kGgDecodeRows && (wmk_now() == 13 || wmk_now() == 14);
+    /* Lever FPP (DRAFTER track 20.11.2026 round 33, ds41_wmk 15 = 14's codes): fold a ONE launch at 3..32 rows with the prologue
+     * that loads its rows together (GgWkFold pro 3, gg_fold_norm_rows in r4d_ds41_wmk.hip); 1..2 rows the old prologue (one launch);
+     * 33..48 rows its two launches as 13 / 14. The same bytes as the old prologue and as the two launches (--wmkroute under
+     * R4D_WMKROUTE_MODE 15: fold == its two launches). xeon GPU1 r33c (cold, us a call, mode 14 -> 15): q6_K 3 / 4 / 8 / 12 / 16 rows
+     * 31.0 / 32.3 / 37.6 / 42.6 / 47.6 -> 29.3 / 29.4 / 29.8 / 29.7 / 29.8 (its plain GEMM 27.5-28.0), 24 / 32 rows (two launches ->
+     * the G2 fold) 34.9 / 35.2 -> 33.5 / 33.7; q5_K 29.4 / 30.7 / 35.9 / 40.9 / 45.9 -> 28.0 / 28.1 / 28.3 / 28.3 / 28.4, 31.6 / 31.8
+     * -> 31.4 / 31.6; at 40 / 48 rows the FPP G2 fold (three row tiles) 38.7-44.1 vs the two launches 34.4-37.3: not taken. Bench
+     * pin: code bit 27 (134217728, no other meaning) asks pro 3 under r4d_gg_wk_pin. */
+    const int wmode = wmk_now();
+    const bool dmx_two = !g_gg_wk && M > (wmode == 15 ? 32 : 16) && M <= kGgDecodeRows && (wmode >= 13 && wmode <= 15);
     if (dmx_two) {
         /* (the rmsnorm + gg_gemm_run tail below) */
     } else if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
         if (g->dtype == RAD_F32) {
             GgWkFold fo{};
-            fo.pro = 1; fo.g = (const float*)g->data; fo.eps = eps; fo.wadd = wadd; fo.mult = mult;
+            fo.pro = (g_gg_wk ? (g_gg_wk & 134217728) != 0 : wmode == 15 && M >= 3) ? 3 : 1;   /* FPP from 3 rows (r33b: at 1 / 2 rows the old loop is 0.4-1.5 us faster) */
+            fo.g = (const float*)g->data; fo.eps = eps; fo.wadd = wadd; fo.mult = mult;
             fo.nw = r4d_act_threads((int)M, (int)K) / 32;
             fo.h = (uint16_t*)h->data; fo.h_ld = h_ld; fo.h_al = h_al;
             const uint16_t* xp = (const uint16_t*)x->data;
@@ -4676,7 +4686,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_tsk")) return r4d_tsk_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 14 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34), 11: 2 + HDP + TDP (DRAFTER round 23), 12: 11 with HRS's head at 17..48 rows (DRAFTER round 31) , 13: 12 + the band to 64 rows + the per-shape 33..64-row codes (DRAFTER round 32, DMX) , 14: 13 + the plain q_b GEMM in G2 (DMX) */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 15 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34), 11: 2 + HDP + TDP (DRAFTER round 23), 12: 11 with HRS's head at 17..48 rows (DRAFTER round 31) , 13: 12 + the band to 64 rows + the per-shape 33..64-row codes (DRAFTER round 32, DMX) , 14: 13 + the plain q_b GEMM in G2 (DMX), 15: 14 with fold a one launch on lever FPP's prologue at 3..32 rows (DRAFTER round 33) */
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
@@ -4702,7 +4712,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
     if (!std::strcmp(name, "ds41_tsk")) { r4d_tsk_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 14 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 15 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
