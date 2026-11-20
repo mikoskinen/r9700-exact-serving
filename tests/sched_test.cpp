@@ -7192,6 +7192,79 @@ TEST(a_requests_plugin_words_ride_the_step_that_samples_its_first_token) {
     bb.fini();
 }
 
+/* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N): a builder told to carve N block-table rows (a BG lane's) reserves the tables of
+ * max_seqs - N rows less, lays its span out under another hash (the follower's replay refuses a mismatch), builds a plan of N
+ * sequences and refuses one of N + 1 by name; unset (0) and N >= max_seqs are today's carve and hash. The env parse takes 1 .. 256. */
+TEST(a_bg_lanes_builder_carves_its_block_tables_for_its_rows_and_refuses_more) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    REQUIRE(f.cfg.max_seqs > 2);
+    const int64_t full = BatchBuilder::device_bytes(f.prog, f.cfg, kvg), two = BatchBuilder::device_bytes(f.prog, f.cfg, kvg, 2);
+    CHECK(full > 0 && two > 0 && two < full);
+    CHECK_EQ(BatchBuilder::device_bytes(f.prog, f.cfg, kvg, f.cfg.max_seqs), full);
+    CHECK_EQ(BatchBuilder::device_bytes(f.prog, f.cfg, kvg, f.cfg.max_seqs + 5), full);
+    fprintf(stderr, "    slab %lld B at max_seqs %lld rows, %lld B at 2 rows\n", (long long)full, (long long)f.cfg.max_seqs, (long long)two);
+    BatchBuilder ref, bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(ref.init(f.prog, f.cfg, geo, kvg, rio));
+    bb.set_bt_rows(2);
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+    CHECK_EQ(bb.bt_rows(), (int64_t)2);
+    CHECK_EQ(ref.bt_rows(), f.cfg.max_seqs);
+    CHECK(bb.layout_hash() != ref.layout_hash());
+    {
+        BatchBuilder same;
+        same.set_bt_rows(f.cfg.max_seqs);   /* not below max_seqs: today's carve and hash */
+        CHECK_OK(same.init(f.prog, f.cfg, geo, kvg, rio));
+        CHECK_EQ(same.layout_hash(), ref.layout_hash());
+        same.fini();
+    }
+    for (uint64_t id = 1; id <= 3; ++id) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_OK(f.kv.ensure(id, 80));
+    }
+    Request r;
+    r.prompt.assign(8, 1);
+    StepPlan p;
+    auto plan = [&](int n) {
+        p.reset();
+        for (int i = 1; i <= n; ++i) {
+            StepEntry e;
+            e.seq = (uint64_t)i;
+            e.card = i - 1;
+            e.req = &r;
+            e.n_tokens = 8;
+            e.ctx_len = 0;
+            e.is_prefill = true;
+            e.produces_token = true;
+            p.e.push_back(e);
+            p.n_tok += 8;
+        }
+    };
+    plan(2);
+    CHECK(bb.build(p, f.kv, 0) != nullptr);
+    CHECK(ref.build(p, f.kv, 0) != nullptr);
+    plan(3);
+    CHECK(bb.build(p, f.kv, 1) == nullptr);   /* refused: more sequences than its block tables hold */
+    CHECK(ref.build(p, f.kv, 1) != nullptr);
+    bb.fini();
+    ref.fini();
+    struct Env { ~Env() { unsetenv("RADIANCE_PP_BG_ROWS"); } } env;
+    for (const auto& [v, want] : std::vector<std::pair<const char*, int64_t>>{ { "4", 4 }, { "1", 1 }, { "256", 256 }, { "0", 0 },
+                                                                               { "257", 0 }, { "x", 0 }, { "-3", 0 } }) {
+        setenv("RADIANCE_PP_BG_ROWS", v, 1);
+        CHECK_EQ(LaneSet::bg_rows_env(), want);
+    }
+}
+
 /* A sequence that leaves a row and returns to it is restaged whole. Its change marks are taken
  * wherever it is written, so the old row's copy goes stale; restaging only later changes would
  * keep entries a rollback replaced earlier. The scheduler's own passes reorder rows, so this
