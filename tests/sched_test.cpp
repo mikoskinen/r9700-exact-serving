@@ -12808,6 +12808,54 @@ TEST(cap48_the_step_issued_ahead_is_capped) {
     }
 }
 
+/* qfn-on-ds round 2 (xeon s1-cap 20.11.: a sched_row_cap POSTed mid-load reached the steps only at the next full step; a
+ * steady decode stretch is issued ahead step after step): a value set after step() planned is the one the step issued
+ * ahead behind it holds to -- 0 -> 48 trims that step to 16 x 3 rows, 48 -> 0 gives it back its 16 x 6. */
+TEST(cap48_a_value_set_between_steps_reaches_the_step_issued_ahead) {
+    for (const auto& ft : { std::pair<int, int>{ 0, 48 }, std::pair<int, int>{ 48, 0 } }) {
+        DstSwitches restore;
+        CapSwitch restore_cap;
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 5;
+        CHECK(DstSwitches::set("sched_row_cap", ft.first));
+        CHECK_OK(f.start());
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 16; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[5] = { 21, 22, 23, 24, 25 };
+        for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, draft, 5));
+        REQUIRE(f.sch.step() != nullptr);
+        const int k0 = ft.first ? 2 : 5, k1 = ft.second ? 2 : 5;
+        for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, k0);
+        for (uint64_t id : ids) {
+            f.sch.find(id)->speculation_fixed = true;
+            f.sch.expect_draft(id, 5);
+        }
+        CHECK(DstSwitches::set("sched_row_cap", ft.second));   /* lands between the step and the one issued ahead */
+        const RadBatch* nb = f.sch.step_next();
+        REQUIRE(nb != nullptr);
+        CHECK_EQ((int)nb->n_tok, 16 * (1 + k1));
+        CHECK_EQ((int)nb->n_spec, k1);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        for (uint64_t id : ids) {
+            CHECK_OK(f.sch.set_draft(id, draft, 5));
+            CHECK_EQ(f.sch.find(id)->n_draft, k1);
+        }
+        f.sch.promote_next();
+        for (const StepEntry& e : f.sch.plan().e) {
+            CHECK_EQ(e.n_spec, k1);
+            CHECK_EQ(e.n_tokens, 1 + k1);
+        }
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        f.sch.step_finished();
+        const auto m = cap_counts();
+        CHECK_EQ(m.at("steps_capped"), (int64_t)((ft.first ? 1 : 0) + (ft.second ? 1 : 0)));
+        CHECK_EQ(m.at("ahead_capped"), ft.second ? (int64_t)1 : (int64_t)0);
+    }
+}
+
 
 /* ================================================== lever CBH (ds41-int10b): the co-batch hold
  * fn4 sched_cb_hold_ms H (RADIANCE_SCHED_CB_HOLD_MS at start) / sched_cb_hold_k K: while >= 2 sequences decode, a fresh

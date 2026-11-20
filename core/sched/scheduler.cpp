@@ -4793,8 +4793,13 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
-    /* Lever CAP48: the step issued ahead held to the cap in force for the step before it (cap_rows; its KV was reserved
-     * above for the drafter's count, as a rejected draft's is) */
+    /* Lever CAP48: the step issued ahead held to the cap in force now (cap_rows; its KV was reserved above for the drafter's
+     * count, as a rejected draft's is). qfn-on-ds round 2 (xeon s1-cap, 20.11.): the switch is read here too -- read only in
+     * step(), a POSTed value waited for the next full step, and a steady decode stretch is issued ahead step after step
+     * (xeon TP2 c24: sched_row_cap 64 POSTed, 69 of 71 steps of the next 25 s still at 96 rows; 0 POSTed, 90 of 90 still
+     * at 64). Trimming only lowers a reserved window, so a value that changed since the step before is safe either way. */
+    cap_now_ = fn4::sched_row_cap();
+    cap_seq_note(cfg_.max_seqs);
     (void)cap_rows(plan_next_, /*ahead=*/true);
     plan_next_.phase        = RAD_PHASE_DECODE;
     plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
