@@ -22,7 +22,8 @@
 #define __forceinline__ inline
 #define __launch_bounds__(n)
 /* R4D_WAVES (r4d_common.h) names a kernel attribute; on the host it becomes an empty attribute */
-#define amdgpu_waves_per_eu(lo, hi)
+/* variadic: lever XWO (DRAFTER round 28) names one argument, amdgpu_waves_per_eu(12) */
+#define amdgpu_waves_per_eu(...)
 #define __align__(n) __attribute__((aligned(n)))
 
 struct dim3 {
@@ -46,6 +47,10 @@ inline hipError_t hipStreamIsCapturing(hipStream_t, hipStreamCaptureStatus* s) {
 }
 /* every launch runs to completion before it returns */
 inline hipError_t hipDeviceSynchronize() { return hipSuccess; }
+/* lever XPG (DRAFTER round 28, r4d_ds41_mxfp4_mr.hip xm_pg_grid): the IL forms' grid capped at the resident blocks. The emu
+ * answers 4 blocks a CU (the card's gate_up form) so a capped grid -- each block looping over its items -- is what the emu runs */
+template <class K>
+inline hipError_t hipOccupancyMaxActiveBlocksPerMultiprocessor(int* nb, K, int, size_t) { *nb = 4; return hipSuccess; }
 /* __device__ variables are host globals, so a symbol copy is a memcpy */
 enum hipMemcpyKind { hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3 };
 #define HIP_SYMBOL(s) (&(s))
