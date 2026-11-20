@@ -2057,6 +2057,200 @@ unsigned long long* rgk_scratch(RadStream s, const void* lg) {
 #endif
 }
 
+/* ==================================================================== lever RGM (RULE B)
+ * Lever RGM (DRAFTER track round 40, tp8 loop 20.11.2026; ds41_f32dec 10): DeepSeek-V4.1's router projection (K 5120, bf16
+ * weights) on v_wmma_f32_16x16x16_bf16 EVERYWHERE the router's logits are formed -- the fused decode launch (form 22 at 1..64
+ * rows: + lever RGK's epilogue scores / keys, the per-row-group selection, the stock small sort) AND gemm_nt_f32 at the router's
+ * shape at any M (code 40: a mixed / prefill pass's projection, glm_router's column split of 96 included). NOT the stock fmaf
+ * chain: the logits move (bench: max |d| ~5e-6 vs the stock chain), so this is rule B -- deterministic and batch-invariant
+ * against the build's own reference:
+ *   a logit (row r, expert e) = (((p_0 + p_1) + p_2) + ... + p_7), p_w = wave w's slice k in [640 w, 640 (w + 1)) as 40 WMMA steps
+ *   in ascending order from 0, step j feeding k = 640 w + 8 j + i and 640 w + 320 + 8 j + i (i < 8) for BOTH operands; the WMMA's
+ *   element (r, e) is a function of x row r, weight row e and its accumulator alone. So a logit depends on its own x row and
+ *   weight row only: not on M, on the row tiles / expert tiles a workgroup holds (RT / ET), on the unroll U, on which columns a
+ *   call computes (the 96-column split), on aligned or element loads (AL), or on the kernel (rgm_gemm_kernel vs form 22).
+ * Then everything downstream of the logits (scores, keys, the 6 rounds, the weights, the sort) is the stock function's: given the
+ * logits, ids / weights / sorted / offsets / counts are the stock bytes. r4d_selftest --case spdf32 SPD_PART=rgm checks it. */
+typedef __bf16 rgm_v8bf __attribute__((ext_vector_type(8)));
+typedef float rgm_v8f __attribute__((ext_vector_type(8)));
+constexpr int kRgmS = 8;        /* waves a workgroup = the K slices: part of every logit's arithmetic, never a tuning knob */
+constexpr int kRgmK = 5120;     /* the trunk router's K: slices of 640, 40 WMMA steps a slice */
+template <bool AL>
+__device__ __forceinline__ uint4 rgm_ld8(const uint16_t* p) {
+    if constexpr (AL) return *(const uint4*)(const void*)p;
+    uint4 v;
+    v.x = (uint32_t)p[0] | ((uint32_t)p[1] << 16);
+    v.y = (uint32_t)p[2] | ((uint32_t)p[3] << 16);
+    v.z = (uint32_t)p[4] | ((uint32_t)p[5] << 16);
+    v.w = (uint32_t)p[6] | ((uint32_t)p[7] << 16);
+    return v;
+}
+/* wave `wave`'s partials of the workgroup's RT 16-row x ET 16-expert tiles into sp[wave][RT ET 256] (D lane L: expert L % 16, rows
+ * 8 (L / 16) + i). Rows past m feed zeros (their own outputs only); experts past n read the last one (not stored). */
+template <int RT, int ET, int U, bool AL>
+__device__ __forceinline__ void rgm_wave(const uint16_t* x, long xp, const uint16_t* wt, long wtp, int m, int n, int K, int e0,
+                                         int r0, int wave, int lane, float* sp) {
+    const int nl = lane & 15, h = lane >> 4;
+    const int ks = K / kRgmS, half = ks >> 1, J = half >> 3;
+    const long kb = (long)wave * ks + (long)h * half;
+    const uint16_t* bp[ET];
+#pragma unroll
+    for (int q = 0; q < ET; ++q) {
+        const int e = e0 + 16 * q + nl;
+        bp[q] = wt + (long)(e < n ? e : n - 1) * wtp + kb;
+    }
+    const uint16_t* ap[RT];
+    bool rv[RT];
+#pragma unroll
+    for (int t = 0; t < RT; ++t) {
+        const int r = r0 + 16 * t + nl;
+        rv[t] = r < m;
+        ap[t] = x + (long)(r < m ? r : 0) * xp + kb;
+    }
+    rgm_v8f c[RT][ET];
+#pragma unroll
+    for (int t = 0; t < RT; ++t)
+#pragma unroll
+        for (int q = 0; q < ET; ++q) c[t][q] = (rgm_v8f){ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+    int ntv = 0;   /* row tiles with a valid row: the rest skip their WMMAs */
+#pragma unroll
+    for (int t = 0; t < RT; ++t) ntv += r0 + 16 * t < m ? 1 : 0;
+    for (int j = 0; j < J; j += U) {
+        uint4 bv[U][ET], av[U][RT];
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int q = 0; q < ET; ++q) bv[u][q] = rgm_ld8<AL>(bp[q] + 8 * (j + u));
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int t = 0; t < RT; ++t) {
+                uint4 z = { 0u, 0u, 0u, 0u };
+                if (t < ntv && rv[t]) z = rgm_ld8<AL>(ap[t] + 8 * (j + u));
+                av[u][t] = z;
+            }
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int t = 0; t < RT; ++t)
+                if (t < ntv)
+#pragma unroll
+                    for (int q = 0; q < ET; ++q)
+                        c[t][q] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(rgm_v8bf, av[u][t]),
+                                                                                   __builtin_bit_cast(rgm_v8bf, bv[u][q]), c[t][q]);
+    }
+#pragma unroll
+    for (int t = 0; t < RT; ++t)
+#pragma unroll
+        for (int q = 0; q < ET; ++q)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sp[(wave * RT * ET + t * ET + q) * 256 + (8 * h + i) * 16 + nl] = c[t][q][i];
+}
+/* the slices' fold in wave order: element q of the workgroup's tiles */
+template <int RT, int ET>
+__device__ __forceinline__ float rgm_fold(const float* sp, int q) {
+    float s = sp[q];
+#pragma unroll
+    for (int w = 1; w < kRgmS; ++w) s += sp[w * RT * ET * 256 + q];
+    return s;
+}
+/* code 40: y[M, n] = the logits alone at any M (gemm_nt_f32's router shape) */
+template <int RT, int ET, int U, bool AL>
+__global__ __launch_bounds__(kRgmS * 32) void rgm_gemm_kernel(const uint16_t* x, long xp, const uint16_t* wt, long wtp, float* y,
+                                                              long yp, int m, int n, int K) {
+    __shared__ float sp[kRgmS * RT * ET * 256];
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int e0 = (int)blockIdx.x * 16 * ET, r0 = (int)blockIdx.y * 16 * RT;
+    rgm_wave<RT, ET, U, AL>(x, xp, wt, wtp, m, n, K, e0, r0, wave, lane, sp);
+    __syncthreads();
+    for (int q = threadIdx.x; q < RT * ET * 256; q += kRgmS * 32) {
+        const int tq = q >> 8, row = r0 + 16 * (tq / ET) + ((q >> 4) & 15), col = e0 + 16 * (tq % ET) + (q & 15);
+        if (row < m && col < n) y[(long)row * yp + col] = rgm_fold<RT, ET>(sp, q);
+    }
+}
+/* form 22: the fused router at 1..64 rows -- the logits as code 40's, then lever RGK's epilogue (score + rank key of each logit,
+ * the same element functions), the row group's (16 rows) last arriver runs router_keyed_row (the stock 6 rounds), the last row
+ * group the stock small sort */
+template <int ET, int U, bool AL, int OWN, int SCORE, bool INV>
+__global__ __launch_bounds__(kRgmS * 32) void router_wm_rowkey_kernel(
+    const uint16_t* x, long xp, const uint16_t* wt, long wtp, float* lg, long lp, int m, int ne, int K,
+    const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
+    int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
+    r4d_moesort::Protect prot, unsigned* ctr, unsigned long long* keys, float* sc) {
+    __shared__ float sp[kRgmS * ET * 256];
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int e0 = (int)blockIdx.x * 16 * ET, r0 = (int)blockIdx.y * 16;
+    rgm_wave<1, ET, U, AL>(x, xp, wt, wtp, m, ne, K, e0, r0, wave, lane, sp);
+    __syncthreads();
+    for (int q = threadIdx.x; q < ET * 256; q += kRgmS * 32) {
+        const int row = r0 + ((q >> 4) & 15), col = e0 + 16 * (q >> 8) + (q & 15);
+        if (row < m && col < ne) {
+            const float s = rgm_fold<1, ET>(sp, q);
+            lg[(long)row * lp + col] = s;
+            const float p = router_score_one<SCORE>(s);
+            sc[(long)row * ne + col] = p;
+            keys[(long)row * ne + col] = ds_rank_key(p + bias[(long)col * bp], col);
+        }
+    }
+    __shared__ unsigned s_last;
+    __threadfence();   // this workgroup's logits, scores and keys, device-wide, before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned* gc = ctr + 1 + blockIdx.y;
+        const unsigned old = __hip_atomic_fetch_add(gc, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.x ? 1u : 0u;
+        if (s_last) __hip_atomic_store(gc, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // the row group's keys from its other workgroups
+    for (int r = r0 + wave; r < r0 + 16 && r < m; r += kRgmS) {
+        const int e = router_keyed_row<OWN>(keys, sc, ne, ids, ip, weights, wp, r, ne, k, norm, factor, lane) - base;
+        if (lane < k)
+            sorted[r * k + lane] = e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+    }
+    __threadfence();   // this row group's slots (and ids / weights) before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.y ? 1u : 0u;
+        if (s_last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // every row group's slots
+    __shared__ r4d_moesort::ScatterLds<(uint32_t)kRgmS> sl;
+    for (int e = threadIdx.x; e < n_local; e += kRgmS * 32) sl.cnt[e] = 0;
+    for (int i = threadIdx.x; i < m * k; i += kRgmS * 32) sl.e[i] = sorted[i];
+    lds_barrier();   // the slot list is in LDS before the sort writes `sorted`
+    r4d_moesort::scatter_small_place<(uint32_t)kRgmS, INV>(sorted, off, cnt, (uint32_t)(m * k), (uint32_t)n_local, sl, inv);
+}
+static bool rgm_aligned(const void* x, long xp, const void* w, long wp) {
+    return ((uintptr_t)x & 15u) == 0 && ((uintptr_t)w & 15u) == 0 && (xp & 7) == 0 && (wp & 7) == 0;
+}
+}  // namespace
+
+/* code 40 (r4d_ds41_f32pf.h): RAD_OK, a launch failure or R4D_F32PF_DECLINE (not bf16 weights, K not the router's, N not whole
+ * 16-expert tiles). The tiles a workgroup by M (speed only: the arithmetic is the same at every choice). */
+int r4d_rgm_gemm(RadStream s, const R4dF32PfCall& c) {
+    if (!c.wbf16 || c.K != kRgmK || c.M < 1 || c.N < 16 || (c.N & 15) || !c.x || !c.w || !c.y) return R4D_F32PF_DECLINE;
+    const bool al = rgm_aligned(c.x, c.xp, c.w, c.wp);
+    const bool et2 = (c.N & 31) == 0;
+#define RGM_G(RT, ET, U)                                                                                                  \
+    (al ? R4D_EMIT(s, (rgm_gemm_kernel<RT, ET, U, true>),                                                                 \
+                   dim3((unsigned)((c.N + 16 * (ET) - 1) / (16 * (ET))), (unsigned)((c.M + 16 * (RT) - 1) / (16 * (RT)))), \
+                   dim3(kRgmS * 32), 0, c.x, c.xp, (const uint16_t*)c.w, c.wp, c.y, c.yp, c.M, c.N, c.K)                   \
+        : R4D_EMIT(s, (rgm_gemm_kernel<RT, ET, U, false>),                                                                \
+                   dim3((unsigned)((c.N + 16 * (ET) - 1) / (16 * (ET))), (unsigned)((c.M + 16 * (RT) - 1) / (16 * (RT)))), \
+                   dim3(kRgmS * 32), 0, c.x, c.xp, (const uint16_t*)c.w, c.wp, c.y, c.yp, c.M, c.N, c.K))
+    if ((long)c.M > 16L * 65535L) return R4D_F32PF_DECLINE;
+    if (c.M <= 64) return et2 ? RGM_G(1, 2, 8) : RGM_G(1, 1, 8);
+    return et2 ? RGM_G(2, 2, 4) : RGM_G(2, 1, 4);
+#undef RGM_G
+}
+
+namespace {
+
 /* The op instance's arrival counter (router_gemm_topk_scatter's rule, r4d_moe.hip): taken at init -- once per resolved
  * instance during declare, before the engine measures free VRAM -- never on the launch path; zeroed, and zeroed again by
  * each launch's last arriver. One 64-byte slot an instance (op, band, domain, rank); each routed layer declares its own
@@ -2156,6 +2350,47 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
              factor, base, prot, ctr, sk, sc)
             return inv ? RGK_L(4, 4, 8, 8u, true) : RGK_L(4, 4, 8, 8u, false);
 #undef RGK_L
+        }
+        /* lever RGM (DRAFTER track round 40, RULE B): the WMMA logits (gemm_nt_f32's code 40 arithmetic) + RGK's epilogue keys + the
+         * per-row-group selection + the stock sort. The trunk router (384 experts) with bf16 weights at K 5120 only; f32 weights,
+         * another K or another router take form 21 (the stock arithmetic), as code 40 / r4d_rgm_route leave them to the stock gemm:
+         * a router's logits are one function in every pass either way. */
+        case 22: {
+            unsigned long long* sk = (SCORE == kSqrtSoftplus || SCORE == kSigmoid) && m <= kRgkRows && ne <= kRgkExperts
+                                         ? rgk_scratch(stream, lg.data) : nullptr;
+            /* the trunk router only (384 experts, the shape r4d_rgm_route takes in gemm_nt_f32): the DSpark drafter's router (128
+             * experts; its context pass's projection is gemm_nt_f32 at N 128, which code 40 leaves stock) stays in form 21 */
+            if (!std::is_same<WT, uint16_t>::value || K != kRgmK || ne != 384) {
+                if (!sk) return RGP_I(4, 4, 8, 8u);
+                float* sc = (float*)(sk + kRgkRows * kRgkExperts);
+#define RGK_L(R, C, U, NW, INV)                                                                                   \
+    R4D_EMIT(stream, (router_gemm_rowkey_kernel<R, C, U, WT, 12, (SCORE == kSigmoid ? kSigmoid : kSqrtSoftplus), NW, INV>), \
+             dim3((unsigned)((ne + (NW) * (C) - 1) / ((NW) * (C))), (unsigned)((m + (R) - 1) / (R))),             \
+             dim3((NW) * 32), 0, (const uint16_t*)x.data, (long)x.stride[0], (const WT*)w.data, (long)w.stride[0],  \
+             (float*)lg.data, (long)lg.stride[0], m, ne, K, (const float*)bias.data, (long)bias.stride[0],         \
+             (int32_t*)ids.data, (long)ids.stride[0], (float*)wts.data, (long)wts.stride[0], (int32_t*)sorted.data, \
+             (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
+             factor, base, prot, ctr, sk, sc)
+                return inv ? RGK_L(4, 4, 8, 8u, true) : RGK_L(4, 4, 8, 8u, false);
+#undef RGK_L
+            }
+            if (!sk) return R4D_NO(RAD_E_NOMEM);   /* the WMMA logits or nothing: never the stock arithmetic for a bf16 router */
+            float* sc = (float*)(sk + kRgkRows * kRgkExperts);
+            const bool al = rgm_aligned(x.data, (long)x.stride[0], w.data, (long)w.stride[0]);
+            const bool et2 = m > 32 && (ne & 31) == 0;   /* speed only */
+#define RGM_L(ET, AL, INV)                                                                                        \
+    R4D_EMIT(stream, (router_wm_rowkey_kernel<ET, 8, AL, 12, (SCORE == kSigmoid ? kSigmoid : kSqrtSoftplus), INV>),    \
+             dim3((unsigned)((ne + 16 * (ET) - 1) / (16 * (ET))), (unsigned)((m + 15) / 16)), dim3(kRgmS * 32), 0, \
+             (const uint16_t*)x.data, (long)x.stride[0], (const uint16_t*)w.data, (long)w.stride[0],                \
+             (float*)lg.data, (long)lg.stride[0], m, ne, K, (const float*)bias.data, (long)bias.stride[0],         \
+             (int32_t*)ids.data, (long)ids.stride[0], (float*)wts.data, (long)wts.stride[0], (int32_t*)sorted.data, \
+             (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
+             factor, base, prot, ctr, sk, sc)
+#define RGM_A(ET, INV) (al ? RGM_L(ET, true, INV) : RGM_L(ET, false, INV))
+            if (inv) return et2 ? RGM_A(2, true) : RGM_A(1, true);
+            return et2 ? RGM_A(2, false) : RGM_A(1, false);
+#undef RGM_A
+#undef RGM_L
         }
         default: break;
     }

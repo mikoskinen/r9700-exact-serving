@@ -270,6 +270,265 @@ static void attn_part(const Plugin& pl) {
     }
 }
 
+/* ---- lever RGM (DRAFTER track round 40, RULE B; SPD_PART=rgm): ds41_f32dec 10 forms every router logit on bf16 WMMA (gemm_nt_f32
+ * code 40 at the router's shape, any M; the fused decode launch form 22 at 1..64 rows). Not the stock bytes, so the checks are rule B's:
+ *   (a) gemm code 40 (the pin 40): repeat = the same bytes; rows of an M-row call = the same rows of a 2112-row call (M 1..1000);
+ *       element loads (an x row pitch of K + 1, base off 16 bytes) = the 16-byte loads; the 96-column split (4 slices) = the 384-column
+ *       call's columns; vs the stock chain: how far the logits move and how many rows change their top-6 set (information);
+ *   (b) under the SWITCH (rad_fn4_switch ds41_f32dec 10, no pin): the fused launch (form 22, launched twice) = the chain gemm_nt_f32
+ *       (code 40 by the rule) -> router_scored_topk -> moe_scatter, all 6 outputs + guard tails, expert split and EP slice, M 1..64;
+ *       its logits = (a)'s rows;
+ *   (c) SPDPERF: the fused launch at value 10 vs 9 (RGK) vs 1 (BEST's rule); gemm_nt_f32 at the router's prefill shapes value 10 vs
+ *       value 1 + f32_pf 25 (BEST's prefill form). */
+static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
+    const RadKernelInfo* rg = find(pl, "gemm_nt_f32_bf16");
+    const RadKernelInfo* rs = find(pl, "router_scored_topk_f32");
+    const RadKernelInfo* rc = find(pl, "moe_scatter_i32");
+    const RadKernelInfo* f2 = find(pl, "router_gemm_f32_scored_topk_scatter_bf16");
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    if (!rg || !rs || !rc || !f2 || !f2->init || !f2->fini || !sw) {
+        ok("spdf32 rgm rows", false, "gemm_nt_f32_bf16 / router_scored_topk_f32 / moe_scatter_i32 / router_gemm_f32_scored_topk_scatter_bf16 / "
+                                     "rad_fn4_switch absent");
+        return;
+    }
+    if (sw("ds41_f32dec", 10) != 1) { ok("spdf32 rgm: ds41_f32dec 10 taken", false, "refused (a plugin without lever RGM)"); return; }
+    sw("ds41_f32dec", 0);
+    void* inst = nullptr;
+    if (f2->init(nullptr, 0, 0, 1, &inst) != RAD_OK || !inst) { ok("spdf32 rgm init", false, "no instance"); return; }
+    constexpr int64_t K = 5120, NE = 384, TK = 6, MR = 2112;
+    const double scale = 1.5;
+    const size_t tail = 64;
+    fuse::g_rs = 0x5EEDB00Bull;
+    std::vector<uint16_t> wb((size_t)(NE * K));
+    for (auto& v : wb) v = bf((float)(gauss() * 0.02));
+    std::vector<float> bias((size_t)NE);
+    for (auto& v : bias) v = (float)(gauss() * 0.05);
+    std::vector<uint16_t> x((size_t)(MR * K));
+    for (int64_t r = 0; r < MR; ++r) {
+        const double rs_ = std::ldexp(1.0, (int)(rnd() % 5) - 2);
+        for (int64_t i = 0; i < K; ++i) x[(size_t)(r * K + i)] = bf((float)(gauss() * rs_));
+        if ((r % 97) == 5) x[(size_t)(r * K + (int64_t)(rnd() % K))] = bf(NAN);
+    }
+    /* the same rows at a pitch of K + 1, 8 elements in: every 16-byte load misaligned (code 40's element-load path) */
+    std::vector<uint16_t> xu((size_t)(MR * (K + 1) + 16), 0);
+    for (int64_t r = 0; r < MR; ++r)
+        for (int64_t i = 0; i < K; ++i) xu[(size_t)(8 + 1 + r * (K + 1) + i)] = x[(size_t)(r * K + i)];
+    void* dw = up(wb);
+    void* db = up(bias);
+    void* dx = up(x);
+    void* dxu0 = up(xu);
+    void* dxu = dxu0 ? (void*)((uint16_t*)dxu0 + 9) : nullptr;
+    auto gemm = [&](void* xd, int64_t xpitch, int64_t M, const void* wd, int64_t N, void* yd) -> int {
+        std::vector<RadParam> pg = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") };
+        std::vector<RadTensor> t = { T(xd, RAD_BF16, { M, K }), T((void*)wd, RAD_BF16, { N, K }), T(yd, RAD_F32, { M, N }) };
+        t[0].stride[0] = xpitch;
+        RadArgs a = args(t, pg);
+        return rg->launch(&a, nullptr);
+    };
+    const size_t yrs = (size_t)(MR * NE * 4);
+    void* yref = dalloc(yrs + tail);
+    void* yrep = dalloc(yrs + tail);
+    if (!dw || !db || !dx || !dxu || !yref || !yrep) { ok("spdf32 rgm alloc", false, "hipMalloc failed"); dfree_all(); f2->fini(inst); return; }
+    /* (a) */
+    pin(-1, 40);
+    st_memset(yref, 0xA5, yrs + tail);
+    st_memset(yrep, 0xA5, yrs + tail);
+    const int ra = gemm(dx, K, MR, dw, NE, yref), rb = gemm(dx, K, MR, dw, NE, yrep);
+    st_stream_sync(nullptr);
+    const std::vector<uint8_t> ref = bytes(yref, yrs + tail);
+    ok(fmt("spdf32 rgm gemm code 40: M %lld x N %lld launched twice, the same bytes (+ tail)", (long long)MR, (long long)NE).c_str(),
+       ra == RAD_OK && rb == RAD_OK && ref == bytes(yrep, yrs + tail), fmt("rc %d %d", ra, rb));
+    int checks = 0, bad = 0;
+    /* rows [0, M) x columns [c0, c0 + N) of y (pitch N) vs the 2112-row reference; the guard tail untouched */
+    auto same_rows = [&](void* yd, int64_t M, int64_t N, int64_t c0) -> std::string {
+        const std::vector<uint8_t> got = bytes(yd, (size_t)(M * N * 4) + tail);
+        for (int64_t r = 0; r < M; ++r)
+            if (std::memcmp(&got[(size_t)(r * N * 4)], &ref[(size_t)((r * NE + c0) * 4)], (size_t)(N * 4)))
+                return fmt("row %lld differs", (long long)r);
+        for (size_t i = 0; i < tail; ++i)
+            if (got[(size_t)(M * N * 4) + i] != 0xA5) return "guard tail written";
+        return std::string();
+    };
+    {
+        std::string fails;
+        for (int64_t M : { 1, 2, 3, 4, 5, 8, 12, 16, 17, 24, 31, 32, 33, 40, 47, 48, 49, 56, 63, 64, 65, 96, 128, 255, 256, 1000 }) {
+            for (int al : { 1, 0 }) {
+                if (!al && !(M == 1 || M == 16 || M == 47 || M == 64 || M == 65 || M == 256)) continue;
+                void* y = dalloc((size_t)(M * NE * 4) + tail);
+                if (!y) { fails += " alloc;"; break; }
+                st_memset(y, 0xA5, (size_t)(M * NE * 4) + tail);
+                const int r = al ? gemm(dx, K, M, dw, NE, y) : gemm(dxu, K + 1, M, dw, NE, y);
+                st_stream_sync(nullptr);
+                const std::string d = r != RAD_OK ? fmt("rc %d", r) : same_rows(y, M, NE, 0);
+                ++checks;
+                if (!d.empty()) { ++bad; fails += fmt(" M %lld %s: %s;", (long long)M, al ? "16-byte loads" : "element loads", d.c_str()); }
+            }
+        }
+        for (int64_t c0 : { (int64_t)0, (int64_t)96, (int64_t)192, (int64_t)288 })
+            for (int64_t M : { (int64_t)16, (int64_t)48, (int64_t)64, (int64_t)256, MR }) {
+                void* y = dalloc((size_t)(M * 96 * 4) + tail);
+                if (!y) { fails += " alloc;"; break; }
+                st_memset(y, 0xA5, (size_t)(M * 96 * 4) + tail);
+                const int r = gemm(dx, K, M, (const uint16_t*)dw + c0 * K, 96, y);
+                st_stream_sync(nullptr);
+                const std::string d = r != RAD_OK ? fmt("rc %d", r) : same_rows(y, M, 96, c0);
+                ++checks;
+                if (!d.empty()) { ++bad; fails += fmt(" split cols %lld.. M %lld: %s;", (long long)c0, (long long)M, d.c_str()); }
+            }
+        ok(fmt("spdf32 rgm gemm code 40 batch-invariant: rows of M 1..1000 (16-byte and element loads) and the 96-column split's 4 slices "
+               "(M 16..2112) = the 2112-row call's bytes (%d calls)", checks).c_str(),
+           fails.empty(), fails);
+    }
+    /* vs the stock chain (information): M 64 */
+    {
+        pin(-1, 0);
+        const int64_t M = 64;
+        void* y = dalloc((size_t)(M * NE * 4));
+        const int r = y ? gemm(dx, K, M, dw, NE, y) : -1;
+        st_stream_sync(nullptr);
+        if (r == RAD_OK) {
+            std::vector<float> s((size_t)(M * NE)), g((size_t)(M * NE));
+            st_memcpy(s.data(), y, s.size() * 4, hipMemcpyDeviceToHost);
+            std::memcpy(g.data(), ref.data(), g.size() * 4);
+            long nd = 0, rows_set = 0;
+            double md = 0, mr = 0;
+            for (int64_t i = 0; i < M; ++i) {
+                std::vector<std::pair<double, int>> a, b;
+                bool nan = false;
+                for (int64_t e = 0; e < NE; ++e) {
+                    const float u = s[(size_t)(i * NE + e)], v = g[(size_t)(i * NE + e)];
+                    if (std::memcmp(&u, &v, 4)) ++nd;
+                    if (std::isnan(u) || std::isnan(v)) { nan = true; continue; }
+                    md = std::max(md, std::fabs((double)u - v));
+                    if (u != 0) mr = std::max(mr, std::fabs(((double)u - v) / u));
+                    auto sc_ = [&](double l) { return std::sqrt(l > 20 ? l : std::log1p(std::exp(l))) + bias[(size_t)e]; };
+                    a.push_back({ -sc_(u), (int)e });
+                    b.push_back({ -sc_(v), (int)e });
+                }
+                if (nan) continue;
+                std::partial_sort(a.begin(), a.begin() + TK, a.end());
+                std::partial_sort(b.begin(), b.begin() + TK, b.end());
+                std::vector<int> sa, sb;
+                for (int j = 0; j < TK; ++j) { sa.push_back(a[(size_t)j].second); sb.push_back(b[(size_t)j].second); }
+                std::sort(sa.begin(), sa.end());
+                std::sort(sb.begin(), sb.end());
+                if (sa != sb) ++rows_set;
+            }
+            fuse::info(fmt("spdf32 rgm vs the stock chain (M 64, random rows): %ld of %lld logits differ, max |d| %.3g, max rel %.3g, rows "
+                           "with another top-6 set %ld (rows with a NaN skipped)",
+                           nd, (long long)(M * NE), md, mr, rows_set)
+                           .c_str());
+        }
+    }
+    /* (b) under the switch */
+    pin(-1, -1);
+    sw("ds41_f32dec", 10);
+    {
+        static const char* const kOut[6] = { "logits", "ids", "weights", "sorted_tok", "expert_offset", "expert_count" };
+        std::string fails;
+        int nb = 0;
+        for (int64_t M : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 24, 32, 33, 40, 47, 48, 49, 56, 63, 64 }) {
+            for (int lay : { 0, 1 }) {
+                const int64_t NL = lay ? 96 : NE, base = lay ? 96 : 0;
+                const std::array<size_t, 6> sz = { (size_t)(M * NE * 4) + tail, (size_t)(M * TK * 4) + tail, (size_t)(M * TK * 4) + tail,
+                                                   (size_t)(M * TK * 4) + tail, (size_t)(NL + 1) * 4 + tail, (size_t)NL * 4 + tail };
+                void* o[2][6];
+                bool okm = true;
+                for (int f = 0; f < 2; ++f)
+                    for (int j = 0; j < 6; ++j) { o[f][j] = dalloc(sz[(size_t)j]); if (o[f][j]) st_memset(o[f][j], 0xA5, sz[(size_t)j]); else okm = false; }
+                if (!okm) { fails += " alloc;"; break; }
+                std::vector<RadParam> psel = { PI("M", M), PI("n_expert", NE), PI("top_k", TK), PI("norm", 1),
+                                               PF("route_scale", scale), PS("score", "sqrtsoftplus"), PS("dtype", "f32") };
+                std::vector<RadParam> psort = { PI("M", M), PI("n_expert", NL), PI("top_k", TK), PI("expert_base", base) };
+                std::vector<RadParam> pf2 = { PI("M", M), PI("K", K), PI("n_expert", NE), PI("n_local", NL), PI("top_k", TK),
+                                              PI("norm", 1), PF("route_scale", scale), PS("score", "sqrtsoftplus"),
+                                              PS("dtype", "bf16"), PI("expert_base", base) };
+                std::vector<RadTensor> tsel = { T(o[0][0], RAD_F32, { M, NE }), T(db, RAD_F32, { NE }),
+                                                T(o[0][1], RAD_I32, { M, TK }), T(o[0][2], RAD_F32, { M, TK }) };
+                std::vector<RadTensor> tsort = { T(o[0][1], RAD_I32, { M, TK }), T(o[0][3], RAD_I32, { M * TK }),
+                                                 T(o[0][4], RAD_I32, { NL + 1 }), T(o[0][5], RAD_I32, { NL }) };
+                std::vector<RadTensor> tf2 = { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(db, RAD_F32, { NE }),
+                                               T(o[1][0], RAD_F32, { M, NE }), T(o[1][1], RAD_I32, { M, TK }),
+                                               T(o[1][2], RAD_F32, { M, TK }), T(o[1][3], RAD_I32, { M * TK }),
+                                               T(o[1][4], RAD_I32, { NL + 1 }), T(o[1][5], RAD_I32, { NL }) };
+                RadArgs asel = args(tsel, psel), asort = args(tsort, psort), af2 = args(tf2, pf2, inst);
+                int c0 = gemm(dx, K, M, dw, NE, o[0][0]);
+                if (c0 == RAD_OK) c0 = rs->launch(&asel, nullptr);
+                if (c0 == RAD_OK) c0 = rc->launch(&asort, nullptr);
+                const int c1 = f2->launch(&af2, nullptr), c2 = f2->launch(&af2, nullptr);   /* twice: the counters reset */
+                st_stream_sync(nullptr);
+                int first = -1;
+                for (int j = 0; c0 == RAD_OK && c1 == RAD_OK && c2 == RAD_OK && j < 6 && first < 0; ++j)
+                    if (bytes(o[0][j], sz[(size_t)j]) != bytes(o[1][j], sz[(size_t)j])) first = j;
+                const std::string dl = c0 == RAD_OK ? same_rows(o[0][0], M, NE, 0) : std::string("chain failed");
+                ++nb;
+                if (c0 != RAD_OK || c1 != RAD_OK || c2 != RAD_OK || first >= 0 || !dl.empty())
+                    fails += fmt(" M %lld %s: %s;", (long long)M, lay ? "EP 96 @ 96" : "ETP",
+                                 c0 != RAD_OK || c1 != RAD_OK || c2 != RAD_OK ? fmt("rc %d %d %d", c0, c1, c2).c_str()
+                                 : first >= 0                                ? kOut[first]
+                                                                             : ("chain logits vs (a): " + dl).c_str());
+            }
+        }
+        ok(fmt("spdf32 rgm under ds41_f32dec 10: the fused launch (form 22, twice) = gemm_nt_f32 (code 40 by the rule) -> router_scored_topk -> "
+               "moe_scatter, 6 outputs + tails, ETP and EP slice, M 1..64 (%d cases); the chain's logits = (a)'s rows", nb).c_str(),
+           fails.empty(), fails);
+    }
+    /* (c) SPDPERF */
+    {
+        void* o[6];
+        const int64_t MM = 64;
+        const std::array<size_t, 6> sz = { (size_t)(MM * NE * 4), (size_t)(MM * TK * 4), (size_t)(MM * TK * 4), (size_t)(MM * TK * 4),
+                                           (size_t)(NE + 1) * 4, (size_t)NE * 4 };
+        for (int j = 0; j < 6; ++j) o[j] = dalloc(sz[(size_t)j]);
+        for (int64_t M : { 1, 8, 16, 32, 48, 64 }) {
+            std::vector<RadParam> pf2 = { PI("M", M), PI("K", K), PI("n_expert", NE), PI("n_local", NE), PI("top_k", TK),
+                                          PI("norm", 1), PF("route_scale", scale), PS("score", "sqrtsoftplus"),
+                                          PS("dtype", "bf16"), PI("expert_base", 0) };
+            std::vector<RadTensor> tf2 = { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(db, RAD_F32, { NE }),
+                                           T(o[0], RAD_F32, { M, NE }), T(o[1], RAD_I32, { M, TK }), T(o[2], RAD_F32, { M, TK }),
+                                           T(o[3], RAD_I32, { M * TK }), T(o[4], RAD_I32, { NE + 1 }), T(o[5], RAD_I32, { NE }) };
+            RadArgs af2 = args(tf2, pf2, inst);
+            double w[3] = { 0, 0, 0 }, c[3] = { 0, 0, 0 };
+            const int vals[3] = { 10, 9, 1 };
+            for (int rep = 0; rep < 2; ++rep)
+                for (int i = 0; i < 3; ++i) {
+                    sw("ds41_f32dec", vals[i]);
+                    double ww = 0, cc = 0;
+                    time2([&]() { return f2->launch(&af2, nullptr); }, 200, &ww, &cc);
+                    std::printf("  SPDPERF rgm fused M=%lld ds41_f32dec %2d rep %d warm %7.2f cold %7.2f us\n", (long long)M, vals[i], rep, ww, cc);
+                    w[i] += ww / 2;
+                    c[i] += cc / 2;
+                }
+            std::printf("  SPDPERF rgm fused M=%lld mean of 2: value 10 (RGM) %7.2f / %7.2f | 9 (RGK) %7.2f / %7.2f | 1 (BEST) %7.2f / %7.2f us "
+                        "(warm / cold); 10 vs 9 cold %+6.2f us\n",
+                        (long long)M, w[0], c[0], w[1], c[1], w[2], c[2], c[0] - c[1]);
+        }
+        for (int64_t N : { (int64_t)384, (int64_t)96 })
+            for (int64_t M : { (int64_t)64, (int64_t)128, (int64_t)256, (int64_t)1024, MR }) {
+                void* y = dalloc((size_t)(M * N * 4));
+                if (!y) break;
+                double w[2] = { 0, 0 }, c[2] = { 0, 0 };
+                for (int rep = 0; rep < 2; ++rep)
+                    for (int i = 0; i < 2; ++i) {
+                        sw("ds41_f32dec", i == 0 ? 10 : 1);
+                        sw("f32_pf", i == 0 ? 0 : 25);
+                        double ww = 0, cc = 0;
+                        time2([&]() { return gemm(dx, K, M, dw, N, y); }, 100, &ww, &cc);
+                        w[i] += ww / 2;
+                        c[i] += cc / 2;
+                    }
+                std::printf("  SPDPERF rgm gemm N=%lld M=%lld: value 10 (code 40) warm %8.2f cold %8.2f | value 1 + f32_pf 25 warm %8.2f cold "
+                            "%8.2f us | %+7.2f / %+7.2f\n",
+                            (long long)N, (long long)M, w[0], c[0], w[1], c[1], w[0] - w[1], c[0] - c[1]);
+            }
+        sw("f32_pf", 0);
+    }
+    sw("ds41_f32dec", 0);
+    pin(-1, -1);
+    dfree_all();
+    f2->fini(inst);
+}
+
 static void spd_case(const Plugin& pl) {
     auto pin = (void (*)(int, int))dlsym(pl.h, "r4d_f32dec_pin");
     if (!pin) { ok("spdf32", false, "r4d_f32dec_pin absent (a plugin without lever SPD-F)"); return; }
@@ -277,6 +536,7 @@ static void spd_case(const Plugin& pl) {
     if (!part || !std::strcmp(part, "rgs") || !std::strcmp(part, "all")) rgs_part(pl, pin);
     if (!part || !std::strcmp(part, "gemm") || !std::strcmp(part, "all")) gemm_part(pl, pin);
     if (!part || !std::strcmp(part, "attn") || !std::strcmp(part, "all")) attn_part(pl);
+    if (part && (!std::strcmp(part, "rgm") || !std::strcmp(part, "all"))) rgm_part(pl, pin);
     pin(-1, -1);
 }
 
