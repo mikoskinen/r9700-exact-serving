@@ -133,12 +133,87 @@ struct Wk3Tl {
 /* DP (stage 2, r6 bench): 1 = the raw words a slab ahead as gg_wm_kernel loads them (the early words a slab ahead, the rest reloaded
  * in place after their last use: half a slab of latency); 2 = every raw word of slab t + 2 loaded at slab t's start into a ring of
  * three register sets (two slabs of loads in flight, no in-place reloads). Only the load timing differs: the same operations. */
+/* Round 42 (bench, AB bit 128): the q6_K weight in a TILE-INTERLEAVED copy -- for 16-row tile T and slab s (half a block, 128 K
+ * values) the 16 rows' slab pieces are 1,696 contiguous bytes, row r at 106 r: its 64 ql bytes (block offset 64 c), its 32 qh bytes
+ * (128 + 32 c), its 8 scales (192 + 8 c) and d (208, both slabs carry it). A lane loads the same words into the same registers as
+ * Wq<GG_Q6_K>::load / reload, so the decode, WMMA and scale fma (bfrag / scale, inherited) and every output byte are unchanged. */
+constexpr int kIl6 = 1696, kIl6R = 106;
+struct Wq6Il : Wq<GG_Q6_K> {
+    __device__ static __forceinline__ void lql(const uint8_t* b, int h, int i, uint32_t* r) {
+        const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 32 * (i >> 1) + 16 * (i & 1) + 8 * h);
+        r[2 * i] = q.x;
+        r[2 * i + 1] = q.y;
+    }
+    __device__ static __forceinline__ void lqh(const uint8_t* b, int h, int i, uint32_t* r) {
+        const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 64 + 16 * i + 8 * h);
+        r[8 + 2 * i] = q.x;
+        r[9 + 2 * i] = q.y;
+    }
+    __device__ static __forceinline__ void load(const uint8_t* row, int s, int h, uint32_t* r) {
+        const uint8_t* b = row + (long long)s * kIl6;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) lql(b, h, i, r);
+        lqh(b, h, 0, r);
+        lqh(b, h, 1, r);
+        const gg_u32x2 sc = *(gg_gu64a2)(const void*)(b + 96);
+        r[12] = sc.x;
+        r[13] = sc.y;
+        r[14] = gg_u16(b + 104);
+    }
+    template <int J>
+    __device__ static __forceinline__ void reload(const uint8_t* row, int s, int h, uint32_t* r) {
+        const uint8_t* b = row + (long long)s * kIl6;
+        if constexpr (J >= 4) lql(b, h, J - 4, r);
+        if constexpr (J == 3) r[12] = *(gg_gu32a2)(const void*)(b + 96);
+        if constexpr (J == 7) r[13] = *(gg_gu32a2)(const void*)(b + 100);
+    }
+};
+/* Round 42 (bench, AB bit 256): IL-B, the tile-slab's 1,696 bytes in LOAD order -- ql load i (i 0..3) of lane L (= 16 h + c16) at
+ * 256 i + 8 L, qh load i (0..1) at 1024 + 256 i + 8 L, the row's 8 scales at 1536 + 8 c16, d at 1664 + 2 c16: every ql / qh load
+ * instruction of a wave reads 256 contiguous bytes. The same words into the same registers as Wq<GG_Q6_K>. The row pointer is the
+ * tile's base. */
+struct Wq6Il2 : Wq<GG_Q6_K> {
+    __device__ static __forceinline__ void load(const uint8_t* tb, int s, int h, uint32_t* r) {
+        const int L = (int)(threadIdx.x & 31), c = L & 15;
+        const uint8_t* b = tb + (long long)s * kIl6;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * i + 8 * L);
+            r[2 * i] = q.x;
+            r[2 * i + 1] = q.y;
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 1024 + 256 * i + 8 * L);
+            r[8 + 2 * i] = q.x;
+            r[9 + 2 * i] = q.y;
+        }
+        const gg_u32x2 sc = *(const gg_u32x2*)(const void*)(b + 1536 + 8 * c);
+        r[12] = sc.x;
+        r[13] = sc.y;
+        r[14] = gg_u16(b + 1664 + 2 * c);
+    }
+    template <int J>
+    __device__ static __forceinline__ void reload(const uint8_t* tb, int s, int h, uint32_t* r) {
+        const int L = (int)(threadIdx.x & 31), c = L & 15;
+        const uint8_t* b = tb + (long long)s * kIl6;
+        if constexpr (J >= 4) {
+            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * (J - 4) + 8 * L);
+            r[2 * (J - 4)] = q.x;
+            r[2 * (J - 4) + 1] = q.y;
+        }
+        if constexpr (J == 3) r[12] = *(const uint32_t*)(const void*)(b + 1536 + 8 * c);
+        if constexpr (J == 7) r[13] = *(const uint32_t*)(const void*)(b + 1540 + 8 * c);
+    }
+};
 /* AB (DRAFTER round 35, BENCH ablation only, env R4D_WK3_AB as gg_wk3_kernel's; outputs NOT the part order under AB != 0): bit 1 no
  * weight loads in the K loop (the prologue's words reused), bit 2 no per-slab activation staging, bit 4 no math (the raw words folded). */
+/* Round 43 (bench, AB bits 128 / 256 as gg_wk3_kernel's): G1 on the q6_K tile-interleaved copies IL-A / IL-B (Wq6Il / Wq6Il2: the
+ * same words into the same registers, so the same bytes); the prefetch (pfm 0 / 2) takes a wave's two tile-slab pairs (2 x 3,392 B). */
 template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1, int AB = 0>
 __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     const Wk3Tl wtl;
-    using W = Wq<T>;
+    using W = std::conditional_t<(AB & 256) != 0, Wq6Il2, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
@@ -176,7 +251,10 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
         const int n = n0 + ns * 32 + nt * 16 + c16;
-        wr[nt] = wb + (long long)(n < N ? n : N - 1) * A.w_ld;
+        const long long nn = n < N ? n : N - 1;
+        if constexpr ((AB & 256) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6;
+        else if constexpr ((AB & 128) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6 + (nn & 15) * kIl6R;
+        else wr[nt] = wb + nn * A.w_ld;
     }
     /* Activation staging: KP 16-byte chunks a thread a slab (the tile's row tid >> 4, values 8 (tid & 15), at run i's
      * slab); a row past M stages the tile's last row (rows are independent; its outputs are not written). WL: 8 chunks a
@@ -309,6 +387,13 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     const int pfl = A.pfl, pfm = A.pfm;
     auto prefetch = [&](int s) {
         if (pfm == 1) return;
+        if constexpr ((AB & 384) != 0) {   /* round 43: the wave's two tiles, slabs s + 3 and s + 4 (contiguous in a tile) */
+            const long long t0 = (long long)(n0 + ns * 32) >> 4, tl = (long long)(N - 1) >> 4;
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+                __builtin_amdgcn_s_prefetch_data(gg_sptr(wb + (std::min(t0 + nt, tl) * (long long)S + min(s + 3, S - 1)) * kIl6), 27);
+            return;
+        }
         const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;
         if (pfm == 2 && prmax >= 31) {
 #pragma unroll
@@ -603,41 +688,6 @@ std::atomic<int> g_gg_wk_last{0};
  * PRO 1 / 2 (stage 2, r5): lever K1's folds a / e in the staging exactly as gg_wk_kernel's (the producer's bf16 octet of each staged
  * chunk, rmsnorm's row scales from a block prologue in mr_norm_scales' order; grid row 0 also stores h) -- the same bytes as the
  * producer's launch then the GEMM. */
-/* Round 42 (bench, AB bit 128): the q6_K weight in a TILE-INTERLEAVED copy -- for 16-row tile T and slab s (half a block, 128 K
- * values) the 16 rows' slab pieces are 1,696 contiguous bytes, row r at 106 r: its 64 ql bytes (block offset 64 c), its 32 qh bytes
- * (128 + 32 c), its 8 scales (192 + 8 c) and d (208, both slabs carry it). A lane loads the same words into the same registers as
- * Wq<GG_Q6_K>::load / reload, so the decode, WMMA and scale fma (bfrag / scale, inherited) and every output byte are unchanged. */
-constexpr int kIl6 = 1696, kIl6R = 106;
-struct Wq6Il : Wq<GG_Q6_K> {
-    __device__ static __forceinline__ void lql(const uint8_t* b, int h, int i, uint32_t* r) {
-        const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 32 * (i >> 1) + 16 * (i & 1) + 8 * h);
-        r[2 * i] = q.x;
-        r[2 * i + 1] = q.y;
-    }
-    __device__ static __forceinline__ void lqh(const uint8_t* b, int h, int i, uint32_t* r) {
-        const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 64 + 16 * i + 8 * h);
-        r[8 + 2 * i] = q.x;
-        r[9 + 2 * i] = q.y;
-    }
-    __device__ static __forceinline__ void load(const uint8_t* row, int s, int h, uint32_t* r) {
-        const uint8_t* b = row + (long long)s * kIl6;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) lql(b, h, i, r);
-        lqh(b, h, 0, r);
-        lqh(b, h, 1, r);
-        const gg_u32x2 sc = *(gg_gu64a2)(const void*)(b + 96);
-        r[12] = sc.x;
-        r[13] = sc.y;
-        r[14] = gg_u16(b + 104);
-    }
-    template <int J>
-    __device__ static __forceinline__ void reload(const uint8_t* row, int s, int h, uint32_t* r) {
-        const uint8_t* b = row + (long long)s * kIl6;
-        if constexpr (J >= 4) lql(b, h, J - 4, r);
-        if constexpr (J == 3) r[12] = *(gg_gu32a2)(const void*)(b + 96);
-        if constexpr (J == 7) r[13] = *(gg_gu32a2)(const void*)(b + 100);
-    }
-};
 __global__ __launch_bounds__(256) void gg_il6_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) {
     const long long i = (long long)blockIdx.x * 256 + threadIdx.x;   /* (tile, slab, row) */
     const long long tiles = (N + 15) / 16;
@@ -654,44 +704,6 @@ __global__ __launch_bounds__(256) void gg_il6_pack_kernel(const uint8_t* src, lo
     d[104] = b[208];
     d[105] = b[209];
 }
-/* Round 42 (bench, AB bit 256): IL-B, the tile-slab's 1,696 bytes in LOAD order -- ql load i (i 0..3) of lane L (= 16 h + c16) at
- * 256 i + 8 L, qh load i (0..1) at 1024 + 256 i + 8 L, the row's 8 scales at 1536 + 8 c16, d at 1664 + 2 c16: every ql / qh load
- * instruction of a wave reads 256 contiguous bytes. The same words into the same registers as Wq<GG_Q6_K>. The row pointer is the
- * tile's base. */
-struct Wq6Il2 : Wq<GG_Q6_K> {
-    __device__ static __forceinline__ void load(const uint8_t* tb, int s, int h, uint32_t* r) {
-        const int L = (int)(threadIdx.x & 31), c = L & 15;
-        const uint8_t* b = tb + (long long)s * kIl6;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * i + 8 * L);
-            r[2 * i] = q.x;
-            r[2 * i + 1] = q.y;
-        }
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 1024 + 256 * i + 8 * L);
-            r[8 + 2 * i] = q.x;
-            r[9 + 2 * i] = q.y;
-        }
-        const gg_u32x2 sc = *(const gg_u32x2*)(const void*)(b + 1536 + 8 * c);
-        r[12] = sc.x;
-        r[13] = sc.y;
-        r[14] = gg_u16(b + 1664 + 2 * c);
-    }
-    template <int J>
-    __device__ static __forceinline__ void reload(const uint8_t* tb, int s, int h, uint32_t* r) {
-        const int L = (int)(threadIdx.x & 31), c = L & 15;
-        const uint8_t* b = tb + (long long)s * kIl6;
-        if constexpr (J >= 4) {
-            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * (J - 4) + 8 * L);
-            r[2 * (J - 4)] = q.x;
-            r[2 * (J - 4) + 1] = q.y;
-        }
-        if constexpr (J == 3) r[12] = *(const uint32_t*)(const void*)(b + 1536 + 8 * c);
-        if constexpr (J == 7) r[13] = *(const uint32_t*)(const void*)(b + 1540 + 8 * c);
-    }
-};
 __global__ __launch_bounds__(256) void gg_il6b_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) {
     const long long i = (long long)blockIdx.x * 256 + threadIdx.x;   /* (tile, slab, lane) */
     const long long tiles = (N + 15) / 16;
@@ -1174,7 +1186,7 @@ constexpr unsigned gg_wk_lds(int kp, int P, bool wl = false) {
                       (kp > 1 ? (P - P / kp) * (8 / kp) * 32 * 64 : 0));
 }
 template <int T>
-int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid) {
+int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid, int abo = -1) {
     const bool wl = (code & 262144) != 0;
     const bool dp2 = (code & 8388608) != 0 && !wl;   /* bit 23: DP 2 (two slabs of raw words in flight; block staging only) */
     const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P, wl);
@@ -1195,9 +1207,43 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 #undef GG_WK_F2
         return R4D_WK_DECLINE;
     }
-    /* DRAFTER round 35 bench ablation (env R4D_WK3_AB 1 / 3 / 6, read once; outputs not the part order): the trunk's served 33..48-row G1
-     * forms -- block staging, bf16 out, KP 1 / 2 / 4, DP 1 (595012 / 70724) and q6_K DP 2 (TDP 8459332) */
-    static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+    /* DRAFTER round 43 bench (env R4D_WK3_AB 128 IL-A / 384 IL-B, q6_K, no fold): G1 on the tile-interleaved copy (r4d_gg_wk_run swaps
+     * the weight pointers); the forms the decode band serves: WL KP 1 / 2 / 4 / 8 (f32 + bf16), block staging KP 1 / 2 / 4 DP 1 bf16 + DP 2 */
+    static const int ab0 = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+    const int ab = abo >= 0 ? abo : ab0;   /* round 43: the IL byte check's stock launch passes 0 */
+    if constexpr (T == GG_Q6_K) {
+        if ((ab == 128 || ab == 384) && !pro) {
+#define GG_WK_IL(ABV)                                                                                                            \
+            if (dp2) {                                                                                                           \
+                if (kp == 1 && !f32out) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 2, ABV>), grid, dim3(256), lds, A); \
+                if (kp == 2 && !f32out) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 2, ABV>), grid, dim3(256), lds, A); \
+                return R4D_WK_DECLINE;                                                                                           \
+            }                                                                                                                    \
+            if (wl) {                                                                                                            \
+                if (f32out) {                                                                                                    \
+                    if (kp == 8) return R4D_EMIT(s, (gg_wk_kernel<T, 8, true, float, 0, 1, ABV>), grid, dim3(256), lds, A);      \
+                    if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, true, float, 0, 1, ABV>), grid, dim3(256), lds, A);      \
+                    return R4D_WK_DECLINE;                                                                                       \
+                }                                                                                                                \
+                if (kp == 8) return R4D_EMIT(s, (gg_wk_kernel<T, 8, true, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);       \
+                if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, true, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);       \
+                if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, true, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);       \
+                if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, true, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);       \
+                return R4D_WK_DECLINE;                                                                                           \
+            }                                                                                                                    \
+            if (f32out) {                                                                                                        \
+                if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, float, 0, 1, ABV>), grid, dim3(256), lds, A);         \
+                return R4D_WK_DECLINE;                                                                                           \
+            }                                                                                                                    \
+            if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);          \
+            if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);          \
+            if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);          \
+            return R4D_WK_DECLINE;
+            if (ab == 128) { GG_WK_IL(128) }
+            GG_WK_IL(384)
+#undef GG_WK_IL
+        }
+    }
     if ((ab == 1 || ab == 3 || ab == 6) && !wl && !f32out) {
 #define GG_WK_AB(KPV, DPV)                                                                                          \
         if (kp == KPV && dp2 == (DPV == 2)) {                                                                       \
@@ -1334,6 +1380,47 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
 #undef GG_WK3_X
     return R4D_WK_DECLINE;
 }
+/* Round 42 / 43 bench (R4D_WK3_AB & 384, q6_K, no fold): the weights' tile-interleaved copies (IL-A 128 / IL-B 256), cached by pointer +
+ * an 8 KiB check; a pack is followed by a 256 MiB read so the timed launch starts cold. Shared by G1 (r4d_gg_wk_run) and G2. */
+static bool gg_il_swap(GgWkArgs& A, int ty, const GgWkFold* fo, int tlab, int nm, const uint8_t* const* wd, const long long* Nv, long long K,
+                       long long w_ld) {
+    if ((tlab & 384) && ty == GG_Q6_K && !fo) {   /* round 42 bench: the weights' tile-interleaved copies (cached by pointer + 8 KiB check) */
+        struct Il { const void* src; long long N, K, ld; int mode; std::vector<uint8_t> chk; uint8_t* dst; };
+        const int ilm = (tlab & 256) ? 2 : 1;
+        bool packed = false;
+        static std::vector<Il> cache;
+        for (int i = 0; i < nm; ++i) {
+            const long long N_ = Nv[i], S_ = K / kWmS, bytes = N_ * w_ld;
+            std::vector<uint8_t> chk(8192);
+            (void)hipMemcpy(chk.data(), wd[i], 4096, hipMemcpyDeviceToHost);
+            (void)hipMemcpy(chk.data() + 4096, (const uint8_t*)wd[i] + bytes - 4096, 4096, hipMemcpyDeviceToHost);
+            uint8_t* dst = nullptr;
+            for (auto& c : cache)
+                if (c.src == wd[i] && c.N == N_ && c.K == K && c.ld == w_ld && c.mode == ilm && c.chk == chk) dst = c.dst;
+            if (!dst) {
+                if (cache.size() >= 64) { (void)hipFree(cache.front().dst); cache.erase(cache.begin()); }
+                const long long tiles = (N_ + 15) / 16;
+                if (hipMalloc((void**)&dst, (size_t)(tiles * S_ * kIl6)) != hipSuccess) return false;
+                const long long th = tiles * S_ * (ilm == 2 ? 32 : 16);
+                if (ilm == 2) hipLaunchKernelGGL(gg_il6b_pack_kernel, dim3((unsigned)((th + 255) / 256)), dim3(256), 0, 0, (const uint8_t*)wd[i], w_ld, dst, N_, (int)S_);
+                else hipLaunchKernelGGL(gg_il6_pack_kernel, dim3((unsigned)((th + 255) / 256)), dim3(256), 0, 0, (const uint8_t*)wd[i], w_ld, dst, N_, (int)S_);
+                (void)hipDeviceSynchronize();
+                cache.push_back(Il{ wd[i], N_, K, w_ld, ilm, chk, dst });
+                packed = true;
+            }
+            A.w[i] = dst;
+            if (nm == 1) A.w[1] = dst;
+        }
+        if (packed) {   /* the pack left the copy in L2 / MALL: read 256 MiB so the timed launch starts cold, as --cold's flush */
+            static uint4* fb = nullptr;
+            static uint32_t* fo4 = nullptr;
+            if (!fb && (hipMalloc((void**)&fb, 256u << 20) != hipSuccess || hipMemset(fb, 1, 256u << 20) != hipSuccess || hipMalloc((void**)&fo4, 64) != hipSuccess)) fb = nullptr;
+            if (fb) hipLaunchKernelGGL(gg_il6_flush_kernel, dim3(1024), dim3(256), 0, 0, (const uint4*)fb, (long long)((256u << 20) / 16), fo4);
+            (void)hipDeviceSynchronize();
+        }
+    }
+    return true;
+}
 static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
                const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
                long long K, const GgWkFold* fo) {
@@ -1393,41 +1480,7 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     static const int tl = [] { const char* e = std::getenv("R4D_WK3_TL"); return e && e[0] == '1' ? 1 : 0; }();
     static const int tlab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
     const GgWkArgs A0 = A;   /* round 42: the stored-layout arguments (the IL byte check) */
-    if ((tlab & 384) && ty == GG_Q6_K && !fo) {   /* round 42 bench: the weights' tile-interleaved copies (cached by pointer + 8 KiB check) */
-        struct Il { const void* src; long long N, K, ld; int mode; std::vector<uint8_t> chk; uint8_t* dst; };
-        const int ilm = (tlab & 256) ? 2 : 1;
-        bool packed = false;
-        static std::vector<Il> cache;
-        for (int i = 0; i < nm; ++i) {
-            const long long N_ = Nv[i], S_ = K / kWmS, bytes = N_ * w_ld;
-            std::vector<uint8_t> chk(8192);
-            (void)hipMemcpy(chk.data(), wd[i], 4096, hipMemcpyDeviceToHost);
-            (void)hipMemcpy(chk.data() + 4096, (const uint8_t*)wd[i] + bytes - 4096, 4096, hipMemcpyDeviceToHost);
-            uint8_t* dst = nullptr;
-            for (auto& c : cache)
-                if (c.src == wd[i] && c.N == N_ && c.K == K && c.ld == w_ld && c.mode == ilm && c.chk == chk) dst = c.dst;
-            if (!dst) {
-                if (cache.size() >= 64) { (void)hipFree(cache.front().dst); cache.erase(cache.begin()); }
-                const long long tiles = (N_ + 15) / 16;
-                if (hipMalloc((void**)&dst, (size_t)(tiles * S_ * kIl6)) != hipSuccess) return R4D_WK_DECLINE;
-                const long long th = tiles * S_ * (ilm == 2 ? 32 : 16);
-                if (ilm == 2) hipLaunchKernelGGL(gg_il6b_pack_kernel, dim3((unsigned)((th + 255) / 256)), dim3(256), 0, 0, (const uint8_t*)wd[i], w_ld, dst, N_, (int)S_);
-                else hipLaunchKernelGGL(gg_il6_pack_kernel, dim3((unsigned)((th + 255) / 256)), dim3(256), 0, 0, (const uint8_t*)wd[i], w_ld, dst, N_, (int)S_);
-                (void)hipDeviceSynchronize();
-                cache.push_back(Il{ wd[i], N_, K, w_ld, ilm, chk, dst });
-                packed = true;
-            }
-            A.w[i] = dst;
-            if (nm == 1) A.w[1] = dst;
-        }
-        if (packed) {   /* the pack left the copy in L2 / MALL: read 256 MiB so the timed launch starts cold, as --cold's flush */
-            static uint4* fb = nullptr;
-            static uint32_t* fo4 = nullptr;
-            if (!fb && (hipMalloc((void**)&fb, 256u << 20) != hipSuccess || hipMemset(fb, 1, 256u << 20) != hipSuccess || hipMalloc((void**)&fo4, 64) != hipSuccess)) fb = nullptr;
-            if (fb) hipLaunchKernelGGL(gg_il6_flush_kernel, dim3(1024), dim3(256), 0, 0, (const uint4*)fb, (long long)((256u << 20) / 16), fo4);
-            (void)hipDeviceSynchronize();
-        }
-    }
+    if (!gg_il_swap(A, ty, fo, tlab, nm, wd, Nv, K, w_ld)) return R4D_WK_DECLINE;
     if (tl) {
         A.tl = 1;
         const unsigned long long z[5] = { ~0ull, 0ull, 0ull, 0ull, 0ull };
@@ -1548,11 +1601,37 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
         (void)hipMemcpyToSymbol(HIP_SYMBOL(g_wk3_tl), z, sizeof z);
     }
     const int pro = fo ? (fo->pro == 3 ? 1 : fo->pro) : 0;
+    const GgWkArgs A0 = A;   /* round 43: the stored-layout arguments (the IL byte check) */
+    if (!gg_il_swap(A, ty, fo, tlab, nm, wd, Nv, K, w_ld)) return R4D_WK_DECLINE;
     int rc;
     switch (ty) {
     case GG_Q8_0: rc = gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, pro, A, grid); break;
     case GG_Q6_K: rc = gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, pro, A, grid); break;
     default: rc = gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, pro, A, grid); break;
+    }
+    static const int ilchk1 = [] { const char* e = std::getenv("R4D_WK3_ILCHK"); return e && e[0] == '1' ? 1 : 0; }();
+    if (ilchk1 && (tlab & 384) && ty == GG_Q6_K && !fo && rc == 0) {   /* round 43: G1's IL launch bytes vs the stock kernel on the stored layout */
+        (void)hipDeviceSynchronize();
+        const size_t ob = f32out ? 4 : 2;
+        GgWkArgs B = A0;
+        void* sy[2] = { nullptr, nullptr };
+        for (int i = 0; i < nm; ++i) { (void)hipMalloc(&sy[i], (size_t)M * (size_t)y_ld[i] * ob); B.y[i] = sy[i]; }
+        if (nm == 1) B.y[1] = sy[0];
+        const int rs = gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, pro, B, grid, 0);
+        (void)hipDeviceSynchronize();
+        long long dif = 0, tot = 0;
+        for (int i = 0; i < nm; ++i) {
+            std::vector<uint8_t> a((size_t)M * y_ld[i] * ob), b(a.size());
+            (void)hipMemcpy(a.data(), yd[i], a.size(), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(b.data(), sy[i], b.size(), hipMemcpyDeviceToHost);
+            for (long long r = 0; r < M; ++r) {
+                tot += Nv[i];
+                for (long long n = 0; n < Nv[i]; ++n) dif += std::memcmp(&a[(r * y_ld[i] + n) * ob], &b[(r * y_ld[i] + n) * ob], ob) != 0;
+            }
+            (void)hipFree(sy[i]);
+        }
+        std::fprintf(stderr, "IL43CHK1 ab %d N %lld K %lld M %lld kp %d wl %d: %lld of %lld outputs differ (stock rc %d)\n", tlab,
+                     (long long)(nm == 2 ? Nv[0] + Nv[1] : Nv[0]), K, M, kp, (code & 262144) ? 1 : 0, dif, tot, rs);
     }
     if (tl && rc == 0) {
         unsigned long long r[5] = {};
