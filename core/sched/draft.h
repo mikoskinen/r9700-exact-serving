@@ -219,9 +219,21 @@ public:
     int  configure(const Params& p);
     const Params& params() const { return p_; }
 
-    /* The draft depth for the next step; 0 means do not speculate. Constant: under the adaptive
-     * policy it is the ceiling, and window_for() is the window. */
-    int  next_depth() const { return p_.max_depth; }
+    /* The draft depth for the next step; 0 means do not speculate. Under the adaptive policy it is
+     * the ceiling, and window_for() is the window. With the policy off it is the configured depth,
+     * or the held cap of fixed_cycle() (DLH below). */
+    int  next_depth() const { return fix_d_ > 0 ? fix_d_ : p_.max_depth; }
+    /* QFN-TP4 DLH (qwen loop round 3, 20.11.2026; RESULTS dep4 / dep5: depth 4 / 5 pay at 1-8 sequences, lose at 32): SPB's
+     * hold (draft_dcap D + draft_dcap_n 100 + N) under the FIXED window. A cycle that opens with at least N decode rows
+     * drafts D for every sequence (next_depth() = D, the head's rounds and every window with it), a cycle under N the
+     * configured depth: one depth a step, chosen by the count of decode rows alone (no measurement, no hold, no
+     * hysteresis). Off while the adaptive policy runs, draft_dcap is 0, the hold is unset (1 .. 64) or D is not under the
+     * configured depth. Exact as far as a row's bytes do not move with its depth (Qwen: att_bi 6). */
+    bool fixed_hold_wanted() const { return !adapt_ && dcap_hold_ && dcap_d_ > 0 && dcap_d_ < p_.max_depth; }
+    void fixed_cycle(int n_rows) {
+        fix_d_ = fixed_hold_wanted() && n_rows >= dcap_n_ ? dcap_d_ : 0;
+        if (fix_d_ > 0) ++n_dhold_;
+    }
 
     /* ---------------------------------------------------------- the adaptive policy */
     bool adaptive() const { return adapt_; }
@@ -426,7 +438,7 @@ public:
      * the head (prompt lookup) are held to it, so they add no deeper pass shape. */
     int  step_window() const {
         if (zero_now()) return 0;
-        return adapt_ && step_w_ > 0 ? step_w_ : p_.max_depth;
+        return adapt_ && step_w_ > 0 ? step_w_ : next_depth();
     }
 
     /* T(depth, n): a decode step with deepest window `depth` and `n_rows` decode rows took `ms`
@@ -541,6 +553,7 @@ private:
     int64_t n_dcap_ = 0, n_dcap_moves_ = 0;
     bool    dcap_hold_ = false;                   /* D20: draft_dcap_n 101 .. 164 */
     int64_t n_dhold_ = 0;
+    int32_t fix_d_ = 0;                           /* DLH: the fixed window's held depth this cycle (0: the configured) */
     /* DCA (cost_age()): the switch, the decode steps step_time has seen, each key's step at its last sample. */
     int32_t cost_age_ = 0;
     int64_t steps_seen_ = 0;

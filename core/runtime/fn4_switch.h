@@ -807,7 +807,9 @@
  *                   dense decode sequences in one pinned launch; 4 (15.11.) + each sequence of a sparse step on the
  *                   path of its alone step's context bound (qwen/build2/LONGPROMPT.md); 5 (20.11.) + a DENSE
  *                   step (no sparse sequence) through the same per-sequence launches (its one attn_paged over
- *                   n_seq sequences splits a row's keys by n_seq); 0 today's launches             RADIANCE_FN4_ATT_BI
+ *                   n_seq sequences splits a row's keys by n_seq); 6 (20.11., qwen loop round 3) + every sparse
+ *                   decode row at any verify depth, alone too, on the depth-3 split law (split_rows 4): answers
+ *                   the same at every draft depth (a depth rule's enabler); 0 today's launches    RADIANCE_FN4_ATT_BI
  *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
  *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;
  *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS

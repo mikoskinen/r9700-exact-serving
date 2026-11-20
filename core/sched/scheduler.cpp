@@ -4611,7 +4611,22 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 
 /* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle() {
-    if (!draft_.adaptive()) return;
+    if (!draft_.adaptive()) {
+        /* QFN-TP4 DLH (draft.h fixed_cycle): the held cap under the fixed window, by the opening step's decode rows
+         * (counted as below) */
+        int n_rows = 0;
+        if (draft_.fixed_hold_wanted())
+            for (int32_t slot : running_) {
+                SchedReq& s = *reqs_[(size_t)slot];
+                if (!s.req || !s.running) continue;
+                const Request& r = *s.req;
+                if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
+                ++n_rows;
+            }
+        draft_.fixed_cycle(n_rows);
+        return;
+    }
+    draft_.fixed_cycle(0);
     /* The rows the opening step will decode: every running sequence past its prompt. Those that
      * may speculate choose D through their estimates; the rest emit one token each, which still
      * counts in the step's yield and cost. A sequence still prefilling is neither. */

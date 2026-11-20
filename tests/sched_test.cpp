@@ -12879,6 +12879,65 @@ TEST(cap48_a_value_set_between_steps_reaches_the_step_issued_ahead) {
     }
 }
 
+/* QFN-TP4 DLH (qwen loop round 3; draft.h fixed_cycle): SPB's hold under the FIXED window -- --num-speculative-tokens 4,
+ * draft_dcap 3 + draft_dcap_n 100 + 6: six decoding sequences verify 3 drafts each (one depth for all, 24 decode rows),
+ * four verify the configured 4 (20 rows); the cap without the hold (draft_dcap_n 6) and draft_dcap 0 leave the fixed
+ * window at 4 (negative controls). The controller alone: the held depth by the rows, every cycle, no hysteresis. */
+TEST(dlh_the_fixed_window_drafts_the_held_cap_from_its_decode_rows) {
+    {
+        DraftController c;
+        DraftController::Params p;
+        p.max_depth = 4;
+        p.adapt_capable = true;
+        CHECK_OK(c.configure(p));
+        CHECK(!c.adaptive());
+        c.set_dcap(3);
+        c.set_dcap_n(106);
+        CHECK(c.fixed_hold_wanted());
+        for (int n : { 6, 5, 7, 4, 32, 1 }) {
+            c.fixed_cycle(n);
+            CHECK_EQ(c.next_depth(), n >= 6 ? 3 : 4);
+            CHECK_EQ(c.step_window(), n >= 6 ? 3 : 4);
+        }
+        c.set_dcap_n(6);   /* the cap without the hold: D7's bound only, the fixed window stays */
+        CHECK(!c.fixed_hold_wanted());
+        c.fixed_cycle(32);
+        CHECK_EQ(c.next_depth(), 4);
+        c.set_dcap_n(106);
+        c.set_dcap(4);     /* not under the configured depth: nothing to hold */
+        c.fixed_cycle(32);
+        CHECK_EQ(c.next_depth(), 4);
+        c.set_dcap(0);
+        c.fixed_cycle(32);
+        CHECK_EQ(c.next_depth(), 4);
+    }
+    struct Arm { int seqs, dcap, dcap_n, want; };
+    for (const Arm a : { Arm{ 6, 3, 106, 3 }, Arm{ 4, 3, 106, 4 }, Arm{ 6, 3, 6, 4 }, Arm{ 6, 0, 106, 4 } }) {
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        (void)f.sch.set_draft_dcap(a.dcap);
+        (void)f.sch.set_draft_dcap_n(a.dcap_n);
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < a.seqs; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        for (int round = 0; round < 3; ++round) {
+            for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, draft, 4));
+            REQUIRE(f.sch.step() != nullptr);
+            int64_t rows = 0;
+            for (const StepEntry& e : f.sch.plan().e) {
+                CHECK_EQ(e.n_spec, a.want);
+                rows += e.n_tokens;
+            }
+            CHECK_EQ(rows, (int64_t)a.seqs * (1 + a.want));
+            CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        }
+    }
+}
+
 
 /* ================================================== lever CBH (ds41-int10b): the co-batch hold
  * fn4 sched_cb_hold_ms H (RADIANCE_SCHED_CB_HOLD_MS at start) / sched_cb_hold_k K: while >= 2 sequences decode, a fresh
