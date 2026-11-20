@@ -329,13 +329,16 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
     void* yref = dalloc(yrs + tail);
     void* yrep = dalloc(yrs + tail);
     if (!dw || !db || !dx || !dxu || !yref || !yrep) { ok("spdf32 rgm alloc", false, "hipMalloc failed"); dfree_all(); f2->fini(inst); return; }
+    const bool po = std::getenv("RGM_PERFONLY") != nullptr;   /* only (c)'s gemm lines (a tile sweep: R4D_RGM_TILE a process) */
+    std::vector<uint8_t> ref;
+    if (!po) {
     /* (a) */
     pin(-1, 40);
     st_memset(yref, 0xA5, yrs + tail);
     st_memset(yrep, 0xA5, yrs + tail);
     const int ra = gemm(dx, K, MR, dw, NE, yref), rb = gemm(dx, K, MR, dw, NE, yrep);
     st_stream_sync(nullptr);
-    const std::vector<uint8_t> ref = bytes(yref, yrs + tail);
+    ref = bytes(yref, yrs + tail);
     ok(fmt("spdf32 rgm gemm code 40: M %lld x N %lld launched twice, the same bytes (+ tail)", (long long)MR, (long long)NE).c_str(),
        ra == RAD_OK && rb == RAD_OK && ref == bytes(yrep, yrs + tail), fmt("rc %d %d", ra, rb));
     int checks = 0, bad = 0;
@@ -503,6 +506,9 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                         "(warm / cold); 10 vs 9 cold %+6.2f us\n",
                         (long long)M, w[0], c[0], w[1], c[1], w[2], c[2], c[0] - c[1]);
         }
+    }
+    }   /* !po */
+    {
         for (int64_t N : { (int64_t)384, (int64_t)96 })
             for (int64_t M : { (int64_t)64, (int64_t)128, (int64_t)256, (int64_t)1024, MR }) {
                 void* y = dalloc((size_t)(M * N * 4));
@@ -521,6 +527,55 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                             "%8.2f us | %+7.2f / %+7.2f\n",
                             (long long)N, (long long)M, w[0], c[0], w[1], c[1], w[0] - w[1], c[0] - c[1]);
             }
+        /* RGM_COMP=1 (measurement only, no serving rule takes it): the ratio > 1 compressor's fused kv | gate projection (N 1024, K 5120, bf16
+         * under ROUTER_BF16) in code 40 (the pin) vs today's rule (value 1: the decode band's forms; f32_pf 25 from 64 rows); + one
+         * batch-invariance line (rows of 64 = the 2112-row call's) */
+        if (const char* ce = std::getenv("RGM_COMP"); ce && ce[0] == '1') {
+            constexpr int64_t NC = 1024;
+            std::vector<uint16_t> wc((size_t)(NC * K));
+            for (auto& v : wc) v = bf((float)(gauss() * 0.02));
+            void* dwc = up(wc);
+            void* yb = dalloc((size_t)(MR * NC * 4));
+            void* ys = dalloc((size_t)(64 * NC * 4));
+            if (dwc && yb && ys) {
+                pin(-1, 40);
+                const int r1 = gemm(dx, K, MR, dwc, NC, yb), r2 = gemm(dx, K, 64, dwc, NC, ys);
+                st_stream_sync(nullptr);
+                const bool same = r1 == RAD_OK && r2 == RAD_OK && bytes(ys, (size_t)(64 * NC * 4)) == bytes(yb, (size_t)(64 * NC * 4));
+                ok("spdf32 rgm compressor shape (N 1024): code 40 rows of 64 = the 2112-row call's bytes", same, fmt("rc %d %d", r1, r2));
+                /* value 11 (lever RGC): the compressor shape takes code 40 by the RULE (no pin) at decode and prefill heights alike */
+                {
+                    pin(-1, -1);
+                    sw("ds41_f32dec", 11);
+                    void* y2 = dalloc((size_t)(MR * NC * 4));
+                    void* y3 = dalloc((size_t)(64 * NC * 4));
+                    const int r3 = y2 ? gemm(dx, K, MR, dwc, NC, y2) : -1, r4 = y3 ? gemm(dx, K, 64, dwc, NC, y3) : -1;
+                    st_stream_sync(nullptr);
+                    const bool s11 = r3 == RAD_OK && r4 == RAD_OK && bytes(y2, (size_t)(MR * NC * 4)) == bytes(yb, (size_t)(MR * NC * 4)) &&
+                                     bytes(y3, (size_t)(64 * NC * 4)) == bytes(ys, (size_t)(64 * NC * 4));
+                    ok("spdf32 rgm value 11: the compressor shape's 2112- and 64-row calls by the rule = code 40's (pin) bytes", s11,
+                       fmt("rc %d %d", r3, r4));
+                    sw("ds41_f32dec", 1);
+                }
+                for (int64_t M : { (int64_t)16, (int64_t)32, (int64_t)48, (int64_t)64, (int64_t)256, (int64_t)1024, MR }) {
+                    double w[2] = { 0, 0 }, c[2] = { 0, 0 };
+                    for (int rep = 0; rep < 2; ++rep)
+                        for (int i = 0; i < 2; ++i) {
+                            pin(-1, i == 0 ? 40 : -1);
+                            sw("ds41_f32dec", 1);
+                            sw("f32_pf", i == 0 ? 0 : 25);
+                            double ww = 0, cc = 0;
+                            time2([&]() { return gemm(dx, K, M, dwc, NC, yb); }, 100, &ww, &cc);
+                            w[i] += ww / 2;
+                            c[i] += cc / 2;
+                        }
+                    std::printf("  SPDPERF rgm compressor N=1024 M=%lld: code 40 warm %8.2f cold %8.2f | value 1 + f32_pf 25 warm %8.2f cold %8.2f us | "
+                                "%+7.2f / %+7.2f\n",
+                                (long long)M, w[0], c[0], w[1], c[1], w[0] - w[1], c[0] - c[1]);
+                }
+                pin(-1, -1);
+            }
+        }
         sw("f32_pf", 0);
     }
     sw("ds41_f32dec", 0);

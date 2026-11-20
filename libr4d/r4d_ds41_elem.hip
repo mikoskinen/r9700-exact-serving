@@ -2245,7 +2245,21 @@ int r4d_rgm_gemm(RadStream s, const R4dF32PfCall& c) {
                    dim3(kRgmS * 32), 0, c.x, c.xp, (const uint16_t*)c.w, c.wp, c.y, c.yp, c.M, c.N, c.K))
     if ((long)c.M > 16L * 65535L) return R4D_F32PF_DECLINE;
     if (c.M <= 64) return et2 ? RGM_G(1, 2, 8) : RGM_G(1, 1, 8);
-    return et2 ? RGM_G(2, 2, 4) : RGM_G(2, 1, 4);
+    /* above 64 rows: R4D_RGM_TILE=t (read once; bench knob, speed only -- every choice forms each logit by rgm_wave / rgm_fold):
+     * 0 RT 2 ET 2 U 4, 1 RT 4 ET 1 U 4, 2 RT 1 ET 4 U 4, 3 RT 2 ET 2 U 8, 4 RT 4 ET 1 U 8, 5 RT 1 ET 2 U 8 */
+    /* unset: by N (xeon card 1 r40e, cold us a call at 2112 rows vs tile 0): N 96 (the router's split) tile 5 89.5 vs 97.2 (256 rows 16.4 vs
+     * 19.6); N 384 from 128 rows tile 2 231.0 vs 302.8; N 1024 (the compressor, value 11) tile 3 697.7 vs 758.0 */
+    static const int tile_env = [] { const char* e = std::getenv("R4D_RGM_TILE"); return e && *e ? std::atoi(e) : -1; }();
+    const int tile = tile_env >= 0 ? tile_env : c.N == 96 ? 5 : c.N == 384 && c.M >= 128 ? 2 : c.N == 1024 ? 3 : 0;
+    if (!et2) return tile == 1 || tile == 4 ? RGM_G(4, 1, 4) : RGM_G(2, 1, 4);
+    switch (tile) {
+        case 1: return RGM_G(4, 1, 4);
+        case 2: return (c.N & 63) == 0 ? RGM_G(1, 4, 4) : RGM_G(2, 2, 4);
+        case 3: return RGM_G(2, 2, 8);
+        case 4: return RGM_G(4, 1, 8);
+        case 5: return RGM_G(1, 2, 8);
+        default: return RGM_G(2, 2, 4);
+    }
 #undef RGM_G
 }
 

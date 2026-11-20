@@ -289,7 +289,7 @@ int f32dec_env() {
     const char* v = std::getenv("RADIANCE_DS41_F32DEC");
     if (!v || !*v) return 0;
     const int x = std::atoi(v);
-    return x >= 0 && x <= 10 ? x : 0;   /* 4 .. 7: tp8 loop D28; 8: lever RGP (DRAFTER round 17); 9: RGK; 10: RGM (round 40) */
+    return x >= 0 && x <= 11 ? x : 0;   /* 4 .. 7: tp8 loop D28; 8: lever RGP (DRAFTER round 17); 9: RGK; 10: RGM (round 40); 11: RGM + RGC */
 }
 std::atomic<int> g_f32dec{ f32dec_env() };
 std::atomic<int> g_f32dec_pin_rgs{ -1 }, g_f32dec_pin_gemm{ -1 };
@@ -307,7 +307,7 @@ static void f32dec_note(int kind, int rows, int form) {
                  rows);
 }
 
-int r4d_f32dec_known(int v) { return v >= 0 && v <= 10 ? 1 : 0; }   /* 4 .. 7: tp8 loop D28; 8: lever RGP; 9: lever RGK; 10: lever RGM */
+int r4d_f32dec_known(int v) { return v >= 0 && v <= 11 ? 1 : 0; }   /* 4 .. 7: tp8 loop D28; 8: lever RGP; 9: lever RGK; 10: lever RGM; 11: RGM + RGC */
 int r4d_f32dec_set(int v) {
     if (!r4d_f32dec_known(v)) return -1;
     g_f32dec.store(v, std::memory_order_relaxed);
@@ -378,7 +378,7 @@ int r4d_f32dec_gemm_form(int rows, int n) {
         /* 4 .. 7: 1's gemm rule (D28); 8 (lever RGP) too -- F74 (DRAFTER round 20): without it RGP's value sent the compressor's
          * 17..63-row calls to the stock form (lq190: gemm_nt_f32_tile<8,1,8> 363-500 us vs form 4's 60-87, L +0.31 ms at c16);
          * 9 (lever RGK) too; 10 (lever RGM) for every shape but the router's (r4d_rgm_route took that one already) */
-        if (v == 1 || v == 3 || (v >= 4 && v <= 10)) f = r4d_f32dec_rule_gemm(rows, n);
+        if (v == 1 || v == 3 || (v >= 4 && v <= 11)) f = r4d_f32dec_rule_gemm(rows, n);
     }
     if (f > 0) {
         g_f32dec_n[1].fetch_add(1, std::memory_order_relaxed);
@@ -391,7 +391,7 @@ int r4d_f32dec_rgs_form(int rows) {
     const int p = g_f32dec_pin_rgs.load(std::memory_order_relaxed);
     const int v = g_f32dec.load(std::memory_order_relaxed);
     /* above 48 rows (only under the core's RADIANCE_RGS_ROWS=64): a pin or lever RGP's value, else the stock form as before */
-    if (rows > 48 && p < 0 && v != 8 && v != 9 && v != 10) return 0;
+    if (rows > 48 && p < 0 && v != 8 && v != 9 && v != 10 && v != 11) return 0;
     int f = 0;
     if (p >= 0) f = p;
     else {
@@ -404,7 +404,7 @@ int r4d_f32dec_rgs_form(int rows) {
         else if (v == 9) f = 21;
         /* lever RGM (DRAFTER track round 40, RULE B): 10 = form 22 at 1..64 rows (the WMMA logits; with gemm_nt_f32's code 40 at the
          * router's shape, every pass forms a router logit by the same function) */
-        else if (v == 10) f = 22;
+        else if (v == 10 || v == 11) f = 22;
         else if (v == 1 || v == 2) f = r4d_f32dec_rule_rgs(rows);
         /* tp8 loop D28 (DECODE round 22): 4 .. 7 = 1 with the router's 17..48 rows in the 2-D wave map form 15 .. 18 (a workgroup
          * = row groups x expert groups, so each weight row is read by fewer workgroups; the stock bytes) */
@@ -439,12 +439,16 @@ extern "C" int rad_f32dec_stats(long long* out, int n) {
  * every M, so a decode row of a mixed pass, a prefill row and a decode-only pass's row (form 22) all get their logits from the same
  * function. The pin 40 (bench / test) takes every call code 40 can at any M. */
 bool r4d_rgm_wants() {
-    return g_f32dec_pin_gemm.load(std::memory_order_relaxed) == 40 || g_f32dec.load(std::memory_order_relaxed) == 10;
+    const int v = g_f32dec.load(std::memory_order_relaxed);
+    return g_f32dec_pin_gemm.load(std::memory_order_relaxed) == 40 || v == 10 || v == 11;
 }
 int r4d_rgm_route(RadStream s, const R4dF32PfCall& c) {
     const int p = g_f32dec_pin_gemm.load(std::memory_order_relaxed);
     if (p == 40) return r4d_rgm_gemm(s, c);
-    if (p >= 0 || g_f32dec.load(std::memory_order_relaxed) != 10 || (c.N != 384 && c.N != 96)) return R4D_F32PF_DECLINE;
+    const int v = g_f32dec.load(std::memory_order_relaxed);
+    /* 10: the router (N 384 / its 96-column split); 11 (lever RGC, round 40, RULE B too): + the ratio > 1 compressors' fused kv | gate
+     * projection (N 1024, K 5120, bf16 under ROUTER_BF16) at every M -- its prefill rows and its decode-band calls alike */
+    if (p >= 0 || (v != 10 && v != 11) || (c.N != 384 && c.N != 96 && !(v == 11 && c.N == 1024))) return R4D_F32PF_DECLINE;
     const int rc = r4d_rgm_gemm(s, c);
     if (rc != R4D_F32PF_DECLINE) {
         g_f32dec_n[1].fetch_add(1, std::memory_order_relaxed);
