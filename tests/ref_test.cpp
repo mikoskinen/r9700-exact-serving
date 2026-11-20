@@ -6458,6 +6458,112 @@ TEST(op_stage_send_row_shards_between_plain_payloads_world4) {
     }
 }
 
+/* tp8 loop P46 (RadPpRing::ash_rows / ash_on, RADIANCE_PP_SEND_ASH): a row-sharded payload's shares through each rank's own
+ * staging buffer, published from a helper (the card's side stream). The sequence of F38's test (plain, plain, sharded, plain,
+ * sharded, sharded; the link takes each payload 30 ms after it is published) at ash_on 1 with every rank's staging buffer:
+ * every payload's bytes the whole parts' and its number its own, the three sharded ones counted once a rank in ash_sends; and
+ * the async half proven -- each rank overwrites its parts with junk the moment its op returns (the next pass), before the
+ * payload is published, and the ring still carries the packed bytes. Then the over-the-buffer form (send_stage_cap below a
+ * share): the pass-stream path, counted in ash_over, the same bytes; and ash_on 0 (the switch off): nothing counted. Parts: 9
+ * rows of 8 f32 (masked) + 5 rows of 3 i32 (unmasked: rank 0's whole). */
+TEST(op_stage_send_row_shards_through_rank_staging_world4) {
+    const int W = 4;
+    const int64_t R0 = 9, R2 = 5, q = (R0 + W - 1) / W;
+    for (const char* form : { "ash", "over", "off" }) {
+        std::vector<uint8_t> ring((size_t)RAD_PP_RING_HDR + 65536, 0);
+        RadPpRing* r = reinterpret_cast<RadPpRing*>(ring.data());
+        r->magic = RAD_PP_RING_MAGIC;
+        r->cap = 65536 - RAD_PP_TRAILER;
+        r->send_ranks = W;
+        r->n_ranks = W;
+        r->deadline_ms = 20000;
+        std::vector<std::vector<uint8_t>> stage((size_t)W, std::vector<uint8_t>(4096, 0xEE));
+        r->ash_rows = 4;   /* the 9-row payloads: plain ones (rank 0 alone) never take it, sharded ones do */
+        r->ash_on = std::strcmp(form, "off") ? 1 : 0;
+        r->send_stage_cap = !std::strcmp(form, "over") ? 64 : 4096;
+        for (int rk = 0; rk < W; ++rk) r->send_stage[rk] = (uint64_t)(uintptr_t)stage[(size_t)rk].data();
+        T ringt(RAD_U8, { (int64_t)ring.size() });
+        ringt.t.data = ring.data();
+        const uint64_t b0 = (uint64_t)R0 * 8 * 4, b2 = (uint64_t)R2 * 3 * 4, o2 = rad_pp_align(b0);
+        const uint8_t* pay = ring.data() + RAD_PP_RING_HDR;
+        int seq = 0, sharded = 0;
+        for (const char* kind : { "plain", "plain", "shard", "plain", "shard", "shard" }) {
+            ++seq;
+            const bool shard = !std::strcmp(kind, "shard");
+            sharded += shard ? 1 : 0;
+            const float base = (float)(seq * 1000);
+            std::vector<std::vector<T>> parts((size_t)W);
+            for (int rk = 0; rk < W; ++rk) {
+                parts[(size_t)rk].reserve(2);
+                parts[(size_t)rk].emplace_back(RAD_F32, std::vector<int64_t>{ R0, 8 });
+                parts[(size_t)rk].emplace_back(RAD_I32, std::vector<int64_t>{ R2, 3 });
+                for (int64_t i = 0; i < R0 * 8; ++i) {
+                    const bool mine = shard ? (i / 8) / q == rk : rk == 0;
+                    parts[(size_t)rk][0].set(i, mine ? base + (float)i : -1.0f - (float)rk);
+                }
+                for (int64_t i = 0; i < R2 * 3; ++i)
+                    st_int(RAD_I32, parts[(size_t)rk][1].t.data, i, rk == 0 ? (int64_t)(seq * 100 + i) : (int64_t)(-1 - i));
+            }
+            std::thread link([&] {
+                for (int w = 0; w < 200000 && __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE) < (uint64_t)seq; ++w)
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                __atomic_store_n(&r->sent, __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+            });
+            int st[W] = { 0, 0, 0, 0 };
+            auto body = [&](int rk) {
+                A a;
+                a.t(ringt).t(parts[(size_t)rk][0]).t(parts[(size_t)rk][1]).i("M", R0).i("ring", 0).i("parts", 2).i("sender", 0);
+                if (shard) a.i("shard", 1);
+                st[rk] = run("stage_send", a, rk, W);
+                /* the next pass rewrites the parts at once: an async share must have been packed already */
+                for (int64_t i = 0; i < R0 * 8; ++i) parts[(size_t)rk][0].set(i, -99.0f);
+                for (int64_t i = 0; i < R2 * 3; ++i) st_int(RAD_I32, parts[(size_t)rk][1].t.data, i, (int64_t)-99);
+            };
+            std::vector<std::thread> th;
+            for (int rk = 0; rk < W; ++rk) th.emplace_back(body, rk);
+            for (std::thread& x : th) x.join();
+            link.join();
+            for (int rk = 0; rk < W; ++rk) CHECK_OK(st[rk]);
+            uint64_t trailer = 0;
+            std::memcpy(&trailer, pay + o2 + rad_pp_align(b2), 8);
+            int64_t bad = 0;
+            for (int64_t i = 0; i < R0 * 8; ++i) {
+                float v;
+                std::memcpy(&v, pay + 4 * i, 4);
+                bad += v != base + (float)i;
+            }
+            for (int64_t i = 0; i < R2 * 3; ++i) {
+                int32_t v;
+                std::memcpy(&v, pay + o2 + 4 * i, 4);
+                bad += v != (int32_t)(seq * 100 + i);
+            }
+            uint64_t sends = 0, over = 0;
+            for (int rk = 0; rk < W; ++rk) {
+                sends += r->ash_sends[rk];
+                over += r->ash_over[rk];
+            }
+            fprintf(stderr, "    %s payload %d (%s): ready %llu, trailer %llu, %lld wrong words, shares from staging %llu, over %llu\n",
+                    form, seq, kind, (unsigned long long)r->ready, (unsigned long long)trailer, (long long)bad,
+                    (unsigned long long)sends, (unsigned long long)over);
+            CHECK_EQ((long long)r->ready, (long long)seq);
+            CHECK_EQ((long long)trailer, (long long)seq);
+            CHECK_EQ(bad, (int64_t)0);
+            if (!std::strcmp(form, "ash")) {
+                for (int rk = 0; rk < W; ++rk) CHECK_EQ((long long)r->ash_sends[rk], (long long)sharded);
+                CHECK_EQ((long long)over, 0LL);
+            } else if (!std::strcmp(form, "over")) {
+                /* ranks 0-2 hold 3 rows each (96 B, + rank 0's part 1): over 64 B; rank 3 holds none (q = 3), an empty share fits */
+                for (int rk = 0; rk < 3; ++rk) CHECK_EQ((long long)r->ash_over[rk], (long long)sharded);
+                CHECK_EQ((long long)r->ash_sends[3], (long long)sharded);
+                CHECK_EQ((long long)sends, (long long)sharded);
+            } else {
+                CHECK_EQ((long long)(sends + over), 0LL);
+            }
+        }
+    }
+}
+
 /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG=2): a segment boundary's save / restore (stage ops in loop mode, each rank its own
  * buffer) with `shard` + `ranks` -- each rank saves only ITS rows [r q, (r + 1) q) of the masked parts (q = ceil(rows / 4))
  * and the other parts whole, and the restore writes back exactly those: a masked part's other rows keep what the buffer held

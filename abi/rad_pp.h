@@ -168,6 +168,21 @@ typedef struct RadPpRing {
     uint64_t recv_stage[RAD_PP_MAX_RANKS];
     uint64_t recv_cap;
     volatile uint64_t recv_async[RAD_PP_MAX_RANKS];   /* payloads rank r took the async way (its host thread counts) */
+    /* tp8 loop P46 (RADIANCE_PP_SEND_ASH=N, a send ring only; 0 from an engine before it): a ROW-SHARDED payload (the op's
+     * `shard` mask, split 3: every rank its rows of the masked parts, rank `sender` the other parts whole) of at least
+     * `ash_rows` rows, while `ash_on` is 1, is packed by every rank of the node into its own card staging buffer
+     * `send_stage[r]` (`send_stage_cap` bytes, the core's: the rank's share at 256-byte aligned offsets in part order) on the
+     * pass's stream, and copied from there into the ring on a side stream of that card by the same split send (its waits,
+     * `done` / `staged` handshake and publish unchanged), so the pass's stream goes on with the next pass while the share
+     * crosses PCIe. The ring's bytes are the same words in the same places. A share over the buffer takes the pass's stream
+     * (counted in `ash_over`). `ash_on` is fn4 pp_send_ash's value on this node (the core writes it between steps, every
+     * rank thread parked). The core issues every pass of >= ash_rows rows live (never recorded). */
+    uint64_t ash_rows;
+    uint64_t ash_on;
+    uint64_t send_stage[RAD_PP_MAX_RANKS];
+    uint64_t send_stage_cap;
+    volatile uint64_t ash_sends[RAD_PP_MAX_RANKS];   /* shares rank r sent the async way (its host thread counts) */
+    volatile uint64_t ash_over[RAD_PP_MAX_RANKS];    /* shares of >= ash_rows rows rank r sent on the pass's stream: over the buffer */
 } RadPpRing;
 
 #if defined(__cplusplus)

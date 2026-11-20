@@ -310,6 +310,27 @@ __global__ void __launch_bounds__(kThreads) stage_pack_kernel(Parts P, char* sta
         copy_part(reinterpret_cast<const char*>(P.p[k]), stage + P.off[k], P.bytes[k], (P.w16 >> k) & 1u, stride);
 }
 
+/* tp8 loop P46 (RadPpRing::ash_rows, split 3): this rank's share of a row-sharded payload -- its rows [srow0, srow1) of every
+ * masked part, and (rank `sender`) every other part whole -- in part order at 256-byte aligned offsets: the layout the pack
+ * writes and send_split_async's parts read (one rule on both sides: ash_share below). `len` 0 = the part is not this rank's. */
+__host__ __device__ inline uint64_t ash_len(const Parts& P, int k, bool pub) {
+    if ((P.smask >> k) & 1u) return (P.srow1 - P.srow0) * (P.bytes[k] / P.srows);
+    return pub ? P.bytes[k] : 0;
+}
+__host__ __device__ inline uint64_t ash_src_off(const Parts& P, int k) {   /* the share's first byte inside part k */
+    return ((P.smask >> k) & 1u) ? P.srow0 * (P.bytes[k] / P.srows) : 0;
+}
+__global__ void __launch_bounds__(kThreads) stage_pack_share_kernel(Parts P, char* stage, int pub) {
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    uint64_t at = 0;
+    for (int k = 0; k < P.n; ++k) {
+        const uint64_t len = ash_len(P, k, pub != 0);
+        if (len)
+            copy_part(reinterpret_cast<const char*>(P.p[k]) + ash_src_off(P, k), stage + at, len, (P.w16 >> k) & 1u, stride);
+        at += (len + RAD_PP_PART_ALIGN - 1) / RAD_PP_PART_ALIGN * RAD_PP_PART_ALIGN;
+    }
+}
+
 /* tp8 loop P10b (RadPpRing::recv_rows): the payload's parts out of the rank's card staging buffer, on the pass's stream,
  * once the side stream's stage_recv_kernel copied the ring into it */
 __global__ void __launch_bounds__(kThreads) stage_unpack_kernel(Parts P, const char* stage) {
@@ -541,6 +562,47 @@ int send_async(RadPpRing* r, const Parts& P, int dev, RadStream stream) {
     return RAD_OK;
 }
 
+/* tp8 loop P46 (RadPpRing::ash_rows / ash_on): this rank's share of a row-sharded payload (split 3, P already holds the rank's
+ * rows: shard_rows) through its own card staging buffer -- packed on the pass's stream (stage_pack_share_kernel, ash_len's
+ * layout), then the same stage_send_split_kernel launch reading the staging buffer on this card's side stream: its waits, the
+ * `staged` / `done` handshake and the publish are the pass-stream send's, so the ring gets the same bytes. The pass's stream
+ * waits for the previous side-stream copy of this card before it packs again (`copied`: one staging buffer a rank, shared by
+ * the lanes, and with P10's send_async on the sender's card the same side stream and events). `share` = the packed bytes. */
+int send_split_async(RadPpRing* r, const Parts& P, int dev, RadStream stream, char* stage, uint64_t share) {
+    AsyncCard* c = async_card(dev);
+    if (!c) return R4D_NO(RAD_E_DEVICE);
+    const RadDev& d = rad_dev_api();
+    uint32_t* counter = counter_for(dev, r, 3);   /* the side stream's own (P10's send_async shares it: one side stream) */
+    uint32_t* diff = counter_for(dev, r, 5);      /* split 2's compare counts only; never read for split 3 */
+    if (!counter || !diff) return R4D_NO(RAD_E_NOMEM);
+    if (c->copied_once && d.event_wait(stream, c->copied) < 0) return R4D_NO(RAD_E_DEVICE);
+    const bool pub = P.rank == P.sender;
+    uint32_t blocks = (uint32_t)((share / 16 + kThreads * 4 - 1) / (kThreads * 4));
+    if (blocks < 1) blocks = 1;
+    if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+    int rc = R4D_EMIT(stream, stage_pack_share_kernel, dim3(blocks), dim3(kThreads), 0, P, stage, pub ? 1 : 0);
+    if (rc < 0) return rc;
+    if (d.event_record(c->packed, stream) < 0) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_wait(c->side, c->packed) < 0) return R4D_NO(RAD_E_DEVICE);
+    /* the split send's parts now the staging buffer's: part k's share starts at its packed offset, so the kernel's source
+     * (p[k] + its range start - off[k]) lands there; a part this rank does not copy keeps a pointer that is never read */
+    Parts Q = P;
+    uint64_t at = 0;
+    for (int k = 0; k < Q.n; ++k) {
+        const uint64_t len = ash_len(P, k, pub);
+        Q.p[k] = (uint64_t)(uintptr_t)(stage + at) - ash_src_off(P, k);
+        at += rad_pp_align(len);
+    }
+    uint32_t sb = async_blocks();
+    if (sb > blocks) sb = blocks;
+    rc = R4D_EMIT(c->side, stage_send_split_kernel, dim3(sb), dim3(kThreads), 0, r, Q, counter, diff);
+    if (rc < 0) return rc;
+    if (d.event_record(c->copied, c->side) < 0) return R4D_NO(RAD_E_DEVICE);
+    c->copied_once = true;
+    if (P.rank >= 0 && P.rank < RAD_PP_MAX_RANKS) r->ash_sends[P.rank] = r->ash_sends[P.rank] + 1;   /* this rank's thread only */
+    return RAD_OK;
+}
+
 /* tp8 loop P10b: the receive through rank `rank`'s staging buffer: the ring copy (stage_recv_kernel with the staging
  * buffer as its parts: the same wait, checks and `taken` count) on the receive side stream, the unpack on the pass's */
 int recv_async(RadPpRing* r, const Parts& P, int dev, RadStream stream, int rank) {
@@ -634,6 +696,13 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
             if (hipGetDevice(&d) == hipSuccess) {
                 (void)counter_for(d, r, 0);
                 (void)counter_for(d, r, 2);
+                /* tp8 loop P46: the side stream, its events and counters a share through the staging buffer takes, made here
+                 * (the node's first steps) as the counters above, not inside a cold prompt's first SP pass */
+                if (r->ash_rows) {
+                    (void)async_card(d);
+                    (void)counter_for(d, r, 3);
+                    (void)counter_for(d, r, 5);
+                }
             }
         }
         return RAD_OK;
@@ -656,6 +725,11 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
     if (send && !loop && r->send_ranks >= 2) (void)counter_for(dev, r, 2);   /* (the sender's for a sharded send, as above) */
+    if (send && !loop && r->ash_rows) {   /* tp8 loop P46: the sender's side stream + counters, as above */
+        (void)async_card(dev);
+        (void)counter_for(dev, r, 3);
+        (void)counter_for(dev, r, 5);
+    }
     if (split == 3) {
         P.split = 3;
         P.sender = sender;
@@ -667,6 +741,15 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
             share += ((shard >> k) & 1u) ? (P.srow1 - P.srow0) * (P.bytes[k] / P.srows) : a->rank == sender ? P.bytes[k] : 0;
         uint32_t* diff = counter_for(dev, r, 2);
         if (!diff) return R4D_NO(RAD_E_NOMEM);
+        /* tp8 loop P46: a share of >= ash_rows rows through this rank's staging buffer, from the card's side stream */
+        if (r->ash_rows && r->ash_on && P.rows >= r->ash_rows && a->rank >= 0 && a->rank < RAD_PP_MAX_RANKS &&
+            r->send_stage[a->rank]) {
+            uint64_t packed = 0;
+            for (int k = 0; k < P.n; ++k) packed += rad_pp_align(ash_len(P, k, a->rank == sender));
+            if (packed <= r->send_stage_cap)
+                return send_split_async(r, P, dev, stream, reinterpret_cast<char*>((uintptr_t)r->send_stage[a->rank]), packed);
+            r->ash_over[a->rank] = r->ash_over[a->rank] + 1;   /* this rank's thread only */
+        }
         uint32_t blocks = (uint32_t)((share / 16 + kThreads * 4 - 1) / (kThreads * 4));
         if (blocks < 1) blocks = 1;
         if (blocks > kMaxBlocks) blocks = kMaxBlocks;

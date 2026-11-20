@@ -254,6 +254,77 @@ static int send_split(const RadArgs* a, RadPpRing* r, int split, int sender, int
     return RAD_OK;
 }
 
+/* tp8 loop P46 (RadPpRing::ash_rows / ash_on), as r4d_stage.hip's send_split_async on a card: this rank's share of a row-sharded
+ * payload (split 3: its rows of the masked parts, `sender` the other parts whole) packed into its own staging buffer
+ * (send_stage[rank]) in part order at 256-byte aligned offsets on the rank's thread (the pass's stream), then split 3's wait /
+ * copy / handshake / publish -- send_split's, from the staging buffer -- on a helper thread (the card's side stream), which the
+ * rank's next share through that buffer waits for before it packs (the `copied` event). The ring's bytes are the same. */
+static int send_split_ash(const RadArgs* a, RadPpRing* r, int sender, int n, const uint64_t* bytes, uint64_t total, int64_t rows,
+                          uint32_t shard, uint64_t packed) {
+    const int rank = a->rank;
+    char* stage = reinterpret_cast<char*>((uintptr_t)r->send_stage[rank]);
+    AsyncStage& st = async_stage(r->send_stage[rank]);
+    while (st.busy.load(std::memory_order_acquire)) {
+        if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    struct Piece { uint64_t s, e, at; };
+    std::vector<Piece> pc((size_t)n);
+    uint64_t off = 0, at = 0;
+    for (int i = 0; i < n; ++i) {
+        uint64_t s = 0, e = 0;
+        shard_range(a, r, shard, sender, i, off, bytes[i], &s, &e);
+        pc[(size_t)i] = { s, e, at };
+        if (s < e) std::memcpy(stage + at, static_cast<const char*>(a->t[1 + i].data) + (s - off), (size_t)(e - s));
+        at += rad_pp_align(e > s ? e - s : 0);
+        off += rad_pp_align(bytes[i]);
+    }
+    if (at != packed) return RAD_E_STATE;   /* the layout the caller sized is this one */
+    std::vector<uint64_t> b(bytes, bytes + n);
+    const uint64_t nr = r->send_ranks;
+    st.busy.store(true, std::memory_order_release);
+    r->ash_sends[rank] = r->ash_sends[rank] + 1;
+    std::thread([r, stage, rank, sender, n, b, pc, total, rows, nr, &st] {
+        const bool pub = rank == sender;
+        auto run = [&]() -> int {
+            uint64_t d = __atomic_load_n(&r->done[rank], __ATOMIC_ACQUIRE), mine = d + 1;
+            if (pub) {   /* send_split's split 3 numbering (FINDINGS F38) */
+                d = __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+                mine = d + 1;
+                RAD_REF_TRY(wait_for(r, &r->sent, d));
+                __atomic_store_n(&r->staged, mine, __ATOMIC_RELEASE);
+            } else {
+                RAD_REF_TRY(wait_for(r, &r->staged, d + 1));
+                mine = __atomic_load_n(&r->staged, __ATOMIC_ACQUIRE);
+            }
+            char* ring = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
+            for (int i = 0; i < n; ++i)
+                if (pc[(size_t)i].s < pc[(size_t)i].e)
+                    std::memcpy(ring + pc[(size_t)i].s, stage + pc[(size_t)i].at, (size_t)(pc[(size_t)i].e - pc[(size_t)i].s));
+            if (!pub) {
+                __atomic_store_n(&r->done[rank], mine, __ATOMIC_RELEASE);
+                return RAD_OK;
+            }
+            for (uint64_t q = 0; q < nr; ++q)
+                if ((int)q != sender) RAD_REF_TRY(wait_for(r, &r->done[q], mine));
+            for (int i = 0; i < n; ++i) r->part_bytes[i] = b[(size_t)i];
+            std::memset(ring + total, 0, RAD_PP_TRAILER);
+            *reinterpret_cast<uint64_t*>(ring + total + 8) = rad_pp_layout(b.data(), n);
+            __atomic_store_n(reinterpret_cast<uint64_t*>(ring + total), mine, __ATOMIC_RELEASE);
+            r->rows = (uint64_t)rows;
+            r->parts = (uint64_t)n;
+            r->bytes = total + RAD_PP_TRAILER;
+            __atomic_store_n(&r->done[rank], mine, __ATOMIC_RELEASE);
+            __atomic_store_n(&r->ready, mine, __ATOMIC_RELEASE);
+            r->ready_ns = mono_ns();
+            return RAD_OK;
+        };
+        (void)run();   /* a wait that gives up leaves `abort` / the deadline to the core, as on a card */
+        st.busy.store(false, std::memory_order_release);
+    }).detach();
+    return RAD_OK;
+}
+
 int ref_stage_send(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 2) return RAD_E_INVAL;
     RadPpRing* r = static_cast<RadPpRing*>(a->t[0].data);
@@ -286,6 +357,22 @@ int ref_stage_send(const RadArgs* a, RadStream) {
         total += rad_pp_align(bytes[i]);
     }
     if (total + RAD_PP_TRAILER > (loop ? loop_cap(a->t[0]) - RAD_PP_RING_HDR : r->cap)) return RAD_E_FULL;
+    /* tp8 loop P46: a share of >= ash_rows rows through the rank's staging buffer, published from a helper (the side stream) */
+    if (split == 3 && r->ash_rows && r->ash_on && (uint64_t)rows >= r->ash_rows && a->rank >= 0 && a->rank < RAD_PP_MAX_RANKS &&
+        r->send_stage[a->rank]) {
+        uint64_t off = 0, packed = 0;
+        for (int i = 0; i < n; ++i) {
+            uint64_t s = 0, e = 0;
+            shard_range(a, r, shard, sender, i, off, bytes[i], &s, &e);
+            packed += rad_pp_align(e > s ? e - s : 0);
+            off += rad_pp_align(bytes[i]);
+        }
+        if (packed <= r->send_stage_cap) {
+            if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
+            return send_split_ash(a, r, sender, n, bytes, total, rows, shard, packed);
+        }
+        r->ash_over[a->rank] = r->ash_over[a->rank] + 1;
+    }
     if (split) return send_split(a, r, split, sender, n, bytes, total, rows, shard);
     /* tp8 loop P10: a large payload through the node's staging buffer, published from a helper (the card's side stream) */
     if (!loop && r->async_rows && r->stage_dev && (uint64_t)rows >= r->async_rows && total <= r->stage_cap) {
