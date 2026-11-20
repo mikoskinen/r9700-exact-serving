@@ -938,6 +938,48 @@ TEST(a_weight_slice_that_reaches_past_the_weight_is_refused) {
     CHECK(std::strstr(f.ctx.step_error(), "reaches past weight 'blk.0.w'") != nullptr);
 }
 
+/* tp8 loop lq216 (lever FCS): a weight stored in GGUF native blocks is declared at its codes plane's element shape, so a stored
+ * row is longer than its declared width (q8_0: 34 bytes a 32-element block). A row view of the LAST rows -- byte offset a whole
+ * number of stored rows, ending at the stored end -- is taken; a view one stored row further, or not on a stored row's start
+ * past the element shape, is refused; and a weight whose rows are not longer than its shape keeps the element rule. */
+TEST(a_block_weight_row_view_is_judged_in_its_stored_rows) {
+    static uint8_t q8[8 * 34];   /* eight q8_0 rows of 32 elements */
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.q8", RAD_I8, 8, 32, q8);
+    f.P.weights[(size_t)w].stored_bytes = 8 * 34;
+    rad_weight wb = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op op = f.add_op("gemm_nt", "M", { 8192 }, { k_pre }, { "prefill" }, &g_gemm_schema, { w });
+    CHECK_OK(f.start());
+    auto issue = [&](RadOperand v, int at) {
+        return f.step(4, at, [&](Ctx& c) {
+            RadOperand opd[3] = { RAD_B(x), v, RAD_B(y) };
+            c.issue(op, opd, 3, RAD_N_BATCH);
+        });
+    };
+    RadOperand last = RAD_W(w);
+    last.offset = 6 * 34;   /* stored rows 6..7: the element rule alone reads 204 + 63 >= 256 and refuses it */
+    last.rows   = 2;
+    CHECK_OK(issue(last, 0));
+    RadOperand q3 = RAD_W(w);
+    q3.offset = 4 * 34;     /* the last quarter of two-row parts as FCS issues rank 3's */
+    q3.rows   = 4;
+    CHECK_OK(issue(q3, 1));
+    RadOperand past = last;
+    past.offset = 7 * 34;   /* rows 7..8: one stored row past the end */
+    CHECK_EQ(issue(past, 2), RAD_E_SHAPE);
+    CHECK(std::strstr(f.ctx.step_error(), "reaches past weight 'blk.0.q8'") != nullptr);
+    RadOperand mid = RAD_W(w);
+    mid.offset = 7 * 34 + 1;   /* not on a stored row's start, past the element shape */
+    mid.rows   = 1;
+    CHECK_EQ(issue(mid, 3), RAD_E_SHAPE);
+    RadOperand bpast = RAD_W(wb);   /* bf16: stored rows = the shape's, the element rule as before */
+    bpast.offset = 5 * 4;
+    bpast.rows   = 4;
+    CHECK_EQ(issue(bpast, 4), RAD_E_SHAPE);
+}
+
 /* Two kernels using the shared scratch region, one on each lane, with no join between them: the
  * second is ordered behind the first. Each launch below queues its work on the stream it is
  * given, so an unordered pair really overlaps and an early reader would see the poison. */
