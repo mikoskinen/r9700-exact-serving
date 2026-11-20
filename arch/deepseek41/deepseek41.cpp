@@ -9807,7 +9807,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         t_tw_off = !m.twin_mask ? 0
                  : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng && !tw_sub ? kTwEng : 0) |
                    (bi_pmm(g_sw_bi.load(std::memory_order_relaxed)) ? kTwShx : 0) |
-                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score && !tw_sub ? kTwQkv : 0) |
+                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !tw_sub &&
+                            ((!L.src && !L.i_score) ||
+                             /* tp8 loop P26c: a kv / index source of ratio > 1 where level 3 runs q_a / kv over the quarter */
+                             (sp_attn >= 3 && m.sp_ag_iw && m.sp_ag_kvs && (!L.src || c.ratio[(size_t)L.l] > 1)))
+                        ? kTwQkv : 0) |
                    (psk_l && !tw_psk ? kTwAll : 0) |
                    (cr_any && !tw_psk ? kTwAll : 0) |
                    (g_sw_engdd.load(std::memory_order_relaxed) > 0 ? kTwEng : 0);
