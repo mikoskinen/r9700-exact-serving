@@ -485,6 +485,10 @@
  *                   + 256 (tp8 loop D36): no band passes -- under RADIANCE_PP_BAND=1 a fresh BG step runs W(h, t)'s (the band layers
  *                   stay declared), so one start compares P28's band (with RADIANCE_PP_LEAD_SEG_BAND=1: its head in these segments)
  *                   with none: v = 2 vs 258, 0 vs 256.
+ *                   + 1024 x N (tp8 loop D49b, N 1 .. 63): forms 1 / 2 segment a BG step only while the decode lanes' last steps
+ *                   decoded <= N sequences (Scheduler::decoded_seqs summed over the decode lanes); above N the step's parts run
+ *                   whole as under form 0 -- so ONE value segments at c8 (the leader's BG head stops both decode lanes there,
+ *                   lq218) and keeps c16 / c32's whole parts (lq207: segments -1.7..-6.4 % there). 0 = no load rule.
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all
