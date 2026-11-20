@@ -3732,13 +3732,15 @@ static int wmk_tdp(int ty, long long Ntot, long long K, long long M) {
  *   o_a pair (2048 x 4096)        33..48 rows 36.0 / 34.9 -> G2 NT 1 29.5 / 28.4 (17..32 rows: <= 1 % apart, left)
  *   o_b (5120 x 2048)             17..32 rows 32.9 / 33.1 -> G2 KP 1 NT 1 29.4 / 29.8 (33..48 rows: 70724 the best, left)
  *   main_proj (5120 x 15360; the context pass, every lane step) 205.3 / 207.9 / 228.6 / 232.9 -> G2 NT 1 148.4 / 149.6 / 176.2 / 181.0
+ *   round 26 (lever FCS): main_proj's one-rank column part (1280 x 15360; xeon r26a, --cold 256, us a call at M 24 / 32 / 40 / 48)
+ *   engine path 66.5 / 66.9 / 67.1 / 67.6 -> G2 NT 1 55.2 / 55.9 / 60.4 / 61.0 (the 4 row-view parts = the whole call's bytes, 0 differ)
  * Every code computes the part order: the same bytes (--wmgcheck q8_0 WMKCROSS). Pin r4d_gg_wmk_dq8 0 = 70724 as before. */
 int g_wmk_dq8 = 1;
 extern "C" void r4d_gg_wmk_dq8(int on) { g_wmk_dq8 = on ? 1 : 0; }
 static int wmk_dq8(int ty, long long Ntot, long long K, long long M) {
     constexpr int G2NT1 = kWmkCode | 2097152 | 4194304, G2KP1NT1 = G2NT1 | 16777216;
     if (ty != GG_Q8_0 || M <= 16 || M > 48) return 0;
-    if ((K == 5120 && Ntot == 1792) || (K == 1280 && Ntot == 8192) || (K == 15360 && Ntot == 5120)) return G2NT1;
+    if ((K == 5120 && Ntot == 1792) || (K == 1280 && Ntot == 8192) || (K == 15360 && (Ntot == 5120 || Ntot == 1280))) return G2NT1;
     if (K == 4096 && Ntot == 2048 && M > 32) return G2NT1;
     if (K == 2048 && Ntot == 5120 && M <= 32) return G2KP1NT1;
     return 0;
@@ -4613,7 +4615,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_known(value) ? 1 : -1;   /* lever SPD-F */
-    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 5 ? 1 : -1;   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both), 4 / 5: 2's bytes faster */
+    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 7 ? 1 : -1;   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both), 4 / 5 / 6 / 7: 2's bytes faster (6: lever XPG, 7: + XWO) */
     if (!std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }

@@ -196,6 +196,45 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                 const long long took = wcount(h) - c0;
                 const int wkform = wk ? h.wk_last() : 0;
                 const bool dec_same = dec == stock, wm_ran = took == (pair && !wk ? 2 : 1);
+                /* DRAFTER track round 26 (lever FCS), env R4D_WMG_SLICE=4: the same output as 4 launches over row views of the
+                 * weight (rows [r N / 4, (r + 1) N / 4), N / 4 wide, into their columns at pitch N) -- what a rank's column part +
+                 * the row-interleaved all_gather give -- byte-compared with the whole call, under the decode band (D) and the
+                 * W arm's code (the engine path under --wmk 1048586). */
+                if (std::getenv("R4D_WMG_SLICE") && !pair && !sh.logits && sh.N % 4 == 0) {
+                    const int64_t Q = sh.N / 4;
+                    auto slices = [&](int* rc) {
+                        st_memset(d_y, 0xff, yb);
+                        *rc = RAD_OK;
+                        std::vector<RadParam> ps = { PI("M", M), PI("N", Q), PI("K", sh.K), PS("type", ty.name), PS("dtype", "bf16") };
+                        for (int r = 0; r < 4 && *rc == RAD_OK; ++r) {
+                            std::vector<RadTensor> t = { T(d_x, RAD_BF16, { M, sh.K }), T((uint8_t*)d_w + (size_t)(r * Q * rb), RAD_U8, { Q, rb }),
+                                                         gqst::TP((uint16_t*)d_y + r * Q, RAD_BF16, M, Q, sh.N) };
+                            RadArgs a{};
+                            a.t = t.data(); a.n_t = 3; a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+                            *rc = rg->launch(&a, nullptr);
+                        }
+                        if (st_stream_sync(nullptr) != hipSuccess) *rc = -999;
+                        std::vector<uint8_t> got(yb);
+                        st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                        return got;
+                    };
+                    auto ndif = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+                        size_t n = 0;
+                        for (size_t e = 0; e < yb; e += ob) n += std::memcmp(&a[e], &b[e], ob) != 0;
+                        return n;
+                    };
+                    int rsd = 0, rsw = 0;
+                    set_dec(h);
+                    const std::vector<uint8_t> sd = slices(&rsd);
+                    set_wm(h);
+                    const std::vector<uint8_t> sw = slices(&rsw);
+                    clear(h);
+                    const size_t nd = ndif(sd, dec), nw = ndif(sw, wm);
+                    std::printf("WMGSLICE %s|%s|M=%lld|N %lld = 4 x %lld, K %lld|D slices vs D whole: %zu of %zu differ|W slices vs W whole: "
+                                "%zu differ|D whole vs W whole: %zu differ|rc %d %d\n", ty.name, sh.name, (long long)M, (long long)sh.N,
+                                (long long)Q, (long long)sh.K, nd, yb / ob, nw, ndif(dec, wm), rsd, rsw);
+                    if (nd || nw || rsd != RAD_OK || rsw != RAD_OK) ++g_fail;
+                }
                 size_t ndiff = 0, nout = yb / ob;
                 double maxrel = 0.0;
                 for (size_t e = 0; e < yb; e += ob) {

@@ -1404,9 +1404,15 @@ void Engine::pp_send_fn4_state() {
 int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
     pp_ni_ = nullptr;
     const char* v = std::getenv("RADIANCE_PP_NODE_IDLE");
-    if (!v || std::strcmp(v, "1") || ranks_.empty()) return 0;
+    if (!v || (std::strcmp(v, "1") && std::strcmp(v, "2")) || ranks_.empty()) return 0;
     *own = std::make_unique<PpNodeIdle>();
     PpNodeIdle& ni = **own;
+    ni.split = !std::strcmp(v, "2");   /* tp8 loop D45: + the line by stretch (BG step in flight or not) */
+    if (const char* ps = std::getenv("RADIANCE_PP_NODE_IDLE_S"); ps && *ps) {   /* tp8 loop D45: the lines' period */
+        const int n = std::atoi(ps);
+        if (n >= 1 && n <= 600) ni.period_s = n;
+        else RAD_WARN("RADIANCE_PP_NODE_IDLE_S=%s is not taken (1..600 s): the node-idle lines stay a minute apart", ps);
+    }
     const bool lead = !pp_follower();
     ni.node = lead ? "leader" : "follower";
     ni.crossing = lead ? "X2" : "X1";
@@ -1424,6 +1430,13 @@ int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
     RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE=1 -- rank 0's card time in parts, between parts and waiting on the "
              "card for the %s's %s (%zu ring(s)), a line a minute and the run's at stop (tp8 dev D8)",
              lead ? "follower" : "leader", ni.crossing, ni.rings.size());
+    if (ni.split || ni.period_s != 60)
+        RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE=%s -- %sthe lines every %d s (tp8 loop D45)", v,
+                 ni.split ? (lead ? "+ the same time by stretch, with a BG step in flight (a BG lane busy or holding a newcomer at "
+                                    "the round's top) or without; "
+                                  : "+ the same time by stretch, with a BG lane's frame in pass on this node or without; ")
+                          : "",
+                 ni.period_s);
     return 1;
 }
 
@@ -2031,6 +2044,13 @@ int Engine::follower_loop() {
                            pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1], b->n_seq);
         else if (pfl)
             pff->begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN);
+        /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2): a BG lane's frame in pass on this node -- its parts and every pass run between
+         * them count to the stretch with a BG step in flight, until this frame's handling returns */
+        struct NiBg {
+            PpNodeIdle* n;
+            NiBg(PpNodeIdle* p, bool on) : n(p && on && p->split ? p : nullptr) { if (n) ++n->bg_depth; }
+            ~NiBg() { if (n) --n->bg_depth; }
+        } ni_bg(pp_ni_, seg_bg >= 0 && lane >= seg_bg);
         for (size_t k = 0; k < parts.size(); ++k) {
             if (k > 0) {
                 /* the segment k - 1 - ahead must have run before segment k goes out (ahead 1: one queued behind the

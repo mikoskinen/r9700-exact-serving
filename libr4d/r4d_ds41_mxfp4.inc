@@ -29,10 +29,22 @@ static const RadConstraint cDs41MxMoeTiled[] = {
     C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
     C_IN("type", "mxfp4"), C_IN("dtype", "bf16"),
 };
+/* moe_gemm_mxil (lever WIL): drafter_mx's token bound (kXmMaxTokens), whole 16-row groups */
+static const RadConstraint cDs41MxIl[] = {
+    C_GE("M", 1), C_LE("M", 512), C_GE("N", 16), C_DIV("N", 16), C_GE("K", 32), C_DIV("K", 32),
+    C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
+    C_IN("type", "mxfp4"), C_IN("dtype", "bf16"),
+};
 
 #elif defined(R4D_DS41_SCHEMAS)
 
-/* gemm_nt_ggml's and moe_gemm_ggml's schemas are r4d_ds41_ggml.inc's. */
+/* gemm_nt_ggml's and moe_gemm_ggml's schemas are r4d_ds41_ggml.inc's. moe_gemm_mxil (lever WIL, libr4d only) takes
+ * moe_gemm_ggml's parameters and operands. */
+SCHEMA("moe_gemm_mxil", pDs41MoeGemmGgml, oDs41MoeGemmGgml,
+       "moe_gemm_ggml at type=mxfp4 with the weight stored tile-interleaved (libr4d's own layout, tag r4d_mxfp4_il16: "
+       "16-row x 1-block tiles of 272 bytes, the native blocks' bytes moved): the same values and arithmetic as "
+       "moe_gemm_ggml under drafter_mx 2 / 4 / 5 (rule B against the stock kernels), so its outputs are those forms' "
+       "byte for byte. The DSpark drafter's routed experts under RADIANCE_DS41_DSPARK_WIL=1."),
 
 #elif defined(R4D_DS41_ROWS)
 #if defined(R4D_HAVE_GGML)
@@ -69,6 +81,16 @@ static const RadConstraint cDs41MxMoeTiled[] = {
   "i32 routing",
   RAD_DOMAIN_DEVICE, 30, ROW(cDs41MxMoeTiled), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gemm_mxfp4_tiled, nullptr, R4D_DS41_MX_HOOKS(r4d_shape_moe_gemm_mxfp4) },
+
+{ "moe_gemm_mxil_wmma", "moe_gemm_mxil", "moe",
+  "the grouped GEMM over tile-interleaved MXFP4 experts (lever WIL): a wave a 16-row group, one 64-bit load a lane a "
+  "block (256 contiguous bytes a wave) and the group's 16 exponents, two v_wmma_f32_16x16x16_bf16 a block and one fma "
+  "of its scale; K below 2048 the sequential-tile form (four 16-row tiles a wave, the activations staged once an item)",
+  "M 1..512 tokens, N a multiple of 16, K a multiple of 32, up to 1024 experts", "bf16 a and y; mxfp4 experts "
+  "stored tile-interleaved (table or stacked), i32 routing",
+  RAD_DOMAIN_DEVICE, 58, ROW(cDs41MxIl), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_mxil, nullptr,
+  r4d_ds41_mxil_layout, r4d_ds41_mxil_relayout, r4d_shape_moe_gemm_mxfp4, r4d_ds41_mxil_unrelayout },
 
 #undef R4D_DS41_MX_HOOKS
 #endif  /* R4D_HAVE_GGML */

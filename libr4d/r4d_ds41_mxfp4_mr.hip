@@ -635,10 +635,51 @@ __device__ __forceinline__ void xw_stage_st(uint8_t* xs, int nt, int b0, int b1,
     }
 }
 
-template <int WR, int NT, int PD, int AB = 0>   /* AB: bench ablations (outputs differ): 1 no WMMA / fma, 2 no decode, 4 no staging */
-__global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
+/* IL (DRAFTER track 19.11.2026 round 27, lever WIL; bench form): the weights in the TILE-INTERLEAVED layout xm_il_pack writes
+ * (r4d_ds41_mxfp4_mr.h): an expert's rows in 16-row groups, a group's blocks in K order, each (group, block) 272 bytes = lane
+ * L's 8 code bytes (qs[4 h .. 4 h + 3], qs[8 + 4 h .. 8 + 4 h + 3] of row L % 16, h = L / 16) at 8 L, then the 16 rows' E8M0
+ * scales at 256 + row -- the same 17 bytes a block, so a wave's 32 lanes read 256 contiguous bytes a block (one 64-bit load a
+ * lane, no window realignment, no cross-half scale shuffle). The operands each WMMA sees are the 17-byte form's (the same
+ * nibbles in the same slots, the same scale): IL moves only where the bytes sit, not one operation (the same bytes). */
+typedef __attribute__((address_space(1))) const uint64_t* mx_gu64;
+typedef __attribute__((address_space(1))) const uint8_t* mx_gu8;
+constexpr int kXmIlTile = 272;
+
+#ifdef R4D_XM_TL
+/* Item timeline (DRAFTER track 20.11.2026 round 28, bench builds only: -DR4D_XM_TL): AB bit 8 of the IL forms = thread 0 of each
+ * block stamps the steady clock at the block's entry, at each item's start and end (wave 0's end), with the item, its expert
+ * and the WGP (HW_ID1) -- the outputs are the AB 0 form's. dbench --tl reads them (r4d_mx_tl_read). */
+constexpr int kXmTlMax = 8192;
+__device__ unsigned long long g_xm_tlb[4 * kXmTlMax];
+__device__ unsigned int g_xm_tln;
+__device__ __forceinline__ void xm_tl_put(unsigned long long tin, unsigned long long t0, int it, int e) {
+    if (threadIdx.x != 0) return;
+    const unsigned long long t1 = (unsigned long long)wall_clock64();
+    const unsigned int hw = (unsigned int)__builtin_amdgcn_s_getreg((31 << 11) | 23);
+    const unsigned int k = atomicAdd(&g_xm_tln, 1u);
+    if (k < (unsigned)kXmTlMax) {
+        g_xm_tlb[4 * k] = tin; g_xm_tlb[4 * k + 1] = t0; g_xm_tlb[4 * k + 2] = t1;
+        g_xm_tlb[4 * k + 3] = ((unsigned long long)hw << 32) | ((unsigned long long)(uint32_t)(it + 1) << 12) | (unsigned long long)(e & 0xfff);
+    }
+}
+#define XM_TL_IN(AB) const unsigned long long tl_in = ((AB) & 8) ? (unsigned long long)wall_clock64() : 0ull; int tl_did = 0;
+#define XM_TL_T0(AB) const unsigned long long tl_t0 = ((AB) & 8) ? (unsigned long long)wall_clock64() : 0ull;
+#define XM_TL_PUT(AB, it, e) do { if constexpr (((AB) & 8) != 0) { xm_tl_put(tl_in, tl_t0, (it), (e)); tl_did = 1; } } while (0)
+#define XM_TL_IDLE(AB) do { if constexpr (((AB) & 8) != 0) { if (!tl_did) xm_tl_put(tl_in, tl_in, -1, 0); } } while (0)
+#else
+#define XM_TL_IN(AB)
+#define XM_TL_T0(AB)
+#define XM_TL_PUT(AB, it, e) do { } while (0)
+#define XM_TL_IDLE(AB) do { } while (0)
+#endif
+
+template <int WR, int NT, int PD, int AB = 0, int IL = 0>   /* AB: bench ablations (outputs differ): 1 no WMMA / fma, 2 no decode, 4 no staging; 8 the item timeline,
+                                                              16 / 32 the compiler asked for 12 / 16 waves a SIMD (same outputs) */
+__global__ __launch_bounds__(kXmThreads) __attribute__((amdgpu_waves_per_eu((AB & 16) ? 12 : (AB & 32) ? 16 : 1)))
+void xm_wm_kernel(MxMrArgs A) {
     using Q = Mx<MX_FP4>;
     constexpr int MT = 16 * NT;
+    XM_TL_IN(AB)
     R4D_DYN_LDS(r4d_u32x4, xm_lds);
     uint8_t* const smem = (uint8_t*)xm_lds;
     __shared__ int s_n, s_items;
@@ -654,6 +695,7 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
     const int nlive = s_n, nitems = s_items;
     uint8_t* const xs = smem + A.x_off;
     for (int it = (int)blockIdx.x; it < nitems; it += (int)gridDim.x) {
+        XM_TL_T0(AB)
         int e = 0, r0 = 0, r1 = 0, rg = 0;
         xm_item<MT>(L, nlive, it, &e, &r0, &r1, &rg);
         const int mc = r1 - r0, n0 = rg * A.RB;
@@ -668,6 +710,7 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
         ml = __builtin_amdgcn_readfirstlane(ml);
         if (ml == 0) {
             xm_zero(A, r0, mc, n0);
+            XM_TL_PUT(AB, it, e);
             continue;
         }
         const int nt = (ml + 15) >> 4;
@@ -675,7 +718,9 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
         const int nw = n0 + wave * 16 * WR + nl;          /* this lane's weight rows nw + 16 r */
         const uint8_t* wr[WR];
 #pragma unroll
-        for (int r = 0; r < WR; ++r) wr[r] = wb + (long long)min(nw + 16 * r, A.N - 1) * A.w_ld;
+        for (int r = 0; r < WR; ++r)
+            wr[r] = IL ? wb + (long long)(min(nw + 16 * r, A.N - 1) >> 4) * A.UK * kXmIlTile
+                       : wb + (long long)min(nw + 16 * r, A.N - 1) * A.w_ld;
         xw_v8f acc[WR][NT];
 #pragma unroll
         for (int r = 0; r < WR; ++r)
@@ -693,9 +738,16 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
             if (b < A.UK) {
 #pragma unroll
                 for (int r = 0; r < WR; ++r) {
-                    const uintptr_t pa = ((uintptr_t)(wr[r] + (long long)b * Q::BB) & ~(uintptr_t)3) + 4 * h;
-                    const mx_gu32 g = (mx_gu32)(const void*)pa;
-                    rw[r][0] = g[0]; rw[r][1] = g[1]; rw[r][2] = g[2]; rw[r][3] = g[3];
+                    if constexpr (IL != 0) {
+                        const uint8_t* tp = wr[r] + (long long)b * kXmIlTile;
+                        const uint64_t v = *(mx_gu64)(const void*)(tp + 8 * lane);
+                        rw[r][0] = (uint32_t)v; rw[r][1] = (uint32_t)(v >> 32);
+                        rw[r][2] = *(mx_gu8)(const void*)(tp + 256 + nl);
+                    } else {
+                        const uintptr_t pa = ((uintptr_t)(wr[r] + (long long)b * Q::BB) & ~(uintptr_t)3) + 4 * h;
+                        const mx_gu32 g = (mx_gu32)(const void*)pa;
+                        rw[r][0] = g[0]; rw[r][1] = g[1]; rw[r][2] = g[2]; rw[r][3] = g[3];
+                    }
                 }
             }
         };
@@ -707,6 +759,10 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
 #pragma unroll
             for (int r = 0; r < WR; ++r) {
                 const r4d_u32x4 w = rw[r];
+                if constexpr (IL != 0) {
+                    q0[r] = w[0]; q1[r] = w[1];
+                    d[r] = mx_e8m0_half(w[2]);
+                } else {
                 const int sA = (sb[r] + b) & 3;           /* the block's byte offset in its window (17 b = b mod 4) */
                 const int sh = (sA + 1) & 3;
                 const bool s3 = sA == 3;
@@ -715,6 +771,7 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
                 const uint32_t e0 = (w[0] >> (8 * sA)) & 0xffu;
                 const uint32_t e1 = (uint32_t)__builtin_amdgcn_permlanex16((int)e0, (int)e0, 0x76543210, 0xfedcba98, false, false);
                 d[r] = mx_e8m0_half(h ? e1 : e0);
+                }
             }
             load(b + PD, rw);
             r4d_u32x4 bw[WR][2];
@@ -784,7 +841,9 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
                 }
             }
         }
+        XM_TL_PUT(AB, it, e);
     }
+    XM_TL_IDLE(AB);
 }
 
 /* xm_wt_kernel (DRAFTER track 19.11.2026 round 12, lever DTS; tools/dbench/patd.cpp): xm_wm_kernel WR 1 NT 1 with TS row tiles a
@@ -797,10 +856,11 @@ __global__ __launch_bounds__(kXmThreads) void xm_wm_kernel(MxMrArgs A) {
  * blocks a wave). Tile t's rows: n0 + (t WN + wave) 16 + nl (the block's waves read one contiguous range a tile).
  * Exactness: each output is xm_wm_kernel's (WR 1 NT 1): blocks in K order, a block's two WMMAs from 0, one fma of its scale,
  * one rounding -- TS and WN only move which lane computes it and when its words are loaded (the same bytes as drafter_mx 2). */
-template <int PD, int TS>
+template <int PD, int TS, int IL = 0, int AB = 0>   /* IL: the tile-interleaved weights (xm_wm_kernel's IL note); AB 8: the item timeline */
 __global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
     using Q = Mx<MX_FP4>;
     constexpr int MT = 16;
+    XM_TL_IN(AB)
     R4D_DYN_LDS(r4d_u32x4, xm_lds);
     uint8_t* const smem = (uint8_t*)xm_lds;
     __shared__ int s_n, s_items;
@@ -818,11 +878,13 @@ __global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
     uint8_t* const xs = smem + A.x_off;
     const int UK = A.UK, NB = TS * UK;
     for (int it = (int)blockIdx.x; it < nitems; it += (int)gridDim.x) {
+        XM_TL_T0(AB)
         int e = 0, r0 = 0, r1 = 0, rg = 0;
         xm_item<MT>(L, nlive, it, &e, &r0, &r1, &rg);
         const int mc = r1 - r0, n0 = rg * A.RB;
         const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         auto rowp = [&](int t) -> const uint8_t* {
+            if constexpr (IL != 0) return wb + (long long)(min(n0 + (t * WN + wave) * 16 + nl, A.N - 1) >> 4) * UK * kXmIlTile;
             return wb + (long long)min(n0 + (t * WN + wave) * 16 + nl, A.N - 1) * A.w_ld;
         };
         /* the load cursor (tile tl, block bl) and the first PD blocks in flight before the set-up's round trips */
@@ -831,9 +893,16 @@ __global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
         r4d_u32x4 raw[PD];
         auto load = [&](r4d_u32x4& rw) {
             if (tl < TS) {
+                if constexpr (IL != 0) {
+                    const uint8_t* tp = lrow + (long long)bl * kXmIlTile;
+                    const uint64_t v = *(mx_gu64)(const void*)(tp + 8 * lane);
+                    rw[0] = (uint32_t)v; rw[1] = (uint32_t)(v >> 32);
+                    rw[2] = *(mx_gu8)(const void*)(tp + 256 + nl);
+                } else {
                 const uintptr_t pa = ((uintptr_t)(lrow + (long long)bl * Q::BB) & ~(uintptr_t)3) + 4 * h;
                 const mx_gu32 g = (mx_gu32)(const void*)pa;
                 rw[0] = g[0]; rw[1] = g[1]; rw[2] = g[2]; rw[3] = g[3];
+                }
                 if (++bl == UK) { bl = 0; ++tl; lrow = rowp(tl); }
             }
         };
@@ -845,6 +914,7 @@ __global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
         const uint32_t lm = (bal >> (8 * h)) & 0xffu;
         if (bal == 0u) {   /* a segment of dead slots only: zeros (its loads land in registers nobody reads) */
             xm_zero(A, r0, mc, n0);
+            XM_TL_PUT(AB, it, e);
             continue;
         }
         lds_barrier();
@@ -862,14 +932,21 @@ __global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
             for (int k = 0; k < PD; ++k) {
                 if (j0 + k < NB) {
                     const r4d_u32x4 w = raw[k];
+                    uint32_t q0, q1;
+                    float d;
+                    if constexpr (IL != 0) {
+                        q0 = w[0]; q1 = w[1];
+                        d = mx_e8m0_half(w[2]);
+                    } else {
                     const int sA = (int)(((uintptr_t)crow + 17u * (uintptr_t)bc) & 3u);
                     const int sh = (sA + 1) & 3;
                     const bool s3 = sA == 3;
-                    const uint32_t q0 = __builtin_amdgcn_alignbyte(w[1], s3 ? w[1] : w[0], sh);
-                    const uint32_t q1 = __builtin_amdgcn_alignbyte(w[3], s3 ? w[3] : w[2], sh);
+                    q0 = __builtin_amdgcn_alignbyte(w[1], s3 ? w[1] : w[0], sh);
+                    q1 = __builtin_amdgcn_alignbyte(w[3], s3 ? w[3] : w[2], sh);
                     const uint32_t e0 = (w[0] >> (8 * sA)) & 0xffu;
                     const uint32_t e1 = (uint32_t)__builtin_amdgcn_permlanex16((int)e0, (int)e0, 0x76543210, 0xfedcba98, false, false);
-                    const float d = mx_e8m0_half(h ? e1 : e0);
+                    d = mx_e8m0_half(h ? e1 : e0);
+                    }
                     load(raw[k]);
                     r4d_u32x4 bw0, bw1;
 #pragma unroll
@@ -902,7 +979,9 @@ __global__ __launch_bounds__(kXmThreads) void xm_wt_kernel(MxMrArgs A) {
                 }
             }
         }
+        XM_TL_PUT(AB, it, e);
     }
+    XM_TL_IDLE(AB);
 }
 
 /* xm_wq_kernel (DRAFTER track 18.11.2026; tools/dbench/pat.cpp): the WMMA form with the weight rows read in long runs. A lane
@@ -1263,9 +1342,59 @@ int xm_launch_s(RadStream s, int R, int MT, int EX, const MxMrArgs& A, unsigned 
 /* WMMA form: (WR, NT, PD, AB). */
 #define XM_WFORMS(X) X(1, 1, 2, 0) X(1, 1, 4, 0) X(1, 1, 6, 0) X(1, 1, 8, 0) X(1, 1, 9, 0) X(1, 1, 12, 0) X(1, 1, 14, 0) X(1, 2, 4, 0) X(1, 4, 2, 0) X(2, 1, 2, 0) X(2, 1, 4, 0) X(2, 1, 6, 0) X(2, 2, 2, 0) \
     X(2, 2, 4, 0) X(2, 4, 2, 0) X(4, 1, 2, 0) X(2, 1, 2, 1) X(2, 1, 2, 2) X(2, 1, 2, 4) X(2, 1, 2, 3) X(2, 1, 2, 7) X(2, 1, 2, 5)
+/* lever WIL (bench): the IL forms -- WR 1 NT 1 at PD 2 / 9 (drafter_mx 4 / 5's gate_up) and the sequential-tile PD 9 TS 4 */
+#ifdef R4D_XM_TL
+int g_xm_tl = 0;                          /* bench (-DR4D_XM_TL): the IL forms PD 9 / PD 9 TS 4 with the item timeline (AB 8) */
+int g_xm_wpe = 0, g_xm_wpe_pd = 9;        /* bench: the IL gate_up's waves-per-EU forms (AB 16 / 32, + 8 with the timeline) */
+#endif
+/* lever XPG (DRAFTER track 20.11.2026 round 28; bench hook r4d_mx_mr_pg): the IL forms' grid capped at the blocks the card
+ * holds at once (occupancy x WGPs: 4 x 32 for xm_wm PD 9, 5 x 32 for xm_wt PD 9 TS 4), each block looping over its items --
+ * no idle blocks behind the items. Only which block computes an item moves (the same bytes). */
+int g_xm_pg = 0;
+extern int g_xm_on;
+int xm_cu_count();
+template <class K>
+unsigned xm_pg_grid(K kern, unsigned grid, unsigned thr, unsigned lds) {
+    if (!g_xm_pg && g_xm_on < 6) return grid;   /* drafter_mx 6 / 7 */
+    int nb = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kern, (int)thr, (size_t)lds) != hipSuccess || nb < 1) return grid;
+    const long long cap = (long long)nb * xm_cu_count();
+    return cap < (long long)grid ? (unsigned)cap : grid;
+}
+int xm_launch_wil(RadStream s, int PD, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
+#ifdef R4D_XM_TL
+    if (g_xm_tl && PD == 9) return R4D_EMIT(s, (xm_wm_kernel<1, 1, 9, 8, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 9, 8, 1>, grid, thr, lds)), dim3(thr), lds, A);
+    /* bench (round 28): the IL gate_up asked for 12 waves a SIMD (6 blocks a WGP), PD g_xm_wpe_pd */
+#define XM_WPE(pd, ab) if (g_xm_wpe == ab && PD == 9 && g_xm_wpe_pd == pd) \
+        return R4D_EMIT(s, (xm_wm_kernel<1, 1, pd, ab, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, pd, ab, 1>, grid, thr, lds)), dim3(thr), lds, A);
+    XM_WPE(9, 16) XM_WPE(8, 16) XM_WPE(6, 16) XM_WPE(4, 16) XM_WPE(4, 32) XM_WPE(9, 24) XM_WPE(6, 24)
+#undef XM_WPE
+#endif
+    /* lever XWO (round 28; drafter_mx 7): the gate_up (PD 9's caller) at 12 waves a SIMD = 99 VGPRs, PD 4, 6 blocks a WGP at the
+     * resident grid -- tools/dbench, five lq168 record sets, A B A B: pass -2.8..-6.4 % at 32 rows, +0.3..-6.5 % at 40 vs drafter_mx 6
+     * (the same bytes: PD only moves when a block's words are loaded) */
+    if (PD == 9 && g_xm_on == 7)
+        return R4D_EMIT(s, (xm_wm_kernel<1, 1, 4, 16, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 4, 16, 1>, grid, thr, lds)), dim3(thr), lds, A);
+    if (PD == 9) return R4D_EMIT(s, (xm_wm_kernel<1, 1, 9, 0, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 9, 0, 1>, grid, thr, lds)), dim3(thr), lds, A);
+#define XM_WIL(pd) if (PD == pd) return R4D_EMIT(s, (xm_wm_kernel<1, 1, pd, 0, 1>), dim3(grid), dim3(thr), lds, A);
+    XM_WIL(2) XM_WIL(6) XM_WIL(9) XM_WIL(12) XM_WIL(16)
+#undef XM_WIL
+    return R4D_MX_MR_DECLINE;
+}
+int xm_launch_til(RadStream s, int PD, int TS, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
+#ifdef R4D_XM_TL
+    if (g_xm_tl && PD == 9 && TS == 4) return R4D_EMIT(s, (xm_wt_kernel<9, 4, 1, 8>), dim3(xm_pg_grid(xm_wt_kernel<9, 4, 1, 8>, grid, thr, lds)), dim3(thr), lds, A);
+#endif
+    if (PD == 9 && TS == 4) return R4D_EMIT(s, (xm_wt_kernel<9, 4, 1>), dim3(xm_pg_grid(xm_wt_kernel<9, 4, 1>, grid, thr, lds)), dim3(thr), lds, A);
+#define XM_TIL(pd, ts) if (PD == pd && TS == ts) return R4D_EMIT(s, (xm_wt_kernel<pd, ts, 1>), dim3(grid), dim3(thr), lds, A);
+    XM_TIL(9, 4) XM_TIL(12, 4) XM_TIL(16, 4) XM_TIL(9, 2) XM_TIL(9, 8) XM_TIL(6, 4)
+#undef XM_TIL
+    return R4D_MX_MR_DECLINE;
+}
 int xm_launch_w(RadStream s, int WR, int NT, int PD, int AB, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
 #define XM_W(wr, nt, pd, ab) \
-    if (WR == wr && NT == nt && PD == pd && AB == ab) return R4D_EMIT(s, (xm_wm_kernel<wr, nt, pd, ab>), dim3(grid), dim3(thr), lds, A);
+    if (WR == wr && NT == nt && PD == pd && AB == ab) \
+        return R4D_EMIT(s, (xm_wm_kernel<wr, nt, pd, ab>), dim3(xm_pg_grid(xm_wm_kernel<wr, nt, pd, ab>, grid, thr, lds)), dim3(thr), lds, A);
     XM_WFORMS(XM_W)
 #undef XM_W
     return R4D_MX_MR_DECLINE;
@@ -1274,7 +1403,7 @@ int xm_launch_w(RadStream s, int WR, int NT, int PD, int AB, const MxMrArgs& A, 
 #define XM_TFORMS(X) X(2, 1) X(2, 2) X(2, 4) X(2, 8) X(4, 2) X(4, 4) X(4, 8) X(6, 4) X(6, 8) X(9, 2) X(9, 4) X(9, 8) X(12, 2) X(12, 4) X(12, 8) X(14, 4) X(14, 8)
 int xm_launch_t(RadStream s, int PD, int TS, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
 #define XM_T(pd, ts) \
-    if (PD == pd && TS == ts) return R4D_EMIT(s, (xm_wt_kernel<pd, ts>), dim3(grid), dim3(thr), lds, A);
+    if (PD == pd && TS == ts) return R4D_EMIT(s, (xm_wt_kernel<pd, ts>), dim3(xm_pg_grid(xm_wt_kernel<pd, ts>, grid, thr, lds)), dim3(thr), lds, A);
     XM_TFORMS(XM_T)
 #undef XM_T
     return R4D_MX_MR_DECLINE;
@@ -1474,9 +1603,15 @@ __global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) {
 /* ------------------------------------------------------------------ the switch, the pin, the rule */
 int env_drafter_mx() {
     const char* v = std::getenv("RADIANCE_DS41_DRAFTER_MX");
-    const int on = (v && (*v == '1' || *v == '2' || *v == '3' || *v == '4' || *v == '5') && !v[1]) ? *v - '0' : 0;
+    const int on = (v && *v >= '1' && *v <= '7' && !v[1]) ? *v - '0' : 0;
     if (v && *v && !on && std::strcmp(v, "0"))
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3 / 4 / 5: the stock MXFP4 grouped GEMM\n", v);
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3 / 4 / 5 / 6 / 7: the stock MXFP4 grouped GEMM\n", v);
+    if (on == 7)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_mxil takes drafter_mx 6's forms with the gate_up at 12 waves a SIMD, 4 blocks in flight a lane "
+                             "(RADIANCE_DS41_DRAFTER_MX=7, the fn4 switch drafter_mx 7, lever XWO: drafter_mx 2's bytes; on the 17-byte rows = 6)\n");
+    if (on == 6)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml / moe_gemm_mxil type=mxfp4 take drafter_mx 5's forms at the card's resident grid "
+                             "(RADIANCE_DS41_DRAFTER_MX=6, the fn4 switch drafter_mx 6, lever XPG: drafter_mx 2's bytes)\n");
     if (on == 5)
         std::fprintf(stderr, "radiance: libr4d: moe_gemm_ggml type=mxfp4 takes the WMMA form at every call, 9 blocks in flight a lane at "
                              "K >= 2048 and 4 row tiles a wave in sequence below (RADIANCE_DS41_DRAFTER_MX=5, the fn4 switch drafter_mx 5: "
@@ -1501,15 +1636,16 @@ int g_xm_pin_h = 4, g_xm_pin_r = 1, g_xm_pin_mt = 4, g_xm_pin_wn = 0, g_xm_pin_g
 int g_xm_cap = kXmMaxTokens;              /* the forms' token bound (bench hook r4d_mx_mr_cap) */
 char g_xm_last[160];
 int g_xm_wm_slab = 0;                     /* WMMA form: LDS bytes of a slab (0: 16 KiB; bench hook) */
+int g_xm_il = 0;                          /* lever WIL (bench hook r4d_mx_mr_il): the weights are in the IL layout */
 
 }  // namespace
 
 int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
-void r4d_mx_mr_set(int on) { g_xm_on = on == 2 || on == 3 || on == 4 || on == 5 ? on : (on ? 1 : 0); }
+void r4d_mx_mr_set(int on) { g_xm_on = on >= 2 && on <= 7 ? on : (on ? 1 : 0); }
 int r4d_mx_mr_get() { return g_xm_on; }
 
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
-static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap) {
+static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap, int il = g_xm_il) {
     if (!xm_has_w(WR, NT, PD, AB) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
     A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
@@ -1536,12 +1672,17 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
     if (grid < 1) grid = 1;
     std::snprintf(g_xm_last, sizeof g_xm_last, "wmma WR%d NT%d PD%d%s WN%d SS%d RB%d grid %lld lds %lld", WR, NT, PD, AB ? " ABL" : "", WN, A.SS,
                   A.RB, grid, lds);
+    if (il) {   /* lever WIL: 16-row groups, so N % 16 == 0; WR 1 NT 1 only */
+        if (WR != 1 || NT != 1 || AB != 0 || c.N % 16) return R4D_MX_MR_DECLINE;
+        std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-IL WR1 NT1 PD%d WN%d SS%d RB%d grid %lld lds %lld", PD, WN, A.SS, A.RB, grid, lds);
+        return xm_launch_wil(s, PD, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+    }
     return xm_launch_w(s, WR, NT, PD, AB, A, (unsigned)grid, 32u * WN, (unsigned)lds);
 }
 
 /* The sequential-tile form's launch (lever DTS; drafter_mx 2's bytes): WN waves, TS 16-row tiles a wave in sequence, segments
  * of up to 16 rows, the whole K's activations in one slab (declines K above ~60 blocks). */
-static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, int gridcap) {
+static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, int gridcap, int il = g_xm_il) {
     if (!xm_has_t(PD, TS) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
     A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
@@ -1563,6 +1704,11 @@ static int xm_wt_moe(RadStream s, const R4dMxMrCall& c, int PD, int TS, int WN, 
     if (grid > est) grid = est;
     if (grid < 1) grid = 1;
     std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-seq PD%d TS%d WN%d RB%d grid %lld lds %lld", PD, TS, WN, A.RB, grid, lds);
+    if (il) {
+        if (c.N % 16) return R4D_MX_MR_DECLINE;
+        std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-seq-IL PD%d TS%d WN%d RB%d grid %lld lds %lld", PD, TS, WN, A.RB, grid, lds);
+        return xm_launch_til(s, PD, TS, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+    }
     return xm_launch_t(s, PD, TS, A, (unsigned)grid, 32u * WN, (unsigned)lds);
 }
 
@@ -1664,11 +1810,12 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
          * TS 4 WN 8: an item = (expert, segment, 512 rows), the activations staged once an item, the loads 9 blocks ahead across
          * the 4 tiles -- tools/dbench --quad on lq168's records, xeon GPU1, steady state (300 passes): DEP down 422-450 -> 329-343
          * us a pass (-22..-25 %), pass 1,065-1,129 -> 982-1,031 (-7.8..-9.2 %) at 32 and 40 tokens; bytes IDENTICAL to mx 2. */
-        if (g_xm_on == 5 && c.K < 2048) {
+        /* drafter_mx 6 (round 28, lever XPG): 5's forms at the resident grid (xm_pg_grid) -- the same bytes. */
+        if (g_xm_on >= 5 && c.K < 2048) {
             const int t = xm_wt_moe(s, c, 9, 4, 8, 0);
             if (t != R4D_MX_MR_DECLINE) return t;
         }
-        const int wm = xm_wm_moe(s, c, 1, 1, (g_xm_on == 4 || g_xm_on == 5) && c.K >= 2048 ? 9 : 2, 0, 8, 0);
+        const int wm = xm_wm_moe(s, c, 1, 1, g_xm_on >= 4 && c.K >= 2048 ? 9 : 2, 0, 8, 0);
         if (wm != R4D_MX_MR_DECLINE) return wm;
     }
     if (pinned && g_xm_pin_h >= 2048 && g_xm_pin_h < 4096) {   /* sequential-tile pin (lever DTS): h = 2048 + PD + 16 TS */
@@ -1726,6 +1873,20 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
                   : xm_launch_s(s, R, MT, EX, A, (unsigned)grid, 32u * WN, (unsigned)lds);
 }
 
+/* Lever WIL's serving entry (moe_gemm_mxil, r4d_ds41_mxfp4.inc): the weights are in the IL layout its row's relayout
+ * writes, so only the IL forms may read them -- drafter_mx 5's forms (and bytes): K below 2048 (lever DEP's down, K 576)
+ * the sequential-tile form PD 9 TS 4, else the WMMA form WR 1 NT 1 PD 9, 8 waves. A decline is the caller's error (no
+ * other kernel reads this layout). Independent of drafter_mx and of the bench pins. */
+int r4d_mx_mr_moe_il(RadStream s, const R4dMxMrCall& c) {
+    if (c.tokens < 1 || c.tokens > kXmMaxTokens || c.T < 1 || c.N < 16 || c.N % 16 || c.K < 32 || c.K % 32 || c.n_expert < 1)
+        return R4D_MX_MR_DECLINE;
+    if (c.K < 2048) {
+        const int t = xm_wt_moe(s, c, 9, 4, 8, 0, 1);
+        if (t != R4D_MX_MR_DECLINE) return t;
+    }
+    return xm_wm_moe(s, c, 1, 1, 9, 0, 8, 0, 1);
+}
+
 /* r4d_mx_mr_pin (bench / test hook, r4d_selftest --mxcheck / --perfmx): on 0 clears the pin (the switch decides),
  * -1 forces the rule, 1 pins (H, R, MT, WN; the tiled order reads R and MT) and a grid cap (0: the rule's). */
 extern "C" void r4d_mx_mr_pin(int on, int h, int r, int mt, int wn, int grid) {
@@ -1738,6 +1899,29 @@ extern "C" const char* r4d_mx_mr_last() { return g_xm_last; }
 extern "C" void r4d_mx_mr_cap(int tokens) { g_xm_cap = tokens > 0 ? tokens : kXmMaxTokens; }
 /* r4d_mx_wm_slab (bench hook, DRAFTER track): the WMMA form's slab in LDS bytes (<= 0: 16 KiB). */
 extern "C" void r4d_mx_wm_slab(int bytes) { g_xm_wm_slab = bytes > 0 ? bytes : 0; }
+/* lever WIL (bench hook): 1 = the calls' weights are in the IL layout (xm_wm_kernel's IL note): drafter_mx 4 / 5 take the IL
+ * kernels (WR 1 NT 1 / the sequential-tile PD 9 TS 4), any other form declines. 0 = the 17-byte rows (today). */
+extern "C" void r4d_mx_mr_il(int on) { g_xm_il = on ? 1 : 0; }
+/* lever XPG (bench hook): 1 = the IL forms' grid at the card's resident capacity (xm_pg_grid). */
+extern "C" void r4d_mx_mr_pg(int on) { g_xm_pg = on ? 1 : 0; }
+#ifdef R4D_XM_TL
+/* the item timeline (bench builds only): r4d_mx_tl(1) = the IL forms stamp their items; r4d_mx_tl_reset() before a call,
+ * r4d_mx_tl_read(out, max) after it: records of 4 x u64 (block entry, item start, item end, HW_ID1 << 32 | (item + 1) << 12 | expert). */
+extern "C" void r4d_mx_tl(int on) { g_xm_tl = on ? 1 : 0; }
+extern "C" void r4d_mx_wpe(int ab, int pd) { g_xm_wpe = ab; g_xm_wpe_pd = pd; }
+extern "C" int r4d_mx_tl_reset() {
+    const unsigned int z = 0;
+    return hipMemcpyToSymbol(HIP_SYMBOL(g_xm_tln), &z, sizeof z) == hipSuccess ? 0 : -1;
+}
+extern "C" int r4d_mx_tl_read(unsigned long long* out, int max) {
+    unsigned int n = 0;
+    if (hipMemcpyFromSymbol(&n, HIP_SYMBOL(g_xm_tln), sizeof n) != hipSuccess) return -1;
+    if ((int)n > kXmTlMax) n = (unsigned)kXmTlMax;
+    if ((int)n > max) n = (unsigned)max;
+    if (n && hipMemcpyFromSymbol(out, HIP_SYMBOL(g_xm_tlb), (size_t)n * 4 * sizeof(unsigned long long)) != hipSuccess) return -1;
+    return (int)n;
+}
+#endif
 
 #ifdef R4D_EMU_HOST
 /* tests/r4d_emu (ds41mx): the stock grouped GEMM's launches as mx_moe issues them (gemv band or tiled), from this

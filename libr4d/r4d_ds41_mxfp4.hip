@@ -770,8 +770,9 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
  * gemv kernel, or drafter_mx's gemv form), so a drafter pass's bits do not depend on how many sequences it carries. */
 int g_mx_gemv_all = 0;
 
-/* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. */
-int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
+/* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. `il` (lever WIL, moe_gemm_mxil):
+ * the weight is in the tile-interleaved layout its row stores, served by the IL forms alone (r4d_mx_mr_moe_il). */
+int mx_moe(const RadArgs* a, RadStream s, bool gemv, bool il = false) {
     if (g_mx_gemv_all) gemv = true;
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
@@ -819,6 +820,15 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
 #if R4D_MXDUMP
     mx_dump(of->data, (int)ne, (int)tokens, (int)T, s);
 #endif
+    if (il) {
+        if (ty != MX_FP4 || N % 16) return R4D_NO(RAD_E_SHAPE);
+        const R4dMxMrCall c{ (const uint16_t*)A_->data, x_ld, mx_al16(A_->data, x_ld) ? 1 : 0, (int)AR,
+                             table ? nullptr : (const uint8_t*)W->data, table ? (const uint8_t* const*)W->data : nullptr,
+                             w_ld, w_es, (uint16_t*)Y->data, y_ld, (const int32_t*)so->data, (const int32_t*)of->data,
+                             (int)T, (int)N, (int)K, (int)ne, (int)top_k, a_sorted ? 1 : 0, (int)tokens, false };
+        const int mr = r4d_mx_mr_moe_il(s, c);
+        return mr != R4D_MX_MR_DECLINE ? mr : R4D_NO(RAD_E_SHAPE);
+    }
     /* drafter_mx (r4d_ds41_mxfp4_mr.hip): the multi-row forms when switched on, in the summation order of the
      * stock path this call would run (the gemv band's lane partials, else the tiled kernel's one chain an
      * output); the same bits. What they decline runs the stock kernels below. */
@@ -885,6 +895,7 @@ extern "C" int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs* a, RadStream s) { retur
 extern "C" int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_gemm(a, s, false); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs* a, RadStream s) { return mx_moe(a, s, true); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_moe(a, s, false); }
+extern "C" int r4d_rad_moe_mxil(const RadArgs* a, RadStream s) { return mx_moe(a, s, false, true); }
 extern "C" void r4d_mx_gemv_order(int on) { g_mx_gemv_all = on ? 1 : 0; }
 
 #endif  /* R4D_MX_BLOCKS_ONLY */

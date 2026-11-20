@@ -314,6 +314,10 @@ struct MoeFP8 {
          * whole experts like bf16, read by moe_gemm_ggml. The type is each layer's and
          * projection's own (declare reads it), since a GGUF mixes them. */
         int     expert_ggml  = 0;
+        /* expert_ggml's op name for MXFP4 projections, null = moe_gemm_ggml. Lever WIL (deepseek41's DSpark
+         * drafter, RADIANCE_DS41_DSPARK_WIL=1): "moe_gemm_mxil", the same values over libr4d's tile-interleaved
+         * stored form (its own layout hook, so these weights are read by that op alone). */
+        const char* expert_ggml_op = nullptr;
         /* The routed experts are IQR trellis planes (r4d_iqr.h; format 11): `moe_gemm_iqr` over one
          * table in expert order, the codes/trellis/mad planes and the kRowF32 scale pair. */
         int     expert_iqr   = 0;
@@ -1355,7 +1359,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                               RAD_INT("top_k", c.top_k), RAD_STR("a_order", order),
                                               RAD_STR("dtype", "bf16")),
                                    tab, (int)ne);
-            return rad_decl_op(b, "moe_gemm_ggml",
+            const bool il_op = c.expert_ggml_op && ggml_ty[i] && !strcmp(ggml_ty[i], "mxfp4");
+            return rad_decl_op(b, il_op ? c.expert_ggml_op : "moe_gemm_ggml",
                                RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", N),
                                           RAD_INT("K", K), RAD_INT("n_expert", ne),
                                           RAD_INT("top_k", c.top_k), RAD_STR("a_order", order),

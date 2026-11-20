@@ -12,6 +12,15 @@ int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs*, RadStream);
+/* lever WIL (DRAFTER track round 27): moe_gemm_mxil = moe_gemm_ggml type=mxfp4 over the tile-interleaved stored form
+ * (r4d_ds41_mxil_* hooks, tag "r4d_mxfp4_il16"), drafter_mx 5's forms and bytes. */
+int r4d_rad_moe_mxil(const RadArgs*, RadStream);
+int r4d_ds41_mxil_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                         const RadTensor* planes, int n_planes, RadLayout* out);
+int r4d_ds41_mxil_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                           const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes);
+int r4d_ds41_mxil_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                             const void* src, int64_t src_bytes, const RadTensor* planes, int n_planes);
 
 /* -- operand descriptions (r4d_ds41_mxfp4_shapes.inc), libref's for type=mxfp4: the weight in its float
  * logical form. */

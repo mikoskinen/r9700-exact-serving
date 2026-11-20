@@ -455,6 +455,7 @@ struct Dsp {
     int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
     int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
     bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
+    bool wil = false;                     /* lever WIL (dsp_wil_env): the routed experts as moe_gemm_mxil (tile-interleaved) */
     int64_t ff_rank = 0;                  /* the routed experts' intermediate width on this rank (DEP: n_ff / world) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
@@ -469,6 +470,11 @@ struct Dsp {
     MoeFP8::Wire mw{};
     rad_weight fc = 0, main_norm = 0, norm = 0, mk1 = 0, mk2 = 0;
     rad_op c_tab = 0, c_fc = 0, c_norm = 0, sizing = 0;
+    /* lever FCS (RADIANCE_DS41_DSPARK_FCS; fn4 ds41_e2 bit 1): main_proj as this rank's column part (rows [rank P, (rank + 1) P)
+     * of the replicated fc, an operand view) into `cpart` + the row-interleaved all_gather into `c`, at <= fc_rows rows */
+    rad_op c_fcp = 0, c_fcg = 0;
+    rad_buf cpart = 0;
+    int64_t fc_part = 0, fc_rb = 0, fc_rows = 0;
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
     /* lever W1, the full-vocabulary walk (RADIANCE_DS41_DSPARK_WALK; walk_read_env): world > 1, a dspark_walk_step a
@@ -1766,6 +1772,22 @@ static int dsp_dep_env() {
     }();
     return v;
 }
+/* Lever WIL (DRAFTER track 19.11.2026 round 27): RADIANCE_DS41_DSPARK_WIL=1 (or on) at start declares the DSpark
+ * drafter's routed MXFP4 experts (gate_up and down, every stage) as moe_gemm_mxil instead of moe_gemm_ggml: libr4d stores
+ * those weights tile-interleaved at load (its relayout hook: 16-row x 1-block tiles of 272 bytes, the native blocks'
+ * bytes moved) and reads them with drafter_mx 5's forms on one 64-bit load a lane a block -- the same operations, so the
+ * outputs are drafter_mx 2 / 4 / 5's byte for byte (exact: no reference change); drafter_mx no longer picks these calls'
+ * form. xeon dbench (lever DEP's shapes, lq168 records, 300 passes): the experts' pass 1,091 -> 1,047 us at 32 tokens,
+ * 902 -> 848 at 40. Unset / 0: moe_gemm_ggml as published. Needs a kernel plugin serving moe_gemm_mxil (libr4d). */
+static int dsp_wil_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_WIL");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
 /* Lever DAW (DRAFTER track 19.11.2026 round 9): RADIANCE_DS41_DSPARK_AWM=1 (or on) at start declares the DSpark stages'
  * attention (the drafter's own block and every short block) with the int param wm_from 1: libr4d then runs every one of
  * those passes, at any row count, on the WMMA form the trunk's prefill takes (ds41_attn_sparse_sink_wm_kernel, a workgroup
@@ -2394,7 +2416,26 @@ static bool gq_declared() { return g_sw_gq_env.load(std::memory_order_relaxed) >
 static bool e2_declared() { return g_sw_e2_env.load(std::memory_order_relaxed) >= 0; }
 /* the live mask / flag, 0 where nothing was declared */
 static int gq_now() { return g_sw_gq_ok.load(std::memory_order_relaxed) ? g_sw_gq.load(std::memory_order_relaxed) : 0; }
-static bool e2_now() { return g_sw_e2_ok.load(std::memory_order_relaxed) && g_sw_e2.load(std::memory_order_relaxed) > 0; }
+static bool e2_now() { return g_sw_e2_ok.load(std::memory_order_relaxed) && (g_sw_e2.load(std::memory_order_relaxed) & 1); }
+/* Lever FCS (DRAFTER track 19.11.2026 round 26): the DSpark context pass's main_proj (dspark.fc, q8_0 5120 x 15360, replicated:
+ * 83.6 MB read on every rank every lane step; lq198 c32 tape 9: gg_wk3 168 us of the 261-us context pass) as E2's technique --
+ * rank r issues gemm_nt_ggml over rows [r D / W, (r + 1) D / W) of the replicated weight (an operand view: nothing loaded twice)
+ * into dspark_ctx_part, then one row-interleaved all_gather (row D / W) writes dspark_main whole on every rank. Exact: each
+ * output keeps gemm_nt_ggml's per-output sequence (xeon r26a: the call as 4 row-view slices vs the whole call, M 16..48, the
+ * decode band and the engine path at ds41_wmk 11: 0 bytes differ), the gather only copies. Declared by
+ * RADIANCE_DS41_DSPARK_FCS=1 (start value on), switched in process by fn4 ds41_e2 BIT 1 (values 2 / 3; bit 0 stays E2's
+ * Engram split); rows above fc_rows (prefill, the pfctx runs) keep the whole call. */
+static std::atomic<int> g_fcs_env{-2}, g_fcs_ok{0}, g_fcs_noted{0};
+static std::atomic<long long> g_fcs_passes{0}, g_fcs_rows{0};
+static bool fcs_declared() {
+    if (g_fcs_env.load(std::memory_order_relaxed) == -2) {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_FCS");
+        int unread = -2;
+        g_fcs_env.compare_exchange_strong(unread, e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : -1);
+    }
+    return g_fcs_env.load(std::memory_order_relaxed) == 1;
+}
+static bool fcs_now() { return g_fcs_ok.load(std::memory_order_relaxed) && (g_sw_e2.load(std::memory_order_relaxed) & 2); }
 /* Lever FUSE-R (ds41-fuse, 13.11.2026; zzzaql's AQL-stamped c8 on int14: gemm_nt_f32_tile -> router_scored 173 us and
  * router_scored -> scatter_small 172 us of dependent-launch gaps a decode step, both on the critical path): the trunk MoE
  * layers' router chain in fewer launches, each form the stock code with only the launch boundaries removed (libr4d
@@ -2730,8 +2771,9 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;   /* lever IX-NI: counted here, libr4d's */
     if (!std::strcmp(name, "ds41_gq"))   /* lever 1U-GQ */
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 */
-        return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 (bit 0) + lever FCS (bit 1): each bit needs its ops declared */
+        return value >= 0 && value <= 3 && (!(value & 1) || g_sw_e2_ok.load(std::memory_order_relaxed)) &&
+                       (!(value & 2) || g_fcs_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_prefetch"))   /* tp8 loop D24: >= 1 needs the reads declared */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_pf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_moe1"))   /* lever P: 1 needs the dk ops declared at some trunk layer */
@@ -2842,8 +2884,8 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         *applied = gq_now();
         return 1;
     }
-    if (!std::strcmp(name, "ds41_e2")) {
-        *applied = e2_now() ? 1 : 0;
+    if (!std::strcmp(name, "ds41_e2")) {   /* bit 0 E2, bit 1 FCS: what the issue reads */
+        *applied = (e2_now() ? 1 : 0) | (fcs_now() ? 2 : 0);
         return 1;
     }
     if (!std::strcmp(name, "ds41_moe1")) {   /* what the issue reads: 0 where nothing was declared */
@@ -4656,6 +4698,23 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                             "on every rank as width slices of %lld of %lld (expert tensor parallel; EP held %lld a rank)\n",
                     (long long)d.n_expert, (long long)d.ff_rank, (long long)c.n_ff, (long long)(d.n_expert / g.world));
     }
+    d.wil = false;
+    if (dsp_wil_env() < 0) {   /* lever WIL */
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WIL=%s is not 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_DSPARK_WIL"));
+        return RAD_E_INVAL;
+    }
+    if (dsp_wil_env() > 0) {
+        if (!rad_op_declared(b, "moe_gemm_mxil")) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WIL: no loaded kernel plugin serves moe_gemm_mxil\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        d.wil = true;
+        rad_note(b, "DSpark drafter routed experts tile-interleaved (lever WIL, RADIANCE_DS41_DSPARK_WIL): moe_gemm_mxil");
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever WIL (RADIANCE_DS41_DSPARK_WIL): the DSpark drafter's routed MXFP4 experts "
+                            "as moe_gemm_mxil (tile-interleaved weights; drafter_mx 5's operations and bytes)\n");
+    }
     if (dsp_awm_env() < 0) {   /* lever DAW */
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_AWM=%s is not 0 / off or 1 / on\n",
                 std::getenv("RADIANCE_DS41_DSPARK_AWM"));
@@ -4819,6 +4878,10 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = d.top_k;
     s.cfg.n_ff_exp = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: this rank's slice (MoeFP8's even ROW / COL shard) */
+    /* lever WIL: moe_gemm_mxil serves up to 512 tokens a call (drafter_mx's bound); a larger drafter block keeps moe_gemm_ggml */
+    if (d.wil && Q <= 512) s.cfg.expert_ggml_op = "moe_gemm_mxil";
+    else if (d.wil && l == d.base)
+        rad_note(b, "lever WIL: the drafter's %lld rows exceed moe_gemm_mxil's 512: moe_gemm_ggml kept", (long long)Q);
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;
@@ -4962,6 +5025,42 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                        RAD_F64("scale", 1.0), RAD_STR("dtype", "f32") },
                      {}, {}, { m.cs_a });
         d.c_fc = linear(b, m, T, d.fc, D, nt * D, d.src, d.c);
+        /* Lever FCS: this rank's column part of main_proj + the row-interleaved gather, beside the whole call (which serves rows
+         * above fc_rows and the switch's bit 1 off). Every rank must declare it (m.aw == world: no attention-zero rank), the weight
+         * a GGUF block type, the part whole 16-byte rows. */
+        const auto fty = m.wty.find(d.fc);
+        if (fcs_declared() && d.c_fc && g.world > 1 && m.aw == g.world && fty != m.wty.end() && !m.wsc.count(d.fc) &&
+            D % g.world == 0 && ((D / g.world) * 2) % 16 == 0) {
+            const int64_t P = D / g.world, R = std::min<int64_t>(T, kBiBand), rb = ggml_row_bytes(fty->second, nt * D);
+            if (rb > 0) {
+                d.cpart = decl_b(b, nm.f("dspark_ctx_part"), RAD_BF16, { R, P });
+                if (!d.cpart) return RAD_E_INVAL;
+                d.c_fcp = op(b, "gemm_nt_ggml",
+                             { RAD_RANGE("M", 1, R), RAD_INT("N", P), RAD_INT("K", nt * D), RAD_STR("type", fty->second),
+                               RAD_STR("dtype", g.dtype) },
+                             { d.fc }, { d.src }, { d.cpart });
+                d.c_fcg = d.c_fcp ? op(b, "all_gather",
+                                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", P, R * P), RAD_STR("dtype", "bf16"),
+                                         RAD_INT("row", P) },
+                                       {}, { d.cpart }, { d.c })
+                                  : 0;
+                if (d.c_fcp && d.c_fcg) {
+                    d.fc_part = P;
+                    d.fc_rb = rb;
+                    d.fc_rows = R;
+                }
+            }
+            if (!ctx->shape_probe) {
+                const bool ok = d.fc_rows > 0;
+                if (ok && !g_fcs_ok.exchange(1, std::memory_order_relaxed)) g_sw_e2.fetch_or(2, std::memory_order_relaxed);
+                if (ctx->rank == 0 && !g_fcs_noted.exchange(1, std::memory_order_relaxed))
+                    fprintf(stderr, "radiance: deepseek41: lever FCS (RADIANCE_DS41_DSPARK_FCS, fn4 ds41_e2 bit 1, now %d) %s: the DSpark "
+                                    "context pass's main_proj (%s %lld x %lld, replicated) as this rank's %lld-column part + one "
+                                    "row-interleaved all_gather at <= %lld rows\n",
+                            g_sw_e2.load(std::memory_order_relaxed), ok ? "declared" : "not declared (no library serves the part / the gather)",
+                            fty->second, (long long)D, (long long)(nt * D), (long long)P, (long long)R);
+            }
+        }
         d.c_norm = rmsnorm(b, m, T, d.main_norm, D, d.c, d.cn);
         for (auto& L : d.st) {
             L.d_kv = linear(b, m, T, L.wkv, hd, D, d.cn, d.ckv);
@@ -7358,7 +7457,7 @@ static void i11_declare(Model& m, const RadBuildCtx* ctx) {
     }
     if (e2_declared()) {
         g_sw_e2_ok.store(e2 > 0 ? 1 : 0, std::memory_order_relaxed);
-        if (e2 == 0) g_sw_e2.store(0, std::memory_order_relaxed);
+        if (e2 == 0) g_sw_e2.fetch_and(~1, std::memory_order_relaxed);   /* bit 1 is lever FCS's (dsp_declare) */
     }
     if (ctx->rank != 0) return;
     g_gq_layers.store(gq_declared() ? gq : 0, std::memory_order_relaxed);
@@ -7635,7 +7734,21 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
         }
     }
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
-    lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
+    if (d.c_fcp && d.c_fcg && T >= 1 && T <= d.fc_rows && fcs_now()) {   /* lever FCS: this rank's part + the gather */
+        RadOperand w = RAD_W(d.fc);
+        w.offset = (int64_t)m.g.rank * d.fc_part * d.fc_rb;   /* u8 elements of the stored rows = bytes */
+        w.rows = d.fc_part;
+        RAD_ISSUE_N(x, d.c_fcp, T, brows(d.src, T), w, brows(d.cpart, T));
+        RAD_ISSUE_N(x, d.c_fcg, T * d.fc_part, brows(d.cpart, T), brows(d.c, T));
+        if (rad_rank(x) == 0) {
+            const long long np = g_fcs_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+            const long long nr = g_fcs_rows.fetch_add(T, std::memory_order_relaxed) + T;
+            if (np == 1 || np % 65536 == 0)
+                fprintf(stderr, "radiance: deepseek41: lever FCS: %lld context passes split, %lld rows (this pass %lld rows)\n", np, nr,
+                        (long long)T);
+        }
+    } else
+        lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
     const bool kvfold = dmr_now() >= 2;   /* lever DMR 2 */
     for (const auto& L : d.st) {

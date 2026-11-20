@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,17 @@ extern "C" const char* r4d_mx_mr_last();
 extern "C" void r4d_mx_mr_cap(int tokens);
 extern "C" void r4d_mx_gemv_order(int on);
 extern "C" void r4d_mx_wm_slab(int bytes);
+extern "C" void r4d_mx_mr_il(int on);   /* lever WIL (round 27): the weights in the tile-interleaved layout */
+extern "C" void r4d_mx_mr_pg(int on);   /* lever XPG (round 28): the IL forms' grid at the resident capacity */
+static int g_il = 0;
+#ifdef R4D_XM_TL
+/* round 28: the IL forms' item timeline (libr4d built with -DR4D_XM_TL) */
+extern "C" void r4d_mx_tl(int on);
+extern "C" int r4d_mx_tl_reset();
+extern "C" int r4d_mx_tl_read(unsigned long long* out, int max);
+extern "C" void r4d_mx_wpe(int ab, int pd);
+#endif
+static int g_tl = 0;   /* --tl N: N passes of the item timeline after an IL form's timing */
 void r4d_mx_mr_set(int on);
 /* The a8 arms (COORDINATOR 19:52): libr4d's moe_gemm_mxfp4a8 (r4d_moe_mxfp4.hip body(): canonical planes, E2M1 codes as exact
  * E4M3 bytes, fp8 WMMA, the E8M0 and the activation scales folded in f32 a 32-group) on activations quantised by
@@ -186,6 +198,7 @@ struct Call {          /* one (stage, projection) launch */
     void* y = nullptr;
     Route rt;
     int p = 0, stage = 0;
+    void *wn = nullptr, *wi = nullptr;   /* the expert pointer tables: 17-byte rows / lever WIL's interleaved tiles */
     /* a8: quantised activations, the canonical planes' pointer tables (even / odd experts), its own args */
     void *aq = nullptr, *as = nullptr, *w8[2] = { nullptr, nullptr }, *s8[2] = { nullptr, nullptr };
     int64_t AR = 0, K = 0, N = 0;
@@ -212,7 +225,7 @@ struct Call {          /* one (stage, projection) launch */
     }
 };
 
-struct Form { std::string name; int on, h, r, mt, wn, grid; };
+struct Form { std::string name; int on, h, r, mt, wn, grid; int il = 0; int pg = 0; int wab = 0, wpd = 9; };
 
 /* ---- value comparison (a rule-B form against the stock bytes) */
 static float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
@@ -296,15 +309,28 @@ static std::vector<std::string> split(const std::string& s) {
     return v;
 }
 static bool parse_form(const std::string& n0, Form* f) {
-    f->name = n0; f->h = 4; f->r = 1; f->mt = 4; f->wn = 0; f->grid = 0;
+    f->name = n0; f->h = 4; f->r = 1; f->mt = 4; f->wn = 0; f->grid = 0; f->il = 0; f->pg = 0; f->wab = 0; f->wpd = 9;
     std::string n = n0;
+    /* a leading "wpeABpPD-" (bench, -DR4D_XM_TL builds): the IL gate_up's waves-per-EU form AB at PD */
+    { int ab = 0, pd = 0; size_t q = n.find('-');
+      if (n.rfind("wpe", 0) == 0 && q != std::string::npos && std::sscanf(n.c_str(), "wpe%dp%d", &ab, &pd) == 2) { f->wab = ab; f->wpd = pd; n = n.substr(q + 1); } }
+    /* a leading "pg-": lever XPG (the IL forms at the resident grid) */
+    if (n.rfind("pg-", 0) == 0) { f->pg = 1; n = n.substr(3); }
+    /* a leading "il-": the pinned form on lever WIL's tile-interleaved weights */
+    if (n.rfind("il-", 0) == 0) { f->il = 1; n = n.substr(3); }
     /* a trailing _gGRID: the grid cap */
     if (size_t q = n.find("_g"); q != std::string::npos) { f->grid = std::atoi(n.c_str() + q + 2); n = n.substr(0, q); }
     if (n == "stock") { f->on = 0; return true; }
     if (n == "rule") { f->on = -1; return true; }
     if (n == "mx2") { f->on = -2; return true; }   /* the switch drafter_mx 2, no pin */
     if (n == "mx4") { f->on = -7; return true; }   /* the switch drafter_mx 4 (round 10: 2's bytes, PD 9 at K >= 2048) */
-    if (n == "mx5") { f->on = -8; return true; }   /* the switch drafter_mx 5 (round 12, lever DTS: 4 + xm_wt PD 9 TS 4 below K 2048) */
+    if (n == "mx5") { f->on = -8; return true; }
+    if (n == "mx5il") { f->on = -9; return true; }   /* lever WIL: drafter_mx 5's forms on the tile-interleaved weights */
+    if (n == "mx5ilp") { f->on = -9; f->pg = 1; return true; }   /* lever XPG: mx5il at the resident grid */
+    if (n == "mx6") { f->on = -11; return true; }    /* the switch drafter_mx 6 (lever XPG: 5's forms at the resident grid) */
+    if (n == "mx6il") { f->on = -12; return true; }  /* drafter_mx 6 on the tile-interleaved weights (WIL + XPG) */
+    if (n == "mx7il") { f->on = -13; return true; }  /* drafter_mx 7 on the tile-interleaved weights (WIL + XPG + XWO) */
+    if (n == "mx4il") { f->on = -10; return true; }  /* lever WIL: drafter_mx 4's forms on the tile-interleaved weights */   /* the switch drafter_mx 5 (round 12, lever DTS: 4 + xm_wt PD 9 TS 4 below K 2048) */
     if (n == "a8") { f->on = -3; return true; }    /* fp8 quant + moe_gemm_mxfp4a8 a call */
     if (n == "mx3") { f->on = -6; return true; }   /* the switch drafter_mx 3 (xm_a8_kernel: fp8 x fp8 on the 17-byte blocks) */
     if (n == "a8g") { f->on = -4; return true; }   /* moe_gemm_mxfp4a8 only (activations quantised before) */
@@ -349,6 +375,14 @@ static bool parse_form(const std::string& n0, Form* f) {
     return false;
 }
 static void apply_form(const Form& f) {
+    g_il = f.on == -9 || f.on == -10 || f.on == -12 || f.on == -13 || f.il;
+    r4d_mx_mr_il(g_il);
+    r4d_mx_mr_pg(f.pg);
+#ifdef R4D_XM_TL
+    r4d_mx_wpe(f.wab, f.wpd);
+#endif
+    if (g_il && !f.il) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(f.on == -9 ? 5 : f.on == -12 ? 6 : f.on == -13 ? 7 : 4); g_a8 = 0; return; }
+    if (f.on == -11) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(6); g_a8 = 0; return; }
     g_a8 = f.on == -3 ? 1 : f.on == -4 ? 2 : f.on == -5 ? 3 : 0;
     if (g_a8) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(0); return; }
     if (f.on == -6) { r4d_mx_mr_pin(0, 0, 0, 0, 0, 0); r4d_mx_mr_set(3); return; }
@@ -359,6 +393,73 @@ static void apply_form(const Form& f) {
     else if (f.on < 0) { r4d_mx_mr_set(1); r4d_mx_mr_pin(-1, 0, 0, 0, 0, 0); }
     else { r4d_mx_mr_set(1); r4d_mx_mr_pin(1, f.h, f.r, f.mt, f.wn, f.grid); }
 }
+
+#ifdef R4D_XM_TL
+/* round 28: per call, N passes: the calls before it plain, then the call with the item timeline; medians over the passes of
+ * the span (first block entry -> last item end), the item time (start -> wave 0's end), the set-up before the first item,
+ * items in flight (peak, time-weighted mean), the time to reach 90 % of the peak (fill) and the time after the in-flight
+ * count last falls below half the peak (tail), blocks a WGP at once (max). Times in us from the steady clock. */
+static long long wclk_khz = 100000;
+static void tl_report(std::vector<Call>& calls, hipStream_t s, int passes, double khz) {
+    std::vector<unsigned long long> b(4 * 8192);
+    for (size_t i = 0; i < calls.size(); ++i) {
+        std::vector<double> sp, ip50, ip10, ip90, su, pk, mn, fi, ta, ev, wg, first;
+        int items = 0, idle = 0;
+        for (int p = 0; p < passes; ++p) {
+            for (size_t j = 0; j < i; ++j) calls[j].launch(s);
+            CK(hipStreamSynchronize(s));
+            r4d_mx_tl_reset(); r4d_mx_tl(1);
+            hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
+            CK(hipEventRecord(e0, s)); calls[i].launch(s); CK(hipEventRecord(e1, s));
+            CK(hipStreamSynchronize(s)); r4d_mx_tl(0);
+            float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1)); ev.push_back(ms * 1000.0);
+            hipEventDestroy(e0); hipEventDestroy(e1);
+            const int n = r4d_mx_tl_read(b.data(), 8192);
+            if (n <= 0) { std::printf("             tl call %zu: no records (%d)\n", i, n); break; }
+            const double us = 1000.0 / khz;   /* us a tick */
+            unsigned long long t0 = ~0ull, t1 = 0;
+            std::vector<std::pair<double, int>> evs; std::vector<double> dur, set;
+            std::map<unsigned, std::vector<std::pair<unsigned long long, unsigned long long>>> wgp;
+            items = 0; idle = 0;
+            unsigned long long fs = ~0ull;
+            for (int k = 0; k < n; ++k) {
+                const unsigned long long a = b[4 * k], c = b[4 * k + 1], d = b[4 * k + 2], h = b[4 * k + 3];
+                t0 = std::min(t0, a); t1 = std::max(t1, d);
+                if (((h >> 12) & 0xfffffull) == 0) { ++idle; continue; }
+                ++items; fs = std::min(fs, c);
+                evs.push_back({ (double)c, +1 }); evs.push_back({ (double)d, -1 });
+                dur.push_back((d - c) * us); set.push_back((c - a) * us);
+                const unsigned hw = (unsigned)(h >> 32);
+                const unsigned key = ((hw >> 10) & 0xfu) | (((hw >> 16) & 1u) << 4) | (((hw >> 18) & 7u) << 5);
+                wgp[key].push_back({ c, d });
+            }
+            if (!items) break;
+            std::sort(evs.begin(), evs.end());
+            int cur = 0, peak = 0; double area = 0, last = evs.front().first;
+            for (auto& x : evs) { area += cur * (x.first - last); last = x.first; cur += x.second; peak = std::max(peak, cur); }
+            const double span_t = (double)(t1 - t0);
+            /* fill: first time the count reaches 90 % of peak; tail: last time it is >= half the peak */
+            cur = 0; double tfill = -1, thalf = evs.front().first;
+            for (auto& x : evs) { cur += x.second; if (tfill < 0 && cur >= (peak * 9 + 9) / 10) tfill = x.first; if (cur >= (peak + 1) / 2) thalf = x.first; }
+            int wmax = 0;
+            for (auto& kv : wgp) {
+                std::vector<std::pair<unsigned long long, int>> q;
+                for (auto& iv : kv.second) { q.push_back({ iv.first, +1 }); q.push_back({ iv.second, -1 }); }
+                std::sort(q.begin(), q.end());
+                int c2 = 0; for (auto& x : q) { c2 += x.second; wmax = std::max(wmax, c2); }
+            }
+            std::sort(dur.begin(), dur.end()); std::sort(set.begin(), set.end());
+            sp.push_back(span_t * us); ip50.push_back(dur[dur.size() / 2]); ip10.push_back(dur[dur.size() / 10]); ip90.push_back(dur[dur.size() * 9 / 10]);
+            su.push_back(set[set.size() / 2]); pk.push_back(peak); mn.push_back(area / std::max(1.0, (double)(t1 - fs)));
+            fi.push_back((tfill - (double)t0) * us); ta.push_back(((double)t1 - thalf) * us); wg.push_back(wmax); first.push_back(((double)fs - (double)t0) * us);
+        }
+        auto md = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        std::printf("             tl s%d.%s: event %.1f us, span %.1f | items %d (+%d idle blocks) | item p10 / p50 / p90 %.1f / %.1f / %.1f | set-up p50 %.1f, first item at %.1f |"
+                    " in flight peak %.0f mean %.1f | fill (90 %% of peak) %.1f | tail (< half peak) %.1f | blocks a WGP max %.0f\n",
+                    calls[i].stage, kProj[calls[i].p].name, md(ev), md(sp), items, idle, md(ip10), md(ip50), md(ip90), md(su), md(first), md(pk), md(mn), md(fi), md(ta), md(wg));
+    }
+}
+#endif
 
 int main(int argc, char** argv) {
     std::string toks = "40,80", forms = "stock,rule", route = "synth";
@@ -388,6 +489,10 @@ int main(int argc, char** argv) {
         else if (a == "--wfile-width") wfw = std::atoll(nx().c_str());
         else if (a == "--route-x7") route_x7 = nx();
         else if (a == "--quad") quad = 1;
+        else if (a == "--tl") g_tl = std::atoi(nx().c_str());
+#ifdef R4D_XM_TL
+        else if (a == "--wpe") { const int ab = std::atoi(nx().c_str()); const int pd = std::atoi(nx().c_str()); r4d_mx_wpe(ab, pd); }
+#endif
         else { std::fprintf(stderr, "unknown %s\n", a.c_str()); return 2; }
     }
     if (model == "main") set_main(width);
@@ -409,6 +514,10 @@ int main(int argc, char** argv) {
     r4d_mx_gemv_order(gemv_order);   /* 1: every call in the gemv band's order (stock = mx_gemv_kernel at any tokens) */
     if (gemv_order) std::printf("gemv order at every token count: the reference is the stock gemv kernel\n");
     hipDeviceProp_t pr; CK(hipGetDeviceProperties(&pr, 0));
+#ifdef R4D_XM_TL
+    { int r = 0; if (hipDeviceGetAttribute(&r, hipDeviceAttributeWallClockRate, 0) == hipSuccess && r > 0) wclk_khz = r;
+      std::printf("timeline: steady clock %lld kHz\n", wclk_khz); }
+#endif
     std::printf("synth routing: pool %d, %d/10 of picks from it\n", g_pool, g_pin10);
     std::printf("dbench: %s, %d WGPs, %d MHz, mem %d MHz x %d bit; route %s; iters %d; stages %d; forms' token cap %d\n", pr.gcnArchName,
                 pr.multiProcessorCount, pr.clockRate / 1000, pr.memoryClockRate / 1000, pr.memoryBusWidth, route.c_str(), iters, stages, cap > 0 ? cap : 48);
@@ -419,6 +528,7 @@ int main(int argc, char** argv) {
     /* weights: stage x projection, 32 experts each, a pointer table; for the a8 arms also the canonical planes (E2M1 codes,
      * element 2i in the low nibble of byte i, [N, K/2]; E8M0 [N, K/32]) of the same values, even / odd experts' tables */
     void* wtab[12][2]; size_t ebytes[2];
+    void* wtabil[12][2] = {};   /* lever WIL: the same weights as 16-row x 1-block tiles of 272 bytes (xm_wm_kernel's IL note) */
     void* w8tab[12][2][2] = {}; void* s8tab[12][2][2] = {};
     /* --wfile (mxslice.py's canonical planes of one layer, expert after expert): the same weights at every stage, each stage its
      * own copy in device memory (no stage reads another's bytes from a cache) */
@@ -468,6 +578,30 @@ int main(int argc, char** argv) {
             for (int64_t e = 0; e < kE; ++e) ptrs[(size_t)e] = d + e * (int64_t)ebytes[p];
             CK(hipMalloc(&wtab[st][p], kE * sizeof(void*)));
             CK(hipMemcpy(wtab[st][p], ptrs.data(), kE * sizeof(void*), hipMemcpyHostToDevice));
+            {   /* lever WIL: the tile-interleaved copy (same size): tile (group g, block b) at (g UK + b) 272, lane L = row % 16 + 16 h
+                 * holds qs[4 h .. 4 h + 3], qs[8 + 4 h .. 8 + 4 h + 3] at 8 L, the 16 rows' scales at 256 + row % 16 */
+                const int64_t UK = P.K / 32;
+                std::vector<uint8_t> il(hw.size());
+                for (int64_t e = 0; e < kE; ++e)
+                    for (int64_t n = 0; n < P.N; ++n)
+                        for (int64_t b = 0; b < UK; ++b) {
+                            const uint8_t* q = hw.data() + ((e * P.N + n) * UK + b) * 17;
+                            uint8_t* t = il.data() + (size_t)(e * (int64_t)ebytes[p]) + ((n / 16) * UK + b) * 272;
+                            const int64_t r = n % 16;
+                            for (int h = 0; h < 2; ++h)
+                                for (int i = 0; i < 4; ++i) {
+                                    t[8 * (r + 16 * h) + i] = q[1 + 4 * h + i];
+                                    t[8 * (r + 16 * h) + 4 + i] = q[1 + 8 + 4 * h + i];
+                                }
+                            t[256 + r] = q[0];
+                        }
+                uint8_t* di = nullptr; CK(hipMalloc((void**)&di, il.size()));
+                CK(hipMemcpy(di, il.data(), il.size(), hipMemcpyHostToDevice));
+                std::vector<void*> pi((size_t)kE);
+                for (int64_t e = 0; e < kE; ++e) pi[(size_t)e] = di + e * (int64_t)ebytes[p];
+                CK(hipMalloc(&wtabil[st][p], kE * sizeof(void*)));
+                CK(hipMemcpy(wtabil[st][p], pi.data(), kE * sizeof(void*), hipMemcpyHostToDevice));
+            }
             if (want_a8) {
                 const int64_t nb = P.K / 32, cb = P.N * P.K / 2, sbb = P.N * nb;
                 std::vector<uint8_t> codes((size_t)(kE * cb)), sc((size_t)(kE * sbb));
@@ -531,7 +665,7 @@ int main(int argc, char** argv) {
         for (int st = 0; st < stages; ++st)
             for (int p = 0; p < 2; ++p) {
                 const Proj& P = kProj[p];
-                Call c; c.rt = rts[(size_t)st]; c.p = p; c.stage = st;
+                Call c; c.rt = rts[(size_t)st]; c.p = p; c.stage = st; c.wn = wtab[st][p]; c.wi = wtabil[st][p];
                 const int64_t TR = (int64_t)c.rt.sorted.size(), AR = P.sorted_rows ? TR : tk, rb = P.K / 32 * 17;
                 std::vector<uint16_t> hx((size_t)(AR * P.K));
                 uint64_t rs = 0x777ull + (uint64_t)tk + 7919ull * (uint64_t)(2 * st + p);
@@ -567,6 +701,7 @@ int main(int argc, char** argv) {
         double stock_pass = 0;
         for (const Form& f : fl) {
             apply_form(f);
+            for (auto& c : calls) c.ts[1].data = g_il ? c.wi : c.wn;
             /* correctness: each call once, bytes vs the stock path's */
             bool same = true; std::string formdesc;
             DiffStats dst; long long rbn = 0; int rb_fail = 0, vs_a8 = 0, vs_a8_n = 0, vs_m2 = 0, vs_m2_n = 0;
@@ -585,7 +720,7 @@ int main(int argc, char** argv) {
                 CK(hipMemcpy(got.data(), calls[i].y, calls[i].ybytes, hipMemcpyDeviceToHost));
                 if (f.on == -3 && outa8[i].empty()) outa8[i] = got;
                 if (f.on == -2 && outmx2[i].empty()) outmx2[i] = got;
-                if ((f.on == -7 || f.on == -8 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
+                if ((f.on == -7 || f.on == -8 || f.on == -9 || f.on == -10 || f.on == -11 || f.on == -12 || f.on == -13 || (f.on == 1 && (f.h >= 16384 || (f.h >= 1024 && f.h < 4096)))) && !outmx2[i].empty()) { vs_m2 += got != outmx2[i] ? 1 : 0; vs_m2_n++; }
                 if (f.on == -6 && !outa8[i].empty()) {
                     const size_t nv = (size_t)(calls[i].rt.live * kProj[calls[i].p].N) * 2;
                     vs_a8 += std::memcmp(got.data(), outa8[i].data(), std::min(nv, got.size())) ? 1 : 0;
@@ -663,6 +798,9 @@ int main(int argc, char** argv) {
                 std::printf("             EP (4 ranks' records a stage): critical (slowest rank a stage) %.1f us a pass, mean rank %.1f |%s\n", crit, mean, per.c_str());
             }
             if (f.on != 0 && !same && !((f.h >= 1024 || f.on == -2 || f.on == -6 || f.on == -7 || f.on == -8) && g_rb) && f.on > -3) ++fails;
+#ifdef R4D_XM_TL
+            if (g_tl > 0 && g_il) tl_report(calls, s, g_tl, (double)wclk_khz);
+#endif
             std::fflush(stdout);
         }
         apply_form(fl[0]);

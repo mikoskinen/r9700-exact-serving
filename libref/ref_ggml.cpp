@@ -326,4 +326,112 @@ extern "C" int64_t ref_ggml_block(const char* type) {
     return k ? k->block : 0;
 }
 
+/* moe_gemm_mxil (libr4d's lever WIL, DRAFTER track 19.11.2026 round 27): moe_gemm_ggml at type mxfp4 with each expert's
+ * native blocks moved into 16-row x 1-block tiles of 272 bytes -- tile (row group g, block b) at (g nb + b) 272: for lane
+ * L = r + 16 h, qs[4 h .. 4 h + 3] and qs[8 + 4 h .. 8 + 4 h + 3] of the group's row r at 8 L, then the 16 rows' E8M0 at
+ * 256 + r. The same stored form and tag as libr4d's (r4d_ds41_ggml_layout.cpp), so a weight both read is stored once;
+ * the kernel moves each expert's bytes back and is ref_moe_gemm_ggml (the same values, the same outputs). */
+namespace {
+constexpr int64_t kMxilTile = 272;
+void mxil_pack(const uint8_t* blk, uint8_t* dst, int64_t rows, int64_t nb) {
+    for (int64_t g = 0; g < rows / 16; ++g)
+        for (int64_t b = 0; b < nb; ++b) {
+            uint8_t* t = dst + (g * nb + b) * kMxilTile;
+            for (int64_t r = 0; r < 16; ++r) {
+                const uint8_t* q = blk + ((16 * g + r) * nb + b) * 17;
+                for (int h = 0; h < 2; ++h) {
+                    std::memcpy(t + 8 * (r + 16 * h), q + 1 + 4 * h, 4);
+                    std::memcpy(t + 8 * (r + 16 * h) + 4, q + 9 + 4 * h, 4);
+                }
+                t[256 + r] = q[0];
+            }
+        }
+}
+void mxil_unpack(const uint8_t* src, uint8_t* blk, int64_t rows, int64_t nb) {
+    for (int64_t g = 0; g < rows / 16; ++g)
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint8_t* t = src + (g * nb + b) * kMxilTile;
+            for (int64_t r = 0; r < 16; ++r) {
+                uint8_t* q = blk + ((16 * g + r) * nb + b) * 17;
+                for (int h = 0; h < 2; ++h) {
+                    std::memcpy(q + 1 + 4 * h, t + 8 * (r + 16 * h), 4);
+                    std::memcpy(q + 9 + 4 * h, t + 8 * (r + 16 * h) + 4, 4);
+                }
+                q[0] = t[256 + r];
+            }
+        }
+}
+bool mxil_type(const RadParam* p, int n_p) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    return t && t->kind == RAD_P_STR && t->sval && !std::strcmp(t->sval, "mxfp4");
+}
+}  // namespace
+
+extern "C" int ref_mxil_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                               const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (!mxil_type(p, n_p)) return RAD_E_DTYPE;
+    const int rc = ref_ggml_layout(p, n_p, operand, enc, sel, planes, n_planes, out);
+    if (rc != RAD_OK) return rc;
+    if (out->shape[0] % 16) return RAD_E_SHAPE;
+    out->tag = "r4d_mxfp4_il16";
+    return RAD_OK;
+}
+
+extern "C" int ref_mxil_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                 const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (!mxil_type(p, n_p)) return RAD_E_DTYPE;
+    const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
+    if (K <= 0 || K % 32 || rows <= 0 || rows % 16) return RAD_E_SHAPE;
+    const int64_t nb = K / 32;
+    if (dst_bytes < rows * nb * 17) return RAD_E_SHAPE;
+    std::vector<uint8_t> blk((size_t)(rows * nb * 17));
+    const int rc = ref_ggml_relayout(p, n_p, operand, enc, sel, planes, n_planes, blk.data(), (int64_t)blk.size());
+    if (rc != RAD_OK) return rc;
+    mxil_pack(blk.data(), (uint8_t*)dst, rows, nb);
+    return RAD_OK;
+}
+
+extern "C" int ref_mxil_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                   const void* src, int64_t src_bytes, const RadTensor* planes, int n_planes) {
+    if (!mxil_type(p, n_p)) return RAD_E_DTYPE;
+    const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
+    if (K <= 0 || K % 32 || rows <= 0 || rows % 16) return RAD_E_SHAPE;
+    const int64_t nb = K / 32;
+    if (src_bytes < rows * nb * 17) return RAD_E_SHAPE;
+    std::vector<uint8_t> blk((size_t)(rows * nb * 17));
+    mxil_unpack((const uint8_t*)src, blk.data(), rows, nb);
+    return ref_ggml_unrelayout(p, n_p, operand, enc, sel, blk.data(), (int64_t)blk.size(), planes, n_planes);
+}
+
+/* The kernel: native-block weights (u8) moved back expert by expert into a table, then ref_moe_gemm_ggml; the float
+ * logical form has no arrangement and goes straight through. */
+int ref_moe_gemm_mxil(const RadArgs* a, RadStream s) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor& W = a->t[1];
+    if (W.dtype != RAD_U8) return ref_moe_gemm_ggml(a, s);
+    const int64_t N = p_int(a, "N", 0), K = p_int(a, "K", 0), ne = p_int(a, "n_expert", 0);
+    if (N <= 0 || N % 16 || K <= 0 || K % 32 || ne <= 0 || W.rank != 3 || W.shape[0] < ne || W.shape[1] != N)
+        return RAD_E_SHAPE;
+    const int64_t nb = K / 32, eb = N * nb * 17;
+    std::vector<std::vector<uint8_t>> nat((size_t)ne);
+    std::vector<void*> tab((size_t)ne);
+    for (int64_t e = 0; e < ne; ++e) {
+        RadTensor we = expert_entry(&W, e);
+        if (W.stride[0] != 0) we.data = (uint8_t*)W.data + e * eb;
+        if (!we.data) return RAD_E_STRIDE;
+        nat[(size_t)e].resize((size_t)eb);
+        mxil_unpack((const uint8_t*)we.data, nat[(size_t)e].data(), N, nb);
+        tab[(size_t)e] = nat[(size_t)e].data();
+    }
+    std::vector<RadTensor> ts(a->t, a->t + a->n_t);
+    ts[1].data = tab.data();
+    ts[1].stride[0] = 0;   /* a table of expert pointers, as the engine hands them */
+    RadArgs b = *a;
+    b.t = ts.data();
+    return ref_moe_gemm_ggml(&b, s);
+}
+int ref_moe_gemm_mxil_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_moe_gemm_ggml_shape(p, n_p, operand, out);
+}
+
 #endif /* REF_HAVE_GGML */

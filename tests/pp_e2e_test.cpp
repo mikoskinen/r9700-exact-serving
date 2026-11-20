@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -2136,6 +2137,97 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2 + RADIANCE_PP_NODE_IDLE_S=1 on both nodes): the node-idle time BY STRETCH -- with a BG
+ * step in flight or without -- beside D8's line, with newcomers lent whole to a BG lane (3 lanes, BG_LANE=1, W(1,3), the
+ * follower's one-layer segments): every request's tokens are one process's; each node's run line is D8's (the same text, so
+ * kit/d8cell.py reads it) and its by-stretch line splits it -- the two stretches' covered time and parts add up to the run
+ * line's, both nodes saw time with a BG step in flight, every share is a share -- and the lines come every second. */
+TEST(node_idle_by_stretch_splits_the_card_time_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    std::vector<std::string> env = kSplitEnv;
+    for (const char* v : { "RADIANCE_PP_BG_LANE=1", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                           "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_NODE_IDLE=2", "RADIANCE_PP_NODE_IDLE_S=1" })
+        env.push_back(v);
+    std::vector<std::string> ex = ext;
+    ex.push_back("--pp-lanes");
+    ex.push_back("3");
+    Serving pp;
+    REQUIRE(pp.start("1,3", ex, env));
+    const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+    kill(pp.lead.child.pid, SIGTERM);
+    CHECK_EQ(pp.lead.finish(60), 0);
+    CHECK_EQ(pp.fol.finish(30), 0);
+    REQUIRE_EQ(ref.size(), got.size());
+    int differ = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        CHECK(!ref[i].empty());
+        if (ref[i] != got[i]) ++differ;
+    }
+    CHECK_EQ(differ, 0);
+    for (const auto& [log, who] : { std::pair<std::string, const char*>{ pp.lead.output(), "leader" },
+                                    std::pair<std::string, const char*>{ pp.fol.output(), "follower" } }) {
+        CHECK(log.find("RADIANCE_PP_NODE_IDLE=2 -- + the same time by stretch") != std::string::npos);
+        const std::string key = std::string("two-node pipeline, ") + who + " node idle (RADIANCE_PP_NODE_IDLE=2, tp8 dev D8): rank 0's card over ";
+        const std::string skey = std::string("two-node pipeline, ") + who + " node idle by stretch (RADIANCE_PP_NODE_IDLE=2, tp8 loop D45): "
+                                 "rank 0's card over ";
+        const auto occ = [&](const std::string& t) {
+            long long n = 0;
+            for (size_t q = log.find(t); q != std::string::npos; q = log.find(t, q + t.size())) ++n;
+            return n;
+        };
+        const long long n_lines = occ(key), n_split = occ(skey), n_sec = occ(key + "the last 1 s (");
+        CHECK(n_lines >= 2);           /* the run's + at least one 1-s window */
+        if (n_lines < 2 || n_sec < 1)
+            for (size_t q = log.find("NODE_IDLE"); q != std::string::npos; q = log.find("NODE_IDLE", q + 9)) {
+                const size_t a0 = log.rfind('\n', q), a1 = log.find('\n', q);
+                fprintf(stderr, "    %s: %s\n", who, log.substr(a0 == std::string::npos ? 0 : a0 + 1, std::min<size_t>(260, a1 - a0)).c_str());
+                q = a1 == std::string::npos ? q : a1;
+            }
+        CHECK_EQ(n_split, n_lines);    /* a by-stretch line beside each */
+        CHECK(n_sec >= 1);
+        const size_t at = log.find(key + "the run (");
+        const size_t sat = log.find(skey + "the run: ");
+        CHECK(at != std::string::npos);
+        CHECK(sat != std::string::npos);
+        if (at == std::string::npos || sat == std::string::npos) continue;
+        const std::string line = log.substr(at + key.size(), log.find('\n', at) - at - key.size());
+        const std::string sline = log.substr(sat + skey.size(), log.find('\n', sat) - sat - skey.size());
+        double wall = -1, cov = -1, left = -1, part = -1, ppct = -1, wait = -1, wpct = -1, gap = -1;
+        long long idles = -1, parts = -1, recvs = -1;
+        CHECK_EQ(std::sscanf(line.c_str(), "the run (%lf s wall, %lf s covered; %lld gaps > %*s s left out, %lf s): in parts %lf s (%lf %%, "
+                             "%lld parts), of which waiting on the card for the other node's %*s %lf s (%lf %%, %lld receives); between "
+                             "parts %lf s", &wall, &cov, &idles, &left, &part, &ppct, &parts, &wait, &wpct, &recvs, &gap), 11);
+        double c[2] = { -1, -1 }, of[2] = { -1, -1 }, ip[2] = { -1, -1 }, wt[2] = { -1, -1 }, bt[2] = { -1, -1 }, wk[2] = { -1, -1 };
+        long long np[2] = { -1, -1 };
+        const int n = std::sscanf(sline.c_str(), "the run: with a BG step in flight %lf s covered (%lf %% of it): in parts %lf %% (%lld parts), "
+                                  "waiting on the card for the other node's %*s %lf %%, between parts %lf %% -> working %lf %%; without %lf s "
+                                  "covered (%lf %% of it): in parts %lf %% (%lld parts), waiting on the card for the other node's %*s %lf %%, "
+                                  "between parts %lf %% -> working %lf %%", &c[1], &of[1], &ip[1], &np[1], &wt[1], &bt[1], &wk[1], &c[0],
+                                  &of[0], &ip[0], &np[0], &wt[0], &bt[0], &wk[0]);
+        CHECK_EQ(n, 14);
+        fprintf(stderr, "    %s: %s\n    %s: %s\n", who, line.c_str(), who, sline.c_str());
+        if (n != 14) continue;
+        CHECK(c[1] > 0);                                   /* newcomers ran on the BG lane: both nodes saw BG time */
+        CHECK(std::fabs(c[0] + c[1] - cov) <= 0.15);       /* the stretches split the run's covered time (0.1-s rounding) */
+        CHECK(std::fabs(of[0] + of[1] - 100.0) <= 0.15);
+        CHECK_EQ(np[0] + np[1], parts);
+        for (int k = 0; k < 2; ++k) {
+            CHECK(ip[k] >= 0 && ip[k] <= 100.05 && bt[k] >= 0 && bt[k] <= 100.05 && wt[k] >= 0);
+            CHECK(std::fabs(ip[k] + bt[k] - (c[k] > 0 ? 100.0 : 0.0)) <= 0.15);
+            CHECK(wk[k] <= ip[k] + 0.05);
+        }
+    }
+}
+
 /* tp8 loop P22b (RADIANCE_PP_PF_TIMELINE=1 on the follower): a BG newcomer's body in one-layer segments with decode passes
  * between them is read on its own record -- one line a newcomer, every segment read ("(S read;" = its segments), its own
  * lane's X1 wait read, the passes between its segments counted -- and the follower prints the run's BG-body summary at stop
@@ -2967,6 +3059,80 @@ TEST(tail_band_passes_serve_one_process_tokens) {
             tb_all, off_all, skip_differ);
     CHECK(tb_all > 0);
     CHECK(off_all > 0);
+    CHECK(skip_differ > 0);
+}
+
+/* tp8 loop D39j2 step 1 (DECODE round 32, QUEUE D39j2): the engine's tail band at DEPTH 2 -- RADIANCE_LLAMA_PP_TBAND=2 declares
+ * layers t - 2 and t - 1 on the leader too; a BG step of fresh prompts runs W(0,3) as the follower over [0, 1), X2 at 1, then layer 1
+ * whole and layer 2's k / v from its own rows (the decode owner's keys of both band layers; llama's attention is not windowed, so
+ * the stand-in saves nothing -- this proves the engine's j = 2 plumbing: frames, the follower's pass end, the leader's tail from
+ * t - 2, the KV of both layers on the owner), the leader's tail from 1: every request's tokens = one process's at 3 lanes BG 1
+ * (whole, + follower segments) and 4 lanes BG 2 (FOL_ORDER 2); negative control: the follower's stores left out -> requests differ. */
+TEST(tail_band_at_depth_two_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; };
+    long long tb_all = 0;
+    int skip_differ = 0;
+    for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, false, false, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_LLAMA_PP_TBAND=2");
+        env.push_back("RADIANCE_PP_TAIL_BAND=1");
+        env.push_back("RADIANCE_PP_READY_FIRST=1");
+        if (a.fseg)
+            for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
+                env.push_back(v);
+        if (a.fo2) env.push_back("RADIANCE_PP_FOL_ORDER=2");
+        if (a.skip) env.push_back("RADIANCE_PP_TEST_TBAND_SKIP=1");
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start("0,3", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (ref[i] != got[i]) ++differ;
+        for (size_t i = 0; i < ref_b.size(); ++i)
+            if (ref_b[i] != got_b[i]) ++differ;
+        long long tb = -1;
+        const char* key = " lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                tb = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        fprintf(stderr, "    TAIL BAND DEPTH 2 (llama stand-in), %d lanes BG %d W(0,3)%s%s%s: %d of %zu requests differ; %lld lane steps ran as "
+                        "tail band passes\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.fo2 ? " + FOL_ORDER 2" : "",
+                a.skip ? " + the k / v stores LEFT OUT (negative control)" : "", differ, ref.size() + ref_b.size(), tb);
+        CHECK(tb > 0);
+        if (a.skip) {
+            skip_differ = differ;
+            continue;
+        }
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(differ, 0);
+        /* the engine's start line names the depth: the follower's pass ends at t - 2 = 1 */
+        CHECK(llog.find("RADIANCE_PP_TAIL_BAND=1 -- a BG lane's step of fresh prompts runs as a tail band pass") != std::string::npos);
+        tb_all += std::max(0LL, tb);
+    }
+    fprintf(stderr, "    depth-2 tail band passes, all arms: %lld; the negative control: %d requests differ\n", tb_all, skip_differ);
+    CHECK(tb_all > 0);
     CHECK(skip_differ > 0);
 }
 
