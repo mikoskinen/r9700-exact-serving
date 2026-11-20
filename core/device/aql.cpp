@@ -1999,7 +1999,11 @@ int waitk_mode() {
         return v;
     }();
     const int t = g_waitk_test.load(std::memory_order_relaxed);
-    return t >= 0 ? t : m;
+    if (t >= 0) return t;
+    /* tp8 loop W1s (PREFILL round 42): fn4 aql_waitk (106) once set, so a start A / Bs the lever in process; unset it is
+     * RADIANCE_AQL_WAITK's same parse (fn4_switch.cpp env_aql_waitk = waitk_mode_of), i.e. m. */
+    const int sw = rad::fn4::aql_waitk();
+    return sw >= 0 ? sw : m;
 }
 void waitk_line(int mode) {
     using clk = std::chrono::steady_clock;
@@ -4290,6 +4294,7 @@ WaitkCounts waitk_counts() {
     return c;
 }
 void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
+int waitk_mode_now() { return waitk_mode(); }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4709,6 +4714,7 @@ bool ride_reusable(void*) { return false; }
 /* ... and issues no wait kernel (tp8 loop W1). */
 WaitkCounts waitk_counts() { return WaitkCounts{}; }
 void waitk_set_for_test(int) {}
+int waitk_mode_now() { return 0; }
 }  // namespace aql
 }  // namespace rad
 

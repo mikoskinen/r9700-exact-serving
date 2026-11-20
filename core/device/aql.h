@@ -78,7 +78,8 @@ void set_next_fence(uint8_t f);
  * signal is still pending when it is enqueued gets a one-wave wait kernel (aql_blit.hip) on the waiting stream ahead of
  * its unchanged barrier-AND, so the packet processor never holds a pending barrier (one costs every other queue of its
  * CP pipe ~+40 us a packet, FINDINGS DRAFTER note 00:18 21.11.). The start value: unset / empty / 0 / negative / not a
- * number = off, 1 = event waits (rad_event_wait), 2 or more = event + ride waits (rad_ride_wait). */
+ * number = off, 1 = event waits (rad_event_wait), 2 or more = event + ride waits (rad_ride_wait). In process: fn4 aql_waitk
+ * (switch 106, tp8 loop W1s) 0 / 1 / 2 replaces the start value from the step it is applied at. */
 inline int waitk_mode_of(const char* env) {
     if (!env || !*env) return 0;
     char* end = nullptr;
@@ -106,6 +107,9 @@ WaitkCounts waitk_counts();
 bool ride_reusable(void* token);
 /* tests/device_test.cpp: replaces RADIANCE_AQL_WAITK's start value for this process; -1 = the start value again. */
 void waitk_set_for_test(int mode);
+/* The mode the next wait runs at: the test value, else fn4 aql_waitk once set (tp8 loop W1s), else RADIANCE_AQL_WAITK's start value
+ * (0 in a build without the AQL backend). */
+int waitk_mode_now();
 
 }  // namespace aql
 }  // namespace rad

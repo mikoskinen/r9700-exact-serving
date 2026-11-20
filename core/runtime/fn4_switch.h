@@ -544,6 +544,14 @@
  *                   0 -- every share on the pass's stream, as before. The ring's bytes are the same either way (a copy's order only).
  *                   Needs RADIANCE_PP_SEND_ASH=N at start (the staging buffers, kept by the budget on every rank; passes of >= N
  *                   rows issued live), which starts it at 1; without the env 1 is refused. The follower takes the leader's request.
+ *   aql_waitk       core, the AQL backend, BOTH nodes (tp8 loop W1s, PREFILL round 42; 106 here, after pp_send_ash): lever WAITK
+ *                   (DRAFTER round 49, reviewed in DECODE W1: core/device/aql.h) in process. 0 -- an event / ride wait is its
+ *                   barrier-AND alone, as before; 1 -- an event wait (rad_event_wait) whose signal is still pending at enqueue gets a
+ *                   one-wave wait kernel (an aside packet) on the waiting stream AHEAD of the unchanged barrier-AND, so the packet
+ *                   processor never holds a pending barrier (one costs every other queue of its CP pipe ~+40 us a packet); 2 -- 1, and
+ *                   ride waits (rad_ride_wait) too. Scheduling only: no kernel's bytes change (rule A). Read at every wait; nothing
+ *                   is allocated, so 1 / 2 are taken without the env. Unset: the start's RADIANCE_AQL_WAITK (0 / 1 / 2, the parse of
+ *                   rad::aql::waitk_mode_of). A follower switch (each node's own waits). A tape capture keeps its waits plain either way.
  *   sched_lane_room scheduler (tp8 loop D56; 104 here, after ds41_csplit): 0 -- a lane's admission room gates (a fresh prompt's whole
  *                   rest, a preempted request's whole recompute, beside every runner's rest of prompt + a block each) count the asking
  *                   lane's running requests, as before; 1 -- they count every lane's (each lane's running set and the ones its plan left
@@ -787,7 +795,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -918,6 +926,9 @@ int  aql_hdp();
 /* tp8 loop P46 (pp_send_ash): the switch once set, else 1 where RADIANCE_PP_SEND_ASH=N allocated the staging buffers (0 = off); the
  * engine writes it into this node's send rings (RadPpRing::ash_on) whenever a switch changes. */
 int  pp_send_ash();
+/* tp8 loop W1s (aql_waitk): the switch once set, else RADIANCE_AQL_WAITK at start (0 / 1 / 2; unset = 0); read at every event / ride
+ * wait the AQL backend enqueues (rad::aql's wait_ahead). */
+int  aql_waitk();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
