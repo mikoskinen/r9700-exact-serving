@@ -160,7 +160,8 @@ public:
         return bg_lane() >= 0 && bg_rows_n_ > 0 && bg_rows_n_ < max_seqs ? bg_rows_n_ : max_seqs;
     }
     void note_bg_rows_kept_locked() { ++bg_rows_kept_; }
-    /* tp8 loop D47b (RADIANCE_PP_LANE_ROWS=M, 1 .. 256; the same value on both nodes): a decode lane (not a BG lane) carves its
+    /* tp8 loop D47b (RADIANCE_PP_LANE_ROWS=M, 1 .. 256; the same value on both nodes): a decode lane (not a BG lane, not lane 0 =
+     * the MERGE target, which keeps --max-num-seqs rows) carves its
      * block tables for its own cards + M rows (its own sequences never exceed its cards: Scheduler::init's split), and
      * lane_split_own lends a piece into it only while its inbox holds fewer than M (else the piece stays home, as when its rows
      * do not fit). 0 (unset): --max-num-seqs, today. lane_rows(cards, max_seqs) = a decode lane's rows. */

@@ -261,9 +261,9 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                      lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not below --max-num-seqs");
     }
     if (const int64_t lm = LaneSet::lane_rows_env(); lm > 0)   /* tp8 loop D47b */
-        RAD_INFO("two-node pipeline: RADIANCE_PP_LANE_ROWS=%lld (tp8 loop D47b) -- a decode lane's step slab carves its block tables for "
-                 "its own cards + %lld rows (%lld at --max-num-seqs %lld over %d decode lanes), and takes a lent piece only while its "
-                 "inbox holds fewer than %lld", (long long)lm, (long long)lm,
+        RAD_INFO("two-node pipeline: RADIANCE_PP_LANE_ROWS=%lld (tp8 loop D47b) -- a decode lane's step slab (lanes 1 ..; lane 0, the MERGE "
+                 "target, keeps --max-num-seqs) carves its block tables for its own cards + %lld rows (%lld at --max-num-seqs %lld over %d "
+                 "decode lanes), and takes a lent piece only while its inbox holds fewer than %lld", (long long)lm, (long long)lm,
                  (long long)LaneSet::lane_rows(cfg_.max_seqs / std::max(1, n_lanes_ - lanes_.bg_n()), lm, cfg_.max_seqs),
                  (long long)cfg_.max_seqs, n_lanes_ - lanes_.bg_n(), (long long)lm);
     if (lanes_.bg_lane() >= 0)

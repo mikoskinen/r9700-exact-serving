@@ -3831,7 +3831,7 @@ TEST(lane_rows_cap_the_decode_lanes_slabs_and_serve_one_process_tokens) {
                     (int)slab_f);
             CHECK_EQ(differ, 0);
             if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
-            CHECK(llog.find("RADIANCE_PP_LANE_ROWS=" + std::to_string(m) + " (tp8 loop D47b) -- a decode lane's step slab carves") != std::string::npos);
+            CHECK(llog.find("RADIANCE_PP_LANE_ROWS=" + std::to_string(m) + " (tp8 loop D47b) -- a decode lane's step slab (lanes 1 ..; lane 0, the MERGE target, keeps") != std::string::npos);
             CHECK(llog.find("the lanes' step slabs at their block-table rows (RADIANCE_PP_BG_ROWS 0 / RADIANCE_PP_LANE_ROWS " +
                             std::to_string(m)) != std::string::npos);
             CHECK(slab_l);
@@ -3880,9 +3880,29 @@ TEST(lane_rows_cap_the_decode_lanes_slabs_and_serve_one_process_tokens) {
     fprintf(stderr, "    BG_ROWS=1 + LANE_ROWS=1, 4 lanes W(1,3) BG 1: %d of %zu requests differ; slab lines 4 rows %d, 5 rows %d, 1 row %d\n", differ,
             ref2.size(), (int)s4, (int)s5, (int)s1);
     CHECK_EQ(differ, 0);
-    CHECK(s4);
-    CHECK(s5);
+    CHECK(s4);   /* lane 1: 3 cards + 1 (lane 0, the MERGE target, keeps 10) */
+    CHECK(s5);   /* lane 2: 4 cards + 1 */
     CHECK(s1);
+    /* + the MERGE target: RADIANCE_PP_MERGE=2 (the decode lanes merged into lane 0 always: it holds every card) beside both rows caps;
+     * lane 0 keeps --max-num-seqs rows, so the merged lane's steps of all the sequences build */
+    std::vector<std::string> envm = env;
+    envm.push_back("RADIANCE_PP_MERGE=2");
+    Serving pm;
+    REQUIRE(pm.start("1,3", ex, envm));
+    const std::vector<std::vector<int32_t>> gotm = bg_room_set(pm.port);
+    kill(pm.lead.child.pid, SIGTERM);
+    CHECK_EQ(pm.lead.finish(60), 0);
+    CHECK_EQ(pm.fol.finish(30), 0);
+    const std::string mlog = pm.lead.output();
+    REQUIRE_EQ(ref2.size(), gotm.size());
+    int differm = 0;
+    for (size_t i = 0; i < ref2.size(); ++i) if (ref2[i] != gotm[i]) ++differm;
+    const bool merged = mlog.find("tp8 MERGE") != std::string::npos;
+    fprintf(stderr, "    + RADIANCE_PP_MERGE=2: %d of %zu requests differ; merge lines %d; refused builds %d\n", differm, ref2.size(), (int)merged,
+            (int)(mlog.find("exceeds this lane's block tables") != std::string::npos));
+    CHECK_EQ(differm, 0);
+    CHECK(mlog.find("exceeds this lane's block tables") == std::string::npos);
+    CHECK(mlog.find("lent pieces in its inbox beside") == std::string::npos);
 }
 
 /* tp8 loop D15: RADIANCE_PP_FOL_ORDER (the follower) -- between a split pass's segments, bit 1: another lane's decode frame is
