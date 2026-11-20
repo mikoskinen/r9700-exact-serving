@@ -4798,6 +4798,64 @@ static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
         const double us = st_time_us([&](int) { l.r->launch(&a, nullptr); }, iters, nullptr);
         std::printf("  %-62s %8.1f us\n", l.what, us);
     }
+    /* Qwen loop round 3 (FINDINGS F7): the fused launch's own split and its row-tile form (bench-only params rg_notail /
+     * rg_mt; libr4d r4d_moe.hip RgGeom): the GEMM part alone (no arrival, no ranking) at 1 / 2 / 4 row tiles a block, the
+     * whole launch at 2 / 4, then every output byte of rg_mt 2 / 4 against rg_mt 1 (outputs poisoned 0x5a before each run;
+     * an rg_mt 1 vs 1 control first). */
+    {
+        const L& f = ls[0];
+        auto run = [&](long long mt, long long notail, bool timed, const char* what) -> bool {
+            std::vector<RadParam> ps = f.ps;
+            if (mt > 1) ps.push_back(PI("rg_mt", mt));
+            if (notail) ps.push_back(PI("rg_notail", 1));
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            std::vector<RadTensor> ts = f.ts;
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1; a.instance = f.inst;
+            int rc = f.r->launch(&a, nullptr);
+            if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+            if (rc != RAD_OK) { std::printf("  %-62s refused (rc %d)\n", what, rc); return false; }
+            if (timed) {
+                const double us = st_time_us([&](int) { f.r->launch(&a, nullptr); }, iters, nullptr);
+                std::printf("  %-62s %8.1f us\n", what, us);
+            }
+            return true;
+        };
+        for (long long mt : { 1LL, 2LL, 4LL })
+            (void)run(mt, 1, true, fmt("fused, GEMM part only (rg_notail), rg_mt %lld", mt).c_str());
+        for (long long mt : { 2LL, 4LL })
+            (void)run(mt, 0, true, fmt("fused, whole launch, rg_mt %lld (row tiles a block)", mt).c_str());
+        struct B { void* d; size_t n; const char* name; };
+        const B outs[] = { { d_lg, (size_t)(M * ne * 2), "logits" }, { d_g, (size_t)(M * 2), "gate" },
+                           { d_id, (size_t)(NS * 4), "ids" }, { d_ew, (size_t)(NS * 2), "weights" },
+                           { d_so, (size_t)(NS * 4), "sorted" }, { d_of, (size_t)((nl + 1) * 4), "offsets" },
+                           { d_cn, (size_t)(nl * 4), "counts" }, { d_inv, (size_t)(NS * 4), "inverse" } };
+        auto grab = [&](long long mt, std::vector<std::vector<uint8_t>>& h) -> bool {
+            for (const B& b : outs) st_memset(b.d, 0x5a, b.n);
+            if (st_stream_sync(nullptr) != hipSuccess) return false;
+            if (!run(mt, 0, false, fmt("fused, rg_mt %lld (bytes)", mt).c_str())) return false;
+            h.assign(sizeof(outs) / sizeof(outs[0]), {});
+            for (size_t i = 0; i < h.size(); ++i) {
+                h[i].resize(outs[i].n);
+                st_memcpy(h[i].data(), outs[i].d, outs[i].n, hipMemcpyDeviceToHost);
+            }
+            return true;
+        };
+        std::vector<std::vector<uint8_t>> ref, got;
+        if (grab(1, ref)) {
+            for (long long mt : { 1LL, 2LL, 4LL }) {
+                if (!grab(mt, got)) continue;
+                std::string diff;
+                for (size_t i = 0; i < ref.size() && diff.empty(); ++i)
+                    for (size_t j = 0; j < ref[i].size(); ++j)
+                        if (ref[i][j] != got[i][j]) { diff = fmt("%s byte %zu (0x%02x vs 0x%02x)", outs[i].name, j, ref[i][j], got[i][j]); break; }
+                const std::string what = fmt("router_gemm_topk_scatter_inv M=%lld: rg_mt %lld vs 1", (long long)M, mt);
+                std::printf("  %s: %s\n", what.c_str(), diff.empty() ? "every output byte identical" : ("DIFFERENT at " + diff).c_str());
+                ok(what.c_str(), diff.empty(), diff.c_str());
+            }
+        }
+    }
     rgi->fini(inst);
 }
 

@@ -3528,6 +3528,10 @@ struct RgGeom {
     uint32_t M, K, n_expert, n_local, top_k, lg_ld;
     int32_t  norm, base;
     uint32_t sk, tpb, nrb, skg;
+    /* Qwen loop round 3 (FINDINGS F7, bench only: the op params rg_mt / rg_notail, never declared by an architecture):
+     * `mt` 16-row tiles a block, one after the other (1 = today's grid; each tile's items, chains and split sums are
+     * today's, so the bytes are), `notail` 1 = return after the GEMM part (no arrival, no ranking: a timing split). */
+    uint32_t mt, notail;
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
@@ -3550,9 +3554,13 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     const int       N   = gb ? 1 : (int)g.n_expert;
     const uint32_t  nt0 = gb ? 0u : blockIdx.x * g.tpb;
     const uint16_t* Wb  = gb ? Wg : W;
-    const int       m0  = (int)(blockIdx.y * 16u);
+    const uint32_t  MT  = g.mt > 1u ? g.mt : 1u;
 
     const uint32_t items = nti * (uint32_t)SK;
+    for (uint32_t t = 0; t < MT; ++t) {
+    const int m0 = (int)((blockIdx.y * MT + t) * 16u);
+    if (m0 >= (int)g.M) break;
+    if (t > 0) __syncthreads();   /* the previous tile's reduction has read `red` */
     for (uint32_t it = wave; it < items; it += NW) {
         const uint32_t j = it / (uint32_t)SK, ks = it % (uint32_t)SK;
         const rg_v8f acc = rg_item(A, Wb, (int)g.M, (int)g.K, N, (int)((nt0 + j) * 16u), m0,
@@ -3576,6 +3584,8 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
             else    ((__hip_bfloat16*)lg)[(size_t)m * g.lg_ld + (size_t)n] = (__hip_bfloat16)v;
         }
     }
+    }   /* the block's row tiles */
+    if (g.notail) return;   /* bench split (rg_notail): the GEMM part only */
 
     /* ---- the last block ranks. Every store is made visible device-wide before the arrival is
      * published; the block completing the count resets it for the next launch and acquires the
@@ -3819,7 +3829,12 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
     g.norm = (int32_t)norm;          g.base = (int32_t)base;
     g.sk = (uint32_t)cr.sk;          g.tpb = (uint32_t)tpb;
     g.nrb = (uint32_t)nrb;           g.skg = wg ? (uint32_t)cg.sk : 0u;
-    const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
+    /* bench only (RgGeom note): row tiles a block, the GEMM part alone */
+    const long long rg_mt = r4d_geti_or(a, "rg_mt", 1);
+    g.mt = rg_mt >= 2 && rg_mt <= 8 ? (uint32_t)rg_mt : 1u;
+    g.notail = r4d_geti_or(a, "rg_notail", 0) != 0 ? 1u : 0u;
+    const long long rtiles = (M + 15) / 16;
+    const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((rtiles + g.mt - 1) / g.mt));
     /* The chained form (r4d_chain.h) where the row resolved with `chain`. */
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M);
 
