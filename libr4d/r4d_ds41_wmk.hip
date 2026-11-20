@@ -1338,6 +1338,28 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
         if constexpr (T != GG_Q8_0) { GG_WK3_AB(1, 3, 1, uint16_t, 1) GG_WK3_AB(4, 3, 1, uint16_t, 1) GG_WK3_AB(4, 2, 1, uint16_t, 1) }   /* round 35: q_b's plain GEMM at 33..48 rows (52499524); DG2's G2 NT 1 (6362180) */
 #undef GG_WK3_AB
     }
+    /* DRAFTER round 43 bench: IL-B (R4D_WK3_AB 384) at EVERY geometry the launch below serves for q6_K (bf16; f32 at KP 1, the head's),
+     * no fold; a geometry without an IL-B instance declines (never the stock kernel on the interleaved copy) */
+    if constexpr (T == GG_Q6_K) {
+        if (abo < 0 && ab == 384 && !pro) {
+#define GG_WK3_IL(KPV, NMV, NTV, DPV)                                                                                     \
+            if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2) {                                              \
+                if (f32out) {                                                                                             \
+                    if constexpr (KPV == 1) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float, 0, DPV, 384>), grid, dim3(256), lds, A); \
+                    return R4D_WK_DECLINE;                                                                                \
+                }                                                                                                         \
+                return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, 0, DPV, 384>), grid, dim3(256), lds, A);    \
+            }
+            GG_WK3_IL(1, 2, 2, 2) GG_WK3_IL(1, 3, 1, 2) GG_WK3_IL(1, 2, 1, 2)
+            GG_WK3_IL(2, 2, 2, 2) GG_WK3_IL(2, 3, 1, 2) GG_WK3_IL(2, 2, 1, 2)
+            GG_WK3_IL(4, 2, 2, 2) GG_WK3_IL(4, 3, 1, 2) GG_WK3_IL(4, 2, 1, 2)
+            GG_WK3_IL(1, 2, 2, 1) GG_WK3_IL(1, 3, 2, 1) GG_WK3_IL(1, 2, 1, 1) GG_WK3_IL(1, 3, 1, 1) GG_WK3_IL(1, 4, 1, 1)
+            GG_WK3_IL(2, 2, 2, 1) GG_WK3_IL(2, 3, 2, 1) GG_WK3_IL(2, 2, 1, 1) GG_WK3_IL(2, 3, 1, 1)
+            GG_WK3_IL(4, 2, 2, 1) GG_WK3_IL(4, 3, 2, 1) GG_WK3_IL(4, 2, 1, 1) GG_WK3_IL(4, 3, 1, 1)
+#undef GG_WK3_IL
+            return R4D_WK_DECLINE;
+        }
+    }
     if (dp2 && !pro) {   /* bit 23: DP 2 (bench) at the (NM, NT) the launch picks: (2, 2), (3, 1), bit 22's (2, 1) */
 #define GG_WK3_X2(KPV, NMV, NTV)                                                                                         \
         if (kp == KPV && nmt == NMV && nt == NTV) {                                                                       \
@@ -1503,7 +1525,7 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
         (void)hipDeviceSynchronize();
         long long dif = 0, tot = 0;
         for (int i = 0; i < nm; ++i) {
-            std::vector<uint8_t> a((size_t)M * y_ld[i] * ob), b(a.size());
+            std::vector<uint8_t> a((size_t)((M - 1) * y_ld[i] + Nv[i]) * ob), b(a.size());   /* round 43: a pair's second output is a column view: read its extent only */
             (void)hipMemcpy(a.data(), yd[i], a.size(), hipMemcpyDeviceToHost);
             (void)hipMemcpy(b.data(), sy[i], b.size(), hipMemcpyDeviceToHost);
             for (long long r = 0; r < M; ++r) {
@@ -1621,7 +1643,7 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
         (void)hipDeviceSynchronize();
         long long dif = 0, tot = 0;
         for (int i = 0; i < nm; ++i) {
-            std::vector<uint8_t> a((size_t)M * y_ld[i] * ob), b(a.size());
+            std::vector<uint8_t> a((size_t)((M - 1) * y_ld[i] + Nv[i]) * ob), b(a.size());   /* round 43: a pair's second output is a column view: read its extent only */
             (void)hipMemcpy(a.data(), yd[i], a.size(), hipMemcpyDeviceToHost);
             (void)hipMemcpy(b.data(), sy[i], b.size(), hipMemcpyDeviceToHost);
             for (long long r = 0; r < M; ++r) {
