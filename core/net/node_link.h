@@ -181,6 +181,17 @@ public:
     };
     Stats stats() const;
 
+    /* tp8 loop D51: this node's card load for the peer -- `pm` = rank 0's card working share over its recent window, in permille
+     * (-1 = none yet; the follower's engine sets it, core/pp_nodeidle.h recent_pm), sent every `period_ms` (0 = never, the default)
+     * as a heartbeat frame's aux (kLoadTag << 32 | pm), and only when the socket is free (a frame being written is the heartbeat).
+     * A heartbeat's aux was 0 before; a node that does not read it ignores it. peer_load: the peer's last report (permille, -1 =
+     * none came) and its age in ms. */
+    static constexpr uint64_t kLoadTag = 0x4c4f4144ull;   /* "LOAD" */
+    void set_load_period(int period_ms) { load_ms_.store(period_ms > 0 ? period_ms : 0, std::memory_order_relaxed); }
+    void set_load(int pm) { load_pm_.store(pm, std::memory_order_relaxed); }
+    int  peer_load(int* age_ms) const;
+    uint64_t load_reports_in() const { return peer_load_n_.load(std::memory_order_relaxed); }
+
     /* Called on the receive thread for every kData frame landed (ring id, seq); tests hook it. */
     std::function<void(int, uint64_t)> on_landed;
     /* Called on the receive thread for every control frame once started; true consumes it (it is
@@ -242,6 +253,10 @@ private:
     std::atomic<bool>       tx_torn_{ false };   /* a writer gave up mid-frame: no frame may follow */
     std::atomic<uint64_t>   tx_progress_ns_{ 0 };
     std::atomic<uint64_t>   released_{ 0 };
+    /* tp8 loop D51: this node's load report (set_load) and the peer's last one */
+    std::atomic<int>        load_ms_{ 0 }, load_pm_{ -1 }, peer_load_pm_{ -1 };
+    std::atomic<uint64_t>   peer_load_ns_{ 0 }, peer_load_n_{ 0 };
+    uint64_t                last_load_ns_ = 0;   /* the heartbeat thread's */
     uint64_t                due_k_ = 0, due_ns_ = 0, watch_ns_ = 0;   /* the proxy thread's */
     std::thread             rx_, proxy_, hb_;
     mutable std::mutex      st_mu_;

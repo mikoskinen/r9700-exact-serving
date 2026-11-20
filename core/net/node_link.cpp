@@ -654,6 +654,11 @@ void NodeLink::rx_loop() {
             ++st_.frames_in;
         }
         if (h.kind == kHeartbeat) {
+            if ((h.aux >> 32) == kLoadTag) {   /* tp8 loop D51: the peer's card load (permille) */
+                peer_load_pm_.store((int)(uint32_t)h.aux, std::memory_order_relaxed);
+                peer_load_ns_.store(now_ns(), std::memory_order_release);
+                peer_load_n_.fetch_add(1, std::memory_order_relaxed);
+            }
             std::lock_guard<std::mutex> sl(st_mu_);
             ++st_.heartbeats_in;
             continue;
@@ -820,7 +825,9 @@ void NodeLink::hb_loop() {
     const uint64_t hb = (uint64_t)o_.heartbeat_ms * 1000000ull;
     const uint64_t dead = (uint64_t)o_.dead_ms * 1000000ull;
     while (!stopping_.load(std::memory_order_acquire) && alive()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, o_.heartbeat_ms / 2)));
+        const int lms = load_ms_.load(std::memory_order_relaxed);   /* tp8 loop D51: a load report every lms ms */
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, lms > 0 ? std::min(lms, o_.heartbeat_ms / 2)
+                                                                                   : o_.heartbeat_ms / 2)));
         const uint64_t t = now_ns();
         /* Robustness 1(b): the silence check first, never behind the socket's lock. */
         const uint64_t rx = last_rx_ns_.load(std::memory_order_relaxed);
@@ -844,7 +851,24 @@ void NodeLink::hb_loop() {
              * heartbeat to the peer's receive thread. */
             if (write_frame(h, nullptr, 0, nullptr, 0, true) == RAD_E_IO) return;
         }
+        /* tp8 loop D51: this node's card load in a heartbeat's aux, when the socket is free (else the next turn tries) */
+        const int pm = load_pm_.load(std::memory_order_relaxed);
+        if (lms > 0 && pm >= 0 && t - last_load_ns_ >= (uint64_t)lms * 1000000ull) {
+            WireHdr h{};
+            h.kind = kHeartbeat;
+            h.aux = (kLoadTag << 32) | (uint64_t)(uint32_t)pm;
+            const int rc = write_frame(h, nullptr, 0, nullptr, 0, true);
+            if (rc == RAD_E_IO) return;
+            if (rc == RAD_OK) last_load_ns_ = t;
+        }
     }
+}
+
+int NodeLink::peer_load(int* age_ms) const {
+    const uint64_t at = peer_load_ns_.load(std::memory_order_acquire);
+    const int pm = peer_load_pm_.load(std::memory_order_relaxed);
+    if (age_ms) *age_ms = at ? (int)std::min<uint64_t>((now_ns() - at) / 1000000ull, 1u << 30) : -1;
+    return at ? pm : -1;
 }
 
 /* Robustness 2: this node's own stage owes a crossing payload -- the follower an X2 for an X1 that

@@ -1004,12 +1004,12 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpLeadSeg) {   /* tp8 loop D32 (LSP): the leader's */
-        if (v < 0 || v > 65535 || (v & 7) > 2) {
+        if (v < 0 || v > 131071 || (v & 7) > 2) {   /* tp8 loop F81: + 65536 = no position-order guard */
             if (err) *err = "pp_lead_seg takes form + 16 x stride (+ 256): form 0 (a BG step's leader parts whole), 1 (M9 segments as built) or 2 "
                             "(decode first), stride 0 .. 15 (every s-th declared boundary; 0 = 1); + 256 = no band passes (RADIANCE_PP_BAND's "
                             "fresh BG steps run W(h, t)'s, tp8 loop D36); + 8 = the tail whole, + 512 = the SP word on the head's segments "
                             "(tp8 loop D40); + 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N "
-                            "sequences (tp8 loop D49b)";
+                            "sequences (tp8 loop D49b); + 65536 = no position-order guard (tp8 loop F81)";
             return false;
         }
         const int cap = s.lseg_capable.load(std::memory_order_acquire);
@@ -1037,12 +1037,14 @@ static bool check_here(const std::string& name, int v, std::string* err) {
          * (loop lq215: the undo of {"pp_tband": 1} was refused and the start stopped, F67's case) -- taken everywhere */
         if (v == -1) return true;
         /* tp8 loop D50: 4 (3 in every stretch) and 4 + 1024 x N (N 1 .. 63: in a clean stretch only above N decoded sequences) */
-        if (v < 0 || (v > 4 && !(v > 1024 && v <= 4 + 1024 * 63 && (v & 1023) == 4))) {
+        /* tp8 loop D51: 5 (the band follows the measured bound: the follower's load report against the leader's own) */
+        if (v < 0 || (v > 5 && !(v > 1024 && v <= 4 + 1024 * 63 && (v & 1023) == 4))) {
             if (err) *err = "pp_tband takes -1 (back to the start's RADIANCE_PP_TAIL_BAND), 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's "
                             "fresh BG steps run W(h, t)'s, the band layer stays declared), 1 (they run as tail band passes; tp8 loop D39), 2 "
                             "(1 + the later chunks of a prompt whose every chunk so far ran as one; D39b), 3 (1 + a decode lane's step while a "
-                            "BG step is in flight, with the plugin's tail copy; D46), 4 (3 in every stretch; D50) or 4 + 1024 x N, N 1 .. 63 "
-                            "(3, and in a clean stretch while the decode lanes' last steps decoded > N sequences; D50)";
+                            "BG step is in flight, with the plugin's tail copy; D46), 4 (3 in every stretch; D50), 4 + 1024 x N, N 1 .. 63 "
+                            "(3, and in a clean stretch while the decode lanes' last steps decoded > N sequences; D50) or 5 (a decode step "
+                            "bands while the follower's card works more than the leader's: its load report, RADIANCE_PP_LOAD_REPORT_MS; D51)";
             return false;
         }
         const int cap = s.tband_capable.load(std::memory_order_acquire);

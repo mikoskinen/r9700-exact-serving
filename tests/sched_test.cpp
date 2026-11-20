@@ -3589,14 +3589,20 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK(!fn4::check("pp_lead_seg", 11, &err));
     CHECK(err.find("+ 8 = the tail whole, + 512 = the SP word") != std::string::npos);
     /* tp8 loop D49b: + 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N sequences; the
-     * form bits keep their rule (1027 = form 3 + 1024 refused); 65536 refused */
+     * form bits keep their rule (1027 = form 3 + 1024 refused) */
     CHECK(fn4::check("pp_lead_seg", 1024, &err));     /* form 0 + N 1: whole anyway */
     CHECK(fn4::check("pp_lead_seg", 1026, &err));     /* decode first, N 1 */
     CHECK(fn4::check("pp_lead_seg", 2 + 1024 * 12, &err));
     CHECK(fn4::check("pp_lead_seg", 65535 - 5, &err));   /* 65530 = 1018 + 1024 x 63 */
     CHECK(!fn4::check("pp_lead_seg", 1027, &err));
-    CHECK(!fn4::check("pp_lead_seg", 65536, &err));
     CHECK(err.find("+ 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N") != std::string::npos);
+    /* tp8 loop F81: + 65536 = no position-order guard (the negative control); 131072 and a bad form with it refused */
+    CHECK(fn4::check("pp_lead_seg", 65536, &err));
+    CHECK(fn4::check("pp_lead_seg", 34 + 65536, &err));
+    CHECK(fn4::check("pp_lead_seg", 65530 + 65536, &err));
+    CHECK(!fn4::check("pp_lead_seg", 131072, &err));
+    CHECK(!fn4::check("pp_lead_seg", 3 + 65536, &err));
+    CHECK(err.find("+ 65536 = no position-order guard") != std::string::npos);
     CHECK(!fn4::check("pp_lead_seg", -1, &err));
     fn4::lead_seg_register(false);
     CHECK(fn4::check("pp_lead_seg", 0, &err));
@@ -3650,13 +3656,15 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     CHECK(fn4::check("pp_tband", 4, &err));   /* tp8 loop D50: 3 in every stretch */
     CHECK(fn4::check("pp_tband", 4 + 1024, &err));        /* ... and 4 + 1024 x N, N 1 .. 63 */
     CHECK(fn4::check("pp_tband", 4 + 1024 * 63, &err));
-    for (const int bad : { 5, 1023, 1024, 1027, 1029, 3 + 1024 * 10, 4 + 1024 * 64, 2048 })
+    CHECK(fn4::check("pp_tband", 5, &err));   /* tp8 loop D51: the band follows the measured bound */
+    for (const int bad : { 6, 1023, 1024, 1027, 1029, 5 + 1024, 3 + 1024 * 10, 4 + 1024 * 64, 2048 })
         CHECK(!fn4::check("pp_tband", bad, &err));
-    CHECK(!fn4::check("pp_tband", 5, &err));
+    CHECK(!fn4::check("pp_tband", 6, &err));
     CHECK(err.find("pp_tband takes -1 (back to the start's RADIANCE_PP_TAIL_BAND), 0 (no tail band passes") != std::string::npos);
     CHECK(err.find("2 (1 + the later chunks") != std::string::npos);
     CHECK(err.find("3 (1 + a decode lane's step while a BG step is in flight") != std::string::npos);
-    CHECK(err.find("4 (3 in every stretch; D50) or 4 + 1024 x N, N 1 .. 63") != std::string::npos);
+    CHECK(err.find("4 (3 in every stretch; D50), 4 + 1024 x N, N 1 .. 63") != std::string::npos);
+    CHECK(err.find("or 5 (a decode step bands while the follower's card works more than the leader's") != std::string::npos);
     CHECK(fn4::check("pp_tband", -1, &err));    /* the never-set value, which the kit's arm undo POSTs back (loop lq215) */
     CHECK(!fn4::check("pp_tband", -2, &err));
     fn4::tband_register(false);
@@ -3668,6 +3676,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     CHECK(!fn4::check("pp_tband", 3, &err));
     CHECK(!fn4::check("pp_tband", 4, &err));
     CHECK(!fn4::check("pp_tband", 4 + 1024 * 10, &err));
+    CHECK(!fn4::check("pp_tband", 5, &err));
     fn4::tband_register(true);
     CHECK(fn4::check("pp_tband", 1, &err));
     CHECK(fn4::check("pp_tband", 2, &err));
@@ -3677,13 +3686,16 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     CHECK(!fn4::check("pp_tband", 4, &err));   /* tp8 loop D50: so are 4 / 4 + 1024 x N */
     CHECK(err.find("pp_tband=4 refused: the plugin declared no tail band copy") != std::string::npos);
     CHECK(!fn4::check("pp_tband", 4 + 1024 * 10, &err));
+    CHECK(!fn4::check("pp_tband", 5, &err));   /* tp8 loop D51: 5 too */
+    CHECK(err.find("pp_tband=5 refused: the plugin declared no tail band copy") != std::string::npos);
     fn4::tband_register(2);                    /* ... with it */
     CHECK(fn4::check("pp_tband", 3, &err));
     CHECK(fn4::check("pp_tband", 1, &err));
     CHECK(fn4::check("pp_tband", -1, &err));
     CHECK(fn4::check("pp_tband", 4, &err));
     CHECK(fn4::check("pp_tband", 4 + 1024 * 10, &err));
-    CHECK(!fn4::check("pp_tband", 5, &err));
+    CHECK(fn4::check("pp_tband", 5, &err));    /* tp8 loop D51 */
+    CHECK(!fn4::check("pp_tband", 6, &err));
     CHECK(!fn4::check("pp_tband", 3 + 1024 * 10, &err));
     fn4::tband_register(false);
 }

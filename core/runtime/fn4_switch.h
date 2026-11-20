@@ -489,6 +489,10 @@
  *                   decoded <= N sequences (Scheduler::decoded_seqs summed over the decode lanes); above N the step's parts run
  *                   whole as under form 0 -- so ONE value segments at c8 (the leader's BG head stops both decode lanes there,
  *                   lq218) and keeps c16 / c32's whole parts (lq207: segments -1.7..-6.4 % there). 0 = no load rule.
+ *                   Position-order guard (tp8 loop F81, on unless + 65536): a step whose prompt entries are not all WHOLE FRESH
+ *                   prompts (context 0, the prompt's last row, no snapshot / replay) runs its parts whole -- a piece of a longer
+ *                   prompt in segments let a later piece's head / tail run before its remaining segments (lq225 'all': layer 8's
+ *                   compressed-KV copy differed). + 65536 = no guard (the F75 / F81 form, a negative control only).
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all
@@ -523,6 +527,10 @@
  *                   band pass is W(h, t)'s decode: 4 is the in-process control of the published cut, 3 puts layer t on the follower in
  *                   the leader-bound clean stretches (lq222 D45: L 93-97 / F 82-90 % working at c4 .. c32) and on the leader in the
  *                   follower-bound BG ones, 4 + 1024 x N keeps it on the leader in clean stretches above N (c16 / c32).
+ *                   5 (tp8 loop D51) -- a held decode step bands while the FOLLOWER's card worked more than the leader's over the last
+ *                   RADIANCE_PP_TBAND_BOUND_MS (default 200) by > RADIANCE_PP_TBAND_BOUND_H permille (default 20; the follower's share
+ *                   from its heartbeat load report, RADIANCE_PP_LOAD_REPORT_MS=N on the follower, RADIANCE_PP_NODE_IDLE on both), not
+ *                   while the leader's did, else as the last step; no fresh report -> 3's rule. Where the band layer runs only (rule A).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head

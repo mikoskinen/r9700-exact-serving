@@ -545,6 +545,19 @@ private:
      * and the load */
     int64_t pp_tband_dec_clean_ = 0; /* decode lanes' band passes with no BG step in flight (pp_tband 4) */
     int64_t pp_tband_dec_low_ = 0;   /* clean-stretch decode steps 4 + 1024 x N kept W(h, t)'s at a load <= N */
+    int64_t pp_tband_dec_seen_ = 0;  /* decode lanes' steps pp_tband_step judged (the cell's denominator) */
+    std::string tband_text(const char* when) const;   /* the periodic / run-end counters line */
+    /* tp8 loop D51 (fn4 pp_tband 5): the decode band follows the MEASURED bound -- the follower's recent card working share (its
+     * heartbeat load report, RADIANCE_PP_LOAD_REPORT_MS on the follower) against the leader's own (RADIANCE_PP_NODE_IDLE on both):
+     * band once the follower works more by > pp_bound_h_ permille over the last pp_bound_ms_, keep the layer on the follower once
+     * the leader does, else the last decision; no fresh report -> 3's rule */
+    int  pp_bound_ms_ = 200, pp_bound_h_ = 20;   /* RADIANCE_PP_TBAND_BOUND_MS / _H */
+    int  pp_load_ms_ = 0;                        /* the follower: RADIANCE_PP_LOAD_REPORT_MS (0 = no report) */
+    bool pp_t5_on_ = false;
+    int64_t pp_t5_band_ = 0, pp_t5_keep_ = 0, pp_t5_fb_ = 0;
+    double  pp_t5_lsum_ = 0, pp_t5_fsum_ = 0;
+    bool pp_tband_by_bound(bool count);
+    std::string t5_text(const char* when) const;
     std::unordered_map<uint64_t, int64_t> pp_tcopy_seq_;   /* core/sched/tcopy.h Gap: -1 all written, p the last gap */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
