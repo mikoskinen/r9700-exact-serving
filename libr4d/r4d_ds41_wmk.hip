@@ -174,7 +174,9 @@ struct Wq6Il : Wq<GG_Q6_K> {
 template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1, int AB = 0>
 __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     const Wk3Tl wtl;
-    using W = std::conditional_t<(AB & 256) != 0, Wq6Il2, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;
+    /* lever Q8IL (round 44): AB 256 on q8_0 = its tile-interleaved form (Wq8Il) */
+    using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, Wq6Il2>, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;
+    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : kIl6;   /* bytes a tile-slab (IL-B) */
     using Pf = typename W::Pf;
     static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
@@ -213,7 +215,7 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     for (int nt = 0; nt < 2; ++nt) {
         const int n = n0 + ns * 32 + nt * 16 + c16;
         const long long nn = n < N ? n : N - 1;
-        if constexpr ((AB & 256) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6;
+        if constexpr ((AB & 256) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * ILB;
         else if constexpr ((AB & 128) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6 + (nn & 15) * kIl6R;
         else wr[nt] = wb + nn * A.w_ld;
     }
@@ -352,7 +354,11 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
             const long long t0 = (long long)(n0 + ns * 32) >> 4, tl = (long long)(N - 1) >> 4;
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
-                __builtin_amdgcn_s_prefetch_data(gg_sptr(wb + (std::min(t0 + nt, tl) * (long long)S + min(s + 3, S - 1)) * kIl6), 27);
+            {
+                const uint8_t* pp = gg_sptr(wb + (std::min(t0 + nt, tl) * (long long)S + min(s + 3, S - 1)) * ILB);
+                __builtin_amdgcn_s_prefetch_data(pp, 27);
+                if constexpr (ILB > 1792) __builtin_amdgcn_s_prefetch_data(pp + 1792, 5);   /* Q8IL: 2,176 bytes a tile-slab */
+            }
             return;
         }
         const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;
@@ -697,7 +703,8 @@ __global__ __launch_bounds__(256) void gg_il6_flush_kernel(const uint4* p, long 
 template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1, int AB = 0>   /* DP: as gg_wk_kernel's */
 __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
     const Wk3Tl wtl;
-    using W = std::conditional_t<(AB & 256) != 0, Wq6Il2, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;   /* round 42 bench: the tile-interleaved q6_K copies */
+    using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, Wq6Il2>, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;   /* round 42 bench: the tile-interleaved q6_K copies; Q8IL (round 44): q8_0's */
+    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : kIl6;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0 && !W::PIPE || W::TB == 0, "gg_wk3_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
@@ -725,7 +732,7 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
     for (int nt = 0; nt < NT; ++nt) {
         const int n = n0 + (ns * NT + nt) * 16 + c16;
         const long long nn = n < N ? n : N - 1;
-        if constexpr ((AB & 256) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6;
+        if constexpr ((AB & 256) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * ILB;
         else if constexpr ((AB & 128) != 0) wr[nt] = wb + (nn >> 4) * (long long)A.S * kIl6 + (nn & 15) * kIl6R;
         else wr[nt] = wb + nn * A.w_ld;
     }
@@ -1150,10 +1157,45 @@ template <int T>
 /* il (lever Q6IL, round 44): the weight is the stored tile-interleaved q6_K (type q6_K_il16b): only the IL-B instances (template AB
  * 384: Wq6Il2 + the tile pointers), never the native-row kernels; a geometry without one declines (the caller's IL fallback runs). */
 int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid, int abo = -1, bool il = false) {
-    if (il && T != GG_Q6_K) return R4D_WK_DECLINE;
+    if (il && T != GG_Q6_K && T != GG_Q8_0) return R4D_WK_DECLINE;   /* Q6IL / Q8IL */
     const bool wl = (code & 262144) != 0;
     const bool dp2 = (code & 8388608) != 0 && !wl;   /* bit 23: DP 2 (two slabs of raw words in flight; block staging only) */
     const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P, wl);
+    if constexpr (T == GG_Q8_0) {   /* lever Q8IL (round 44): the tile-interleaved q8_0 (Wq8Il) in the stock q8_0 G1 sets, bf16 only */
+        if (il) {
+            if (f32out) return R4D_WK_DECLINE;
+            if (pro) {   /* the stock fold sets: PRO 1 / 2 DP 1, PRO 2 DP 2 (q8_0 has no PRO 1 DP 2) */
+#define GG_WK_FIL8(KPV, WLV, PV, DPV)                                                                               \
+                if (kp == KPV && wl == WLV && pro == PV && dp2 == (DPV == 2)) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t, PV, DPV, 384>), grid, dim3(256), lds, A);
+                if (dp2) {
+                    GG_WK_FIL8(1, false, 2, 2) GG_WK_FIL8(2, false, 2, 2) GG_WK_FIL8(4, false, 2, 2)
+                    return R4D_WK_DECLINE;
+                }
+                GG_WK_FIL8(1, false, 1, 1) GG_WK_FIL8(2, false, 1, 1) GG_WK_FIL8(1, true, 1, 1) GG_WK_FIL8(2, true, 1, 1)
+                GG_WK_FIL8(1, false, 2, 1) GG_WK_FIL8(2, false, 2, 1) GG_WK_FIL8(4, false, 2, 1) GG_WK_FIL8(1, true, 2, 1) GG_WK_FIL8(2, true, 2, 1)
+                GG_WK_FIL8(4, true, 2, 1)
+#undef GG_WK_FIL8
+                return R4D_WK_DECLINE;
+            }
+            if (dp2) {
+                if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
+                if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
+                if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
+                return R4D_WK_DECLINE;
+            }
+            if (wl) {
+                if (kp == 8) return R4D_EMIT(s, (gg_wk_kernel<T, 8, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                return R4D_WK_DECLINE;
+            }
+            if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+            if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+            if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+            return R4D_WK_DECLINE;
+        }
+    }
     if (pro) {   /* the folds (bf16 out): the (KP, WL) their K allows (q_b K 1280: P 2; shexp down 768 / 512: P 2 / 4) */
         if (f32out) return R4D_WK_DECLINE;
         if constexpr (T == GG_Q6_K) {   /* round 43 bench: the folds on IL-B (R4D_WK3_AB 384) */
@@ -1272,7 +1314,32 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 template <int T>
 static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, int pro, bool dp2, const GgWkArgs& A, dim3 grid,
                            unsigned lds, int abo = -1, bool il = false) {   /* abo 0 (round 42 bench): the stock kernel whatever R4D_WK3_AB says */
-    if (il && T != GG_Q6_K) return R4D_WK_DECLINE;   /* lever Q6IL: as gg_launch_wk_t's il */
+    if (il && T != GG_Q6_K && T != GG_Q8_0) return R4D_WK_DECLINE;   /* levers Q6IL / Q8IL: as gg_launch_wk_t's il */
+    if constexpr (T == GG_Q8_0) {   /* lever Q8IL (round 44): the stock q8_0 G2 sets on Wq8Il, bf16 only (the folds: PRO 2 at DP 1, the stock rule) */
+        if (il) {
+            if (f32out) return R4D_WK_DECLINE;
+#define GG_WK3_IL8(KPV, NMV, NTV, PV, DPV)                                                                              \
+            if (kp == KPV && nmt == NMV && nt == NTV && pro == PV) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV, DPV, 384>), grid, dim3(256), lds, A);
+            if (pro) {
+                if (pro != 2) return R4D_WK_DECLINE;
+                GG_WK3_IL8(1, 2, 2, 2, 1) GG_WK3_IL8(1, 3, 1, 2, 1) GG_WK3_IL8(1, 2, 1, 2, 1)
+                GG_WK3_IL8(2, 2, 2, 2, 1) GG_WK3_IL8(2, 3, 1, 2, 1) GG_WK3_IL8(2, 2, 1, 2, 1)
+                return R4D_WK_DECLINE;
+            }
+            if (dp2) {
+                GG_WK3_IL8(1, 2, 2, 0, 2) GG_WK3_IL8(1, 3, 1, 0, 2) GG_WK3_IL8(1, 2, 1, 0, 2)
+                GG_WK3_IL8(2, 2, 2, 0, 2) GG_WK3_IL8(2, 3, 1, 0, 2) GG_WK3_IL8(2, 2, 1, 0, 2)
+                GG_WK3_IL8(4, 2, 2, 0, 2) GG_WK3_IL8(4, 3, 1, 0, 2) GG_WK3_IL8(4, 2, 1, 0, 2)
+                return R4D_WK_DECLINE;
+            }
+            GG_WK3_IL8(1, 2, 2, 0, 1) GG_WK3_IL8(1, 3, 2, 0, 1) GG_WK3_IL8(1, 2, 1, 0, 1) GG_WK3_IL8(1, 3, 1, 0, 1) GG_WK3_IL8(1, 4, 1, 0, 1)
+            GG_WK3_IL8(2, 2, 2, 0, 1) GG_WK3_IL8(2, 3, 2, 0, 1) GG_WK3_IL8(2, 2, 1, 0, 1) GG_WK3_IL8(2, 3, 1, 0, 1)
+            GG_WK3_IL8(4, 2, 2, 0, 1) GG_WK3_IL8(4, 3, 2, 0, 1) GG_WK3_IL8(4, 2, 1, 0, 1) GG_WK3_IL8(4, 3, 1, 0, 1)
+#undef GG_WK3_IL8
+            return R4D_WK_DECLINE;
+        }
+    }
+
     /* DRAFTER round 30 bench ablation (env R4D_WK3_AB = 1..7, read once; outputs not the part order): the drafter's q8_0 G2 combos
      * (DP 1, bf16) and the head's q6_K (KP 1, f32; DP 2 at NM 2 NT 2, DP 1 at NM 3 NT 1) */
     static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); const int v = e ? std::atoi(e) : 0;
@@ -1553,7 +1620,7 @@ static int gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const u
                      const long long* Nv, long long M, long long K, const GgWkFold* fo, int il) {
     if (!code || (ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) || K % (2 * kWmS) || M > 0x7fffff)
         return R4D_WK_DECLINE;
-    if (il && ty != GG_Q6_K) return R4D_WK_DECLINE;
+    if (il && ty != GG_Q6_K && ty != GG_Q8_0) return R4D_WK_DECLINE;
     if (fo && (nm != 1 || f32out || ((fo->pro == 1 || fo->pro == 3) && (!fo->g || ((uintptr_t)fo->g & 15u))) || !fo->h))
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
@@ -1667,10 +1734,10 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
                   const long long* Nv, long long M, long long K, const GgWkFold* fo) {
     return gg_wk_run(s, code, ty, f32out, nm, xd, x_ld, x_al, wd, w_ld, yd, y_ld, Nv, M, K, fo, 0);
 }
-int r4d_gg_wk_run_il(RadStream s, int code, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld, const int* x_al,
+int r4d_gg_wk_run_il(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld, const int* x_al,
                      const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
                      long long K, const GgWkFold* fo) {
-    return gg_wk_run(s, code, GG_Q6_K, f32out, nm, xd, x_ld, x_al, wd, w_ld, yd, y_ld, Nv, M, K, fo, 1);
+    return gg_wk_run(s, code, ty, f32out, nm, xd, x_ld, x_al, wd, w_ld, yd, y_ld, Nv, M, K, fo, 1);
 }
 
 extern "C" long long r4d_gg_wk_count() { return g_gg_wk_count.load(std::memory_order_relaxed); }
@@ -2198,15 +2265,21 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
  * form 326 (MT 3 NT 2 WN 8, the folds interleaved: the q6_K table's form at every DeepSeek-V4.1 shape) with the part fold and FI bit
  * 16 (Wq6Il2 + the tile pointers): the part order, the bytes of the native form's 326 (and of every other part-order form). The
  * bench pins (r4d_gg_wkpf_default / follow / ts) do not apply: one form. */
-int r4d_gg_wkpf_run_il(RadStream s, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w, void* y,
+int r4d_gg_wkpf_run_il(RadStream s, int ty, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w, void* y,
                        long long y_ld, long long M, long long N, long long K) {
-    if (!x_al || K % (2 * kWmS) || M < 1 || M > 0x7fffffff || N > 0x7fffffff || N % 16) return R4D_WK_DECLINE;
+    if ((ty != GG_Q6_K && ty != GG_Q8_0) || !x_al || K % (2 * kWmS) || M < 1 || M > 0x7fffffff || N > 0x7fffffff || N % 16) return R4D_WK_DECLINE;
     GgTiledArgs A{};
     A.x = x; A.x_ld = x_ld;
-    A.w = w; A.wtab = nullptr; A.w_ld = K / kWmS * kIl6R; A.w_es = 0;
+    A.w = w; A.wtab = nullptr; A.w_ld = ty == GG_Q8_0 ? K / 32 * 34 : K / kWmS * kIl6R; A.w_es = 0;
     A.y = y; A.y_ld = y_ld;
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
+    if (ty == GG_Q8_0) {   /* lever Q8IL (round 44): the native q8_0 rows' forms -- the table's 414 (MT 4 NT 1 WN 16), the drafter's K-heavy rule 214 */
+        if (f32out) return R4D_WK_DECLINE;
+        const bool f214 = K >= 4096 && N <= 2048 && M >= 49 && M <= 160;
+        g_wkpf_last.store((f214 ? pf_code(2, 1, 16, 0, 0) : pf_code(4, 1, 16, 0, 0)) + 16000, std::memory_order_relaxed);
+        return f214 ? wkpf_launch_f<GG_Q8_0, 2, 1, 16, 16>(s, false, A) : wkpf_launch_f<GG_Q8_0, 4, 1, 16, 16>(s, false, A);
+    }
     g_wkpf_last.store(pf_code(3, 2, 8, 1, 0) + 16000, std::memory_order_relaxed);
     const dim3 grid((unsigned)((A.M + 47) / 48), (unsigned)((A.N + 255) / 256));
     if (grid.y > 65535u) return R4D_WK_DECLINE;

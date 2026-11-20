@@ -2728,6 +2728,35 @@ template <> struct Wq<GG_Q8_0> : WqBase {
     __device__ static __forceinline__ void table(uint8_t*) {}
 };
 
+/* Lever Q8IL (DRAFTER track 20.11.2026 round 44): q8_0 stored TILE-INTERLEAVED (type "q8_0_il16b", tag "r4d_q8_0_il16b",
+ * r4d_ds41_ggml_layout.cpp) -- for 16-row tile t and slab s (4 blocks, 128 K values) the 16 rows' 4 x 34 bytes are kIl8 = 2,176
+ * contiguous bytes at (t S + s) kIl8 in the order a wave loads them: block i's quant bytes 2 + 16 p + 8 h .. + 7 of lane L = 16 h + r
+ * (r the tile's row) at 256 (2 i + p) + 8 L, the rows' d at 2048 + 8 r + 2 i. The native bytes moved (no duplicate: the stored row is
+ * the native 34 K / 32 bytes); the same words into the same registers as Wq<GG_Q8_0>, so every output is the native form's. */
+constexpr int kIl8 = 2176;
+struct Wq8Il : Wq<GG_Q8_0> {
+    static constexpr int ILB = kIl8;   /* bytes a tile-slab */
+    __device__ static __forceinline__ void load1(const uint8_t* tb, int s, int, int i, uint32_t* r) {
+        const int L = (int)(threadIdx.x & 31), c = L & 15;
+        const uint8_t* b = tb + (long long)s * kIl8;
+        r[5 * i] = gg_u16(b + 2048 + 8 * c + 2 * i);
+        const gg_u32x2 q0 = *(const gg_u32x2*)(const void*)(b + 512 * i + 8 * L);
+        const gg_u32x2 q1 = *(const gg_u32x2*)(const void*)(b + 512 * i + 256 + 8 * L);
+        r[5 * i + 1] = q0.x;
+        r[5 * i + 2] = q0.y;
+        r[5 * i + 3] = q1.x;
+        r[5 * i + 4] = q1.y;
+    }
+    __device__ static __forceinline__ void load(const uint8_t* tb, int s, int h, uint32_t* r) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) load1(tb, s, h, i, r);
+    }
+    template <int J>
+    __device__ static __forceinline__ void reload(const uint8_t* tb, int s, int h, uint32_t* r) {
+        if constexpr (J & 1) load1(tb, s, h, J >> 1, r);
+    }
+};
+
 /* Q6_K. Slab s is half c = s & 1 of block s >> 1; K step J is the 16-value group J (quarter
  * q = J >> 1, l = 16 (J & 1) + 8h + t), scale sc[8c + J]. The WMMA sees 128 + q6 (bf16 0x43 | q6,
  * one v_perm_b32 a pair) and each chain starts at -160 (sum x) over the group: the sum is
@@ -2813,6 +2842,7 @@ constexpr int kIl6 = 1696, kIl6R = 106;
  * instruction of a wave reads 256 contiguous bytes. The same words into the same registers as Wq<GG_Q6_K>. The row pointer is the
  * tile's base. */
 struct Wq6Il2 : Wq<GG_Q6_K> {
+    static constexpr int ILB = kIl6;   /* bytes a tile-slab */
     __device__ static __forceinline__ void load(const uint8_t* tb, int s, int h, uint32_t* r) {
         const int L = (int)(threadIdx.x & 31), c = L & 15;
         const uint8_t* b = tb + (long long)s * kIl6;
@@ -3384,7 +3414,7 @@ constexpr GgType kGgTypes[] = {
     { "q8_0", GG_Q8_0, 32, 34, 0, 0 },        { "q5_K", GG_Q5_K, 256, 176, 0, 0 },
     { "q6_K", GG_Q6_K, 256, 210, 0, 0 },      { "iq4_nl", GG_IQ4_NL, 32, 18, 64, 0 },
     { "iq2_xxs", GG_IQ2_XXS, 256, 66, 2048, 0 }, { "iq1_s", GG_IQ1_S, 256, 50, 16384, 0 },
-    { "q6_K_il16b", GG_Q6_K, 256, 210, 0, 1 },
+    { "q6_K_il16b", GG_Q6_K, 256, 210, 0, 1 }, { "q8_0_il16b", GG_Q8_0, 32, 34, 0, 1 },   /* lever Q8IL (round 44): q8_0 tile-interleaved */
 };
 const GgType* gg_type(const char* s) {
     if (!s) return nullptr;
@@ -3835,6 +3865,7 @@ constexpr long long kWmkBand5 = 64;
  * every mode: every code computes the part order (--wmkroute under R4D_WMKROUTE_MODE 6 / 7, --wmgcheck --wmk 70724,595012,
  * 52499524 on one card). One start A/Bs 5 / 6 / 7 in process (a switch flip bumps the epoch: recorded passes re-record). */
 constexpr int kWmkG2x4 = kWmkCode | 2097152 | 16777216 | 33554432;   /* 52499524 */
+constexpr int kWmkHeadR2 = kWmkCode | 2097152 | 16777216 | 67108864 | 8388608;   /* 94442564: lever HG2R (ds41_wmk 18) */
 constexpr int kWmkTile = 595012;                                     /* 70724 | bit 19 */
 /* tp8 loop D25 step 2b (DECODE round 21): mode 8 = mode 5 + a per-shape code at 49..64 rows from the one-card run d25a-de3b (TEST
  * 08:50, gpu03 card c4:00, --perfwmg 48,56,64 under 70724 / 595012 / 52499524, us a call at 64 rows): wide-N short-K calls take the
@@ -3978,9 +4009,12 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
     const bool m2 = mode == 2 || mode >= 5;
-    const bool dmx = mode >= 13 && mode <= 17;   /* 15 = 14's codes (lever FPP: fold a's prologue); 16 = 15 + DG2; 17 = 16 + G2R */
-    if (dmx && head && M > 48 && M <= kWmkBand5) return kWmkG2x4;   /* lever DMX: the head's four-tile G2 (D22) */
-    if (mode == 17 && !head)   /* lever G2R (round 36): 49..64 rows */
+    const bool dmx = mode >= 13 && mode <= 18;   /* 15 = 14's codes (lever FPP: fold a's prologue); 16 = 15 + DG2; 17 = 16 + G2R; 18 = 17 + HG2R */
+    /* lever HG2R (DRAFTER track 20.11.2026 round 44, ds41_wmk 18): the head at 49..64 rows in G2R's two-block-row G2 at KP 1 NT 2 with DP 2
+     * (bits 21 + 24 + 26 + 23) instead of the four-tile G2: xeon r44d in chain, us a call at 49 / 56 / 64 rows, native 444-450 / 439-442 /
+     * 439-442 -> 387 / 386 / 387, on Q6IL's tile-interleaved head 419-423 / 416-417 / 413-415 -> 336 / 334 / 336; the part order (the same bytes) */
+    if (dmx && head && M > 48 && M <= kWmkBand5) return mode == 18 ? kWmkHeadR2 : kWmkG2x4;   /* lever DMX: the head's four-tile G2 (D22) */
+    if ((mode == 17 || mode == 18) && !head)   /* lever G2R (round 36): 49..64 rows */
         if (const int c = wmk_code17(ty, Ntot, K, M)) return c;
     if (mode >= 16 && !head)   /* lever DG2 (round 35) */
         if (const int c = wmk_code16(ty, Ntot, K, M)) return c;
@@ -4032,7 +4066,7 @@ int wmk_now() {
 /* the switch takes a call of M rows (the bench pin r4d_gg_wk_pin, when set, runs ahead of it at every M) */
 bool wmk_take(long long M) {
     const int v = wmk_now();
-    return v >= 1 && M <= ((v >= 5 && v <= 10) || (v >= 13 && v <= 17) ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-10, 13..15: the band to 64 rows (tp8 loop D22 / D25; DRAFTER r32 DMX, r33 FPP); 11 / 12: 48 as 2 */
+    return v >= 1 && M <= ((v >= 5 && v <= 10) || (v >= 13 && v <= 18) ? kWmkBand5 : (long long)kGgDecodeRows);   /* modes 5-10, 13..15: the band to 64 rows (tp8 loop D22 / D25; DRAFTER r32 DMX, r33 FPP); 11 / 12: 48 as 2 */
 }
 void wmk_count(long long M) {
     g_wmk_launches.fetch_add(1, std::memory_order_relaxed);
@@ -4067,10 +4101,11 @@ int gg_launch_embed(RadStream s, int ty, const int32_t* tok, const uint8_t* w, l
  * float logical form [N, K]. Sets the kernel type and the row stride in bytes. */
 int gg_weight2(const RadTensor* w, const GgType* gt, long long N, long long K, int* ty, long long* ld) {
     if (!w || !w->data || w->rank != 2 || w->shape[0] != N) return R4D_NO(RAD_E_SHAPE);
-    if (gt->il) {   /* lever Q6IL: u8, its declared [N, K] (the engine's) or the stored [N, K / 128 * 106]; whole 16-row tiles, 8-byte loads */
-        const long long rbi = K / kWmS * kIl6R;
-        if (w->dtype != RAD_U8 || (w->shape[1] != rbi && w->shape[1] != K) || N % 16 || ((uintptr_t)w->data & 7u)) return R4D_NO(RAD_E_SHAPE);
-        *ty = GG_Q6_K;
+    if (gt->il) {   /* levers Q6IL / Q8IL: u8, its declared [N, K] (the engine's) or the stored [N, K / 128 * 106] (q6_K) / [N, 34 K / 32]
+                     * (q8_0); whole 16-row tiles and 128-value slabs, 8-byte loads */
+        const long long rbi = gt->t == GG_Q8_0 ? K / 32 * 34 : K / kWmS * kIl6R;
+        if (w->dtype != RAD_U8 || (w->shape[1] != rbi && w->shape[1] != K) || N % 16 || K % kWmS || ((uintptr_t)w->data & 7u)) return R4D_NO(RAD_E_SHAPE);
+        *ty = gt->t;
         *ld = rbi;
         return RAD_OK;
     }
@@ -4126,7 +4161,7 @@ std::atomic<long long> g_il_declines{0};
 int il_decline(const char* op, long long N, long long K, long long M, int x_al) {
     const long long n = g_il_declines.fetch_add(1, std::memory_order_relaxed);
     if (n < 16)
-        std::fprintf(stderr, "radiance: libr4d: lever Q6IL: %s on a tile-interleaved q6_K weight (N %lld, K %lld, M %lld, x aligned %d): no "
+        std::fprintf(stderr, "radiance: libr4d: lever Q6IL / Q8IL: %s on a tile-interleaved weight (N %lld, K %lld, M %lld, x aligned %d): no "
                              "form reads it (decline %lld)\n", op, N, K, M, x_al, n + 1);
     return R4D_NO(RAD_E_SHAPE);
 }
@@ -4139,14 +4174,14 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
     if (il) {
         if (g_gg_wk || wmk_take(M) || (wmk_now() < 1 && M <= kGgDecodeRows)) {
             const long long Nv = N;
-            const int wk = r4d_gg_wk_run_il(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, logits), logits, 1, &xd, &x_ld, &x_al, &wd, w_ld,
+            const int wk = r4d_gg_wk_run_il(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, logits), ty, logits, 1, &xd, &x_ld, &x_al, &wd, w_ld,
                                             &yd, &y_ld, &Nv, M, K, nullptr);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
                 return wk;
             }
         }
-        const int wp = r4d_gg_wkpf_run_il(s, logits, xd, x_ld, x_al, wd, yd, y_ld, M, N, K);
+        const int wp = r4d_gg_wkpf_run_il(s, ty, logits, xd, x_ld, x_al, wd, yd, y_ld, M, N, K);
         if (wp != R4D_WK_DECLINE) {
             wmk_count(M);
             return wp;
@@ -4542,7 +4577,7 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
     const int wmode = wmk_now();
     const GgType* gti = gg_type(r4d_gets(a, "type"));
     const int il = gti ? gti->il : 0;   /* lever Q6IL: the IL fold forms, the IL GEMM in the tail; never lever D2's fold */
-    const bool dmx_two = !g_gg_wk && M > (wmode >= 15 ? 32 : 16) && M <= kGgDecodeRows && (wmode >= 13 && wmode <= 17);
+    const bool dmx_two = !g_gg_wk && M > (wmode >= 15 ? 32 : 16) && M <= kGgDecodeRows && (wmode >= 13 && wmode <= 18);
     if (dmx_two) {
         /* (the rmsnorm + gg_gemm_run tail below) */
     } else if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
@@ -4558,7 +4593,7 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
             void* yp = y->data;
             const long long Nv = N;
             const int wcode = g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false);
-            const int wk = il ? r4d_gg_wk_run_il(s, wcode, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo)
+            const int wk = il ? r4d_gg_wk_run_il(s, wcode, ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo)
                               : r4d_gg_wk_run(s, wcode, ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
@@ -4616,7 +4651,7 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
             void* yp = y->data;
             const long long Nv = N;
             const int wcode = g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false);
-            const int wk = il ? r4d_gg_wk_run_il(s, wcode, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo)
+            const int wk = il ? r4d_gg_wk_run_il(s, wcode, ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo)
                               : r4d_gg_wk_run(s, wcode, ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
@@ -4694,7 +4729,7 @@ extern "C" int r4d_rad_gemm_nt_ggml_pair(const RadArgs* a, RadStream s) {
         const uint8_t* ws2[2] = { (const uint8_t*)w->data, (const uint8_t*)w2->data };
         void* ys2[2] = { y->data, y2->data };
         const int wcode = g_gg_wk ? g_gg_wk : wmk_code(ty, N + N2, K, M, false);
-        const int wk = il ? r4d_gg_wk_run_il(s, wcode, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr)
+        const int wk = il ? r4d_gg_wk_run_il(s, wcode, ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr)
                           : r4d_gg_wk_run(s, wcode, ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr);
         if (wk != R4D_WK_DECLINE) {
             if (wmk) wmk_count(M);
@@ -4844,7 +4879,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_tsk")) return r4d_tsk_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 17 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34), 11: 2 + HDP + TDP (DRAFTER round 23), 12: 11 with HRS's head at 17..48 rows (DRAFTER round 31) , 13: 12 + the band to 64 rows + the per-shape 33..64-row codes (DRAFTER round 32, DMX) , 14: 13 + the plain q_b GEMM in G2 (DMX), 15: 14 with fold a one launch on lever FPP's prologue at 3..32 rows (DRAFTER round 33), 16: 15 + DG2's G2 forms for the trunk's dense at 17..48 rows (DRAFTER round 35), 17: 16 + G2R's two-block-row G2 at 49..64 rows (DRAFTER round 36) */
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 18 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes; 4: 2 without WHG / DQ8; 5: 2 + the band to 64 rows (D22); 6 / 7: 5 + another 49..64-row code, 8: 5 + the per-shape 49..64-row table (D25), 9: 8 + the per-shape 33..48-row table (D27), 10: 9 without its two q_b entries (D34), 11: 2 + HDP + TDP (DRAFTER round 23), 12: 11 with HRS's head at 17..48 rows (DRAFTER round 31) , 13: 12 + the band to 64 rows + the per-shape 33..64-row codes (DRAFTER round 32, DMX) , 14: 13 + the plain q_b GEMM in G2 (DMX), 15: 14 with fold a one launch on lever FPP's prologue at 3..32 rows (DRAFTER round 33), 16: 15 + DG2's G2 forms for the trunk's dense at 17..48 rows (DRAFTER round 35), 17: 16 + G2R's two-block-row G2 at 49..64 rows (DRAFTER round 36), 18: 17 + the head at 49..64 rows in G2R + DP 2 (HG2R, DRAFTER round 44) */
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
@@ -4870,7 +4905,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
     if (!std::strcmp(name, "ds41_tsk")) { r4d_tsk_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 17 ? value : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 18 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }

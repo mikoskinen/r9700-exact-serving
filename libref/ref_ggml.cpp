@@ -96,8 +96,48 @@ void q6il_unpack(const uint8_t* src, uint8_t* nat, int64_t rows, int64_t K) {
         }
 }
 
+/* libr4d's lever Q8IL (round 44): type "q8_0_il16b" = q8_0 stored tile-interleaved (tag "r4d_q8_0_il16b", libr4d's bytes): tile t,
+ * slab s (blocks 4 s .. 4 s + 3) at (t S + s) 2176, lane L = 16 h + r: block i's bytes 2 + 16 p + 8 h .. + 7 at 512 i + 256 p + 8 L,
+ * d at 2048 + 8 r + 2 i. Rows a multiple of 16, K of 128, the native size. */
+bool il8_type(const RadParam* p, int n_p) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    return t && t->kind == RAD_P_STR && t->sval && !std::strcmp(t->sval, "q8_0_il16b");
+}
+constexpr int64_t kQ8Il = 2176;
+void q8il_pack(const uint8_t* nat, uint8_t* dst, int64_t rows, int64_t K) {
+    const int64_t S = K / 128, rb = K / 32 * 34;
+    for (int64_t t = 0; t < rows / 16; ++t)
+        for (int64_t sl = 0; sl < S; ++sl) {
+            uint8_t* d = dst + (t * S + sl) * kQ8Il;
+            for (int L = 0; L < 32; ++L) {
+                const int r = L & 15, h = L >> 4;
+                for (int i = 0; i < 4; ++i) {
+                    const uint8_t* b = nat + (16 * t + r) * rb + (4 * sl + i) * 34;
+                    for (int q = 0; q < 2; ++q) std::memcpy(d + 512 * i + 256 * q + 8 * L, b + 2 + 16 * q + 8 * h, 8);
+                    if (h == 0) std::memcpy(d + 2048 + 8 * r + 2 * i, b, 2);
+                }
+            }
+        }
+}
+void q8il_unpack(const uint8_t* src, uint8_t* nat, int64_t rows, int64_t K) {
+    const int64_t S = K / 128, rb = K / 32 * 34;
+    for (int64_t t = 0; t < rows / 16; ++t)
+        for (int64_t sl = 0; sl < S; ++sl) {
+            const uint8_t* d = src + (t * S + sl) * kQ8Il;
+            for (int L = 0; L < 32; ++L) {
+                const int r = L & 15, h = L >> 4;
+                for (int i = 0; i < 4; ++i) {
+                    uint8_t* b = nat + (16 * t + r) * rb + (4 * sl + i) * 34;
+                    for (int q = 0; q < 2; ++q) std::memcpy(b + 2 + 16 * q + 8 * h, d + 512 * i + 256 * q + 8 * L, 8);
+                    if (h == 0) std::memcpy(b, d + 2048 + 8 * r + 2 * i, 2);
+                }
+            }
+        }
+}
+
 const lq::ggml::PlaneKind* kind_of(const RadParam* p, int n_p) {
     if (il6_type(p, n_p)) return kind_named("q6_K");
+    if (il8_type(p, n_p)) return kind_named("q8_0");
     const RadParam* t = rad_param_find(p, n_p, "type");
     return kind_named(t && t->kind == RAD_P_STR ? t->sval : nullptr);
 }
@@ -155,6 +195,10 @@ extern "C" int ref_ggml_layout(const RadParam* p, int n_p, int operand, const Ra
         out->tag = "r4d_q6k_il16b";
         out->shape[1] = K / 128 * kQ6IlR;
     }
+    if (il8_type(p, n_p)) {   /* Q8IL: the native size, whole 16-row tiles and 128-value slabs */
+        if (rows % 16 || K % 128) return RAD_E_SHAPE;
+        out->tag = "r4d_q8_0_il16b";
+    }
     out->bytes = out->shape[0] * out->shape[1];
     return RAD_OK;
 }
@@ -168,8 +212,9 @@ extern "C" int ref_ggml_relayout(const RadParam* p, int n_p, int operand, const 
     if (rc < 0) return rc;
     const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
     const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
-    const bool il = il6_type(p, n_p);
-    if (K <= 0 || K % k->block || rows <= 0 || (il && rows % 16) || dst_bytes < rows * (il ? K / 128 * kQ6IlR : rb)) return RAD_E_SHAPE;
+    const bool il6 = il6_type(p, n_p), il8 = il8_type(p, n_p), il = il6 || il8;
+    if (K <= 0 || K % k->block || rows <= 0 || (il && rows % 16) || (il8 && K % 128) || dst_bytes < rows * (il6 ? K / 128 * kQ6IlR : rb))
+        return RAD_E_SHAPE;
     const lq::ggml::PackFn pack = lq::ggml::pack_of(k->type);
     std::vector<uint8_t> nat(il ? (size_t)(rows * rb) : 0);
     uint8_t* const out = il ? nat.data() : (uint8_t*)dst;
@@ -178,7 +223,8 @@ extern "C" int ref_ggml_relayout(const RadParam* p, int n_p, int operand, const 
         for (int i = 0; i < n_planes; ++i) row[(size_t)i] = plane_row(enc, planes, i, r);
         pack(row.data(), nb, out + r * rb);
     }
-    if (il) q6il_pack(nat.data(), (uint8_t*)dst, rows, K);
+    if (il6) q6il_pack(nat.data(), (uint8_t*)dst, rows, K);
+    if (il8) q8il_pack(nat.data(), (uint8_t*)dst, rows, K);
     return RAD_OK;
 }
 
@@ -191,10 +237,12 @@ extern "C" int ref_ggml_unrelayout(const RadParam* p, int n_p, int operand, cons
     if (rc < 0) return rc;
     const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
     const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
-    const bool il = il6_type(p, n_p);
-    if (K <= 0 || K % k->block || rows <= 0 || (il && rows % 16) || src_bytes < rows * (il ? K / 128 * kQ6IlR : rb)) return RAD_E_SHAPE;
+    const bool il6 = il6_type(p, n_p), il8 = il8_type(p, n_p), il = il6 || il8;
+    if (K <= 0 || K % k->block || rows <= 0 || (il && rows % 16) || (il8 && K % 128) || src_bytes < rows * (il6 ? K / 128 * kQ6IlR : rb))
+        return RAD_E_SHAPE;
     std::vector<uint8_t> nat(il ? (size_t)(rows * rb) : 0);
-    if (il) q6il_unpack((const uint8_t*)src, nat.data(), rows, K);
+    if (il6) q6il_unpack((const uint8_t*)src, nat.data(), rows, K);
+    if (il8) q8il_unpack((const uint8_t*)src, nat.data(), rows, K);
     const uint8_t* const in = il ? nat.data() : (const uint8_t*)src;
     std::vector<uint8_t*> row((size_t)n_planes);
     std::vector<void*> all((size_t)n_planes);
@@ -226,11 +274,12 @@ static int gemm_ggml_impl(const RadArgs* a, const char* nN, const char* nK) {
         return RAD_E_SHAPE;
     const int64_t rb = K / k->block * (int64_t)k->block_bytes;
     const bool native = w.dtype == RAD_U8;
-    const bool il = il6_type(a->p, a->n_p);   /* Q6IL: the stored tiles moved back to the native rows, then q6_K */
-    if (il && (!native || N % 16 || (w.shape[1] != K / 128 * kQ6IlR && w.shape[1] != K))) return RAD_E_SHAPE;
+    const bool il6 = il6_type(a->p, a->n_p), il8 = il8_type(a->p, a->n_p), il = il6 || il8;   /* Q6IL / Q8IL: moved back, then the native type */
+    if (il && (!native || N % 16 || (il8 && K % 128) || (w.shape[1] != (il6 ? K / 128 * kQ6IlR : rb) && w.shape[1] != K))) return RAD_E_SHAPE;
     if (!il && (native ? (w.shape[1] != rb && w.shape[1] != K) : w.shape[1] != K)) return RAD_E_SHAPE;
     std::vector<uint8_t> nat(il ? (size_t)(N * rb) : 0);
-    if (il) q6il_unpack((const uint8_t*)w.data, nat.data(), N, K);
+    if (il6) q6il_unpack((const uint8_t*)w.data, nat.data(), N, K);
+    if (il8) q8il_unpack((const uint8_t*)w.data, nat.data(), N, K);
     const uint8_t* const wbase = il ? nat.data() : (const uint8_t*)w.data;
     const lq::ggml::DequantFn dq = lq::ggml::dequant_of(k->type);
 #pragma omp parallel
@@ -273,7 +322,7 @@ int ref_embed_lookup_ggml(const RadArgs* a, RadStream) {
     const int64_t E = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0);
     const int64_t voff = p_int(a, "vocab_offset", 0);
     const float mult = p_f32(a, "mult", 1.0f);
-    if (il6_type(a->p, a->n_p)) return RAD_E_DTYPE;   /* Q6IL: the dense GEMMs only */
+    if (il6_type(a->p, a->n_p) || il8_type(a->p, a->n_p)) return RAD_E_DTYPE;   /* Q6IL / Q8IL: the dense GEMMs only */
     if (!k || E <= 0 || V <= 0 || voff < 0 || E % k->block || w.rank != 2 || w.shape[0] < V)
         return RAD_E_SHAPE;
     const int64_t rb = E / k->block * (int64_t)k->block_bytes;
@@ -316,7 +365,7 @@ int ref_embed_lookup_ggml(const RadArgs* a, RadStream) {
 int ref_moe_gemm_ggml(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor &A = a->t[0], &W = a->t[1], &sorted = a->t[2], &off = a->t[3], &Y = a->t[4];
-    if (il6_type(a->p, a->n_p)) return RAD_E_DTYPE;   /* Q6IL: the dense GEMMs only */
+    if (il6_type(a->p, a->n_p) || il8_type(a->p, a->n_p)) return RAD_E_DTYPE;   /* Q6IL / Q8IL: the dense GEMMs only */
     const lq::ggml::PlaneKind* k = kind_of(a->p, a->n_p);
     const int64_t N = p_int(a, "N", 0), K = p_int(a, "K", 0);
     const int64_t ne = p_int(a, "n_expert", 0), top_k = p_int(a, "top_k", 0);

@@ -68,8 +68,9 @@ namespace {
 template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
 __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
     constexpr bool IL = (FI & 16) != 0;
-    static_assert(!IL || T == GG_Q6_K, "gg_pf_kernel: the tile-interleaved form is q6_K's");
-    using W = std::conditional_t<IL, Wq6Il2, Wq<T>>;
+    static_assert(!IL || T == GG_Q6_K || T == GG_Q8_0, "gg_pf_kernel: the tile-interleaved forms are q6_K's and q8_0's");
+    using W = std::conditional_t<IL, std::conditional_t<T == GG_Q8_0, Wq8Il, Wq6Il2>, Wq<T>>;   /* Q8IL (round 44): q8_0's */
+    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : kIl6;
     using Pf = typename W::Pf;
     constexpr int NTH = WN * 32;
     constexpr int BM = 16 * MT, BN = 16 * NT * WN, WC = 16 * NT;   /* WC weight rows a wave */
@@ -109,7 +110,7 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
     for (int nt = 0; nt < NT; ++nt) {
         const int n = n0 + wave * WC + nt * 16 + c16;
         const long long nn = n < A.N ? n : A.N - 1;
-        if constexpr (IL) wr[nt] = wb + (nn >> 4) * (long long)(A.K / kWmS) * kIl6;
+        if constexpr (IL) wr[nt] = wb + (nn >> 4) * (long long)(A.K / kWmS) * ILB;
         else wr[nt] = wb + nn * A.w_ld;
     }
     /* Activation staging as the stock's: XC 16-byte chunks a thread a slab (row q >> 4, values 8 (q & 15)). */
@@ -155,7 +156,11 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
             const long long t0 = (long long)(n0 + __builtin_amdgcn_readfirstlane(wave) * WC) >> 4, tl = (long long)(A.N - 1) >> 4;
 #pragma unroll
             for (int nt = 0; nt < NT; ++nt)
-                __builtin_amdgcn_s_prefetch_data(gg_sptr(wb + ((t0 + nt < tl ? t0 + nt : tl) * (long long)S + min(s + 3, S - 1)) * kIl6), 27);
+            {
+                const uint8_t* pp = gg_sptr(wb + ((t0 + nt < tl ? t0 + nt : tl) * (long long)S + min(s + 3, S - 1)) * ILB);
+                __builtin_amdgcn_s_prefetch_data(pp, 27);
+                if constexpr (ILB > 1792) __builtin_amdgcn_s_prefetch_data(pp + 1792, 5);
+            }
             return;
         }
         const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;

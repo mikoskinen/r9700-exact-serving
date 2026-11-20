@@ -66,7 +66,7 @@ constexpr int kWkEngine = 1048576;
 static void set_wm(const Hk& h) {
     clear(h);
     /* 1048576 / 1048577 / 1048578: the engine's path under ds41_wmk 1 / 2 / 3 (FINDINGS F7: the r6 table / 70724 / r5's table) */
-    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 16) {   /* + 16: 17 (DRAFTER r36: G2R) */   /* + 15: 16 (DRAFTER r35: DG2) */   /* + 14: 15 (DRAFTER r33: FPP) */   /* + 3: ds41_wmk 4 (DRAFTER r7: 2 without WHG / DQ8); + 10: 11 (DRAFTER r23: 2 + HDP + TDP); + 11: 12 (DRAFTER r31: 11 with HRS's head); + 12: 13 (DRAFTER r32: DMX) */ h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
+    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 17) {   /* + 17: 18 (DRAFTER r44: HG2R) */   /* + 16: 17 (DRAFTER r36: G2R) */   /* + 15: 16 (DRAFTER r35: DG2) */   /* + 14: 15 (DRAFTER r33: FPP) */   /* + 3: ds41_wmk 4 (DRAFTER r7: 2 without WHG / DQ8); + 10: 11 (DRAFTER r23: 2 + HDP + TDP); + 11: 12 (DRAFTER r31: 11 with HRS's head); + 12: 13 (DRAFTER r32: DMX) */ h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
     else if (g_wk_cur) h.wk_pin(g_wk_cur);
     else h.wm_pin(1);
 }
@@ -846,7 +846,7 @@ static void route(const Plugin& pl, const char* tlist) {
      * 64 rows: 49..64-row calls in gg_wk_kernel / the head's G2 at four row tiles instead of the GPF prefill form); default 1 */
     /* tp8 loop D25 step 2 (DECODE round 21): modes 6 / 7 (5 + another 49..64-row launch code) too, the band 64 as 5's */
     /* tp8 loop D27 (DECODE round 22): mode 9 (8 + the per-shape 33..48-row table) too */
-    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); const int v = e ? std::atoi(e) : 1; return v >= 1 && v <= 17 ? v : 1; }();   /* DRAFTER r31: 11 / 12 too; r32: 13 / 14; r33: 15; r35: 16; r36: 17 */
+    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); const int v = e ? std::atoi(e) : 1; return v >= 1 && v <= 18 ? v : 1; }();   /* DRAFTER r31: 11 / 12 too; r32: 13 / 14; r33: 15; r35: 16; r36: 17 */
     const int64_t band = rmode >= 5 ? 64 : 48;
     const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 56, 63, 64, 97, 130 };
     const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
@@ -1112,8 +1112,12 @@ static void route(const Plugin& pl, const char* tlist) {
 static void q6il(const Plugin& pl, const char* tlist) {
     Hk h;
     if (!hooks(pl, h, "--q6ilcheck")) return;
-    auto pack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, "r4d_q6k_il16b_pack");
-    auto unpack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, "r4d_q6k_il16b_unpack");
+    /* R4D_IL_TYPE=q8_0 (lever Q8IL, round 44): the q8_0 dense shapes (the DSpark drafter's DLW linears + its context main_proj) on q8_0_il16b */
+    const bool q8 = [] { const char* e = std::getenv("R4D_IL_TYPE"); return e && !std::strcmp(e, "q8_0"); }();
+    const char* iln = q8 ? "q8_0_il16b" : "q6_K_il16b";
+    const char* nan_ = q8 ? "q8_0" : "q6_K";
+    auto pack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, q8 ? "r4d_q8_0_il16b_pack" : "r4d_q6k_il16b_pack");
+    auto unpack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, q8 ? "r4d_q8_0_il16b_unpack" : "r4d_q6k_il16b_unpack");
     auto wst = (int (*)(long long*, int))dlsym(pl.h, "rad_wmk_stats");
     if (!pack || !unpack || !wst) { std::printf("--q6ilcheck: r4d_q6k_il16b_pack / unpack / rad_wmk_stats absent (not a Q6IL libr4d)\n"); ++g_fail; return; }
     const std::vector<int64_t> modes = ilist(std::getenv("R4D_Q6IL_MODES"), "15,17");
@@ -1132,22 +1136,25 @@ static void q6il(const Plugin& pl, const char* tlist) {
         { "shexp_gate_up_w512", 0, 1024, 0, 5120, false, 2048 }, { "shexp_down(fold e)", 4, 5120, 0, 768, false, 2048 },
         { "shexp_down_w512(fold e)", 4, 5120, 0, 512, false, 2048 }, { "engram_kv", 0, 6400, 0, 6144, false, 2048 },
         { "engram_kv_e2part", 0, 1600, 0, 6144, false, 2048 },  { "head", 1, 32320, 0, 5120, false, 256 },
+        { "dspark_fc(main_proj)", 0, 5120, 0, 15360, false, 2048 }, { "dspark_fc_fcs_part", 0, 1280, 0, 15360, false, 2048 },
     };
-    const MrTy& ty = kMrTypes[1];   /* q6_K */
+    const MrTy& ty = kMrTypes[q8 ? 2 : 1];   /* q6_K, or q8_0 under R4D_IL_TYPE=q8_0 */
     /* R4D_Q6IL_DECL=1: the IL weight handed at its DECLARED shape [N, K] (what the engine passes a relayouted weight), not [N, 106 K / 128] */
     const bool decl = [] { const char* e = std::getenv("R4D_Q6IL_DECL"); return e && e[0] == '1'; }();
     long long keys = 0, bad_keys = 0, calls = 0;
-    std::printf("Q6IL check: q6_K_il16b (tile-interleaved, r4d_q6k_il16b_pack) vs q6_K (native rows) through each op row, modes");
+    std::printf("Q6IL check: %s (tile-interleaved, the plugin's pack) vs %s (native rows) through each op row, modes", iln, nan_);
     for (int64_t m : modes) std::printf(" %lld", (long long)m);
     std::printf(", %zu row counts\n", Ms.size());
     for (const Op& op : ops) {
         if (!want.empty() && !mr_in(want.c_str(), op.name)) continue;
-        const char* rn = op.kind == 0 ? "gemm_nt_ggml_qk256_tiled" : op.kind == 1 ? "logits_gemm_ggml_qk256_tiled"
+        if (q8 ? (op.kind == 1 || !std::strncmp(op.name, "engram", 6)) : !std::strncmp(op.name, "dspark", 6)) continue;   /* the type's own shapes */
+        const char* rn = q8 ? (op.kind == 0 ? "gemm_nt_ggml_qk32_tiled" : op.kind == 2 ? "gemm_nt_ggml_pair_qk32" : op.kind == 3 ? "rmsnorm_gemm_nt_ggml_qk32" : "swiglu_clamped_gemm_nt_ggml_qk32")
+                       : op.kind == 0 ? "gemm_nt_ggml_qk256_tiled" : op.kind == 1 ? "logits_gemm_ggml_qk256_tiled"
                        : op.kind == 2 ? "gemm_nt_ggml_pair_qk256" : op.kind == 3 ? "rmsnorm_gemm_nt_ggml_qk256" : "swiglu_clamped_gemm_nt_ggml_qk256";
         const RadKernelInfo* row = find(pl, rn);
         if (!row) { std::printf("  Q6IL %s: row %s absent\n", op.name, rn); ++g_fail; ++bad_keys; ++keys; continue; }
         dfree_all();
-        const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, rbi = K / 128 * 106, xc = op.kind == 4 ? 2 * K : K;
+        const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, rbi = q8 ? rb : K / 128 * 106, xc = op.kind == 4 ? 2 * K : K;
         const int64_t NY = N + N2, hw_ = op.kind >= 3 ? K : 0, RB = op.mmax;
         std::vector<uint8_t> hw, hw2, hil, hil2, back;
         mr_weights(hw, ty, N, K, 0x6A10001ull ^ (uint64_t)(N * 7 + K));
@@ -1211,7 +1218,7 @@ static void q6il(const Plugin& pl, const char* tlist) {
         auto call = [&](bool il, int64_t M, std::vector<uint8_t>& out) -> int {
             st_memset(d_y, 0xff, (size_t)M * yrow);
             if (hrow) st_memset(d_h, 0x5a, (size_t)M * hrow);
-            const int rc = il ? launch("q6_K_il16b", d_wi, hil.size(), decl ? K : rbi, M) : launch("q6_K", d_w, hw.size(), rb, M);
+            const int rc = il ? launch(iln, d_wi, hil.size(), decl ? K : rbi, M) : launch(nan_, d_w, hw.size(), rb, M);
             ++calls;
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : -999;
             out.resize((size_t)M * (yrow + hrow));
@@ -1240,8 +1247,8 @@ static void q6il(const Plugin& pl, const char* tlist) {
             const bool kb = rt_bad || rc_bad || diff || ndecl;
             ++keys;
             if (kb) { ++bad_keys; ++g_fail; }
-            std::printf("Q6IL %s %lldx%lld%s mode %lld | pack inverse %s | calls compared %lld, IL != native %lld, rc bad %lld, WMK declines on IL %lld -> %s%s\n",
-                        op.name, (long long)NY, (long long)K, op.kind == 1 ? " f32" : "", (long long)mode, rt_bad ? "NO" : "ok", cmp, diff, rc_bad, ndecl,
+            std::printf("Q6IL %s %s %lldx%lld%s mode %lld | pack inverse %s | calls compared %lld, IL != native %lld, rc bad %lld, WMK declines on IL %lld -> %s%s\n",
+                        nan_, op.name, (long long)NY, (long long)K, op.kind == 1 ? " f32" : "", (long long)mode, rt_bad ? "NO" : "ok", cmp, diff, rc_bad, ndecl,
                         kb ? "FAIL" : "ok", fails.c_str());
             std::fflush(stdout);
         }
@@ -1259,9 +1266,11 @@ static void q6il(const Plugin& pl, const char* tlist) {
             if ((int)cw.size() < NC) { std::printf("  Q6IL %s perf: alloc of %d copies\n", op.name, NC); continue; }
             hipEvent_t e0, e1;
             st_ev_create(&e0); st_ev_create(&e1);
+            const int pin = [] { const char* e = std::getenv("R4D_Q6IL_PIN"); return e ? std::atoi(e) : 0; }();   /* a launch code for both arms (bench pin) */
             for (int64_t mode : modes) {
                 set_dec(h);
                 h.sw("ds41_wmk", (int)mode);
+                if (pin) h.wk_pin(pin);
                 std::string line;
                 for (int64_t M : PM) {
                     if (M > RB) continue;
@@ -1272,7 +1281,7 @@ static void q6il(const Plugin& pl, const char* tlist) {
                             const bool il = (rep + arm) & 1;
                             st_ev_record(e0, nullptr);
                             for (int c = 0; c < NC; ++c)
-                                (void)(il ? launch("q6_K_il16b", ci[(size_t)c], hil.size(), rbi, M) : launch("q6_K", cw[(size_t)c], hw.size(), rb, M));
+                                (void)(il ? launch(iln, ci[(size_t)c], hil.size(), rbi, M) : launch(nan_, cw[(size_t)c], hw.size(), rb, M));
                             st_ev_record(e1, nullptr);
                             st_ev_sync(e1);
                             float ms = 0;
@@ -1284,7 +1293,8 @@ static void q6il(const Plugin& pl, const char* tlist) {
                     const float a = tn_[tn_.size() / 2], b = ti_[ti_.size() / 2];
                     line += fmt(" M %lld %.1f -> %.1f (%+.1f %%);", (long long)M, a, b, 100.0 * (b - a) / a);
                 }
-                std::printf("Q6ILPERF %s %lldx%lld mode %lld chain %d copies, us a call native -> IL:%s\n", op.name, (long long)NY, (long long)K,
+                if (pin) { h.wk_pin(0); line += fmt(" (pin %d)", pin); }
+                std::printf("Q6ILPERF %s %s %lldx%lld mode %lld chain %d copies, us a call native -> IL:%s\n", nan_, op.name, (long long)NY, (long long)K,
                             (long long)mode, NC, line.c_str());
                 std::fflush(stdout);
             }
