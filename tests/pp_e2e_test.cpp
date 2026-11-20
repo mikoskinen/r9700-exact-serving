@@ -6993,7 +6993,9 @@ TEST(d57_the_scheduler_levers_together_serve_one_process_tokens) {
  * form alone: every reply's view (text, thinking, the calls' names and arguments / the tool_use blocks' names and inputs, finish /
  * stop reason, prompt and completion tokens) and, where a form asks logprobs, its token ids with their log-probabilities and top
  * alternatives; at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (the KV copy checked), BEST's shape with the morning candidate's
- * scheduler levers (SRF 2 + PUB_PROMPT 2 + HOLD + LANE_ROOM), and the DSpark-drafted fixture at BEST's shape: 0 differ, all 200, KV copy 0 differ, 0 E lines, the head
+ * scheduler levers (SRF 2 + PUB_PROMPT 2 + HOLD + LANE_ROOM), the same at BEST's own grid (4,160-token steps, span 2, interval
+ * 2048, 32 sequences, SPAN_SHORT / SPAN_TAIL / WIN_STEPS; RAD_TEST_LEVEL >= 2 only), and the DSpark-drafted fixture at BEST's
+ * shape: 0 differ, all 200, KV copy 0 differ, 0 E lines, the head
  * attention-cached. In one process: every form answered, a streamed form's tokens = its non-streamed sibling's (and its whole view
  * when the reply ended on its own), the forced ping calls complete. Ids (call_*, toolu_*) are minted at random per reply and are not
  * compared. ~5-6 min alone (the ~6,100-token head is prefilled once a process; the forms alone in one process ~50-60 s a fixture). */
@@ -7387,6 +7389,11 @@ const std::vector<std::string> kD58Best = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_P
 const std::vector<std::string> kD58Sched = { "RADIANCE_SCHED_SRF=2", "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=5000",
                                              "RADIANCE_SCHED_LANE_ROOM=1" };
 bool d58_same(const D58Reply& x, const D58Reply& y) { return x.view == y.view && x.ids == y.ids; }
+/* BEST S1P14F's own grid and lane envs (loop BEST.md): 4,160-token steps, prefill span 2, checkpoint interval 2048, 32 sequences, a
+ * lone prefill of <= 24,576 rows one interval a chunk, its last 8,192 rows too, 3 window steps -- the cache's hits on the 2,048 grid */
+const std::vector<std::string> kD58GridArgs = { "--max-num-batched-tokens", "4160", "--prefill-span", "2", "--checkpoint-interval", "2048",
+                                                "--max-num-seqs", "32" };
+const std::vector<std::string> kD58GridEnv = { "RADIANCE_PP_SPAN_SHORT=24576", "RADIANCE_PP_SPAN_TAIL=8192", "RADIANCE_PP_WIN_STEPS=3" };
 
 /* One process serving each form alone on the default pool (0: the plain fixture, 1: the drafted one), once a test binary: D58's
  * reference and D59's. */
@@ -7501,22 +7508,32 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
         CHECK(ptok > 4000);
         CHECK(hit > 4000);
     }
-    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv; };
+    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv, grid; };
     /* "one process" (the set in one process against its forms alone) runs only when PP_E2E_D58_ARM names it: a debugging aid for a
-     * lane arm that differs */
-    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false, false },
-                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true },
-                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, false, true },
-                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true },
-                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true, true } }) {
+     * lane arm that differs. "BEST's grid" = BEST's own steps / span / interval / lane envs (kD58GridArgs / kD58GridEnv) against the
+     * same reference (the arithmetic is row-independent: hits on another grid are the same bytes) */
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false, false },
+                         Arm{ "2 lanes", "0,2", 2, false, false, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true, false },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, false, true, false },
+                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true, false },
+                         Arm{ "BEST's shape + levers at BEST's grid", "1,3", 4, true, true, false, true, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true, true, false } }) {
         if ((only && !std::strstr(a.name, only)) || (!a.lanes && !only)) continue;
+        /* BEST's grid hits the head at 4,096 of 6,114 tokens, not 5,632: +~140 s of prefill (134 s of wall) -- RAD_TEST_LEVEL >= 2 */
+        if (a.grid && radtest::level() < 2) {
+            fprintf(stderr, "    D58 %s: at RAD_TEST_LEVEL >= 2 only (~2.5 min)\n", a.name);
+            continue;
+        }
         std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
         if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
         if (a.best) env = cat(env, kBest);
         if (a.sched) env = cat(env, kSched);
+        if (a.grid) env = cat(env, kD58GridEnv);
         Serving pp;
         if (a.ds) pp.model = worldds().llama_rad;
         std::vector<std::string> ex = a.ds ? cat(ext, spec) : ext;
+        if (a.grid) ex = cat(ex, kD58GridArgs);
         if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
         REQUIRE(pp.start(a.cut, ex, env));
         const auto t0 = std::chrono::steady_clock::now();
@@ -7553,7 +7570,7 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
         const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
         if (const char* dd = std::getenv("PP_E2E_D58_LOGS")) {
             const std::string base = std::string(dd) + "/d58-" + std::to_string(a.lanes) + (a.best ? "-best" : "") + (a.sched ? "-sched" : "") +
-                                     (a.ds ? "-ds" : "");
+                                     (a.grid ? "-grid" : "") + (a.ds ? "-ds" : "");
             tiny::write_text(base + "-leader.log", llog);
             tiny::write_text(base + "-follower.log", flog);
         }
@@ -7578,7 +7595,8 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
  * tokens fits, the set -- the ~6,100-token head shared + seventeen tails, ~8,700 -- does not) and serves D58's set (both heads alone, all seventeen at once, two
  * alone again); every reply = one process serving that form alone on the default pool (D58's reference): the view and the logprob
  * ids / values / top-2. Arms: one process, 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape + the scheduler levers (SRF 2 +
- * PUB_PROMPT 2 + HOLD 5000 + LANE_ROOM; the KV copy checked), the DSpark-drafted fixture at BEST's shape + the levers. Checks: 0
+ * PUB_PROMPT 2 + HOLD 5000 + LANE_ROOM; the KV copy checked), the same at BEST's own grid, the DSpark-drafted fixture at BEST's
+ * shape + the levers. Checks: 0
  * differ, all 200, KV copy 0 differ, 0 E lines, and the pool was reached (preemptions > 0 in the one-process arm). Runs at
  * RAD_TEST_LEVEL >= 2 only (skipped in the default suite run). */
 namespace {
@@ -7596,12 +7614,14 @@ TEST(d59_chat_and_anthropic_forms_with_tools_under_kv_pressure_serve_one_process
     const std::vector<D58Form> forms = d58_forms();
     REQUIRE_EQ(forms.size(), (size_t)17);
     const char* only = std::getenv("PP_E2E_D59_ARM");   /* a debugging aid: the arms whose name holds this text */
-    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv; };
+    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv, grid; };
     long long pre_all = 0, pre_one = -1;
-    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false, false },
-                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true },
-                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true },
-                         Arm{ "drafted, BEST's shape + the scheduler levers", "1,3", 4, true, true, true, true } }) {
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false, false },
+                         Arm{ "2 lanes", "0,2", 2, false, false, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true, false },
+                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true, false },
+                         Arm{ "BEST's shape + levers at BEST's grid", "1,3", 4, true, true, false, true, true },
+                         Arm{ "drafted, BEST's shape + the scheduler levers", "1,3", 4, true, true, true, true, false } }) {
         if (only && !std::strstr(a.name, only)) continue;
         const D58Ref& ref = d58_reference(a.ds ? 1 : 0, forms);
         REQUIRE(ref.ok);
@@ -7609,7 +7629,9 @@ TEST(d59_chat_and_anthropic_forms_with_tools_under_kv_pressure_serve_one_process
         if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
         if (a.best) env = cat(env, kD58Best);
         if (a.sched) env = cat(env, kD58Sched);
+        if (a.grid) env = cat(env, kD58GridEnv);
         std::vector<std::string> ex = a.ds ? cat(d58_ext(), kD58Spec) : d58_ext();
+        if (a.grid) ex = cat(ex, kD58GridArgs);
         if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
         const std::string model = a.ds ? worldds().llama_rad : std::string();
         auto pool_at = [&](int mib) -> long long {
@@ -7669,7 +7691,8 @@ TEST(d59_chat_and_anthropic_forms_with_tools_under_kv_pressure_serve_one_process
                 (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
         const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
         if (const char* dd = std::getenv("PP_E2E_D59_LOGS")) {
-            const std::string base = std::string(dd) + "/d59-" + std::to_string(a.lanes) + (a.best ? "-best" : "") + (a.ds ? "-ds" : "");
+            const std::string base = std::string(dd) + "/d59-" + std::to_string(a.lanes) + (a.best ? "-best" : "") + (a.grid ? "-grid" : "") +
+                                     (a.ds ? "-ds" : "");
             tiny::write_text(base + "-leader.log", llog);
             if (a.lanes) tiny::write_text(base + "-follower.log", flog);
         }
