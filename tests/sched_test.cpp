@@ -3567,7 +3567,8 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
         CHECK(!fn4::check("pp_rband", -2, &e2));
         CHECK(e2.find("RADIANCE_PP_RBAND_EVERY") != std::string::npos);
     }
-    CHECK_EQ(i + 7, (int)fn4::kSwitches);
+    CHECK_EQ(fn4::switch_index("sched_srf"), 101);   /* tp8 loop P44 */
+    CHECK_EQ(i + 8, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -3626,7 +3627,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100 */
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3644,7 +3645,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100 */
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101 */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3755,7 +3756,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 6, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100 */
+    CHECK_EQ(i + 7, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
@@ -11778,7 +11779,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12750,7 +12751,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
@@ -13314,6 +13315,157 @@ TEST(lever_ti_the_switch_takes_0_and_1_and_starts_off) {
         CHECK(fn4::state_json().find("\"sched_tail_inner\": 1") != std::string::npos);
     }
     CHECK_EQ(fn4::sched_tail_inner(), 0);
+}
+
+/* tp8 loop P44 (fn4 sched_srf, upstream 67cf57b8): 0 / 1 / 2, the scheduler's (read at every step it plans, not handed over as a
+ * sched switch), off at start; no -1 (its read-back is never -1: the kit's arm undo POSTs 0 / 1 / 2). */
+namespace {
+struct SrfSwitch {
+    explicit SrfSwitch(int v) { CHECK(DstSwitches::set("sched_srf", v)); }
+    ~SrfSwitch() { DstSwitches::set("sched_srf", 0); }
+};
+}  // namespace
+
+TEST(srf_the_switch_takes_0_1_2_and_starts_off) {
+    std::string err;
+    for (int v : { 0, 1, 2 }) CHECK(fn4::check("sched_srf", v, &err));
+    for (int v : { -1, 3, 256 }) {
+        CHECK(!fn4::check("sched_srf", v, &err));
+        CHECK(err.find("sched_srf takes 0") != std::string::npos);
+    }
+    CHECK_EQ(fn4::sched_srf(), 0);
+    CHECK_EQ(fn4::switch_index("sched_srf"), (int)fn4::kSchedSrf);
+    CHECK(!fn4::sched_switch(fn4::kSchedSrf));
+    CHECK(!fn4::follower_switch(fn4::kSchedSrf));
+    for (int v : { 1, 2 }) {
+        SrfSwitch on(v);
+        CHECK_EQ(fn4::sched_srf(), v);
+        CHECK(fn4::state_json().find(fmt("\"sched_srf\": %d", v)) != std::string::npos);
+    }
+    CHECK_EQ(fn4::sched_srf(), 0);
+}
+
+/* sched_srf 1 = upstream 67cf57b8's rule on one scheduler (its sched_test case, ported): prompts prefilling side by side with
+ * nothing decoding and no one to admit -- each step is spanned and holds one of them, the one with the fewest prompt tokens left,
+ * and the others wait for it (no share of it); as soon as one decodes, the steps are shared again; no wide step holds two
+ * sequences; the step after a request finished beside a prefill is shared, then spans again. At 0 the second step is today's:
+ * both prompts in it. */
+TEST(srf_1_concurrent_prefills_with_nothing_decoding_span_one_at_a_time_shortest_first) {
+    {   /* control: sched_srf 0 shares the steps after the admission */
+        Fixture f;
+        f.build();
+        f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        f.submit(3000, 3);
+        f.submit(1300, 3);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
+        f.commit_plain();
+    }
+    SrfSwitch on(1);
+    Fixture f;
+    f.build();                            /* interval 256, budget 512, shared 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(3000, 3);
+    const uint64_t b = f.submit(1300, 3);
+    /* Both admitted in the first step, at the shared budget. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
+    CHECK(f.sch.plan().n_tok <= 256);
+    f.commit_plain();
+    /* Then b, the shorter, alone in spanned steps up to its first token; a takes nothing. */
+    std::vector<int32_t> b_chunks;
+    int b_first = -1;
+    for (int k = 0; k < 20 && b_first < 0; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        CHECK_EQ((int64_t)p.e.size(), 1ll);
+        CHECK_EQ(p.e[0].seq, b);
+        CHECK(p.e[0].is_prefill);
+        b_chunks.push_back(p.e[0].n_tokens);
+        if (p.e[0].produces_token) b_first = k;
+        f.commit_plain();
+    }
+    CHECK(b_first >= 0);
+    int wide = 0;
+    for (int32_t n : b_chunks) wide += n > 256;
+    CHECK(wide >= 1);
+    /* With b decoding, every step is shared: no entry and no step past 256 tokens, a's chunk beside b's row. */
+    int shared = 0, a_beside_b = 0;
+    for (int k = 0; k < 6; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        bool has_a = false, has_b = false;
+        for (const StepEntry& e : p.e) {
+            has_a = has_a || e.seq == a;
+            has_b = has_b || (e.seq == b && !e.is_prefill);
+        }
+        if (!has_b) break;
+        ++shared;
+        CHECK(p.n_tok <= 256);
+        a_beside_b += has_a;
+        f.commit_plain();
+    }
+    CHECK(shared >= 2);
+    CHECK_EQ(a_beside_b, shared);
+    int64_t c[Scheduler::kSrfN];
+    f.sch.srf_counts(c);
+    CHECK(c[Scheduler::kSrfAlone] >= (int64_t)b_chunks.size());
+    CHECK(c[Scheduler::kSrfOut] >= (int64_t)b_chunks.size());
+
+    /* A step wider than the shared budget never holds more than one sequence, over a run of three prompts arriving together
+     * (RadBuildCtx::max_mixed_tok). */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    g.submit(2500, 2);
+    g.submit(900, 2);
+    g.submit(1700, 2);
+    int bad = 0, spans = 0, done = 0;
+    for (int k = 0; k < 200; ++k) {
+        if (!g.sch.step()) break;
+        const StepPlan& p = g.sch.plan();
+        if (p.n_tok > 256) { ++spans; bad += p.e.size() != 1; }
+        g.commit_plain();
+        ++done;
+    }
+    CHECK(done < 200);
+    CHECK(spans >= 3);
+    CHECK_EQ(bad, 0);
+
+    /* The step after a request finishes beside a prefill is shared: a follow-up turn its client sends at once waits for that
+     * step, not for a span. Then the prefill spans again. */
+    Fixture h;
+    h.build();
+    h.cfg.prefill_span = 2;
+    CHECK_OK(h.start());
+    const uint64_t d = h.submit(100, 3);
+    CHECK(h.sch.step() != nullptr);
+    h.commit_plain();
+    const uint64_t p = h.submit(3000, 2);
+    std::vector<int64_t> after;           /* p's chunks from the step after d finished */
+    bool d_gone = false;
+    for (int k = 0; k < 40 && after.size() < 3; ++k) {
+        if (!h.sch.step()) break;
+        bool has_d = false;
+        int64_t p_tok = 0;
+        for (const StepEntry& e : h.sch.plan().e) {
+            has_d = has_d || e.seq == d;
+            if (e.seq == p) p_tok = e.n_tokens;
+        }
+        if (!has_d) { d_gone = true; after.push_back(p_tok); }
+        h.commit_plain();
+    }
+    CHECK(d_gone);
+    CHECK_EQ((int64_t)after.size(), 3ll);
+    if (after.size() == 3) {
+        CHECK(after[0] > 0 && after[0] <= 256);
+        CHECK(after[1] > 256 || after[2] > 256);
+    }
 }
 
 TEST(lever_ti_a_conversation_takes_its_fine_tails_inside_one_last_chunk) {
@@ -15908,3 +16060,161 @@ TEST(merged_lane_runs_depth_zero_at_once_from_draft_occ_rows_and_lends_nothing) 
 }
 
 
+
+/* ======================================================= tp8 loop P44: fn4 sched_srf over the lanes (upstream 67cf57b8) */
+namespace {
+/* Several prompts submitted together (lane l_i, n_i tokens), planned as Engine::step_loop_lanes plans the lanes (run_cold's loop)
+ * until every one has its first token: each prompt's chunks [at, end), the round its first token came, the plans that carried
+ * prefill rows of two prompts or more, window misses and failed commits. */
+struct SrfRun {
+    std::vector<std::vector<std::pair<int, int>>> chunks;
+    std::vector<int> first;
+    int two = 0, failed = 0, rounds = 0;
+    int64_t misses = 0;
+};
+SrfRun run_multi(Lanes& L, int lanes, const std::vector<uint64_t>& ids, const std::vector<int>& home) {
+    SrfRun out;
+    out.chunks.resize(ids.size());
+    out.first.assign(ids.size(), -1);
+    std::vector<int> fifo;
+    std::vector<char> busy((size_t)lanes, 0);
+    int next = 0;
+    for (int round = 0; round < 1200; ++round) {
+        bool all = true;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const Request* r = L.req(home[i], ids[i]);
+            if (out.first[i] < 0 && (!r || !r->output.empty() || r->state == ReqState::Finished)) out.first[i] = round;
+            if (r && r->state == ReqState::Failed) ++out.failed;
+            all = all && out.first[i] >= 0;
+        }
+        if (all) break;
+        out.rounds = round + 1;
+        std::vector<int> todo;
+        for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+        for (size_t at = 0; at < todo.size(); ++at) {
+            const int l = todo[at];
+            if (busy[(size_t)l]) continue;
+            std::vector<int> order, idle_after;
+            for (int j = 1; j < lanes; ++j)
+                if (!busy[(size_t)((l + j) % lanes)]) {
+                    order.push_back((l + j) % lanes);
+                    idle_after.push_back((l + j) % lanes);
+                }
+            for (int f : fifo) order.push_back(f);
+            const RadBatch* b = L.plan(l, order);
+            if (!b) continue;
+            out.misses += L.window_misses(l, b);
+            std::vector<uint64_t> seqs;
+            for (const StepEntry& e : L.at(l).plan().e) {
+                if (!e.is_prefill) continue;
+                if (std::find(seqs.begin(), seqs.end(), e.seq) == seqs.end()) seqs.push_back(e.seq);
+                for (size_t i = 0; i < ids.size(); ++i)
+                    if (e.seq == ids[i]) out.chunks[i].emplace_back(e.ctx_len, e.ctx_len + e.n_tokens);
+            }
+            out.two += seqs.size() >= 2;
+            busy[(size_t)l] = 1;
+            fifo.push_back(l);
+            next = (l + 1) % lanes;
+            todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+        }
+        if (fifo.empty()) continue;
+        const int l = fifo.front();
+        fifo.erase(fifo.begin());
+        if (L.commit(l, 5) < 0) ++out.failed;
+        busy[(size_t)l] = 0;
+    }
+    return out;
+}
+
+/* the DS line's geometry (lanes_span_off_cuts_...'s): interval 2048, MNBT 4160, span 2, window 16; `best` = BEST's span cut
+ * (RADIANCE_PP_SPAN_SHORT=24576 + RADIANCE_PP_SPAN_TAIL=8192) */
+void srf_lanes(Lanes& L, int lanes, bool best) {
+    L.grid = 2048;
+    L.cfg.prefill_span = 2;
+    L.max_tok = 4160;
+    L.max_ctx = 70000;
+    L.kv_blocks = 16384;
+    L.stage_rows = 1024;
+    L.win = 16;
+    L.seqs = 8;
+    REQUIRE_EQ(L.start(lanes), RAD_OK);
+    if (best) {
+        L.set.set_span_short(24576);
+        L.set.set_span_tail(8192);
+    }
+}
+}  /* namespace */
+
+/* sched_srf 2 over 2 and 3 lanes: prompts submitted together to the decode lanes (pick()'s spread), nothing decoding -- every
+ * prompt's chunks are exactly its lone plan (the one-process grid; run_cold of it alone), no plan carries rows of two prompts,
+ * the first tokens come shortest first (equal lengths: the first arrival first), every window key is read right and nothing
+ * fails; sched_srf 0 (the control) interleaves them (plans with two prompts, or a chunk off a lone plan). */
+TEST(srf_2_prompts_over_the_lanes_one_at_a_time_shortest_first_each_its_lone_plan) {
+    struct Case { std::vector<int> n; };
+    const std::vector<Case> cases = { { { 15777, 8500 } }, { { 16384, 16384 } }, { { 16000, 9000, 12000, 20000 } },
+                                      { { 40000, 6000 } } };
+    for (int best : { 0, 1 })
+    for (int lanes : { 2, 3 })
+    for (const Case& c : cases) {
+        /* each prompt alone: its lone plan at this lane count */
+        std::vector<std::vector<std::pair<int, int>>> lone;
+        for (size_t i = 0; i < c.n.size(); ++i) {
+            Lanes L;
+            srf_lanes(L, lanes, best != 0);
+            const uint64_t s = L.submit(0, c.n[i], 1, 1000);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            lone.push_back(run_cold(L, lanes, s, &misses, &failed));
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+        }
+        for (int srf : { 0, 2 }) {
+            SrfSwitch on(srf);
+            Lanes L;
+            srf_lanes(L, lanes, best != 0);
+            std::vector<uint64_t> ids;
+            std::vector<int> home;
+            for (size_t i = 0; i < c.n.size(); ++i) {
+                const int h = (int)(i % (size_t)lanes);   /* pick(): the fewest live requests, the lowest index */
+                ids.push_back(L.submit(h, c.n[i], 1, 1000));
+                home.push_back(h);
+                REQUIRE(ids.back() != 0);
+            }
+            const SrfRun r = run_multi(L, lanes, ids, home);
+            CHECK(L.set.broken().empty());
+            CHECK_EQ(r.failed, 0);
+            CHECK_EQ(r.misses, (int64_t)0);
+            int off_lone = 0;
+            for (size_t i = 0; i < c.n.size(); ++i) {
+                CHECK(r.first[i] >= 0);
+                off_lone += r.chunks[i] != lone[i];
+                int64_t rows = 0;
+                for (size_t k = 0; k < r.chunks[i].size(); ++k) {
+                    rows += r.chunks[i][k].second - r.chunks[i][k].first;
+                    if (k) CHECK_EQ(r.chunks[i][k].first, r.chunks[i][k - 1].second);   /* position order */
+                }
+                CHECK_EQ(rows, (int64_t)c.n[i]);
+            }
+            std::string firsts;
+            for (size_t i = 0; i < c.n.size(); ++i) firsts += fmt("%s%d@%d", i ? " " : "", c.n[i], r.first[i]);
+            fprintf(stderr, "    %s%d lanes, sched_srf %d: first tokens (prompt@round) %s; %d plans with two prompts, %d of %zu "
+                    "prompts off their lone plan, %d rounds\n", best ? "BEST's span cut, " : "", lanes, srf, firsts.c_str(), r.two,
+                    off_lone, c.n.size(), r.rounds);
+            if (srf == 0) continue;
+            CHECK_EQ(r.two, 0);
+            CHECK_EQ(off_lone, 0);
+            /* shortest first: a shorter prompt's first token never after a longer one's (equal: the earlier id first) */
+            for (size_t i = 0; i < c.n.size(); ++i)
+                for (size_t j = 0; j < c.n.size(); ++j)
+                    if (c.n[i] < c.n[j] || (c.n[i] == c.n[j] && i < j)) CHECK(r.first[i] <= r.first[j]);
+            int64_t k[Scheduler::kSrfN] = {}, one[Scheduler::kSrfN];
+            for (int l = 0; l < lanes; ++l) {
+                L.at(l).srf_counts(one);
+                for (int q = 0; q < Scheduler::kSrfN; ++q) k[q] += one[q];
+            }
+            CHECK(k[Scheduler::kSrfSteps] > 0);
+            CHECK(k[Scheduler::kSrfHeld] > 0);
+        }
+    }
+}

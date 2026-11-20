@@ -5378,3 +5378,88 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
     CHECK(rev_all > 0);
     CHECK(skip_differ > 0);
 }
+
+/* tp8 loop P44 (fn4 sched_srf, upstream 67cf57b8): cold prompts sent together (nothing decoding) at 2 lanes W(0,2) / W(1,3) and 3
+ * lanes W(0,3), sched_srf 2 (prompts one at a time over the lanes, the fewest rows left first; a longer waiting one held), 1 (per
+ * lane) and 2 POSTed in process (the test side's A/B form), serve one process's greedy tokens for every prompt -- one process run
+ * with the same requests at sched_srf 0 -- and the leader's end line counts the rule's plans (and, at 2, held admissions); at 0 the
+ * line names nothing done. The chunk plans (each prompt its lone plan, no plan with two prompts) are sched_test's
+ * srf_2_prompts_over_the_lanes_* (DeepSeek's grid, window keys checked). */
+namespace {
+std::vector<std::vector<int32_t>> srf_set(int port, int n_predict) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (const auto& [seed, n] : std::vector<std::pair<uint64_t, size_t>>{ { 501, 3300 }, { 502, 1900 }, { 503, 2600 }, { 504, 1900 } }) {
+        f.push_back(std::async(std::launch::async, [port, seed, n, n_predict] { return complete(port, prompt_ids(seed, n), n_predict); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+long long srf_field(const std::string& log, const char* tag) {
+    const size_t l = log.rfind("two-node pipeline: fn4 sched_srf ");
+    if (l == std::string::npos) return -1;
+    const std::string ln = log.substr(l, log.find('\n', l) - l);
+    const size_t at = ln.find(tag);
+    if (at == std::string::npos) return -1;
+    size_t b = at;
+    while (b > 0 && ln[b - 1] == ' ') --b;
+    while (b > 0 && std::isdigit((unsigned char)ln[b - 1])) --b;
+    return std::atoll(ln.c_str() + b);
+}
+}  /* namespace */
+
+TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "2112", "--max-model-len", "4096",
+                                           "--prefill-span", "2", "--checkpoint-interval", "1024" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = srf_set(one.port, 12);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    REQUIRE(ref.size() == 4);
+    for (const auto& t : ref) CHECK_EQ(t.size(), (size_t)12);
+    struct Arm { int lanes; const char* cut; int srf; bool post; };
+    for (const Arm a : { Arm{ 2, "0,2", 0, false }, Arm{ 2, "0,2", 2, false }, Arm{ 2, "1,3", 2, false }, Arm{ 3, "0,3", 2, false },
+                         Arm{ 2, "0,2", 1, false }, Arm{ 2, "0,2", 2, true } }) {
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_PP_SPAN_SHORT=24576" });
+        if (a.srf && !a.post) env.push_back("RADIANCE_SCHED_SRF=" + std::to_string(a.srf));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        if (a.post) {
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "sched_srf", a.srf } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            (void)complete(pp.port, prompt_ids(9, 8), 2);   /* a step release applies it */
+        }
+        std::vector<std::vector<int32_t>> got = srf_set(pp.port, 12);
+        if (a.post) got = srf_set(pp.port, 12);   /* the in-process arm: a second set, the switch long applied */
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output();
+        int differ = 0;
+        for (size_t i = 0; i < ref.size() && i < got.size(); ++i) differ += got[i] != ref[i];
+        const long long plans = srf_field(llog, "lane plans under the rule"), held = srf_field(llog, "admissions held"),
+                        out = srf_field(llog, "times a running prompt sat a plan out");
+        fprintf(stderr, "    %d lanes W(%s), sched_srf %d%s: %d of %zu prompts differ from one process; rule plans %lld, sat out %lld, "
+                        "held %lld\n", a.lanes, a.cut, a.srf, a.post ? " (POSTed)" : "", differ, ref.size(), plans, out, held);
+        CHECK_EQ(got.size(), ref.size());
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        if (a.srf == 0) {
+            CHECK(plans <= 0);
+            continue;
+        }
+        CHECK(plans > 0);
+        if (a.srf == 2) CHECK(held > 0);
+    }
+}
