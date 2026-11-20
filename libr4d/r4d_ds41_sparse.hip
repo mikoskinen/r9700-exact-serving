@@ -70,8 +70,11 @@ __device__ __forceinline__ float ds_bf(uint32_t h) { return __uint_as_float((h &
  * 270 s_wait_alu, for 33 roundings a tile. Here both words are formed and the quiet NaN is SELECTED when isnan(f) -- the
  * same function for every input: NaN -> (u & 0xffff0000) | 0x00400000 = (((u >> 16) | 0x40) & 0xffff) << 16; otherwise
  * (u + 0x7fff + lsb) & 0xffff0000 = ((u + 0x7fff + lsb) >> 16 & 0xffff) << 16 (no carry out of the word: the largest
- * non-NaN word, -inf 0xff800000, + 0x8000 stays below 2^32). The loop becomes 522 instructions (VALU slots 458 -> 364,
- * 2 exec saves, 51 waits). M 2 = the selftest's mutation 6 only (NOT exact): an infinity taken for a NaN, so a check
+ * non-NaN word, -inf 0xff800000, + 0x8000 stays below 2^32). The loop becomes 415 instructions (VALU slots 458 -> 267 =
+ * 212 + 39 cndmask + 16 dual-issue pairs, 2 exec saves, 51 waits). Every finite / infinite score is bit for bit; a NaN score
+ * is a NaN, its payload / sign the f32 add's / multiply's operand order (the compiler's per instantiation, the stock form's
+ * too), which index_topk (v > -inf) and index_candidates (bs < v) do not read. M 2 = the selftest's mutation 6 only (NOT
+ * exact): an infinity taken for a NaN, so a check
  * whose data reaches the non-finite path (overflowing dots) must see it. */
 template <int M>
 __device__ __forceinline__ float ds_round_bf16_sel(float f) {
