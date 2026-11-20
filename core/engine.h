@@ -480,7 +480,8 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0, int rband = 0,
+                     int rkeys = 0);
     /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
      * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
      * (StepHdr flags bit 2), the follower's parts start at h + k */
@@ -513,6 +514,19 @@ private:
     int64_t pp_tband_cont_n_ = 0;   /* tail band passes with a later chunk (ctx > 0) in them */
     std::unordered_map<uint64_t, uint8_t> pp_tband_seq_;
     void pp_tband_note(int lane, int tband);
+    /* tp8 loop P41 (fn4 pp_rband / RADIANCE_PP_RBAND_EVERY on the leader, with the plugin's reverse band, rad_pp_rband l = h - 1;
+     * unset: nothing): a lone prompt chunk's head may run as a REVERSE pass -- the leader's head over [0, l) (+ layer l's key chain),
+     * the follower from l (its frame says so: StepHdr flags bit 5). Only a chunk whose every earlier row of its sequence crossed X1
+     * in a prompt pass (the plugin's keys form) or ran a reverse pass, so the follower's copy of layer l's window is whole:
+     * pp_rband_seq_ = such sequences (KV keys) and their chunk count; a decode entry or a prefix restore drops one. */
+    int  pp_ship_rband_ = 0;      /* the frame pp_frame makes now is a reverse pass's (flags bit 5) */
+    int  pp_ship_rkeys_ = 0;      /* step 5: ... crosses X1 in the keys form (flags bit 6) */
+    int64_t pp_rkeys_n_ = 0;      /* step 5: lane steps that crossed X1 in the keys form */
+    int  pp_rband_start_ = 0;     /* RADIANCE_PP_RBAND_EVERY's value (fn4 pp_rband -1 reads it) */
+    int64_t pp_rband_n_ = 0, pp_rband_rows_ = 0, pp_rband_unclean_ = 0, pp_rband_end_ = 0;
+    std::unordered_map<uint64_t, int32_t> pp_rband_seq_;
+    int  pp_rband_step(int lane, const RadBatch* b, int* keys = nullptr);
+    void pp_rband_note(int lane, int rband, int rkeys);
     int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
     int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 loop D46 (fn4 pp_tband 3 / RADIANCE_PP_TAIL_BAND=3, with the plugin's tail COPY, rad_pp_tail_copy): the leader holds the
@@ -526,6 +540,24 @@ private:
     bool pp_tband_bg_ = false;
     int64_t pp_tband_dec_n_ = 0;     /* decode lanes' steps that ran as tail band passes (pp_tband 3) */
     int64_t pp_tband_dec_skip_ = 0;  /* ... and those a BG step was in flight for that a sequence of kept W(h, t)'s */
+    /* tp8 loop D50 (fn4 pp_tband 4 / 4 + 1024 x N): a held decode step bands in a CLEAN stretch too (4), or only above N decoded
+     * sequences there (4 + 1024 x N) -- at --pp-cut h,t+1 the band = W(h, t)'s decode, so where layer t runs follows the stretch
+     * and the load */
+    int64_t pp_tband_dec_clean_ = 0; /* decode lanes' band passes with no BG step in flight (pp_tband 4) */
+    int64_t pp_tband_dec_low_ = 0;   /* clean-stretch decode steps 4 + 1024 x N kept W(h, t)'s at a load <= N */
+    int64_t pp_tband_dec_seen_ = 0;  /* decode lanes' steps pp_tband_step judged (the cell's denominator) */
+    std::string tband_text(const char* when) const;   /* the periodic / run-end counters line */
+    /* tp8 loop D51 (fn4 pp_tband 5): the decode band follows the MEASURED bound -- the follower's recent card working share (its
+     * heartbeat load report, RADIANCE_PP_LOAD_REPORT_MS on the follower) against the leader's own (RADIANCE_PP_NODE_IDLE on both):
+     * band once the follower works more by > pp_bound_h_ permille over the last pp_bound_ms_, keep the layer on the follower once
+     * the leader does, else the last decision; no fresh report -> 3's rule */
+    int  pp_bound_ms_ = 200, pp_bound_h_ = 20;   /* RADIANCE_PP_TBAND_BOUND_MS / _H */
+    int  pp_load_ms_ = 0;                        /* the follower: RADIANCE_PP_LOAD_REPORT_MS (0 = no report) */
+    bool pp_t5_on_ = false;
+    int64_t pp_t5_band_ = 0, pp_t5_keep_ = 0, pp_t5_fb_ = 0;
+    double  pp_t5_lsum_ = 0, pp_t5_fsum_ = 0;
+    bool pp_tband_by_bound(bool count);
+    std::string t5_text(const char* when) const;
     std::unordered_map<uint64_t, int64_t> pp_tcopy_seq_;   /* core/sched/tcopy.h Gap: -1 all written, p the last gap */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();

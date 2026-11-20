@@ -42,7 +42,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
-                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms",
+                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
+                                        "sched_srf", "aql_hdp",
                                         /* qfn-on-ds: the Qwen line's (kQwenFirst on, fn4-x3-pf 6fdca84a's order) */
                                         "no_route", "gather_inv", "hc_fusedown", "hc_normwave", "hc_writevec", "hc_readv",
                                         "ar_lanethreads", "hc_upmix", "ar_laneblocks", "exl3_pfprep", "exl3_mapshare", "exl3_gd",
@@ -372,6 +373,24 @@ int env_tail_grid() {
     return env;
 }
 
+/* tp8 loop U1 (upstream 8f2e511f): RADIANCE_AQL_HDP_FLUSH=1 at start (anything else, or unset, is 0). */
+int env_aql_hdp() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_AQL_HDP_FLUSH");
+        return e && !std::strcmp(e, "1") ? 1 : 0;
+    }();
+    return env;
+}
+
+/* tp8 loop P44: RADIANCE_SCHED_SRF=1 / 2 at start (anything else, or unset, is 0). */
+int env_sched_srf() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_SRF");
+        return e && !std::strcmp(e, "1") ? 1 : e && !std::strcmp(e, "2") ? 2 : 0;
+    }();
+    return env;
+}
+
 /* Lever TI (ds41-pf2): RADIANCE_SCHED_TAIL_INNER=1 at start (anything else, or unset, is 0). */
 int env_tail_inner() {
     static const int env = [] {
@@ -400,6 +419,14 @@ int reported(State& s, int i) {
     if (i == kSchedTailInner) {    /* lever TI: set, else RADIANCE_SCHED_TAIL_INNER (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_tail_inner();
+    }
+    if (i == kSchedSrf) {          /* tp8 loop P44: set, else RADIANCE_SCHED_SRF (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_sched_srf();
+    }
+    if (i == kAqlHdp) {            /* tp8 loop U1: set, else RADIANCE_AQL_HDP_FLUSH (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_aql_hdp();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -530,6 +557,14 @@ int sched_tail_grid() {
 int sched_tail_inner() {
     const int v = st().val[kSchedTailInner].load(std::memory_order_acquire);
     return v >= 0 ? v : env_tail_inner();
+}
+int sched_srf() {
+    const int v = st().val[kSchedSrf].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_sched_srf();
+}
+int aql_hdp() {
+    const int v = st().val[kAqlHdp].load(std::memory_order_relaxed);
+    return v >= 0 ? v : env_aql_hdp();
 }
 int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     State& s = st();
@@ -948,7 +983,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, epoch_bump) and the Qwen line's ("
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, epoch_bump) and the Qwen line's ("
                         "no_route, gather_inv, hc_fusedown, hc_normwave, hc_writevec, hc_readv, ar_lanethreads, hc_upmix, ar_laneblocks, exl3_pfprep, exl3_mapshare, exl3_gd, moe_pair, exl3_dz, exl3_bi, exl3_dual, hc_bi, bi_seg, att_bi, arw_rows, hc_spprobe, hc_sp, mtp_flat, ar_sdma, bi_wide, sp_serial, hc_pinpf2, resume_cold, preempt_keep, kvs_bi, kvs_vic, qsa_split, sp_ple, ar_fence, sp_route)";
         return false;
     }
@@ -1059,12 +1094,12 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpLeadSeg) {   /* tp8 loop D32 (LSP): the leader's */
-        if (v < 0 || v > 65535 || (v & 7) > 2) {
+        if (v < 0 || v > 131071 || (v & 7) > 2) {   /* tp8 loop F81: + 65536 = no position-order guard */
             if (err) *err = "pp_lead_seg takes form + 16 x stride (+ 256): form 0 (a BG step's leader parts whole), 1 (M9 segments as built) or 2 "
                             "(decode first), stride 0 .. 15 (every s-th declared boundary; 0 = 1); + 256 = no band passes (RADIANCE_PP_BAND's "
                             "fresh BG steps run W(h, t)'s, tp8 loop D36); + 8 = the tail whole, + 512 = the SP word on the head's segments "
                             "(tp8 loop D40); + 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N "
-                            "sequences (tp8 loop D49b)";
+                            "sequences (tp8 loop D49b); + 65536 = no position-order guard (tp8 loop F81)";
             return false;
         }
         const int cap = s.lseg_capable.load(std::memory_order_acquire);
@@ -1076,23 +1111,38 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kPpRband) {   /* tp8 loop P41: the leader's; -1 = the start's RADIANCE_PP_RBAND_EVERY (the kit's undo) */
+        if (v == -1) return true;
+        if (v < 0 || v > 511 || ((v & 15) == 0 && v != 0)) {
+            if (err) *err = "pp_rband takes -1 (back to the start's RADIANCE_PP_RBAND_EVERY), 0 (no reverse pass) or p + 16 x phase (+ 256) "
+                            "with p = 1 .. 15 (a lone prompt chunk i with i % p == phase runs as a reverse pass: the follower from layer "
+                            "h - 1; + 256 never the chunk before the last; tp8 loop P41)";
+            return false;
+        }
+        return true;
+    }
     if (i == kPpTband) {   /* tp8 loop D39: the leader's */
         /* -1 = the value before any request (the engine then reads the start's RADIANCE_PP_TAIL_BAND, engine_lanes.cpp
          * pp_tband_step): the read-back of a start that never named the switch, which the test kit's arm undo POSTs back
          * (loop lq215: the undo of {"pp_tband": 1} was refused and the start stopped, F67's case) -- taken everywhere */
         if (v == -1) return true;
-        if (v < 0 || v > 3) {
+        /* tp8 loop D50: 4 (3 in every stretch) and 4 + 1024 x N (N 1 .. 63: in a clean stretch only above N decoded sequences) */
+        /* tp8 loop D51: 5 (the band follows the measured bound: the follower's load report against the leader's own) */
+        if (v < 0 || (v > 5 && !(v > 1024 && v <= 4 + 1024 * 63 && (v & 1023) == 4))) {
             if (err) *err = "pp_tband takes -1 (back to the start's RADIANCE_PP_TAIL_BAND), 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's "
                             "fresh BG steps run W(h, t)'s, the band layer stays declared), 1 (they run as tail band passes; tp8 loop D39), 2 "
-                            "(1 + the later chunks of a prompt whose every chunk so far ran as one; D39b) or 3 (1 + a decode lane's step while a "
-                            "BG step is in flight, with the plugin's tail copy; D46)";
+                            "(1 + the later chunks of a prompt whose every chunk so far ran as one; D39b), 3 (1 + a decode lane's step while a "
+                            "BG step is in flight, with the plugin's tail copy; D46), 4 (3 in every stretch; D50), 4 + 1024 x N, N 1 .. 63 "
+                            "(3, and in a clean stretch while the decode lanes' last steps decoded > N sequences; D50) or 5 (a decode step "
+                            "bands while the follower's card works more than the leader's: its load report, RADIANCE_PP_LOAD_REPORT_MS; D51)";
             return false;
         }
         const int cap = s.tband_capable.load(std::memory_order_acquire);
-        if (v == 3 && cap >= 0 && cap < 2) {   /* tp8 loop D46: registered without the copy (one machine / the follower: range only) */
+        if ((v & 1023) >= 3 && cap >= 0 && cap < 2) {   /* tp8 loop D46 / D50: registered without the copy (one machine / the follower: range only) */
             if (err)
-                *err = "pp_tband=3 refused: the plugin declared no tail band copy (RADIANCE_DS41_PP_TBAND_COPY=1 / RADIANCE_LLAMA_PP_TBAND_COPY=1 "
-                       "on both nodes with the tail band: the leader then holds the band layers' state of every sequence)";
+                *err = "pp_tband=" + std::to_string(v) + " refused: the plugin declared no tail band copy (RADIANCE_DS41_PP_TBAND_COPY=1 / "
+                       "RADIANCE_LLAMA_PP_TBAND_COPY=1 on both nodes with the tail band: the leader then holds the band layers' state of every "
+                       "sequence)";
             return false;
         }
         if (v != 0 && cap == 0) {
@@ -1509,6 +1559,24 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kAqlHdp) {            /* tp8 loop U1: the AQL backend's, read at every doorbell */
+        if (v != 0 && v != 1) {
+            if (err) *err = "aql_hdp takes 0 (a store fence in front of a doorbell, as before) or 1 (the fence, then a store to the "
+                            "card's host data path flush register, so the kernel arguments written through the BAR are in VRAM before "
+                            "the packets that read them are announced: upstream 8f2e511f; tp8 loop U1)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kSchedSrf) {          /* tp8 loop P44: the scheduler's, read at every step it plans */
+        if (v < 0 || v > 2) {
+            if (err) *err = "sched_srf takes 0 (today's plan), 1 (running prompts with no decode row and no admission possible take "
+                            "the step one at a time, the fewest rows left first: upstream 67cf57b8, in each lane) or 2 (1, and across "
+                            "the decode lanes of a pipeline, a lane holding back a waiting prompt longer than that one's rest; tp8 loop P44)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedTailInner) {    /* lever TI (ds41-pf2): the scheduler's, read at every step it plans */
         if (v != 0 && v != 1) {
             if (err) *err = "sched_tail_inner takes 0 (off: lever G's fine tail snapshot cuts the prompt's last chunk there) or 1 "
@@ -1626,7 +1694,7 @@ PeerCheck& peer_fn() { static PeerCheck f; return f; }
 
 bool follower_switch(int i) {
     if (i < 0 || i >= kSwitches) return false;
-    return plugin_switch(i) || i == kAqlAcq || i == kRouteCopyOv || i == kPlaceLf || i == kPlaceSwapLent ||
+    return plugin_switch(i) || i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kPlaceLf || i == kPlaceSwapLent ||
            i == kHeatMinGainX100 || i == kHeatHystX100 || i == kPlaceHb ||
            i == kPpFolReserve ||   /* tp8 loop IDEAS #9: the follower's own loop reads it */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
@@ -1770,7 +1838,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)

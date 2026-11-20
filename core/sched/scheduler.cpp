@@ -257,6 +257,26 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    {   /* tp8 loop D55: a prompt published at its last chunk's commit (publish_prompt_done); unset / 0 = at its close only */
+        const char* e = std::getenv("RADIANCE_SCHED_PUB_PROMPT");
+        pub_mode_ = e && (!std::strcmp(e, "1") || !std::strcmp(e, "2")) ? std::atoi(e) : 0;
+        pub_prompt_ = pub_mode_ >= 1;
+        if (pub_prompt_ && lane_ <= 0 && cfg.prefix_cache)
+            RAD_INFO("scheduler: RADIANCE_SCHED_PUB_PROMPT=%d (tp8 loop D55) -- a prompt's computed blocks go into the prefix cache "
+                     "when its last chunk commits%s, not only at its close: a prompt admitted after that (another lane's too) hits them",
+                     pub_mode_, pub_mode_ >= 2 ? " and at every prefill chunk's commit before it (D55b)" : "");
+        /* tp8 loop D55b: the hold for a running sibling's head (a start env, ms; 0 / unset: none) */
+        const char* h = std::getenv("RADIANCE_SCHED_PUB_HOLD_MS");
+        const long long hm = h && *h ? std::atoll(h) : 0;
+        /* without a publish rule the head reaches the cache only at the sibling's close: a hold would only delay */
+        pub_hold_us_ = hm > 0 && cfg.prefix_cache && pub_prompt_ ? (int64_t)hm * 1000 : 0;
+        if (hm > 0 && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_PUB_HOLD_MS=%lld (tp8 loop D55b) -- %s", hm,
+                     pub_hold_us_ > 0
+                         ? fmt("a fresh prompt that shares >= %lld tokens with a running prompt (any lane) that has not computed and "
+                               "published that head waits for it, at most %lld ms from its arrival", (long long)kPubHoldMin, hm).c_str()
+                         : "OFF: it needs RADIANCE_SCHED_PUB_PROMPT=1 or 2 (and the prefix cache)");
+    }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
         plan_reserved_ = e && !std::strcmp(e, "1");
@@ -788,6 +808,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.lent_hold = false;   /* tp8 M56 (lanes): a recycled slot holds nothing back */
+    s.srf_kv = false;      /* tp8 loop P44 */
+    s.pub_prompt = false;  /* tp8 loop D55: a recycled slot's request has not published its prompt */
+    s.pub_held = false;    /* tp8 loop D55b */
     s.drafter_reset();
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
@@ -1014,6 +1037,61 @@ void Scheduler::trim_prefix_cache() {
 /* What a request computed, into the prefix cache, while it still owns the blocks: at its close,
  * and at a preemption, whose recompute then adopts its prompt instead of computing it again.
  * True when published. */
+void Scheduler::publish_prompt_done(SchedReq& s) {
+    if (!pub_prompt_ || s.pub_prompt || !s.req || s.lent > 0 || s.req->embed) return;
+    if ((int64_t)s.req->n_computed < (int64_t)s.req->prompt.size()) return;
+    s.pub_prompt = true;
+    if (publish_prefix(s)) {
+        ++pub_prompt_n_;
+        pub_prompt_tok_ += s.req->n_computed;
+        RAD_DEBUG("prefix cache: request %llu's prompt of %lld tokens published at its last chunk's commit (tp8 loop D55; %lld so "
+                  "far)", (unsigned long long)s.req->id, (long long)s.req->n_computed, (long long)pub_prompt_n_);
+    }
+}
+
+/* tp8 loop D55b: RADIANCE_SCHED_PUB_PROMPT=2 -- the committed part of a running prompt, chunk by chunk */
+void Scheduler::publish_chunk_done(SchedReq& s) {
+    if (pub_mode_ < 2 || s.pub_prompt || !s.req || s.req->embed) return;
+    if ((int64_t)s.req->n_computed >= (int64_t)s.req->prompt.size()) return;   /* the last chunk: publish_prompt_done */
+    (void)publish_prefix(s);
+}
+
+/* tp8 loop D55b: does a RUNNING prompt (this lane's or another's: the lane schedulers share lane 0's mutex) share at least
+ * kPubHoldMin tokens with `s`'s prompt and not yet have that head in the cache? Only fresh requests wait, only on admitted ones
+ * (never on another waiting one: no cycle), and never past pub_hold_us_ from the arrival. */
+bool Scheduler::pub_holds(const SchedReq& s) const {
+    if (pub_hold_us_ <= 0 || !s.req || s.req->embed || s.req->media || s.req->n_computed != 0 ||
+        s.req->state == ReqState::Preempted)
+        return false;
+    if (s.arrived_us <= 0 || mono_us() - s.arrived_us > pub_hold_us_) return false;
+    const std::vector<int32_t>& p = s.req->prompt;
+    auto holds_on = [&](const SchedReq* o) {
+        if (!o || o == &s || !o->req || o->req->embed || o->req->state != ReqState::Running) return false;
+        const std::vector<int32_t>& q = o->req->prompt;
+        const size_t n = std::min(p.size(), q.size());
+        const int64_t common = (int64_t)(std::mismatch(p.begin(), p.begin() + (long)n, q.begin()).first - p.begin());
+        if (common < kPubHoldMin) return false;
+        /* available: the whole prompt published (D55), or with per-chunk publishing its computed end past the head */
+        if (o->pub_prompt || (int64_t)o->req->n_computed >= (int64_t)q.size()) return false;
+        if (pub_mode_ >= 2 && (int64_t)o->req->n_computed >= std::min<int64_t>(common, (int64_t)p.size() - 1)) return false;
+        return true;
+    };
+    auto scan = [&](const Scheduler& L) {
+        for (int32_t slot : L.running_)
+            if (holds_on(slot >= 0 && (size_t)slot < L.reqs_.size() ? L.reqs_[(size_t)slot].get() : nullptr)) return true;
+        return false;
+    };
+    /* this walk's own admissions join running_ only after the walk (took_): a sibling admitted just before is running too */
+    for (size_t i : took_)
+        if (i < waiting_.size() && holds_on(reqs_[(size_t)waiting_[i]].get())) return true;
+    if (lanes_ && n_lanes_ > 1) {
+        for (int l = 0; l < n_lanes_; ++l)
+            if (const Scheduler* L = lanes_->lane(l); L && scan(*L)) return true;
+        return false;
+    }
+    return scan(*this);
+}
+
 bool Scheduler::publish_prefix(SchedReq& s) {
     if (cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
         s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
@@ -1085,6 +1163,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (s.req->finish_reason.empty() && reason) s.req->finish_reason = reason;
     queue_erase(running_, s.slot);
     queue_erase(waiting_, s.slot);
+    /* tp8 loop P44 (upstream 67cf57b8): a request finished beside others -- the next step is planned as today (sched_srf) */
+    if (st == ReqState::Finished && !s.req->embed && !running_.empty()) finished_beside_ = true;
     s.n_draft = 0;
 
     /* Terminal. The sink keeps the first finish, so a cancel racing a natural stop yields one
@@ -3242,6 +3322,112 @@ bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
     return waited_ms >= cfg_.preempt_wait_ms;
 }
 
+/* ------------------------------------------------------------------ tp8 loop P44: shortest remaining prompt first */
+/* fn4 sched_srf (upstream 67cf57b8, 'concurrent prefills with nothing decoding take the span one at a time'). A running request
+ * counts by the rows of its prompt left to PLAN: its committed rows, the rows lent to other lanes and not committed (SchedReq::lent),
+ * and -- another lane's, read under the lanes' lock -- a chunk of its own in that lane's step in flight; one whose rows are all
+ * planned (its first token in flight) is no candidate. A decode row (committed past its prompt) turns the rule off. */
+void Scheduler::srf_scan(bool planning, bool waiting, SrfPick& pk) const {
+    auto pick = [&](int32_t slot, int64_t left, uint64_t id, bool w) {
+        if (pk.slot < 0 || left < pk.left || (left == pk.left && id < pk.id)) {
+            pk.lane = lane_;
+            pk.slot = slot;
+            pk.left = left;
+            pk.id = id;
+            pk.waiting = w;
+        }
+    };
+    auto one = [&](int32_t slot, bool in_running) {
+        if (slot < 0 || (size_t)slot >= reqs_.size() || !reqs_[(size_t)slot]) return;
+        const SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running) return;
+        const Request& r = *s.req;
+        const int64_t tg = s.seq_len();
+        /* the planning lane's running_ is bumped past its lent rows (lane_plan_begin) */
+        const int64_t done = planning && in_running && lanes_ && s.lent > 0 ? r.n_computed - s.lent : r.n_computed;
+        if (done >= (int64_t)r.prompt.size() && done + 1 >= tg) {
+            pk.dec = true;
+            return;
+        }
+        int64_t planned = done + s.lent;
+        if (!planning) {
+            if (step_open_ && s.entry >= 0 && (size_t)s.entry < plan_.e.size() && plan_.e[(size_t)s.entry].seq == r.id)
+                planned += plan_.e[(size_t)s.entry].n_tokens;
+            if (next_open_ && s.entry_next >= 0 && (size_t)s.entry_next < plan_next_.e.size() &&
+                plan_next_.e[(size_t)s.entry_next].seq == r.id && plan_next_.e[(size_t)s.entry_next].is_prefill)
+                planned += plan_next_.e[(size_t)s.entry_next].n_tokens;
+        }
+        const int64_t left = tg - planned;
+        if (left <= 0) return;
+        if (s.srf_kv) {
+            ++pk.kv;
+            return;
+        }
+        pick(slot, left, r.id, false);
+    };
+    for (int32_t slot : running_) one(slot, true);
+    if (planning)
+        for (int32_t slot : lane_out_) one(slot, false);
+    /* sched_srf 2: a waiting prompt (fresh: no preempted recompute, no media / embedding) by its whole prompt, where this
+     * scheduler has a card and a row for it */
+    if (waiting && !free_cards_.empty() && (int64_t)running_.size() < cfg_.max_seqs)
+        for (int32_t slot : waiting_) {
+            if (slot < 0 || (size_t)slot >= reqs_.size() || !reqs_[(size_t)slot]) continue;
+            const SchedReq& s = *reqs_[(size_t)slot];
+            if (!s.req || s.req->state == ReqState::Preempted || s.req->media || s.req->embed) continue;
+            if (s.srf_kv) {
+                ++pk.kv;
+                continue;
+            }
+            pick(slot, (int64_t)s.req->prompt.size(), s.req->id, true);
+        }
+}
+
+void Scheduler::srf_choose(bool after_finish) {
+    srf_on_ = false;
+    srf_slot_ = -1;
+    srf_away_ = false;
+    srf_hold_ = false;
+    srf_wslot_ = -1;
+    if (srf_now_ <= 0 || cfg_.prefill_span <= 1) return;
+    if (lanes_ && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) return;   /* a BG lane holds no prompt of its own */
+    SrfPick pk;
+    srf_scan(true, false, pk);
+    if (pk.dec) return;   /* a decode row here: today's plan (upstream: steps are shared as soon as anyone decodes) */
+    bool cross = false;
+    if (srf_now_ >= 2 && lanes_ && n_lanes_ > 1 && lanes_->merged_to() < 0) {
+        /* every decode lane's running prompts and waiting prompts: the fewest rows left first */
+        SrfPick all;
+        srf_scan(true, true, all);
+        for (int l = 0; l < lanes_->n(); ++l) {
+            const Scheduler* o = lanes_->lane(l);
+            if (!o || o == this || lanes_->is_bg(l)) continue;
+            o->srf_scan(false, true, all);
+        }
+        if (!all.dec) {
+            pk = all;
+            cross = true;
+        }
+    }
+    /* sched_srf 1 (upstream): the step after a request finished beside others is planned as today. sched_srf 2 across the lanes
+     * keeps the order (a lane's follow-up turn is held unless it is the shortest, as any waiting prompt) */
+    if (!cross && after_finish) return;
+    srf_n_[kSrfKv] += pk.kv;
+    if (pk.slot < 0) return;
+    srf_left_ = pk.left;
+    srf_id_ = pk.id;
+    srf_hold_ = cross;
+    /* sched_srf 1 (upstream): a request this step may admit makes it a shared step, as today */
+    if (!cross && !waiting_.empty() && !free_cards_.empty() && (int64_t)running_.size() < cfg_.max_seqs) return;
+    srf_on_ = true;
+    srf_away_ = pk.lane != lane_;
+    if (pk.lane != lane_) return;
+    if (!pk.waiting) srf_slot_ = pk.slot;
+    /* a waiting prompt chosen: admitted into a step of its own -- not beside a piece another lane lent this one (that piece runs
+     * alone first; nothing more is lent here while it is the chosen) */
+    else if (lanes_->inbox_rows_locked(lane_) == 0) srf_wslot_ = pk.slot;
+}
+
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
@@ -3402,6 +3588,21 @@ const RadBatch* Scheduler::step() {
      * grid, so a prompt may switch between them at any step. */
     span_now_ = true;
     struct SpanReset { bool& f; ~SpanReset() { f = true; } } span_reset{span_now_};
+    /* tp8 loop P44 (fn4 sched_srf, upstream 67cf57b8): running prompts with no decode row take the step one at a time, the fewest
+     * rows left to plan first (srf_choose); 0 = today's plan below, untouched. */
+    const bool srf_after_finish = finished_beside_;
+    finished_beside_ = false;
+    srf_now_ = fn4::sched_srf();
+    int64_t srf_nw = 0;   /* waiting requests the rule lets this step admit */
+    srf_choose(srf_after_finish);
+    if (srf_on_)
+        for (int32_t w : waiting_) {
+            if (!reqs_[(size_t)w]) continue;
+            SchedReq& ws = *reqs_[(size_t)w];
+            if (!srf_holds(ws)) { ++srf_nw; continue; }
+            ++ws.lst.srf_held;   /* a plan it waited through (counted here, whether or not the admission walk reaches it) */
+            ++srf_n_[kSrfHeld];
+        }
     /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
      * plugin that a step wider than shared_tok is one sequence (RadBuildCtx::max_mixed_tok),
      * whatever the geometry turned out to be. */
@@ -3409,7 +3610,30 @@ const RadBatch* Scheduler::step() {
         bool lone = false;
         const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
                                     (int64_t)running_.size() < cfg_.max_seqs;
-        if (running_.size() == 1 && !admit_possible) {
+        const bool srf_admit = srf_on_ && srf_nw > 0 && !free_cards_.empty() && (int64_t)running_.size() < cfg_.max_seqs;
+        if (srf_on_) {
+            /* the chosen prompt alone (no admission this step), or -- every running prompt here sitting out -- the one request
+             * this step may admit, as a single request in an empty engine spans */
+            ++srf_n_[kSrfSteps];
+            if (srf_slot_ >= 0 && !srf_admit &&
+                std::find(running_.begin(), running_.end(), srf_slot_) != running_.end()) {
+                const SchedReq& s0 = *reqs_[(size_t)srf_slot_];
+                lone = span_min_ == 0 || std::max<int64_t>((int64_t)s0.req->prompt.size(), s0.seq_len()) >= span_min_;
+            } else if (srf_slot_ < 0 && srf_nw == 1) {
+                bool all_out = true;
+                for (int32_t slot : running_) all_out = all_out && srf_sits_out(slot);
+                if (all_out)
+                    for (int32_t w : waiting_)
+                        if (reqs_[(size_t)w] && reqs_[(size_t)w]->req && !srf_holds(*reqs_[(size_t)w])) {
+                            lone = span_min_ == 0 || (int64_t)reqs_[(size_t)w]->req->prompt.size() >= span_min_;
+                            break;
+                        }
+            }
+            if (lone) ++srf_n_[kSrfAlone];
+        } else if (srf_now_ > 0 && srf_after_finish && !running_.empty()) {
+            /* sched_srf (upstream 67cf57b8): the one step after a request finished beside others is shared, a lone prefill's too --
+             * the finished conversation's next turn, which its client sends at once, waits for this step, not a span */
+        } else if (running_.size() == 1 && !admit_possible) {
             const SchedReq& s0 = *reqs_[(size_t)running_[0]];
             lone = s0.req->n_computed < (int64_t)s0.req->prompt.size() ||
                    s0.req->n_computed + 1 < s0.seq_len();
@@ -3553,10 +3777,11 @@ const RadBatch* Scheduler::step() {
             const Request& rr = *reqs_[(size_t)slot]->req;
             const int64_t tg = reqs_[(size_t)slot]->seq_len();
             const bool pf = (rr.n_computed < (int64_t)rr.prompt.size()) || (rr.n_computed + 1 < tg);
+            if (pf && srf_sits_out(slot)) continue;   /* tp8 loop P44: those the rule leaves out take no share of the step */
             if (pf) ++behind_pf; else behind_dec += dec_row_tok;
         }
     }
-    const bool admit_waits = share_step && !waiting_.empty() && !free_cards_.empty() &&
+    const bool admit_waits = share_step && (srf_on_ ? srf_nw > 0 : !waiting_.empty()) && !free_cards_.empty() &&
                              (int64_t)running_.size() < cfg_.max_seqs;
     /* The first prefill chunk held back this step (its index in plan_.e before the sort) and what
      * it would have taken: whatever the work it made room for did not use goes back to it. */
@@ -3589,6 +3814,13 @@ const RadBatch* Scheduler::step() {
         const int64_t target = s.seq_len();
         const bool prefill = (r.n_computed < (int64_t)r.prompt.size()) ||
                              (r.n_computed + 1 < target);
+        /* tp8 loop P44 (fn4 sched_srf): a running prompt the rule did not choose sits this step out (planned unchanged at the next) */
+        if (prefill && srf_sits_out(slot)) {
+            ++s.lst.srf_out;
+            ++srf_n_[kSrfOut];
+            ++i;
+            continue;
+        }
         if (share_step) {
             if (prefill) behind_pf = std::max<int64_t>(0, behind_pf - 1);
             else         behind_dec = std::max<int64_t>(0, behind_dec - dec_row_tok);
@@ -3791,6 +4023,8 @@ const RadBatch* Scheduler::step() {
              * pushed: the index belongs to the next entry pushed or to none, and the hand-back below read plan_.e past its
              * end (SIGSEGV in pp_e2e's preemption case: SchedReq::seq_len() of a closed slot) or grew another entry. */
             if (capped_at == (int32_t)plan_.e.size()) { capped_at = -1; capped_full = 0; }
+            /* tp8 loop P44: the chosen prompt's chunk did not fit the pool -- it chooses nobody until it plans again (srf_kv) */
+            if (prefill && slot == srf_slot_ && srf_on_ && stays) s.srf_kv = true;
             if (stays) ++i;
             continue;
         }
@@ -3839,7 +4073,7 @@ const RadBatch* Scheduler::step() {
         plan_.n_tok += want;
         if (!prefill && s.n_draft > plan_.n_spec) plan_.n_spec = s.n_draft;
         budget -= want;
-        if (prefill) { s.noa_starved = false; s.noa_displaced = false; }   /* lever NOA: it ran a chunk */
+        if (prefill) { s.noa_starved = false; s.noa_displaced = false; s.srf_kv = false; }   /* lever NOA: it ran a chunk (+ P44's valve) */
         ++i;
     }
 
@@ -3859,6 +4093,7 @@ const RadBatch* Scheduler::step() {
             const int64_t target = s.seq_len();
             if (!(r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < target)) continue;
             if (noa_disp_ && !s.noa_starved) continue;   /* displaced this step */
+            if (srf_sits_out(slot)) continue;            /* tp8 loop P44 */
             bool in = false;
             for (const StepEntry& pe : plan_.e) in = in || pe.slot == slot;
             if (in) continue;
@@ -3959,6 +4194,14 @@ const RadBatch* Scheduler::step() {
                            s.req->state == ReqState::Preempted)) { ++at; continue; }
             /* lever NOA: a displacement step admits only a starved request (the one it displaced the others for) */
             if (noa_disp_ && !s.noa_starved) { ++at; continue; }
+            /* tp8 loop P44 (fn4 sched_srf 2): a waiting prompt not ahead of the chosen one keeps its place */
+            if (srf_holds(s)) { ++at; continue; }
+            /* tp8 loop D55b (RADIANCE_SCHED_PUB_HOLD_MS): a running sibling is computing this prompt's head -- wait for it */
+            if (pub_hold_us_ > 0 && pub_holds(s)) {
+                if (!s.pub_held) { s.pub_held = true; ++pub_hold_n_; }
+                ++at;
+                continue;
+            }
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
              * close_request removes a refused input from waiting_, so `at` names the next one. */
@@ -4005,6 +4248,9 @@ const RadBatch* Scheduler::step() {
             admit_full_ = 0;
             admit_next_step_ = false;
             const int as = admit_one(s, budget, bypass ? 0 : areserve, bypass ? bypass_now_ : 0);
+            /* tp8 loop P44: the KV valve for a chosen waiting prompt the pool cannot take now (it chooses nobody until admitted) */
+            if (as == RAD_OK) s.srf_kv = false;
+            else if (as == kAdmitWait && srf_on_ && slot == srf_wslot_) s.srf_kv = true;
             /* lever DST: a request the bypass does not take keeps its place for the next ordinary admission, and the
              * walk asks the one behind it */
             if (bypass && as != RAD_OK) { ++at; continue; }
@@ -4690,6 +4936,7 @@ int Scheduler::commit(StepResult& res) {
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
+            publish_chunk_done(s);   /* tp8 loop D55b (RADIANCE_SCHED_PUB_PROMPT=2; else nothing) */
             /* tp8 prefill P0: chunks of this prompt still in flight in other lanes (SchedReq::lent) start at the
              * committed end (pieces commit in position order), so the keep floor follows it: left at the lend's
              * committed end it kept this chunk's window too, and the home lane's next chunk behind the lent one then
@@ -4708,6 +4955,7 @@ int Scheduler::commit(StepResult& res) {
                 /* From here a decode step reads the ring, and the engine checks the resolve's
                  * overflow. */
                 last_prefill_ids_.push_back(r.id);
+                publish_prompt_done(s);   /* tp8 loop D55 (off: nothing) */
             }
             if (e.produces_token && res.token && r.embed) {
                 /* The answer is the pooled vector the engine already put in the sink; there is

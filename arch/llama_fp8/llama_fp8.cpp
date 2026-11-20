@@ -153,6 +153,18 @@ struct Model {
     bool     tcopy = false;
     bool     tcopy_skip = false;
     rad_op   op_tcopy = 0;
+    /* tp8 loop P41, a host test of the engine's REVERSE (head) band (RADIANCE_LLAMA_PP_RBAND=1 on both nodes, W(h >= 2, t), lanes;
+     * unset: nothing here): the follower also declares layer l = h - 1 (its weights and its own cache of that layer); every pass with
+     * prompt rows sends X1 of W(h, t) + layer l's fused q|k|v rows and the follower stores layer l's k / v into its own cache of that
+     * layer at the batch's slots (so its copy holds every PROMPT row; decode-only passes send W(h, t)'s X1 alone); on a REVERSE pass
+     * (RadPpInfo.reserved[3] == l) the leader's head runs [0, l), sends X1 of W(l, t) (the stream (+ the delta) at l) and then only
+     * layer l's k / v from its own rows (step_kv_only: its cache stays whole for decode), the follower runs [l, t). The engine
+     * reverses only chunks whose sequence's earlier rows all came over prompt passes. RADIANCE_PP_TEST_RBAND_SKIP=1 (follower): the
+     * keys' store left out -- the negative control. */
+    int      rband = 0;           /* l, 0 off */
+    int      parts_x1r = 0;
+    bool     rband_skip = false;
+    rad_op   op_x1k = 0, op_x1r = 0, op_rband_st = 0;
     /* tp8 dev 1a (RADIANCE_PP_FOLLOWER_EMBED=1 on both nodes, W(0, t) only; unset: nothing here): the follower looks up
      * the step's embedding itself (the same op over the same table, the vocab-sharded rows completed by the same
      * all-reduce) where it took X1, and the leader's head part issues neither the lookup nor X1: the follower starts a
@@ -456,6 +468,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 const char* tc = std::getenv("RADIANCE_LLAMA_PP_TBAND_COPY");   /* tp8 loop D46 */
                 m.tcopy = m.tband == 1 && tc && !std::strcmp(tc, "1");
             }
+            /* tp8 loop P41 test stand-in: the reverse band (layer h - 1 declared on the follower too) */
+            if (const char* rb = std::getenv("RADIANCE_LLAMA_PP_RBAND"); rb && !std::strcmp(rb, "1") && m.pp_h >= 2 && !m.band &&
+                !m.tband && !m.fe && pp.lanes > 1) {
+                m.rband = (int)m.pp_h - 1;
+                if (m.pp_rank == 1) m.held[(size_t)m.rband] = 1;
+            }
             /* tp8 dev D10 round 2: beside the follower's own lookup, X1 is the step's token ids (the follower reads them) */
             const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
             m.x1_ids = m.fe && ia && !std::strcmp(ia, "1");
@@ -709,7 +727,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.parts_x1 = parts_at(m.pp_h);
         m.parts_x2 = parts_at(m.pp_t);
         const char* kc = std::getenv("RADIANCE_LLAMA_PP_KVCOPY");
-        m.kvcopy = kc && !std::strcmp(kc, "1") && m.pp_h > 0;
+        m.kvcopy = kc && !std::strcmp(kc, "1") && m.pp_h > 0 && !m.rband;   /* tp8 loop P41: the follower's layer h - 1 is its own */
         const int64_t row = g.n_embd * (int64_t)rad_dtype_bytes(rad_dtype_parse(g.dtype), 1);
         const int64_t qkv_row = (g.q_dim() + 2 * g.kv_dim()) * (int64_t)rad_dtype_bytes(g.act_dtype, 1);
         if (m.x1_ids) {   /* tp8 dev D10 round 2: the ids alone, 4 B a row */
@@ -724,6 +742,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             x1_row = std::max(x1_row, row * m.parts_x1b + qkv_row);
             x1_parts = std::max(x1_parts, m.parts_x1b + 1);
             rad_pp_declare_band(1);
+        }
+        if (m.rband) {   /* tp8 loop P41 stand-in: X1 + layer l's q|k|v rows (prompt passes), or X1 of W(l, t) (reverse) */
+            m.parts_x1r = parts_at(m.rband);
+            x1_row = std::max({ x1_row, row * m.parts_x1 + qkv_row, row * m.parts_x1r });
+            x1_parts = std::max({ x1_parts, m.parts_x1 + 1, m.parts_x1r });
+            rad_pp_declare_rband(m.rband);
         }
         rad_pp_declare_crossing(RAD_PP_X1, x1_row, x1_parts);
         }
@@ -801,6 +825,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (m.op_band_st == RAD_NULL_HANDLE) return RAD_E_INVAL;
                 const char* bs = std::getenv("RADIANCE_PP_TEST_BAND_SKIP");
                 m.band_skip = bs && !std::strcmp(bs, "1");
+            }
+        }
+        if (m.rband) {   /* tp8 loop P41 stand-in: the keys form (X1 + layer l's q|k|v rows), the reverse X1 (at l), the store */
+            const bool kv1 = m.parts_x1 == 2;
+            std::vector<rad_buf> pk = { m.b_x };
+            if (kv1) pk.push_back(m.a_h.x);
+            pk.push_back(m.b_qkv);
+            m.op_x1k = RAD_OP(b, lead ? "stage_send" : "stage_recv",
+                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", RAD_PP_X1), RAD_INT("parts", (int)pk.size())),
+                              RAD_NOWEIGHTS);
+            std::vector<rad_buf> pr = { m.b_x };
+            if (m.parts_x1r == 2) pr.push_back(m.a_h.x);
+            m.op_x1r = RAD_OP(b, lead ? "stage_send" : "stage_recv",
+                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", RAD_PP_X1), RAD_INT("parts", (int)pr.size())),
+                              RAD_NOWEIGHTS);
+            if (m.op_x1k == RAD_NULL_HANDLE || m.op_x1r == RAD_NULL_HANDLE) return RAD_E_INVAL;
+            if (lead) {
+                rad_op_reads(b, m.op_x1k, pk.data(), (int)pk.size());
+                rad_op_reads(b, m.op_x1r, pr.data(), (int)pr.size());
+            } else {
+                rad_op_writes(b, m.op_x1k, pk.data(), (int)pk.size());
+                rad_op_writes(b, m.op_x1r, pr.data(), (int)pr.size());
+                m.op_rband_st = rw(b, RAD_OP(b, "kv_store",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                                  RAD_INT("n_head_kv", g.n_head_kv),
+                                                  RAD_INT("block_size", rad_kv_block_size(b, m.kv_full)),
+                                                  RAD_STR("kv_dtype", g.kv_dtype)),
+                                       RAD_NOWEIGHTS),
+                                   {m.b_qkv}, {});
+                if (m.op_rband_st == RAD_NULL_HANDLE) return RAD_E_INVAL;
+                const char* rs = std::getenv("RADIANCE_PP_TEST_RBAND_SKIP");
+                m.rband_skip = rs && !std::strcmp(rs, "1");
             }
         }
         if (m.kvcopy) {
@@ -957,10 +1013,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const bool run_head = part != RAD_PP_PART_TAIL, run_tail = part != RAD_PP_PART_HEAD;
     /* tp8 loop P28 stand-in: a band pass crosses at h + 1 */
     const int bnd = m.band && ppi.reserved[0] == m.band ? m.band : 0;
-    const int64_t he = m.pp_h + bnd;
+    const int64_t he = m.pp_h + bnd - (m.rband && ppi.reserved[3] == m.rband ? 1 : 0);   /* tp8 loop P41: l on a reverse pass */
     /* tp8 loop D39 stand-in: a tail band pass crosses at t - 1 (the follower's parts end there) */
     const int tbd = m.tband && ppi.reserved[2] == m.tband ? m.tband : 0;
     const int64_t te = m.pp_t - tbd;
+    /* tp8 loop P41 stand-in: a reverse pass crosses at l = h - 1 (the leader's head ends there + layer l's k / v); every pass with
+     * prompt rows that is not one crosses in the keys form */
+    const bool rrev = m.rband && ppi.reserved[3] == m.rband;
+    const bool rkey = m.rband && !rrev && ppi.reserved[4] == 1 && batch->n_tok_decode < batch->n_tok;   /* step 5: the engine's word */
+    if (m.pp && (ppi.reserved[3] != 0 || ppi.reserved[4] != 0) && !rrev && !(m.rband && ppi.reserved[3] == 0)) {
+        rad_step_fail(c, "llama: the engine's reverse band word (tp8 loop P41) on a node that declared no reverse band");
+        return;
+    }
     /* tp8 dev M4: a follower segment issues layers [s0, s1) of its [h, t): X1 (or the lookup) only in the first, X2 only in
      * the last, a boundary's restore / save at its ends */
     const bool seg = m.pp && m.pp_rank == 1 && ppi.part == RAD_PP_PART_SEG && !m.seg_b.empty();
@@ -1006,6 +1070,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
         /* tp8 S6 test: + layer h - 1's q|k|v rows; tp8 loop D46: W(h, t)'s X2 (op_x2) + layer t - 1's */
         const bool kv = (ring == RAD_PP_X1 && m.kvcopy) || (ring == RAD_PP_X2 && m.tcopy && op == m.op_x2);
+        if (ring == RAD_PP_X1 && rrev) {   /* tp8 loop P41 stand-in: X1 of W(l, t) */
+            if (m.parts_x1r == 2) RAD_ISSUE(c, m.op_x1r, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T));
+            else                  RAD_ISSUE(c, m.op_x1r, praw(rg, RAD_U8, 1), brows(m.b_x, T));
+            return;
+        }
+        if (ring == RAD_PP_X1 && rkey) {   /* tp8 loop P41 stand-in: X1 of W(h, t) + layer l's q|k|v rows */
+            if (parts == 2) RAD_ISSUE(c, m.op_x1k, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T), brows(m.b_qkv, T));
+            else            RAD_ISSUE(c, m.op_x1k, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.b_qkv, T));
+            return;
+        }
         if (ring == RAD_PP_X1 && bnd) {   /* tp8 loop P28 stand-in: the band X1 */
             if (m.parts_x1b == 2)
                 RAD_ISSUE(c, m.op_x1b, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T), brows(m.b_qkv, T));
@@ -1045,6 +1119,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE(c, m.op_band_st, bcol(m.b_qkv, q_dim, kv_dim, T), bcol(m.b_qkv, q_dim + kv_dim, kv_dim, T),
                       praw(kvb ? kvb->slot_mapping : nullptr, RAD_I32, T), kv_cache(m.kv_full, (int)m.pp_h));
         }
+        if (rkey && m.op_rband_st && !m.rband_skip) {   /* tp8 loop P41 stand-in: layer l's k / v into this node's own cache */
+            const RadKVGroupBatch* kvb = kv_batch(batch, m.kv_full);
+            const int64_t q_dim = m.g.q_dim(), kv_dim = m.g.kv_dim();
+            RAD_ISSUE(c, m.op_rband_st, bcol(m.b_qkv, q_dim, kv_dim, T), bcol(m.b_qkv, q_dim + kv_dim, kv_dim, T),
+                      praw(kvb ? kvb->slot_mapping : nullptr, RAD_I32, T), kv_cache(m.kv_full, m.rband));
+        }
         if (m.op_kvcopy && m.kvcopy_pass++ != m.kvcopy_skip) {
             const RadKVGroupBatch* kvb = kv_batch(batch, m.kv_full);
             const int64_t q_dim = m.g.q_dim(), kv_dim = m.g.kv_dim();
@@ -1059,7 +1139,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
              * follower's last layer hands its result back. */
             if (m.pp_rank == 0 && (int64_t)li == he) {
                 if (run_head && (!m.fe || m.x1_ids)) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+                /* tp8 loop P41 stand-in: a reverse pass's head then issues layer l's k / v from its own rows (its cache whole) */
+                if (rrev && run_head) m.layers[(size_t)m.rband].attn.step_kv_only(c, batch);
                 if (!run_tail) return;   /* tp8 S5: the head part ends with X1's send */
+                if (rrev) {
+                    rad_step_fail(c, "llama: a reverse pass (tp8 loop P41) issued as a whole leader pass (the engine reverses lane heads only)");
+                    return;
+                }
                 if (lfirst) {   /* tp8 dev M9: a later tail segment: its restore; tp8 loop D39: a tail band's X2 at t - 1 */
                     if (tbd) {
                         cross(m.op_x2b, RAD_PP_X2, m.parts_x2b);
@@ -1079,6 +1165,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
             if (m.band && m.pp_rank == 0 && (int64_t)li >= m.pp_h && (int64_t)li < m.pp_h + m.band && !(bnd && run_head)) continue;
             /* ... and a band pass's follower starts at h + 1 */
             if (bnd && m.pp_rank == 1 && (int64_t)li < he) continue;
+            /* tp8 loop P41 stand-in: the follower's layer l runs only in a reverse pass */
+            if (m.rband && m.pp_rank == 1 && (int64_t)li == m.rband && !rrev) continue;
             /* tp8 loop D39 stand-in: the leader's layers [t - j, t) run only in a tail band pass's tail; that pass's follower ends at t - j */
             if (m.tband && m.pp_rank == 0 && (int64_t)li >= m.pp_t - m.tband && (int64_t)li < m.pp_t && !(tbd && run_tail)) continue;
             if (tbd && m.pp_rank == 1 && (int64_t)li >= te) continue;

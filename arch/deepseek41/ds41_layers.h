@@ -535,6 +535,53 @@ inline int tail_band_crossing(const Geo& g, int h, int t, int j, TailBand* out, 
     return 0;
 }
 
+/* tp8 loop P41 (QUEUE P41's form of 09:30 / 10:08): the HEAD band on the FOLLOWER -- at W(h, t) a lone cold prompt's body chunk
+ * may run layer l = h - 1 on the follower (a REVERSE pass: the leader's head over [0, l) and layer l's key chain only, X1 of
+ * W(l, t) = layer l's input rows), every other pass as W(h, t). Layer l's window keys stay whole on BOTH nodes: the leader writes
+ * them in every pass (the whole layer, or in a reverse pass its key chain: a window key of row p at layer l is the key chain of
+ * layer l's INPUT row p, which the leader computed), the follower in a reverse pass from X1's residual and in a normal PROMPT
+ * pass from the keys a second X1 form carries -- W(h, t)'s X1 + layer l's window keys = P28's band X1 of the band [l, h)
+ * (band_crossing(g, l, 1, t)). Decode passes stay W(h, t)'s without keys (the follower's copy lags there: the engine reverses
+ * only chunks whose earlier rows all crossed in one of the two forms). Refused: h < 2 (the leader must keep a layer), l an
+ * Engram layer, a DSpark tap or a kv source (band_crossing's rules: a source's latent / index keys / compressor tail are written
+ * once, by the leader), an X1 of W(l, t) whose kv source / selections / keep differ from W(h, t)'s (the follower's copy of the
+ * source is one plane set; layers [h, t) read the same selections either way), an X2 that differs. 0 with *out, or -1. */
+struct RBand {
+    int h = -1, t = -1, l = -1;   /* the band layer l = h - 1 */
+    Crossing x1r;                 /* a reverse pass's X1: W(l, t)'s */
+    Band x1k;                     /* a normal prompt pass's X1: W(h, t)'s + layer l's window keys (x1k.x1, x1k.window = {l}) */
+};
+inline int head_rband_crossing(const Geo& g, int h, int t, RBand* out, std::string* err) {
+    if (h < 2) {
+        *err = "a head band on the follower at W(" + std::to_string(h) + "," + std::to_string(t) +
+               ") needs h >= 2 (the leader keeps layers [0, h - 1))";
+        return -1;
+    }
+    const int l = h - 1;
+    Band k;
+    if (band_crossing(g, l, 1, t, &k, err) < 0) return -1;
+    Crossing base[2], rev[2];
+    if (crossings(g, h, t, base, err) < 0 || crossings(g, l, t, rev, err) < 0) return -1;
+    const Crossing &a = rev[0], &b = base[0];
+    if (a.src != b.src || a.latent != b.latent || a.index != b.index || a.sel != b.sel || a.keep != b.keep) {
+        *err = "a reverse pass's X1 of W(" + std::to_string(l) + "," + std::to_string(t) + ") carries other entries / selections / "
+               "keep words than W(" + std::to_string(h) + "," + std::to_string(t) + ")'s (the follower's copy is one plane set)";
+        return -1;
+    }
+    const Crossing &a2 = rev[1], &b2 = base[1];
+    if (a2.src != b2.src || a2.latent != b2.latent || a2.index != b2.index || a2.sel != b2.sel || a2.keep != b2.keep) {
+        *err = "a reverse pass's X2 of W(" + std::to_string(l) + "," + std::to_string(t) + ") differs from W(" + std::to_string(h) +
+               "," + std::to_string(t) + ")'s";
+        return -1;
+    }
+    out->h = h;
+    out->t = t;
+    out->l = l;
+    out->x1r = a;
+    out->x1k = k;
+    return 0;
+}
+
 /* tp8 S5 + S6: with lanes the leader issues a lane step's pass in two parts -- its head (layers [0, h), X1) and its tail
  * (X2, layers [t, n)) -- with other lanes' parts between them, which rewrite the step's activations. What its tail reads
  * of its head must then be kv / state (paged per sequence) or cross in X2: a layer >= t that reads the selections of an

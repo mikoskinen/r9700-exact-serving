@@ -1073,9 +1073,15 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
                long long K, const GgWkFold* fo) {
     const int P = gg_wk_parts(K);
     const int kp = (code & 16777216) || P < 2 ? 1 : P / 2;   /* bit 24: KP 1 (one run holds the running total; no LDS partials) */
-    const int nmt = (int)((M + 15) / 16);
+    /* DRAFTER track round 36 (lever G2R): bit 26 = TWO row tiles a block and ceil(M / 32) block rows (grid x), 33..64 rows: KP P / 2
+     * fits LDS at 64 rows (NM 4 at KP 4 stages 69.6 KiB), and twice the waves a SIMD for G2's latency-bound math (r35 ISA: 3.5 waves a
+     * SIMD at NM 3). The block rows of one column group are dispatched next to each other (x fastest): the second reads the weight
+     * words the first pulled into L2. A row's bytes: the part order, independent of its tile / block row (--wmgcheck). */
+    const bool rt2 = (code & 67108864) != 0;
+    const int nmt = rt2 ? (int)std::min<long long>(2, (M + 15) / 16) : (int)((M + 15) / 16);
+    const unsigned gx = rt2 ? (unsigned)((M + 31) / 32) : 1u;
     /* tp8 loop D22: four row tiles (49..64 rows, code bit 25) only at KP 1 (KP > 1 at four tiles stages past 64 KiB) */
-    if (nmt < 2 || nmt > ((code & 33554432) ? 4 : 3) || kp > 4 || (nmt == 4 && kp != 1)) return R4D_WK_DECLINE;
+    if (nmt < 2 || nmt > ((code & 33554432) ? 4 : 3) || kp > 4 || (nmt == 4 && kp != 1) || gx > 2) return R4D_WK_DECLINE;
     const unsigned xg = Wq<GG_Q6_K>::XG > 0 ? (unsigned)(kWmS / 16 * 16 * nmt * kp * 4) : 0u;   /* the widest group sums (q6_K) */
     const unsigned stage = (unsigned)(kp * 16 * nmt * kWmXP * 2) + xg;
     auto parts_lds = [&](int nt) { return (unsigned)((kp - 1) * (P / kp) * (8 / kp) * 32 * nmt * nt * 8 * 4); };
@@ -1117,7 +1123,7 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     const int pro = fo ? (fo->pro == 3 ? 1 : fo->pro) : 0;
     const bool dp2 = (code & 8388608) != 0;
     int rc;
-    const dim3 grid(1u, (unsigned)gy);
+    const dim3 grid(gx, (unsigned)gy);
     switch (ty) {
     case GG_Q8_0: rc = gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
     case GG_Q6_K: rc = gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
@@ -1141,7 +1147,7 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
         if (!x_al[i]) return R4D_WK_DECLINE;
     /* bit 21: G2 (row tiles a block) at 17..48 rows, folds included; bit 25 (tp8 loop D22, ds41_wmk 5's head): G2 to 64 rows;
      * declined -> the rule below */
-    if ((code & 2097152) && M > 16 && M <= ((code & 33554432) ? 64 : 48)) {
+    if ((code & 2097152) && M > 16 && M <= ((code & (33554432 | 67108864)) ? 64 : 48)) {   /* bit 26 (lever G2R): to 64 rows too */
         const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K, fo);
         if (g2 != R4D_WK_DECLINE) return g2;
     }

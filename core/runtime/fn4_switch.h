@@ -489,6 +489,10 @@
  *                   decoded <= N sequences (Scheduler::decoded_seqs summed over the decode lanes); above N the step's parts run
  *                   whole as under form 0 -- so ONE value segments at c8 (the leader's BG head stops both decode lanes there,
  *                   lq218) and keeps c16 / c32's whole parts (lq207: segments -1.7..-6.4 % there). 0 = no load rule.
+ *                   Position-order guard (tp8 loop F81, on unless + 65536): a step whose prompt entries are not all WHOLE FRESH
+ *                   prompts (context 0, the prompt's last row, no snapshot / replay) runs its parts whole -- a piece of a longer
+ *                   prompt in segments let a later piece's head / tail run before its remaining segments (lq225 'all': layer 8's
+ *                   compressed-KV copy differed). + 65536 = no guard (the F75 / F81 form, a negative control only).
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all
@@ -502,6 +506,29 @@
  *                   from ONE word pair (decode_frags_x3d, the decode band's X3D-F form): the same f16 weights, each output's WMMA
  *                   order unchanged -- the same bytes (Xeon GPU2: y at M 17 / 64 / 1,150 / 4,096 identical to 0). -1 when no loaded
  *                   object serves it (an exl3r4d before 4fd50e4).
+ *   pp_rband        engine, the two-node LEADER (tp8 loop P41, the HEAD band on the follower; 100 here, after pp_merge_ms): v = p + 16 x
+ *                   phase (+ 256): a lone prompt chunk i of a sequence with i % p == phase runs as a REVERSE pass -- the leader's head over
+ *                   [0, h - 1) + layer h - 1's key chain, the follower from h - 1 (X1 of W(h - 1, t)); + 256: never the chunk before the
+ *                   last; 0 = none; -1 = the start's RADIANCE_PP_RBAND_EVERY. Needs the plugin's reverse band (RADIANCE_DS41_PP_RBAND=1 on
+ *                   both nodes, whose every prompt pass crosses layer h - 1's window keys); else no pass changes. Read at each lane step's
+ *                   head; the same TP4 functions on either node (rule A), the follower's window copy whole for every reversed chunk.
+ *   sched_srf       scheduler (tp8 loop P44, upstream 67cf57b8 'concurrent prefills take the span one at a time'; 101 here, after
+ *                   pp_rband): 0 -- today's plan; 1 -- in each scheduler (one process, or each lane of a pipeline) running prompts with no
+ *                   decode row and no admission possible take the step one at a time, the fewest prompt rows left to plan first: that
+ *                   one is planned alone (its lone prefill's span / chunk plan), the others sit the step out (no share of it); the one
+ *                   step after a request finished beside others is planned as today (a follow-up turn waits a shared step, not a
+ *                   span); 2 -- 1, and across the decode lanes of a pipeline while no lane has a decode row: of every decode lane's
+ *                   running prompts (rows left to plan) and waiting prompts (whole prompt) only the fewest plans prompt rows -- the
+ *                   others sit out or stay queued, a waiting one is admitted into a step of its own -- and its chunks go over the
+ *                   lanes as a lone cold prompt's (a wide span piece too: the borrowers' prompts sit out). Each prompt's chunks are
+ *                   its lone plan (exact as a lone prompt's). Unset: the start's RADIANCE_SCHED_SRF (0 / 1 / 2).
+ *   aql_hdp         core, the AQL backend (tp8 loop U1 = upstream 8f2e511f's first half; 102 here, after sched_srf): 0 -- a store
+ *                   fence in front of a doorbell, as before; 1 -- the fence, then a store to the card's host data path flush register
+ *                   (HSA_AMD_AGENT_INFO_HDP_FLUSH) in front of every doorbell (a live packet's publish and a played run's ring), so the
+ *                   kernel arguments and chain records written into VRAM through the BAR are there before the packets that read them
+ *                   are announced. Order of host writes only: no packet, argument or kernel changes (rule A). A card whose arguments
+ *                   live in host memory, or whose driver gives no register, flushes nothing. Both nodes of a pipeline (a follower
+ *                   switch). Unset: the start's RADIANCE_AQL_HDP_FLUSH (0 / 1).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -511,6 +538,16 @@
  *                   at or above the chunk (4160). Needs RADIANCE_PP_TAIL_BAND=1 or 2 on the leader at start (its start value; else only 0 is taken)
  *                   and the plugin's tail band (RADIANCE_DS41_PP_TBAND=1 on both nodes). Read at each BG step's head; never a pass's
  *                   ops (both forms issue the published ops: rule A, as P28's band).
+ *                   3 (tp8 loop D46, needs the plugin's tail copy) -- 1 + a decode lane's step while a BG step is in flight when every
+ *                   sequence of it is held (core/sched/tcopy.h). 4 (tp8 loop D50) -- 3 in EVERY stretch; 4 + 1024 x N (N 1 .. 63) -- 3,
+ *                   and in a clean stretch only while the decode lanes' last steps decoded > N sequences. At --pp-cut h,t+1 a decode
+ *                   band pass is W(h, t)'s decode: 4 is the in-process control of the published cut, 3 puts layer t on the follower in
+ *                   the leader-bound clean stretches (lq222 D45: L 93-97 / F 82-90 % working at c4 .. c32) and on the leader in the
+ *                   follower-bound BG ones, 4 + 1024 x N keeps it on the leader in clean stretches above N (c16 / c32).
+ *                   5 (tp8 loop D51) -- a held decode step bands while the FOLLOWER's card worked more than the leader's over the last
+ *                   RADIANCE_PP_TBAND_BOUND_MS (default 200) by > RADIANCE_PP_TBAND_BOUND_H permille (default 20; the follower's share
+ *                   from its heartbeat load report, RADIANCE_PP_LOAD_REPORT_MS=N on the follower, RADIANCE_PP_NODE_IDLE on both), not
+ *                   while the leader's did, else as the last step; no fresh report -> 3's rule. Where the band layer runs only (rule A).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
@@ -868,9 +905,10 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs,
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp,
               /* qfn-on-ds (20.11.2026): the Qwen Flash-Next line's switches (fn4-x3-pf 6fdca84a), after the DeepSeek
-               * line's, which keep their numbers; draft_adaptive, aql_acq, sched_bi_chunk and ar_xpush are both lines' and
+               * line's, which keep their numbers (the DeepSeek line's own after 0735a8e2 -- pp_rband 100, sched_srf 101,
+               * aql_hdp 102 -- go before kQwenFirst, so the Qwen block moves up with them: 21.11. merge of ds41-pp-dev 1bee48aa); draft_adaptive, aql_acq, sched_bi_chunk and ar_xpush are both lines' and
                * keep the DeepSeek numbers. kQwenFirst is the first of these (qwen_switch). */
               kNoRoute, kGatherInv, kHcFuseDown, kHcNormWave, kHcWriteVec, kHcReadV,
               kArLaneThreads, kHcUpMix, kArLaneBlocks, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair,
@@ -1007,6 +1045,10 @@ void note_sched_tail_grid(const int64_t* v);
  * the plugin's rad_ckpt_conv_src; a LINEAR state is the chunk end's, which a resume at a multiple of every ratio never
  * reads -- deepseek41's compressor tails). 0 = today (the cut). RADIANCE_SCHED_TAIL_INNER=1 at start. */
 int  sched_tail_inner();
+/* tp8 loop P44 (sched_srf): the switch once set, else RADIANCE_SCHED_SRF at start (0 = off); read at every step planned. */
+int  sched_srf();
+/* tp8 loop U1 (aql_hdp): the switch once set, else RADIANCE_AQL_HDP_FLUSH at start (0 = off); read at every doorbell. */
+int  aql_hdp();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */

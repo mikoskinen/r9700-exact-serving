@@ -31,6 +31,7 @@
 #include "device/device.h"   /* rad_event_create_local */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -62,6 +63,27 @@ struct PpNodeIdle {
     bool sp_prev = false;
     uint64_t sp_wt_last = 0;
     bool bg_now() const { return bg || bg_depth > 0; }
+    /* tp8 loop D51 (fn4 pp_tband 5; RADIANCE_PP_LOAD_REPORT_MS on the follower): the card's RECENT working share -- cumulative
+     * part / gap ms (as the lines count them) and the receive waits, sampled at every mark while recent_keep_ns > 0 (0 = off,
+     * nothing kept: today); recent_pm(w) = (parts - waits) / (parts + gaps) between the newest sample and the last one at least
+     * w old, in permille, -1 while under a quarter of w is covered */
+    struct Smp { uint64_t t; double part, gap, wait; };
+    uint64_t recent_keep_ns = 0;
+    double cum_part = 0, cum_gap = 0;
+    std::deque<Smp> smp;
+    int recent_pm(uint64_t w_ns) const {
+        if (smp.size() < 2) return -1;
+        const Smp& b = smp.back();
+        const Smp* a = &smp.front();
+        for (const Smp& x : smp) {
+            if (x.t + w_ns > b.t) break;
+            a = &x;
+        }
+        const double cov = (b.part - a->part) + (b.gap - a->gap);
+        if (cov <= 0 || cov * 4e6 < (double)w_ns) return -1;
+        const double wk = (b.part - a->part) - std::max(0.0, b.wait - a->wait);
+        return (int)std::lround(std::min(1000.0, std::max(0.0, wk * 1000.0 / cov)));
+    }
     const char* node = "";                /* "leader" / "follower" */
     const char* crossing = "";            /* what rank 0 receives: "X2" / "X1" */
     RadStream s = nullptr;
@@ -168,6 +190,13 @@ struct PpNodeIdle {
             run.sp_wait[sp_prev] += d;
             sp_prev = now_bg;
         }
+        if (recent_keep_ns) {   /* tp8 loop D51: a sample of the cumulative counts (the drain above brought them up to date) */
+            uint64_t wt = 0, n = 0, tp = 0;
+            waits(&wt, &n, &tp);
+            const uint64_t now = rad_mono_ns();
+            smp.push_back({ now, cum_part, cum_gap, tp ? (double)wt / (double)tp : 0.0 });
+            while (smp.size() > 2 && (smp.front().t + recent_keep_ns < now || smp.size() > 8192)) smp.pop_front();
+        }
         RadEvent e = take();
         if (!e) { ++dropped; return; }
         if (rad_event_record(e, s) < 0) { pool.push_back(e); ++dropped; return; }
@@ -184,6 +213,7 @@ struct PpNodeIdle {
                 float ms = 0.0f;
                 if (rad_event_elapsed_ms(last.ev, r.ev, &ms) < 0) ++unread;
                 else if (last.begin) {   /* a part (a begin with no end before the next begin: still that part) */
+                    cum_part += ms;   /* tp8 loop D51 */
                     for (Win* w : { &win, &run }) {
                         w->part_ms += ms;
                         ++w->parts;
@@ -191,6 +221,7 @@ struct PpNodeIdle {
                         ++w->sp_parts[last.bg];
                     }
                 } else if (r.begin) {    /* between two parts; one over kIdleMs is the server without work, left out */
+                    if (ms <= kIdleMs) cum_gap += ms;   /* tp8 loop D51 */
                     for (Win* w : { &win, &run }) {
                         if (ms > kIdleMs) { w->idle_ms += ms; ++w->idles; continue; }
                         w->gap_ms += ms;

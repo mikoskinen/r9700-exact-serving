@@ -21,7 +21,8 @@
  *     an invalidation. A slot is rewritten one lap after it was last read, so a system-scope
  *     acquire is placed at least once per half lap; without it every kernel after the first lap
  *     reads its predecessor's arguments. Slots are 1 KiB so no argument fetch shares a cache line
- *     with the next slot;
+ *     with the next slot. No fence makes a write through the BAR arrive: fn4 aql_hdp 1 flushes the
+ *     card's host data path in front of every doorbell (host_writes_out; upstream 8f2e511f);
  *   - host-written memory: the first dispatch after the host waits on any queue takes a
  *     system-scope acquire, since host writes for the next step follow such a wait;
  *   - copies touching host or peer memory carry the scope themselves, as do the barrier packets
@@ -222,6 +223,9 @@ struct Dev {
     bool        has_vram = false;
     uint32_t    kfd_id = 0;             /* the driver's gpu_id: its sysfs and ioctls name it so */
     bool        host_kargs = false;     /* no large BAR: the argument ring lives in host memory */
+    /* The card's host data path flush register (HSA_AMD_AGENT_INFO_HDP_FLUSH), where the host
+     * writes arguments into VRAM; see host_writes_out (tp8 loop U1, upstream 8f2e511f). */
+    volatile uint32_t* hdp_flush = nullptr;
 };
 
 struct Global {
@@ -438,6 +442,18 @@ bool init_devices() {
             RAD_INFO("device: card %d (%s) keeps kernel arguments in pinned host memory, as a "
                      "test asked", i, bus);
         }
+        /* tp8 loop U1 (upstream 8f2e511f): the register fn4 aql_hdp 1 stores to in front of a
+         * doorbell. Read for every card whose arguments are VRAM; used only while the switch is 1. */
+        if (!g.dev[(size_t)i].host_kargs) {
+            hsa_amd_hdp_flush_t hdp{};
+            if (hsa_agent_get_info(g.dev[(size_t)i].agent,
+                                   (hsa_agent_info_t)HSA_AMD_AGENT_INFO_HDP_FLUSH,
+                                   &hdp) == HSA_STATUS_SUCCESS)
+                g.dev[(size_t)i].hdp_flush = hdp.HDP_MEM_FLUSH_CNTL;
+            if (!g.dev[(size_t)i].hdp_flush)
+                RAD_INFO("device: card %d (%s) gives no host data path flush register, so fn4 "
+                         "aql_hdp 1 flushes nothing there (tp8 loop U1)", i, bus);
+        }
     }
     /* Without the handler a fault falls back to the runtime's own handling, which the
      * memory-fault report below replaces; warn at startup. */
@@ -622,6 +638,7 @@ struct Stream {
     hsa_queue_t*    q = nullptr;
     uint64_t        mask = 0;
     char*           karg = nullptr;           /* VRAM the CPU writes through the BAR, or host memory */
+    volatile uint32_t* hdp = nullptr;         /* Dev::hdp_flush where `karg` is VRAM (tp8 loop U1) */
     std::atomic<bool> busy{false};
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
@@ -1020,10 +1037,29 @@ inline int reserve(Stream* s, uint64_t* out) {
     return RAD_OK;
 }
 
+/* What the host wrote for the card, on its way before the packets that read it are announced
+ * (tp8 loop U1 = upstream 8f2e511f's first half, behind fn4 aql_hdp; 0 = the sfence alone, as before).
+ *
+ * An argument slot in VRAM is written through the BAR: the bytes sit in the processor's
+ * write-combining buffers until a store fence, and behind the link in the card's host data path,
+ * which hands them on to memory in its own time unless it is told to flush. Nothing orders that
+ * against the doorbell. A kernel the card starts soon enough after its packet was announced reads
+ * the slot as the launch a lap of the ring before left it. Upstream measured "soon enough" at a
+ * microsecond or two on an R9700, with failures only once the packets went without the packet
+ * processor's acquire (~0.9 us a launch): the margin is timing, not ordering. Here a live
+ * dispatch keeps that acquire (acquire_scope never answers none), a played packet that drops it
+ * (aql_acq rule / rule-w) reads an argument block written once at a_tape_end, and no launch
+ * chains on the DeepSeek line ('chained launches: off'). The store goes to the driver's flush
+ * register (HSA_AMD_AGENT_INFO_HDP_FLUSH), behind the slot's bytes and in front of the doorbell. */
+inline void host_writes_out(Stream* s) {
+    _mm_sfence();
+    if (s->hdp && rad::fn4::aql_hdp() == 1) *s->hdp = 1;
+}
+
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
-    _mm_sfence();                       /* the argument slot, written before the header */
+    host_writes_out(s);                 /* the argument slot, written before the header */
     __atomic_store_n(reinterpret_cast<uint32_t*>(
                          static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) +
                          (idx & s->mask)),
@@ -1281,6 +1317,9 @@ struct PlayRun {
 
     void ring() {
         if (!unrung) return;
+        /* fn4 aql_hdp 1 (tp8 loop U1): the tape's argument blocks and any chained record put this
+         * run, through the host data path before the packets are announced. 0: as before. */
+        if (s->hdp && rad::fn4::aql_hdp() == 1) host_writes_out(s);
         hsa_queue_store_write_index_relaxed(s->q, next);
         hsa_signal_store_relaxed(s->q->doorbell_signal, (hsa_signal_value_t)(next - 1));
         unrung = 0;
@@ -1646,6 +1685,7 @@ int a_stream_create(RadStream* out, int high_priority) {
     }
     const uint64_t t_q2 = steady_ns();
     s->karg = static_cast<char*>(ka);
+    s->hdp = d.host_kargs ? nullptr : d.hdp_flush;
     s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
     *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
     _mm_sfence();

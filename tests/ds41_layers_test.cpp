@@ -668,3 +668,56 @@ TEST(layers_d39_tail_band_of_w10_32) {
 }
 
 RAD_TEST_MAIN()
+
+/* tp8 loop P41: the head band on the follower at W(10,32) -- layer 9 (no Engram, tap or kv source). A reverse pass's X1 is
+ * W(9,32)'s: the residual into layer 9 with source 8's latent copy and index 8's selections, as W(10,32)'s X1 carries them;
+ * a normal prompt pass's X1 is W(10,32)'s + layer 9's window keys (P28's band X1 of [9, 10)). Refused where layer h - 1 is an
+ * Engram layer, a kv source or a tap (h = 2, 9, 15, 21, 38), and h < 2; over every cut each accepted band's two X1 forms carry
+ * the same source / selections / keep and its X2 is W(h, t)'s. */
+TEST(layers_p41_head_band_on_the_follower) {
+    const Geo g = flash1017();
+    RBand r;
+    std::string err;
+    CHECK_EQ(head_rband_crossing(g, 10, 32, &r, &err), 0);
+    if (!err.empty()) std::fprintf(stderr, "  rband W(10,32): %s\n", err.c_str());
+    CHECK_EQ(r.l, 9);
+    CHECK_EQ(r.x1r.at, 9);
+    CHECK(r.x1r.residual);
+    CHECK_EQ(r.x1r.src, 8);
+    CHECK(r.x1r.latent);
+    CHECK_EQ(r.x1r.sel, 8);
+    CHECK_EQ(r.x1k.x1.at, 10);
+    CHECK_EQ(r.x1k.x1.src, r.x1r.src);
+    CHECK_EQ(r.x1k.x1.sel, r.x1r.sel);
+    CHECK_EQ(r.x1k.copy_src, 8);
+    CHECK_EQ((int)r.x1k.window.size(), 1);
+    CHECK_EQ(r.x1k.window.front(), 9);
+    std::fprintf(stderr, "  rband W(10,32): X1 reverse at %d src %d latent %d sel %d keep %d; normal + window key of layer %d\n", r.x1r.at,
+                 r.x1r.src, (int)r.x1r.latent, r.x1r.sel, r.x1r.keep, r.x1k.window.front());
+    CHECK(head_rband_crossing(g, 9, 32, &r, &err) < 0);     /* layer 8: a kv source */
+    CHECK(err.find("layer 8") != std::string::npos);
+    CHECK(head_rband_crossing(g, 15, 32, &r, &err) < 0);    /* layer 14: Engram + kv source */
+    CHECK(head_rband_crossing(g, 2, 20, &r, &err) < 0);     /* layer 1: Engram */
+    CHECK(head_rband_crossing(g, 1, 20, &r, &err) < 0);     /* the leader would keep no layer */
+    int accepted = 0, refused_n = 0;
+    for (int h = 0; h < 39; ++h)
+        for (int t = h + 1; t < 40; ++t) {
+            RBand x;
+            std::string e;
+            if (head_rband_crossing(g, h, t, &x, &e) < 0) { ++refused_n; CHECK(!e.empty()); continue; }
+            ++accepted;
+            const int l = h - 1;
+            CHECK(!(g.is_src[(size_t)l] && g.ratio[(size_t)l] > 0));
+            CHECK(l != 1 && l != 14 && l < 37);
+            Crossing c[2];
+            std::string e2;
+            CHECK_EQ(crossings(g, h, t, c, &e2), 0);
+            CHECK_EQ(x.x1r.src, c[0].src);
+            CHECK_EQ(x.x1r.sel, c[0].sel);
+            CHECK_EQ(x.x1r.keep, c[0].keep);
+            CHECK_EQ(x.x1k.x1.src, c[0].src);
+        }
+    CHECK(accepted > 0);
+    CHECK(refused_n > 0);
+    std::fprintf(stderr, "  rband over every cut: %d accepted, %d refused\n", accepted, refused_n);
+}

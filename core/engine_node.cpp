@@ -76,6 +76,11 @@ struct PpGlobal {
     std::atomic<int>     tband_k{ 0 }, tband{ 0 };
     /* tp8 loop D46: the plugin keeps the tail band layers' state on the leader for every sequence (rad_pp_tail_copy) */
     std::atomic<int>     tcopy{ 0 };
+    /* tp8 loop P41: the reverse (head) band layer the plugin declared (rad_pp_rband) and the pass being issued's word (0: none) */
+    std::atomic<int>     rband_l{ 0 }, rband{ 0 };
+    /* tp8 loop P41 step 5: the pass being issued crosses X1 in the keys form (the leader's rule asked for it: a lone prompt chunk
+     * of a clean sequence while fn4 pp_rband > 0); 0 every other pass */
+    std::atomic<int>     rkeys{ 0 };
     /* tp8 loop D40: the leader head / tail segment being issued's RAD_PP_LSEG_* bits (0 every other pass) */
     std::atomic<int>     lflags{ 0 };
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
@@ -111,6 +116,8 @@ extern "C" int rad_pp_info(RadPpInfo* out) {
     out->reserved[0] = g.band.load();   /* tp8 loop P28: the pass's band k (abi/rad_pp.h rad_pp_band) */
     out->reserved[2] = g.tband.load();  /* tp8 loop D39: the pass's tail band j (abi/rad_pp.h rad_pp_tail_band) */
     out->reserved[1] = g.lflags.load();  /* tp8 loop D40: a leader segment's RAD_PP_LSEG_* bits */
+    out->reserved[3] = g.rband.load();  /* tp8 loop P41: the pass's reverse band layer l (abi/rad_pp.h rad_pp_rband) */
+    out->reserved[4] = g.rkeys.load();  /* tp8 loop P41 step 5: 1 = X1 in the keys form (layer l's window keys for the follower) */
     for (int i = 0; i < RAD_PP_N_RINGS; ++i) out->ring[i] = g.ring[lane * RAD_PP_N_RINGS + i].load();
     return 0;
 }
@@ -126,6 +133,7 @@ extern "C" void rad_pp_x1_ids(int on) { pp_g().x1_ids.store(on ? 1 : 0, std::mem
 extern "C" void rad_pp_band(int k) { pp_g().band_k.store(k > 0 ? k : 0, std::memory_order_relaxed); }
 extern "C" void rad_pp_tail_band(int j) { pp_g().tband_k.store(j > 0 ? j : 0, std::memory_order_relaxed); }
 extern "C" void rad_pp_tail_copy(int form) { pp_g().tcopy.store(form > 0 ? form : 0, std::memory_order_relaxed); }
+extern "C" void rad_pp_rband(int l) { pp_g().rband_l.store(l > 0 ? l : 0, std::memory_order_relaxed); }
 
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
@@ -160,6 +168,8 @@ int pp_band_k() { return pp_g().band_k.load(std::memory_order_relaxed); }
 int pp_tail_band_k() { return pp_g().tband_k.load(std::memory_order_relaxed); }
 /* tp8 loop D46: the plugin's tail band copy form (rad_pp_tail_copy) on this node, 0 none (core/sched/tcopy.h) */
 int pp_tail_copy() { return pp_g().tcopy.load(std::memory_order_relaxed); }
+/* tp8 loop P41: the reverse band layer the plugin declared on this node (rad_pp_rband), 0 none */
+int pp_rband_l() { return pp_g().rband_l.load(std::memory_order_relaxed); }
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
@@ -859,12 +869,14 @@ void Engine::pp_on_build(const RadBatch* b, int lane) {
     pp_draft_q_.emplace_back(b->step, lane, std::move(fr));
 }
 
-void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band, int lflags, int tband) {
+void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band, int lflags, int tband, int rband, int rkeys) {
     PpGlobal& g = pp_g();
     g.lane.store(lane, std::memory_order_relaxed);
     g.part.store(part, std::memory_order_relaxed);
     g.band.store(band, std::memory_order_relaxed);   /* tp8 loop P28: every other pass resets it */
     g.tband.store(tband, std::memory_order_relaxed); /* tp8 loop D39: the same */
+    g.rband.store(rband, std::memory_order_relaxed); /* tp8 loop P41: the same */
+    g.rkeys.store(rkeys, std::memory_order_relaxed); /* tp8 loop P41 step 5: the same */
     /* tp8 dev M9: a leader's head / tail part names its segment too (seg_l1 > 0); 0 = the whole part, as before */
     const bool seg = part == RAD_PP_PART_SEG || ((part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && seg_l1 > 0);
     g.seg_l0.store(seg ? seg_l0 : 0, std::memory_order_relaxed);
@@ -891,6 +903,8 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     if (run && pp_ship_ahead_) h.flags |= 2;   /* tp8 dev D10 round 2 */
     if (run && pp_ship_band_) h.flags |= 4;    /* tp8 loop P28: a band pass (the follower's parts start at h + k) */
     if (run && pp_ship_tband_) h.flags |= 8;   /* tp8 loop D39: a tail band pass (the follower's parts end at t - j) */
+    if (run && pp_ship_rband_) h.flags |= 32;  /* tp8 loop P41: a reverse pass (the follower's parts start at the band layer h - 1) */
+    if (run && pp_ship_rkeys_) h.flags |= 64;  /* tp8 loop P41 step 5: X1 in the keys form (the follower stores layer h - 1's keys) */
     if (run && lane >= 0 && lane < 32 && ((pp_relay_mask_ >> lane) & 1u)) h.flags |= 16;   /* tp8 MERGE: a relay lane's BG step (bit 8 = D39's tail band on the dev line) */
     if (run) {
         h.n_fn4 = fn4::kSwitches;
@@ -1466,6 +1480,24 @@ int Engine::follower_loop() {
     std::unique_ptr<PpNodeIdle> ni_own;   /* tp8 dev D8 */
     struct NiReset { Engine* e; ~NiReset() { e->pp_ni_ = nullptr; } } ni_reset{ this };
     pp_node_idle_open(&ni_own);
+    /* tp8 loop D51 (RADIANCE_PP_LOAD_REPORT_MS=N, 1 .. 1000, with RADIANCE_PP_NODE_IDLE): this follower's recent card working share
+     * over RADIANCE_PP_TBAND_BOUND_MS (default 200) goes to the leader every N ms in a heartbeat's aux (fn4 pp_tband 5 reads it) */
+    pp_load_ms_ = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_LOAD_REPORT_MS"); v && *v && pp_link_) {
+        const int n = std::atoi(v);
+        if (n >= 1 && n <= 1000 && pp_ni_) {
+            pp_load_ms_ = n;
+            pp_bound_ms_ = 200;
+            if (const char* w = std::getenv("RADIANCE_PP_TBAND_BOUND_MS"); w && *w) pp_bound_ms_ = std::min(5000, std::max(20, std::atoi(w)));
+            pp_ni_->recent_keep_ns = 4ull * (uint64_t)pp_bound_ms_ * 1000000ull;
+            pp_link_->set_load_period(n);
+            RAD_INFO("follower: RADIANCE_PP_LOAD_REPORT_MS=%d -- this node's card working share over the last %d ms goes to the leader "
+                     "every %d ms (a heartbeat's aux; fn4 pp_tband 5 there, tp8 loop D51)", n, pp_bound_ms_, n);
+        } else {
+            RAD_WARN("follower: RADIANCE_PP_LOAD_REPORT_MS=%s is not taken: %s (tp8 loop D51)", v,
+                     pp_ni_ ? "1 .. 1000 ms" : "it needs RADIANCE_PP_NODE_IDLE=1 / 2 on this node");
+        }
+    }
     /* tp8 loop P22 (RADIANCE_PP_PF_TIMELINE=1, the leader's switch, on this node too): the follower's side of a lone cold
      * prompt's timeline (core/pp_pftl_fol.h) */
     std::unique_ptr<PfFolTimeline> pff;
@@ -1876,6 +1908,24 @@ int Engine::follower_loop() {
             return fail_loop(RAD_E_STATE);
         }
         const int pass_t = cfg_.pp_cut_t - tband;
+        /* tp8 loop P41: a reverse pass (frame flags bit 5) starts at the band layer l = h - 1 on this node (never beside a band
+         * / tail band word: the plugin declares the reverse band only without them) */
+        const int rband = (h.flags & 32) ? pp_rband_l() : 0;
+        if ((h.flags & 32) && (rband <= 0 || rband != cfg_.pp_cut_h - 1 || band > 0 || tband > 0)) {
+            pp_link_->fail(fmt("step %d: the leader ran a reverse (head band) pass, but %s", h.step,
+                               rband <= 0 ? "this node's plugin declared no reverse band (RADIANCE_DS41_PP_RBAND=1 on both nodes)"
+                               : rband != cfg_.pp_cut_h - 1 ? "its declared layer is not h - 1"
+                                                           : "the frame is a band / tail band pass's too"));
+            return fail_loop(RAD_E_STATE);
+        }
+        const int pass_h0 = rband > 0 ? rband : pass_h;
+        /* tp8 loop P41 step 5: X1 in the keys form (frame flags bit 6; only beside a declared reverse band, never on a reverse pass) */
+        const int rkeys = (h.flags & 64) ? 1 : 0;
+        if ((h.flags & 64) && (pp_rband_l() <= 0 || rband > 0)) {
+            pp_link_->fail(fmt("step %d: the leader asked for X1's keys form, but %s", h.step,
+                               rband > 0 ? "the frame is a reverse pass's too" : "this node's plugin declared no reverse band"));
+            return fail_loop(RAD_E_STATE);
+        }
         /* tp8 dev M4: the pass's parts -- [h, t) whole, or its segments at the declared boundaries */
         std::vector<std::pair<int, int>> parts;
         const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows &&
@@ -1886,7 +1936,7 @@ int Engine::follower_loop() {
             const int sv = segset_now();
             const std::vector<int32_t> pick =
                 segset_pick(sv, seg_bg >= 0 && h.lane >= seg_bg && b->n_tok_decode == 0 ? reserve_now() : 0);
-            int a = pass_h;
+            int a = pass_h0;
             for (int32_t x : pick) {
                 if (x <= a || x >= pass_t) continue;
                 parts.emplace_back(a, x);
@@ -1903,7 +1953,7 @@ int Engine::follower_loop() {
                 d33_last = sv;
             }
         } else {
-            parts.emplace_back(pass_h, pass_t);
+            parts.emplace_back(pass_h0, pass_t);
         }
         const int lane = h.lane, sstep = h.step;
         /* between two segments: the frames that have arrived (no wait on a card past the segment's run; a host test's
@@ -2113,8 +2163,8 @@ int Engine::follower_loop() {
                 for (auto& r : ranks_) r->stager.set_layer_end(end);
             }
             issue_sched_.store(&ls, std::memory_order_release);
-            if (split) pp_set_pass(lane, RAD_PP_PART_SEG, parts[k].first, parts[k].second, band, 0, tband);
-            else pp_set_pass(lane, RAD_PP_PART_WHOLE, 0, 0, band, 0, tband);
+            if (split) pp_set_pass(lane, RAD_PP_PART_SEG, parts[k].first, parts[k].second, band, 0, tband, rband, rkeys);
+            else pp_set_pass(lane, RAD_PP_PART_WHOLE, 0, 0, band, 0, tband, rband, rkeys);
             issue_what_.store(kIssueFollower, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the ranks are parked, rank 0's stream is this thread's */
@@ -2250,6 +2300,7 @@ int Engine::follower_loop() {
         if (steps == 1 || steps % 1024 == 0)
             RAD_INFO("follower: %lld steps run, %lld builds replayed", (long long)steps, (long long)builds);
         if (pp_ni_) pp_ni_->minute();
+        if (pp_load_ms_ > 0 && pp_ni_) pp_link_->set_load(pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull));   /* tp8 loop D51 */
         if (!segs.empty() && seg_passes > 0 && (seg_passes == 1 || seg_passes % 256 == 0) && steps % 64 == 0)
             RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, %lld held "
                      "in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts, (long long)seg_between,
