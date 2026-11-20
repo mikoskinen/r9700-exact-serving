@@ -686,6 +686,7 @@ struct Model {
     bool edd_rec = false, edd_synced = false, edd_counted = false;
     ds41_engdd::Plan edd_plan;
     std::vector<ds41_engdd::Launch> edd_ls;
+    std::vector<int> edd_tw;   /* tp8 loop P48b: the twin classes step_bi's by-segment issue gives each edd_ls launch (t_twin) */
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
     MoeFP8::Wire mw{};
@@ -1218,6 +1219,14 @@ struct TwinScope {
     ~TwinScope() { t_twin = prev; }
     TwinScope(const TwinScope&) = delete;
     TwinScope& operator=(const TwinScope&) = delete;
+};
+/* tp8 loop P48b: t_twin set to classes a by-launch issue recorded (lever E1's kept launches, its unique rows' GEMM) */
+struct TwinSet {
+    int prev;
+    explicit TwinSet(int v) : prev(t_twin) { t_twin = v; }
+    ~TwinSet() { t_twin = prev; }
+    TwinSet(const TwinSet&) = delete;
+    TwinSet& operator=(const TwinSet&) = delete;
 };
 static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
@@ -2339,6 +2348,13 @@ static bool pfctx_plan(const RadBatch* b, int64_t window, std::vector<std::pair<
  * id rows, every row's kv row then gathered from its unique row (ds41_engram_dedup.h: why it is exact, the plan, the
  * 48-row guard). Switch "ds41_engdd" (fn4): 1 = deduplicate a step with a prefill sequence (a pass with no prefill
  * sequence, the drafter's passes and every launch of <= 48 rows are issued as today), 0 = today's issue.
+ * tp8 loop P48b: 2 = 1 where no launch of the layer takes the Engram twin (RADIANCE_DS41_TWIN with class 8, ds41_twin's mask);
+ * where one does, the pass dedups ON the twin: launches of <= 64 rows (the int8 GEMM's narrow band, ds41_psk_cone.h
+ * kTwinNarrowM) are kept and issued as the undeduplicated pass issues them (e2_gemm under the launch's own twin classes), the
+ * pooled launches (> 64 rows, each in the int8 GEMM's row-invariant tiled band) must all take the twin or none (else the pass
+ * keeps today's by-launch issue), their unique rows run the twin's GEMM beside engram_kv_u's GGUF op (> 64 unique rows, else
+ * the guard), so a pooled row's bytes are the tiled twin's, as its own launch would give them; and the Engram class is no
+ * longer held GGUF in every pass for E1 (t_tw_off). Rule B, as every twin class.
  * RADIANCE_DS41_ENGDD=0 / off declares it and starts at 0, 1 / on at 1; unset declares nothing (1 refused, the program
  * and the issue are today's). Declared: per Engram layer a second lookup (the compact ids), a GEMM into a scratch plane
  * (engram_kv_u) and a gather_rows back into engram_kv; host buffers for the compact ids and each layer's map. A pass it
@@ -2349,6 +2365,9 @@ static std::atomic<int> g_sw_engdd{0}, g_sw_engdd_ok{0}, g_sw_engdd_env{-2};   /
  * repeat share, steps with a deduplicated layer, passes with no launch above the band. */
 static std::atomic<long long> g_edd_passes{0}, g_edd_rows{0}, g_edd_pooled{0}, g_edd_guard{0}, g_edd_low{0}, g_edd_steps{0},
     g_edd_nopool{0};
+/* tp8 loop P48b (ds41_engdd 2): layer passes deduplicated on the Engram twin, layer passes kept whole because their pooled
+ * launches did not all take the twin */
+static std::atomic<long long> g_edd_tw{0}, g_edd_twmix{0};
 static void engdd_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_ENGDD");
@@ -2825,8 +2844,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_psk_l20_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_pfctx"))
         return value == 0 || (value == 1 && g_sw_pfctx_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_engdd"))
-        return value == 0 || (value == 1 && g_sw_engdd_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_engdd"))   /* tp8 loop P48b: 2 = 1 + the Engram twin under the dedup */
+        return value == 0 || ((value == 1 || value == 2) && g_sw_engdd_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "mhc_fuse"))   /* lever M1 */
         return value == 0 || (value >= 1 && value <= 1048576 && g_sw_mhc_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;   /* lever IX-NI: counted here, libr4d's */
@@ -7590,6 +7609,11 @@ static void engdd_declare(Model& m, const RadBuildCtx* ctx) {
                 g_sw_engdd.load(std::memory_order_relaxed), (long long)((m.c.hc + 1) * m.c.n_embd),
                 (long long)(m.c.ple_heads * m.c.ple_dim), want, (long long)ds41_engdd::kFormRows,
                 (long long)ds41_engdd::kFormRows, (long long)ds41_engdd::kMinShareDiv);
+    if (ctx->rank == 0 && (twin_env() & kTwEng))
+        fprintf(stderr, "radiance: deepseek41: tp8 loop P48b: ds41_engdd 2 = lever E1 ON the Engram twin where a launch takes it "
+                        "(launches of <= %lld rows kept as issued undeduplicated, the pooled ones' unique rows on the int8 GEMM); "
+                        "1 holds the Engram kv GGUF in every pass, as before\n",
+                (long long)ds41cone::kTwinNarrowM);
 }
 
 /* Lever M1 at the end of a declare (RADIANCE_DS41_MHC_FUSE set): the layers that declared the fused op beside pcn_a; none
@@ -8558,8 +8582,22 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
     int32_t* map = static_cast<int32_t*>(rad_buf_ptr(x, L.edd_map));
     if (!ids || !cids || !map) return false;
     Plan& p = m.edd_plan;
-    const Outcome o = plan(ids, T, H, ls.data(), ls.size(), p);
     const bool r0 = rad_rank(x) == 0;
+    /* tp8 loop P48b (ds41_engdd 2): a launch that takes the Engram twin (step_bi's by-launch TwinScope, recorded in m.edd_tw)
+     * makes the int8 GEMM's narrow band the floor: launches of <= 64 rows are kept, the pooled ones (> 64 rows, the tiled
+     * row-invariant band) must all take the twin or none -- their unique rows' GEMM then takes what they take */
+    int tw_or = 0, tw_u = 0;
+    if (g_sw_engdd.load(std::memory_order_relaxed) == 2 && m.edd_tw.size() == ls.size())
+        for (int v : m.edd_tw) tw_or |= v & kTwEng;
+    const int64_t floor_rows = tw_or ? ds41cone::kTwinNarrowM : kFormRows;
+    if (tw_or) {
+        tw_u = pool_twin(ls.data(), m.edd_tw.data(), ls.size(), T, kTwEng, floor_rows);
+        if (tw_u < 0) {
+            if (r0) g_edd_twmix.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    const Outcome o = plan(ids, T, H, ls.data(), ls.size(), p, kMinShareDiv, floor_rows);
     if (o != kDedup) {
         if (r0) (o == kGuard ? g_edd_guard : o == kLowShare ? g_edd_low : g_edd_nopool).fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -8575,10 +8613,24 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
     else
         RAD_ISSUE_N(x, L.e_emb_dd, p.rows * H, brows(L.edd_ids, p.rows), RAD_W(m.ple_table), brows(m.emb, p.rows));
     RAD_ISSUE_N(x, L.e_copy, p.rows, brows(m.emb, p.rows), brows(m.embd, p.rows));
-    /* the kept launches as today (their own rows: the same form), into their step rows */
-    for (const Kept& k : p.kept) lin_issue(x, m, L.e_gemm, k.n, RS(m.embd, k.c0, k.n), L.e_kv, RS(m.ekv, k.r0, k.n));
-    /* the unique rows, one launch of > 48 rows, then each pooled run gathered from them */
-    lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    if (!tw_or) {
+        /* the kept launches as today (their own rows: the same form), into their step rows */
+        for (const Kept& k : p.kept) lin_issue(x, m, L.e_gemm, k.n, RS(m.embd, k.c0, k.n), L.e_kv, RS(m.ekv, k.r0, k.n));
+        /* the unique rows, one launch of > 48 rows, then each pooled run gathered from them */
+        lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    } else {
+        /* P48b: each kept launch (<= 64 rows) as the undeduplicated pass issues it -- e2_gemm under that launch's own twin
+         * classes, its rows read at their compact rows -- then the unique rows (> 64) under the pooled launches' choice */
+        for (const Kept& k : p.kept) {
+            int tk = 0;
+            for (size_t i = 0; i < ls.size(); ++i)
+                if (ls[i].r0 == k.r0) { tk = m.edd_tw[i]; break; }
+            const TwinSet ts(tk);
+            e2_gemm(x, m, L, k.n, RS(m.embd, k.c0, k.n), RS(m.ekv, k.r0, k.n));
+        }
+        const TwinSet ts(tw_u);
+        lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    }
     for (const auto& u : p.runs)
         RAD_ISSUE_N(x, L.e_scat, u.second, brows(m.ekv_u, p.uniq), RS(L.edd_map, u.first, u.second),
                     RS(m.ekv, u.first, u.second));
@@ -8586,6 +8638,7 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
         g_edd_passes.fetch_add(1, std::memory_order_relaxed);
         g_edd_rows.fetch_add(p.pooled - p.uniq, std::memory_order_relaxed);
         g_edd_pooled.fetch_add(p.pooled, std::memory_order_relaxed);
+        if (tw_u) g_edd_tw.fetch_add(1, std::memory_order_relaxed);
         if (!m.edd_counted) {
             m.edd_counted = true;
             g_edd_steps.fetch_add(1, std::memory_order_relaxed);
@@ -8601,6 +8654,12 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
                     (long long)kFormRows, g_edd_low.load(std::memory_order_relaxed), (long long)kMinShareDiv,
                     g_edd_nopool.load(std::memory_order_relaxed), L.l, (long long)T, (long long)p.pooled, (long long)p.uniq,
                     p.kept.size(), p.runs.size());
+        if ((n == 1 || n % 256 == 0) && g_sw_engdd.load(std::memory_order_relaxed) == 2)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop P48b (ds41_engdd 2): %lld of those on the Engram twin (unique rows on the "
+                            "int8 GEMM, launches of <= %lld rows kept), %lld layer passes kept whole (their pooled launches split "
+                            "on the twin); this pass %s\n",
+                    g_edd_tw.load(std::memory_order_relaxed), (long long)ds41cone::kTwinNarrowM,
+                    g_edd_twmix.load(std::memory_order_relaxed), tw_u ? "on the twin" : "GGUF");
     }
     return true;
 }
@@ -9814,7 +9873,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         ? kTwQkv : 0) |
                    (psk_l && !tw_psk ? kTwAll : 0) |
                    (cr_any && !tw_psk ? kTwAll : 0) |
-                   (g_sw_engdd.load(std::memory_order_relaxed) > 0 ? kTwEng : 0);
+                   /* tp8 loop P48b: ds41_engdd 2 dedups on the twin itself (engdd_issue), so only 1 holds the class GGUF */
+                   (g_sw_engdd.load(std::memory_order_relaxed) == 1 ? kTwEng : 0);
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
         /* tp8 S5 + S6: a lane step's leader part issues its own layers; the other part's are as another node's (their
@@ -10047,8 +10107,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * reads), lever E1's dedup otherwise as today over every row */
             const int64_t H = c.ple_heads;
             m.edd_ls.clear();
+            m.edd_tw.clear();
             const bool e_gg = gguf_dense(m, L.e_kv);
-            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            /* tp8 loop P48b: each launch's twin classes as the by-launch issue below would see them (dense()'s TwinScope) */
+            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); m.edd_tw.push_back(t_twin); });
             const bool edd_ok = !m.sphc_eng && engdd_issue(x, m, L, batch, T, m.edd_ls);
             if (!edd_ok && m.sphc_eng && spn > 0) {
                 const RadOperand ids = brow_slice(L.ids, sp0, spn, H);
@@ -10082,8 +10144,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
              * band (the decode segment's pieces and a short prefill segment keep their own launch) */
             m.edd_ls.clear();
+            m.edd_tw.clear();
             const bool e_gg = gguf_dense(m, L.e_kv);   /* lever WMK: a mixed run's Engram rows in one launch (dense()) */
-            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            /* tp8 loop P48b: each launch's twin classes as the by-launch issue below would see them (dense()'s TwinScope) */
+            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); m.edd_tw.push_back(t_twin); });
             if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
                 if (m.ple_group > 0)
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
@@ -11393,6 +11457,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             const int64_t H = c.ple_heads;
             /* lever E1: the step's rows are one kv GEMM launch below; deduplicated when its plan says so */
             m.edd_ls.assign(1, ds41_engdd::Launch{ 0, T });
+            m.edd_tw.clear();   /* step(): no twin (twin_bi_now) */
             if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
                 /* T rows of operands; the gather's band is T * H, one table row per head per token,
                  * read through the ids and rows as flat (rad_block_ple.h does the same). */

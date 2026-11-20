@@ -52,7 +52,7 @@ enum Outcome { kNone = 0, kGuard = 1, kLowShare = 2, kDedup = 3 };
 struct Plan {
     Outcome out = kNone;
     int64_t T = 0, H = 0;
-    int64_t pooled = 0;                       /* rows of launches wider than kFormRows */
+    int64_t pooled = 0;                       /* rows of launches wider than the form floor (kFormRows unless given) */
     int64_t uniq = 0;                         /* the pool's distinct id rows */
     int64_t rows = 0;                         /* compact rows: the kept launches' rows, then the unique rows */
     int64_t u0 = 0;                           /* the unique rows' first compact row */
@@ -72,9 +72,12 @@ inline uint64_t row_hash(const int32_t* r, int64_t H) {
 }
 
 /* The plan for one Engram layer of a step: `ids` the layer's [T, H] row ids (host), `ls` the undeduplicated launches,
- * ascending and covering the rows they name once. min_share_div <= 0: deduplicate at any repeat. */
+ * ascending and covering the rows they name once. min_share_div <= 0: deduplicate at any repeat. `form_rows`: the GEMM's
+ * row-dependent band (launches of <= form_rows rows are kept, a pool of <= form_rows unique rows is refused): kFormRows for
+ * gemm_nt_ggml; tp8 loop P48b passes the int8 twin's narrow band (ds41_psk_cone.h kTwinNarrowM, 64) where the Engram kv
+ * takes its twin. */
 inline Outcome plan(const int32_t* ids, int64_t T, int64_t H, const Launch* ls, size_t nl, Plan& p,
-                    int64_t min_share_div = kMinShareDiv) {
+                    int64_t min_share_div = kMinShareDiv, int64_t form_rows = kFormRows) {
     p.out = kNone;
     p.T = T;
     p.H = H;
@@ -87,7 +90,7 @@ inline Outcome plan(const int32_t* ids, int64_t T, int64_t H, const Launch* ls, 
     if (!ids || T <= 0 || H <= 0) return p.out;
     for (size_t i = 0; i < nl; ++i) {
         const Launch& l = ls[i];
-        if (l.n <= kFormRows || l.r0 < 0 || l.r0 + l.n > T) continue;
+        if (l.n <= form_rows || l.r0 < 0 || l.r0 + l.n > T) continue;
         p.pooled += l.n;
         if (!p.runs.empty() && p.runs.back().first + p.runs.back().second == l.r0) p.runs.back().second += l.n;
         else p.runs.push_back({ l.r0, l.n });
@@ -110,13 +113,13 @@ inline Outcome plan(const int32_t* ids, int64_t T, int64_t H, const Launch* ls, 
             p.map[(size_t)r] = p.slot[i];
         }
     p.uniq = (int64_t)p.first.size();
-    if (p.uniq <= kFormRows) return p.out = kGuard;
+    if (p.uniq <= form_rows) return p.out = kGuard;
     const int64_t rep = p.pooled - p.uniq;
     if (rep <= 0 || (min_share_div > 0 && rep * min_share_div < p.pooled)) return p.out = kLowShare;
     int64_t c = 0;
     for (size_t i = 0; i < nl; ++i) {
         const Launch& l = ls[i];
-        if (l.n > kFormRows || l.n <= 0 || l.r0 < 0 || l.r0 + l.n > T) continue;
+        if (l.n > form_rows || l.n <= 0 || l.r0 < 0 || l.r0 + l.n > T) continue;
         p.kept.push_back({ l.r0, l.n, c });
         for (int64_t r = l.r0; r < l.r0 + l.n; ++r) p.src.push_back((int32_t)r);
         c += l.n;
@@ -125,6 +128,20 @@ inline Outcome plan(const int32_t* ids, int64_t T, int64_t H, const Launch* ls, 
     for (int32_t r : p.first) p.src.push_back(r);
     p.rows = p.u0 + p.uniq;
     return p.out = kDedup;
+}
+
+/* tp8 loop P48b: the twin classes the unique rows' GEMM takes. `tw` [nl] = each launch's twin classes as the undeduplicated
+ * pass issues it (deepseek41 step_bi: dense()'s TwinScope), `cls` the kv GEMM's class: cls when every launch the plan pools
+ * (> form_rows rows, in range) takes it, 0 when none does, -1 when they split -- the pass then keeps its by-launch issue, so
+ * no pooled row's bytes come from another weight than its own launch's. */
+inline int pool_twin(const Launch* ls, const int* tw, size_t nl, int64_t T, int cls, int64_t form_rows) {
+    int n_pool = 0, n_tw = 0;
+    for (size_t i = 0; i < nl; ++i) {
+        if (ls[i].n <= form_rows || ls[i].r0 < 0 || ls[i].r0 + ls[i].n > T) continue;
+        ++n_pool;
+        n_tw += (tw[i] & cls) ? 1 : 0;
+    }
+    return n_tw == 0 ? 0 : n_tw == n_pool ? cls : -1;
 }
 
 /* The compact ids: row c of `out` [rows, H] is step row src[c]'s ids. */
