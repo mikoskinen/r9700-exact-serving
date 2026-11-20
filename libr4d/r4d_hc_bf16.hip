@@ -2305,6 +2305,14 @@ __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_w(R4D_HCW_PARAMS) {
  * count, so the same number of blocks is resident a WGP: B3 capped at the plain kernel's 118 VGPRs (the stamps alone took
  * it to 127) and held there by a clobber of v117, A' G16p / G16 raised to the plain 194 / 130 by a clobber of the top
  * register (the stamps let the compiler drop to 191 / 120). The bench prints the residency it measures. */
+/* qfn-on-ds lever HCO (Qwen loop round 4, 21.11.2026; RADIANCE_FN4_HC_OCC bit 2): B3 at 16 rows a group with the register budget
+ * of 16 waves a SIMD (<= 96 VGPRs: 8 blocks a WGP resident instead of 6 at 118). The same body, the same arithmetic in the same
+ * order (only the allocation moves): every output byte is hc_up_w_kernel<16>'s. R6 (hctl1): at 64 / 128 rows B3 runs 2.1 / 4.0
+ * rounds of ~12 us blocks at 6 a WGP. */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(16, 16))) void hc_up_w_o_kernel(R4D_HCW_PARAMS) {
+    hc_up_w_body<RG, false, I8>(R4D_HCW_ARGS);
+}
 template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) void hc_up_w_tl_kernel(R4D_HCW_PARAMS) {
     asm volatile("" ::: "v117");
@@ -3001,6 +3009,21 @@ void hc_read_g16q_down_kernel(const unsigned short* __restrict__ h, const float*
                               float eps, float wadd, int ntd, long rows) {
     hc_read_g16p_down_body<RG, false, false, 4>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                 hrow, irow, eps, wadd, ntd, rows);
+}
+/* qfn-on-ds lever HCO (RADIANCE_FN4_HC_OCC bit 1): A' G16p with the register budget of 8 waves a SIMD (<= 192 VGPRs: 4 blocks a WGP
+ * resident instead of 3 at 194; LDS 27,208 B x 4 fits). The same body and arithmetic: every output byte is
+ * hc_read_g16p_down_kernel<16>'s. R6 (hctl1): at 64 / 128 rows A' runs 2.2 / 4.1 rounds of ~10-13 us blocks at 3 a WGP. */
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void hc_read_g16p_down_o_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                const unsigned char* __restrict__ downv, long dld,
+                                const unsigned short* __restrict__ injw,
+                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                float* __restrict__ scaleout, float* __restrict__ part,
+                                unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                float eps, float wadd, int ntd, long rows) {
+    hc_read_g16p_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                      hrow, irow, eps, wadd, ntd, rows);
 }
 /* qfn-on-ds Q17 (bench only, r4d_hc_tl): A' G16 / G16p with the phase timeline, region 0 */
 template <int RG>
@@ -4498,6 +4521,22 @@ static void fc_add(int f, long rows, bool bd) {
 static std::atomic<int> g_hc_pf2_stages{31};
 /* qfn-on-ds Q17 (bench only): r4d_hc_tl(1) = the bi_dec read's A' (G16 / G16p) and B3 (16-row groups) launch their TL copies */
 static std::atomic<int> g_hc_tl{0};
+/* qfn-on-ds lever HCO: RADIANCE_FN4_HC_OCC bit mask (read once; r4d_hc_occ sets it): 1 A' G16p, 2 B3 at 16-row groups in their
+ * occupancy instances (hc_read_g16p_down_o_kernel / hc_up_w_o_kernel). 0 / unset = today's kernels. -1 until read. */
+static std::atomic<int> g_hc_occ{-1};
+static int hc_occ() {
+    int v = g_hc_occ.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_OCC");
+        int want = -1;
+        g_hc_occ.compare_exchange_strong(want, (e && *e) ? (std::atoi(e) & 3) : 0, std::memory_order_relaxed);
+        v = g_hc_occ.load(std::memory_order_relaxed);
+        if (v > 0) std::fprintf(stderr, "radiance: libr4d: lever HCO (RADIANCE_FN4_HC_OCC=%d): the bi_dec read's %s at the occupancy "
+                                        "register budget (the same bytes)\n", v,
+                                v == 1 ? "A' G16p" : v == 2 ? "B3 (16-row groups)" : "A' G16p and B3 (16-row groups)");
+    }
+    return v;
+}
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -7914,6 +7953,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         fc_add(kFcG16p, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16>
                                : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16p_down_tl_kernel<16>
+                               : (hc_occ() & 1) ? &hc_read_g16p_down_o_kernel<16>
                                : &hc_read_g16p_down_kernel<16>),
                            dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
@@ -8006,6 +8046,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 #define HC_UPW_K(RG_, I8_)                                                                       \
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_>                                 \
                                : (RG_ == 16 && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_up_w_tl_kernel<16, I8_> \
+                               : (RG_ == 16 && (hc_occ() & 2)) ? &hc_up_w_o_kernel<16, I8_>     \
                                : &hc_up_w_kernel<RG_, I8_>),                                     \
                            dim3((unsigned)(n / kHcBCh), (unsigned)((rows + RG_ - 1) / RG_)),    \
                            dim3(kThreads), 0,                                                     \
@@ -8094,6 +8135,8 @@ extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (
  * after it; a block that did not run reads 0. */
 static unsigned long long* g_hc_tl_buf = nullptr;   /* the bench's device buffer (r4d_hc_tl) */
 constexpr size_t kHcTlBytes = (size_t)2 * kHcTlMax * kHcTlW * sizeof(unsigned long long);
+/* qfn-on-ds lever HCO (bench / test hook): the occupancy instances' mask, as RADIANCE_FN4_HC_OCC */
+extern "C" void r4d_hc_occ(int m) { g_hc_occ.store(m < 0 ? 0 : (m & 3), std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
     if (on && !g_hc_tl_buf) {
         void* p = nullptr;
