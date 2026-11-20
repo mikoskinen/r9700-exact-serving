@@ -2319,6 +2319,7 @@ __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) voi
     asm volatile("" ::: "v117");
     hc_up_w_body<RG, false, I8, true>(R4D_HCW_ARGS);
 }
+/* (no timeline copy of HCO bit 2's B3: at the 16-waves budget the stamped body spills 18 VGPRs; under r4d_hc_tl B3 stays today's) */
 
 /* qfn-on-ds lever B3R (Qwen loop round 1, 20.11.2026; hc_readv bits 11-12): kernel B3 under bi_dec with GPB 16-row
  * groups a block instead of one. The constant operands -- this lane's W_up row halves, their quarter scales, the norm
@@ -3100,6 +3101,45 @@ void hc_read_g16p_down_tl_kernel(const unsigned short* __restrict__ h, const flo
     asm volatile("" ::: "v193");
     hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                       hrow, irow, eps, wadd, ntd, rows);
+}
+/* qfn-on-ds Q17 / HCO (bench only): the timelines of HCO's A' instances at their budgets -- bit 1 (o: <= 192 VGPRs), bit 4 G16p
+ * (np: 191 untimed -> held <= 192) and G16 (np: 126 untimed -> held in the 121-144 granule by a clobber of v125) */
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void hc_read_g16p_down_tl_o_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                   const unsigned char* __restrict__ downv, long dld,
+                                   const unsigned short* __restrict__ injw,
+                                   unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                   float* __restrict__ scaleout, float* __restrict__ part,
+                                   unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                   float eps, float wadd, int ntd, long rows) {
+    hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                      hrow, irow, eps, wadd, ntd, rows);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void hc_read_g16p_down_tl_np_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                    const unsigned char* __restrict__ downv, long dld,
+                                    const unsigned short* __restrict__ injw,
+                                    unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                    float* __restrict__ scaleout, float* __restrict__ part,
+                                    unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                    float eps, float wadd, int ntd, long rows) {
+    hc_read_g16p_down_body<RG, false, false, 2, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                            hrow, irow, eps, wadd, ntd, rows);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16_down_tl_np_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                   const unsigned char* __restrict__ downv, long dld,
+                                   const unsigned short* __restrict__ injw,
+                                   unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                   float* __restrict__ scaleout, float* __restrict__ part,
+                                   unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                   float eps, float wadd, int ntd, long rows) {
+    asm volatile("" ::: "v125");
+    hc_read_g16_down_body<RG, false, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                 hrow, irow, eps, wadd, ntd, rows);
 }
 template <int RG>
 __global__ __launch_bounds__(kThreads)
@@ -8016,7 +8056,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
          * 16 rows +4 % slower, 32 -6 %, 64 -7 %) */
         fc_add(kFcG16p, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16>
-                               : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16p_down_tl_kernel<16>
+                               : g_hc_tl.load(std::memory_order_relaxed)
+                                   ? ((hc_occ() & 4) ? &hc_read_g16p_down_tl_np_kernel<16>
+                                      : (hc_occ() & 1) ? &hc_read_g16p_down_tl_o_kernel<16> : &hc_read_g16p_down_tl_kernel<16>)
                                : (hc_occ() & 4) ? ((hc_occ() & 1) ? &hc_read_g16p_down_onp_kernel<16>
                                                                   : &hc_read_g16p_down_np_kernel<16>)
                                : (hc_occ() & 1) ? &hc_read_g16p_down_o_kernel<16>
@@ -8030,7 +8072,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     } else if (hcg && g16) {
         fc_add(kFcG16, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16>
-                               : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16_down_tl_kernel<16>
+                               : g_hc_tl.load(std::memory_order_relaxed)
+                                   ? ((hc_occ() & 4) ? &hc_read_g16_down_tl_np_kernel<16> : &hc_read_g16_down_tl_kernel<16>)
                                : (hc_occ() & 4) ? &hc_read_g16_down_np_kernel<16>
                                : &hc_read_g16_down_kernel<16>),
                            dim3((unsigned)((hcg_nt + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,

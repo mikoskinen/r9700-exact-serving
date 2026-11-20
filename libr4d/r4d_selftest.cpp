@@ -166,6 +166,7 @@ struct Plugin {
     void (*tl_hc)(int) = nullptr;          /* optional (qfn-on-ds Q17: the bi_dec read's phase timeline) */
     int (*tl_hc_reset)() = nullptr;
     int (*tl_hc_read)(unsigned long long*, int, int) = nullptr;
+    void (*occ_hc)(int) = nullptr;         /* optional (qfn-on-ds lever HCO: r4d_hc_occ) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -250,6 +251,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->tl_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_tl");
     pl->tl_hc_reset = (int (*)())dlsym(pl->h, "r4d_hc_tl_reset");
     pl->tl_hc_read = (int (*)(unsigned long long*, int, int))dlsym(pl->h, "r4d_hc_tl_read");
+    pl->occ_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_occ");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -25057,6 +25059,20 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     if (okb) for (size_t i = 0; i < o0.size() && i < o1.size(); ++i) diff += o0[i] != o1[i];
     std::printf("HCTL M=%lld hc_readv %d bi_dec: timeline launch vs plain: %s\n", (long long)M, rv,
                 !okb ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
+    /* lever HCO (RADIANCE_FN4_HC_OCC = the arm, read by libr4d): the arm's plain launch against today's kernels (occ 0) */
+    const char* oe = std::getenv("RADIANCE_FN4_HC_OCC");
+    const int arm = oe && *oe ? (std::atoi(oe) & 7) : 0;
+    if (arm && pl.occ_hc) {
+        std::vector<uint8_t> oref;
+        pl.occ_hc(0);
+        const bool okr = grab(false, oref);
+        pl.occ_hc(arm);
+        size_t d2 = 0;
+        if (okr) for (size_t i = 0; i < oref.size() && i < o0.size(); ++i) d2 += oref[i] != o0[i];
+        std::printf("HCTL M=%lld HC_OCC %d vs today's kernels (HC_OCC 0): %s\n", (long long)M, arm,
+                    !okr ? "launch failed" : d2 ? fmt("%zu bytes differ", d2).c_str() : "every output byte identical");
+        diff += d2;
+    }
     /* the plain kernels' times */
     pl.tl_hc(0);
     pl.pf2_stages_hc(3);
