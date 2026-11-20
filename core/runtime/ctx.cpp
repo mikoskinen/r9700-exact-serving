@@ -20,6 +20,7 @@ namespace rad {
 /* tp8 S5 (core/engine_node.cpp): the part of a pipeline leader's pass being issued, 0 for a whole pass. */
 int pp_pass_part();
 int pp_pass_seg();
+int pp_pass_bands();   /* tp8 loop D46: the pass's band / tail band words (0: none) */
 /* tp8 loop P10 (core/engine_node.cpp): passes of at least this many rows are issued live (0 = no such rule) */
 int64_t pp_live_rows();
 }  /* namespace rad */
@@ -1133,6 +1134,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     if (const int pp = pp_pass_part()) mix(0x7070000ull + (uint64_t)pp);
     /* tp8 dev M4: a follower segment's layers (RAD_PP_PART_SEG): each its own recording */
     if (pp_pass_part() == 3 /* RAD_PP_PART_SEG */) mix(0x7071000ull + (uint64_t)pp_pass_seg());
+    /* tp8 loop D46: a band / tail band pass is its own recording (fn4 pp_tband 3 makes DECODE passes, which are recorded, tail
+     * band passes: the follower's part then ends at t - 1 with layer t - 1's key chain, the leader's tail starts there). Zero on
+     * every other pass: every key is the one this function gave before. */
+    if (const int bw = pp_pass_bands()) mix(0x7072000ull + (uint64_t)bw);
     return h | 1;
 }
 
