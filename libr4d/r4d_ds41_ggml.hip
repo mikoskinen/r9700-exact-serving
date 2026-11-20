@@ -4737,9 +4737,10 @@ void r4d_mix_fin_set(int v);
 extern "C" int r4d_attn_dec_sw_get();
 extern "C" int r4d_attn_dec_sw_set(int v);
 extern "C" int r4d_attn_dec_sw_known(int v);
-/* Lever TSK (DRAFTER track round 15, r4d_ds41_sparse.hip): "ds41_tsk" 0 / 1 / 2 -- the compressing layers' decode-band attention in
- * the split-key WMMA form (rule B: its own reference); 1 / 2 only with RADIANCE_DS41_TSK=0 / 1 / 2 at load (the op's scratch sized);
- * 2 = lever TSKC (round 22): 1 with the merge's grid stepped past the full-card cliff, 1's bytes. */
+/* Lever TSK (DRAFTER track round 15, r4d_ds41_sparse.hip): "ds41_tsk" 0 / 1 / 2 / 3 -- the compressing layers' decode-band attention in
+ * the split-key WMMA form (rule B: its own reference); 1 / 2 / 3 only with RADIANCE_DS41_TSK=0 / 1 / 2 / 3 at load (the op's scratch sized);
+ * 2 = lever TSKC (round 22): 1 with the merge's grid stepped past the full-card cliff, 1's bytes; 3 = lever TDD (round 38): 2 + latent_gather
+ * writes a sequence's shared selections once and a row map the gathered pass reads through, 1's bytes. */
 bool r4d_tsk_known(int v);
 int r4d_tsk_get();
 void r4d_tsk_set(int v);

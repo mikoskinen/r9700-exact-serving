@@ -36,6 +36,8 @@
 
 #include <atomic>
 #include <climits>
+#include <map>
+#include <mutex>
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
@@ -2357,13 +2359,44 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
  * key setup finds an entry (the same checks), so the same keys are present; an invalid one is not written (the
  * kernel reads the zero row for it, as before). Grid (ceil(topk / 8), M), 256 threads: a wave an entry, lane L the 16
  * values of its block L (8 code bytes at 8 L, scale byte 256 + L) -> 32 bytes at 16 L of the entry's bf16 row. */
-__global__ __launch_bounds__(256) void ds41_latent_gather_nv4_kernel(DsAttnArgs a, uint16_t* out, long rs) {
+/* Lever TDD (DRAFTER track round 38; RADIANCE_DS41_TDD=1 at load, latent_gather's form when its map exists): `map` non-null =
+ * the rows of one sequence share their gathered entries. Row m's valid selection j that its sequence's FIRST row m0 also
+ * selects (sel rows are ascending entry indices, -1 after: index_topk's output) is not written again: map[m T + j] =
+ * (m0 << 16) | j' (m0's slot j' holds the same entry's bytes); every other valid selection is written at its own slot as
+ * before, map = (m << 16) | j. Rows of a sequence at consecutive positions select (nearly) the same entries -- all of them
+ * while the context has <= topk compressed entries -- so the gathered bytes written and read fall ~B-fold for B rows. */
+__global__ __launch_bounds__(256) void ds41_latent_gather_nv4_kernel(DsAttnArgs a, uint16_t* out, long rs,
+                                                                    int* __restrict__ map = nullptr) {
     const long m = blockIdx.y;
     const int j = (int)blockIdx.x * 8 + (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31u);
-    if (j >= a.nk - a.win) return;
+    const int T = a.nk - a.win;
+    if (j >= T) return;
     const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
     const long c = a.sel[m * a.selr + (long)j * a.selc];
     if (c < 0 || (c * a.ratio) / a.cbs >= a.ncbt) return;
+    if (map) {
+        const long m0 = a.cu[(long)s * a.cs];
+        long src = m, sj = j;
+        if (m0 != m) {   /* c in m0's ascending list: slots j - 16 .. j + 15 in one probe (lane L slot j - 16 + L), else a binary
+                          * search (-1 = past the end) */
+            const int* r0 = a.sel + m0 * a.selr;
+            const int pj = j - 16 + lane;
+            const uint32_t hit = (uint32_t)__builtin_amdgcn_ballot_w32(pj >= 0 && pj < T && (long)r0[(long)pj * a.selc] == c);
+            if (hit) { src = m0; sj = j - 16 + __builtin_ctz(hit); }
+            else {
+                int lo = 0, hi = T;
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    const long v = r0[(long)mid * a.selc];
+                    if (v < 0 || v > c) hi = mid;
+                    else if (v < c) lo = mid + 1;
+                    else { src = m0; sj = mid; break; }
+                }
+            }
+        }
+        if (lane == 0) map[m * T + j] = (int)((src << 16) | sj);
+        if (src != m) return;
+    }
     const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
     if (blk < 0 || blk >= a.ncblk) return;
     const unsigned char* e = (const unsigned char*)(a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot);
@@ -2843,7 +2876,8 @@ constexpr int kTskTpc = R4D_TSK_TPC;
 __host__ __device__ constexpr long ds_tsk_lds() { return ds_wm_sbuf_off(kTskTpc) + kWmSbufBytes + kWmNvBytes; }
 template <bool GA>
 __global__ __launch_bounds__(128) void ds41_attn_tsk_kernel(DsAttnArgs a, float sl2, float* __restrict__ wso,
-                                                            float* __restrict__ wsm, int nch) {
+                                                            float* __restrict__ wsm, int nch,
+                                                            const int* __restrict__ map = nullptr) {
     constexpr int D = kDsAttnD, TPC = kTskTpc;
     const int nkt = (a.nk + 15) >> 4;
     const int ch = (int)blockIdx.y;
@@ -2881,7 +2915,9 @@ __global__ __launch_bounds__(128) void ds41_attn_tsk_kernel(DsAttnArgs a, float 
                     if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
                         const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
                         if (blk >= 0 && blk < a.ncblk)
-                            ptr = GA ? a.cg + m * a.cgr + (long)(k - a.win) * D
+                            ptr = GA ? (map ? a.cg + (long)(map[m * (a.nk - a.win) + (k - a.win)] >> 16) * a.cgr +
+                                                  (long)(map[m * (a.nk - a.win) + (k - a.win)] & 0xffff) * D   /* lever TDD */
+                                            : a.cg + m * a.cgr + (long)(k - a.win) * D)
                                      : a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
                     }
                 }
@@ -3941,7 +3977,7 @@ int nv_gather(RadStream stream, const RadArgs* ra, const A& s, A* g) {
     uint16_t* out = (uint16_t*)ra->scratch;
     const DsAttnArgs& b = s;
     const int rc = R4D_EMIT(stream, ds41_latent_gather_nv4_kernel, dim3((unsigned)((topk + 7) / 8), (unsigned)s.M),
-                            dim3(256), 0u, b, out, topk * (long)kDsAttnD);
+                            dim3(256), 0u, b, out, topk * (long)kDsAttnD, (int*)nullptr);
     if (rc != RAD_OK) return rc;
     *g = s;
     g->cnv = 0;
@@ -4216,15 +4252,17 @@ int tsk_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_TSK");
         if (!e || !*e) return -1;
-        if (!std::strcmp(e, "0") || !std::strcmp(e, "1") || !std::strcmp(e, "2")) {
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "1") || !std::strcmp(e, "2") || !std::strcmp(e, "3")) {
             std::fprintf(stderr, "radiance: libr4d: lever TSK: the compressing layers' decode-band attention (<= %d rows) in the split-key "
                                  "WMMA form (chunks of %d key tiles fixed by key index; rule B: its own reference) %s (RADIANCE_DS41_TSK=%s; "
-                                 "fn4 ds41_tsk 0 / 1 / 2 = 1 with the merge's grid past the full-card cliff, 1's bytes); attn_sparse_sink's "
+                                 "fn4 ds41_tsk 0 / 1 / 2 = 1 with the merge's grid past the full-card cliff, 1's bytes / 3 = 2 + lever TDD: "
+                                 "a sequence's shared gathered selections written once + a row map, 1's bytes); attn_sparse_sink's "
                                  "scratch sized for it\n",
-                         kWmRows, kTskTpc, *e == '2' ? "ON at start, merge past the cliff" : *e == '1' ? "ON at start" : "off at start", e);
+                         kWmRows, kTskTpc, *e == '3' ? "ON at start, merge past the cliff, TDD" : *e == '2' ? "ON at start, merge past the cliff"
+                                         : *e == '1' ? "ON at start" : "off at start", e);
             return *e - '0';
         }
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_TSK=%s is not 0 / 1 / 2: lever TSK not loaded (today's attention)\n", e);
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_TSK=%s is not 0 / 1 / 2 / 3: lever TSK not loaded (today's attention)\n", e);
         return -1;
     }();
     return v;
@@ -4232,6 +4270,41 @@ int tsk_env() {
 std::atomic<int> g_tsk{tsk_env() > 0 ? tsk_env() : 0};
 std::atomic<long long> g_tsk_decl{0};
 std::atomic<int> g_tsk_bench{0};   /* bench only (r4d_tsk_bench_nomerge): 1 = without the merge launch, 2 = the merge alone */
+/* Lever TDD (DRAFTER track round 38): fn4 ds41_tsk 3 (RADIANCE_DS41_TSK=3 at load) = 2 + latent_gather writes a sequence's shared
+ * selections once (its first row's slots) plus a map [M][topk] of where each row's selection sits, and lever TSK's gathered pass
+ * reads through the map: the same bf16 entries in the same key order = TSK's bytes (rule A against ds41_tsk 1 / 2). The map is
+ * libr4d's own buffer, one per gathered view (the latent_gather output pointer), made at the first gather that view takes
+ * (r4d_8a8_split_ctr's pattern); its state (on, rows, topk) is set at that gather's issue and read at each attention's issue, both
+ * in stream order. A view whose gather wrote a map is read through it whatever the switch says later, and never by a form without
+ * it (the stock gathered decode pass is skipped for it: the packed cache serves that call). */
+std::atomic<int> g_tdd{-1};        /* -1: the switch's (ds41_tsk 3); 0 / 1: a bench's (r4d_tdd_set) */
+constexpr long kTddRows = 64, kTddTopk = 2048;
+struct TddView { int* map = nullptr; long rows = 0, topk = 0; bool on = false; };
+std::mutex g_tdd_mu;
+std::map<const void*, TddView> g_tdd_views;
+bool tdd_on() { const int b = g_tdd.load(std::memory_order_relaxed); return b >= 0 ? b > 0 : g_tsk.load(std::memory_order_relaxed) == 3; }
+/* The gather's issue: the view's map (made once) when the lever takes this gather (on, <= 64 rows, topk <= 2048), else nullptr
+ * and the view marked off (its rows are written whole). */
+int* tdd_gather_map(const void* view, long M, long topk) {
+    std::lock_guard<std::mutex> lk(g_tdd_mu);
+    TddView& v = g_tdd_views[view];
+    if (!tdd_on() || M < 1 || M > kTddRows || topk < 1 || topk > kTddTopk) { v.on = false; return nullptr; }
+    if (!v.map) {
+        void* p = nullptr;
+        if (hipMalloc(&p, (size_t)kTddRows * kTddTopk * sizeof(int)) != hipSuccess) { v.on = false; return nullptr; }
+        v.map = (int*)p;
+    }
+    v.on = true; v.rows = M; v.topk = topk;
+    return v.map;
+}
+/* An attention's issue over a gathered view: its map when the view's last gather wrote one (and covers these rows), else nullptr. */
+const int* tdd_view_map(const void* view, long M, long topk, bool* deduped) {
+    std::lock_guard<std::mutex> lk(g_tdd_mu);
+    auto it = g_tdd_views.find(view);
+    const bool on = it != g_tdd_views.end() && it->second.on;
+    if (deduped) *deduped = on;
+    return on && M <= it->second.rows && topk == it->second.topk ? it->second.map : nullptr;
+}
 /* the chunk partials of M rows: o [M][nch][H][D] f32, then (m, den) [M][nch][H][2] f32 */
 long tsk_chunks(long nk) { return ((nk + 15) / 16 + kTskTpc - 1) / kTskTpc; }
 long tsk_ws_bytes(long M, long H, long nk) { return M * tsk_chunks(nk) * H * (kDsAttnD + 2) * 4 + 256; }
@@ -4248,9 +4321,12 @@ int tsk_emit(RadStream stream, const RadArgs* ra, const DsAttnArgsT<ORT>& s0, co
     if (!s0.cc || !s0.sel || s0.wf8 || s0.M < 1 || s0.M > band || s0.nk <= s0.win) return RAD_E_UNSUPPORTED;
     DsAttnArgsT<ORT> s = s0;
     bool ga = false;
+    const int* tmap = nullptr;
     if (gth) {
+        bool dd = false;   /* lever TDD: a deduplicated view is read through its map or not at all (the packed cache serves) */
+        const int* mp = tdd_view_map(gth->data, s0.M, (long)s0.nk - s0.win, &dd);
         DsAttnArgsT<ORT> g{};
-        if (g_fold(s0, gth, &g, band)) { s = g; ga = true; }
+        if ((!dd || mp) && g_fold(s0, gth, &g, band)) { s = g; ga = true; tmap = mp; }
     }
     const long nch = tsk_chunks(s.nk);
     const long need = tsk_ws_bytes(s.M, s.H, s.nk);
@@ -4275,8 +4351,9 @@ int tsk_emit(RadStream stream, const RadArgs* ra, const DsAttnArgsT<ORT>& s0, co
     const DsAttnArgs b = s;
     const int bm = g_tsk_bench.load(std::memory_order_relaxed);
     const int rc = bm == 2 ? RAD_OK
-                 : ga ? R4D_EMIT(stream, ds41_attn_tsk_kernel<true>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch)
-                      : R4D_EMIT(stream, ds41_attn_tsk_kernel<false>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch);
+                 : ga ? R4D_EMIT(stream, ds41_attn_tsk_kernel<true>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch, tmap)
+                      : R4D_EMIT(stream, ds41_attn_tsk_kernel<false>, grid, dim3(128), (uint32_t)ds_tsk_lds(), b, sl2, wso, wsm, (int)nch,
+                                 (const int*)nullptr);
     if (rc != RAD_OK || bm == 1) return rc;
     const long n = (long)s.M * s.H * (kDsAttnD / 4);
     /* lever TSKC (DRAFTER track 19.11.2026 round 22; fn4 ds41_tsk 2): the merge's grid stepped past the R9700 full-card cliff
@@ -4286,7 +4363,7 @@ int tsk_emit(RadStream stream, const RadArgs* ra, const DsAttnArgsT<ORT>& s0, co
      * at 48; served (lq190 stamps) 17.2-17.6 us a call at 32 rows vs 9.1-9.4 at 48 on both nodes. The extra workgroup's threads
      * have i >= M H 128: they store nothing (tsk_merge's `ok`), so the bytes are value 1's. */
     unsigned nb = (unsigned)((n + 255) / 256);
-    if (g_tsk.load(std::memory_order_relaxed) == 2) nb = r4d_cliff_rows(nb, 1, 8);
+    if (g_tsk.load(std::memory_order_relaxed) >= 2) nb = r4d_cliff_rows(nb, 1, 8);   /* 2, and 3 (= 2 + TDD) */
     return R4D_EMIT(stream, ds41_attn_tsk_merge_kernel<ORT>, dim3(nb), dim3(256), 0u, s,
                     (const float*)wso, (const float*)wsm, (int)nch);
 }
@@ -4360,7 +4437,9 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
         const int rt = tsk_emit<false>(stream, a, s, gth, band);
         if (rt != RAD_E_UNSUPPORTED) return rt;
     }
-    if (rows <= band && gth) {   /* lever DKV-G */
+    bool tdd_view = false;   /* lever TDD: a deduplicated gathered view is TSK's alone */
+    if (gth) tdd_view_map(gth->data, s.M, (long)s.nk - s.win, &tdd_view);
+    if (rows <= band && gth && !tdd_view) {   /* lever DKV-G */
         DsAttnArgs g{};
         if (g_fold(s, gth, &g, band)) {
             const int rc = attn_dec_emit<false>(stream, g);
@@ -4455,7 +4534,9 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
             if (rt != RAD_E_UNSUPPORTED) return rt;
         }
         DsAttnArgsOrt sg{};
-        if (gth && g_fold(so, gth, &sg, band)) {   /* lever DKV-G */
+        bool tdd_view = false;   /* lever TDD: a deduplicated gathered view is TSK's alone */
+        if (gth) tdd_view_map(gth->data, so.M, (long)so.nk - so.win, &tdd_view);
+        if (gth && !tdd_view && g_fold(so, gth, &sg, band)) {   /* lever DKV-G */
             const int rc4 = attn_dec_emit<true>(stream, sg);
             if (rc4 != RAD_E_UNSUPPORTED) return rc4;
         }
@@ -4568,8 +4649,9 @@ int lg_body(const RadArgs* a, RadStream stream) {
     s.M = (int)sel.shape[0];
     s.win = 0;
     s.nk = (int)topk;
+    int* const map = tdd_gather_map(g.data, (long)s.M, (long)topk);   /* lever TDD */
     return R4D_EMIT(stream, ds41_latent_gather_nv4_kernel, dim3((unsigned)((topk + 7) / 8), (unsigned)s.M), dim3(256), 0u,
-                    s, (uint16_t*)g.data, (long)g.stride[0]);
+                    s, (uint16_t*)g.data, (long)g.stride[0], map);
 }
 
 }  // namespace
@@ -4683,11 +4765,13 @@ extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs* a) {
     return nvg > tsk ? nvg : tsk;
 }
 /* Lever TSK's fn4 switch ds41_tsk (r4d_ds41_ggml.hip's rad_fn4_*): 1 only when RADIANCE_DS41_TSK sized the scratch at load. */
-bool r4d_tsk_known(int v) { return v == 0 || ((v == 1 || v == 2) && tsk_env() >= 0); }
+bool r4d_tsk_known(int v) { return v == 0 || (v >= 1 && v <= 3 && tsk_env() >= 0); }
 int r4d_tsk_get() { return g_tsk.load(std::memory_order_relaxed); }
-void r4d_tsk_set(int v) { g_tsk.store((v == 1 || v == 2) && tsk_env() >= 0 ? v : 0, std::memory_order_relaxed); }
+void r4d_tsk_set(int v) { g_tsk.store(v >= 1 && v <= 3 && tsk_env() >= 0 ? v : 0, std::memory_order_relaxed); }
 /* bench only (tools/dbench/tbench, round 22): 1 = TSK without its merge launch, 2 = the merge alone (prices the merge) */
 void r4d_tsk_bench_nomerge(int v) { g_tsk_bench.store(v == 1 || v == 2 ? v : 0, std::memory_order_relaxed); }
+/* lever TDD (round 38): a bench's override of the switch (-1 = ds41_tsk 3 decides) */
+void r4d_tdd_set(int v) { g_tdd.store(v < 0 ? -1 : (v ? 1 : 0), std::memory_order_relaxed); }
 extern "C" long long r4d_tsk_declines() { return g_tsk_decl.load(std::memory_order_relaxed); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);

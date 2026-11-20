@@ -42,6 +42,8 @@ extern "C" void r4d_attn_dec_pin(int c);   /* the decode band's form 0-6 (-1: th
 void r4d_tsk_set(int v);                   /* lever TSK (round 15): the fn4 switch ds41_tsk's setter (2 = TSKC, round 22) */
 void r4d_tsk_bench_nomerge(int v);          /* round 22: ds41_tsk 1 without its merge launch (bench only: prices the merge) */
 int r4d_tsk_get();
+void r4d_tsk_bench_dedup(int v) __attribute__((weak));   /* round 38: TDD bound (WRONG bytes; bench branch only): TSK GA reads its sequence's first row's copy, the gather writes first rows */
+void r4d_tdd_set(int v);                    /* round 38: lever TDD on / off (-1 = the switch: ds41_tsk 3) */
 extern "C" long long r4d_tsk_declines();
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
@@ -68,8 +70,17 @@ static uint64_t rnd() { g_rs ^= g_rs << 13; g_rs ^= g_rs >> 7; g_rs ^= g_rs << 1
 static float frand() { return (float)((rnd() >> 11) * (1.0 / 9007199254740992.0)) * 2.0f - 1.0f; }
 struct Call { std::vector<RadTensor> t; std::vector<RadParam> p; RadArgs a; void fix() { std::memset(&a, 0, sizeof(a)); a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1; a.wgp_count = 32; } };
 
+/* round 38: a READ flush (clean lines, as the experts' weight stream leaves L2 / MALL between two layers' attentions; a memset leaves
+ * dirty lines whose write-back the next kernel pays) */
+__global__ void tb_flush_read(const uint4* __restrict__ p, size_t n, uint4* __restrict__ sink) {
+    uint4 acc = make_uint4(0u, 0u, 0u, 0u);
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const uint4 v = p[i]; acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+    }
+    if ((acc.x & acc.y & acc.z & acc.w) == 0xdeadbeefu) sink[0] = acc;
+}
 int main(int argc, char** argv) {
-    int S = 16, bpr = 3, ctx = 8192, ratio = 4, topk = 512, iters = 200, coldmb = 0, pieces = 1, K = 10, decpins = 0, timing = 1;
+    int S = 16, bpr = 3, ctx = 8192, ratio = 4, topk = 512, iters = 200, coldmb = 0, pieces = 1, K = 10, decpins = 0, timing = 1, fast = 0, coldr = 0;
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         auto nx = [&]() { return i + 1 < argc ? argv[++i] : (char*)"0"; };
@@ -80,10 +91,12 @@ int main(int argc, char** argv) {
         else if (k == "--topk") topk = std::atoi(nx());
         else if (k == "--iters") iters = std::atoi(nx());
         else if (k == "--cold") coldmb = std::atoi(nx());
+        else if (k == "--coldr") { coldmb = std::atoi(nx()); coldr = 1; }   /* round 38: the flush READS coldmb MiB instead of a memset */
         else if (k == "--pieces") pieces = std::atoi(nx());
         else if (k == "--k") K = std::atoi(nx());
         else if (k == "--no-timing") timing = 0;
         else if (k == "--decpins") decpins = 1;
+        else if (k == "--fast") fast = 1;   /* round 38: timing = TSKC arms + the TDD bound only */
         else { std::fprintf(stderr, "unknown %s\n", k.c_str()); return 1; }
     }
     const int H = 16, D = 512, ROT = 64, OFF = D - ROT, HD = H * D, win = 128, bs = 64, cbs = 64;
@@ -92,7 +105,9 @@ int main(int argc, char** argv) {
     const int epb = cbs / ratio, ncbt = (ncomp + epb - 1) / epb, ncblk = S * ncbt + 8;
     const int nvb = 288, cslot = nvb / 2 / ratio;                      /* ds_nv4_bytes(512) = 288 */
     const int maxctx = used + 64;
-    if (ncomp < topk) { std::fprintf(stderr, "ctx / ratio %d < topk %d\n", ncomp, topk); return 1; }
+    /* round 38: a context with fewer compressed entries than topk (the mb load's ~1.1-1.6k tokens): every row selects all of its reachable
+     * entries in position order, -1 after (index_topk's output when reach <= K) */
+    const bool allsel = ncomp < topk;
     std::printf("tbench: rows %d (%d sequences x %d), heads %d x %d, window %d, ratio %d, topk %d, ctx %d (%d compressed entries a sequence), iters %d, cold %d MiB, pieces %d\n",
                 M, S, bpr, H, D, win, ratio, topk, ctx, ncomp, iters, coldmb, pieces);
     std::vector<uint16_t> hq((size_t)M * HD), hc((size_t)nblk * bs * D);
@@ -110,6 +125,11 @@ int main(int argc, char** argv) {
         for (int r = 0; r < bpr; ++r) {
             const int m = s * bpr + r;
             pos[m] = used - bpr + r;
+            if (allsel) {
+                const int reach = std::min((pos[m] + 1) / ratio, ncomp);
+                for (int j = 0; j < topk; ++j) sel[(size_t)m * topk + j] = j < reach ? j : -1;
+                continue;
+            }
             std::vector<int32_t> pick(base.begin(), base.begin() + topk);
             for (int q = 0; q < topk / 16; ++q) pick[(size_t)(rnd() % (uint64_t)topk)] = base[(size_t)(topk + (rnd() % (uint64_t)(ncomp - topk)))];
             std::sort(pick.begin(), pick.end()); pick.erase(std::unique(pick.begin(), pick.end()), pick.end());
@@ -286,7 +306,12 @@ int main(int argc, char** argv) {
     }
     if (!timing) { for (void* d : pcu) CK(hipFree(d)); return 0; }
     hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
-    auto cold = [&]() { if (dcold) CK(hipMemsetAsync(dcold, (int)(rnd() & 0xff), (size_t)coldmb << 20, st)); };
+    if (dcold && coldr) CK(hipMemset(dcold, 0x5a, (size_t)coldmb << 20));
+    auto cold = [&]() {
+        if (!dcold) return;
+        if (coldr) hipLaunchKernelGGL(tb_flush_read, dim3(1024), dim3(256), 0, st, (const uint4*)dcold, ((size_t)coldmb << 20) / 16, (uint4*)dcold);
+        else CK(hipMemsetAsync(dcold, (int)(rnd() & 0xff), (size_t)coldmb << 20, st));
+    };
     auto timed = [&](const char* name, auto body) {
         std::vector<float> v;
         for (int it = 0; it < iters + 3; ++it) {
@@ -305,7 +330,59 @@ int main(int argc, char** argv) {
     CK(hipStreamSynchronize(st));
     std::printf("timing (us a layer call, K %d back to back, median of %d); gathered rows %.1f MB, packed entries read %.1f MB\n", K, iters,
                 gb / 1e6, (double)M * topk * nvb / 1e6);
-    for (int rep = 0; rep < 2; ++rep) {
+    if (fast) {   /* round 38: lever TDD's bytes = TSKC's (rule A), repeat, each of three sequences alone vs in the pass */
+        std::vector<uint16_t> f1(ob / 2), x1(ob / 2), x2(ob / 2), x3(ob / 2);
+        r4d_tsk_set(2); r4d_tdd_set(0);
+        clr(); served(); grab(f1);
+        r4d_tdd_set(1);
+        clr(); served(); grab(x1); clr(); served(); grab(x2); clr(); attn_only(); grab(x3);
+        long bi = 0;
+        for (int s1 : { 0, S / 2, S - 1 }) {   /* the sequence's rows as their own pass (gather + attention over its rows alone) */
+            const int r0 = s1 * bpr;
+            void* c1 = piece_cu(bpr);
+            Call g1; RadTensor tcbt = T(dcbt, RAD_I32, { 1, ncbt }); tcbt.data = (int32_t*)dcbt + (size_t)s1 * ncbt;
+            void* dg1; CK(hipMalloc(&dg1, (size_t)bpr * topk * D * 2)); pcu.push_back(dg1);
+            g1.t = { T(dcc, RAD_BF16, { ncblk, 1, cbs, cslot }), tcbt, OFFS(T(dsel, RAD_I32, { bpr, topk }), r0), T(c1, RAD_I32, { 2 }),
+                     T(dg1, RAD_BF16, { bpr, (int64_t)topk * D }) };
+            g1.p = { PI("dim", D), PI("ratio", ratio), PI("topk", topk), PS("latent_format", "nvfp4") }; g1.fix();
+            Call a1; a1.t = attn_ts(r0, bpr, dout); a1.t[8] = T(c1, RAD_I32, { 2 }); a1.t.push_back(T(dcs, RAD_F32, { maxctx, ROT }));
+            a1.t.push_back(T(dg1, RAD_BF16, { bpr, (int64_t)topk * D })); a1.p = ortp(ap(bpr)); a1.fix();
+            a1.a.scratch = dscr; a1.a.scratch_bytes = (int64_t)scrb;
+            clr(); run(g1, r4d_rad_ds41_latent_gather, "gather1"); run(a1, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered, "attn1");
+            std::vector<uint16_t> x(ob / 2); grab(x);
+            for (size_t i = (size_t)r0 * HD; i < (size_t)(r0 + bpr) * HD; ++i) bi += x[i] != f1[i];
+        }
+        std::vector<uint16_t> x4(ob / 2), x5(ob / 2);
+        r4d_tdd_set(-1); r4d_tsk_set(3);   /* the serving form: fn4 ds41_tsk 3 */
+        const int on3 = r4d_tsk_get();
+        clr(); served(); grab(x4);
+        r4d_tsk_set(2); clr(); attn_only(); grab(x5);   /* switch back to 2 with the view still deduplicated: read through its map */
+        r4d_tdd_set(0); r4d_tsk_set(0);
+        std::printf("  TDD bytes: vs TSKC (served, gather + attn) %ld of %zu differ, repeat %ld, attn alone after the gather %ld, three sequences alone vs "
+                    "the TSKC pass %ld; switch %d (ds41_tsk 3) vs TSKC %ld, switch 2 over a deduplicated view %ld; hash %016llx (TSKC %016llx); declines %lld\n",
+                    diff(x1, f1), f1.size(), diff(x1, x2), diff(x3, f1), bi, on3, diff(x4, f1), diff(x5, f1),
+                    (unsigned long long)fnv(x1), (unsigned long long)fnv(f1), r4d_tsk_declines());
+    }
+    for (int rep = 0; rep < 2 && fast; ++rep) {   /* round 38 */
+        r4d_tsk_set(2);
+        timed("TSKC: gather + attn gathered (ORT)", served);
+        timed("  TSKC attn gathered alone (ORT)", attn_only);
+        timed("  gather alone", gather_only);
+        r4d_tdd_set(1);
+        timed("TDD: gather + attn gathered (ORT)", served);
+        timed("  TDD attn gathered alone (ORT)", attn_only);
+        timed("  TDD gather alone", gather_only);
+        r4d_tdd_set(0);
+        if (r4d_tsk_bench_dedup) {
+            r4d_tsk_bench_dedup(1);
+            timed("TDD bound: gather + attn gathered (ORT)", served);
+            timed("  TDD bound attn gathered alone (ORT)", attn_only);
+            timed("  TDD bound gather alone", gather_only);
+            r4d_tsk_bench_dedup(0);
+        }
+        r4d_tsk_set(0);
+    }
+    for (int rep = 0; rep < 2 && !fast; ++rep) {
         r4d_tsk_set(0);
         timed("stock: gather + attn gathered (ORT)", served);
         timed("  stock attn gathered alone (ORT)", attn_only);
