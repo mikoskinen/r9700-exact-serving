@@ -269,7 +269,8 @@
  *                   a function of the row's ids alone, inference/model.py:353), and gather_rows copies every row's kv row
  *                   from its unique row; launches of <= 48 rows (the decode band) are issued as today, and nothing is
  *                   deduplicated when the unique rows would be <= 48 or fewer than 1/16 of the pooled rows repeat;
- *                   0 today's issue. RADIANCE_DS41_ENGDD=0 | 1 declares it (and starts at that value); unset: 1 refused,
+ *                   0 today's issue. 2 (tp8 loop P48b) = 1, and where a launch takes the Engram twin (RADIANCE_DS41_TWIN
+ *                   class 8) the dedup runs on it: launches of <= 64 rows kept, the unique rows on the int8 GEMM. RADIANCE_DS41_ENGDD=0 | 1 declares it (and starts at that value); unset: 1 refused,
  *                   the program and the issue are today's. A pass it may act on is not recorded. Exact: the same bytes
  *                   (gemm_nt_ggml's per-row form above the band). Live counters: /stats "engdd".
  *   sched_noa       scheduler (lever NOA, ds41-noa: a prefill's piece over the shared budget): 0 off (today); 1 / 2 on,
@@ -447,7 +448,8 @@
  *                   (start) = RADIANCE_DS41_SPHC's; N >= it: a lone prefill pass / a follower segment pass is sequence-
  *                   parallel from N rows (above --max-num-batched-tokens: none). Refused without RADIANCE_DS41_SPHC.
  *   ds41_sphc_attn  deepseek41 (tp8 loop P25s; 86): 0 .. RADIANCE_DS41_SPHC_ATTN (starts at it): 0 = an SP layer's q_a / kv
- *                   after xn's gather (P26 off), 1 P26, 2 + P26b.
+ *                   after xn's gather (P26 off), 1 P26, 2 + P26b, 3 + P26c (the kv / index sources of ratio > 1 without xn's
+ *                   gather: the indexer's projection over the quarter, iw gathered; tp8 loop PREFILL round 38).
  *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 87): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
  *                   passes whole (P25 off), 1 / 2 P25, 3 + P25b. Each only takes away what the env declared; exact at every
  *                   value (SP is the replicated pass's fold and bytes; X1 / X2 carry every row whichever side shards).
@@ -529,6 +531,12 @@
  *                   are announced. Order of host writes only: no packet, argument or kernel changes (rule A). A card whose arguments
  *                   live in host memory, or whose driver gives no register, flushes nothing. Both nodes of a pipeline (a follower
  *                   switch). Unset: the start's RADIANCE_AQL_HDP_FLUSH (0 / 1).
+ *   ds41_csplit     deepseek41 (tp8 loop P47; 103 here, after aql_hdp): 0 -- the candidate layer's indexer unsplit where its keep
+ *                   words cross (the follower of W(10, 32): layer 20, every rank every row's full-width index_score), as before; 1 --
+ *                   split there as at every other index layer, the keep rows all-gathered after it. Needs RADIANCE_DS41_CAND_SPLIT=1
+ *                   at load on BOTH nodes (keep's pitch padded to 16-byte words, X2's keep part with it; the follower declares the
+ *                   part + gather), which starts it at 1; without the env 1 is refused. Exact either way (lever I1's split + a word
+ *                   gather). The follower takes it with the leader's; the leader holds nothing it changes.
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -765,7 +773,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

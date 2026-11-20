@@ -651,6 +651,13 @@ struct Model {
     bool w8 = false, w8d = false;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
+    /* tp8 loop P47 (RADIANCE_DS41_CAND_SPLIT=1; csplit_env()): where the candidate layer's keep words cross (pp_unsplit_cand),
+     * its indexer keeps the row split -- a rank's index_candidates write its runs' rows into `keep_part` (qmax runs of irows
+     * rows, as sel_part) and `keep_gather` lays every rank's part where the unsplit layer writes it (keep rows s.r0 + r q R:
+     * the selections' gather), so every rank, rank 0's crossing too, holds every row's keep, as unsplit. `csplit`: declared. */
+    bool csplit = false;
+    rad_buf keep_part = 0;
+    rad_op keep_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
      * its `gr` output groups; `zero` for an attention-zero rank. */
     int aw = 1, ar = 0;
@@ -679,6 +686,7 @@ struct Model {
     bool edd_rec = false, edd_synced = false, edd_counted = false;
     ds41_engdd::Plan edd_plan;
     std::vector<ds41_engdd::Launch> edd_ls;
+    std::vector<int> edd_tw;   /* tp8 loop P48b: the twin classes step_bi's by-segment issue gives each edd_ls launch (t_twin) */
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
     MoeFP8::Wire mw{};
@@ -818,6 +826,10 @@ struct Model {
     /* tp8 loop P26b (RADIANCE_DS41_SPHC_ATTN=2): at an SP kv-source layer the compressor's kv | gate GEMM over the quarter and
      * its f32 output kvs gathered raw (libr4d sp_ag_rows_4rank_f32: the words on the bf16 instance) */
     rad_op sp_ag_kvs = 0;
+    /* tp8 loop P26c (RADIANCE_DS41_SPHC_ATTN=3, with P26b): at an SP kv / index source layer (ratio > 1) the indexer's projection
+     * (gemm_nt bf16 32 x 5120) over the quarter too and its output iw gathered raw, so no op there reads xn past the rank's
+     * quarter: q_a / kv run P26's form (quarter + qr / kv gathers) and xn's gather goes */
+    rad_op sp_ag_iw = 0;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
@@ -1207,6 +1219,14 @@ struct TwinScope {
     ~TwinScope() { t_twin = prev; }
     TwinScope(const TwinScope&) = delete;
     TwinScope& operator=(const TwinScope&) = delete;
+};
+/* tp8 loop P48b: t_twin set to classes a by-launch issue recorded (lever E1's kept launches, its unique rows' GEMM) */
+struct TwinSet {
+    int prev;
+    explicit TwinSet(int v) : prev(t_twin) { t_twin = v; }
+    ~TwinSet() { t_twin = prev; }
+    TwinSet(const TwinSet&) = delete;
+    TwinSet& operator=(const TwinSet&) = delete;
 };
 static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
@@ -2328,6 +2348,13 @@ static bool pfctx_plan(const RadBatch* b, int64_t window, std::vector<std::pair<
  * id rows, every row's kv row then gathered from its unique row (ds41_engram_dedup.h: why it is exact, the plan, the
  * 48-row guard). Switch "ds41_engdd" (fn4): 1 = deduplicate a step with a prefill sequence (a pass with no prefill
  * sequence, the drafter's passes and every launch of <= 48 rows are issued as today), 0 = today's issue.
+ * tp8 loop P48b: 2 = 1 where no launch of the layer takes the Engram twin (RADIANCE_DS41_TWIN with class 8, ds41_twin's mask);
+ * where one does, the pass dedups ON the twin: launches of <= 64 rows (the int8 GEMM's narrow band, ds41_psk_cone.h
+ * kTwinNarrowM) are kept and issued as the undeduplicated pass issues them (e2_gemm under the launch's own twin classes), the
+ * pooled launches (> 64 rows, each in the int8 GEMM's row-invariant tiled band) must all take the twin or none (else the pass
+ * keeps today's by-launch issue), their unique rows run the twin's GEMM beside engram_kv_u's GGUF op (> 64 unique rows, else
+ * the guard), so a pooled row's bytes are the tiled twin's, as its own launch would give them; and the Engram class is no
+ * longer held GGUF in every pass for E1 (t_tw_off). Rule B, as every twin class.
  * RADIANCE_DS41_ENGDD=0 / off declares it and starts at 0, 1 / on at 1; unset declares nothing (1 refused, the program
  * and the issue are today's). Declared: per Engram layer a second lookup (the compact ids), a GEMM into a scratch plane
  * (engram_kv_u) and a gather_rows back into engram_kv; host buffers for the compact ids and each layer's map. A pass it
@@ -2338,6 +2365,9 @@ static std::atomic<int> g_sw_engdd{0}, g_sw_engdd_ok{0}, g_sw_engdd_env{-2};   /
  * repeat share, steps with a deduplicated layer, passes with no launch above the band. */
 static std::atomic<long long> g_edd_passes{0}, g_edd_rows{0}, g_edd_pooled{0}, g_edd_guard{0}, g_edd_low{0}, g_edd_steps{0},
     g_edd_nopool{0};
+/* tp8 loop P48b (ds41_engdd 2): layer passes deduplicated on the Engram twin, layer passes kept whole because their pooled
+ * launches did not all take the twin */
+static std::atomic<long long> g_edd_tw{0}, g_edd_twmix{0};
 static void engdd_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_ENGDD");
@@ -2754,6 +2784,21 @@ static void ixni_note(RadCtx* x, const int32_t* hp, int64_t rows, int64_t R, int
     g_ixni_dead.fetch_add(4 * dead, std::memory_order_relaxed);
 }
 
+/* tp8 loop P47 (RADIANCE_DS41_CAND_SPLIT): rank 0 counts the candidate layer's split segments at issue (a recorded pass when it
+ * is recorded) and names the first one and every 256th: the deal, the rows the layer ran, the gather's bytes a rank. */
+static std::atomic<long long> g_csplit_segs{0}, g_csplit_rows{0};
+static void csplit_note(RadCtx* x, const Ds41IdxRuns& ru, int64_t seg_rows, int64_t layer_rows, int64_t kwords) {
+    if (rad_rank(x) != 0) return;
+    const long long n = g_csplit_segs.fetch_add(1, std::memory_order_relaxed) + 1;
+    const long long r = g_csplit_rows.fetch_add(layer_rows, std::memory_order_relaxed) + layer_rows;
+    if (n == 1 || n % 256 == 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_CAND_SPLIT=1 (tp8 loop P47): %lld candidate-layer segment(s) split, "
+                        "%lld rows at the layer; this one %lld rows (%lld at the layer) as %lld runs of %lld, %lld a rank%s, the keep "
+                        "gather %.2f MiB a rank\n",
+                n, r, (long long)seg_rows, (long long)layer_rows, (long long)ru.n, (long long)ru.R, (long long)ru.q,
+                ru.balanced ? " (balanced)" : "", (double)(ru.q * ru.R * kwords * 4) / (1024.0 * 1024.0));
+}
+
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -2763,6 +2808,10 @@ static void sw_note_decl(int64_t rows) {
 static int idx_fn4_accepts(const char* name, int value);
 static int idx_fn4_switch(const char* name, int value);
 static int idx_fn4_value(const char* name, int* applied);
+/* ds41_csplit (tp8 loop P47), below index_runs() */
+static bool csplit_env();
+static int csplit_on();
+static void csplit_set(int v);
 
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
@@ -2795,8 +2844,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_psk_l20_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_pfctx"))
         return value == 0 || (value == 1 && g_sw_pfctx_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_engdd"))
-        return value == 0 || (value == 1 && g_sw_engdd_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_engdd"))   /* tp8 loop P48b: 2 = 1 + the Engram twin under the dedup */
+        return value == 0 || ((value == 1 || value == 2) && g_sw_engdd_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "mhc_fuse"))   /* lever M1 */
         return value == 0 || (value >= 1 && value <= 1048576 && g_sw_mhc_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;   /* lever IX-NI: counted here, libr4d's */
@@ -2825,6 +2874,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     /* tp8 loop P30t: mask + 256 x rows, the mask a subset of RADIANCE_DS41_TWIN's classes (0: every row GGUF) */
     if (!std::strcmp(name, "ds41_twin"))
         return value >= 0 && ((value & 255) & ~twin_env()) == 0 && (value >> 8) <= 65535 ? 1 : -1;
+    /* tp8 loop P47: 1 needs RADIANCE_DS41_CAND_SPLIT=1 at load (both nodes carry it; the leader holds nothing it changes) */
+    if (!std::strcmp(name, "ds41_csplit")) return value == 0 || (value == 1 && csplit_env()) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -2852,6 +2903,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_sphc_attn")) g_sw_spattn.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc_seg")) g_sw_spseg.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_twin")) g_sw_twin.store(value, std::memory_order_relaxed);   /* tp8 loop P30t */
+    else if (!std::strcmp(name, "ds41_csplit")) csplit_set(value);   /* tp8 loop P47 */
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -2951,6 +3003,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         const int v = g_sw_twin.load(std::memory_order_relaxed);
         *applied = twin_mask_now() + (twin_psk_now() ? kTwPsk : 0) +
                    (twin_sub_asked() && twin_rows_now() <= ds41cone::kTwinNarrowM + 1 ? kTwSub : 0) + 256 * (v < 0 ? 0 : (v >> 8));
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_csplit")) {   /* tp8 loop P47 */
+        *applied = csplit_on();
         return 1;
     }
     return 0;
@@ -3103,6 +3159,33 @@ static int64_t ds41_irows_min() {
     }();
     return v;
 }
+/* tp8 loop P47 -- RADIANCE_DS41_CAND_SPLIT=1 (read at the first declare, BOTH nodes: it sets keep's row pitch, which X2's keep
+ * part carries; unset = today's declare byte for byte). On a pipeline node where the candidate layer's keep words cross
+ * (Model::pp_unsplit_cand: the follower of W(10, 32), layer 20) the candidate layer's indexer keeps the row split -- each rank
+ * scores / selects its own runs as at every other index layer -- and an all_gather of the keep rows (keep_part -> keep, the
+ * selections' layout) gives every rank, rank 0's crossing too, every row's keep words, as the unsplit layer did. EXACT by
+ * construction: a row's score / candidates / selection are its own whichever rank runs it (ds41_index_split.h, lever I1), the
+ * gather moves words. Why (FINDINGS PREFILL 14:54 / QUEUE P45, M START P42): unsplit, layer 20 runs every cone row's full-width
+ * index_score on all four ranks -- its cone part 11.2-11.6 us a row at 16k and ~21-24 at 64k vs ~5.1-5.3 at a plain cut layer,
+ * on the drain (first-token time). A node where no keep crosses pads the pitch only. */
+static bool csplit_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_CAND_SPLIT"); return e && e[0] == '1' && !e[1]; }();
+    return on;
+}
+/* fn4 ds41_csplit (core switch 103): 1 = the split + gather above where it is declared, 0 = the candidate layer unsplit (today's
+ * issue, the declare unchanged: keep's pitch stays padded, the part and gather stay declared). Starts at 1 under the env; 1 is
+ * refused without it. Read at every candidate-layer issue; the core changes it at a step release with every rank parked. */
+static std::atomic<int> g_sw_csplit{-1};
+static void csplit_set(int v) { g_sw_csplit.store(v, std::memory_order_relaxed); }
+static int csplit_on() {
+    int v = g_sw_csplit.load(std::memory_order_relaxed);
+    if (v < 0) {
+        int unread = -1;
+        g_sw_csplit.compare_exchange_strong(unread, csplit_env() ? 1 : 0);
+        v = g_sw_csplit.load(std::memory_order_relaxed);
+    }
+    return v;
+}
 static void index_runs(Model& m) {
     const auto& g = m.g;
     const auto& c = m.c;
@@ -3110,7 +3193,7 @@ static void index_runs(Model& m) {
     m.iparts = (g.max_tok + m.irows - 1) / m.irows;
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
-        m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
+        m.kwords = ds41_keep_pitch(keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block), csplit_env());
 }
 
 /* The row split's balanced deal (ds41_index_split.h; lever I1) as an in-process switch, "idx_split": 0 = the plain
@@ -3360,14 +3443,15 @@ static std::atomic<long long> g_sp_x2{0};   /* tp8 loop P36: the follower's X2s 
  * above the decode band (lever WMG's byte check: 28 keys, 25,928 rows, 0 differ; lever GPF's forms keep the per-output
  * order) and a quarter of an SP pass is >= 128 rows (SPHC >= 512); the gathers move the owner's words. */
 static int sphc_attn_env() {
-    /* 1 = q_a / kv (P26); 2 = + the compressor at the kv-source layers (P26b); anything else 0 */
+    /* 1 = q_a / kv (P26); 2 = + the compressor at the kv-source layers (P26b); 3 = + the indexer's projection there, so those
+     * layers take P26's form without xn's gather (P26c, tp8 loop PREFILL round 38); anything else 0 */
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_SPHC_ATTN");
-        return e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
+        return e && (e[0] == '1' || e[0] == '2' || e[0] == '3') && !e[1] ? e[0] - '0' : 0;
     }();
     return v;
 }
-static std::atomic<long long> g_sp_attn{0}, g_sp_comp{0};
+static std::atomic<long long> g_sp_attn{0}, g_sp_comp{0}, g_sp_iw{0};
 /* tp8 loop P25s (PREFILL round 17) -- the SP route's in-process switches, so ONE start serves both arms of an A / B (TESTQUEUE
  * 2b: the control beside RADIANCE_DS41_SPHC=1024 SPHC_ATTN=1 SPHC_SEG=3) on the same image, cards and load. Each only takes
  * away what the start's env declared, and its default is that env's (a start that sets none of them is today's):
@@ -3385,7 +3469,7 @@ static int64_t sphc_now(const Model& m) {
     return m.sphc > 0 && v > m.sphc ? (int64_t)v : m.sphc;
 }
 static int spattn_now(const Model& m) {
-    const int d = m.sp_ag_qr ? (m.sp_ag_kvs ? 2 : 1) : 0, v = g_sw_spattn.load(std::memory_order_relaxed);
+    const int d = m.sp_ag_qr ? (m.sp_ag_kvs ? (m.sp_ag_iw ? 3 : 2) : 1) : 0, v = g_sw_spattn.load(std::memory_order_relaxed);
     return v >= 0 && v < d ? v : d;
 }
 static int spseg_now(const Model& m) {
@@ -3630,17 +3714,25 @@ static int buffers(RadBuilder* b, Model& m) {
     /* score_rows (lever VA "arena", a sizing declare below irows): no split at such a step, so the
      * selections are its rows too. */
     m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.score_rows ? m.score_rows : m.irows, m.cmax });
-    /* (layer ranges: only where a held layer writes or reads it) */
-    if (m.kwords > 0 && lr_keep_used(m)) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
     /* lever BI: a prefill segment's split runs are laid from its first row, so up to a decode segment's rows (48)
      * past the unsplit plane; lever PSK: a cut segment's runs from its cut row, up to the ranks' runs past the step */
     const int64_t sel_rows = (m.isplit && !m.score_rows ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T) +
                              (bi_declared() || psk_declared() ? (int64_t)m.aw * m.irows + 64 : 0);
+    /* tp8 loop P47: the split candidate layer where its keep words cross (csplit_env(), the row split on) -- keep's gather
+     * lays the ranks' parts as sel's does, so keep takes sel's rows; flags off: decided false, keep as before */
+    m.csplit = csplit_env() && m.pp_unsplit_cand && m.isplit && m.kwords > 0 && m.kwords % 4 == 0;
+    /* (layer ranges: only where a held layer writes or reads it) */
+    if (m.kwords > 0 && lr_keep_used(m))
+        m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { m.csplit ? std::max(T, sel_rows) : T, m.kwords });
+    if (!m.keep) m.csplit = false;
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { sel_rows, c.itopk });
     if (m.isplit)
         m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32,
                             { m.score_rows ? std::min(m.score_rows, m.qmax * m.irows) : m.qmax * m.irows, c.itopk });
+    if (m.csplit)
+        m.keep_part = decl_b(b, nm.f("index_keep_part"), RAD_I32,
+                             { m.score_rows ? std::min(m.score_rows, m.qmax * m.irows) : m.qmax * m.irows, m.kwords });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     if (!c.ple.empty() && lr_engram(m)) {   /* (layer ranges: a node that holds an Engram layer) */
@@ -4230,12 +4322,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             }
             if (l == c.cand) {
                 if (!m.keep) return RAD_E_INVAL;
+                /* tp8 loop P47: split, a rank's candidates go to its part, which keep_gather joins into keep */
                 L.i_cand = op(b, "index_candidates",
                               { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                 RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
                                 RAD_INT("ratio", r) },
-                              {}, { m.score }, { m.keep });
+                              {}, { m.score }, { m.csplit ? m.keep_part : m.keep });
                 if (!L.i_cand) return RAD_E_INVAL;
+                if (m.csplit && rw(b, L.i_cand, {}, { m.keep }) == 0) return RAD_E_INVAL;
             }
             const bool uses = c.cand >= 0 && c.cand < l;
             if (uses && (!m.keep || c.ratio[(size_t)c.cand] != r)) {
@@ -4254,6 +4348,20 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                           { sel_out });
             if (L.i_topk && m.isplit && rw(b, L.i_topk, {}, { m.sel }) == 0) return RAD_E_INVAL;
             if (!L.i_topk) return RAD_E_INVAL;
+            /* tp8 loop P47: the keep rows' join, declared after the layer's selection as it is issued (after every run's
+             * candidates and selection), the words moved as f32 (the selections' gather moves its i32 rows the same way); a
+             * library that serves no such gather leaves the candidate layer unsplit, as before */
+            if (l == c.cand && m.csplit && !m.keep_gather) {
+                m.keep_gather = op(b, "all_gather",
+                                   { RAD_INT("world_size", g.world), RAD_INT("numel", m.qmax * IR * m.kwords),
+                                     RAD_STR("dtype", "f32") },
+                                   {}, { m.keep_part }, { m.keep });
+                if (!m.keep_gather) {
+                    m.csplit = false;
+                    rad_note(b, "deepseek41: RADIANCE_DS41_CAND_SPLIT (tp8 loop P47) off: no all_gather of the keep words "
+                                "resolves at %d ranks; layer %lld's indexer stays unsplit", g.world, (long long)c.cand);
+                }
+            }
         }
 
         /* ---- the sparse attention and the output projection */
@@ -6267,7 +6375,13 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
         if (in.src >= 0)
             cp = fmt_s("; a copy of source %d's %s (stored here from X%d at the owner's pages)", in.src,
                        in.latent && in.index ? "latent + index keys" : in.latent ? "latent" : "index keys", in.at == m.pp_h ? 1 : 2);
-        if (m.pp_unsplit_cand) cp += fmt_s("; layer %lld's indexer unsplit (its keep words cross)", (long long)c.cand);
+        if (m.pp_unsplit_cand && m.csplit && m.keep_gather)   /* tp8 loop P47 */
+            cp += fmt_s("; layer %lld's indexer split, its keep words gathered (%lld words a row, RADIANCE_DS41_CAND_SPLIT, tp8 loop "
+                        "P47)", (long long)c.cand, (long long)m.kwords);
+        else if (m.pp_unsplit_cand) cp += fmt_s("; layer %lld's indexer unsplit (its keep words cross)", (long long)c.cand);
+        if (!m.pp_unsplit_cand && csplit_env() && m.kwords > 0)
+            cp += fmt_s("; keep words padded to %lld a row (RADIANCE_DS41_CAND_SPLIT, tp8 loop P47: X2's layout = the follower's)",
+                        (long long)m.kwords);
         const bool clean = m.pp_h == 0 && m.pp_cx[RAD_PP_X2].sel < 0 && m.pp_cx[RAD_PP_X2].keep < 0 &&
                            m.pp_cx[RAD_PP_X2].src < 0;
         if (clean)   /* W(0,t), a clean cut: S4's line, byte for byte (its declare is S4's) */
@@ -6713,15 +6827,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      ? rad_decl_op(b, "all_gather_rows", ps.data(), (int)ps.size(), nullptr, 0) : 0;
                 m.sp_ag_kvs = h && rad_op_resolved(b, h) ? rw(b, h, { m.kvs }, { m.kvs }) : 0;
             }
+            /* tp8 loop P26c (=3): the indexer's weights iw [T][ih] bf16 (ih = 32: one 64-byte row), `bound` the all-reduce's */
+            if (m.sp_ag_kvs && sphc_attn_env() >= 3 && c.ih > 0 && c.ih % 32 == 0)
+                m.sp_ag_iw = rows_op("all_gather_rows", c.ih, m.iw, true);
             if (ctx->rank == 0 && !ctx->shape_probe)
-                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_ATTN=%d (tp8 loop P26): %s%s\n", sphc_attn_env(),
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_ATTN=%d (tp8 loop P26): %s%s%s\n", sphc_attn_env(),
                         m.sp_ag_qr ? "an SP layer whose xn no compressor / indexer reads runs q_a and kv over each rank's "
                                      "quarter and gathers their outputs (qr, kv) in place of xn"
                                    : "off -- the gathers of qr / kv do not resolve here",
                         sphc_attn_env() < 2 || !m.sp_ag_qr ? ""
                         : m.sp_ag_kvs ? "; an SP kv-source layer runs the compressor's kv | gate GEMM over the quarter and "
                                         "gathers its f32 output (P26b)"
-                                      : "; P26b off -- the f32 gather of the compressor's output does not resolve here");
+                                      : "; P26b off -- the f32 gather of the compressor's output does not resolve here",
+                        sphc_attn_env() < 3 || !m.sp_ag_kvs ? ""
+                        : m.sp_ag_iw ? "; an SP kv / index source layer (ratio > 1) runs the indexer's projection over the quarter "
+                                       "too, gathers iw and takes P26's q_a / kv form: no xn gather there (P26c)"
+                                     : "; P26c off -- the gather of the indexer's weights does not resolve here");
         }
     }
     /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG): the follower's segment passes SP; 2's row-sharded boundary ops are declared with
@@ -7020,7 +7141,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "many rows; up to 16777216 = none), ds41_sphc_attn 0..%d, ds41_sphc_seg 0..%d -- each at this "
                             "start's env, and lower only takes away what the env declared (this node issues P26 at %d, "
                             "segment SP at %d at most)\n",
-                    (long long)m.sphc, sphc_attn_env(), sphc_seg_env(), m.sp_ag_qr ? (m.sp_ag_kvs ? 2 : 1) : 0, m.sp_seg);
+                    (long long)m.sphc, sphc_attn_env(), sphc_seg_env(), m.sp_ag_qr ? (m.sp_ag_kvs ? (m.sp_ag_iw ? 3 : 2) : 1) : 0, m.sp_seg);
     }
     /* tp8 loop P30t: the twins this declare holds, and what ds41_twin may take (the env's classes this node twinned) */
     if (twin_env() && !ctx->shape_probe) {
@@ -7488,6 +7609,11 @@ static void engdd_declare(Model& m, const RadBuildCtx* ctx) {
                 g_sw_engdd.load(std::memory_order_relaxed), (long long)((m.c.hc + 1) * m.c.n_embd),
                 (long long)(m.c.ple_heads * m.c.ple_dim), want, (long long)ds41_engdd::kFormRows,
                 (long long)ds41_engdd::kFormRows, (long long)ds41_engdd::kMinShareDiv);
+    if (ctx->rank == 0 && (twin_env() & kTwEng))
+        fprintf(stderr, "radiance: deepseek41: tp8 loop P48b: ds41_engdd 2 = lever E1 ON the Engram twin where a launch takes it "
+                        "(launches of <= %lld rows kept as issued undeduplicated, the pooled ones' unique rows on the int8 GEMM); "
+                        "1 holds the Engram kv GGUF in every pass, as before\n",
+                (long long)ds41cone::kTwinNarrowM);
 }
 
 /* Lever M1 at the end of a declare (RADIANCE_DS41_MHC_FUSE set): the layers that declared the fused op beside pcn_a; none
@@ -8456,8 +8582,24 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
     int32_t* map = static_cast<int32_t*>(rad_buf_ptr(x, L.edd_map));
     if (!ids || !cids || !map) return false;
     Plan& p = m.edd_plan;
-    const Outcome o = plan(ids, T, H, ls.data(), ls.size(), p);
     const bool r0 = rad_rank(x) == 0;
+    /* tp8 loop P48b (ds41_engdd 2): a launch that takes the Engram twin (step_bi's by-launch TwinScope, recorded in m.edd_tw)
+     * makes the int8 GEMM's narrow band the floor: launches of <= 64 rows are kept, the pooled ones (> 64 rows, the tiled
+     * row-invariant band) must all take the twin or none -- their unique rows' GEMM then takes what they take */
+    int tw_or = 0, tw_u = 0;
+    if (g_sw_engdd.load(std::memory_order_relaxed) == 2 && m.edd_tw.size() == ls.size())
+        for (int v : m.edd_tw) tw_or |= v & kTwEng;
+    const int64_t floor_rows = tw_or ? ds41cone::kTwinNarrowM : kFormRows;
+    if (tw_or) {
+        tw_u = pool_twin(ls.data(), m.edd_tw.data(), ls.size(), T, kTwEng, floor_rows);
+        /* the unique rows' GEMM can take the twin exactly where a launch's GEMM can (both twin ops declared, or neither) */
+        if (tw_u > 0 && m.twop.count(L.e_gemm) != m.twop.count(L.e_gemm_u)) tw_u = -1;
+        if (tw_u < 0) {
+            if (r0) g_edd_twmix.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    const Outcome o = plan(ids, T, H, ls.data(), ls.size(), p, kMinShareDiv, floor_rows);
     if (o != kDedup) {
         if (r0) (o == kGuard ? g_edd_guard : o == kLowShare ? g_edd_low : g_edd_nopool).fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -8473,10 +8615,24 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
     else
         RAD_ISSUE_N(x, L.e_emb_dd, p.rows * H, brows(L.edd_ids, p.rows), RAD_W(m.ple_table), brows(m.emb, p.rows));
     RAD_ISSUE_N(x, L.e_copy, p.rows, brows(m.emb, p.rows), brows(m.embd, p.rows));
-    /* the kept launches as today (their own rows: the same form), into their step rows */
-    for (const Kept& k : p.kept) lin_issue(x, m, L.e_gemm, k.n, RS(m.embd, k.c0, k.n), L.e_kv, RS(m.ekv, k.r0, k.n));
-    /* the unique rows, one launch of > 48 rows, then each pooled run gathered from them */
-    lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    if (!tw_or) {
+        /* the kept launches as today (their own rows: the same form), into their step rows */
+        for (const Kept& k : p.kept) lin_issue(x, m, L.e_gemm, k.n, RS(m.embd, k.c0, k.n), L.e_kv, RS(m.ekv, k.r0, k.n));
+        /* the unique rows, one launch of > 48 rows, then each pooled run gathered from them */
+        lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    } else {
+        /* P48b: each kept launch (<= 64 rows) as the undeduplicated pass issues it -- e2_gemm under that launch's own twin
+         * classes, its rows read at their compact rows -- then the unique rows (> 64) under the pooled launches' choice */
+        for (const Kept& k : p.kept) {
+            int tk = 0;
+            for (size_t i = 0; i < ls.size(); ++i)
+                if (ls[i].r0 == k.r0) { tk = m.edd_tw[i]; break; }
+            const TwinSet ts(tk);
+            e2_gemm(x, m, L, k.n, RS(m.embd, k.c0, k.n), RS(m.ekv, k.r0, k.n));
+        }
+        const TwinSet ts(tw_u);
+        lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    }
     for (const auto& u : p.runs)
         RAD_ISSUE_N(x, L.e_scat, u.second, brows(m.ekv_u, p.uniq), RS(L.edd_map, u.first, u.second),
                     RS(m.ekv, u.first, u.second));
@@ -8484,6 +8640,7 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
         g_edd_passes.fetch_add(1, std::memory_order_relaxed);
         g_edd_rows.fetch_add(p.pooled - p.uniq, std::memory_order_relaxed);
         g_edd_pooled.fetch_add(p.pooled, std::memory_order_relaxed);
+        if (tw_u) g_edd_tw.fetch_add(1, std::memory_order_relaxed);
         if (!m.edd_counted) {
             m.edd_counted = true;
             g_edd_steps.fetch_add(1, std::memory_order_relaxed);
@@ -8499,6 +8656,12 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
                     (long long)kFormRows, g_edd_low.load(std::memory_order_relaxed), (long long)kMinShareDiv,
                     g_edd_nopool.load(std::memory_order_relaxed), L.l, (long long)T, (long long)p.pooled, (long long)p.uniq,
                     p.kept.size(), p.runs.size());
+        if ((n == 1 || n % 256 == 0) && g_sw_engdd.load(std::memory_order_relaxed) == 2)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop P48b (ds41_engdd 2): %lld of those on the Engram twin (unique rows on the "
+                            "int8 GEMM, launches of <= %lld rows kept), %lld layer passes kept whole (their pooled launches split "
+                            "on the twin); this pass %s\n",
+                    g_edd_tw.load(std::memory_order_relaxed), (long long)ds41cone::kTwinNarrowM,
+                    g_edd_twmix.load(std::memory_order_relaxed), tw_u ? "on the twin" : "GGUF");
     }
     return true;
 }
@@ -8931,7 +9094,26 @@ static void pf_pass_note(RadCtx* x, const RadBatch* b, int bits) {
  * on or off (an event record is no op of the pass): the same bytes. */
 static constexpr int64_t kPflRows = 256;
 static constexpr int64_t kPflEvents = 16384;   /* the event pool's cap (records hold ~45 a pass) */
+static constexpr int64_t kPflEventsOps = 32768;   /* tp8 loop P42 step 2: with the group marks (~10 a layer: ~240 a follower pass) */
 static std::atomic<long long> g_pfl_min{-2};   /* -2 unread, -1 off, else the rows of a prompt that gets its own lines */
+/* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS=1, read with PF_LAYERS on): marks at each issued layer's op groups (ds41pfl::gname)
+ * -- events only, the issue the same; -2 unread, 0 off, 1 on */
+static std::atomic<int> g_pfl_ops{-2};
+static bool pfl_ops() {
+    int v = g_pfl_ops.load(std::memory_order_relaxed);
+    if (v != -2) return v > 0;
+    const char* e = std::getenv("RADIANCE_DS41_PF_OPS");
+    const int n = e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
+    if (e && *e && !n && std::strcmp(e, "0") && std::strcmp(e, "off"))
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=%s is not 1 / on or 0 / off: off\n", e);
+    int unread = -2;
+    if (g_pfl_ops.compare_exchange_strong(unread, n) && n > 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=1 (tp8 loop P42 step 2): with RADIANCE_DS41_PF_LAYERS, rank 0 also "
+                        "marks each issued layer's op groups (e Engram, n input norm / mix, q attention inputs + window store, c "
+                        "compressor chain + stores, i indexer, a attention + output projections, r attention all-reduce + FFN input, "
+                        "f MoE, o layer end); two more lines a prompt (ops by layer and group)\n");
+    return g_pfl_ops.load(std::memory_order_relaxed) > 0;
+}
 static long long pfl_min() {
     long long v = g_pfl_min.load(std::memory_order_relaxed);
     if (v != -2) return v;
@@ -8977,7 +9159,8 @@ static RadEvent pfl_ev() {   /* g_pfl_mu held */
         return e;
     }
     RadEvent e = nullptr;
-    if (g_pfl_made >= kPflEvents || !rad_event_create_local || rad_event_create_local(&e) < 0 || !e) return nullptr;
+    if (g_pfl_made >= (pfl_ops() ? kPflEventsOps : kPflEvents) || !rad_event_create_local || rad_event_create_local(&e) < 0 || !e)
+        return nullptr;
     ++g_pfl_made;
     return e;
 }
@@ -9015,6 +9198,7 @@ static void pfl_poll(bool lone) {
 /* step_bi's record: built at its start (the pass's start event), a mark at each layer it issues, the end at its return */
 struct PflScope {
     bool on = false;
+    bool ops = false;   /* tp8 loop P42 step 2: the group marks (RADIANCE_DS41_PF_OPS) */
     RadStream s = nullptr;
     PflPend p;
     PflScope(RadCtx* x, const Model& m, const RadBatch* b, const std::vector<BiSeg>& sg) {
@@ -9038,6 +9222,15 @@ struct PflScope {
         p.r.pos0 = b->positions_h[0];
         p.r.rows = sg[0].n;
         on = true;
+        ops = pfl_ops();
+    }
+    /* tp8 loop P42 step 2: op group g of layer l starts here */
+    void sub(int l, int g) {
+        if (ops) layer(ds41pfl::sub_id(l, g));
+    }
+    /* tp8 loop P42 step 2: the rows layer l runs after lever PSK's cut (the ops lines' "rows a/b" of the last two chunks) */
+    void rows(int l, int64_t n) {
+        if (ops) p.r.lrows.push_back({ l, n });
     }
     void layer(int l) {
         if (!on) return;
@@ -9523,7 +9716,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     static thread_local std::vector<uint8_t> spv;
     static thread_local std::vector<ds41sp::Layer> spl;
     spv.assign(m.layers.size(), 0);
-    int sp_n = 0, sp_ga = 0, sp_lo = -1, sp_hi = -1, sp_en = 0, sp_at = 0, sp_ac = 0;   /* sp_at / sp_ac: P26's / P26b's layers */
+    int sp_n = 0, sp_ga = 0, sp_lo = -1, sp_hi = -1, sp_en = 0, sp_at = 0, sp_ac = 0, sp_aw = 0;   /* sp_at / sp_ac / sp_aw: P26's / P26b's / P26c's layers */
     int sp_deep = 0;   /* tp8 loop P25c: SP layers past PSK's first */
     if (sp_pass) {
         spl.assign(m.layers.size(), ds41sp::Layer{});
@@ -9592,6 +9785,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 g_sp_eng.fetch_add(sp_en, std::memory_order_relaxed);
                 const long long at = g_sp_attn.fetch_add(sp_at, std::memory_order_relaxed) + sp_at;
                 const long long ac = g_sp_comp.fetch_add(sp_ac, std::memory_order_relaxed) + sp_ac;
+                const long long aw = g_sp_iw.fetch_add(sp_aw, std::memory_order_relaxed) + sp_aw;
                 const long long n = g_sp_passes.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (sp_lonep && sp_deep > 0) {   /* tp8 loop P25c: its own line, the first and every 64th such pass */
                     const long long cn = g_sp_cone_passes.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9602,7 +9796,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                         "this one step %d, %lld rows, layers %d..%d SP (%d, %d past PSK's first)\n",
                                 cn, cl, batch->step, (long long)T, sp_lo, sp_hi, sp_n, sp_deep);
                 }
-                char p26[256] = "";
+                char p26[384] = "";
                 if (m.sp_ag_qr)   /* tp8 loop P26: appended only with RADIANCE_DS41_SPHC_ATTN=1 / 2 */
                     std::snprintf(p26, sizeof p26, "; RADIANCE_DS41_SPHC_ATTN (tp8 loop P26): %lld layer-passes ran q_a / kv "
                                                    "over the quarter, this one %d", at, sp_at);
@@ -9610,6 +9804,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     const size_t u = std::strlen(p26);
                     std::snprintf(p26 + u, sizeof p26 - u, "; %lld source layer-passes the compressor over the quarter "
                                                            "(P26b), this one %d", ac, sp_ac);
+                }
+                if (m.sp_ag_iw) {   /* P26c */
+                    const size_t u = std::strlen(p26);
+                    std::snprintf(p26 + u, sizeof p26 - u, "; %lld source layer-passes without xn's gather (P26c), this one %d",
+                                  aw, sp_aw);
                 }
                 if (n == 1 || n % 64 == 0)
                     fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC (tp8 loop P20): %lld prefill passes ran %lld "
@@ -9669,10 +9868,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         t_tw_off = !m.twin_mask ? 0
                  : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng && !tw_sub ? kTwEng : 0) |
                    (bi_pmm(g_sw_bi.load(std::memory_order_relaxed)) ? kTwShx : 0) |
-                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !L.src && !L.i_score && !tw_sub ? kTwQkv : 0) |
+                   (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !tw_sub &&
+                            ((!L.src && !L.i_score) ||
+                             /* tp8 loop P26c: a kv / index source of ratio > 1 where level 3 runs q_a / kv over the quarter */
+                             (sp_attn >= 3 && m.sp_ag_iw && m.sp_ag_kvs && (!L.src || c.ratio[(size_t)L.l] > 1)))
+                        ? kTwQkv : 0) |
                    (psk_l && !tw_psk ? kTwAll : 0) |
                    (cr_any && !tw_psk ? kTwAll : 0) |
-                   (g_sw_engdd.load(std::memory_order_relaxed) > 0 ? kTwEng : 0);
+                   /* tp8 loop P48b: ds41_engdd 2 dedups on the twin itself (engdd_issue), so only 1 holds the class GGUF */
+                   (g_sw_engdd.load(std::memory_order_relaxed) == 1 ? kTwEng : 0);
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
         /* tp8 S5 + S6: a lane step's leader part issues its own layers; the other part's are as another node's (their
@@ -9820,6 +10024,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         } else if (cut) {
             set_runs();
         }
+        if (held) {   /* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS): the rows this layer runs (0 where the cut leaves none) */
+            int64_t nr = 0;
+            for (const BiSeg& s : *cur) nr += s.n;
+            pfl.rows(l, nr);
+        }
         /* lever PSK-L20: the split layer cut (its cone part over fewer rows); none of its cone part when no segment has a
          * row there -- the all-row part still runs, every cone-part op below issues over the empty segments / runs */
         const bool l20_none = l20 && cut && cur->empty();
@@ -9893,14 +10102,17 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const bool tbo_a = (m.pipe2_tbo & 1) && !(m.pipe2_tbo & 4) && pa > 0 && L.pcn_f && !m.bt.on && moe_pc() == pa;
         /* P15 bit 2: a deferral for another layer, or one this layer cannot take in its order (never by design) */
         if (t_tbo.l >= 0 && (t_tbo.l != l || cut || !p2_layer || p0 != t_tbo.p0 || pn != t_tbo.pn)) tbo_flush();
+        if (L.e_ids) pfl.sub(l, 0);   /* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS): e = the Engram block */
         if (L.e_ids && sp_l) {
             /* tp8 loop P20: an SP Engram layer -- the gate (+ its copy back) over this rank's quarter of the streams; with
              * m.sphc_eng the lookup, the copy and the kv GEMM over the quarter too (each a row's own: the rows the gate
              * reads), lever E1's dedup otherwise as today over every row */
             const int64_t H = c.ple_heads;
             m.edd_ls.clear();
+            m.edd_tw.clear();
             const bool e_gg = gguf_dense(m, L.e_kv);
-            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            /* tp8 loop P48b: each launch's twin classes as the by-launch issue below would see them (dense()'s TwinScope) */
+            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); m.edd_tw.push_back(t_twin); });
             const bool edd_ok = !m.sphc_eng && engdd_issue(x, m, L, batch, T, m.edd_ls);
             if (!edd_ok && m.sphc_eng && spn > 0) {
                 const RadOperand ids = brow_slice(L.ids, sp0, spn, H);
@@ -9934,8 +10146,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
              * band (the decode segment's pieces and a short prefill segment keep their own launch) */
             m.edd_ls.clear();
+            m.edd_tw.clear();
             const bool e_gg = gguf_dense(m, L.e_kv);   /* lever WMK: a mixed run's Engram rows in one launch (dense()) */
-            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            /* tp8 loop P48b: each launch's twin classes as the by-launch issue below would see them (dense()'s TwinScope) */
+            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); m.edd_tw.push_back(t_twin); });
             if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
                 if (m.ple_group > 0)
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
@@ -9951,6 +10165,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
+        pfl.sub(l, 1);   /* P42 step 2: n = the attention input's collapse + norm + mix (+ a DSpark tap) */
         bt_pt(x, m, m.h0, T, "h0", l);
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         const bool late = !m.zero;
@@ -9995,13 +10210,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (m.zero) {
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.attn_fill, n, R(m.attn_out, r0, n)); });
         } else {
+            pfl.sub(l, 2);   /* P42 step 2: q = the attention's input linears, norms, rope, the window-key store */
             /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, m.sp_ag_qr): an SP layer whose xn only q_a and kv read (no compressor
              * chain: L.src; no indexer projection: L.i_score) runs both over this rank's quarter and gathers their outputs
              * instead of xn; everything below reads qr / kv over every row as today (a1_cheap skips the two GEMMs) */
             const bool cheap0 = bi_cheap(g_sw_bi.load(std::memory_order_relaxed));
-            const bool p26 = sp_l && xn_sh && m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && cheap0 && !L.norm_a && !L.src &&
-                             !L.i_score &&
+            /* tp8 loop P26c (level 3, m.sp_ag_iw): a kv / index source layer of ratio > 1 too -- its compressor's GEMM reads
+             * the quarter (P26b, or no chain in an all-replay pass) and its indexer's projection runs over the quarter below,
+             * so nothing there reads xn past this rank's quarter either */
+            const bool p26c = sp_attn >= 3 && m.sp_ag_iw && m.sp_ag_kvs && !kvo &&
+                              (!L.src || cr_all || r > 1) && (!L.i_score || L.i_w);
+            const bool p26 = sp_l && xn_sh && m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && cheap0 && !L.norm_a &&
+                             ((!L.src && !L.i_score) || p26c) &&
                              L.q_a && L.kv_g && gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv) && !p2_layer && t_tbo.l != l;
+            const bool p26w = p26 && L.i_score && p26c;   /* the indexer's projection over the quarter + iw's gather */
             if (p26) {
                 with_rows(sp0, spn, [&] {
                     dense(true, true, [&](int64_t r0, int64_t n) {
@@ -10010,9 +10232,19 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     dense(true, true, [&](int64_t r0, int64_t n) {
                         lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                     });
+                    /* tp8 loop P26c: a row's gemm_nt (bf16, N 32, K 5120) bytes at any M -- r4d_gemm_args.h's split law has no
+                     * M term (pick_sk: N's tiles, K, the block bound) and every M > 16 is one band of one kernel (m64) */
+                    if (p26w)
+                        dense(gguf_dense(m, L.iproj), true, [&](int64_t r0, int64_t n) {
+                            lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
+                        });
                 });
                 RAD_ISSUE_N(x, m.sp_ag_qr, T * c.q_lora, brows(m.qr, T), RAD_NONE);
                 RAD_ISSUE_N(x, m.sp_ag_kv, T * c.head_dim, brows(m.kv, T), RAD_NONE);
+                if (p26w) {
+                    RAD_ISSUE_N(x, m.sp_ag_iw, T * c.ih, brows(m.iw, T), RAD_NONE);
+                    ++sp_aw;
+                }
                 xn_sh = false;   /* xn past this rank's quarter is stale; nothing reads it before the next layer writes it */
                 ++sp_at;
             }
@@ -10092,7 +10324,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (tw_take(m, L.q_a) || !gq_qkv_on(L, n)) lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                 });
                 }
-                if (L.i_score && qp)
+                if (L.i_score && qp && !p26w)   /* tp8 loop P26c: issued over the quarter above */
                     dense(gguf_dense(m, L.iproj), true, [&](int64_t r0, int64_t n) {
                         lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
                     });
@@ -10243,6 +10475,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * all-replay pass stores no global KV (the cache holds every row's), so the chain is skipped whole; the
              * index query rope (A2) reads the angles rope_b_step wrote for the step's positions -- c_tab writes the
              * same rope_table bytes at the same positions (one pure function of the position, the same parameters) */
+            if (L.src) pfl.sub(l, 3);   /* P42 step 2: c = a kv source's compressor chain + stores */
             const bool chain = L.src && !cr_all;
             if (L.src && cr_all && rad_rank(x) == 0) g_cr_chains.fetch_add(1, std::memory_order_relaxed);
             /* tp8 loop P26b (RADIANCE_DS41_SPHC_ATTN=2, m.sp_ag_kvs): at an SP kv-source layer the compressor's kv | gate
@@ -10297,6 +10530,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (chain) RAD_ISSUE_N(x, L.l_st, crows, brows(m.lat, crows), page, kv_cache(m.comp[r], l));
             if (chain) RAD_ISSUE_N(x, L.k_st, crows, brows(m.ikn, crows), page, kv_cache(m.index[r], l));
             /* the indexer: score / candidates / selection by segment, each segment's runs from its own first row */
+            if (L.i_score) pfl.sub(l, 4);   /* P42 step 2: i = the indexer */
             if (L.i_score) {
                 const int src = c.src_of[(size_t)l];
                 const auto* ib = kv_batch(batch, m.index[r]);
@@ -10304,8 +10538,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
                 const int64_t kw = keep_words(live, c.cand_block);
                 const bool uses = c.cand >= 0 && c.cand < l;
-                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) */
-                const bool split = m.isplit && m.sel_gather && !(m.pp_unsplit_cand && l == c.cand);
+                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) -- split there
+                 * under tp8 loop P47 (m.csplit: its keep rows gathered after the runs) */
+                const bool csp = m.csplit && m.keep_gather && l == c.cand && csplit_on() > 0;
+                const bool split = m.isplit && m.sel_gather && (!(m.pp_unsplit_cand && l == c.cand) || csp);
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
                 size_t sj = 0;
                 for (size_t si = 0; si < sg.size(); ++si) {
@@ -10329,9 +10565,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             if (rad_rank(x) == 0) g_dband_runs.fetch_add(rd.n, std::memory_order_relaxed);
                         }
                     }
+                    /* tp8 loop P47: this segment's candidates into the rank's keep part (split runs only) */
+                    const bool kpart = csp && ru.split;
                     for (int64_t p = ru.p0; p < ru.p1; ++p) {
                         const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
-                        if (s.r0 + q0 + qn <= cut0) continue;
+                        if (ds41_idx_run_skipped(s.r0, q0, qn, cut0)) continue;
                         ixni_note(x, batch->positions_h ? batch->positions_h + s.r0 + q0 : nullptr, qn, ru.R, live, r);
                         RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, R(m.iq, s.r0, s.n), R(m.iw, s.r0, s.n),
                                     kv_cache(m.index[r], src),
@@ -10341,7 +10579,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                     rkeep ? bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn) : RAD_NONE);
                         if (L.i_cand)
                             RAD_ISSUE_N(x, L.i_cand, qn, bcol(m.score, 0, live, qn), P(batch->positions, s.r0 + q0, qn),
-                                        bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn));
+                                        kpart ? bcol_at(m.keep_part, (p - ru.p0) * ru.R, m.kwords, 0, kw, qn)
+                                              : bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn));
                         RAD_ISSUE_N(x, L.i_topk, qn, bcol(m.score, 0, live, qn),
                                     uses ? bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn) : RAD_NONE,
                                     P(batch->positions, s.r0 + q0, qn),
@@ -10351,6 +10590,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (ru.split)
                         RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
                                   brow_slice(m.sel, s.r0, (int64_t)m.aw * ru.q * ru.R, c.itopk));
+                    /* tp8 loop P47: every rank's keep rows where the unsplit layer writes them (rank r's part at s.r0 + r q R;
+                     * a skipped run's rows, before this layer's cut, and the rows past the segment are read by no layer) */
+                    if (kpart) {
+                        RAD_ISSUE(x, m.keep_gather, brows(m.keep_part, ru.q * ru.R),
+                                  brow_slice(m.keep, s.r0, (int64_t)m.aw * ru.q * ru.R, m.kwords));
+                        csplit_note(x, ru, s.n, sg[si].n, m.kwords);
+                    }
                 }
             }
             bt_pt(x, m, m.qr, T, "qr", l);
@@ -10362,6 +10608,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 bt_pt(x, m, m.sel, T, "sel", l);
             }
             /* the attention by segment (its band at the segment's rows), its sequences' slices */
+            pfl.sub(l, 5);   /* P42 step 2: a = the attention + its output projections */
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
@@ -10488,6 +10735,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
          * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
+        pfl.sub(l, 6);   /* P42 step 2: r = the attention all-reduce + post / collapse / norm into the FFN input */
         if (L.ar_attn && (pfb & 3)) pf_attn(x, L, pfb);   /* tp8 loop D24: beside the attention all-reduce below */
         if (L.ar_attn && pa > 0 && tbo_a) {
             /* tp8 loop P15 bit 1: lane 0 behind piece 0's all-reduce (lane 1) for piece 0's pcn below; piece 1's
@@ -10559,6 +10807,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.act.x, T, "ffn_in", l);
         /* the MoE: one pass a segment (the router, the experts at the segment's rows, the shared arm, the gather and
          * the all-reduce over its rows); the ffn mix beside the first (r0 = 0) */
+        pfl.sub(l, 7);   /* P42 step 2: f = the MoE */
         MixBeside mb{ &L, &m, T };
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
@@ -10811,6 +11060,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.mw.ew, T, "ew", l);
         bt_pt(x, m, m.mw.sout, T, "sout", l);
         bt_pt(x, m, m.act.x, T, "moe_out", l);
+        pfl.sub(l, 8);   /* P42 step 2: o = the layer's end (a crossing's send, the next layer's post / collapse / norm) */
         /* tp8 S6: the sender's last layer before the cut ends at the boundary op's inputs, which the crossing carries over
          * this layer's live rows (the follower's t - 1: X2, then its pass ends; the leader's h - 1: X1, then its next
          * layer is t) */
@@ -11209,6 +11459,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             const int64_t H = c.ple_heads;
             /* lever E1: the step's rows are one kv GEMM launch below; deduplicated when its plan says so */
             m.edd_ls.assign(1, ds41_engdd::Launch{ 0, T });
+            m.edd_tw.clear();   /* step(): no twin (twin_bi_now) */
             if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
                 /* T rows of operands; the gather's band is T * H, one table row per head per token,
                  * read through the ids and rows as flat (rad_block_ple.h does the same). */
@@ -11451,8 +11702,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                  * idx_split switch (idx_balance()) a split step whose runs the ranks do not divide
                  * takes the balanced deal: an equal block of rows a rank, in runs within the
                  * declared ones -- the same loop and gather below, only R, q and the runs' bounds move. */
-                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) */
-                const bool split = m.isplit && m.sel_gather && !(m.pp_unsplit_cand && l == c.cand);
+                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) -- split there
+                 * under tp8 loop P47 (m.csplit: its keep rows gathered after the runs) */
+                const bool csp = m.csplit && m.keep_gather && l == c.cand && csplit_on() > 0;
+                const bool split = m.isplit && m.sel_gather && (!(m.pp_unsplit_cand && l == c.cand) || csp);
                 const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, split, m.split_min_live,
                                                      split && idx_balance(), (int64_t)L.i_runs.size());
                 if (ru.balanced && m.ar == 0 && !g_idx_bal_noted.exchange(1, std::memory_order_relaxed)) {
@@ -11475,9 +11728,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
                                 bcol(m.score, 0, live, ru.R),
                                 rkeep ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE);
-                    if (L.i_cand)
+                    if (L.i_cand)   /* tp8 loop P47: split, into the rank's keep part */
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
-                                    bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
+                                    csp && ru.split ? bcol_at(m.keep_part, (p - ru.p0) * ru.R, m.kwords, 0, kw, rows)
+                                                    : bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
                     RAD_ISSUE_N(x, L.i_topk, rows, bcol(m.score, 0, live, rows),
                                 uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
                                 ru.split ? brow_slice(m.sel_part, (p - ru.p0) * ru.R, rows, c.itopk)
@@ -11486,6 +11740,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (ru.split)
                     RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
                               brows(m.sel, (int64_t)m.aw * ru.q * ru.R));
+                if (csp && ru.split) {   /* tp8 loop P47: every rank's keep rows where the unsplit layer writes them */
+                    RAD_ISSUE(x, m.keep_gather, brows(m.keep_part, ru.q * ru.R), brows(m.keep, (int64_t)m.aw * ru.q * ru.R));
+                    csplit_note(x, ru, T, T, m.kwords);
+                }
             };
 
             c_gemm();

@@ -43,7 +43,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
-                                        "sched_srf", "aql_hdp" };
+                                        "sched_srf", "aql_hdp", "ds41_csplit" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -67,7 +67,8 @@ bool plugin_switch(int i) {
            i == kDs41Sphc || i == kDs41SphcAttn || i == kDs41SphcSeg ||   /* tp8 loop P25s (85-87): deepseek41's SP route */
            i == kDs41Twin ||   /* tp8 loop P30t (90): deepseek41's twins */
            i == kDs41Tsk ||     /* ds41_tsk (91 here after PREFILL's 85-90; 83 on ds41-drafter round 15): libr4d (lever TSK) */
-           i == kExl3X3dPf;     /* exl3_x3d_pf (96, tp8 loop PX1): exl3r4d (A10) */
+           i == kExl3X3dPf ||   /* exl3_x3d_pf (96, tp8 loop PX1): exl3r4d (A10) */
+           i == kDs41Csplit;    /* ds41_csplit (103, tp8 loop P47): deepseek41 */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -936,7 +937,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, epoch_bump)";
         return false;
     }
     State& s = st();

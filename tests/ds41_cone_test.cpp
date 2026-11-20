@@ -1081,6 +1081,7 @@ ds41pfl::Rec pfl_rec(int64_t pos0, int64_t rows, float pre, int l0, int l1, floa
     for (int l = l0; l <= l1; ++l) r.lms.push_back({ l, ms });
     return r;
 }
+bool has_quiet(const std::string& s, const char* t) { return s.find(t) != std::string::npos; }
 bool has(const std::string& s, const char* t) {
     if (s.find(t) != std::string::npos) return true;
     std::fprintf(stderr, "  missing '%s' in: %s\n", t, s.c_str());
@@ -1142,4 +1143,78 @@ TEST(pf_layers_groups_follower_segments_and_short_prompts) {
     const std::vector<std::string> o2 = b.flush();
     CHECK_EQ(o2.size(), (size_t)1);
     if (o2.size() == 1) CHECK(has(o2[0], "prompt of 5096 rows, 2 chunks, 2 records; body 2 chunks / 5096 rows"));
+}
+
+/* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS): records with op-group marks fold into the per-layer lines exactly as the same records
+ * without them (a group's time goes to the layer's ops bucket: rx<l> where the layer received, else l), and two more lines name
+ * the groups -- the body in ms a 1k rows by layer and group, the last two chunks in ms (a / b), each with a by-group total */
+TEST(pf_ops_fold_into_the_layer_lines_and_name_the_groups) {
+    using namespace ds41pfl;
+    /* a follower pass of layers 10-11 of `rows` rows: layer 10 receives (X1: `w` ms), then its ops in groups n 1, q 2, i 3, f 4 ms
+     * (x rows / 1,000 for a body chunk: ms a 1k rows stay whole numbers); layer 11 has no receive: in 0.5, n 1, q 2, a 3, f 4 */
+    auto pass = [](int64_t pos0, int64_t rows, float w, bool ops) {
+        Rec r;
+        r.pos0 = pos0;
+        r.rows = rows;
+        const float k = (float)rows / 1000.0f;
+        r.lms.push_back({ 10, w });
+        r.lms.push_back({ kRx + 10, 0.25f * k });   /* the ops before the first group */
+        const std::pair<int, float> g10[] = { { 1, 1.0f }, { 2, 2.0f }, { 4, 3.0f }, { 7, 4.0f } };
+        const std::pair<int, float> g11[] = { { 1, 1.0f }, { 2, 2.0f }, { 5, 3.0f }, { 7, 4.0f } };
+        if (ops) {
+            for (const auto& g : g10) r.lms.push_back({ sub_id(10, g.first), g.second * k });
+        } else {
+            r.lms.back().second += 10.0f * k;
+        }
+        r.lms.push_back({ 11, 0.5f * k });
+        if (ops) {
+            for (const auto& g : g11) r.lms.push_back({ sub_id(11, g.first), g.second * k });
+            r.lrows = { { 10, rows }, { 11, rows / 2 } };   /* layer 11 cut to half its rows */
+        } else {
+            r.lms.back().second += 10.0f * k;
+        }
+        return r;
+    };
+    CHECK_EQ(sub_l(sub_id(31, 8)), 31);
+    CHECK_EQ(sub_g(sub_id(31, 8)), 8);
+    CHECK(is_sub(sub_id(0, 0)) && !is_sub(kRx + 39) && !is_sub(kPre));
+    CHECK_EQ(std::string(gname(4)), std::string("i"));
+    for (bool ops : { false, true }) {
+        Acc a(4096, 128);
+        const int64_t P[4] = { 0, 2000, 4000, 6000 };
+        for (int i = 0; i < 4; ++i) CHECK(a.add(pass(P[i], 2000, i == 0 ? 50.0f : 8.0f, ops)).empty());
+        const std::vector<std::string> out = a.flush();
+        CHECK_EQ(out.size(), (size_t)(ops ? 4 : 2));
+        if (out.size() < 2) continue;
+        /* the per-layer lines: the same with and without group marks */
+        CHECK(has(out[0], "body 2 chunks / 4000 rows: ms a 1k rows by layer: "));
+        CHECK(has(out[0], ", 10 14.50, 11 10.50, rx10 10.25; layers sum 35.25"));   /* (50 + 8) / 4; 0.5 + 10; 0.25 + 10 */
+        CHECK(has(out[1], ", 10 8.00 / 8.00, 11 21.00 / 21.00, rx10 20.50 / 20.50; sums"));
+        if (!ops || out.size() < 4) continue;
+        CHECK(has(out[2], "ops (RADIANCE_DS41_PF_OPS): body 2 chunks / 4000 rows, ms a 1k rows by layer"));
+        CHECK(has(out[2], "10 [rx 14.50 in 0.25 n 1.00 q 2.00 i 3.00 f 4.00], 11 [in 0.50 n 1.00 q 2.00 a 3.00 f 4.00]"));
+        CHECK(has(out[2], "; by group: rx 14.50, in 0.75, n 2.00, q 4.00, i 3.00, a 3.00, f 8.00"));
+        CHECK(has(out[3], "the last two chunks 2000@4000 / 2000@6000, ms by layer (a / b): "));
+        CHECK(has(out[3], "10 [rows 2000/2000 rx 8.00/8.00 in 0.50/0.50 n 2.00/2.00 q 4.00/4.00 i 6.00/6.00 f 8.00/8.00]"));
+        CHECK(has(out[3], "11 [rows 1000/1000 in 1.00/1.00 n 2.00/2.00"));   /* the rows the layer ran after the cut */
+        CHECK(!has_quiet(out[2], "[rows"));   /* the body line names no layer rows (every layer ran the chunk's) */
+        CHECK(has(out[3], "; by group: rx 8.00/8.00, in 1.50/1.50, n 4.00/4.00, q 8.00/8.00, i 6.00/6.00, a 6.00/6.00, f 16.00/16.00"));
+    }
+    /* short prompts' records with group marks: the summary (folded) and, beside it, an ops summary every `every` prompts */
+    Acc s(8192, 2);
+    CHECK(s.add(pass(0, 1000, 1.0f, true)).empty());
+    CHECK(s.flush().empty());   /* the first short prompt: no line yet (every 2) */
+    CHECK(s.add(pass(0, 1000, 3.0f, true)).empty());
+    const std::vector<std::string> o2 = s.flush();
+    CHECK_EQ(o2.size(), (size_t)2);
+    if (o2.size() == 2) {
+        CHECK(has(o2[0], "2 prompts under 8192 rows (2000 rows): ms a 1k rows by layer: "));
+        CHECK(has(o2[0], ", 10 2.00, 11 10.50, rx10 10.25; layers sum"));
+        CHECK(has(o2[1], "2 prompts under 8192 rows, ops (RADIANCE_DS41_PF_OPS): ms a 1k rows by layer: "));
+        CHECK(has(o2[1], "10 [rx 2.00 in 0.25 n 1.00 q 2.00 i 3.00 f 4.00], 11 [in 0.50 n 1.00 q 2.00 a 3.00 f 4.00]; by group: rx 2.00,"));
+    }
+    /* without group marks: no ops summary */
+    Acc u(8192, 1);
+    CHECK(u.add(pass(0, 1100, 1.0f, false)).empty());
+    CHECK_EQ(u.flush().size(), (size_t)1);
 }
