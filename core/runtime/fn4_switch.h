@@ -482,7 +482,10 @@
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
- *                   same in both arms). Needs RADIANCE_PP_TAIL_BAND=1 on the leader at start (its start value; else only 0 is taken)
+ *                   same in both arms); 2 (tp8 loop D39b) -- 1 + a step of prompt rows only on ANY lane (a lone cold prompt plans
+ *                   on its home decode lane) + a prompt's LATER chunks while every chunk of it so far ran as a tail band pass (the
+ *                   leader holds the band layer's keys of all its rows): the cold prompts' chunks, with RADIANCE_PP_BAND_MAX_ROWS
+ *                   at or above the chunk (4160). Needs RADIANCE_PP_TAIL_BAND=1 or 2 on the leader at start (its start value; else only 0 is taken)
  *                   and the plugin's tail band (RADIANCE_DS41_PP_TBAND=1 on both nodes). Read at each BG step's head; never a pass's
  *                   ops (both forms issue the published ops: rule A, as P28's band).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),

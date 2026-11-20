@@ -1003,9 +1003,10 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpTband) {   /* tp8 loop D39: the leader's */
-        if (v < 0 || v > 1) {
+        if (v < 0 || v > 2) {
             if (err) *err = "pp_tband takes 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's fresh BG steps run W(h, t)'s, the band layer "
-                            "stays declared) or 1 (they run as tail band passes; tp8 loop D39)";
+                            "stays declared), 1 (they run as tail band passes; tp8 loop D39) or 2 (1 + the later chunks of a prompt whose "
+                            "every chunk so far ran as one; D39b)";
             return false;
         }
         const int cap = s.tband_capable.load(std::memory_order_acquire);

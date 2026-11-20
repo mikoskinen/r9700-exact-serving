@@ -47,6 +47,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace rad {
 
@@ -499,6 +500,15 @@ private:
     int64_t pp_tband_off_n_ = 0;   /* step 2c: fresh BG steps fn4 pp_tband 0 kept W(h, t)'s */
     std::vector<int> pp_tband_lane_;
     int  pp_tband_step(int lane, const RadBatch* b, bool count = false);
+    /* tp8 loop D39b (fn4 pp_tband 2 / RADIANCE_PP_TAIL_BAND=2): a prompt's LATER chunks run as tail band passes too while every
+     * chunk of it so far did -- the leader then holds the band layers' keys of all its rows (its own band layer wrote them), the
+     * follower its own (its key chain): pp_tband_seq_ = the sequences (KV keys) whose every chunk so far ran as one; pp_tband_note
+     * keeps it at each step's head (any prefill entry of a step that is not a tail band pass, and every decode entry, drops its
+     * sequence: safe both ways -- a dropped sequence only runs W(h, t)'s) */
+    int  pp_tband_start_ = 1;
+    int64_t pp_tband_cont_n_ = 0;   /* tail band passes with a later chunk (ctx > 0) in them */
+    std::unordered_map<uint64_t, uint8_t> pp_tband_seq_;
+    void pp_tband_note(int lane, int tband);
     int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
     int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */

@@ -2920,7 +2920,11 @@ TEST(tail_band_passes_serve_one_process_tokens) {
  * source 8 at W(10,32)) with its check at EVERY trunk step, over F75's set (decoders, a burst of whole newcomers, long prompts of 3 / 4
  * chunks: their first chunks are band steps, the rest W(2,5)'s, newcomers beside them): every request's tokens = one process's and
  * the copy = the owner's bytes, with the band alone, with P23s's batched BG steps (several fresh prompts in ONE band pass), and with
- * fn4 pp_tband 0 then 1 in process (the control: the same tokens, fewer band passes). */
+ * fn4 pp_tband 0 then 1 in process (the control: the same tokens, fewer band passes). Every arm then serves ONE LONE long prompt
+ * (1,900 rows: three chunks on its home decode lane, no decoder beside it -- the cold cells' shape). D39b: RADIANCE_PP_TAIL_BAND=2
+ * bands those prompt-only steps on any lane, the later chunks while every chunk of the prompt was banded (the leader then holds
+ * layer 4's KV of all its rows): the same tokens and copy, band passes with a later chunk > 0; negative control
+ * RADIANCE_PP_TEST_TBAND_CONT_ONLY=1 (later chunks banded, first chunks not: the leader's layer 4 reads KV it never wrote) -> differ. */
 TEST(d39_tail_band_keeps_one_process_tokens_and_the_kv_copy_in_bests_shape) {
     REQUIRE(world().ok);
     REQUIRE(world6().ok);
@@ -2931,17 +2935,22 @@ TEST(d39_tail_band_keeps_one_process_tokens_and_the_kv_copy_in_bests_shape) {
         one.model = world6().llama_rad;
         REQUIRE(one.start("", ext));
         ref = f75_set(one.port);
+        ref.push_back(complete(one.port, prompt_ids(97, 1900), 12));   /* D39b: the lone long prompt */
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { const char* name; bool p23; bool sw; };
-    long long tb_all = 0;
-    for (const Arm a : { Arm{ "band", false, false }, Arm{ "band+P23s", true, false }, Arm{ "band, pp_tband 0 / 1", false, true } }) {
+    struct Arm { const char* name; bool p23; bool sw; const char* tbv = "1"; bool cont_only = false; };
+    long long tb_all = 0, cont_all = 0;
+    int ctl_differ = 0;
+    for (const Arm a : { Arm{ "band", false, false }, Arm{ "band+P23s", true, false }, Arm{ "band, pp_tband 0 / 1", false, true },
+                         Arm{ "band 2 (later chunks)", false, false, "2" }, Arm{ "band 2, CONT_ONLY (ctl)", false, false, "2", true } }) {
         std::vector<std::string> env = kSplitEnv;
         for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0",
                                "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
-                               "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1", "RADIANCE_LLAMA_PP_TBAND=1", "RADIANCE_PP_TAIL_BAND=1" })
+                               "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1", "RADIANCE_LLAMA_PP_TBAND=1" })
             env.push_back(v);
+        env.push_back(std::string("RADIANCE_PP_TAIL_BAND=") + a.tbv);
+        if (a.cont_only) env.push_back("RADIANCE_PP_TEST_TBAND_CONT_ONLY=1");
         if (a.p23) { env.push_back("RADIANCE_PP_BG_ROOM=700"); env.push_back("RADIANCE_PP_BG_JOIN_MS=250"); }
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
@@ -2960,9 +2969,10 @@ TEST(d39_tail_band_keeps_one_process_tokens_and_the_kv_copy_in_bests_shape) {
             Call c;
             CHECK_EQ(c.send(pp.port, "/admin/fn4", json{ { "pp_tband", 1 } }.dump()) ? c.read(&out) : -1, 200);
             const std::vector<std::vector<int32_t>> got2 = f75_set(pp.port);
-            REQUIRE_EQ(got2.size(), ref.size());
-            for (size_t i = 0; i < ref.size(); ++i) CHECK(got2[i] == ref[i]);
+            REQUIRE_EQ(got2.size() + 1, ref.size());
+            for (size_t i = 0; i < got2.size(); ++i) CHECK(got2[i] == ref[i]);
         }
+        got.push_back(complete(pp.port, prompt_ids(97, 1900), 12));   /* D39b: the lone long prompt, the cold cells' shape */
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -2978,21 +2988,34 @@ TEST(d39_tail_band_keeps_one_process_tokens_and_the_kv_copy_in_bests_shape) {
             if (const size_t b = flog.rfind("(", at); b != std::string::npos)
                 (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
         const bool notowner = flog.find("NOT the owner's bytes") != std::string::npos;
-        long long tb = -1, off = -1;
+        long long tb = -1, off = -1, cont = -1;
         const char* key = " lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39)";
         if (const size_t at = llog.rfind(key); at != std::string::npos) {
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
                 tb = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
             if (const size_t b = llog.find("; ", at); b != std::string::npos) off = std::atoll(llog.c_str() + b + 2);
+            if (const size_t b = llog.find(" pp_tband 0; ", at); b != std::string::npos) cont = std::atoll(llog.c_str() + b + 13);
         }
         long long bg_n = -1, bg_newc = -1, bg_b2 = -1;
         if (const size_t at = llog.rfind("two-node pipeline: BG steps over the run (RADIANCE_PP_BG_ROOM="); at != std::string::npos)
             if (const size_t b = llog.find("): ", at); b != std::string::npos)
                 (void)std::sscanf(llog.c_str() + b, "): %lld steps with %lld newcomers; %lld steps", &bg_n, &bg_newc, &bg_b2);
-        fprintf(stderr, "    TAIL BAND W(2,5) 4 lanes BG 2 + KV copy + check, %-22s: %d of %zu requests differ; KV-copy checks %lld, %lld differ%s; "
-                        "%lld tail band passes, %lld fresh BG steps W(2,5)'s under pp_tband 0; P23: %lld BG steps, %lld newcomers, %lld with >= 2\n",
-                a.name, differ, ref.size(), checks, kdiff, notowner ? " (NOT the owner's bytes)" : "", tb, off, bg_n, bg_newc, bg_b2);
+        fprintf(stderr, "    TAIL BAND W(2,5) 4 lanes BG 2 + KV copy + check, %-24s: %d of %zu requests differ; KV-copy checks %lld, %lld differ%s; "
+                        "%lld tail band passes (%lld with a later chunk), %lld fresh BG steps W(2,5)'s under pp_tband 0; P23: %lld BG steps, "
+                        "%lld newcomers, %lld with >= 2\n",
+                a.name, differ, ref.size(), checks, kdiff, notowner ? " (NOT the owner's bytes)" : "", tb, cont, off, bg_n, bg_newc, bg_b2);
+        if (a.cont_only) {   /* the negative control: later chunks banded over a leader that never wrote layer 4 of their first */
+            ctl_differ = differ;
+            CHECK(cont > 0);
+            continue;
+        }
         CHECK_EQ(differ, 0);
+        if (!std::strcmp(a.tbv, "2")) {
+            CHECK(cont > 0);
+            cont_all += std::max(0LL, cont);
+        } else {
+            CHECK_EQ(cont, 0LL);
+        }
         CHECK(!notowner);
         CHECK(checks > 0);
         CHECK(tb > 0);
@@ -3001,7 +3024,11 @@ TEST(d39_tail_band_keeps_one_process_tokens_and_the_kv_copy_in_bests_shape) {
         if (differ || notowner) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         tb_all += std::max(0LL, tb);
     }
+    fprintf(stderr, "    tail band passes, all arms: %lld (%lld with a later chunk under 2); the negative control: %d requests differ\n", tb_all,
+            cont_all, ctl_differ);
     CHECK(tb_all > 0);
+    CHECK(cont_all > 0);
+    CHECK(ctl_differ > 0);
 }
 
 /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader): P28's band steps through LSP's head segments -- a band step's head

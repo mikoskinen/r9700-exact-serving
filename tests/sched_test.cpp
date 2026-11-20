@@ -3601,7 +3601,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
 }
 
 /* tp8 loop D39 step 2c (DECODE round 31): pp_tband is 97, the last, the LEADER's engine switch (not a plugin's, not the scheduler's,
- * not the follower's: a tail band pass reaches the follower as its frame's flag); 0 / 1, other values refused; an unregistered node
+ * not the follower's: a tail band pass reaches the follower as its frame's flag); 0 / 1 / 2 (D39b), other values refused; an unregistered node
  * (one machine, the follower) checks the range only; a leader that took no tail band (RADIANCE_PP_TAIL_BAND unset / not taken)
  * takes 0 only and names RADIANCE_PP_TAIL_BAND; one that took it takes both. */
 TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
@@ -3616,15 +3616,19 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     std::string err;
     CHECK(fn4::check("pp_tband", 0, &err));
     CHECK(fn4::check("pp_tband", 1, &err));   /* unregistered: the range only */
-    CHECK(!fn4::check("pp_tband", 2, &err));
+    CHECK(fn4::check("pp_tband", 2, &err));   /* tp8 loop D39b: + the later chunks of an all-band prompt */
+    CHECK(!fn4::check("pp_tband", 3, &err));
     CHECK(err.find("pp_tband takes 0 (no tail band passes") != std::string::npos);
+    CHECK(err.find("2 (1 + the later chunks") != std::string::npos);
     CHECK(!fn4::check("pp_tband", -1, &err));
     fn4::tband_register(false);
     CHECK(fn4::check("pp_tband", 0, &err));
     CHECK(!fn4::check("pp_tband", 1, &err));
     CHECK(err.find("RADIANCE_PP_TAIL_BAND=1 on the leader at start") != std::string::npos);
+    CHECK(!fn4::check("pp_tband", 2, &err));
     fn4::tband_register(true);
     CHECK(fn4::check("pp_tband", 1, &err));
+    CHECK(fn4::check("pp_tband", 2, &err));
     CHECK(fn4::check("pp_tband", 0, &err));
     fn4::tband_register(false);
 }
