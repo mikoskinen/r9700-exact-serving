@@ -163,9 +163,10 @@ void BatchBuilder::carve(Set& s, char* h) {
     {
         int64_t bt_n = 0;
         s.bt_base = od;
+        const int64_t R = bt_rows();   /* tp8 loop D47: S unless RADIANCE_PP_BG_ROWS set a BG lane's rows */
         for (Group& g : s.groups) {
             g.bt_fix = bt_n;
-            bt_n += align_up(S * g.max_blocks * (int64_t)sizeof(int32_t), k_carve_align) /
+            bt_n += align_up(R * g.max_blocks * (int64_t)sizeof(int32_t), k_carve_align) /
                     (int64_t)sizeof(int32_t);
         }
         pair(&s.bt_h0, &s.bt_d0, bt_n);
@@ -215,8 +216,8 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     /* The ring holds three worst-case builds before a long-context prefill waits on an upload two
      * builds back. A decode build's span is far smaller, so hundreds fit. */
     int64_t worst_pay = 0;
-    for (const Group& g : s.groups) worst_pay += max_seqs_ * g.max_blocks * (int64_t)sizeof(int32_t);
-    const int64_t worst_ranges = worst_pay / k_range_max + max_seqs_ * (int64_t)s.groups.size() + 1;
+    for (const Group& g : s.groups) worst_pay += bt_rows() * g.max_blocks * (int64_t)sizeof(int32_t);   /* tp8 loop D47 */
+    const int64_t worst_ranges = worst_pay / k_range_max + bt_rows() * (int64_t)s.groups.size() + 1;
     ranges_.reserve((size_t)worst_ranges);
     ring_.bytes = 3 * (s.host_bytes + worst_ranges * (int64_t)sizeof(RadCopyRange) + k_carve_align);
     ring_.host = static_cast<char*>(rad_dev_alloc(ring_.bytes, RAD_MEM_HOST_PINNED));
@@ -369,10 +370,12 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
     /* Report both the reservation and the block-table share of it: tables are carved for the
      * worst step, but a step uploads only the rows it filled. */
     RAD_INFO("step batch: %s pinned staging ring + %s device slab a rank (%s of it block "
-             "tables), %d KV group(s), %d derived buffer(s)",
+             "tables), %d KV group(s), %d derived buffer(s)%s",
              humanb(ring_.bytes).c_str(), humanb(set_.dev_bytes).c_str(),
              humanb(set_.dev_bytes - set_.bt_base).c_str(), (int)prog.kv_groups.size(),
-             (int)derived_.size());
+             (int)derived_.size(),
+             bt_rows() < max_seqs_ ? fmt("; block tables for %lld rows, not %lld (a BG lane's, RADIANCE_PP_BG_ROWS, "
+                                         "tp8 loop D47)", (long long)bt_rows(), (long long)max_seqs_).c_str() : "");
     return RAD_OK;
 }
 
@@ -380,11 +383,12 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
  * the builder. An uncharged reservation would eat --gpu-headroom-mib, where running out faults
  * inside the HIP runtime; the block tables grow with --max-num-seqs and the media staging with
  * --max-num-batched-tokens. Uses the same layout() and carve as init(). */
-int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg) {
+int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg, int64_t bt_rows) {
     BatchBuilder b;
     b.prog_ = &prog;
     b.cfg_ = cfg;
     b.kvgeom_ = kvg;
+    b.set_bt_rows(bt_rows);   /* tp8 loop D47: a BG lane's rows (0: --max-num-seqs) */
     if (b.layout(prog, cfg) < 0) return -1;
     b.size_set(b.set_, prog.kv_groups);
     const MediaBytes m = b.mm_on_ ? b.media_bytes() : MediaBytes{};
@@ -921,6 +925,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         RAD_ERR("step plan of %d sequences / %lld tokens exceeds the pools sized at %lld / %lld",
                 (int)plan.e.size(), (long long)plan.n_tok,
                 (long long)max_seqs_, (long long)max_tok_);
+        return nullptr;
+    }
+    if ((int64_t)plan.e.size() > bt_rows()) {   /* tp8 loop D47: a BG lane's slab (RADIANCE_PP_BG_ROWS) */
+        RAD_ERR("step plan of %d sequences exceeds this lane's block tables of %lld rows (RADIANCE_PP_BG_ROWS, tp8 loop D47)",
+                (int)plan.e.size(), (long long)bt_rows());
         return nullptr;
     }
     Set& s = set_;

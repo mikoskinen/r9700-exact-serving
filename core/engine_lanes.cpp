@@ -250,6 +250,16 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "0-%d%s", lanes_.bg_lane(), n_lanes_ - 1, lanes_.bg_n(), n_lanes_ - lanes_.bg_n(), (long long)cfg_.max_seqs,
                  lanes_.bg_lane() - 1,
                  lanes_.lend_split() || lanes_.lend_mixed() ? " (before RADIANCE_PP_LEND_MIXED, which takes what it leaves)" : "");
+    if (const int64_t bgr = LaneSet::bg_rows_env(); bgr > 0) {   /* tp8 loop D47 */
+        if (lanes_.bg_lane() >= 0 && lanes_.bg_rows(cfg_.max_seqs) < cfg_.max_seqs)
+            RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROWS=%lld (tp8 loop D47) -- the BG lanes' step slabs carve their block tables "
+                     "for %lld rows, not --max-num-seqs %lld, and a BG lane takes a lent newcomer only while its inbox holds fewer "
+                     "than %lld (else the next BG lane, or its home as a MIXED step)", (long long)bgr, (long long)bgr,
+                     (long long)cfg_.max_seqs, (long long)bgr);
+        else
+            RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROWS=%lld is not taken (tp8 loop D47): %s", (long long)bgr,
+                     lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not below --max-num-seqs");
+    }
     if (lanes_.bg_lane() >= 0)
         RAD_INFO("two-node pipeline: a lent piece's commit opens its home request's drafter range as the home's own chunk would, so "
                  "a newcomer the BG lane ran whole drafts from its second token on (tp8 loop F22)");
@@ -546,7 +556,7 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
                  "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "
                  "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld; drafter ranges opened "
-                 "by a lent piece's commit %lld (on, tp8 loop F22)%s", lanes_.bg_lane(),
+                 "by a lent piece's commit %lld (on, tp8 loop F22)%s%s", lanes_.bg_lane(),
                  (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
                  (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
                  (long long)c.bg_skip[LaneSet::kBgOrder], (long long)c.bg_floor,
@@ -557,6 +567,10 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
                            (long long)c.hold_steps, (long long)c.hold_lent, (long long)c.hold_home,
                            c.hold_lent + c.hold_home > 0 ? (double)c.hold_us / 1000.0 / (double)(c.hold_lent + c.hold_home) : 0.0,
                            (double)c.hold_max_us / 1000.0).c_str()
+                     : "",
+                 lanes_.bg_rows(cfg_.max_seqs) < cfg_.max_seqs
+                     ? fmt("; a BG lane's %lld-row slab turned away %lld lends (RADIANCE_PP_BG_ROWS, tp8 loop D47)",
+                           (long long)lanes_.bg_rows(cfg_.max_seqs), (long long)lanes_.bg_rows_kept()).c_str()
                      : "");
 }
 

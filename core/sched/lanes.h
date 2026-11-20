@@ -149,6 +149,18 @@ public:
      * follower runs the BG lanes' passes in layer segments (RADIANCE_PP_SEG_LAYERS, without RADIANCE_PP_SEG_PREFILL) with the
      * decode lanes' passes between them; the leader's RADIANCE_PP_READY_FIRST=1 lets decode tails go before them. Default 0. */
     static int bg_env();   /* k from the environment (0: off) */
+    /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N, 1 .. 256; with BG lanes, the same value on both nodes): a BG lane's step slab carves
+     * its block tables for N rows instead of --max-num-seqs (each row --max-model-len wide: at 32 x 1 M that is ~512 MiB a card
+     * a lane, the whole of a BG lane's slab), and lane_split_bg lends into a BG lane only while its inbox holds fewer than N
+     * pieces (a newcomer then goes to the next BG lane with room, or runs at home, as when its rows do not fit). A BG lane's
+     * step is its inbox (it holds no sequence of its own), so its plans keep to N sequences; build() refuses more by name.
+     * Capacity / step composition only. 0 (unset): --max-num-seqs, today. bg_rows(max_seqs) = a BG lane's cap. */
+    static int64_t bg_rows_env();
+    int64_t bg_rows(int64_t max_seqs) const {
+        return bg_lane() >= 0 && bg_rows_n_ > 0 && bg_rows_n_ < max_seqs ? bg_rows_n_ : max_seqs;
+    }
+    void note_bg_rows_kept_locked() { ++bg_rows_kept_; }
+    int64_t bg_rows_kept() const { std::lock_guard<std::mutex> lk(*mu_); return bg_rows_kept_; }
     /* the first BG lane, or -1 */
     int  bg_lane() const { return bg_ > 0 && (int)lanes_.size() > bg_ ? (int)lanes_.size() - bg_ : -1; }
     int  bg_n() const { return bg_lane() >= 0 ? bg_ : 0; }
@@ -358,6 +370,8 @@ private:
     int64_t bg_floor_n_ = 0;
     int64_t bg_hold_ms_ = 0;                /* RADIANCE_PP_BG_HOLD_MS (bg_hold_ms, tp8 dev D11) */
     int64_t bg_room_ = 0;                   /* RADIANCE_PP_BG_ROOM (bg_room, tp8 loop P23) */
+    int64_t bg_rows_n_ = 0;                 /* RADIANCE_PP_BG_ROWS (bg_rows, tp8 loop D47) */
+    int64_t bg_rows_kept_ = 0;              /* lends a BG lane's rows cap turned away (tp8 loop D47) */
     int64_t bg_join_ms_ = 0;                /* RADIANCE_PP_BG_JOIN_MS (bg_join_ms, tp8 loop P23b) */
     std::vector<int64_t> bgt0_, bgrows_;    /* a BG lane's step in flight: when it took its inbox, its rows */
     double  bg_us_row_ = 0.0;

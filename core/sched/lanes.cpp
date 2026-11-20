@@ -55,6 +55,7 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     const char* lm = std::getenv("RADIANCE_PP_LEND_MIXED");
     lend_mixed_ = lm && !std::strcmp(lm, "1") ? 1 : lm && !std::strcmp(lm, "2") ? 2 : 0;
     bg_ = bg_env();
+    bg_rows_n_ = bg_rows_env();   /* tp8 loop D47 */
     const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
     bg_split_ = bs && !std::strcmp(bs, "1");
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh) {
@@ -84,6 +85,14 @@ int LaneSet::bg_env() {
     char* end = nullptr;
     const long k = std::strtol(v, &end, 10);
     return end && !*end && k > 0 && k <= 3 ? (int)k : 0;
+}
+
+int64_t LaneSet::bg_rows_env() {   /* tp8 loop D47 */
+    const char* v = std::getenv("RADIANCE_PP_BG_ROWS");
+    if (!v || !*v) return 0;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    return end && !*end && n >= 1 && n <= 256 ? (int64_t)n : 0;
 }
 
 int LaneSet::pick() const {
@@ -310,6 +319,18 @@ void Scheduler::lane_take_inbox() {
             RAD_ERR("lane %d: %lld rows of other lanes' pieces (%zu) beside %lld of its own, %lld reserved at the step's "
                     "start, step budget %lld", lane_, (long long)rows, got.size(), (long long)plan_.n_tok,
                     (long long)lane_reserved_, (long long)cfg_.max_tok);
+    }
+    /* tp8 loop D47: a lane whose block tables hold fewer rows than --max-num-seqs (a BG lane under RADIANCE_PP_BG_ROWS) takes
+     * no more pieces than they hold. Never in a plain run (lane_split_bg lends into it only below that many); a failed build's
+     * pieces back in the inbox beside newer lends could pass it: the later ones wait there for the next step, in order. */
+    if (const int64_t room = builder_.bt_rows() - (int64_t)plan_.e.size();
+        builder_.bt_rows() < cfg_.max_seqs && (int64_t)got.size() > std::max<int64_t>(room, 0)) {
+        const size_t keep = (size_t)std::max<int64_t>(room, 0);
+        RAD_WARN("lane %d: %zu lent pieces in its inbox beside %zu of its own entries, %lld block-table rows "
+                 "(RADIANCE_PP_BG_ROWS, tp8 loop D47): %zu wait for its next step", lane_, got.size(), plan_.e.size(),
+                 (long long)builder_.bt_rows(), got.size() - keep);
+        for (size_t k = keep; k < got.size(); ++k) lanes_->lend_locked(lane_, got[k], /*count=*/false);
+        got.resize(keep);
     }
     /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
     if (!got.empty() && lanes_->is_bg(lane_)) {
@@ -569,6 +590,10 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     auto room = [&](int l, int64_t rows) {
         const int64_t in = lanes_->inbox_rows_locked(l);
         if (in + rows > cap || (int64_t)lanes_->inbox_n_locked(l) + 1 > cfg_.max_seqs) return false;
+        if ((int64_t)lanes_->inbox_n_locked(l) + 1 > lanes_->bg_rows(cfg_.max_seqs)) {   /* tp8 loop D47: the BG lane's slab rows */
+            lanes_->note_bg_rows_kept_locked();
+            return false;
+        }
         if (join_us <= 0 || in + rows <= base) return true;
         const int64_t rem = lanes_->bg_remaining_us_locked(l, now_j);
         const bool ok = rem <= join_us;   /* -1: no measurement yet -> joins */

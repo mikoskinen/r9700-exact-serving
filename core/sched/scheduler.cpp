@@ -592,6 +592,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_est_.clear();
     draft_est_.reserve((size_t)cfg.max_seqs);
 
+    /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N with RADIANCE_PP_BG_LANE=k): a BG lane (the last k; it holds no sequence, its steps
+     * carry only lent newcomers, lane_split_bg lends into it only below N pieces) carves its block tables for N rows */
+    if (lanes_ && n_lanes_ > 1) {
+        const int kbg = LaneSet::bg_env() < n_lanes_ ? LaneSet::bg_env() : 0;
+        builder_.set_bt_rows(kbg > 0 && lane_ >= n_lanes_ - kbg ? LaneSet::bg_rows_env() : 0);
+    }
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
     /* tp8 prefill P0: a lane's window rows from their own window (BatchBuilder::win_row) */
     builder_.set_lanes_rebase(n_lanes_ > 1);
