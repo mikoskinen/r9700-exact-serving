@@ -36,6 +36,7 @@
 #include "rad_plugin.h"
 #include "r4d_args.h"
 #include "rad_pp.h"   /* tp8 loop P20 rounds 3 + 4: --case stage_shard's ring */
+#include "rad_device.h"   /* tp8 loop P46: RadEvent, the rad_stream / rad_event entry points this binary exports (HIP shims) */
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
 #include "r4d_hc_fp8.h"
@@ -32552,6 +32553,28 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
  * holds the whole parts' bytes, the layout word and `ready` 1; a control without shard (rank 0 alone) carries rank 0's junk. Then
  * receive with shard 3 into sentinel-filled buffers: each rank's own rows right, the others keep the sentinel, p2 whole, `taken`
  * 1 a rank; and without shard: every row. R = R4D_SELFTEST_STROWS (default 4096; also 1441: an uneven last shard). */
+/* tp8 loop P46: libr4d's side-stream sends (send_split_async, P10's send_async) take the engine's streams and events through
+ * dlsym(RTLD_DEFAULT, "rad_stream_create" ...): here they are HIP's (the selftest's launches run on HIP streams), exported by the
+ * link's dynamic list (r4d_selftest.dynlist) and nothing else. A non-blocking stream: never ordered behind the default one. */
+extern "C" int rad_stream_create(RadStream* out, int) {
+    hipStream_t s = nullptr;
+    if (!out || hipStreamCreateWithFlags(&s, hipStreamNonBlocking) != hipSuccess) return RAD_E_DEVICE;
+    *out = (RadStream)s;
+    return RAD_OK;
+}
+extern "C" int rad_event_create(RadEvent* out) {
+    hipEvent_t e = nullptr;
+    if (!out || hipEventCreateWithFlags(&e, hipEventDisableTiming) != hipSuccess) return RAD_E_DEVICE;
+    *out = (RadEvent)e;
+    return RAD_OK;
+}
+extern "C" int rad_event_record(RadEvent e, RadStream s) {
+    return hipEventRecord((hipEvent_t)e, (hipStream_t)s) == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+extern "C" int rad_event_wait(RadStream s, RadEvent e) {
+    return hipStreamWaitEvent((hipStream_t)s, (hipEvent_t)e, 0) == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
 struct StShardT {
     const RadKernelInfo* snd = nullptr;
     const RadKernelInfo* rcv = nullptr;
@@ -32564,6 +32587,7 @@ struct StShardT {
     void* p[3] = { nullptr, nullptr, nullptr };
     std::vector<uint8_t> got[3];
     int rc = RAD_OK;
+    bool junk_after = false;   /* tp8 loop P46 */
 };
 static float st_good(int k, int64_t i) { return (float)((k * 7919 + i) % 65536) * 0.25f; }
 static float st_junk(int rank, int k, int64_t i) { return -(float)((rank * 104729 + k * 7919 + i) % 65536) - 0.5f; }
@@ -32600,6 +32624,10 @@ static void stage_shard_worker(StShardT* t) {
     a.t = ts; a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size(); a.rank = t->rank; a.world_size = 4;
     const RadKernelInfo* k = t->recv ? t->rcv : t->snd;
     const int rc = k->launch(&a, nullptr);
+    /* tp8 loop P46: the next pass rewrites the parts on the pass's stream at once -- a share sent from the side stream must have
+     * been packed into the rank's staging buffer before it (the ring would carry the junk otherwise) */
+    if (t->junk_after && rc == RAD_OK && !t->recv)
+        for (int j = 0; j < 3; ++j) (void)hipMemsetAsync(t->p[j], 0x5A, (size_t)(rows[j] * cols[j] * esz[j]), nullptr);
     st_stream_sync(nullptr);
     if (rc != RAD_OK) { t->rc = rc; return; }
     if (t->recv)
@@ -32752,6 +32780,73 @@ static void stage_shard(const Plugin& pl, const std::vector<int>& devs) {
             }
             ok(fmt("stage_shard rows %lld, sharded payloads between plain ones (ready / trailer: %s)", (long long)R,
                    got.c_str()).c_str(), seq_ok && wrong == 0, fmt("%lld words of the sharded payloads wrong", (long long)wrong));
+        }
+        /* tp8 loop P46 (RadPpRing::ash_rows / ash_on): F38's sequence with every rank's share through its own card staging buffer
+         * from the card's side stream (send_split_async), each rank's parts rewritten on the pass's stream right after its launch:
+         * `ready` / the trailer 1 .. 6, every sharded payload the whole parts' bytes, 3 shares a rank from staging, 0 over; then
+         * a staging buffer below a share (the pass's stream, counted in ash_over, the same bytes) */
+        for (const bool over : { false, true }) {
+            std::memset(ring, 0, bytes);
+            RadPpRing* r = static_cast<RadPpRing*>(ring);
+            r->magic = RAD_PP_RING_MAGIC;
+            r->cap = cap;
+            r->send_ranks = 4;
+            r->n_ranks = 4;
+            r->deadline_ms = 10000;
+            r->ash_rows = 8;
+            r->ash_on = 1;
+            r->send_stage_cap = over ? 256 : total + 4096;
+            std::vector<void*> stg(4, nullptr);
+            bool alloc = true;
+            for (int k = 0; k < 4; ++k) {
+                st_set_device(devs[(size_t)k]);
+                alloc = alloc && hipMalloc(&stg[(size_t)k], (size_t)(total + 4096)) == hipSuccess;
+                r->send_stage[k] = (uint64_t)(uintptr_t)stg[(size_t)k];
+            }
+            if (!alloc) { ok(nm, false, "hipMalloc of the staging buffers"); break; }
+            const int kinds[6] = { 0, 0, 3, 0, 3, 3 };
+            std::string got;
+            bool seq_ok = true;
+            int64_t wrong = 0;
+            for (int i = 0; i < 6; ++i) {
+                std::vector<std::thread> th;
+                for (int k = 0; k < 4; ++k) {
+                    StShardT& x = t[(size_t)k];
+                    x.snd = snd; x.rcv = rcv; x.rank = k; x.dev = devs[(size_t)k]; x.ring = ring; x.ring_bytes = bytes; x.R = R;
+                    x.shard = kinds[i]; x.recv = false; x.rc = RAD_OK; x.junk_after = true;
+                    th.emplace_back(stage_shard_worker, &x);
+                }
+                for (std::thread& x : th) x.join();
+                bool good = true;
+                for (const StShardT& x : t) good = good && x.rc == RAD_OK;
+                /* the side streams publish after the pass's stream is done: wait for the payload, then for every card */
+                for (int w = 0; w < 100000 && __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE) < (uint64_t)(i + 1); ++w)
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                for (int k = 0; k < 4; ++k) { st_set_device(devs[(size_t)k]); (void)hipDeviceSynchronize(); }
+                const uint8_t* pay = static_cast<const uint8_t*>(ring) + RAD_PP_RING_HDR;
+                uint64_t seq = 0;
+                std::memcpy(&seq, pay + total, 8);
+                got += fmt("%s%s %llu/%llu", i ? ", " : "", kinds[i] ? "shard" : "plain", (unsigned long long)r->ready,
+                           (unsigned long long)seq);
+                seq_ok = seq_ok && good && r->ready == (uint64_t)(i + 1) && seq == (uint64_t)(i + 1);
+                if (kinds[i]) {
+                    for (int64_t j = 0; j < R * 8; ++j) { float v; std::memcpy(&v, pay + j * 4, 4); wrong += v != st_good(0, j); }
+                    for (int64_t j = 0; j < R * 10; ++j) { uint16_t v; std::memcpy(&v, pay + o1 + j * 2, 2); wrong += v != h_to_bf16(st_good(1, j)); }
+                    for (int64_t j = 0; j < 20; ++j) { int32_t v; std::memcpy(&v, pay + o2 + j * 4, 4); wrong += v != (int32_t)st_good(2, j); }
+                }
+                if (!good) break;
+                __atomic_store_n(&r->sent, r->ready, __ATOMIC_RELEASE);   /* the link took it */
+            }
+            uint64_t sends = 0, overn = 0;
+            for (int k = 0; k < 4; ++k) { sends += r->ash_sends[k]; overn += r->ash_over[k]; }
+            const bool counts = over ? overn == 12 && sends == 0 : sends == 12 && overn == 0;
+            ok(fmt("stage_shard rows %lld, %s (ready / trailer: %s)", (long long)R,
+                   over ? "P46 staging below a share: the pass's stream" : "P46 shares through each rank's staging buffer from the side stream",
+                   got.c_str()).c_str(), seq_ok && wrong == 0 && counts,
+               fmt("%lld words of the sharded payloads wrong, %llu shares from staging, %llu over", (long long)wrong,
+                   (unsigned long long)sends, (unsigned long long)overn));
+            for (StShardT& x : t) x.junk_after = false;
+            for (int k = 0; k < 4; ++k) { st_set_device(devs[(size_t)k]); st_free(stg[(size_t)k]); }
         }
         for (StShardT& x : t) {
             st_set_device(x.dev);

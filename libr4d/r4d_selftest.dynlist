@@ -1,0 +1,8 @@
+/* tp8 loop P46: the engine's stream / event entry points libr4d's side-stream sends look up (dlsym RTLD_DEFAULT), exported by
+ * r4d_selftest over HIP streams so --case stage_shard can run the side-stream form on cards; nothing else is exported */
+{
+    rad_stream_create;
+    rad_event_create;
+    rad_event_record;
+    rad_event_wait;
+};
