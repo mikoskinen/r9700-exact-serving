@@ -277,6 +277,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                                "published that head waits for it, at most %lld ms from its arrival", (long long)kPubHoldMin, hm).c_str()
                          : "OFF: it needs RADIANCE_SCHED_PUB_PROMPT=1 or 2 (and the prefix cache)");
     }
+    {   /* qfn-on-ds Q18 (FINDINGS F11): one prefill sequence a step under BI chunking 6 (scheduler.h bi_one_pf_) */
+        const char* e = std::getenv("RADIANCE_SCHED_BI_ONE_PF");
+        bi_one_pf_ = e && !std::strcmp(e, "1");
+        if (bi_one_pf_ && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_BI_ONE_PF=1 (qfn-on-ds Q18) -- under lever BI chunking 6 a step carries at most one "
+                     "prefill sequence: a second prompt's piece waits for the next step (every piece alone or beside decode rows)");
+    }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
         plan_reserved_ = e && !std::strcmp(e, "1");
@@ -1558,6 +1565,16 @@ static int bi_chunk_env() {
 }
 
 static constexpr int64_t kBiMinPiece = 128;
+
+/* qfn-on-ds Q18 (FINDINGS F11, 21.11.2026): F11's deep 12-row tail answered otherwise only in a step that also carried another
+ * prompt's piece (T 1,236 = 29 x 4 + 12 + 1,108); beside decode rows alone it kept its bytes. With RADIANCE_SCHED_BI_ONE_PF=1 the
+ * step being planned takes no second prefill sequence under chunking 6, whatever op made the difference. */
+bool Scheduler::bi_pf_full() const {
+    if (!bi_one_pf_ || bi_chunk_ != 6) return false;
+    for (const StepEntry& e : plan_.e)
+        if (e.is_prefill) return true;
+    return false;
+}
 
 /* RADIANCE_SCHED_BI_GRID: lever BI chunking 4's grid G (default 1024); a divisor of the interval, a multiple of 32. */
 static int64_t bi_grid_env() {
@@ -3839,6 +3856,9 @@ const RadBatch* Scheduler::step() {
         /* lever DST (sched_bypass_total): a request the bypass took runs its alone pieces, held steps included; with the
          * switch off, or at an alone piece the bypass cannot run (over N, not cut under 0 / 1 / 2), an ordinary prefill */
         bool bp = false;
+        /* qfn-on-ds Q18: the step already holds a prefill sequence -> this one's piece waits (a held chunk: no step is issued
+         * ahead of the next full step, step_next's held_prefill_ rule) */
+        if (prefill && bi_pf_full()) { ++held_prefill_; ++i; continue; }
         /* lever NOA: a displacement step runs a starved request as its only prefill; every other prefill's chunk waits a step
          * (planned unchanged at the next) */
         if (prefill && noa_disp_ && !s.noa_starved) {
@@ -4102,6 +4122,7 @@ const RadBatch* Scheduler::step() {
             if (!(r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < target)) continue;
             if (noa_disp_ && !s.noa_starved) continue;   /* displaced this step */
             if (srf_sits_out(slot)) continue;            /* tp8 loop P44 */
+            if (bi_pf_full()) break;                     /* qfn-on-ds Q18: one prefill sequence a step */
             bool in = false;
             for (const StepEntry& pe : plan_.e) in = in || pe.slot == slot;
             if (in) continue;
@@ -4253,6 +4274,8 @@ const RadBatch* Scheduler::step() {
                 }
                 /* the cache lost its blocks: an ordinary preempted request now (n_computed 0), admitted below */
             }
+            /* qfn-on-ds Q18: a step that already carries a prefill sequence admits nobody (the queue keeps its order) */
+            if (bi_pf_full()) break;
             admit_full_ = 0;
             admit_next_step_ = false;
             const int as = admit_one(s, budget, bypass ? 0 : areserve, bypass ? bypass_now_ : 0);

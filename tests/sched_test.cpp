@@ -796,6 +796,66 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     rad::fn4::apply_pending(1, da);
 }
 
+/* qfn-on-ds Q18 (Qwen loop round 4, FINDINGS F11): RADIANCE_SCHED_BI_ONE_PF=1 under BI chunking 6. Two short prompts that both
+ * fit beside a decoding request's rows: without the env (the control) they share a step; with it no step carries two prefill
+ * sequences, both prompts still finish, each in its alone pieces (one piece of 100 rows here), and the decoding request keeps
+ * a row in every step. */
+TEST(q18_bi_one_pf_keeps_a_second_prompts_piece_out_of_a_step_that_holds_one) {
+    std::string err;
+    CHECK(rad::fn4::request("sched_bi_chunk", 6, &err));
+    int da[rad::fn4::kSwitches];
+    rad::fn4::apply_pending(0, da);
+    CHECK_EQ(rad::fn4::sched_bi_chunk(), 6);
+    struct Out { int two_pf = 0, steps = 0, d_missing = 0; std::vector<int32_t> ap, bp; };
+    auto run = [&](bool one) {
+        Out o;
+        Fixture f;
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        if (one) setenv("RADIANCE_SCHED_BI_ONE_PF", "1", 1); else unsetenv("RADIANCE_SCHED_BI_ONE_PF");
+        CHECK_OK(f.start());
+        unsetenv("RADIANCE_SCHED_BI_ONE_PF");
+        auto rd = f.request(100, 300);
+        for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;
+        rd->ignore_eos = true;
+        const uint64_t d = f.add(std::move(rd));
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+        auto ra = f.request(100, 2);
+        for (int i = 0; i < 100; ++i) ra->prompt[(size_t)i] = 40000 + i;
+        auto rb = f.request(100, 2);
+        for (int i = 0; i < 100; ++i) rb->prompt[(size_t)i] = 50000 + i;
+        const uint64_t a = f.add(std::move(ra));
+        const uint64_t b = f.add(std::move(rb));
+        for (int k = 0; k < 30 && f.sch.step(); ++k) {
+            int npf = 0;
+            bool has_d = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == d) has_d = true;
+                if (!e.is_prefill) continue;
+                ++npf;
+                if (e.seq == a) o.ap.push_back(e.n_tokens);
+                if (e.seq == b) o.bp.push_back(e.n_tokens);
+            }
+            o.two_pf += npf >= 2;
+            o.d_missing += !has_d;
+            ++o.steps;
+            f.commit_plain();
+        }
+        return o;
+    };
+    const Out off = run(false);
+    const Out on = run(true);
+    CHECK(off.two_pf >= 1);                               /* the control: the two prompts shared a step */
+    CHECK_EQ(on.two_pf, 0);                               /* the rule: never two prefill sequences a step */
+    CHECK(on.ap == std::vector<int32_t>{ 100 });          /* each prompt in its alone piece, both finished */
+    CHECK(on.bp == std::vector<int32_t>{ 100 });
+    CHECK(off.ap == std::vector<int32_t>{ 100 });
+    CHECK(off.bp == std::vector<int32_t>{ 100 });
+    CHECK_EQ(on.d_missing, 0);                            /* the decoding request is in every step */
+    CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
 /* fn4 resume_cold (15.11.2026, qwen/EXACT-PRESSURE.md): a hit resumes only where the prompt's idle cold prefill starts a
  * chunk, and a head other prompts share takes no snapshot cut -- so every piece after the resume is one the cold run
  * prefills. Off (today): the hit resumes at the snapshot (640, inside the cold run's [256, 768) span) and the pieces

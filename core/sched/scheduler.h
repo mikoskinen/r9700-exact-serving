@@ -964,6 +964,11 @@ private:
     /* fn4 BI chunking 6: the current plan is a lone step (other running sequences left out of it); no step is issued
      * ahead of it (step_next would carry on with the lone sequence only), nor while a request waits for its lone step */
     bool          bi6_plan_lone_ = false;
+    /* qfn-on-ds Q18 (Qwen loop round 4, FINDINGS F11): RADIANCE_SCHED_BI_ONE_PF=1 -- under BI chunking 6 a step carries at
+     * most ONE prefill sequence: a second prompt's piece (a running prefill or an admission) waits for the next step, so
+     * every prefill piece runs alone or beside decode rows only. bi_pf_full(): the plan being built already holds one. */
+    bool          bi_one_pf_ = false;
+    bool          bi_pf_full() const;
     /* fn4 resume_cold (15.11.2026): where this prompt's idle cold prefill starts a chunk -- 0 and the end of every chunk
      * but the last, from plan_chunk with the alone span and no checkpoint_at (the pieces bi_chunk_plan gives it alone),
      * ascending. A hit that resumes at one of them recomputes the rest of the prompt in the cold run's own pieces. */
