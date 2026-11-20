@@ -259,10 +259,23 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     pc_ = pc;
     {   /* tp8 loop D55: a prompt published at its last chunk's commit (publish_prompt_done); unset / 0 = at its close only */
         const char* e = std::getenv("RADIANCE_SCHED_PUB_PROMPT");
-        pub_prompt_ = e && !std::strcmp(e, "1");
+        pub_mode_ = e && (!std::strcmp(e, "1") || !std::strcmp(e, "2")) ? std::atoi(e) : 0;
+        pub_prompt_ = pub_mode_ >= 1;
         if (pub_prompt_ && lane_ <= 0 && cfg.prefix_cache)
-            RAD_INFO("scheduler: RADIANCE_SCHED_PUB_PROMPT=1 (tp8 loop D55) -- a prompt's computed blocks go into the prefix cache "
-                     "when its last chunk commits, not only at its close: a prompt admitted after that (another lane's too) hits them");
+            RAD_INFO("scheduler: RADIANCE_SCHED_PUB_PROMPT=%d (tp8 loop D55) -- a prompt's computed blocks go into the prefix cache "
+                     "when its last chunk commits%s, not only at its close: a prompt admitted after that (another lane's too) hits them",
+                     pub_mode_, pub_mode_ >= 2 ? " and at every prefill chunk's commit before it (D55b)" : "");
+        /* tp8 loop D55b: the hold for a running sibling's head (a start env, ms; 0 / unset: none) */
+        const char* h = std::getenv("RADIANCE_SCHED_PUB_HOLD_MS");
+        const long long hm = h && *h ? std::atoll(h) : 0;
+        /* without a publish rule the head reaches the cache only at the sibling's close: a hold would only delay */
+        pub_hold_us_ = hm > 0 && cfg.prefix_cache && pub_prompt_ ? (int64_t)hm * 1000 : 0;
+        if (hm > 0 && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_PUB_HOLD_MS=%lld (tp8 loop D55b) -- %s", hm,
+                     pub_hold_us_ > 0
+                         ? fmt("a fresh prompt that shares >= %lld tokens with a running prompt (any lane) that has not computed and "
+                               "published that head waits for it, at most %lld ms from its arrival", (long long)kPubHoldMin, hm).c_str()
+                         : "OFF: it needs RADIANCE_SCHED_PUB_PROMPT=1 or 2 (and the prefix cache)");
     }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
@@ -797,6 +810,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.lent_hold = false;   /* tp8 M56 (lanes): a recycled slot holds nothing back */
     s.srf_kv = false;      /* tp8 loop P44 */
     s.pub_prompt = false;  /* tp8 loop D55: a recycled slot's request has not published its prompt */
+    s.pub_held = false;    /* tp8 loop D55b */
     s.drafter_reset();
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
@@ -1033,6 +1047,49 @@ void Scheduler::publish_prompt_done(SchedReq& s) {
         RAD_DEBUG("prefix cache: request %llu's prompt of %lld tokens published at its last chunk's commit (tp8 loop D55; %lld so "
                   "far)", (unsigned long long)s.req->id, (long long)s.req->n_computed, (long long)pub_prompt_n_);
     }
+}
+
+/* tp8 loop D55b: RADIANCE_SCHED_PUB_PROMPT=2 -- the committed part of a running prompt, chunk by chunk */
+void Scheduler::publish_chunk_done(SchedReq& s) {
+    if (pub_mode_ < 2 || s.pub_prompt || !s.req || s.req->embed) return;
+    if ((int64_t)s.req->n_computed >= (int64_t)s.req->prompt.size()) return;   /* the last chunk: publish_prompt_done */
+    (void)publish_prefix(s);
+}
+
+/* tp8 loop D55b: does a RUNNING prompt (this lane's or another's: the lane schedulers share lane 0's mutex) share at least
+ * kPubHoldMin tokens with `s`'s prompt and not yet have that head in the cache? Only fresh requests wait, only on admitted ones
+ * (never on another waiting one: no cycle), and never past pub_hold_us_ from the arrival. */
+bool Scheduler::pub_holds(const SchedReq& s) const {
+    if (pub_hold_us_ <= 0 || !s.req || s.req->embed || s.req->media || s.req->n_computed != 0 ||
+        s.req->state == ReqState::Preempted)
+        return false;
+    if (s.arrived_us <= 0 || mono_us() - s.arrived_us > pub_hold_us_) return false;
+    const std::vector<int32_t>& p = s.req->prompt;
+    auto holds_on = [&](const SchedReq* o) {
+        if (!o || o == &s || !o->req || o->req->embed || o->req->state != ReqState::Running) return false;
+        const std::vector<int32_t>& q = o->req->prompt;
+        const size_t n = std::min(p.size(), q.size());
+        const int64_t common = (int64_t)(std::mismatch(p.begin(), p.begin() + (long)n, q.begin()).first - p.begin());
+        if (common < kPubHoldMin) return false;
+        /* available: the whole prompt published (D55), or with per-chunk publishing its computed end past the head */
+        if (o->pub_prompt || (int64_t)o->req->n_computed >= (int64_t)q.size()) return false;
+        if (pub_mode_ >= 2 && (int64_t)o->req->n_computed >= std::min<int64_t>(common, (int64_t)p.size() - 1)) return false;
+        return true;
+    };
+    auto scan = [&](const Scheduler& L) {
+        for (int32_t slot : L.running_)
+            if (holds_on(slot >= 0 && (size_t)slot < L.reqs_.size() ? L.reqs_[(size_t)slot].get() : nullptr)) return true;
+        return false;
+    };
+    /* this walk's own admissions join running_ only after the walk (took_): a sibling admitted just before is running too */
+    for (size_t i : took_)
+        if (i < waiting_.size() && holds_on(reqs_[(size_t)waiting_[i]].get())) return true;
+    if (lanes_ && n_lanes_ > 1) {
+        for (int l = 0; l < n_lanes_; ++l)
+            if (const Scheduler* L = lanes_->lane(l); L && scan(*L)) return true;
+        return false;
+    }
+    return scan(*this);
 }
 
 bool Scheduler::publish_prefix(SchedReq& s) {
@@ -3859,6 +3916,12 @@ const RadBatch* Scheduler::step() {
             if (noa_disp_ && !s.noa_starved) { ++at; continue; }
             /* tp8 loop P44 (fn4 sched_srf 2): a waiting prompt not ahead of the chosen one keeps its place */
             if (srf_holds(s)) { ++at; continue; }
+            /* tp8 loop D55b (RADIANCE_SCHED_PUB_HOLD_MS): a running sibling is computing this prompt's head -- wait for it */
+            if (pub_hold_us_ > 0 && pub_holds(s)) {
+                if (!s.pub_held) { s.pub_held = true; ++pub_hold_n_; }
+                ++at;
+                continue;
+            }
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
              * close_request removes a refused input from waiting_, so `at` names the next one. */
@@ -4567,6 +4630,7 @@ int Scheduler::commit(StepResult& res) {
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
+            publish_chunk_done(s);   /* tp8 loop D55b (RADIANCE_SCHED_PUB_PROMPT=2; else nothing) */
             /* tp8 prefill P0: chunks of this prompt still in flight in other lanes (SchedReq::lent) start at the
              * committed end (pieces commit in position order), so the keep floor follows it: left at the lend's
              * committed end it kept this chunk's window too, and the home lane's next chunk behind the lent one then

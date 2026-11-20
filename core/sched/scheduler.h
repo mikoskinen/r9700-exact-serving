@@ -173,6 +173,8 @@ struct SchedReq {
     bool     lent_hold = false;
     /* tp8 loop D55 (RADIANCE_SCHED_PUB_PROMPT=1): its prompt went into the prefix cache when its last chunk committed */
     bool     pub_prompt = false;
+    /* tp8 loop D55b (RADIANCE_SCHED_PUB_HOLD_MS): an admission walk held it for a running sibling's head (counted once) */
+    bool     pub_held = false;
     /* The first position of the next piece another lane must take from its inbox: pieces are taken
      * (and so issued) in position order, which LaneSet checks loudly (-1: none waiting). */
     int64_t  lent_next = -1;
@@ -1399,6 +1401,16 @@ private:
     void publish_prompt_done(SchedReq& s);
     bool pub_prompt_ = false;
     int64_t pub_prompt_n_ = 0, pub_prompt_tok_ = 0;
+    /* tp8 loop D55b: RADIANCE_SCHED_PUB_PROMPT=2 also publishes at every committed prefill chunk (publish_chunk_done), so a
+     * running prompt's computed head is in the cache chunk by chunk; RADIANCE_SCHED_PUB_HOLD_MS=N holds a fresh waiting request
+     * whose prompt shares >= kPubHoldMin tokens with a RUNNING prompt (any lane) that has not made that head available yet,
+     * at most N ms from its arrival (pub_holds). 0 / unset: no hold. */
+    int  pub_mode_ = 0;
+    int64_t pub_hold_us_ = 0;
+    int64_t pub_hold_n_ = 0;   /* admission walks that held a request (a request counts once a walk) */
+    static constexpr int64_t kPubHoldMin = 256;
+    void publish_chunk_done(SchedReq& s);
+    bool pub_holds(const SchedReq& s) const;
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets
