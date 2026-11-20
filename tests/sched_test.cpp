@@ -724,8 +724,8 @@ TEST(a_span_is_taken_only_by_a_prefill_alone_in_its_step) {
 TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone) {
     std::string err;
     CHECK(rad::fn4::request("sched_bi_chunk", 6, &err));
-    int da = -1;
-    rad::fn4::apply_pending(0, &da);
+    int da[rad::fn4::kSwitches];   /* qfn-on-ds: apply_pending hands every switch's value over */
+    rad::fn4::apply_pending(0, da);
     CHECK_EQ(rad::fn4::sched_bi_chunk(), 6);
     auto pieces_alone = [&]() {
         Fixture f;
@@ -793,7 +793,7 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     CHECK(c_lone);
     CHECK(!ahead_after_lone);
     CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
-    rad::fn4::apply_pending(1, &da);
+    rad::fn4::apply_pending(1, da);
 }
 
 /* fn4 resume_cold (15.11.2026, qwen/EXACT-PRESSURE.md): a hit resumes only where the prompt's idle cold prefill starts a
@@ -802,10 +802,10 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
  * from there are other ones. */
 TEST(fn4_resume_cold_resumes_on_the_cold_plan_and_cuts_no_shared_head) {
     std::string err;
-    int da = -1;
+    int da[rad::fn4::kSwitches];   /* qfn-on-ds: apply_pending hands every switch's value over */
     auto pieces = [&](int rc, int lin, int branch, int64_t* resumed, int64_t* ck_at) {
         CHECK(rad::fn4::request("resume_cold", rc, &err));
-        rad::fn4::apply_pending(0, &da);
+        rad::fn4::apply_pending(0, da);
         CHECK_EQ(rad::fn4::resume_cold(), rc);
         Fixture f;
         f.build();                        /* interval 256, budget 512 */
@@ -854,7 +854,7 @@ TEST(fn4_resume_cold_resumes_on_the_cold_plan_and_cuts_no_shared_head) {
     for (const auto& p : hd1) CHECK(std::find(cold.begin(), cold.end(), p) != cold.end());
     (void)hd0;
     CHECK(rad::fn4::request("resume_cold", 0, &err));
-    rad::fn4::apply_pending(1, &da);
+    rad::fn4::apply_pending(1, da);
 }
 
 /* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes
@@ -2450,9 +2450,9 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
  * position -- no prefill entry for it after the preemption, nothing replayed. */
 TEST(fn4_preempt_keep_rejoins_a_decoder_at_its_own_position) {
     std::string err;
-    int da = -1;
+    int da[rad::fn4::kSwitches];   /* qfn-on-ds: apply_pending hands every switch's value over */
     CHECK(rad::fn4::request("preempt_keep", 1, &err));
-    rad::fn4::apply_pending(0, &da);
+    rad::fn4::apply_pending(0, da);
     CHECK_EQ(rad::fn4::preempt_keep(), 1);
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -2497,7 +2497,7 @@ TEST(fn4_preempt_keep_rejoins_a_decoder_at_its_own_position) {
     CHECK_EQ(f.sch.preempt_keep_counts()[1], (int64_t)1);
     (void)slot_a;
     CHECK(rad::fn4::request("preempt_keep", 0, &err));
-    rad::fn4::apply_pending(1, &da);
+    rad::fn4::apply_pending(1, da);
 }
 
 /* ================================================================== the step batch */
@@ -3748,7 +3748,7 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
      * (sched_switch, as pp_bg_room) */
     CHECK_EQ(fn4::switch_index("pp_merge"), 98);
     CHECK_EQ(fn4::switch_index("pp_merge_ms"), 99);
-    CHECK_EQ(i + 6, (int)fn4::kSwitches);
+    CHECK_EQ(i + 6, (int)fn4::kQwenFirst);   /* qfn-on-ds: the ds41 line's registry ends where the Qwen line's begins */
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -3801,7 +3801,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99 */
+    CHECK_EQ(i + 4, (int)fn4::kQwenFirst);   /* qfn-on-ds: the ds41 line's registry ends where the Qwen line's begins */   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3819,7 +3819,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it */
+    CHECK_EQ(i + 3, (int)fn4::kQwenFirst);   /* qfn-on-ds: the ds41 line's registry ends where the Qwen line's begins */   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3910,7 +3910,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99 */
+    CHECK_EQ(i + 5, (int)fn4::kQwenFirst);   /* qfn-on-ds: the ds41 line's registry ends where the Qwen line's begins */   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");

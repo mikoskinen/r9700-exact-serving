@@ -3180,6 +3180,9 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
 /* fn4 runtime switch (the core's runtime/fn4_switch.h, between steps, every rank parked): "gather_inv"
  * picks MoeFP8's inverse twins when the blocks were declared switchable (RADIANCE_FN4_SWITCHABLE=1 at
  * start); refused (-1) otherwise. */
+/* qfn-on-ds: this plugin's switches are the Qwen line's, which the core checks by its own ranges and never asks a plugin
+ * about; for every other name (the ds41 line's plugin switches, checked through rad_fn4_accepts) it is not the owner. */
+extern "C" int rad_fn4_accepts(const char*, int) { return 0; }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (step_pipelined; RADIANCE_FN4_P2X=1 declares) */
         if (value < 0 || value > 2) return -1;

@@ -2827,6 +2827,7 @@ TEST(exl3_experts_issue_each_op_at_its_schema_count_split_and_fused) {
     src.cfg.rows = ROWS;
     REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
     REQUIRE_EQ(src.cfg.expert_exl3, 1);
+    src.cfg.exl3_v12 = 1;   /* qfn-on-ds: the Qwen line's EXL3 form (qwen4exp sets it after probe) */
     MoeFP8::Wire w{};
     auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
         return decl_b(&b, name, dt, { rows, cols });

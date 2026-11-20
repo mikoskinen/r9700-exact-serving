@@ -28,6 +28,9 @@ RAD_ARCH_PLUGIN(qwen4exp_x3, "qwen4exp", "exl3", "0.1.0",
  * MoeFP8's EXL3 ops with or without the pass's shared routing map (fn4_exl3_map_flag); "exl3_gd" 0 / 1 -- the decode
  * band's fused moe_exl3_gate_up_down in place of the split pair (fn4_exl3_gd_flag; rad_block_moe_fp8.h). Every other
  * name is not this plugin's (0). */
+/* qfn-on-ds: this plugin's switches are the Qwen line's, which the core checks by its own ranges and never asks a plugin
+ * about; for every other name (the ds41 line's plugin switches, checked through rad_fn4_accepts) it is not the owner. */
+extern "C" int rad_fn4_accepts(const char*, int) { return 0; }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
     if (std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (qwen4exp_fp8's step_pipelined; RADIANCE_FN4_P2X=1 declares) */
