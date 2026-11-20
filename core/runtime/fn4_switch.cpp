@@ -42,7 +42,40 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
-                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms" };
+                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms",
+                                        /* qfn-on-ds: the Qwen line's (kQwenFirst on, fn4-x3-pf 6fdca84a's order) */
+                                        "no_route", "gather_inv", "hc_fusedown", "hc_normwave", "hc_writevec", "hc_readv",
+                                        "ar_lanethreads", "hc_upmix", "ar_laneblocks", "exl3_pfprep", "exl3_mapshare", "exl3_gd",
+                                        "moe_pair", "exl3_dz", "exl3_bi", "exl3_dual", "hc_bi", "bi_seg",
+                                        "att_bi", "arw_rows", "hc_spprobe", "hc_sp", "mtp_flat", "ar_sdma",
+                                        "bi_wide", "sp_serial", "hc_pinpf2", "resume_cold", "preempt_keep", "kvs_bi",
+                                        "kvs_vic", "qsa_split", "sp_ple", "ar_fence", "sp_route" };
+/* The Qwen line's switches' start variables (that line's kEnv, for its own switches), and its start-value rule: unset /
+ * empty / 0 -> 0, a number > 1 as given, anything else 1 -- as the plugins read the same variables. */
+const char* const kEnvQ[kSwitches - kQwenFirst] = {
+    "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV", "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
+    "RADIANCE_FN4_HC_WRITEVEC", "RADIANCE_FN4_HC_READV", "RADIANCE_FN4_AR_LANE_THREADS", "RADIANCE_FN4_HC_UPMIX",
+    "RADIANCE_FN4_AR_LANE_BLOCKS", nullptr, "RADIANCE_FN4_X3MAP", "RADIANCE_FN4_X3GD",
+    "RADIANCE_FN4_MOE_PAIR", "RADIANCE_FN4_X3DZ", "RADIANCE_FN4_X3BI", "RADIANCE_FN4_X3DUAL",
+    "RADIANCE_FN4_HC_BI", "RADIANCE_FN4_BI_SEG", "RADIANCE_FN4_ATT_BI", "RADIANCE_FN4_ARW_ROWS",
+    "RADIANCE_FN4_SPPROBE", "RADIANCE_FN4_HC_SP", "RADIANCE_FN4_MTP_FLAT", "RADIANCE_FN4_AR_SDMA",
+    "RADIANCE_FN4_BI_WIDE", "RADIANCE_FN4_SPSERIAL", "RADIANCE_FN4_HC_PINPF2", "RADIANCE_FN4_RESUME_COLD",
+    "RADIANCE_FN4_PREEMPT_KEEP", "RADIANCE_FN4_KVS_BI", "RADIANCE_FN4_KVS_VIC", "RADIANCE_FN4_QSA_SPLIT",
+    "RADIANCE_FN4_SP_PLE", "RADIANCE_FN4_AR_FENCE", "RADIANCE_FN4_SP_ROUTE" };
+int env_val(const char* k) {
+    const char* v = k ? std::getenv(k) : nullptr;
+    if (!(v && *v && *v != '0')) return 0;
+    const int n = std::atoi(v);
+    return n > 1 ? n : 1;
+}
+/* The Qwen line's POST ranges for its own switches (0 .. hi; its request()). */
+int qwen_hi(int i) {
+    return i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
+         : i == kHcReadV ? 2047 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
+         : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 4 : i == kBiSeg ? 2
+         : i == kArwRows ? 4096 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3
+         : i == kArFence ? 7 : i == kSpRoute ? 63 : 1;
+}
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -66,7 +99,10 @@ bool plugin_switch(int i) {
            i == kDs41Sphc || i == kDs41SphcAttn || i == kDs41SphcSeg ||   /* tp8 loop P25s (85-87): deepseek41's SP route */
            i == kDs41Twin ||   /* tp8 loop P30t (90): deepseek41's twins */
            i == kDs41Tsk ||     /* ds41_tsk (91 here after PREFILL's 85-90; 83 on ds41-drafter round 15): libr4d (lever TSK) */
-           i == kExl3X3dPf;     /* exl3_x3d_pf (96, tp8 loop PX1): exl3r4d (A10) */
+           i == kExl3X3dPf ||   /* exl3_x3d_pf (96, tp8 loop PX1): exl3r4d (A10) */
+           /* qfn-on-ds: the Qwen line's plugin switches (its apply_pending's hook list; no_route, resume_cold, preempt_keep
+            * and sp_ple are the core's / read at start) */
+           (qwen_switch(i) && i != kNoRoute && i != kResumeCold && i != kPreemptKeep && i != kSpPle);
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -165,10 +201,14 @@ struct State {
     std::vector<Hooks> hooks;
     State() {
         for (int i = 0; i < kSwitches; ++i) {
-            val[i].store(-1, std::memory_order_relaxed);
+            /* qfn-on-ds: the Qwen line's switches start at their environment value, as that line's registry did */
+            val[i].store(qwen_switch(i) ? env_val(kEnvQ[i - kQwenFirst]) : -1, std::memory_order_relaxed);
             want[i] = 0;
             pend[i] = false;
         }
+        if (val[kNoRoute].load(std::memory_order_relaxed))
+            RAD_INFO("RADIANCE_FN4_NO_ROUTE: no routing reports (the heat engine, mover and file "
+                     "stager get no histograms; for --placement all_vram)");
         for (auto& c : cnt) c.store(0, std::memory_order_relaxed);
         for (auto& c : dcap) c.store(0, std::memory_order_relaxed);
         for (auto& c : shb) c.store(0, std::memory_order_relaxed);
@@ -261,7 +301,8 @@ int plugin_value(State& s, int i) {
 int env_sched_bi() {
     static const int env = [] {
         const char* e = std::getenv("RADIANCE_SCHED_BI_CHUNK");
-        return e && e[0] >= '0' && e[0] <= '4' && !e[1] ? e[0] - '0' : 0;
+        /* qfn-on-ds: 5 / 6 are the Qwen line's (every prefill piece alone in its step; alone's piece whole) */
+        return e && e[0] >= '0' && e[0] <= '6' && !e[1] ? e[0] - '0' : 0;
     }();
     return env;
 }
@@ -342,6 +383,7 @@ int env_tail_inner() {
 
 /* The reported value of switch i. Under s.mu. */
 int reported(State& s, int i) {
+    if (qwen_switch(i)) return s.val[i].load(std::memory_order_acquire);   /* qfn-on-ds: the Qwen line's rule */
     if (plugin_switch(i)) return plugin_value(s, i);
     if (i == kAqlAcq) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -443,6 +485,11 @@ void note_rco(int64_t copies, int64_t freed) {
     s.rco[1].fetch_add(copies, std::memory_order_relaxed);
     s.rco[2].fetch_add(freed, std::memory_order_relaxed);
 }
+/* qfn-on-ds: the Qwen line's core-read switches */
+bool no_route() { return st().val[kNoRoute].load(std::memory_order_relaxed) == 1; }
+int resume_cold() { return st().val[kResumeCold].load(std::memory_order_acquire); }
+int preempt_keep() { return st().val[kPreemptKeep].load(std::memory_order_acquire); }
+int kvs_bi() { return st().val[kKvsBi].load(std::memory_order_acquire); }
 int sched_bi_chunk() {
     const int v = st().val[kSchedBiChunk].load(std::memory_order_acquire);
     return v >= 0 ? v : env_sched_bi();
@@ -901,10 +948,18 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, "
+                        "no_route, gather_inv, hc_fusedown, hc_normwave, hc_writevec, hc_readv, ar_lanethreads, hc_upmix, ar_laneblocks, exl3_pfprep, exl3_mapshare, exl3_gd, moe_pair, exl3_dz, exl3_bi, exl3_dual, hc_bi, bi_seg, att_bi, arw_rows, hc_spprobe, hc_sp, mtp_flat, ar_sdma, bi_wide, sp_serial, hc_pinpf2, resume_cold, preempt_keep, kvs_bi, kvs_vic, qsa_split, sp_ple, ar_fence, sp_route, epoch_bump)";
         return false;
     }
     State& s = st();
+    if (qwen_switch(i)) {   /* qfn-on-ds: the Qwen line's switch, checked as that line's request() checked it */
+        if (v < 0 || v > qwen_hi(i)) {
+            if (err) *err = std::string(kNames[i]) + " takes 0.." + std::to_string(qwen_hi(i));
+            return false;
+        }
+        return true;
+    }
     if (i == kDraftSample) {
         if (v < 0 || v > 200) {
             if (err) *err = "draft_sample takes 0 (greedy drafts, the agreement rule), 1 (sampled drafts x ~ Q at the "
@@ -1427,9 +1482,10 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kSchedBiChunk) {
-        if (v < 0 || v > 4) {
+        if (v < 0 || v > 6) {
             if (err) *err = "sched_bi_chunk takes 0 (today), 1 (alone's boundaries), 2 (the interval grid), 3 / 4 (alone's "
-                            "pieces cut on the interval / RADIANCE_SCHED_BI_GRID grid)";
+                            "pieces cut on the interval / RADIANCE_SCHED_BI_GRID grid), 5 (every prefill piece alone in its "
+                            "step) or 6 (alone's piece whole where it fits beside other work, else alone in its step)";
             return false;
         }
         return true;
@@ -1734,11 +1790,13 @@ bool apply_pending(int step, int* sched) {
                 if (r < 0) refused = true;
             }
             if (refused || handled == 0) {
-                RAD_WARN("fn4: %s -> %d at step %d refused (%d plugin(s) took it); unchanged", kNames[i], v, step,
-                         handled);
+                RAD_WARN("fn4: %s -> %d at step %d refused (%d plugin(s) took it%s); unchanged", kNames[i], v, step,
+                         handled, i == kGatherInv ? "; gather_inv needs RADIANCE_FN4_SWITCHABLE=1 at start" : "");
                 continue;
             }
-            if (const int got = plugin_value(s, i); got >= 0) v = got;
+            if (qwen_switch(i)) {
+                /* qfn-on-ds: the Qwen line reports the value as set */
+            } else if (const int got = plugin_value(s, i); got >= 0) v = got;
         }
         if (sched_switch(i) && sched) sched[i] = v;
         s.val[i].store(v, std::memory_order_release);

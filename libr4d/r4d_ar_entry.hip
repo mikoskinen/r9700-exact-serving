@@ -19,6 +19,7 @@
  */
 
 #include "r4d_chain.h"
+#include "r4d_ar_wide_chain.h"
 #include "r4d_args.h"
 #include "r4d_ar_gather_admit.h"
 #include "r4d.h"
@@ -35,6 +36,82 @@
 #include <mutex>
 #include <vector>
 #include <chrono>
+#include <dlfcn.h>
+#include <hip/hip_runtime.h>
+
+/* fn4 SDMA-AR (r4d_ar_sdma.hip): the exact collectives with the peer bytes on the copy engines. */
+extern "C" {
+void* r4d_sdma_ar_create(int world, int rank, int dev, int engine, long long max_numel, int scr_mode, char* why, int cap);
+void  r4d_sdma_ar_destroy(void* p);
+int   r4d_sdma_ar_launch_tab(void* p, const void* in, void* out, long long numel, const long long* tab, int mode,
+                             hipStream_t st);
+int   r4d_sdma_untaped_ok(void);
+}
+
+/* fn4 SDMA-AR (12.11.2026; RADIANCE_FN4_AR_SDMA, rad_fn4_switch("ar_sdma")): 1 = a prefill piece's collectives at
+ * `overlap` 1 -- the lane all-reduce (ar_twoshot_4rank_exact_lane: the coded / plain CU two-shot otherwise) and SP's raw
+ * reduce_scatter_rows / all_gather_rows -- move their peer bytes on each card's SDMA engine; the compute units only
+ * fold (the same fp32 ascending-rank sum, the same rounding) and copy the gathered shards out of the scratch: the same
+ * bytes, with the CUs left to the compute beside them (sdma1 12.11.: a VRAM-bound kernel stream lost 162-199 us an
+ * all-reduce at 10.5 MB against 486 us beside the CU xpush two-shot). Declared by setting the variable (0 or 1, its
+ * start value): build() then gives every four-rank P2P bf16 instance whose bound lies in [sdma_min, R4D_SDMA_CAP_MB] a
+ * copy-engine context (collective; ~4x the bound's bytes of fine-grained scratch a card). Messages under sdma_min
+ * (R4D_SDMA_MIN_ELEMS, 1048576: above every decode and verify height) keep the CU forms. A pass recording a tape
+ * cannot replay copy-engine lists, so such a pass's tape is refused (rad_tape_refuse, core/device/aql.cpp) and the pass
+ * stays live: every rank always takes the same path. -1 until the environment is read; a launch parameter `sdma`
+ * overrides the switch (r4d_selftest --sdmaeng4). */
+static std::atomic<int> g_ar_sdma{-1};
+static int sdma_declared() {
+    const char* e = std::getenv("RADIANCE_FN4_AR_SDMA");
+    return e && *e ? 1 : 0;
+}
+static int ar_sdma_switch() {
+    int v = g_ar_sdma.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_SDMA");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_ar_sdma.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_ar_sdma.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_sdma_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    if (on && !sdma_declared()) return -1;   /* no context was built: declare with RADIANCE_FN4_AR_SDMA */
+    g_ar_sdma.store(on, std::memory_order_relaxed);
+    return 1;
+}
+static long long sdma_min() {
+    static const long long m = [] {
+        const char* e = std::getenv("R4D_SDMA_MIN_ELEMS");
+        const long long v = e && *e ? std::atoll(e) : 0;
+        return v > 0 ? v : 1048576LL;
+    }();
+    return m;
+}
+static long long sdma_cap_bytes() {
+    static const long long m = [] {
+        const char* e = std::getenv("R4D_SDMA_CAP_MB");
+        const long long v = e && *e ? std::atoll(e) : 0;
+        return (v > 0 ? v : 32LL) << 20;
+    }();
+    return m;
+}
+/* Whether a copy-engine launch may run now: the core's rad_tape_refuse (an open tape is marked unplayable, so the pass
+ * stays live on every rank), or no tapes in this process at all (r4d_selftest). Without either, never. */
+static int sdma_tape_ok() {
+    using RefuseFn = int (*)(const char*);
+    static RefuseFn refuse = [] { return (RefuseFn)dlsym(RTLD_DEFAULT, "rad_tape_refuse"); }();
+    if (refuse) { refuse("fn4 SDMA all-reduce: copy-engine lists a tape cannot replay"); return 1; }
+    if (r4d_sdma_untaped_ok()) return 1;
+    static std::once_flag said;
+    std::call_once(said, [] {
+        std::fprintf(stderr, "[r4d] fn4 SDMA-AR: this engine exports no rad_tape_refuse, so the copy-engine path "
+                             "stays off (the CU collectives serve)\n");
+    });
+    return 0;
+}
 
 static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
@@ -131,6 +208,8 @@ struct ArInst {
     /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
     long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
     long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
+    /* fn4 SDMA-AR: the copy-engine context (r4d_ar_sdma.hip), or null (see g_ar_sdma). */
+    void* sdma = nullptr;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -413,7 +492,25 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
      * message would be pushed into a mapping the receiver has not opened. */
-    return rv_barrier(world);
+    rc = rv_barrier(world);
+    if (rc != RAD_OK) return rc;
+
+    /* fn4 SDMA-AR: the copy-engine context, collective (every rank's conditions are the same: the environment, the world,
+     * the dtype and the bound). A failure leaves every rank without one; the CU forms then serve. */
+    if (sdma_declared() && world == 4 && !host && dtype_code == 0 && max_numel >= sdma_min() &&
+        max_numel * in->esize <= sdma_cap_bytes() && max_numel % 8 == 0) {
+        const char* ee = std::getenv("R4D_SDMA_ENGINE");
+        const int engine = ee && *ee ? std::atoi(ee) : 1;   /* the core's DMA lane has engine 0 */
+        char why[256] = { 0 };
+        in->sdma = r4d_sdma_ar_create(world, rank, dev, engine, max_numel, 1, why, (int)sizeof why);
+        if (rank == 0)
+            std::fprintf(stderr, in->sdma ? "[r4d] fn4 SDMA-AR: copy-engine context (engine %d) for messages of %lld to "
+                                            "%lld elements%s\n"
+                                          : "[r4d] fn4 SDMA-AR: no copy-engine context (engine %d, %lld..%lld elements): "
+                                            "%s; the CU forms serve\n",
+                         engine, sdma_min(), max_numel, in->sdma ? "" : why);
+    }
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ one world, shared
@@ -494,6 +591,7 @@ void release(ArInst* in) {
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
     r4d_ar_ipc_free(in->my_stage);
+    r4d_sdma_ar_destroy(in->sdma);
     delete in;
 }
 
@@ -1001,8 +1099,85 @@ static long ar_xpush_form(long numel) {
     return (long)R4D_AR8_FORM_XPUSH;
 }
 int r4d_ar_xpush_get() { return ar_xpush_on(); }
-void r4d_ar_xpush_set(int v) { g_ar_xpush.store(v == 1 ? 1 : 0, std::memory_order_relaxed); }
+/* qfn-on-ds: one setter for both lines' switch handlers (libr4d's rad_fn4_switch, ds41 and fn4 names): 1 applied, -1 a value
+ * other than 0 / 1 */
+extern "C" int r4d_ar_xpush_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_ar_xpush.store(on, std::memory_order_relaxed);
+    return 1;
+}
+/* The Qwen line's form of the same rule (fn4 RSF, fn4-x3-sp3 808866c2 / 5f0352a8): 1 where the message is at least the
+ * bound and the switch is on, or the launch's `xpush` parameter where it names one (r4d_selftest --perfar4); else 0. */
+static int ar_xpush(const RadArgs* a, long long numel) {
+    if (numel < g_ar_xpush_min) return 0;
+    const int v = (int)r4d_geti_or(a, "xpush", ar_xpush_on());
+    if (v == 1) (void)ar_xpush_form((long)numel);   /* the process's first XPUSH line, as ar_xpush_form says it */
+    return v;
+}
 
+/* fn4 PFF (16.11.2026, qwen/prefill; RADIANCE_FN4_AR_FENCE at start, rad_fn4_switch("ar_fence"); 0 = today): the cache
+ * maintenance of a four-rank prefill-sized collective (the rule in r4d_rows.cpp r4d_cfg_ar: from kArFenceFromElems
+ * elements every thread's __threadfence_system() before the flag, drain 1, and every wave's system-scope invalidate after
+ * it, acq 0 -- per launch of 4 x 1024 threads 128 L2 writebacks and 256 L2 invalidates on the card while the compute lane
+ * runs beside it). The forms (drain, acq), for the four-rank exact two-shot (lane and wide) and SP's rows halves:
+ *   1  (3, 0)  every wave's store wait (s_wait_storecnt 0) and ONE system writeback a block (the publisher's release,
+ *              pub 1), the system invalidate a wave after the flag -- the form before the drain-1 rule (16.11. 23:40
+ *              qwen/prefill s1c: global_wb scope:SYS is the costly instruction, 2-14 us a wave beside compute, an
+ *              L2-resident kernel +60 % at 128 of them a ms; the invalidates cost nothing measurable);
+ *   2  (3, 4)  as 1 with every wave's device-scope invalidate;
+ *   3  (5, 4)  every wave's release half (global_wb SYS + store wait), device-scope invalidates;
+ *   4  (7, 4)  SP's raw rows: the pushes as system-scope stores, every wave's store wait, device-scope invalidates
+ *              (other kernels: form 3);
+ *   5  (7, 3)  as 4 with form 2's acquire (other kernels: form 2).
+ * The bytes each launch moves and folds are the same in every form; what changes is when the flag may go out and what an
+ * acquire drops. A launch parameter `fence` overrides it (r4d_selftest's stress / contention arms). Only messages that
+ * the drain-1 rule caught (drain 1 at >= 131072 elements) move. -1 until the environment is read. */
+static std::atomic<int> g_ar_fence{-1};
+static int ar_fence(const RadArgs* a) {
+    int v = g_ar_fence.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_FENCE");
+        int on = (e && *e) ? std::atoi(e) : 0;
+        if (on < 0 || on > 7) on = 0;
+        int want = -1;
+        g_ar_fence.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_ar_fence.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "fence", v);
+}
+static void ar_fence_apply(const RadArgs* a, ArCall* c, bool sys_push) {
+    /* prefill messages only: from 1048576 elements (XPUSH's gate: above every decode / verify height -- Qwen's c32 verify
+     * is 128 x 2560 = 327680, which the drain-1 rule also catches; d1 16.11.: fence 1 there +0.2..0.3 % a c32 step) */
+    if (c->drain != 1 || c->numel < 1048576) return;
+    switch (ar_fence(a)) {
+        case 1: c->drain = 3; break;
+        case 2: c->drain = 3; c->acq = 4; break;
+        case 3: c->drain = 5; c->acq = 4; break;
+        case 4: c->drain = sys_push ? 7 : 5; c->acq = 4; break;
+        case 5: c->drain = sys_push ? 7 : 5; c->acq = 3; break;
+        case 6: c->drain = 3; c->acq = 0 | 8; break;   /* fn4 PF prio: form 1 + the waves at s_setprio 3 */
+        case 7: c->drain = 3; c->acq = 4 | 8; break;   /* form 2 + s_setprio 3 */
+        default: break;
+    }
+}
+extern "C" int r4d_ar_fence_set(int v) {
+    if (v < 0 || v > 7) return -1;
+    g_ar_fence.store(v, std::memory_order_relaxed);
+    return 1;
+}
+
+/* r4d_selftest --sdmaeng4: whether an instance got a copy-engine context at build. */
+extern "C" int r4d_ar_inst_sdma(const void* inst) { return inst && ((const ArInst*)inst)->sdma ? 1 : 0; }
+
+/* fn4 SDMA-AR: whether this launch takes the copy-engine path (see g_ar_sdma): a context, the switch (or the launch's
+ * `sdma`), a prefill-sized message at `overlap` 1, and a tape that may be refused. The same answer on every rank. */
+static bool sdma_route(const RadArgs* a, const ArInst* in, long long numel) {
+    if (!in->sdma || in->world != 4 || in->dtype != 0 || in->host) return false;
+    if (numel < sdma_min() || numel > in->max_numel) return false;
+    if (r4d_geti_or(a, "overlap", 0) != 1) return false;
+    if (r4d_geti_or(a, "sdma", ar_sdma_switch()) <= 0) return false;
+    return sdma_tape_ok() != 0;
+}
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0);
@@ -1032,7 +1207,8 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                        c.inp, c.out, c.numel, in->dtype, in->rank,
                                        (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
                                        c.pub, early, early ? in->gate_ctr : 0L,
-                                       ar_chain(a, c.numel), ar_xpush_form(c.numel)));
+                                       ar_chain(a, c.numel), ar_xpush(a, c.numel) ? (long)R4D_AR8_FORM_XPUSH : 0L,
+                                       r4d_geti_or(a, "timeline", 0)));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
     /* The wide release, the two-rank family's rule: over P2P the kernel ends the engine's hold
@@ -1145,6 +1321,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     int rc = ar_setup(a, &c, 1);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
+    ar_fence_apply(a, &c, false);   /* fn4 PFF */
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
     /* The message must shard evenly in whole 16-byte words and 2*shard must fit the slot. */
     const long words16 = c.numel * c.in->esize / 16;
@@ -1158,6 +1335,14 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
      * beside them. `coded` 0, a launch parameter no declaration carries, keeps the plain wire:
      * r4d_selftest's plain arm. */
     const bool lane = r4d_geti_or(a, "overlap", 0) == 1;
+    /* fn4 SDMA-AR: a prefill piece's lane all-reduce on the copy engines (the even shard table, the same fold); the
+     * engine ends the link hold behind the launch (RAD_OK). */
+    if (lane && sdma_route(a, in, c.numel)) {
+        const int src = r4d_sdma_ar_launch_tab(in->sdma, (const void*)c.inp, (void*)c.out, c.numel, nullptr, 0,
+                                               (hipStream_t)s);
+        if (src != RAD_OK) return src;
+        return RAD_OK;
+    }
     if (lane && r4d_geti_or(a, "coded", 1) != 0 &&
         r4d_ar_twoshot_coded_ok(c.numel, in->dtype, 4, in->slot16)) {
         const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1167,7 +1352,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                              in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                              c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s,
                                              4, 1024, c.drain, c.acq, c.pub, early,
-                                             early ? in->gate_ctr : 0L, ar_chain(a, c.numel)));
+                                             early ? in->gate_ctr : 0L, ar_chain(a, c.numel),
+                                             ar_xpush(a, c.numel) ? 1L : 0L));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
     /* Lever ARC (ds41-int10, fn4 ds41_arcoded, r4d_ar_arc.h): at overlap 0, a launch of at least ds41_arcoded rows takes
@@ -1214,7 +1400,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
                                    c.pub, early, early ? in->gate_ctr : 0L,
-                                   ar_chain(a, c.numel), ar_xpush_form(c.numel)));
+                                   ar_chain(a, c.numel), ar_xpush(a, c.numel) ? (long)R4D_AR8_FORM_XPUSH : 0L,
+                                   r4d_geti_or(a, "timeline", 0)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -1301,6 +1488,51 @@ extern "C" int r4d_rad_ar_twoshot_3rank_ti8(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* fn4 ar_lanethreads (r4d_ar_lane_threads_set): the block width of the four-rank tiered-int8 two-shot
+ * at `overlap` 1 -- the pipelined prefill's all-reduce, beside the compute lane -- in place of the
+ * resolved tunable (4 x 1024 by default). The grid and the shards are unchanged, so every rank still
+ * pairs block b with block b, and each element's fold over the ranks is the same. -1 until read. */
+static std::atomic<int> g_ar_lane_threads{-1};
+static int ar_lane_threads() {
+    int v = g_ar_lane_threads.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_LANE_THREADS");
+        int t = (e && *e) ? std::atoi(e) : 0;
+        if (t != 256 && t != 512 && t != 1024) t = 0;
+        int want = -1;
+        g_ar_lane_threads.compare_exchange_strong(want, t, std::memory_order_relaxed);
+        v = g_ar_lane_threads.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_lane_threads_set(int threads) {
+    if (threads != 0 && threads != 256 && threads != 512 && threads != 1024) return -1;
+    g_ar_lane_threads.store(threads, std::memory_order_relaxed);
+    return 1;
+}
+/* fn4 ar_laneblocks (r4d_ar_lane_blocks_set): the same lane's block count (4 by default, the tunable's
+ * axis offers 4 / 8 / 16 / 24) -- 0 the resolved tunable, else 4..24 in steps of 4, still under the flag
+ * array's capacity. Every rank switches at the same step release, so block b still pairs with block b;
+ * the shards and each element's rank fold do not depend on the count. -1 until read. */
+static std::atomic<int> g_ar_lane_blocks{-1};
+static int ar_lane_blocks() {
+    int v = g_ar_lane_blocks.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_LANE_BLOCKS");
+        int b = (e && *e) ? std::atoi(e) : 0;
+        if (b < 0 || b > 24 || (b > 2 && (b % 4))) b = 0;   /* 13.11.: 1 / 2 too (227: more lane blocks cost prefill) */
+        int want = -1;
+        g_ar_lane_blocks.compare_exchange_strong(want, b, std::memory_order_relaxed);
+        v = g_ar_lane_blocks.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_lane_blocks_set(int blocks) {
+    if (blocks < 0 || blocks > 24 || (blocks > 2 && (blocks % 4))) return -1;   /* 1 / 2: below the tunable's 4 (227) */
+    g_ar_lane_blocks.store(blocks, std::memory_order_relaxed);
+    return 1;
+}
+
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 1);
@@ -1317,6 +1549,12 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     /* The slot holds two wire images of one shard, each 16-byte aligned. */
     const long wire = ((c.numel / c.in->world / group) * group_bytes + 15) / 16 * 16;
     if (2 * wire > c.in->slot_bytes) return RAD_E_SCRATCH;
+    if (r4d_geti_or(a, "overlap", 0) == 1) {
+        const int lt = ar_lane_threads();
+        if (lt > 0) c.nthreads = lt;
+        const int lb = ar_lane_blocks();
+        if (lb > 0) c.nblocks = lb < c.in->max_blocks ? lb : c.in->max_blocks;
+    }
     if (c.nthreads % 32) return RAD_E_INVAL;
 
     const ArInst* in = c.in;
@@ -1359,17 +1597,41 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
     const long q = (rows + 3) / 4;
     const long need = (op == 2 || op == 3) ? q * (long)row * c.in->esize : q * ((long)row / 32) * 38;
     if (need > c.in->slot_bytes) return RAD_E_SCRATCH;
+    /* qfn-on-ds: the Qwen line's fn4 PFF fence forms, its lane block shape and its SDMA route (all off unless switched) */
+    ar_fence_apply(a, &c, op == 2 || op == 3);   /* fn4 PFF: the raw halves push through r4d_ar_push16 */
+    if (r4d_geti_or(a, "overlap", 0) == 1) {
+        const int lt = ar_lane_threads();
+        if (lt > 0) c.nthreads = lt;
+        const int lb = ar_lane_blocks();
+        if (lb > 0) c.nblocks = lb < c.in->max_blocks ? lb : c.in->max_blocks;
+    }
     if (c.nthreads % 32) return RAD_E_INVAL;
     const ArInst* in = c.in;
+    /* fn4 SDMA-AR: the raw halves of a prefill piece on the copy engines, over the same whole-row shards (q = ceil(rows /
+     * 4) rows a rank); the reduce-scatter's fold is the raw kernel's (fp32 from 0, ascending rank, one rounding). */
+    if ((op == 2 || op == 3) && in->dtype == 0 && sdma_route(a, in, c.numel)) {
+        long long tab[5];
+        for (int sh = 0; sh <= 4; ++sh) {
+            const long lo = sh * q < rows ? sh * q : rows;
+            tab[sh] = (long long)lo * row * 2 / 16;
+        }
+        const int src = r4d_sdma_ar_launch_tab(in->sdma, (const void*)c.inp, (void*)c.out, c.numel, tab,
+                                               op == 3 ? 1 : 2, (hipStream_t)s);
+        if (src != RAD_OK) return src;
+        return RAD_OK;
+    }
     const long gate = link_gate(a), early = in->host ? 0L : gate;
-    const long xp = op == 3 && ar_xpush_form(c.numel) == (long)R4D_AR8_FORM_XPUSH ? 1L : 0L;
+    /* the raw reduce-scatter pushes interleaved over the peers where the all-reduce would (ar_xpush: fn4 ar_xpush 1 from
+     * RADIANCE_FN4_AR_XPUSH_MIN elements, or the launch's `xpush`) */
+    const long xp = op == 3 && ar_xpush(a, c.numel) ? 1L : 0L;
     R4D_TRY("sp_rows_4rank",
         r4d_ar_sp_rows_4rank(op, in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                              in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
                              in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
                              c.inp, rows, (long)row, in->dtype, in->rank,
                              (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                             c.pub, early, early ? in->gate_ctr : 0L, xp));
+                             c.pub, early, early ? in->gate_ctr : 0L, xp,
+                             (op == 2 || op == 3) ? (long)r4d_geti_or(a, "timeline", 0) : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 /* tp8 loop P20 round 2: the instance of a rows collective -- the all-reduce's key {rank, world, dtype, bound}, `bound`
@@ -1444,7 +1706,6 @@ extern "C" int r4d_rad_ar_ag_rows_4rank_f32(const RadArgs* a, RadStream s) {
                              c.pub, early, early ? in->gate_ctr : 0L, 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
-
 /* ------------------------------------------------------------------ the fused all-reduce + norm */
 
 enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16, AL_WPOST };
@@ -1960,7 +2221,7 @@ extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
     const long gate = link_gate(a), early = in->host ? 0L : gate;
 
     R4D_TRY("ar_gather_hc_write_4rank",
-        r4d_ar_gather_hc_write_4rank(
+        r4d_ar_gather_hc_write_4rank_c(
             in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
@@ -1970,7 +2231,8 @@ extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
             (long)g.ew_ld, (long)g.sh_ld, (long)g.sg_ld, (long)g.top_k, (long)g.sig,
             (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq,
             cfgv.pub, g.has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-            early ? in->gate_ctr : 0L));
+            early ? in->gate_ctr : 0L,
+            r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(g.M) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -2249,13 +2511,14 @@ extern "C" int r4d_rad_ar_hc_write_4rank(const RadArgs* a, RadStream s) {
     const long gate = link_gate(a), early = in->host ? 0L : gate;
 
     R4D_TRY("ar_hc_write_4rank",
-        r4d_ar_hc_write_4rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+        r4d_ar_hc_write_4rank_c(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                               in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
                               in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                               r4d_addr(w.y), r4d_addr(w.inj), r4d_addr(w.h),
                               (long)w.M, (long)w.n, (long)w.hc, (long)w.irow, (long)w.hrow,
                               (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
                               cfgv.drain, cfgv.acq, cfgv.pub, early,
-                              early ? in->gate_ctr : 0L));
+                              early ? in->gate_ctr : 0L,
+                              r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(w.M) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }

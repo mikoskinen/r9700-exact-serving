@@ -135,6 +135,8 @@ set(R4D_UNITS
   "r4d_ar_oneshot_2rank_wht6|"
   "r4d_ar_oneshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_exact|"
+  # fn4 SDMA-AR: the exact two-shot with the peer bytes on the copy engines (selftest entry points).
+  "r4d_ar_sdma|"
   "r4d_ar_twoshot_Nrank_ti8|"
   # tp8 loop P20 (from fn4 SP-hc): the two-shot's halves over whole-row shards (reduce_scatter_rows / all_gather_rows)
   "r4d_ar_sp_rows|"
@@ -206,6 +208,8 @@ set(R4D_UNITS
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
   "r4d_expert_scale_bf16|"
+  # fn4 BI's engine tracer (debug): bi_rowhash, a fingerprint of each row.
+  "r4d_fn4_bi|"
   # Runtime LoRA's two halves (lora_shrink, lora_expand), per-row adapter slot: scalar and tiled rows.
   "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"

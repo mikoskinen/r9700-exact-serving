@@ -84,15 +84,19 @@ inline int protect_of(const RadArgs* a, long long n_local, Protect* p) {
  * ascending i, as in the reference, whatever the ticket order. Every barrier orders LDS only, so
  * none waits on or invalidates the vector memory path. */
 constexpr uint32_t kScatterSmall = 1024;
+/* fn4 BI wide (14.11.2026): the small sort's LDS capacity, above kScatterSmall so the fused router can sort a decode step of
+ * up to 128 rows at top_k <= 16 (router_gemm_topk_scatter, kRgMaxM) in its one launch. The standalone forms keep their
+ * kScatterSmall crossover; the placement is the same stable order at any capacity. */
+constexpr uint32_t kScatterCap = 2048;
 
 /* The small sort's LDS (about 16 KiB), defined once for the standalone and fused kernels. NW is the
  * workgroup's wave count, which sizes the scan's exchange. */
 template <uint32_t NW>
 struct ScatterLds {
     static constexpr uint32_t kTiles = (kMaxExpert + NW * kSortWave - 1) / (NW * kSortWave);
-    int32_t e[kScatterSmall];                    /* the slot list: expert in the slice, or -1 */
-    int32_t tk[kScatterSmall];                   /* the slot's ticket inside its expert's run */
-    int32_t run[kScatterSmall];                  /* slots grouped by expert, tickets' order */
+    int32_t e[kScatterCap];                      /* the slot list: expert in the slice, or -1 */
+    int32_t tk[kScatterCap];                     /* the slot's ticket inside its expert's run */
+    int32_t run[kScatterCap];                    /* slots grouped by expert, tickets' order */
     int32_t cnt[kMaxExpert + 1];
     int32_t off[kMaxExpert + 1];
     int32_t wt[kTiles][NW];                      /* each wave's total, a slot per tile */

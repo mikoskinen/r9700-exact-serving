@@ -8,11 +8,13 @@ namespace rad {
 void kv_bind_views(const KVGroupPlan& p, KVPoolBinding* b) {
     if (!b || !p.paged()) return;
     b->base = p.base;
+    b->pool_base = p.base;
 
     b->ring.layer_stride = p.layer_stride();
     b->ring.bytes        = kv_ring_bytes(p, p.pool_blocks());
     b->ring.depth        = 0;
     b->ring.shape0       = p.pool_blocks();
+    b->ring.base_off     = 0;
 
     b->has_stage = p.depth == 1;
     if (b->has_stage) {
@@ -20,6 +22,9 @@ void kv_bind_views(const KVGroupPlan& p, KVPoolBinding* b) {
         b->stage.bytes        = b->stage.layer_stride;
         b->stage.depth        = 1;
         b->stage.shape0       = p.n_blocks;
+        /* fn4 kvs_apart: the stage past the ring (kv_pool_bytes funds ring + stage) */
+        b->stage_apart        = kvstream_stage_apart();
+        b->stage.base_off     = b->stage_apart ? b->ring.bytes : 0;
     }
 
     kv_binding_enter(*b, KVView::Ring);
@@ -39,6 +44,7 @@ KVView kv_pass_view(int phase, int64_t n_tok, int64_t n_seq, int n_spec) {
 
 void kv_binding_enter(KVPoolBinding& b, KVView view) {
     const KVViewState& v = (view == KVView::Stage && b.has_stage) ? b.stage : b.ring;
+    if (b.pool_base) b.base = static_cast<char*>(b.pool_base) + v.base_off;
     b.layer_stride = v.layer_stride;
     b.bytes        = v.bytes;
     b.depth        = v.depth;

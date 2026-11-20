@@ -244,6 +244,10 @@ int     r4d_rad_norm_add_norm_bf16      (const RadArgs*, RadStream);
 int     r4d_rad_norm_add_norm_route_bf16(const RadArgs*, RadStream);
 int     r4d_rad_join_add_scale_bf16     (const RadArgs*, RadStream);
 int     r4d_rad_expert_scale_bf16       (const RadArgs*, RadStream);
+/* fn4 BI's engine tracer: a 64-bit fingerprint a row (debug, RADIANCE_FN4_BITRACE; r4d_fn4_bi.hip) */
+int     r4d_rad_bi_rowhash              (const RadArgs*, RadStream);
+/* fn4 BI-dual: a step's row bands from its cu_seqlens (r4d_fn4_bi.hip) */
+int     r4d_rad_bi_band                 (const RadArgs*, RadStream);
 /* Runtime LoRA's two halves, each row's adapter named by its slot (r4d_lora_bf16.hip): the scalar
  * rows, and the tiled rows (a WMMA shrink over row tiles with a K split fixed by K and R, its
  * partials in the op's scratch, and an expand that stages B[s] in LDS for a tile of rows). */
@@ -514,6 +518,8 @@ int  r4d_rad_sp_rows_init(const RadParam*, int, int rank, int world, void** out)
 int  r4d_rad_ar_ag_rows_4rank     (const RadArgs*, RadStream);   /* tp8 loop P20 (fn4 SP-hc) */
 int  r4d_rad_sp_rows_f32_init(const RadParam*, int, int rank, int world, void** out);   /* tp8 loop P26b: f32 rows on the bf16 instance */
 int  r4d_rad_ar_ag_rows_4rank_f32 (const RadArgs*, RadStream);   /* tp8 loop P26b: raw all-gather of f32 rows */
+int  r4d_rad_hc_codes(const RadArgs*, RadStream);   /* fn4 SP-hc: hc_read's codes stage alone */
+int  r4d_shape_hc_codes(const RadParam*, int, int operand, RadOpdDesc*);
 /* The fused all-reduce + norm shares the IPC set, so it shares init/fini. */
 int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_ln_had_quant_i8(const RadArgs*, RadStream);
@@ -588,6 +594,7 @@ int     r4d_rad_router_topk_scatter(const RadArgs*, RadStream);
 int  r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int rank, int world, void** out);
 void r4d_rad_router_gemm_topk_scatter_fini(void*);
 int     r4d_rad_router_gemm_topk_scatter(const RadArgs*, RadStream);
+int     r4d_rad_router_gemm_topk_scatter_inv(const RadArgs*, RadStream);   /* fn4 */
 int64_t r4d_rad_moe_scatter_scratch(const RadArgs*);
 int     r4d_rad_moe_gemm_q         (const RadArgs*, RadStream);
 /* Scratch for the run map that aligns the prefill form. Zero in the decode band and for a shape
@@ -653,6 +660,9 @@ int64_t r4d_rad_gemm_fp8a8_m16_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
+/* fn4 BI wide: gemm_nt_q_dec, the narrow tile over decode heights above 64 (64-token groups on grid.y). */
+int r4d_rad_gemm_i8a8_m16_dec(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_i8a8_m16_dec_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_iqr(const RadArgs*, RadStream);
 /* `logits_gemm_vocab`: the head as width classes of the vocabulary's rows (r4d_logits_vocab.hip). */
@@ -693,6 +703,9 @@ int r4d_rad_qsa_block_key   (const RadArgs*, RadStream);
 int r4d_rad_qsa_score       (const RadArgs*, RadStream);
 int r4d_rad_qsa_select      (const RadArgs*, RadStream);
 int64_t r4d_rad_qsa_select_scratch(const RadArgs*);
+/* fn4 qsa_split (qwen/QSA-SPLIT.md): a rank's part of the selection, and the merge of the gathered parts */
+int r4d_rad_qsa_select_part (const RadArgs*, RadStream);
+int r4d_rad_qsa_select_merge(const RadArgs*, RadStream);
 int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
 int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
 int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
@@ -1052,6 +1065,7 @@ int r4d_shape_row_topk       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_gemm_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_router_gemm_topk_scatter_inv(const RadParam*, int, int, RadOpdDesc*);   /* fn4 */
 int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);
@@ -1082,6 +1096,8 @@ int r4d_shape_gram_accum         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_qsa_block_key      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_score          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_select_part    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_select_merge   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);

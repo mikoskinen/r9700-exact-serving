@@ -61,6 +61,7 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <atomic>   /* tp8 loop P20: sp_rows_exact's shared failure count */
+#include <tuple>
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -75,6 +76,8 @@ extern "C" {
 #include <map>
 #include <mutex>
 #include <thread>
+#include <chrono>
+#include <immintrin.h>
 #include <vector>
 
 /* posix_spawn's environment; declared here rather than relying on unistd.h's _GNU_SOURCE guard. */
@@ -155,6 +158,14 @@ struct Plugin {
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_hc_dec)(int) = nullptr;
+    void (*fuse_hc_down)(int) = nullptr;   /* optional (fn4 F1a): absent from a stock libr4d */
+    void (*norm_hc_wave)(int) = nullptr;   /* optional (fn4 F1n) */
+    void (*write_hc_vec)(int) = nullptr;   /* optional (fn4 hcw) */
+    void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
+    void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
+    void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
+    void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
+    void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -228,6 +239,14 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
+    pl->fuse_hc_down = (void (*)(int))dlsym(pl->h, "r4d_hc_read_fuse_down");
+    pl->norm_hc_wave = (void (*)(int))dlsym(pl->h, "r4d_hc_read_norm_wave");
+    pl->write_hc_vec = (void (*)(int))dlsym(pl->h, "r4d_hc_write_vec");
+    pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
+    pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
+    pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
+    pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
+    pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -1235,6 +1254,227 @@ static void attn_slice_case(const Plugin& pl, const char* name, int64_t head_dim
     ok((std::string(name) + ": a slice's rows equal the whole step's, T " + std::to_string((long long)nt) +
         " cut " + std::to_string((long long)cut) + " ctx " + std::to_string((long long)ctx)).c_str(),
        ndiff == 0, why);
+}
+
+/* fn4 att_bi 3 (13.11.2026): the dense decode row over k sequences in ONE launch with split_rows 1 (the split law
+ * reads one sequence, as each sequence's alone launch does) against k launches of one sequence each, byte for byte on
+ * every output element; and the same batch without the pin (the law at k sequences) as a control that must differ
+ * where its split count differs. Flash-Next's TP4 decode geometry: head 256, gqa 6, one KV head, 4-token pages, fp8
+ * cache, q_len 1 + n_spec = 4, max_ctx 262144 (the engine's declare), contexts `ctxs`. --case attn_bi_batch. */
+static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::vector<int32_t>& ctxs, int64_t qd,
+                               int64_t gqa_ = 6) {
+    if (!sel("attn_bi_batch")) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { skip(name, "row absent"); return; }
+    /* the batched run through the attn_paged_pin row (the arch's op_attn_bi) where it exists */
+    const RadKernelInfo* rp = find(pl, gqa_ == 12 ? "attn_decode_pin_h256_gqa12_fp8kv" : "attn_decode_pin_h256_gqa6_bs4_fp8kv");
+    if (!rp) rp = r;
+    const int64_t head_dim = 256, gqa = gqa_, kv_heads = 1, bs = 4, q_heads = kv_heads * gqa, k = (int64_t)ctxs.size();
+    int64_t maxb = 0, nblk = 0;
+    for (int32_t c : ctxs) { maxb = std::max<int64_t>(maxb, (c + bs - 1) / bs); nblk += (c + bs - 1) / bs; }
+    const int64_t rowq = q_heads * head_dim, qn = k * qd * rowq, kvn = nblk * kv_heads * bs * 2 * head_dim;
+    std::vector<uint16_t> hq((size_t)qn);
+    for (int64_t i = 0; i < qn; ++i) hq[(size_t)i] = st_rand_bf16((uint32_t)i * 3u + 1u);
+    std::vector<uint8_t> hkv((size_t)kvn);
+    for (int64_t i = 0; i < kvn; ++i) hkv[(size_t)i] = st_rand_e4m3((uint32_t)i + 5u);
+    /* each sequence its own pages, padded rows -1 past its own */
+    std::vector<int32_t> bt((size_t)(k * maxb), 0);
+    int32_t next = 0;
+    for (int64_t s = 0; s < k; ++s) {
+        const int64_t nb = (ctxs[(size_t)s] + bs - 1) / bs;
+        for (int64_t b2 = 0; b2 < maxb; ++b2) bt[(size_t)(s * maxb + b2)] = b2 < nb ? next++ : 0;
+    }
+    void* d_q = dalloc((size_t)qn * 2);
+    void* d_kv = dalloc((size_t)kvn);
+    void* d_o1 = dalloc((size_t)qn * 2);
+    void* d_ob = dalloc((size_t)qn * 2);
+    void* d_oc = dalloc((size_t)qn * 2);
+    if (!d_q || !d_kv || !d_o1 || !d_ob || !d_oc) { ok(name, false, "hipMalloc failed"); return; }
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_kv, hkv.data(), hkv.size(), hipMemcpyHostToDevice);
+    auto run = [&](int64_t s0, int64_t ns, void* out, long long pin) {
+        std::vector<int32_t> b(bt.begin() + s0 * maxb, bt.begin() + (s0 + ns) * maxb);
+        std::vector<int32_t> u(ctxs.begin() + s0, ctxs.begin() + s0 + ns);
+        std::vector<RadTensor> ts = {
+            T((char*)d_q + (size_t)(s0 * qd * rowq * 2), RAD_BF16, { ns * qd, q_heads, head_dim }),
+            T(d_kv, RAD_F8E4M3, { nblk, kv_heads, bs, 2 * head_dim }),
+            TI32({ ns, maxb }, b),
+            TI32({ ns }, u),
+            TF32({ ns, kv_heads }, 1.0f),
+            TF32({ ns, kv_heads }, 1.0f),
+            T(nullptr, RAD_I32, { ns + 1 }),
+            T((char*)out + (size_t)(s0 * qd * rowq * 2), RAD_BF16, { ns * qd, q_heads, head_dim }),
+        };
+        absent(ts[4]); absent(ts[5]);   /* as the arch issues it (RAD_NONE: no descales); [1, kv] read past seq 0 */
+        absent(ts[6]);
+        std::vector<RadParam> ps = {
+            PI("q_len", qd), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
+            PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"),
+            PI("max_ctx", 262144),
+        };
+        if (pin > 0) ps.push_back(PI("split_rows", pin));
+        run_case(pin > 0 ? rp : r, ts, ps);
+    };
+    st_memset(d_o1, 0, (size_t)qn * 2); st_memset(d_ob, 0, (size_t)qn * 2); st_memset(d_oc, 0, (size_t)qn * 2);
+    for (int64_t s = 0; s < k; ++s) run(s, 1, d_o1, 0);   /* alone: one sequence a launch, the law's own count (1) */
+    run(0, k, d_ob, 1);                                     /* att_bi 3: one launch, pinned to one sequence */
+    run(0, k, d_oc, 0);                                     /* control: one launch, the law at k sequences */
+    std::vector<uint16_t> o1((size_t)qn), ob((size_t)qn), oc((size_t)qn);
+    st_memcpy(o1.data(), d_o1, o1.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(ob.data(), d_ob, ob.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(oc.data(), d_oc, oc.size() * 2, hipMemcpyDeviceToHost);
+    int64_t nb = 0, nc = 0, fb = -1;
+    for (int64_t i = 0; i < qn; ++i) {
+        if (o1[(size_t)i] != ob[(size_t)i]) { if (fb < 0) fb = i / rowq; ++nb; }
+        nc += o1[(size_t)i] != oc[(size_t)i];
+    }
+    std::string cs;
+    for (int32_t c : ctxs) cs += (cs.empty() ? "" : ",") + std::to_string(c);
+    std::printf("attn_bi_batch %s k %lld q_len %lld ctx [%s]: pinned batch vs alone %lld of %lld elements differ%s; unpinned "
+                "control %lld differ\n", name, (long long)k, (long long)qd, cs.c_str(), (long long)nb, (long long)qn,
+                fb >= 0 ? fmt(" (first at row %lld)", (long long)fb).c_str() : "", (long long)nc);
+    ok(fmt("%s: att_bi 3 one pinned launch = alone launches, k %lld ctx [%s]", name, (long long)k, cs.c_str()).c_str(),
+       nb == 0, nb ? fmt("%lld elements differ, first at row %lld", (long long)nb, (long long)fb) : std::string());
+}
+
+/* fn4 long-prompt identity (15.11.2026, qwen/build2/LONGPROMPT.md): one Flash-Next TP4 decode step's attention for ONE
+ * sequence of 1 + n_spec = 4 rows ending at context `ctx` (head 256, gqa 6, one KV head, 4-token pages, fp8 cache, max_ctx
+ * 262144), in the launch forms the engine issues it:
+ *   A    alone, dense (rad_block_attn_gated_fp8.h, the step's last branch): the decode row over one sequence at its alone
+ *        table width (core/sched/batch.cpp: bound_bucket(ctx_len, 1024) + 4 rows + 2 draft windows, 256-block steps) with
+ *        cu_seqlens {0, 4};
+ *   B    beside a 3k-key sequence under att_bi 3 (op_attn_bi): attn_paged_pin, split_rows 1, the step's width (1024 blocks),
+ *        no cu; B16 the same launch over 16 copies of the sequence (a run of dense decode sequences);
+ *   C    alone, sparse (a step whose bound passes qsa_exact_to): the decode row over the 4 rows as 4 one-row sequences, each
+ *        its selection as qsa_select emits it below the budget (every complete page in order, the partial page last) and
+ *        its sequ ((nsel - 1) * 4 + pos % 4 + 1);
+ *   D    the loaded sparse form (att_bi 2 / 4, op_attn_gq_bi's law): attn_paged_pin over 16 copies of C's rows, split_rows 4.
+ * Prints per ctx the elements of A that differ in B, B16 and C (and C's rows that differ), and of C in D. A = B = B16 and
+ * C = D must hold; A vs C is the reading under test. --case attn_lp. */
+static int64_t lp_bound(int64_t v) {   /* core/sched/batch.cpp bound_bucket(v, 1024) */
+    if (v <= 0) return v;
+    int64_t q = 1024;
+    if (v > 64) {
+        const int lg = 63 - __builtin_clzll((unsigned long long)v);
+        if (((int64_t)1 << (lg - 5)) > q) q = (int64_t)1 << (lg - 5);
+    }
+    return (v + q - 1) / q * q;
+}
+static void attn_lp_case(const Plugin& pl, const std::vector<int32_t>& ctxs) {
+    if (!sel("attn_lp")) return;
+    const RadKernelInfo* r = find(pl, "attn_decode_h256_gqa6_bs4_fp8kv");
+    const RadKernelInfo* rp = find(pl, "attn_decode_pin_h256_gqa6_bs4_fp8kv");
+    if (!r || !rp) { skip("attn_lp", "row absent"); return; }
+    const int64_t hd = 256, gqa = 6, kvh = 1, bs = 4, qh = kvh * gqa, qd = 4, rowq = qh * hd, topk = 512, cop = 16;
+    int32_t cmax = 0;
+    for (int32_t c : ctxs) cmax = std::max(cmax, c);
+    const int64_t nblk = (cmax + bs - 1) / bs + 1, kvn = nblk * kvh * bs * 2 * hd, qn = qd * rowq;
+    std::vector<uint8_t> hkv((size_t)kvn);
+    for (int64_t i = 0; i < kvn; ++i) hkv[(size_t)i] = st_rand_e4m3((uint32_t)i + 11u);
+    std::vector<uint16_t> hq((size_t)(qn * cop));
+    for (int64_t i = 0; i < qn; ++i) hq[(size_t)i] = st_rand_bf16((uint32_t)i * 5u + 3u);
+    for (int64_t k = 1; k < cop; ++k) std::copy(hq.begin(), hq.begin() + qn, hq.begin() + k * qn);
+    void* d_kv = dalloc((size_t)kvn);
+    void* d_q = dalloc((size_t)(qn * cop) * 2);
+    void* d_oa = dalloc((size_t)qn * 2);
+    void* d_ob = dalloc((size_t)qn * 2);
+    void* d_oc = dalloc((size_t)qn * 2);
+    void* d_o16 = dalloc((size_t)(qn * cop) * 2);
+    void* d_od = dalloc((size_t)(qn * cop) * 2);
+    if (!d_kv || !d_q || !d_oa || !d_ob || !d_oc || !d_o16 || !d_od) { ok("attn_lp", false, "hipMalloc failed"); return; }
+    st_memcpy(d_kv, hkv.data(), hkv.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    auto base_ps = [&](int64_t q_len) {
+        return std::vector<RadParam>{ PI("q_len", q_len), PI("head_dim", hd), PI("gqa", gqa), PI("block_size", bs),
+                                      PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"),
+                                      PI("max_ctx", 262144) };
+    };
+    auto rd = [&](void* d, int64_t n) { std::vector<uint16_t> h((size_t)n); st_memcpy(h.data(), d, (size_t)n * 2, hipMemcpyDeviceToHost); return h; };
+    int bad = 0;
+    for (int32_t c : ctxs) {
+        const int64_t nb = (c + bs - 1) / bs;
+        const int64_t wa = ((lp_bound(c - qd) + qd + 8 + bs - 1) / bs + 255) / 256 * 256, wb = 1024;
+        auto table = [&](int64_t w) { std::vector<int32_t> t((size_t)w, 0); for (int64_t b = 0; b < nb && b < w; ++b) t[(size_t)b] = (int32_t)b; return t; };
+        const std::vector<int32_t> ta = table(wa), tb = table(wb);
+        st_memset(d_oa, 0, (size_t)qn * 2); st_memset(d_ob, 0, (size_t)qn * 2); st_memset(d_oc, 0, (size_t)qn * 2);
+        st_memset(d_o16, 0, (size_t)(qn * cop) * 2); st_memset(d_od, 0, (size_t)(qn * cop) * 2);
+        {   /* A */
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ 1, wa }, ta), TI32({ 1 }, { c }), TF32({ 1, kvh }, 1.0f), TF32({ 1, kvh }, 1.0f),
+                TI32({ 2 }, { 0, (int32_t)qd }), T(d_oa, RAD_BF16, { qd, qh, hd }) };
+            absent(ts[4]); absent(ts[5]);
+            std::vector<RadParam> ps = base_ps(qd);
+            run_case(r, ts, ps);
+        }
+        {   /* B, B16 */
+            for (int64_t k : { (int64_t)1, cop }) {
+                std::vector<int32_t> tk; for (int64_t s = 0; s < k; ++s) tk.insert(tk.end(), tb.begin(), tb.end());
+                std::vector<RadTensor> ts = {
+                    T(d_q, RAD_BF16, { k * qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                    TI32({ k, wb }, tk), TI32({ k }, rep_i32(k, c)), TF32({ k, kvh }, 1.0f), TF32({ k, kvh }, 1.0f),
+                    T(nullptr, RAD_I32, { k + 1 }), T(k == 1 ? d_ob : d_o16, RAD_BF16, { k * qd, qh, hd }) };
+                absent(ts[4]); absent(ts[5]); absent(ts[6]);
+                std::vector<RadParam> ps = base_ps(qd);
+                ps.push_back(PI("split_rows", 1));
+                run_case(rp, ts, ps);
+            }
+        }
+        /* C, D: each row its selection */
+        std::vector<int32_t> sel1, su1;
+        for (int64_t j = 0; j < qd; ++j) {
+            const int64_t p = c - qd + j, own = (p + 1) / bs;
+            std::vector<int32_t> row((size_t)(topk + 1), -1);
+            int64_t out = 0;
+            for (int64_t b = 0; b < own && out < topk; ++b) row[(size_t)out++] = (int32_t)b;
+            if ((p + 1) % bs != 0 && own < nb) row[(size_t)out++] = (int32_t)own;
+            sel1.insert(sel1.end(), row.begin(), row.end());
+            su1.push_back(out == 0 ? 0 : (int32_t)((out - 1) * bs + p % bs + 1));
+        }
+        {   /* C */
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ qd, topk + 1 }, sel1), TI32({ qd }, su1), TF32({ qd, kvh }, 1.0f), TF32({ qd, kvh }, 1.0f),
+                T(nullptr, RAD_I32, { qd + 1 }), T(d_oc, RAD_BF16, { qd, qh, hd }) };
+            absent(ts[4]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = base_ps(1);
+            run_case(r, ts, ps);
+        }
+        {   /* D */
+            std::vector<int32_t> sk, uk;
+            for (int64_t k = 0; k < cop; ++k) { sk.insert(sk.end(), sel1.begin(), sel1.end()); uk.insert(uk.end(), su1.begin(), su1.end()); }
+            const int64_t rows = cop * qd;
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { rows, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ rows, topk + 1 }, sk), TI32({ rows }, uk), TF32({ rows, kvh }, 1.0f), TF32({ rows, kvh }, 1.0f),
+                T(nullptr, RAD_I32, { rows + 1 }), T(d_od, RAD_BF16, { rows, qh, hd }) };
+            absent(ts[4]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = base_ps(1);
+            ps.push_back(PI("split_rows", qd));
+            run_case(rp, ts, ps);
+        }
+        const std::vector<uint16_t> oa = rd(d_oa, qn), ob = rd(d_ob, qn), oc = rd(d_oc, qn), o16 = rd(d_o16, qn * cop),
+                                    od = rd(d_od, qn * cop);
+        int64_t nab = 0, na16 = 0, nac = 0, ncd = 0;
+        std::string rows_ac;
+        for (int64_t i = 0; i < qn; ++i) { nab += oa[(size_t)i] != ob[(size_t)i]; nac += oa[(size_t)i] != oc[(size_t)i]; }
+        for (int64_t k = 0; k < cop; ++k)
+            for (int64_t i = 0; i < qn; ++i) {
+                na16 += oa[(size_t)i] != o16[(size_t)(k * qn + i)];
+                ncd += oc[(size_t)i] != od[(size_t)(k * qn + i)];
+            }
+        for (int64_t j = 0; j < qd; ++j) {
+            int64_t d = 0;
+            for (int64_t i = j * rowq; i < (j + 1) * rowq; ++i) d += oa[(size_t)i] != oc[(size_t)i];
+            rows_ac += fmt(" %lld:%lld keys %s", (long long)j, (long long)(c - qd + j + 1), d ? "DIFF" : "same");
+        }
+        std::printf("ATTNLP ctx %d (alone width %lld blocks, loaded 1024): A vs B %lld, A vs B16 %lld, A vs C %lld of %lld "
+                    "elements differ [rows%s]; C vs D %lld of %lld\n", c, (long long)wa, (long long)nab, (long long)na16,
+                    (long long)nac, (long long)qn, rows_ac.c_str(), (long long)ncd, (long long)(qn * cop));
+        if (nab || na16 || ncd) ++bad;
+    }
+    ok("attn_lp: the dense alone launch = the pinned dense launch (B, B16); the sparse alone launch = the pinned sparse launch (D)",
+       bad == 0, bad ? fmt("%d contexts differ", bad) : std::string());
 }
 
 /* A token's bytes in a (block, head) page of an 8-bit cache: kvq 0 fp8 (K then V), 1 fp8_v4, 2
@@ -4205,8 +4445,12 @@ static void topk_scatter_at(const RadKernelInfo* rf, const RadKernelInfo* rt,
  * self-resetting counter, owned by the instance the row's init creates, which all launches here
  * share while the grid changes between them. A launch with no instance is refused. */
 static void router_gemm_fused_case(const Plugin& pl) {
-    if (!sel("router_gemm_topk_scatter_bf16")) return;
+    if (!sel("router_gemm_topk_scatter_bf16") && !sel("router_gemm_topk_scatter_inv_bf16")) return;
     const RadKernelInfo* rg  = find(pl, "router_gemm_topk_scatter_bf16");
+    /* fn4 F2a, optional: the same op writing the inverse slot table as well. Each shape's two
+     * launches are followed by two of it, every output against the unfused launches and the
+     * inverse against the table built from their `sorted_tok` (as moefuse_gather checks it). */
+    const RadKernelInfo* rgi = find(pl, "router_gemm_topk_scatter_inv_bf16");
     const RadKernelInfo* m16 = find(pl, "gemm_bf16_nt_m16");
     const RadKernelInfo* m64 = find(pl, "gemm_bf16_nt_m64");
     const RadKernelInfo* rf  = find(pl, "router_topk_scatter_bf16");
@@ -4243,7 +4487,9 @@ static void router_gemm_fused_case(const Plugin& pl) {
     void* d_so[2] = { dalloc((size_t)maxNS * 4), dalloc((size_t)maxNS * 4) };
     void* d_of[2] = { dalloc((size_t)(maxNe + 1) * 4), dalloc((size_t)(maxNe + 1) * 4) };
     void* d_cn[2] = { dalloc((size_t)maxNe * 4), dalloc((size_t)maxNe * 4) };
-    if (!d_a || !d_w || !d_wg || !d_lg[0] || !d_lg[1] || !d_g[0] || !d_g[1] || !d_id[0] ||
+    void* d_inv = dalloc((size_t)(maxNS + 16) * 4);
+    if (!d_inv ||
+        !d_a || !d_w || !d_wg || !d_lg[0] || !d_lg[1] || !d_g[0] || !d_g[1] || !d_id[0] ||
         !d_id[1] || !d_ew[0] || !d_ew[1] || !d_so[0] || !d_so[1] || !d_of[0] || !d_of[1] ||
         !d_cn[0] || !d_cn[1]) {
         ok("router_gemm_topk_scatter", false, "hipMalloc failed");
@@ -4367,6 +4613,68 @@ static void router_gemm_fused_case(const Plugin& pl) {
                 same("sorted_tok", d_so[0], d_so[1], (size_t)NS * 4);
                 same("expert_offset", d_of[0], d_of[1], (size_t)(c.nl + 1) * 4);
                 same("expert_count", d_cn[0], d_cn[1], (size_t)c.nl * 4);
+            }
+
+            /* ---- fn4 F2a: the _inv op, twice, on the same instance */
+            for (int rep = 0; rep < 2 && rgi; ++rep) {
+                st_memset(d_lg[1], 0xFF, (size_t)maxM * maxNe * 2);
+                st_memset(d_g[1], 0xFF, (size_t)maxM * 2);
+                st_memset(d_id[1], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_ew[1], 0, (size_t)maxNS * 2);
+                st_memset(d_so[1], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_of[1], 0xFF, (size_t)(maxNe + 1) * 4);
+                st_memset(d_cn[1], 0xFF, (size_t)maxNe * 4);
+                st_memset(d_inv, 0xa5, (size_t)(maxNS + 16) * 4);
+                std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, c.K }),
+                                              T(d_w, RAD_BF16, { c.ne, c.K }),
+                                              T(d_wg, RAD_BF16, { 1, c.K }),
+                                              T(d_lg[1], RAD_BF16, { M, c.ne }),
+                                              T(d_id[1], RAD_I32, { M, c.k }),
+                                              T(d_ew[1], RAD_BF16, { M, c.k }),
+                                              T(d_so[1], RAD_I32, { NS }),
+                                              T(d_of[1], RAD_I32, { c.nl + 1 }),
+                                              T(d_cn[1], RAD_I32, { c.nl }),
+                                              T(d_g[1], RAD_BF16, { M, 1 }),
+                                              T(d_inv, RAD_I32, { NS }) };
+                if (!c.gate) { absent(ts[2]); absent(ts[9]); }
+                std::vector<RadParam> ps = { PI("M", M), PI("K", c.K), PI("n_expert", c.ne),
+                                             PI("n_local", c.nl), PI("top_k", c.k), PI("norm", 1),
+                                             PS("dtype", "bf16"), PI("expert_base", c.base) };
+                if (c.prot) ps.push_back(PS("protect", c.prot));
+                run_case(rgi, ts, ps, RAD_OK, inst);
+
+                const std::string tag = at + (rep ? ", second launch" : "");
+                auto same = [&](const char* what, void* a, void* b, size_t bytes) {
+                    std::vector<uint8_t> x(bytes), y(bytes);
+                    st_memcpy(x.data(), a, bytes, hipMemcpyDeviceToHost);
+                    st_memcpy(y.data(), b, bytes, hipMemcpyDeviceToHost);
+                    int64_t n_off = 0;
+                    for (size_t i = 0; i < bytes; ++i) n_off += x[i] != y[i];
+                    ok((std::string("router_gemm_topk_scatter_inv ") + what +
+                        " is byte-identical to the unfused launches" + tag).c_str(),
+                       n_off == 0, n_off ? fmt("%lld byte(s) differ", (long long)n_off) : std::string());
+                };
+                same("logits", d_lg[0], d_lg[1], (size_t)M * c.ne * 2);
+                if (c.gate) same("shared gate", d_g[0], d_g[1], (size_t)M * 2);
+                same("expert_ids", d_id[0], d_id[1], (size_t)NS * 4);
+                same("expert_w", d_ew[0], d_ew[1], (size_t)NS * 2);
+                same("sorted_tok", d_so[0], d_so[1], (size_t)NS * 4);
+                same("expert_offset", d_of[0], d_of[1], (size_t)(c.nl + 1) * 4);
+                same("expert_count", d_cn[0], d_cn[1], (size_t)c.nl * 4);
+                std::vector<int32_t> srt((size_t)NS), inv((size_t)NS + 16), want((size_t)NS, -1);
+                st_memcpy(srt.data(), d_so[0], (size_t)NS * 4, hipMemcpyDeviceToHost);
+                st_memcpy(inv.data(), d_inv, ((size_t)NS + 16) * 4, hipMemcpyDeviceToHost);
+                for (int64_t p = 0; p < NS; ++p)
+                    if (srt[(size_t)p] >= 0) want[(size_t)srt[(size_t)p]] = (int32_t)p;
+                bool tail = true;
+                for (int i = 0; i < 16; ++i) tail = tail && inv[(size_t)NS + (size_t)i] == (int32_t)0xa5a5a5a5;
+                int64_t n_bad = 0;
+                for (int64_t i = 0; i < NS; ++i) n_bad += inv[(size_t)i] != want[(size_t)i];
+                ok(("router_gemm_topk_scatter_inv inverse is the table built from sorted_tok" + tag).c_str(),
+                   n_bad == 0 && tail,
+                   !tail ? std::string("wrote past the table")
+                         : n_bad ? fmt("%lld of %lld entries differ", (long long)n_bad, (long long)NS)
+                                 : std::string());
             }
         }
     }
@@ -24064,6 +24372,1321 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
                           out[0].fns.size(), out[1].fns.size()));
 }
 
+/* fn4 F1a: the split-K down product with its reduce folded in (r4d_hc_read_fuse_down(1)) against
+ * the pair, at Flash-Next's shape (n 2560, four streams, lowrank 320, inject gains, the fp8 twin
+ * and its rotated twin) on a real stream. Every output -- x, the inject gains, both code planes and
+ * their scales, and d in the scratch -- byte for byte, the folded form launched twice (its tile
+ * counters reset themselves). Where the tiled split runs (17 to 64 rows, and the decode tiles at
+ * 128 rows under prefill pin 1) the folded kernel must show in r4d_record_dispatches -- it goes
+ * through r4d_emit, the pair through hipLaunchKernelGGL, which the log does not see, so the folded
+ * run records one launch more -- and elsewhere the same count, so an ignored switch cannot pass. */
+/* fn4 hcw: hc_write's eight-wide form (hc_write_vec_kernel) against the plain one, byte for byte on
+ * every stream, with the dispatched kernel checked: the eight-wide form where n, the pitches and the
+ * bases are 16-byte aligned and the switch (or its row floor) takes the step, the plain one where
+ * not. `hoff` shifts h's base by that many elements (1 = misaligned, the plain form must run). */
+static void hc_write_vec_case(const Plugin& pl, int64_t M, int64_t n, int64_t hoff) {
+    const int64_t hc = 4, HN = hc * n;
+    const bool aligned = (n % 8) == 0 && hoff % 8 == 0;
+    const std::string nm = fmt("hc_write at M=%lld, n=%lld%s: the eight-wide form (fn4 hcw) "
+                               "byte-identical to the plain form", (long long)M, (long long)n,
+                               hoff ? ", h misaligned" : "");
+    const RadKernelInfo* r = find(pl, "hc_write_bf16");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.write_hc_vec || !pl.record) { skip(nm.c_str(), "no r4d_hc_write_vec"); return; }
+    uint64_t rs = 0xD1B54A32D192ED03ull ^ (uint64_t)(M * 131 + n);
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> h0((size_t)(M * HN)), y((size_t)(M * n)), inj((size_t)(M * hc));
+    for (auto& v : h0) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 997.0f);
+    for (auto& v : y) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 3001.0f);
+    for (auto& v : inj) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 313.0f);
+    const size_t hb = h0.size() * 2;
+    void* d_hall = dalloc(hb + 64);
+    void* d_y = dalloc(y.size() * 2);
+    void* d_i = dalloc(inj.size() * 2);
+    if (!d_hall || !d_y || !d_i) { ok(nm.c_str(), false, "hipMalloc failed"); return; }
+    void* d_h = (void*)((char*)d_hall + hoff * 2);
+    st_memcpy(d_y, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_i, inj.data(), inj.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    std::vector<RadTensor> ts = { T(d_y, RAD_BF16, { M, n }), T(d_i, RAD_BF16, { M, hc }),
+                                  T(d_h, RAD_BF16, { M, HN }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    /* plain; eight-wide twice; from M rows (taken); from M + 1 rows (not taken) */
+    constexpr int kRuns = 5;
+    static const char* const kRun[kRuns] = { "plain", "eight-wide", "eight-wide again",
+                                             "floor M", "floor M+1" };
+    const int vset[kRuns] = { 0, 1, 1, (int)(M >= 2 ? M : 1), (int)(M + 1 >= 2 ? M + 1 : 2) };
+    const bool vec_want[kRuns] = { false, aligned, aligned, aligned, false };
+    std::vector<uint8_t> out[kRuns];
+    const void* first[kRuns] = {};
+    int nd[kRuns] = {};
+    for (int run = 0; run < kRuns; ++run) {
+        pl.write_hc_vec(vset[run]);
+        st_memcpy(d_h, h0.data(), hb, hipMemcpyHostToDevice);
+        const void* fns[8] = {};
+        pl.record(fns, 8);
+        const int rc = r->launch(&a, (RadStream)hs);
+        nd[run] = pl.record(nullptr, 0);
+        first[run] = fns[0];
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("run %s rc=%d", kRun[run], rc));
+            pl.write_hc_vec(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        out[run].resize(hb);
+        st_memcpy(out[run].data(), d_h, hb, hipMemcpyDeviceToHost);
+    }
+    pl.write_hc_vec(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    for (int run = 1; run < kRuns; ++run) {
+        if (out[0] != out[run]) bad += std::string(" ") + kRun[run];
+        const bool is_vec = first[run] != first[0];
+        if (nd[run] != 1 || is_vec != vec_want[run])
+            bad += fmt(" [%s: %d launch(es), %s form]", kRun[run], nd[run], is_vec ? "other" : "plain");
+    }
+    int64_t changed = 0;
+    for (size_t i = 0; i < hb; ++i) changed += out[0][i] != ((const uint8_t*)h0.data())[i];
+    ok(nm.c_str(), bad.empty() && nd[0] == 1 && changed > (int64_t)hb / 4,
+       !bad.empty() ? "differs or wrong form:" + bad
+                    : fmt("%lld of %zu bytes written, %s", (long long)changed, hb,
+                          aligned ? "eight-wide form taken" : "plain form kept"));
+}
+
+/* --perfhcw M [iters]: hc_write at Qwen3.8-Flash-Next's shape (n 2560, hc 4) and M rows, the plain form
+ * and the eight-wide one (fn4 hcw), each timed as one op (warm, or cold under --cold), with the bytes
+ * it moves (y read, every stream of h read and written) as GB/s; the forms' bytes compared. */
+static void hc_write_perf(const Plugin& pl, int64_t M, int iters) {
+    const RadKernelInfo* r = find(pl, "hc_write_bf16");
+    if (!r || !pl.write_hc_vec) { skip("hc_write timing", !r ? "row absent" : "no r4d_hc_write_vec"); return; }
+    const int64_t n = 2560, hc = 4, HN = hc * n;
+    uint64_t rs = 0x2545F4914F6CDD1Dull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> h0((size_t)(M * HN)), y((size_t)(M * n)), inj((size_t)(M * hc));
+    for (auto& v : h0) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 997.0f);
+    for (auto& v : y) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 3001.0f);
+    for (auto& v : inj) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 313000.0f);
+    const size_t hb = h0.size() * 2;
+    void* d_h = dalloc(hb);
+    void* d_y = dalloc(y.size() * 2);
+    void* d_i = dalloc(inj.size() * 2);
+    if (!d_h || !d_y || !d_i) { ok("hc_write timing", false, "hipMalloc failed"); return; }
+    st_memcpy(d_y, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_i, inj.data(), inj.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok("hc_write timing", false, "stream"); return; }
+    std::vector<RadTensor> ts = { T(d_y, RAD_BF16, { M, n }), T(d_i, RAD_BF16, { M, hc }),
+                                  T(d_h, RAD_BF16, { M, HN }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const double bytes = (double)M * (double)(n * 2 + 2 * HN * 2);
+    std::vector<uint8_t> once[2];
+    double us[2] = { 0.0, 0.0 };
+    for (int form = 0; form < 2; ++form) {
+        pl.write_hc_vec(form);
+        st_memcpy(d_h, h0.data(), hb, hipMemcpyHostToDevice);
+        if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok("hc_write timing", false, fmt("form %d launch failed", form));
+            pl.write_hc_vec(0); (void)hipStreamDestroy(hs); return;
+        }
+        once[form].resize(hb);
+        st_memcpy(once[form].data(), d_h, hb, hipMemcpyDeviceToHost);
+        us[form] = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+    }
+    pl.write_hc_vec(0);
+    (void)hipStreamDestroy(hs);
+    std::printf("hc_write n=2560 hc=4 M=%lld (%.2f MB a call)%s: plain %.2f us (%.0f GB/s), eight-wide %.2f us "
+                "(%.0f GB/s), %.3fx\n", (long long)M, bytes * 1e-6, g_cold > 0 ? " cold" : " warm",
+                us[0], bytes / us[0] * 1e-3, us[1], bytes / us[1] * 1e-3, us[0] / us[1]);
+    ok(fmt("hc_write at M=%lld: the eight-wide form's bytes equal the plain form's (one call)", (long long)M).c_str(),
+       once[0] == once[1]);
+}
+
+/* fn4 hc_readv: the faster hc_read forms against the stock ones, byte for byte on every output, with
+ * F1n's norm wave on (the main line) and off; the dispatched kernels must change where the form
+ * serves (17-64 rows: the pipelined down product; from 512 rows: PF2's 32-row down product) and
+ * nowhere else, with the same launch count. */
+static void hc_readv_case(const Plugin& pl, int64_t M, bool i8) {
+    const bool here = (M > 16 && M <= 64) || M >= 512;
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes: the hc_readv forms (fn4) byte-identical "
+                               "to the stock forms", (long long)M, i8 ? "int8" : "E4M3");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    /* hc_mix_ctr's four slots a device run out over the cases' streams; without them the fused
+     * up-mix and decode forms G / S never run here (both arms would take the unfused pair). */
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; std::vector<const void*> fns; };
+    constexpr int kRuns = 5;
+    Out out[kRuns];
+    static const int kV[kRuns]    = { 0, 7, 7, 0, 7 };
+    static const int kWave[kRuns] = { 1, 1, 1, 0, 0 };
+    for (int run = 0; run < kRuns; ++run) {
+        pl.readv_hc(kV[run]);
+        pl.norm_hc_wave(kWave[run]);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
+        const void* fns[32] = {};
+        pl.record(fns, 32);
+        const int rc = r->launch(&a, (RadStream)hs);
+        out[run].nd = pl.record(nullptr, 0);
+        out[run].fns.assign(fns, fns + (out[run].nd < 32 ? out[run].nd : 32));
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("run %d rc=%d", run, rc));
+            pl.readv_hc(0); pl.norm_hc_wave(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[run].x, d_x, xb); get(out[run].inj, d_inj, ib); get(out[run].q, d_q, qb);
+        get(out[run].qs, d_qs, sb); get(out[run].rq, d_rq, qb); get(out[run].rs, d_rs, sb);
+        if (a.scratch && (size_t)a.scratch_bytes >= db) get(out[run].d, a.scratch, db);
+    }
+    pl.readv_hc(0);
+    pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    auto cmp = [&](int ra, int rb, const char* at) {
+        if (out[ra].x != out[rb].x)     bad += std::string(" x") + at;
+        if (out[ra].inj != out[rb].inj) bad += std::string(" inj") + at;
+        if (out[ra].q != out[rb].q)     bad += std::string(" q") + at;
+        if (out[ra].qs != out[rb].qs)   bad += std::string(" qs") + at;
+        if (out[ra].rq != out[rb].rq)   bad += std::string(" rq") + at;
+        if (out[ra].rs != out[rb].rs)   bad += std::string(" rs") + at;
+        if (out[ra].d != out[rb].d)     bad += std::string(" d") + at;
+    };
+    cmp(0, 1, " (F1n, hc_readv 7)"); cmp(0, 2, " (F1n, hc_readv 7 again)"); cmp(3, 4, " (hc_readv 7, F1n off)");
+    /* The forms: hc_readv may only swap kernels, never add or drop a launch. The dispatch log
+     * holds the launches made through r4d_emit (the new forms always are). */
+    const bool same_n = out[1].nd == out[0].nd && out[2].nd == out[0].nd && out[4].nd == out[3].nd;
+    const bool swapped = out[1].fns != out[0].fns;
+    int64_t nz = 0;
+    for (uint8_t v : out[0].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && swapped == here && nz > (int64_t)qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : swapped != here ? fmt("the dispatched kernels %s (want %s); %d / %d launches logged",
+                               swapped ? "changed" : "did not change", here ? "changed" : "unchanged",
+                               out[0].nd, out[1].nd)
+                         : fmt("%d / %d launches logged%s", out[0].nd, out[1].nd, same_n ? "" : " (counts differ)"));
+}
+
+/* --perfhcv M [iters]: hc_read_e4m3 at M rows with F1n, the stock forms against hc_readv 3, each
+ * timed as one op (cold under --cold), and from 512 rows PF2's launches one stage at a time
+ * (cumulative masks of r4d_hc_pf2_stages, so a stage's time is the difference). */
+/* fn4 (12.11.2026): R4D_SELFTEST_READV_OR bits OR-ed into every hc_readv value --perfhcv sets (64: hc_bi 5's G16) */
+static int st_readv_or() { const char* e = std::getenv("R4D_SELFTEST_READV_OR"); return e && *e ? std::atoi(e) : 0; }
+static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 timing at M=%lld", (long long)M);
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.readv_hc || !pl.norm_hc_wave) { skip(nm.c_str(), "row absent or no r4d_hc_readv"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    /* fn4 (12.11.2026): R4D_SELFTEST_KC_ROWS pins the read's K split to that height (hc_read kc_rows, SP-hc's quarter read) */
+    if (const char* e = std::getenv("R4D_SELFTEST_KC_ROWS"); e && std::atoll(e) > 0) ps.push_back(PI("kc_rows", std::atoll(e)));
+    /* fn4 (12.11.2026): R4D_SELFTEST_BI_DEC=1 times hc_bi 5's one-launch decode read (bi_dec: form G in 8-row groups + B3) */
+    if (const char* e = std::getenv("R4D_SELFTEST_BI_DEC"); e && std::atoi(e) > 0) ps.push_back(PI("bi_dec", 1));
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    pl.norm_hc_wave(1);
+    /* fn4 (12.11.2026): under bi_dec, G16 (hc_readv bit 6) against 8-row form G on every output byte (x, inj, both codes) */
+    const int cmp_or = std::getenv("R4D_SELFTEST_CMP_OR") ? std::atoi(std::getenv("R4D_SELFTEST_CMP_OR")) : 64;
+    if ((std::getenv("R4D_SELFTEST_BI_DEC") && M > 8) || std::getenv("R4D_SELFTEST_CMP_OR")) {
+        auto grab = [&](int v, std::vector<uint8_t>& o) {
+            pl.readv_hc(v);
+            if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) return false;
+            o.clear();
+            for (auto [p, b] : { std::pair<void*, size_t>{ d_x, xb }, { d_inj, ib }, { d_q, qb }, { d_qs, sb }, { d_rq, qb }, { d_rs, sb } }) {
+                const size_t at = o.size();
+                o.resize(at + b);
+                st_memcpy(o.data() + at, p, b, hipMemcpyDeviceToHost);
+            }
+            return true;
+        };
+        std::vector<uint8_t> g8, g16;
+        const bool okl = grab(0, g8) && grab(cmp_or, g16);
+        size_t diff = 0;
+        if (okl) for (size_t i = 0; i < g8.size() && i < g16.size(); ++i) diff += g8[i] != g16[i];
+        std::printf("hc_read_e4m3 M=%lld: hc_readv %d vs 0 (bi_dec %s): %s\n", (long long)M, cmp_or,
+                    std::getenv("R4D_SELFTEST_BI_DEC") ? "on" : "off",
+                    !okl ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
+        ok((nm + fmt(" hc_readv %d = 0", cmp_or)).c_str(), okl && diff == 0);
+    }
+    /* fn4 (12.11.2026): under bi_dec, kernel A' alone (the stage mask's bit 1 + 0) against the whole read: A' and B3 apart */
+    if (std::getenv("R4D_SELFTEST_BI_DEC") && pl.pf2_stages_hc) {
+        pl.readv_hc(3 | st_readv_or());
+        pl.pf2_stages_hc(3);
+        const double ta = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+        pl.pf2_stages_hc(31);
+        const double tt = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+        std::printf("hc_read_e4m3 M=%lld bi_dec stages (hc_readv %d): A' %.2f us, B3 + rest %.2f us (total %.2f us)\n",
+                    (long long)M, 3 | st_readv_or(), ta, tt - ta, tt);
+    }
+    double us[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int v : { 0, 1, 2, 3, 7 }) {
+        pl.readv_hc(v | st_readv_or());
+        if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d launch failed", v)); pl.readv_hc(0); pl.norm_hc_wave(0); return;
+        }
+        us[v] = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+    }
+    std::printf("hc_read_e4m3 M=%lld %s%s (F1n): stock %.2f us, hc_readv 1 %.2f us (%.3fx), 2 %.2f us (%.3fx), "
+                "3 %.2f us (%.3fx), 7 %.2f us (%.3fx)\n", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm",
+                us[0], us[1], us[0] / us[1], us[2], us[0] / us[2], us[3], us[0] / us[3], us[7], us[0] / us[7]);
+    if (M >= 512 && pl.pf2_stages_hc) {
+        static const int kMask[5] = { 1, 3, 7, 15, 31 };
+        static const char* const kStage[5] = { "prologue", "down", "reduce", "up-mix", "codes" };
+        for (int v : { 0, 2, 7 }) {
+            pl.readv_hc(v | st_readv_or());
+            double t[5];
+            for (int k = 0; k < 5; ++k) {
+                pl.pf2_stages_hc(kMask[k]);
+                t[k] = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+            }
+            pl.pf2_stages_hc(31);
+            std::printf("  PF2 stages M=%lld hc_readv %d:", (long long)M, v);
+            for (int k = 0; k < 5; ++k) std::printf(" %s %.2f us%s", kStage[k], k ? t[k] - t[k - 1] : t[0], k < 4 ? "," : "");
+            std::printf(" (total %.2f us)\n", t[4]);
+        }
+    }
+    pl.readv_hc(0);
+    pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    ok(nm.c_str(), true);
+}
+
+/* fn4 SP-serial (14.11.2026, --spqcheck [mask]): Qwen3.8-Flash-Next's serial-step sequence-parallel read. A prefill segment of
+ * h rows read whole (hc_read_e4m3 as the trunk declares it: M band 2048, no pin) against its parts on their own row slices
+ * with kc_rows = 128 ceil(h / 128) (HyperConn::read_kt) -- the parts a rank's rows of a step of td decode rows + h (q =
+ * ceil((td + h) / 4) rows a rank, the decode rows first), at td 0 / 32 / 64 / 128; a partial part of <= 64 rows is not
+ * taken (the engine then keeps step_serial). Every output byte compared: x, inj, codes + scales, rotated codes + scales.
+ * Arms (mask, default 7): 1 the engine's switches (hc_readv 331, F1n, hc_upmix 5), 2 the same with the norm scales handed
+ * in (`ss`, hc_readv bit 3: the write's scales), 4 stock forms (hc_readv 0, F1n off). A control per arm: the parts at their
+ * own split (no pin) -- expected to differ wherever the part's row-tile count gives another split. */
+static void hc_spq_check(const Plugin& pl, int mask) {
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.readv_hc || !pl.norm_hc_wave || !pl.upmix_hc) { skip("SP-serial part reads", "row absent or no hc hooks"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp, MB = 2048;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x5DEECE66Dull;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(MB * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    std::vector<float> ssv((size_t)(MB * 8));
+    for (auto& v : ssv) v = 0.25f + (float)(rnd() % 1000) / 1000.0f;
+    const size_t xb = (size_t)(MB * n * 2), ib = (size_t)(MB * hc * 2), qb = (size_t)(MB * n), sb = (size_t)(MB * nkb * 4);
+    void* d_h = dalloc(hh.size() * 2);  void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());   void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2); void* d_ss = dalloc(ssv.size() * 4);
+    struct Out { void *x, *inj, *q, *qs, *rq, *rs; };
+    Out o[2];
+    for (Out& e : o) { e.x = dalloc(xb); e.inj = dalloc(ib); e.q = dalloc(qb); e.qs = dalloc(sb); e.rq = dalloc(qb); e.rs = dalloc(sb); }
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_ss || !o[0].x || !o[1].rs) { ok("SP-serial part reads", false, "hipMalloc failed"); return; }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_ss, ssv.data(), ssv.size() * 4, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok("SP-serial part reads", false, "stream"); return; }
+    /* scratch for the widest band any launch below declares */
+    void* scr = nullptr; int64_t scr_b = 0;
+    auto launch = [&](int which, int64_t r0, int64_t rows, int64_t band, int64_t kcr, bool ss, bool sync = true) {
+        auto off = [&](void* p, int64_t pitch_bytes) { return (void*)((char*)p + r0 * pitch_bytes); };
+        const Out& e = o[which];
+        std::vector<RadTensor> ts = {
+            T(off(d_h, HN * 2), RAD_BF16, { rows, HN }),  T(d_w, RAD_F32, { HN }),
+            T(d_dn, RAD_F8E4M3, { lr, HN }),               T(d_up, RAD_F8E4M3, { HN, lr }),
+            T(d_iw, RAD_BF16, { hc, HN }),                 T(off(e.x, n * 2), RAD_BF16, { rows, n }),
+            T(off(e.inj, hc * 2), RAD_BF16, { rows, hc }), T(off(e.q, n), RAD_I8, { rows, n }),
+            T(off(e.qs, nkb * 4), RAD_F32, { rows, nkb }), T(off(e.rq, n), RAD_F8E4M3, { rows, n }),
+            T(off(e.rs, nkb * 4), RAD_F32, { rows, nkb }),
+        };
+        if (ss) ts.push_back(T(off(d_ss, 32), RAD_F32, { rows, 8 }));
+        std::vector<RadParam> ps = {
+            PI("M", band), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+            PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+            PI("rotate", 1), PS("mix", "e4m3"),
+        };
+        if (kcr > 0) ps.push_back(PI("kc_rows", kcr));
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > scr_b) { scr = dalloc((size_t)need); scr_b = scr ? need : 0; }
+            a.scratch = scr; a.scratch_bytes = scr_b;
+        }
+        if (!sync) return r->launch(&a, (RadStream)hs) == RAD_OK;
+        return r->launch(&a, (RadStream)hs) == RAD_OK && st_stream_sync(hs) == hipSuccess;
+    };
+    auto diff_rows = [&](int64_t h) {
+        size_t d = 0;
+        for (auto [pa, pb, b] : { std::tuple<void*, void*, size_t>{ o[0].x, o[1].x, (size_t)(h * n * 2) },
+                                   { o[0].inj, o[1].inj, (size_t)(h * hc * 2) }, { o[0].q, o[1].q, (size_t)(h * n) },
+                                   { o[0].qs, o[1].qs, (size_t)(h * nkb * 4) }, { o[0].rq, o[1].rq, (size_t)(h * n) },
+                                   { o[0].rs, o[1].rs, (size_t)(h * nkb * 4) } }) {
+            std::vector<uint8_t> A(b), B(b);
+            st_memcpy(A.data(), pa, b, hipMemcpyDeviceToHost);
+            st_memcpy(B.data(), pb, b, hipMemcpyDeviceToHost);
+            for (size_t i = 0; i < b; ++i) d += A[i] != B[i];
+        }
+        return d;
+    };
+    static const int64_t kH[] = { 200, 257, 300, 383, 384, 385, 450, 511, 512, 513, 600, 640, 641, 700, 768, 769, 900, 1000, 1024,
+                                  1025, 1073, 1080, 1100, 1135, 1144, 1162, 1200, 1300, 1400, 1536, 1537, 1700, 1900, 1920, 1921,
+                                  2000, 2048 };
+    static const int64_t kTd[] = { 0, 32, 64, 128 };
+    for (int arm = 0; arm < 4; ++arm) {
+        if (!(mask & (arm == 3 ? 16 : (1 << arm)))) continue;
+        if (arm == 3 && !pl.pinpf2_hc) { skip("SP-serial part reads, arm 3", "no r4d_hc_read_pinpf2"); continue; }
+        const bool ss = arm == 1;
+        const int rv = arm == 2 ? 0 : (331 | (ss ? 8 : 0));
+        pl.readv_hc(rv);
+        pl.norm_hc_wave(arm == 2 ? 0 : 1);
+        pl.upmix_hc(arm == 2 ? 0 : 5);
+        if (pl.pinpf2_hc) pl.pinpf2_hc(arm == 3 ? 1 : 0);
+        int cases = 0, same = 0, ctl_cases = 0, ctl_diff = 0;
+        std::string bad;
+        for (int64_t h : kH) for (int64_t td : kTd) {
+            const int64_t T = td + h, q = (T + 3) / 4;
+            if (T > MB) continue;
+            /* the parts of [td, T) on the four ranks, segment-relative */
+            std::vector<std::pair<int64_t, int64_t>> parts;
+            bool take = true;
+            for (int rk = 0; rk < 4; ++rk) {
+                const int64_t lo = std::max(std::min(rk * q, T), td), hi = std::min((rk + 1) * q, T);
+                if (hi <= lo) continue;
+                if (hi - lo < h && hi - lo <= 64) take = false;
+                parts.push_back({ lo - td, hi - lo });
+            }
+            if (!take || parts.size() < 2) continue;
+            const int64_t kcr = 128 * ((h + 127) / 128);
+            for (Out& e : o) { st_memset(e.x, 0xa5, xb); st_memset(e.inj, 0xa5, ib); st_memset(e.q, 0xa5, qb);
+                               st_memset(e.qs, 0xa5, sb); st_memset(e.rq, 0xa5, qb); st_memset(e.rs, 0xa5, sb); }
+            bool okl = launch(0, 0, h, MB, 0, ss);
+            for (auto [a, k] : parts) okl = okl && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, ss);
+            ++cases;
+            const size_t d = okl ? diff_rows(h) : (size_t)-1;
+            if (d == 0) ++same;
+            else if (bad.size() < 400) bad += fmt(" h%lld/td%lld:%s", (long long)h, (long long)td, okl ? fmt("%zu", d).c_str() : "launch");
+            /* control: the same parts at their own split */
+            for (auto [a, k] : parts) (void)launch(1, a, k, MB, 0, ss);
+            ++ctl_cases;
+            if (diff_rows(h) != 0) ++ctl_diff;
+        }
+        std::printf("SPQCHECK arm %s: %d / %d cases every output byte identical (pinned parts vs the segment read whole)%s; "
+                    "control (parts unpinned): %d / %d cases differ\n",
+                    arm == 0 ? "engine (hc_readv 331, F1n, hc_upmix 5)" : arm == 1 ? "engine + ss (hc_readv 339)"
+                    : arm == 3 ? "engine + hc_pinpf2 (pinned parts below 512 rows through PF2)" : "stock",
+                    same, cases, bad.empty() ? "" : (" -- differ:" + bad).c_str(), ctl_diff, ctl_cases);
+        ok(fmt("SP-serial part reads, arm %d", arm).c_str(), cases > 0 && same == cases, bad);
+    }
+    /* Timing at the newcomer step's heights (warm, the engine's switches): the segment read whole against its parts (each part
+     * alone; the step's critical path is the slowest rank's part), the parts in each prefill form a pin allows (1 the tiled
+     * 128-row down + unfused up, 2 wide, 3 PF2), each form's bytes against the whole read. */
+    if (mask & 8) {
+        pl.readv_hc(331); pl.norm_hc_wave(1); pl.upmix_hc(5);
+        for (int64_t h : { (int64_t)1073, (int64_t)1135, (int64_t)2048 - 64 }) {
+            const int64_t td = 64, T = td + h, q = (T + 3) / 4, kcr = 128 * ((h + 127) / 128);
+            std::vector<std::pair<int64_t, int64_t>> parts;
+            for (int rk = 0; rk < 4; ++rk) {
+                const int64_t lo = std::max(std::min(rk * q, T), td), hi = std::min((rk + 1) * q, T);
+                if (hi > lo) parts.push_back({ lo - td, hi - lo });
+            }
+            if (pl.pin_hc) pl.pin_hc(0);
+            (void)launch(0, 0, h, MB, 0, false);
+            const double tw = st_time_us([&](int) { (void)launch(0, 0, h, MB, 0, false, false); }, 20, hs);
+            std::string line = fmt("SPQTIME h %lld (td %lld, q %lld): whole %.1f us |", (long long)h, (long long)td, (long long)q, tw);
+            for (int form : { 0, 1, 2, 3, 4 }) {
+                if (form && form < 4 && !pl.pin_hc) break;
+                if (form == 4 && !pl.pinpf2_hc) break;
+                if (pl.pin_hc) pl.pin_hc(form == 4 ? 0 : form);
+                if (form == 4) pl.pinpf2_hc(1);   /* 4: the launcher's rule + hc_pinpf2 */
+                double mx = 0, sum = 0; bool okf = true;
+                for (auto [a, k] : parts) {
+                    okf = okf && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false);
+                    const double t = st_time_us([&](int) { (void)launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false, false); }, 20, hs);
+                    mx = std::max(mx, t); sum += t;
+                }
+                if (pl.pin_hc) pl.pin_hc(0);
+                if (form == 4) pl.pinpf2_hc(0);
+                const size_t d = okf ? diff_rows(h) : (size_t)-1;
+                line += fmt(" form %d: parts max %.1f / sum %.1f us, %s |", form, mx, sum,
+                            !okf ? "refused" : d == 0 ? "bytes = whole" : fmt("%zu bytes differ", d).c_str());
+            }
+            std::printf("%s\n", line.c_str());
+        }
+        if (pl.pin_hc) pl.pin_hc(0);
+    }
+    if (pl.pinpf2_hc) pl.pinpf2_hc(0);
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.upmix_hc(0);
+    (void)hipStreamDestroy(hs);
+}
+
+/* fn4 hc_readv bit 3 (W1b): a write and the read after it at Qwen3.8-Flash-Next's shape, the pair as the trunk
+ * issues it -- hc_write_bf16 (y, inj, h, ss; eps) then hc_read_e4m3 (..., ss) -- on device buffers the case and
+ * the timing share. `ss` is [M][8] f32. */
+struct HcSsRig {
+    int64_t M = 0, n = 2560, hc = 4, lr = 320, HN = 10240, grp = 128, nkb = 20;
+    const RadKernelInfo* rw = nullptr;
+    const RadKernelInfo* rr = nullptr;
+    std::vector<uint16_t> h0;
+    void *d_h = nullptr, *d_y = nullptr, *d_y1 = nullptr, *d_i = nullptr, *d_ss = nullptr;
+    void *d_w = nullptr, *d_dn = nullptr, *d_up = nullptr, *d_iw = nullptr, *d_x = nullptr, *d_inj = nullptr;
+    void *d_q = nullptr, *d_qs = nullptr, *d_rq = nullptr, *d_rs = nullptr;
+    size_t hb = 0, xb = 0, ib = 0, qb = 0, sb = 0, ssb = 0;
+    std::vector<RadTensor> tw, tr;
+    std::vector<RadParam> pw, pr;
+    RadArgs aw{}, ar{};
+    hipStream_t hs = nullptr;
+    bool ready = false;
+
+    /* `misaligned`: the write's `y` 2 bytes off a 16-byte boundary, so it takes the plain form and the separate
+     * pass. `with_ss`: hand `ss` to both ops (else the 4th and 12th operands are absent). */
+    bool build(const Plugin& pl, int64_t rows, bool i8) {
+        M = rows; HN = hc * n; nkb = n / grp;
+        rw = find(pl, "hc_write_bf16");
+        rr = find(pl, "hc_read_e4m3");
+        if (!rw || !rr) return false;
+        const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+        const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+        uint64_t rs = 0x5851F42D4C957F2Dull ^ (uint64_t)M;
+        auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+        h0.resize((size_t)(M * HN));
+        std::vector<uint16_t> y((size_t)(M * n)), inj((size_t)(M * hc));
+        for (auto& v : h0) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 997.0f);
+        for (auto& v : y) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 3001.0f);
+        for (auto& v : inj) v = h_to_bf16(0.2f + (float)(rnd() % 1601) / 1000.0f);   /* (0, 2), as 2 sigmoid */
+        std::vector<float> wg((size_t)HN);
+        for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+        auto plane = [&](int64_t prow, int64_t K, int64_t G, int64_t ld) {
+            std::vector<uint8_t> b((size_t)(prow * ld), 0);
+            for (int64_t r0 = 0; r0 < prow; ++r0) {
+                uint8_t* row = b.data() + r0 * ld;
+                for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+                float* sc = (float*)(row + K);
+                for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+            }
+            return b;
+        };
+        std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+        std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+        std::vector<uint16_t> injw((size_t)(hc * HN));
+        for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+        hb = h0.size() * 2; xb = (size_t)(M * n * 2); ib = (size_t)(M * hc * 2); qb = (size_t)(M * n);
+        sb = (size_t)(M * nkb * 4); ssb = (size_t)(M * 8 * 4);
+        d_h = dalloc(hb); d_y = dalloc(y.size() * 2); d_y1 = dalloc(y.size() * 2 + 16); d_i = dalloc(inj.size() * 2);
+        d_ss = dalloc(ssb); d_w = dalloc(wg.size() * 4); d_dn = dalloc(down.size()); d_up = dalloc(up.size());
+        d_iw = dalloc(injw.size() * 2); d_x = dalloc(xb); d_inj = dalloc(ib); d_q = dalloc(qb); d_qs = dalloc(sb);
+        d_rq = dalloc(qb); d_rs = dalloc(sb);
+        if (!d_h || !d_y || !d_y1 || !d_i || !d_ss || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q ||
+            !d_qs || !d_rq || !d_rs)
+            return false;
+        st_memcpy(d_y, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy((char*)d_y1 + 2, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_i, inj.data(), inj.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+        if (hipStreamCreate(&hs) != hipSuccess) return false;
+        const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+        tr = {
+            T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+            T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+            T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+            T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+            T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+            T(d_rs, RAD_F32,    { M, nkb }),    T(d_ss, RAD_F32,    { M, 8 }),
+        };
+        pr = {
+            PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+            PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+            PI("rotate", 1), PS("mix", "e4m3"),
+        };
+        tw = { T(d_y, RAD_BF16, { M, n }), T(d_i, RAD_BF16, { M, hc }), T(d_h, RAD_BF16, { M, HN }),
+               T(d_ss, RAD_F32, { M, 8 }) };
+        pw = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16"), PF("eps", 1e-6) };
+        std::memset(&aw, 0, sizeof(aw)); std::memset(&ar, 0, sizeof(ar));
+        aw.t = tw.data(); aw.n_t = (int)tw.size(); aw.p = pw.data(); aw.n_p = (int)pw.size();
+        ar.t = tr.data(); ar.n_t = (int)tr.size(); ar.p = pr.data(); ar.n_p = (int)pr.size();
+        if (rr->scratch) {
+            const int64_t need = rr->scratch(&ar);
+            if (need > 0) { ar.scratch = dalloc((size_t)need); ar.scratch_bytes = need; }
+        }
+        ready = true;
+        return true;
+    }
+    /* The operands for the next launches: `ss` handed or absent, `y` aligned or not. */
+    void set(bool with_ss, bool misaligned) {
+        tw[0] = T(misaligned ? (void*)((char*)d_y1 + 2) : d_y, RAD_BF16, { M, n });
+        tw[3] = with_ss ? T(d_ss, RAD_F32, { M, 8 }) : RadTensor{};
+        tr[11] = with_ss ? T(d_ss, RAD_F32, { M, 8 }) : RadTensor{};
+    }
+    void reset() {
+        st_memcpy(d_h, h0.data(), hb, hipMemcpyHostToDevice);
+        st_memset(d_ss, 0xa5, ssb);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (ar.scratch) st_memset(ar.scratch, 0xa5, (size_t)ar.scratch_bytes);
+    }
+    ~HcSsRig() { if (hs) (void)hipStreamDestroy(hs); }
+};
+
+/* The case: the pair under hc_readv 3 without `ss` (the stack) is the reference; under 11 with `ss` the write's
+ * stream bytes, the scales it stores (against the read's own pass, which hc_read keeps in its scratch after `d`)
+ * and every output of the read must be the same bytes, with the read's norm launch gone below PF2's rows; with
+ * the write misaligned (plain write + the separate pass), F1n off, and the bit off or the rows below 17 with
+ * `ss` handed (then neither side may touch it). */
+static void hc_ss_case(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_write + hc_read_e4m3 at M=%lld, %s codes: the norm scales from the write (fn4 "
+                               "hc_readv bit 3) byte-identical to the read's own pass", (long long)M, i8 ? "int8" : "E4M3");
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.write_hc_vec || !pl.record) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    struct Out { std::vector<uint8_t> h, ss, x, inj, q, qs, rq, rs, sc; int nw = 0, nr = 0; };
+    auto run = [&](int readv, int wave, bool with_ss, bool mis, Out& o) -> bool {
+        pl.readv_hc(readv); pl.norm_hc_wave(wave); pl.write_hc_vec(1);
+        g.set(with_ss, mis);
+        g.reset();
+        const void* fns[64] = {};
+        pl.record(fns, 64);
+        if (g.rw->launch(&g.aw, (RadStream)g.hs) != RAD_OK) { pl.record(nullptr, 0); return false; }
+        o.nw = pl.record(fns, 64);                 /* the write's launches; recording restarts */
+        if (g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK) { pl.record(nullptr, 0); return false; }
+        o.nr = pl.record(nullptr, 0);              /* the read's */
+        if (st_stream_sync(g.hs) != hipSuccess) return false;
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) { v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost); };
+        get(o.h, g.d_h, g.hb); get(o.ss, g.d_ss, g.ssb); get(o.x, g.d_x, g.xb); get(o.inj, g.d_inj, g.ib);
+        get(o.q, g.d_q, g.qb); get(o.qs, g.d_qs, g.sb); get(o.rq, g.d_rq, g.qb); get(o.rs, g.d_rs, g.sb);
+        /* the read's own scales: hc_read's scratch holds `d` (M x lr bf16) and then [M][8] f32 */
+        if (g.ar.scratch && (size_t)g.ar.scratch_bytes >= (size_t)(M * g.lr * 2) + g.ssb)
+            get(o.sc, (const char*)g.ar.scratch + M * g.lr * 2, g.ssb);
+        return true;
+    };
+    enum { REF = 0, SS, SS_MIS, SS_NOWAVE, OFF_SS, kRuns };
+    Out o[kRuns];
+    const bool ok_runs = run(3, 1, false, false, o[REF]) && run(11, 1, true, false, o[SS]) &&
+                         run(11, 1, true, true, o[SS_MIS]) && run(11, 0, true, false, o[SS_NOWAVE]) &&
+                         run(3, 1, true, false, o[OFF_SS]);
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0);
+    if (!ok_runs) { ok(nm.c_str(), false, "a launch failed"); return; }
+    const bool used = M >= 17;   /* kHcSsMinRows */
+    std::string bad;
+    auto outs = [&](int r, const char* at) {
+        if (o[r].h != o[REF].h)     bad += std::string(" h") + at;
+        if (o[r].x != o[REF].x)     bad += std::string(" x") + at;
+        if (o[r].inj != o[REF].inj) bad += std::string(" inj") + at;
+        if (o[r].q != o[REF].q)     bad += std::string(" q") + at;
+        if (o[r].qs != o[REF].qs)   bad += std::string(" qs") + at;
+        if (o[r].rq != o[REF].rq)   bad += std::string(" rq") + at;
+        if (o[r].rs != o[REF].rs)   bad += std::string(" rs") + at;
+    };
+    /* the stored scales against the reference read's: hc entries a row (the rest of the row is not written) */
+    auto scales = [&](int r, const char* at) {
+        if (o[REF].sc.size() != g.ssb) { bad += std::string(" (no reference scales)") + at; return; }
+        const float* a = (const float*)o[r].ss.data();
+        const float* b = (const float*)o[REF].sc.data();
+        int64_t nbad = 0;
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < g.hc; ++c) nbad += std::memcmp(&a[i * 8 + c], &b[i * 8 + c], 4) != 0;
+        if (nbad) bad += fmt(" ss%s (%lld of %lld)", at, (long long)nbad, (long long)(M * g.hc));
+    };
+    auto untouched = [&](int r, const char* at) {
+        for (uint8_t v : o[r].ss) if (v != 0xa5) { bad += std::string(" ss written") + at; return; }
+    };
+    outs(SS, " (11)"); outs(SS_MIS, " (11, misaligned write)"); outs(SS_NOWAVE, " (11, F1n off)"); outs(OFF_SS, " (3, ss handed)");
+    if (used) { scales(SS, " (11)"); scales(SS_MIS, " (11, misaligned write)"); scales(SS_NOWAVE, " (11, F1n off)"); }
+    else untouched(SS, " (11, below 17 rows)");
+    untouched(OFF_SS, " (3)");
+    /* Launch counts (r4d_emit's log): the write is one launch (fused) or two (misaligned: write + pass); the read
+     * loses its norm launch on the tiled forms below PF2 (PF2's prologue is not logged and stays). */
+    const int rw_ref = o[REF].nw, rr_ref = o[REF].nr;
+    const int rw_ss = o[SS].nw, rr_ss = o[SS].nr;
+    const int rw_mis = o[SS_MIS].nw;
+    const bool counts = !used || (rw_ss == rw_ref && rw_mis == rw_ref + 1 && rr_ss == rr_ref - (M < 512 ? 1 : 0));
+    int64_t nz = 0;
+    for (uint8_t v : o[REF].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && counts && nz > (int64_t)g.qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : !counts ? fmt("launches: write %d / %d / %d (ref / ss / misaligned), read %d / %d", rw_ref, rw_ss, rw_mis, rr_ref, rr_ss)
+                 : fmt("write %d launch(es), read %d -> %d", rw_ref, rr_ref, rr_ss));
+}
+
+/* fn4 W2 (hc_readv bits 4-5): the codes stage at two, four and five groups a wave against one, byte for byte on every
+ * read output (hc_read alone, the stack's hc_readv 3 under it); the dispatched codes kernel must change from 65 rows
+ * (the wide tile and PF2, which run it as a launch of its own) and nowhere below. */
+static void hc_quantg_case(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes: the codes stage at 2 / 4 / 5 groups a wave (fn4 W2) "
+                               "byte-identical to one", (long long)M, i8 ? "int8" : "E4M3");
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; int nd = 0; };
+    static const int kV[4] = { 3, 3 | 16, 3 | 32, 3 | 48 };
+    Out o[4];
+    pl.norm_hc_wave(1);
+    g.set(false, false);
+    for (int k = 0; k < 4; ++k) {
+        pl.readv_hc(kV[k]);
+        g.reset();
+        const void* fns[64] = {};
+        pl.record(fns, 64);
+        const int rc = g.rr->launch(&g.ar, (RadStream)g.hs);
+        o[k].nd = pl.record(nullptr, 0);
+        o[k].fns.assign(fns, fns + (o[k].nd < 64 ? o[k].nd : 64));
+        if (rc != RAD_OK || st_stream_sync(g.hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d rc=%d", kV[k], rc)); pl.readv_hc(0); pl.norm_hc_wave(0); return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) { v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost); };
+        get(o[k].x, g.d_x, g.xb); get(o[k].inj, g.d_inj, g.ib); get(o[k].q, g.d_q, g.qb);
+        get(o[k].qs, g.d_qs, g.sb); get(o[k].rq, g.d_rq, g.qb); get(o[k].rs, g.d_rs, g.sb);
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0);
+    std::string bad;
+    for (int k = 1; k < 4; ++k) {
+        const std::string at = fmt(" (%d)", kV[k]);
+        if (o[k].x != o[0].x)     bad += " x" + at;
+        if (o[k].inj != o[0].inj) bad += " inj" + at;
+        if (o[k].q != o[0].q)     bad += " q" + at;
+        if (o[k].qs != o[0].qs)   bad += " qs" + at;
+        if (o[k].rq != o[0].rq)   bad += " rq" + at;
+        if (o[k].rs != o[0].rs)   bad += " rs" + at;
+    }
+    const bool here = M > 64;
+    bool swapped = true, same_n = true;
+    for (int k = 1; k < 4; ++k) { swapped = swapped && o[k].fns != o[0].fns; same_n = same_n && o[k].nd == o[0].nd; }
+    if (!here) { swapped = false; for (int k = 1; k < 4; ++k) swapped = swapped || o[k].fns != o[0].fns; }
+    int64_t nz = 0;
+    for (uint8_t v : o[0].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && swapped == here && same_n && nz > (int64_t)g.qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : swapped != here ? fmt("the dispatched kernels %s (want %s)", swapped ? "changed" : "did not change", here ? "changed" : "unchanged")
+                         : fmt("%d launches logged%s", o[0].nd, same_n ? "" : " (counts differ)"));
+}
+
+/* --perfhcq M [iters]: hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at one / two / four / five groups a
+ * wave: the read timed as one op, and from 512 rows PF2's codes stage alone (its cumulative stage masks 15 and 31). */
+static void hc_quantg_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 codes-stage timing at M=%lld (fn4 W2)", (long long)M);
+    if (!pl.readv_hc || !pl.norm_hc_wave) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    pl.norm_hc_wave(1);
+    g.set(false, false);
+    g.reset();
+    static const int kV[4] = { 3, 3 | 16, 3 | 32, 3 | 48 };
+    static const int kGr[4] = { 1, 2, 4, 5 };
+    double t[4], c[4] = { 0, 0, 0, 0 };
+    for (int k = 0; k < 4; ++k) {
+        pl.readv_hc(kV[k]);
+        if (g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK || st_stream_sync(g.hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d launch failed", kV[k])); pl.readv_hc(0); pl.norm_hc_wave(0); return;
+        }
+        t[k] = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+        if (M >= 512 && pl.pf2_stages_hc) {
+            pl.pf2_stages_hc(15);
+            const double t15 = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+            pl.pf2_stages_hc(31);
+            const double t31 = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+            c[k] = t31 - t15;
+        }
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0);
+    std::printf("hc_quantg M=%lld %s%s (F1n, hc_readv 3):", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm");
+    for (int k = 0; k < 4; ++k)
+        std::printf(" G%d read %.2f us%s", kGr[k], t[k], M >= 512 ? fmt(" (codes %.2f)", c[k]).c_str() : "");
+    std::printf("\n");
+    ok(nm.c_str(), true);
+}
+
+/* --perfhcs M [iters]: the pair at M rows, hc_readv 3 without `ss` against 11 with it, each op timed alone (warm,
+ * or cold under --cold) and the pair back to back. */
+static void hc_ss_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_write + hc_read_e4m3 timing at M=%lld (hc_readv 3 vs 11)", (long long)M);
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.write_hc_vec) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    pl.norm_hc_wave(1); pl.write_hc_vec(1);
+    double tw[2], tr[2], tp[2];
+    for (int k = 0; k < 2; ++k) {
+        const int v = k ? 11 : 3;
+        pl.readv_hc(v);
+        g.set(k == 1, false);
+        g.reset();
+        if (g.rw->launch(&g.aw, (RadStream)g.hs) != RAD_OK || g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK ||
+            st_stream_sync(g.hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d launch failed", v)); pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0); return;
+        }
+        /* Repeated writes keep adding into h; the bytes moved and the work do not depend on its values. */
+        tw[k] = st_time_us([&](int) { (void)g.rw->launch(&g.aw, (RadStream)g.hs); }, iters, g.hs);
+        tr[k] = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+        tp[k] = st_time_us([&](int) { (void)g.rw->launch(&g.aw, (RadStream)g.hs); (void)g.rr->launch(&g.ar, (RadStream)g.hs); },
+                           iters, g.hs);
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0);
+    std::printf("hc_ss M=%lld %s%s (F1n, hcw): write %.2f -> %.2f us, read %.2f -> %.2f us, pair %.2f -> %.2f us "
+                "(%+.2f us, %.3fx)\n", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm",
+                tw[0], tw[1], tr[0], tr[1], tp[0], tp[1], tp[1] - tp[0], tp[0] / tp[1]);
+    ok(nm.c_str(), true);
+}
+
+/* fn4 hc_upmix: the up-mix's other tiles against the stock one, byte for byte on every output (hc_readv 3
+ * and F1n in both): PF2's forms 1-4 from 512 rows, the 64-row decode tile (8) at 33-64 rows. */
+static void hc_upmix_case(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes: the hc_upmix forms (fn4) byte-identical "
+                               "to the stock up-mix", (long long)M, i8 ? "int8" : "E4M3");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.upmix_hc || !pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_upmix"); return; }
+    /* hc_mix_ctr's four slots a device run out over the cases' streams; without them the fused
+     * up-mix and decode forms G / S never run here (both arms would take the unfused pair). */
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; std::vector<const void*> fns; };
+    std::vector<int> vals = { 0 };
+    if (M >= 512) { for (int v : { 1, 2, 3, 4, 5 }) vals.push_back(v); }
+    else if (M > 32 && M <= 64) vals.push_back(8);
+    else vals.push_back(8);   /* not served here: must change nothing */
+    const bool here = M > 32;
+    std::vector<Out> out(vals.size());
+    pl.readv_hc(3);
+    pl.norm_hc_wave(1);
+    for (size_t run = 0; run < vals.size(); ++run) {
+        pl.upmix_hc(vals[run]);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
+        const void* fns[32] = {};
+        pl.record(fns, 32);
+        const int rc = r->launch(&a, (RadStream)hs);
+        out[run].nd = pl.record(nullptr, 0);
+        out[run].fns.assign(fns, fns + (out[run].nd < 32 ? out[run].nd : 32));
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_upmix %d rc=%d", vals[run], rc));
+            pl.upmix_hc(0); pl.readv_hc(0); pl.norm_hc_wave(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[run].x, d_x, xb); get(out[run].inj, d_inj, ib); get(out[run].q, d_q, qb);
+        get(out[run].qs, d_qs, sb); get(out[run].rq, d_rq, qb); get(out[run].rs, d_rs, sb);
+        if (a.scratch && (size_t)a.scratch_bytes >= db) get(out[run].d, a.scratch, db);
+    }
+    pl.upmix_hc(0); pl.readv_hc(0); pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    for (size_t run = 1; run < vals.size(); ++run) {
+        const std::string at = fmt(" (hc_upmix %d)", vals[run]);
+        if (out[0].x != out[run].x)     bad += " x" + at;
+        if (out[0].inj != out[run].inj) bad += " inj" + at;
+        if (out[0].q != out[run].q)     bad += " q" + at;
+        if (out[0].qs != out[run].qs)   bad += " qs" + at;
+        if (out[0].rq != out[run].rq)   bad += " rq" + at;
+        if (out[0].rs != out[run].rs)   bad += " rs" + at;
+        if (out[0].d != out[run].d)     bad += " d" + at;
+        const bool sw = out[run].fns != out[0].fns;
+        if (sw != here) bad += fmt(" [hc_upmix %d: kernels %s]", vals[run], sw ? "changed" : "unchanged");
+    }
+    int64_t nz = 0;
+    for (uint8_t v : out[0].x) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && nz > (int64_t)xb / 2, !bad.empty() ? "differs:" + bad : "");
+}
+
+/* --perfhcu M [iters]: hc_read_e4m3 at M rows (F1n, hc_readv 3) with every hc_upmix form that serves M,
+ * one op each (cold under --cold), and from 512 rows the up-mix stage alone (PF2 masks 15 - 7). */
+static void hc_upmix_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 hc_upmix timing at M=%lld", (long long)M);
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.upmix_hc || !pl.readv_hc || !pl.norm_hc_wave) { skip(nm.c_str(), "row absent or no r4d_hc_upmix"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    pl.norm_hc_wave(1);
+    pl.readv_hc(3);
+    std::vector<int> vals = { 0 };
+    if (M >= 512) { for (int v : { 1, 2, 3, 4, 5 }) vals.push_back(v); } else vals.push_back(8);
+    std::printf("hc_upmix M=%lld %s%s (F1n, hc_readv 3):", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm");
+    for (int v : vals) {
+        pl.upmix_hc(v);
+        if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            std::printf(" v%d failed", v); continue;
+        }
+        const double t = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+        double up = -1.0;
+        if (M >= 512 && pl.pf2_stages_hc) {
+            pl.pf2_stages_hc(7);
+            const double t7 = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+            pl.pf2_stages_hc(15);
+            const double t15 = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+            pl.pf2_stages_hc(31);
+            up = t15 - t7;
+        }
+        if (up >= 0) std::printf(" v%d %.2f us (up-mix %.2f)", v, t, up);
+        else         std::printf(" v%d %.2f us", v, t);
+    }
+    std::printf("\n");
+    pl.upmix_hc(0); pl.readv_hc(0); pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    ok(nm.c_str(), true);
+}
+
+static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) {
+    const bool fused_here = (M > 16 && M <= 64) || pf_pin == 1;
+    const bool wave_here  = M > 16;     /* the tiled path's norm launch (fn4 F1n) */
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes%s: the folded down reduce "
+                               "(fn4 F1a) and the wave norm scales (F1n) byte-identical to the "
+                               "pair", (long long)M, i8 ? "int8" : "E4M3",
+                               pf_pin ? ", prefill pin 1" : "");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.fuse_hc_down || !pl.norm_hc_wave || !pl.record || (pf_pin && !pl.pin_hc)) {
+        skip(nm.c_str(), "no r4d_hc_read_fuse_down");
+        return;
+    }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; };
+    /* the pair; the folded form twice; the wave norm alone; both; the low-register tail (v2) twice;
+     * the wave norm from 33 rows */
+    constexpr int kRuns = 8;
+    Out out[kRuns];
+    static const int kFuse[kRuns] = { 0, 1, 1, 0, 1, 2, 2, 0 };
+    static const int kWave[kRuns] = { 0, 0, 0, 1, 1, 0, 0, 33 };
+    if (pf_pin) pl.pin_hc(pf_pin);
+    for (int run = 0; run < kRuns; ++run) {
+        pl.fuse_hc_down(kFuse[run]);
+        pl.norm_hc_wave(kWave[run]);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
+        const void* fns[32] = {};
+        pl.record(fns, 32);
+        const int rc = r->launch(&a, (RadStream)hs);
+        out[run].nd = pl.record(nullptr, 0);
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("run %d rc=%d", run, rc));
+            pl.fuse_hc_down(0);
+            pl.norm_hc_wave(0);
+            if (pf_pin) pl.pin_hc(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[run].x, d_x, xb); get(out[run].inj, d_inj, ib); get(out[run].q, d_q, qb);
+        get(out[run].qs, d_qs, sb); get(out[run].rq, d_rq, qb); get(out[run].rs, d_rs, sb);
+        if (a.scratch && (size_t)a.scratch_bytes >= db) get(out[run].d, a.scratch, db);
+    }
+    pl.fuse_hc_down(0);
+    pl.norm_hc_wave(0);
+    if (pf_pin) pl.pin_hc(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    static const char* const kRun[kRuns] = { "", " (folded)", " (folded again)", " (wave norm)",
+                                             " (folded + wave norm)", " (folded v2)",
+                                             " (folded v2 again)", " (wave norm from 33 rows)" };
+    for (int run = 1; run < kRuns; ++run) {
+        const char* at = kRun[run];
+        if (out[0].x != out[run].x)     bad += std::string(" x") + at;
+        if (out[0].inj != out[run].inj) bad += std::string(" inj") + at;
+        if (out[0].q != out[run].q)     bad += std::string(" q") + at;
+        if (out[0].qs != out[run].qs)   bad += std::string(" qs") + at;
+        if (out[0].rq != out[run].rq)   bad += std::string(" rq") + at;
+        if (out[0].rs != out[run].rs)   bad += std::string(" rs") + at;
+        if (out[0].d != out[run].d)     bad += std::string(" d") + at;
+    }
+    const int want = fused_here ? out[0].nd + 1 : out[0].nd;
+    const int wantn = wave_here ? out[0].nd + 1 : out[0].nd;
+    const int wantb = want + (wantn - out[0].nd);
+    const int wantg = (wave_here && (M >= 33 || pf_pin == 1)) ? out[0].nd + 1 : out[0].nd;
+    const bool count_ok = out[1].nd == want && out[2].nd == want && out[3].nd == wantn
+                          && out[4].nd == wantb && out[5].nd == want && out[6].nd == want
+                          && out[7].nd == wantg;
+    int64_t nz = 0;
+    for (uint8_t v : out[0].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && count_ok && nz > (int64_t)qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : !count_ok  ? fmt("%d launches unfolded, %d and %d folded (want %d), %d wave norm "
+                          "(want %d), %d both (want %d), %d / %d folded v2, %d gated wave (want %d)",
+                          out[0].nd, out[1].nd, out[2].nd, want, out[3].nd, wantn, out[4].nd, wantb,
+                          out[5].nd, out[6].nd, out[7].nd, wantg)
+                    : fmt("%d and %d launches", out[0].nd, out[1].nd));
+}
+
 /* The gated residual's read at a prefill chunk: hc_read_e4m3 at Qwen3.8-Flash-Next's shape (n
  * 2560, four streams, lowrank 320, inject gains, the fp8 twin and its rotated twin). Several
  * launches at prefill, so also a harness for libr4d/isa/trace.sh. Random codes, small positive
@@ -28847,6 +30470,36 @@ static void kv_resolve_case(const Plugin& pl) {
             { { 3, 2 }, { 3, 2 }, { 3, 2 } });
     }
 
+    /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md): a ring that fills and stays warm, many calls -- the free list (more than
+     * kVicListMin = 256 slots occupied) and CLOCK in rotations (4b) against libref's serial sweep. 1024 slots, 8 rows
+     * of up to 96 entries over a drifting window of the id space (some rows overlapping, some ids below the ring for
+     * the identity path), 48 calls: the ring goes from empty through partly full (free list) to full (CLOCK, heats 1-3
+     * from repeated hits), and the last calls claim near the ring's size. */
+    {
+        const int64_t M = 8, pitch = 96, slots = 1024, blocks = 16384;   /* union <= 768 < slots: no overflow */
+        State c; seed(c, M, blocks, slots, pitch, 16);
+        std::vector<std::vector<int32_t>> sels, nsels;
+        uint32_t rng = 12345u;
+        auto nx = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+        for (int call = 0; call < 48; ++call) {
+            std::vector<int32_t> sel((size_t)(M * pitch), -1), ns((size_t)M, 0);
+            const int64_t base = (int64_t)(call * 211) % (blocks - 4096);
+            const int64_t win = call < 40 ? 1536 : 3072;
+            for (int64_t q = 0; q < M; ++q) {
+                const int64_t n = call >= 44 ? pitch : 24 + (int64_t)(nx() % (pitch - 24));
+                std::vector<int32_t> row;
+                while ((int64_t)row.size() < n) {
+                    int32_t b = (int32_t)((q % 3 == 0 && nx() % 4 == 0) ? nx() % 900
+                                                                        : base + (int64_t)(nx() % win));
+                    if (std::find(row.begin(), row.end(), b) == row.end()) row.push_back(b);
+                }
+                for (int64_t i = 0; i < n; ++i) sel[(size_t)(q * pitch + i)] = row[(size_t)i];
+                ns[(size_t)q] = (int32_t)n;
+            }
+            sels.push_back(sel); nsels.push_back(ns);
+        }
+        run("kv_resolve kvs_vic: a warm ring over 48 calls (free list, CLOCK rotations) = libref", c, sels, nsels);
+    }
     /* The deployment's own block: 2 KiB across 32 lanes is 128 vectors, one full four-wide group per
      * thread with nothing left over, and 2064 bytes is that group plus one vector of tail. Both are
      * the copy phase 6 exists for -- four loads in flight -- and both are compared against libref's
@@ -30152,6 +31805,229 @@ static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, 
                 det ? "ok" : "NO");
     ok(what, pass, std::string("split_ran=") + (split_ran ? "1" : "0") +
                    " same=" + (same ? "1" : "0") + " det=" + (det ? "1" : "0"));
+}
+
+/* fn4 qsa_split (16.11.2026, qwen/QSA-SPLIT.md): the selection split across `parts` ranks -- each rank's qsa_select_part
+ * over its block range of each sequence (r4d_qsa_part.h cuts of nc), its slab of the range's own top-k, the slabs placed
+ * as the all_gather leaves them ([M][parts][LW]), then qsa_select_merge -- against qsa_select_i32's single-workgroup /
+ * wide form (no scratch), byte for byte: table, nsel, seqused. Each rank's score plane is POISONED outside its range (a
+ * score above every live one), so a part that read past its range would take those blocks. parts 1 is the one-card form
+ * (chunks, no slab, the merge over the chunk lists). Few distinct scores, so ties decide most slots. */
+static int qsa_cut_h(int nc, int parts, int r) {
+    if (r <= 0 || nc <= 0) return 0;
+    if (r >= parts) return nc;
+    return (int)(((long long)nc * r / parts) & ~15LL);
+}
+static void qsa_select_part_one(const Plugin& pl, const char* what, int64_t S, int64_t per, int64_t nb, int64_t n0,
+                                int64_t dstep, int distinct, int parts) {
+    const RadKernelInfo* rs = find(pl, "qsa_select_i32");
+    const RadKernelInfo* rp = find(pl, "qsa_select_part_i32");
+    const RadKernelInfo* rm = find(pl, "qsa_select_merge_i32");
+    if (!rs || !rp || !rm) { ok(what, false, "row absent"); return; }
+    const int64_t M = S * per, topk = 512, ratio = 4, pages = 1 << 20, lw = 4 + 2 * topk;
+    std::vector<float>   sc((size_t)(M * nb));
+    std::vector<int32_t> bt((size_t)(S * nb)), nc((size_t)S), pos((size_t)M), cuh((size_t)(S + 1));
+    for (int64_t s = 0; s < S; ++s) {
+        int64_t ns = n0 - s * dstep; if (ns < 1) ns = 1; if (ns > nb - 1) ns = nb - 1;
+        nc[(size_t)s] = (int32_t)ns;
+        for (int64_t b = 0; b < nb; ++b)
+            bt[(size_t)(s * nb + b)] = b > ns ? -1 : ((b % 64) == 37 ? -1 : (int32_t)((b * 4099 + 11 + s * 71) % pages));
+        cuh[(size_t)s] = (int32_t)(s * per);
+        for (int64_t j = 0; j < per; ++j) pos[(size_t)(s * per + j)] = (int32_t)(ns * ratio + j - 2);
+    }
+    cuh[(size_t)S] = (int32_t)M;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t b = 0; b < nb; ++b)
+            sc[(size_t)(m * nb + b)] = (float)(((b * 31 + m * 17) % distinct)) * 0.125f;
+    void* d_sc = dalloc(sc.size() * 4);
+    void* d_bt = dalloc(bt.size() * 4);
+    void* d_nc = dalloc(nc.size() * 4);
+    void* d_po = dalloc(pos.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_se = dalloc((size_t)(M * (topk + 1)) * 4);
+    void* d_ns = dalloc((size_t)M * 4);
+    void* d_su = dalloc((size_t)M * 4);
+    void* d_li = dalloc((size_t)(M * 8 * lw) * 4);
+    void* d_sb = dalloc((size_t)(M * lw) * 4);
+    void* d_ga = dalloc((size_t)(M * parts * lw) * 4);
+    if (!d_sc || !d_bt || !d_nc || !d_po || !d_cu || !d_se || !d_ns || !d_su || !d_li || !d_sb || !d_ga) {
+        ok(what, false, "alloc failed"); return;
+    }
+    st_memcpy(d_bt, bt.data(), bt.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nc.data(), nc.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_po, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    auto run_ref = [&](std::vector<int32_t>& se, std::vector<int32_t>& ns, std::vector<int32_t>& su) {
+        st_memcpy(d_sc, sc.data(), sc.size() * 4, hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = { T(d_sc, RAD_F32, { M, nb }), T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }),
+                                      T(d_po, RAD_I32, { M }), T(d_cu, RAD_I32, { S + 1 }),
+                                      T(d_se, RAD_I32, { M, topk + 1 }), T(d_ns, RAD_I32, { M }), T(d_su, RAD_I32, { M }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", S) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_se, 0xAA, (size_t)(M * (topk + 1)) * 4);
+        const int rc = rs->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        se.assign((size_t)(M * (topk + 1)), 0); ns.assign((size_t)M, 0); su.assign((size_t)M, 0);
+        st_memcpy(se.data(), d_se, se.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(ns.data(), d_ns, ns.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(su.data(), d_su, su.size() * 4, hipMemcpyDeviceToHost);
+        return rc;
+    };
+    std::vector<int32_t> rse, rns, rsu;
+    int rc = run_ref(rse, rns, rsu);
+    if (rc != RAD_OK) { ok(what, false, "reference launch rc=" + std::to_string(rc)); return; }
+
+    auto merge = [&](void* lists, int64_t nlist, int64_t lpitch, std::vector<int32_t>& se, std::vector<int32_t>& ns,
+                     std::vector<int32_t>& su) {
+        RadTensor tl = T(lists, RAD_I32, { M, nlist * lw });
+        tl.stride[0] = lpitch;
+        std::vector<RadTensor> ts = { tl, T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }), T(d_po, RAD_I32, { M }),
+                                      T(d_cu, RAD_I32, { S + 1 }), T(d_se, RAD_I32, { M, topk + 1 }),
+                                      T(d_ns, RAD_I32, { M }), T(d_su, RAD_I32, { M }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", S) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_se, 0x55, (size_t)(M * (topk + 1)) * 4);
+        st_memset(d_ns, 0x55, (size_t)M * 4); st_memset(d_su, 0x55, (size_t)M * 4);
+        const int r = rm->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        se.assign((size_t)(M * (topk + 1)), 0); ns.assign((size_t)M, 0); su.assign((size_t)M, 0);
+        st_memcpy(se.data(), d_se, se.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(ns.data(), d_ns, ns.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(su.data(), d_su, su.size() * 4, hipMemcpyDeviceToHost);
+        return r;
+    };
+    auto part = [&](int64_t P, int64_t r, int64_t nlist, bool slab) {
+        /* the rank's plane: poisoned outside its range of each sequence */
+        std::vector<float> pl_sc(sc);
+        if (P > 1)
+            for (int64_t m = 0; m < M; ++m) {
+                int64_t s = 0; while (s + 1 < S && m >= cuh[(size_t)(s + 1)]) ++s;
+                const int lo = qsa_cut_h(nc[(size_t)s], (int)P, (int)r), hi = qsa_cut_h(nc[(size_t)s], (int)P, (int)r + 1);
+                for (int64_t b = 0; b < nb; ++b) if (b < lo || b >= hi) pl_sc[(size_t)(m * nb + b)] = 1e9f;
+            }
+        st_memcpy(d_sc, pl_sc.data(), pl_sc.size() * 4, hipMemcpyHostToDevice);
+        RadTensor tl = T(d_li, RAD_I32, { M, nlist * lw });
+        tl.stride[0] = 8 * lw;
+        std::vector<RadTensor> ts = { T(d_sc, RAD_F32, { M, nb }), T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }),
+                                      T(d_po, RAD_I32, { M }), T(d_cu, RAD_I32, { S + 1 }), tl,
+                                      T(d_sb, RAD_I32, { M, lw }) };
+        if (!slab) absent(ts[6]);
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", S),
+                                     PI("parts", P), PI("part", r) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_sb, 0x33, (size_t)(M * lw) * 4);
+        const int rr = rp->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        return rr;
+    };
+    auto nl_of = [&](int64_t width) { int64_t x = (width + 4095) / 4096; return x < 1 ? 1 : x > 8 ? 8 : x; };
+    /* the split across `parts` ranks */
+    const int64_t nl = nl_of((nb + parts - 1) / parts + 15);
+    std::vector<int32_t> gh((size_t)(M * parts * lw), 0), sb((size_t)(M * lw));
+    for (int64_t r = 0; r < parts && rc == RAD_OK; ++r) {
+        rc = part(parts, r, nl, true);
+        st_memcpy(sb.data(), d_sb, sb.size() * 4, hipMemcpyDeviceToHost);
+        for (int64_t m = 0; m < M; ++m)
+            std::memcpy(&gh[(size_t)((m * parts + r) * lw)], &sb[(size_t)(m * lw)], (size_t)lw * 4);
+    }
+    if (rc != RAD_OK) { ok(what, false, "part launch rc=" + std::to_string(rc)); return; }
+    st_memcpy(d_ga, gh.data(), gh.size() * 4, hipMemcpyHostToDevice);
+    std::vector<int32_t> xse, xns, xsu;
+    rc = merge(d_ga, parts, parts * lw, xse, xns, xsu);
+    if (rc != RAD_OK) { ok(what, false, "merge launch rc=" + std::to_string(rc)); return; }
+    /* one card, chunks */
+    const int64_t nl1 = nl_of(nb);
+    rc = nb <= 8 * 8192 ? part(1, 0, nl1, false) : RAD_OK;
+    std::vector<int32_t> cse, cns, csu;
+    if (rc == RAD_OK && nb <= 8 * 8192) rc = merge(d_li, nl1, 8 * lw, cse, cns, csu);
+    if (rc != RAD_OK) { ok(what, false, "one-card launch rc=" + std::to_string(rc)); return; }
+    long dx = 0, dc = 0; long long fx = -1;
+    for (size_t i = 0; i < rse.size(); ++i) {
+        if (xse[i] != rse[i]) { ++dx; if (fx < 0) fx = (long long)i; }
+        if (nb <= 8 * 8192 && cse[i] != rse[i]) ++dc;
+    }
+    const bool xok = dx == 0 && xns == rns && xsu == rsu;
+    const bool cok = nb > 8 * 8192 || (dc == 0 && cns == rns && csu == rsu);
+    long full = 0; for (int32_t v : rns) full += v >= (int32_t)topk ? 1 : 0;
+    std::printf("        %lld seq x %lld rows, %lld blocks (nc %lld..%lld), %d distinct scores, %d parts x %lld chunks: "
+                "%ld of %lld slots differ (first %lld), nsel %s, seqused %s; one card (%lld chunks): %ld differ, nsel %s; "
+                "rows with a full table %ld\n",
+                (long long)S, (long long)per, (long long)nb, (long long)nc[(size_t)S - 1], (long long)nc[0], distinct, parts,
+                (long long)nl, dx, (long long)rse.size(), fx, xns == rns ? "ok" : "DIFFERS", xsu == rsu ? "ok" : "DIFFERS",
+                (long long)nl1, dc, (nb > 8 * 8192 || cns == rns) ? "ok" : "DIFFERS", full);
+    ok(what, xok && cok, std::string("split=") + (xok ? "1" : "0") + " onecard=" + (cok ? "1" : "0"));
+}
+
+/* qsa_score's `parts` form: a rank writes exactly the whole launch's scores over its range of each sequence, bit for bit,
+ * and nothing outside it (the plane is filled with a sentinel first). */
+static void qsa_score_part_case(const Plugin& pl, int parts) {
+    const char* what = "qsa_score parts form vs the whole launch, inside and outside each rank's range";
+    const RadKernelInfo* r = find(pl, "qsa_score_bf16");
+    const RadKernelInfo* rp = find(pl, "qsa_score_part_bf16");
+    if (!r || !rp) { ok(what, false, "row absent"); return; }
+    const int64_t S = 5, per = 4, M = S * per, n = 128, heads = 4, nb = 9001, pages = 12000;
+    std::vector<uint16_t> qh((size_t)(M * heads * n)), bkh((size_t)(pages * n));
+    for (int64_t i = 0; i < M * heads * n; ++i) qh[(size_t)i] = h_to_bf16((float)(((i * 29 + 7) % 83) - 41) / 47.0f);
+    for (int64_t i = 0; i < pages * n; ++i) bkh[(size_t)i] = h_to_bf16((float)(((i * 41 + 13) % 71) - 35) / 39.0f);
+    std::vector<int32_t> bth((size_t)(S * nb)), cuh((size_t)(S + 1)), nch((size_t)S);
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t live = nb - 1 - s * 1777;
+        nch[(size_t)s] = (int32_t)live;
+        for (int64_t b = 0; b < nb; ++b)
+            bth[(size_t)(s * nb + b)] = b < live ? ((b % 97) == 5 ? -1 : (int32_t)((b * 13 + s * 5) % pages)) : -1;
+        cuh[(size_t)s] = (int32_t)(s * per);
+    }
+    cuh[(size_t)S] = (int32_t)M;
+    void* d_q  = dalloc(qh.size() * 2);
+    void* d_bk = dalloc(bkh.size() * 2);
+    void* d_bt = dalloc(bth.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_nc = dalloc(nch.size() * 4);
+    void* d_o  = dalloc((size_t)(M * nb) * 4);
+    st_memcpy(d_q,  qh.data(),  qh.size() * 2,  hipMemcpyHostToDevice);
+    st_memcpy(d_bk, bkh.data(), bkh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nch.data(), nch.size() * 4, hipMemcpyHostToDevice);
+    auto go = [&](int64_t P, int64_t rk, std::vector<uint32_t>& out) {
+        std::vector<RadTensor> ts = { T(d_q, RAD_BF16, { M, heads * n }), T(d_bk, RAD_BF16, { pages, n }),
+                                      T(d_bt, RAD_I32, { S, nb }), T(d_cu, RAD_I32, { S + 1 }), T(d_nc, RAD_I32, { S }),
+                                      T(d_o, RAD_F32, { M, nb }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("heads", heads), PI("blocks", nb), PI("seqs", S),
+                                     PS("dtype", "bf16") };
+        if (P > 1) { ps.push_back(PI("parts", P)); ps.push_back(PI("part", rk)); }
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_o, 0x7F, (size_t)(M * nb) * 4);
+        const int rc = (P > 1 ? rp : r)->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        out.assign((size_t)(M * nb), 0);
+        st_memcpy(out.data(), d_o, out.size() * 4, hipMemcpyDeviceToHost);
+        return rc;
+    };
+    std::vector<uint32_t> ref, got;
+    int rc = go(1, 0, ref);
+    if (rc != RAD_OK) { ok(what, false, "whole launch rc=" + std::to_string(rc)); return; }
+    long bad_in = 0, bad_out = 0, cells = 0;
+    for (int64_t rk = 0; rk < parts; ++rk) {
+        rc = go(parts, rk, got);
+        if (rc != RAD_OK) { ok(what, false, "part launch rc=" + std::to_string(rc)); return; }
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t s = m / per;
+            const int lo = qsa_cut_h(nch[(size_t)s], parts, (int)rk), hi = qsa_cut_h(nch[(size_t)s], parts, (int)rk + 1);
+            for (int64_t b = 0; b < nb; ++b) {
+                const size_t i = (size_t)(m * nb + b);
+                if (b >= lo && b < hi && b < nch[(size_t)s]) { ++cells; if (got[i] != ref[i]) ++bad_in; }
+                else if (got[i] != 0x7F7F7F7Fu) ++bad_out;
+            }
+        }
+    }
+    std::printf("        %d parts, %lld rows, %lld blocks: %ld scores inside the ranges, %ld differ from the whole launch; "
+                "%ld written outside\n", parts, (long long)M, (long long)nb, cells, bad_in, bad_out);
+    ok(what, bad_in == 0 && bad_out == 0 && cells > 0, "in " + std::to_string(bad_in) + " out " + std::to_string(bad_out));
 }
 
 /* qsa_select over more than topk blocks with topk or fewer live, in every form, against libref's
@@ -33000,6 +34876,11 @@ struct Ar8Perf {
     std::vector<const RadKernelInfo*> rows;
     std::vector<int> ks;               /* per row: the `pieces` parameter, 0 or -1 none */
     std::vector<int> forms;            /* per row: the `form` parameter, -1 none */
+    /* --perfar4 (fn4 12.11.2026): per row the SP rows' `raw` (-1: not an SP row; else in place, with `row` = the
+     * size's width from `widths`); empty for --perfar8. */
+    std::vector<int> sp_raw;
+    std::vector<int64_t> widths;
+    std::vector<std::vector<RadParam>> extra;   /* --perfar4: per row, launch parameters appended */
     std::vector<int> nbs;
     StBarrier* bar = nullptr;
     int rc_init = RAD_OK;
@@ -33011,6 +34892,14 @@ struct Ar8Perf {
     std::vector<std::vector<float>> cold;
     /* --timeline: per config, the two-shot's stamps (nblocks x R4D_AR_TL_WORDS, -1 unset). */
     std::vector<std::vector<long long>> tl;
+    /* fn4 PF (qwen/prefill): R4D_SELFTEST_AR4_BESIDE=N -- N launches of a bf16 GEMM (gemm_bf16_nt_tiled, 2048 x 2560 x 2560,
+     * the size of a prefill piece's projection) queued on a second stream of every card while a config is timed (and before
+     * its timeline launch), so the collective runs beside compute as in a pipelined prefill step; per config the GEMM's us a
+     * launch beside it, and alone once. */
+    const RadKernelInfo* gemm = nullptr;
+    int beside = 0;
+    double gemm_alone_us = 0;
+    std::vector<double> gemm_with_us;
 };
 
 static void ar8_perf_worker(Ar8Perf* t) {
@@ -33047,8 +34936,47 @@ static void ar8_perf_worker(Ar8Perf* t) {
     std::vector<uint8_t> h((size_t)most * esz), want((size_t)most * esz), got((size_t)most * esz);
     std::vector<hipEvent_t> ev(2 * (size_t)std::max(t->iters, 1));
     for (hipEvent_t& e : ev) st_ev_create(&e);
+    /* fn4 PF beside-compute mode */
+    t->gemm_with_us.assign(ncfg, 0.0);
+    hipStream_t sb = nullptr;
+    hipEvent_t gb0 = nullptr, gb1 = nullptr;
+    void *ga = nullptr, *gw = nullptr, *gc = nullptr;
+    const int64_t GM = 2048, GN = 2560, GK = 2560;
+    std::vector<RadTensor> gts;
+    std::vector<RadParam> gps = { PI("M", GM), PI("N", GN), PI("K", GK), PS("dtype", "bf16") };
+    RadArgs ga_args;
+    std::memset(&ga_args, 0, sizeof(ga_args));
+    const bool bes = t->beside > 0 && t->gemm && t->rc_init == RAD_OK;
+    if (bes) {
+        if (hipStreamCreateWithFlags(&sb, hipStreamNonBlocking) != hipSuccess || hipMalloc(&ga, (size_t)(GM * GK) * 2) != hipSuccess ||
+            hipMalloc(&gw, (size_t)(GN * GK) * 2) != hipSuccess || hipMalloc(&gc, (size_t)(GM * GN) * 2) != hipSuccess)
+            t->rc_init = RAD_E_NOMEM;
+        else {
+            hip_ck(hipMemset(ga, 0x3c, (size_t)(GM * GK) * 2), "hipMemset", __LINE__);
+            hip_ck(hipMemset(gw, 0x3b, (size_t)(GN * GK) * 2), "hipMemset", __LINE__);
+            gts = { T(ga, RAD_BF16, { GM, GK }), T(gw, RAD_BF16, { GN, GK }), T(gc, RAD_BF16, { GM, GN }) };
+            ga_args.t = gts.data(); ga_args.n_t = (int)gts.size();
+            ga_args.p = gps.data(); ga_args.n_p = (int)gps.size(); ga_args.world_size = 1;
+            st_ev_create(&gb0); st_ev_create(&gb1);
+            for (int i = 0; i < 20; ++i) t->gemm->launch(&ga_args, (RadStream)sb);
+            st_stream_sync(sb);
+            st_ev_record(gb0, sb);
+            for (int i = 0; i < 100; ++i) t->gemm->launch(&ga_args, (RadStream)sb);
+            st_ev_record(gb1, sb);
+            st_ev_sync(gb1);
+            float ms = 0; st_ev_elapsed(&ms, gb0, gb1);
+            t->gemm_alone_us = 10.0 * ms;
+        }
+    }
+    auto bg = [&](int nl) {
+        if (!bes || t->rc_init != RAD_OK) return;
+        st_ev_record(gb0, sb);
+        for (int i = 0; i < nl; ++i) t->gemm->launch(&ga_args, (RadStream)sb);
+        st_ev_record(gb1, sb);
+    };
     size_t cfg = 0;
-    for (int64_t n : t->sizes) {
+    for (size_t si = 0; si < t->sizes.size(); ++si) {
+        const int64_t n = t->sizes[si];
         for (int64_t i = 0; i < n; ++i) {
             float acc = 0.0f;
             for (int r = 0; r < t->world; ++r) {
@@ -33065,13 +34993,25 @@ static void ar8_perf_worker(Ar8Perf* t) {
         }
         if (t->rc_init == RAD_OK) st_memcpy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
         const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+        /* SP's raw rows run in place on `in` (their timed launches rewrite it), so a checked config after one
+         * reloads the input first (fn4 PF, 17.11.: the coded lane rows listed after the SP fence rows read "every
+         * element differs" from a rewritten input, while the stale-read stress over the same forms read 0). */
+        bool dirty = false;
         for (size_t j = 0; j < t->rows.size(); ++j) {
             for (int nb : t->nbs) {
                 std::vector<RadParam> ps = ip;
                 if (nb > 0) ps.push_back(PI("nblocks", nb));
                 if (t->ks[j] > 0) ps.push_back(PI("pieces", t->ks[j]));
                 if (t->forms[j] >= 0) ps.push_back(PI("form", t->forms[j]));
-                RadTensor ts[2] = { T(in, dt, { n }), T(out, dt, { n }) };
+                if (j < t->extra.size()) for (const RadParam& q : t->extra[j]) ps.push_back(q);
+                const bool spr = j < t->sp_raw.size() && t->sp_raw[j] >= 0;
+                if (spr) {
+                    ps.push_back(PI("raw", t->sp_raw[j]));
+                    ps.push_back(PI("row", si < t->widths.size() ? t->widths[si] : n));
+                }
+                if (dirty && t->rc_init == RAD_OK) st_memcpy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
+                dirty = spr;
+                RadTensor ts[2] = { T(in, dt, { n }), T(spr ? in : out, dt, { n }) };
                 RadArgs a;
                 std::memset(&a, 0, sizeof(a));
                 a.t = ts; a.n_t = 2;
@@ -33109,6 +35049,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
                 t->bar->wait();
                 if (timed) {
                     if (g_cold <= 0) {
+                        bg(t->beside);
                         st_ev_record(ev[0], t->st);
                         for (int i = 0; i < t->iters; ++i) t->rows[j]->launch(&a, t->st);
                         st_ev_record(ev[1], t->st);
@@ -33116,6 +35057,11 @@ static void ar8_perf_worker(Ar8Perf* t) {
                         float ms = 0.0f;
                         st_ev_elapsed(&ms, ev[0], ev[1]);
                         t->period[cfg] = ms / (float)t->iters;
+                        if (bes) {
+                            st_ev_sync(gb1);
+                            float gms = 0.0f; st_ev_elapsed(&gms, gb0, gb1);
+                            t->gemm_with_us[cfg] = 1000.0 * gms / t->beside;
+                        }
                     } else {
                         for (int i = 0; i < t->iters; ++i) {
                             for (int64_t off = 0; off < g_cold; off += kColdChunk)
@@ -33143,9 +35089,12 @@ static void ar8_perf_worker(Ar8Perf* t) {
                     a.p = pt.data(); a.n_p = (int)pt.size();
                     hip_ck(hipMemsetAsync(tlbuf, 0xff, tl_words * sizeof(long long), t->st),
                            "hipMemsetAsync", __LINE__);
+                    st_stream_sync(t->st);
                     t->bar->wait();
+                    if (bes) { bg(8); std::this_thread::sleep_for(std::chrono::microseconds(300)); }
                     t->rows[j]->launch(&a, t->st);
                     st_stream_sync(t->st);
+                    if (bes) st_stream_sync(sb);
                     t->tl[cfg].resize(tl_words);
                     st_memcpy(t->tl[cfg].data(), tlbuf, tl_words * sizeof(long long),
                               hipMemcpyDeviceToHost);
@@ -33163,6 +35112,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
         if (inst[j] && t->rows[j]->fini) t->rows[j]->fini(inst[j]);
     for (void* p : { in, out, csrc, cdst, tlbuf }) if (p) st_free(p);
     if (t->st) hip_ck(hipStreamDestroy(t->st), "hipStreamDestroy", __LINE__);
+    if (sb) { st_stream_sync(sb); for (void* p : { ga, gw, gc }) if (p) st_free(p); st_ev_destroy(gb0); st_ev_destroy(gb1); (void)hipStreamDestroy(sb); }
 }
 
 /* The two-shot's stamps for one config as each rank's phases, in microseconds. A rank's event is
@@ -33254,6 +35204,1294 @@ static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::str
                                    wd[3], wd[4], wd[5], wd[6], wd[7]);
     for (int r = 1; r < 8; ++r) if (w[r] != w[0]) return true;
     return false;
+}
+
+/* --perfar4 RxW[,RxW..] [iters] (fn4 12.11.2026, after the riser move): the four-rank collectives a TP4 step runs, timed on
+ * the four cards as ar8_perf times the eight-rank ones (one thread a card, warm, the slowest rank's period, the block rule):
+ * the exact two-shot (lockstep and RSF's interleaved first hop, `xpush`), its coded lane form (overlap 1, ~12.2 bits a
+ * value, exact), the true one-shot (ts_min 0), the tiered-int8 two-shot (lossy), and fn4 SP-hc's whole-row halves
+ * (reduce_scatter_rows raw 1 = the exact fold, lockstep and xpush; all_gather_rows raw 1; the ti8 pair), each message R rows
+ * of W bf16. The exact rows also at drain 1 / 2 / 3 / 0 (drain_force: the fence before the flag; r4d_ar_wide.h). Bytes a
+ * rank sends: one-shot (N-1) S, two-shot 2 (N-1) / N S (both phases), a reduce-scatter or all-gather alone (N-1) / N S.
+ * The all-reduces are checked against the fp32 ascending-rank fold after the first launch (ti8 lossy: information); the
+ * SP rows are timed only here. R4D_SELFTEST_AR4_STRESS=N then runs N launches a point of the exact two-shot (lockstep /
+ * xpush) and the raw reduce-scatter (lockstep / xpush) at each drain, from the first launch of a fresh instance (the
+ * slots' first reuse included), every launch's output checked: eight launches back to back into eight output buffers
+ * (the reduce-scatter: its input restored on the device before each, its own shard copied out after), then the checks. */
+struct Ar4Stress {
+    int rank = 0, dev = 0, world = 4, launches = 0;
+    const RadKernelInfo* row = nullptr;
+    std::vector<RadParam> extra;
+    bool rs = false;
+    bool ag = false;   /* fn4 PFF: SP's raw all-gather in place (every rank's buffer = each owner's shard rows) */
+    int64_t n = 0, width = 0;
+    StBarrier* bar = nullptr;
+    int rc = RAD_OK;
+    int64_t bad = 0, bad_launches = 0, first_bad = -1;
+};
+static void ar4_stress_worker(Ar4Stress* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; t->bar->wait(); return; }
+    constexpr int NB = 8;
+    const int64_t n = t->n, rows = n / t->width, q = (rows + t->world - 1) / t->world;
+    const int64_t lo = std::min<int64_t>(t->rank * q, rows) * t->width, hi = std::min<int64_t>((t->rank + 1) * q, rows) * t->width;
+    void* inst = nullptr;
+    std::vector<RadParam> ip = { PI("world_size", t->world), PI("numel", n), PS("dtype", "bf16"), PI("exact", 1) };
+    t->rc = t->row->init(ip.data(), (int)ip.size(), t->rank, t->world, &inst);
+    void *in = nullptr, *pristine = nullptr;
+    void* outs[NB] = { nullptr };
+    if (t->rc == RAD_OK) {
+        if (hipMalloc(&in, (size_t)n * 2) != hipSuccess || hipMalloc(&pristine, (size_t)n * 2) != hipSuccess) t->rc = RAD_E_NOMEM;
+        for (int j = 0; j < NB && t->rc == RAD_OK; ++j)
+            if (hipMalloc(&outs[j], (size_t)(t->rs ? hi - lo : n) * 2) != hipSuccess) t->rc = RAD_E_NOMEM;
+    }
+    std::vector<uint16_t> h((size_t)n), want((size_t)n), got((size_t)n);
+    for (int64_t i = 0; i < n; ++i) {
+        float acc = 0.0f;
+        for (int r = 0; r < t->world; ++r) acc += h_bf16(h_to_bf16(ar_rough_value(r, i)));
+        h[(size_t)i] = h_to_bf16(ar_rough_value(t->rank, i));
+        want[(size_t)i] = h_to_bf16(acc);
+        if (t->ag) want[(size_t)i] = h_to_bf16(ar_rough_value((int)std::min<int64_t>(i / t->width / q, t->world - 1), i));
+    }
+    if (t->rc == RAD_OK) {
+        st_memcpy(pristine, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        st_memcpy(in, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+    }
+    t->bar->wait();
+    if (t->rc != RAD_OK) { t->bar->wait(); return; }
+    std::vector<RadParam> ps = ip;
+    for (const RadParam& x : t->extra) ps.push_back(x);
+    if (t->rs || t->ag) { ps.push_back(PI("raw", 1)); ps.push_back(PI("row", t->width)); }
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst; a.rank = t->rank; a.world_size = t->world;
+    for (int L = 0; L < t->launches && t->rc == RAD_OK; L += NB) {
+        const int nb = std::min(NB, t->launches - L);
+        for (int j = 0; j < nb && t->rc == RAD_OK; ++j) {
+            RadTensor ts[2];
+            if (t->rs || t->ag) {
+                hip_ck(hipMemcpyAsync(in, pristine, (size_t)n * 2, hipMemcpyDeviceToDevice, nullptr), "hipMemcpyAsync", __LINE__);
+                ts[0] = T(in, RAD_BF16, { n }); ts[1] = T(in, RAD_BF16, { n });
+            } else {
+                ts[0] = T(in, RAD_BF16, { n }); ts[1] = T(outs[j], RAD_BF16, { n });
+            }
+            a.t = ts; a.n_t = 2;
+            const int rc = t->row->launch(&a, nullptr);
+            if (rc != RAD_OK) { t->rc = rc; break; }
+            if (t->rs)
+                hip_ck(hipMemcpyAsync(outs[j], (const uint16_t*)in + lo, (size_t)(hi - lo) * 2, hipMemcpyDeviceToDevice, nullptr),
+                       "hipMemcpyAsync", __LINE__);
+            else if (t->ag)
+                hip_ck(hipMemcpyAsync(outs[j], in, (size_t)n * 2, hipMemcpyDeviceToDevice, nullptr), "hipMemcpyAsync", __LINE__);
+        }
+        if (st_stream_sync(nullptr) != hipSuccess && t->rc == RAD_OK) t->rc = RAD_E_DEVICE;
+        for (int j = 0; j < nb && t->rc == RAD_OK; ++j) {
+            const int64_t len = t->rs ? hi - lo : n, off = t->rs ? lo : 0;
+            st_memcpy(got.data(), outs[j], (size_t)len * 2, hipMemcpyDeviceToHost);
+            int64_t b = 0;
+            for (int64_t i = 0; i < len; ++i) b += got[(size_t)i] != want[(size_t)(off + i)];
+            if (b) { t->bad += b; ++t->bad_launches; if (t->first_bad < 0) t->first_bad = L + j; }
+        }
+    }
+    t->bar->wait();
+    if (inst && t->row->fini) t->row->fini(inst);
+    for (void* p : { in, pristine }) if (p) st_free(p);
+    for (void* p : outs) if (p) st_free(p);
+}
+
+static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
+    constexpr int W = 4;
+    if (iters <= 0) iters = 100;
+    std::vector<int64_t> sizes, widths;
+    {
+        std::string all = spec ? spec : "";
+        size_t at = 0;
+        while (at < all.size()) {
+            const size_t comma = all.find(',', at);
+            const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            long long r = 0, w = 0;
+            if (std::sscanf(one.c_str(), "%lldx%lld", &r, &w) != 2 || r <= 0 || w <= 0 || w % 32 || (r * w * 2) % 16) {
+                std::printf("--perfar4: '%s' is not RxW (W a multiple of 32)\n", one.c_str());
+                return;
+            }
+            sizes.push_back(r * w); widths.push_back(w);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+    }
+    if (sizes.empty()) { std::printf("--perfar4: no sizes\n"); return; }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess) nd = 0;
+    std::vector<int> devs;
+    for (int d = 0; d < nd; ++d) {
+        hipDeviceProp_t pr;
+        if (hipGetDeviceProperties(&pr, d) == hipSuccess && !std::strncmp(pr.gcnArchName, "gfx1201", 7)) devs.push_back(d);
+    }
+    if ((int)devs.size() < W) { std::printf("--perfar4: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
+    devs.resize(W);
+    int wall_khz_i = 0;
+    if (hipDeviceGetAttribute(&wall_khz_i, hipDeviceAttributeWallClockRate, devs[0]) != hipSuccess) wall_khz_i = 0;
+    /* kind 0 one-shot, 1 two-shot, 2 RS / AG; raw -1 = not an SP row */
+    struct Rw { const char* row; int raw; std::string label; int kind; std::vector<RadParam> extra; };
+    std::vector<Rw> want;
+    auto dr = [](int d) { return std::vector<RadParam>{ PI("drain", d), PI("drain_force", 1) }; };
+    auto cat = [](std::vector<RadParam> a, const std::vector<RadParam>& b) { a.insert(a.end(), b.begin(), b.end()); return a; };
+    want.push_back({ "ar_twoshot_4rank_exact", -1, "AR two-shot exact", 1, {} });
+    want.push_back({ "ar_twoshot_4rank_exact", -1, "AR two-shot exact xpush", 1, { PI("xpush", 1) } });
+    for (int d : { 2, 3, 0 }) {
+        want.push_back({ "ar_twoshot_4rank_exact", -1, fmt("AR two-shot exact drain %d", d), 1, dr(d) });
+        want.push_back({ "ar_twoshot_4rank_exact", -1, fmt("AR two-shot exact xpush drain %d", d), 1, cat({ PI("xpush", 1) }, dr(d)) });
+    }
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR coded exact (lane, 4x1024)", 1, { PI("overlap", 1) } });
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR coded exact (lane) xpush", 1, { PI("overlap", 1), PI("xpush", 1) } });
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR lane plain (coded 0)", 1, { PI("overlap", 1), PI("coded", 0) } });
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR lane plain (coded 0) xpush", 1,
+                     { PI("overlap", 1), PI("coded", 0), PI("xpush", 1) } });
+    want.push_back({ "ar_oneshot_4rank_exact", -1, "AR one-shot exact (ts_min 0)", 0, { PI("ts_min", 0) } });
+    want.push_back({ "ar_twoshot_4rank_ti8", -1, "AR two-shot ti8 (lossy)", 1, {} });
+    want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw", 2, {} });
+    want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw xpush", 2, { PI("xpush", 1) } });
+    for (int d : { 2, 3, 0 }) {
+        want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw drain %d", d), 2, dr(d) });
+        want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw xpush drain %d", d), 2, cat({ PI("xpush", 1) }, dr(d)) });
+    }
+    want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw", 2, {} });
+    /* fn4 13.11.: the SP rows as the pipelined prefill issues them (overlap 1: the lane's block / thread knobs apply,
+     * RADIANCE_FN4_AR_LANE_BLOCKS / _THREADS at start) */
+    want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw xpush (lane)", 2, { PI("overlap", 1), PI("xpush", 1) } });
+    want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw (lane)", 2, { PI("overlap", 1) } });
+    want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw drain 3", 2, dr(3) });
+    /* fn4 PFF (qwen/prefill): the lane forms under the ar_fence forms (launch parameter `fence`) */
+    for (int f : { 1, 2, 3, 6 }) {
+        want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw xpush (lane) fence %d", f), 2, { PI("overlap", 1), PI("xpush", 1), PI("fence", f) } });
+        want.push_back({ "sp_ag_rows_4rank", 1, fmt("SP AG raw (lane) fence %d", f), 2, { PI("overlap", 1), PI("fence", f) } });
+        want.push_back({ "ar_twoshot_4rank_exact_lane", -1, fmt("AR coded exact (lane) xpush fence %d", f), 1,
+                         { PI("overlap", 1), PI("xpush", 1), PI("fence", f) } });
+    }
+    want.push_back({ "sp_rs_rows_4rank_ti8", 0, "SP RS ti8", 2, {} });
+    want.push_back({ "sp_ag_rows_4rank", 0, "SP AG ti8", 2, {} });
+    std::vector<const RadKernelInfo*> rows;
+    std::vector<int> ks, forms, raws, kinds;
+    std::vector<std::string> labels;
+    std::vector<std::vector<RadParam>> extras;
+    for (const Rw& w : want) {
+        const RadKernelInfo* r = find(pl, w.row);
+        if (!r) { std::printf("  %-36s row %s absent\n", w.label.c_str(), w.row); continue; }
+        rows.push_back(r); ks.push_back(0); forms.push_back(-1); raws.push_back(w.raw); kinds.push_back(w.kind);
+        labels.push_back(w.label); extras.push_back(w.extra);
+    }
+    if (rows.empty()) return;
+    std::printf("four-rank collectives, bf16, cards");
+    for (int d : devs) {
+        char bus[64] = { 0 };
+        if (hipDeviceGetPCIBusId(bus, (int)sizeof bus, d) != hipSuccess) bus[0] = 0;
+        std::printf(" %d=%s", d, bus);
+    }
+    std::printf(", %d launches a point, warm (back to back, period over the span, slowest rank), the block rule\n", iters);
+    StBarrier bar(W);
+    std::vector<Ar8Perf> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        Ar8Perf& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.dtype = "bf16";
+        if (const char* be = std::getenv("R4D_SELFTEST_AR4_BESIDE")) { x.beside = std::atoi(be); x.gemm = find(pl, "gemm_bf16_nt_tiled"); }
+        x.sizes = sizes; x.rows = rows; x.ks = ks; x.forms = forms; x.nbs = { 0 }; x.bar = &bar;
+        x.sp_raw = raws; x.widths = widths; x.extra = extras;
+        th.emplace_back(ar8_perf_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    for (const Ar8Perf& x : t)
+        if (x.rc_init != RAD_OK) { std::printf("  rank %d: init rc=%d\n", x.rank, x.rc_init); return; }
+    size_t cfg = 0;
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        const double bytes = (double)sizes[si] * 2.0;
+        std::printf("  %lld x %lld bf16 (%.2f MB)\n", (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6);
+        for (size_t j = 0; j < rows.size(); ++j, ++cfg) {
+            if (t[0].rc[cfg] != RAD_OK) {
+                std::printf("    %-36s rc=%d (not served)\n", labels[j].c_str(), t[0].rc[cfg]);
+                continue;
+            }
+            double us = 0.0;
+            std::string per;
+            for (const Ar8Perf& x : t) {
+                us = std::max(us, (double)x.period[cfg] * 1000.0);
+                per += fmt(" %.1f", (double)x.period[cfg] * 1000.0);
+            }
+            const double sent = kinds[j] == 0 ? (double)(W - 1) * bytes
+                              : kinds[j] == 1 ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) / W * bytes;
+            int64_t bad = 0;
+            for (const Ar8Perf& x : t) bad += x.bad[cfg];
+            std::printf("    %-36s %9.1f us  %6.2f GB/s payload  %6.2f GB/s a rank a direction  %s | us by rank:%s\n",
+                        labels[j].c_str(), us, us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
+                        kinds[j] == 2 ? "(timed only)" : bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
+                                                             : "= fold on every rank", per.c_str());
+            if (g_timeline && (kinds[j] == 1 || kinds[j] == 2)) ar8_print_timeline(t, cfg, (double)wall_khz_i);
+            double gw = 0.0;
+            for (const Ar8Perf& x : t) gw = std::max(gw, x.gemm_with_us.size() > cfg ? x.gemm_with_us[cfg] : 0.0);
+            std::printf("AR4 %s\n", fmt("{\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"op\": \"%s\", \"us\": %.1f, "
+                                        "\"gbs_dir\": %.2f, \"bad\": %lld, \"checked\": %s, \"beside\": %d, \"gemm_alone_us\": %.1f, "
+                                        "\"gemm_with_us\": %.1f}", (long long)(sizes[si] / widths[si]),
+                                        (long long)widths[si], bytes / 1e6, labels[j].c_str(), us,
+                                        us > 0 ? sent / (us * 1e3) : 0.0, (long long)bad,
+                                        kinds[j] == 2 ? "false" : "true", t[0].beside, t[0].gemm_alone_us, gw).c_str());
+        }
+    }
+    /* the stale-read stress (R4D_SELFTEST_AR4_STRESS launches a point): fresh instances, every launch checked */
+    const char* se = std::getenv("R4D_SELFTEST_AR4_STRESS");
+    const int nst = se ? std::atoi(se) : 0;
+    if (nst <= 0) return;
+    const RadKernelInfo* two = find(pl, "ar_twoshot_4rank_exact");
+    const RadKernelInfo* rsr = find(pl, "sp_rs_rows_4rank_ti8");
+    /* fn4 PFF (16.11.2026, qwen/prefill): R4D_SELFTEST_AR4_FENCE=list (e.g. 0,1,2,3,4,5) runs the stale-read stress over the
+     * ar_fence forms instead (r4d_ar_entry.hip; launch parameter `fence`, no drain_force: the drain-1 rule fires and the form
+     * replaces it), on the four ops a pipelined prefill step issues: the exact two-shot (wide) and its lane twin (overlap 1,
+     * the coded wire), SP's raw reduce-scatter and SP's raw all-gather, with xpush 1 (the published setting). */
+    if (const char* fe = std::getenv("R4D_SELFTEST_AR4_FENCE")) {
+        std::vector<int> forms;
+        for (const char* q = fe; *q;) { forms.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
+        const RadKernelInfo* agr = find(pl, "sp_ag_rows_4rank");
+        for (size_t si = 0; si < sizes.size(); ++si) {
+            if (sizes[si] / widths[si] < 64) continue;
+            for (int op = 0; op < 4; ++op)
+                for (int f : forms) {
+                    const RadKernelInfo* row = op == 2 ? rsr : op == 3 ? agr : two;
+                    if (!row) continue;
+                    StBarrier b2(W);
+                    std::vector<Ar4Stress> st((size_t)W);
+                    std::vector<std::thread> th2;
+                    for (int r = 0; r < W; ++r) {
+                        Ar4Stress& x = st[(size_t)r];
+                        x.rank = r; x.dev = devs[(size_t)r]; x.launches = nst; x.row = row; x.rs = op == 2; x.ag = op == 3;
+                        x.n = sizes[si]; x.width = widths[si]; x.bar = &b2;
+                        x.extra = { PI("fence", f), PI("xpush", 1) };
+                        if (op == 1) x.extra.push_back(PI("overlap", 1));
+                        th2.emplace_back(ar4_stress_worker, &x);
+                    }
+                    for (std::thread& x : th2) x.join();
+                    int64_t bad = 0, bl = 0, fb = -1;
+                    int rc = RAD_OK;
+                    for (const Ar4Stress& x : st) {
+                        bad += x.bad; bl += x.bad_launches;
+                        if (x.first_bad >= 0 && (fb < 0 || x.first_bad < fb)) fb = x.first_bad;
+                        if (x.rc != RAD_OK) rc = x.rc;
+                    }
+                    const char* on[4] = { "AR two-shot exact", "AR lane coded exact", "SP RS raw", "SP AG raw" };
+                    std::printf("FSTRESS {\"rows\": %lld, \"width\": %lld, \"op\": \"%s\", \"fence\": %d, \"launches\": %d, "
+                                "\"rc\": %d, \"bad\": %lld, \"bad_launches\": %lld, \"first_bad\": %lld}\n",
+                                (long long)(sizes[si] / widths[si]), (long long)widths[si], on[op], f, nst, rc, (long long)bad,
+                                (long long)bl, (long long)fb);
+                    std::fflush(stdout);
+                    if (bad) ++g_fail;
+                }
+        }
+        return;
+    }
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        if (sizes[si] / widths[si] < 64) continue;   /* the prefill sizes: the fence rule's (>= 131072 elements) */
+        for (int rs = 0; rs <= 1; ++rs)
+            for (int xp = 0; xp <= 1; ++xp)
+                for (int d : { 1, 2, 3, 0 }) {
+                    const RadKernelInfo* row = rs ? rsr : two;
+                    if (!row) continue;
+                    StBarrier b2(W);
+                    std::vector<Ar4Stress> st((size_t)W);
+                    std::vector<std::thread> th2;
+                    for (int r = 0; r < W; ++r) {
+                        Ar4Stress& x = st[(size_t)r];
+                        x.rank = r; x.dev = devs[(size_t)r]; x.launches = nst; x.row = row; x.rs = rs != 0;
+                        x.n = sizes[si]; x.width = widths[si]; x.bar = &b2;
+                        x.extra = { PI("drain", d), PI("drain_force", 1) };
+                        if (xp) x.extra.push_back(PI("xpush", 1));
+                        th2.emplace_back(ar4_stress_worker, &x);
+                    }
+                    for (std::thread& x : th2) x.join();
+                    int64_t bad = 0, bl = 0, fb = -1;
+                    int rc = RAD_OK;
+                    for (const Ar4Stress& x : st) {
+                        bad += x.bad; bl += x.bad_launches;
+                        if (x.first_bad >= 0 && (fb < 0 || x.first_bad < fb)) fb = x.first_bad;
+                        if (x.rc != RAD_OK) rc = x.rc;
+                    }
+                    std::printf("STRESS {\"rows\": %lld, \"width\": %lld, \"op\": \"%s\", \"xpush\": %d, \"drain\": %d, "
+                                "\"launches\": %d, \"rc\": %d, \"bad\": %lld, \"bad_launches\": %lld, \"first_bad\": %lld}\n",
+                                (long long)(sizes[si] / widths[si]), (long long)widths[si], rs ? "SP RS raw" : "AR two-shot exact",
+                                xp, d, nst, rc, (long long)bad, (long long)bl, (long long)fb);
+                    std::fflush(stdout);
+                }
+    }
+}
+
+/* ---- fn4 SDMA-AR (12.11.2026): the copy engines as the all-reduce's transport (libr4d r4d_ar_sdma.hip) ----
+ *
+ * --perfsdma [bytes,..] [iters]: each card's SDMA engine copying card -> peer (push) and peer -> card (pull) on the
+ * four TP4 cards, engine 0 and 1: one pair, a pair both ways, one card to three, three to one, every card to its three
+ * peers at once (the two-shot's hop: S/4 to each peer, ring order), the same pulled, the hop split over both engines,
+ * a local VRAM copy, and the hop beside a VRAM-bound kernel on every card (the kernel's time with and without it).
+ * Timed from the host: every queue polls a start word, the host releases it and waits for each queue's fence.
+ * --sdmaar4 RxW[,RxW..] [iters]: the exact SDMA two-shot (r4d_sdma_ar_launch) checked and timed against today's CU
+ * exact two-shot (ar_twoshot_4rank_exact, xpush 1) in the same process: R4D_SDMA_CHECKS launches a size (default 1000) from a
+ * fresh context, each on newly generated inputs (written by a kernel, through L2) into an output poisoned by a kernel,
+ * every output compared on the card with the fp32 ascending-rank fold; then in place; then the CU row's bytes vs the
+ * SDMA row's on the same input; then timed (warm, back to back, slowest rank), also its RS and AG halves.
+ * R4D_SDMA_ENGINE (0) picks the engine, R4D_SDMA_SCR (1) the scratch: 0 coarse, 1 fine-grained, 2 uncached. */
+struct SdmaApi {
+    void* (*open)(int, int, char*, int) = nullptr;
+    void (*close)(void*) = nullptr;
+    int (*copy)(void*, void*, const void*, unsigned long long) = nullptr;
+    int (*fence)(void*, void*, unsigned int) = nullptr;
+    int (*poll)(void*, const void*, unsigned int) = nullptr;
+    int (*kick)(void*) = nullptr;
+    int (*k_stream)(hipStream_t, void*, const void*, long long, int, int) = nullptr;
+    int (*k_gen)(hipStream_t, void*, long long, int, unsigned int) = nullptr;
+    int (*k_check)(hipStream_t, const void*, long long, int, unsigned int, unsigned long long*) = nullptr;
+    void* (*ar_create)(int, int, int, int, long long, int, char*, int) = nullptr;
+    void (*ar_destroy)(void*) = nullptr;
+    unsigned int (*ar_error)(void*) = nullptr;
+    int (*ar_launch)(void*, const void*, void*, long long, hipStream_t, int) = nullptr;
+    /* fn4 SDMA-AR engine path (--sdmaeng4) and the timeline (R4D_SDMA_TL) */
+    int (*ar_launch_tab)(void*, const void*, void*, long long, const long long*, int, hipStream_t) = nullptr;
+    int (*tl_on)(void*, int) = nullptr;
+    long long (*tl_read)(void*, unsigned long long*) = nullptr;
+    void (*allow_untaped)(int) = nullptr;
+    int (*k_check2)(hipStream_t, const void*, long long, int, int, int, long long, long long, long long, unsigned int,
+                    unsigned long long*) = nullptr;
+    int (*k_cmp)(hipStream_t, const void*, const void*, long long, unsigned long long*) = nullptr;
+    int (*inst_sdma)(const void*) = nullptr;
+};
+static SdmaApi g_sdma;
+
+static bool sdma_api(const Plugin& pl) {
+    bool okall = true;
+    auto get = [&](const char* n, auto* f) {
+        void* p = dlsym(pl.h, n);
+        if (!p) { std::printf("  libr4d has no %s (not an fn4 SDMA-AR build)\n", n); okall = false; }
+        std::memcpy(f, &p, sizeof(p));
+    };
+    get("r4d_sdma_open", &g_sdma.open); get("r4d_sdma_close", &g_sdma.close); get("r4d_sdma_copy", &g_sdma.copy);
+    get("r4d_sdma_fence", &g_sdma.fence); get("r4d_sdma_poll", &g_sdma.poll); get("r4d_sdma_kick", &g_sdma.kick);
+    get("r4d_sdma_k_stream", &g_sdma.k_stream); get("r4d_sdma_k_gen", &g_sdma.k_gen); get("r4d_sdma_k_check", &g_sdma.k_check);
+    get("r4d_sdma_ar_create", &g_sdma.ar_create); get("r4d_sdma_ar_destroy", &g_sdma.ar_destroy);
+    get("r4d_sdma_ar_error", &g_sdma.ar_error); get("r4d_sdma_ar_launch", &g_sdma.ar_launch);
+    get("r4d_sdma_ar_launch_tab", &g_sdma.ar_launch_tab); get("r4d_sdma_ar_timeline", &g_sdma.tl_on);
+    get("r4d_sdma_ar_timeline_read", &g_sdma.tl_read); get("r4d_sdma_allow_untaped", &g_sdma.allow_untaped);
+    get("r4d_sdma_k_check2", &g_sdma.k_check2); get("r4d_sdma_k_cmp", &g_sdma.k_cmp);
+    get("r4d_ar_inst_sdma", &g_sdma.inst_sdma);
+    return okall;
+}
+
+static std::vector<int> sdma_cards(int want) {
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess) nd = 0;
+    std::vector<int> devs;
+    for (int d = 0; d < nd; ++d) {
+        hipDeviceProp_t pr;
+        if (hipGetDeviceProperties(&pr, d) == hipSuccess && !std::strncmp(pr.gcnArchName, "gfx1201", 7)) devs.push_back(d);
+    }
+    if ((int)devs.size() > want) devs.resize((size_t)want);
+    return devs;
+}
+
+static void sdma_cont(const Plugin& pl, long long n);
+
+static void sdma_perf(const Plugin& pl, const char* spec, int iters) {
+    constexpr int W = 4;
+    if (!sdma_api(pl)) { ++g_fail; return; }
+    if (iters <= 0) iters = 20;
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::vector<long long> sizes;
+    {
+        std::string all = spec && *spec ? spec : "65536,262144,1048576,4194304,10485760,20971520,41943040";
+        size_t at = 0;
+        while (at < all.size()) {
+            const size_t c = all.find(',', at);
+            const long long v = std::strtoll(all.substr(at, c == std::string::npos ? std::string::npos : c - at).c_str(), nullptr, 0);
+            if (v <= 0 || v % 64) { std::printf("--perfsdma: sizes are bytes, multiples of 64\n"); return; }
+            sizes.push_back(v);
+            if (c == std::string::npos) break;
+            at = c + 1;
+        }
+    }
+    const std::vector<int> devs = sdma_cards(W);
+    if ((int)devs.size() < W) { std::printf("--perfsdma: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
+    long long maxs = 0;
+    for (long long s : sizes) maxs = std::max(maxs, s);
+    const long long bigk = 512ll << 20;   /* the VRAM-bound kernel's buffers */
+    void *src[W], *rcv[W], *loc[W], *ka[W], *kb[W];
+    void* q[W][2] = { { nullptr } };
+    std::printf("SDMA copy engines, cards");
+    for (int i = 0; i < W; ++i) {
+        char bus[64] = { 0 };
+        if (hipDeviceGetPCIBusId(bus, (int)sizeof bus, devs[(size_t)i]) != hipSuccess) bus[0] = 0;
+        std::printf(" %d=%s", i, bus);
+    }
+    std::printf(", %d timed runs a point (median, host-timed from the start word to the last fence)\n", iters);
+    for (int i = 0; i < W; ++i) {
+        st_set_device(devs[(size_t)i]);
+        for (int j = 0; j < W; ++j)
+            if (j != i) {
+                const hipError_t e = hipDeviceEnablePeerAccess(devs[(size_t)j], 0);
+                if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+                    std::printf("  peer access %d -> %d: %s\n", i, j, hipGetErrorString(e)); ++g_fail; return;
+                }
+                (void)hipGetLastError();
+            }
+        if (hipMalloc(&src[i], (size_t)maxs) != hipSuccess || hipMalloc(&rcv[i], (size_t)maxs * 3) != hipSuccess ||
+            hipMalloc(&loc[i], (size_t)maxs) != hipSuccess || hipMalloc(&ka[i], (size_t)bigk) != hipSuccess ||
+            hipMalloc(&kb[i], (size_t)bigk) != hipSuccess) {
+            std::printf("  card %d: allocation failed\n", i); ++g_fail; return;
+        }
+        st_memset(src[i], 0x5a, (size_t)maxs);
+        st_memset(ka[i], 0x33, (size_t)bigk);
+        for (int e = 0; e < 2; ++e) {
+            char why[256] = { 0 };
+            q[i][e] = g_sdma.open(devs[(size_t)i], e, why, (int)sizeof why);
+            if (!q[i][e]) std::printf("  card %d engine %d: no SDMA queue (%s)\n", i, e, why);
+        }
+        st_set_device(devs[(size_t)i]);
+        hip_ck(hipDeviceSynchronize(), "hipDeviceSynchronize", __LINE__);
+    }
+    volatile unsigned int* hw = nullptr;
+    if (hipHostMalloc((void**)&hw, 4096, hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable) != hipSuccess) {
+        std::printf("  no host words\n"); ++g_fail; return;
+    }
+    std::memset((void*)hw, 0, 4096);
+    auto done_w = [&](int c, int e) { return hw + 16 * (1 + c * 2 + e); };
+    unsigned int gen = 0;
+    struct Cp { void* dst; const void* src; long long bytes; };
+    struct Job { int c, e; std::vector<Cp> cps; };
+    /* median us from the start release to the last queue's fence; -1 when a queue is missing or a run timed out */
+    auto run = [&](const std::vector<Job>& jobs, int n) -> double {
+        for (const Job& j : jobs) if (!q[j.c][j.e]) return -1.0;
+        std::vector<double> t;
+        for (int it = 0; it < n + 2; ++it) {
+            const unsigned int k = ++gen;
+            for (const Job& j : jobs) {
+                void* qq = q[j.c][j.e];
+                g_sdma.poll(qq, (const void*)hw, k);
+                for (const Cp& c : j.cps) g_sdma.copy(qq, c.dst, c.src, (unsigned long long)c.bytes);
+                g_sdma.fence(qq, (void*)done_w(j.c, j.e), k);
+                g_sdma.kick(qq);
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            _mm_sfence();
+            hw[0] = k;
+            _mm_sfence();
+            bool timeout = false;
+            for (const Job& j : jobs)
+                while (*done_w(j.c, j.e) != k) {
+                    _mm_pause();
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) { timeout = true; break; }
+                }
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (timeout) { std::printf("  TIMEOUT: a queue never finished (run %d)\n", it); ++g_fail; return -1.0; }
+            if (it >= 2) t.push_back(us);
+        }
+        std::sort(t.begin(), t.end());
+        return t[t.size() / 2];
+    };
+    auto row = [&](long long s, const char* what, int e, double us, double bytes_dir, const char* per) {
+        if (us < 0) { std::printf("    %-46s e%d  (not run)\n", what, e); return; }
+        std::printf("    %-46s e%d %9.1f us  %6.2f GB/s %s\n", what, e, us, bytes_dir / (us * 1e3), per);
+        std::printf("SDMA {\"bytes\": %lld, \"case\": \"%s\", \"engine\": %d, \"us\": %.1f, \"gbs\": %.2f}\n", s, what, e, us,
+                    bytes_dir / (us * 1e3));
+    };
+    char* rc_[W];
+    for (int i = 0; i < W; ++i) rc_[i] = (char*)rcv[i];
+    for (long long s : sizes) {
+        std::printf("  %lld bytes (%.2f MB)\n", s, s / 1e6);
+        const long long sh = s / 4 / 16 * 16, s3 = s / 3 / 16 * 16;
+        for (int e = 0; e < 2; ++e) {
+            row(s, "push 1 peer (0 -> 1)", e, run({ { 0, e, { { rc_[1], src[0], s } } } }, iters), (double)s, "out of card 0");
+            row(s, "pull 1 peer (1 <- 0)", e, run({ { 1, e, { { rc_[1], src[0], s } } } }, iters), (double)s, "into card 1");
+            row(s, "push pair both ways (0 <-> 1)", e,
+                run({ { 0, e, { { rc_[1], src[0], s } } }, { 1, e, { { rc_[0], src[1], s } } } }, iters), (double)s, "each way");
+            row(s, "push 1 -> 3 peers (S/3 each)", e,
+                run({ { 0, e, { { rc_[1], src[0], s3 }, { rc_[2], src[0], s3 }, { rc_[3], src[0], s3 } } } }, iters),
+                (double)(3 * s3), "out of card 0");
+            row(s, "push 3 -> 1 (S/3 each)", e,
+                run({ { 1, e, { { rc_[0], src[1], s3 } } }, { 2, e, { { rc_[0] + s3, src[2], s3 } } },
+                      { 3, e, { { rc_[0] + 2 * s3, src[3], s3 } } } }, iters), (double)(3 * s3), "into card 0");
+            std::vector<Job> a2a, a2p;
+            for (int c = 0; c < W; ++c) {
+                Job j{ c, e, {} }, jp{ c, e, {} };
+                for (int i = 1; i < W; ++i) {
+                    const int p = (c + i) % W;
+                    j.cps.push_back({ rc_[p] + (size_t)c * sh, (const char*)src[c] + (size_t)p * sh, sh });
+                    jp.cps.push_back({ rc_[c] + (size_t)p * sh, (const char*)src[p] + (size_t)c * sh, sh });
+                }
+                a2a.push_back(j); a2p.push_back(jp);
+            }
+            row(s, "all-to-all push (the hop: S/4 to each peer)", e, run(a2a, iters), 0.75 * (double)(4 * sh), "a rank a direction");
+            row(s, "all-to-all pull (S/4 from each peer)", e, run(a2p, iters), 0.75 * (double)(4 * sh), "a rank a direction");
+            row(s, "local VRAM copy (card 0)", e, run({ { 0, e, { { loc[0], src[0], s } } } }, iters), (double)s, "copied");
+        }
+        {
+            std::vector<Job> two;
+            for (int c = 0; c < W; ++c)
+                for (int e = 0; e < 2; ++e) {
+                    Job j{ c, e, {} };
+                    for (int i = 1; i < W; ++i) {
+                        const int p = (c + i) % W;
+                        const long long h = sh / 2 / 16 * 16;
+                        j.cps.push_back({ rc_[p] + (size_t)c * sh + (size_t)(e ? h : 0), (const char*)src[c] + (size_t)p * sh + (e ? h : 0),
+                                          e ? sh - h : h });
+                    }
+                    two.push_back(j);
+                }
+            row(s, "all-to-all push, each copy halved on e0 + e1", 2, run(two, iters), 0.75 * (double)(4 * sh), "a rank a direction");
+        }
+    }
+    for (int i = 0; i < W; ++i) {
+        st_set_device(devs[(size_t)i]);
+        hip_ck(hipDeviceSynchronize(), "hipDeviceSynchronize", __LINE__);
+        for (int e = 0; e < 2; ++e) if (q[i][e]) g_sdma.close(q[i][e]);
+        for (void* p : { src[i], rcv[i], loc[i], ka[i], kb[i] }) st_free(p);
+    }
+    (void)hipHostFree((void*)hw);
+    for (long long n : { 20971520ll, 5242880ll }) if (n * 2 <= maxs) sdma_cont(pl, n);
+}
+
+/* The contention question (after 204: the CU XPUSH two-shot already moves 25.1 GB/s a direction at 42 MB): what a
+ * VRAM-bound kernel stream on every card loses while an all-reduce's bytes move beside it. One thread a card; on stream K
+ * `kpass` passes of a 256 MB -> 256 MB copy kernel (~40 ms), on stream A `nar` back-to-back all-reduces of S (~20 ms,
+ * inside the kernel stream's span): today's CU exact two-shot lockstep and xpush, and the SDMA copies of the same bytes
+ * (both hops: S/4 to each peer twice, ring order, copies only) on engine 0 and on engine 1. Reported: the kernel stream's
+ * time alone and beside each, the loss in us a 42 MB-equivalent all-reduce, and the all-reduce's own time alone / beside. */
+struct SdmaCont {
+    int rank = 0, dev = 0, world = 4, kpass = 0, nar = 0;
+    long long n = 0;               /* bf16 elements of the all-reduce */
+    const RadKernelInfo* cu = nullptr;
+    StBarrier* bar = nullptr;
+    char** rcv_all = nullptr;      /* every rank's receive buffer (2 S), published before the barrier */
+    int rc = RAD_OK;
+    std::string why;
+    double k_alone = 0, k_one = 0;
+    double ar_alone[4] = { 0 }, ar_with[4] = { 0 }, k_with[4] = { 0 };
+};
+
+static void sdma_cont_worker(SdmaCont* t) {
+    const int W = t->world, r = t->rank;
+    const long long S = t->n * 2, sh = S / 4 / 16 * 16;
+    const long long big = 256ll << 20;
+    if (st_set_device(t->dev) != hipSuccess) t->rc = RAD_E_DEVICE;
+    hipStream_t sk = nullptr, sa = nullptr;
+    if (t->rc == RAD_OK && (hipStreamCreateWithFlags(&sk, hipStreamNonBlocking) != hipSuccess ||
+                            hipStreamCreateWithFlags(&sa, hipStreamNonBlocking) != hipSuccess))
+        t->rc = RAD_E_DEVICE;
+    void *in = nullptr, *out = nullptr, *rcv = nullptr, *ka = nullptr, *kb = nullptr;
+    if (t->rc == RAD_OK && (hipMalloc(&in, (size_t)S) != hipSuccess || hipMalloc(&out, (size_t)S) != hipSuccess ||
+                            hipMalloc(&rcv, (size_t)S * 2) != hipSuccess || hipMalloc(&ka, (size_t)big) != hipSuccess ||
+                            hipMalloc(&kb, (size_t)big) != hipSuccess))
+        t->rc = RAD_E_NOMEM;
+    if (t->rc == RAD_OK) {
+        g_sdma.k_gen(nullptr, in, t->n, r, 77u);
+        st_memset(ka, 0x33, (size_t)big);
+    }
+    t->rcv_all[r] = (char*)rcv;
+    void* inst = nullptr;
+    std::vector<RadParam> ip = { PI("world_size", W), PI("numel", t->n), PS("dtype", "bf16"), PI("exact", 1) };
+    const int irc = t->cu ? t->cu->init(ip.data(), (int)ip.size(), r, W, &inst) : RAD_E_STATE;   /* collective */
+    if (irc != RAD_OK && t->rc == RAD_OK) { t->rc = irc; t->why = "CU two-shot init"; }
+    t->bar->wait();
+    for (int p = 0; p < W; ++p)
+        if (p != r) {
+            const hipError_t e = hipDeviceEnablePeerAccess(t->dev - r + p, 0);   /* devs are consecutive ordinals (checked) */
+            if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled && t->rc == RAD_OK) { t->rc = RAD_E_DEVICE; t->why = "peer"; }
+            (void)hipGetLastError();
+        }
+    void* q[2] = { nullptr, nullptr };
+    for (int e = 0; e < 2; ++e) {
+        char why[256] = { 0 };
+        q[e] = g_sdma.open(t->dev, e, why, (int)sizeof why);
+        if (!q[e] && t->rc == RAD_OK) { t->rc = RAD_E_DEVICE; t->why = why; }
+    }
+    volatile unsigned int* hw = nullptr;
+    if (hipHostMalloc((void**)&hw, 4096, hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable) != hipSuccess)
+        t->rc = RAD_E_NOMEM;
+    else std::memset((void*)hw, 0, 4096);
+    hip_ck(hipDeviceSynchronize(), "hipDeviceSynchronize", __LINE__);
+    t->bar->wait();
+    const bool ok = t->rc == RAD_OK;
+    hipEvent_t k0, k1, a0, a1;
+    st_ev_create(&k0); st_ev_create(&k1); st_ev_create(&a0); st_ev_create(&a1);
+    auto el = [](hipEvent_t x, hipEvent_t y) { st_ev_sync(y); float ms = 0; st_ev_elapsed(&ms, x, y); return (double)ms; };
+    auto kstream = [&](int passes) {
+        st_ev_record(k0, sk);
+        for (int i = 0; i < passes; ++i) g_sdma.k_stream(sk, kb, ka, big, 1, 0);
+        st_ev_record(k1, sk);
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    std::vector<RadParam> ps_lock = ip, ps_xp = ip;
+    ps_xp.push_back(PI("xpush", 1));
+    RadTensor ts[2] = { T(in, RAD_BF16, { t->n }), T(out, RAD_BF16, { t->n }) };
+    a.t = ts; a.n_t = 2; a.instance = inst; a.rank = r; a.world_size = W;
+    unsigned int gen = 0;
+    /* arm 0 CU lockstep, 1 CU xpush, 2 SDMA copies e0, 3 SDMA copies e1; returns ms of the all-reduces */
+    auto ars = [&](int arm, int n, bool wait_done) -> double {
+        if (arm < 2) {
+            a.p = arm == 0 ? ps_lock.data() : ps_xp.data();
+            a.n_p = arm == 0 ? (int)ps_lock.size() : (int)ps_xp.size();
+            st_ev_record(a0, sa);
+            for (int i = 0; i < n; ++i) t->cu->launch(&a, sa);
+            st_ev_record(a1, sa);
+            return wait_done ? el(a0, a1) : 0.0;
+        }
+        void* qq = q[arm - 2];
+        const unsigned int k = ++gen;
+        for (int i = 0; i < n; ++i)
+            for (int hop = 0; hop < 2; ++hop)
+                for (int j = 1; j < W; ++j) {
+                    const int p = (r + j) % W;
+                    g_sdma.copy(qq, t->rcv_all[p] + (size_t)hop * S + (size_t)r * sh, (const char*)in + (size_t)p * sh,
+                                (unsigned long long)sh);
+                }
+        g_sdma.fence(qq, (void*)(hw + 16), k);
+        const auto t0 = std::chrono::steady_clock::now();
+        g_sdma.kick(qq);
+        while (hw[16] != k) {
+            _mm_pause();
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) { t->rc = RAD_E_DEVICE; t->why = "SDMA timeout"; break; }
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    if (ok) {
+        kstream(1); t->k_one = el(k0, k1);
+        if (t->cu) for (int i = 0; i < 2; ++i) ars(1, 4, true);   /* warm */
+        t->bar->wait();
+        std::vector<double> v;
+        for (int i = 0; i < 3; ++i) { t->bar->wait(); kstream(t->kpass); v.push_back(el(k0, k1)); }
+        std::sort(v.begin(), v.end());
+        t->k_alone = v[1];
+        for (int arm = 0; arm < 4; ++arm) {
+            if (arm < 2 && !t->cu) continue;
+            t->bar->wait();
+            ars(arm, 2, true);
+            t->bar->wait();
+            t->ar_alone[arm] = ars(arm, t->nar, true);
+            t->bar->wait();
+            kstream(t->kpass);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            t->ar_with[arm] = ars(arm, t->nar, true);
+            t->k_with[arm] = el(k0, k1);
+            hip_ck(hipDeviceSynchronize(), "hipDeviceSynchronize", __LINE__);
+        }
+    } else {
+        t->bar->wait();
+        for (int i = 0; i < 3; ++i) t->bar->wait();
+        for (int arm = 0; arm < 4; ++arm) { if (arm < 2 && !t->cu) continue; t->bar->wait(); t->bar->wait(); t->bar->wait(); }
+    }
+    t->bar->wait();
+    if (inst && t->cu && t->cu->fini) t->cu->fini(inst);
+    for (void* x : q) if (x) g_sdma.close(x);
+    if (hw) (void)hipHostFree((void*)hw);
+    for (void* x : { in, out, rcv, ka, kb }) if (x) st_free(x);
+    st_ev_destroy(k0); st_ev_destroy(k1); st_ev_destroy(a0); st_ev_destroy(a1);
+    if (sk) (void)hipStreamDestroy(sk);
+    if (sa) (void)hipStreamDestroy(sa);
+}
+
+static void sdma_cont(const Plugin& pl, long long n) {
+    constexpr int W = 4;
+    const std::vector<int> devs = sdma_cards(W);
+    for (int i = 1; i < W; ++i)
+        if (devs[(size_t)i] != devs[0] + i) { std::printf("  contention: the cards are not consecutive ordinals\n"); return; }
+    const RadKernelInfo* cu = find(pl, "ar_twoshot_4rank_exact");
+    const char* ne = std::getenv("R4D_SDMA_CONT_NAR");
+    const char* ke = std::getenv("R4D_SDMA_CONT_KMS");
+    const double kms = ke ? std::atof(ke) : 60.0;
+    std::printf("  contention, %lld bf16 (%.2f MB) all-reduces beside a VRAM-bound kernel stream on every card%s\n", n, n * 2 / 1e6,
+                cu ? "" : " (no CU two-shot row: SDMA arms only)");
+    StBarrier bar(W);
+    char* rcv_all[W] = { nullptr };
+    std::vector<SdmaCont> t((size_t)W);
+    /* nar ~ 1/3 of the kernel span at 25 GB/s a direction, kpass from a 1-pass probe inside the worker: fixed here as
+     * passes of ~0.9 ms (512 MB of traffic at ~560 GB/s) */
+    const double ar_ms = 2.0 * 0.75 * n * 2 / 25e6;
+    const int nar = ne ? std::atoi(ne) : std::max(2, (int)(kms / 3.0 / std::max(ar_ms, 0.01)));
+    const int kpass = std::max(4, (int)(kms / 0.9));
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        SdmaCont& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.n = n; x.cu = cu; x.bar = &bar; x.rcv_all = rcv_all;
+        x.nar = nar; x.kpass = kpass;
+        th.emplace_back(sdma_cont_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    for (const SdmaCont& x : t)
+        if (x.rc != RAD_OK) { std::printf("    rank %d: rc %d %s\n", x.rank, x.rc, x.why.c_str()); ++g_fail; return; }
+    double ka = 0, k1 = 0;
+    for (const SdmaCont& x : t) { ka = std::max(ka, x.k_alone); k1 = std::max(k1, x.k_one); }
+    std::printf("    kernel stream alone: %.2f ms (%d passes of 256 MB -> 256 MB, %.0f GB/s r+w a card; one pass %.3f ms)\n", ka, kpass,
+                2.0 * kpass * (256ll << 20) / (ka * 1e6), k1);
+    const char* names[4] = { "CU two-shot exact lockstep", "CU two-shot exact xpush", "SDMA copies, same bytes, e0",
+                             "SDMA copies, same bytes, e1" };
+    for (int arm = 0; arm < 4; ++arm) {
+        if (arm < 2 && !cu) continue;
+        double aa = 0, aw = 0, kw = 0;
+        for (const SdmaCont& x : t) { aa = std::max(aa, x.ar_alone[arm]); aw = std::max(aw, x.ar_with[arm]); kw = std::max(kw, x.k_with[arm]); }
+        const double loss_us = 1000.0 * (kw - ka) / nar;
+        std::printf("    %-30s %d x AR: alone %.2f ms (%.1f us each), beside the kernels %.2f ms (%.1f us each, %+.0f %%); kernel "
+                    "stream %.2f ms (%+.2f ms = %.0f us lost an all-reduce, %.0f %% of its alone time)\n",
+                    names[arm], nar, aa, 1000.0 * aa / nar, aw, 1000.0 * aw / nar, aa > 0 ? 100.0 * (aw - aa) / aa : 0.0, kw, kw - ka,
+                    loss_us, aa > 0 ? 100.0 * loss_us / (1000.0 * aa / nar) : 0.0);
+        std::printf("SDMACONT {\"mb\": %.3f, \"arm\": \"%s\", \"nar\": %d, \"ar_alone_us\": %.1f, \"ar_with_us\": %.1f, "
+                    "\"k_alone_ms\": %.2f, \"k_with_ms\": %.2f, \"loss_us_per_ar\": %.1f}\n", n * 2 / 1e6, names[arm], nar,
+                    1000.0 * aa / nar, 1000.0 * aw / nar, ka, kw, loss_us);
+    }
+}
+
+struct SdmaArT {
+    int rank = 0, dev = 0, world = 4, iters = 100, checks = 1000, engine = 0, scr = 1;
+    std::vector<int64_t> sizes;
+    const RadKernelInfo* cu = nullptr;
+    StBarrier* bar = nullptr;
+    std::string why;
+    int rc = RAD_OK;
+    unsigned int err = 0;
+    /* per size */
+    std::vector<long long> bad_oop, bad_inp, bad_cu, launches;
+    std::vector<double> us_sdma, us_cu, us_rs, us_ag;
+    /* R4D_SDMA_TL=1: the full all-reduce's per-launch phases (medians over the last timed launches, us): the chain wait,
+     * go1 -> the first hop landed, the fold, go2 -> the second hop landed, the assemble, the gap to the next launch;
+     * and us_sdma1 / us_sdma2 apart (the timeline on the second only) */
+    std::vector<std::array<double, 6>> ph;
+    std::vector<double> us_s1, us_s2;
+};
+
+static void sdma_ar_worker(SdmaArT* t) {
+    const size_t ns = t->sizes.size();
+    t->bad_oop.assign(ns, -1); t->bad_inp.assign(ns, -1); t->bad_cu.assign(ns, -1); t->launches.assign(ns, 0);
+    t->us_sdma.assign(ns, 0); t->us_cu.assign(ns, 0); t->us_rs.assign(ns, 0); t->us_ag.assign(ns, 0);
+    t->ph.assign(ns, std::array<double, 6>{}); t->us_s1.assign(ns, 0); t->us_s2.assign(ns, 0);
+    const bool tl_want = std::getenv("R4D_SDMA_TL") && std::atoi(std::getenv("R4D_SDMA_TL")) > 0;
+    int wall_khz = 0;
+    if (hipDeviceGetAttribute(&wall_khz, hipDeviceAttributeWallClockRate, t->dev) != hipSuccess || wall_khz <= 0) wall_khz = 100000;
+    if (st_set_device(t->dev) != hipSuccess) t->rc = RAD_E_DEVICE;
+    int64_t most = 0;
+    for (int64_t n : t->sizes) most = std::max(most, n);
+    char why[256] = { 0 };
+    /* collective: every rank calls it whatever its state */
+    void* ar = g_sdma.ar_create(t->world, t->rank, t->dev, t->engine, most, t->scr, why, (int)sizeof why);
+    if (!ar) { t->rc = RAD_E_DEVICE; t->why = why; }
+    void* inst = nullptr;
+    std::vector<RadParam> ip = { PI("world_size", t->world), PI("numel", most), PS("dtype", "bf16"), PI("exact", 1) };
+    if (t->rc == RAD_OK && t->cu && t->cu->init(ip.data(), (int)ip.size(), t->rank, t->world, &inst) != RAD_OK) {
+        t->rc = RAD_E_DEVICE; t->why = "the CU two-shot's init failed";
+    }
+    void *in = nullptr, *out = nullptr, *cuo = nullptr;
+    unsigned long long* bad = nullptr;
+    if (t->rc == RAD_OK &&
+        (hipMalloc(&in, (size_t)most * 2) != hipSuccess || hipMalloc(&out, (size_t)most * 2) != hipSuccess ||
+         hipMalloc(&cuo, (size_t)most * 2) != hipSuccess || hipMalloc((void**)&bad, 8) != hipSuccess))
+        t->rc = RAD_E_NOMEM;
+    hipEvent_t e0, e1;
+    st_ev_create(&e0); st_ev_create(&e1);
+    std::vector<uint16_t> ha((size_t)most), hb((size_t)most);
+    unsigned int salt = 1u + 1000003u * (unsigned int)t->rank * 0u;   /* the same salt on every rank (the fold needs it) */
+    for (size_t si = 0; si < ns; ++si) {
+        const int64_t n = t->sizes[si];
+        t->bar->wait();
+        bool ok = t->rc == RAD_OK;
+        /* 1. checks, out of place: inputs generated by a kernel, output poisoned by a kernel, every launch compared */
+        if (ok) {
+            hip_ck(hipMemset(bad, 0, 8), "hipMemset", __LINE__);
+            long long nl = 0;
+            for (int L = 0; L < t->checks && ok; ++L, ++salt) {
+                g_sdma.k_gen(nullptr, in, n, t->rank, salt);
+                hip_ck(hipMemsetAsync(out, (L & 1) ? 0xff : 0x00, (size_t)n * 2, nullptr), "hipMemsetAsync", __LINE__);
+                if (g_sdma.ar_launch(ar, in, out, n, nullptr, 0) != RAD_OK) { ok = false; t->rc = RAD_E_DEVICE; break; }
+                g_sdma.k_check(nullptr, out, n, t->world, salt, bad);
+                ++nl;
+                if ((L & 63) == 63 && st_stream_sync(nullptr) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            }
+            if (st_stream_sync(nullptr) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            unsigned long long b = 0;
+            st_memcpy(&b, bad, 8, hipMemcpyDeviceToHost);
+            t->bad_oop[si] = ok ? (long long)b : -1;
+            t->launches[si] = nl;
+        }
+        t->bar->wait();
+        /* 2. in place (the engine's residual form), a quarter as many */
+        if (ok) {
+            hip_ck(hipMemset(bad, 0, 8), "hipMemset", __LINE__);
+            for (int L = 0; L < std::max(16, t->checks / 4) && ok; ++L, ++salt) {
+                g_sdma.k_gen(nullptr, in, n, t->rank, salt);
+                if (g_sdma.ar_launch(ar, in, in, n, nullptr, 0) != RAD_OK) { ok = false; t->rc = RAD_E_DEVICE; break; }
+                g_sdma.k_check(nullptr, in, n, t->world, salt, bad);
+            }
+            if (st_stream_sync(nullptr) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            unsigned long long b = 0;
+            st_memcpy(&b, bad, 8, hipMemcpyDeviceToHost);
+            t->bad_inp[si] = ok ? (long long)b : -1;
+        }
+        t->bar->wait();
+        /* 3. today's CU exact two-shot and the SDMA two-shot on the same input: the bytes compared */
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        std::vector<RadParam> ps = ip;
+        ps.push_back(PI("xpush", 1));   /* 204's baseline (RSF, fn4-x3-sp3); a tree without RSF ignores it */
+        RadTensor ts[2] = { T(in, RAD_BF16, { n }), T(cuo, RAD_BF16, { n }) };
+        a.t = ts; a.n_t = 2; a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst; a.rank = t->rank; a.world_size = t->world;
+        if (ok && t->cu) {
+            long long diff = 0;
+            for (int L = 0; L < 3 && ok; ++L, ++salt) {
+                g_sdma.k_gen(nullptr, in, n, t->rank, salt);
+                if (t->cu->launch(&a, nullptr) != RAD_OK) { ok = false; t->rc = RAD_E_DEVICE; break; }
+                if (g_sdma.ar_launch(ar, in, out, n, nullptr, 0) != RAD_OK) { ok = false; t->rc = RAD_E_DEVICE; break; }
+                if (st_stream_sync(nullptr) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; break; }
+                st_memcpy(ha.data(), cuo, (size_t)n * 2, hipMemcpyDeviceToHost);
+                st_memcpy(hb.data(), out, (size_t)n * 2, hipMemcpyDeviceToHost);
+                for (int64_t i = 0; i < n; ++i) diff += ha[(size_t)i] != hb[(size_t)i];
+            }
+            t->bad_cu[si] = ok ? diff : -1;
+        }
+        t->bar->wait();
+        /* 4. timed, warm, back to back: SDMA, CU, CU, SDMA (each the mean of its two), then the halves */
+        auto timed = [&](int which) -> double {   /* 0 SDMA AR, 1 CU, 2 SDMA RS half, 3 SDMA AG half */
+            if (!ok) return 0.0;
+            auto one = [&]() {
+                return which == 1 ? t->cu->launch(&a, nullptr) : g_sdma.ar_launch(ar, in, out, n, nullptr, which == 0 ? 0 : which - 1);
+            };
+            for (int i = 0; i < 20; ++i) one();
+            st_stream_sync(nullptr);
+            t->bar->wait();
+            st_ev_record(e0, nullptr);
+            for (int i = 0; i < t->iters; ++i) one();
+            st_ev_record(e1, nullptr);
+            st_ev_sync(e1);
+            float ms = 0;
+            st_ev_elapsed(&ms, e0, e1);
+            t->bar->wait();
+            return 1000.0 * ms / t->iters;
+        };
+        const double s1 = timed(0);
+        const double c1 = t->cu ? timed(1) : 0.0;
+        const double c2 = t->cu ? timed(1) : 0.0;
+        const bool tl = tl_want && ok && g_sdma.tl_on(ar, 1) == RAD_OK;
+        const double s2 = timed(0);
+        if (tl) {
+            std::vector<unsigned long long> st((size_t)64 * 8);
+            const long long last = g_sdma.tl_read(ar, st.data());
+            std::vector<double> d[6];
+            const double tick_us = 1000.0 / (double)wall_khz;
+            for (long long v = std::max(1ll, last - std::min(63, t->iters - 1)); v <= last && last > 0; ++v) {
+                const unsigned long long* x = &st[(size_t)(v % 64) * 8];
+                d[0].push_back((double)(x[1] - x[0]) * tick_us);
+                d[1].push_back((double)(x[2] - x[1]) * tick_us);
+                d[2].push_back((double)(x[3] - x[2]) * tick_us);
+                d[3].push_back((double)(x[4] - x[3]) * tick_us);
+                d[4].push_back((double)(x[5] - x[4]) * tick_us);
+                if (v < last) d[5].push_back((double)(st[(size_t)((v + 1) % 64) * 8] - x[5]) * tick_us);
+            }
+            for (int k = 0; k < 6; ++k) {
+                std::sort(d[k].begin(), d[k].end());
+                t->ph[si][(size_t)k] = d[k].empty() ? 0.0 : d[k][d[k].size() / 2];
+            }
+            g_sdma.tl_on(ar, 0);
+        }
+        t->us_s1[si] = s1; t->us_s2[si] = s2;
+        t->us_sdma[si] = 0.5 * (s1 + s2);
+        t->us_cu[si] = 0.5 * (c1 + c2);
+        t->us_rs[si] = timed(2);
+        t->us_ag[si] = timed(3);
+        if (!ok) for (int i = 0; i < 16; ++i) t->bar->wait();   /* (not reached in lockstep: every rank fails together) */
+    }
+    if (ar) t->err = g_sdma.ar_error(ar);
+    t->bar->wait();
+    if (ar) g_sdma.ar_destroy(ar);
+    if (inst && t->cu && t->cu->fini) t->cu->fini(inst);
+    for (void* p : { in, out, cuo, (void*)bad }) if (p) st_free(p);
+    st_ev_destroy(e0); st_ev_destroy(e1);
+}
+
+static void sdma_ar4(const Plugin& pl, const char* spec, int iters) {
+    constexpr int W = 4;
+    if (!sdma_api(pl)) { ++g_fail; return; }
+    if (iters <= 0) iters = 100;
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::vector<int64_t> sizes, widths;
+    {
+        std::string all = spec ? spec : "";
+        size_t at = 0;
+        while (at < all.size()) {
+            const size_t comma = all.find(',', at);
+            const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            long long r = 0, w = 0;
+            if (std::sscanf(one.c_str(), "%lldx%lld", &r, &w) != 2 || r <= 0 || w <= 0 || (r * w) % 8) {
+                std::printf("--sdmaar4: '%s' is not RxW (R*W a multiple of 8)\n", one.c_str());
+                return;
+            }
+            sizes.push_back(r * w); widths.push_back(w);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+    }
+    if (sizes.empty()) { std::printf("--sdmaar4: no sizes\n"); return; }
+    const std::vector<int> devs = sdma_cards(W);
+    if ((int)devs.size() < W) { std::printf("--sdmaar4: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
+    const char* ee = std::getenv("R4D_SDMA_ENGINE");
+    const char* se = std::getenv("R4D_SDMA_SCR");
+    const char* ce = std::getenv("R4D_SDMA_CHECKS");
+    const int engine = ee ? std::atoi(ee) : 0, scr = se ? std::atoi(se) : 1, checks = ce ? std::atoi(ce) : 1000;
+    const RadKernelInfo* cu = find(pl, "ar_twoshot_4rank_exact");
+    if (!cu) std::printf("  row ar_twoshot_4rank_exact absent: no CU reference\n");
+    std::printf("SDMA exact two-shot, four cards, engine %d, scratch %s, %d checked launches a size (+%d in place), %d timed\n",
+                engine, scr == 0 ? "coarse" : scr == 2 ? "uncached" : "fine-grained", checks, std::max(16, checks / 4), iters);
+    StBarrier bar(W);
+    std::vector<SdmaArT> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        SdmaArT& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.checks = checks; x.engine = engine; x.scr = scr;
+        x.sizes = sizes; x.cu = cu; x.bar = &bar;
+        th.emplace_back(sdma_ar_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    for (const SdmaArT& x : t)
+        if (x.rc != RAD_OK || x.err)
+            std::printf("  rank %d: rc %d%s%s, error word 0x%08x\n", x.rank, x.rc, x.why.empty() ? "" : ": ", x.why.c_str(), x.err);
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        const double bytes = (double)sizes[si] * 2.0;
+        long long bo = 0, bi = 0, bc = 0, nl = 0;
+        double us = 0, uc = 0, ur = 0, ua = 0;
+        bool any_fail = false;
+        for (const SdmaArT& x : t) {
+            any_fail |= x.bad_oop[si] < 0 || x.bad_inp[si] < 0 || (cu && x.bad_cu[si] < 0);
+            bo += std::max(0ll, x.bad_oop[si]); bi += std::max(0ll, x.bad_inp[si]); bc += std::max(0ll, x.bad_cu[si]);
+            nl += x.launches[si];
+            us = std::max(us, x.us_sdma[si]); uc = std::max(uc, x.us_cu[si]);
+            ur = std::max(ur, x.us_rs[si]); ua = std::max(ua, x.us_ag[si]);
+        }
+        const double sent2 = 2.0 * (W - 1) / W * bytes, sent1 = (double)(W - 1) / W * bytes;
+        std::printf("  %lld x %lld bf16 (%.2f MB)%s\n", (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6,
+                    any_fail ? "  (A RANK FAILED: counts below incomplete)" : "");
+        std::printf("    checks: %lld launches x 4 ranks out of place, %lld elements differ from the fold; in place %lld; "
+                    "SDMA vs CU bytes %lld differ\n", nl / W, bo, bi, bc);
+        std::printf("    AR SDMA two-shot exact   %9.1f us  %6.2f GB/s a rank a direction\n", us, us > 0 ? sent2 / (us * 1e3) : 0.0);
+        if (cu) std::printf("    AR CU two-shot exact xp  %9.1f us  %6.2f GB/s a rank a direction  (SDMA %+.1f %%)\n", uc,
+                            uc > 0 ? sent2 / (uc * 1e3) : 0.0, uc > 0 ? 100.0 * (us - uc) / uc : 0.0);
+        std::printf("    SDMA RS half             %9.1f us  %6.2f GB/s a rank a direction (timed only)\n", ur,
+                    ur > 0 ? sent1 / (ur * 1e3) : 0.0);
+        std::printf("    SDMA AG half             %9.1f us  %6.2f GB/s a rank a direction (timed only)\n", ua,
+                    ua > 0 ? sent1 / (ua * 1e3) : 0.0);
+        {
+            std::string sp;
+            for (const SdmaArT& x : t) sp += fmt(" %.1f/%.1f", x.us_s1[si], x.us_s2[si]);
+            std::printf("    SDMA AR first / second timing by rank (us):%s\n", sp.c_str());
+        }
+        if (std::getenv("R4D_SDMA_TL") && std::atoi(std::getenv("R4D_SDMA_TL")) > 0) {
+            std::printf("    SDMA AR phases by rank (median us of the last timed launches): chain-wait | go1 -> hop 1 landed | "
+                        "fold | go2 -> hop 2 landed | assemble | gap to the next launch\n");
+            for (const SdmaArT& x : t)
+                std::printf("      rank %d  %7.1f | %7.1f | %7.1f | %7.1f | %7.1f | %7.1f\n", x.rank, x.ph[si][0], x.ph[si][1],
+                            x.ph[si][2], x.ph[si][3], x.ph[si][4], x.ph[si][5]);
+            std::string js;
+            for (const SdmaArT& x : t)
+                js += fmt("%s[%.1f, %.1f, %.1f, %.1f, %.1f, %.1f]", x.rank ? ", " : "", x.ph[si][0], x.ph[si][1], x.ph[si][2],
+                          x.ph[si][3], x.ph[si][4], x.ph[si][5]);
+            std::printf("SDMAPH {\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"phases_us\": [%s]}\n",
+                        (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6, js.c_str());
+        }
+        std::printf("SDMAAR %s\n", fmt("{\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"engine\": %d, \"scr\": %d, \"launches\": %lld, "
+                                       "\"bad_oop\": %lld, \"bad_inplace\": %lld, \"bad_vs_cu\": %lld, \"us_sdma\": %.1f, \"us_cu\": %.1f, "
+                                       "\"us_rs\": %.1f, \"us_ag\": %.1f, \"failed\": %s}",
+                                       (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6, engine, scr, nl / W, bo,
+                                       bi, bc, us, uc, ur, ua, any_fail ? "true" : "false").c_str());
+        if (bo || bi || bc || any_fail) ++g_fail;
+    }
+}
+
+/* --sdmaeng4 RxW[,RxW..] [iters]: fn4 SDMA-AR through the ENGINE path -- the rows the Qwen prefill lane launches
+ * (ar_twoshot_4rank_exact_lane, sp_rs_rows_4rank_ti8_lane raw 1, sp_ag_rows_4rank_lane raw 1, all at overlap 1 on one
+ * shared instance, its copy-engine context built by init as the engine builds it: RADIANCE_FN4_AR_SDMA set), launched
+ * with `sdma` 0 (today's CU forms: the coded lane two-shot, the raw RS xpush, the raw AG) and 1 (the copy engines).
+ *   checks (R4D_SDMA_CHECKS iterations, default 200): per iteration on fresh generated inputs, CU into buffer A and SDMA
+ *     into buffer B: the all-reduce; the reduce-scatter, then the all-gather of its result; an all-gather alone; a burst
+ *     of eight back to back (RS AG AR AR RS AG AG AR) -- A and B compared word for word after each, B also against the
+ *     fp32 ascending-rank fold (or the halves' expectations); every launch of both paths on one stream, the CU and SDMA
+ *     launches interleaved on the one instance as the engine interleaves decode and prefill;
+ *   cross-stream: rounds of eight SDMA launches over eight buffers alternating two streams with no event between them
+ *     (the context's device-side chain alone orders them), each buffer checked against its expectation;
+ *   timed: each op x sdma 0 / 1, back to back alone; then beside a VRAM-bound kernel stream on a second stream (the
+ *     prefill's compute lane): the collectives' time and the kernel stream's loss per collective. */
+struct SdmaEngT {
+    int rank = 0, dev = 0, world = 4, iters = 50, checks = 200;
+    std::vector<int64_t> sizes, widths;
+    const RadKernelInfo* row[3] = { nullptr, nullptr, nullptr };   /* AR lane, RS, AG */
+    StBarrier* bar = nullptr;
+    int rc = RAD_OK, has_ctx = 0;
+    std::string why;
+    unsigned int err = 0;
+    std::vector<long long> bad_cmp, bad_ana, bad_x, nchk;
+    std::vector<std::array<double, 6>> us_alone, us_with, k_with;   /* [op * 2 + sdma] */
+    std::vector<double> k_alone;
+};
+
+static void sdma_eng_worker(SdmaEngT* t) {
+    const int W = t->world, r = t->rank;
+    const size_t ns = t->sizes.size();
+    t->bad_cmp.assign(ns, -1); t->bad_ana.assign(ns, -1); t->bad_x.assign(ns, -1); t->nchk.assign(ns, 0);
+    t->us_alone.assign(ns, std::array<double, 6>{}); t->us_with.assign(ns, std::array<double, 6>{});
+    t->k_with.assign(ns, std::array<double, 6>{}); t->k_alone.assign(ns, 0);
+    if (st_set_device(t->dev) != hipSuccess) t->rc = RAD_E_DEVICE;
+    int64_t most = 0;
+    for (int64_t n : t->sizes) most = std::max(most, n);
+    hipStream_t s1 = nullptr, s2 = nullptr, s3 = nullptr;
+    if (t->rc == RAD_OK && (hipStreamCreateWithFlags(&s1, hipStreamNonBlocking) != hipSuccess ||
+                            hipStreamCreateWithFlags(&s2, hipStreamNonBlocking) != hipSuccess ||
+                            hipStreamCreateWithFlags(&s3, hipStreamNonBlocking) != hipSuccess))
+        t->rc = RAD_E_DEVICE;
+    /* collective: every rank inits the three rows in the same order (one build, two cache hits) */
+    void* inst[3] = { nullptr, nullptr, nullptr };
+    std::vector<RadParam> ip = { PI("world_size", W), PI("numel", most), PS("dtype", "bf16"), PI("exact", 1), PI("overlap", 1) };
+    for (int k = 0; k < 3; ++k) {
+        const int irc = t->row[k]->init(ip.data(), (int)ip.size(), r, W, &inst[k]);
+        if (irc != RAD_OK && t->rc == RAD_OK) { t->rc = irc; t->why = fmt("init of %s", t->row[k]->name); }
+    }
+    t->has_ctx = inst[0] && g_sdma.inst_sdma(inst[0]) ? 1 : 0;
+    const long long big = 256ll << 20;
+    void *A = nullptr, *B = nullptr, *ka = nullptr, *kb = nullptr;
+    void* X[8] = { nullptr };
+    unsigned long long* bad = nullptr;
+    if (t->rc == RAD_OK) {
+        bool ok = hipMalloc(&A, (size_t)most * 2) == hipSuccess && hipMalloc(&B, (size_t)most * 2) == hipSuccess &&
+                  hipMalloc(&ka, (size_t)big) == hipSuccess && hipMalloc(&kb, (size_t)big) == hipSuccess &&
+                  hipMalloc((void**)&bad, 32) == hipSuccess;
+        for (void*& x : X) ok = ok && hipMalloc(&x, (size_t)most * 2) == hipSuccess;
+        if (!ok) t->rc = RAD_E_NOMEM;
+        else st_memset(ka, 0x33, (size_t)big);
+    }
+    hipEvent_t e0, e1, f0, f1;
+    st_ev_create(&e0); st_ev_create(&e1); st_ev_create(&f0); st_ev_create(&f1);
+    /* one launch of op k (0 AR lane, 1 RS raw, 2 AG raw) on buf, in place */
+    auto launch = [&](int k, void* buf, int64_t n, int64_t w, int sdma, hipStream_t st) -> int {
+        std::vector<RadParam> ps = { PI("world_size", W), PI("numel", n), PS("dtype", "bf16"), PI("exact", 1), PI("overlap", 1),
+                                     PI("sdma", sdma), PI("xpush", 1) };
+        if (k) { ps.push_back(PI("raw", 1)); ps.push_back(PI("row", w)); }
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 1; a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst[k]; a.rank = r; a.world_size = W;
+        const int rc = t->row[k]->launch(&a, st);
+        return rc == RAD_LINK_ENDED ? RAD_OK : rc;
+    };
+    unsigned int salt = 101u;
+    for (size_t si = 0; si < ns; ++si) {
+        const int64_t n = t->sizes[si], w = t->widths[si], rows = n / w, q = (rows + 3) / 4 * w;
+        const long long lo = std::min<int64_t>((int64_t)r * q, n), hi = std::min<int64_t>((int64_t)(r + 1) * q, n);
+        t->bar->wait();
+        bool ok = t->rc == RAD_OK;
+        auto L = [&](int k, void* buf, int sdma, hipStream_t st) {
+            if (ok && launch(k, buf, n, w, sdma, st) != RAD_OK) { ok = false; t->rc = RAD_E_DEVICE; t->why = fmt("launch op %d sdma %d", k, sdma); }
+        };
+        /* ---- checks */
+        if (ok) {
+            hip_ck(hipMemset(bad, 0, 32), "hipMemset", __LINE__);
+            unsigned long long* bc = bad;      /* SDMA vs CU */
+            unsigned long long* ba = bad + 1;  /* SDMA vs the expectation */
+            long long it = 0;
+            for (int Lc = 0; Lc < t->checks && ok; ++Lc, salt += 4, ++it) {
+                g_sdma.k_gen(s1, A, n, r, salt); g_sdma.k_gen(s1, B, n, r, salt);
+                L(0, A, 0, s1); L(0, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check(s1, B, n, W, salt, ba);
+                g_sdma.k_gen(s1, A, n, r, salt + 1); g_sdma.k_gen(s1, B, n, r, salt + 1);
+                L(1, A, 0, s1); L(1, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check2(s1, B, n, W, r, 1, lo, hi, q, salt + 1, ba);
+                L(2, A, 0, s1); L(2, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check(s1, B, n, W, salt + 1, ba);
+                g_sdma.k_gen(s1, A, n, r, salt + 2); g_sdma.k_gen(s1, B, n, r, salt + 2);
+                L(2, A, 0, s1); L(2, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check2(s1, B, n, W, r, 2, 0, 0, q, salt + 2, ba);
+                g_sdma.k_gen(s1, A, n, r, salt + 3); g_sdma.k_gen(s1, B, n, r, salt + 3);
+                static const int burst[8] = { 1, 2, 0, 0, 1, 2, 2, 0 };
+                for (int k : burst) L(k, A, 0, s1);
+                for (int k : burst) L(k, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc);
+                if ((Lc & 15) == 15 && st_stream_sync(s1) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            }
+            if (st_stream_sync(s1) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            unsigned long long h[2] = { 0, 0 };
+            st_memcpy(h, bad, 16, hipMemcpyDeviceToHost);
+            t->bad_cmp[si] = ok ? (long long)h[0] : -1;
+            t->bad_ana[si] = ok ? (long long)h[1] : -1;
+            t->nchk[si] = it;
+        }
+        t->bar->wait();
+        /* ---- cross-stream: the device-side chain alone orders the context's launches */
+        if (ok) {
+            hip_ck(hipMemset(bad + 2, 0, 8), "hipMemset", __LINE__);
+            for (int round = 0; round < 20 && ok; ++round, salt += 8) {
+                for (int j = 0; j < 8; ++j) g_sdma.k_gen(s1, X[j], n, r, salt + (unsigned)j);
+                st_stream_sync(s1);
+                t->bar->wait();
+                for (int j = 0; j < 8; ++j) L(j % 3, X[j], 1, (j & 1) ? s3 : s1);
+                st_stream_sync(s1); st_stream_sync(s3);
+                for (int j = 0; j < 8; ++j) {
+                    const int k = j % 3;
+                    if (k == 0) g_sdma.k_check(s1, X[j], n, W, salt + (unsigned)j, bad + 2);
+                    else g_sdma.k_check2(s1, X[j], n, W, r, k, lo, hi, q, salt + (unsigned)j, bad + 2);
+                }
+                st_stream_sync(s1);
+            }
+            unsigned long long h = 0;
+            st_memcpy(&h, bad + 2, 8, hipMemcpyDeviceToHost);
+            t->bad_x[si] = ok ? (long long)h : -1;
+        }
+        t->bar->wait();
+        /* ---- timed alone */
+        for (int k = 0; k < 3; ++k)
+            for (int sd = 0; sd < 2; ++sd) {
+                if (!ok) break;
+                g_sdma.k_gen(s1, B, n, r, 5u);
+                for (int i = 0; i < 10; ++i) L(k, B, sd, s1);
+                st_stream_sync(s1);
+                t->bar->wait();
+                st_ev_record(e0, s1);
+                for (int i = 0; i < t->iters; ++i) L(k, B, sd, s1);
+                st_ev_record(e1, s1);
+                st_ev_sync(e1);
+                float ms = 0;
+                st_ev_elapsed(&ms, e0, e1);
+                t->us_alone[si][(size_t)(k * 2 + sd)] = 1000.0 * ms / t->iters;
+                t->bar->wait();
+            }
+        /* ---- beside a VRAM-bound kernel stream (48 passes of 256 MB -> 256 MB on s2) */
+        const int kpass = 48;
+        if (ok) {
+            st_stream_sync(s1);
+            t->bar->wait();
+            st_ev_record(f0, s2);
+            for (int i = 0; i < kpass; ++i) g_sdma.k_stream(s2, kb, ka, big, 1, 0);
+            st_ev_record(f1, s2);
+            st_ev_sync(f1);
+            float ms = 0;
+            st_ev_elapsed(&ms, f0, f1);
+            t->k_alone[si] = ms;
+            t->bar->wait();
+        }
+        for (int k = 0; k < 3; ++k)
+            for (int sd = 0; sd < 2; ++sd) {
+                if (!ok) break;
+                st_stream_sync(s1); st_stream_sync(s2);
+                t->bar->wait();
+                st_ev_record(f0, s2);
+                for (int i = 0; i < kpass; ++i) g_sdma.k_stream(s2, kb, ka, big, 1, 0);
+                st_ev_record(f1, s2);
+                st_ev_record(e0, s1);
+                for (int i = 0; i < t->iters; ++i) L(k, B, sd, s1);
+                st_ev_record(e1, s1);
+                st_ev_sync(e1); st_ev_sync(f1);
+                float ma = 0, mk = 0;
+                st_ev_elapsed(&ma, e0, e1);
+                st_ev_elapsed(&mk, f0, f1);
+                t->us_with[si][(size_t)(k * 2 + sd)] = 1000.0 * ma / t->iters;
+                t->k_with[si][(size_t)(k * 2 + sd)] = mk;
+                t->bar->wait();
+            }
+        if (!ok) for (int i = 0; i < 64; ++i) t->bar->wait();   /* (not reached in lockstep: every rank fails together) */
+    }
+    t->bar->wait();
+    for (int k = 0; k < 3; ++k) if (inst[k] && t->row[k]->fini) t->row[k]->fini(inst[k]);
+    for (void* p : { A, B, ka, kb, (void*)bad }) if (p) st_free(p);
+    for (void* x : X) if (x) st_free(x);
+    for (hipStream_t s : { s1, s2, s3 }) if (s) (void)hipStreamDestroy(s);
+    st_ev_destroy(e0); st_ev_destroy(e1); st_ev_destroy(f0); st_ev_destroy(f1);
+}
+
+static void sdma_eng4(const Plugin& pl, const char* spec, int iters) {
+    constexpr int W = 4;
+    if (!sdma_api(pl)) { ++g_fail; return; }
+    if (iters <= 0) iters = 50;
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::vector<int64_t> sizes, widths;
+    {
+        std::string all = spec ? spec : "";
+        size_t at = 0;
+        while (at < all.size()) {
+            const size_t comma = all.find(',', at);
+            const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            long long r = 0, w = 0;
+            if (std::sscanf(one.c_str(), "%lldx%lld", &r, &w) != 2 || r < 4 || w <= 0 || w % 32) {
+                std::printf("--sdmaeng4: '%s' is not RxW (R >= 4 rows, W a multiple of 32)\n", one.c_str());
+                return;
+            }
+            sizes.push_back(r * w); widths.push_back(w);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+    }
+    if (sizes.empty()) { std::printf("--sdmaeng4: no sizes\n"); return; }
+    const std::vector<int> devs = sdma_cards(W);
+    if ((int)devs.size() < W) { std::printf("--sdmaeng4: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
+    const char* names[3] = { "ar_twoshot_4rank_exact_lane", "sp_rs_rows_4rank_ti8_lane", "sp_ag_rows_4rank_lane" };
+    const RadKernelInfo* rows[3];
+    for (int k = 0; k < 3; ++k)
+        if (!(rows[k] = find(pl, names[k]))) { std::printf("--sdmaeng4: row %s absent\n", names[k]); ++g_fail; return; }
+    /* the engine's declaration: contexts built at init; the launches pick the path by `sdma` */
+    if (!std::getenv("RADIANCE_FN4_AR_SDMA")) setenv("RADIANCE_FN4_AR_SDMA", "0", 1);
+    g_sdma.allow_untaped(1);
+    const char* ce = std::getenv("R4D_SDMA_CHECKS");
+    const int checks = ce ? std::atoi(ce) : 200;
+    std::printf("SDMA engine path, four cards: the lane AR / SP raw RS / SP raw AG rows at sdma 0 (CU) and 1 (copy "
+                "engines), %d check iterations a size, %d timed launches\n", checks, iters);
+    StBarrier bar(W);
+    std::vector<SdmaEngT> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        SdmaEngT& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.checks = checks;
+        x.sizes = sizes; x.widths = widths; x.bar = &bar;
+        for (int k = 0; k < 3; ++k) x.row[k] = rows[k];
+        th.emplace_back(sdma_eng_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    bool ctx_all = true;
+    for (const SdmaEngT& x : t) {
+        ctx_all = ctx_all && x.has_ctx;
+        if (x.rc != RAD_OK) std::printf("  rank %d: rc %d%s%s\n", x.rank, x.rc, x.why.empty() ? "" : ": ", x.why.c_str());
+    }
+    if (!ctx_all) std::printf("  NO COPY-ENGINE CONTEXT on some rank (the bound %lld elements outside [R4D_SDMA_MIN_ELEMS, "
+                              "R4D_SDMA_CAP_MB]?): sdma 1 ran the CU forms\n", (long long)*std::max_element(sizes.begin(), sizes.end()));
+    const char* opn[3] = { "AR lane", "RS raw ", "AG raw " };
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        long long bc = 0, ba = 0, bx = 0, nc = 0;
+        bool fail = false;
+        for (const SdmaEngT& x : t) {
+            fail |= x.bad_cmp[si] < 0 || x.bad_ana[si] < 0 || x.bad_x[si] < 0;
+            bc += std::max(0ll, x.bad_cmp[si]); ba += std::max(0ll, x.bad_ana[si]); bx += std::max(0ll, x.bad_x[si]);
+            nc = std::max(nc, x.nchk[si]);
+        }
+        const double mb = (double)sizes[si] * 2 / 1e6;
+        std::printf("  %lld x %lld bf16 (%.2f MB)%s\n", (long long)(sizes[si] / widths[si]), (long long)widths[si], mb,
+                    fail ? "  (A RANK FAILED: counts incomplete)" : "");
+        std::printf("    checks: %lld iterations x 4 ranks (12 launches a path each): SDMA vs CU %lld words differ; SDMA vs "
+                    "the fold / halves' expectations %lld; cross-stream (20 rounds x 8) %lld\n", nc, bc, ba, bx);
+        double ka = 0;
+        for (const SdmaEngT& x : t) ka = std::max(ka, x.k_alone[si]);
+        std::string js;
+        for (int k = 0; k < 3; ++k) {
+            double ua[2] = { 0, 0 }, uw[2] = { 0, 0 }, kw[2] = { 0, 0 };
+            for (int sd = 0; sd < 2; ++sd)
+                for (const SdmaEngT& x : t) {
+                    ua[sd] = std::max(ua[sd], x.us_alone[si][(size_t)(k * 2 + sd)]);
+                    uw[sd] = std::max(uw[sd], x.us_with[si][(size_t)(k * 2 + sd)]);
+                    kw[sd] = std::max(kw[sd], x.k_with[si][(size_t)(k * 2 + sd)]);
+                }
+            const double l0 = 1000.0 * (kw[0] - ka) / iters, l1 = 1000.0 * (kw[1] - ka) / iters;
+            std::printf("    %s alone CU %8.1f us  SDMA %8.1f us (%+.1f %%) | beside the stream: CU %8.1f / SDMA %8.1f us "
+                        "each; the stream lost %6.1f / %6.1f us a collective (CU / SDMA)\n", opn[k], ua[0], ua[1],
+                        ua[0] > 0 ? 100.0 * (ua[1] - ua[0]) / ua[0] : 0.0, uw[0], uw[1], l0, l1);
+            js += fmt("%s\"%s\": {\"cu_us\": %.1f, \"sdma_us\": %.1f, \"cu_with_us\": %.1f, \"sdma_with_us\": %.1f, "
+                      "\"cu_loss_us\": %.1f, \"sdma_loss_us\": %.1f}", k ? ", " : "", k == 0 ? "ar" : k == 1 ? "rs" : "ag",
+                      ua[0], ua[1], uw[0], uw[1], l0, l1);
+        }
+        std::printf("    kernel stream alone %.2f ms (%d passes of 256 MB -> 256 MB)\n", ka, 48);
+        std::printf("SDMAENG {\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"ctx\": %s, \"iters\": %lld, \"bad_vs_cu\": %lld, "
+                    "\"bad_vs_fold\": %lld, \"bad_xstream\": %lld, \"k_alone_ms\": %.2f, %s, \"failed\": %s}\n",
+                    (long long)(sizes[si] / widths[si]), (long long)widths[si], mb, ctx_all ? "true" : "false", nc, bc, ba, bx,
+                    ka, js.c_str(), fail ? "true" : "false");
+        if (bc || ba || bx || fail || !ctx_all) ++g_fail;
+    }
 }
 
 static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dtype,
@@ -33732,6 +36970,124 @@ static void dspark_walk_gather_case(const Plugin& pl, const std::vector<int>& de
         ok("dspark_walk_step_f32 gather: the 8-byte key row of step 4251 is refused (RAD_E_SHAPE), as on the cards",
            refused, "init/launch rc " + rcs);
         if (row->fini) for (ArThread& a : t) if (a.inst) row->fini(a.inst);
+    }
+}
+
+/* fn4 SP-hc: reduce_scatter_rows / all_gather_rows (r4d_ar_sp_rows.hip) at four ranks over whole-row shards. Per
+ * case, every rank fills x [rows][row] with ar_ti8_value(rank, i), runs the reduce-scatter, keeps a copy, then runs the
+ * all-gather on the ti8 wire, and separately an all-gather raw of its pattern. Checked: the reduce-scatter's own shard
+ * within the wire's error of the fp32 sum and every other row untouched; after the ti8 all-gather every rank holds the
+ * same bytes and each shard is within the wire's error of its owner's reduce-scatter output; after the raw all-gather
+ * every row is its owner's input, bit for bit, on every rank. */
+struct SpRows {
+    const RadKernelInfo* rs = nullptr;
+    const RadKernelInfo* ag = nullptr;
+    int rank = 0, dev = 0, world = 4;
+    int64_t row = 2560;
+    std::vector<int64_t> rows;
+    void* inst_rs = nullptr; void* inst_ag = nullptr;
+    int rc = RAD_OK;
+    std::vector<std::vector<uint16_t>> after_rs, after_ag, after_raw;
+};
+static void sp_rows_worker(SpRows* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
+    int64_t most = 0;
+    for (int64_t r : t->rows) most = r * t->row > most ? r * t->row : most;
+    std::vector<RadParam> prs = { PI("world_size", t->world), PI("numel", most), PS("dtype", "bf16"), PI("row", t->row) };
+    std::vector<RadParam> pag = prs, praw = prs;
+    pag.push_back(PI("raw", 0));
+    praw.push_back(PI("raw", 1));
+    if ((t->rc = t->rs->init(prs.data(), (int)prs.size(), t->rank, t->world, &t->inst_rs)) != RAD_OK) return;
+    if ((t->rc = t->ag->init(pag.data(), (int)pag.size(), t->rank, t->world, &t->inst_ag)) != RAD_OK) return;
+    void* buf = nullptr;
+    if (hipMalloc(&buf, (size_t)most * 2) != hipSuccess) { t->rc = RAD_E_NOMEM; return; }
+    std::vector<uint16_t> h((size_t)most);
+    auto run = [&](const RadKernelInfo* k, void* inst, std::vector<RadParam>& ps, int64_t n) {
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 1; a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = inst; a.rank = t->rank; a.world_size = t->world;
+        const int rc = k->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK && t->rc == RAD_OK) t->rc = rc;
+        std::vector<uint16_t> got((size_t)n);
+        st_memcpy(got.data(), buf, (size_t)n * 2, hipMemcpyDeviceToHost);
+        return got;
+    };
+    for (int64_t r : t->rows) {
+        const int64_t n = r * t->row;
+        for (int64_t i = 0; i < n; ++i) h[(size_t)i] = h_to_bf16(ar_ti8_value(t->rank, i));
+        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        t->after_rs.push_back(run(t->rs, t->inst_rs, prs, n));
+        t->after_ag.push_back(run(t->ag, t->inst_ag, pag, n));
+        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        t->after_raw.push_back(run(t->ag, t->inst_ag, praw, n));
+    }
+    st_free(buf);
+}
+static void sp_rows_check(const Plugin& pl, const std::vector<int>& devs) {
+    const char* nm = "sp_rs_rows_4rank_ti8 + sp_ag_rows_4rank";
+    const RadKernelInfo* rs = find(pl, "sp_rs_rows_4rank_ti8");
+    const RadKernelInfo* ag = find(pl, "sp_ag_rows_4rank");
+    if (!rs || !ag) { ok(nm, false, "row absent"); return; }
+    const int world = 4;
+    if ((int)devs.size() < world) { skip(nm, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, world)) { skip(nm, "no peer path between the cards (device.p2p)"); return; }
+    const int64_t row = 2560;
+    const std::vector<int64_t> rows = { 2048, 2049, 1027, 512, 64 };
+    std::vector<SpRows> t((size_t)world);
+    std::vector<std::thread> th;
+    for (int r = 0; r < world; ++r) {
+        t[(size_t)r].rs = rs; t[(size_t)r].ag = ag; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+        t[(size_t)r].row = row; t[(size_t)r].rows = rows;
+        th.emplace_back(sp_rows_worker, &t[(size_t)r]);
+    }
+    for (std::thread& x : th) x.join();
+    std::string rcs;
+    bool good = true;
+    for (const SpRows& a : t) { good = good && a.rc == RAD_OK; rcs += std::to_string(a.rc) + " "; }
+    ok((std::string(nm) + " init + launches").c_str(), good, "rc " + rcs);
+    if (good) {
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const int64_t R = rows[k], n = R * row, q = (R + world - 1) / world;
+            int64_t untouched_bad = 0, ag_diff_ranks = 0, raw_bad = 0;
+            double se = 0.0, sx = 0.0, se2 = 0.0, sx2 = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t rw = i / row;
+                const int owner = (int)(rw / q);
+                float acc = 0.0f;
+                for (int r = 0; r < world; ++r) acc += h_bf16(h_to_bf16(ar_ti8_value(r, i)));
+                for (int r = 0; r < world; ++r) {
+                    const uint16_t v = t[(size_t)r].after_rs[k][(size_t)i];
+                    if (r == owner) { const double e = (double)h_bf16(v) - acc; se += e * e; sx += (double)acc * acc; }
+                    else if (v != h_to_bf16(ar_ti8_value(r, i))) ++untouched_bad;
+                    if (t[(size_t)r].after_ag[k][(size_t)i] != t[0].after_ag[k][(size_t)i]) ++ag_diff_ranks;
+                    if (t[(size_t)r].after_raw[k][(size_t)i] != h_to_bf16(ar_ti8_value(owner, i))) ++raw_bad;
+                }
+                const double ref = h_bf16(t[(size_t)owner].after_rs[k][(size_t)i]);
+                const double e2 = (double)h_bf16(t[0].after_ag[k][(size_t)i]) - ref;
+                se2 += e2 * e2; sx2 += ref * ref;
+            }
+            const double r1 = sx > 0 ? std::sqrt(se / sx) : 0.0, r2 = sx2 > 0 ? std::sqrt(se2 / sx2) : 0.0;
+            const std::string w = std::string(nm) + " rows " + std::to_string(R) + " x " + std::to_string(row);
+            char d[200];
+            std::snprintf(d, sizeof(d), "reduce-scatter relative RMS %.4f%%, ti8 all-gather vs owner %.4f%%", r1 * 100.0,
+                          r2 * 100.0);
+            std::printf("        %s: %s\n", w.c_str(), d);
+            ok((w + ": the reduce-scatter's shard within the wire's error (relative RMS < 1%)").c_str(), r1 < 0.01, d);
+            ok((w + ": the reduce-scatter leaves other rows untouched").c_str(), untouched_bad == 0,
+               std::to_string(untouched_bad) + " elements changed");
+            ok((w + ": after the ti8 all-gather every rank holds the same bytes").c_str(), ag_diff_ranks == 0,
+               std::to_string(ag_diff_ranks) + " elements differ");
+            ok((w + ": the ti8 all-gather within the wire's error of its owner (relative RMS < 1%)").c_str(), r2 < 0.01, d);
+            ok((w + ": the raw all-gather is every owner's rows bit for bit").c_str(), raw_bad == 0,
+               std::to_string(raw_bad) + " elements wrong");
+        }
+    }
+    for (SpRows& a : t) {
+        if (a.inst_rs && rs->fini) rs->fini(a.inst_rs);
+        if (a.inst_ag && ag->fini) ag->fini(a.inst_ag);
     }
 }
 
@@ -35830,6 +39186,16 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_fp8v4", 256, 6, 100, "fp8_v4", 0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_fp8v4",  256, 6, 1,   "fp8_v4", 0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_fp8v4",  256, 6, 4,   "fp8_v4", 0, 2048);
+    /* fn4 att_bi 3: Flash-Next's TP4 dense decode row, k sequences in one launch pinned to one sequence = alone launches */
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 300, 2500 }, 4);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 37, 129, 400, 777, 1024, 2049, 3000, 8191 }, 4);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv",
+                       { 5, 64, 255, 256, 257, 1000, 1500, 2047, 2048, 2049, 4096, 6000, 9000, 12345, 16384, 20000 }, 4);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 700, 900, 1100, 1300 }, 1);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa12_fp8kv", { 37, 129, 400, 777, 1024, 2049, 3000, 8191 }, 4, 12);
+    /* fn4 long prompts (15.11.2026): the dense / sparse alone launches of a 4-row decode step vs the loaded forms */
+    attn_lp_case(pl, { 376, 600, 799, 1000, 1020, 1024, 1025, 1026, 1027, 1028, 1029, 1040, 1051, 1100, 1301, 1435, 1703,
+                       2000, 2051 });
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 64,  "k6_v4",  0, 256);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
@@ -37867,6 +41233,23 @@ static void device_phase(const Plugin& pl) {
         qsa_select_few_live_case(pl);
     }
 
+    if (sel("qsa_select_part_i32")) {
+        if (!g_case) std::printf("\nfn4 qsa_split: the selection split across ranks, against qsa_select\n");
+        qsa_select_part_one(pl, "qsa_split: 16 seq x 4 rows, ~24k-token contexts, 4 parts", 16, 4, 6600, 6200, 37, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 13 seq x 4 rows, mixed contexts, 4 parts", 13, 4, 20500, 20001, 1530, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 2 seq x 4 rows, 80k contexts, 4 parts, 7 distinct", 2, 4, 20500, 20001, 3, 7, 4);
+        qsa_select_part_one(pl, "qsa_split: 32 seq x 4 rows, short to 24k contexts, 4 parts", 32, 4, 6600, 6200, 190, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 4 seq x 1 row, 512k contexts, 4 parts", 4, 1, 131080, 131000, 9000, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 16 seq x 4 rows, 3 parts", 16, 4, 6600, 6200, 37, 96, 3);
+        qsa_select_part_one(pl, "qsa_split: 8 seq x 4 rows, few live (<= topk), 4 parts", 8, 4, 2400, 700, 60, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 3 seq x 4 rows, every score equal, 4 parts", 3, 4, 9000, 8800, 1000, 1, 4);
+    }
+    if (sel("qsa_score_part_bf16")) {
+        if (!g_case) std::printf("\nfn4 qsa_split: the score over a rank's range, against the whole launch\n");
+        qsa_score_part_case(pl, 4);
+        qsa_score_part_case(pl, 3);
+    }
+
     if (sel("kv_resolve_i32")) {
         if (!g_case) std::printf("\nthe streamed-KV residency map, against libref\n");
         kv_resolve_case(pl);
@@ -38527,6 +41910,32 @@ static void device_phase(const Plugin& pl) {
          * form S at 12 and 16 rows, and the tiled up-mix at both of its row tiles. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
+        /* fn4 F1a: the folded down reduce against the pair, at the tiled split's row tiles and
+         * either side of them, and at the decode tiles' 128 rows under prefill pin 1. */
+        for (int64_t m : { 16, 17, 24, 32, 33, 48, 64, 65 })
+            for (bool i8 : { false, true }) hc_fuse_down_case(pl, m, i8, 0);
+        hc_fuse_down_case(pl, 300, true, 1);
+        /* fn4 hc_readv: the faster forms against the stock ones, across the decode tiles' bands and
+         * at PF2's rows. */
+        for (int64_t m : { 16, 17, 24, 32, 33, 40, 48, 64, 65, 512, 700, 2048 })
+            for (bool i8 : { false, true }) hc_readv_case(pl, m, i8);
+        /* fn4 hc_upmix: the up-mix's other tiles against the stock one. */
+        for (int64_t m : { 24, 33, 48, 64, 512, 700, 2048 })
+            for (bool i8 : { false, true }) hc_upmix_case(pl, m, i8);
+        /* fn4 hc_readv bit 3 (W1b): the norm scales from the preceding write, below and at its 17-row floor, on
+         * the decode tiles, the wide tile and PF2. */
+        for (int64_t m : { 16, 17, 33, 64, 300, 512, 2048 }) hc_ss_case(pl, m, false);
+        for (int64_t m : { 64, 2048 }) hc_ss_case(pl, m, true);
+        /* fn4 W2: the codes stage's grouped form, below and from the wide tile. */
+        for (int64_t m : { 64, 65, 300, 512, 2048 })
+            for (bool i8 : { false, true }) hc_quantg_case(pl, m, i8);
+    }
+    if (sel("hc_write_bf16")) {
+        if (!g_case) std::printf("\nthe gated residual's write: the eight-wide form (fn4 hcw) against "
+                                 "the plain form\n");
+        for (int64_t m : { 1, 7, 16, 64, 300, 2048 }) hc_write_vec_case(pl, m, 2560, 0);
+        hc_write_vec_case(pl, 37, 1004, 0);
+        hc_write_vec_case(pl, 16, 2560, 1);
     }
     if (sel("hc_read_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "
@@ -38886,6 +42295,12 @@ static void device_phase(const Plugin& pl) {
             }
         }
     }
+    /* fn4 SP-hc: the two-shot's halves over whole-row shards (sp_rows_check). */
+    if (sel("sp_rs_rows_4rank_ti8") || sel("sp_ag_rows_4rank")) {
+        if (!g_case) std::printf("\ncross-rank, 4, sequence-parallel halves (fn4 SP-hc)\n");
+        std::printf("  sp_rs_rows_4rank_ti8 + sp_ag_rows_4rank\n");
+        sp_rows_check(pl, devs);
+    }
     /* The four-rank two-shot's lane row and its host twin, plain and coded (ar_lane_forms). */
     for (const char* n : { "ar_twoshot_4rank_exact_lane", "ar_twoshot_4rank_exact_lane_host" }) {
         if (!sel(n)) continue;
@@ -39070,6 +42485,16 @@ static void usage(void) {
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
+                "  --perfhcu M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3) with every hc_upmix form\n"
+                "             that serves M (fn4), and from 512 rows the up-mix stage alone.\n"
+                "  --perfhcv M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows with F1n,\n"
+                "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
+                "  --perfhcq M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at 1 / 2 / 4 / 5\n"
+                "             groups a wave (fn4 W2), and from 512 rows PF2's codes stage alone.\n"
+                "  --perfhcs M [iters]:  hc_write + hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows,\n"
+                "             hc_readv 3 against 11 (fn4 W1b: the read's norm scales from the write).\n"
+                "  --perfhcw M [iters]:  hc_write at Qwen3.8-Flash-Next's shape and M rows, the plain\n"
+                "             and the eight-wide form (fn4 hcw) timed as one op each, GB/s, bytes compared.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
                 "             prefill-tile form that serves M (the wide kernels at the wide tile,\n"
                 "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
@@ -39144,6 +42569,17 @@ static void usage(void) {
                 "             or runs (S contiguous runs). a=bf16 (default) or a=fp8_e4m3 (scale\n"
                 "             every 128); y=bf16 (default), y=f16 or y=f32. Each row's t and y are\n"
                 "             compared with the first row's; --cold applies.\n"
+                "  --perfar4 RxW[,RxW..] [iters]:  fn4: the four-rank collectives (exact one-shot / two-shot,\n"
+                "             ti8 two-shot, SP reduce_scatter_rows / all_gather_rows raw 1 and 0) at R rows of W\n"
+                "             bf16, warm, the slowest rank's period; GB/s on the bytes a rank sends (AR4 lines: JSON).\n"
+                "  --perfsdma [bytes,..] [iters]:  fn4 SDMA-AR: the four cards' SDMA engines' P2P copy rates\n"
+                "             (push / pull, pair, fan-out / fan-in, the two-shot's hop, both engines) and a\n"
+                "             VRAM-bound kernel stream's loss beside the CU two-shot vs SDMA copies.\n"
+                "  --sdmaar4 RxW[,RxW..] [iters]:  fn4 SDMA-AR: the exact SDMA two-shot checked\n"
+                "             (R4D_SDMA_CHECKS launches, default 1000) and timed against ar_twoshot_4rank_exact.\n"
+                "             R4D_SDMA_TL=1 adds the per-launch phases (chain, hop 1, fold, hop 2, assemble, gap).\n"
+                "  --sdmaeng4 RxW[,RxW..] [iters]:  fn4 SDMA-AR through the engine's rows (lane AR, SP raw RS / AG)\n"
+                "             at sdma 0 vs 1: bytes (vs CU, vs the fold, cross-stream) and time alone / beside a stream.\n"
                 "  --perfar8 numel [iters] [dtype] [forms]:  the eight-rank exact all-reduce, one thread\n"
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
@@ -39201,10 +42637,14 @@ static void usage(void) {
                 "             about a third of the step. M is 1 + n_spec.\n"
                 "             rad-tune's declared graph does not reach a gemm_nt_q row, so this\n"
                 "             is the only way to sweep it. Safe to chase hard: the head only\n"
-                "             proposes, so its output bits change acceptance, not text.\n");
+                "             proposes, so its output bits change acceptance, not text.\n"
+                "  --bicheck-fn4 [cl] [Ms]: fn4 BI: per op, a row alone (M = 1) vs the same row inside an\n"
+                "             M-row launch, byte for byte, Flash-Next's TP4 shapes (classes hc,gemm or all; Ms a\n"
+                "             comma list, default 1..64 and 65..4160).\n");
 }
 
 #include "r4d_selftest_bi.inc"   /* --bicheck: lever BI, a row alone vs inside an M-row launch */
+#include "r4d_selftest_bi_fn4.inc"   /* --bicheck-fn4: fn4 BI (the Qwen line's, namespace bifn) */
 
 int main(int argc, char** argv) {
     /* Before the runtime starts: eight ranks on one card need a hardware queue each. */
@@ -39216,6 +42656,7 @@ int main(int argc, char** argv) {
     int perf_it = 50, perf_w2 = 0, perf_w4 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0,
         perf_q = 0, perf_mx = 0, perf_wpa = 0, perf_vocab = 0, perf_iqr = 0;
     const char* vocab_spec = nullptr;
+    bool bicf = false; const char* bif_c = nullptr; const char* bif_m = nullptr;   /* --bicheck-fn4 (fn4 BI, the Qwen line) */
     long long perf_pb1 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
@@ -39226,6 +42667,17 @@ int main(int argc, char** argv) {
     const char* mla_fill = "prefill";
     int qsa_it = 200;
     long long hc_m = 0;
+    long long hcw_m = 0;
+    int hcw_it = 50;
+    long long hcv_m = 0;
+    int spq = 0;   /* fn4 SP-serial --spqcheck */
+    int hcv_it = 50;
+    long long hcs_m = 0;
+    int hcs_it = 50;
+    long long hcq_m = 0;
+    int hcq_it = 50;
+    long long hcu_m = 0;
+    int hcu_it = 50;
     int hc_it = 20;
     long long moe_m = 0, moe_e = 512, moe_k = 10, hy_m = 0;
     int hy_it = 100;
@@ -39248,7 +42700,12 @@ int main(int argc, char** argv) {
     bool lo_fp8 = false;
     uint32_t lo_ydt = RAD_BF16;
     long long ar8_n = -1;
+    bool sdma_perf_on = false, sdma_ar_on = false, sdma_eng_on = false;   /* fn4 SDMA-AR */
+    const char* sdma_spec = nullptr;
+    int sdma_it = 0;
     int ar8_it = 200;
+    const char* ar4_spec = nullptr;   /* fn4 --perfar4 */
+    int ar4_it = 100;
     const char* ar8_dt = "bf16";
     long long lg_m = 0;
     int lg_it = 200;
@@ -39417,6 +42874,12 @@ int main(int argc, char** argv) {
             if (hy_m < 1 || hy_m > 256 || hy_it < 1) {
                 std::fprintf(stderr, "--perfhyv3moe: M 1..256, iters > 0\n"); return 2;
             }
+        } else if (!std::strcmp(argv[i], "--bicheck-fn4")) {
+            /* fn4 BI (the Qwen line, qfn-on-ds: --bicheck is the ds41 line's): a row alone vs the same row inside an
+             * M-row launch, per op, byte for byte (fn_bi_check). */
+            bicf = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) bif_c = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) bif_m = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmoe")) {
             /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -39458,6 +42921,19 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
+        } else if (!std::strcmp(argv[i], "--perfar4")) {
+            /* fn4: the four-rank collectives timed at RxW bf16 messages (comma-separated) */
+            if (i + 1 >= argc) { usage(); return 2; }
+            ar4_spec = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar4_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfsdma") || !std::strcmp(argv[i], "--sdmaar4") ||
+                   !std::strcmp(argv[i], "--sdmaeng4")) {
+            /* fn4 SDMA-AR: the copy engines' P2P rates / the exact SDMA two-shot / the engine path (see sdma_perf /
+             * sdma_ar4 / sdma_eng4). */
+            (argv[i][2] == 'p' ? sdma_perf_on : argv[i][6] == 'e' ? sdma_eng_on : sdma_ar_on) = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) sdma_spec = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) sdma_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if ((sdma_ar_on || sdma_eng_on) && !sdma_spec) { usage(); return 2; }
         } else if (!std::strcmp(argv[i], "--perfar8")) {
             /* The eight-rank exact all-reduce rows timed; numel 0 runs the default sizes. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -39619,6 +43095,35 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             lg_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcu")) {
+            /* hc_read's up-mix forms (fn4 hc_upmix) at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcu_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcu_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--spqcheck")) {
+            /* fn4 SP-serial: a prefill segment's parts read with the K split pinned vs the segment read whole */
+            spq = 7;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) spq = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcv")) {
+            /* hc_read's faster forms (fn4 hc_readv) against the stock ones at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcv_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcv_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcq")) {
+            /* The codes stage's groups a wave (fn4 W2) at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcq_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcq_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcs")) {
+            /* The write + read pair with the norm scales handed over (fn4 hc_readv bit 3) at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcs_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcs_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcw")) {
+            /* The gated residual's write at M rows, both forms (fn4 hcw). */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcw_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcw_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -39669,6 +43174,17 @@ int main(int argc, char** argv) {
 
     Plugin pl;
 
+    if (bicf) {   /* fn4 BI (the Qwen line) */
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        fn_bi_check(pl, bif_c, bif_m);
+        dfree_all();
+#else
+        skip("fn4 BI per-op check", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+
     /* Timing modes run alone, without the catalogue. */
     if (pg_q > 0 && pg_ctx > 0) {
         if (!load(&pl, path)) return 1;
@@ -39715,6 +43231,66 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("video sparse attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcu_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_upmix_perf(pl, hcu_m, hcu_it, true);
+        dfree_all();
+#else
+        skip("gated residual read timing (hc_upmix)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (spq) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_spq_check(pl, spq);
+        dfree_all();
+#else
+        skip("SP-serial part reads", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+    if (hcv_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_readv_perf(pl, hcv_m, hcv_it, true);
+        dfree_all();
+#else
+        skip("gated residual read timing (hc_readv)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcq_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_quantg_perf(pl, hcq_m, hcq_it, true);
+        dfree_all();
+#else
+        skip("gated residual codes-stage timing (W2)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcs_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_ss_perf(pl, hcs_m, hcs_it, true);
+        dfree_all();
+#else
+        skip("gated residual write + read timing (hc_readv 11)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcw_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_write_perf(pl, hcw_m, hcw_it);
+        dfree_all();
+#else
+        skip("gated residual write timing", "built without HIP");
 #endif
         return 0;
     }
@@ -39767,6 +43343,28 @@ int main(int argc, char** argv) {
         skip("bf16 expert GEMM timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (ar4_spec) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        ar4_perf(pl, ar4_spec, ar4_it);
+        dfree_all();
+#else
+        skip("four-rank collective timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (sdma_perf_on || sdma_ar_on || sdma_eng_on) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (sdma_perf_on) sdma_perf(pl, sdma_spec, sdma_it);
+        else if (sdma_eng_on) sdma_eng4(pl, sdma_spec, sdma_it);
+        else sdma_ar4(pl, sdma_spec, sdma_it);
+        dfree_all();
+#else
+        skip("SDMA all-reduce", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (ar8_n >= 0) {
         if (!load(&pl, path)) return 1;

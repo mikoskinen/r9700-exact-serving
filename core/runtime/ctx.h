@@ -46,6 +46,11 @@ typedef void (*ArchStepFn)(RadCtx*, const RadBatch*);
 /* "[shape]/[stride]" of a tensor's live dimensions, for diagnostics. */
 std::string tensor_shape_str(const RadTensor& t);
 
+/* fn4 (15.11.2026, qwen/build2/STALL.md): whether a program that declares a second lane (Program::scratch_regions > 1)
+ * gets that lane's stream at Ctx::init instead of on its first use mid-run. On unless RADIANCE_FN4_LANE_EAGER=0 at start
+ * (today's lazy build, for comparison). Read once; the VRAM budget's settle check reads it too. */
+bool ctx_lane_eager();
+
 /* ------------------------------------------------------------------ the issue plan */
 /* One resolved (op, band, domain) with everything that does not change per issue filled in: the
  * geometry view, the scratch pointer, the instance init() returned, rank and world size. Per issue
@@ -153,6 +158,7 @@ struct KVViewState {
     int64_t bytes = 0;
     int64_t depth = 0;             /* 0: n_layers; 1: every layer at offset 0 */
     int64_t shape0 = 0;            /* the operand's [blocks] extent for this view */
+    int64_t base_off = 0;          /* fn4 kvs_apart: the view's offset from the pool's base (the stage past the ring) */
 };
 
 /* A byte range of one layer's row in a streamed group's mirror and stage (kvstream/stage.h,
@@ -180,6 +186,11 @@ struct KVPoolBinding {
     KVViewState ring;
     KVViewState stage;
     bool        has_stage = false;
+    /* fn4 kvs_apart (RADIANCE_FN4_KVS_APART=1 at start, qwen/KV-STREAM-EXACT.md): the stage is funded beside the ring
+     * (pool = ring + stage, the stage at pool_base + ring bytes) instead of aliasing it, so a staged pass leaves the ring's
+     * bytes and maps valid; pool_base is the allocation's start, `base` the active view's. */
+    bool        stage_apart = false;
+    void*       pool_base = nullptr;
     /* The ranges of a layer's mirror row a staged pass copies (kvstream/stage.h, "Volume"), set
      * each step. Empty copies the whole row. */
     std::vector<KVStageRun> stage_runs;
@@ -774,8 +785,21 @@ private:
      * and a spinner plus a large copy on two streams cost the max of the two, not the sum. */
     RadStream lane1_      = nullptr;
     bool      own_lane1_  = false;
+    /* fn4 (15.11.2026, qwen/build2/STALL.md): the second lane's stream built at init (ctx_lane_eager()), kept aside until
+     * lane_init adopts it. Building a hardware queue later, mid-run, needs ~35 MiB of VRAM (its context save area and
+     * kernel-argument ring) when the card is full to its headroom, and the driver makes that room by evicting the
+     * process's SVM buffers: 46-231 s on the first prefill step that takes lane 1. Until adopted it is not lane1_, so
+     * every step that does not ask for lane 1 runs exactly the single-lane path (lane_join, pass_key). */
+    RadStream lane1_spare_ = nullptr;
     int       lane_       = 0;
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
+    /* fn4 PF marks (16.11.2026, qwen/prefill): lane_join(from, 0x100 + k) records mark k on lane `from`'s stream at its
+     * current tail; lane_join(0x200 + k, to) makes lane `to` wait for that point only (not for everything issued on the
+     * other lane since). A wait on a mark never recorded joins the whole other lane instead. */
+    static constexpr int kLaneMarks = 16;
+    RadEvent  mark_ev_[kLaneMarks] = {};
+    int       mark_lane_[kLaneMarks] = {};
+    bool      mark_on_[kLaneMarks] = {};
     /* An op was issued on lane 1 since lane 1 was last joined into lane 0; lane 0 joins it before
      * an op outside the second lane's window (Ctx::issue_body). */
     bool      lane1_pending_ = false;

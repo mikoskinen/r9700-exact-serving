@@ -3,6 +3,7 @@
 
 #include "device/device.h"
 #include "kvstream/bind.h"
+#include "runtime/fn4_switch.h"
 #include "runtime/wtab.h"
 
 #include <algorithm>
@@ -72,7 +73,18 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
          * live block from the mirror as a request's first pass does. `slots < blocks` holds for
          * every stream with a stage: bringup gives a stream whose ring covers its context no
          * mirror, no resolve and no stage. */
-        if (was_stage && kb->depth == 0) {
+        /* fn4 kvs_bi bit 2 (15.11.2026, qwen/KV-STREAM-EXACT.md): also when a staged pass BEGINS. On the stage the
+         * cache operand is the stage, and the streamed store writes kv_cache[res[block]] for every block the maps call
+         * resident: a ring slot's index used as a block id inside the stage, i.e. this step's token written into
+         * another block's row of the layer the attention reads next (store_stage_identity then writes the right row,
+         * but the wrong one stays). The maps of the ring passes before are still set, so a MIXED step after decode
+         * steps wrote its decode sequences' new tokens over block ids = their slots -- a block of whichever sequence
+         * holds that id. With the maps reset at the stage's start the store writes the mirror (and the stage at
+         * identity) only; the ring is overwritten by the stage either way and resolves from the mirror afterwards. */
+        const bool kvs_reset_in = !was_stage && kb->depth == 1 && (fn4::kvs_bi() & 2) != 0;
+        /* fn4 kvs_apart: a stage funded beside the ring never overwrites it, and the staged pass's stores keep the ring
+         * current (the cache operand's ring view), so the maps stay valid: no reset either way, the ring stays warm. */
+        if (!kb->stage_apart && ((was_stage && kb->depth == 0) || kvs_reset_in)) {
             const RadKVStream* st = b->kv[i].stream;
             const int64_t bb     = st->block_bytes;
             const int64_t blocks = bb > 0 ? st->host_layer_stride / bb : 0;
@@ -433,7 +445,13 @@ extern "C" int rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroup
                                   int layer) {
     using namespace rad;
     if (!c || !kvb || !kvb->stream) return 0;
-    return kvstage_wait(static_cast<Ctx*>(c), group, kvb, layer);
+    const int r = kvstage_wait(static_cast<Ctx*>(c), group, kvb, layer);
+    /* fn4 kvs_apart: 2 = staged on a stage funded beside the ring (the store then also keeps the ring current) */
+    if (r == 1) {
+        const KVPoolBinding* b = static_cast<Ctx*>(c)->kv_binding(group);
+        if (b && b->stage_apart) return 2;
+    }
+    return r;
 }
 
 extern "C" int rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer) {

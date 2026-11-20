@@ -2800,6 +2800,99 @@ TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_
             }
 }
 
+/* fn4 156 (10.11.2026): with the fused decode chain (exl3_gd = 1) at an in-band height the down issue fell through to
+ * the fp8 two-class branch and issued the EXL3 down handle with 9 operands (schema 11) -- the server stopped at the first
+ * step. Every EXL3 op a pass issues must carry its schema's operand count (exl3_abi.h, the extension's own table), and
+ * the fused op must replace exactly the split pair, at both flag values and at heights in and out of its band. */
+TEST(exl3_experts_issue_each_op_at_its_schema_count_split_and_fused) {
+    using namespace rad::arch;
+    RadEncoding gu{}, dn{};
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 1, &gu), RAD_OK);
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 0, &dn), RAD_OK);
+    const int64_t D = 256, F = 128, NE = 8, TK = 2, ROWS = 32;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", gu }, { "ffn_down_exps", dn } };
+    Names nm("");
+    Geom g{};
+    g.n_embd = D;
+    g.max_tok = ROWS;
+    g.world = 1;
+    g.rank = 0;
+    MoeFP8::Src src{};
+    src.router = "mlp.gate.weight";
+    src.experts = "mlp.experts";
+    src.cfg.n_expert = src.cfg.n_expert_all = NE;
+    src.cfg.top_k = TK;
+    src.cfg.n_ff_exp = F;
+    src.cfg.rows = ROWS;
+    REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+    REQUIRE_EQ(src.cfg.expert_exl3, 1);
+    MoeFP8::Wire w{};
+    auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
+        return decl_b(&b, name, dt, { rows, cols });
+    };
+    w.h.x = buf("h", RAD_BF16, ROWS, D);
+    REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", D), RAD_OK);
+    w.logits = buf("logits", RAD_BF16, ROWS, NE);
+    w.ids = buf("ids", RAD_I32, ROWS, TK);
+    w.ew = buf("ew", RAD_BF16, ROWS, TK);
+    w.eoff = decl_b(&b, "offset", RAD_I32, { NE + 1 });
+    w.ecnt = decl_b(&b, "count", RAD_I32, { NE });
+    w.sorted = decl_b(&b, "sorted", RAD_I32, { ROWS * TK });
+    w.egu = buf("gate_up", RAD_BF16, ROWS * TK, 2 * F);
+    w.eff.x = buf("ff", RAD_BF16, ROWS * TK, F);
+    REQUIRE_EQ(w.eff.declare_qs(&b, nm, g, "ff", F, ROWS * TK), RAD_OK);
+    w.edn = buf("down", RAD_BF16, ROWS * TK, D);
+    MoeFP8 moe;
+    REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+    REQUIRE(moe.op_x3gd != 0u);
+    REQUIRE(moe.x3gd_hi >= EXL3_GD_MIN_ROWS);
+    /* the extension's schema of an EXL3 op: {operands, required (up to the last non-optional one)}, or {-1, -1} */
+    auto schema_of = [](const std::string& op) {
+        for (int i = 0; i < exl3_schema_count(); ++i) {
+            const RadOpSchema* s = exl3_schema_at(i);
+            if (op != s->op) continue;
+            int req = 0;
+            for (int j = 0; j < s->n_operands; ++j)
+                if (!s->operands[j].optional) req = j + 1;
+            return std::make_pair(s->n_operands, req);
+        }
+        return std::make_pair(-1, -1);
+    };
+    const int saved = fn4_exl3_gd_flag().load();
+    for (int gd = 0; gd <= 1; ++gd)
+        for (int64_t rows : { (int64_t)1, (int64_t)EXL3_GD_MIN_ROWS, (int64_t)4, moe.x3gd_hi, moe.x3gd_hi + 1 }) {
+            fn4_exl3_gd_flag().store(gd);
+            RadCtx ctx;
+            ctx.b = &b;
+            ctx.rank = 0;
+            ctx.world = 1;
+            moe.pass(&ctx, rows, 0, rows);
+            int n_gu = 0, n_dn = 0, n_gd = 0;
+            for (const auto& issue : ctx.issues) {
+                const std::string op = b.ops[issue.op - 1].op;
+                if (op.rfind("moe_exl3_", 0) != 0) continue;
+                const auto [n_schema, n_req] = schema_of(op);
+                REQUIRE(n_schema > 0);
+                const int n = (int)issue.opd.size();
+                if (n < n_req || n > n_schema)
+                    std::fprintf(stderr, "  %s at %lld rows (exl3_gd %d): %d operands, schema %d (%d required)\n",
+                                 op.c_str(), (long long)rows, gd, n, n_schema, n_req);
+                CHECK(n >= n_req && n <= n_schema);
+                n_gu += op == EXL3_OP_GATE_UP;
+                n_dn += op == EXL3_OP_DOWN;
+                n_gd += op == EXL3_OP_GU_DN;
+            }
+            const bool fused = gd && rows >= EXL3_GD_MIN_ROWS && rows <= moe.x3gd_hi;
+            CHECK_EQ(n_gd, fused ? 1 : 0);
+            CHECK_EQ(n_gu, fused ? 0 : 1);
+            CHECK_EQ(n_dn, fused ? 0 : 1);
+            /* no other expert GEMM handle stands in for the EXL3 pair */
+            for (const auto& issue : ctx.issues) CHECK(issue.op != moe.op_dn || !fused);
+        }
+    fn4_exl3_gd_flag().store(saved);
+}
+
 /* A quantised container may keep one linear as the checkpoint holds it. Flash-Next's recipe leaves
  * the QSA indexer's projection plain bf16 (its top-k is a hard choice between blocks), so in a
  * four-bit model with fp8 linears it is declared bf16 and read by `gemm_nt` over its input's bf16
@@ -12410,12 +12503,14 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         int world, rank;
         uint64_t graph, steps;
     };
+    /* fn4 W1b (10.11.2026): qwen4exp's step hashes re-pinned -- hc_read and hc_write now issue their trailing optional
+     * `ss` operand (absent, RAD_NONE) so each issue still carries the schema's full count; the graphs are unchanged. */
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x32869dce302eb0e0ull, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xf0b6701dd7cbb37aull, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
+        { "qwen4exp_fp8", 1, 0, 0x32869dce302eb0e0ull, 0xe8f31869db7cc67aull },
+        { "qwen4exp_fp8", 2, 0, 0xf0b6701dd7cbb37aull, 0x3bfababbd75d9957ull },
+        { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0xb7256695da2dfb73ull },
+        { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0x8cf4e752ed7ea163ull },
+        { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x8314501760657f93ull },
         { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
         { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },

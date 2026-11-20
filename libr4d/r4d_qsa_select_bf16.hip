@@ -23,6 +23,7 @@
 #include "r4d_chain.h"
 #include "r4d_launch.h"   // R4D_DYN_LDS
 #include "r4d_common.h"   // the DPP wave scans
+#include "r4d_qsa_part.h"  // fn4 qsa_split: rank ranges and the candidate-list layout
 
 #include <hip/hip_runtime.h>
 #include <cmath>
@@ -1102,6 +1103,207 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
         seqused[m] = su;
     }
 }
+
+/* ===================================================== fn4 qsa_split (16.11.2026, qwen/QSA-SPLIT.md)
+ *
+ * The split path above across the ranks of a tensor-parallel group: rank r selects over its own block range of each
+ * sequence (r4d_qsa_part.h, scored by qsa_score's `parts` form), in chunks of that range like qsa_local_kernel, then its
+ * chunk lists are merged to the range's own top-k in block order (the list a rank gathers to the others), and after the
+ * gather one merge per query reads the ranks' lists in rank order -- ascending block order, as the chunk lists of one card
+ * -- and emits the single-workgroup kernel's table. Both merges are qsa_merge_kernel's (same threshold, same tie rule by
+ * list position, same flags), so the table is the unsplit one's byte for byte at every chunk and rank count. With one part
+ * the same two kernels are the split path at any launch height (fn4 qsa_split bit 2, the in-card form).
+ *
+ * Lists are qsa_list_words(topk) words (r4d_qsa_part.h): count | kParOver, the block bound nb, two zero words, topk keys,
+ * topk pages. */
+
+/* ---- a chunk of this rank's range: its own top-k, as (key, page) in block order. */
+template <bool Signed>
+__global__ __launch_bounds__(kLocalThreads) void qsa_local_part_kernel(
+    const float* __restrict__ score, const int32_t* __restrict__ bt,
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, int32_t* __restrict__ lists, int lpitch,
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk, int parts, int part) {
+
+    constexpr int LT = kLocalThreads;
+    __shared__ uint32_t hist[kBins], suf[kBins], wsum[LT / kWave];
+    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord;
+    __shared__ int      sh_seq;
+    R4D_DYN_LDS(uint32_t, sh_key);
+
+    const int m = (int)blockIdx.y, c = (int)blockIdx.x;
+    const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
+    int32_t* const L = lists + (size_t)m * lpitch + (size_t)c * qsa_list_words(topk);
+
+    if (t == 0) { sh_seq = 0; L[0] = 0; L[1] = nb; L[2] = 0; L[3] = 0; }
+    __syncthreads();
+    for (int i = t; i < nseq; i += LT)
+        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+    __syncthreads();
+    const int seq = sh_seq;
+    const int p   = pos ? pos[m] : 0;
+    const int own = (p + 1) / ratio;
+    int n = nc[seq] < nb ? nc[seq] : nb;
+    if (own < n) n = own;
+
+    const int rlo = qsa_part_cut(nc[seq], parts, part);
+    int rhi = qsa_part_cut(nc[seq], parts, part + 1);
+    if (rhi > n) rhi = n;
+    const int lo = rlo + c * chunk;
+    if (lo >= rhi) return;
+    const int hi = (lo + chunk) < rhi ? (lo + chunk) : rhi;
+    const int cn = hi - lo;
+
+    const float*   sc = score + (size_t)m * s_ld;
+    const int32_t* tb = bt    + (size_t)seq * t_ld;
+    for (int i = t; i < cn; i += LT) sh_key[i] = keyof<Signed>(sc[lo + i], tb[lo + i]);
+    __syncthreads();
+
+    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, cn <= topk };
+    if (!e.all) {
+        radix_thresh<LT>(sh_key, cn, (uint32_t)topk, true, hist, suf, wsum, &sh_T, &sh_need);
+        e.T = sh_T; e.need = sh_need;
+    }
+    const bool over = !e.all && e.T != 0u;
+    if (t == 0) { sh_hi = 0; sh_ord = 0; }
+    __syncthreads();
+
+    uint32_t* dk = (uint32_t*)(L + kQsaListHead);
+    int32_t*  di = L + kQsaListHead + topk;
+    for (int i0 = 0; i0 < cn; i0 += LT) {
+        const int i = i0 + t;
+        const uint32_t k = i < cn ? sh_key[i] : 0u;
+        const ParTake r = par_take<false, true, LT>(e, k, lane, wave);
+        if (r.take && r.slot_ord < (uint32_t)topk) {
+            dk[r.slot_ord] = k;
+            di[r.slot_ord] = tb[lo + i];
+        }
+    }
+    if (t == 0) L[0] = (int32_t)(sh_ord < (uint32_t)topk ? sh_ord : (uint32_t)topk) | (over ? kParOver : 0);
+}
+
+/* ---- merge a query's lists. Slab: into its range's top-k, again a list in block order (a rank's chunks -> the list it
+ * gathers); otherwise into the page-id table (the ranks' lists after the gather, or one card's chunks). The threshold and
+ * the emit are qsa_merge_kernel's; `all` is taken against the range's block count in the slab form (a range of at most topk
+ * blocks, or with topk or fewer live, keeps every live block) and against the query's in the table form. */
+template <bool Signed, bool Slab>
+__global__ __launch_bounds__(kMergeThreads) void qsa_merge_lists_kernel(
+    const int32_t* __restrict__ lists, int lpitch, int nlist,
+    const int32_t* __restrict__ bt, const int32_t* __restrict__ nc,
+    const int32_t* __restrict__ pos, const int32_t* __restrict__ cu,
+    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ slab, int spitch,
+    int topk, int ratio, int nseq, int t_ld, int o_ld, int parts, int part) {
+
+    constexpr int NT = kMergeThreads;
+    __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];
+    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord, sh_tot, sh_over;
+    __shared__ int      sh_seq, sh_off[kParWMax + 1];
+    R4D_DYN_LDS(uint32_t, sh_key);
+
+    const int m = (int)blockIdx.x;
+    const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
+    const int lw = qsa_list_words(topk);
+    const int32_t* const Lr = lists + (size_t)m * lpitch;
+    const int nb = Lr[1];
+
+    if (t == 0) sh_seq = 0;
+    __syncthreads();
+    for (int i = t; i < nseq; i += NT)
+        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+    __syncthreads();
+    const int seq = sh_seq;
+    const int p   = pos ? pos[m] : 0;
+    const int own = (p + 1) / ratio;
+    int n = nc[seq] < nb ? nc[seq] : nb;
+    if (own < n) n = own;
+
+    if (t == 0) {
+        int s = 0;
+        uint32_t over = 0;
+        for (int c = 0; c < nlist; ++c) {
+            const int32_t v = Lr[(size_t)c * lw];
+            over |= (v & kParOver) ? 1u : 0u;
+            sh_off[c] = s;
+            s += v & ~kParOver;
+        }
+        sh_off[nlist] = s;
+        sh_tot = (uint32_t)s;
+        sh_over = over;
+    }
+    __syncthreads();
+    const int tot = (int)sh_tot;
+
+    for (int c = 0; c < nlist; ++c) {
+        const int base = sh_off[c], cnt = sh_off[c + 1] - base;
+        const uint32_t* src = (const uint32_t*)(Lr + (size_t)c * lw + kQsaListHead);
+        for (int i = t; i < cnt; i += NT) sh_key[base + i] = src[i];
+    }
+    __syncthreads();
+
+    int ne = n;
+    if constexpr (Slab) {
+        const int rlo = qsa_part_cut(nc[seq], parts, part);
+        int rhi = qsa_part_cut(nc[seq], parts, part + 1);
+        if (rhi > n) rhi = n;
+        ne = rhi > rlo ? rhi - rlo : 0;
+    }
+    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, ne <= topk || (!sh_over && tot <= topk) };
+    if (!e.all) {
+        radix_thresh<NT>(sh_key, tot, (uint32_t)topk, false, hist, suf, wsum, &sh_T, &sh_need);
+        e.T = sh_T; e.need = sh_need;
+    }
+    if (t == 0) { sh_hi = 0; sh_ord = 0; }
+    __syncthreads();
+
+    if constexpr (Slab) {
+        int32_t* const S = slab + (size_t)m * spitch;
+        uint32_t* dk = (uint32_t*)(S + kQsaListHead);
+        int32_t*  di = S + kQsaListHead + topk;
+        for (int i0 = 0; i0 < tot; i0 += NT) {
+            const int i = i0 + t;
+            const uint32_t k = i < tot ? sh_key[i] : 0u;
+            const ParTake r = par_take<false, true, NT>(e, k, lane, wave);
+            if (r.take && r.slot_ord < (uint32_t)topk) {
+                int c = nlist - 1;
+                while (c > 0 && sh_off[c] > i) --c;
+                dk[r.slot_ord] = k;
+                di[r.slot_ord] = Lr[(size_t)c * lw + kQsaListHead + topk + (i - sh_off[c])];
+            }
+        }
+        /* More than topk live in the range exactly when not `all` (see qsa_local_kernel's `over`). */
+        if (t == 0) {
+            S[0] = (int32_t)(sh_ord < (uint32_t)topk ? sh_ord : (uint32_t)topk) | (!e.all ? kParOver : 0);
+            S[1] = nb; S[2] = 0; S[3] = 0;
+        }
+    } else {
+        const int32_t* tb = bt  + (size_t)seq * t_ld;
+        int32_t*       ou = sel + (size_t)m * o_ld;
+        for (int i0 = 0; i0 < tot; i0 += NT) {
+            const int i = i0 + t;
+            const uint32_t k = i < tot ? sh_key[i] : 0u;
+            const ParTake r = par_take<true, false, NT>(e, k, lane, wave);
+            if (r.take) {
+                int c = nlist - 1;
+                while (c > 0 && sh_off[c] > i) --c;
+                const int32_t page = Lr[(size_t)c * lw + kQsaListHead + topk + (i - sh_off[c])];
+                if (r.hi) { if (r.slot_hi < (uint32_t)topk) ou[r.slot_hi] = page; }
+                else       { ou[(uint32_t)topk - e.need + r.rank_eq] = page; }
+            }
+        }
+        /* The partial page and the tail, as qsa_merge_kernel. */
+        if (t == 0) {
+            uint32_t out = e.all ? sh_hi : (uint32_t)topk;
+            const int32_t partp = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
+            if (partp >= 0) ou[out++] = partp;
+            for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+            nsel[m] = (int32_t)out;
+            const int32_t su = (int32_t)((out == 0) ? 0
+                                       : (out - 1) * (uint32_t)ratio + (uint32_t)(p % ratio) + 1u);
+            seqused[m] = su;
+        }
+    }
+}
 }  // namespace
 
 /* Split-path scratch, sized from topk alone so declare (parameters only) and issue agree: two
@@ -1238,3 +1440,110 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
                 stream);
 }
 
+
+/* ============================================================== fn4 qsa_split: the plugin ABI entry points
+ *
+ * qsa_select_part  score, bt, nc, pos, cu -> lists [M, nlist * LW] (this rank's range in nlist chunks; nlist from the
+ *                  operand's width) and, when `slab` [M, LW] is given, the range's own list (merged when nlist > 1, else
+ *                  the one chunk written there directly). `parts` / `part`: the rank's range (1 / 0: the whole history).
+ * qsa_select_merge lists [M, nlist * LW] (the gathered ranks' lists, or one card's chunks) + bt, nc, pos, cu -> sel, nsel,
+ *                  seqused, byte for byte qsa_select's. The block bound comes from the lists' head (the part launch's).
+ * Unsigned order only (the Qwen indexer's relu sums). */
+enum { QP_SCORE = 0, QP_BT = 1, QP_NC = 2, QP_POS = 3, QP_CU = 4, QP_LISTS = 5, QP_SLAB = 6 };
+enum { QM_LISTS = 0, QM_BT = 1, QM_NC = 2, QM_POS = 3, QM_CU = 4, QM_SEL = 5, QM_NSEL = 6, QM_SEQ = 7 };
+
+static int qsa_lists_of(const RadTensor* l, long long M, long long lw, long long* nlist, long long* pitch) {
+    if (!l || l->rank != 2 || l->shape[0] < M || lw <= 0) return RAD_E_SHAPE;
+    if (l->shape[1] % lw) return RAD_E_SHAPE;
+    *nlist = l->shape[1] / lw;
+    if (*nlist < 1 || *nlist > kParWMax) return RAD_E_SHAPE;
+    *pitch = r4d_row_pitch(l);
+    return *pitch < 0 ? RAD_E_STRIDE : RAD_OK;
+}
+
+extern "C" int r4d_rad_qsa_select_part(const RadArgs* a, RadStream stream) {
+    const RadTensor* sc = r4d_opt(a, QP_SCORE);
+    const RadTensor* bt = r4d_opt(a, QP_BT);
+    const RadTensor* nc = r4d_opt(a, QP_NC);
+    const RadTensor* po = r4d_opt(a, QP_POS);
+    const RadTensor* cu = r4d_opt(a, QP_CU);
+    const RadTensor* li = r4d_opt(a, QP_LISTS);
+    const RadTensor* sb = r4d_opt(a, QP_SLAB);
+    if (!sc || !bt || !nc || !po || !cu || !li) return R4D_NO(RAD_E_INVAL);
+    if (sc->rank != 2 || bt->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long topk = r4d_geti_or(a, "topk", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    const long long parts = r4d_geti_or(a, "parts", 1), part = r4d_geti_or(a, "part", 0);
+    if (topk <= 0 || ratio <= 0 || parts < 1 || parts > 64 || part < 0 || part >= parts) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "signed", 0) != 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long M = sc->shape[0];
+    const long long nb = bt->shape[1] < sc->shape[1] ? bt->shape[1] : sc->shape[1];
+    if (M < 1 || nb < 1) return R4D_NO(RAD_E_SHAPE);
+    if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
+    const long long nseq = cu->shape[0] - 1;
+    if (bt->shape[0] < nseq || r4d_numel(nc) < nseq || r4d_numel(po) < M) return R4D_NO(RAD_E_SHAPE);
+    const long long lw = qsa_list_words((int)topk);
+    long long nlist = 0, lp = 0, sp = 0;
+    int rc = qsa_lists_of(li, M, lw, &nlist, &lp);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    if (sb) {
+        if (sb->rank != 2 || sb->shape[0] < M || sb->shape[1] != lw) return R4D_NO(RAD_E_SHAPE);
+        sp = r4d_row_pitch(sb);
+        if (sp < 0) return R4D_NO(RAD_E_STRIDE);
+    }
+    /* The widest range a rank can own (r4d_qsa_part.h), in nlist chunks that must fit the key cache. */
+    const long long width = parts > 1 ? (nb + parts - 1) / parts + 15 : nb;
+    const long long chunk = (width + nlist - 1) / nlist;
+    const int lds = lds_cap_of();
+    if (chunk > kParCap || chunk > lds || nlist * topk > lds) return R4D_NO(RAD_E_SHAPE);
+    const long long s_ld = r4d_row_pitch(sc), t_ld = r4d_row_pitch(bt);
+    if (s_ld < 0 || t_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    /* One chunk and a slab: the chunk's list is the range's. */
+    const bool direct = sb && nlist == 1;
+    int32_t* const out = direct ? (int32_t*)r4d_addr(sb) : (int32_t*)r4d_addr(li);
+    rc = R4D_EMIT(stream, qsa_local_part_kernel<false>, dim3((unsigned)nlist, (unsigned)M), dim3(kLocalThreads),
+                  (size_t)chunk * sizeof(uint32_t), (const float*)r4d_addr(sc), (const int32_t*)r4d_addr(bt),
+                  (const int32_t*)r4d_addr(nc), (const int32_t*)r4d_addr(po), (const int32_t*)r4d_addr(cu),
+                  out, (int)(direct ? sp : lp), (int)nb, (int)topk, (int)ratio, (int)nseq, (int)s_ld, (int)t_ld,
+                  (int)chunk, (int)parts, (int)part);
+    if (rc != RAD_OK || !sb || direct) return rc;
+    return R4D_EMIT(stream, (qsa_merge_lists_kernel<false, true>), dim3((unsigned)M), dim3(kMergeThreads),
+                    (size_t)nlist * topk * sizeof(uint32_t), (const int32_t*)r4d_addr(li), (int)lp, (int)nlist,
+                    (const int32_t*)r4d_addr(bt), (const int32_t*)r4d_addr(nc), (const int32_t*)r4d_addr(po),
+                    (const int32_t*)r4d_addr(cu), (int32_t*)nullptr, (int32_t*)nullptr, (int32_t*)nullptr,
+                    (int32_t*)r4d_addr(sb), (int)sp, (int)topk, (int)ratio, (int)nseq, (int)t_ld, 0,
+                    (int)parts, (int)part);
+}
+
+extern "C" int r4d_rad_qsa_select_merge(const RadArgs* a, RadStream stream) {
+    const RadTensor* li = r4d_opt(a, QM_LISTS);
+    const RadTensor* bt = r4d_opt(a, QM_BT);
+    const RadTensor* nc = r4d_opt(a, QM_NC);
+    const RadTensor* po = r4d_opt(a, QM_POS);
+    const RadTensor* cu = r4d_opt(a, QM_CU);
+    const RadTensor* se = r4d_opt(a, QM_SEL);
+    const RadTensor* ns = r4d_opt(a, QM_NSEL);
+    const RadTensor* su = r4d_opt(a, QM_SEQ);
+    if (!li || !bt || !nc || !po || !cu || !se || !ns || !su) return R4D_NO(RAD_E_INVAL);
+    if (bt->rank != 2 || se->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long topk = r4d_geti_or(a, "topk", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    if (topk <= 0 || ratio <= 0) return R4D_NO(RAD_E_INVAL);
+    const long long M = se->shape[0];
+    if (M < 1 || se->shape[1] != topk + 1) return R4D_NO(RAD_E_SHAPE);
+    if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
+    const long long nseq = cu->shape[0] - 1;
+    if (bt->shape[0] < nseq || r4d_numel(nc) < nseq || r4d_numel(po) < M) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(ns) < M || r4d_numel(su) < M) return R4D_NO(RAD_E_SHAPE);
+    const long long lw = qsa_list_words((int)topk);
+    long long nlist = 0, lp = 0;
+    const int rc = qsa_lists_of(li, M, lw, &nlist, &lp);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    if (nlist * topk > lds_cap_of()) return R4D_NO(RAD_E_SHAPE);
+    const long long t_ld = r4d_row_pitch(bt), o_ld = r4d_row_pitch(se);
+    if (t_ld < 0 || o_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    return R4D_EMIT(stream, (qsa_merge_lists_kernel<false, false>), dim3((unsigned)M), dim3(kMergeThreads),
+                    (size_t)nlist * topk * sizeof(uint32_t), (const int32_t*)r4d_addr(li), (int)lp, (int)nlist,
+                    (const int32_t*)r4d_addr(bt), (const int32_t*)r4d_addr(nc), (const int32_t*)r4d_addr(po),
+                    (const int32_t*)r4d_addr(cu), (int32_t*)r4d_addr(se), (int32_t*)r4d_addr(ns),
+                    (int32_t*)r4d_addr(su), (int32_t*)nullptr, 0, (int)topk, (int)ratio, (int)nseq, (int)t_ld,
+                    (int)o_ld, 1, 0);
+}

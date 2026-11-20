@@ -703,6 +703,146 @@
  *   extern "C" int rad_fn4_value(const char* name, int* applied)  1 and the value it applies, 0 not its switch
  * The kernel and architecture plugins are dlopen'ed RTLD_LOCAL, so the core finds the hooks in every loaded object
  * through its own handle (fn4_switch.cpp). */
+/* THE QWEN FLASH-NEXT LINE'S SWITCHES (qfn-on-ds 20.11.2026: fn4-x3-pf 6fdca84a's registry, carried over as it was; numbered
+ * after the DeepSeek line's from kQwenFirst). Their start value is their environment variable as that line read it (env_val:
+ * unset / empty / 0 -> 0, a number > 1 as given, else 1), GET reports the applied value, and a request is checked against
+ * that line's ranges. The text below is that line's header, unchanged:
+ *
+ *
+ * A switch is set from the environment at start (RADIANCE_FN4_*), and may be changed while the server
+ * runs through POST /admin/fn4. A change is queued by the server thread and applied by the scheduler
+ * thread at the next step release (Engine::prepare_release), while every rank thread is parked, so all
+ * ranks issue each step under one setting. Every applied change advances an epoch that Ctx::pass_key
+ * mixes in, so no recorded pass from before the change is played after it.
+ *
+ *   no_route        core (Ctx::route_report): no routing reports                  RADIANCE_FN4_NO_ROUTE
+ *   gather_inv      architecture plugin (rad_fn4_switch): the fused gather inverse RADIANCE_FN4_GATHER_INV
+ *                   -- runtime changes need RADIANCE_FN4_SWITCHABLE=1 at start (both paths declared)
+ *   hc_fusedown     libr4d (rad_fn4_switch): hc_read's folded down reduce          RADIANCE_FN4_HC_FUSEDOWN
+ *                   -- 1 the first tail, 2 the low-register tail (v2)
+ *   hc_normwave     libr4d (rad_fn4_switch): hc_read's wave norm scales            RADIANCE_FN4_HC_NORMWAVE
+ *                   -- 1 at every row count, N >= 2 from N rows
+ *   draft_adaptive  scheduler: --draft-window adaptive (1) or fixed (0); -1 = the configured window
+ *   hc_writevec     libr4d (rad_fn4_switch): hc_write eight elements a thread      RADIANCE_FN4_HC_WRITEVEC
+ *                   -- 1 at every row count, N >= 2 from N rows
+ *   hc_readv        libr4d (rad_fn4_switch): hc_read's faster forms, a mask         RADIANCE_FN4_HC_READV
+ *                   -- 1 the decode tiles (17-64 rows), 2 PF2's down product (prefill), 4 PF2's norm scales in the down product,
+ *                   8 the norm scales from the preceding hc_write (W1b; the trunk hands them over only when started with
+ *                   RADIANCE_FN4_HC_SS=1, which declares their buffer), 16 / 32 / 48 the codes stage at 2 / 4 / 5 groups a
+ *                   wave (W2)
+ *   ar_lanethreads  libr4d (rad_fn4_switch): the prefill all-reduce lane's block    RADIANCE_FN4_AR_LANE_THREADS
+ *                   width -- 0 the resolved tunable, 256 / 512 / 1024
+ *   hc_upmix        libr4d (rad_fn4_switch): hc_read's up-mix tile                  RADIANCE_FN4_HC_UPMIX
+ *                   -- value & 7 PF2's form (0 stock, 1-4), + 8 the 64-row decode tile pipelined
+ *   ar_laneblocks   libr4d (rad_fn4_switch): the prefill all-reduce lane's blocks   RADIANCE_FN4_AR_LANE_BLOCKS
+ *                   -- 0 the resolved tunable (4), 4..24 in steps of 4
+ *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule, 0 off, 1 rule,
+ *                   2 rule-w (cohbench2 7.11.: a CU can serve a line it stored after another CU rewrote it, so
+ *                   rule-w is the safe one); -1 until set = RADIANCE_AQL_ACQ=rule | rule-w at start
+ *   exl3_pfprep     exl3r4d (rad_fn4_switch): gate_up's prep in the EXL3 prefill band -- 0 the build's (the map,
+ *                   then the prep by map entry), 2 the map and the prep by row in one launch; no start value (the
+ *                   plugin reads no environment), so it is set through POST /admin/fn4 only
+ *
+ *   exl3_dz         exl3r4d (rad_fn4_switch): fn4 DZ at run time -- the decode band's spare workgroups zero their own
+ *                   dead rows directly (1) or by the scan (0); a plugin built at EXL3R4D_DZ 2 takes both  RADIANCE_FN4_X3DZ
+ *   exl3_bi         exl3r4d (rad_fn4_switch): fn4 BI -- the decode band computes every row as the prefill band does (no
+ *                   EPIC in down, no small-M split-K in gate_up); 0 the adopted forms                RADIANCE_FN4_X3BI
+ *   hc_bi           libr4d + qwen4exp (rad_fn4_switch): fn4 BI -- 1 hc_read up to 64 rows through one form family
+ *                   (tiled from a single row, the one-tile K split, hc_norm_scale_kernel's scales: a one-time change
+ *                   at 1..7 rows); 2 up to 64 rows through today's per-row kernels (bf16 mixing: today's alone bytes
+ *                   kept); both: the architecture reads a step's decode rows / each prefill sequence alone; 3 the
+ *                   E4M3 decode rows <= 8 a read (form G), the final read a sequence a read; 5 as 3, the connections
+ *                   with the inject gains read the decode rows in one launch (bi_dec twin: form G / B3 in row groups
+ *                   on grid.y, the same bytes; needs RADIANCE_FN4_BIDEC or RADIANCE_FN4_X3DUAL at start, else as 3);
+ *                   0 today                                                                          RADIANCE_FN4_HC_BI
+ *   bi_seg          architecture plugin (rad_fn4_switch): fn4 BI -- every trunk linear (LinearFP8) cut at the step's
+ *                   segments (decode rows, each prefill sequence): a decode row's linears at its own height (the
+ *                   narrow tiles, M-invariant to 64); 2 also the lm_head at each output row's alone height class
+ *                   (a prompt's last row its own M = 1 launch: logits_gemm runs a matvec at M <= 2, WMMA from 3);
+ *                   0 one launch over the step                                                     RADIANCE_FN4_BI_SEG
+ *   att_bi          architecture plugin (rad_fn4_switch): fn4 BI -- a step's prefill sequences' dense attention each in
+ *                   a launch shaped as its alone step's (its rows, its band, its table row and seqused), every sparse
+ *                   sequence in launches of its own; 2 as 1, the sparse decode sequences in one launch whose split law
+ *                   counts 1 + n_spec rows (libr4d split_rows; RADIANCE_FN4_BIDEC / X3DUAL declare it); 3 + a run of
+ *                   dense decode sequences in one pinned launch; 4 (15.11.) + each sequence of a sparse step on the
+ *                   path of its alone step's context bound (qwen/build2/LONGPROMPT.md); 0 today's
+ *                   launches                                                                       RADIANCE_FN4_ATT_BI
+ *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
+ *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;
+ *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS
+ *   sched_bi_chunk  core scheduler: fn4 BI -- a prompt's prefill chunk boundaries the same alone and beside other work
+ *                   (ported from ds41-bi: 1 alone's boundaries, 2 the interval grid, 3 / 4 alone's pieces cut on the
+ *                   interval / RADIANCE_SCHED_BI_GRID grid, >= 128 rows a side; 5 every prefill piece alone in its
+ *                   step; 6 (15.11.) alone's piece whole where it fits beside other work, else alone in its step, never
+ *                   cut); 0 today                                                                  RADIANCE_SCHED_BI_CHUNK
+ *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
+ *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
+ *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
+ *                   bands)                                                                            RADIANCE_FN4_X3DUAL
+ *   moe_pair        architecture plugin (rad_fn4_switch): fn4 P2x, a pipelined prefill step's two pieces through
+ *                   ONE routed-expert pass (0 off, 1 the shared arm a piece after it, 2 the shared arms inside it);
+ *                   needs RADIANCE_FN4_P2X=1 at start (the expert buffers declared two pieces tall)  RADIANCE_FN4_MOE_PAIR
+ *   ar_sdma         libr4d (rad_fn4_switch): fn4 SDMA-AR -- a prefill piece's lane all-reduce and SP's raw
+ *                   reduce-scatter / all-gather move their peer bytes on the SDMA copy engines (the same fold, the
+ *                   same bytes); needs RADIANCE_FN4_AR_SDMA set at start (0 / 1: builds the copy-engine contexts; such
+ *                   passes stay untaped)                                                          RADIANCE_FN4_AR_SDMA
+ *
+ *   bi_wide         architecture plugin (rad_fn4_switch): fn4 BI wide (14.11.2026) -- the forms a step above 64 decode
+ *                   rows takes, a mask: 1 the trunk's int8 linears over the decode rows in libr4d's gemm_nt_q_dec (the
+ *                   narrow tile in 64-token groups: each row its alone bytes), 2 the hc reads' decode rows in one bi_dec
+ *                   launch up to 128 rows, 4 the fused router up to 128 rows, 8 the fused attention / QSA prologues up to
+ *                   128 rows; RADIANCE_FN4_BI_WIDE at start declares the forms (its value the start value); 0 today
+ *                                                                                                  RADIANCE_FN4_BI_WIDE
+ *
+ *   sp_serial       architecture plugin (rad_fn4_switch): fn4 SP-serial (14.11.2026) -- a serial step's prefill rows (the
+ *                   newcomer step, a lone prompt of up to a pass) take the sequence-parallel gated residual: the block's
+ *                   reduce-scatter, the write and read on this rank's quarter of the rows (a prefill segment's part with the
+ *                   segment's K split pinned), the all-gather and the codes on every row; the same bytes; needs
+ *                   RADIANCE_FN4_SPSERIAL set at start (declares; its value the start value); 2 the step in two halves,
+ *                   one half's collectives on the second lane beside the other half's write and read; 0 today
+ *                                                                                                 RADIANCE_FN4_SPSERIAL
+ *
+ *   hc_pinpf2       libr4d (rad_fn4_switch): fn4 SP-serial (14.11.2026) -- a read whose K split is pinned to a taller height
+ *                   (SP's part reads) takes the PF2 form below 512 rows too, where its band holds the planes; the same bytes
+ *                   (PF2 = the wide form at one split); 0 today                                   RADIANCE_FN4_HC_PINPF2
+ *
+ *   resume_cold     core scheduler (15.11.2026, qwen/EXACT-PRESSURE.md): a prefix hit answers as a cold run -- 1: the hit
+ *                   resumes only at a snapshot where this prompt's idle cold prefill starts a chunk (Scheduler::cold_starts:
+ *                   its own pieces from 0 with the alone span, keep_at 0), the deepest such at or below the hit
+ *                   (HitCap::resume_at), and a head other prompts share (CacheHit::branch_at) takes no snapshot cut
+ *                   (Request::checkpoint_at stays 0); 0 today                                       RADIANCE_FN4_RESUME_COLD
+ *   preempt_keep    core scheduler + KV manager (15.11.2026, qwen/EXACT-PRESSURE.md): a decoding request preempted for
+ *                   KV is not recomputed -- 1: it publishes its prefix as today, gives up its whole blocks only
+ *                   (KVManager::preempt_keep), keeps its state slots (linear with the replay copies, conv, QSA tail, PLE),
+ *                   its partial last blocks, its card's StepSlot and its drafter state, and rejoins at the same position
+ *                   once the pool holds its next verify (rejoin_kept: the cache's hit puts the whole blocks back, nothing
+ *                   is prefilled); a hit the cache can no longer give falls back to today's recompute (counted); 0 today
+ *                                                                                                   RADIANCE_FN4_PREEMPT_KEEP
+ *   kvs_bi          arch + core (15.11.2026, qwen/KV-STREAM-EXACT.md): KV streaming (--kv-resident) exact under load, a mask
+ *                   0..3 -- 1: a streamed group's decode sequences take their alone step's attention in every pass
+ *                   (sparse, launches of their own rows through att_bi's per-sequence path, on the ring and on the stage;
+ *                   rad_block_attn_gated_fp8.h); 2: the residency maps are reset when a staged pass begins on the aliased
+ *                   stage, so its streamed store never writes a ring slot's offset inside the stage (core/kvstream/
+ *                   stage.cpp); 0 today                                                              RADIANCE_FN4_KVS_BI
+ *   kvs_vic         libr4d (16.11.2026, qwen/KV-STREAM-EXACT.md): kv_resolve's victims by order-keeping compactions of
+ *                   the ring (a free list, CLOCK in rotations) instead of thread 0 walking it slot by slot; the same
+ *                   placement (libref's); 0 today                                                    RADIANCE_FN4_KVS_VIC
+ *   qsa_split       architecture (16.11.2026, qwen/QSA-SPLIT.md): the QSA indexer's score and selection split, a mask --
+ *                   bit 1 across the ranks by block range (all_gather + exact merge), bit 2 in chunks on one card at any
+ *                   decode height; the same table byte for byte; RADIANCE_FN4_QSA_SPLIT at start declares; 0 today
+ *                                                                                                    RADIANCE_FN4_QSA_SPLIT
+ *   sp_ple          qwen4exp (16.11.2026, qwen/SP-SERIAL-EXACT.md): a pipelined SP-hc step keeps the layers before the
+ *                   PLE's replicated (their all-reduces, whole-row reads and writes), so the PLE reads the whole stream
+ *                   on every rank and every rank leaves the same convolution window; 0 today            RADIANCE_FN4_SP_PLE
+ *
+ * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
+ * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
+ *
+ * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair
+ * re-records exactly as an A/B pair does.
+ *
+ * A plugin takes part by exporting  extern "C" int rad_fn4_switch(const char* name, int value):
+ * 1 = applied, 0 = not its switch, < 0 = refused. */
 #ifndef RAD_RUNTIME_FN4_SWITCH_H
 #define RAD_RUNTIME_FN4_SWITCH_H
 
@@ -728,7 +868,16 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs,
+              /* qfn-on-ds (20.11.2026): the Qwen Flash-Next line's switches (fn4-x3-pf 6fdca84a), after the DeepSeek
+               * line's, which keep their numbers; draft_adaptive, aql_acq, sched_bi_chunk and ar_xpush are both lines' and
+               * keep the DeepSeek numbers. kQwenFirst is the first of these (qwen_switch). */
+              kNoRoute, kGatherInv, kHcFuseDown, kHcNormWave, kHcWriteVec, kHcReadV,
+              kArLaneThreads, kHcUpMix, kArLaneBlocks, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair,
+              kExl3Dz, kExl3Bi, kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows,
+              kHcSpProbe, kHcSp, kMtpFlat, kArSdma, kBiWide, kSpSerial, kHcPinPf2,
+              kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kQsaSplit, kSpPle, kArFence, kSpRoute, kSwitches };
+static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -741,6 +890,14 @@ uint64_t epoch();                             /* applied changes so far; 0 until
  * rule-w) at start. aql_acq_none: RADIANCE_AQL_ACQ=none (the unsafe experiment; start-time only). */
 int  aql_acq_rule();
 bool aql_acq_none();
+/* The Qwen line's core-read switches (qfn-on-ds; see that line's text above): no_route (Ctx::route_report), resume_cold /
+ * preempt_keep (the scheduler), kvs_bi (core/kvstream); the applied value, the environment's at start. */
+bool no_route();
+int  resume_cold();
+int  preempt_keep();
+int  kvs_bi();
+/* Whether switch i is one of the Qwen line's (kQwenFirst on). */
+inline bool qwen_switch(int i) { return i >= kQwenFirst && i < kSwitches; }
 /* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by
  * Ctx::route_report_impl and Ctx::haz_mark while a pass is recorded. note_rco adds one recording's counts (the
  * routing copies tracked, the dispatches after one left unordered) to GET "rco". */

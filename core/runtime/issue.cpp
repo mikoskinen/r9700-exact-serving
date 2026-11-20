@@ -919,25 +919,33 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "rad_kv_group_zero and then issued against, which the "
                                           "plugin must not do", i, g));
             const KVPoolBinding& b = kv_[g];
+            /* fn4 kvs_apart: `cols` -1 names the RING view of a streamed group whatever view the pass is on (a staged
+             * pass's streamed store keeps the ring current while the stage, funded beside it, takes the pass's reads).
+             * Only a stage funded apart has a ring to name during a staged pass; otherwise the active view as always. */
+            const bool ring_view = o.cols == -1 && b.has_stage && b.stage_apart && b.pool_base && b.depth == 1;
+            void* const   vbase   = ring_view ? static_cast<char*>(b.pool_base) + b.ring.base_off : b.base;
+            const int64_t vstride = ring_view ? b.ring.layer_stride : b.layer_stride;
+            const int64_t vbytes  = ring_view ? b.ring.bytes : b.bytes;
             /* A lookup, not a subtraction: a group's layers need not be contiguous
              * (KVPoolBinding::layer_slot). */
             const int64_t layer = (o.offset >= 0 && (size_t)o.offset < b.layer_slot.size())
                                       ? b.layer_slot[(size_t)o.offset]
                                       : -1;
-            const int64_t off   = kv_binding_offset(b, layer);
-            if (layer < 0 || (b.bytes && off + b.layer_stride > b.bytes))
+            const int64_t off   = ring_view ? layer * vstride : kv_binding_offset(b, layer);
+            if (layer < 0 || (vbytes && off + vstride > vbytes))
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d asks KV group %u for layer %lld, which is "
                                           "outside the %lld bytes it was allocated", i, g,
                                           (long long)o.offset, (long long)b.bytes));
             std::memset(&tt, 0, sizeof tt);
-            tt.data  = static_cast<char*>(b.base) + off;
+            tt.data  = static_cast<char*>(vbase) + off;
             tt.dtype = b.dtype;
             /* The operand carries the layer's shape, composed at load (see KVPoolBinding in
              * ctx.h); libr4d shims refuse a flat span. */
             if (b.rank) {
                 tt.rank = b.rank;
                 for (uint32_t d = 0; d < b.rank; ++d) tt.shape[d] = b.shape[d];
+                if (ring_view) tt.shape[0] = b.ring.shape0;
                 rad_tensor_pack(&tt);
             } else {
                 tt.rank      = 1;

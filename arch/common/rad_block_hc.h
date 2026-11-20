@@ -89,6 +89,9 @@ struct HyperConn {
          * Flash-Next's shape, on every lane with a scratch region), so a model that reads a wider
          * step in pieces anyway declares the band no wider than a piece. */
         int64_t read_rows = 0;
+        /* fn4 SP-serial: declare the K-split-pinned part reads (op_read_kt); the architecture sets it on the trunk's
+         * connections when RADIANCE_FN4_SPSERIAL is set at start, four ranks. */
+        int     sp_twins = 0;
     };
 
     struct Wire {
@@ -97,6 +100,10 @@ struct HyperConn {
         rad_buf inj = 0;    /* [max_tok, hc]           the per-branch write gains */
         rad_buf rq  = 0;    /* [max_tok, n_embd]       the rotated codes, when `rotate` */
         rad_buf rs  = 0;    /* [max_tok, n_embd/128]   and their scales */
+        /* fn4 W1b (test builds, RADIANCE_FN4_HC_SS=1): [max_tok, 8] f32, the norm scales a write stores for the
+         * read that follows it (docs/OPS.md `ss`). 0: neither op is handed one. One buffer for every connection
+         * of a stream: each write refills it and only the read right after takes it. */
+        rad_buf ss  = 0;
     };
 
     struct Src {
@@ -115,6 +122,36 @@ struct HyperConn {
      * `mix`), read from their encoding at declare. */
     bool       mix_e4m3 = false;
     rad_op     op_read = 0, op_write = 0;
+    /* fn4 BI (hc_bi 5): the read of a step's decode rows in one launch -- op_read with bi_dec 1 (libr4d hc_read: form G
+     * in 8-row groups, B3 in 16-row groups, each row's bytes its own sequence's alone read's; without the inject gains -- the
+     * final read -- the per-row kernels at every height). Declared with E4M3 mixing, when RADIANCE_FN4_BIDEC (default:
+     * RADIANCE_FN4_X3DUAL, the BI declarations) is on at start; rows up to kBiDecRowsMax. 0 otherwise (then hc_bi 5 reads
+     * as hc_bi 3). */
+    static constexpr int64_t kBiDecRowsMax = 64;
+    rad_op     op_read_bd = 0;
+    /* fn4 BI wide bit 2 at start: op_read_bd declared up to kBiWideRows (a step's decode rows above 64 in one launch, each
+     * row's bytes as in a 64-row piece: form G16 / G16p and B3 in row groups on grid.y); bd_rows its declared ceiling. */
+    int64_t    bd_rows = kBiDecRowsMax;
+    int64_t    bd_piece() const { return bd_rows > kBiDecRowsMax && fn4_biwide(2) ? bd_rows : kBiDecRowsMax; }
+    void read_bd(RadCtx* c_, int64_t r0, int64_t rows, bool ss_in) const;
+    /* fn4 SP-hc (RADIANCE_FN4_SPHC=1 at start, four ranks, a piece height): the read a rank's quarter of a pipelined piece
+     * takes -- op_read with kc_rows = the piece's rows, so its K split is the whole piece's (libr4d hc_read). */
+    rad_op     op_read_sp = 0;
+    /* fn4 SP-serial (14.11.2026, RADIANCE_FN4_SPSERIAL at start, four ranks): the read of a rank's PART of a step's prefill
+     * segment, its K split pinned to the whole segment's -- op_read with kc_rows = 128 t for a segment of t = ceil(h / 128)
+     * row tiles. libr4d's hc_read takes nrt_k = ceil(kc_rows / rt) where kc_rows > rows; a part of more than 64 rows reads
+     * at the 128-row tile (hc_down_rt) as the segment does, so nrt_k = t and kc = hc_down_kchunk(lr, HN, t), the segment's
+     * own split: every row's down product sums in the order the segment read whole gives (the wide and PF2 forms are the
+     * same bytes at one split, and the norm scales are one sum in every form). op_read_kt[t] for t = 2..kSpTiles (0 where
+     * not declared); declared on the connections with the inject gains (hc_mix / hc_ffn). */
+    static constexpr int kSpTiles = 16;
+    rad_op     op_read_kt[kSpTiles + 1] = {};
+    /* the twin for a segment of `seg` rows, 0 when there is none */
+    rad_op read_kt_op(int64_t seg) const {
+        const int64_t t = (seg + 127) / 128;
+        return t >= 2 && t <= kSpTiles ? op_read_kt[t] : 0;
+    }
+    void read_kt(RadCtx* c_, int64_t r0, int64_t rows, int64_t seg, bool ss_in) const;
     /* The write with the all-reduce folded in; 0 when not requested or not served.
      * `op_ar_write6` is the same on the rotated 6-bit wire, declared only when a lossy payload is
      * accepted and issued on the steps ar_wire_is_exact rejects (every trunk all-reduce at a
@@ -157,17 +194,29 @@ struct HyperConn {
 
     int  declare_gather(RadBuilder* b, const GatherSrc& src);
 
-    void read (RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
-    void write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
+    /* `ss_in`: the write issued just before on these rows handed the scales (write() returned true) and nothing
+     * touched the stream since; the read then hands `ss` on and libr4d may skip its own pass. */
+    void read (RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in = false) const;
+    /* True when the write was handed `ss` for its rows (the plain write, not a reducing or gathering form). */
+    bool write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
     /* The read over rows [0, T), in pieces of Config::read_rows where it is set; one read
      * otherwise. The read's down product splits K by how many row tiles it is handed
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
      * two reads over half of them; reading a wide step in pieces computes what the narrower steps
      * did. */
-    void read_pieces(RadCtx* c_, int64_t T) const {
+    /* fn4 SP-hc: the read's codes stage alone (hc_codes), over rows whose block input `x` another rank read and an
+     * all-gather brought here: the same codes and the same rotated twin the read writes for the same x. Declared by
+     * declare_codes() on a connection with `quant`; 0 otherwise (then a sequence-parallel step has nothing to redo). */
+    rad_op op_codes = 0;
+    int  declare_codes(RadBuilder* b, int64_t rows_hi);
+    void codes(RadCtx* c_, int64_t r0, int64_t rows) const;
+    /* fn4 SP-hc: read() through op_read_sp (a quarter of a full piece) */
+    void read_sp(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const;
+    void read_pieces(RadCtx* c_, int64_t T, bool ss_in = false) const {
         const int64_t piece = c.read_rows;
-        if (piece <= 0 || T <= piece) { read(c_, T, 0, T); return; }
-        for (int64_t r0 = 0; r0 < T; r0 += piece) read(c_, T, r0, T - r0 < piece ? T - r0 : piece);
+        if (piece <= 0 || T <= piece) { read(c_, T, 0, T, ss_in); return; }
+        for (int64_t r0 = 0; r0 < T; r0 += piece)
+            read(c_, T, r0, T - r0 < piece ? T - r0 : piece, ss_in);
     }
 };
 
@@ -264,17 +313,94 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                   wts, n_wts);
     if (!op_read) return RAD_E_INVAL;
     {
-        const rad_buf rd[1] = { w.h };
-        rad_op_reads (b, op_read, rd, 1);
+        const rad_buf rd[2] = { w.h, w.ss };
+        rad_op_reads (b, op_read, rd, w.ss ? 2 : 1);
         rad_op_writes(b, op_read, wr, n_wr);
+    }
+    {   /* fn4 BI twin (hc_bi 5): the decode rows' read in one launch */
+        const char* e = std::getenv("RADIANCE_FN4_BIDEC");
+        if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
+        if (e && *e && *e != '0' && mix_e4m3) {
+            const int64_t bdm = (fn4_biwide_start() & 2) ? kBiWideRows : kBiDecRowsMax;
+            const int64_t hi = g.max_tok < bdm ? g.max_tok : bdm;
+            bd_rows = hi;
+            op_read_bd = RAD_OP(b, "hc_read",
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
+                                        RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                                        RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                                        RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
+                                        RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                                        RAD_INT("rotate", c.rotate ? 1 : 0),
+                                        RAD_STR("mix", "e4m3"), RAD_INT("bi_dec", 1)),
+                             wts, n_wts);
+            if (op_read_bd) {
+                const rad_buf rd[2] = { w.h, w.ss };
+                rad_op_reads (b, op_read_bd, rd, w.ss ? 2 : 1);
+                rad_op_writes(b, op_read_bd, wr, n_wr);
+            }
+        }
+    }
+    {   /* fn4 SP-hc twin: the same read, its K split pinned to the piece height (c.read_rows) */
+        const char* e = std::getenv("RADIANCE_FN4_SPHC");
+        if (e && *e && *e != '0' && g.world == 4 && c.read_rows > 64 && c.read_rows < g.max_tok) {
+            op_read_sp = RAD_OP(b, "hc_read",
+                             RAD_PARAMS(RAD_RANGE("M", 1, c.read_rows), RAD_INT("n", g.n_embd),
+                                        RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                                        RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                                        RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
+                                        RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                                        RAD_INT("rotate", c.rotate ? 1 : 0),
+                                        RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16"),
+                                        RAD_INT("kc_rows", c.read_rows)),
+                             wts, n_wts);
+            if (op_read_sp) {
+                const rad_buf rd[2] = { w.h, w.ss };
+                rad_op_reads (b, op_read_sp, rd, w.ss ? 2 : 1);
+                rad_op_writes(b, op_read_sp, wr, n_wr);
+            }
+        }
+    }
+    {   /* fn4 SP-serial twins: op_read with kc_rows = 128 t (see op_read_kt) */
+        const int64_t band = c.read_rows > 0 && c.read_rows < g.max_tok ? c.read_rows : g.max_tok;
+        if (c.sp_twins && g.world == 4 && c.inject) {
+            for (int t = 2; t <= kSpTiles && 128LL * t <= ((band + 127) / 128) * 128; ++t) {
+                const int64_t kcr = 128LL * t;
+                /* the SP-hc twin already pins a 2048-row piece's split: ceil(2048 / 128) = 16 tiles */
+                if (op_read_sp && (c.read_rows + 127) / 128 == t) { op_read_kt[t] = op_read_sp; continue; }
+                op_read_kt[t] = RAD_OP(b, "hc_read",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, kcr < band ? kcr : band), RAD_INT("n", g.n_embd),
+                                               RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                                               RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                                               RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
+                                               RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                                               RAD_INT("rotate", c.rotate ? 1 : 0),
+                                               RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16"),
+                                               RAD_INT("kc_rows", kcr)),
+                                    wts, n_wts);
+                if (op_read_kt[t]) {
+                    const rad_buf rd[2] = { w.h, w.ss };
+                    rad_op_reads (b, op_read_kt[t], rd, w.ss ? 2 : 1);
+                    rad_op_writes(b, op_read_kt[t], wr, n_wr);
+                }
+            }
+        }
     }
 
     if (c.inject) {
-        op_write = rw(b, RAD_OP(b, "hc_write",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                    RAD_INT("hc", c.hc), RAD_STR("dtype", g.dtype)),
-                         RAD_NOWEIGHTS),
-                     {w.x.x, w.inj, w.h}, {w.h});
+        /* fn4 W1b: with `ss` the write also takes the read's eps, at which it stores the scales. */
+        if (w.ss)
+            op_write = rw(b, RAD_OP(b, "hc_write",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                        RAD_INT("hc", c.hc), RAD_STR("dtype", g.dtype),
+                                        RAD_F64("eps", g.eps)),
+                             RAD_NOWEIGHTS),
+                         {w.x.x, w.inj, w.h}, {w.h, w.ss});
+        else
+            op_write = rw(b, RAD_OP(b, "hc_write",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                        RAD_INT("hc", c.hc), RAD_STR("dtype", g.dtype)),
+                             RAD_NOWEIGHTS),
+                         {w.x.x, w.inj, w.h}, {w.h});
         if (!op_write) return RAD_E_INVAL;
         /* An unresolved handle is 0, not an error: without the fused kernel the pair runs and
          * takes_ar() always answers no. At four ranks only the exact form exists, declared over the
@@ -350,7 +476,80 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     return RAD_OK;
 }
 
-inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+inline void HyperConn::read_bd(RadCtx* c_, int64_t r0, int64_t rows, bool ss_in) const {
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_read_bd, rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                c.inject ? RAD_W(w_inj) : RAD_NONE,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                ss_in && w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
+}
+
+inline int HyperConn::declare_codes(RadBuilder* b, int64_t rows_hi) {
+    if (!c.quant) return RAD_OK;
+    rad_buf wr[4] = { c.codes_i8 ? w.x.q8 : w.x.q, c.codes_i8 ? w.x.s8 : w.x.s, 0, 0 };
+    int n_wr = 2;
+    if (c.rotate) { wr[n_wr++] = w.rq; wr[n_wr++] = w.rs; }
+    op_codes = RAD_OP(b, "hc_codes",
+                      RAD_PARAMS(RAD_RANGE("M", 1, rows_hi), RAD_INT("n", g.n_embd),
+                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_INT("rotate", c.rotate ? 1 : 0),
+                                 RAD_INT("codes_i8", c.codes_i8 ? 1 : 0)),
+                      RAD_NOWEIGHTS);
+    if (!op_codes) return RAD_E_INVAL;
+    const rad_buf rd[1] = { w.x.x };
+    rad_op_reads (b, op_codes, rd, 1);
+    rad_op_writes(b, op_codes, wr, n_wr);
+    return RAD_OK;
+}
+
+inline void HyperConn::codes(RadCtx* c_, int64_t r0, int64_t rows) const {
+    if (!op_codes) return;
+    RAD_ISSUE_N(c_, op_codes, rows,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd),
+                brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows, fp8_blocks(g.n_embd)),
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
+}
+
+inline void HyperConn::read_sp(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const {
+    (void)T;
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_read_sp, rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                c.inject ? RAD_W(w_inj) : RAD_NONE,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                ss_in && w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
+}
+
+inline void HyperConn::read_kt(RadCtx* c_, int64_t r0, int64_t rows, int64_t seg, bool ss_in) const {
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, read_kt_op(seg), rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                c.inject ? RAD_W(w_inj) : RAD_NONE,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                ss_in && w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
+}
+
+inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const {
     (void)T;
     const int64_t HN = hn();
     RAD_ISSUE_N(c_, op_read, rows,
@@ -362,7 +561,8 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                 c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
                                       fp8_blocks(g.n_embd)) : RAD_NONE,
                 c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
-                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                ss_in && w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
 }
 
 /* ================================================================== the control-vector projection
@@ -447,20 +647,22 @@ struct HcProject {
     /* Rows [r0, r0 + rows) of the stream. The whole step is r0 = 0; the pipelined step issues one
      * call per piece, in the same place in the graph. Nothing is issued on a pass where no row
      * takes the vector (RadBatch::control_vector): every row would be skipped. */
-    void step(RadCtx* c_, const RadBatch* batch, int64_t r0, int64_t rows) const {
-        if (!op || !batch || !batch->control_vector) return;
+    /* True when it issued (the stream changed, so a write's norm scales no longer hold). */
+    bool step(RadCtx* c_, const RadBatch* batch, int64_t r0, int64_t rows) const {
+        if (!op || !batch || !batch->control_vector) return false;
         RAD_ISSUE_N(c_, op, rows,
                     brow_slice(h, r0, rows, hc * n),
                     praw(dir, RAD_F32, n),
                     praw((const int32_t*) rad_buf_ptr(c_, on) + r0, RAD_I32, rows));
+        return true;
     }
 };
 
 /* The block's output `y` is read from `w.x.x`, the buffer the read wrote the block's input to:
  * every block leaves its delta in the activation its norm produced, and the input is dead by
  * then. */
-inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
-    if (!op_write) return;
+inline bool HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+    if (!op_write) return false;
     if (takes_gather(T)) {
         const int64_t k = gsrc.top_k;
         const bool shared = gsrc.sh && gsrc.sg;
@@ -473,12 +675,21 @@ inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) co
                     brow_slice(w.x.x, r0, rows, g.n_embd),
                     brow_slice(w.inj, r0, rows, c.hc),
                     brow_slice(w.h, r0, rows, hn()));
-        return;
+        return false;
     }
-    RAD_ISSUE_N(c_, takes_ar(T) ? ar_write(T) : op_write, rows,
+    if (takes_ar(T)) {
+        RAD_ISSUE_N(c_, ar_write(T), rows,
+                    brow_slice(w.x.x, r0, rows, g.n_embd),
+                    brow_slice(w.inj, r0, rows, c.hc),
+                    brow_slice(w.h, r0, rows, hn()));
+        return false;
+    }
+    RAD_ISSUE_N(c_, op_write, rows,
                 brow_slice(w.x.x, r0, rows, g.n_embd),
                 brow_slice(w.inj, r0, rows, c.hc),
-                brow_slice(w.h, r0, rows, hn()));
+                brow_slice(w.h, r0, rows, hn()),
+                w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
+    return w.ss != 0;
 }
 
 }  /* namespace arch */

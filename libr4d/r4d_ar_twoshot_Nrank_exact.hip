@@ -232,7 +232,7 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
 
 // The coded two-shot, bf16 only; the launcher checks that each shard is a whole number of waves'
 // 32 chunks and that a slot holds two regions.
-template <int WS, bool CHAIN>
+template <int WS, bool CHAIN, bool XP = false>
 __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
     const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
@@ -240,6 +240,7 @@ __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
     int slot_stride16, int rank, int drain, int acq, int pub,
     long long* gate, unsigned int* gate_ctr) {
   if (CHAIN) r4d_chain_wait();
+  r4d_ar_prio(acq);   /* fn4 PF prio */
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
@@ -256,6 +257,24 @@ __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
   const int lane = tid & 31;
 
   // phase 1: my contribution to each peer-owned shard, coded, into the owner's region A for me
+  if constexpr (XP) {
+    /* fn4 RSF: every peer's chunk in the same pass (all links at once); each region gets the same coded stores */
+    const int4* srcs[NPEERS];
+    R4dArcRegion dsts[NPEERS][1];
+#pragma unroll
+    for (int p = 0; p < NPEERS; ++p) {
+      srcs[p] = in4 + (size_t)peers.rank[p] * SL;
+      dsts[p][0] = r4d_arc_region(peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16, SL);
+    }
+    for (int k = w0 + tid; k - lane < w1; k += nt) {
+      const bool valid = k < w1;
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) {
+        const int4 v = valid ? srcs[p][k] : make_int4(0, 0, 0, 0);
+        r4d_arc_put<1>(dsts[p], k - lane, r4d_arc_enc(v, valid), v, valid);
+      }
+    }
+  } else
   for (int p = 0; p < NPEERS; ++p) {
     const int owner = peers.rank[p];
     const int4* src = in4 + (size_t)owner * SL;
@@ -341,13 +360,13 @@ __global__ void r4dchain_ar_twoshot_wide_exact(R4D_ARTS_PARAMS) {
     int rank, int drain, int acq, int pub, long long* gate, unsigned int* gate_ctr
 #define R4D_ARTC_ARGS in4, peers, my_base, my_flags, out4, seq_ctrs, n16, slot_stride16, rank,   \
     drain, acq, pub, gate, gate_ctr
-template <int WS>
+template <int WS, bool XP = false>
 __global__ void r4d_ar_twoshot_coded_kernel(R4D_ARTC_PARAMS) {
-  r4d_ar_twoshot_coded_body<WS, false>(R4D_ARTC_ARGS);
+  r4d_ar_twoshot_coded_body<WS, false, XP>(R4D_ARTC_ARGS);
 }
-template <int WS>
+template <int WS, bool XP = false>
 __global__ void r4dchain_ar_twoshot_coded(R4D_ARTC_PARAMS) {
-  r4d_ar_twoshot_coded_body<WS, true>(R4D_ARTC_ARGS);
+  r4d_ar_twoshot_coded_body<WS, true, XP>(R4D_ARTC_ARGS);
 }
 #undef R4D_ARTC_ARGS
 #undef R4D_ARTC_PARAMS
@@ -607,12 +626,13 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr, long chain, long form) {
+                                long acq, long pub, long gate, long gate_ctr, long chain, long form,
+                                long timeline) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr,
-                       nullptr, 1L, 0L, form, chain != 0);
+                       nullptr, 1L, timeline, form, chain != 0);
 }
 
 /* The coded form's conditions: bf16, a message that shards evenly into whole waves' 32 chunks
@@ -629,7 +649,7 @@ void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, lo
                                       long slot_stride16, long inp, long out, long n_elem,
                                       long rank, long stream, long nblocks, long nthreads,
                                       long drain, long acq, long pub, long gate, long gate_ctr,
-                                      long chain) {
+                                      long chain, long xpush) {
   constexpr int WS = 4;
   if (!r4d_ar_twoshot_coded_ok(n_elem, 0, WS, slot_stride16))
     throw std::runtime_error("all_reduce (coded): message or slot outside the coded form");
@@ -653,7 +673,8 @@ void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, lo
     peers.rank[i] = (i < (int)rank) ? i : i + 1;
   }
   hipStream_t st = (hipStream_t)stream;
-  (chain ? r4dchain_ar_twoshot_coded<WS> : r4d_ar_twoshot_coded_kernel<WS>)<<<nb, nt, 0, st>>>(
+  (xpush ? (chain ? r4dchain_ar_twoshot_coded<WS, true> : r4d_ar_twoshot_coded_kernel<WS, true>)
+         : (chain ? r4dchain_ar_twoshot_coded<WS> : r4d_ar_twoshot_coded_kernel<WS>))<<<nb, nt, 0, st>>>(
       (const int4*)inp, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (int4*)out,
       (unsigned int*)seq_ctrs, (int)n16, (int)slot_stride16, (int)rank, (int)drain, (int)acq,
       (int)pub, (long long*)gate, (unsigned int*)gate_ctr);

@@ -40,6 +40,9 @@
 #include "rad_arch.h"
 #include "rad_ggml.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -104,6 +107,29 @@ struct ActFP8 {
     }
 };
 
+/* fn4 BI wide (14.11.2026, Qwen row 1): a step's decode rows above 64 through libr4d's gemm_nt_q_dec (the narrow tile in
+ * 64-token groups, every row its alone bytes) instead of gemm_nt_q's tiled band. Declared when RADIANCE_FN4_BI_WIDE is set
+ * at start (non-zero) and libr4d declares the op; taken by a step whose architecture set bi_wide_rows() (this rank thread's
+ * decode rows when the bi_wide switch's bit 1 is on and they exceed 64; 0 otherwise, cleared with the cuts). */
+/* The start value's mask declares (RADIANCE_FN4_BI_WIDE): bit 1 the linears' gemm_nt_q_dec, 2 the hc reads' bi_dec twin up
+ * to kBiWideRows, 4 the fused router up to kBiWideRows, 8 the fused attention / QSA prologues up to kBiWideRows. The switch
+ * (fn4_biwide_flag) may clear bits at run time and set only bits the start value declared. */
+inline int fn4_biwide_start() {
+    static const int v = [] { const char* e = std::getenv("RADIANCE_FN4_BI_WIDE"); return e && *e ? (std::atoi(e) & 15) : 0; }();
+    return v;
+}
+inline bool fn4_bi_wide_declared() { return fn4_biwide_start() != 0; }
+inline int64_t& bi_wide_rows() { static thread_local int64_t r = 0; return r; }
+/* The bi_wide switch's value (mask, see core/runtime/fn4_switch.h), RADIANCE_FN4_BI_WIDE's at start. */
+inline std::atomic<int>& fn4_biwide_flag() {
+    static std::atomic<int> f{fn4_biwide_start()};
+    return f;
+}
+inline bool fn4_biwide(int bit) { return (fn4_biwide_flag().load(std::memory_order_relaxed) & bit) != 0; }
+/* The fused forms' ceiling under bi_wide bits 2 / 4 / 8: 32 sequences at depth 3 (the hc read's form G16 counters hold
+ * 21 x 8 tile-groups at 128 rows, kHcGTilesMax 192). */
+constexpr int64_t kBiWideRows = 128;
+
 /* The fused attention prologue's row band, shared by the block issuing it, the rope table fill,
  * the QSA indexer reading that table, and the step deciding whether to fill it.
  *
@@ -113,7 +139,15 @@ struct ActFP8 {
  * four separate kernels already fill the device and the fused form, which recomputes each rotary
  * partner's normed value, is slightly slower. */
 inline int64_t qk_fuse_rows(const Geom& g) {
-    return g.max_tok < 64 ? g.max_tok : 64;
+    /* fn4 BI wide bit 8 at start: up to 128 rows (the fused prologue is the unfused chain's bytes at any height), so a
+     * decode step of 17..32 sequences keeps its one launch a layer. */
+    const int64_t hi = (fn4_biwide_start() & 8) ? kBiWideRows : 64;
+    return g.max_tok < hi ? g.max_tok : hi;
+}
+/* The prologue band a step takes now: a declared band above 64 rows only while bi_wide bit 8 is on (cleared at run time,
+ * steps above 64 rows go back to the unfused ops and the table is not filled for them, as before). */
+inline int64_t qk_fuse_now(int64_t declared) {
+    return declared > 64 && !fn4_biwide(8) ? 64 : declared;
 }
 
 /* The rope table's height. `rope_table` writes each position at its own row, so the table needs a
@@ -239,8 +273,14 @@ inline int64_t ar_exact_write_rows(const Geom& g) {
  *
  * ar_wire_is_exact stays false off two ranks: the embedding's collective uses it to ask whether
  * layer 0's fused norm absorbs the reduction, and at four ranks none does. */
+/* fn4 ARW (12.11.2026, switch arw_rows; 0 = today): the four-rank fused write / gather-write (one-shot: a rank sends 3x the
+ * message) only up to this many rows; above, the step keeps the separate gather / all-reduce (two-shot from ts_min: 1.5x)
+ * and write. Both forms are byte-identical (the same fp32 fold in ascending rank order, docs/OPS.md), so it is a cost lever
+ * only. Read between steps; the block and the write ask the same function in a step. */
+inline std::atomic<int>& fn4_arw_rows() { static std::atomic<int> v{0}; return v; }
 inline bool ar_wide_write_exact(const Geom& g, int64_t T) {
     if (g.world != 4 || T < 1 || T > ar_wide_write_rows(g)) return false;
+    { const int cap = fn4_arw_rows().load(std::memory_order_relaxed); if (cap > 0 && T > cap) return false; }
     const int64_t numel = T * g.n_embd;
     if (numel <= 0) return false;
     if (g.wire_exact) return true;
@@ -300,8 +340,11 @@ struct ArPieces {
      * lane behind the previous block's piece), so a block with its own norm takes the piece path
      * as one with an external input does and skips that norm. */
     bool in_ready = false;
+    /* fn4 PF-ORDER (qwen/prefill): the most pieces the block hands; the caller issues the rest's reductions itself (a
+     * piece not handed is one the caller's `handed` count says it must issue) */
+    int64_t max_hand = (int64_t)1 << 62;
     bool cuts(int64_t T) const { return done && rows > 0 && T > rows; }
-    void hand(int64_t r0, int64_t n) { done(u, r0, n); ++handed; }
+    void hand(int64_t r0, int64_t n) { if (handed >= max_hand) return; done(u, r0, n); ++handed; }
 };
 
 /* Whether a MoE block's gather is folded into the following reduction (ar_gather_hc_write).
@@ -748,9 +791,12 @@ struct RowParts {
 };
 
 /* ================================================================== one block-scaled linear */
+constexpr int64_t kBiNarrowRows = 64;   /* libr4d's narrow tiles' band (gemm_nt_q m16 rows) */
+
 struct LinearFP8 {
     rad_weight w = 0, ws = 0;
     rad_op     op = 0;
+    rad_op     op_dec = 0;   /* fn4 BI wide: gemm_nt_q_dec over decode rows > 64 (int8 weights only); 0 otherwise */
     int64_t    N = 0, K = 0;
     /* Weight rows per scale-plane row: RAD_FP8_BLOCK for block fp8, 1 otherwise. Row spans on `ws`
      * are converted with it (declare, span_parts). */
@@ -895,6 +941,8 @@ struct LinearFP8 {
      * that is set: a rank's run of a step's rows written to a buffer sized for the run. */
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0, int64_t y0 = -1) const;
+    /* One launch over rows [r0, r0 + rows) (step() cuts at bi_cuts() first). */
+    void step_rows(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0, int64_t rows, int64_t y0) const;
     /* A span per stacked row part (rad_weight_shard_span_parts), in weight rows; the scale plane
      * gets the same spans in its rows. Call after declare(). With a 1/128 plane every span and
      * total must be whole scale blocks. */
@@ -1458,6 +1506,17 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                      RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt)),
                           RAD_WEIGHTS(w, ws)),
                       { a.q8, a.s8 }, { y });
+        /* fn4 BI wide: the decode twin over the same weight views (the same stored form: the narrow and tiled rows share
+         * libr4d's i8 block layout), up to the most decode rows a step carries. */
+        if (op && !trb && !asym && (fn4_biwide_start() & 1) && rad_op_declared(b, "gemm_nt_q_dec")) {
+            const int64_t dh = std::min<int64_t>(ar_wide_write_rows(g), hi);
+            if (dh > kBiNarrowRows)
+                op_dec = rw(b, RAD_OP(b, "gemm_nt_q_dec",
+                                RAD_PARAMS(RAD_RANGE("M", 1, dh), RAD_INT("N", N), RAD_INT("K", K),
+                                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt)),
+                                RAD_WEIGHTS(w, ws)),
+                            { a.q8, a.s8 }, { y });
+        }
         return (op_q || a.q8_fed) && op ? RAD_OK : RAD_E_INVAL;
     }
 
@@ -1803,8 +1862,27 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
 /* `gemm_nt_q` has seven positional operands; the optional `a_sum` and `b_ref` after `y` (for
  * asymmetric integer and mxfp4 grids) are passed as RAD_NONE when unused, since the runtime checks
  * the operand count against the schema (core/runtime/issue.cpp). */
+/* fn4 BI (12.11.2026, switch bi_seg): this rank thread's step segments -- {0, decode rows, each prefill sequence's
+ * first row, .., T} -- set by the architecture for a step; while set, every LinearFP8 launch is cut at them, so a decode
+ * row or a short prompt meets its linears in a launch of its own height (libr4d's narrow tiles are M-invariant to 64
+ * rows; the tiled form above differs in rare elements: fn4 185's bicheck). Unset (n 0): one launch, as before. */
+struct BiCuts { const int64_t* cut = nullptr; int n = 0; };
+inline BiCuts& bi_cuts() { static thread_local BiCuts b; return b; }
+
 inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
                             int64_t rows, int64_t y0) const {
+    if (rows <= 0) rows = T - r0;
+    const BiCuts& bc = bi_cuts();
+    if (bc.n <= 2 || !bc.cut) { step_rows(c, a, y, T, r0, rows, y0); return; }
+    for (int i = 0; i + 1 < bc.n; ++i) {
+        const int64_t lo = bc.cut[i] > r0 ? bc.cut[i] : r0;
+        const int64_t hi = bc.cut[i + 1] < r0 + rows ? bc.cut[i + 1] : r0 + rows;
+        if (hi > lo) step_rows(c, a, y, T, lo, hi - lo, y0 < 0 ? -1 : y0 + (lo - r0));
+    }
+}
+
+inline void LinearFP8::step_rows(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
+                                 int64_t rows, int64_t y0) const {
     if (rows <= 0) rows = T - r0;
     const int64_t yr = y0 < 0 ? r0 : y0;
     if (bf16 || ggml) {
@@ -1815,7 +1893,9 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         if (op_q)
             RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
                         brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK));
-        RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
+        /* fn4 BI wide: a launch of decode rows only ([r0, r0 + rows) inside [0, bi_wide_rows())) above the narrow band */
+        const bool dec = op_dec && rows > kBiNarrowRows && r0 + rows <= bi_wide_rows();
+        RAD_ISSUE_N(c, dec ? op_dec : op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;

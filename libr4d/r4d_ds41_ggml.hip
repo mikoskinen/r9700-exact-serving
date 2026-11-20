@@ -4654,7 +4654,7 @@ void r4d_arc_set(int v);
 /* ds41-int13 XPUSH (r4d_ar_entry.hip, ported from fn4-x3-sp3 808866c2): "ar_xpush" 0 / 1 -- the four-rank exact two-shot's
  * plain launch of >= 1048576 elements (int14c, FN 5f0352a8; RADIANCE_FN4_AR_XPUSH_MIN) pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH; the same bytes). */
 int r4d_ar_xpush_get();
-void r4d_ar_xpush_set(int v);
+extern "C" int r4d_ar_xpush_set(int on);   /* qfn-on-ds: one setter for both lines (r4d_ar_entry.hip) */
 /* Lever 1U-MX (ds41-int11, r4d_ds41_elem.hip): "ds41_mix_wv" 0 / 12 / 16 / 24 -- mhc_mix's split launch at decode heights
  * with that many waves a chunk (0: the stock 8; the same partials, so the same bytes). tp8 loop X8: + 100 x 1 .. 5 = the
  * 9 .. 64-row launch's form (r4d_ds41_elem.hip mix_wv_known), the same partials too. */
@@ -4702,9 +4702,14 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
+/* qfn-on-ds: the Qwen line's libr4d switches (r4d_hc_bf16.hip): hc_* forms, the all-reduce lane, ar_fence, ar_sdma, kvs_vic */
+extern "C" int r4d_fn4_switch_fn(const char* name, int value);
+extern "C" void r4d_fn4_fc_dump_if_on();
 extern "C" int rad_fn4_switch(const char* name, int value) {
+    if (name) r4d_fn4_fc_dump_if_on();   /* fn4 engagement counter (RADIANCE_FN4_FORMCTR): the counts up to this switch */
     const int ok = rad_fn4_accepts(name, value);
-    if (ok <= 0) return ok;
+    if (ok == 0) return r4d_fn4_switch_fn(name, value);   /* not a ds41 name: the Qwen line's, or none */
+    if (ok < 0) return ok;
     if (!std::strcmp(name, "ix_lds")) { r4d_ix_lds_set(value); return 1; }
     if (!std::strcmp(name, "ix_ni")) { r4d_ix_ni_set(value); return 1; }
     if (!std::strcmp(name, "ds41_arcoded")) { r4d_arc_set(value); return 1; }

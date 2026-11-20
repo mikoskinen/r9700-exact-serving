@@ -2421,7 +2421,9 @@ int Engine::plan() {
             /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP): allocated at start beside the step
              * state (ctxskip_setup), so in the budget and not kept for later. 0 when unset. */
             f.staging += ctxskip_bytes(r->program);
-            int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
+            /* A second lane's queue is kept free for its build on first use; built at Ctx::init (ctx_lane_eager, fn4
+             * 15.11.2026, the Qwen line) it is allocated before the settle check below and not kept again. */
+            int64_t lazy = r->program.scratch_regions > 1 && !ctx_lane_eager() ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
              * bound), each with the blocks an entry at the lcm of their block sizes holds

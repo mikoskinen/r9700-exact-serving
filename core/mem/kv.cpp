@@ -323,6 +323,11 @@ int64_t KVManager::ceiling(int64_t ctx) const {
         int64_t blocks = max_seqs_ * ((ctx + p.block_size - 1) / p.block_size);
         if (p.kind == RAD_KV_WINDOW && !p.runtime_win && p.window_blocks > 0)
             blocks = std::min(blocks, window_pool_cap(p));
+        /* fn4 kvs_ctx: a streamed group and its dense-read sibling address the id space kv_context_blocks gives (the
+         * budget when RADIANCE_FN4_KVS_CTX is set; the carve takes the same), so the probe prices that, not
+         * max_seqs full contexts. A resident pool (nothing streams) is never capped by the budget. */
+        if (stream_.windowed(p.index) || kvstream_dense(p, plans_, stream_))
+            blocks = std::min(blocks, kv_context_blocks(p.block_size, ctx, max_seqs_));
         need += kv_ceiling_bytes(p, blocks, stream_.resident_blocks(p));
     }
     /* The streamed groups' maps come out of this pool too (kvstream/carve.h). */
@@ -1043,6 +1048,7 @@ int KVManager::release_idle_states() {
     int n = 0;
     for (auto& kv : seqs_) {
         Seq& s = kv.second;
+        if (s.kept) continue;   /* fn4 preempt_keep: its states are its decode position */
         for (size_t g = 0; g < plans_.size(); ++g) {
             if (!plans_[g].stateful() || s.state[g] < 0) continue;
             drop_state((int32_t)g, s.state[g]);
@@ -1057,6 +1063,9 @@ int KVManager::release_idle_states() {
         std::vector<char> seen((size_t)nalloc, 0);
         for (int32_t s : free_states_[g])
             if (s >= 0 && s < nalloc) seen[(size_t)s] = 1;
+        for (const auto& kv : seqs_)
+            if (kv.second.kept && kv.second.state[g] >= 0 && kv.second.state[g] < nalloc)
+                seen[(size_t)kv.second.state[g]] = 1;
         for (int64_t s = 0; s < nalloc; ++s) {
             if (seen[(size_t)s]) continue;
             free_states_[g].push_back((int32_t)s);
@@ -1109,7 +1118,61 @@ int KVManager::preempt(uint64_t id) {
         if (s->state[g] >= 0) { drop_state((int32_t)g, s->state[g]); s->state[g] = -1; }
     }
     s->n_tokens = 0;
+    s->kept = false;
+    s->kept_whole = 0;
     ++seq_frees_;
+    return RAD_OK;
+}
+
+int64_t KVManager::preempt_keep(uint64_t id, int64_t n_valid) {
+    Seq* s = find(id);
+    if (!s) return RAD_E_NOTFOUND;
+    const int64_t n = std::min<int64_t>(s->n_tokens, std::max<int64_t>(0, n_valid));
+    int64_t whole = -1;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const auto& p = plans_[g];
+        if (!p.paged()) continue;
+        if (s->win[g].set || s->first_block_pos[g] != 0) return RAD_E_UNSUPPORTED;
+        const int64_t w = n / p.block_size * p.block_size;
+        whole = whole < 0 ? w : std::min(whole, w);
+    }
+    if (whole < 0) whole = 0;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const auto& p = plans_[g];
+        if (!p.paged()) continue;
+        const int64_t nb = whole / p.block_size;
+        std::vector<int32_t>& bt = s->blocks[g];
+        const int64_t drop = std::min<int64_t>(nb, (int64_t)bt.size());
+        for (int64_t b = 0; b < drop; ++b) drop_block((int32_t)g, bt[(size_t)b]);
+        bt.erase(bt.begin(), bt.begin() + drop);   /* the partial block (and any past it) stays */
+        s->dirty_from[g] = 0;
+    }
+    s->kept = true;
+    s->kept_whole = whole;
+    ++seq_frees_;
+    return whole;
+}
+
+int KVManager::rejoin(uint64_t id, int32_t g, const std::vector<int32_t>& whole) {
+    Seq* s = find(id);
+    if (!s || !s->kept) return RAD_E_STATE;
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->paged()) return RAD_E_INVAL;
+    if ((int64_t)whole.size() != s->kept_whole / p->block_size) return RAD_E_INVAL;
+    for (int32_t b : whole) if (b < 0 || b >= p->n_blocks) return RAD_E_INVAL;
+    for (int32_t b : whole) add_ref((size_t)g, b);
+    std::vector<int32_t>& bt = s->blocks[(size_t)g];
+    bt.insert(bt.begin(), whole.begin(), whole.end());
+    s->dirty_from[(size_t)g] = 0;
+    /* Every paged group rejoined: the sequence is whole again. The scheduler rejoins each cached group, and those
+     * are every paged group here (a rejoin of a model with an uncached paged group is refused before it starts). */
+    bool all = true;
+    for (size_t k = 0; k < plans_.size(); ++k) {
+        if (!plans_[k].paged()) continue;
+        const int64_t want = (s->n_tokens + plans_[k].block_size - 1) / plans_[k].block_size;
+        if ((int64_t)s->blocks[k].size() != want) all = false;
+    }
+    if (all) { s->kept = false; s->kept_whole = 0; }
     return RAD_OK;
 }
 

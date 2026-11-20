@@ -1452,9 +1452,10 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
  * prefix another request starts from) still splits where it falls, as alone. */
 static int bi_chunk_env() {
     const char* v = std::getenv("RADIANCE_SCHED_BI_CHUNK");
-    const int m = (v && v[0] >= '1' && v[0] <= '4' && !v[1]) ? v[0] - '0' : 0;
+    /* qfn-on-ds: 5 / 6 are the Qwen line's (fn4 BI chunking 5 the proof form, 6 alone's piece whole or a step of its own) */
+    const int m = (v && v[0] >= '1' && v[0] <= '6' && !v[1]) ? v[0] - '0' : 0;
     if (v && *v && !(m || (v[0] == '0' && !v[1])))
-        std::fprintf(stderr, "radiance: scheduler: RADIANCE_SCHED_BI_CHUNK=%s is not 0 / 1 / 2 / 3 / 4: today's chunking\n", v);
+        std::fprintf(stderr, "radiance: scheduler: RADIANCE_SCHED_BI_CHUNK=%s is not 0 .. 6: today's chunking\n", v);
     if (m)
         std::fprintf(stderr, "radiance: scheduler: lever BI chunking %d (RADIANCE_SCHED_BI_CHUNK): %s; a chunk that does "
                              "not fit the step waits\n", m,
@@ -1462,6 +1463,8 @@ static int bi_chunk_env() {
                      : m == 2 ? "every prefill chunk on the checkpoint-interval grid or the prompt's end, no span"
                      : m == 3 ? "beside other work a chunk ends on the checkpoint-interval grid inside alone's piece (each "
                                 "part >= 128 rows) or at the piece's end"
+                     : m == 5 ? "a prefill takes a step of its own (its alone step), the decode rows the next"
+                     : m == 6 ? "alone's piece whole beside other work where it fits, else in a step of its own (no cut)"
                               : "beside other work a chunk ends on the RADIANCE_SCHED_BI_GRID grid (default 1024) inside alone's "
                                 "piece (each part >= 128 rows) or at the piece's end");
     return m;
@@ -1575,6 +1578,16 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
         return pe - n;
     };
     if (bi_chunk_ <= 2 || span_now_) return pe - n <= room ? whole() : 0;   /* 1 / 2, or a lone prefill: the piece */
+    /* 6 (15.11.2026, Qwen, qwen/build2/LONGPROMPT.md): never cut. A cut piece's rows take other forms than alone's piece
+     * gives them -- Flash-Next's dense prefill attention splits the KV by the launch's rows (abi/rad_prefill_split.h: 1024
+     * rows of one KV head split in 2, 1345 rows and up not), kBiMinPiece's premise -- and a step wider than the shared
+     * budget beside other sequences is refused (QSA's score plane) or pipelined. The piece runs whole where it fits;
+     * else the request takes the next step alone (bi6_wait_; option 5's lone step for this one request). */
+    if (bi_chunk_ == 6) {
+        if (pe - n <= room) return whole();
+        if (!bi6_wait_) bi6_wait_ = r.id;
+        return 0;
+    }
     /* 3 / 4 beside other work (option D): an end on the grid G (3: the interval, 4: RADIANCE_SCHED_BI_GRID) inside the
      * piece leaving at least kBiMinPiece rows on both sides, or the piece's end; the largest that fits the room. A piece
      * that cannot be cut and does not fit the shared budget runs whole over it when it is the step's first prefill
@@ -1808,6 +1821,30 @@ int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
     return cut;
 }
 
+/* fn4 resume_cold (15.11.2026, the Qwen line, qwen/EXACT-PRESSURE.md; hero2/QWEN-LP-IDENTITY.md condition 1): the positions
+ * where this prompt's idle cold prefill starts a chunk -- the pieces bi_chunk_plan gives it alone (plan_chunk from 0 at
+ * --max-num-batched-tokens with the alone span, no Request::checkpoint_at). A hit that resumes at one of them computes the
+ * rest in the cold run's own pieces (plan_chunk depends on the position and the target only), so it answers as the cold
+ * run; one that resumes anywhere else (another prompt's tail, a shared head's cut) runs every later piece off the cold
+ * grid -- a 896-row piece and 8192-row spans from 16384 instead of from 10240 -- and the rows take other arithmetic. */
+void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_t>* out) {
+    out->clear();
+    out->push_back(0);
+    if (!geo_.checkpoints() || target <= 0) return;
+    const bool keep = span_now_;
+    span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+    const int64_t end = chunk_end(r, target);
+    int64_t n = 0;
+    for (int guard = 0; n < end && guard < 1 << 20; ++guard) {
+        int64_t ck = -1;
+        const int64_t w = plan_chunk(n, end, cfg_.max_tok, &ck, 0, &r);
+        if (w <= 0) break;
+        n += w;
+        if (n < end) out->push_back(n);
+    }
+    span_now_ = keep;
+}
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
  * written (spec §7.3; see scheduler.h).
  *
@@ -2405,6 +2442,45 @@ bool Scheduler::preempt_back() {
      * is published first: the recompute adopts it from the cache, and under pressure the cache gives
      * the blocks back (the newest entries last). */
     const bool published = publish_prefix(s);
+    /* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md; condition 2 of hero2/QWEN-LP-IDENTITY.md): a recompute replays
+     * the generated tokens as prefill rows -- other arithmetic than the verify steps that computed them (D2: u10
+     * preempted after 581 tokens, 576 + 14 rows replayed, the answer differs from char 11,421). A decoding request
+     * instead gives up its whole blocks (the cache holds them: published above) and keeps its state slots, partial
+     * blocks, card and drafter state; it rejoins at this position (rejoin_kept) with nothing replayed. */
+    if (fn4::preempt_keep() > 0) {
+        const char* no = !published ? "its prefix was not published"
+                       : r.embed ? "an embedding input"
+                       : r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len() ? "it is prefilling"
+                       : kv_->has_runtime_window(r.id) ? "a runtime window"
+                       : !keep_possible() ? "inert here" : nullptr;
+        if (no && pk_n_[2] < 1000) {
+            ++pk_n_[2];
+            RAD_INFO("fn4 preempt_keep: request %llu preempted by recompute (%s; %lld of %lld tokens computed)",
+                     (unsigned long long)r.id, no, (long long)r.n_computed, (long long)s.seq_len());
+        }
+    }
+    if (fn4::preempt_keep() > 0 && published && !r.embed && r.n_computed >= (int64_t)r.prompt.size() &&
+        r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible()) {
+        const int64_t whole = kv_->preempt_keep(r.id, r.n_computed);
+        if (whole >= 0) {
+            s.keep_whole = whole;
+            r.state = ReqState::Preempted;
+            s.preempted_us = mono_us();
+            /* the step's window only (Sampler::build_step); the proposal in s.draft is the next verify's */
+            r.n_draft = 0;
+            r.draft = nullptr;
+            r.draft_parent = nullptr;
+            s.running = false;
+            running_.pop_back();
+            queue_insert(waiting_, slot);
+            ++m_.preemptions;
+            ++pk_n_[0];
+            RAD_INFO("fn4 preempt_keep: request %llu kept at %lld tokens (%lld in whole blocks to the cache, the rest "
+                     "and its states kept; card %d)", (unsigned long long)r.id, (long long)r.n_computed,
+                     (long long)whole, (int)s.card);
+            return published;
+        }
+    }
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -2429,6 +2505,94 @@ bool Scheduler::preempt_back() {
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
     ++m_.preemptions;
     return published;
+}
+
+/* fn4 preempt_keep: a rejoin puts every paged group back from the cache, so every paged group must be one the cache
+ * indexes (a drafter's own uncached group would come back empty). */
+bool Scheduler::keep_possible() {
+    if (pk_ok_ < 0) {
+        pk_ok_ = cfg_.prefix_cache && pc_ ? 1 : 0;
+        if (pk_ok_) {
+            const std::vector<int32_t>& cg = pc_->cached_groups();
+            for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+                if (!kvgeom_.g[g].paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+                if (std::find(cg.begin(), cg.end(), (int32_t)g) == cg.end()) pk_ok_ = 0;
+            }
+        }
+        if (!pk_ok_) RAD_WARN("fn4 preempt_keep: inert here (no prefix cache, or a paged group it does not index)");
+    }
+    return pk_ok_ > 0;
+}
+
+/* fn4 preempt_keep: a kept request back into the running set at its own position. 1 rejoined (it decodes from the next
+ * step), -1 the cache no longer holds its whole blocks (it is now an ordinary preempted request at zero: recomputed). */
+int Scheduler::rejoin_kept(SchedReq& s) {
+    Request& r = *s.req;
+    /* the publish indexed prompt ++ output: the rejoin restores and looks that up (the prompt alone would stop at the
+     * first generated token) */
+    std::vector<int32_t> toks;
+    toks.reserve(r.prompt.size() + r.output.size());
+    toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
+    toks.insert(toks.end(), r.output.begin(), r.output.end());
+    pc_->whole_sequence(&toks);
+    const RestoreResult rr = pc_->restore(r, /*whole_only=*/true);
+    /* no snapshot: the sequence's own states are its position */
+    static const std::vector<int64_t> kNoSnapshot;
+    HitCap cap;
+    cap.tokens = -1;
+    cap.resume_at = &kNoSnapshot;
+    const CacheHit h = pc_->lookup(r, &hit_blocks_, &cap);
+    pc_->whole_sequence(nullptr);
+    const std::vector<int32_t>& cg = pc_->cached_groups();
+    /* A chain the pool cannot take back whole yet (Declined), or one whose host copies are still landing (Cut): wait,
+     * as a preempted request waits for room -- up to kKeepTries attempts, then today's recompute. */
+    if (h.n_attn_tokens < s.keep_whole && rr != RestoreResult::Whole && ++s.keep_tries < kKeepTries) {
+        if (s.keep_tries == 1 || s.keep_tries % 16 == 0)
+            RAD_INFO("fn4 preempt_keep: request %llu waits to rejoin (restore %s, %lld of %lld tokens in VRAM, try %d)",
+                     (unsigned long long)r.id, rr == RestoreResult::Cut ? "cut" : "declined",
+                     (long long)h.n_attn_tokens, (long long)s.keep_whole, s.keep_tries);
+        return 0;
+    }
+    bool ok = h.n_attn_tokens >= s.keep_whole && hit_blocks_.size() >= cg.size();
+    for (size_t i = 0; ok && i < cg.size(); ++i) {
+        std::vector<int32_t> w = hit_blocks_[i];
+        const int64_t nb = s.keep_whole / kvgeom_.g[(size_t)cg[i]].block_size;
+        if ((int64_t)w.size() < nb) { ok = false; break; }
+        w.resize((size_t)nb);
+        if (kv_->rejoin(r.id, cg[i], w) < 0) ok = false;
+    }
+    if (!ok) {
+        RAD_WARN("fn4 preempt_keep: request %llu cannot rejoin (the cache gives back %lld of %lld tokens, restore %s, "
+                 "try %d): recomputed", (unsigned long long)r.id, (long long)h.n_attn_tokens, (long long)s.keep_whole,
+                 rr == RestoreResult::Whole ? "whole" : rr == RestoreResult::Cut ? "cut" : "declined", s.keep_tries);
+        ++pk_n_[2];
+        unkeep(s);
+        return -1;
+    }
+    s.keep_whole = -1;
+    s.keep_tries = 0;
+    r.state = ReqState::Running;
+    s.preempted_us = 0;
+    s.running = true;
+    ++pk_n_[1];
+    RAD_INFO("fn4 preempt_keep: request %llu rejoined at %lld tokens (card %d), nothing replayed",
+             (unsigned long long)r.id, (long long)r.n_computed, (int)s.card);
+    return 1;
+}
+
+void Scheduler::unkeep(SchedReq& s) {
+    Request& r = *s.req;
+    if (kv_->has_sequence(r.id)) kv_->preempt(r.id);
+    drop_card(s);
+    r.n_computed = 0;
+    r.n_cached = 0;
+    r.n_accepted = 0;
+    s.drafter_reset();
+    r.n_draft = 0;
+    r.draft = nullptr;
+    r.draft_parent = nullptr;
+    s.keep_whole = -1;
+    s.keep_tries = 0;
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -2534,7 +2698,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
             cap.max_give_back = 2 * draft_refill_;
         }
-        CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        /* fn4 resume_cold (the Qwen line): a snapshot only where this prompt's cold prefill starts a chunk (cold_starts) */
+        const bool rcold = fn4::resume_cold() > 0 && geo_.checkpoints() && has_linear_state_;
+        if (rcold) {
+            cold_starts(r, s.seq_len(), &cold_starts_);
+            cap.resume_at = &cold_starts_;
+            if (draft_refill_ <= 0) cap.tokens = -1;   /* no token cap: the resume rule only */
+        }
+        CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 || rcold ? &cap : nullptr);
+        if (rcold && h.n_attn_tokens > 0) {
+            ++rc_n_[0];
+            /* what the unfiltered rule would have resumed at is not known here; the rows between the hit and the
+             * resume are what the rule costs (a hit at a grid point costs none) */
+            const int64_t at = h.checkpoint_slot >= 0 ? h.n_linear_tokens : 0;
+            if (at < h.n_attn_tokens) { ++rc_n_[1]; rc_n_[2] += h.n_attn_tokens - at; }
+        }
         /* Lever G: a snapshot off the resume grid (another prompt's fine tail) is a resume point of THIS prompt only
          * where it leaves the prompt's last piece at least kTailMinPiece rows -- a cut option D could make in this
          * prompt's cold plan. Nearer its end the rows behind it would run in a piece of another form band than the
@@ -2709,7 +2887,15 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * request with the same head skips it -- the same system prompt or instructions in front
          * of a different text, as TranslateGemma's chunks are. The interval and tail snapshots
          * miss it: the head is shorter than an interval, and each prompt's tail is its own. */
-        if (geo_.checkpoints() && r.checkpoint_at == 0 &&
+        /* fn4 resume_cold (the Qwen line): no cut there -- a snapshot off this prompt's cold chunk starts would run its later
+         * pieces off its cold grid (and the requests that resume there off theirs); the cold run's own chunk ends carry the
+         * snapshots a later request with the same head resumes at */
+        if (rcold && geo_.checkpoints() && r.checkpoint_at == 0 &&
+            h.branch_at - std::max<int64_t>(reuse, cr_at) >= kSharedHeadMin) {
+            ++rc_n_[3];
+            RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; no snapshot cut there (fn4 resume_cold)",
+                      (unsigned long long)r.id, (long long)h.branch_at);
+        } else if (geo_.checkpoints() && r.checkpoint_at == 0 &&
             h.branch_at - std::max<int64_t>(reuse, cr_at) >= kSharedHeadMin) {
             r.checkpoint_at = h.branch_at;
             RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
@@ -2824,7 +3010,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             else if (rest <= budget) { want = rest; ckpt = ck; }
         }
         if (s.bypass_no) ++n_bypass_refused_;
-    } else if (bi_chunk_) {
+    } else if (bi_chunk_ && bi_chunk_ != 5) {   /* the Qwen line's 5: the default path, its lone step */
         want = bi_chunk_plan(s, r, target, budget, &ckpt, reserve > 0);   /* lever BI: the whole chunk or none */
         /* lever NOA: D turned it away beside another prefill -> D's own piece (alone's whole, else its largest grid cut
          * >= 128 rows a side) at the step's max_tok room; nothing fits beside the step's first prefill and decode rows
@@ -2950,10 +3136,24 @@ void Scheduler::undo_hit(SchedReq& s) {
  * which is the loop. */
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
-    const int64_t target = s.seq_len();
+    /* fn4 preempt_keep: a kept request needs its next verify's rows, not a recompute (its states are kept) */
+    const bool kept = s.keep_whole >= 0;
+    const int64_t target = kept ? r.n_computed + 1 + std::max<int64_t>(s.n_draft, 0) + 4 : s.seq_len();
     /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
      * no new block. */
-    const int64_t hit = (cfg_.prefix_cache && pc_) ? pc_->lookup(r, nullptr, nullptr).n_attn_tokens : 0;
+    int64_t hit = 0;
+    if (cfg_.prefix_cache && pc_) {
+        /* a kept request's publish indexed prompt ++ output (rejoin_kept) */
+        std::vector<int32_t> toks;
+        if (kept) {
+            toks.reserve(r.prompt.size() + r.output.size());
+            toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
+            toks.insert(toks.end(), r.output.begin(), r.output.end());
+            pc_->whole_sequence(&toks);
+        }
+        hit = pc_->lookup(r, nullptr, nullptr).n_attn_tokens;
+        if (kept) pc_->whole_sequence(nullptr);
+    }
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
@@ -2982,7 +3182,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     /* Stateful groups: the recompute needs its state slots back, and every running sequence must
      * keep the slot it already holds. A sequence the manager does not know is not a refusal:
      * admit_one adds it, and can_grow on a missing id is false forever. */
-    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
+    if (!kept && kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];
         if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
@@ -3255,6 +3455,80 @@ const RadBatch* Scheduler::step() {
             }
         noa_disp_ = starved && others > 0 && !blocked;
     }
+    /* fn4 lever BI chunking 5 (12.11.2026, the proof form; coordinator: before the per-sequence K pin): a prefill takes a
+     * step of its own -- its ALONE step: the span where it would span alone, the whole budget, no decode rows, no other
+     * prefill and no admission beside it -- and the next step serves the decode rows (prefills held), alternating while
+     * anything decodes. Every prefill row then runs in exactly the step an idle engine gives it; the decode rows wait one
+     * step a chunk (the stall a per-sequence K pin would save). */
+    int32_t bi_lone_slot = -1;
+    bool bi_lone_admit = false;
+    if (bi_chunk_ == 5) {
+        bool any_dec = false;
+        for (int32_t sl : running_) {
+            const SchedReq& q = *reqs_[(size_t)sl];
+            if (!q.req || !q.running) continue;
+            const Request& rr = *q.req;
+            const bool pf = rr.n_computed < (int64_t)rr.prompt.size() || rr.n_computed + 1 < q.seq_len();
+            if (!pf) any_dec = true;
+            else if (bi_lone_slot < 0) bi_lone_slot = sl;
+        }
+        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                    (int64_t)running_.size() < cfg_.max_seqs;
+        if (any_dec && bi_lone_last_) {
+            hold_prefill = true;            /* the decode rows' turn: no prefill, no admission */
+            bi_lone_slot = -1;
+            bi_lone_last_ = false;
+        } else if (bi_lone_slot >= 0 || admit_possible) {
+            bi_lone_admit = bi_lone_slot < 0;
+            bi_lone_last_ = any_dec;
+            const Request* pr = bi_lone_slot >= 0 ? reqs_[(size_t)bi_lone_slot]->req.get()
+                                                  : reqs_[(size_t)waiting_[0]]->req.get();
+            const int64_t plen = pr ? (int64_t)pr->prompt.size() : 0;
+            span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || plen >= span_min_);
+            budget = span_now_ ? cfg_.max_tok : geo_.shared_tok;
+        } else {
+            bi_lone_last_ = false;
+        }
+    }
+    /* fn4 lever BI chunking 6: the request whose alone piece did not fit beside the last step's other work takes this
+     * step alone (its alone step: the span where it would span alone, nothing beside it), unless the last step was such
+     * a lone step beside decoding sequences -- then their rows go first and it waits one more step. */
+    bool bi6_lone = false;
+    if (bi_chunk_ == 6) {
+        bool any_dec = false;
+        for (int32_t sl : running_) {
+            const SchedReq& q = *reqs_[(size_t)sl];
+            if (!q.req || !q.running) continue;
+            const Request& rr = *q.req;
+            if (!(rr.n_computed < (int64_t)rr.prompt.size() || rr.n_computed + 1 < q.seq_len())) any_dec = true;
+        }
+        const uint64_t want = bi6_wait_;
+        bi6_wait_ = 0;
+        if (want && any_dec && bi6_lone_last_) {
+            bi6_wait_ = want;                  /* the decode rows' turn */
+        } else if (want) {
+            for (int32_t sl : running_) {
+                const SchedReq& q = *reqs_[(size_t)sl];
+                if (q.req && q.running && q.req->id == want &&
+                    q.req->n_computed < (int64_t)q.req->prompt.size()) { bi_lone_slot = sl; break; }
+            }
+            if (bi_lone_slot < 0 && !waiting_.empty() && !free_cards_.empty() &&
+                (int64_t)running_.size() < cfg_.max_seqs) {
+                const SchedReq& w = *reqs_[(size_t)waiting_[0]];
+                if (w.req && w.req->id == want) bi_lone_admit = true;
+            }
+            if (bi_lone_slot >= 0 || bi_lone_admit) {
+                bi6_lone = true;
+                const Request* pr = bi_lone_slot >= 0 ? reqs_[(size_t)bi_lone_slot]->req.get()
+                                                      : reqs_[(size_t)waiting_[0]]->req.get();
+                const int64_t plen = pr ? (int64_t)pr->prompt.size() : 0;
+                span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || plen >= span_min_);
+                budget = span_now_ ? cfg_.max_tok : geo_.shared_tok;
+            }
+        }
+        bi6_lone_last_ = bi6_lone && any_dec;
+    }
+    bi6_plan_lone_ = bi6_lone;
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
      * decode rows and the chunked path over its prefill rows, so a verifying row rolls back as in
@@ -3345,7 +3619,12 @@ const RadBatch* Scheduler::step() {
         }
         if (bp) {
         } else if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
-        else if (prefill && bi_chunk_) {
+        /* fn4 BI chunking 5 / 6 (the Qwen line): a lone step holds its one prefill, nothing else */
+        else if ((bi_chunk_ == 5 || bi6_lone) && (bi_lone_admit || (bi_lone_slot >= 0 && slot != bi_lone_slot))) { ++i; continue; }
+        else if (prefill && bi_chunk_ == 5) {
+            want = plan_chunk(r.n_computed, chunk_end(r, target), budget, &ckpt, r.checkpoint_at, &r);
+            if (want <= 0) { ++i; continue; }
+        } else if (prefill && bi_chunk_) {
             want = bi_chunk_plan(s, r, target, budget, &ckpt, share_step && (behind_pf > 0 || admit_waits));
             if (want <= 0) { ++i; continue; }   /* lever BI: the whole chunk or none; decode rows behind it go on */
             psk_ckpt(s, target, &ckpt);         /* lever PSK design 2: a snapshot at a target only */
@@ -3656,7 +3935,7 @@ const RadBatch* Scheduler::step() {
         if (d == kCbhHold) { cbh_hold(now); cb_held = true; }
         else cbh_release(d, now);
     }
-    if (!preempted_here && !cb_held && (!hold_prefill || bypass)) {
+    if (!preempted_here && !cb_held && (!hold_prefill || bypass) && !((bi_chunk_ == 5 || bi6_lone) && !bi_lone_admit)) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
@@ -3666,6 +3945,7 @@ const RadBatch* Scheduler::step() {
                (int64_t)plan_.e.size() < cfg_.max_seqs && (budget > 0 || noa_room() > 0)) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+            if ((bi_chunk_ == 5 || bi6_lone) && !plan_.e.empty()) break;   /* fn4 BI 5 / 6: one admission, alone in its step */
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
             /* lever DST: on a held step only a fresh request not turned away before is asked */
@@ -3695,6 +3975,27 @@ const RadBatch* Scheduler::step() {
                 share_step && !s.req->embed && at + 1 < waiting_.size() &&
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
                     ? share_tok : 0;
+            /* fn4 preempt_keep: a kept request rejoins at its own position once the pool holds its next verify; it waits
+             * as a preempted request does (an overdue one holds the queue behind it) */
+            if (s.keep_whole >= 0) {
+                if (!preempted_can_prefill(s)) {
+                    if (preempt_wait_overdue(s)) break;
+                    ++at;
+                    continue;
+                }
+                const int kr = rejoin_kept(s);
+                if (kr > 0) {
+                    took_.push_back(at);   /* into running_ below; it decodes from the next step */
+                    ++at;
+                    continue;
+                }
+                if (kr == 0) {             /* its blocks are coming back: wait as a preempted request does */
+                    if (preempt_wait_overdue(s)) break;
+                    ++at;
+                    continue;
+                }
+                /* the cache lost its blocks: an ordinary preempted request now (n_computed 0), admitted below */
+            }
             admit_full_ = 0;
             admit_next_step_ = false;
             const int as = admit_one(s, budget, bypass ? 0 : areserve, bypass ? bypass_now_ : 0);
@@ -4166,6 +4467,10 @@ const RadBatch* Scheduler::step_next_locked() {
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
+    /* fn4 BI chunking 6: a lone step holds one request and leaves every other running sequence out; a step issued
+     * ahead of it would carry on with that one alone (F2 15.11.: 150-170 single-sequence steps after each lone step at
+     * 32 requests). A request waiting for its lone step needs the full step too. */
+    if (bi_chunk_ == 6 && (bi6_plan_lone_ || bi6_wait_)) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
     /* The hybrid (scheduler.h): a sequence whose lookup matches long on the text committed so far
@@ -4272,6 +4577,7 @@ void Scheduler::promote_next() {
     draft_cycle();
     std::swap(plan_, plan_next_);
     plan_next_.reset();
+    bi6_plan_lone_ = false;   /* a step issued ahead is never a lone step */
     step_prefill_tok_ = 0;
     step_decode_tok_  = 0;
     for (size_t i = 0; i < plan_.e.size(); ++i) {

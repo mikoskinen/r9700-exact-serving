@@ -114,6 +114,15 @@ static const RadParamSpec pAttnPaged[] = {
     /* e4m3 products a caller accepts (docs/OPS.md): 1 Q.K^T, 2 P.V, 3 both; absent is 0. */
     P_INTO("prefill_fp8"),
 };
+/* fn4 BI (att_bi 3, 13.11.2026): attn_paged under its own name with `split_rows`, the split law's sequence count in place of
+ * the launch's (r4d_split_rows_pin, the split-KV decode rows): a launch of several dense decode sequences pinned to 1 splits
+ * each as its alone launch. Its own op, libr4d's alone: every plugin that declares attn_paged must agree on its schema. */
+static const RadParamSpec pAttnPagedPin[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"), P_INT("window"),
+    P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"), P_INTO("n_head"), P_INTO("max_seqs"),
+    P_INTO("prefill_fp8"),
+    P_INTO("split_rows"),
+};
 static const RadOperandSpec oAttnPaged[] = {
     { "q",           RAD_OPD_IN,  0 },
     { "kv_cache",    RAD_OPD_IN,  0 },
@@ -174,6 +183,9 @@ static const RadParamSpec pAttnPagedGq[] = {
     { "max_seqs", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
     P_INT("group"),
     P_STR("act"),
+    /* fn4 BI (att_bi 2): the split law's sequence count in place of the launch's rows (libr4d r4d_split_rows_pin; the
+     * decode rows only); absent 0. Not decomposed: attn_paged has no such parameter. */
+    P_INTO("split_rows"),
 };
 static const RadOperandSpec oAttnPagedGq[] = {
     { "q",           RAD_OPD_IN,  0 },
@@ -642,8 +654,14 @@ static const RadOperandSpec oSsdUpdate[] = {
     {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
     {"o", RAD_OPD_OUT, 0},
 };
+/* hc_write's own list: `eps` and the `ss` output (fn4 W1b) are optional -- with both, the write also stores the
+ * next read's norm scales ([M][8] f32, the read's grouped-rmsnorm rsqrt per stream at that eps), which that read
+ * takes as its `ss` input instead of its own pass over the stream. */
+static const RadParamSpec pHcWrite[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype"), P_F64O("eps"),
+};
 static const RadOperandSpec oHcWrite[] = {
-    { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 }, { "ss", RAD_OPD_OUT, 1 },
 };
 /* hc_write with the preceding all-reduce folded in: `y` is also the message, so it is inout and
  * holds the reduced sum as the standalone collective leaves it. */
@@ -700,9 +718,17 @@ static const RadOperandSpec oMtpEnter[] = {
     { "fc_h", RAD_OPD_WEIGHT, 0 }, { "fc_e", RAD_OPD_WEIGHT, 0 },
     { "x", RAD_OPD_OUT, 0 },
 };
+/* fn4 SP-hc: hc_read's codes stage alone (r4d_rad_hc_codes). */
+static const RadParamSpec pHcCodes[] = {
+    P_INT("M"), P_INT("n"), P_INTO("group"), P_INTO("rotate"), P_INTO("codes_i8"),
+};
+static const RadOperandSpec oHcCodes[] = {
+    { "x", RAD_OPD_IN, 0 }, { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
+    { "rq", RAD_OPD_OUT, 1 }, { "rscale", RAD_OPD_OUT, 1 },
+};
 static const RadParamSpec pHcRead[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
-    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"),
+    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"), P_INTO("bi_dec"), P_INTO("kc_rows"),
 };
 static const RadOperandSpec oHcRead[] = {
     { "h",        RAD_OPD_IN,     0 },
@@ -716,6 +742,7 @@ static const RadOperandSpec oHcRead[] = {
     { "scale",    RAD_OPD_OUT,    1 },
     { "rq",       RAD_OPD_OUT,    1 },
     { "rscale",   RAD_OPD_OUT,    1 },
+    { "ss",       RAD_OPD_IN,     1 },   /* fn4 W1b: the norm scales the preceding hc_write stored */
 };
 
 static const RadParamSpec pGdnGatedRmsNorm[] = {
@@ -872,6 +899,7 @@ static const RadOperandSpec oAllReduce[] = {
     { "x", RAD_OPD_INOUT, 0 },
     { "y", RAD_OPD_OUT,   1 },
 };
+/* fn4 SP-hc (r4d_ar_sp_rows.hip): the two-shot's halves over whole-row shards, in place. */
 
 /* tp8 loop P20 (fn4 SP-hc, r4d_ar_sp_rows.hip): the two-shot's halves over whole-row shards, in place. */
 static const RadParamSpec pRowsColl[] = {
@@ -1120,6 +1148,22 @@ static const RadOperandSpec oRouterGemmTopkScatter[] = {
     { "expert_offset", RAD_OPD_OUT,    0 },
     { "expert_count",  RAD_OPD_OUT,    0 },
     { "gate",          RAD_OPD_OUT,    1 },
+};
+/* router_gemm_topk_scatter_inv (fn4): router_gemm_topk_scatter's operands and moe_scatter_inv's
+ * `inverse` after them -- an op of its own, as moe_scatter_inv is, since the shared vocabulary
+ * fixes router_gemm_topk_scatter's operands. */
+static const RadOperandSpec oRouterGemmTopkScatterInv[] = {
+    { "a",             RAD_OPD_IN,     0 },
+    { "b",             RAD_OPD_WEIGHT, 0 },
+    { "gate_b",        RAD_OPD_WEIGHT, 1 },
+    { "logits",        RAD_OPD_OUT,    0 },
+    { "expert_ids",    RAD_OPD_OUT,    0 },
+    { "expert_w",      RAD_OPD_OUT,    0 },
+    { "sorted_tok",    RAD_OPD_OUT,    0 },
+    { "expert_offset", RAD_OPD_OUT,    0 },
+    { "expert_count",  RAD_OPD_OUT,    0 },
+    { "gate",          RAD_OPD_OUT,    1 },
+    { "inverse",       RAD_OPD_OUT,    0 },
 };
 static const RadOperandSpec oMoeScatter[] = {
     { "expert_ids",    RAD_OPD_IN,  0 },
@@ -1566,6 +1610,19 @@ static const RadParamSpec pQsaScore[] = {
     { "seqs",   RAD_P_INT, RAD_REQUIRED },
     { "dtype",  RAD_P_STR, RAD_REQUIRED },
 };
+/* fn4 qsa_split (qwen/QSA-SPLIT.md): `qsa_score` over rank `part` of `parts`' block range of each sequence only
+ * (r4d_qsa_part.h), the same scores at the same columns; an op of its own because every plugin that serves qsa_score fixes
+ * the same schema. Operands are qsa_score's. */
+static const RadParamSpec pQsaScorePart[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "heads",  RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "parts",  RAD_P_INT, RAD_REQUIRED },
+    { "part",   RAD_P_INT, RAD_REQUIRED },
+};
 static const RadOperandSpec oQsaScore[] = {
     { "q",     RAD_OPD_IN,  0 },
     { "bk",    RAD_OPD_IN,  0 },
@@ -1577,6 +1634,47 @@ static const RadOperandSpec oQsaScore[] = {
      * bound for every query in the chunk, which `qsa_select` narrows per query. */
     { "nc",    RAD_OPD_IN,  0 },
     { "score", RAD_OPD_OUT, 0 },
+};
+
+/* fn4 qsa_split (16.11.2026, qwen/QSA-SPLIT.md): `qsa_select` split across the ranks of a tensor-parallel group.
+ * `qsa_select_part` selects over rank `part` of `parts`' block range of each sequence (the range qsa_score's `parts` form
+ * scored) and writes candidate lists (r4d_qsa_part.h: [M, nlist * LW], nlist chunks of the range a query, LW = 4 + 2 topk
+ * words), and with `slab` the range's own list [M, LW]; `qsa_select_merge` reads a query's lists in order (the gathered
+ * ranks' slabs, or one card's chunks with parts 1) and writes qsa_select's three outputs byte for byte. */
+static const RadParamSpec pQsaSelectPart[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "topk",   RAD_P_INT, RAD_REQUIRED },
+    { "ratio",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "parts",  RAD_P_INT, RAD_REQUIRED },
+    { "part",   RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaSelectPart[] = {
+    { "score", RAD_OPD_IN,  0 },
+    { "bt",    RAD_OPD_IN,  0 },
+    { "nc",    RAD_OPD_IN,  0 },
+    { "pos",   RAD_OPD_IN,  0 },
+    { "cu",    RAD_OPD_IN,  0 },
+    { "lists", RAD_OPD_OUT, 0 },
+    { "slab",  RAD_OPD_OUT, 1 },
+};
+static const RadParamSpec pQsaSelectMerge[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "topk",   RAD_P_INT, RAD_REQUIRED },
+    { "ratio",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaSelectMerge[] = {
+    { "lists",   RAD_OPD_IN,  0 },
+    { "bt",      RAD_OPD_IN,  0 },
+    { "nc",      RAD_OPD_IN,  0 },
+    { "pos",     RAD_OPD_IN,  0 },
+    { "cu",      RAD_OPD_IN,  0 },
+    { "sel",     RAD_OPD_OUT, 0 },
+    { "nsel",    RAD_OPD_OUT, 0 },
+    { "seqused", RAD_OPD_OUT, 0 },
 };
 
 /* `rmsnorm_quant_fp8` and `gated_quant_fp8`, new ops whose schemas this plugin fixes. Each is its
@@ -2749,6 +2847,9 @@ static const RadOperandSpec oJoinAddScale[] = {
     { "w_n", RAD_OPD_WEIGHT, 1 },
     { "y",   RAD_OPD_OUT,    1 },
 };
+/* fn4 BI-dual: a step's row bands from its cu_seqlens (r4d_fn4_bi.hip). */
+static const RadParamSpec pBiBand[] = { P_INT("M"), P_INT("band") };
+static const RadOperandSpec oBiBand[] = { { "cu_seqlens", RAD_OPD_IN, 0 }, { "band", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pExpertScale[] = {
     P_INT("M"),
     P_INT("n_expert"),
@@ -3569,6 +3670,9 @@ static const RadOpSchema kSchemas[] = {
            "paged causal attention, varlen. The ranged parameter is q_len, not M: one query row "
            "at decode, up to 64/gqa at a speculative verify, thousands in a prefill chunk, and "
            "libr4d has a different kernel for each band."),
+    SCHEMA("attn_paged_pin", pAttnPagedPin, oAttnPaged,
+           "fn4 BI: attn_paged with split_rows, the split law's sequence count in place of the launch's "
+           "(a run of decode sequences split each as its own alone launch)."),
     SCHEMA("attn_paged_anchor_window", pAttnPaged, oAttnPaged,
            "paged attention whose query rows all use the sequence's first query as the sliding-window anchor."),
     /* attn_paged under its own name, for q read at its own row pitch. The windowed kernels
@@ -3682,6 +3786,9 @@ static const RadOpSchema kSchemas[] = {
            "exp(-exp(A_log) dt') and gains dt' x B^T; o = state C + D x. verify stores candidate "
            "states; prefill commits the final state. Absolute cu offsets, accepted-prefix read slot, "
            "optional cold initialization, per_candidate only."),
+    SCHEMA("hc_codes", pHcCodes, oHcCodes,
+           "fn4 SP-hc: hc_read's codes stage alone over rows already read -- x's block-scaled codes (E4M3, or int8 "
+           "with codes_i8) and, with rotate, the Hadamard-rotated E4M3 twin, the bytes hc_read writes for the same x."),
     SCHEMA("hc_read", pHcRead, oHcRead,
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
@@ -3692,7 +3799,7 @@ static const RadOpSchema kSchemas[] = {
            "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
            "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
            "the stock model's."),
-    SCHEMA("hc_write", pHcPlain, oHcWrite,
+    SCHEMA("hc_write", pHcWrite, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
            "The MTP head's entry for a wide residual stream: x[k*n+i] = fc_h[i] . "
@@ -3766,6 +3873,9 @@ static const RadOpSchema kSchemas[] = {
            "The split COUNT changes, so a row here is not bit-identical to the same row split; "
            "both are exact. An op name of its own so every other caller keeps the split and "
            "its bits."),
+    SCHEMA("gemm_nt_q_dec", pGemmNtQ, oGemmNtQ,
+           "fn4 BI wide: `gemm_nt_q` over a step's decode rows above 64, every row in the narrow tile's arithmetic "
+           "(the bytes it has in a launch of <= 64 rows). libr4d's own op, so gemm_nt_q keeps its bands."),
     SCHEMA("gemm_nt_q_bias", pGemmNtQBias, oGemmNtQBias,
            "gemm_nt_q with a per-column bias added to the f32 product before its one rounding."),
     SCHEMA("dequant_w4", pDequantW4, oDequantW4,
@@ -3810,6 +3920,10 @@ static const RadOpSchema kSchemas[] = {
            "split-K WMMA arithmetic at the split the unfused GEMM's own law picks, and the same "
            "selection and sort. Decode only: M <= 64 and M * top_k within the sort's "
            "single-workgroup form."),
+    SCHEMA("router_gemm_topk_scatter_inv", pRouterGemmTopkScatter, oRouterGemmTopkScatterInv,
+           "`router_gemm_topk_scatter`, also writing `inverse`: for every slot token*top_k + slot its "
+           "row in `sorted_tok`, -1 for a dropped slot -- the table `moe_scatter_inv` writes, so "
+           "`moe_gather_inv` reads it. Every other output is router_gemm_topk_scatter's bytes."),
     SCHEMA("moe_scatter", pMoeScatter, oMoeScatter,
            "a STABLE counting sort of the (token, slot) pairs by expert. `sorted_tok` holds the "
            "FLATTENED index token*top_k + slot and not the bare token id, because gather has to "
@@ -4037,6 +4151,18 @@ static const RadOpSchema kSchemas[] = {
            "negative cancel another's positive. `bt` holds PAGE IDS, and a negative entry scores "
            "-inf rather than zero, because a real score can be zero and padding must not outrank "
            "a block the model chose to ignore."),
+    SCHEMA("qsa_score_part", pQsaScorePart, oQsaScore,
+           "fn4 qsa_split: qsa_score over rank `part` of `parts`' block range of each sequence only -- the cuts of the "
+           "sequence's complete-block count at multiples of 16 (r4d_qsa_part.h) -- the same scores at the same columns, "
+           "nothing written outside the range."),
+    SCHEMA("qsa_select_part", pQsaSelectPart, oQsaSelectPart,
+           "fn4 qsa_split: rank `part` of `parts`' share of qsa_select -- over its block range of each sequence, in chunks, "
+           "each chunk's own top-k as (key, page) lists in ASCENDING BLOCK ORDER, and with `slab` the range's own top-k "
+           "list; lists carry count | over-topk flag and the selection's block bound (r4d_qsa_part.h)."),
+    SCHEMA("qsa_select_merge", pQsaSelectMerge, oQsaSelectMerge,
+           "fn4 qsa_split: a query's candidate lists, read in order as one block-ordered list, to qsa_select's table, "
+           "length and seqused BYTE FOR BYTE: above the threshold first in block order, ties last lowest block first, "
+           "the partial page appended."),
     SCHEMA("qsa_block_key", pQsaBlockKey, oQsaBlockKey,
            "the QSA indexer's compressed key: out[b] = rope(rmsnorm(mean of the `ratio` raw keys "
            "of block b), at the position of the block's FIRST token). The mean is accumulated in "
@@ -4132,6 +4258,9 @@ static const RadOpSchema kSchemas[] = {
            "where the unfused chain rounds. Two arms' post-norms, their sum, its norm, the residual "
            "add, a per-layer scalar and the next layer's input norm (Gemma 4's feed-forward "
            "join)."),
+    SCHEMA("bi_band", pBiBand, oBiBand,
+           "band[m] = 1 when row m's sequence (cu_seqlens) has at most `band` rows in the step, else 0 (rows past the "
+           "last sequence 0): fn4 BI-dual's row bands for the EXL3 down's v12 band operand."),
     SCHEMA("expert_scale", pExpertScale, oExpertScale,
            "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id "
            "outside it reading 0; one product rounded once, so the embed_lookup + mul pair's value "
@@ -5046,8 +5175,15 @@ static const RadConstraint cArTi8Ts4[] = {
     C_P2P,
 };
 /* tp8 loop P20 (fn4 SP-hc rows: reduce_scatter_rows / all_gather_rows). */
+static const RadConstraint cHcCodes[] = {
+    C_DIV("n", 128), C_EQ("group", 128),
+};
 static const RadConstraint cSpRows4[] = {
     C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16"), C_DIV("row", 32), C_P2P,
+};
+/* fn4 SP-hc (the Qwen line): the lane rows, at `overlap` 1 */
+static const RadConstraint cSpRows4Lane[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16"), C_DIV("row", 32), C_EQ("overlap", 1), C_P2P,
 };
 /* tp8 loop P26b: the raw all-gather of f32 rows (2 x row bf16 words on the bf16 instance) */
 static const RadConstraint cSpRows4F32[] = {
@@ -5108,6 +5244,7 @@ static const RadConstraint cLiliAttn[] = {
 };
 static const RadConstraint cLiliFactor[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cLiliWalk[] = { C_GE("k", 1), C_LE("k", 64), C_IN("dtype", "bf16") };
+static const RadConstraint cBiBand[] = { C_GE("M", 1), C_GE("band", 1), C_LE("band", 65536) };
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
@@ -5316,7 +5453,7 @@ static const RadConstraint cRouterSigmoidScatter[] = { C_GE("M", 1),        C_LE
                                                        C_IN("dtype", "f32") };
 /* The selection's bounds and the skinny GEMM's decode band: four 16-row tiles. */
 static const RadConstraint cRouterGemmTopkScatter[] = {
-    C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("M", 1), C_LE("M", 128), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
     C_GE("top_k", 1), C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cMoeScatter[] = {
@@ -5465,6 +5602,11 @@ static const RadConstraint cGemmNtQBiasFp8A8M16[] = {
  * tag and its activation (had_quant_act_i8g) differ. */
 static const RadConstraint cGemmNtI8A8M16[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
+/* fn4 BI wide: gemm_nt_q_dec's band (libr4d r4d_gemm_fp8a8.hip kDecMaxM). */
+static const RadConstraint cGemmNtI8A8Dec[] = {
+    C_LE("M", 512), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
 static const RadConstraint cGemmNtI8A8Tiled[] = {
@@ -7984,6 +8126,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr,
   r4d_shape_attn_paged_gate_quant, nullptr, r4d_fuse_attn_paged_gate_quant },
 
+/* fn4 BI (att_bi 3): the TP2 leg's decode row under attn_paged_pin (split_rows), the same launcher */
+{ "attn_decode_pin_h256_gqa12_fp8kv", "attn_paged_pin", "attn",
+  "attn_decode_h256_gqa12_fp8kv with split_rows: the split law reads that many sequences (fn4 BI att_bi 3)",
+  "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G12Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa12_fp8, r4d_rad_attn_decode_h256_gqa12_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
 { "attn_decode_h256_gqa12_bf16kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
   "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
@@ -8031,6 +8184,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "attn_decode_h256_gqa6_bs4_fp8kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_fp8, r4d_rad_attn_decode_h256_gqa6_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+/* fn4 BI (att_bi 3): the same row under attn_paged_pin (split_rows), the same launcher (g8_decode_common pins the law) */
+{ "attn_decode_pin_h256_gqa6_bs4_fp8kv", "attn_paged_pin", "attn",
+  "attn_decode_h256_gqa6_bs4_fp8kv with split_rows: the split law reads that many sequences (fn4 BI att_bi 3)",
   "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
   "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
@@ -8588,6 +8752,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_hc_read, r4d_rad_hc_read_scratch, nullptr, nullptr,
   r4d_shape_hc_read },
 
+/* fn4 SP-hc: hc_read's codes stage alone. */
+{ "hc_codes_bf16", "hc_codes", "norm",
+  "fn4 SP-hc: hc_read's codes stage over rows already read (the gathered block input of a sequence-parallel residual)",
+  "any M; n a multiple of 128; group 128",
+  "bf16 in, E4M3 / int8 codes + f32 scales, E4M3 rotated twin",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcCodes), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_codes, nullptr, nullptr, nullptr, r4d_shape_hc_codes, nullptr },
+
 { "hc_read_e4m3", "hc_read", "norm",
   "hc_read with the two mixing matrices stored as E4M3 rows -- half their bytes, the largest "
   "weight stream a decode step reads after the experts -- in the same two launches",
@@ -8826,6 +8999,24 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArTi8Ts4), ROW(tAr), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_4rank_ti8, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+/* fn4 SP-hc (the Qwen line): the lane rows (its SP-hc and SP-serial declare overlap 1); the wide rows are tp8 loop P20's above. */
+{ "sp_rs_rows_4rank_ti8_lane", "reduce_scatter_rows", "ar",
+  "fn4 SP-hc reduce-scatter over whole-row shards, tiered-int8 wire -- lossy; narrow launch beside compute",
+  "exactly 4 ranks, all peer-accessible, overlap 1; row a multiple of 32, at least 4 rows; in place",
+  "as sp_rs_rows_4rank_ti8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cSpRows4Lane), ROW(tArTs4Lane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_rs_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+{ "sp_ag_rows_4rank_lane", "all_gather_rows", "ar",
+  "fn4 SP-hc all-gather over whole-row shards; narrow launch beside compute",
+  "exactly 4 ranks, all peer-accessible, overlap 1; row a multiple of 32, at least 4 rows; in place",
+  "as sp_ag_rows_4rank",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cSpRows4Lane), ROW(tArTs4Lane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
 /* The row above at `overlap` 1: the same entry point and the same arithmetic, a launch that leaves
@@ -9079,6 +9270,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_M16,
   ROW(cGemmNtI8A8M16), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_i8a8_m16, r4d_rad_gemm_i8a8_m16_scratch,
+  r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
+  nullptr, r4d_rad_unrelayout_i8_block },
+
+{ "gemm_i8a8_nt_m16_dec", "gemm_nt_q_dec", "gemm",
+  "fn4 BI wide: gemm_i8a8_nt_m16 over any decode height up to 512 rows, 64-token groups on grid.y, so every row "
+  "keeps the narrow tile's arithmetic (the bytes it has alone)",
+  "M <= 512; K a multiple of 128; N a multiple of 16",
+  "as gemm_i8a8_nt_m16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_M16,
+  ROW(cGemmNtI8A8Dec), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_i8a8_m16_dec, r4d_rad_gemm_i8a8_m16_dec_scratch,
   r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
   nullptr, r4d_rad_unrelayout_i8_block },
 
@@ -9445,7 +9647,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
   "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
   "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",
-  "M <= 64 and M*top_k <= 1024; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "M <= 128 and M*top_k <= 2048; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
   "16 times the split the bf16 skinny GEMM's law picks",
   "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
   "sorted slots, offsets and counts out",
@@ -9454,6 +9656,19 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_router_gemm_topk_scatter_init, r4d_rad_router_gemm_topk_scatter_fini,
   r4d_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr,
   r4d_shape_router_gemm_topk_scatter },
+
+{ "router_gemm_topk_scatter_inv_bf16", "router_gemm_topk_scatter_inv", "moe",
+  "router_gemm_topk_scatter's one launch, its sort also writing every slot's row in the sort "
+  "(the inverse moe_gather_inv reads)",
+  "M <= 128 and M*top_k <= 2048; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "16 times the split the bf16 skinny GEMM's law picks",
+  "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
+  "sorted slots, offsets, counts and inverse out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRouterGemmTopkScatter), NOTUNE,
+  r4d_rad_router_gemm_topk_scatter_init, r4d_rad_router_gemm_topk_scatter_fini,
+  r4d_rad_router_gemm_topk_scatter_inv, nullptr, nullptr, nullptr,
+  r4d_shape_router_gemm_topk_scatter_inv },
 
 { "moe_scatter_i32", "moe_scatter", "moe",
   "a stable counting sort of the routing slots by expert, with the offsets and the histogram",
@@ -9780,6 +9995,32 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,
   r4d_shape_qsa_select },
+
+/* fn4 qsa_split (qwen/QSA-SPLIT.md): qsa_select across the ranks (or in chunks on one card) and its merge. */
+{ "qsa_score_part_bf16", "qsa_score_part", "attn",
+  "the QSA block score over a rank's block range of each sequence (fn4 qsa_split)",
+  "n 128, at most 4 heads (the matrix form), any block count and any M",
+  "bf16 queries and block keys, an i32 page-id table, f32 scores at the whole launch's columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_score },
+{ "qsa_select_part_i32", "qsa_select_part", "attn",
+  "a rank's part of the QSA selection: its block range's top-k as block-ordered candidate lists",
+  "any M, any block count; the range in chunks of at most 8192 blocks that fit the key cache; unsigned order",
+  "f32 scores and an i32 page table in; i32 candidate lists out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaSelect), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_select_part, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_select_part },
+{ "qsa_select_merge_i32", "qsa_select_merge", "attn",
+  "the merge of a query's candidate lists into qsa_select's page-id table",
+  "any M, at most 16 lists a query, topk x lists within the key cache",
+  "i32 candidate lists and page table in; an i32 [M, topk+1] table and a live count out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaSelect), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_select_merge, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_select_merge },
 
 /* The residency map of a streamed KV group, in one workgroup: the CLOCK hand is serial state and
  * the phases are barriers. The copies run in the same launch. */
@@ -10596,6 +10837,11 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cNormJoin), NOTUNE,
   nullptr, nullptr, r4d_rad_join_add_scale_bf16 },
+
+{ "bi_band", "bi_band", "elem",
+  "a step's row bands from its cu_seqlens: a thread a row, a binary search over the sequences", "any M",
+  "i32 cu_seqlens and band", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cBiBand), NOTUNE,
+  nullptr, nullptr, r4d_rad_bi_band },
 
 { "expert_scale_bf16", "expert_scale", "moe",
   "routing weight times its expert's scale, in place: one thread an element",
@@ -11621,6 +11867,9 @@ extern "C" int rad_kernel_chain(int i) {
         /* ...and the rest of a delta-net layer */
         "hc_read_bf16", "hc_read_e4m3", "gdn_recurrent_update_k128_v128_bf16_fp32state",
         "gdn_conv_recurrent_update_k128_v128_bf16", "ar_hc_write", "ar_gather_hc_write",
+        /* fn4 10.11.: the four-rank fused all-reduce + write at width (r4d_ar_wide_chain.h: r4dchain_
+         * wrappers around the unchanged kernel bodies, chained at <= r4d_chain_rows_ok rows) */
+        "ar_hc_write_4rank", "ar_gather_hc_write_4rank",
         /* the four-bit routed experts and their rotated quantiser */
         "moe_gemm_w4a8", "moe_gemm_w4a8_mod4", "gated_had_quant_fp8", "gated_had_quant_i8g",
         /* ...and an attention layer: the indexer, the norm/rope/gate, the quantiser before o_proj
@@ -11662,6 +11911,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_hc_write, r4d_rad_ar_gather_hc_write,
         r4d_rad_ar_oneshot_4rank_exact, r4d_rad_ar_twoshot_4rank_exact,
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
+        r4d_rad_ar_rs_rows_4rank, r4d_rad_ar_ag_rows_4rank,   /* fn4 SP-hc's lane rows (ar_init): released after their one handshake */
         r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank, r4d_rad_ar_mhc_pcn_4rank,
         r4d_rad_ar_rmsnorm_quant_i8_4rank, r4d_rad_moe_gather_ar_4rank,
     };
@@ -11757,8 +12007,10 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->pub      = 1;                 /* not an axis; see the note at tAr */
     /* Operand 0 is the message on every collective that reads this (all_reduce's x, a junction's
      * [M, n] input, all_gather's source). */
+    /* fn4 RSF (12.11.2026): a launch parameter `drain_force` 1 keeps the `drain` given (r4d_selftest --perfar4's fence
+     * A/B and stale-read stress); no declaration carries it. */
     if (a && a->t && a->n_t > 0 && rad_tensor_numel(&a->t[0]) >= kArFenceFromElems &&
-        r4d_geti_or(a, "world_size", a->world_size) == 4)
+        r4d_geti_or(a, "world_size", a->world_size) == 4 && r4d_geti_or(a, "drain_force", 0) == 0)
         out->drain = 1;
 }
 extern "C" int r4d_cfg_ar_tail(const RadArgs* a) {

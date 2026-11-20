@@ -22,9 +22,95 @@
 #include "rad_fp8.h"
 
 #include <cstring>
+#include <atomic>
+#include <cstdlib>
+#include <vector>
 
 namespace rad {
 namespace arch {
+
+/* fn4 BI (12.11.2026, switch att_bi / RADIANCE_FN4_ATT_BI): 1 = a step that holds a prefill sequence beside other
+ * sequences issues each prefill sequence's dense attention in a launch of its own, shaped as its alone step's: band =
+ * its query rows, q / out sliced to its rows, its own table row and seqused (so the host bound, the split law's units
+ * and cap and the decode-band partials are its own), no cu (one sequence). The decode sequences keep one launch at their
+ * band. 0 (default) = today's launches. fn4 180: L03.att first-differing in 19 of 40 probes, every one a prompt's rows in
+ * a mixed step -- at 10 rows or fewer the alone step runs the split-KV decode row and the mixed step the query-tiled row
+ * at the top band; above, the mixed launch's query bound / split cap moved with the step. */
+/* 2 (12.11.2026, 199: att_bi costs 3.6 % ms/step at c16): as 1, the sparse decode sequences of a step in one launch
+ * through op_attn_gq_bi, whose split law counts 1 + n_spec rows as its sequences (libr4d split_rows) -- each row's
+ * keys split as in its own sequence's alone launch. */
+/* 3 (13.11.2026, 220: att_bi 2 never engages on dense contexts -- the per-sequence dense attn_paged + gate_quant_fp8
+ * are att_bi's cost): as 2, and a run of DENSE decode sequences in ONE attn_paged launch through op_attn_bi, whose split
+ * law reads one sequence (split_rows 1: each sequence's alone launch is one sequence at its q_len), plus ONE gate_quant
+ * over the run's rows (a row's quantisation is its own). Above q_len x gqa 32 the law reads the block table's depth (the
+ * step's pitch), as the per-sequence launches of 1 / 2 do. */
+/* 4 (15.11.2026, qwen/build2/LONGPROMPT.md: prompts of 1047-1699 tokens answered beside any longer sequence differ from
+ * alone from their first decode step, L03.att): as 3, and a sequence of a sparse step takes the dense or sparse path its
+ * ALONE step takes. That step's choice reads the step's context BOUND, not the context: core/sched/batch.cpp hands a step
+ * max_ctx_len = bound_bucket(its longest ctx_len, 1024) (fn4_alone_ctx_bound below), so a sequence alone at ctx_len
+ * 1025..2048 with 4 rows has reach 2048 + 4 > qsa_exact_to 2051 and decodes SPARSE, while 1..3 read its exact seqused
+ * (<= 2051: dense). The two launches agree while a row's keys fit the sparse 4-row launch's 64 one-tile segments
+ * (1024 keys) and part beyond. 4 reads the bound (fn4_attbi_sparse); 0..3 keep today's choice and bytes. */
+inline std::atomic<int>& fn4_attbi_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
+                                   const int v = e && *e ? std::atoi(e) : 0;
+                                   return v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+    return f;
+}
+/* fn4 kvs_bi (15.11.2026, qwen/KV-STREAM-EXACT.md; switch kvs_bi / RADIANCE_FN4_KVS_BI, a mask; 0 = today): KV streaming
+ * (--kv-resident) exact under load. Bit 1 (this block): a decode sequence of a STREAMED group takes its alone step's attention
+ * in every pass. Alone, a streamed decode step is ring-bound, so every context decodes sparse (the dense path cannot read
+ * ring slots) in a launch of its own rows; today a ring-bound step of several sequences skips att_bi and issues one gated
+ * launch over all its rows (the split law then reads the step's rows as its units), and a MIXED step (the stage view) takes
+ * att_bi's per-sequence dense / sparse choice, dense below qsa_exact_to. With the bit, ring-bound and staged passes alike
+ * issue each decode sequence sparse through att_bi's per-sequence launches (op_attn_gq_bi's pinned split law for runs of
+ * whole verify sequences, else op_attn_gq at the sequence's rows), the resolve per launch. Bit 2 is the core's
+ * (core/kvstream/stage.cpp: the residency maps reset when a staged pass begins on the aliased stage). */
+inline std::atomic<int>& fn4_kvsbi_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_KVS_BI");
+                                   const int v = e && *e ? std::atoi(e) : 0;
+                                   return v < 0 ? 0 : v > 3 ? 3 : v; }()};
+    return f;
+}
+/* fn4 att_bi 4: the max_ctx_len a step of this one sequence would carry -- core/sched/batch.cpp's
+ * `min(bound_bucket(ctx_len, k_bound_tokens), max_ctx_)`, k_bound_tokens 1024, copied (keep the two in step): rounded up
+ * to a multiple of 1024, or above 64 to 1/32..1/64 of its power of two where that is coarser; 0 stays 0. */
+inline int64_t fn4_alone_ctx_bound(int64_t ctx_len, int64_t max_ctx) {
+    if (ctx_len <= 0) return ctx_len;
+    int64_t q = 1024;
+    if (ctx_len > 64) {
+        const int lg = 63 - __builtin_clzll((unsigned long long)ctx_len);
+        if (((int64_t)1 << (lg - 5)) > q) q = (int64_t)1 << (lg - 5);
+    }
+    int64_t b = (ctx_len + q - 1) / q * q;
+    if (max_ctx > 0 && b > max_ctx) b = max_ctx;
+    return b;
+}
+/* fn4 att_bi: whether a sequence of `rows` query rows ending at seqused `used` takes the sparse path under att_bi `mode`:
+ * one row (its alone step has T == n_seq), else 1..3 its exact context past `ex` (qsa_exact_to), 4 its alone step's reach
+ * (the bound of its ctx_len = used - rows, plus its rows) past `ex`, as step() decides that step. */
+inline bool fn4_attbi_sparse(int mode, int64_t used, int64_t rows, int64_t ex, int64_t max_ctx) {
+    if (rows == 1) return true;
+    if (mode < 4) return used > ex;
+    return fn4_alone_ctx_bound(used - rows, max_ctx) + rows > ex;
+}
+/* fn4 att_bi: the prefill sequences' row counts of a step, from the full-attention group's host seqused and the host
+ * positions (a sequence's rows end at position seqused - 1); false when they do not tile rows [DT, T) exactly. */
+inline bool attbi_rows(const RadBatch* b, const RadKVGroupBatch* kvb, int64_t D, int64_t DT, int64_t T,
+                       std::vector<int64_t>& q) {
+    q.clear();
+    if (!b || !kvb || !kvb->seqused_h || !b->positions_h || D < 0 || DT < 0 || DT > T) return false;
+    int64_t r = DT;
+    for (int64_t s = D; s < b->n_seq; ++s) {
+        if (r >= T) return false;
+        const int64_t n = (int64_t)kvb->seqused_h[s] - (int64_t)b->positions_h[r];
+        if (n < 1 || r + n > T) return false;
+        if (b->positions_h[r + n - 1] != kvb->seqused_h[s] - 1) return false;
+        q.push_back(n);
+        r += n;
+    }
+    return r == T;
+}
 
 /* Whether the streamed store has a row for this cache layout: libr4d's are E4M3 and bf16 only. A
  * packed cache (fp8_v4, k6_v4) must not declare it, since a weightless op with no row is a hole
@@ -126,6 +212,21 @@ struct AttnGatedFP8 {
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    /* fn4 att_bi 2: op_attn_gq with split_rows = 1 + max_spec (a decode sequence's alone rows), up to kGqBiRows rows a
+     * launch; declared under RADIANCE_FN4_BIDEC (default RADIANCE_FN4_X3DUAL) with max_spec > 0. 0 otherwise. */
+    static constexpr int64_t kGqBiRows = 64;
+    rad_op     op_attn_gq_bi = 0;
+    int64_t    gq_bi_qd = 0;
+    /* fn4 att_bi 3: op_attn as attn_paged_pin with split_rows = 1 (a dense decode sequence's alone launch is one sequence),
+     * declared beside op_attn_gq_bi where a plugin declares attn_paged_pin (libr4d); 0 otherwise. */
+    rad_op     op_attn_bi = 0;
+    /* fn4 KVCAP C2 (15.11.2026, qwen/KV-BOUNDS.md): the most sequences one op_attn_bi launch carries, its declared
+     * max_seqs. A launch is a run of the step's DENSE decode sequences (at most the step's n_seq <= g.max_seqs), each at
+     * 1 + n_spec rows; the sparse path's row budget (qsa_rows(), 256: one row per query) never applies to it. libr4d sizes
+     * its split-KV partials at declare as max_seqs x q_len band x n_head x the pinned split count (256 at max_ctx 262144)
+     * x 520 B: 780 MiB a card at 256, 97.5 MiB at 32 -- the arena's scratch is the largest op's. step() checks every run
+     * against it and fails the step loudly past it. */
+    int64_t    bi_seqs = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -195,7 +296,7 @@ struct AttnGatedFP8 {
         return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
-               !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
+               !(T <= qk_fuse_now(fused_rows)) && batch->positions && !rope_mixed(batch) &&
                kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
     }
 };
@@ -357,6 +458,31 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                      (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
         rad_op_writes(b, op_attn, &w.attn.x, 1);
     }
+    {   /* fn4 att_bi 3: the dense decode twin (split_rows 1), under RADIANCE_FN4_BIDEC (default RADIANCE_FN4_X3DUAL) */
+        const char* e = std::getenv("RADIANCE_FN4_BIDEC");
+        if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
+        if (op_attn && e && *e && *e != '0' && g.max_spec > 0 && rad_op_declared(b, "attn_paged_pin")) {
+            /* the decode band only (1 + n_spec rows a sequence): attn_paged_pin has decode rows alone */
+            op_attn_bi = decl_attn(b, g, "attn_paged_pin",
+                             RAD_PARAMS(RAD_RANGE("q_len", 1, 1 + g.max_spec), RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                        RAD_INT("window", 0),
+                                        RAD_INT("n_head", g.n_head),
+                                        RAD_INT("block_size", kv_block > 0 ? kv_block : (int64_t)RAD_KV_BLOCK),
+                                        RAD_INT("max_seqs", g.max_seqs),   /* fn4 KVCAP C2: a run of decode sequences */
+                                        RAD_INT("max_ctx", g.max_ctx),
+                                        RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype),
+                                        RAD_INT("split_rows", 1)),
+                             RAD_NOWEIGHTS);
+            if (op_attn_bi) {
+                bi_seqs = g.max_seqs;
+                const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, qsa_nsel };
+                rad_op_reads(b, op_attn_bi, rd,
+                             (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
+                rad_op_writes(b, op_attn_bi, &w.attn.x, 1);
+            }
+        }
+    }
 
     /* The resolve belongs here rather than in the indexer: it must follow this layer's store,
      * since a block copied in from the mirror has to carry this step's tokens. Its band is the
@@ -492,6 +618,30 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
             RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq, rd, 4));
             RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq, wr, 3));
         }
+        const char* e = std::getenv("RADIANCE_FN4_BIDEC");
+        if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
+        if (op_attn_gq && e && *e && *e != '0' && g.max_spec > 0) {
+            gq_bi_qd = 1 + g.max_spec;
+            op_attn_gq_bi = RAD_OP(b, "attn_paged_gate_quant",
+                                RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
+                                           RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                           RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
+                                           RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                           RAD_INT("max_seqs", kGqBiRows),
+                                           RAD_INT("max_ctx", g.max_ctx),
+                                           RAD_STR("q_dtype", g.dtype),
+                                           RAD_STR("kv_dtype", g.kv_dtype),
+                                           RAD_INT("group", RAD_FP8_BLOCK),
+                                           RAD_STR("act", "sigmoid"),
+                                           RAD_INT("split_rows", gq_bi_qd)),
+                                RAD_NOWEIGHTS);
+            if (op_attn_gq_bi) {
+                const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, w.qg };
+                const rad_buf wr[3] = { w.attn.x, w.attn.cq(), w.attn.cs() };
+                RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq_bi, rd, 4));
+                RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq_bi, wr, 3));
+            }
+        }
     }
 
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
@@ -547,15 +697,18 @@ inline void AttnGatedFP8::store_cache(RadCtx* c, const RadKVGroupBatch* kvb,
     /* A streamed group writes its host mirror, and the ring slot only where the block is resident
      * (docs/OPS.md "kv_store_streamed"). kv_store alone would treat a block id as a ring slot, so
      * a build without the streamed store fails the step. */
-    const bool staged = kv_stage_wait(c, kv, kvb, layer);
+    const int sv = kv_stage_wait_view(c, kv, kvb, layer);
+    const bool staged = sv != 0;
     const KVStreamLayer L = kv_stream_layer(c, kv, layer, kvb);
     if (!op_kv_stream || !L.host || L.blocks <= 0) {
         rad_step_fail(c, "kv streaming: this layer's KV group streams but the build has no "
                          "kv_store_streamed row to write its host mirror with");
         return;
     }
+    /* fn4 kvs_apart: on a stage funded beside the ring the streamed store writes the RING (resident blocks) and the
+     * mirror; the stage takes this step's tokens at identity below. Aliased (sv 1), the operand is the active view. */
     RAD_ISSUE(c, op_kv_stream,
-              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), sv == 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
               praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
     if (staged) store_stage_identity(c, slot, T);
 }
@@ -644,7 +797,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
      * token, so a pass with media tokens (differing components) takes the unfused path with the
      * full [3, T] positions. */
-    const bool fuse_ok = T <= fused_rows && !rope_mixed(batch);
+    const bool fuse_ok = T <= qk_fuse_now(fused_rows) && !rope_mixed(batch);   /* fn4 BI wide bit 8: the band now */
     /* A streamed group folds the streamed store into the prologue instead (op_fused_stream); one
      * whose layer has no mirror row leaves the store to store_cache, which fails the step. */
     const bool streamed = kvb && kvb->stream;
@@ -654,12 +807,13 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const bool folded_stream = L.host && L.blocks > 0;
     if (folded_stream) {
         /* The prologue is the store, so the stage copy must land before it (kv_stage_wait). */
-        const bool staged = kv_stage_wait(c, kv, kvb, layer);
+        const int sv = kv_stage_wait_view(c, kv, kvb, layer);
+        const bool staged = sv != 0;
         RAD_ISSUE_N(c, op_fused_stream, T,
                     brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
                     brows(w.q, T), brows(w.k, T), RAD_NONE,
-                    brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+                    brows(w.v, T), praw(slot, RAD_I32, T), sv == 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
                     praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
         if (staged) store_stage_identity(c, slot, T);
     } else if (fused_kv) {
@@ -721,6 +875,126 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
                          brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows);
     };
+    /* fn4 att_bi (12.11.2026, 193's trace: L03.att first-differing in 12 of 20 pf probes): the sparse / dense choice is the
+     * step's (reach = the longest sequence), so a short sequence beside a long one takes the sparse path where it alone takes
+     * the dense one. Under att_bi each sequence takes the path its alone step would: sparse (gated, per row, its rows only)
+     * when its own context passes qsa_exact_to or it has one row, else dense in a launch shaped as its alone step's, with
+     * the gate over its rows. Only when the step mixes both; a pipelined piece pass and a ring-bound pass keep today's. */
+    const int abf0 = fn4_attbi_flag().load(std::memory_order_relaxed);
+    /* fn4 kvs_bi bit 1: a streamed group's decode sequences in their alone (sparse, own-launch) form, ring or stage */
+    const bool kvs_alone = ring_addressed && (fn4_kvsbi_flag().load(std::memory_order_relaxed) & 1) != 0;
+    if (gated && abf0 > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
+        table && used && kvb && kvb->seqused_h && (!ring_bound || kvs_alone) && qsa_exact_to > 0 && op_attn && op_gq &&
+        !(pieces && pieces->cuts(T))) {
+        int64_t D = 0, DT = 0;
+        batch_split(batch, &D, &DT);
+        const int64_t qd = D > 0 ? DT / D : 0;
+        std::vector<int64_t> bq;
+        if ((D == 0 || DT == D * qd) && attbi_rows(batch, kvb, D, DT, T, bq)) {
+            const int64_t ns = batch->n_seq;
+            std::vector<int64_t> r0(ns), nr(ns);
+            std::vector<char> sp(ns);
+            int64_t at = 0;
+            for (int64_t s2 = 0; s2 < ns; ++s2) {
+                r0[s2] = at; nr[s2] = s2 < D ? qd : bq[(size_t)(s2 - D)]; at += nr[s2];
+                /* att_bi 4: the path of the sequence's alone step (its bound, fn4_attbi_sparse); 1..3 its exact context */
+                sp[s2] = fn4_attbi_sparse(abf0, (int64_t)kvb->seqused_h[s2], nr[s2], qsa_exact_to, g.max_ctx);
+                /* kvs_bi bit 1: alone, a streamed decode sequence is ring-bound, hence sparse at every context */
+                if (kvs_alone && s2 < D) sp[s2] = 1;
+            }
+            /* every sequence in launches of its own (12.11. x04c: long prompts): a sparse launch's split law reads its
+             * row count as the sequence count (r4d_decode_splits: units = kv_heads x rows), so a sequence's rows inside a
+             * wider launch split their 2048 selected keys otherwise than alone -- all-sparse steps too, not only mixed ones */
+            if (at == T) {
+                const int64_t qw = g.q_dim(), hd = g.head_dim, chunk = qsa_gq_rows();
+                const int64_t pitch = kvb->block_table_pitch;
+                /* att_bi 2: a run of sparse decode sequences in launches of up to kGqBiRows rows (whole sequences) */
+                const int abf = abf0;
+                const bool one = abf >= 2 && op_attn_gq_bi &&
+                                 qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows;
+                /* att_bi 3: a run of dense decode sequences in one op_attn_bi launch + one gate_quant (fn4_attbi_flag's note) */
+                /* no q_len x gqa bound: above 32 the law reads the block table's depth, the step's pitch, which the
+                 * per-sequence launches of att_bi 1 / 2 pass too (praw2(table + s2 * pitch, .., 1, pitch)) */
+                const bool oned = abf >= 3 && op_attn_bi && qd > 0 && qd <= 1 + g.max_spec;
+                for (int64_t s2 = 0; s2 < ns; ++s2) {
+                    const int64_t a0 = r0[s2], n = nr[s2];
+                    if (oned && s2 < D && !sp[s2]) {
+                        int64_t e2 = s2 + 1;
+                        while (e2 < D && !sp[e2]) ++e2;
+                        const int64_t k = e2 - s2, rows = k * qd;
+                        if (k > bi_seqs) {   /* fn4 KVCAP C2: the run fits the partials op_attn_bi was declared for */
+                            char why[320];
+                            snprintf(why, sizeof why,
+                                     "attention (gated fp8): fn4 KVCAP C2: a run of %lld dense decode sequences for the "
+                                     "batch-invariant decode attention (op_attn_bi), past the %lld its split-KV partials "
+                                     "are declared for (max_seqs)", (long long)k, (long long)bi_seqs);
+                            rad_step_fail(c, why);
+                            return;
+                        }
+                        RAD_ISSUE_N(c, op_attn_bi, qd,
+                                    brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
+                                    praw2(table + s2 * pitch, RAD_I32, k, pitch), praw(used + s2, RAD_I32, k),
+                                    RAD_NONE, RAD_NONE, RAD_NONE,
+                                    brow_slice(w.attn.x, a0, rows, qw));
+                        RAD_ISSUE_N(c, op_gq, rows * g.n_head,
+                                    bcol_at(w.qg, a0, g.n_head * 2 * hd, hd, hd, rows), brow_slice(w.attn.x, a0, rows, qw),
+                                    brow_slice(w.attn.cq(), a0, rows, qw), brow_slice(w.attn.cs(), a0, rows, fp8_blocks(qw)),
+                                    brow_slice(w.attn.x, a0, rows, qw));
+                        s2 = e2 - 1;
+                        continue;
+                    }
+                    if (one && s2 < D && sp[s2]) {
+                        int64_t e2 = s2 + 1;
+                        while (e2 < D && sp[e2] && (e2 - s2 + 1) * qd <= kGqBiRows) ++e2;
+                        const int64_t rows = (e2 - s2) * qd;
+                        resolve_sel(a0, rows);
+                        RAD_ISSUE_N(c, op_attn_gq_bi, 1,
+                                    brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
+                                    brow_slice(qsa_sel, a0, rows, qsa_topk + 1),
+                                    brow_slice(qsa_sequ, a0, rows, 1),
+                                    RAD_NONE, RAD_NONE, RAD_NONE,
+                                    brow_slice(w.attn.x, a0, rows, qw),
+                                    bcol_at(w.qg, a0, g.n_head * 2 * hd, hd, hd, rows),
+                                    brow_slice(w.attn.cq(), a0, rows, qw),
+                                    brow_slice(w.attn.cs(), a0, rows, fp8_blocks(qw)));
+                        s2 = e2 - 1;
+                        continue;
+                    }
+                    if (sp[s2]) {
+                        for (int64_t off = a0; off < a0 + n; off += chunk) {
+                            const int64_t rows = (a0 + n - off) < chunk ? (a0 + n - off) : chunk;
+                            resolve_sel(off, rows);
+                            RAD_ISSUE_N(c, op_attn_gq, 1,
+                                        brow_slice(w.q, off, rows, qw), kv_cache(kv, layer),
+                                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                                        brow_slice(qsa_sequ, off, rows, 1),
+                                        RAD_NONE, RAD_NONE, RAD_NONE,
+                                        brow_slice(w.attn.x, off, rows, qw),
+                                        bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
+                                        brow_slice(w.attn.cq(), off, rows, qw),
+                                        brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
+                        }
+                    } else {
+                        RAD_ISSUE_N(c, op_attn, n,
+                                    brow_slice(w.q, a0, n, qw), kv_cache(kv, layer),
+                                    praw2(table + s2 * pitch, RAD_I32, 1, pitch), praw(used + s2, RAD_I32, 1),
+                                    RAD_NONE, RAD_NONE, RAD_NONE,
+                                    brow_slice(w.attn.x, a0, n, qw));
+                        RAD_ISSUE_N(c, op_gq, n * g.n_head,
+                                    bcol_at(w.qg, a0, g.n_head * 2 * hd, hd, hd, n), brow_slice(w.attn.x, a0, n, qw),
+                                    brow_slice(w.attn.cq(), a0, n, qw), brow_slice(w.attn.cs(), a0, n, fp8_blocks(qw)),
+                                    brow_slice(w.attn.x, a0, n, qw));
+                    }
+                }
+                if (kvb->stream) kv_stage_next(c, kv, layer);
+                o.step(c, w.attn, w.h.x, T);
+                if (own_ar && op_ar && !ar_taken(g, T, ar_out, ar_out_take))
+                    RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
+                if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+                return;
+            }
+        }
+    }
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated
      * sparse path every query row is its own (q_len 1) and the gate rides in the merge, so the
      * attention and out projection can finish a piece's rows and hand off its reduction while the
@@ -811,7 +1085,27 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
         const int32_t qp = batch->max_q_len_prefill > 0 ? batch->max_q_len_prefill
                                                         : batch->max_q_len;
-        if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
+        std::vector<int64_t> bq;
+        if (fn4_attbi_flag().load(std::memory_order_relaxed) > 0 && batch->n_seq > 1 && D < batch->n_seq &&
+            table && used && batch->draft_pass == 0 && attbi_rows(batch, kvb, D, DT, T, bq)) {
+            const int64_t qw = g.q_dim();
+            if (D > 0)
+                RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode > 0 ? batch->max_q_len_decode : batch->max_q_len,
+                            brows(w.q, DT), kv_cache(kv, layer),
+                            praw2(table, RAD_I32, D, pitch), praw(used, RAD_I32, D),
+                            RAD_NONE, RAD_NONE, praw(batch->cu_seqlens, RAD_I32, D + 1),
+                            brows(w.attn.x, DT));
+            int64_t r0 = DT;
+            for (size_t j = 0; j < bq.size(); ++j) {
+                const int64_t s = D + (int64_t)j, n = bq[j];
+                RAD_ISSUE_N(c, op_attn, n,
+                            brow_slice(w.q, r0, n, qw), kv_cache(kv, layer),
+                            praw2(table + s * pitch, RAD_I32, 1, pitch), praw(used + s, RAD_I32, 1),
+                            RAD_NONE, RAD_NONE, RAD_NONE,
+                            brow_slice(w.attn.x, r0, n, qw));
+                r0 += n;
+            }
+        } else if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
             batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode) {
             const int64_t P = batch->n_seq - D;
             RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode,

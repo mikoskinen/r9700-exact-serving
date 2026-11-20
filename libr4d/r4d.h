@@ -471,7 +471,7 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
                                 long acq, long pub, long gate, long gate_ctr, long chain,
-                                long form = 0);   /* ds41-int13 XPUSH: form 3 = R4D_AR8_FORM_XPUSH (r4d_ar_shards.h) */
+                                long form = 0, long timeline = 0);   /* ds41-int13 / fn4 RSF XPUSH: form 3 = R4D_AR8_FORM_XPUSH (r4d_ar_shards.h); fn4 timeline */
 // The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
 // same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
 // and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.
@@ -482,7 +482,7 @@ void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, lo
                                       long slot_stride16, long inp, long out, long n_elem,
                                       long rank, long stream, long nblocks, long nthreads,
                                       long drain, long acq, long pub, long gate, long gate_ctr,
-                                      long chain);
+                                      long chain, long xpush = 0);   /* fn4 (the Qwen line): xpush */
 // moe_gather_all_reduce's two-shot form (four ranks, exact wire, bf16; r4d_ar_twoshot_Nrank_exact.hip):
 // the MoE gather (r4d_ar_gather_hc_write_4rank's gather operands, words and arithmetic) as the
 // plain two-shot's phase-1 source, then its reduce and assemble on the same instance (flags, seq,
@@ -526,6 +526,16 @@ void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long slot_stride_bytes, long inp, long out, long n_elem,
                               long dtype, long rank, long stream, long nblocks,
                               long nthreads, long drain, long acq, long pub);
+/* fn4 SP-hc (r4d_ar_sp_rows.hip; the ds41 line's tp8 loop P20 uses it too): the four-rank two-shot's halves over
+ * whole-row shards, in place on `buf` [n_rows][row]; `op` 0 the reduce-scatter (ti8, lossy), 1 the all-gather on the ti8
+ * wire, 2 the all-gather raw, 3 the reduce-scatter raw (the exact all-reduce's fold: fp32 over the ranks in ascending
+ * order, one rounding). */
+void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
+                          long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
+                          long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
+                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
+                          long xpush = 0,    /* fn4 RSF: the raw reduce-scatter's pushes interleaved over the peers */
+                          long tl = 0);      /* fn4 PF timeline (qwen/prefill): a block's stamps, R4D_AR_TL_WORDS a block */
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,
@@ -534,14 +544,6 @@ void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long nthreads, long drain, long acq, long pub, long gate,
                               long gate_ctr);
 void r4d_ar_ti8_dims(int* group, int* group_bytes);  // tiered-int8 wire only
-// tp8 loop P20 (r4d_ar_sp_rows.hip, from fn4 SP-hc): the four-rank two-shot's halves over whole-row shards, in place on
-// `buf` [n_rows][row]; `op` 0 the reduce-scatter (ti8, lossy), 1 the all-gather on the ti8 wire, 2 the all-gather raw, 3 the
-// reduce-scatter raw (the exact all-reduce's fold: fp32 over the ranks in ascending order, one rounding).
-void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
-                          long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
-                          long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
-                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
-                          long xpush = 0);   /* the raw reduce-scatter's pushes interleaved over the peers (XPUSH) */
 
 // ---- GEMM ----------------------------------------------------------------------------------
 // Skinny bf16 GEMM for M up to 64: C[M,N] = A[M,K] @ W[N,K]^T with 16x16x16 WMMA, so a 16-wide K
@@ -759,6 +761,46 @@ void r4d_hc_read_pin_prefill(int form);
 // the tiled up-mix's passes unpipelined). Bit-identical; r4d_selftest compares their bytes
 // and --perfhc times both.
 void r4d_hc_read_pin_decode(int form);
+// Test hook (fn4 F1a): 1 folds the split-K down product's reduce into its launch, 0 keeps the pair,
+// overriding RADIANCE_FN4_HC_FUSEDOWN. Bit-identical; r4d_selftest compares their bytes.
+void r4d_hc_read_fuse_down(int on);
+// Test hook (fn4 F1n): 1 computes the decode tiles' norm scales with hc_pf2_prep_kernel's scale
+// blocks (one wave per (row, stream)), 0 with hc_norm_scale_kernel, overriding
+// RADIANCE_FN4_HC_NORMWAVE. Bit-identical; r4d_selftest compares their bytes.
+void r4d_hc_read_norm_wave(int on);
+// Test hook (fn4 hcw): 1 takes hc_write's eight-wide form (hc_write_vec_kernel) where every 16-byte
+// access is aligned, N >= 2 from N rows, 0 the plain form, overriding RADIANCE_FN4_HC_WRITEVEC. Bit-identical;
+// r4d_selftest compares their bytes.
+void r4d_hc_write_vec(int on);
+// Test hook (fn4 hc_readv): faster hc_read forms with the same bytes, a mask -- 1 the decode tiles
+// (pipelined down product; the 32-row tile from 33 rows, split-K unchanged), 2 PF2's down product at
+// 32 rows a workgroup, 4 PF2's norm scales in the down product -- overriding RADIANCE_FN4_HC_READV. r4d_selftest compares their bytes.
+void r4d_hc_readv(int v);
+// Measurement hook: the PF2 launches that run (1 prologue, 2 down, 4 reduce, 8 up-mix, 16 codes);
+// anything but 31 leaves the outputs incomplete. r4d_selftest --perfhcv times cumulative masks.
+void r4d_hc_pf2_stages(int mask);
+// Test hook (fn4 hc_upmix): the up-mix's tile, same bytes -- value & 7 PF2's form (0 stock, 1-4 the
+// hc_up_mix_pf3_kernel variants), bit 3 the 33-64-row decode up-mix at the 64-row tile pipelined (with
+// hc_readv bit 0); overrides RADIANCE_FN4_HC_UPMIX. r4d_selftest compares their bytes.
+void r4d_hc_upmix(int v);
+// Test hook (fn4): frees this device's hc mix-counter slots (four streams a device, never freed
+// otherwise), so a test making a stream a case still runs the fused forms. Device idle only.
+void r4d_hc_mix_ctr_release(void);
+// fn4 ar_lanethreads: the threads a block of the four-rank tiered-int8 two-shot at `overlap` 1 (the
+// pipelined prefill's all-reduce lane) launches with -- 0 the resolved tunable, else 256 / 512 /
+// 1024 (RADIANCE_FN4_AR_LANE_THREADS at start). The sums do not depend on it. 1 applied, -1 refused.
+int r4d_ar_lane_threads_set(int threads);
+/* fn4 RSF: the four-rank exact two-shot's first hop and SP's raw reduce-scatter pushes interleaved over the peers (0 / 1) */
+int r4d_ar_xpush_set(int on);
+/* fn4 PFF (qwen/prefill): the four-rank prefill collectives' cache maintenance form 0..5 (r4d_ar_entry.hip ar_fence) */
+int r4d_ar_fence_set(int v);
+int r4d_kv_vic_set(int on);   /* fn4 kvs_vic: kv_resolve victims by compaction (1) or serially (0) */
+// fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
+// (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.
+int r4d_ar_lane_blocks_set(int blocks);
+// fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" / "hc_writevec" /
+// "hc_readv" / "ar_lanethreads" -> 1 applied, -1 refused, anything else 0.
+int rad_fn4_switch(const char* name, int value);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.

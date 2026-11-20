@@ -70,6 +70,23 @@ int acq_rule_mode() { return rad::fn4::aql_acq_rule(); }   /* fn4: the aql_acq s
 bool acq_rule_on() { return acq_rule_mode() != 0; }
 }  // namespace
 
+namespace {
+/* fn4 (13.11.2026, 227: the prefill comm lane's waves slow the compute beside them): RADIANCE_FN4_LANE_LOWPRIO=1 at start
+ * creates the second lane at the device's low queue priority (scheduling only; the same launches and bytes). */
+int lane1_prio() {
+    static const int p = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_LOWPRIO"); return e && *e && *e != '0' ? -1 : 0; }();
+    return p;
+}
+}  // namespace
+
+/* qfn-on-ds: the Qwen line's eager second lane (fn4 4f74a8fa, qwen/build2/STALL.md) is opt-in in the merged tree --
+ * RADIANCE_FN4_LANE_EAGER=1 at start (the Qwen line's env sets it; there it was on unless =0), so the DeepSeek line keeps
+ * its lazy build unless asked. */
+bool ctx_lane_eager() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_EAGER"); return e && *e && *e != '0'; }();
+    return on;
+}
+
 /* ================================================================== lifecycle */
 
 Ctx::Ctx() = default;
@@ -113,7 +130,21 @@ int Ctx::init(const CtxDesc& d) {
         own_stream_ = true;
     }
 
-    /* The second lane is created lazily; see lane_init(). */
+    /* The second lane's stream: built here, while the card still has the room the VRAM budget kept for it, where the
+     * program declares a second lane (its own scratch region, Program::scratch_regions); lane_init() adopts it at the
+     * first rad_lane(1). Built on first use instead (today's) where it is not declared or RADIANCE_FN4_LANE_EAGER=0.
+     * fn4 (15.11.2026, qwen/build2/STALL.md): built mid-run, on a card full to its headroom, the queue's VRAM came from
+     * the driver evicting this process's SVM buffers (kernel: svm_range_evict_svm_bo_worker / svm_range_restore_work),
+     * and the first prefill step that took lane 1 stalled 46-231 s on 6 of 7 starts. */
+    if (program_->scratch_regions > 1 && ctx_lane_eager()) {
+        const uint64_t t0 = rad_mono_ns();
+        RAD_TRY(rad_stream_create(&lane1_spare_, lane1_prio()));
+        for (int i = 0; i < 2; ++i)
+            if (!lane_ev_[i]) RAD_TRY(rad_event_create_local(&lane_ev_[i]));
+        if (rank_ == 0)
+            RAD_INFO("second lane: its stream built at start (%.1f ms on rank 0), adopted by the first step that takes "
+                     "lane 1 (RADIANCE_FN4_LANE_EAGER=0 builds it there instead)", (double)(rad_mono_ns() - t0) / 1e6);
+    }
 
     int s = prepare();
     if (s < 0) { shutdown(); return s; }
@@ -157,7 +188,13 @@ void Ctx::shutdown() {
         if (host_touch_ev_[i]) { rad_event_destroy(host_touch_ev_[i]); host_touch_ev_[i] = nullptr; }
         host_touch_pending_[i] = false;
     }
+    for (int i = 0; i < kLaneMarks; ++i) {   /* fn4 PF marks */
+        if (mark_ev_[i]) { rad_event_destroy(mark_ev_[i]); mark_ev_[i] = nullptr; }
+        mark_on_[i] = false;
+    }
     if (own_lane1_ && lane1_) rad_stream_destroy(lane1_);
+    if (lane1_spare_) rad_stream_destroy(lane1_spare_);   /* built at init, never taken: nothing was issued on it */
+    lane1_spare_ = nullptr;
     lane1_      = nullptr;
     own_lane1_  = false;
     lane_       = 0;
@@ -681,7 +718,12 @@ int Ctx::route_flush() {
     return RAD_OK;
 }
 
+/* fn4 F2b, RADIANCE_FN4_NO_ROUTE=1: no routing report at all -- no histogram copy (one ordered
+ * aql_copy16 dispatch a routed layer, ~4 us of the card idling before it at decode) and no host
+ * step between played stretches. For a placement whose experts never move (--placement all_vram):
+ * the reports feed only the heat engine, the mover and the file stager's trigger. Unset: as before. */
 int Ctx::route_report(int layer, const RadRouting* r) {
+    if (fn4::no_route()) return RAD_OK;   /* fn4 F2b (fn4_switch.h) */
     if (rec_ && r) {
         tape_cut();
         TapeStep st;
@@ -1007,7 +1049,18 @@ void Ctx::dump_profile() const {
 int Ctx::lane_init() {
     if (lane1_) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
-    RAD_TRY(rad_stream_create(&lane1_, 0));
+    if (lane1_spare_) {
+        /* Built at init (ctx_lane_eager): the same stream kind and priority, nothing issued on it yet. */
+        lane1_ = lane1_spare_;
+        lane1_spare_ = nullptr;
+    } else {
+        /* fn4 (15.11.2026, qwen/build2/STALL.md): timed, since a hardware queue built mid-run on a full card is where the
+         * first-use stall waited; said once a rank. */
+        const uint64_t t0 = rad_mono_ns();
+        RAD_TRY(rad_stream_create(&lane1_, lane1_prio()));
+        RAD_INFO("second lane: rank %d built its stream on first use in %.1f ms (RADIANCE_FN4_LANE_EAGER=0 or no "
+                 "second lane declared)", rank_, (double)(rad_mono_ns() - t0) / 1e6);
+    }
     own_lane1_ = true;
     /* Local scope: a lane join only orders this card's two queues. */
     for (int i = 0; i < 2; ++i)
@@ -1029,6 +1082,26 @@ int Ctx::set_lane(int lane) {
 }
 
 int Ctx::lane_join(int from, int to) {
+    /* fn4 PF marks (qwen/prefill; see ctx.h). Recording a mark changes no order; waiting on one orders `to` behind that
+     * point of the other lane only, so the caller names what it depends on. */
+    if (to >= 0x100 && to < 0x100 + kLaneMarks) {
+        if (from < 0 || from > 1) return RAD_E_INVAL;
+        const int k = to - 0x100;
+        if (!lane1_) { mark_on_[k] = false; return RAD_OK; }
+        if (!mark_ev_[k]) RAD_TRY(rad_event_create_local(&mark_ev_[k]));
+        RAD_TRY(rad_event_record(mark_ev_[k], from ? lane1_ : stream_));
+        mark_on_[k] = true;
+        mark_lane_[k] = from;
+        return RAD_OK;
+    }
+    if (from >= 0x200 && from < 0x200 + kLaneMarks) {
+        if (to < 0 || to > 1) return RAD_E_INVAL;
+        const int k = from - 0x200;
+        if (!lane1_) return RAD_OK;
+        if (!mark_on_[k] || mark_lane_[k] == to) return lane_join(to ^ 1, to);
+        mark_on_[k] = false;   /* one wait a recording */
+        return rad_event_wait(to ? lane1_ : stream_, mark_ev_[k]);
+    }
     if (from == to) return RAD_OK;
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     /* No lane 1 yet: nothing to order, and a later lane 1 starts behind lane 0 (lane_init). Every
@@ -1182,8 +1255,15 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     if (!t) {
         if (step_status_ >= 0) {
             tape_refused_.push_back(key);
-            RAD_WARN("rank %d: draft pass %d at %lld tokens is issued in full every step: %s",
-                     rank_, b->draft_pass, (long long)b->n_tok, rad_dev_last_error());
+            /* fn4 SDMA-AR: every prefill pass with a copy-engine collective stays untaped (rad_tape_refuse); said once */
+            const char* why = rad_dev_last_error();
+            static thread_local bool said_sdma = false;
+            const bool sdma = why && std::strstr(why, "fn4 SDMA");
+            if (!sdma || !said_sdma)
+                RAD_WARN("rank %d: draft pass %d at %lld tokens is issued in full every step: %s%s",
+                         rank_, b->draft_pass, (long long)b->n_tok, why,
+                         sdma ? " (later passes untaped for the same reason are not reported)" : "");
+            if (sdma) said_sdma = true;
         }
         return 0;
     }
@@ -1394,6 +1474,38 @@ int Ctx::haz_mark(PassTape& t) {
             const int32_t own = part_of[(size_t)i];
             /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it. */
             if (own < 0 || haz_ops_[(size_t)own].opaque || haz_ops_[(size_t)own].route_copy) {
+                aw->unknown = true;
+            } else {
+                const HazOp& h = haz_ops_[(size_t)own];
+                const LineSet rd = lines_of(h.rd, h.n_rd), wr = lines_of(h.wr, h.n_wr);
+                if (aw->unknown || ls_meet(rd, aw->risky)) {
+                    /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
+                     * it touch lines after the invalidation too. */
+                    aw->r = rd;
+                    aw->w = wr;
+                    if (ok)
+                        for (int32_t x : q->infl) {
+                            const HazOp& f = haz_ops_[(size_t)x];
+                            aw->r = ls_unite(aw->r, lines_of(f.rd, f.n_rd));
+                            aw->w = ls_unite(aw->w, lines_of(f.wr, f.n_wr));
+                        }
+                    aw->risky = acq_w ? aw->w : ls_inter(aw->r, aw->w);
+                    aw->unknown = false;
+                } else {
+                    const int sc = tape_set_noacq(t.dev, i, true);
+                    if (sc < 0) return sc;
+                    ++t.noacq;
+                    if (!ok) ++t.noacq_ordered;
+                    aw->risky = ls_unite(aw->risky, ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r)));
+                    aw->risky = ls_unite(aw->risky, acq_w ? wr : ls_inter(rd, wr));
+                    aw->r = ls_unite(aw->r, rd);
+                    aw->w = ls_unite(aw->w, wr);
+                }
+            }
+        }
+        if (aw) {
+            const int32_t own = part_of[(size_t)i];
+            if (own < 0 || haz_ops_[(size_t)own].opaque) {
                 aw->unknown = true;
             } else {
                 const HazOp& h = haz_ops_[(size_t)own];

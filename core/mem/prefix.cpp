@@ -306,13 +306,16 @@ std::vector<BlockHash> PrefixCache::chain_all(const std::vector<int32_t>& tokens
 
 /* A snapshot is on the chain when its key equals the chain hash at its position. */
 std::unordered_map<BlockHash, PrefixCache::Ckpt, BlockHashHash>::iterator
-PrefixCache::deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const {
+PrefixCache::deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit,
+                          const std::vector<int64_t>* at) const {
     auto best = ck_by_prefix_.end();
     for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
         const Ckpt& c = it->second;
         if (!c.valid || c.slot < 0 || c.pos <= 0 || c.pos > limit || c.pos % block_size_ != 0 ||
             c.pos / block_size_ > (int64_t)hs.size())
             continue;
+        /* fn4 resume_cold: only where this prompt's cold prefill starts a chunk (HitCap::resume_at) */
+        if (at && !std::binary_search(at->begin(), at->end(), c.pos)) continue;
         if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
         if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
         best = it;
@@ -357,7 +360,8 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     /* Back a full hit off by one entry so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
 
-    auto deepest = [&](int64_t limit) { return deepest_ckpt(hs, limit); };
+    const std::vector<int64_t>* at = cap ? cap->resume_at : nullptr;
+    auto deepest = [&](int64_t limit) { return deepest_ckpt(hs, limit, at); };
     /* Tokens a hit of `m` blocks lets a sequence skip: all of them, or with recurrent state only
      * up to the deepest checkpoint (Scheduler::admit_one resumes there). */
     auto reusable = [&](int64_t m) -> int64_t {
@@ -365,7 +369,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         const auto b = deepest(m * block_size_);
         return b == ck_by_prefix_.end() ? 0 : b->second.pos;
     };
-    if (cap && matched > cap->tokens / block_size_) {
+    if (cap && cap->tokens >= 0 && matched > cap->tokens / block_size_) {
         const int64_t whole = reusable(matched);
         if (whole > cap->tokens) {
             const int64_t m = cap->tokens > 0 ? cap->tokens / block_size_ : 0;

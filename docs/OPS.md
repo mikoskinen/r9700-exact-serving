@@ -204,8 +204,9 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
 | `mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: mhc_post, mhc_collapse over out, rmsnorm over xc; each rounded before the next reads it; out must not alias h) |
 | `mhc_post_collapse_rmsnorm_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`:inout, `comb`:inout → `out`; `pre` → `xc`; `w`w → `y`; `fn`w, `scale`w, `base`w → `pre_o` (device-only: mhc_post_collapse_rmsnorm, then mhc_mix over out writing pre_o, post and comb; hc 4, n a multiple of 1024) |
-| `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
-| `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
+| `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt `bi_dec`/opt `kc_rows`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`?; in `ss`? |
+| `hc_codes` | `M`(range) `n` `group`/opt `rotate`/opt `codes_i8`/opt | `x` → `q`, `scale`, `rq`?, `rscale`? |
+| `hc_write` | `M`(range) `n` `hc` `dtype` `eps`:f64/opt | `y`, `inj`, `h`:inout → `ss`? |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
@@ -411,6 +412,11 @@ is easy to miss.
   1.26 GB a step. The scales in the row's tail are libr4d's arrangement; the container holds codes
   and an f32 scale plane (a group of 128 for `mix_down`, a quarter row for `mix_up`), which a host
   kernel reads joined (Weights of several planes).
+- `ss` (fn4 test builds, libr4d only; optional on both ops, ignored elsewhere): `[M, 8]` f32, the
+  grouped norm's rsqrt per (row, stream) at `eps`. A write handed `ss` and `eps` stores the scales
+  of the stream it leaves; a read handed the same `ss` takes them instead of its own pass. An
+  architecture hands `ss` to a read only right after the write that filled it, with nothing
+  touching `h` in between. Under fn4's `hc_readv` bit 3, from 17 rows; same bits as the read's pass.
 
 **mHC** (manifold-constrained hyper-connections) keeps `hc` residual streams in one `[M, hc*n]`
 row and is a separate family from `hc_read`/`hc_write`. `mhc_pre` projects the whole row with the
@@ -472,6 +478,20 @@ of the scalar kernels that serve the rows it cannot read.
   `sin(d * inv[i])` over the first half and `cos(d * inv[i])` over the second,
   `inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's
   torch expressions are, then rounded.
+
+### `bi_rowhash` (debug, device-only)
+
+| op | params | operands |
+|---|---|---|
+| `bi_rowhash` | `M`(range) | `x` → `h` |
+| `bi_band` | `M`(range) `band` | `cu_seqlens` → `band` |
+
+A 64-bit fingerprint of each row's bytes as two i32: an order-free fold of the row's 16-bit units and
+their indices, so a function of the row's bytes alone, whatever the launch's grid. fn4 BI's engine
+tracer; qwen4exp declares it only under `RADIANCE_FN4_BITRACE`.
+
+`bi_band` (fn4 BI-dual) writes a step's row bands for the EXL3 down's v12 `band` operand: 1 for a row whose sequence
+has at most `band` rows in the step (`cu_seqlens`), 0 for the others and for rows past the last sequence.
 
 ### Gemma 4 fusions (device-only)
 
@@ -1320,7 +1340,7 @@ output) and beside its two `attn_output_a` groups under RADIANCE_DS41_GQ (lever 
 
 | op | params | operands |
 |---|---|---|
-| `attn_paged_gate_quant` | `q_len`(range) `head_dim` `gqa` `block_size` `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt:capacity `group` `act` | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `gate` → `q8`, `q8_scale` |
+| `attn_paged_gate_quant` | `q_len`(range) `head_dim` `gqa` `block_size` `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt:capacity `group` `act` `split_rows`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `gate` → `q8`, `q8_scale` |
 
 **`attn_paged_gate_quant`** (device-only) is `attn_paged` followed by `gate_quant_fp8` over its
 output, finished inside the split-KV merge. A merge row is one (token, head) pair of `head_dim`
@@ -2243,6 +2263,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `moe_scatter` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
+| `router_gemm_topk_scatter_inv` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse` |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `moe_gemm_ggml` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `type` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
@@ -2429,6 +2450,10 @@ own tile body, and the GEMM's last workgroup to finish runs the selection's row 
 sort. Every output is the bytes the separate launches write. Decode band only (`M <= 48`,
 `n_expert <= 384`, score `sqrtsoftplus`). DeepSeek-V4.1's lever FUSE-R issues it in place of its router's
 `gemm_nt_f32`, `router_scored_topk` and `moe_scatter` (two dispatches fewer a MoE layer).
+
+**`router_gemm_topk_scatter_inv`** (device-only) is `router_gemm_topk_scatter` whose sort also
+writes `inverse`, every slot's row in `sorted_tok` (-1 for a dropped slot), as `moe_scatter_inv`
+does, so a fused router can feed `moe_gather_inv`. An op of its own for the same reason.
 
 **`moe_scatter_inv`** and **`moe_gather_inv`** (device-only) are `moe_scatter` and `moe_gather`
 with the gather's slot table passed between them. `inverse` `[M * top_k]` holds, for slot

@@ -129,6 +129,37 @@ static const int64_t kMoeShexpLaneRows = 64;
  * issued first it runs at the routed down's start. The same ops over the same operands: the bytes do not move. */
 static const int kMoeSdfBit = 4;
 
+/* fn4 F2a as a runtime switch (the core's runtime/fn4_switch.h, through the architecture's
+ * rad_fn4_switch): -1 = not switchable (the declare-time choice stands), 0 / 1 = the plain or the
+ * inverse path, read at every issue of a block declared with `inv_switchable`. */
+inline std::atomic<int>& fn4_gather_inv_flag() {
+    static std::atomic<int> f{-1};
+    return f;
+}
+
+/* fn4 (10.11.2026) EXL3's shared routing map (exl3/exl3_abi.h v10) as a runtime switch: 1 = issue the layer's
+ * moe_exl3_gate_up and moe_exl3_down with the pass's `map` buffer (gate_up writes it, down reads it in place of its
+ * own map kernel), 0 = without (each op as at v8). The core switch "exl3_mapshare" reaches it through the
+ * architecture's rad_fn4_switch (qwen4exp_x3); RADIANCE_FN4_X3MAP=1 at start sets it on. Read at every issue. */
+/* fn4 E10 (10.11.2026): EXL3's decode chain as ONE op (interface v5 moe_exl3_gate_up_down) for passes of
+ * EXL3_GD_MIN_ROWS..16 tokens, 1 = issue it in place of the split gate_up / down, 0 = the split ops. The core switch
+ * "exl3_gd" reaches it through qwen4exp_x3's rad_fn4_switch; RADIANCE_FN4_X3GD=1 at start sets it on. Read at every
+ * issue. From 3 tokens up both forms are split-K 1, so the fused op's y is the split chain's bits (perfmoe GD-CHECK). */
+inline std::atomic<int>& fn4_exl3_gd_flag() {
+    static std::atomic<int> f{[] {
+        const char* e = std::getenv("RADIANCE_FN4_X3GD");
+        return e && *e && std::strcmp(e, "0") != 0 ? 1 : 0;
+    }()};
+    return f;
+}
+inline std::atomic<int>& fn4_exl3_map_flag() {
+    static std::atomic<int> f{[] {
+        const char* e = std::getenv("RADIANCE_FN4_X3MAP");
+        return e && *e && std::strcmp(e, "0") != 0 ? 1 : 0;
+    }()};
+    return f;
+}
+
 struct MoeFP8 {
     struct Config {
         /* Routed experts this rank owns. Equal to `n_expert_all` unless experts are split across
@@ -336,6 +367,12 @@ struct MoeFP8 {
          * same positions as the real program (Builder::set_reference; an unresolved op is in the list by name too), or
          * the level is refused. It is never issued there. */
         int     exl3_dk_probe = 0;
+        /* qfn-on-ds (20.11.2026): with expert_exl3, which line's EXL3 declare the layer takes. 0 = the DeepSeek line's
+         * (declare_exl3: ETP slices, lever P's dk pair, interface v9 `bi` / v10 `xring`; no protected experts, an even
+         * count), 1 = the Qwen Flash-Next line's (declare_exl3_q: protected bf16 experts by place in the sort, the v10
+         * shared routing map buffer, the E10 fused decode chain, the v12 band). Each line's exl3r4d serves its own form;
+         * the architecture that serves the Qwen model sets 1 after probe(). */
+        int     exl3_v12 = 0;
         /* The layer and global expert whose gate_up probe() read the format from (and so mapped);
          * declare() maps the rest. Layer -1: none. */
         int64_t probed_layer = -1;
@@ -466,7 +503,18 @@ struct MoeFP8 {
      * `router_fused_rows` tokens, plus the shared expert's gate (`op_sgate`) when
      * `router_fused_gate`. Otherwise, or for larger passes, the separate ops run. */
     rad_op  op_router_fused = 0;
+    bool    router_fused_inv = false;   /* fn4 F2a: op_router_fused is router_gemm_topk_scatter_inv */
+    /* fn4 F2a switchable (set before declare, with `w.inv`): both paths declared -- the plain ops
+     * above serve, and these inverse twins when fn4_gather_inv_flag() is 1 -- so the buffer plan is
+     * the same whichever runs. `inv_ok`: every twin the block needs resolved. */
+    bool    inv_switchable = false, inv_ok = false;
+    rad_op  op_scatter_inv2 = 0, op_gather_inv2 = 0, op_router_fused_inv2 = 0;
     int64_t router_fused_rows = 0;
+    /* fn4 BI wide bit 4 at start: router_fused_rows up to kBiWideRows (libr4d's sort capacity kScatterCap 2048 slots);
+     * router_fused_std the band today's declaration has (the pair's sort bound and the skinny GEMM's 64). The step takes
+     * the wide band while the switch's bit 4 is on (the fused op is the separate ops' bytes at any height). */
+    int64_t router_fused_std = 0;
+    int64_t router_fused_now() const { return router_fused_rows > router_fused_std && !fn4_biwide(4) ? router_fused_std : router_fused_rows; }
     bool    router_fused_gate = false;
     /* `router_sigmoid_topk_scatter` (Config::router_fuse), up to `sigmoid_scatter_rows` tokens,
      * writing the shared gate's fill too when `sigmoid_scatter_gate`. */
@@ -638,13 +686,29 @@ struct MoeFP8 {
     uint32_t    x3_cdt[2]   = { 0, 0 };
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
+    rad_buf     b_x3map = 0;    /* fn4 v10: the pass's shared routing map, i32 [exl3_map_words(rows * top_k, n_reg)] */
+    rad_op      op_x3gd = 0;    /* fn4 E10: moe_exl3_gate_up_down over the decode band, or 0 */
+    int64_t     x3gd_hi = 0;    /* ...its declared top (min(16, rows)) */
+    /* The DeepSeek line's EXL3 declare (Config::exl3_v12 0: ETP slices, lever P's dk pair, interface v9 `bi` / v10 `xring`)
+     * and the Qwen line's (exl3_v12 1: protected bf16 experts by place in the sort, the shared routing map, the fused decode
+     * chain). Kept as two functions so each line declares exactly what it declared before the merge (qfn-on-ds). */
     int declare_exl3(RadBuilder* b, Names& nm, int l);
-    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
+    int declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg);
+    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out,
+                    int64_t r0 = -1) const;
+    /* fn4 BI-dual (exl3 interface v12, 11.11.2026): the step's token bands for the EXL3 down's `band` operand, i32
+     * [>= T], or 0. While set (set_band), every EXL3 down this block issues passes its rows [r0, r0 + rows) of it: a
+     * row marked non-zero gets the M <= 16 band's down arithmetic (EPIC's paired tile sums) in an M > 16 launch, so a
+     * mixed step's decode rows get their decode-band bytes and its prefill rows their prefill-band bytes in one pass.
+     * 0 (the default): the operand is not passed (a v10 plugin's schema serves it). The architecture owns the buffer
+     * (PERSIST, written each step by libr4d's bi_band) and the switch (exl3_dual). */
+    mutable rad_buf x3band = 0;
+    void set_band(rad_buf b) const { x3band = b; }
     /* Per projection (gate_up, down), the GGUF type and its block along K of this layer's experts
      * under expert_ggml. */
     const char* ggml_ty[2] = { nullptr, nullptr };
     int64_t     ggml_blk[2] = { 0, 0 };
-    /* bf16 and GGUF-block experts both read the bf16 activation, whole on their rank. */
+    /* bf16, GGUF-block and EXL3 experts all read the bf16 activation, whole on their rank. */
     bool act_bf16() const { return c.expert_bf16 || c.expert_ggml || c.expert_exl3; }
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -670,10 +734,15 @@ struct MoeFP8 {
     void step_rows(RadCtx* c, int64_t T, const Beside* beside = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
      * all-reduce itself (issue_ar), as GdnFP8::step describes. `dk` (lever P; only where dk_takes(rows)): the routed
-     * EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk, the decode band's bytes per row. */
+     * EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk, the decode band's bytes per row. `routed` (fn4
+     * SP-route, the Qwen line): the caller already issued the router GEMM (route_rows) and gathered the logits. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
               const Beside* beside = nullptr, bool dk = false, bool projected = false,
-              bool piece = false) const;
+              bool piece = false, bool routed = false) const;
+    /* The Qwen line's call form pass(c, T, r0, rows, own_ar, routed) (fn4 SP-route). */
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar, bool routed) const {
+        pass(c, T, r0, rows, own_ar, nullptr, false, false, false, routed);
+    }
     /* `projected` true (deepseek41's RADIANCE_DS41_PIPE2): the caller already issued the sigmoid
      * router's projection of these rows into the logits (route_part + route_gather), so the pass
      * starts at the selection -- the same ops on the same operands as pass() issues them. `piece`
@@ -688,6 +757,27 @@ struct MoeFP8 {
     void route_gather(RadCtx* c_, int64_t r0, int64_t rows) const {
         glm_router.project_gather(c_, rows, r0);
     }
+    /* fn4 SP-route (16.11.2026, qwen/prefill; switch sp_route): the router GEMM alone over rows [r0, r0 + rows) of a pass of
+     * `pass_rows` rows -- an SP-hc piece's quarter on its rank, before the piece's all-gather -- where pass() at that height
+     * issues the separate router (no fused router, no sigmoid form, an external norm, no expert prefetch); the caller then
+     * gathers the logits rows to every rank (raw) and calls pass(..., routed = true), which skips the GEMM and runs the
+     * top-k and everything after it over the whole piece. A row's logits do not depend on the launch's other rows
+     * (gemm_bf16_nt_tiled: the same WMMA chain and split count at every M, BYTE-IDENTICAL to the skinny row), so the
+     * gathered rows are the bytes today's whole-piece GEMM writes. False when the form does not apply. */
+    bool route_rows(RadCtx* c, int64_t pass_rows, int64_t r0, int64_t rows) const;
+    rad_buf logits_buf() const { return w.logits; }
+    /* fn4 P2x (10.11.2026; ported from fn4-c16 3b88be82 with the EXL3 and protected-expert forms): the routed experts
+     * of a pipelined step's pieces [0, R) and [R, T) in ONE pass (every touched expert read and decoded once for both),
+     * the rest a piece at a time as pass() issues it. pair_routed: per piece the router and the top-k (pass()'s forms
+     * at a piece's rows), then over [0, T) the scatter, the expert GEMMs (EXL3: gate_up -> b_x3h -> down; the protected
+     * bf16 experts after them) and the quantiser between them; with `shared_in` each piece's shared arm interleaved
+     * there as pass() interleaves it. pair_finish: a piece's shared arm (`shared_here`) and its gather, which reads the
+     * joint pass's slots through the inverse table. A sorted row's GEMM output does not depend on the pass's other
+     * rows (162, 10.11.: 4096 vs 2048 rows byte-identical, libr4d and exl3r4d incl. EP4). The caller issues the
+     * all-reduces. */
+    bool pair_ok(int64_t T, int64_t R) const;
+    void pair_routed(RadCtx* c, int64_t T, int64_t R, bool shared_in) const;
+    void pair_finish(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool shared_here) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -1055,8 +1145,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             return RAD_E_INVAL;
         }
         /* The quantised GEMM takes two equal tables by parity; with four classes
-         * (Config::ff_lo4), four tables with the first n_reg % 4 one longer, so any count works. */
-        if (!(c.ff_hi[0] > 0 && c.ff_hi4[0] > 0) && n_reg % 2) {
+         * (Config::ff_lo4), four tables with the first n_reg % 4 one longer, so any count works.
+         * EXL3's ops take any count too: class c holds ceil((n - c) / 2) entries
+         * (exl3_class_entries), and declare_exl3 splits its tables so -- an odd count is what a
+         * rank gets at expert parallel four when one of its 128 experts is kept plain bf16. */
+        if (!c.expert_exl3 && !(c.ff_hi[0] > 0 && c.ff_hi4[0] > 0) && n_reg % 2) {
             fprintf(stderr, "radiance: layer %d keeps %zu experts plain bf16 on this rank, which "
                             "leaves %lld quantised; they come in pairs on a rank so the rest split "
                             "into two equal tables by parity\n", l, prot.size(), (long long)n_reg);
@@ -1128,7 +1221,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                 RAD_STR("protect", prot_list) };
         /* With `w.inv` the sort also writes the gather's slot table. It writes everything
          * moe_scatter does, so a moe_gather_inv that does not resolve leaves moe_gather to serve. */
-        if (w.inv && rad_op_declared(b, "moe_scatter_inv") && rad_op_declared(b, "moe_gather_inv"))
+        const bool inv_decl = w.inv && rad_op_declared(b, "moe_scatter_inv") &&
+                              rad_op_declared(b, "moe_gather_inv");
+        if (inv_decl && inv_switchable && !c.sigmoid_router)   /* fn4: the twin; the plain sort serves */
+            op_scatter_inv2 = rw(b, rad_decl_op(b, "moe_scatter_inv", ps, 4 + n_prot, RAD_NOWEIGHTS),
+                                 {w.ids}, {w.sorted, w.eoff, w.ecnt, w.inv});
+        else if (inv_decl)
             op_scatter = rw(b, rad_decl_op(b, "moe_scatter_inv", ps, 4 + n_prot, RAD_NOWEIGHTS),
                             {w.ids}, {w.sorted, w.eoff, w.ecnt, w.inv});
         scatter_inv = op_scatter != 0;
@@ -1148,7 +1246,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * depend on it. The sigmoid router selects in its own op and takes no fused pair. */
     topk_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows ? c.rows
                                                                    : kMoeSortRows / c.top_k;
-    if (c.sigmoid_router || scatter_inv) topk_scatter_rows = 0;
+    /* fn4 F2a: with the inverse, the fused router can still serve -- router_gemm_topk_scatter_inv
+     * writes it -- so the rows stay (the plain topk + scatter pair is then not issued, below). */
+    const bool inv_router = scatter_inv && !c.sigmoid_router &&
+                            rad_op_declared(b, "router_gemm_topk_scatter_inv");
+    if (c.sigmoid_router || (scatter_inv && !inv_router)) topk_scatter_rows = 0;
     /* Asked for only where a loaded library declares it: a CPU-only engine would refuse the
      * declare, and the two separate ops serve without it. */
     if (topk_scatter_rows > 0 && rad_op_declared(b, "router_topk_scatter")) {
@@ -1297,7 +1399,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     };
     const bool rot = c.expert_rot != 0;
     if (c.expert_exl3) {
-        RAD_ARCH_TRY(declare_exl3(b, nm, l));
+        RAD_ARCH_TRY(c.exl3_v12 ? declare_exl3_q(b, nm, l, reg) : declare_exl3(b, nm, l));
     } else if (act_bf16() && !c.expert_iqr) {
         /* ---- Plain bf16 experts: one table per projection of whole experts in expert order
          * (`moe_gemm`, expert e at entry e), so the two loops must not be merged. Each expert is
@@ -1862,6 +1964,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rad_op_writes(b, op_gather, gwr, 1);
     }
     if (!op_gather) return RAD_E_INVAL;
+    if (op_scatter_inv2) {   /* fn4: the inverse gather's twin */
+        rad_buf grd[5] = { w.edn, w.ew, w.inv, w.sout, w.sgate };
+        rad_buf gwr[1] = { separate_fp32_combine ? w.moe : w.h.x };
+        op_gather_inv2 = RAD_OP(b, "moe_gather_inv",
+                                RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                           RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
+                                           RAD_STR("act", gfold && !c.shared_ungated ? "sigmoid" : "none")),
+                                RAD_NOWEIGHTS);
+        if (op_gather_inv2) {
+            rad_op_reads (b, op_gather_inv2, grd, gfold ? 5 : 3);
+            rad_op_writes(b, op_gather_inv2, gwr, 1);
+        }
+    }
 
     /* ---- the shared expert. Ordinary dense linears over the same normed input. */
     if (shared) {
@@ -2041,9 +2156,15 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      *
      * The parameter list, weights and write set are conditional, so each is an array cut to
      * length. */
-    if (op_topk_scatter && !c.shared_ungated && rad_op_declared(b, "router_gemm_topk_scatter")) {
+    if (op_topk_scatter && !c.shared_ungated &&
+        rad_op_declared(b, inv_router ? "router_gemm_topk_scatter_inv" : "router_gemm_topk_scatter")) {
         router_fused_rows = topk_scatter_rows < kMoeRouterFusedRows ? topk_scatter_rows
                                                                     : kMoeRouterFusedRows;
+        router_fused_std = router_fused_rows;
+        if (fn4_biwide_start() & 4) {   /* fn4 BI wide: to kBiWideRows, within libr4d's sort capacity (2048 slots) */
+            const int64_t wr = std::min<int64_t>(std::min<int64_t>(kBiWideRows, c.rows), 2048 / c.top_k);
+            if (wr > router_fused_rows) router_fused_rows = wr;
+        }
         const bool gate = op_sgate != 0;
         if (gate && !sgate_concurrent) {
             fprintf(stderr, "radiance: layer %d: the fused router writes the shared gate ahead of "
@@ -2060,15 +2181,36 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         };
         const int n_fp = (int)(sizeof(fp) / sizeof(fp[0])) - (prot_list ? 0 : 1);
         const rad_weight fw[2] = { w_router, w_sgate };
-        op_router_fused = rad_decl_op(b, "router_gemm_topk_scatter", fp, n_fp, fw, gate ? 2 : 1);
+        op_router_fused = rad_decl_op(b, inv_router ? "router_gemm_topk_scatter_inv"
+                                                    : "router_gemm_topk_scatter",
+                                      fp, n_fp, fw, gate ? 2 : 1);
         if (op_router_fused) {
             const rad_buf rd[1] = { w.h.x };
-            const rad_buf wr[7] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt, w.sgate };
+            rad_buf wr[8] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+            int n_wr = 6;
+            if (gate) wr[n_wr++] = w.sgate;
+            if (inv_router) wr[n_wr++] = w.inv;
             rad_op_reads (b, op_router_fused, rd, 1);
-            rad_op_writes(b, op_router_fused, wr, gate ? 7 : 6);
+            rad_op_writes(b, op_router_fused, wr, n_wr);
         }
+        router_fused_inv = op_router_fused && inv_router;
         router_fused_gate = op_router_fused && gate;
+        /* fn4: the inverse fused router's twin, same rows, parameters, weights and writes plus `inv` */
+        if (op_router_fused && op_scatter_inv2 && rad_op_declared(b, "router_gemm_topk_scatter_inv")) {
+            op_router_fused_inv2 = rad_decl_op(b, "router_gemm_topk_scatter_inv", fp, n_fp, fw,
+                                               gate ? 2 : 1);
+            if (op_router_fused_inv2) {
+                const rad_buf rd[1] = { w.h.x };
+                rad_buf wr[8] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+                int n_wr = 6;
+                if (gate) wr[n_wr++] = w.sgate;
+                wr[n_wr++] = w.inv;
+                rad_op_reads (b, op_router_fused_inv2, rd, 1);
+                rad_op_writes(b, op_router_fused_inv2, wr, n_wr);
+            }
+        }
     }
+    inv_ok = op_scatter_inv2 && op_gather_inv2 && (!op_router_fused || op_router_fused_inv2);
 
     /* GLM's selection and the sort as one op, plus the ungated shared arm's gate fill. Declared
      * here for the reason the fused router above is: it writes `w.sgate` ahead of `op_sgate`'s
@@ -2438,26 +2580,170 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     return RAD_OK;
 }
 
+/* ---- EXL3 experts (expert_exl3): the radiance-exl3 extension's whole-expert ops over this rank's experts.
+ *
+ * Every expert is whole on its rank (expert parallel, or one rank), so the ops run at their "tp1" geometry:
+ * gate_up [2 n_ff, n_embd] and down [n_embd, n_ff] for every expert, in two parity tables (expert e at entry
+ * e / 2 of class e % 2), as the extension's own architecture issues them at one rank. One run a plane --
+ * gate_up's codes, suh, suh.1, svh; down's codes, suh, svh -- each declared as the even experts then the odd
+ * ones, so a (plane, class) table is RAD_WTAB(run[0], (ne + 1) / 2) for class 0 and RAD_WTAB(run[(ne + 1) / 2], ne / 2)
+ * for class 1 (an odd count -- expert parallel four with one expert kept bf16 -- makes class 0 the longer). gate_up reads the bf16 normed input
+ * (one row per token), writes f16 h already rotated for down (h_rot 1, with down's suh run as its dn_suh
+ * table), applies silu(gate) * up with the model's swiglu_limit (interface v8 `limit`); down reads h in the
+ * scatter's order and writes the bf16 `edn` rows the gather sums. The prefill stager keys a layer on its first
+ * declared expert op: gate_up, declared first. */
+inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg) {
+    /* The EXL3 tables hold the layer's EXL3 experts by place in the sort (`reg`): with experts kept plain bf16
+     * (`prot`, sorted last), those take the protected GEMM pair below declare() as for any other format, over the
+     * trailing offsets, and the EXL3 ops see n_reg experts. */
+    const int64_t ne = (int64_t)reg.size();
+    const bool ep = c.n_expert != c.n_expert_all;
+    if (c.ff_hi[0] > 0 || c.ff_hi4[0] > 0 || (!ep && g.world > 1)) {
+        fprintf(stderr, "radiance: layer %d's EXL3 experts are served whole on their rank (expert parallel, or "
+                        "one rank); this configuration slices every expert\n", l);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (c.calib || c.expert_rot || c.expert_w4) {
+        fprintf(stderr, "radiance: layer %d: EXL3 experts take no calibration tap or rotated/four-bit form\n", l);
+        return RAD_E_UNSUPPORTED;
+    }
+    /* Two parity tables, class 0 (even places) the longer by one when the count is odd: the
+     * extension sizes class c at ceil((ne - c) / 2) entries (exl3_class_entries) and reads expert e
+     * at entry e / 2 of class e % 2. `run` holds the even places, then the odd ones. */
+    if (ne < 1) {
+        fprintf(stderr, "radiance: layer %d holds no EXL3 expert on this rank\n", l);
+        return RAD_E_INVAL;
+    }
+    if (!x3_dtype[0] || !x3_dtype[1] || std::strcmp(x3_cb[0], x3_cb[1]) != 0) {
+        fprintf(stderr, "radiance: layer %d's EXL3 experts: encodings unknown (no model behind the builder) or "
+                        "gate_up and down in different codebooks\n", l);
+        return RAD_E_DTYPE;
+    }
+    if (g.n_embd % EXL3_HAD || c.n_ff_exp % EXL3_HAD || (2 * c.n_ff_exp) % 256) return RAD_E_SHAPE;
+    const int64_t n0 = (ne + 1) / 2, D = g.n_embd, F = c.n_ff_exp;   /* class 0's entries; class 1 has ne / 2 */
+    static const char* const gu_role[4] = { "codes", "suh", "suh.1", "svh" };
+    static const char* const dn_role[3] = { "codes", "suh", "svh" };
+    for (int proj = 0; proj < 2; ++proj) {
+        const int np = proj == 0 ? 4 : 3;
+        const char* stem = proj == 0 ? "ffn_gate_up_exps" : "ffn_down_exps";
+        const int64_t R = proj == 0 ? 2 * F : D, C = proj == 0 ? D : F;
+        for (int p = 0; p < np; ++p) {
+            const char* role = proj == 0 ? gu_role[p] : dn_role[p];
+            const bool codes = p == 0, per_row = std::strcmp(role, "svh") == 0, per_col = !codes && !per_row;
+            const int64_t rows = per_col ? 1 : R;
+            const int64_t cols = per_row ? 1 : codes ? C / x3_cpe[proj] : C;
+            std::vector<rad_weight>& run = proj == 0 ? x3_gu[p] : x3_dn[p];
+            run.clear();
+            run.reserve((size_t)ne);
+            for (int q = 0; q < 2; ++q)
+                for (int64_t i = q; i < ne; i += 2) {
+                    const int64_t e = reg[(size_t)i];   /* place i in the sort; its unit is the place's slot */
+                    const long long ge = (long long)(c.expert_base + e);
+                    const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
+                    const rad_weight h =
+                        decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
+                                  codes ? nullptr : weight, role, codes ? x3_cdt[proj] : (uint32_t)RAD_F16,
+                                  {rows, cols}, RAD_ACCESS_CONDITIONAL, RAD_SHARD_NONE,
+                                  grp_expert_slot(l, (int)i, proj));
+                    if (!h) return RAD_E_INVAL;
+                    run.push_back(h);
+                }
+        }
+    }
+    b_x3h = decl_b(b, nm.f("blk.%d.moe_exl3_h", l), RAD_F16, {c.rows * c.top_k, F});
+    /* fn4 v10: declared whatever the switch says, so it can flip between steps; gate_up writes it, down reads it, and
+     * nothing between them does (the shared expert's ops have their own buffers). */
+    b_x3map = decl_b(b, nm.f("blk.%d.moe_exl3_map", l), RAD_I32, {exl3_map_words(c.rows * c.top_k, ne)});
+    /* the weights in each op's table-operand order: class 0's tables, then class 1's */
+    std::vector<rad_weight> tab;
+    const auto tables = [&](bool gate_up) {
+        tab.clear();
+        for (int q = 0; q < 2; ++q)
+            for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
+                const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
+                for (int64_t i = 0, b0 = q ? n0 : 0, n = q ? ne / 2 : n0; i < n; ++i)
+                    tab.push_back(run[(size_t)(b0 + i)]);
+            }
+    };
+    tables(true);
+    std::vector<RadParam> gp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * F), RAD_INT("K", D),
+                                 RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                 RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
+                                 RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
+                                 RAD_INT("a_rot", 0) };
+    if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
+    op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
+               {w.h.x, w.sorted, w.eoff}, {b_x3h, b_x3map});
+    tables(false);
+    std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", F),
+                                 RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                 RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
+                                 RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
+    op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
+               {b_x3h, w.sorted, w.eoff, b_x3map}, {w.edn});
+    if (!op_gu || !op_dn) return RAD_E_INVAL;
+    /* fn4 E10: the decode chain as one op over EXL3_GD_MIN_ROWS..16 tokens, when a row serves it, both projections
+     * share a dtype and there is no swiglu limit (the fused op takes none). Its tables: each class's gate_up five, then
+     * down's codes and svh (exl3_positions(EXL3_GU_DN)). */
+    x3gd_hi = c.rows < 16 ? c.rows : 16;
+    if (x3gd_hi >= EXL3_GD_MIN_ROWS && rad_op_declared(b, EXL3_OP_GU_DN) && std::strcmp(x3_dtype[0], x3_dtype[1]) == 0 &&
+        !(c.swiglu_limit > 0)) {
+        tab.clear();
+        for (int q = 0; q < 2; ++q)
+            for (int t = 0; t < 7; ++t) {
+                const std::vector<rad_weight>& run = t < 4 ? x3_gu[t] : t == 4 ? x3_dn[1] : t == 5 ? x3_dn[0] : x3_dn[2];
+                for (int64_t i = 0, b0 = q ? n0 : 0, n = q ? ne / 2 : n0; i < n; ++i) tab.push_back(run[(size_t)(b0 + i)]);
+            }
+        std::vector<RadParam> gdp = { RAD_RANGE("M", EXL3_GD_MIN_ROWS, x3gd_hi), RAD_INT("N", 2 * F), RAD_INT("K", D),
+                                      RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                      RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
+                                      RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D) };
+        op_x3gd = rw(b, rad_decl_op(b, EXL3_OP_GU_DN, gdp.data(), (int)gdp.size(), tab.data(), (int)tab.size()),
+                     {w.h.x, w.sorted, w.eoff}, {w.edn});
+    }
+    if (!op_x3gd) x3gd_hi = 0;
+    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank (%zu more kept plain bf16), swiglu "
+                "limit %g", l, x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, prot.size(), c.swiglu_limit);
+    return RAD_OK;
+}
+
 /* One EXL3 op over this rank's tables, each operand where exl3_positions() puts it. */
 inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in,
-                               RadOperand out) const {
+                               RadOperand out, int64_t r0) const {
     const Exl3Positions& at = *exl3_positions(op);
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
-    const bool gate_up = op == EXL3_GATE_UP;
-    const int64_t ne = c.n_expert, half = ne / 2, k = c.top_k;
-    RadOperand opd[16];
+    static const int slot_gd[7] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH, EXL3_P_DN_CODES,
+                                    EXL3_P_DN_SVH };
+    const bool gate_up = op == EXL3_GATE_UP, gd = op == EXL3_GU_DN;
+    const int64_t ne = n_reg, n0 = (ne + 1) / 2, k = c.top_k;   /* the EXL3 experts (protected ones after them) */
+    RadOperand opd[24];
     for (RadOperand& o : opd) o = RAD_NONE;
     opd[at.x] = in;
     opd[at.sorted] = brows(w.sorted, rows * k);
     opd[at.offset] = brows(w.eoff, ne + 1);
     opd[at.y] = out;
+    if (at.map >= 0 && b_x3map && fn4_exl3_map_flag().load(std::memory_order_relaxed))   /* fn4 v10 */
+        opd[at.map] = brows(b_x3map, exl3_map_words(rows * k, ne));
     for (int q = 0; q < 2; ++q)
-        for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
-            const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
-            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
+        for (int t = 0; t < (gd ? 7 : gate_up ? 5 : 3); ++t) {
+            const std::vector<rad_weight>& run = gd ? (t < 4 ? x3_gu[t] : t == 4 ? x3_dn[1] : t == 5 ? x3_dn[0] : x3_dn[2])
+                                               : gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
+            /* class 0: the even places (n0 entries), class 1: the odd ones after them (ne / 2) */
+            opd[at.plane[q][gd ? slot_gd[t] : gate_up ? slot_gu[t] : slot_dn[t]]] =
+                RAD_WTAB(run[(size_t)(q ? n0 : 0)], q ? ne / 2 : n0);
         }
-    rad_issue(c_, op_h, opd, at.n_opd, rows);
+    /* fn4 BI-dual (v12): the pass's rows of the step's bands, or the operand left off (the trailing optional) */
+    int n_opd = at.n_opd;
+    if (at.band >= 0) {
+        if (x3band && r0 >= 0) opd[at.band] = brow_slice(x3band, r0, rows, 1);
+        else n_opd = at.band;
+    }
+    /* qfn-on-ds: a block declared in the DeepSeek line's form (Config::exl3_v12 0) never declares the shared map, and its
+     * exl3r4d exports the pre-v10 operand lists (gate_up 14, down 10, down_mod4 16): the trailing map / band slots are left
+     * off, which is exactly the operand list that line issued before the merge. */
+    if (!b_x3map && at.map >= 0 && n_opd > at.map) n_opd = at.map;
+    rad_issue(c_, op_h, opd, n_opd, rows);
 }
 
 /* The shared arm's first stage: its one-column gate and its gate_up over the normed input. Its
@@ -2486,8 +2772,28 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
+inline bool MoeFP8::route_rows(RadCtx* c_, int64_t pass_rows, int64_t r0, int64_t rows) const {
+    /* fn4 SP-route: why a call refuses, printed once a reason (rank 0) */
+    const char* why = !op_router ? "no separate router op" : c.sigmoid_router ? "sigmoid router" : rows <= 0 ? "no rows"
+                    : !ext_in ? "the block norms its own input" : (op_sigmoid_scatter && pass_rows <= sigmoid_scatter_rows) ? "fused sigmoid scatter"
+                    : (op_router_fused && pass_rows <= router_fused_now()) ? "fused router at this height"
+                    : (xp_next && xp_next->xp.n_parts > 0) ? "expert prefetch reads the router input" : nullptr;
+    static std::atomic<int> said{0};
+    if (why) {
+        if (g.rank == 0 && !(said.fetch_or(1) & 1))
+            fprintf(stderr, "radiance: fn4 SP-route: not taken (layer %d, %lld rows): %s\n", layer, (long long)pass_rows, why);
+        return false;
+    }
+    if (g.rank == 0 && !(said.fetch_or(2) & 2))
+        fprintf(stderr, "radiance: fn4 SP-route: taken (layer %d, a pass of %lld rows, this rank's rows %lld..%lld)\n", layer,
+                (long long)pass_rows, (long long)r0, (long long)(r0 + rows));
+    RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
+                brow_slice(w.logits, r0, rows, c.n_expert_all));
+    return true;
+}
+
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
-                          const Beside* beside, bool dk, bool projected, bool piece) const {
+                          const Beside* beside, bool dk, bool projected, bool piece, bool routed) const {
     /* lever P: the decode-band-bytes ops only where they are declared for this many rows */
     const bool xdk = dk && c.expert_exl3 && dk_takes(rows);
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
@@ -2499,7 +2805,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* rows with the second correction bias this step (Vl): the separate router ops, so the picks can be fixed before
      * the sort */
     const bool vlp = vl.select && vl_n > 0 && vl_rows && c.sigmoid_router;
-    const bool rfused = op_router_fused && rows <= router_fused_rows;
+    const bool rfused = op_router_fused && rows <= router_fused_now();   /* fn4 BI wide bit 4: up to 128 rows */
     const bool sfused = !vlp && op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     /* lever FUSE-R (rfuse_live): 2 = the projection, the selection and the sort in one launch where the pass fits it (and
      * the projection is not column-split), else 1 = the selection and the sort in one; the separate ops otherwise */
@@ -2563,6 +2869,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * weights. The declared buffer is stable across record and replay, and route_report hands
      * the same buffer on, so the stager's stream-ordered read sees this pass's counts. */
     const RadOperand ecnt = brows(w.ecnt, ne);
+    /* fn4 F2a switchable: the inverse twins this issue (all of them, or none) */
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
     if (rgsf) {
         RAD_ISSUE_N(c_, op_rgs_fused, rows, brow_slice(glm_router.w.input, r0, rows, glm_router.g.n_embd),
                     RAD_W(glm_router.projection), RAD_W(glm_router.correction),
@@ -2589,20 +2897,28 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     } else if (c.sigmoid_router) {
         if (projected) glm_router.select(c_, rows, r0);
         else           glm_router.step(c_, r0, rows, r0);
-    } else if (rfused)
+    } else if (rfused && (router_fused_inv || inv_now))
+        RAD_ISSUE_N(c_, inv_now ? op_router_fused_inv2 : op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                    RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
+                    brow_slice(w.logits, r0, rows, ne_all),
+                    brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                    router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brows(w.inv, rows * k));
+    else if (rfused)
         RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
                     brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
                     router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE);
-    else
+    else if (!routed)   /* fn4 SP-route: the caller issued the GEMM on every rank's quarter and gathered the logits */
         RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                     brow_slice(w.logits, r0, rows, ne_all));
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
     if (rfused || sfused || rgsf || rsf) {
         /* the fused router wrote all five */
-    } else if (op_topk_scatter && rows <= topk_scatter_rows) {
+    } else if (op_topk_scatter && rows <= topk_scatter_rows && !scatter_inv && !inv_now) {   /* fn4: it writes no inverse */
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
@@ -2611,8 +2927,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k));
         if (vlp) vl_fix(c_, T, r0, rows);
-        if (scatter_inv)
-            RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
+        if (scatter_inv || inv_now)
+            RAD_ISSUE_N(c_, inv_now ? op_scatter_inv2 : op_scatter, rows, brow_slice(w.ids, r0, rows, k),
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
                         brows(w.inv, rows * k));
         else
@@ -2647,7 +2963,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_aq, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
-    if (c.expert_exl3)
+    /* fn4 E10: the decode band's fused chain, in place of the split gate_up here and down below */
+    const bool x3gd = c.expert_exl3 && op_x3gd && rows >= EXL3_GD_MIN_ROWS && rows <= x3gd_hi &&
+                      fn4_exl3_gd_flag().load(std::memory_order_relaxed);
+    if (x3gd)
+        issue_exl3(c_, op_x3gd, EXL3_GU_DN, rows, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
+    else if (c.expert_exl3)
         issue_exl3(c_, xdk ? op_gu_dk : op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                    brows(b_x3h, rows * k));
     else if (c.expert_iqr)
@@ -2694,8 +3015,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     };
     const bool sdf = shared && !lane1 && (sl_w & kMoeSdfBit) && T <= kMoeShexpLaneRows;
     if (sdf) sh_down_issue();
-    if (c.expert_exl3)
-        issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+    /* fn4 E10 fix (156, 10.11.): with the fused chain the down projection is already done -- before this, x3gd fell
+     * through to the fp8 two-class branch and issued the EXL3 down handle with that branch's 9 operands (schema 11) */
+    if (x3gd) {
+        /* moe_exl3_gate_up_down wrote edn */
+    } else if (c.expert_exl3)
+        issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), r0);
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_dn, rows, brows(iqr_d.q8, rows * k), brows(iqr_d.s8, rows * k),
                     RAD_WTAB(w_dn[0], ne), RAD_WTAB(w_dns[0], ne),
@@ -2806,8 +3131,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                     brow_slice(w.h.x, r0, rows, g.n_embd));
     else if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
-        RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
-                    brows(gather_inv ? w.inv : w.sorted, rows * k),
+        RAD_ISSUE_N(c_, inv_now ? op_gather_inv2 : op_gather, rows, brows(w.edn, rows * k),
+                    brow_slice(w.ew, r0, rows, k),
+                    brows(gather_inv || inv_now ? w.inv : w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
                     gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                     brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
@@ -2829,6 +3155,126 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(w.x, r0, rows, g.n_embd));
+}
+
+inline bool MoeFP8::pair_ok(int64_t T, int64_t R) const {
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    /* both pieces wider than every fused router / top-k form, so pass() would take the separate ops at each */
+    const int64_t small = R < T - R ? R : T - R;
+    return R > 0 && T > R && T <= c.rows && ext_in && !c.sigmoid_router && !op_sigmoid_scatter && op_router &&
+           op_topk && small > router_fused_rows && small > topk_scatter_rows && small > sigmoid_scatter_rows &&
+           small > x3gd_hi && (scatter_inv || inv_now) && (gather_inv || inv_now) &&
+           (inv_now ? op_scatter_inv2 && op_gather_inv2 : op_scatter && op_gather) &&
+           !op_gram_gu && !op_combine && !op_moe_ar && !op_shared_ar && !op_add &&
+           !gather_taken(g, T, gather_out_rows, gather_out_rows6);
+}
+
+inline void MoeFP8::pair_routed(RadCtx* c_, int64_t T, int64_t R, bool shared_in) const {
+    const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
+    const bool shared = op_sgate != 0;
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    const int64_t pr0[2] = { 0, R }, prn[2] = { R, T - R };
+    if (xp_next && xp_next->xp.n_parts > 0)
+        (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, 0, T, g.n_embd);
+    const RadOperand ecnt = brows(w.ecnt, ne);
+    for (int q = 0; q < 2; ++q) {
+        RAD_ISSUE_N(c_, op_router, prn[q], brow_slice(w.h.x, pr0[q], prn[q], g.n_embd), RAD_W(w_router),
+                    brow_slice(w.logits, pr0[q], prn[q], ne_all));
+        RAD_ISSUE_N(c_, op_topk, prn[q], brow_slice(w.logits, pr0[q], prn[q], ne_all),
+                    brow_slice(w.ids, pr0[q], prn[q], k), brow_slice(w.ew, pr0[q], prn[q], k));
+    }
+    RAD_ISSUE_N(c_, inv_now ? op_scatter_inv2 : op_scatter, T, brow_slice(w.ids, 0, T, k),
+                brows(w.sorted, T * k), brows(w.eoff, ne + 1), ecnt, brows(w.inv, T * k));
+    const bool rot = c.expert_rot != 0;
+    if (op_hq)
+        for (int q = 0; q < 2; ++q)
+            RAD_ISSUE_N(c_, op_hq, prn[q], brow_slice(w.h.x, pr0[q], prn[q], g.n_embd),
+                        brow_slice(w.hr.q, pr0[q], prn[q], g.n_embd),
+                        brow_slice(w.hr.s, pr0[q], prn[q], g.n_embd / RAD_FP8_BLOCK));
+    const int64_t n4[4] = { (n_reg + 3) / 4, (n_reg + 2) / 4, (n_reg + 1) / 4, n_reg / 4 };
+    (void)rad_expert_prefetch_step(c_, layer);
+    const int64_t rows = T;
+    if (c.expert_exl3)
+        issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, 0, rows, g.n_embd), brows(b_x3h, rows * k));
+    else if (c.expert_bf16)
+        RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, 0, rows, g.n_embd),
+                    RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
+                    brows(w.egu, rows * k));
+    else if (ncls == 4)
+        RAD_ISSUE_N(c_, op_gu, rows,
+                    brow_slice(rot ? w.hr.q : w.h.q, 0, rows, g.n_embd),
+                    brow_slice(rot ? w.hr.s : w.h.s, 0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
+                    RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
+                    RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
+                    brows(w.egu, rows * k));
+    else
+        RAD_ISSUE_N(c_, op_gu, rows,
+                    brow_slice(rot ? w.hr.q : w.h.q, 0, rows, g.n_embd),
+                    brow_slice(rot ? w.hr.s : w.h.s, 0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+                    brows(w.egu, rows * k));
+    if (shared && shared_in)
+        for (int q = 0; q < 2; ++q) shared_up(c_, T, pr0[q], prn[q], false);
+    if (!c.expert_exl3)   /* EXL3: inside gate_up */
+        gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    if (shared && shared_in)
+        for (int q = 0; q < 2; ++q) gq_sh.step(c_, w.sgu, T, pr0[q], prn[q]);
+    if (c.expert_exl3)
+        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), 0);
+    else if (c.expert_bf16)
+        RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
+    else if (ncls == 4)
+        RAD_ISSUE_N(c_, op_dn, rows,
+                    brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                    RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
+                    RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
+                    RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
+                    brows(w.edn, rows * k));
+    else
+        RAD_ISSUE_N(c_, op_dn, rows,
+                    brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                    RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
+                    brows(w.edn, rows * k));
+    (void)rad_expert_prefetch_mark(c_);
+    if (op_pgu) {   /* the protected experts over the trailing offsets, as pass() issues them, at the joint rows */
+        const int64_t np = (int64_t)prot.size();
+        const RadOperand poff = brow_slice(w.eoff, n_reg, np + 1, 1);
+        RAD_ISSUE_N(c_, op_pgu, rows, brow_slice(w.h.x, 0, rows, g.n_embd),
+                    RAD_WTAB(w_pgu[0], np), brows(w.sorted, rows * k), poff,
+                    brows(b_pgu, rows * k));
+        gq_prot.step(c_, b_pgu, rows * k, 0, rows * k);
+        RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
+                    brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
+    }
+    if (shared && shared_in)
+        for (int q = 0; q < 2; ++q) sh_down.step(c_, w.sff, w.sout, T, pr0[q], prn[q]);
+}
+
+inline void MoeFP8::pair_finish(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool shared_here) const {
+    const int64_t k = c.top_k;
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    if (op_sgate != 0 && shared_here) {
+        shared_up(c_, T, r0, rows, false);
+        gq_sh.step(c_, w.sgu, T, r0, rows);
+        sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    }
+    RAD_ISSUE_N(c_, inv_now ? op_gather_inv2 : op_gather, rows, brows(w.edn, T * k),
+                brow_slice(w.ew, r0, rows, k),
+                brow_slice(w.inv, r0 * k, rows * k, 1),   /* fn4 P2x fix 12.11.: w.inv is 1-D [rows * k]; [rows][k] gave
+                                                           * numel `rows` < M * top_k -> moe_gather_inv refused (189) */
+                gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
+                gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                brow_slice(w.h.x, r0, rows, g.n_embd));
 }
 
 /* One pass of the per-expert tap. The scatter's expert offsets are copied back first (they decide

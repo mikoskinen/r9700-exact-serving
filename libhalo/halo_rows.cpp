@@ -156,6 +156,9 @@ static const RadParamSpec pAttnPagedGq[] = {
     { "max_seqs", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
     P_INT("group"),
     P_STR("act"),
+    /* fn4 BI (att_bi 2): the split law's sequence count in place of the launch's rows (libr4d r4d_split_rows_pin; the
+     * decode rows only); absent 0. Not decomposed: attn_paged has no such parameter. */
+    P_INTO("split_rows"),
 };
 static const RadOperandSpec oAttnPagedGq[] = {
     { "q",           RAD_OPD_IN,  0 },
@@ -590,8 +593,12 @@ static const RadOperandSpec oKdaUpdate[] = {
     {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
     {"o", RAD_OPD_OUT, 0},
 };
+/* hc_write's own list, libr4d's (fn4 W1b): optional `eps` and `ss` output, the next read's norm scales. */
+static const RadParamSpec pHcWrite[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype"), P_F64O("eps"),
+};
 static const RadOperandSpec oHcWrite[] = {
-    { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 }, { "ss", RAD_OPD_OUT, 1 },
 };
 /* hc_write with the preceding all-reduce folded in: `y` is also the message, so it is inout and
  * holds the reduced sum as the standalone collective leaves it. */
@@ -629,7 +636,7 @@ static const RadOperandSpec oMtpEnter[] = {
 };
 static const RadParamSpec pHcRead[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
-    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"),
+    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"), P_INTO("bi_dec"), P_INTO("kc_rows"),
 };
 static const RadOperandSpec oHcRead[] = {
     { "h",        RAD_OPD_IN,     0 },
@@ -643,6 +650,7 @@ static const RadOperandSpec oHcRead[] = {
     { "scale",    RAD_OPD_OUT,    1 },
     { "rq",       RAD_OPD_OUT,    1 },
     { "rscale",   RAD_OPD_OUT,    1 },
+    { "ss",       RAD_OPD_IN,     1 },   /* fn4 W1b (libr4d's schema) */
 };
 
 static const RadParamSpec pGdnGatedRmsNorm[] = {
@@ -3220,7 +3228,7 @@ static const RadOpSchema kSchemas[] = {
            "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
            "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
            "the stock model's."),
-    SCHEMA("hc_write", pHcPlain, oHcWrite,
+    SCHEMA("hc_write", pHcWrite, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
            "The MTP head's entry for a wide residual stream: x[k*n+i] = fc_h[i] . "

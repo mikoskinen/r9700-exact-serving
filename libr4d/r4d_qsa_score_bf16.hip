@@ -23,6 +23,7 @@
 #include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_qsa_part.h"   // fn4 qsa_split: a rank's block range
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -242,12 +243,16 @@ constexpr long long kMxWavesTarget = 4096;
  * heads) would otherwise dominate. */
 constexpr long long kMxMinTiles    = 4;
 
-template <int HEADS>
+/* fn4 qsa_split (Part): the wave's block range starts at this rank's cut of the sequence (r4d_qsa_part.h) and ends at the
+ * next rank's, so a rank scores only its own blocks of each sequence; every score it writes is the same (query, block)
+ * product as in the whole launch, at the same column. Part = false is the whole range. */
+template <int HEADS, bool Part = false>
 __device__ __forceinline__ void qsa_score_mx_kernel_body(
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec,
+    int parts = 1, int part = 0) {
 
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
     const int half = lane >> 4, col = lane & 15;
@@ -282,13 +287,19 @@ __device__ __forceinline__ void qsa_score_mx_kernel_body(
         const int mend = cu[seq + 1] < mlim ? cu[seq + 1] : mlim;
         const bool live = row >= m && row < mend;
         const int nbs  = nc[seq] < nb ? nc[seq] : nb;
-        const int bend = wb0 + tpw * 16 < nbs ? wb0 + tpw * 16 : nbs;
+        int wlo = wb0, hiw = nbs;
+        if constexpr (Part) {
+            wlo = qsa_part_cut(nc[seq], parts, part) + wb0;
+            const int c1 = qsa_part_cut(nc[seq], parts, part + 1);
+            if (c1 < hiw) hiw = c1;
+        }
+        const int bend = wlo + tpw * 16 < hiw ? wlo + tpw * 16 : hiw;
         const int32_t* tab = bt + (size_t)seq * bt_ld;
 
         /* Read the next tile's page id while this tile's key loads, hiding one dependent latency
          * per tile. */
-        int pg_next = wb0 + col < bend ? tab[wb0 + col] : -1;
-        for (int b0 = wb0; b0 < bend; b0 += 16) {
+        int pg_next = wlo + col < bend ? tab[wlo + col] : -1;
+        for (int b0 = wlo; b0 < bend; b0 += 16) {
             /* A operand: block b0 + col's key. A block past the end or without a page reads page
              * 0's key (always present) and is masked or skipped at the store. */
             const int b  = b0 + col;
@@ -344,6 +355,29 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
     qsa_score_mx_kernel_body<HEADS>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec);
 }
+/* fn4 qsa_split: the rank's block range, plain and chained as the whole-range form. */
+template <int HEADS>
+__global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_part_kernel(
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
+    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
+    const int32_t* __restrict__ nc, float* __restrict__ out,
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec,
+    int parts, int part) {
+    qsa_score_mx_kernel_body<HEADS, true>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec,
+                                          parts, part);
+}
+template <int HEADS>
+__global__ __launch_bounds__(kMxWaves * kWave) void r4dchain_qsa_score_mx_part(
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
+    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
+    const int32_t* __restrict__ nc, float* __restrict__ out,
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec,
+    int parts, int part) {
+    r4d_chain_wait();
+    qsa_score_mx_kernel_body<HEADS, true>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec,
+                                          parts, part);
+    r4d_chain_done();
+}
 template <int HEADS>
 __global__ __launch_bounds__(kMxWaves * kWave) void r4dchain_qsa_score_mx(
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
@@ -371,7 +405,8 @@ extern "C" void r4d_qsa_score_pin_form(int form) { g_qsa_form = form; }
 //   out  [M][nb]         f32, `out_ld` elements a row (0 = nb)
 static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, long out,
                                   int M, int n, int heads, int nb, int nseq,
-                                  int q_ld, int bk_ld, int bt_ld, int out_ld, RadStream stream) {
+                                  int q_ld, int bk_ld, int bt_ld, int out_ld, RadStream stream,
+                                  int parts = 1, int part = 0) {
     int emit_rc = RAD_OK;
     if (!q || !bk || !bt || !cu || !nc || !out) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n <= 0 || heads <= 0 || nb <= 0 || nseq <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -386,6 +421,35 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
      * query rows fit in registers); the scalar form serves the rest. */
     const bool mx_fits = n == kMxKS * 16 && heads <= 4;
     if (g_qsa_form == 2 && !mx_fits) return R4D_NO(RAD_E_SHAPE);
+    /* fn4 qsa_split: a rank's block range, matrix form only. The grid covers the widest range a rank can own (ceil(nb /
+     * parts) plus the cut's alignment, r4d_qsa_part.h); tiles past a sequence's range skip. */
+    if (parts > 1) {
+        if (!mx_fits || part < 0 || part >= parts) return R4D_NO(RAD_E_SHAPE);
+        const long long qt = (M + kMxQ - 1) / kMxQ;
+        const long long wide = (nb + parts - 1) / parts + 15;
+        const long long tiles = (wide + 15) / 16;
+        long long tpw = (tiles * qt + kMxWavesTarget - 1) / kMxWavesTarget;
+        if (tpw < kMxMinTiles) tpw = kMxMinTiles;
+        const unsigned gx = (unsigned)((tiles + tpw * kMxWaves - 1) / (tpw * kMxWaves));
+        const int vec = (out_ld % 4 == 0) && ((out & 15) == 0);
+#define RAD_QSA_MXP(H)                                                                            \
+        emit_rc = R4D_EMIT(stream, (g_r4d_chain_arg ? &r4dchain_qsa_score_mx_part<H> : &qsa_score_mx_part_kernel<H>), \
+                           dim3(gx, (unsigned)qt),                                                \
+                           dim3(kMxWaves * kWave), 0, (const unsigned short*)q,                   \
+                           (const unsigned short*)bk,                                             \
+                           (const int32_t*)bt, (const int32_t*)cu, (const int32_t*)nc,            \
+                           (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec,   \
+                           parts, part)
+        switch (heads) {
+            case 1: RAD_QSA_MXP(1); break;
+            case 2: RAD_QSA_MXP(2); break;
+            case 3: RAD_QSA_MXP(3); break;
+            case 4: RAD_QSA_MXP(4); break;
+            default: return R4D_NO(RAD_E_SHAPE);
+        }
+#undef RAD_QSA_MXP
+        return emit_rc;
+    }
     const bool mx = g_qsa_form == 1 ? false : mx_fits;
     if (mx) {
         /* Tiles per wave: about kMxWavesTarget waves in the grid, at least kMxMinTiles each. */
@@ -483,9 +547,12 @@ extern "C" int r4d_rad_qsa_score(const RadArgs* a, RadStream stream) {
     const long long tp = r4d_row_pitch(bt), op = r4d_row_pitch(o);
     if (qp < 0 || kp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
     const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
+    /* fn4 qsa_split: `parts` / `part` (both optional; absent = the whole range) */
+    const long long parts = r4d_geti_or(a, "parts", 1), part = r4d_geti_or(a, "part", 0);
+    if (parts < 1 || parts > 64 || part < 0 || part >= parts) return R4D_NO(RAD_E_INVAL);
     return r4d_qsa_score_bf16_emit(r4d_addr(q), r4d_addr(bk), r4d_addr(bt), r4d_addr(cu),
                                    r4d_addr(nc), r4d_addr(o),
                                    (int)M, (int)n, (int)heads, (int)nb, (int)nseq,
-                                   (int)qp, (int)kp, (int)tp, (int)op, stream);
+                                   (int)qp, (int)kp, (int)tp, (int)op, stream, (int)parts, (int)part);
 }
 
