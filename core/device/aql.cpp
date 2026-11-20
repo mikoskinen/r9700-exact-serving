@@ -1730,10 +1730,17 @@ int a_stream_create(RadStream* out, int high_priority) {
     }
     g_queue_id_at[slot].store(s->id, std::memory_order_release);
     g_queue_by_id[slot].store(s->q, std::memory_order_release);
+    size_t live = 0;
     {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         G().streams.push_back(s.get());
+        for (const Stream* x : G().streams) live += x->ord == ord ? 1 : 0;
     }
+    /* lever WAITK's companion (DRAFTER round 49): RADIANCE_AQL_QLOG=1 logs each HSA queue the process creates, with the card's live
+     * count (creation order decides which queues share a CP pipe: 4 a card map cleanly, 8 do not -- drafter/kit/mes r49d / r49g) */
+    static const bool qlog = [] { const char* e = std::getenv("RADIANCE_AQL_QLOG"); return e && e[0] == '1'; }();
+    if (qlog) std::fprintf(stderr, "aql: queue created card %d stream id %u slot %u hp %d (live on the card %zu)\n", ord, s->id, slot,
+                           high_priority, live);
     *out = (RadStream)s.release();
     return RAD_OK;
 }
