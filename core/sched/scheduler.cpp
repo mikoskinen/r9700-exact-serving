@@ -276,6 +276,16 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                          ? fmt("a fresh prompt that shares >= %lld tokens with a running prompt (any lane) that has not computed and "
                                "published that head waits for it, at most %lld ms from its arrival", (long long)kPubHoldMin, hm).c_str()
                          : "OFF: it needs RADIANCE_SCHED_PUB_PROMPT=1 or 2 (and the prefix cache)");
+        /* tp8 loop D57: the hold beside sched_srf 2 and the lanes' lent pieces (bits 1 / 2, default both; 0 = before D57) */
+        const char* k = std::getenv("RADIANCE_SCHED_D57");
+        d57_ = k && *k ? (std::atoi(k) & 3) : 3;
+        if (d57_ != 3 && pub_hold_us_ > 0 && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_D57=%d (tp8 loop D57) -- %s; %s", d57_,
+                     d57_ & 1 ? "sched_srf 2 passes over a prompt the hold keeps out"
+                              : "sched_srf 2 may choose a prompt the hold keeps out (before D57: every running prompt then sits out until "
+                                "the hold's bound)",
+                     d57_ & 2 ? "the hold reads committed ends, lent pieces included"
+                              : "the hold misses a prompt whose piece runs in another lane and reads its planned end (before D57)");
     }
     {   /* tp8 loop D56 (fn4 sched_lane_room, RADIANCE_SCHED_LANE_ROOM its start value): the room gates count every lane's runners
          * (room_runners); 0 = this lane's (today). The switch is read at every gate; the start line once. */
@@ -1066,31 +1076,45 @@ void Scheduler::publish_chunk_done(SchedReq& s) {
 /* tp8 loop D55b: does a RUNNING prompt (this lane's or another's: the lane schedulers share lane 0's mutex) share at least
  * kPubHoldMin tokens with `s`'s prompt and not yet have that head in the cache? Only fresh requests wait, only on admitted ones
  * (never on another waiting one: no cycle), and never past pub_hold_us_ from the arrival. */
-bool Scheduler::pub_holds(const SchedReq& s) const {
+bool Scheduler::pub_holds(const SchedReq& s, bool walk) const {
     if (pub_hold_us_ <= 0 || !s.req || s.req->embed || s.req->media || s.req->n_computed != 0 ||
         s.req->state == ReqState::Preempted)
         return false;
     if (s.arrived_us <= 0 || mono_us() - s.arrived_us > pub_hold_us_) return false;
     const std::vector<int32_t>& p = s.req->prompt;
-    auto holds_on = [&](const SchedReq* o) {
+    auto holds_on = [&](const SchedReq* o, int64_t bumped) {
         if (!o || o == &s || !o->req || o->req->embed || o->req->state != ReqState::Running) return false;
         const std::vector<int32_t>& q = o->req->prompt;
         const size_t n = std::min(p.size(), q.size());
         const int64_t common = (int64_t)(std::mismatch(p.begin(), p.begin() + (long)n, q.begin()).first - p.begin());
         if (common < kPubHoldMin) return false;
-        /* available: the whole prompt published (D55), or with per-chunk publishing its computed end past the head */
-        if (o->pub_prompt || (int64_t)o->req->n_computed >= (int64_t)q.size()) return false;
-        if (pub_mode_ >= 2 && (int64_t)o->req->n_computed >= std::min<int64_t>(common, (int64_t)p.size() - 1)) return false;
+        /* available: the whole prompt published (D55), or with per-chunk publishing its computed end past the head. tp8 loop D57
+         * (bit 2): the committed end -- the planning lane's lane_plan_begin bumps n_computed past the rows lent to other lanes */
+        const int64_t done = (int64_t)o->req->n_computed - bumped;
+        if (o->pub_prompt || done >= (int64_t)q.size()) return false;
+        if (pub_mode_ >= 2 && done >= std::min<int64_t>(common, (int64_t)p.size() - 1)) return false;
         return true;
     };
     auto scan = [&](const Scheduler& L) {
+        auto at = [&](int32_t slot) { return slot >= 0 && (size_t)slot < L.reqs_.size() ? L.reqs_[(size_t)slot].get() : nullptr; };
+        auto bump = [&](int32_t slot) -> int64_t {
+            if (!(d57_ & 2)) return 0;
+            for (const auto& [b, rows] : L.lane_bump_)
+                if (b == slot) return rows;
+            return 0;
+        };
         for (int32_t slot : L.running_)
-            if (holds_on(slot >= 0 && (size_t)slot < L.reqs_.size() ? L.reqs_[(size_t)slot].get() : nullptr)) return true;
+            if (holds_on(at(slot), bump(slot))) return true;
+        /* tp8 loop D57 (bit 2): the planning lane's prompts with a piece in another lane are out of running_ for its plan */
+        if (d57_ & 2)
+            for (int32_t slot : L.lane_out_)
+                if (holds_on(at(slot), 0)) return true;
         return false;
     };
     /* this walk's own admissions join running_ only after the walk (took_): a sibling admitted just before is running too */
-    for (size_t i : took_)
-        if (i < waiting_.size() && holds_on(reqs_[(size_t)waiting_[i]].get())) return true;
+    if (walk)
+        for (size_t i : took_)
+            if (i < waiting_.size() && holds_on(reqs_[(size_t)waiting_[i]].get(), 0)) return true;
     if (lanes_ && n_lanes_ > 1) {
         for (int l = 0; l < n_lanes_; ++l)
             if (const Scheduler* L = lanes_->lane(l); L && scan(*L)) return true;
@@ -3188,6 +3212,9 @@ void Scheduler::srf_scan(bool planning, bool waiting, SrfPick& pk) const {
                 ++pk.kv;
                 continue;
             }
+            /* tp8 loop D57: a prompt the D55b hold keeps out cannot be admitted -- choosing it would make every running prompt
+             * (the sibling it waits for among them) sit out until the hold's bound; the running one computes the head instead */
+            if ((d57_ & 1) && pub_hold_us_ > 0 && pub_holds(s, false)) continue;
             pick(slot, (int64_t)s.req->prompt.size(), s.req->id, true);
         }
 }
