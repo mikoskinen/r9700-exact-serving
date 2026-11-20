@@ -66,7 +66,7 @@ constexpr int kWkEngine = 1048576;
 static void set_wm(const Hk& h) {
     clear(h);
     /* 1048576 / 1048577 / 1048578: the engine's path under ds41_wmk 1 / 2 / 3 (FINDINGS F7: the r6 table / 70724 / r5's table) */
-    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 10) {   /* + 3: ds41_wmk 4 (DRAFTER r7: 2 without WHG / DQ8); + 10: 11 (DRAFTER r23: 2 + HDP + TDP) */ h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
+    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 11) {   /* + 3: ds41_wmk 4 (DRAFTER r7: 2 without WHG / DQ8); + 10: 11 (DRAFTER r23: 2 + HDP + TDP); + 11: 12 (DRAFTER r31: 11 with HRS's head) */ h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
     else if (g_wk_cur) h.wk_pin(g_wk_cur);
     else h.wm_pin(1);
 }
@@ -816,7 +816,7 @@ static void route(const Plugin& pl, const char* tlist) {
      * 64 rows: 49..64-row calls in gg_wk_kernel / the head's G2 at four row tiles instead of the GPF prefill form); default 1 */
     /* tp8 loop D25 step 2 (DECODE round 21): modes 6 / 7 (5 + another 49..64-row launch code) too, the band 64 as 5's */
     /* tp8 loop D27 (DECODE round 22): mode 9 (8 + the per-shape 33..48-row table) too */
-    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); return e && e[0] >= '1' && e[0] <= '9' && !e[1] ? e[0] - '0' : 1; }();
+    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); const int v = e ? std::atoi(e) : 1; return v >= 1 && v <= 12 ? v : 1; }();   /* DRAFTER r31: 11 / 12 too */
     const int64_t band = rmode >= 5 ? 64 : 48;
     const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 56, 63, 64, 97, 130 };
     const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
