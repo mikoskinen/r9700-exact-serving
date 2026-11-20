@@ -37,7 +37,9 @@
  *     commit (commit_checkpoint), so a restore from it is planned behind the save on both nodes;
  *   - the KV-copy check (RADIANCE_PP_KV_CHECK) compares the copies with no lane step in flight: when one is
  *     due, the loop stops planning until every tail is in, then sends it (two lanes' copies would otherwise
- *     differ by the step whose head ran and whose tail has not);
+ *     differ by the step whose head ran and whose tail has not); with RADIANCE_PP_KV_CHECK_DEFER=1 (tp8 loop P37) a
+ *     check due while prompt rows are in flight or waiting waits for a round without them (at most N more trunk
+ *     steps), so it does not drain a cold prompt's pipeline -- it still goes out with no lane step in flight;
  *   - the depth-0 context skip (draft_ctxskip) keeps the trunk's rows of consecutive steps in one
  *     ring on the card; lanes interleave their steps, so the skip is refused (fn4 and at start).
  * Every lane's step numbers come from one counter (lanes.h): a step number names one build on both
@@ -1126,6 +1128,9 @@ int Engine::step_loop_lanes() {
     int next = 0;   /* the lane planned first on the next round */
     int64_t lane_steps = 0, rounds_two = 0;
     int64_t kv_check_at = 0;   /* tp8 S6: trunk steps shipped at the last KV-copy check */
+    /* tp8 loop P37: the due check's deferral / drain with prompt rows in flight (the step it began at, -1 = none) + counts */
+    int64_t kv_defer_from = -1, kv_drain_from = -1, kv_deferred = 0, kv_drained = 0;
+    bool kv_draining = false;
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
         if (pp_link_ && !pp_link_->alive()) {
@@ -1152,12 +1157,46 @@ int Engine::step_loop_lanes() {
         /* tp8 S6: a KV-copy check due waits for every lane step in flight (the head comment), then goes out
          * before the next build */
         const bool kv_due = pp_kv_check_every_ > 0 && pp_steps_shipped_ - kv_check_at >= pp_kv_check_every_;
+        /* tp8 loop P37: whether prompt rows are in flight or waiting (a lone prompt's chunks, a newcomer): a drain now
+         * puts one pass of bubble on both nodes inside that prompt (lq212: 134-251 ms in 5 of 12 colds). Without
+         * RADIANCE_PP_KV_CHECK_DEFER the check still drains at once and the line below says so; with it the check waits
+         * for a round without them, at most every more trunk steps (then it drains as before). */
+        bool kv_hold = kv_due && !fifo.empty();
+        if (kv_hold && !kv_draining) {   /* a drain once begun runs to its end (a newcomer arriving meanwhile waits) */
+            bool prompt_rows = false;
+            for (const auto& f : fifo) prompt_rows = prompt_rows || f.second->phase != RAD_PHASE_DECODE;
+            for (int k = 0; k < n_lanes_ && !prompt_rows; ++k) prompt_rows = lanes_.prefill_pending(k) || lanes_.inbox_n(k) > 0;
+            if (prompt_rows && pp_kv_check_defer_ && pp_steps_shipped_ - kv_check_at < 2 * (int64_t)pp_kv_check_every_) {
+                kv_hold = false;
+                if (kv_defer_from < 0) kv_defer_from = pp_steps_shipped_;
+            } else {
+                kv_draining = true;
+                if (prompt_rows) kv_drain_from = pp_steps_shipped_;
+            }
+        }
         if (kv_due && fifo.empty()) {
             pp_kv_check_send();
+            if (kv_defer_from >= 0 || kv_drain_from >= 0)
+                RAD_INFO("two-node pipeline: the KV-copy check due after trunk step %lld went out after step %lld: %s (tp8 loop P37; "
+                         "%lld deferred, %lld drained with prompt rows in flight so far)",
+                         (long long)(kv_check_at + pp_kv_check_every_), (long long)pp_steps_shipped_,
+                         kv_drain_from >= 0
+                             ? (pp_kv_check_defer_ ? "drained the pipeline with prompt rows in flight at the deferral's bound "
+                                                     "(no lane planned until every tail was in)"
+                                                   : "drained the pipeline with prompt rows in flight (no lane planned until "
+                                                     "every tail was in: one pass of bubble on both nodes inside a prompt; "
+                                                     "RADIANCE_PP_KV_CHECK_DEFER=1 defers it)")
+                             : "deferred while prompt rows were in flight (RADIANCE_PP_KV_CHECK_DEFER=1)",
+                         (long long)(kv_deferred + (kv_drain_from < 0 ? 1 : 0)), (long long)(kv_drained + (kv_drain_from >= 0 ? 1 : 0)));
+            if (kv_drain_from >= 0) ++kv_drained;
+            else if (kv_defer_from >= 0) ++kv_deferred;
+            kv_defer_from = kv_drain_from = -1;
+            kv_draining = false;
             kv_check_at = pp_steps_shipped_;
+            kv_hold = false;
         }
         std::vector<int> todo;
-        if (!(kv_due && !fifo.empty())) {
+        if (!kv_hold) {
             for (int k = 0; k < n_lanes_; ++k) todo.push_back((next + k) % n_lanes_);
             if (decode_first) {
                 const std::vector<int> was = todo;

@@ -1347,6 +1347,67 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
     }
 }
 
+/* tp8 loop P37 (RADIANCE_PP_KV_CHECK_DEFER=1 with RADIANCE_PP_KV_CHECK=N): a cold multi-chunk prompt at the wrap-around cut
+ * W(1,3) with the KV copy on, at 2 and 3 lanes, N = its chunks - 1 (so a check comes due inside the prompt and 2N lies past
+ * its last chunk). Without the switch the due check drains the pipeline inside the prompt and the leader says so; with it
+ * the check waits for the prompt's rows to be out (a line says it was deferred, none says a drain with prompt rows) -- one
+ * process's tokens and chunk plan in every arm, and every check finds the copy byte-equal (the follower's lines). */
+TEST(a_kv_check_deferred_past_a_cold_prompt_keeps_one_process_tokens_and_the_kv_copy) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(1039, 1000);
+    std::vector<int32_t> ref;
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        ref = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    REQUIRE(ref_plan.size() >= 4);
+    const std::string every = std::to_string(ref_plan.size() - 1);
+    struct Arm { const char* lanes; bool defer; };
+    for (const Arm a : { Arm{ "2", false }, Arm{ "2", true }, Arm{ "3", true } }) {
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_LLAMA_PP_KVCOPY=1",
+                                                        std::string("RADIANCE_PP_KV_CHECK=") + every });
+        if (a.defer) env.push_back("RADIANCE_PP_KV_CHECK_DEFER=1");
+        Serving sv;
+        REQUIRE(sv.start("1,3", { "--max-num-seqs", "6", "--pp-lanes", a.lanes }, env));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        const std::string llog = sv.lead.output(), flog = sv.fol.output();
+        auto occ = [](const std::string& log, const char* tag) {
+            long long n = 0;
+            for (size_t at = log.find(tag); at != std::string::npos; at = log.find(tag, at + 1)) ++n;
+            return n;
+        };
+        const long long drained = occ(llog, "drained the pipeline with prompt rows in flight");
+        const long long deferred = occ(llog, "deferred while prompt rows were in flight");
+        const long long eq = occ(flog, "on both nodes (");
+        fprintf(stderr, "    %s lanes W(1,3), KV check every %s, defer %d: tokens %s, plan %s; checks equal %lld, due with prompt "
+                        "rows in flight: drained %lld, deferred %lld\n", a.lanes, every.c_str(), a.defer ? 1 : 0,
+                got == ref ? "identical" : "DIFFERENT", chunks_of(llog) == ref_plan ? "identical" : "DIFFERENT", eq, drained,
+                deferred);
+        CHECK(!ref.empty());
+        CHECK(got == ref);
+        CHECK(chunks_of(llog) == ref_plan);
+        CHECK(eq >= 1);
+        CHECK(flog.find("NOT the owner's bytes") == std::string::npos);
+        if (a.defer) {
+            CHECK(llog.find("RADIANCE_PP_KV_CHECK_DEFER=1 (tp8 loop P37)") != std::string::npos);
+            CHECK(deferred >= 1);
+            CHECK_EQ(drained, 0);
+        } else {
+            CHECK(llog.find("RADIANCE_PP_KV_CHECK_DEFER=1 (tp8 loop P37)") == std::string::npos);
+            CHECK(drained >= 1);
+            CHECK_EQ(deferred, 0);
+        }
+    }
+}
+
 /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS on both nodes): a cold multi-chunk prompt at 2 and 3 lanes, W(0,2) and W(1,3), with
  * every issue over the threshold (0.0001 ms, passes of >= 1 row) serves one process's tokens and plan; each node says the switch at start and
  * prints slow-issue lines (op, kernel, band, own + launch, the first-launch resolves) up to its budget of 128, the 128th

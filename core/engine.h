@@ -456,6 +456,10 @@ private:
     int  pp_kv_crc(int32_t group, int32_t slot, int64_t top, uint32_t* crc, int64_t* bytes);
     int  pp_kv_check_every_ = 0;
     int64_t pp_kv_checks_ = 0, pp_kv_bad_ = 0;
+    /* tp8 loop P37 (RADIANCE_PP_KV_CHECK_DEFER=1, with RADIANCE_PP_KV_CHECK=N): under lanes a due check waits for a round
+     * with no prompt rows in flight or waiting, up to N more trunk steps (engine_lanes.cpp), instead of draining the
+     * pipeline inside a prompt. Off (0) = today's drain at once. */
+    bool pp_kv_check_defer_ = false;
     /* Robustness 5: SIGTERM / SIGINT reached a follower (serve() installs the handler there). */
     bool pp_stop_requested() const;
     bool pp_on() const { return cfg_.pp_nodes == 2; }

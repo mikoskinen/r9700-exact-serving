@@ -808,6 +808,13 @@ int Engine::pp_serve_setup() {
         RAD_INFO("two-node pipeline: RADIANCE_PP_KV_CHECK=%d: the copied KV layers (%s) zeroed on every rank; the "
                  "leader sends their CRC-32C every %d trunk steps and the follower compares its own",
                  pp_kv_check_every_, names.empty() ? "none on this cut" : names.c_str(), pp_kv_check_every_);
+        /* tp8 loop P37: the check's timing under lanes (the leader plans; the follower compares whenever it arrives) */
+        if (const char* v = std::getenv("RADIANCE_PP_KV_CHECK_DEFER"); v && std::atoi(v) > 0 && cfg_.pp_rank == 0) {
+            pp_kv_check_defer_ = true;
+            RAD_INFO("two-node pipeline: RADIANCE_PP_KV_CHECK_DEFER=1 (tp8 loop P37): under lanes a due KV-copy check waits for a "
+                     "round with no prompt rows in flight or waiting, at most %d more trunk steps, instead of draining the "
+                     "pipeline inside a prompt (the copies compared and the tokens are unchanged)", pp_kv_check_every_);
+        }
     }
     RAD_INFO("two-node pipeline: the %s of W(%d,%d) is ready; link %s:%d (%s), crossings X1 %lld / X2 %lld "
              "bytes a row (rings %s / %s, %d lane%s), KV %lld tokens here, %lld on the peer",
