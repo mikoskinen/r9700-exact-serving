@@ -651,6 +651,13 @@ struct Model {
     bool w8 = false, w8d = false;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
+    /* tp8 loop P47 (RADIANCE_DS41_CAND_SPLIT=1; csplit_env()): where the candidate layer's keep words cross (pp_unsplit_cand),
+     * its indexer keeps the row split -- a rank's index_candidates write its runs' rows into `keep_part` (qmax runs of irows
+     * rows, as sel_part) and `keep_gather` lays every rank's part where the unsplit layer writes it (keep rows s.r0 + r q R:
+     * the selections' gather), so every rank, rank 0's crossing too, holds every row's keep, as unsplit. `csplit`: declared. */
+    bool csplit = false;
+    rad_buf keep_part = 0;
+    rad_op keep_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
      * its `gr` output groups; `zero` for an attention-zero rank. */
     int aw = 1, ar = 0;
@@ -2754,6 +2761,21 @@ static void ixni_note(RadCtx* x, const int32_t* hp, int64_t rows, int64_t R, int
     g_ixni_dead.fetch_add(4 * dead, std::memory_order_relaxed);
 }
 
+/* tp8 loop P47 (RADIANCE_DS41_CAND_SPLIT): rank 0 counts the candidate layer's split segments at issue (a recorded pass when it
+ * is recorded) and names the first one and every 256th: the deal, the rows the layer ran, the gather's bytes a rank. */
+static std::atomic<long long> g_csplit_segs{0}, g_csplit_rows{0};
+static void csplit_note(RadCtx* x, const Ds41IdxRuns& ru, int64_t seg_rows, int64_t layer_rows, int64_t kwords) {
+    if (rad_rank(x) != 0) return;
+    const long long n = g_csplit_segs.fetch_add(1, std::memory_order_relaxed) + 1;
+    const long long r = g_csplit_rows.fetch_add(layer_rows, std::memory_order_relaxed) + layer_rows;
+    if (n == 1 || n % 256 == 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_CAND_SPLIT=1 (tp8 loop P47): %lld candidate-layer segment(s) split, "
+                        "%lld rows at the layer; this one %lld rows (%lld at the layer) as %lld runs of %lld, %lld a rank%s, the keep "
+                        "gather %.2f MiB a rank\n",
+                n, r, (long long)seg_rows, (long long)layer_rows, (long long)ru.n, (long long)ru.R, (long long)ru.q,
+                ru.balanced ? " (balanced)" : "", (double)(ru.q * ru.R * kwords * 4) / (1024.0 * 1024.0));
+}
+
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -2763,6 +2785,10 @@ static void sw_note_decl(int64_t rows) {
 static int idx_fn4_accepts(const char* name, int value);
 static int idx_fn4_switch(const char* name, int value);
 static int idx_fn4_value(const char* name, int* applied);
+/* ds41_csplit (tp8 loop P47), below index_runs() */
+static bool csplit_env();
+static int csplit_on();
+static void csplit_set(int v);
 
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
@@ -2825,6 +2851,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     /* tp8 loop P30t: mask + 256 x rows, the mask a subset of RADIANCE_DS41_TWIN's classes (0: every row GGUF) */
     if (!std::strcmp(name, "ds41_twin"))
         return value >= 0 && ((value & 255) & ~twin_env()) == 0 && (value >> 8) <= 65535 ? 1 : -1;
+    /* tp8 loop P47: 1 needs RADIANCE_DS41_CAND_SPLIT=1 at load (both nodes carry it; the leader holds nothing it changes) */
+    if (!std::strcmp(name, "ds41_csplit")) return value == 0 || (value == 1 && csplit_env()) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -2852,6 +2880,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_sphc_attn")) g_sw_spattn.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_sphc_seg")) g_sw_spseg.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_twin")) g_sw_twin.store(value, std::memory_order_relaxed);   /* tp8 loop P30t */
+    else if (!std::strcmp(name, "ds41_csplit")) csplit_set(value);   /* tp8 loop P47 */
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -2951,6 +2980,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         const int v = g_sw_twin.load(std::memory_order_relaxed);
         *applied = twin_mask_now() + (twin_psk_now() ? kTwPsk : 0) +
                    (twin_sub_asked() && twin_rows_now() <= ds41cone::kTwinNarrowM + 1 ? kTwSub : 0) + 256 * (v < 0 ? 0 : (v >> 8));
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_csplit")) {   /* tp8 loop P47 */
+        *applied = csplit_on();
         return 1;
     }
     return 0;
@@ -3103,6 +3136,33 @@ static int64_t ds41_irows_min() {
     }();
     return v;
 }
+/* tp8 loop P47 -- RADIANCE_DS41_CAND_SPLIT=1 (read at the first declare, BOTH nodes: it sets keep's row pitch, which X2's keep
+ * part carries; unset = today's declare byte for byte). On a pipeline node where the candidate layer's keep words cross
+ * (Model::pp_unsplit_cand: the follower of W(10, 32), layer 20) the candidate layer's indexer keeps the row split -- each rank
+ * scores / selects its own runs as at every other index layer -- and an all_gather of the keep rows (keep_part -> keep, the
+ * selections' layout) gives every rank, rank 0's crossing too, every row's keep words, as the unsplit layer did. EXACT by
+ * construction: a row's score / candidates / selection are its own whichever rank runs it (ds41_index_split.h, lever I1), the
+ * gather moves words. Why (FINDINGS PREFILL 14:54 / QUEUE P45, M START P42): unsplit, layer 20 runs every cone row's full-width
+ * index_score on all four ranks -- its cone part 11.2-11.6 us a row at 16k and ~21-24 at 64k vs ~5.1-5.3 at a plain cut layer,
+ * on the drain (first-token time). A node where no keep crosses pads the pitch only. */
+static bool csplit_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_CAND_SPLIT"); return e && e[0] == '1' && !e[1]; }();
+    return on;
+}
+/* fn4 ds41_csplit (core switch 103): 1 = the split + gather above where it is declared, 0 = the candidate layer unsplit (today's
+ * issue, the declare unchanged: keep's pitch stays padded, the part and gather stay declared). Starts at 1 under the env; 1 is
+ * refused without it. Read at every candidate-layer issue; the core changes it at a step release with every rank parked. */
+static std::atomic<int> g_sw_csplit{-1};
+static void csplit_set(int v) { g_sw_csplit.store(v, std::memory_order_relaxed); }
+static int csplit_on() {
+    int v = g_sw_csplit.load(std::memory_order_relaxed);
+    if (v < 0) {
+        int unread = -1;
+        g_sw_csplit.compare_exchange_strong(unread, csplit_env() ? 1 : 0);
+        v = g_sw_csplit.load(std::memory_order_relaxed);
+    }
+    return v;
+}
 static void index_runs(Model& m) {
     const auto& g = m.g;
     const auto& c = m.c;
@@ -3110,7 +3170,7 @@ static void index_runs(Model& m) {
     m.iparts = (g.max_tok + m.irows - 1) / m.irows;
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
-        m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
+        m.kwords = ds41_keep_pitch(keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block), csplit_env());
 }
 
 /* The row split's balanced deal (ds41_index_split.h; lever I1) as an in-process switch, "idx_split": 0 = the plain
@@ -3630,17 +3690,25 @@ static int buffers(RadBuilder* b, Model& m) {
     /* score_rows (lever VA "arena", a sizing declare below irows): no split at such a step, so the
      * selections are its rows too. */
     m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.score_rows ? m.score_rows : m.irows, m.cmax });
-    /* (layer ranges: only where a held layer writes or reads it) */
-    if (m.kwords > 0 && lr_keep_used(m)) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
     /* lever BI: a prefill segment's split runs are laid from its first row, so up to a decode segment's rows (48)
      * past the unsplit plane; lever PSK: a cut segment's runs from its cut row, up to the ranks' runs past the step */
     const int64_t sel_rows = (m.isplit && !m.score_rows ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T) +
                              (bi_declared() || psk_declared() ? (int64_t)m.aw * m.irows + 64 : 0);
+    /* tp8 loop P47: the split candidate layer where its keep words cross (csplit_env(), the row split on) -- keep's gather
+     * lays the ranks' parts as sel's does, so keep takes sel's rows; flags off: decided false, keep as before */
+    m.csplit = csplit_env() && m.pp_unsplit_cand && m.isplit && m.kwords > 0 && m.kwords % 4 == 0;
+    /* (layer ranges: only where a held layer writes or reads it) */
+    if (m.kwords > 0 && lr_keep_used(m))
+        m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { m.csplit ? std::max(T, sel_rows) : T, m.kwords });
+    if (!m.keep) m.csplit = false;
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { sel_rows, c.itopk });
     if (m.isplit)
         m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32,
                             { m.score_rows ? std::min(m.score_rows, m.qmax * m.irows) : m.qmax * m.irows, c.itopk });
+    if (m.csplit)
+        m.keep_part = decl_b(b, nm.f("index_keep_part"), RAD_I32,
+                             { m.score_rows ? std::min(m.score_rows, m.qmax * m.irows) : m.qmax * m.irows, m.kwords });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     if (!c.ple.empty() && lr_engram(m)) {   /* (layer ranges: a node that holds an Engram layer) */
@@ -4230,12 +4298,27 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             }
             if (l == c.cand) {
                 if (!m.keep) return RAD_E_INVAL;
+                /* tp8 loop P47: split, a rank's candidates go to its part, which keep_gather joins into keep */
                 L.i_cand = op(b, "index_candidates",
                               { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                 RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
                                 RAD_INT("ratio", r) },
-                              {}, { m.score }, { m.keep });
+                              {}, { m.score }, { m.csplit ? m.keep_part : m.keep });
                 if (!L.i_cand) return RAD_E_INVAL;
+                if (m.csplit && rw(b, L.i_cand, {}, { m.keep }) == 0) return RAD_E_INVAL;
+                if (m.csplit && !m.keep_gather) {
+                    /* the words moved as f32 (the selections' gather does the same with its i32 rows); a library that
+                     * serves no such gather leaves the candidate layer unsplit, as before */
+                    m.keep_gather = op(b, "all_gather",
+                                       { RAD_INT("world_size", g.world), RAD_INT("numel", m.qmax * IR * m.kwords),
+                                         RAD_STR("dtype", "f32") },
+                                       {}, { m.keep_part }, { m.keep });
+                    if (!m.keep_gather) {
+                        m.csplit = false;
+                        rad_note(b, "deepseek41: RADIANCE_DS41_CAND_SPLIT (tp8 loop P47) off: no all_gather of the keep words "
+                                    "resolves at %d ranks; layer %lld's indexer stays unsplit", g.world, (long long)c.cand);
+                    }
+                }
             }
             const bool uses = c.cand >= 0 && c.cand < l;
             if (uses && (!m.keep || c.ratio[(size_t)c.cand] != r)) {
@@ -6267,7 +6350,13 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
         if (in.src >= 0)
             cp = fmt_s("; a copy of source %d's %s (stored here from X%d at the owner's pages)", in.src,
                        in.latent && in.index ? "latent + index keys" : in.latent ? "latent" : "index keys", in.at == m.pp_h ? 1 : 2);
-        if (m.pp_unsplit_cand) cp += fmt_s("; layer %lld's indexer unsplit (its keep words cross)", (long long)c.cand);
+        if (m.pp_unsplit_cand && m.csplit && m.keep_gather)   /* tp8 loop P47 */
+            cp += fmt_s("; layer %lld's indexer split, its keep words gathered (%lld words a row, RADIANCE_DS41_CAND_SPLIT, tp8 loop "
+                        "P47)", (long long)c.cand, (long long)m.kwords);
+        else if (m.pp_unsplit_cand) cp += fmt_s("; layer %lld's indexer unsplit (its keep words cross)", (long long)c.cand);
+        if (!m.pp_unsplit_cand && csplit_env() && m.kwords > 0)
+            cp += fmt_s("; keep words padded to %lld a row (RADIANCE_DS41_CAND_SPLIT, tp8 loop P47: X2's layout = the follower's)",
+                        (long long)m.kwords);
         const bool clean = m.pp_h == 0 && m.pp_cx[RAD_PP_X2].sel < 0 && m.pp_cx[RAD_PP_X2].keep < 0 &&
                            m.pp_cx[RAD_PP_X2].src < 0;
         if (clean)   /* W(0,t), a clean cut: S4's line, byte for byte (its declare is S4's) */
@@ -10344,8 +10433,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
                 const int64_t kw = keep_words(live, c.cand_block);
                 const bool uses = c.cand >= 0 && c.cand < l;
-                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) */
-                const bool split = m.isplit && m.sel_gather && !(m.pp_unsplit_cand && l == c.cand);
+                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) -- split there
+                 * under tp8 loop P47 (m.csplit: its keep rows gathered after the runs) */
+                const bool csp = m.csplit && m.keep_gather && l == c.cand && csplit_on() > 0;
+                const bool split = m.isplit && m.sel_gather && (!(m.pp_unsplit_cand && l == c.cand) || csp);
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
                 size_t sj = 0;
                 for (size_t si = 0; si < sg.size(); ++si) {
@@ -10369,9 +10460,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             if (rad_rank(x) == 0) g_dband_runs.fetch_add(rd.n, std::memory_order_relaxed);
                         }
                     }
+                    /* tp8 loop P47: this segment's candidates into the rank's keep part (split runs only) */
+                    const bool kpart = csp && ru.split;
                     for (int64_t p = ru.p0; p < ru.p1; ++p) {
                         const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
-                        if (s.r0 + q0 + qn <= cut0) continue;
+                        if (ds41_idx_run_skipped(s.r0, q0, qn, cut0)) continue;
                         ixni_note(x, batch->positions_h ? batch->positions_h + s.r0 + q0 : nullptr, qn, ru.R, live, r);
                         RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, R(m.iq, s.r0, s.n), R(m.iw, s.r0, s.n),
                                     kv_cache(m.index[r], src),
@@ -10381,7 +10474,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                     rkeep ? bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn) : RAD_NONE);
                         if (L.i_cand)
                             RAD_ISSUE_N(x, L.i_cand, qn, bcol(m.score, 0, live, qn), P(batch->positions, s.r0 + q0, qn),
-                                        bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn));
+                                        kpart ? bcol_at(m.keep_part, (p - ru.p0) * ru.R, m.kwords, 0, kw, qn)
+                                              : bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn));
                         RAD_ISSUE_N(x, L.i_topk, qn, bcol(m.score, 0, live, qn),
                                     uses ? bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn) : RAD_NONE,
                                     P(batch->positions, s.r0 + q0, qn),
@@ -10391,6 +10485,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (ru.split)
                         RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
                                   brow_slice(m.sel, s.r0, (int64_t)m.aw * ru.q * ru.R, c.itopk));
+                    /* tp8 loop P47: every rank's keep rows where the unsplit layer writes them (rank r's part at s.r0 + r q R;
+                     * a skipped run's rows, before this layer's cut, and the rows past the segment are read by no layer) */
+                    if (kpart) {
+                        RAD_ISSUE(x, m.keep_gather, brows(m.keep_part, ru.q * ru.R),
+                                  brow_slice(m.keep, s.r0, (int64_t)m.aw * ru.q * ru.R, m.kwords));
+                        csplit_note(x, ru, s.n, sg[si].n, m.kwords);
+                    }
                 }
             }
             bt_pt(x, m, m.qr, T, "qr", l);
@@ -11495,8 +11596,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                  * idx_split switch (idx_balance()) a split step whose runs the ranks do not divide
                  * takes the balanced deal: an equal block of rows a rank, in runs within the
                  * declared ones -- the same loop and gather below, only R, q and the runs' bounds move. */
-                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) */
-                const bool split = m.isplit && m.sel_gather && !(m.pp_unsplit_cand && l == c.cand);
+                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) -- split there
+                 * under tp8 loop P47 (m.csplit: its keep rows gathered after the runs) */
+                const bool csp = m.csplit && m.keep_gather && l == c.cand && csplit_on() > 0;
+                const bool split = m.isplit && m.sel_gather && (!(m.pp_unsplit_cand && l == c.cand) || csp);
                 const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, split, m.split_min_live,
                                                      split && idx_balance(), (int64_t)L.i_runs.size());
                 if (ru.balanced && m.ar == 0 && !g_idx_bal_noted.exchange(1, std::memory_order_relaxed)) {
@@ -11519,9 +11622,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
                                 bcol(m.score, 0, live, ru.R),
                                 rkeep ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE);
-                    if (L.i_cand)
+                    if (L.i_cand)   /* tp8 loop P47: split, into the rank's keep part */
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
-                                    bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
+                                    csp && ru.split ? bcol_at(m.keep_part, (p - ru.p0) * ru.R, m.kwords, 0, kw, rows)
+                                                    : bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
                     RAD_ISSUE_N(x, L.i_topk, rows, bcol(m.score, 0, live, rows),
                                 uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
                                 ru.split ? brow_slice(m.sel_part, (p - ru.p0) * ru.R, rows, c.itopk)
@@ -11530,6 +11634,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (ru.split)
                     RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
                               brows(m.sel, (int64_t)m.aw * ru.q * ru.R));
+                if (csp && ru.split) {   /* tp8 loop P47: every rank's keep rows where the unsplit layer writes them */
+                    RAD_ISSUE(x, m.keep_gather, brows(m.keep_part, ru.q * ru.R), brows(m.keep, (int64_t)m.aw * ru.q * ru.R));
+                    csplit_note(x, ru, T, T, m.kwords);
+                }
             };
 
             c_gemm();

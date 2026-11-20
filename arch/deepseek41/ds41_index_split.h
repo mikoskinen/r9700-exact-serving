@@ -99,4 +99,15 @@ inline Ds41IdxRuns ds41_idx_runs(int64_t T, int64_t irows, int64_t live, int wor
     return r;
 }
 
+/* Lever PSK's skip (deepseek41 step_bi): a run of a cut prefill segment whose rows [seg_r0 + q0, seg_r0 + q0 + qn) all lie
+ * before the layer's cut row cut0 is not issued; a run reaching cut0 runs whole. One function, so the issue and the tests
+ * (ds41_sp_test, tp8 loop P47) read the same rule. */
+inline bool ds41_idx_run_skipped(int64_t seg_r0, int64_t q0, int64_t qn, int64_t cut0) { return seg_r0 + q0 + qn <= cut0; }
+
+/* tp8 loop P47 (RADIANCE_DS41_CAND_SPLIT=1, both nodes): the candidate layer's keep words a row, padded to whole 16-byte
+ * words so a rank's rows can ride an all_gather (r4d_ar_gather_admit: the message and both ends in 16-byte words). The
+ * padding words are never written by index_candidates (it writes keep_words(live, block) <= the unpadded count) and never
+ * read (every reader takes the same live count's columns); X2's keep part grows by them on both nodes alike. */
+inline int64_t ds41_keep_pitch(int64_t kwords, bool pad) { return pad && kwords > 0 ? (kwords + 3) / 4 * 4 : kwords; }
+
 #endif
