@@ -529,6 +529,12 @@
  *                   are announced. Order of host writes only: no packet, argument or kernel changes (rule A). A card whose arguments
  *                   live in host memory, or whose driver gives no register, flushes nothing. Both nodes of a pipeline (a follower
  *                   switch). Unset: the start's RADIANCE_AQL_HDP_FLUSH (0 / 1).
+ *   ds41_csplit     deepseek41 (tp8 loop P47; 103 here, after aql_hdp): 0 -- the candidate layer's indexer unsplit where its keep
+ *                   words cross (the follower of W(10, 32): layer 20, every rank every row's full-width index_score), as before; 1 --
+ *                   split there as at every other index layer, the keep rows all-gathered after it. Needs RADIANCE_DS41_CAND_SPLIT=1
+ *                   at load on BOTH nodes (keep's pitch padded to 16-byte words, X2's keep part with it; the follower declares the
+ *                   part + gather), which starts it at 1; without the env 1 is refused. Exact either way (lever I1's split + a word
+ *                   gather). The follower takes it with the leader's; the leader holds nothing it changes.
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -765,7 +771,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
