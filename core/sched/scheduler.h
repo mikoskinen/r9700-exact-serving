@@ -1228,6 +1228,9 @@ private:
     /* tp8 prefill P0: the leader's line for a prompt whose chunks went over the lanes, at its first token */
     void lane_prompt_note(SchedReq& s);
     int64_t  lane_reserved_ = 0;   /* the inbox rows lane_reserve set aside this step */
+    /* tp8 loop D53 (lane_take_inbox): pieces left in this lane's inbox because an earlier piece of their sequence was not taken
+     * yet (the run's count), and since when (mono us) the current wait lasts (0: none) */
+    int64_t  lane_order_waits_ = 0, lane_order_wait_us_ = 0;
     /* tp8 loop F71 (RADIANCE_PP_PLAN_RESERVED=1 at init; unset: false = as before): lane_reserved_ counts as planned where a plan may
      * take the step's max_tok room (lever NOA's room, option D's over-budget first prefill), so the inbox pieces lane_take_inbox
      * appends never take the step past max_tok. room_taken() = the rows those rules see as planned. */
@@ -1272,6 +1275,10 @@ private:
     std::vector<LaneLent> lane_lent_now_;
     void    lane_unsplit_own();
     bool    lane_others_hold() const;
+    /* tp8 loop D53: no request of ANY lane holds the shared pool (running_ empty and !lane_others_hold()) -- one lane:
+     * running_ empty. What "nothing else is running" means for an overdue preempted request: its fail-instead-of-wait,
+     * the forced admission and release_idle_states() (which drops EVERY sequence's state slots). */
+    bool    pool_idle() const;
     friend class LaneSet;
     /* A piece of one of this lane's sequences, run in lane `by`'s step, committed there: called by
      * the LaneSet with the lock held. `i` is the entry in that step's StepResult. */

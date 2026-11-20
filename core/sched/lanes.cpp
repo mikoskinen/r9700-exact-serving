@@ -461,6 +461,11 @@ bool Scheduler::lane_others_hold() const {
     return false;
 }
 
+/* tp8 loop D53: the pool is idle only when no lane holds it -- this lane's running set empty is not enough under lanes:
+ * another lane's running requests hold blocks (and DeepSeek's per-sequence state slots: the compressor tails, the Engram
+ * token window) that their commits will give back. One lane: running_ empty, as before. The lock is held. */
+bool Scheduler::pool_idle() const { return running_.empty() && !lane_others_hold(); }
+
 /* The budget this lane's own plan may take: the pieces lent to it run in this step whatever it
  * plans, so they come first; a step carrying another lane's piece is a shared step (no span). */
 int64_t Scheduler::lane_reserve(int64_t budget) {
@@ -507,6 +512,47 @@ void Scheduler::lane_take_inbox() {
                  (long long)builder_.bt_rows(), got.size() - keep);
         for (size_t k = keep; k < got.size(); ++k) lanes_->lend_locked(lane_, got[k], /*count=*/false);
         got.resize(keep);
+    }
+    /* tp8 loop D53: a piece whose sequence has an EARLIER piece not taken yet (in another lane's inbox, or in this one's behind
+     * it) waits in this lane's inbox for its next step, in order, with every piece of that sequence after it. A lender lends to
+     * the lanes in the order they plan next (set_planners), but several lanes can commit before a round plans again -- a
+     * KV-copy check's drain (RADIANCE_PP_KV_CHECK), a merge drain -- and the next round plans them from `next`, not in their
+     * commit order: the order guard below then stopped the engine (pp_e2e's preemption case, 3 lanes at W(1,3), ~1 run in 4).
+     * Waiting keeps every sequence's pieces in position order on both nodes; the predecessor's lane is idle with it in its
+     * inbox and plans in a later round. A wait past 30 s is the guard's case again (a predecessor that is nowhere). */
+    {
+        std::vector<LaneSet::Piece> keep, wait;
+        std::vector<uint64_t> taken;   /* one piece of a sequence a step, as a lend walk gives (one lane each) */
+        for (LaneSet::Piece& p : got) {
+            int64_t nx = -1;
+            if (Scheduler* home = lanes_->lane(p.home)) {
+                const auto it = home->by_id_.find(p.e.seq);
+                if (it != home->by_id_.end() && home->reqs_[(size_t)it->second]) nx = home->reqs_[(size_t)it->second]->lent_next;
+            }
+            if ((nx >= 0 && p.e.ctx_len != nx) || std::find(taken.begin(), taken.end(), p.e.seq) != taken.end()) {
+                wait.push_back(p);
+                continue;
+            }
+            taken.push_back(p.e.seq);
+            keep.push_back(std::move(p));
+        }
+        if (!wait.empty()) {
+            const int64_t now = mono_us();
+            if (!lane_order_wait_us_) lane_order_wait_us_ = now;
+            if (lane_order_waits_++ == 0)
+                RAD_INFO("two-node pipeline: lane %d left %zu lent piece(s) in its inbox whose sequence has an earlier piece not taken "
+                         "yet (request %llu's at %d): they run in position order, at its next step (tp8 loop D53; the first such "
+                         "wait of the run)", lane_, wait.size(), (unsigned long long)wait[0].e.seq, (int)wait[0].e.ctx_len);
+            if (now - lane_order_wait_us_ > 30000000LL)
+                lanes_->note_broken_locked(fmt("lane %d: the piece [%d, %d) of request %llu waited %lld s for an earlier piece of its "
+                                               "sequence that no lane took", lane_, (int)wait[0].e.ctx_len,
+                                               (int)(wait[0].e.ctx_len + wait[0].e.n_tokens), (unsigned long long)wait[0].e.seq,
+                                               (long long)((now - lane_order_wait_us_) / 1000000)));
+            for (const LaneSet::Piece& p : wait) lanes_->lend_locked(lane_, p, /*count=*/false);
+        } else {
+            lane_order_wait_us_ = 0;
+        }
+        got.swap(keep);
     }
     /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
     if (!got.empty() && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) {
