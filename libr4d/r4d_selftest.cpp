@@ -163,6 +163,9 @@ struct Plugin {
     void (*write_hc_vec)(int) = nullptr;   /* optional (fn4 hcw) */
     void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
     void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
+    void (*tl_hc)(int) = nullptr;          /* optional (qfn-on-ds Q17: the bi_dec read's phase timeline) */
+    int (*tl_hc_reset)() = nullptr;
+    int (*tl_hc_read)(unsigned long long*, int, int) = nullptr;
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -244,6 +247,9 @@ static bool load(Plugin* pl, const char* path) {
     pl->write_hc_vec = (void (*)(int))dlsym(pl->h, "r4d_hc_write_vec");
     pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
     pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
+    pl->tl_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_tl");
+    pl->tl_hc_reset = (int (*)())dlsym(pl->h, "r4d_hc_tl_reset");
+    pl->tl_hc_read = (int (*)(unsigned long long*, int, int))dlsym(pl->h, "r4d_hc_tl_read");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -24950,6 +24956,215 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     ok(nm.c_str(), true);
 }
 
+/* qfn-on-ds Q17 (Qwen loop round 4, 21.11.2026): --perfhctl M [reps] -- the bi_dec decode read (hc_bi 5's one launch at the
+ * engine's hc_readv 331: kernel A' = G16 at 9..31 rows, G16p from 32; B3 in 16-row groups) at M rows with every block's phase
+ * timeline (libr4d r4d_hc_tl: thread 0 stamps the 100 MHz clock after each block-wide barrier). Per kernel over `reps`
+ * launches (warm: back to back; --cold N: the flush before each): span (first block in -> last block out), the blocks'
+ * start spread, block latency, blocks in flight (mean = sum of latencies / span; max by sweep), the most blocks resident on
+ * one WGP at once (HW_ID1 bits 10-20) and the WGPs used, rounds = span / mean latency, each phase's mean us, and the gap from
+ * A''s last block out to B3's first block in. Beside it the plain kernels (timeline off): A' alone (stage hook) and the whole
+ * read, so the stamps' own cost is visible. Every output byte of the TL launch is compared with the plain launch's. */
+static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
+    const std::string nm = fmt("hc_read bi_dec timeline at M=%lld", (long long)M);
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.readv_hc || !pl.norm_hc_wave || !pl.tl_hc || !pl.tl_hc_reset || !pl.tl_hc_read || !pl.pf2_stages_hc) {
+        skip(nm.c_str(), "row absent or no r4d_hc_tl hooks"); return;
+    }
+    if (M < 16 || M > 256) { std::printf("--perfhctl: 16 <= M <= 256 (A' G16 / G16p and B3's 16-row groups carry the timeline)\n"); return; }
+    if (reps < 1) reps = 20;
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n), sb = (size_t)(M * nkb * 4);
+    void* d_h = dalloc(hh.size() * 2);  void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());   void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb); void* d_inj = dalloc(ib); void* d_q = dalloc(qb); void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb); void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed"); return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  RAD_I8,     { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"), PI("bi_dec", 1),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    const int rv = 331 | st_readv_or();
+    pl.readv_hc(rv);
+    pl.norm_hc_wave(1);
+    pl.pf2_stages_hc(31);
+    auto launch = [&](int) { (void)r->launch(&a, (RadStream)hs); };
+    /* the bytes: plain vs TL (outputs poisoned before each) */
+    auto grab = [&](bool tl, std::vector<uint8_t>& o) {
+        pl.tl_hc(tl ? 1 : 0);
+        for (auto [p, b] : { std::pair<void*, size_t>{ d_x, xb }, { d_inj, ib }, { d_q, qb }, { d_qs, sb }, { d_rq, qb }, { d_rs, sb } })
+            st_memset(p, 0x5a, b);
+        if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) return false;
+        o.clear();
+        for (auto [p, b] : { std::pair<void*, size_t>{ d_x, xb }, { d_inj, ib }, { d_q, qb }, { d_qs, sb }, { d_rq, qb }, { d_rs, sb } }) {
+            const size_t at = o.size();
+            o.resize(at + b);
+            st_memcpy(o.data() + at, p, b, hipMemcpyDeviceToHost);
+        }
+        return true;
+    };
+    std::vector<uint8_t> o0, o1;
+    const bool okb = grab(false, o0) && grab(true, o1);
+    size_t diff = 0;
+    if (okb) for (size_t i = 0; i < o0.size() && i < o1.size(); ++i) diff += o0[i] != o1[i];
+    std::printf("HCTL M=%lld hc_readv %d bi_dec: timeline launch vs plain: %s\n", (long long)M, rv,
+                !okb ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
+    /* the plain kernels' times */
+    pl.tl_hc(0);
+    pl.pf2_stages_hc(3);
+    const double pa = st_time_us(launch, 50, hs);
+    pl.pf2_stages_hc(31);
+    const double pt = st_time_us(launch, 50, hs);
+    /* the timeline: reps launches, every block's record */
+    struct Rec { unsigned long long w[8]; };
+    std::vector<Rec> rec[2];
+    std::vector<double> span[2], spread[2], gapab;
+    std::vector<int> fly_max[2], wgp_max[2], wgps[2], nblk[2];
+    std::vector<double> fly_mean[2];
+    std::vector<unsigned long long> buf((size_t)2048 * 8);
+    pl.tl_hc(1);
+    for (int rep = 0; rep < reps; ++rep) {
+        if (pl.tl_hc_reset() != 0) { ok(nm.c_str(), false, "r4d_hc_tl_reset failed"); pl.tl_hc(0); return; }
+        (void)st_time_us(launch, 1, hs);
+        (void)st_stream_sync(hs);
+        unsigned long long a_end = 0, b_start = ~0ull;
+        for (int g = 0; g < 2; ++g) {
+            const int got = pl.tl_hc_read(buf.data(), g, 2048);
+            if (got <= 0) continue;
+            std::vector<Rec> rr;
+            for (int b = 0; b < got; ++b) {
+                Rec e;
+                std::memcpy(e.w, buf.data() + (size_t)b * 8, sizeof(e.w));
+                if (e.w[0] && e.w[5]) rr.push_back(e);
+            }
+            if (rr.empty()) continue;
+            unsigned long long t0 = ~0ull, t1 = 0, s1 = 0;
+            for (const Rec& e : rr) { t0 = std::min(t0, e.w[0]); t1 = std::max(t1, e.w[5]); s1 = std::max(s1, e.w[0]); }
+            if (g == 0) a_end = t1; else b_start = t0;
+            span[g].push_back((double)(t1 - t0) / 100.0);
+            spread[g].push_back((double)(s1 - t0) / 100.0);
+            nblk[g].push_back((int)rr.size());
+            /* in flight: sweep; per WGP the same */
+            std::vector<std::pair<unsigned long long, int>> ev;
+            std::map<unsigned, std::vector<std::pair<unsigned long long, int>>> per;
+            double lat = 0;
+            for (const Rec& e : rr) {
+                ev.push_back({ e.w[0], 1 }); ev.push_back({ e.w[5], -1 });
+                const unsigned wgp = (unsigned)((e.w[7] >> 32) >> 10) & 0x7ffu;
+                per[wgp].push_back({ e.w[0], 1 }); per[wgp].push_back({ e.w[5], -1 });
+                lat += (double)(e.w[5] - e.w[0]);
+            }
+            auto sweep = [](std::vector<std::pair<unsigned long long, int>>& v) {
+                std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.first != y.first ? x.first < y.first : x.second < y.second; });
+                int c = 0, m = 0;
+                for (const auto& p : v) { c += p.second; m = std::max(m, c); }
+                return m;
+            };
+            fly_max[g].push_back(sweep(ev));
+            int wm = 0;
+            for (auto& kv : per) wm = std::max(wm, sweep(kv.second));
+            wgp_max[g].push_back(wm);
+            wgps[g].push_back((int)per.size());
+            fly_mean[g].push_back(t1 > t0 ? lat / (double)(t1 - t0) : 0.0);
+            for (const Rec& e : rr) rec[g].push_back(e);
+        }
+        if (a_end && b_start != ~0ull) gapab.push_back(((double)b_start - (double)a_end) / 100.0);
+    }
+    pl.tl_hc(0);
+    auto mean = [](const std::vector<double>& v) { double s = 0; for (double x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size(); };
+    auto meani = [](const std::vector<int>& v) { double s = 0; for (int x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size(); };
+    auto maxi = [](const std::vector<int>& v) { int m = 0; for (int x : v) m = std::max(m, x); return m; };
+    auto pct = [](std::vector<double> v, double q) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[(size_t)std::min<double>((double)v.size() - 1, q * (double)v.size())]; };
+    static const char* const kPhA[5] = { "prologue + norm", "scale", "dots", "partials + fence + atomic", "finish" };
+    static const char* const kPhB[4] = { "operands + d stage", "up product + mix + x + fence", "atomic", "quantise" };
+    for (int g = 0; g < 2; ++g) {
+        if (rec[g].empty()) { std::printf("HCTL M=%lld %s: no records\n", (long long)M, g ? "B3" : "A'"); continue; }
+        std::vector<double> lat;
+        for (const Rec& e : rec[g]) lat.push_back((double)(e.w[5] - e.w[0]) / 100.0);
+        const double lm = mean(lat);
+        std::string ph;
+        const int np = g ? 4 : 5;
+        for (int k = 0; k < np; ++k) {
+            /* phase k: from stamp k to stamp k + 1; the last phase ends at word 5; B3's word 4 is unused */
+            std::vector<double> dl, dl_last, dl_rest;
+            for (const Rec& e : rec[g]) {
+                const unsigned long long from = e.w[k];
+                const unsigned long long to = (g == 1 && k == 3) ? e.w[5] : (g == 0 && k == 4) ? e.w[5] : e.w[k + 1];
+                if (!from || !to || to < from) continue;
+                const double d = (double)(to - from) / 100.0;
+                dl.push_back(d);
+                const unsigned fl = (unsigned)(e.w[7] >> 24) & 0xffu;
+                if (k == np - 1) (fl ? dl_last : dl_rest).push_back(d);
+            }
+            if (k == np - 1)
+                ph += fmt("%s%s %.2f (%zu blocks) / exit %.2f", k ? ", " : "", g ? kPhB[k] : kPhA[k], mean(dl_last), dl_last.size() / (size_t)reps, mean(dl_rest));
+            else
+                ph += fmt("%s%s %.2f (p90 %.2f)", k ? ", " : "", g ? kPhB[k] : kPhA[k], mean(dl), pct(dl, 0.9));
+        }
+        std::printf("HCTL M=%lld %s %s (%s, %.0f blocks a launch, %d reps): span %.2f us (plain: %s %.2f us), start spread %.2f us, "
+                    "block %.2f us (p50 %.2f, p90 %.2f), in flight mean %.1f max %d, one WGP max %d (%.0f WGPs), rounds %.2f | phase us: %s\n",
+                    (long long)M, g_cold > 0 ? "cold" : "warm", g ? "B3" : "A'",
+                    g ? "hc_up_w 16" : (M >= 32 ? "G16p" : "G16"), meani(nblk[g]), reps, mean(span[g]),
+                    g ? "whole read" : "A' alone", g ? pt : pa, mean(spread[g]), lm, pct(lat, 0.5), pct(lat, 0.9),
+                    mean(fly_mean[g]), maxi(fly_max[g]), maxi(wgp_max[g]), meani(wgps[g]), lm > 0 ? mean(span[g]) / lm : 0.0, ph.c_str());
+    }
+    if (!gapab.empty())
+        std::printf("HCTL M=%lld %s: A' last block out -> B3 first block in %.2f us (p50 %.2f, min %.2f)\n", (long long)M,
+                    g_cold > 0 ? "cold" : "warm", mean(gapab), pct(gapab, 0.5), pct(gapab, 0.0));
+    pl.readv_hc(0);
+    pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    ok(nm.c_str(), okb && diff == 0, diff ? "the timeline launch's bytes differ" : "");
+}
+
 /* fn4 SP-serial (14.11.2026, --spqcheck [mask]): Qwen3.8-Flash-Next's serial-step sequence-parallel read. A prefill segment of
  * h rows read whole (hc_read_e4m3 as the trunk declares it: M band 2048, no pin) against its parts on their own row slices
  * with kc_rows = 128 ceil(h / 128) (HyperConn::read_kt) -- the parts a rank's rows of a step of td decode rows + h (q =
@@ -42751,6 +42966,9 @@ static void usage(void) {
                 "             pinned (r4d_moe_mxfp4_pin_small), their outputs compared byte for byte.\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
                 "             mhc_post at GLM's shape, 16-byte rows against pitched ones.\n"
+                "  --perfhctl M [reps]:  the bi_dec decode hc_read (hc_readv 331: A' G16 / G16p, B3) at M rows\n"
+                "             (16..256) with every block's phase timeline (r4d_hc_tl): span, block latency,\n"
+                "             blocks in flight, per-WGP residency, rounds, phase us; bytes vs the plain launch.\n"
                 "  --perfrg M [iters]:  the Qwen tp4 decode router (router_gemm_topk_scatter_inv at 512\n"
                 "             experts, K 2560, top 10, 128 local, shared gate) against its parts alone, timed.\n"
                 "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
@@ -42883,6 +43101,7 @@ int main(int argc, char** argv) {
     long long rt_m = 0;
     int rt_it = 200;
     long long rg_m = 0;   /* --perfrg */
+    long long hctl_m = 0; int hctl_reps = 20;   /* --perfhctl (qfn-on-ds Q17) */
     int rg_it = 200;
     long long mf_m = 0;
     int mf_it = 200;
@@ -43111,6 +43330,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             mhc_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mhc_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhctl")) {
+            /* qfn-on-ds Q17: the bi_dec decode read's per-block phase timeline at M rows (hc_tl_perf) */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hctl_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hctl_reps = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfrg")) {
             /* qfn-on-ds: the Qwen tp4 decode router's parts at M rows (router_rg_perf) */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -43545,6 +43769,16 @@ int main(int argc, char** argv) {
         skip("mhc timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (hctl_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_tl_perf(pl, hctl_m, hctl_reps);
+        dfree_all();
+#else
+        skip("hc_read timeline", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (rg_m) {
         if (!load(&pl, path)) return 1;

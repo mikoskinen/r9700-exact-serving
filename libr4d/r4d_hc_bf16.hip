@@ -2107,7 +2107,43 @@ __device__ __forceinline__ void hc_read_s_down_body(
  * channels 32b + 4w .. + 3 (16 W_up rows). RG: the step's rows (1..16). W_up and its scales load
  * before the chain wait. */
 constexpr int kHcBCh = 32;                         /* channels a block */
-template <int RG, bool CH, bool I8>
+
+/* qfn-on-ds Q17 (Qwen loop round 4, 21.11.2026; bench only): the per-block phase timeline of the bi_dec decode read's
+ * kernels -- A' (G16 / G16p, region 0) and B3 at 16 rows a group (region 1). r4d_hc_tl(1) makes the launcher take the TL
+ * copies: the same bodies (TL = true) with thread 0 storing wall_clock64 (100 MHz) right after each block-wide barrier
+ * into the bench's buffer [region][block][k] (g_hc_tlp, allocated by r4d_hc_tl(1); 8 bytes of module memory otherwise), and
+ * in word 7 HW_ID1 << 32 | flags << 24 | blockIdx.y << 12 | blockIdx.x. The stamps write only that buffer: every output byte
+ * is the plain kernel's. TL = false (every engine launch) adds no instruction. */
+constexpr int kHcTlMax = 2048;                     /* blocks a region */
+constexpr int kHcTlW   = 8;                        /* words a block */
+__device__ unsigned long long* g_hc_tlp;
+template <bool TL>
+__device__ __forceinline__ void hc_tl_put(int region, int k) {
+    if constexpr (TL) {
+        unsigned long long* const tb = g_hc_tlp;
+        if (threadIdx.x != 0 || !tb) return;
+        const unsigned b = blockIdx.y * gridDim.x + blockIdx.x;
+        if (b < (unsigned)kHcTlMax)
+            tb[((unsigned long long)region * kHcTlMax + b) * kHcTlW + k] = (unsigned long long)wall_clock64();
+    }
+}
+template <bool TL>
+__device__ __forceinline__ void hc_tl_end(int region, unsigned flags) {
+    if constexpr (TL) {
+        unsigned long long* const tb = g_hc_tlp;
+        if (threadIdx.x != 0 || !tb) return;
+        const unsigned b = blockIdx.y * gridDim.x + blockIdx.x;
+        if (b >= (unsigned)kHcTlMax) return;
+        const unsigned long long t = (unsigned long long)wall_clock64();
+        const unsigned hw = (unsigned)__builtin_amdgcn_s_getreg((31 << 11) | 23);   /* HW_ID1 */
+        unsigned long long* const r = tb + ((unsigned long long)region * kHcTlMax + b) * kHcTlW;
+        r[5] = t;
+        r[7] = ((unsigned long long)hw << 32) | ((unsigned long long)(flags & 0xffu) << 24)
+               | ((unsigned long long)(blockIdx.y & 0xfffu) << 12) | (unsigned long long)(blockIdx.x & 0xfffu);
+    }
+}
+
+template <int RG, bool CH, bool I8, bool TL = false>
 __device__ __forceinline__ void hc_up_w_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
@@ -2121,6 +2157,7 @@ __device__ __forceinline__ void hc_up_w_body(
     __shared__ float s_usc[kWaves][16][4];
     __shared__ unsigned s_arrived;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(1, 0);
     const int col = lane & 15, hh = lane >> 4;
     const long i0 = (long)blockIdx.x * kHcBCh;
     const long iw = i0 + 4 * wave;
@@ -2181,6 +2218,7 @@ __device__ __forceinline__ void hc_up_w_body(
         for (int a = 0; a < 2; ++a)
             Npre[a][c] = nbf(bfw_f(a ? (hv2[c] >> 16) : (hv2[c] & 0xffffu)) * sc[c] * wv[a][c]);
     __syncthreads();
+    hc_tl_put<TL>(1, 1);
 
     /* ---- the up product: per quarter five WMMA steps, folded with the quarter's scale */
     float U[8];
@@ -2212,17 +2250,19 @@ __device__ __forceinline__ void hc_up_w_body(
         }
         *(uint32_t*)(x + (long)col * xrow + iw + 2 * hh) = f2bf2(acc[0], acc[1]);
     }
-    if (!q || !ctr) return;
+    if (!q || !ctr) { hc_tl_end<TL>(1, 2u); return; }
 
     /* ---- the 128-channel group's last block quantises it */
     const int nb = kUpTB / kHcBCh;
     __threadfence();
     __syncthreads();
+    hc_tl_put<TL>(1, 2);
     const unsigned slot = (unsigned)(i0 / kUpTB + (long)blockIdx.y * (n / kUpTB));
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
-    if (s_arrived + 1u != (unsigned)nb) return;
+    hc_tl_put<TL>(1, 3);
+    if (s_arrived + 1u != (unsigned)nb) { hc_tl_end<TL>(1, 0u); return; }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     const long base = (i0 / kUpTB) * kUpTB;
     for (int r = wave; r < RG && r < rows; r += kWaves) {
@@ -2240,6 +2280,7 @@ __device__ __forceinline__ void hc_up_w_body(
         if (rq) hc_rot_group(v, lane, rq + (long)r * rqrow + base, rqs + (long)r * rsrow + base / kUpTB);
     }
     if (tid == 0) __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    hc_tl_end<TL>(1, 1u);
 }
 
 #define R4D_HCW_PARAMS                                                                            \
@@ -2259,6 +2300,15 @@ template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_w(R4D_HCW_PARAMS) {
     hc_up_w_body<RG, true, I8>(R4D_HCW_ARGS);
     r4d_chain_done();
+}
+/* qfn-on-ds Q17 (bench only, r4d_hc_tl): B3 with the phase timeline, region 1. The TL copies keep the plain kernels' VGPR
+ * count, so the same number of blocks is resident a WGP: B3 capped at the plain kernel's 118 VGPRs (the stamps alone took
+ * it to 127) and held there by a clobber of v117, A' G16p / G16 raised to the plain 194 / 130 by a clobber of the top
+ * register (the stamps let the compiler drop to 191 / 120). The bench prints the residency it measures. */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) void hc_up_w_tl_kernel(R4D_HCW_PARAMS) {
+    asm volatile("" ::: "v117");
+    hc_up_w_body<RG, false, I8, true>(R4D_HCW_ARGS);
 }
 
 /* qfn-on-ds lever B3R (Qwen loop round 1, 20.11.2026; hc_readv bits 11-12): kernel B3 under bi_dec with GPB 16-row
@@ -2469,7 +2519,7 @@ void r4dchain_hc_read_g_down(const unsigned short* __restrict__ h, const float* 
  * the norm weight (staged in LDS) instead of an [RG][n] LDS plane (16 rows would not fit). Every element of N is the same
  * expression in the same order (bf16(bf16(h) * scale * (w + wadd))), the scales the same per-row sums, the dots the same
  * WMMA sequence a row: each row's bytes are form G's (and its alone read's). Rows h must be 16-byte aligned. */
-template <int RG, bool CH>
+template <int RG, bool CH, bool TL = false>
 __device__ __forceinline__ void hc_read_g16_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2485,6 +2535,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
     constexpr long HN = hc * kHcGN;
     constexpr long NG = HN / r4d_hc8::kDownGroup;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(0, 0);
     const int t = (int)blockIdx.x / hc, c = (int)blockIdx.x % hc;
     const bool itile = t == ntd;
     /* This block's row group: rows r0 .. r0 + rr - 1 of the step (RG a group, the last may be short). */
@@ -2540,6 +2591,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
         if (lane == 0) s_part[wave][r] = acc;
     }
     __syncthreads();
+    hc_tl_put<TL>(0, 1);
     if (tid < RG) {
         float ss = 0.0f;
         for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
@@ -2547,6 +2599,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
         if (t == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
     }
     __syncthreads();
+    hc_tl_put<TL>(0, 2);
 
     /* ---- the dots: rows of N as A (rows past RG repeat the last; their D rows are dropped) */
     const int  rowl = col < rr ? col : rr - 1;
@@ -2618,6 +2671,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
 #pragma unroll
     for (int e = 0; e < 8; ++e) s_red[wave][col][8 * hh + e] = P[e];
     __syncthreads();
+    hc_tl_put<TL>(0, 3);
     const long pstride = (long)RG * kHcGTile;                 /* one stream's partials of a tile */
     float* const pt = part + (long)t * hc * pstride;
     if (tid < RG * kHcGTile) {
@@ -2634,7 +2688,8 @@ __device__ __forceinline__ void hc_read_g16_down_body(
         s_last = __hip_atomic_fetch_add(&tctr[t], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT)
                  + 1u == (unsigned)hc;
     __syncthreads();
-    if (!s_last) return;
+    hc_tl_put<TL>(0, 4);
+    if (!s_last) { hc_tl_end<TL>(0, 0u); return; }
     /* Every wave: a workgroup's waves may sit on both CUs of a WGP, each with its own cache. The
      * reset goes after the payload, so this acquire waits for no store. */
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -2659,6 +2714,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
             inj[(long)r * irow + n] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
         }
     }
+    hc_tl_end<TL>(0, 1u);
 }
 
 /* fn4 BI (hc_bi 5, 12.11.2026; x17: G16 at 64 rows still +35 % over today's forms): G16 with TWO 16-column tiles a block
@@ -2666,7 +2722,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
  * half the h reads), the two tiles' WMMAs fed by the same A fragments. Per tile the arithmetic is G16's (the same chunk
  * order, the same group-scale folds, the same wave and stream sums), so every row's bytes are G16's = form G's. The inject
  * tile (bf16 gains) keeps a block of its own: blocks p < ntd / 2 take tiles 2p, 2p + 1; block ntd / 2 the inject tile. */
-template <int RG, bool CH, bool PRE = false, int NTB = 2>
+template <int RG, bool CH, bool PRE = false, int NTB = 2, bool TL = false>
 __device__ __forceinline__ void hc_read_g16p_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2682,6 +2738,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
     constexpr long HN = hc * kHcGN;
     constexpr long NG = HN / r4d_hc8::kDownGroup;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(0, 0);
     const int pb = (int)blockIdx.x / hc, c = (int)blockIdx.x % hc;
     const int npairs = ntd / NTB;
     const bool itile = pb == npairs;
@@ -2750,6 +2807,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
             if (lane == 0) s_part[wave][r] = acc;
         }
         __syncthreads();
+        hc_tl_put<TL>(0, 1);
         if (tid < RG) {
             float ss = 0.0f;
             for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
@@ -2757,6 +2815,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
             if (pb == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
         }
         __syncthreads();
+        hc_tl_put<TL>(0, 2);
     }
 
     const int  rowl = col < rr ? col : rr - 1;
@@ -2844,6 +2903,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
             for (int e = 0; e < 8; ++e) s_red[u][wave][col][8 * hh + e] = P[u][e];
         }
     __syncthreads();
+    hc_tl_put<TL>(0, 3);
     const long pstride = (long)RG * kHcGTile;
     for (int u = 0; u < nt_here; ++u) {
         float* const pt = part + (long)tt[u] * hc * pstride;
@@ -2860,6 +2920,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         for (int u = 0; u < nt_here; ++u)
             s_last[u] = __hip_atomic_fetch_add(&tctr[tt[u]], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1u == (unsigned)hc;
     __syncthreads();
+    hc_tl_put<TL>(0, 4);
     for (int u = 0; u < nt_here; ++u) {
         if (!s_last[u]) continue;
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -2882,6 +2943,11 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         }
         __syncthreads();
         if (tid == 0) __hip_atomic_store(&tctr[tt[u]], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    if constexpr (TL) {
+        unsigned fl = 0;
+        for (int u = 0; u < nt_here; ++u) fl |= s_last[u] ? (1u << u) : 0u;
+        hc_tl_end<TL>(0, fl);
     }
 }
 /* fn4 BI (hc_readv bit 9): form G's per-row norm scales once a (stream, 16-row group), for G16p's PRE form -- the same
@@ -2935,6 +3001,33 @@ void hc_read_g16q_down_kernel(const unsigned short* __restrict__ h, const float*
                               float eps, float wadd, int ntd, long rows) {
     hc_read_g16p_down_body<RG, false, false, 4>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                 hrow, irow, eps, wadd, ntd, rows);
+}
+/* qfn-on-ds Q17 (bench only, r4d_hc_tl): A' G16 / G16p with the phase timeline, region 0 */
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16p_down_tl_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                 const unsigned char* __restrict__ downv, long dld,
+                                 const unsigned short* __restrict__ injw,
+                                 unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                 float* __restrict__ scaleout, float* __restrict__ part,
+                                 unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                 float eps, float wadd, int ntd, long rows) {
+    asm volatile("" ::: "v193");
+    hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                      hrow, irow, eps, wadd, ntd, rows);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16_down_tl_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                const unsigned char* __restrict__ downv, long dld,
+                                const unsigned short* __restrict__ injw,
+                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                float* __restrict__ scaleout, float* __restrict__ part,
+                                unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                float eps, float wadd, int ntd, long rows) {
+    asm volatile("" ::: "v129");
+    hc_read_g16_down_body<RG, false, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                           hrow, irow, eps, wadd, ntd, rows);
 }
 template <int RG>
 __global__ __launch_bounds__(kThreads)
@@ -4403,6 +4496,8 @@ static void fc_add(int f, long rows, bool bd) {
  * 2 the down product, 4 the split-K reduce, 8 the up-mix, 16 the codes. A mask other than 31
  * leaves the outputs incomplete; r4d_selftest --perfhcv times the cumulative masks. */
 static std::atomic<int> g_hc_pf2_stages{31};
+/* qfn-on-ds Q17 (bench only): r4d_hc_tl(1) = the bi_dec read's A' (G16 / G16p) and B3 (16-row groups) launch their TL copies */
+static std::atomic<int> g_hc_tl{0};
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -7817,7 +7912,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone), from 32 rows (x19 / x21 one card:
          * 16 rows +4 % slower, 32 -6 %, 64 -7 %) */
         fc_add(kFcG16p, (long)rows, bidec);
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16> : &hc_read_g16p_down_kernel<16>),
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16>
+                               : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16p_down_tl_kernel<16>
+                               : &hc_read_g16p_down_kernel<16>),
                            dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
                            (const unsigned char*)down->data, (long)dld,
@@ -7826,7 +7923,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (int)hcg_nt, (long)rows);
     } else if (hcg && g16) {
         fc_add(kFcG16, (long)rows, bidec);
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16> : &hc_read_g16_down_kernel<16>),
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16>
+                               : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16_down_tl_kernel<16>
+                               : &hc_read_g16_down_kernel<16>),
                            dim3((unsigned)((hcg_nt + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
                            (const unsigned char*)down->data, (long)dld,
@@ -7905,7 +8004,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     } else if (hcw) {
         unsigned int* const qctr = q ? mctr : nullptr;
 #define HC_UPW_K(RG_, I8_)                                                                       \
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_> : &hc_up_w_kernel<RG_, I8_>),  \
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_>                                 \
+                               : (RG_ == 16 && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_up_w_tl_kernel<16, I8_> \
+                               : &hc_up_w_kernel<RG_, I8_>),                                     \
                            dim3((unsigned)(n / kHcBCh), (unsigned)((rows + RG_ - 1) / RG_)),    \
                            dim3(kThreads), 0,                                                     \
                            (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf, \
@@ -7988,6 +8089,32 @@ extern "C" void r4d_hc_mix_ctr_release() {
 extern "C" void r4d_hc_read_pinpf2(int on) { g_hc_pinpf2.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 5) ? 0 : v, std::memory_order_relaxed); }
 extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (m & 31), std::memory_order_relaxed); }
+/* qfn-on-ds Q17 (bench only): the per-block phase timeline (g_hc_tlp's note). r4d_hc_tl(1) on, r4d_hc_tl_reset() zeroes the
+ * records before a launch, r4d_hc_tl_read(out, region, max) copies min(max, 2048) records of 8 words of a region (0 A', 1 B3)
+ * after it; a block that did not run reads 0. */
+static unsigned long long* g_hc_tl_buf = nullptr;   /* the bench's device buffer (r4d_hc_tl) */
+constexpr size_t kHcTlBytes = (size_t)2 * kHcTlMax * kHcTlW * sizeof(unsigned long long);
+extern "C" void r4d_hc_tl(int on) {
+    if (on && !g_hc_tl_buf) {
+        void* p = nullptr;
+        if (hipMalloc(&p, kHcTlBytes) != hipSuccess) return;
+        if (hipMemset(p, 0, kHcTlBytes) != hipSuccess || hipMemcpyToSymbol(HIP_SYMBOL(g_hc_tlp), &p, sizeof p) != hipSuccess) {
+            (void)hipFree(p); return;
+        }
+        g_hc_tl_buf = (unsigned long long*)p;
+    }
+    g_hc_tl.store(on && g_hc_tl_buf ? 1 : 0, std::memory_order_relaxed);
+}
+extern "C" int r4d_hc_tl_reset() {
+    if (!g_hc_tl_buf) return -1;
+    return hipMemset(g_hc_tl_buf, 0, kHcTlBytes) == hipSuccess && hipDeviceSynchronize() == hipSuccess ? 0 : -1;
+}
+extern "C" int r4d_hc_tl_read(unsigned long long* out, int region, int max) {
+    if (!g_hc_tl_buf || region < 0 || region > 1 || max <= 0) return -1;
+    const int n = max < kHcTlMax ? max : kHcTlMax;
+    return hipMemcpy(out, g_hc_tl_buf + (size_t)region * kHcTlMax * kHcTlW, (size_t)n * kHcTlW * sizeof(unsigned long long),
+                     hipMemcpyDeviceToHost) == hipSuccess ? n : -1;
+}
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
  * parked): hc_read's two forms, hc_write's eight-wide form, hc_read's faster forms (hc_readv) and the
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */
