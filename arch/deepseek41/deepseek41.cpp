@@ -4306,19 +4306,6 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                               {}, { m.score }, { m.csplit ? m.keep_part : m.keep });
                 if (!L.i_cand) return RAD_E_INVAL;
                 if (m.csplit && rw(b, L.i_cand, {}, { m.keep }) == 0) return RAD_E_INVAL;
-                if (m.csplit && !m.keep_gather) {
-                    /* the words moved as f32 (the selections' gather does the same with its i32 rows); a library that
-                     * serves no such gather leaves the candidate layer unsplit, as before */
-                    m.keep_gather = op(b, "all_gather",
-                                       { RAD_INT("world_size", g.world), RAD_INT("numel", m.qmax * IR * m.kwords),
-                                         RAD_STR("dtype", "f32") },
-                                       {}, { m.keep_part }, { m.keep });
-                    if (!m.keep_gather) {
-                        m.csplit = false;
-                        rad_note(b, "deepseek41: RADIANCE_DS41_CAND_SPLIT (tp8 loop P47) off: no all_gather of the keep words "
-                                    "resolves at %d ranks; layer %lld's indexer stays unsplit", g.world, (long long)c.cand);
-                    }
-                }
             }
             const bool uses = c.cand >= 0 && c.cand < l;
             if (uses && (!m.keep || c.ratio[(size_t)c.cand] != r)) {
@@ -4337,6 +4324,20 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                           { sel_out });
             if (L.i_topk && m.isplit && rw(b, L.i_topk, {}, { m.sel }) == 0) return RAD_E_INVAL;
             if (!L.i_topk) return RAD_E_INVAL;
+            /* tp8 loop P47: the keep rows' join, declared after the layer's selection as it is issued (after every run's
+             * candidates and selection), the words moved as f32 (the selections' gather moves its i32 rows the same way); a
+             * library that serves no such gather leaves the candidate layer unsplit, as before */
+            if (l == c.cand && m.csplit && !m.keep_gather) {
+                m.keep_gather = op(b, "all_gather",
+                                   { RAD_INT("world_size", g.world), RAD_INT("numel", m.qmax * IR * m.kwords),
+                                     RAD_STR("dtype", "f32") },
+                                   {}, { m.keep_part }, { m.keep });
+                if (!m.keep_gather) {
+                    m.csplit = false;
+                    rad_note(b, "deepseek41: RADIANCE_DS41_CAND_SPLIT (tp8 loop P47) off: no all_gather of the keep words "
+                                "resolves at %d ranks; layer %lld's indexer stays unsplit", g.world, (long long)c.cand);
+                }
+            }
         }
 
         /* ---- the sparse attention and the output projection */
