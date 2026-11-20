@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <type_traits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +69,7 @@ struct GgWkArgs {
     long long h_ld;
     int h_al;
     int fpp;                             /* PRO 1: lever FPP's prologue (GgWkFold pro 3; gg_fold_norm_rows) */
+    int tl;                              /* round 30 bench: gg_wk3_kernel's block stamps (R4D_WK3_TL) */
 };
 
 /* Lever FPP (DRAFTER track 20.11.2026 round 33): fold a's norm prologue (PRO 1) with RB rows' loads in flight at once. The old loop
@@ -109,14 +111,31 @@ constexpr int gg_wk_parts(long long K) {
     return S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1;
 }
 
+/* TL (round 30, bench only, env R4D_WK3_TL=1): thread 0 of each block adds its entry / exit clock (wall_clock64, 100 MHz) to
+ * g_wk3_tl = { min entry, max exit, sum of block durations, blocks, max entry }; gg_wk3_run syncs and prints a WK3TL line. Round 35: gg_wk_kernel (G1) too
+ * (r4d_gg_wk_run prints WK1TL). */
+__device__ unsigned long long g_wk3_tl[5];
+struct Wk3Tl {
+    unsigned long long t0;
+    __device__ __forceinline__ Wk3Tl() : t0((unsigned long long)wall_clock64()) {}
+    __device__ __forceinline__ void done(bool on) const {
+        if (!on || threadIdx.x != 0) return;
+        const unsigned long long t1 = (unsigned long long)wall_clock64();
+        atomicMin(&g_wk3_tl[0], t0); atomicMax(&g_wk3_tl[1], t1); atomicAdd(&g_wk3_tl[2], t1 - t0); atomicAdd(&g_wk3_tl[3], 1ull);
+        atomicMax(&g_wk3_tl[4], t0);
+    }
+};
 /* WL (lever WMK stage 2, G1): each wave stages ITS OWN run's 16 rows a slab into its own LDS region, single-buffered, so the
  * K loop has no block barrier (a wave-scope fence a slab); the staged values, the group sums (the same lanes, the same
  * DPP partners, the same order) and every operation after them are the block-staged form's, so the bytes are the same. */
 /* DP (stage 2, r6 bench): 1 = the raw words a slab ahead as gg_wm_kernel loads them (the early words a slab ahead, the rest reloaded
  * in place after their last use: half a slab of latency); 2 = every raw word of slab t + 2 loaded at slab t's start into a ring of
  * three register sets (two slabs of loads in flight, no in-place reloads). Only the load timing differs: the same operations. */
-template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1>
+/* AB (DRAFTER round 35, BENCH ablation only, env R4D_WK3_AB as gg_wk3_kernel's; outputs NOT the part order under AB != 0): bit 1 no
+ * weight loads in the K loop (the prologue's words reused), bit 2 no per-slab activation staging, bit 4 no math (the raw words folded). */
+template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1, int AB = 0>
 __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
+    const Wk3Tl wtl;
     using W = Wq<T>;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
@@ -316,12 +335,16 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
         if constexpr (DP == 2) {
             W::load(wr[nt], sb, h, rF[0][nt]);
             W::load(wr[nt], sb + (1 < SW ? 1 : SW - 1), h, rF[1][nt]);
+            if constexpr ((AB & 1) != 0) {
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) rF[2][nt][k] = rF[0][nt][k];
+            }
         } else {
             uint32_t t[W::RAW];
             W::load(wr[nt], sb, h, t);
 #pragma unroll
             for (int k = 0; k < W::RAW; ++k) {
-                if ((W::EARLY >> k) & 1u) rE[0][nt][k] = t[k];
+                if ((W::EARLY >> k) & 1u) { rE[0][nt][k] = t[k]; if constexpr ((AB & 1) != 0) rE[1][nt][k] = t[k]; }
                 else rR[nt][k] = t[k];
             }
         }
@@ -358,8 +381,9 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
             for (int k = 0; k < W::RAW; ++k)
                 rc[nt][k] = DP == 2 ? rF[RS][nt][k] : ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
         const int sn = t + 1 < SW ? s + 1 : s;
-        if (pbr == 0) prefetch(s);
-        if constexpr (DP == 2) {   /* slab t + 2 into the set slab t - 1 held */
+        if (pbr == 0 && (AB & 1) == 0) prefetch(s);
+        if constexpr ((AB & 1) != 0) {
+        } else if constexpr (DP == 2) {   /* slab t + 2 into the set slab t - 1 held */
             const int s2 = sb + (t + 2 < SW ? t + 2 : SW - 1);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) W::load(wr[nt], s2, h, rF[(RS + 2) % 3][nt]);
@@ -373,6 +397,24 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
                     if ((W::EARLY >> k) & 1u) rE[PB ^ 1][nt][k] = tw[k];
             }
         }
+        if constexpr ((AB & 4) != 0) {   /* ablation: no math -- the slab's raw words folded into one value (their loads stay) */
+            uint32_t xw = 0;
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) xw ^= rc[nt][k];
+            acc[0][0] += __uint_as_float(xw & 0x3fffffffu);
+            if constexpr (W::ROLL && DP == 1 && (AB & 1) == 0)
+                gg_for<8>([&](auto jc) {
+                    constexpr int J = decltype(jc)::value;
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
+                });
+            if constexpr (!WL && (AB & 2) == 0) {
+                xstore(pbr ^ 1);
+                xload(t + 2 < SW ? t + 2 : SW - 1);
+            }
+        } else {
         const uint16_t* xb = xa + (WL ? 0 : pbr * XE);
         const float* xg = xgl + (WL ? 0 : pbr * XGE);
         gg_v8f P[2];
@@ -448,17 +490,19 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) gg_pin8(acc[nt]);
             }
-            if constexpr (W::ROLL && DP == 1) {
+            if constexpr (W::ROLL && DP == 1 && (AB & 1) == 0) {
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
             }
-            if constexpr (J == 3 && !WL) {
+            if constexpr (J == 3 && !WL && (AB & 2) == 0) {
                 xstore(pbr ^ 1);
                 xload(t + 2 < SW ? t + 2 : SW - 1);
             }
             __builtin_amdgcn_sched_barrier(0);
         });
-        if constexpr (WL) {   /* the one buffer: slab t + 1 in once slab t's reads are issued (a wave's LDS ops run in order) */
+        }   /* AB 4 */
+        if constexpr ((AB & 2) != 0) {
+        } else if constexpr (WL) {   /* the one buffer: slab t + 1 in once slab t's reads are issued (a wave's LDS ops run in order) */
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
             xstore(0);
             sync();
@@ -531,6 +575,7 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
             gg_put((OT*)A.y[mi] + (long long)row * A.y_ld[mi] + n, tot[nt][q]);
         }
     }
+    wtl.done(A.tl != 0);
 }
 
 /* gg_wk_kernel's launch (ds41-wmk, bench). g_gg_wk, the bench pin r4d_gg_wk_pin (no engine path sets it): 0 off; else
@@ -556,8 +601,13 @@ std::atomic<int> g_gg_wk_last{0};
  * PRO 1 / 2 (stage 2, r5): lever K1's folds a / e in the staging exactly as gg_wk_kernel's (the producer's bf16 octet of each staged
  * chunk, rmsnorm's row scales from a block prologue in mr_norm_scales' order; grid row 0 also stores h) -- the same bytes as the
  * producer's launch then the GEMM. */
-template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1>   /* DP: as gg_wk_kernel's */
+/* AB (DRAFTER track 20.11.2026 round 30, BENCH ablation only, env R4D_WK3_AB; outputs are NOT the part order under AB != 0): which
+ * part of a slab costs the call -- bit 1 no weight loads in the K loop (the prologue's words reused), bit 2 no per-slab activation
+ * staging (the two block barriers, the LDS store and the next slab's global load: slab 0's staging reused), bit 4 no math (no A
+ * fragment reads, no decode, no WMMA, no scale fma; the raw words folded into one value so their loads stay). */
+template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1, int AB = 0>   /* DP: as gg_wk_kernel's */
 __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
+    const Wk3Tl wtl;
     using W = Wq<T>;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0 && !W::PIPE || W::TB == 0, "gg_wk3_kernel: the table types are not built");
@@ -719,6 +769,10 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
         if constexpr (DP == 2) {
             W::load(wr[nt], sb, h, rF[0][nt]);
             W::load(wr[nt], sb + (1 < SW ? 1 : SW - 1), h, rF[1][nt]);
+            if constexpr ((AB & 1) != 0) {
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) rF[2][nt][k] = rF[0][nt][k];
+            }
         } else {
             uint32_t t[W::RAW];
             W::load(wr[nt], sb, h, t);
@@ -759,7 +813,8 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
             for (int k = 0; k < W::RAW; ++k)
                 rc[nt][k] = DP == 2 ? rF[RS][nt][k] : ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
         const int sn = t + 1 < SW ? s + 1 : s;
-        if constexpr (DP == 2) {   /* slab t + 2 into the set slab t - 1 held */
+        if constexpr ((AB & 1) != 0) {
+        } else if constexpr (DP == 2) {   /* slab t + 2 into the set slab t - 1 held */
             const int s2 = sb + (t + 2 < SW ? t + 2 : SW - 1);
 #pragma unroll
             for (int nt = 0; nt < NT; ++nt) W::load(wr[nt], s2, h, rF[(RS + 2) % 3][nt]);
@@ -773,6 +828,20 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
                     if ((W::EARLY >> k) & 1u) rE[PB ^ 1][nt][k] = tw[k];
             }
         }
+        if constexpr ((AB & 4) != 0) {   /* ablation: no math -- the slab's raw words folded into one value (their loads stay) */
+            uint32_t xw = 0;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) xw ^= rc[nt][k];
+            acc[0][0][0] += __uint_as_float(xw & 0x3fffffffu);
+            if constexpr (W::ROLL && DP == 1 && (AB & 1) == 0)
+                gg_for<8>([&](auto jc) {
+                    constexpr int J = decltype(jc)::value;
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
+                });
+        } else {
         gg_v8f P[NM][NT];
         r4d_u32x4 af[2][NM];
         gg_v8f ci[NM];
@@ -862,17 +931,20 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
                     for (int nt = 0; nt < NT; ++nt) gg_pin8(acc[mt][nt]);
                 }
             }
-            if constexpr (W::ROLL && DP == 1) {
+            if constexpr (W::ROLL && DP == 1 && (AB & 1) == 0) {
 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
             }
             __builtin_amdgcn_sched_barrier(0);
         });
+        }   /* AB 4 */
         /* the one buffer: every wave done reading slab t, then slab t + 1 in, then slab t + 2's loads */
-        lds_barrier();
-        xstore();
-        lds_barrier();
-        xload(t + 2 < SW ? t + 2 : SW - 1);
+        if constexpr ((AB & 2) == 0) {
+            lds_barrier();
+            xstore();
+            lds_barrier();
+            xload(t + 2 < SW ? t + 2 : SW - 1);
+        }
         /* a part ends with this slab: run 0 folds it into its total; a later run's first part goes to hold (= tot here) */
         if (--pleft == 0) {
             pleft = SP;
@@ -957,6 +1029,7 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
                 gg_put((OT*)A.y[mi] + (long long)row * A.y_ld[mi] + n, tot[mt][nt][q]);
             }
         }
+    wtl.done(A.tl != 0);
 }
 
 template <int T>
@@ -988,6 +1061,20 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 #undef GG_WK_F
 #undef GG_WK_F2
         return R4D_WK_DECLINE;
+    }
+    /* DRAFTER round 35 bench ablation (env R4D_WK3_AB 1 / 3 / 6, read once; outputs not the part order): the trunk's served 33..48-row G1
+     * forms -- block staging, bf16 out, KP 1 / 2 / 4, DP 1 (595012 / 70724) and q6_K DP 2 (TDP 8459332) */
+    static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+    if ((ab == 1 || ab == 3 || ab == 6) && !wl && !f32out) {
+#define GG_WK_AB(KPV, DPV)                                                                                          \
+        if (kp == KPV && dp2 == (DPV == 2)) {                                                                       \
+            if (ab == 1) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, false, uint16_t, 0, DPV, 1>), grid, dim3(256), lds, A); \
+            if (ab == 3) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, false, uint16_t, 0, DPV, 3>), grid, dim3(256), lds, A); \
+            return R4D_EMIT(s, (gg_wk_kernel<T, KPV, false, uint16_t, 0, DPV, 6>), grid, dim3(256), lds, A);           \
+        }
+        GG_WK_AB(1, 1) GG_WK_AB(2, 1) GG_WK_AB(4, 1)
+        if constexpr (T == GG_Q6_K) { GG_WK_AB(1, 2) GG_WK_AB(2, 2) }
+#undef GG_WK_AB
     }
     if (dp2) {
 #define GG_WK_X2(KPV)                                                                                         \
@@ -1026,6 +1113,29 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 template <int T>
 static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, int pro, bool dp2, const GgWkArgs& A, dim3 grid,
                            unsigned lds) {
+    /* DRAFTER round 30 bench ablation (env R4D_WK3_AB = 1..7, read once; outputs not the part order): the drafter's q8_0 G2 combos
+     * (DP 1, bf16) and the head's q6_K (KP 1, f32; DP 2 at NM 2 NT 2, DP 1 at NM 3 NT 1) */
+    static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); const int v = e ? std::atoi(e) : 0;
+                               if (v) std::fprintf(stderr, "libr4d: gg_wk3 ABLATION %d (bench only)\n", v); return v; }();
+    if (ab > 0 && ab < 8 && !pro) {
+#define GG_WK3_AB(KPV, NMV, NTV, OTV, DPV)                                                                                \
+        if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2 && f32out == std::is_same<OTV, float>::value) {     \
+            switch (ab) {                                                                                                  \
+            case 1: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 1>), grid, dim3(256), lds, A);       \
+            case 2: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 2>), grid, dim3(256), lds, A);       \
+            case 3: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 3>), grid, dim3(256), lds, A);       \
+            case 4: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 4>), grid, dim3(256), lds, A);       \
+            case 6: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 6>), grid, dim3(256), lds, A);       \
+            default: break;                                                                                                \
+            }                                                                                                              \
+        }
+        if constexpr (T == GG_Q8_0) {
+            GG_WK3_AB(4, 2, 1, uint16_t, 1) GG_WK3_AB(4, 3, 1, uint16_t, 1) GG_WK3_AB(1, 2, 1, uint16_t, 1) GG_WK3_AB(1, 3, 1, uint16_t, 1)
+        }
+        if constexpr (T == GG_Q6_K) { GG_WK3_AB(1, 2, 2, float, 2) GG_WK3_AB(1, 3, 1, float, 1) }
+        if constexpr (T != GG_Q8_0) { GG_WK3_AB(1, 3, 1, uint16_t, 1) }   /* round 35: q_b's plain GEMM at 33..48 rows (52499524) */
+#undef GG_WK3_AB
+    }
     if (dp2 && !pro) {   /* bit 23: DP 2 (bench) at the (NM, NT) the launch picks: (2, 2), (3, 1), bit 22's (2, 1) */
 #define GG_WK3_X2(KPV, NMV, NTV)                                                                                         \
         if (kp == KPV && nmt == NMV && nt == NTV) {                                                                       \
@@ -1124,6 +1234,13 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     const bool dp2 = (code & 8388608) != 0;
     int rc;
     const dim3 grid(gx, (unsigned)gy);
+    static const int tl = [] { const char* e = std::getenv("R4D_WK3_TL"); return e && e[0] == '1' ? 1 : 0; }();
+    static const int tlab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+    if (tl) {
+        A.tl = 1;
+        const unsigned long long z[5] = { ~0ull, 0ull, 0ull, 0ull, 0ull };
+        (void)hipMemcpyToSymbol(HIP_SYMBOL(g_wk3_tl), z, sizeof z);
+    }
     switch (ty) {
     case GG_Q8_0: rc = gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
     case GG_Q6_K: rc = gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
@@ -1132,6 +1249,15 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     if (rc != R4D_WK_DECLINE) {
         g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
         g_gg_wk_last.store(kp * 100 + P + 10000 * nmt + 100000 * nt, std::memory_order_relaxed);
+    }
+    if (tl && rc != R4D_WK_DECLINE) {
+        unsigned long long r[5] = {};
+        (void)hipDeviceSynchronize();
+        (void)hipMemcpyFromSymbol(r, HIP_SYMBOL(g_wk3_tl), sizeof r);
+        if (r[3])
+            std::fprintf(stderr, "WK3TL ty %d N %lld K %lld M %lld kp %d nmt %d nt %d dp %d ab %d blocks %llu span %.2f mean_block %.2f last_entry %.2f\n",
+                         ty, (long long)(nm == 2 ? Nv[0] + Nv[1] : Nv[0]), K, M, kp, nmt, nt, dp2 ? 2 : 1, tlab, r[3],
+                         (double)(r[1] - r[0]) / 100.0, (double)r[2] / (double)r[3] / 100.0, (double)(r[4] - r[0]) / 100.0);
     }
     return rc;
 }
@@ -1197,11 +1323,31 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
     g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
     g_gg_wk_last.store(kp * 100 + P, std::memory_order_relaxed);
     const dim3 grid((unsigned)gx, (unsigned)gy);
-    switch (ty) {
-    case GG_Q8_0: return gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, fo ? (fo->pro == 3 ? 1 : fo->pro) : 0, A, grid);
-    case GG_Q6_K: return gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, fo ? (fo->pro == 3 ? 1 : fo->pro) : 0, A, grid);
-    default: return gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, fo ? (fo->pro == 3 ? 1 : fo->pro) : 0, A, grid);
+    /* round 35 bench (env R4D_WK3_TL=1): G1's block stamps, a WK1TL line a launch (the launch synced: card time, not chain time) */
+    static const int tl = [] { const char* e = std::getenv("R4D_WK3_TL"); return e && e[0] == '1' ? 1 : 0; }();
+    static const int tlab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+    if (tl) {
+        A.tl = 1;
+        const unsigned long long z[5] = { ~0ull, 0ull, 0ull, 0ull, 0ull };
+        (void)hipMemcpyToSymbol(HIP_SYMBOL(g_wk3_tl), z, sizeof z);
     }
+    const int pro = fo ? (fo->pro == 3 ? 1 : fo->pro) : 0;
+    int rc;
+    switch (ty) {
+    case GG_Q8_0: rc = gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, pro, A, grid); break;
+    case GG_Q6_K: rc = gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, pro, A, grid); break;
+    default: rc = gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, pro, A, grid); break;
+    }
+    if (tl && rc == 0) {
+        unsigned long long r[5] = {};
+        (void)hipDeviceSynchronize();
+        (void)hipMemcpyFromSymbol(r, HIP_SYMBOL(g_wk3_tl), sizeof r);
+        if (r[3])
+            std::fprintf(stderr, "WK1TL ty %d N %lld K %lld M %lld kp %d nmt %lld nt 2 dp %d ab %d blocks %llu span %.2f mean_block %.2f last_entry %.2f\n",
+                         ty, (long long)(nm == 2 ? Nv[0] + Nv[1] : Nv[0]), K, M, kp, gx, (code & 8388608) ? 2 : 1, tlab, r[3],
+                         (double)(r[1] - r[0]) / 100.0, (double)r[2] / (double)r[3] / 100.0, (double)(r[4] - r[0]) / 100.0);
+    }
+    return rc;
 }
 
 extern "C" long long r4d_gg_wk_count() { return g_gg_wk_count.load(std::memory_order_relaxed); }
