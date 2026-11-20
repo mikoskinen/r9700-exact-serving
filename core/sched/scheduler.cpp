@@ -2454,12 +2454,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
                 ++rounds;
             /* Nothing else is running, so a missing state slot will not come back by waiting.
              * Put leaked slots back, then admit. A recompute the empty pool cannot hold is
-             * failed below (spec §17) rather than left in kAdmitWait, which parks the engine. */
-            if (!preempted_can_prefill(s) && running_.empty())
+             * failed below (spec §17) rather than left in kAdmitWait, which parks the engine.
+             * tp8 loop D53: under lanes "nothing else" is every lane's (pool_idle): release_idle_states()
+             * drops EVERY sequence's state slots, another lane's running ones too. */
+            if (!preempted_can_prefill(s) && pool_idle())
                 (void)kv_->release_idle_states();
         }
         if (!preempted_can_prefill(s)) {
-            if (!(running_.empty() && preempt_wait_overdue(s) && kv_->can_ever_fit(s.seq_len())))
+            if (!(pool_idle() && preempt_wait_overdue(s) && kv_->can_ever_fit(s.seq_len())))
                 return kAdmitWait;
         }
     }
@@ -3209,7 +3211,7 @@ const RadBatch* Scheduler::step() {
                 ++evict_rounds;
                 continue;
             }
-            if (running_.empty()) {
+            if (pool_idle()) {   /* tp8 loop D53: every lane's runners, not only this lane's (pool_idle) */
                 /* One reclaim of state slots no runner holds. Waiting again changes nothing. */
                 if (!released_states && kv_->release_idle_states() > 0) {
                     released_states = true;
@@ -3661,6 +3663,10 @@ const RadBatch* Scheduler::step() {
         }
         /* close_request or preempt_back removed it from running_; i now indexes the next. */
         if (failed || yielded) {
+            /* tp8 loop D53: this request's chunk was the step's capped one (capped_at = its index to be), but it was never
+             * pushed: the index belongs to the next entry pushed or to none, and the hand-back below read plan_.e past its
+             * end (SIGSEGV in pp_e2e's preemption case: SchedReq::seq_len() of a closed slot) or grew another entry. */
+            if (capped_at == (int32_t)plan_.e.size()) { capped_at = -1; capped_full = 0; }
             /* tp8 loop P44: the chosen prompt's chunk did not fit the pool -- it chooses nobody until it plans again (srf_kv) */
             if (prefill && slot == srf_slot_ && srf_on_ && stays) s.srf_kv = true;
             if (stays) ++i;
@@ -3883,7 +3889,9 @@ const RadBatch* Scheduler::step() {
              * the refusal is a restore waiting a step for deferred releases: both clear by the
              * next step, and failing them lost two of ten preempted requests under KV pressure
              * once their prompts were published at the preemption (1. 11. 2026). */
-            if (as < 0 && running_.empty() && plan_.e.empty() && !admit_next_step_ && s.req &&
+            /* tp8 loop D53: and no OTHER lane runs either (pool_idle): under lanes another lane's running requests hold the
+             * shared pool and free it as they finish -- failing here lost 2 of 10 requests in pp_e2e's preemption case. */
+            if (as < 0 && pool_idle() && plan_.e.empty() && !admit_next_step_ && s.req &&
                 s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
                 RAD_WARN("request %llu failed: overdue preempted prefill could not be admitted "
                          "with nothing running (%s)",
