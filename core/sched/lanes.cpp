@@ -1110,7 +1110,10 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
     kv_->set_keep_floor(r.id, s.lent > 0 ? r.n_computed : -1);
     kv_->trim_window(r.id, r.n_computed);
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
-    if (r.n_computed >= (int64_t)r.prompt.size()) server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
+    if (r.n_computed >= (int64_t)r.prompt.size()) {
+        server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
+        publish_prompt_done(s);   /* tp8 loop D55 (off: nothing); its last piece committed in another lane */
+    }
     if (!e.produces_token || !res.token) return;
     /* As commit()'s prefill entry that produces a token, then its finish. */
     const int32_t W = conv_window();

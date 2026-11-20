@@ -171,6 +171,8 @@ struct SchedReq {
     /* tp8 S5 + S6: a lent chunk takes a snapshot while the leader's head writes state (LaneSet::head_state): the
      * sequence's next chunk waits for its commit */
     bool     lent_hold = false;
+    /* tp8 loop D55 (RADIANCE_SCHED_PUB_PROMPT=1): its prompt went into the prefix cache when its last chunk committed */
+    bool     pub_prompt = false;
     /* The first position of the next piece another lane must take from its inbox: pieces are taken
      * (and so issued) in position order, which LaneSet checks loudly (-1: none waiting). */
     int64_t  lent_next = -1;
@@ -1392,6 +1394,11 @@ private:
     const Request* live_req(int32_t slot, uint64_t id) const;
     bool preempt_back();                                      /* true: the victim published its prefix */
     bool publish_prefix(SchedReq& s);
+    /* tp8 loop D55 (RADIANCE_SCHED_PUB_PROMPT=1, pub_prompt_): a request whose last prompt chunk just committed publishes its
+     * computed prompt then, not only at its close; once a request (SchedReq::pub_prompt). */
+    void publish_prompt_done(SchedReq& s);
+    bool pub_prompt_ = false;
+    int64_t pub_prompt_n_ = 0, pub_prompt_tok_ = 0;
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets

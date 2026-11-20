@@ -5716,3 +5716,748 @@ TEST(clients_that_go_away_mid_request_leave_the_others_one_process_tokens) {
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
     }
 }
+
+/* tp8 loop D54: PRODUCTION REQUEST FORMS through the pipeline. Every case above is greedy (temperature 0); the production client
+ * (Claude Code through LiteLLM) samples, streams and stops on strings. One request set of the forms a client sends -- seeded
+ * sampling with and without the cut stages (top-k / top-p / min-p), penalties sampled and greedy, DRY, a GBNF grammar greedy and
+ * sampled, a stop string, three of them streamed, n = 2 (two requests over one prompt: the second a prefix hit, perhaps in another
+ * lane) -- three alone, then all at once. One process answers each form ALONE first (the reference), then the same set, which must
+ * give the same tokens (the draw is (seed, position), not the batch's); the pipeline must give them too at 1 / 2 lanes W(0,2), 3
+ * lanes W(1,3) and BEST's shape (4 lanes BG 2, READY_FIRST, FOL_ORDER 2, the follower's one-layer segments), the last two with
+ * the llama KV copy checked, and the DSpark-drafted fixture (D38a) at 2 lanes W(0,3) / 3 lanes W(1,3) against its own one
+ * process. A streamed reply's chunks must assemble its non-streamed sibling's tokens; both nodes exit 0, no E line. */
+namespace {
+
+/* POST `body` to `path`; the status, the headers and the body (de-chunked when the reply came chunked, as a stream does). */
+int post_raw(int port, const std::string& path, const std::string& body, std::string* headers, std::string* out) {
+    Call c;
+    if (!c.send(port, path, body)) return -1;
+    std::string raw;
+    char buf[16384];
+    for (;;) {
+        const ssize_t n = ::recv(c.fd, buf, sizeof buf, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        raw.append(buf, (size_t)n);
+    }
+    const size_t h = raw.find("\r\n\r\n");
+    if (raw.compare(0, 9, "HTTP/1.1 ") != 0 || h == std::string::npos) return -1;
+    *headers = raw.substr(0, h);
+    std::string b = raw.substr(h + 4);
+    std::string lower = *headers;
+    for (char& ch : lower) ch = (char)std::tolower((unsigned char)ch);
+    if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+        std::string d;
+        size_t at = 0;
+        for (;;) {
+            const size_t eol = b.find("\r\n", at);
+            if (eol == std::string::npos) break;
+            const size_t len = std::strtoul(b.c_str() + at, nullptr, 16);
+            if (len == 0) break;
+            if (eol + 2 + len > b.size()) { d += b.substr(eol + 2); break; }
+            d += b.substr(eol + 2, len);
+            at = eol + 2 + len + 2;
+        }
+        b = d;
+    }
+    *out = b;
+    return std::atoi(raw.c_str() + 9);
+}
+
+/* One reply: the tokens of each choice, the text of the first, the draft counts, and what was wrong with it (empty: nothing). */
+struct Reply {
+    int status = -1;
+    std::vector<std::vector<int32_t>> tok;
+    std::string text, why, stop_type;
+    long long drafted = 0, accepted = 0;
+};
+
+Reply ask(int port, const json& body) {
+    Reply r;
+    std::string hd, out;
+    r.status = post_raw(port, "/completion", body.dump(), &hd, &out);
+    if (r.status != 200) { r.why = "HTTP " + std::to_string(r.status) + ": " + out.substr(0, 240); return r; }
+    auto drafts = [&r](const json& j) {
+        r.drafted += j.value(json::json_pointer("/timings/draft_n"), (long long)0);
+        r.accepted += j.value(json::json_pointer("/timings/draft_n_accepted"), (long long)0);
+    };
+    if (body.value("stream", false)) {
+        /* llama-server's native events: each `stop: false` chunk carries the ids that made its text; the last (`stop: true`) is the
+         * whole result, its ids again when return_tokens asked for them */
+        std::vector<int32_t> got, last;
+        bool ended = false;
+        for (size_t at = 0; (at = out.find("data: ", at)) != std::string::npos;) {
+            const size_t e = out.find("\n", at);
+            const json j = json::parse(out.substr(at + 6, e == std::string::npos ? std::string::npos : e - at - 6), nullptr, false);
+            at = e == std::string::npos ? out.size() : e;
+            if (!j.is_object()) continue;
+            if (j.contains("error")) { r.why = "an error event: " + j["error"].dump().substr(0, 200); continue; }
+            if (!j.value("stop", false)) {
+                for (int32_t t : j.value("tokens", std::vector<int32_t>{})) got.push_back(t);
+                r.text += j.value("content", std::string());
+            } else {
+                ended = true;
+                last = j.value("tokens", std::vector<int32_t>{});
+                r.stop_type = j.value("stop_type", std::string());
+                drafts(j);
+            }
+        }
+        if (!ended && r.why.empty()) r.why = "the stream ended without its last event";
+        if (!last.empty() && last != got && r.why.empty())
+            r.why = "the chunks assemble " + std::to_string(got.size()) + " tokens, the last event names " + std::to_string(last.size());
+        r.tok.push_back(got);
+        return r;
+    }
+    const json j = json::parse(out, nullptr, false);
+    const json arr = j.is_array() ? j : json::array({ j });
+    for (const json& c : arr) {
+        if (!c.is_object() || !c.contains("tokens")) { r.why = "no tokens in " + c.dump().substr(0, 200); return r; }
+        r.tok.push_back(c["tokens"].get<std::vector<int32_t>>());
+        drafts(c);
+    }
+    if (!arr.empty()) {
+        r.text = arr[0].value("content", std::string());
+        r.stop_type = arr[0].value("stop_type", std::string());
+    }
+    return r;
+}
+
+/* The same form with its sampler stages taken out (temperature 0, no penalties, DRY or grammar): a control that the stages acted. */
+json plain_of(json b) {
+    for (const char* k : { "top_k", "top_p", "min_p", "seed", "repeat_penalty", "repeat_last_n", "presence_penalty", "frequency_penalty",
+                           "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n", "grammar", "stop", "stream", "n" })
+        b.erase(k);
+    b["temperature"] = 0.0;
+    return b;
+}
+
+/* Text made of the grammar's words only. */
+bool in_grammar(const std::string& t) {
+    static const char* w[] = { "cat ", "dog ", "sat on ", "the ", "mat " };
+    size_t at = 0;
+    while (at < t.size()) {
+        bool hit = false;
+        for (const char* x : w) {
+            const size_t n = std::strlen(x);
+            if (t.compare(at, n, x) == 0) { at += n; hit = true; break; }
+            /* the reply may end inside a word (n_predict) */
+            if (t.size() - at < n && std::string(x).compare(0, t.size() - at, t, at, std::string::npos) == 0) return true;
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+const char kProdGrammar[] = "root ::= (\"cat \" | \"dog \" | \"sat on \" | \"the \" | \"mat \")+";
+
+/* The forms, in a fixed order. `stop` is the stop string of form 8 (found by the reference: three letters of its own greedy text). */
+struct ProdForm { const char* name; json body; int sibling; };
+std::vector<ProdForm> prod_forms(const std::string& stop) {
+    auto base = [](uint64_t s, size_t len, int n) {
+        return json{ { "prompt", prompt_ids(s, len) }, { "n_predict", n }, { "ignore_eos", true }, { "return_tokens", true } };
+    };
+    std::vector<ProdForm> f;
+    json b;
+    b = base(81, 90, 40); b["temperature"] = 0.0; f.push_back({ "greedy", b, -1 });
+    b = base(82, 110, 48); b["temperature"] = 0.9; b["top_k"] = 40; b["top_p"] = 0.92; b["min_p"] = 0.03; b["seed"] = 1001;
+    f.push_back({ "seeded T0.9 top-k/p min-p", b, -1 });
+    b = base(83, 70, 48); b["temperature"] = 1.0; b["seed"] = 1002; f.push_back({ "seeded T1.0", b, -1 });
+    b = base(84, 130, 56); b["temperature"] = 0.7; b["seed"] = 1003; b["repeat_penalty"] = 1.2; b["repeat_last_n"] = 48;
+    b["presence_penalty"] = 0.5; b["frequency_penalty"] = 0.4; f.push_back({ "seeded T0.7 penalties", b, -1 });
+    b = base(85, 60, 48); b["temperature"] = 0.0; b["repeat_penalty"] = 1.3; b["repeat_last_n"] = 32; b["frequency_penalty"] = 0.5;
+    f.push_back({ "greedy penalties", b, -1 });
+    b = base(86, 100, 48); b["temperature"] = 0.8; b["seed"] = 1005; b["dry_multiplier"] = 0.8; b["dry_base"] = 1.75;
+    b["dry_allowed_length"] = 2; b["dry_penalty_last_n"] = 64; f.push_back({ "seeded T0.8 DRY", b, -1 });
+    b = base(87, 80, 40); b["temperature"] = 0.0; b["grammar"] = kProdGrammar; f.push_back({ "greedy grammar", b, -1 });
+    b = base(88, 75, 40); b["temperature"] = 0.8; b["seed"] = 1007; b["grammar"] = kProdGrammar; f.push_back({ "seeded grammar", b, -1 });
+    b = base(89, 95, 60); b["temperature"] = 0.0; if (!stop.empty()) b["stop"] = json::array({ stop }); f.push_back({ "greedy stop string", b, -1 });
+    b = f[1].body; b["stream"] = true; f.push_back({ "streamed seeded T0.9", b, 1 });
+    b = f[3].body; b["stream"] = true; f.push_back({ "streamed penalties", b, 3 });
+    b = f[6].body; b["stream"] = true; f.push_back({ "streamed grammar", b, 6 });
+    b = base(90, 85, 44); b["temperature"] = 0.85; b["top_p"] = 0.9; b["seed"] = 1012; b["n"] = 2; f.push_back({ "n = 2 seeded", b, -1 });
+    return f;
+}
+
+/* Forms 1, 6 and 12 alone, then all at once; the replies in form order (the alone ones after). */
+std::vector<Reply> prod_set(int port, const std::vector<ProdForm>& forms) {
+    std::vector<Reply> alone;
+    for (size_t i : { (size_t)1, (size_t)6, (size_t)12 }) alone.push_back(ask(port, forms[i].body));
+    std::vector<std::future<Reply>> f;
+    for (const ProdForm& x : forms) f.push_back(std::async(std::launch::async, [port, &x] { return ask(port, x.body); }));
+    std::vector<Reply> out;
+    for (auto& x : f) out.push_back(x.get());
+    for (Reply& r : alone) out.push_back(std::move(r));
+    return out;
+}
+const size_t kProdAloneOf[] = { 1, 6, 12 };
+
+size_t count_of(const std::string& s, const std::string& what) {
+    size_t n = 0;
+    for (size_t at = 0; (at = s.find(what, at)) != std::string::npos; ++at) ++n;
+    return n;
+}
+
+}  /* namespace */
+
+TEST(production_request_forms_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "16" };
+    /* Form 8's stop string: two printable bytes of its own greedy text from its 8th byte on (their first place there; else one byte),
+     * found by each fixture's one process. A reply
+     * cut by a stop string is compared by its TEXT and finish: the server cuts the text at the string, while the token ids it returns
+     * are whatever the step had produced when the stop was read (llama-server's form) -- timing, not the answer. */
+    struct Ref { std::vector<Reply> alone, set; std::vector<ProdForm> forms; std::string stop; };
+    std::map<int, Ref> refs;   /* 0: the plain fixture, 1: the drafted one */
+    auto same = [](const Reply& x, const Reply& y, size_t form) {
+        return form == 8 ? x.text == y.text && x.stop_type == y.stop_type : x.tok == y.tok;
+    };
+    for (int ds = 0; ds < 2; ++ds) {
+        Serving one;
+        if (ds) one.model = worldds().llama_rad;
+        REQUIRE(one.start("", ds ? cat(spec, seqs) : seqs));
+        Ref& rf = refs[ds];
+        {
+            const Reply p = ask(one.port, prod_forms("")[8].body);
+            REQUIRE(p.why.empty());
+            auto ascii = [](char ch) { return ch > ' ' && ch < 0x7f; };
+            for (size_t len : { (size_t)2, (size_t)1 })
+                for (size_t i = 8; i + len <= p.text.size() && rf.stop.empty(); ++i)
+                    if (ascii(p.text[i]) && ascii(p.text[i + len - 1]) && p.text.find(p.text.substr(i, len)) == i) rf.stop = p.text.substr(i, len);
+            fprintf(stderr, "    one process (%s): form 8's stop string '%s' (its greedy text without it: %zu bytes)\n", ds ? "drafted" : "plain",
+                    rf.stop.c_str(), p.text.size());
+        }
+        REQUIRE(!rf.stop.empty());
+        rf.forms = prod_forms(rf.stop);
+        const std::vector<ProdForm>& forms = rf.forms;
+        for (const ProdForm& x : forms) rf.alone.push_back(ask(one.port, x.body));
+        rf.set = prod_set(one.port, forms);
+        /* the one process's own claims: every form served, a streamed form = its sibling, the set = each form alone */
+        int bad = 0;
+        for (size_t i = 0; i < forms.size(); ++i) {
+            const Reply& a = rf.alone[i];
+            if (!a.why.empty() || a.tok.empty() || a.tok[0].empty()) {
+                ++bad;
+                fprintf(stderr, "    one process (%s) form %zu '%s': %s\n", ds ? "drafted" : "plain", i, forms[i].name,
+                        a.why.empty() ? "no tokens" : a.why.c_str());
+                continue;
+            }
+            if (forms[i].sibling >= 0 && a.tok != rf.alone[(size_t)forms[i].sibling].tok) {
+                ++bad;
+                fprintf(stderr, "    one process (%s) form %zu '%s' streamed differs from its sibling %d\n", ds ? "drafted" : "plain", i,
+                        forms[i].name, forms[i].sibling);
+            }
+            if (!same(rf.set[i], a, i)) {
+                ++bad;
+                fprintf(stderr, "    one process (%s) form %zu '%s': in the set != alone%s\n", ds ? "drafted" : "plain", i, forms[i].name,
+                        rf.set[i].why.empty() ? "" : (" (" + rf.set[i].why + ")").c_str());
+            }
+        }
+        for (size_t k = 0; k < 3; ++k)
+            if (!same(rf.set[forms.size() + k], rf.alone[kProdAloneOf[k]], kProdAloneOf[k])) {
+                ++bad;
+                fprintf(stderr, "    one process (%s) form %zu alone twice differs\n", ds ? "drafted" : "plain", kProdAloneOf[k]);
+            }
+        /* the controls: every staged form answers other tokens than its plain greedy self (else the stage did nothing here and the
+         * form proves nothing), the grammar's replies are its words, the stop form ended on its string */
+        int acted = 0, staged = 0;
+        for (size_t i : { (size_t)1, (size_t)2, (size_t)3, (size_t)4, (size_t)5, (size_t)6, (size_t)7, (size_t)12 }) {
+            ++staged;
+            const Reply pl = ask(one.port, plain_of(forms[i].body));
+            if (!rf.alone[i].tok.empty() && pl.tok.size() == 1 && rf.alone[i].tok[0] != pl.tok[0]) ++acted;
+            else fprintf(stderr, "    one process (%s) form %zu '%s' answers its plain greedy tokens: the stage did not act (%zu / %zu choices%s%s)\n",
+                         ds ? "drafted" : "plain", i, forms[i].name, rf.alone[i].tok.size(), pl.tok.size(), pl.why.empty() ? "" : ": ",
+                         pl.why.c_str());
+        }
+        const bool gram = in_grammar(rf.alone[6].text) && in_grammar(rf.alone[7].text);
+        const bool stopped = rf.alone[8].stop_type == "word" && rf.alone[8].text.find(rf.stop) == std::string::npos;
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        fprintf(stderr, "    one process (%s): %d of %d staged forms answer other tokens than plain greedy; grammar replies %s ('%s' / '%s'); "
+                        "the stop form %s (stop_type '%s', %zu text bytes, %zu token ids)\n",
+                ds ? "drafted" : "plain", acted, staged, gram ? "in the grammar" : "NOT in the grammar", rf.alone[6].text.substr(0, 40).c_str(),
+                rf.alone[7].text.substr(0, 40).c_str(), stopped ? "ended on its string" : "did NOT end on its string",
+                rf.alone[8].stop_type.c_str(), rf.alone[8].text.size(), rf.alone[8].tok.empty() ? (size_t)0 : rf.alone[8].tok[0].size());
+        CHECK_EQ(acted, staged);
+        CHECK(gram);
+        CHECK(stopped);
+        long long dr = 0, ac = 0;
+        for (const Reply& r : rf.set) { dr += r.drafted; ac += r.accepted; }
+        fprintf(stderr, "    one process (%s): %zu forms, %d not as claimed; the set %lld drafted / %lld accepted; n = 2's choices %s\n",
+                ds ? "drafted" : "plain", forms.size(), bad, dr, ac,
+                rf.alone[12].tok.size() == 2 && rf.alone[12].tok[0] != rf.alone[12].tok[1] ? "differ (seeds k, k + 1)" : "DO NOT differ");
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(rf.alone[12].tok.size(), (size_t)2);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, ds, kv; };
+    for (const Arm a : { Arm{ "1 lane", "0,2", 1, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, true },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true },
+                         Arm{ "drafted, 2 lanes", "0,3", 2, false, true, false },
+                         Arm{ "drafted, 3 lanes, wrap-around", "1,3", 3, false, true, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, true, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        Serving pp;
+        if (a.ds) pp.model = worldds().llama_rad;
+        const std::vector<std::string> ex = cat(a.ds ? cat(spec, seqs) : seqs, { "--pp-lanes", std::to_string(a.lanes) });
+        REQUIRE(pp.start(a.cut, ex, env));
+        const Ref& rf = refs[a.ds ? 1 : 0];
+        const std::vector<ProdForm>& forms = rf.forms;
+        const std::vector<Reply> got = prod_set(pp.port, forms);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(got.size(), rf.set.size());
+        int differ = 0, failed = 0;
+        long long dr = 0, ac = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const size_t f = i < forms.size() ? i : kProdAloneOf[i - forms.size()];
+            const Reply& want = rf.alone[f];
+            dr += got[i].drafted;
+            ac += got[i].accepted;
+            if (!got[i].why.empty()) {
+                ++failed;
+                fprintf(stderr, "    %s form %zu '%s'%s: %s\n", a.name, f, forms[f].name, i < forms.size() ? "" : " (alone)", got[i].why.c_str());
+            }
+            if (same(got[i], want, f)) continue;
+            ++differ;
+            if (f == 8)
+                fprintf(stderr, "    %s form 8 (stop string): text %zu bytes '%s' vs one process's %zu, finish '%s' vs '%s'\n", a.name, got[i].text.size(),
+                        got[i].text.substr(0, 60).c_str(), want.text.size(), got[i].stop_type.c_str(), want.stop_type.c_str());
+            const size_t nc = std::min(got[i].tok.size(), want.tok.size());
+            for (size_t c = 0; c < nc; ++c) {
+                if (got[i].tok[c] == want.tok[c]) continue;
+                size_t j = 0;
+                while (j < got[i].tok[c].size() && j < want.tok[c].size() && got[i].tok[c][j] == want.tok[c][j]) ++j;
+                fprintf(stderr, "    %s form %zu '%s'%s choice %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", a.name, f,
+                        forms[f].name, i < forms.size() ? "" : " (alone)", c, got[i].tok[c].size(), want.tok[c].size(), j);
+            }
+            if (got[i].tok.size() != want.tok.size())
+                fprintf(stderr, "    %s form %zu: %zu choices vs %zu\n", a.name, f, got[i].tok.size(), want.tok.size());
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        if (const char* dd = std::getenv("PP_E2E_PROD_LOGS")) {
+            const std::string tag = std::string(dd) + "/prod-" + std::to_string(a.lanes) + "-" + a.cut + (a.ds ? "-ds" : "") + (a.best ? "-best" : "");
+            tiny::write_text(tag + "-leader.log", llog);
+            tiny::write_text(tag + "-follower.log", flog);
+        }
+        fprintf(stderr, "    PROD %-34s W(%s): %d of %zu replies differ from one process, %d not served as asked; %lld drafted / %lld accepted; "
+                        "KV-copy checks %lld, %lld differ; %zu E lines; the stop form's token ids %zu (one process %zu)\n",
+                a.name, a.cut, differ, got.size(), failed, dr, ac, checks, kdiff, elines, got[8].tok.empty() ? (size_t)0 : got[8].tok[0].size(),
+                rf.alone[8].tok.empty() ? (size_t)0 : rf.alone[8].tok[0].size());
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(failed, 0);
+        CHECK_EQ(elines, (size_t)0);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (a.ds) CHECK(dr > 0);
+        if (differ || failed || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
+
+/* tp8 loop D54b: CONVERSATIONS, as Claude Code holds them: each turn's prompt is the previous turn's prompt + its answer + the
+ * user's next text, so every turn after the first is a prefix hit over KV that a DECODE wrote (in whichever lane served it) and
+ * the next turn may land in another lane. Four sessions at once, three turns each, sampled (seeded, top-p), two of the sessions
+ * streamed; one process's tokens per (session, turn) -- the sessions run at once and one after another there, the same -- and the
+ * pipeline's at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (KV copy checked), and the DSpark-drafted fixture at BEST's shape;
+ * the prefix cache must have served (attention-cached prompt tokens > 0). */
+namespace {
+std::vector<std::vector<int32_t>> conversations(int port, bool together) {
+    auto session = [port](int s) {
+        std::vector<std::vector<int32_t>> answers;
+        std::vector<int32_t> prompt = prompt_ids(100 + (uint64_t)s, 150 + 20 * (size_t)s);
+        for (int turn = 0; turn < 3; ++turn) {
+            json b = { { "prompt", prompt }, { "n_predict", 32 }, { "ignore_eos", true }, { "return_tokens", true },
+                       { "temperature", 0.8 }, { "top_p", 0.95 }, { "seed", 2000 + 10 * s + turn } };
+            if (s % 2) b["stream"] = true;
+            const Reply r = ask(port, b);
+            answers.push_back(r.why.empty() && r.tok.size() == 1 ? r.tok[0] : std::vector<int32_t>{});
+            if (answers.back().empty()) {
+                fprintf(stderr, "    session %d turn %d: %s\n", s, turn, r.why.empty() ? "no tokens" : r.why.c_str());
+                break;
+            }
+            prompt.insert(prompt.end(), answers.back().begin(), answers.back().end());
+            const std::vector<int32_t> more = prompt_ids(200 + 10 * (uint64_t)s + (uint64_t)turn, 30);
+            prompt.insert(prompt.end(), more.begin(), more.end());
+        }
+        answers.resize(3);
+        return answers;
+    };
+    std::vector<std::vector<std::vector<int32_t>>> per(4);
+    if (together) {
+        std::vector<std::future<std::vector<std::vector<int32_t>>>> f;
+        for (int s = 0; s < 4; ++s) f.push_back(std::async(std::launch::async, session, s));
+        for (int s = 0; s < 4; ++s) per[(size_t)s] = f[(size_t)s].get();
+    } else {
+        for (int s = 0; s < 4; ++s) per[(size_t)s] = session(s);
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& p : per) for (auto& a : p) out.push_back(a);
+    return out;
+}
+}  /* namespace */
+
+TEST(conversations_whose_turns_grow_over_their_answers_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "8" };
+    std::map<int, std::vector<std::vector<int32_t>>> refs;
+    std::map<int, double> hits;   /* a fresh one process's attention-cached prompt tokens over the sessions at once */
+    for (int ds = 0; ds < 2; ++ds) {
+        {
+            Serving fresh;
+            if (ds) fresh.model = worldds().llama_rad;
+            REQUIRE(fresh.start("", ds ? cat(spec, seqs) : seqs));
+            refs[ds] = conversations(fresh.port, true);
+            hits[ds] = metric(get(fresh.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            kill(fresh.lead.child.pid, SIGTERM);
+            CHECK_EQ(fresh.lead.finish(60), 0);
+        }
+        Serving one;
+        if (ds) one.model = worldds().llama_rad;
+        REQUIRE(one.start("", ds ? cat(spec, seqs) : seqs));
+        const std::vector<std::vector<int32_t>> apart = conversations(one.port, false);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        int empty = 0;
+        for (const auto& a : refs[ds]) empty += a.empty();
+        fprintf(stderr, "    one process (%s): 4 sessions x 3 turns, at once %s one after another (another start); %d empty; attention-cached "
+                        "prompt tokens %.0f\n",
+                ds ? "drafted" : "plain", apart == refs[ds] ? "=" : "!=", empty, hits[ds]);
+        CHECK(apart == refs[ds]);
+        CHECK_EQ(empty, 0);
+        CHECK(hits[ds] > 0);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, ds, kv; };
+    for (const Arm a : { Arm{ "2 lanes", "0,2", 2, false, false, false }, Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, true },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, true, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        Serving pp;
+        if (a.ds) pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(a.ds ? cat(spec, seqs) : seqs, { "--pp-lanes", std::to_string(a.lanes) }), env));
+        const std::vector<std::vector<int32_t>> got = conversations(pp.port, true);
+        const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        const auto& ref = refs[a.ds ? 1 : 0];
+        REQUIRE_EQ(got.size(), ref.size());
+        int differ = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i] == ref[i]) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < got[i].size() && j < ref[i].size() && got[i][j] == ref[i][j]) ++j;
+            fprintf(stderr, "    %s session %zu turn %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", a.name, i / 3, i % 3,
+                    got[i].size(), ref[i].size(), j);
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        if (const char* dd = std::getenv("PP_E2E_PROD_LOGS")) {
+            const std::string tag = std::string(dd) + "/conv-" + std::to_string(a.lanes) + "-" + a.cut + (a.ds ? "-ds" : "") + (a.best ? "-best" : "");
+            tiny::write_text(tag + "-leader.log", llog);
+            tiny::write_text(tag + "-follower.log", flog);
+        }
+        fprintf(stderr, "    CONV %-34s W(%s): %d of %zu turns differ from one process; attention-cached prompt tokens %.0f (one process %.0f); "
+                        "KV-copy checks %lld, %lld differ; %zu E lines\n",
+                a.name, a.cut, differ, got.size(), hit, hits[a.ds ? 1 : 0], checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(hit, hits[a.ds ? 1 : 0]);
+        CHECK_EQ(elines, (size_t)0);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (differ || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
+
+/* tp8 loop D54c: SUBAGENTS -- requests that share a long COLD prefix (Claude Code's system prompt + tools) arriving at once, as a
+ * session's parallel subagents do: six at once over a 700-byte common prefix nobody computed yet (the lanes may admit them side by
+ * side, each prefilling the prefix or waiting on another's blocks), then four more 150 ms later while the first wave decodes (a
+ * prefix hit over blocks that may still be in flight in another lane); greedy and seeded, every third streamed. Each request's
+ * tokens = one process's for that request ALONE (and one process's at once = alone), at 2 lanes W(0,2), 3 lanes W(1,3), BEST's
+ * shape (KV copy checked) and the drafted fixture at BEST's shape. */
+namespace {
+json subagent_body(int k) {
+    std::vector<int32_t> p = prompt_ids(300, 700);
+    const std::vector<int32_t> own = prompt_ids(310 + (uint64_t)k, 30 + 7 * (size_t)k);
+    p.insert(p.end(), own.begin(), own.end());
+    json b = { { "prompt", p }, { "n_predict", 24 }, { "ignore_eos", true }, { "return_tokens", true }, { "temperature", 0.0 } };
+    if (k % 2) { b["temperature"] = 0.8; b["seed"] = 3000 + k; }
+    if (k % 3 == 0) b["stream"] = true;
+    return b;
+}
+std::vector<std::vector<int32_t>> subagents(int port, bool together) {
+    std::vector<Reply> r(10);
+    if (together) {
+        std::vector<std::future<Reply>> f;
+        for (int k = 0; k < 6; ++k) f.push_back(std::async(std::launch::async, [port, k] { return ask(port, subagent_body(k)); }));
+        const char* dl = std::getenv("PP_E2E_SUB_DELAY_MS");   /* a debugging aid: the second wave's delay (default 150 ms) */
+        std::this_thread::sleep_for(std::chrono::milliseconds(dl && *dl ? std::atoi(dl) : 150));
+        for (int k = 6; k < 10; ++k) f.push_back(std::async(std::launch::async, [port, k] { return ask(port, subagent_body(k)); }));
+        for (int k = 0; k < 10; ++k) r[(size_t)k] = f[(size_t)k].get();
+    } else {
+        for (int k = 0; k < 10; ++k) r[(size_t)k] = ask(port, subagent_body(k));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (int k = 0; k < 10; ++k) {
+        if (!r[(size_t)k].why.empty()) fprintf(stderr, "    subagent %d: %s\n", k, r[(size_t)k].why.c_str());
+        out.push_back(r[(size_t)k].why.empty() && r[(size_t)k].tok.size() == 1 ? r[(size_t)k].tok[0] : std::vector<int32_t>{});
+    }
+    return out;
+}
+}  /* namespace */
+
+TEST(subagents_sharing_a_cold_prefix_at_once_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "12" };
+    std::map<int, std::vector<std::vector<int32_t>>> refs;
+    for (int ds = 0; ds < 2; ++ds) {
+        std::vector<std::vector<int32_t>> at_once;
+        double hit = -1;
+        for (int pass = 0; pass < 2; ++pass) {   /* a fresh start each: alone, then at once */
+            Serving one;
+            if (ds) one.model = worldds().llama_rad;
+            REQUIRE(one.start("", ds ? cat(spec, seqs) : seqs));
+            if (pass == 0) refs[ds] = subagents(one.port, false);
+            else {
+                at_once = subagents(one.port, true);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* the idle publish of the metrics */
+                hit = metric(get(one.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            }
+            kill(one.lead.child.pid, SIGTERM);
+            CHECK_EQ(one.lead.finish(60), 0);
+        }
+        int empty = 0;
+        for (const auto& a : refs[ds]) empty += a.empty();
+        fprintf(stderr, "    one process (%s): 10 subagents alone %s at once; %d empty; at once: attention-cached prompt tokens %.0f\n",
+                ds ? "drafted" : "plain", at_once == refs[ds] ? "=" : "!=", empty, hit);
+        CHECK(at_once == refs[ds]);
+        CHECK_EQ(empty, 0);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, ds, kv; };
+    for (const Arm a : { Arm{ "1 lane", "0,2", 1, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, true, true } }) {
+        if (const char* only = std::getenv("PP_E2E_SUB_ARM"); only && !std::strstr(a.name, only)) continue;   /* a debugging aid */
+        std::vector<std::string> env = kSplitEnv;
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        if (const char* xe = std::getenv("PP_E2E_SUB_ENV"); xe && *xe) {   /* a debugging aid: more env, space-separated */
+            std::istringstream is(xe);
+            for (std::string w; is >> w;) env.push_back(w);
+        }
+        Serving pp;
+        if (a.ds) pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(a.ds ? cat(spec, seqs) : seqs, { "--pp-lanes", std::to_string(a.lanes) }), env));
+        const std::vector<std::vector<int32_t>> got = subagents(pp.port, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+        const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        const auto& ref = refs[a.ds ? 1 : 0];
+        REQUIRE_EQ(got.size(), ref.size());
+        int differ = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i] == ref[i]) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < got[i].size() && j < ref[i].size() && got[i][j] == ref[i][j]) ++j;
+            fprintf(stderr, "    %s subagent %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", a.name, i, got[i].size(),
+                    ref[i].size(), j);
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        if (const char* dd = std::getenv("PP_E2E_PROD_LOGS")) {
+            const std::string tag = std::string(dd) + "/sub-" + std::to_string(a.lanes) + "-" + a.cut + (a.ds ? "-ds" : "") + (a.best ? "-best" : "");
+            tiny::write_text(tag + "-leader.log", llog);
+            tiny::write_text(tag + "-follower.log", flog);
+        }
+        fprintf(stderr, "    SUB %-34s W(%s): %d of %zu subagents differ from one process alone; attention-cached prompt tokens %.0f; KV-copy "
+                        "checks %lld, %lld differ; %zu E lines\n",
+                a.name, a.cut, differ, got.size(), hit, checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(elines, (size_t)0);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (differ || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
+
+/* tp8 loop D55 (RADIANCE_SCHED_PUB_PROMPT=1): a prompt published into the prefix cache when its last chunk commits, not only
+ * at its close. A long streamed request A over a 500-byte head; once its first token is out (its prompt computed, 400 tokens
+ * still to decode) three siblings over the same head arrive at once. Off (today): A is running, so its blocks are not in the
+ * cache and every sibling computes the head again (0 attention-cached tokens); on: every sibling hits A's head. Each request's
+ * tokens = one process's for it alone, on and off, in one process, at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (the
+ * llama KV copy checked: a sibling's pass reads blocks A's passes wrote on the follower) and the drafted fixture at BEST's
+ * shape; both nodes exit 0, no E line. */
+namespace {
+json sibling_body(int k) {
+    std::vector<int32_t> p = prompt_ids(400, 500);
+    const std::vector<int32_t> own = prompt_ids(410 + (uint64_t)k, 30 + 11 * (size_t)k);
+    p.insert(p.end(), own.begin(), own.end());
+    json b = { { "prompt", p }, { "n_predict", k == 0 ? 400 : 24 }, { "ignore_eos", true }, { "return_tokens", true },
+               { "temperature", 0.0 } };
+    if (k == 2) { b["temperature"] = 0.8; b["seed"] = 4002; }
+    if (k == 0) b["stream"] = true;
+    return b;
+}
+/* A streamed and read up to its first event, B / C / D at once, then the rest of A; the tokens in request order. */
+std::vector<std::vector<int32_t>> siblings(int port, bool alone) {
+    std::vector<std::vector<int32_t>> out(4);
+    if (alone) {
+        for (int k = 0; k < 4; ++k) {
+            const Reply r = ask(port, sibling_body(k));
+            if (!r.why.empty()) fprintf(stderr, "    sibling %d alone: %s\n", k, r.why.c_str());
+            if (r.tok.size() == 1) out[(size_t)k] = r.tok[0];
+        }
+        return out;
+    }
+    Call a;
+    if (!a.send(port, "/completion", sibling_body(0).dump())) return out;
+    std::string raw;
+    char buf[16384];
+    for (;;) {   /* the first event: the prompt is computed (its first token is out) */
+        const ssize_t n = ::recv(a.fd, buf, sizeof buf, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        raw.append(buf, (size_t)n);
+        const size_t h = raw.find("\r\n\r\n");
+        if (h != std::string::npos && raw.find("data: ", h) != std::string::npos) break;
+    }
+    std::vector<std::future<Reply>> f;
+    for (int k = 1; k < 4; ++k) f.push_back(std::async(std::launch::async, [port, k] { return ask(port, sibling_body(k)); }));
+    for (int k = 1; k < 4; ++k) {
+        const Reply r = f[(size_t)k - 1].get();
+        if (!r.why.empty()) fprintf(stderr, "    sibling %d: %s\n", k, r.why.c_str());
+        if (r.tok.size() == 1) out[(size_t)k] = r.tok[0];
+    }
+    for (;;) {
+        const ssize_t n = ::recv(a.fd, buf, sizeof buf, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        raw.append(buf, (size_t)n);
+    }
+    /* de-chunk and assemble A's events as ask() does */
+    const size_t h = raw.find("\r\n\r\n");
+    if (h == std::string::npos) return out;
+    std::string b = raw.substr(h + 4), d;
+    for (size_t at = 0;;) {
+        const size_t eol = b.find("\r\n", at);
+        if (eol == std::string::npos) break;
+        const size_t len = std::strtoul(b.c_str() + at, nullptr, 16);
+        if (len == 0 || eol + 2 + len > b.size()) break;
+        d += b.substr(eol + 2, len);
+        at = eol + 2 + len + 2;
+    }
+    for (size_t at = 0; (at = d.find("data: ", at)) != std::string::npos;) {
+        const size_t e = d.find("\n", at);
+        const json j = json::parse(d.substr(at + 6, e == std::string::npos ? std::string::npos : e - at - 6), nullptr, false);
+        at = e == std::string::npos ? d.size() : e;
+        if (j.is_object() && !j.value("stop", false))
+            for (int32_t t : j.value("tokens", std::vector<int32_t>{})) out[0].push_back(t);
+    }
+    return out;
+}
+}  /* namespace */
+
+TEST(d55_a_prompt_published_at_its_last_chunk_serves_its_siblings_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "8" };
+    std::map<int, std::vector<std::vector<int32_t>>> refs;
+    for (int ds = 0; ds < 2; ++ds) {
+        Serving one;
+        if (ds) one.model = worldds().llama_rad;
+        REQUIRE(one.start("", ds ? cat(spec, seqs) : seqs));
+        refs[ds] = siblings(one.port, true);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        for (const auto& t : refs[ds]) CHECK(!t.empty());
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, ds, kv; };
+    int armed = 0;
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true },
+                         Arm{ "drafted, one process", "", 0, false, true, false },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, true, true } }) {
+        for (int on = 0; on < 2; ++on) {
+            std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+            if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+            if (a.best) env = cat(env, kBest);
+            if (on) env.push_back("RADIANCE_SCHED_PUB_PROMPT=1");
+            Serving pp;
+            if (a.ds) pp.model = worldds().llama_rad;
+            std::vector<std::string> ex = a.ds ? cat(spec, seqs) : seqs;
+            if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
+            REQUIRE(pp.start(a.cut, ex, env));
+            const std::vector<std::vector<int32_t>> got = siblings(pp.port, false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+            const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output(), flog = pp.fol.output();
+            const auto& ref = refs[a.ds ? 1 : 0];
+            int differ = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                if (got[i] == ref[i]) continue;
+                ++differ;
+                size_t j = 0;
+                while (j < got[i].size() && j < ref[i].size() && got[i][j] == ref[i][j]) ++j;
+                fprintf(stderr, "    %s D55 %s sibling %zu: %zu tokens vs one process alone %zu, the first difference at token %zu\n", a.name,
+                        on ? "on" : "off", i, got[i].size(), ref[i].size(), j);
+            }
+            long long checks = -1, kdiff = -1;
+            if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+                if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                    (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+            const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+            const bool said = llog.find("RADIANCE_SCHED_PUB_PROMPT=1 (tp8 loop D55)") != std::string::npos;
+            fprintf(stderr, "    D55 %-34s %s: %d of 4 differ from one process alone; attention-cached prompt tokens %.0f; KV-copy checks %lld, "
+                            "%lld differ; %zu E lines%s\n",
+                    a.name, on ? "on " : "off", differ, hit, checks, kdiff, elines, on && !said ? "; the start line is MISSING" : "");
+            CHECK_EQ(differ, 0);
+            CHECK_EQ(elines, (size_t)0);
+            CHECK_EQ(said, on == 1);
+            if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+            if (on) CHECK(hit >= 3 * 448);   /* each sibling at least the head's whole 64-token chunks below 500: 448 */
+            else CHECK_EQ(hit, 0.0);
+            if (on && hit > 0) ++armed;
+            if (differ || elines)
+                fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        }
+    }
+    CHECK_EQ(armed, 6);
+}

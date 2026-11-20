@@ -257,6 +257,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    {   /* tp8 loop D55: a prompt published at its last chunk's commit (publish_prompt_done); unset / 0 = at its close only */
+        const char* e = std::getenv("RADIANCE_SCHED_PUB_PROMPT");
+        pub_prompt_ = e && !std::strcmp(e, "1");
+        if (pub_prompt_ && lane_ <= 0 && cfg.prefix_cache)
+            RAD_INFO("scheduler: RADIANCE_SCHED_PUB_PROMPT=1 (tp8 loop D55) -- a prompt's computed blocks go into the prefix cache "
+                     "when its last chunk commits, not only at its close: a prompt admitted after that (another lane's too) hits them");
+    }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
         plan_reserved_ = e && !std::strcmp(e, "1");
@@ -1015,6 +1022,18 @@ void Scheduler::trim_prefix_cache() {
 /* What a request computed, into the prefix cache, while it still owns the blocks: at its close,
  * and at a preemption, whose recompute then adopts its prompt instead of computing it again.
  * True when published. */
+void Scheduler::publish_prompt_done(SchedReq& s) {
+    if (!pub_prompt_ || s.pub_prompt || !s.req || s.lent > 0 || s.req->embed) return;
+    if ((int64_t)s.req->n_computed < (int64_t)s.req->prompt.size()) return;
+    s.pub_prompt = true;
+    if (publish_prefix(s)) {
+        ++pub_prompt_n_;
+        pub_prompt_tok_ += s.req->n_computed;
+        RAD_DEBUG("prefix cache: request %llu's prompt of %lld tokens published at its last chunk's commit (tp8 loop D55; %lld so "
+                  "far)", (unsigned long long)s.req->id, (long long)s.req->n_computed, (long long)pub_prompt_n_);
+    }
+}
+
 bool Scheduler::publish_prefix(SchedReq& s) {
     if (cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
         s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
@@ -4565,6 +4584,7 @@ int Scheduler::commit(StepResult& res) {
                 /* From here a decode step reads the ring, and the engine checks the resolve's
                  * overflow. */
                 last_prefill_ids_.push_back(r.id);
+                publish_prompt_done(s);   /* tp8 loop D55 (off: nothing) */
             }
             if (e.produces_token && res.token && r.embed) {
                 /* The answer is the pooled vector the engine already put in the sink; there is
