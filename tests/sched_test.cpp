@@ -14111,6 +14111,58 @@ TEST(lanes_an_overdue_preempted_request_waits_for_the_other_lane_and_keeps_its_s
     }
 }
 
+/* tp8 loop D53: lanes that plan in another order than the lender lent in (several lanes committed before a round planned: a
+ * KV-copy check's drain, a merge drain). Lane 2 plans a 200-token cold prompt's first chunk and lends [64, 128) to lane 1 and
+ * [128, 192) to lane 0 (its planners 1, 0); lane 0 then plans FIRST. Before the fix its take stopped the engine (the order guard:
+ * "took the piece [128, 192) ... while the piece at 64 was not yet taken"); now the piece waits in lane 0's inbox, lane 1 runs
+ * [64, 128), and lane 0's next step runs [128, 192): every piece in position order, nothing broken, all four tokens. */
+TEST(lanes_a_piece_whose_predecessor_is_not_taken_waits_in_its_inbox) {
+    Lanes L;
+    REQUIRE_EQ(L.start(3), RAD_OK);
+    L.set.set_split(true, 16);
+    const uint64_t x = L.submit(2, 200, 4, 7000);
+    REQUIRE(x != 0);
+    REQUIRE(L.plan(2, { 1, 0 }) != nullptr);
+    const StepEntry* h = L.entry_of(2, x);
+    REQUIRE(h != nullptr);
+    CHECK_EQ((int)h->ctx_len, 0);
+    CHECK_EQ((int)L.set.inbox_n(1), 1);
+    CHECK_EQ((int)L.set.inbox_n(0), 1);
+    /* lane 0 plans before lane 1: its piece [128, 192) waits */
+    CHECK(L.plan(0, { 1, 2 }) == nullptr);
+    CHECK(L.set.broken().empty());
+    CHECK_EQ((int)L.set.inbox_n(0), 1);
+    CHECK_OK(L.commit(2, 7));
+    REQUIRE(L.plan(1, { 0, 2 }) != nullptr);
+    const StepEntry* p1 = L.entry_of(1, x);
+    REQUIRE(p1 != nullptr);
+    CHECK_EQ((int)p1->ctx_len, 64);
+    CHECK_OK(L.commit(1, 7));
+    REQUIRE(L.plan(0, { 1, 2 }) != nullptr);
+    const StepEntry* p0 = L.entry_of(0, x);
+    REQUIRE(p0 != nullptr);
+    CHECK_EQ((int)p0->ctx_len, 128);
+    CHECK_OK(L.commit(0, 7));
+    CHECK(L.set.broken().empty());
+    for (int round = 0; round < 40; ++round) {
+        const Request* r = L.req(2, x);
+        if (!r || r->state != ReqState::Running) break;
+        bool any = false;
+        for (int l : { 2, 1, 0 }) {
+            if (!L.plan(l, {})) continue;
+            any = true;
+            CHECK_OK(L.commit(l, 7));
+        }
+        if (!any) break;
+    }
+    const Request* r = L.req(2, x);
+    REQUIRE(r != nullptr);
+    CHECK(r->state == ReqState::Finished);
+    CHECK_EQ((int64_t)r->output.size(), (int64_t)4);
+    CHECK(L.set.broken().empty());
+    if (!L.set.broken().empty()) fprintf(stderr, "    broken: %s\n", L.set.broken().c_str());
+}
+
 /* tp8 S5 review: under a full pool the back of a lane's running set may be a newcomer whose piece
  * runs in another lane, which preempt_back refuses; the request that wanted its blocks then waits a
  * step and the plan moves past it. Before the fix the loop re-tried the same refused ensure forever
