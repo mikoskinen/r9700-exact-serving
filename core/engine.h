@@ -526,6 +526,11 @@ private:
     bool pp_tband_bg_ = false;
     int64_t pp_tband_dec_n_ = 0;     /* decode lanes' steps that ran as tail band passes (pp_tband 3) */
     int64_t pp_tband_dec_skip_ = 0;  /* ... and those a BG step was in flight for that a sequence of kept W(h, t)'s */
+    /* tp8 loop D50 (fn4 pp_tband 4 / 4 + 1024 x N): a held decode step bands in a CLEAN stretch too (4), or only above N decoded
+     * sequences there (4 + 1024 x N) -- at --pp-cut h,t+1 the band = W(h, t)'s decode, so where layer t runs follows the stretch
+     * and the load */
+    int64_t pp_tband_dec_clean_ = 0; /* decode lanes' band passes with no BG step in flight (pp_tband 4) */
+    int64_t pp_tband_dec_low_ = 0;   /* clean-stretch decode steps 4 + 1024 x N kept W(h, t)'s at a load <= N */
     std::unordered_map<uint64_t, int64_t> pp_tcopy_seq_;   /* core/sched/tcopy.h Gap: -1 all written, p the last gap */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();

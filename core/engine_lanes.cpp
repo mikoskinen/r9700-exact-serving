@@ -439,16 +439,38 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
      * (tp8 loop D39b) + a step of prompt rows only on ANY lane (a lone cold prompt plans on its home decode lane: lane_split_bg
      * lends a BG lane only a newcomer's whole rest beside decode rows) and the later chunks of a prompt whose every chunk so far
      * ran as a tail band pass */
-    const int sv0 = fn4::get(fn4::kPpTband), sv = sv0 < 0 ? pp_tband_start_ : sv0;
+    const int sv0 = fn4::get(fn4::kPpTband), sv1 = sv0 < 0 ? pp_tband_start_ : sv0;
+    /* tp8 loop D50: 4 + 1024 x N -- the form (sv) and the decode load N above which a clean stretch's decode step bands too */
+    const int sv = sv1 & 1023, tload = (sv1 >> 10) & 63;
     /* tp8 loop D46: 3 = 1's (a BG lane's steps below, as 2's) + a decode lane's step while a BG step is in flight, when every
-     * sequence in it has its band state on the leader (the plugin's copy since its first row); drafts, context, MIXED rows all go */
-    if (sv == 3 && !lanes_.is_bg(lane)) {
-        if (!pp_tband_copy_ || !pp_tband_bg_) return 0;
+     * sequence in it has its band state on the leader (the plugin's copy since its first row); drafts, context, MIXED rows all go.
+     * tp8 loop D50: 4 = 3 in EVERY stretch (a held decode step is a band pass whether a BG step is in flight or not: at a cut one
+     * layer below the published one, W(h, t + 1), that is W(h, t)'s decode -- the in-process control); 4 + 1024 x N (N 1 .. 63) =
+     * 3's band in a BG stretch, and in a clean one only while the decode lanes' last steps decoded > N sequences (the load
+     * --draft-short-from reads): a clean stretch at low load keeps the band layer on the follower */
+    if (sv >= 3 && !lanes_.is_bg(lane)) {
+        if (!pp_tband_copy_) return 0;
+        bool on = pp_tband_bg_;
+        if (!on && sv == 4) {
+            if (tload == 0) {
+                on = true;
+            } else {
+                int dec = 0;
+                for (int q = 0; q < n_lanes_; ++q)
+                    if (!lanes_.is_bg(q)) dec += sched_of(q).decoded_seqs();
+                on = dec > tload;
+                if (!on && count) ++pp_tband_dec_low_;
+            }
+        }
+        if (!on) return 0;
         if (!tcopy::held(pp_tcopy_seq_, pp_tband_copy_, p.e)) {
             if (count) ++pp_tband_dec_skip_;
             return 0;
         }
-        if (count) ++pp_tband_dec_n_;
+        if (count) {
+            ++pp_tband_dec_n_;
+            if (!pp_tband_bg_) ++pp_tband_dec_clean_;
+        }
         return j;
     }
     if (!lanes_.is_bg(lane) && sv < 2) return 0;
@@ -896,8 +918,15 @@ int Engine::step_loop_lanes() {
     pp_tband_lane_.assign((size_t)n_lanes_, 0);
     pp_tband_seq_.clear();
     pp_tcopy_seq_.clear();
-    if (const char* tv = std::getenv("RADIANCE_PP_TAIL_BAND");
-        tv && (!std::strcmp(tv, "1") || !std::strcmp(tv, "2") || !std::strcmp(tv, "3"))) {
+    /* tp8 loop D50: 4 / 4 + 1024 x N (N 1 .. 63) as well (fn4 pp_tband's values) */
+    auto tband_env_ok = [](const char* v) {
+        if (!v || !*v) return false;
+        for (const char* c = v; *c; ++c)
+            if (*c < '0' || *c > '9') return false;
+        const long x = std::strtol(v, nullptr, 10);
+        return (x >= 1 && x <= 4) || (x > 1024 && x <= 4 + 1024 * 63 && (x & 1023) == 4);
+    };
+    if (const char* tv = std::getenv("RADIANCE_PP_TAIL_BAND"); tband_env_ok(tv)) {
         pp_tband_start_ = std::atoi(tv);   /* tp8 loop D39b: 2 = the later chunks of an all-band prompt too; D46: 3 = + decode lanes */
         if (pp_tail_band_k() > 0 && lanes_.bg_lane() >= 0 && !pp_band_on_) {
             pp_tband_on_ = true;
@@ -916,11 +945,17 @@ int Engine::step_loop_lanes() {
                 RAD_INFO("two-node pipeline: the plugin keeps the tail band layers' state on the leader for every sequence (its tail "
                          "copy, form %d: %s; tp8 loop D46): fn4 pp_tband 3 runs a decode lane's step as a tail band pass too while a BG "
                          "step is in flight%s", pp_tband_copy_, pp_tband_copy_ == 1 ? "every pass that is no tail band pass"
-                         : "decode-only passes, a window of that many positions", pp_tband_start_ == 3 ? " -- on from the start "
-                         "(RADIANCE_PP_TAIL_BAND=3)" : "");
-            if (pp_tband_start_ == 3 && !pp_tband_copy_) {
-                RAD_WARN("two-node pipeline: RADIANCE_PP_TAIL_BAND=3 runs as 1: the plugin declared no tail band copy (tp8 loop D46: "
-                         "RADIANCE_DS41_PP_TBAND_COPY=1 / RADIANCE_LLAMA_PP_TBAND_COPY=1 on both nodes)");
+                         : "decode-only passes, a window of that many positions", (pp_tband_start_ & 1023) >= 3 ? " -- on from the start "
+                         "(RADIANCE_PP_TAIL_BAND=3 / 4)" : "");
+            if (pp_tband_copy_)
+                RAD_INFO("two-node pipeline: fn4 pp_tband 4 runs a held decode lane's step as a tail band pass in EVERY stretch, 4 + 1024 x N "
+                         "in a BG stretch and in a clean one only while the decode lanes' last steps decoded > N sequences: layer %d on the "
+                         "leader for such a step, on the follower for the others (tp8 loop D50)%s", cfg_.pp_cut_t - pp_tail_band_k(),
+                         (pp_tband_start_ & 1023) == 4 ? fmt(" -- RADIANCE_PP_TAIL_BAND=%d from the start (N = %d)", pp_tband_start_,
+                                                             (pp_tband_start_ >> 10) & 63).c_str() : "");
+            if ((pp_tband_start_ & 1023) >= 3 && !pp_tband_copy_) {
+                RAD_WARN("two-node pipeline: RADIANCE_PP_TAIL_BAND=%d runs as 1: the plugin declared no tail band copy (tp8 loop D46: "
+                         "RADIANCE_DS41_PP_TBAND_COPY=1 / RADIANCE_LLAMA_PP_TBAND_COPY=1 on both nodes)", pp_tband_start_);
                 pp_tband_start_ = 1;
             }
         } else {
@@ -1952,8 +1987,10 @@ int Engine::step_loop_lanes() {
                                "(pp_tband 2, D39b)", (long long)pp_tband_n_, (long long)pp_tband_off_n_, (long long)pp_tband_cont_n_);
     if (pp_tband_copy_) RAD_INFO("two-node pipeline: %lld decode lanes' steps ran as tail band passes while a BG step was in flight "
                                  "(pp_tband 3, tp8 loop D46); %lld such steps kept W(h, t)'s for a sequence whose band state the leader "
-                                 "does not hold; %zu sequences held", (long long)pp_tband_dec_n_, (long long)pp_tband_dec_skip_,
-                                 pp_tcopy_seq_.size());
+                                 "does not hold; %zu sequences held; %lld of the band passes had no BG step in flight (pp_tband 4, "
+                                 "tp8 loop D50), %lld clean-stretch decode steps kept W(h, t)'s at a decode load <= N (4 + 1024 x N)",
+                                 (long long)pp_tband_dec_n_, (long long)pp_tband_dec_skip_, pp_tcopy_seq_.size(),
+                                 (long long)pp_tband_dec_clean_, (long long)pp_tband_dec_low_);
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);

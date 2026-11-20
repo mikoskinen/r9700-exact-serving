@@ -511,6 +511,12 @@
  *                   at or above the chunk (4160). Needs RADIANCE_PP_TAIL_BAND=1 or 2 on the leader at start (its start value; else only 0 is taken)
  *                   and the plugin's tail band (RADIANCE_DS41_PP_TBAND=1 on both nodes). Read at each BG step's head; never a pass's
  *                   ops (both forms issue the published ops: rule A, as P28's band).
+ *                   3 (tp8 loop D46, needs the plugin's tail copy) -- 1 + a decode lane's step while a BG step is in flight when every
+ *                   sequence of it is held (core/sched/tcopy.h). 4 (tp8 loop D50) -- 3 in EVERY stretch; 4 + 1024 x N (N 1 .. 63) -- 3,
+ *                   and in a clean stretch only while the decode lanes' last steps decoded > N sequences. At --pp-cut h,t+1 a decode
+ *                   band pass is W(h, t)'s decode: 4 is the in-process control of the published cut, 3 puts layer t on the follower in
+ *                   the leader-bound clean stretches (lq222 D45: L 93-97 / F 82-90 % working at c4 .. c32) and on the leader in the
+ *                   follower-bound BG ones, 4 + 1024 x N keeps it on the leader in clean stretches above N (c16 / c32).
  *   draft_head_cut  engine (DHD, ds41-drafter round 11; 92 here, after ds41_tsk (82 on ds41-drafter, after draft_cost_age); Engine::issue_block_drafter): 0 off (today),
  *                   1: with RADIANCE_DRAFT_HEAD_CUT=1 at start, a query pass at a block drafter's own block (every row
  *                   proposing, block = depth: DSpark) runs its head and walk on the first D rows of each block, D = the head
