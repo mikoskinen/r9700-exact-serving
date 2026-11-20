@@ -2,9 +2,10 @@
  * rank 0, from the card events step_bi records around every layer it issues (no --profile-ops, no sync: a timing start reads it).
  *
  * A record is one step_bi call of a lone planned prefill pass (one prefill segment, no decode row): its first position, rows,
- * the time before its first layer ("pre": the leader head's token ops, the receive before a follower's first layer counts in that
- * layer) and each issued layer's ms (from its mark to the next layer's, the last one to the call's end: the crossing out, the
- * final norm / head). The leader's head and tail of a chunk, a follower pass's layer segments: one record each. Records are
+ * the time before its first layer ("pre": the leader head's token ops) and each issued layer's ms (from its mark to the next
+ * layer's, the last one to the call's end: the crossing out, the final norm / head); a layer that receives a crossing (X1 on the
+ * follower, X2 on the leader's tail, a segment's restore) is split at the receive's end: "rx<l>" = the wait for the payload + its
+ * copy in, "<l>" = the rest of the layer. The leader's head and tail of a chunk, a follower pass's layer segments: one record each. Records are
  * grouped into prompts in arrival order: a record at position 0 whose first layer a position-0 record of the open prompt
  * already covered starts the next prompt (the next newcomer's head, not the same chunk's tail or next segment). One prompt at a
  * time: two prompts whose chunks interleave are read as one (as the P22 line).
@@ -26,6 +27,7 @@
 namespace ds41pfl {
 
 constexpr int kPre = -1;   /* the "layer" of the time before a record's first layer */
+constexpr int kRx = 1000;  /* kRx + l: layer l's crossing receive (its wait for the payload + the copy in), apart from its ops */
 
 struct Rec {
     int64_t pos0 = 0, rows = 0;
@@ -56,7 +58,9 @@ struct Sums {
     }
 };
 
-inline std::string lname(int l) { return l == kPre ? std::string("pre") : std::to_string(l); }
+inline std::string lname(int l) {
+    return l == kPre ? std::string("pre") : l >= kRx ? "rx" + std::to_string(l - kRx) : std::to_string(l);
+}
 
 /* "pre 1.23, 0 4.56, ..." -- ms a 1k rows by layer (per1k) or ms (!per1k) */
 inline std::string by_layer(const Sums& s, bool per1k) {

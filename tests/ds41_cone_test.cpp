@@ -1112,6 +1112,8 @@ TEST(pf_layers_reads_a_leaders_cold_prompt_body_and_last_two_chunks) {
         CHECK(has(out[1], ", 9 12.00 / 12.00, "));
         CHECK(has(out[1], ", 39 0.25 / 5.00; sums"));
     }
+    CHECK_EQ(ds41pfl::lname(ds41pfl::kRx + 10), std::string("rx10"));   /* a receive's own bucket */
+    CHECK_EQ(ds41pfl::lname(ds41pfl::kPre), std::string("pre"));
     CHECK(a.open());          /* the new prompt's head is in */
     out = a.flush();          /* one chunk under 8,192 rows: the summary only (every 128) */
     CHECK(out.empty());

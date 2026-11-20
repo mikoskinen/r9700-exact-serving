@@ -9522,7 +9522,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const bool held = (m.lr.held(L.l) || band_l || tband_l) && (pp_part_layer(m, part, li_) || kvo);
         const int l = held ? L.l : (int)(&L - m.layers.data());
         const int64_t r = held ? L.r : c.ratio[(size_t)l];
-        if (held) pfl.layer(l);   /* tp8 loop P42: this layer's start on rank 0's stream (its receive counts in it) */
+        if (held) pfl.layer(l);   /* tp8 loop P42: this layer's start on rank 0's stream (a receive is split off below) */
         /* tp8 S6: the receiver's first layer after the cut starts from the crossing: its live rows are the previous
          * layer's segments (`cur`, not yet this layer's), over which one process issues the boundary op at the end of the
          * previous layer -- issued the same here (rows(kBiNorm) as below), after this node's copy of the source's
@@ -9546,6 +9546,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (!pp_cross(x, m, batch, ring, lo, hi, x1r_sh || (seg_hsh && sp_segp && sp_seg >= 2))) return;   /* D40: whole */
             if (x1r_sh && rad_rank(x) == 0) g_sp_x1.fetch_add(1, std::memory_order_relaxed);
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
+            pfl.layer(ds41pfl::kRx + l);   /* tp8 loop P42: the receive's end (its wait + copy in = "rx<l>", the layer's ops after it) */
             if (ring == RAD_PP_X2 && t_tband && rad_rank(x) == 0) {   /* tp8 loop D39 step 2c: the leader's tail from t - j */
                 const long long n = g_tband_tail.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (n == 1 || n % 256 == 0)
