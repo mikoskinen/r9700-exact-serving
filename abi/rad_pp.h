@@ -269,16 +269,18 @@ static inline void rad_pp_declare_tail_band(int j) {
 }
 
 /* tp8 loop D46 (the tail band's COPY; unset: never called): beside rad_pp_tail_band, the plugin names (every rank; the last wins)
- * that the leader holds the tail band layers' per-sequence state for EVERY sequence -- each pass that is no tail band pass
- * carries the band layers' KV rows in X2 and the leader stores them where its own band layers would have -- so any lane step,
- * a decode lane's too, may run as a tail band pass (fn4 pp_tband 3). on 0: no copy (only fresh prompts' steps may). Weak. */
+ * how the leader comes to hold the tail band layers' per-sequence state, so a decode lane's step too may run as a tail band pass
+ * (fn4 pp_tband 3; core/sched/tcopy.h keeps which sequences are held). form 0: no copy (only fresh prompts' steps may); 1: every
+ * pass that is no tail band pass carries the band layers' KV rows in X2 and the leader stores them where its own band layers
+ * would (the band layers' whole state); R >= 2: only a pass whose rows are ALL decode rows carries them, and the band layers
+ * keep a window of the last R positions (a sequence is held once its last R positions were written on the leader). Weak. */
 #if defined(__GNUC__)
 __attribute__((weak))
 #endif
-void rad_pp_tail_copy(int on);
+void rad_pp_tail_copy(int form);
 
-static inline void rad_pp_declare_tail_copy(int on) {
-    if (rad_pp_tail_copy) rad_pp_tail_copy(on);
+static inline void rad_pp_declare_tail_copy(int form) {
+    if (rad_pp_tail_copy) rad_pp_tail_copy(form);
 }
 
 /* tp8 loop D40 (the leader; zero from an engine before it): RadPpInfo.reserved[1]'s bits for the leader's head / tail SEGMENT

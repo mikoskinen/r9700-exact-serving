@@ -125,7 +125,7 @@ extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
 extern "C" void rad_pp_x1_ids(int on) { pp_g().x1_ids.store(on ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void rad_pp_band(int k) { pp_g().band_k.store(k > 0 ? k : 0, std::memory_order_relaxed); }
 extern "C" void rad_pp_tail_band(int j) { pp_g().tband_k.store(j > 0 ? j : 0, std::memory_order_relaxed); }
-extern "C" void rad_pp_tail_copy(int on) { pp_g().tcopy.store(on ? 1 : 0, std::memory_order_relaxed); }
+extern "C" void rad_pp_tail_copy(int form) { pp_g().tcopy.store(form > 0 ? form : 0, std::memory_order_relaxed); }
 
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
@@ -152,8 +152,8 @@ bool pp_x1_ids() { return pp_g().x1_ids.load(std::memory_order_relaxed) != 0; }
 int pp_band_k() { return pp_g().band_k.load(std::memory_order_relaxed); }
 /* tp8 loop D39: the tail band the plugin declared on this node (rad_pp_tail_band), 0 none */
 int pp_tail_band_k() { return pp_g().tband_k.load(std::memory_order_relaxed); }
-/* tp8 loop D46: the plugin's tail band copy (rad_pp_tail_copy) on this node */
-bool pp_tail_copy() { return pp_g().tcopy.load(std::memory_order_relaxed) != 0; }
+/* tp8 loop D46: the plugin's tail band copy form (rad_pp_tail_copy) on this node, 0 none (core/sched/tcopy.h) */
+int pp_tail_copy() { return pp_g().tcopy.load(std::memory_order_relaxed); }
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
