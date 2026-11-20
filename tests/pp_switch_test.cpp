@@ -101,6 +101,22 @@ TEST(the_follower_takes_only_its_own_switches_and_never_fails_on_a_refusal) {
     CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
     (void)fn4::apply_pending(2, sw);
     CHECK_EQ(fn4::value(acq), 1);
+    /* tp8 loop U1: aql_hdp (the HDP flush in front of every doorbell) is the core's on both nodes: the leader's request is
+     * taken and applied here, and its undo too. */
+    const int hdp = fn4::kAqlHdp;
+    CHECK(fn4::follower_switch(hdp));
+    CHECK_EQ(fn4::aql_hdp(), 0);
+    count[(size_t)hdp] = 1;
+    value[(size_t)hdp] = 1;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
+    (void)fn4::apply_pending(3, sw);
+    CHECK_EQ(fn4::value(hdp), 1);
+    CHECK_EQ(fn4::aql_hdp(), 1);
+    count[(size_t)hdp] = 2;
+    value[(size_t)hdp] = 0;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
+    (void)fn4::apply_pending(4, sw);
+    CHECK_EQ(fn4::aql_hdp(), 0);
 }
 
 TEST(apply_pending_records_each_request_as_asked) {

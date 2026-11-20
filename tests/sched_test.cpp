@@ -3568,7 +3568,8 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
         CHECK(e2.find("RADIANCE_PP_RBAND_EVERY") != std::string::npos);
     }
     CHECK_EQ(fn4::switch_index("sched_srf"), 101);   /* tp8 loop P44 */
-    CHECK_EQ(i + 8, (int)fn4::kSwitches);
+    CHECK_EQ(fn4::switch_index("aql_hdp"), 102);     /* tp8 loop U1 */
+    CHECK_EQ(i + 9, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -13343,6 +13344,28 @@ TEST(srf_the_switch_takes_0_1_2_and_starts_off) {
         CHECK(fn4::state_json().find(fmt("\"sched_srf\": %d", v)) != std::string::npos);
     }
     CHECK_EQ(fn4::sched_srf(), 0);
+}
+
+/* tp8 loop U1 (fn4 aql_hdp, upstream 8f2e511f's first half): 0 / 1, the AQL backend's (read at every doorbell), off at start, a
+ * follower switch (both nodes' doorbells); not a scheduler switch. The host backend has no doorbell: the value is only stored. */
+TEST(aql_hdp_the_switch_takes_0_1_starts_off_and_acts_on_both_nodes) {
+    std::string err;
+    for (int v : { 0, 1 }) CHECK(fn4::check("aql_hdp", v, &err));
+    for (int v : { -1, 2, 256 }) {
+        CHECK(!fn4::check("aql_hdp", v, &err));
+        CHECK(err.find("aql_hdp takes 0") != std::string::npos);
+        CHECK(err.find("8f2e511f") != std::string::npos);
+    }
+    CHECK_EQ(fn4::aql_hdp(), 0);
+    CHECK_EQ(fn4::switch_index("aql_hdp"), (int)fn4::kAqlHdp);
+    CHECK(!fn4::sched_switch(fn4::kAqlHdp));
+    CHECK(fn4::follower_switch(fn4::kAqlHdp));
+    CHECK(fn4::state_json().find("\"aql_hdp\": 0") != std::string::npos);
+    CHECK(DstSwitches::set("aql_hdp", 1));
+    CHECK_EQ(fn4::aql_hdp(), 1);
+    CHECK(fn4::state_json().find("\"aql_hdp\": 1") != std::string::npos);
+    CHECK(DstSwitches::set("aql_hdp", 0));
+    CHECK_EQ(fn4::aql_hdp(), 0);
 }
 
 /* sched_srf 1 = upstream 67cf57b8's rule on one scheduler (its sched_test case, ported): prompts prefilling side by side with
