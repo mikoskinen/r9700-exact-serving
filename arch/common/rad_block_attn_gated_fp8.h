@@ -51,10 +51,18 @@ namespace arch {
  * 1025..2048 with 4 rows has reach 2048 + 4 > qsa_exact_to 2051 and decodes SPARSE, while 1..3 read its exact seqused
  * (<= 2051: dense). The two launches agree while a row's keys fit the sparse 4-row launch's 64 one-tile segments
  * (1024 keys) and part beyond. 4 reads the bound (fn4_attbi_sparse); 0..3 keep today's choice and bytes. */
+/* 5 (20.11.2026, qwen-port round 3, s5-bt: L03.att first-differing in 16 of 20 probes, every one a DENSE step of 22
+ * sequences x 2 rows): as 4, and a step with no sparse sequence (every bound + rows <= qsa_exact_to: reach 2050 at 2 rows
+ * beside a 1025..2048 context, or every context <= 1024) takes the same per-sequence launches (att_bi 3's pinned runs of
+ * dense decode sequences, each prefill sequence alone-shaped, a 1-row sequence sparse as alone). 1..4 enter only a
+ * sparse step: a dense step issues ONE attn_paged over its n_seq sequences, whose split law (r4d_decode_splits: units =
+ * kv_heads x n_seq, 256 / units segments at q_len x gqa <= 32, 128 / units above) gives a sequence of ctx > 16 x
+ * (256 / units) keys other segments than its alone launch (2 KV heads a rank: 22 sequences -> 5 segments -> past 80
+ * keys; 4 sequences at depth 3 -> 16 -> past 256). Steps without KV streaming only; the declares do not change. */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
                                    const int v = e && *e ? std::atoi(e) : 0;
-                                   return v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   return v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 kvs_bi (15.11.2026, qwen/KV-STREAM-EXACT.md; switch kvs_bi / RADIANCE_FN4_KVS_BI, a mask; 0 = today): KV streaming
@@ -883,7 +891,11 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int abf0 = fn4_attbi_flag().load(std::memory_order_relaxed);
     /* fn4 kvs_bi bit 1: a streamed group's decode sequences in their alone (sparse, own-launch) form, ring or stage */
     const bool kvs_alone = ring_addressed && (fn4_kvsbi_flag().load(std::memory_order_relaxed) & 1) != 0;
-    if (gated && abf0 > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
+    /* att_bi 5: a dense step through the same per-sequence launches (its 1-row sequences sparse, as alone; the selection
+     * is computed every step); not with a streamed group (the dense path stages the layer itself) */
+    const bool dense_bi = !sparse && abf0 >= 5 && qsa_sel && qsa_sequ && op_attn_gq && op_attn_bi &&
+                          !(kvb && kvb->stream);
+    if ((gated || dense_bi) && abf0 > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
         table && used && kvb && kvb->seqused_h && (!ring_bound || kvs_alone) && qsa_exact_to > 0 && op_attn && op_gq &&
         !(pieces && pieces->cuts(T))) {
         int64_t D = 0, DT = 0;

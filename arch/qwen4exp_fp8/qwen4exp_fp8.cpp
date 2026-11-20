@@ -341,7 +341,7 @@ static std::atomic<int>& fn4_hcbi_flag() {
 /* fn4 BI: switch bi_seg's value (RADIANCE_FN4_BI_SEG starts it): the trunk's linears cut at the step's segments. */
 static std::atomic<int>& fn4_biseg_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_BI_SEG");
-                                   const int v = e && *e ? std::atoi(e) : 0; return v == 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   const int v = e && *e ? std::atoi(e) : 0; return v == 3 ? 3 : v == 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 BI: the step's segments (Model::bi_cut) when hc_bi or bi_seg is on; the reads take them under hc_bi
@@ -378,9 +378,16 @@ static void bi_segments(Model& m, const RadBatch* batch) {
  * that finishes this step: the decode rows go in one launch when 1 + n_spec >= 3 (else a launch a sequence, at its own
  * M), each prompt's row in a launch of its own. Returns false (the caller issues one launch) when off, or when the step's
  * outputs do not have that form (uneven verify blocks, scoring rows). 12.11.2026, fn4 180: the logits were the first
- * differing op in 19 of 40 probes, every one a prompt's last row in a mixed step. */
+ * differing op in 19 of 40 probes, every one a prompt's last row in a mixed step.
+ * bi_seg 3 (20.11.2026, qwen-port round 3, s5-bt: logits first-differing in 2 of 20 probes, a row verified at q 3 beside
+ * load vs q 2 alone): the decode rows in ONE launch whenever they are 3 or more, at any verify depth. A decode row's alone
+ * class is that of its alone step at the published depth (MTP 3, draft_adaptive 0: q 4, WMMA); a step whose depth a
+ * row cap lowered (CAP48 / RADIANCE_DECODE_ROW_CAP_UNIFORM: q 2 or 3) then keeps the WMMA class instead of a matvec a
+ * sequence. Only steps below q 3 with two or more decode sequences change; a lone sequence below q 3 (cap <= 3) keeps
+ * its M = qd launch. */
 static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
-    if (fn4_biseg_flag().load(std::memory_order_relaxed) < 2) return false;
+    const int bsm = fn4_biseg_flag().load(std::memory_order_relaxed);
+    if (bsm < 2) return false;
     const int64_t n = batch->n_out;
     if (n <= 1) return false;                      /* one row: already its alone class */
     int64_t sd = 0, td = 0;
@@ -394,7 +401,7 @@ static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
                     brow_slice(m.b_logits, r0, k, V));
     };
     if (td > 0) {
-        if (qd >= 3) one(0, td);
+        if (qd >= 3 || (bsm >= 3 && td >= 3)) one(0, td);
         else for (int64_t s = 0; s < sd; ++s) one(s * qd, qd);
     }
     for (int64_t r = td; r < n; ++r) one(r, 1);
@@ -3207,7 +3214,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
+        if (value < 0 || value > 5) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path; 5: + dense steps */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -3217,8 +3224,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
-        if (value < 0 || value > 2) return -1;
+    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head; 3: + its decode rows in one launch at any depth) */
+        if (value < 0 || value > 3) return -1;
         qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

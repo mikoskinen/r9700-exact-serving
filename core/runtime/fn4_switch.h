@@ -796,14 +796,16 @@
  *                   segments (decode rows, each prefill sequence): a decode row's linears at its own height (the
  *                   narrow tiles, M-invariant to 64); 2 also the lm_head at each output row's alone height class
  *                   (a prompt's last row its own M = 1 launch: logits_gemm runs a matvec at M <= 2, WMMA from 3);
- *                   0 one launch over the step                                                     RADIANCE_FN4_BI_SEG
+ *                   3 (20.11.) + the decode rows in one launch at any verify depth when they are >= 3 (a capped
+ *                   step keeps the published depth's WMMA class); 0 one launch over the step      RADIANCE_FN4_BI_SEG
  *   att_bi          architecture plugin (rad_fn4_switch): fn4 BI -- a step's prefill sequences' dense attention each in
  *                   a launch shaped as its alone step's (its rows, its band, its table row and seqused), every sparse
  *                   sequence in launches of its own; 2 as 1, the sparse decode sequences in one launch whose split law
  *                   counts 1 + n_spec rows (libr4d split_rows; RADIANCE_FN4_BIDEC / X3DUAL declare it); 3 + a run of
  *                   dense decode sequences in one pinned launch; 4 (15.11.) + each sequence of a sparse step on the
- *                   path of its alone step's context bound (qwen/build2/LONGPROMPT.md); 0 today's
- *                   launches                                                                       RADIANCE_FN4_ATT_BI
+ *                   path of its alone step's context bound (qwen/build2/LONGPROMPT.md); 5 (20.11.) + a DENSE
+ *                   step (no sparse sequence) through the same per-sequence launches (its one attn_paged over
+ *                   n_seq sequences splits a row's keys by n_seq); 0 today's launches             RADIANCE_FN4_ATT_BI
  *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
  *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;
  *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS
