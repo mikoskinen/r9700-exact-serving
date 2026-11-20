@@ -13926,8 +13926,10 @@ TEST(a_borrower_plans_its_inbox_first_within_its_budget) {
 }
 
 /* The engine names the lanes in the order they plan; a chunk taken out of that order (the third
- * before the second) would run out of position order, and the set names it. */
-TEST(a_piece_taken_out_of_position_order_is_named) {
+ * before the second) would run out of position order. Until tp8 loop D53 the set named it (and the engine stopped); now the
+ * piece waits in its lane's inbox until its predecessor is taken (lane_take_inbox), so nothing breaks and nothing runs out of
+ * order; the set names it only after a 30 s wait (a predecessor that is nowhere). */
+TEST(a_piece_taken_out_of_position_order_waits_for_its_predecessor) {
     Lanes L;
     REQUIRE_EQ(L.start(3), RAD_OK);
     const uint64_t s = L.submit(0, 200, 2);
@@ -13935,8 +13937,14 @@ TEST(a_piece_taken_out_of_position_order_is_named) {
     REQUIRE(L.plan(0, { 1, 2 }) != nullptr);        /* [0, 64) here, [64, 128) to 1, [128, 192) to 2 */
     CHECK_EQ(L.entry_of(0, s)->n_tokens, 64);
     CHECK(L.set.broken().empty());
-    REQUIRE(L.plan(2, { 1, 0 }) != nullptr);        /* lane 2 before lane 1: out of order */
-    CHECK(!L.set.broken().empty());
+    CHECK(L.plan(2, { 1, 0 }) == nullptr);          /* lane 2 before lane 1: its piece waits */
+    CHECK(L.set.broken().empty());
+    CHECK_EQ((int)L.set.inbox_n(2), 1);
+    REQUIRE(L.plan(1, { 2, 0 }) != nullptr);        /* [64, 128) */
+    CHECK_EQ((int)L.entry_of(1, s)->ctx_len, 64);
+    REQUIRE(L.plan(2, { 0, 1 }) != nullptr);        /* then [128, 192) */
+    CHECK_EQ((int)L.entry_of(2, s)->ctx_len, 128);
+    CHECK(L.set.broken().empty());
     if (!L.set.broken().empty()) fprintf(stderr, "    %s\n", L.set.broken().c_str());
 }
 
@@ -14027,6 +14035,120 @@ TEST(lanes_a_request_another_lane_crowds_out_is_preempted_not_failed) {
             fprintf(stderr, "    request %llu: %s, %zu tokens\n", (unsigned long long)id, r->finish_reason.c_str(),
                     r->output.size());
     }
+}
+
+/* tp8 loop D53: the same crowd-out with the preempted request overdue at once (preempt_wait_ms 0) and a state group as
+ * DeepSeek's (its compressor tails and Engram token window are per-sequence state slots): the preempted request's lane has
+ * nothing running while the other lane's request holds the shared pool. Before the fix the overdue path read "nothing
+ * running" lane by lane -- it called release_idle_states(), which drops EVERY sequence's state slot (the other lane's running
+ * request's too), and failed the request ("could not be admitted with nothing running"). Now it waits for the other lane: both
+ * requests finish with all their tokens, and a running request's state slot never goes away or changes. */
+TEST(lanes_an_overdue_preempted_request_waits_for_the_other_lane_and_keeps_its_state) {
+    Lanes L;
+    L.grid = 32;                    /* the linear state group (kv group 1) */
+    L.cfg.preempt_wait_ms = 0;      /* overdue from the step after its preemption */
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    L.set.set_split(false, 16);
+    L.kv.setup(L.prog.kv_groups, L.cfg.max_ctx, 12, 64);   /* 12 blocks of 16: 192 tokens for both lanes */
+    const uint64_t a = L.submit(0, 90, 60);
+    const uint64_t b = L.submit(1, 90, 60, 3000);
+    REQUIRE(a != 0 && b != 0);
+    int failed = 0, lost = 0;
+    long long preempted = 0;
+    std::map<uint64_t, int32_t> slot_of;
+    auto watch = [&] {
+        for (uint64_t id : { a, b }) {
+            const Request* r = L.req(id == a ? 0 : 1, id);
+            if (!r) continue;
+            if (r->state == ReqState::Failed) ++failed;
+            if (r->state != ReqState::Running) { slot_of.erase(id); continue; }
+            const auto it = L.kv.seqs.find(id);
+            const int32_t st = it == L.kv.seqs.end() || it->second.state.size() < 2 ? -1 : it->second.state[1];
+            const auto was = slot_of.find(id);
+            if (was != slot_of.end() && was->second != st) ++lost;   /* dropped (-1) or moved under a running request */
+            if (st >= 0) slot_of[id] = st;
+        }
+    };
+    for (int round = 0; round < 600; ++round) {
+        bool any = false;
+        for (int l = 0; l < 2; ++l) {
+            const RadBatch* bt = L.plan(l, { 1 - l });
+            watch();
+            if (!bt) continue;
+            any = true;
+            CHECK_OK(L.commit(l, 7));
+            watch();
+        }
+        if (failed) break;
+        const Request* ra = L.req(0, a);
+        const Request* rb = L.req(1, b);
+        if (!any && ra && rb && ra->state == ReqState::Finished && rb->state == ReqState::Finished) break;
+    }
+    preempted = (long long)(L.at(0).metrics().preemptions + L.at(1).metrics().preemptions);
+    fprintf(stderr, "    %lld preemption(s), %d failed, %d running state slot(s) dropped or moved\n", preempted, failed, lost);
+    CHECK(preempted > 0);
+    CHECK_EQ(failed, 0);
+    CHECK_EQ(lost, 0);
+    for (uint64_t id : { a, b }) {
+        const Request* r = L.req(id == a ? 0 : 1, id);
+        REQUIRE(r != nullptr);
+        CHECK(r->state == ReqState::Finished);
+        CHECK_EQ((int64_t)r->output.size(), (int64_t)60);
+        if (r->state != ReqState::Finished)
+            fprintf(stderr, "    request %llu: %s, %zu tokens\n", (unsigned long long)id, r->finish_reason.c_str(), r->output.size());
+    }
+}
+
+/* tp8 loop D53: lanes that plan in another order than the lender lent in (several lanes committed before a round planned: a
+ * KV-copy check's drain, a merge drain). Lane 2 plans a 200-token cold prompt's first chunk and lends [64, 128) to lane 1 and
+ * [128, 192) to lane 0 (its planners 1, 0); lane 0 then plans FIRST. Before the fix its take stopped the engine (the order guard:
+ * "took the piece [128, 192) ... while the piece at 64 was not yet taken"); now the piece waits in lane 0's inbox, lane 1 runs
+ * [64, 128), and lane 0's next step runs [128, 192): every piece in position order, nothing broken, all four tokens. */
+TEST(lanes_a_piece_whose_predecessor_is_not_taken_waits_in_its_inbox) {
+    Lanes L;
+    REQUIRE_EQ(L.start(3), RAD_OK);
+    L.set.set_split(true, 16);
+    const uint64_t x = L.submit(2, 200, 4, 7000);
+    REQUIRE(x != 0);
+    REQUIRE(L.plan(2, { 1, 0 }) != nullptr);
+    const StepEntry* h = L.entry_of(2, x);
+    REQUIRE(h != nullptr);
+    CHECK_EQ((int)h->ctx_len, 0);
+    CHECK_EQ((int)L.set.inbox_n(1), 1);
+    CHECK_EQ((int)L.set.inbox_n(0), 1);
+    /* lane 0 plans before lane 1: its piece [128, 192) waits */
+    CHECK(L.plan(0, { 1, 2 }) == nullptr);
+    CHECK(L.set.broken().empty());
+    CHECK_EQ((int)L.set.inbox_n(0), 1);
+    CHECK_OK(L.commit(2, 7));
+    REQUIRE(L.plan(1, { 0, 2 }) != nullptr);
+    const StepEntry* p1 = L.entry_of(1, x);
+    REQUIRE(p1 != nullptr);
+    CHECK_EQ((int)p1->ctx_len, 64);
+    CHECK_OK(L.commit(1, 7));
+    REQUIRE(L.plan(0, { 1, 2 }) != nullptr);
+    const StepEntry* p0 = L.entry_of(0, x);
+    REQUIRE(p0 != nullptr);
+    CHECK_EQ((int)p0->ctx_len, 128);
+    CHECK_OK(L.commit(0, 7));
+    CHECK(L.set.broken().empty());
+    for (int round = 0; round < 40; ++round) {
+        const Request* r = L.req(2, x);
+        if (!r || r->state != ReqState::Running) break;
+        bool any = false;
+        for (int l : { 2, 1, 0 }) {
+            if (!L.plan(l, {})) continue;
+            any = true;
+            CHECK_OK(L.commit(l, 7));
+        }
+        if (!any) break;
+    }
+    const Request* r = L.req(2, x);
+    REQUIRE(r != nullptr);
+    CHECK(r->state == ReqState::Finished);
+    CHECK_EQ((int64_t)r->output.size(), (int64_t)4);
+    CHECK(L.set.broken().empty());
+    if (!L.set.broken().empty()) fprintf(stderr, "    broken: %s\n", L.set.broken().c_str());
 }
 
 /* tp8 S5 review: under a full pool the back of a lane's running set may be a newcomer whose piece
