@@ -908,7 +908,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp,
               /* qfn-on-ds (20.11.2026): the Qwen Flash-Next line's switches (fn4-x3-pf 6fdca84a), after the DeepSeek
                * line's, which keep their numbers (the DeepSeek line's own after 0735a8e2 -- pp_rband 100, sched_srf 101,
-               * aql_hdp 102 -- go before kQwenFirst, so the Qwen block moves up with them: 21.11. merge of ds41-pp-dev 1bee48aa); draft_adaptive, aql_acq, sched_bi_chunk and ar_xpush are both lines' and
+               * aql_hdp 102 -- go before kQwenFirst, so the Qwen block moves up with them: the 20.11. merge of ds41-pp-dev 1bee48aa); draft_adaptive, aql_acq, sched_bi_chunk and ar_xpush are both lines' and
                * keep the DeepSeek numbers. kQwenFirst is the first of these (qwen_switch). */
               kNoRoute, kGatherInv, kHcFuseDown, kHcNormWave, kHcWriteVec, kHcReadV,
               kArLaneThreads, kHcUpMix, kArLaneBlocks, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair,
