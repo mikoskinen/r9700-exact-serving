@@ -1308,6 +1308,7 @@ private:
      * set. Unset / 0: this lane's running_ only (a long prompt in one lane is admitted beside another lane's prefilling
      * prompt whose rest it then takes: both run out and preempt). One lane: running_ either way. The lock is held. */
     void    room_runners(std::vector<const SchedReq*>* out, bool all_lanes) const;
+    int     lane_room_seen_ = -1;   /* tp8 loop D56: the sched_lane_room value the last step planned under (lane 0; -1 before the first) */
     friend class LaneSet;
     /* A piece of one of this lane's sequences, run in lane `by`'s step, committed there: called by
      * the LaneSet with the lock held. `i` is the entry in that step's StepResult. */

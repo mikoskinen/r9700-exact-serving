@@ -6731,6 +6731,8 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
                     a.name, fname, pool_in(llog), hi, pre, got.wall, hit, differ, ref.tok.size(), failed, checks, kdiff, elines);
             const bool said = llog.find("RADIANCE_SCHED_LANE_ROOM=1 (tp8 loop D56)") != std::string::npos;
             CHECK_EQ(said, room);
+            /* the POSTed switch names itself once, with the preemptions before it (an in-process A/B's per-arm reading) */
+            CHECK_EQ(llog.find("fn4 sched_lane_room 1 from here (was 0; tp8 loop D56)") != std::string::npos, posted);
             pre_form[form] += pre > 0 && a.lanes ? (long long)pre : 0;
             CHECK_EQ(differ, 0);
             CHECK_EQ(failed, 0);

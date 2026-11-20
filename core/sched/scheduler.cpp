@@ -3254,6 +3254,22 @@ const RadBatch* Scheduler::step() {
     struct LaneEnd { Scheduler* s; ~LaneEnd() { if (s) s->lane_plan_end(); } } lane_end{ lanes_ ? this : nullptr };
     if (lanes_) lane_plan_begin();
 
+    /* tp8 loop D56: a POSTed fn4 sched_lane_room names itself once a change, with the preemptions so far (every lane's), so an
+     * in-process A/B reads each arm's count from the log (lane 0 / one process only; nothing while the start value stands) */
+    if (lane_ <= 0) {
+        const int lr = fn4::sched_lane_room();
+        if (lane_room_seen_ < 0) lane_room_seen_ = lr;
+        else if (lr != lane_room_seen_) {
+            long long pre = (long long)m_.preemptions;
+            if (lanes_ && n_lanes_ > 1)
+                for (int l = 0; l < lanes_->n(); ++l)
+                    if (const Scheduler* o = lanes_->lane(l); o && o != this) pre += (long long)o->m_.preemptions;
+            RAD_INFO("scheduler: fn4 sched_lane_room %d from here (was %d; tp8 loop D56): %lld preemption(s) by recompute so far, every lane",
+                     lr, lane_room_seen_, pre);
+            lane_room_seen_ = lr;
+        }
+    }
+
     plan_.reset();
     plan_.spec_is_tree = tree_;
     step_prefill_tok_ = 0;
