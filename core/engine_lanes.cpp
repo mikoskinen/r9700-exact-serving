@@ -66,6 +66,7 @@ namespace rad {
 
 bool pp_x1_ids();   /* engine_node.cpp: the plugin declared X1's token-ids part (tp8 dev D10 round 2) */
 int pp_band_k();    /* engine_node.cpp: the band the plugin declared (tp8 loop P28) */
+int pp_tail_band_k();   /* engine_node.cpp: the tail band the plugin declared (tp8 loop D39) */
 std::vector<int32_t> pp_segments();   /* engine_node.cpp: the boundaries the plugin declared on this node (tp8 dev M4 / M9) */
 
 /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1; FINDINGS F6 22:37): where a lone cold prompt's time goes on the leader. The
@@ -383,6 +384,54 @@ std::string Engine::dch_text() const {
                dch_max_ms_, dch_wait_n_ ? dch_wait_ms_ / (double)dch_wait_n_ : 0.0, (long long)dch_wait_n_);
 }
 
+/* tp8 loop D39: a lane step's tail band j (0: not a tail band pass) -- P28's rule (a BG lane's step whose prompts are all fresh,
+ * no context, no snapshot restore, no draft rows, <= RADIANCE_PP_BAND_MAX_ROWS rows) and no head band in the same step */
+int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
+    if (!pp_tband_on_ || !b || b->n_tok > pp_band_max_rows_) return 0;
+    const int j = pp_tail_band_k();
+    if (j <= 0) return 0;
+    const StepPlan& p = sched_of(lane).plan();
+    if (p.e.empty()) return 0;
+    /* fn4 pp_tband (-1 never requested = the start's RADIANCE_PP_TAIL_BAND value): 0 none, 1 a BG lane's step of fresh prompts, 2
+     * (tp8 loop D39b) + a step of prompt rows only on ANY lane (a lone cold prompt plans on its home decode lane: lane_split_bg
+     * lends a BG lane only a newcomer's whole rest beside decode rows) and the later chunks of a prompt whose every chunk so far
+     * ran as a tail band pass */
+    const int sv0 = fn4::get(fn4::kPpTband), sv = sv0 < 0 ? pp_tband_start_ : sv0;
+    if (!lanes_.is_bg(lane) && sv < 2) return 0;
+    static const bool t_cont_only = [] {   /* RADIANCE_PP_TEST_TBAND_CONT_ONLY=1: later chunks only -- the negative control */
+        const char* v = std::getenv("RADIANCE_PP_TEST_TBAND_CONT_ONLY");
+        return v && !std::strcmp(v, "1");
+    }();
+    bool later = false;
+    for (const StepEntry& e : p.e) {
+        if (!e.is_prefill || e.ckpt_restore >= 0 || e.n_spec > 0) return 0;
+        if (e.ctx_len != 0) {
+            if (sv < 2 || (!t_cont_only && !pp_tband_seq_.count(e.seq))) return 0;
+            later = true;
+        } else if (t_cont_only) {
+            return 0;
+        }
+    }
+    /* fn4 pp_tband 0 (step 2c's in-process control): this fresh BG step runs W(h, t)'s */
+    if (sv == 0) {
+        if (count) ++pp_tband_off_n_;
+        return 0;
+    }
+    if (count && later) ++pp_tband_cont_n_;
+    return j;
+}
+
+/* tp8 loop D39b: after a step's head decided its tail band -- which sequences have run every chunk as a tail band pass */
+void Engine::pp_tband_note(int lane, int tband) {
+    if (!pp_tband_on_) return;
+    for (const StepEntry& e : sched_of(lane).plan().e) {
+        if (!e.is_prefill) { pp_tband_seq_.erase(e.seq); continue; }
+        if (tband > 0 && (e.ctx_len == 0 || pp_tband_seq_.count(e.seq))) pp_tband_seq_[e.seq] = 1;
+        else pp_tband_seq_.erase(e.seq);
+    }
+    if (pp_tband_seq_.size() > 4096) pp_tband_seq_.clear();   /* prompts never finished: forgotten (they run W(h, t)'s) */
+}
+
 int Engine::lane_head(int lane, const RadBatch* b) {
     lane_select(lane);
     /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1): this chunk's head, bracketed on rank 0's stream */
@@ -403,10 +452,17 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     RAD_TRY(restore_checkpoints());
     /* tp8 loop P28: the frame says so; the head runs [0, h + k) */
     const int band = band_pre >= 0 ? band_pre : pp_band_step(lane, b);
+    /* tp8 loop D39: a tail band (never beside a head band); the frame says so, the lane keeps j for its tail part */
+    const int tband = band > 0 ? 0 : pp_tband_step(lane, b, true);
     pp_ship_band_ = band;
+    pp_ship_tband_ = tband;
     const int ss = pp_ship(b, true, lane);
     pp_ship_band_ = 0;
+    pp_ship_tband_ = 0;
     if (ss < 0) return ss;
+    if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = tband;
+    if (tband) ++pp_tband_n_;
+    pp_tband_note(lane, tband);   /* tp8 loop D39b */
     dch_note_head(lane, b);   /* tp8 loop D35 */
     if (band) ++pp_band_n_;
     pp_set_pass(lane, RAD_PP_PART_HEAD, 0, 0, band);
@@ -768,6 +824,30 @@ int Engine::step_loop_lanes() {
                                       : "it needs RADIANCE_PP_BG_LANE");
         }
     }
+    /* tp8 loop D39 (RADIANCE_PP_TAIL_BAND=1, the leader): fresh BG steps run as tail band passes of the plugin's tail band */
+    pp_tband_on_ = false;
+    pp_tband_lane_.assign((size_t)n_lanes_, 0);
+    pp_tband_seq_.clear();
+    if (const char* tv = std::getenv("RADIANCE_PP_TAIL_BAND"); tv && (!std::strcmp(tv, "1") || !std::strcmp(tv, "2"))) {
+        pp_tband_start_ = std::atoi(tv);   /* tp8 loop D39b: 2 = the later chunks of an all-band prompt too */
+        if (pp_tail_band_k() > 0 && lanes_.bg_lane() >= 0 && !pp_band_on_) {
+            pp_tband_on_ = true;
+            if (!std::getenv("RADIANCE_PP_BAND")) {   /* P28's row cap, read here when RADIANCE_PP_BAND did not read it */
+                pp_band_max_rows_ = 2047;
+                if (const char* mr = std::getenv("RADIANCE_PP_BAND_MAX_ROWS"); mr && *mr) pp_band_max_rows_ = std::max<int64_t>(1, std::atoll(mr));
+            }
+            RAD_INFO("two-node pipeline: RADIANCE_PP_TAIL_BAND=%d -- a BG lane's step of fresh prompts runs as a tail band pass: the "
+                     "follower over [%d, %d) (then the band layers' own KV stores), the leader's tail from %d (the plugin's tail band %d; "
+                     "steps of <= %lld rows; tp8 loop D39)%s", pp_tband_start_, cfg_.pp_cut_h, cfg_.pp_cut_t - pp_tail_band_k(),
+                     cfg_.pp_cut_t - pp_tail_band_k(), pp_tail_band_k(), (long long)pp_band_max_rows_,
+                     pp_tband_start_ == 2 ? "; and so does a later chunk of a prompt whose every chunk so far ran as one (D39b)" : "");
+        } else {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_TAIL_BAND=1 is not taken: %s (tp8 loop D39)",
+                     pp_tail_band_k() <= 0 ? "the plugin declared no tail band" : pp_band_on_ ? "not beside RADIANCE_PP_BAND=1"
+                                                                                          : "it needs RADIANCE_PP_BG_LANE");
+        }
+    }
+    fn4::tband_register(pp_tband_on_);   /* tp8 loop D39 step 2c: fn4 pp_tband 1 needs it taken */
     /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader; default unset = a band step's head whole, as P28 built it): a band
      * step's head in LSP's segments too -- [0, b1) .. [b_last, h + k) at the head boundaries the plugin declared, the band word on
      * every segment, the held frame a band frame -- so the k layers a band pass adds to the leader's BG head no longer hold every
@@ -1136,6 +1216,7 @@ int Engine::step_loop_lanes() {
             bool seg_step = lseg && lform != 0 && b->n_tok >= rf_rows && lanes_.is_bg(l);
             const int sband = seg_step ? pp_band_step(l, b) : -1;
             if (sband > 0 && !lseg_band) seg_step = false;
+            if (seg_step && sband <= 0 && pp_tband_step(l, b) > 0) seg_step = false;   /* tp8 loop D39: a tail band step runs whole */
             if (seg_step && lform == 2 && !decode_live()) {   /* D32: no decode lane busy -> whole, as BEST */
                 seg_step = false;
                 ++lsp_whole;
@@ -1513,6 +1594,9 @@ int Engine::step_loop_lanes() {
     if (bgr_on) bgr_line(" over the run");   /* tp8 loop D32 */
     if (pp_link_ && dch_n_ > 0)                /* tp8 loop D35 */
         RAD_INFO("two-node pipeline: decode chain on the leader host over the run (tp8 loop D35): %s", dch_text().c_str());
+    if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39); "
+                               "%lld fresh BG steps ran W(h, t)'s under fn4 pp_tband 0; %lld of the tail band passes carried a later chunk "
+                               "(pp_tband 2, D39b)", (long long)pp_tband_n_, (long long)pp_tband_off_n_, (long long)pp_tband_cont_n_);
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);
@@ -1541,7 +1625,7 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
 int Engine::lane_tail_model(int lane, const RadBatch* b) {
     lane_select(lane);
     if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
-    pp_set_pass(lane, RAD_PP_PART_TAIL);
+    pp_set_pass(lane, RAD_PP_PART_TAIL, 0, 0, 0, 0, pp_tband_of(lane));   /* tp8 loop D39: from t - j on a tail band step */
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
@@ -1575,6 +1659,8 @@ int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool firs
             return RAD_E_STATE;
         }
         pp_trunk_pending_[lane] = false;
+        if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = 0;   /* tp8 loop D39: a segmented step is no tail band step */
+        pp_tband_note(lane, 0);   /* tp8 loop D39b: its prompts' later chunks run W(h, t)'s */
         RAD_TRY(restore_checkpoints());
         /* tp8 loop D36: a band step's held frame says so (flags bit 2: the follower's parts start at h + k) */
         pp_ship_band_ = band;
@@ -1614,7 +1700,7 @@ int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool firs
 int Engine::lane_tail_seg(int lane, const RadBatch* b, int s0, int s1) {
     lane_select(lane);
     if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
-    pp_set_pass(lane, RAD_PP_PART_TAIL, s0, s1);
+    pp_set_pass(lane, RAD_PP_PART_TAIL, s0, s1, 0, 0, pp_tband_of(lane));
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
@@ -1729,7 +1815,7 @@ int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vecto
     if (!model_done) {
         if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
         /* tp8 dev M9: the last of a BG step's tail segments (from boundary tail_seg0_ to the end) with its sampler */
-        pp_set_pass(lane, RAD_PP_PART_TAIL, tail_seg0_, tail_seg0_ > 0 ? RAD_PP_SEG_END : 0);
+        pp_set_pass(lane, RAD_PP_PART_TAIL, tail_seg0_, tail_seg0_ > 0 ? RAD_PP_SEG_END : 0, 0, 0, pp_tband_of(lane));   /* tp8 loop D39 */
         issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
     } else {
         issue_what_.store(kIssueSampler, std::memory_order_release);

@@ -480,6 +480,61 @@ inline int band_crossing(const Geo& g, int h, int k, int t, Band* out, std::stri
     return 0;
 }
 
+/* tp8 loop D39 (the TAIL band, QUEUE D39 design): a fresh BG newcomer's pass of W(h, t) whose follower stops at t - j -- X2 of
+ * W(h, t - j) -- and whose leader's tail runs [t - j, n); decode passes stay W(h, t)'s, so the band layers' window keys belong
+ * to the follower, which writes them itself: a window key of row p at layer l is the key chain of layer l's INPUT row p, and the
+ * follower holds layer t - j's input rows (they are X2's residual). So this form takes j = 1 only (for j > 1 the follower holds
+ * no input row of layer t - j + 1: a window cone, later). Refused: j != 1, t - j <= h (the follower must keep a layer), t >= n;
+ * an Engram layer, a DSpark tap or a kv source in [t - j, t) (a source's compressed latent, index keys and compressor tail are
+ * the leader's to copy, not the follower's to rewrite); an X2 of W(h, t - j) whose kv source entries differ from W(h, t)'s
+ * (the leader's copy of the source is one plane set). Its selections / keep words may differ (at W(10,32) j 1 the band layer 31
+ * reads index layer 28's selections, which W(10,32)'s X2 does not carry): the plugin declares the band's X2 as a second form,
+ * as P28's band X1. 0 with *out, or -1 with the reason. */
+struct TailBand {
+    int h = -1, j = 0, at = -1, t = -1;   /* the band [t - j, t); X2 enters the leader at `at` = t - j */
+    Crossing x2;                          /* X2 of W(h, t - j) */
+    std::vector<int> window;              /* the band layers whose window keys the follower writes from its own rows */
+};
+inline int tail_band_crossing(const Geo& g, int h, int t, int j, TailBand* out, std::string* err) {
+    const int n = g.n_layer;
+    if (j != 1 || h < 0 || t - j <= h || t >= n) {
+        *err = "a tail band of " + std::to_string(j) + " layer(s) over W(" + std::to_string(h) + "," + std::to_string(t) +
+               ") is not j = 1 with t - 1 > h (this form: the follower writes the band layer's window keys from its own X2 rows)";
+        return -1;
+    }
+    const int a = t - j;
+    for (int l = a; l < t; ++l) {
+        const char* why = nullptr;
+        for (int p : g.ple) if (p == l) why = "an Engram layer (its tables and token state would be held on both nodes)";
+        for (int tp : g.taps) if (tp == l) why = "a DSpark tap (the drafter is the leader's)";
+        if (g.is_src[(size_t)l] && g.ratio[(size_t)l] > 0)
+            why = "a kv source (its compressed latent, index keys and compressor tail are written once, by its decode owner)";
+        if (why) {
+            *err = "tail band [" + std::to_string(a) + ", " + std::to_string(t) + ") of W(" + std::to_string(h) + "," +
+                   std::to_string(t) + ") holds layer " + std::to_string(l) + ", " + why;
+            return -1;
+        }
+    }
+    Crossing base[2], at_a[2];
+    if (crossings(g, h, t, base, err) < 0 || crossings(g, h, a, at_a, err) < 0) return -1;
+    const Crossing& x2b = at_a[1];
+    const Crossing& x2 = base[1];
+    if (x2b.src != x2.src || x2b.latent != x2.latent || x2b.index != x2.index) {
+        *err = "a tail band pass's X2 of W(" + std::to_string(h) + "," + std::to_string(a) + ") carries another kv source's entries "
+               "than W(" + std::to_string(h) + "," + std::to_string(t) + ")'s (the leader holds one copy)";
+        return -1;
+    }
+    TailBand b;
+    b.h = h;
+    b.j = j;
+    b.at = a;
+    b.t = t;
+    b.x2 = x2b;
+    for (int l = a; l < t; ++l) b.window.push_back(l);
+    *out = b;
+    return 0;
+}
+
 /* tp8 S5 + S6: with lanes the leader issues a lane step's pass in two parts -- its head (layers [0, h), X1) and its tail
  * (X2, layers [t, n)) -- with other lanes' parts between them, which rewrite the step's activations. What its tail reads
  * of its head must then be kv / state (paged per sequence) or cross in X2: a layer >= t that reads the selections of an
