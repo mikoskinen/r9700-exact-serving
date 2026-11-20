@@ -46,6 +46,7 @@
 // READINGS, NUMBERS, REJECTED ARMS: see the lab notes at the end of this file (the radiance convention -- read
 // them before proposing anything about this kernel).
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <stdint.h>
 #ifdef EXL3R4D_GD_DEBUG
 #include <cstdio>
@@ -1665,7 +1666,7 @@ static __device__ __forceinline__ void wgs_exit(int op, int wg) {
 #define EXL3R4D_LB 1024
 #endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
-__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
@@ -1769,7 +1770,7 @@ template <int G>
 static __device__ __forceinline__ int spb_cb(int g) { return G == 1 ? (int)blockIdx.x : (int)blockIdx.x * G + g; }
 // X5 (FOLD, fn4 exl3_x3d 5): the same kernel with the codebook fold (moe_pass FOLD).
 template <int MATS, int G = 1, bool FOLD = false>
-__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "X3D-F: down's E2 grouping is not ported");
   static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
   EXL3R4D_KARG_PREFETCH();
@@ -1809,7 +1810,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
 // K25_U4). exl3r4d_launch_gemm takes them only when the argument block's x3d is 2 .. 4 (fill(): bits 2.5 and the fn4
 // switch exl3_x3d at 2 / 3 / 4), so with the switch at 0 or 1 no launch reaches them.
 template <int MATS, int MODE, int G = 1, bool FOLD = false>   // G: SPB-G (above exl3r4d_gemm_x3d_kernel), the down only; FOLD: X5
-__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "K25U: down's E2 grouping is not ported");
   static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
   EXL3R4D_KARG_PREFETCH();
@@ -1879,7 +1880,7 @@ static __device__ int spb_live_list(const Exl3r4dGemm& p, int* sh, int* s_live) 
   return __builtin_amdgcn_readfirstlane(total);
 }
 template <int MODE, int G>
-__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdx_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdx_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   static_assert(EXL3R4D_DNG == 1, "SPB-P: down's E2 grouping is not ported");
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
@@ -1984,7 +1985,7 @@ static __device__ __forceinline__ void gemm_unit(const Exl3r4dGemm& p, int cb, i
 }
 
 template <int BITS, int NPW, int MATS>
-__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_GU>(EXL3R4D_WG0);
   extern __shared__ float lds[];
@@ -2031,7 +2032,7 @@ static __device__ __forceinline__ int wgp_key() {  // HW_ID1: SE [20:18], SA [16
 }
 
 #if EXL3R4D_WGQ
-__global__ void __launch_bounds__(64) exl3r4d_wgp_probe_kernel(unsigned* bits) {
+__global__ void __launch_bounds__(64) exl3r4d_wgp_probe_kernel(unsigned* bits) { R4D_IKA_ENTRY();
   if (threadIdx.x == 0) {
     const int k = wgp_key();
     atomicOr(&bits[k >> 5], 1u << (k & 31));
@@ -2108,7 +2109,7 @@ static __device__ Unit find_unit(const Exl3r4dGemm& p, int idx, int* sh, int* to
 // 0000:13:00.0, ABAB x3, tp4 rank 0 split chain, us): M=2 53.6-53.9 -> 41.1-41.2 (gate_up traced 29.2 -> 18.8), M=3
 // 59.9-60.1 -> 58.7-59.0; y identical, ranks 0..3 x M=1..3. Launched only past the card's WGP count (below).
 template <int NPW>
-__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dense_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dense_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[36];
@@ -2201,7 +2202,7 @@ static __device__ void find_unit2(const Exl3r4dGemm& p, int ia, int ib, int* sh,
 // when they fit the WGPs at all: a doubled grid's dead workgroups cost +0.7 us at M=2, S5b); past the live slices dead. Summation order: each output sums its K quarters as (q0 + q1) +
 // (q2 + q3) instead of (q0..q1) + (q2..q3) halves -- deterministic, the same whichever slice finishes.
 template <int NPW>
-__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[36];
@@ -2308,7 +2309,7 @@ static __device__ int wgq_claim_steal(const Exl3r4dGemm& p, int units, int* sh) 
 // total), and each next claim is issued when a unit starts, so its latency hides behind the K loop. A claim past
 // the workgroup's own list falls to wgq_claim's steal / leave path.
 template <int BITS, int NPW, int MATS>
-__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_wq_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_wq_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_GU>(EXL3R4D_WG0);
   extern __shared__ float lds[];
@@ -2372,7 +2373,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_wq_kernel(
 constexpr int kPdnMaxLive = 256;
 #if EXL3R4D_PDN
 template <int BITS, int NPW, int MATS>
-__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
@@ -2808,7 +2809,7 @@ template <bool AP, int GSK = 1>
 #else
 template <bool AP>
 #endif
-__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
 #if !EXL3R4D_GD_SK2
   constexpr int GSK = 1;
@@ -3528,7 +3529,7 @@ extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp4_read(int 
 #define EXL3R4D_PREP_ABL 0
 #endif
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   if constexpr (EXL3R4D_PREP_ABL == 1) return;
   inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
@@ -3612,7 +3613,7 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
 // own prep and the M > 16 band's -- is untouched. y over live experts, x over groups of a row's (matrix, 128-block)
 // tasks, two waves a workgroup, every row of the run a wave's loop: all of a step's tasks in one round. Same bits.
 template <int MATS>
-__global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   if constexpr (EXL3R4D_PREP_ABL == 1) return;   // the readings' exits, as the kernel above (P10-TP4S)
   inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
@@ -3646,7 +3647,7 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
 // off[n_expert]) are left as they are and a dropped row in a run is zeros, as there. Numbers in launch.c.
 #if EXL3R4D_NCLS == 4
 template <int MATS>
-__global__ void __launch_bounds__(64) exl3r4d_prep_id_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(64) exl3r4d_prep_id_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   typedef const __attribute__((address_space(1))) v2u* gv2;
   const int r = (int)blockIdx.y, lane = threadIdx.x % WAVE32;
@@ -3695,7 +3696,7 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_id_kernel(Exl3r4dGemm p) {
 // the live-slot form takes about twelve (traced, tp2 M=4: find_run 2.2 of its 5.8 us, the task loop 2.2-3.3). Same
 // rows, same rotate128_math: bit-identical; a row no live run covers is left as it is, as before.
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   (void)prep_row<MATS>(p, blockIdx.x, __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32)),
                        threadIdx.x % WAVE32);
@@ -3709,7 +3710,7 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
 #define EXL3R4D_PREPE 0
 #endif
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_prep_e_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(256) exl3r4d_prep_e_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   const int e = blockIdx.x;
@@ -3794,7 +3795,7 @@ static __device__ __forceinline__ Run uni_run(Run r) {
 }
 
 template <int BITS, int NPW, int MATS>
-__global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
@@ -3845,7 +3846,7 @@ __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p)
 // class's columns are written as zeros. Four consecutive columns a lane: bits 0, 1 in the lane, 2..5 through DPP
 // row_xmask, 6 through v_permlanex16 -- rotate128's transform, on f32 sums instead of f16(x * suh).
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run(p, blockIdx.y, s_find);
@@ -4019,7 +4020,7 @@ namespace {
 constexpr unsigned kRdStride = 520, kRdMax = EXL3R4D_ROUTEDUMP_MAX;   // ints a record: n, rows, off[0 .. 512], padding
 int* g_rd = nullptr;
 unsigned* g_rd_ctr = nullptr;
-__global__ void exl3r4d_routedump_kernel(int* ring, unsigned* ctr, const int* off, int n, int rows) {
+__global__ void exl3r4d_routedump_kernel(int* ring, unsigned* ctr, const int* off, int n, int rows) { R4D_IKA_ENTRY();
   __shared__ unsigned slot;
   if (threadIdx.x == 0) slot = atomicAdd(ctr, 1u) % kRdMax;
   __syncthreads();

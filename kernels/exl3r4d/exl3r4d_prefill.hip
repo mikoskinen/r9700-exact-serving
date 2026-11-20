@@ -49,6 +49,7 @@
 #define EXL3R4D_STH_H EXL3R4D_PF_STH_H
 #define EXL3R4D_STH_Y EXL3R4D_PF_STH_Y
 #include "exl3r4d_common.hip.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "exl3r4d_prefill.h"
 #include <stdio.h>
 #include <string.h>
@@ -410,7 +411,7 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
   }
 }
 
-__global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   __shared__ int s_w[32];
   pf_map_build(a, s_w);
@@ -1306,7 +1307,7 @@ static __device__ __forceinline__ void pf_xr_redirect(const Exl3r4dPrefill& a, i
 // YS: down's map form with the streamed y (pf_epi_dn_ys; prefill.c's EXL3R4D_PF_YNT_MB decides a launch's form).
 // XR: gate_up's map form with lever XR's copy row (grid row 0) and redirect (above).
 template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN, bool YS = false, bool XR = false>
-__global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
 #if EXL3R4D_PF_WGS_ON
@@ -1378,7 +1379,7 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
 // own (the X3D-F pattern) so the shipped kernels keep their names and code. exl3r4d_launch_prefill takes it only when the
 // block's g.x3d is set (prefill.c: bits 2 and the fn4 switch exl3_x3d_pf) on the two-class build.
 template <int MATS, bool YS>
-__global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_x3d_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_x3d_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   constexpr int MTX = EXL3R4D_PF_MTX, NPW = EXL3R4D_PF_NPW;
   static_assert(!EXL3R4D_PF_PAIR && EXL3R4D_PF_DN_G == 1 && !EXL3R4D_PF_WGS_ON,
                 "A10: the stock map-form path without PAIR, DN_G or the stamps (as configured)");
@@ -1549,7 +1550,7 @@ static __device__ __forceinline__ void pf_pair_dispatch(int mt, const Exl3r4dGem
 #endif
 template <int BITS>
 __global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(EXL3R4D_PF_PAIR_WPE)))
-exl3r4d_pf_pair_kernel(Exl3r4dPrefill a) {
+exl3r4d_pf_pair_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
@@ -1804,7 +1805,7 @@ static __device__ __forceinline__ void pf_fused_dispatch_x(int mt, const Exl3r4d
 // MLO = 1 also zeroes the rows no run owns. WPE: the minimum waves a SIMD asked of the compiler (0: its choice).
 template <int BITS, int MLO, int MHI, int WPE>
 __global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(WPE > 0 ? WPE : 1)))
-exl3r4d_pf_fused_kernel(Exl3r4dPrefill a) {
+exl3r4d_pf_fused_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
@@ -2007,7 +2008,7 @@ static __device__ __forceinline__ void pf_grp_dispatch(int mt, const Exl3r4dGemm
 // One workgroup = map entry blockIdx.y if its expert's class is NCB column blocks wide (the other class's launch takes
 // the rest); the zero entries in the launch with ZERO = true.
 template <int BITS, int MTX, int NCB, bool ZERO>
-__global__ void __launch_bounds__(8 * NCB * WAVE32) exl3r4d_pf_grp_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(8 * NCB * WAVE32) exl3r4d_pf_grp_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
@@ -2183,7 +2184,7 @@ static __device__ __forceinline__ void pf_prep_flat(const Exl3r4dPrefill& a, int
 }
 
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   const Exl3r4dGemm& p = a.g;
   int lo, hi, rbase;
@@ -2257,7 +2258,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
 // Saves the map's own dispatch and its dependent-launch gap (~3 + ~2.8 us a call, the M = 32 trace).
 #define EXL3R4D_PF_ROWS 16
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill a) { R4D_IKA_ENTRY();
   EXL3R4D_KARG_PREFETCH();
   __shared__ int s_w[32];
   __shared__ int s_e[EXL3R4D_PF_ROWS];
@@ -2737,7 +2738,7 @@ struct OpStamp { unsigned site, T; unsigned long long clk; };
 constexpr unsigned kOsMax = 1u << 18;
 OpStamp* g_os = nullptr;
 unsigned* g_os_ctr = nullptr;
-__global__ void exl3r4d_opstamp_kernel(OpStamp* ring, unsigned* ctr, unsigned site, unsigned T) {
+__global__ void exl3r4d_opstamp_kernel(OpStamp* ring, unsigned* ctr, unsigned site, unsigned T) { R4D_IKA_ENTRY();
   if (threadIdx.x == 0) {
     const unsigned long long c = __builtin_readsteadycounter();
     const unsigned i = atomicAdd(ctr, 1u) % kOsMax;

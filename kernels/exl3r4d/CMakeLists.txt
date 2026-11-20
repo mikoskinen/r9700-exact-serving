@@ -55,6 +55,7 @@ if(EXL3R4D_HIP)
     HIP_SOURCES exl3r4d.hip exl3r4d_prefill.hip
                 exl3r4d_mod4.hip exl3r4d_prefill_mod4.hip   # v6: the same kernels at four classes
                 exl3r4d_gd_mod4.hip                         # v7: the fused gate_up_down at four classes
+                exl3r4d_ika.hip                             # lever IKA's list (DRAFTER track round 50; empty unless -DR4D_IKA=1)
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR} ${EXL3_ROOT}/include ${EXL3_ROOT}/common
     GPU_TARGETS ${EXL3R4D_TARGETS})
   set_target_properties(exl3r4d PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
