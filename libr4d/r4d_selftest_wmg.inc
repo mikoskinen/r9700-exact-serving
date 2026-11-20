@@ -116,6 +116,16 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                                                          : (q32 ? "gemm_nt_ggml_qk32_gemv" : "gemm_nt_ggml_qk256_gemv"));
             const RadKernelInfo* rp = pair ? find(pl, q32 ? "gemm_nt_ggml_pair_qk32" : "gemm_nt_ggml_pair_qk256") : nullptr;
             if (!rg || (pair && !rp)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); ++g_fail; continue; }
+            /* DRAFTER track round 32 (lever DMX), env R4D_WMG_FOLD=1: the "(fold a)" / "(fold e)" shapes timed as the served K1 fold ops
+             * (rmsnorm_gemm_nt_ggml / swiglu_clamped_gemm_nt_ggml: the producer in the GEMM's staging where the form takes it, else its own
+             * launch then the GEMM) instead of the plain GEMM row; both arms run the fold op (D = int16's band, W = the code) */
+            const int fold = std::getenv("R4D_WMG_FOLD") && !pair && !sh.logits
+                                 ? (std::strstr(sh.name, "(fold a)") ? 1 : std::strstr(sh.name, "(fold e)") ? 2 : 0) : 0;
+            const RadKernelInfo* rf = !fold ? nullptr
+                                    : find(pl, fold == 1 ? (q32 ? "rmsnorm_gemm_nt_ggml_qk32" : "rmsnorm_gemm_nt_ggml_qk256")
+                                                         : (q32 ? "swiglu_clamped_gemm_nt_ggml_qk32" : "swiglu_clamped_gemm_nt_ggml_qk256"));
+            if (fold && !rf) { std::printf("  %s %s: fold row absent\n", ty.name, sh.name); ++g_fail; continue; }
+            const int64_t xc = fold == 2 ? 2 * sh.K : sh.K;   /* fold e reads the gate / up pair */
             const int64_t rb = sh.K / ty.qk * ty.bb, wa = sh.N * rb, wb = sh.N2 * rb, wbytes = wa + wb;
             const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
             std::vector<uint8_t> hwa, hwb;
@@ -128,13 +138,20 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                 if (M < 1 || M > (wk ? 64 : 48)) continue;
                 dfree_all();
                 std::vector<uint16_t> hx;
-                mr_acts(hx, sh.K, 0xA4ACull ^ (uint64_t)M);
+                mr_acts(hx, xc, 0xA4ACull ^ (uint64_t)M);
                 const size_t ob = sh.logits ? 4 : 2, yw = (size_t)(sh.N + sh.N2), yb = (size_t)M * yw * ob;
-                void* d_x = dalloc((size_t)(M * sh.K) * 2);
+                void* d_x = dalloc((size_t)(M * xc) * 2);
                 void* d_w = dalloc((size_t)wbytes * (size_t)copies);
                 void* d_y = dalloc(yb);
-                if (!d_x || !d_w || !d_y) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); ++g_fail; continue; }
-                st_memcpy(d_x, hx.data(), (size_t)(M * sh.K) * 2, hipMemcpyHostToDevice);
+                void* d_fg = fold == 1 ? dalloc((size_t)sh.K * 4) : nullptr;      /* fold a: rmsnorm's f32 gain */
+                void* d_fh = fold ? dalloc((size_t)(M * sh.K) * 2) : nullptr;     /* the producer's output h */
+                if (!d_x || !d_w || !d_y || (fold == 1 && !d_fg) || (fold && !d_fh)) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); ++g_fail; continue; }
+                st_memcpy(d_x, hx.data(), (size_t)(M * xc) * 2, hipMemcpyHostToDevice);
+                if (fold == 1) {
+                    std::vector<float> g((size_t)sh.K);
+                    for (int64_t k = 0; k < sh.K; ++k) g[(size_t)k] = (k % 7 == 0) ? 0.0f : (k % 5 == 0) ? -0.25f : 0.8f + 0.001f * (float)(k % 97);
+                    st_memcpy(d_fg, g.data(), (size_t)sh.K * 4, hipMemcpyHostToDevice);
+                }
                 for (int c = 0; c < copies; ++c) {
                     uint8_t* base = (uint8_t*)d_w + (size_t)c * (size_t)wbytes;
                     st_memcpy(base, hwa.data(), (size_t)wa, hipMemcpyHostToDevice);
@@ -148,6 +165,19 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                 /* one call of copy c. one_launch: the pair kernel (D); else the plain row, a pair as its two plain launches (W) */
                 auto launch = [&](int c, bool one_launch) -> int {
                     uint8_t* base = (uint8_t*)d_w + (size_t)(c % copies) * (size_t)wbytes;
+                    struct NoSync { bool o = g_k1_sync; NoSync() { g_k1_sync = false; } ~NoSync() { g_k1_sync = o; } };   /* k1_launch: no sync a call */
+                    if (fold == 1) {
+                        NoSync ns;
+                        return k1_launch(rf, { T(d_x, RAD_BF16, { M, sh.K }), T(base, RAD_U8, { sh.N, rb }), T(d_fg, RAD_F32, { sh.K }),
+                                               T(d_fh, RAD_BF16, { M, sh.K }), T(d_y, RAD_BF16, { M, sh.N }) },
+                                         { PI("M", M), PI("N", sh.N), PI("K", sh.K), PS("type", ty.name), PS("dtype", "bf16"), PF("eps", 1e-6) });
+                    }
+                    if (fold == 2) {
+                        NoSync ns;
+                        return k1_launch(rf, { T(d_x, RAD_BF16, { M, 2 * sh.K }), T(base, RAD_U8, { sh.N, rb }), T(d_fh, RAD_BF16, { M, sh.K }),
+                                               T(d_y, RAD_BF16, { M, sh.N }) },
+                                         { PI("M", M), PI("N", sh.N), PI("K", sh.K), PS("type", ty.name), PS("dtype", "bf16"), PF("limit", 10.0) });
+                    }
                     if (pair && one_launch) {
                         std::vector<RadTensor> t = { gqst::TP(d_x, RAD_BF16, M, sh.K, sh.K), T(base, RAD_U8, { sh.N, rb }),
                                                      gqst::TP(d_x, RAD_BF16, M, sh.K, sh.K), T(base + wa, RAD_U8, { sh.N2, rb }),
