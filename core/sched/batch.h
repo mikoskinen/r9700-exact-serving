@@ -137,7 +137,12 @@ public:
 
     /* Bytes init() allocates on each rank's card (the step slab and, with an encoder, the media
      * regions), computed without allocating, for the VRAM budget. -1 if init() would refuse. */
-    static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg);
+    static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg, int64_t bt_rows = 0);
+    /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N, a BG lane's builder): its block tables are carved for `rows` rows (each
+     * --max-model-len wide, as every lane's) instead of --max-num-seqs; build() / wire_replay() refuse a plan of more
+     * sequences by name. 0 (default) = --max-num-seqs, today's carve. Call before init(). */
+    void set_bt_rows(int64_t rows) { bt_rows_ = rows > 0 ? rows : 0; }
+    int64_t bt_rows() const { return bt_rows_ > 0 && bt_rows_ < max_seqs_ ? bt_rows_ : max_seqs_; }
 
     /* Build the batch for this step. The returned pointer stays valid for the next kOut - 1
      * calls and is shared by pointer across rank threads (spec §1). Null on a device failure,
@@ -354,6 +359,7 @@ private:
     std::vector<RankIO> ranks_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
+    int64_t bt_rows_ = 0;   /* tp8 loop D47: the block tables' rows (0: max_seqs_); bt_rows() */
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
      * `conv_state_index` derivation, which no plugin calls at present; conv kernels read
      * RadKVGroupBatch::state_index instead. Kept per group so the derivation is correct with more

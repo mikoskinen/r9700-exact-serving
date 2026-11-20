@@ -25,6 +25,7 @@ uint64_t BatchBuilder::layout_hash() const {
     w.push_back(max_tok_);
     w.push_back(max_seqs_);
     w.push_back(max_ctx_);
+    if (bt_rows() < max_seqs_) w.push_back(-bt_rows());   /* tp8 loop D47: a BG lane's rows (unset: no word, today's hash) */
     w.push_back(set_.host_bytes);
     w.push_back(set_.dev_bytes);
     w.push_back(set_.bt_base);
@@ -168,7 +169,7 @@ const RadBatch* BatchBuilder::wire_replay(const Wire& w, const char* span, int64
         return nullptr;
     }
     if (bytes != w.used || w.used <= 0 || w.n_groups != (int32_t)set_.groups.size() ||
-        w.n_derived != (int32_t)derived_.size() || w.n_seq > max_seqs_ || w.n_tok > max_tok_ ||
+        w.n_derived != (int32_t)derived_.size() || w.n_seq > max_seqs_ || w.n_seq > bt_rows() || w.n_tok > max_tok_ ||
         w.n_seq < 0 || w.n_tok < 0 || w.bt_base != set_.bt_base || w.n_rng < 0 ||
         w.rng_at < w.bt_base || w.rng_at + w.n_rng * (int64_t)sizeof(RadCopyRange) > w.used) {
         RAD_ERR("step wire: step %d's header does not describe its %lld-byte span (%lld groups, %lld "
