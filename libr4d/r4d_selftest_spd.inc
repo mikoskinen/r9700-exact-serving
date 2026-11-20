@@ -27,7 +27,8 @@ static const RgsForm kRgs[] = { { 1, 8, 2, 8, 16 }, { 2, 8, 4, 8, 16 }, { 3, 4, 
                                 { 6, 4, 4, 8, 8 },  { 7, 2, 4, 16, 8 }, { 8, 4, 8, 8, 16 }, { 9, 2, 2, 16, 8 }, { 10, 2, 2, 16, 16 },
                                 { 11, 8, 1, 8, 16 }, { 12, 4, 2, 16, 8 }, { 13, 1, 4, 16, 8 }, { 14, 2, 8, 16, 8 },
                                 { 15, 4, 8, 8, 16, 4 }, { 16, 4, 4, 8, 16, 4 }, { 17, 4, 8, 8, 16, 2 }, { 18, 4, 4, 8, 8, 2 },
-                                { 19, 4, 4, 8, 8 }, { 20, 4, 4, 16, 8 } };   /* 19 / 20: lever RGP (the selection a row group at a time) */
+                                { 19, 4, 4, 8, 8 }, { 20, 4, 4, 16, 8 }, { 21, 4, 4, 8, 8 } };   /* 19 / 20: lever RGP (the selection a row group at a time);
+                                                                      21: lever RGK (19 + the epilogue scores / keys) */
 static const int kGemm[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
 
 static void rgs_part(const Plugin& pl, void (*pin)(int, int)) {
