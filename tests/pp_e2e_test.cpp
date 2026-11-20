@@ -5336,7 +5336,9 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
             for (size_t i = 0; i < ref_s.size(); ++i)
                 if (ref_s[i] != got_s[i]) ++differ;
         }
-        long long rev = -1, rows = -1, unclean = -1;
+        long long rev = -1, rows = -1, unclean = -1, keyed = -1;
+        if (const size_t kk = llog.rfind(" lane steps crossed X1 in the keys form"); kk != std::string::npos)   /* step 5 */
+            if (const size_t b = llog.rfind("; ", kk); b != std::string::npos) keyed = std::atoll(llog.c_str() + b + 2);
         const char* key = " lane steps ran as reverse (head band) passes, ";
         if (const size_t at = llog.rfind(key); at != std::string::npos) {
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
@@ -5346,10 +5348,10 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
                 unclean = std::atoll(llog.c_str() + u + std::strlen("(tp8 loop P41); "));
         }
         fprintf(stderr, "    REVERSE BAND (llama stand-in), %d lanes W(%s), pp_rband %d%s%s%s%s: %d of %zu requests differ; plan %s (%zu chunks); "
-                        "%lld reverse passes, %lld rows; %lld lone chunks kept W(h, t)'s (unclean sequence)\n", a.lanes, a.cut, a.every,
+                        "%lld reverse passes, %lld rows; %lld lone chunks kept W(h, t)'s (unclean sequence); %lld steps crossed the keys\n", a.lanes, a.cut, a.every,
                 a.fseg ? " + follower segments" : "", a.post0 ? " + fn4 pp_rband 0 in process" : "", a.sets ? " + split / burst sets" : "",
                 a.skip ? " + the keys' store LEFT OUT (negative control)" : "", differ, ref.size() + (a.sets ? ref_s.size() : 0),
-                plan == ref_plan ? "= one process's" : "DIFFERENT", plan.size(), rev, rows, unclean);
+                plan == ref_plan ? "= one process's" : "DIFFERENT", plan.size(), rev, rows, unclean, keyed);
         CHECK(llog.find("the plugin declared the reverse (head) band layer") != std::string::npos);
         CHECK(plan == ref_plan);
         if (a.skip) {
@@ -5361,8 +5363,10 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
         CHECK_EQ(differ, 0);
         if (a.post0) {
             CHECK_EQ(rev, 0LL);
+            CHECK_EQ(keyed, 0LL);   /* step 5: pp_rband 0 crosses no keys */
             continue;
         }
+        if ((a.every & 15) >= 2) CHECK(keyed > 0);   /* the chunks between reversed ones carried the keys */
         CHECK(rev > 0);
         CHECK(unclean > 0);   /* p3's chunks after its prefix hit */
         CHECK(flog.find("reverse passes ran this follower from layer") == std::string::npos);   /* (llama: no plugin line; the engine's) */
@@ -5373,4 +5377,103 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
                     "requests differ\n", rev_all, unclean_all, skip_differ);
     CHECK(rev_all > 0);
     CHECK(skip_differ > 0);
+}
+
+/* tp8 loop P44 (fn4 sched_srf, upstream 67cf57b8): cold prompts sent together (nothing decoding) at 2 lanes W(0,2) / W(1,3) and 3
+ * lanes W(0,3), sched_srf 2 (prompts one at a time over the lanes, the fewest rows left first; a longer waiting one held), 1 (per
+ * lane) and 2 POSTed in process (the test side's A/B form), serve one process's greedy tokens for every prompt -- one process run
+ * with the same requests at sched_srf 0 -- and the leader's end line counts the rule's plans (and, at 2, held admissions); at 0 the
+ * line names nothing done. The chunk plans (each prompt its lone plan, no plan with two prompts) are sched_test's
+ * srf_2_prompts_over_the_lanes_* (DeepSeek's grid, window keys checked). */
+namespace {
+std::vector<std::vector<int32_t>> srf_set(int port, int n_predict) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (const auto& [seed, n] : std::vector<std::pair<uint64_t, size_t>>{ { 501, 3300 }, { 502, 1900 }, { 503, 2600 }, { 504, 1900 } }) {
+        f.push_back(std::async(std::launch::async, [port, seed, n, n_predict] { return complete(port, prompt_ids(seed, n), n_predict); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+long long srf_field(const std::string& log, const char* tag) {
+    const size_t l = log.rfind("two-node pipeline: fn4 sched_srf ");
+    if (l == std::string::npos) return -1;
+    const std::string ln = log.substr(l, log.find('\n', l) - l);
+    const size_t at = ln.find(tag);
+    if (at == std::string::npos) return -1;
+    size_t b = at;
+    while (b > 0 && ln[b - 1] == ' ') --b;
+    while (b > 0 && std::isdigit((unsigned char)ln[b - 1])) --b;
+    return std::atoll(ln.c_str() + b);
+}
+}  /* namespace */
+
+TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "2112", "--max-model-len", "4096",
+                                           "--prefill-span", "2", "--checkpoint-interval", "1024" };
+    std::vector<std::vector<int32_t>> ref, ref_mix;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = srf_set(one.port, 12);
+        ref_mix = split_set(one.port);   /* decoders beside newcomers: the rule turns off and on as decode rows come and go */
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    REQUIRE(ref.size() == 4);
+    for (const auto& t : ref) CHECK_EQ(t.size(), (size_t)12);
+    /* bg: BEST's shape -- 4 lanes, the last two BG lanes (RADIANCE_PP_BG_LANE=2) with the follower's one-layer segments and the leader's
+     * decode tails first; mix: the split set (decoders + newcomers) after the cold set, in the same start */
+    struct Arm { int lanes; const char* cut; int srf; bool post; bool bg = false; bool mix = false; };
+    for (const Arm a : { Arm{ 2, "0,2", 0, false }, Arm{ 2, "0,2", 2, false }, Arm{ 2, "1,3", 2, false }, Arm{ 3, "0,3", 2, false },
+                         Arm{ 2, "0,2", 1, false }, Arm{ 2, "0,2", 2, true }, Arm{ 4, "1,3", 2, false, true, true },
+                         Arm{ 4, "0,2", 2, false, true, true }, Arm{ 3, "1,3", 1, false, false, true } }) {
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_PP_SPAN_SHORT=24576" });
+        if (a.bg)
+            for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                                   "RADIANCE_PP_READY_FIRST=1" })
+                env.push_back(v);
+        if (a.srf && !a.post) env.push_back("RADIANCE_SCHED_SRF=" + std::to_string(a.srf));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        if (a.post) {
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "sched_srf", a.srf } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            (void)complete(pp.port, prompt_ids(9, 8), 2);   /* a step release applies it */
+        }
+        std::vector<std::vector<int32_t>> got = srf_set(pp.port, 12), got_mix;
+        if (a.post) got = srf_set(pp.port, 12);   /* the in-process arm: a second set, the switch long applied */
+        if (a.mix) got_mix = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output();
+        int differ = 0;
+        for (size_t i = 0; i < ref.size() && i < got.size(); ++i) differ += got[i] != ref[i];
+        if (a.mix) {
+            CHECK_EQ(got_mix.size(), ref_mix.size());
+            for (size_t i = 0; i < ref_mix.size() && i < got_mix.size(); ++i) differ += got_mix[i] != ref_mix[i];
+        }
+        const long long plans = srf_field(llog, "lane plans under the rule"), held = srf_field(llog, "admissions held"),
+                        out = srf_field(llog, "times a running prompt sat a plan out");
+        fprintf(stderr, "    %d lanes%s W(%s), sched_srf %d%s%s: %d of %zu requests differ from one process; rule plans %lld, sat out %lld, "
+                        "held %lld\n", a.lanes, a.bg ? " (BG 2)" : "", a.cut, a.srf, a.post ? " (POSTed)" : "", a.mix ? " + the split set" : "",
+                differ, ref.size() + (a.mix ? ref_mix.size() : 0), plans, out, held);
+        CHECK_EQ(got.size(), ref.size());
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        if (a.srf == 0) {
+            CHECK(plans <= 0);
+            continue;
+        }
+        CHECK(plans > 0);
+        if (a.srf == 2) CHECK(held > 0);
+    }
 }

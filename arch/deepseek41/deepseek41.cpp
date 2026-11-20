@@ -6030,6 +6030,9 @@ static std::vector<CutPart> ds41_rbandk_liveset(const Model& m) {
  * the same batch; no band / tail band pass: RADIANCE_DS41_PP_RBAND is not taken beside them). A decode-only pass keeps W(h, t)'s. */
 static bool pp_rbandk_pass(const Model& m, const RadBatch* b) {
     if (!m.rband || !b || b->draft_pass != 0 || b->n_tok <= 0) return false;
+    /* step 5: only where the engine's rule asked for it (RadPpInfo.reserved[3 + 1] == 1: a clean sequence's lone prompt chunk
+     * while fn4 pp_rband > 0, not reversed, not its last) -- both nodes read the same word from the leader's frame */
+    if (rad_pp_query().reserved[4] != 1) return false;
     int64_t Dn = 0, DT = 0;
     batch_split(b, &Dn, &DT);
     return DT < b->n_tok;

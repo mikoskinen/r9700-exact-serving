@@ -1020,8 +1020,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* tp8 loop P41 stand-in: a reverse pass crosses at l = h - 1 (the leader's head ends there + layer l's k / v); every pass with
      * prompt rows that is not one crosses in the keys form */
     const bool rrev = m.rband && ppi.reserved[3] == m.rband;
-    const bool rkey = m.rband && !rrev && batch->n_tok_decode < batch->n_tok;
-    if (m.pp && ppi.reserved[3] != 0 && !rrev) {
+    const bool rkey = m.rband && !rrev && ppi.reserved[4] == 1 && batch->n_tok_decode < batch->n_tok;   /* step 5: the engine's word */
+    if (m.pp && (ppi.reserved[3] != 0 || ppi.reserved[4] != 0) && !rrev && !(m.rband && ppi.reserved[3] == 0)) {
         rad_step_fail(c, "llama: the engine's reverse band word (tp8 loop P41) on a node that declared no reverse band");
         return;
     }
