@@ -257,27 +257,71 @@ officially became the capital in 1913 when the city was named and construction b
 Two of these machines, each with four R9700 cards, serve DeepSeek as one server over a 200 Gbit/s
 RDMA link (a ConnectX-6 card in each machine). The model is split by layers: the leader runs layers
 0 to 9 and 32 to 39 and the draft model and serves the API, and the follower runs layers 10 to 31.
-Each machine runs its layers tensor parallel over its own four cards.
+Each machine runs its layers tensor parallel over its own four cards. Prompt rows use an 8-bit twin
+of the dense weights of layers 0 to 39, and decode rows use the model file's own weights.
 
-Both machines ran at 210 W a card with a -50 mV voltage offset. Values are tok/s summed over all
-concurrent requests, and prefill is prompt tokens divided by the time to first token, which is in
-brackets. The one-machine values are the DeepSeek 210 W column of [Results](#results).
+In the tables, cN is N concurrent requests, and its value is decode tok/s summed over the N
+requests. 1 request is the decode tok/s of a single request on a prose prompt and on a code prompt.
+Prefill is one cold prompt of 16k, 64k or 128k tokens, in prompt tokens divided by the time to first
+token, with that time in brackets.
 
-| Measure | Two machines | One machine | Two / one |
+**Stock: 300 W a card, no voltage offset.** Both columns run image `deepseek-tp8-0735a8e2` with the
+commands below.
+
+| Measure | Two machines, tok/s | One machine, tok/s | Two / one |
 |---|---|---|---|
-| 1 request | 104 prose / 209 code | 103 prose / 177 code | 1.01x / 1.18x |
-| 4 requests | 379 | 227 | 1.67x |
-| 8 requests | 484 | 282 | 1.71x |
-| 16 requests | 620 | 319 | 1.94x |
-| 24 requests | 695 | 342 | 2.03x |
-| 32 requests | 749 | 378 | 1.98x |
-| Prefill 16k | 9,985 (1.58 s) | 4,640 (3.40 s) | 2.15x |
-| Prefill 64k | 12,529 (5.24 s) | 5,800 (11.32 s) | 2.16x |
-| Prefill 128k | 12,920 (10.15 s) | 5,810 (22.58 s) | 2.22x |
+| 1 request | 104.3 prose / 208.7 code | 110.2 prose / 201.8 code | 0.95x / 1.03x |
+| c4 | 433.8 | 260.5 | 1.67x |
+| c8 | 566.6 | 309.4 | 1.83x |
+| c16 | 752.7 | 360.7 | 2.09x |
+| c24 | 854.3 | 374.3 | 2.28x |
+| c32 | 926.2 | 406.2 | 2.28x |
+| Prefill 16k | 12,932 (1.22 s) | 5,139 (3.07 s) | 2.52x |
+| Prefill 64k | 16,620 (3.95 s) | 7,581 (8.66 s) | 2.19x |
+| Prefill 128k | 17,278 (7.59 s) | 8,050 (16.29 s) | 2.15x |
 
-Both machines need the [host setup](#host-setup) with `sudo run/power.sh 210`, the files from
-[Model weights](#model-weights) in `MODEL_DIR`, and an address on the RDMA link: `LEADER_IP` on the
-leader and `FOLLOWER_IP` on the follower. Start the follower first:
+**210 W a card with a -50 mV voltage offset.** Two machines run image `deepseek-tp8-0735a8e2`. The
+one-machine column is the DeepSeek 210 W column of [Results](#results), which runs the
+[DeepSeek](#deepseek) command.
+
+| Measure | Two machines, tok/s | One machine, tok/s | Two / one |
+|---|---|---|---|
+| 1 request | 104.5 prose / 207.9 code | 103 prose / 177 code | 1.01x / 1.17x |
+| c4 | 411.7 | 227 | 1.81x |
+| c8 | 507.6 | 282 | 1.80x |
+| c16 | 676.7 | 319 | 2.12x |
+| c24 | 751.7 | 342 | 2.20x |
+| c32 | 805.5 | 378 | 2.13x |
+| Prefill 16k | 11,952 (1.32 s) | 4,640 (3.40 s) | 2.58x |
+| Prefill 64k | 15,267 (4.30 s) | 5,800 (11.32 s) | 2.63x |
+| Prefill 128k | 15,895 (8.25 s) | 5,810 (22.58 s) | 2.74x |
+
+**[BetterBench](https://github.com/GGZ14/BetterBench) 0.6.1 at stock 300 W**, with its default
+settings (temperature 0.7, 20 runs a task category, 48 requests a concurrency level) and the
+server's default thinking. Decode is BetterBench's weighted median over its task categories,
+concurrency N is tok/s summed over N concurrent requests, and prefill is the median of cold prompts
+of each length. The reports are in [results/betterbench/](results/betterbench/).
+
+| BetterBench | Two machines | One machine | Two / one |
+|---|---|---|---|
+| Decode, 1 request | 161.0 tok/s | 153.3 tok/s | 1.05x |
+| Time to first token p50, 1 request | 76 ms | 173 ms | 0.44x |
+| Concurrency 1 / 2 / 4 / 8 | 149.8 / 262.8 / 394.6 / 509.8 tok/s | 139.3 / 197.5 / 252.5 / 302.1 tok/s | 1.08x / 1.33x / 1.56x / 1.69x |
+| Prefill 1.5k / 5.9k / 11.8k tokens | 4,861 / 8,179 / 12,355 tok/s | 3,714 / 6,143 / 7,224 tok/s | 1.31x / 1.33x / 1.71x |
+| Prefill 23.6k / 47.1k tokens | 14,810 / 15,752 tok/s | 7,222 / 8,043 tok/s | 2.05x / 1.96x |
+
+Each machine needs the [host setup](#host-setup) with `sudo run/power.sh 300` (or `210`), the files
+from [Model weights](#model-weights) in `MODEL_DIR`, and the twin sidecar `p30t-i8-twin.rad`, which
+[run/deepseek-tp8/mk-twin-sidecar.sh](run/deepseek-tp8/mk-twin-sidecar.sh) writes into `MODEL_DIR`
+from the model file. Run it once on each machine with no server running. The sidecar is 7.5 GB, the
+script needs 12 GB free in `MODEL_DIR`, and it takes 5 to 7 minutes on 16 CPU cores:
+
+```bash
+MODEL_DIR=~/models/ds41-exl3 run/deepseek-tp8/mk-twin-sidecar.sh
+```
+
+The two machines also need an address each on the RDMA link: `LEADER_IP` on the leader and
+`FOLLOWER_IP` on the follower. Start the follower first:
 
 ```bash
 mkdir -p /dev/shm/ds41ng
@@ -286,9 +330,9 @@ docker run -d --name deepseek-fol --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
   -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
-  --env-file run/deepseek/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  --env-file run/deepseek-tp8/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
   --env-file run/deepseek-tp8/follower.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-5201ad92 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-0735a8e2 \
   --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
   --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
   --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
@@ -309,9 +353,9 @@ docker run -d --name deepseek --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
   -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
-  --env-file run/deepseek/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  --env-file run/deepseek-tp8/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
   --env-file run/deepseek-tp8/leader.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-5201ad92 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-0735a8e2 \
   --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
   --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
   --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
@@ -325,8 +369,42 @@ docker run -d --name deepseek --init --network host \
 run/switches.sh run/deepseek-tp8/switches.json
 ```
 
-The pair is ready in about five minutes, and the API is on the leader's port 8090. The switches go
-to the leader, which passes them on to the follower.
+The pair is ready in about four minutes, and the API is on the leader's port 8090. The switches go
+to the leader, which passes them on to the follower. The KV cache holds 4,331,192 tokens, which is
+4.1 full-length sessions.
+
+One machine runs the same image with the twin sidecar and is ready in four to six minutes:
+
+```bash
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek-tp8/deepseek.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  --env-file run/deepseek-tp8/one-machine.env \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-0735a8e2 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 19456 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 1024 --host 127.0.0.1 --port 8090 --draft-short-from 12
+run/switches.sh run/deepseek-tp8/one-machine-switches.json
+```
+
+One machine needs `--gpu-headroom-mib 1024` with the twin sidecar: at 256 MiB the driver keeps
+moving memory and every decode step takes about 150 ms. The KV cache holds 2,247,140 tokens, which
+is 2.1 full-length sessions. Drafting is off above 16 concurrent requests. The one-machine c4 to c16
+cells ran with the switches in `one-machine-switches.json`. The one-machine cells for 1 request, c24,
+c32 and prefill and the one-machine BetterBench run had `draft_occ` 13, `draft_dcap_n` 8,
+`sched_tail_grid` 512, `draft_cost_age` 0 and `draft_head_cut` 0 in place of the file's values, and
+started without `--draft-short-from 12`, `RADIANCE_DS41_DSPARK_SHORT=2` and `RADIANCE_DRAFT_HEAD_CUT=1`.
+The request in [Check the answer](#check-the-answer) gives the same answer on two machines and on one
+machine.
 
 ## What exact means
 
@@ -414,6 +492,8 @@ The `main` branch has:
 - [gpu02/](gpu02/): the test scripts, the host tuning scripts and the run summaries.
 - [run/](run/): the power script, the environment files and the runtime switches that
   [Run it](#run-it) and [DeepSeek on two machines](#deepseek-on-two-machines) use.
+- [results/betterbench/](results/betterbench/): the BetterBench reports of
+  [DeepSeek on two machines](#deepseek-on-two-machines).
 
 The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
 `deepseek/current` with `exl3/current`, and both Qwen images from `qwen/current` with `exl3/fn4-dual`
@@ -425,7 +505,7 @@ the record.
 ## License
 
 - **CC BY 4.0** ([LICENSE-docs.md](LICENSE-docs.md)) covers the documents and data: `README.md`,
-  `docs/`, `registry/` (except `registry/build.py`), and the run summaries and logs under
+  `docs/`, `registry/` (except `registry/build.py`), `results/`, and the run summaries and logs under
   `gpu02/exl3-test/runs/` and `gpu02/bench/runs/`.
 - **Apache 2.0** ([LICENSE](LICENSE)) covers the scripts and tools: `registry/build.py`, everything under
   `gpu02/exl3-test/` outside `runs/`, `gpu02/host/` and `gpu02/bench/` outside `runs/`, and `run/`. The engine
