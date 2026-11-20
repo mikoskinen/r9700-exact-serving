@@ -550,6 +550,12 @@ int     tape_set_overlap(RadTape t, int i, bool on) {
 int     tape_set_noacq(RadTape t, int i, bool on) {
     return dev()->tape_set_noacq ? dev()->tape_set_noacq(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
 }
+int     tape_set_noacq_bits(RadTape t, int i, int bits) {
+    return dev()->tape_set_noacq ? dev()->tape_set_noacq(t, i, bits) : RAD_E_UNSUPPORTED;
+}
+int     tape_rec_ika(RadTape t, int i) {
+    return dev()->tape_rec_ika ? dev()->tape_rec_ika(t, i) : 0;
+}
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
 /* These getters answer "" on failure and restore the error slot, so the next
  * rad_dev_last_error reader does not see an unrelated error. `get` fills a buffer of `n` bytes. */

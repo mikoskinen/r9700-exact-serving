@@ -362,6 +362,11 @@ struct DeviceBackend {
      * only where no line the dispatch reads can be stale; see Ctx::haz_mark. A system-scope
      * acquire is never dropped. Null on a backend without tapes. */
     int     (*tape_set_noacq)(RadTape t, int i, int on);
+    /* Lever IKA (RADIANCE_AQL_IKA=1): 1 if dispatch `i`'s kernel acquires and releases at agent scope itself (its
+     * library names it in r4d_ika_kernels), else 0. Such a dispatch plays without its packet's release, and without
+     * its acquire where tape_set_noacq's bit 1 is set (Ctx::haz_mark: no line it reads can be stale in a scalar
+     * cache). Null on a backend without it. */
+    int     (*tape_rec_ika)(RadTape t, int i);
 };
 
 
@@ -380,6 +385,8 @@ void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
 int     tape_set_noacq(RadTape t, int i, bool on);
+int     tape_set_noacq_bits(RadTape t, int i, int bits);   /* bit 0 the rule's mark, bit 1 lever IKA's */
+int     tape_rec_ika(RadTape t, int i);                     /* 0 where the backend has no lever IKA */
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);

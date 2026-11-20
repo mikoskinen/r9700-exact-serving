@@ -1244,9 +1244,10 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
                  out->route.size());
         if (acq_rule_on())
             RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- the acquire rule plays %d of the %d "
-                     "dispatches (%d of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=%s)",
+                     "dispatches (%d of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=%s)"
+                     "; lever IKA %d more",
                      b->draft_pass, (long long)b->n_tok, out->noacq, out->dispatches, out->noacq_ordered,
-                     acq_rule_mode() == 2 ? "rule-w" : "rule");
+                     acq_rule_mode() == 2 ? "rule-w" : "rule", out->ika_noacq);
     }
     return 1;
 }
@@ -1308,6 +1309,9 @@ int Ctx::haz_mark(PassTape& t) {
     struct AW {
         uint32_t id = 0;
         LineSet  r, w, risky;
+        /* Lever IKA: the lines a SCALAR cache could hold stale (read, then written, in the window: the plain rule's
+         * set). A self-acquiring kernel (tape_rec_ika) invalidates its CUs' vector caches itself, not the scalar one. */
+        LineSet  risky_rw;
         bool     unknown = true;
     };
     const bool acq_rule = acq_rule_on(), acq_w = acq_rule_mode() == 2;
@@ -1324,6 +1328,7 @@ int Ctx::haz_mark(PassTape& t) {
         return ls_merge(std::move(v));
     };
     t.noacq = t.noacq_ordered = 0;
+    t.ika_noacq = 0;
     t.rco_copies = t.rco_freed = 0;
     for (const HazOp& o : haz_ops_)
         if (o.route_copy && o.rec0 >= 0 && o.rec1 <= n) ++t.rco_copies;
@@ -1398,7 +1403,12 @@ int Ctx::haz_mark(PassTape& t) {
             } else {
                 const HazOp& h = haz_ops_[(size_t)own];
                 const LineSet rd = lines_of(h.rd, h.n_rd), wr = lines_of(h.wr, h.n_wr);
-                if (aw->unknown || ls_meet(rd, aw->risky)) {
+                /* Lever IKA: a self-acquiring kernel the rule would hold to its packet acquire may still drop it
+                 * when no line it reads is in the scalar-cache set; then no invalidation happened for the window
+                 * (its own reached only its CUs' vector caches), so the window goes on as for a marked packet. */
+                const bool keep = aw->unknown || ls_meet(rd, aw->risky);
+                const bool ika_drop = keep && !aw->unknown && tape_rec_ika(t.dev, i) > 0 && !ls_meet(rd, aw->risky_rw);
+                if (keep && !ika_drop) {
                     /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
                      * it touch lines after the invalidation too. */
                     aw->r = rd;
@@ -1410,13 +1420,20 @@ int Ctx::haz_mark(PassTape& t) {
                             aw->w = ls_unite(aw->w, lines_of(f.wr, f.n_wr));
                         }
                     aw->risky = acq_w ? aw->w : ls_inter(aw->r, aw->w);
+                    aw->risky_rw = ls_inter(aw->r, aw->w);
                     aw->unknown = false;
                 } else {
-                    const int sc = tape_set_noacq(t.dev, i, true);
+                    const int sc = ika_drop ? tape_set_noacq_bits(t.dev, i, 2) : tape_set_noacq(t.dev, i, true);
                     if (sc < 0) return sc;
-                    ++t.noacq;
-                    if (!ok) ++t.noacq_ordered;
-                    aw->risky = ls_unite(aw->risky, ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r)));
+                    if (ika_drop) {
+                        ++t.ika_noacq;
+                    } else {
+                        ++t.noacq;
+                        if (!ok) ++t.noacq_ordered;
+                    }
+                    const LineSet cross = ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r));
+                    aw->risky_rw = ls_unite(aw->risky_rw, ls_unite(cross, ls_inter(rd, wr)));
+                    aw->risky = ls_unite(aw->risky, cross);
                     aw->risky = ls_unite(aw->risky, acq_w ? wr : ls_inter(rd, wr));
                     aw->r = ls_unite(aw->r, rd);
                     aw->w = ls_unite(aw->w, wr);
