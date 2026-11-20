@@ -1396,7 +1396,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
         if constexpr (T == GG_Q6_K) {   /* round 43 bench: the folds on IL-B (R4D_WK3_AB 384) */
             if (abo < 0 && ab == 384) {
 #define GG_WK3_FIL(KPV, NMV, NTV, PV)                                                                                   \
-                if (kp == KPV && nmt == NMV && nt == NTV && pro == PV && !dp2) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == KPV && nmt == NMV && nt == NTV && pro == PV) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV, 1, 384>), grid, dim3(256), lds, A);   /* DP 1 whatever bit 23 says: the stock fold path's rule */
                 GG_WK3_FIL(1, 2, 2, 1) GG_WK3_FIL(1, 3, 1, 1) GG_WK3_FIL(1, 2, 1, 1)
                 GG_WK3_FIL(1, 2, 2, 2) GG_WK3_FIL(1, 3, 1, 2) GG_WK3_FIL(1, 2, 1, 2)
                 GG_WK3_FIL(2, 2, 2, 2) GG_WK3_FIL(2, 3, 1, 2) GG_WK3_FIL(2, 2, 1, 2)
