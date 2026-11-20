@@ -812,6 +812,12 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
 #pragma unroll
             for (int k = 0; k < W::RAW; ++k)
                 rc[nt][k] = DP == 2 ? rF[RS][nt][k] : ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+        if constexpr ((AB & 64) != 0) {   /* round 42: the reused words vary a slab (no hoisting of their decode out of the slab loop) */
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) rc[nt][k] ^= (uint32_t)t;
+        }
         const int sn = t + 1 < SW ? s + 1 : s;
         if constexpr ((AB & 1) != 0) {
         } else if constexpr (DP == 2) {   /* slab t + 2 into the set slab t - 1 held */
@@ -858,7 +864,14 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
                     for (int mt = 0; mt < NM; ++mt) af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xa + mt * 16 * kWmXP + W::xoff(J + 1, h));
                 }
 #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+                for (int nt = 0; nt < NT; ++nt) {
+                    if constexpr ((AB & 16) != 0) {   /* round 42 ablation: no B decode (the raw words as the fragment) */
+                        r4d_u32x4 b;
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) b[w] = rc[nt][(4 * J + w) % W::RAW];
+                        bf[C][nt] = b;
+                    } else bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+                }
             } else if constexpr (J < 7) {
 #pragma unroll
                 for (int mt = 0; mt < NM; ++mt) af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xa + mt * 16 * kWmXP + W::xoff(J + 1, h));
@@ -883,7 +896,7 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
                 if constexpr (J % W::SPG == 0) {
                     gg_v8f c0 = (gg_v8f)(0.0f);
                     if constexpr (W::CINIT && W::PIPE) c0 = ci[mt];
-                    else if constexpr (W::CINIT) c0 = *(const gg_v8f*)(const void*)(xgl + (J * 16 / W::XG) * BM + mt * 16);
+                    else if constexpr (W::CINIT && (AB & 32) == 0) c0 = *(const gg_v8f*)(const void*)(xgl + (J * 16 / W::XG) * BM + mt * 16);   /* AB 32 (round 42): no C init */
 #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], c0);
                 } else {
@@ -924,6 +937,7 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
                     for (int nt = 0; nt < NT; ++nt)
 #pragma unroll
                         for (int q = 0; q < 8; ++q) {
+                            if constexpr ((AB & 8) != 0) { if (q != 0) continue; }   /* round 42 ablation: the scale fma on 1 of 8 */
                             acc[mt][nt][q] = __builtin_fmaf(P[mt][nt][q], sc[nt], acc[mt][nt][q]);
                             if constexpr (W::MINS) acc[mt][nt][q] = __builtin_fmaf(g8[mt][q], mn[nt], acc[mt][nt][q]);
                         }
@@ -1117,7 +1131,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
      * (DP 1, bf16) and the head's q6_K (KP 1, f32; DP 2 at NM 2 NT 2, DP 1 at NM 3 NT 1) */
     static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); const int v = e ? std::atoi(e) : 0;
                                if (v) std::fprintf(stderr, "libr4d: gg_wk3 ABLATION %d (bench only)\n", v); return v; }();
-    if (ab > 0 && ab < 8 && !pro) {
+    if (ab > 0 && ab < 128 && !pro) {
 #define GG_WK3_AB(KPV, NMV, NTV, OTV, DPV)                                                                                \
         if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2 && f32out == std::is_same<OTV, float>::value) {     \
             switch (ab) {                                                                                                  \
@@ -1133,6 +1147,25 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
             GG_WK3_AB(4, 2, 1, uint16_t, 1) GG_WK3_AB(4, 3, 1, uint16_t, 1) GG_WK3_AB(1, 2, 1, uint16_t, 1) GG_WK3_AB(1, 3, 1, uint16_t, 1)
         }
         if constexpr (T == GG_Q6_K) { GG_WK3_AB(1, 2, 2, float, 2) GG_WK3_AB(1, 3, 1, float, 1) }
+        /* round 42: the math by part (64 = the reused words vary a slab; 3|64 math only, + 8 scale fma 1 of 8, + 16 no B decode,
+         * + 32 no C init, all three = the WMMAs and their A reads) at the head's HRS forms (NM 3 NT 2 / NM 2 NT 1, f32) and DG2's
+         * q6_K pair form (KP 4 NM 3 NT 1, bf16) */
+#define GG_WK3_AB2(KPV, NMV, NTV, OTV, DPV)                                                                               \
+        if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2 && f32out == std::is_same<OTV, float>::value) {     \
+            switch (ab) {                                                                                                  \
+            case 1: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 1>), grid, dim3(256), lds, A);       \
+            case 3: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 3>), grid, dim3(256), lds, A);       \
+            case 6: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 6>), grid, dim3(256), lds, A);       \
+            case 67: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 67>), grid, dim3(256), lds, A);     \
+            case 75: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 75>), grid, dim3(256), lds, A);     \
+            case 83: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 83>), grid, dim3(256), lds, A);     \
+            case 99: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 99>), grid, dim3(256), lds, A);     \
+            case 123: return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, OTV, 0, DPV, 123>), grid, dim3(256), lds, A);   \
+            default: break;                                                                                                \
+            }                                                                                                              \
+        }
+        if constexpr (T == GG_Q6_K) { GG_WK3_AB2(1, 3, 2, float, 1) GG_WK3_AB2(1, 2, 1, float, 1) GG_WK3_AB2(4, 3, 1, uint16_t, 1) }
+#undef GG_WK3_AB2
         if constexpr (T != GG_Q8_0) { GG_WK3_AB(1, 3, 1, uint16_t, 1) GG_WK3_AB(4, 3, 1, uint16_t, 1) GG_WK3_AB(4, 2, 1, uint16_t, 1) }   /* round 35: q_b's plain GEMM at 33..48 rows (52499524); DG2's G2 NT 1 (6362180) */
 #undef GG_WK3_AB
     }
