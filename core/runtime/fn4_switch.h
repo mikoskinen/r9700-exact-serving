@@ -269,7 +269,8 @@
  *                   a function of the row's ids alone, inference/model.py:353), and gather_rows copies every row's kv row
  *                   from its unique row; launches of <= 48 rows (the decode band) are issued as today, and nothing is
  *                   deduplicated when the unique rows would be <= 48 or fewer than 1/16 of the pooled rows repeat;
- *                   0 today's issue. RADIANCE_DS41_ENGDD=0 | 1 declares it (and starts at that value); unset: 1 refused,
+ *                   0 today's issue. 2 (tp8 loop P48b) = 1, and where a launch takes the Engram twin (RADIANCE_DS41_TWIN
+ *                   class 8) the dedup runs on it: launches of <= 64 rows kept, the unique rows on the int8 GEMM. RADIANCE_DS41_ENGDD=0 | 1 declares it (and starts at that value); unset: 1 refused,
  *                   the program and the issue are today's. A pass it may act on is not recorded. Exact: the same bytes
  *                   (gemm_nt_ggml's per-row form above the band). Live counters: /stats "engdd".
  *   sched_noa       scheduler (lever NOA, ds41-noa: a prefill's piece over the shared budget): 0 off (today); 1 / 2 on,
