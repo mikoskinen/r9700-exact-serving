@@ -291,11 +291,20 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                                      "rad_fn4_switch absent");
         return;
     }
-    if (sw("ds41_f32dec", 10) != 1) { ok("spdf32 rgm: ds41_f32dec 10 taken", false, "refused (a plugin without lever RGM)"); return; }
+    /* RGM_SHAPE=NE,TK (DRAFTER round 41, lever RGD): another router shape -- 128,3 = the DSpark drafter's (128 experts, top 3), checked
+     * under RGM_VAL (default 10; 12 = lever RGD, the value that takes the DSpark router onto the WMMA logits); unset: the trunk's 384,6 */
+    int64_t NE = 384, TK = 6;
+    if (const char* e = std::getenv("RGM_SHAPE")) {
+        long long a = 0, b2 = 0;
+        if (std::sscanf(e, "%lld,%lld", &a, &b2) == 2 && a >= 16 && a % 16 == 0 && a <= 384 && b2 >= 1 && b2 <= 8) { NE = a; TK = b2; }
+    }
+    const int VAL = [] { const char* e = std::getenv("RGM_VAL"); return e && *e ? std::atoi(e) : 10; }();
+    if (NE != 384 || VAL != 10) std::printf("spdf32 rgm: router shape %lld experts, top %lld, value %d (RGM_SHAPE / RGM_VAL)\n", (long long)NE, (long long)TK, VAL);
+    if (sw("ds41_f32dec", VAL) != 1) { ok(fmt("spdf32 rgm: ds41_f32dec %d taken", VAL).c_str(), false, "refused (a plugin without the lever)"); return; }
     sw("ds41_f32dec", 0);
     void* inst = nullptr;
     if (f2->init(nullptr, 0, 0, 1, &inst) != RAD_OK || !inst) { ok("spdf32 rgm init", false, "no instance"); return; }
-    constexpr int64_t K = 5120, NE = 384, TK = 6, MR = 2112;
+    constexpr int64_t K = 5120, MR = 2112;
     const double scale = 1.5;
     const size_t tail = 64;
     fuse::g_rs = 0x5EEDB00Bull;
@@ -369,6 +378,7 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
         }
         for (int64_t c0 : { (int64_t)0, (int64_t)96, (int64_t)192, (int64_t)288 })
             for (int64_t M : { (int64_t)16, (int64_t)48, (int64_t)64, (int64_t)256, MR }) {
+                if (NE != 384) break;   /* glm_router's 96-column split: the trunk's shape only */
                 void* y = dalloc((size_t)(M * 96 * 4) + tail);
                 if (!y) { fails += " alloc;"; break; }
                 st_memset(y, 0xA5, (size_t)(M * 96 * 4) + tail);
@@ -418,21 +428,21 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                 if (sa != sb) ++rows_set;
             }
             fuse::info(fmt("spdf32 rgm vs the stock chain (M 64, random rows): %ld of %lld logits differ, max |d| %.3g, max rel %.3g, rows "
-                           "with another top-6 set %ld (rows with a NaN skipped)",
-                           nd, (long long)(M * NE), md, mr, rows_set)
+                           "with another top-%lld set %ld (rows with a NaN skipped)",
+                           nd, (long long)(M * NE), md, mr, (long long)TK, rows_set)
                            .c_str());
         }
     }
     /* (b) under the switch */
     pin(-1, -1);
-    sw("ds41_f32dec", 10);
+    sw("ds41_f32dec", VAL);
     {
         static const char* const kOut[6] = { "logits", "ids", "weights", "sorted_tok", "expert_offset", "expert_count" };
         std::string fails;
         int nb = 0;
         for (int64_t M : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 24, 32, 33, 40, 47, 48, 49, 56, 63, 64 }) {
             for (int lay : { 0, 1 }) {
-                const int64_t NL = lay ? 96 : NE, base = lay ? 96 : 0;
+                const int64_t NL = lay ? NE / 4 : NE, base = lay ? NE / 4 : 0;   /* EP slice: 96 @ 96 at 384, 32 @ 32 at 128 */
                 const std::array<size_t, 6> sz = { (size_t)(M * NE * 4) + tail, (size_t)(M * TK * 4) + tail, (size_t)(M * TK * 4) + tail,
                                                    (size_t)(M * TK * 4) + tail, (size_t)(NL + 1) * 4 + tail, (size_t)NL * 4 + tail };
                 void* o[2][6];
@@ -466,14 +476,15 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                 const std::string dl = c0 == RAD_OK ? same_rows(o[0][0], M, NE, 0) : std::string("chain failed");
                 ++nb;
                 if (c0 != RAD_OK || c1 != RAD_OK || c2 != RAD_OK || first >= 0 || !dl.empty())
-                    fails += fmt(" M %lld %s: %s;", (long long)M, lay ? "EP 96 @ 96" : "ETP",
+                    fails += fmt(" M %lld %s: %s;", (long long)M, lay ? "EP slice" : "ETP",
                                  c0 != RAD_OK || c1 != RAD_OK || c2 != RAD_OK ? fmt("rc %d %d %d", c0, c1, c2).c_str()
                                  : first >= 0                                ? kOut[first]
                                                                              : ("chain logits vs (a): " + dl).c_str());
             }
         }
-        ok(fmt("spdf32 rgm under ds41_f32dec 10: the fused launch (form 22, twice) = gemm_nt_f32 (code 40 by the rule) -> router_scored_topk -> "
-               "moe_scatter, 6 outputs + tails, ETP and EP slice, M 1..64 (%d cases); the chain's logits = (a)'s rows", nb).c_str(),
+        ok(fmt("spdf32 rgm under ds41_f32dec %d (%lld experts): the fused launch (form 22, twice) = gemm_nt_f32 (code 40 by the rule) -> "
+               "router_scored_topk -> moe_scatter, 6 outputs + tails, ETP and EP slice, M 1..64 (%d cases); the chain's logits = (a)'s rows",
+               VAL, (long long)NE, nb).c_str(),
            fails.empty(), fails);
     }
     /* (c) SPDPERF */
@@ -483,7 +494,7 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
         const std::array<size_t, 6> sz = { (size_t)(MM * NE * 4), (size_t)(MM * TK * 4), (size_t)(MM * TK * 4), (size_t)(MM * TK * 4),
                                            (size_t)(NE + 1) * 4, (size_t)NE * 4 };
         for (int j = 0; j < 6; ++j) o[j] = dalloc(sz[(size_t)j]);
-        for (int64_t M : { 1, 8, 16, 32, 48, 64 }) {
+        for (int64_t M : { 1, 8, 16, 24, 32, 40, 48, 64 }) {
             std::vector<RadParam> pf2 = { PI("M", M), PI("K", K), PI("n_expert", NE), PI("n_local", NE), PI("top_k", TK),
                                           PI("norm", 1), PF("route_scale", scale), PS("score", "sqrtsoftplus"),
                                           PS("dtype", "bf16"), PI("expert_base", 0) };
@@ -491,8 +502,37 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                                            T(o[0], RAD_F32, { M, NE }), T(o[1], RAD_I32, { M, TK }), T(o[2], RAD_F32, { M, TK }),
                                            T(o[3], RAD_I32, { M * TK }), T(o[4], RAD_I32, { NE + 1 }), T(o[5], RAD_I32, { NE }) };
             RadArgs af2 = args(tf2, pf2, inst);
+            /* the chain (three launches: what a router WITHOUT the fused op declared runs -- the DSpark stages' today): gemm_nt_f32 ->
+             * router_scored_topk -> moe_scatter */
+            std::vector<RadParam> psel = { PI("M", M), PI("n_expert", NE), PI("top_k", TK), PI("norm", 1),
+                                           PF("route_scale", scale), PS("score", "sqrtsoftplus"), PS("dtype", "f32") };
+            std::vector<RadParam> psort = { PI("M", M), PI("n_expert", NE), PI("top_k", TK), PI("expert_base", 0) };
+            std::vector<RadTensor> tsel = { T(o[0], RAD_F32, { M, NE }), T(db, RAD_F32, { NE }), T(o[1], RAD_I32, { M, TK }),
+                                            T(o[2], RAD_F32, { M, TK }) };
+            std::vector<RadTensor> tsort = { T(o[1], RAD_I32, { M, TK }), T(o[3], RAD_I32, { M * TK }), T(o[4], RAD_I32, { NE + 1 }),
+                                             T(o[5], RAD_I32, { NE }) };
+            RadArgs asel = args(tsel, psel), asort = args(tsort, psort);
+            auto chain3 = [&]() -> int {
+                int r = gemm(dx, K, M, dw, NE, o[0]);
+                if (r == RAD_OK) r = rs->launch(&asel, nullptr);
+                if (r == RAD_OK) r = rc->launch(&asort, nullptr);
+                return r;
+            };
+            {
+                double cw[2] = { 0, 0 }, cc2[2] = { 0, 0 };
+                for (int rep = 0; rep < 2; ++rep)
+                    for (int i = 0; i < 2; ++i) {
+                        sw("ds41_f32dec", i == 0 ? 1 : VAL);
+                        double ww = 0, cc = 0;
+                        time2(chain3, 200, &ww, &cc);
+                        cw[i] += ww / 2;
+                        cc2[i] += cc / 2;
+                    }
+                std::printf("  SPDPERF rgm chain M=%lld (gemm_nt_f32 + router_scored_topk + moe_scatter, 3 launches) value 1 %7.2f / %7.2f | "
+                            "value %d %7.2f / %7.2f us (warm / cold)\n", (long long)M, cw[0], cc2[0], VAL, cw[1], cc2[1]);
+            }
             double w[3] = { 0, 0, 0 }, c[3] = { 0, 0, 0 };
-            const int vals[3] = { 10, 9, 1 };
+            const int vals[3] = { VAL, 9, 1 };
             for (int rep = 0; rep < 2; ++rep)
                 for (int i = 0; i < 3; ++i) {
                     sw("ds41_f32dec", vals[i]);
@@ -502,30 +542,31 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
                     w[i] += ww / 2;
                     c[i] += cc / 2;
                 }
-            std::printf("  SPDPERF rgm fused M=%lld mean of 2: value 10 (RGM) %7.2f / %7.2f | 9 (RGK) %7.2f / %7.2f | 1 (BEST) %7.2f / %7.2f us "
-                        "(warm / cold); 10 vs 9 cold %+6.2f us\n",
-                        (long long)M, w[0], c[0], w[1], c[1], w[2], c[2], c[0] - c[1]);
+            std::printf("  SPDPERF rgm fused M=%lld mean of 2: value %d %7.2f / %7.2f | 9 (RGK) %7.2f / %7.2f | 1 (BEST) %7.2f / %7.2f us "
+                        "(warm / cold); %d vs 9 cold %+6.2f us\n",
+                        (long long)M, VAL, w[0], c[0], w[1], c[1], w[2], c[2], VAL, c[0] - c[1]);
         }
     }
     }   /* !po */
     {
-        for (int64_t N : { (int64_t)384, (int64_t)96 })
+        for (int64_t N : { (int64_t)384, (int64_t)96, (int64_t)128 })
             for (int64_t M : { (int64_t)64, (int64_t)128, (int64_t)256, (int64_t)1024, MR }) {
+                if ((NE == 384) != (N != 128)) break;   /* 384 / 96 for the trunk's shape, 128 for the DSpark router's */
                 void* y = dalloc((size_t)(M * N * 4));
                 if (!y) break;
                 double w[2] = { 0, 0 }, c[2] = { 0, 0 };
                 for (int rep = 0; rep < 2; ++rep)
                     for (int i = 0; i < 2; ++i) {
-                        sw("ds41_f32dec", i == 0 ? 10 : 1);
+                        sw("ds41_f32dec", i == 0 ? VAL : 1);
                         sw("f32_pf", i == 0 ? 0 : 25);
                         double ww = 0, cc = 0;
                         time2([&]() { return gemm(dx, K, M, dw, N, y); }, 100, &ww, &cc);
                         w[i] += ww / 2;
                         c[i] += cc / 2;
                     }
-                std::printf("  SPDPERF rgm gemm N=%lld M=%lld: value 10 (code 40) warm %8.2f cold %8.2f | value 1 + f32_pf 25 warm %8.2f cold "
+                std::printf("  SPDPERF rgm gemm N=%lld M=%lld: value %d (code 40) warm %8.2f cold %8.2f | value 1 + f32_pf 25 warm %8.2f cold "
                             "%8.2f us | %+7.2f / %+7.2f\n",
-                            (long long)N, (long long)M, w[0], c[0], w[1], c[1], w[0] - w[1], c[0] - c[1]);
+                            (long long)N, (long long)M, VAL, w[0], c[0], w[1], c[1], w[0] - w[1], c[0] - c[1]);
             }
         /* RGM_COMP=1 (measurement only, no serving rule takes it): the ratio > 1 compressor's fused kv | gate projection (N 1024, K 5120, bf16
          * under ROUTER_BF16) in code 40 (the pin) vs today's rule (value 1: the decode band's forms; f32_pf 25 from 64 rows); + one

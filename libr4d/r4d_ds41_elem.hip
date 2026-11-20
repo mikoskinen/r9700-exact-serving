@@ -2372,9 +2372,11 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
         case 22: {
             unsigned long long* sk = (SCORE == kSqrtSoftplus || SCORE == kSigmoid) && m <= kRgkRows && ne <= kRgkExperts
                                          ? rgk_scratch(stream, lg.data) : nullptr;
-            /* the trunk router only (384 experts, the shape r4d_rgm_route takes in gemm_nt_f32): the DSpark drafter's router (128
-             * experts; its context pass's projection is gemm_nt_f32 at N 128, which code 40 leaves stock) stays in form 21 */
-            if (!std::is_same<WT, uint16_t>::value || K != kRgmK || ne != 384) {
+            /* the trunk router (384 experts, the shape r4d_rgm_route takes in gemm_nt_f32); the DSpark drafter's router (128 experts)
+             * only under value 12 (lever RGD, DRAFTER round 41: r4d_rgm_route then takes its context pass's gemm_nt_f32 at N 128 too,
+             * so its logits are one function in every pass); below 12 it stays in form 21 (the stock arithmetic) */
+            const bool rgd = ne == 128 && r4d_f32dec_get() == 12;
+            if (!std::is_same<WT, uint16_t>::value || K != kRgmK || (ne != 384 && !rgd)) {
                 if (!sk) return RGP_I(4, 4, 8, 8u);
                 float* sc = (float*)(sk + kRgkRows * kRgkExperts);
 #define RGK_L(R, C, U, NW, INV)                                                                                   \
@@ -2391,7 +2393,10 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
             if (!sk) return R4D_NO(RAD_E_NOMEM);   /* the WMMA logits or nothing: never the stock arithmetic for a bf16 router */
             float* sc = (float*)(sk + kRgkRows * kRgkExperts);
             const bool al = rgm_aligned(x.data, (long)x.stride[0], w.data, (long)w.stride[0]);
-            const bool et2 = m > 32 && (ne & 31) == 0;   /* speed only */
+            /* speed only: ET 2 above 32 rows at 384 experts; the DSpark router (128) by R4D_RGD_ET (bench knob, read once: 1 / 2; unset
+             * = ET 1 at every height: 8 expert tiles x ceil(m / 16) row groups) */
+            static const int rgd_et = [] { const char* e = std::getenv("R4D_RGD_ET"); return e && *e ? std::atoi(e) : 0; }();
+            const bool et2 = rgd ? rgd_et == 2 : m > 32 && (ne & 31) == 0;
 #define RGM_L(ET, AL, INV)                                                                                        \
     R4D_EMIT(stream, (router_wm_rowkey_kernel<ET, 8, AL, 12, (SCORE == kSigmoid ? kSigmoid : kSqrtSoftplus), INV>),    \
              dim3((unsigned)((ne + 16 * (ET) - 1) / (16 * (ET))), (unsigned)((m + 15) / 16)), dim3(kRgmS * 32), 0, \

@@ -37,7 +37,9 @@ int r4d_f32pf_known(int v);
  * 1 the decode band (rows <= 63) of both in the forms r4d_f32dec_*_form picks, 2 the router's only, 3 gemm_nt_f32's only.
  * tp8 loop D28 (19.11.2026): 4 .. 7 = 1 with the router's 17..48 rows in the 2-D wave map form 15 .. 18 (r4d_ds41_elem.hip).
  * Lever RGP (DRAFTER round 17): 8 = 1 with the router's 17..64 rows in form 19; lever RGK (DRAFTER round 39): 9 = form 21 at 1..64 rows;
- * lever RGM (DRAFTER round 40, RULE B: not the stock arithmetic): 10 = form 22 at 1..64 rows + gemm_nt_f32 code 40 at the router's shape.
+ * lever RGM (DRAFTER round 40, RULE B: not the stock arithmetic): 10 = form 22 at 1..64 rows + gemm_nt_f32 code 40 at the router's shape;
+ * 11 (lever RGC) = 10 + the compressors' kv | gate (N 1024) in code 40; 12 (lever RGD, DRAFTER round 41, RULE B for the drafter's
+ * proposals only) = 11 + the DSpark drafter's router (128 experts: form 22 in its fused launch, code 40 for its gemm_nt_f32 at N 128).
  * Every form keeps the stock per-output arithmetic (lane l folds k = l, l + 32, .. ascending with fmaf, then the xor
  * butterfly: r4d_gemm_f32_tile.h / the GPF-b note above), so the bytes are the stock rule's at every form. */
 int r4d_f32dec_get();
