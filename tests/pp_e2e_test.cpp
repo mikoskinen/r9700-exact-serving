@@ -3322,7 +3322,9 @@ TEST(tail_band_at_depth_two_serves_one_process_tokens) {
  * the leader): every request's tokens are one process's at 3 lanes BG 1 (+ follower segments), 4 lanes BG 2 FOL_ORDER 2, pp_tband 1
  * then 3 by POST in one process (the in-process control), and no check differs; decode lanes' steps ran as band passes (> 0).
  * Negative control: the leader's store left out (RADIANCE_PP_TEST_TCOPY_SKIP=1) -> tokens differ or the check names the copy. No
- * copy declared: RADIANCE_PP_TAIL_BAND=3 runs as 1 (named) and a POST of 3 is refused. */
+ * copy declared: RADIANCE_PP_TAIL_BAND=3 runs as 1 (named) and a POST of 3 is refused. tp8 loop D50: fn4 pp_tband 4 (decode steps
+ * band in clean stretches too: band passes with no BG step in flight > 0), RADIANCE_PP_TAIL_BAND=1028 (4 + 1024 x 1: the load rule
+ * judges clean steps) and 64516 (N = 63: every clean step kept W(1,3)'s, BG stretches still band) -- the same tokens. */
 TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_tokens) {
     REQUIRE(world().ok);
     const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
@@ -3336,15 +3338,20 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         CHECK_EQ(one.lead.finish(60), 0);
     }
     /* sw: 13 = POST pp_tband 1 before the first set and 3 before the second; nocopy = TBAND_COPY unset (3 runs as 1, POST 3 refused) */
-    struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; int sw = -1; bool nocopy = false; };
-    long long dec_all = 0;
+    /* tp8 loop D50: tb = the start's RADIANCE_PP_TAIL_BAND (3; 1028 = 4 + 1024 x 1), tv = fn4 pp_tband POSTed before the first set
+     * (4 = 3 in every stretch: decode band passes with no BG step in flight) */
+    struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; int sw = -1; bool nocopy = false; const char* tb = "3";
+                 int tv = -1; };
+    long long dec_all = 0, clean_all = 0, low_all = 0;
     int skip_bad = 0;
     for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, true, false, false, 13 },
-                         Arm{ 3, 1, false, false, false, -1, true }, Arm{ 3, 1, false, false, true } }) {
+                         Arm{ 3, 1, false, false, false, -1, true }, Arm{ 3, 1, false, false, true },
+                         Arm{ 3, 1, true, false, false, -1, false, "3", 4 }, Arm{ 4, 2, true, true, false, -1, false, "1028" },
+                         Arm{ 3, 1, false, false, false, -1, false, "64516" } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
-        for (const char* v : { "RADIANCE_LLAMA_PP_TBAND=1", "RADIANCE_PP_TAIL_BAND=3", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_LLAMA_PP_KVCOPY=1",
-                               "RADIANCE_PP_KV_CHECK=1" })
+        env.push_back(std::string("RADIANCE_PP_TAIL_BAND=") + a.tb);
+        for (const char* v : { "RADIANCE_LLAMA_PP_TBAND=1", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" })
             env.push_back(v);
         if (!a.nocopy) env.push_back("RADIANCE_LLAMA_PP_TBAND_COPY=1");
         if (a.fseg)
@@ -3367,11 +3374,13 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         };
         if (a.sw == 13) post(1, 200, nullptr);
         if (a.nocopy) post(3, 400, "the plugin declared no tail band copy");
+        if (a.nocopy) post(4, 400, "the plugin declared no tail band copy");   /* tp8 loop D50 */
+        if (a.tv > 0) post(a.tv, 200, nullptr);
         const std::vector<std::vector<int32_t>> got = split_set(pp.port);
         long long dec_mid = -1;
         if (a.sw == 13) post(3, 200, nullptr);
         const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
-        if (a.sw >= 0) post(-1, 200, nullptr);
+        if (a.sw >= 0 || a.tv > 0) post(-1, 200, nullptr);
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -3399,6 +3408,12 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
             (void)std::sscanf(llog.c_str() + at + std::strlen(dkey), "%lld such steps kept W(h, t)'s for a sequence whose band state the "
                                                                      "leader does not hold; %lld sequences held", &dskip, &held);
         }
+        long long dclean = -1, dlow = -1;   /* tp8 loop D50 */
+        const char* ckey = " of the band passes had no BG step in flight (pp_tband 4, tp8 loop D50), ";
+        if (const size_t at = llog.rfind(ckey); at != std::string::npos) {
+            if (const size_t b = llog.rfind("; ", at); b != std::string::npos) dclean = std::atoll(llog.c_str() + b + 2);
+            dlow = std::atoll(llog.c_str() + at + std::strlen(ckey));
+        }
         (void)dec_mid;
         long long checks = -1, kdiff = -1;
         if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
@@ -3406,12 +3421,14 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
                 (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
         const bool notowner = flog.find("NOT the owner's bytes") != std::string::npos;
         const bool copy2 = flog.find("layer 2,") != std::string::npos;   /* the check named the band layer's copy */
-        fprintf(stderr, "    TAIL COPY (llama stand-in), %d lanes BG %d W(1,3)%s%s%s%s%s: %d of %zu requests differ; %lld lane steps ran as tail "
-                        "band passes, %lld of them decode lanes' (pp_tband 3), %lld kept W(1,3)'s for a sequence not held, %lld held; KV-copy "
-                        "checks %lld, %lld differ%s%s\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.fo2 ? " + FOL_ORDER 2" : "",
-                a.sw == 13 ? " + fn4 pp_tband 1 (first set) / 3 (second)" : "", a.nocopy ? " WITHOUT the copy (3 runs as 1)" : "",
-                a.skip ? " + the leader's store LEFT OUT (negative control)" : "", differ, ref.size() + ref_b.size(), tb, dec, dskip, held,
-                checks, kdiff, notowner ? " (NOT the owner's bytes)" : "", copy2 ? "; layer 2 checked" : "");
+        fprintf(stderr, "    TAIL COPY (llama stand-in), %d lanes BG %d W(1,3), TAIL_BAND=%s%s%s%s%s%s%s: %d of %zu requests differ; %lld lane steps "
+                        "ran as tail band passes, %lld of them decode lanes' (pp_tband 3 / 4), %lld kept W(1,3)'s for a sequence not held, %lld "
+                        "held; %lld band passes with no BG step in flight, %lld clean steps kept W(1,3)'s at a load <= N (D50); KV-copy checks "
+                        "%lld, %lld differ%s%s\n", a.lanes, a.k, a.tb, a.fseg ? " + follower segments" : "", a.fo2 ? " + FOL_ORDER 2" : "",
+                a.sw == 13 ? " + fn4 pp_tband 1 (first set) / 3 (second)" : "", a.tv > 0 ? " + fn4 pp_tband 4 (both sets)" : "",
+                a.nocopy ? " WITHOUT the copy (3 runs as 1)" : "", a.skip ? " + the leader's store LEFT OUT (negative control)" : "", differ,
+                ref.size() + ref_b.size(), tb, dec, dskip, held, dclean, dlow, checks, kdiff, notowner ? " (NOT the owner's bytes)" : "",
+                copy2 ? "; layer 2 checked" : "");
         if (a.skip) {
             skip_bad = differ + (notowner ? 1 : 0);
             CHECK(dec > 0);
@@ -3432,10 +3449,29 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         CHECK(llog.find("the plugin keeps the tail band layers' state on the leader for every sequence") != std::string::npos);
         CHECK(dec > 0);
         dec_all += std::max(0LL, dec);
+        CHECK(dclean >= 0);   /* tp8 loop D50: the run line's counters */
+        CHECK(dlow >= 0);
+        if (a.tv == 4) CHECK(dclean > 0);   /* 4: decode band passes with no BG step in flight */
+        if (a.tv < 0 && std::strcmp(a.tb, "3") == 0) {
+            CHECK_EQ(dclean, 0LL);   /* 3: only while a BG step is in flight */
+            CHECK_EQ(dlow, 0LL);
+        }
+        if (std::strcmp(a.tb, "1028") == 0) {
+            CHECK(llog.find("RADIANCE_PP_TAIL_BAND=1028 from the start (N = 1)") != std::string::npos);
+            CHECK(dclean + dlow > 0);   /* the load rule judged clean steps */
+        }
+        if (std::strcmp(a.tb, "64516") == 0) {   /* N = 63: the load never above it -- every clean step kept W(1,3)'s, BG ones band */
+            CHECK(llog.find("RADIANCE_PP_TAIL_BAND=64516 from the start (N = 63)") != std::string::npos);
+            CHECK(dlow > 0);
+            CHECK_EQ(dclean, 0LL);
+        }
+        clean_all += std::max(0LL, dclean);
+        low_all += std::max(0LL, dlow);
     }
-    fprintf(stderr, "    all arms: %lld decode lanes' steps as tail band passes; negative control: %d requests differ / copy named\n", dec_all,
-            skip_bad);
+    fprintf(stderr, "    all arms: %lld decode lanes' steps as tail band passes (%lld with no BG step in flight, %lld clean steps kept W(1,3)'s "
+                    "by the load rule); negative control: %d requests differ / copy named\n", dec_all, clean_all, low_all, skip_bad);
     CHECK(dec_all > 0);
+    CHECK(clean_all > 0);
     CHECK(skip_bad > 0);
 }
 
