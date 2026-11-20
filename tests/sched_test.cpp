@@ -3620,7 +3620,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99 */
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3638,7 +3638,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it */
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100 */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3729,7 +3729,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99 */
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
