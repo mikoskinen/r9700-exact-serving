@@ -16196,11 +16196,18 @@ TEST(srf_2_prompts_over_the_lanes_one_at_a_time_shortest_first_each_its_lone_pla
                 }
                 CHECK_EQ(rows, (int64_t)c.n[i]);
             }
-            std::string firsts;
+            std::string firsts, off;
             for (size_t i = 0; i < c.n.size(); ++i) firsts += fmt("%s%d@%d", i ? " " : "", c.n[i], r.first[i]);
+            /* the first piece of a prompt that is not one of its lone plan's (sched_srf 0: today's composition) */
+            for (size_t i = 0; i < c.n.size(); ++i)
+                for (const auto& pc : r.chunks[i])
+                    if (std::find(lone[i].begin(), lone[i].end(), pc) == lone[i].end()) {
+                        off += fmt("%s%d's [%d, %d)", off.empty() ? "; off-plan pieces e.g. " : ", ", c.n[i], pc.first, pc.second);
+                        break;
+                    }
             fprintf(stderr, "    %s%d lanes, sched_srf %d: first tokens (prompt@round) %s; %d plans with two prompts, %d of %zu "
-                    "prompts off their lone plan, %d rounds\n", best ? "BEST's span cut, " : "", lanes, srf, firsts.c_str(), r.two,
-                    off_lone, c.n.size(), r.rounds);
+                    "prompts off their lone plan, %d rounds%s\n", best ? "BEST's span cut, " : "", lanes, srf, firsts.c_str(), r.two,
+                    off_lone, c.n.size(), r.rounds, off.c_str());
             if (srf == 0) continue;
             CHECK_EQ(r.two, 0);
             CHECK_EQ(off_lone, 0);
