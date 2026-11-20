@@ -37,6 +37,7 @@ struct Pass {
     bool cone = false;          /* ... and the pass holds the prompt's end (cone rows from layer 20) */
     bool x1_sh = false;         /* tp8 loop P20 round 3: X1 leaves row-sharded (each rank its rows of the live set) */
     bool x1r_sh = false;        /* round 4: X1 lands row-sharded at an SP receiving layer (each rank copies its rows) */
+    bool x2_sh = false;         /* tp8 loop P36: X2 leaves the follower row-sharded (each rank its rows of the live set) */
     /* tp8 loop P25 (RADIANCE_DS41_SPHC_SEG): the follower's pass in segments of `seg` layers (0: whole), each boundary saved
      * after its last layer and restored before the next segment's first, other passes between them (every buffer rewritten);
      * the plan is the whole part's. seg_sh: an SP layer's boundary saved / restored row-sharded (2), else whole (1). */
@@ -67,7 +68,7 @@ std::vector<uint8_t> plan_of(const Pass& p, bool engram_rule = true) {
             d.next_pcn_a = pcn_a(i + 1) || !engram_rule;
         }
         const bool send_after = (p.send || p.x2) && i == p.hi - 1;
-        d.out_sharded = p.send && p.x1_sh && i == p.hi - 1;
+        d.out_sharded = ((p.send && p.x1_sh) || (p.x2 && p.x2_sh)) && i == p.hi - 1;   /* P36: X2 too */
         d.self_ok = !tap(i) && !(send_after && !d.out_sharded) && !(p.psk && i >= kL20 && !(i > kL20 && i < p.open_to));
     }
     std::vector<uint8_t> spv;
@@ -174,9 +175,10 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
             need(s.mix, q, "X1 post / comb", l); need(s.pre_f, q, "X1 pre_ffn", l);
             return err;
         }
-        if (l == p.hi - 1 && p.x2) {   /* X2 at a cone pass: the cone rows' live set whole */
-            need(s.act, false, "X2 act.x", l); need(s.h1, false, "X2 h1", l);
-            need(s.mix, false, "X2 post / comb", l); need(s.pre_f, false, "X2 pre_ffn", l);
+        if (l == p.hi - 1 && p.x2) {   /* X2: the live set whole from rank 0, or each rank its rows (P36 row-sharded) */
+            const bool q = p.x2_sh && sp;
+            need(s.act, q, "X2 act.x", l); need(s.h1, q, "X2 h1", l);
+            need(s.mix, q, "X2 post / comb", l); need(s.pre_f, q, "X2 pre_ffn", l);
             return err;
         }
         if (seg_end) {
@@ -415,6 +417,45 @@ TEST(plan_lone_passes_with_uncut_deep_layers_every_read_valid) {
     Pass f = shapes()[5];
     f.open_to = 32;
     CHECK(!run(f, plan_of(f), /*lazy_gather=*/false).empty());
+}
+
+/* tp8 loop P36 (RADIANCE_DS41_SPHC_X2=1): X2 leaves the follower row-sharded, so the plan may take layer 31 too -- the segment
+ * and lone follower passes of P25b / P25c with every deep layer uncut (open to 32), X1 whole / landing sharded, boundaries whole /
+ * sharded: every read valid and 31 SP (21 = 10-19 + 21-31; 20, the split layer, whole); open to 28 (31 cut by PSK) keeps 31
+ * whole (17, as without P36); a body pass (PSK cuts 20-31 to nothing) is unchanged (10 SP). Control: X2 whole after an SP 31
+ * (the shard asked for but the plan's layer read whole) is a bad read. */
+TEST(plan_x2_row_sharded_takes_layer_31_every_read_valid) {
+    int checked = 0;
+    for (int open_to : { 32, 28 })
+        for (Pass f : { shapes()[5], shapes()[10] })
+            for (int seg : { 0, 1, 2 })
+                for (bool sh : { false, true }) {
+                    f.seg = seg;
+                    f.seg_sh = sh;
+                    f.open_to = open_to;
+                    f.x2_sh = true;
+                    const std::vector<uint8_t> spv = plan_of(f);
+                    const std::string e = run(f, spv);
+                    if (!e.empty())
+                        std::fprintf(stderr, "P36 open to %d, segments of %d, sh %d x1r %d: %s\n", open_to, seg, sh, f.x1r_sh, e.c_str());
+                    CHECK_EQ(e, std::string(""));
+                    CHECK_EQ(count(spv), open_to == 32 ? 21 : 17);
+                    CHECK_EQ((int)spv[20], 0);
+                    CHECK_EQ((int)spv[31], open_to == 32 ? 1 : 0);
+                    ++checked;
+                }
+    CHECK_EQ(checked, 24);
+    Pass b = shapes()[4];   /* a body pass: no cone row past 20 */
+    b.x2_sh = true;
+    CHECK_EQ(count(plan_of(b)), 10);
+    CHECK_EQ(run(b, plan_of(b)), std::string(""));
+    /* control: the plan made 31 SP for a sharded X2, the issue sent it whole */
+    Pass f = shapes()[5];
+    f.open_to = 32;
+    f.x2_sh = true;
+    const std::vector<uint8_t> spv = plan_of(f);
+    f.x2_sh = false;
+    CHECK(!run(f, spv).empty());
 }
 
 TEST(plan_control_without_the_lazy_gather_fails) {
