@@ -1133,7 +1133,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
             GG_WK3_AB(4, 2, 1, uint16_t, 1) GG_WK3_AB(4, 3, 1, uint16_t, 1) GG_WK3_AB(1, 2, 1, uint16_t, 1) GG_WK3_AB(1, 3, 1, uint16_t, 1)
         }
         if constexpr (T == GG_Q6_K) { GG_WK3_AB(1, 2, 2, float, 2) GG_WK3_AB(1, 3, 1, float, 1) }
-        if constexpr (T != GG_Q8_0) { GG_WK3_AB(1, 3, 1, uint16_t, 1) }   /* round 35: q_b's plain GEMM at 33..48 rows (52499524) */
+        if constexpr (T != GG_Q8_0) { GG_WK3_AB(1, 3, 1, uint16_t, 1) GG_WK3_AB(4, 3, 1, uint16_t, 1) GG_WK3_AB(4, 2, 1, uint16_t, 1) }   /* round 35: q_b's plain GEMM at 33..48 rows (52499524); DG2's G2 NT 1 (6362180) */
 #undef GG_WK3_AB
     }
     if (dp2 && !pro) {   /* bit 23: DP 2 (bench) at the (NM, NT) the launch picks: (2, 2), (3, 1), bit 22's (2, 1) */
