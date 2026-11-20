@@ -1107,7 +1107,8 @@ static void route(const Plugin& pl, const char* tlist) {
  * native weight (type q6_K), byte for byte (y, and h for the folds), at the engine path's modes (R4D_Q6IL_MODES, default 15,17)
  * and M 1..64 + the prefill heights 65 .. 2048 (the head to 256); the IL call must not fail (no form declines it: the il path has
  * no native fallback). The pack's inverse gives the native rows back. R4D_Q6IL_PERF=1: + a chain of NC weight copies (>= 256 MiB,
- * >= 4) back to back, native and IL alternated, median of 10 chains, us a call at R4D_Q6IL_PM (default 1,16,32,48,64). */
+ * >= 4) back to back, native and IL alternated, median of 10 chains, us a call at R4D_Q6IL_PM (default 1,16,32,48,64). R4D_Q6IL_DECL=1:
+ * the IL weight tensor at its declared [N, K] (the engine's form). */
 static void q6il(const Plugin& pl, const char* tlist) {
     Hk h;
     if (!hooks(pl, h, "--q6ilcheck")) return;
@@ -1133,6 +1134,8 @@ static void q6il(const Plugin& pl, const char* tlist) {
         { "engram_kv_e2part", 0, 1600, 0, 6144, false, 2048 },  { "head", 1, 32320, 0, 5120, false, 256 },
     };
     const MrTy& ty = kMrTypes[1];   /* q6_K */
+    /* R4D_Q6IL_DECL=1: the IL weight handed at its DECLARED shape [N, K] (what the engine passes a relayouted weight), not [N, 106 K / 128] */
+    const bool decl = [] { const char* e = std::getenv("R4D_Q6IL_DECL"); return e && e[0] == '1'; }();
     long long keys = 0, bad_keys = 0, calls = 0;
     std::printf("Q6IL check: q6_K_il16b (tile-interleaved, r4d_q6k_il16b_pack) vs q6_K (native rows) through each op row, modes");
     for (int64_t m : modes) std::printf(" %lld", (long long)m);
@@ -1208,7 +1211,7 @@ static void q6il(const Plugin& pl, const char* tlist) {
         auto call = [&](bool il, int64_t M, std::vector<uint8_t>& out) -> int {
             st_memset(d_y, 0xff, (size_t)M * yrow);
             if (hrow) st_memset(d_h, 0x5a, (size_t)M * hrow);
-            const int rc = il ? launch("q6_K_il16b", d_wi, hil.size(), rbi, M) : launch("q6_K", d_w, hw.size(), rb, M);
+            const int rc = il ? launch("q6_K_il16b", d_wi, hil.size(), decl ? K : rbi, M) : launch("q6_K", d_w, hw.size(), rb, M);
             ++calls;
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : -999;
             out.resize((size_t)M * (yrow + hrow));
