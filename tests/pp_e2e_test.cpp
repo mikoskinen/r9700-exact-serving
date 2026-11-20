@@ -5283,7 +5283,9 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
             for (size_t i = 0; i < ref_s.size(); ++i)
                 if (ref_s[i] != got_s[i]) ++differ;
         }
-        long long rev = -1, rows = -1, unclean = -1;
+        long long rev = -1, rows = -1, unclean = -1, keyed = -1;
+        if (const size_t kk = llog.rfind(" lane steps crossed X1 in the keys form"); kk != std::string::npos)   /* step 5 */
+            if (const size_t b = llog.rfind("; ", kk); b != std::string::npos) keyed = std::atoll(llog.c_str() + b + 2);
         const char* key = " lane steps ran as reverse (head band) passes, ";
         if (const size_t at = llog.rfind(key); at != std::string::npos) {
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
@@ -5293,10 +5295,10 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
                 unclean = std::atoll(llog.c_str() + u + std::strlen("(tp8 loop P41); "));
         }
         fprintf(stderr, "    REVERSE BAND (llama stand-in), %d lanes W(%s), pp_rband %d%s%s%s%s: %d of %zu requests differ; plan %s (%zu chunks); "
-                        "%lld reverse passes, %lld rows; %lld lone chunks kept W(h, t)'s (unclean sequence)\n", a.lanes, a.cut, a.every,
+                        "%lld reverse passes, %lld rows; %lld lone chunks kept W(h, t)'s (unclean sequence); %lld steps crossed the keys\n", a.lanes, a.cut, a.every,
                 a.fseg ? " + follower segments" : "", a.post0 ? " + fn4 pp_rband 0 in process" : "", a.sets ? " + split / burst sets" : "",
                 a.skip ? " + the keys' store LEFT OUT (negative control)" : "", differ, ref.size() + (a.sets ? ref_s.size() : 0),
-                plan == ref_plan ? "= one process's" : "DIFFERENT", plan.size(), rev, rows, unclean);
+                plan == ref_plan ? "= one process's" : "DIFFERENT", plan.size(), rev, rows, unclean, keyed);
         CHECK(llog.find("the plugin declared the reverse (head) band layer") != std::string::npos);
         CHECK(plan == ref_plan);
         if (a.skip) {
@@ -5308,8 +5310,10 @@ TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
         CHECK_EQ(differ, 0);
         if (a.post0) {
             CHECK_EQ(rev, 0LL);
+            CHECK_EQ(keyed, 0LL);   /* step 5: pp_rband 0 crosses no keys */
             continue;
         }
+        if ((a.every & 15) >= 2) CHECK(keyed > 0);   /* the chunks between reversed ones carried the keys */
         CHECK(rev > 0);
         CHECK(unclean > 0);   /* p3's chunks after its prefix hit */
         CHECK(flog.find("reverse passes ran this follower from layer") == std::string::npos);   /* (llama: no plugin line; the engine's) */
