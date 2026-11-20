@@ -4625,11 +4625,13 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
     static const Var kVar[] = {
         { 0, "the rule",                                  false },
         { 2, "a wave a token",                            true  },
+        { 3, "a wave a token, column groups first",       true  },   /* tp8 loop P35 */
+        { 4, "a wave a token walking its row",            true  },   /* tp8 loop P35 */
     };
     for (const Var& v : kVar) {
         const std::string label = "moe_gather, " + std::string(v.name) + at;
         const int rc = run(v.form, got);
-        if (v.wide && (!sh.wide || f32)) {
+        if (v.wide && !sh.wide) {   /* tp8 loop P35: F32 weights take the wide form where the shape does */
             /* A shape the wide form cannot take refuses the pin rather than run another form. */
             ok((label + " is refused").c_str(), rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
             continue;
@@ -4649,7 +4651,7 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
                " differ from a column a thread" + first);
     }
 
-    if (M >= 2048 && sh.wide && !f32) {
+    if (M >= (f32 ? 1024 : 2048) && sh.wide) {   /* tp8 loop P35: DeepSeek's F32 shapes timed too */
         hipEvent_t e0, e1;
         st_ev_create(&e0);
         st_ev_create(&e1);
@@ -4666,10 +4668,15 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
             pl.pin_gather(0);
             return ms * 1000.0f / (float)it;
         };
-        const float t1 = time(1), t2 = time(2);
-        std::printf("      moe_gather at %lld routed rows x %lld: a column a thread %.1f us, a wave "
-                    "a token %.1f us a call, prepass included\n",
-                    (long long)NS, (long long)n, t1, t2);
+        const float t1 = time(1), t2 = time(2), t3 = time(3), t4 = time(4);
+        const float t1b = time(1), t2b = time(2), t3b = time(3), t4b = time(4);
+        const double mb = ((double)NS * n * 2 + (double)M * n * 2 * (shared ? 2 : 1)) / 1e6;
+        auto gbs = [&](float a, float b) { return mb / 1e3 / ((a + b) / 2e6); };
+        std::printf("      moe_gather at %lld routed rows x %lld%s: a column a thread %.1f / %.1f us, a wave "
+                    "a token %.1f / %.1f, column groups first %.1f / %.1f, walking the row %.1f / %.1f us a call, prepass "
+                    "included (%.1f MB: %.0f / %.0f / %.0f / %.0f GB/s)\n",
+                    (long long)NS, (long long)n, f32 ? " (F32 weights)" : "", t1, t1b, t2, t2b, t3, t3b, t4, t4b, mb,
+                    gbs(t1, t1b), gbs(t2, t2b), gbs(t3, t3b), gbs(t4, t4b));
         st_ev_destroy(e0);
         st_ev_destroy(e1);
     }
@@ -4695,8 +4702,14 @@ static void moe_gather_case(const Plugin& pl) {
     // before adding the shared BF16 output, at decode and past the self-scan boundary.
     for (int64_t m : { 1, 4, 65 })
         for (int64_t n : { 2048, 4096 })
-            for (bool shared : { false, true })
-                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, false }, true);
+            for (bool shared : { false, true })   /* tp8 loop P35: past the self-scan bound (65 x 8 > 512) the wide form serves F32 */
+                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, m * 8 > (int64_t)512 }, true);
+    /* tp8 loop P35: DeepSeek-V4.1's prefill gathers (sigmoid router: F32 weights, top 6, 5,120 columns a rank under ETP; the
+     * shared arm ungated) at a newcomer's ~1,150 rows, a 2,048 and a 4,096-row chunk -- every form the column-a-thread bytes and
+     * the host restatement, timed. */
+    for (int64_t m : { 1150, 2048, 4096 })
+        for (bool shared : { true, false })
+            moe_gather_at(pl, r, { m, 5120, 6, shared ? "none" : nullptr, true }, true);
 }
 
 /* ------------------------------------------------------- the vocab-parallel top-R, end to end

@@ -49,7 +49,9 @@
 
 #include <hip/hip_bf16.h>
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
 #include <map>
@@ -2188,17 +2190,22 @@ constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots 
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
-template <uint32_t NW>
+/* tp8 loop P35 (PREFILL round 30): F32 = the routing weights as F32 (deepseek41 / any sigmoid_router: rad_block_moe_fp8.h's `ew`),
+ * which gather_kernel<.., true> folds as fmaf(w, x, acc); here the same fmaf in the same slot order, so the same bytes. The BF16
+ * instantiation is the form as it was (the same loads and `acc += w * x`). */
+/* VAR (tp8 loop P35): the grid -- 0 tokens on x, column groups on y (the form as it was); 1 column groups on x, tokens on y (a
+ * token group's whole rows run in consecutive workgroups); 2 one workgroup a token group, each wave walking its token's column
+ * groups in order. Every column's arithmetic is the same in all three: the same bytes. */
+template <uint32_t NW, bool F32 = false, uint32_t VAR = 0>
 __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
     uint32_t sh_ld, uint32_t sg_ld, int sig) {
     const uint32_t lane = threadIdx.x % kWave;
     const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
-    const uint32_t t = blockIdx.x * NW + wave;
-    const uint32_t c = (blockIdx.y * kWave + lane) * kGatherWideCols;
+    const uint32_t t = (VAR == 1 ? blockIdx.y : blockIdx.x) * NW + wave;
     /* No barrier below, so a wave past the last token simply leaves. */
     if (t >= M) return;
 
@@ -2208,15 +2215,24 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
      * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
-    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    int32_t wl;
+    if constexpr (F32) wl = ((const int32_t*)ew)[(size_t)t * ew_ld + jl];   /* the F32 weight's bits */
+    else wl = (int32_t)((const uint16_t*)ew)[(size_t)t * ew_ld + jl];
     int32_t si[kGatherWideSlots];
     float   sw[kGatherWideSlots];
 #pragma unroll
     for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
         si[j] = __builtin_amdgcn_readlane(il, (int)j);
-        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+        if constexpr (F32) sw[j] = __int_as_float(__builtin_amdgcn_readlane(wl, (int)j));
+        else sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
     }
-    if (c >= n) return;
+    const uint32_t g0 = VAR == 2 ? 0u : (VAR == 1 ? blockIdx.x : blockIdx.y);
+    const uint32_t g1 = VAR == 2 ? (n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols) : g0 + 1;
+    for (uint32_t g = g0; g < g1; ++g) {
+    const uint32_t c = (g * kWave + lane) * kGatherWideCols;
+    if (c >= n) {
+        if constexpr (VAR == 2) continue; else return;
+    }
     /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
      * to scratch. Uniform branches over a constant trip count keep every slot in a register. A slot
      * is live exactly where gather_kernel's loop would use it. */
@@ -2247,8 +2263,13 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
             const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
 #pragma unroll
             for (uint32_t q = 0; q < 4; ++q) {
-                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
-                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                if constexpr (F32) {   /* gather_kernel<.., true>'s fold */
+                    acc[2 * q]     = fmaf(wj, bf16_to_f32((uint16_t)(d[q] & 0xFFFFu)), acc[2 * q]);
+                    acc[2 * q + 1] = fmaf(wj, bf16_to_f32((uint16_t)(d[q] >> 16)), acc[2 * q + 1]);
+                } else {
+                    acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
+                    acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                }
             }
         }
     }
@@ -2268,6 +2289,7 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
         o[q] = (uint32_t)lo | ((uint32_t)hi << 16);
     }
     *(uint4*)(y + (size_t)t * y_ld + c) = make_uint4(o[0], o[1], o[2], o[3]);
+    }   /* the column groups (one for VAR 0 / 1) */
 }
 
 /* ================================================================== scale_rows
@@ -2296,11 +2318,33 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 }  /* namespace */
 
 /* The gather's form, pinnable for tests: 0 the launcher's rule, 1 gather_kernel (a column per
- * thread), 2 gather_wide_kernel (a wave per token). The rule takes 2 past the self-scan bound where
+ * thread), 2 gather_wide_kernel (a wave per token); tp8 loop P35: 3 / 4 = 2 at VAR 1 / 2 (the grid's column groups first / a wave
+ * walking its token's row). The rule takes 2 past the self-scan bound where
  * the shape allows (r4d_rad_moe_gather); an impossible pin is refused. Both are bit-identical
  * (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
+/* tp8 loop P35 (PREFILL round 30; RADIANCE_DS41_GATHER_W=1, read at load): the rule also takes the wide form for F32 routing
+ * weights (deepseek41's sigmoid router), which until now always ran gather_kernel<256, true> (a column a thread: 2 bytes a lane,
+ * the slot loads serialised -- F23's 1.27 ms a 4,096-row call, ~230 GB/s). The same fmaf fold, slot order and narrows: the same
+ * bytes (r4d_selftest moe_gather_bf16: every F32 shape vs a column a thread and the host restatement). Unset = today (the pin 2
+ * takes F32 regardless: a test hook). */
+static int gather_w_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_GATHER_W");
+        const int on = e && !std::strcmp(e, "1");
+        if (on)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GATHER_W=1 (tp8 loop P35): moe_gather with F32 routing weights "
+                                 "takes the wide prefill form (a wave a token, the column groups first) past the self-scan bound (the same bytes)\n");
+        return on ? 1 : 0;
+    }();
+    return v;
+}
+[[maybe_unused]] static const int g_gather_w_load = gather_w_env();
+/* The F32 form's grid under the env (gather_wide_kernel's VAR), fixed by the one-card numbers (QUEUE P35; Xeon GPU2, r4d_selftest
+ * moe_gather_bf16, 5,120 columns, top 6, the shared arm on, us a call: 4,096 rows a column a thread 1,138-1,294, VAR 0 966, VAR 1
+ * 545, VAR 2 596; 2,048 rows 567-716 / 434-439 / 278.5 / 315; 1,150 rows 340-469 / 171-178 / 154-157 / 171-174): VAR 1. */
+static constexpr int kGatherWVar = 1;
 
 /* ============================================================== the plugin ABI entry points */
 
@@ -3269,18 +3313,44 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
-    const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
+    /* tp8 loop P35: F32 weights fit the wide form too (its F32 instantiation); the rule takes it there only under
+     * RADIANCE_DS41_GATHER_W=1 (gather_w_env), the pin 2 always. */
+    const bool f32w = ew->dtype == RAD_F32;
+    const bool wide_ok = !small && top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     const int gpin = g_moe_gather_pin;
-    if (gpin < 0 || gpin > 2) return R4D_NO(RAD_E_INVAL);
+    if (gpin < 0 || gpin > 4) return R4D_NO(RAD_E_INVAL);
     if (gpin >= 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
-    if ((gpin == 0 && wide_ok) || gpin >= 2) {
+    if ((gpin == 0 && wide_ok && (!f32w || gather_w_env())) || gpin >= 2) {
         constexpr uint32_t NW = 8;
         const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
+        const unsigned tg = (unsigned)((M + NW - 1) / NW);
+        /* the F32 form's grid: the pin's, else RADIANCE_DS41_GATHER_W's (P35_VAR below) */
+        const int var = gpin >= 2 ? gpin - 2 : (f32w ? kGatherWVar : 0);
+        if (f32w || var != 0) {
+#define R4D_GW_LAUNCH(F, V, GX, GY)                                                                                   \
+            hipLaunchKernelGGL((gather_wide_kernel<NW, F, V>), dim3(GX, GY), dim3(NW * kWave), 0, (hipStream_t)s,   \
+                               (const uint16_t*)ye->data, (const void*)ew->data, inv,                                  \
+                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,                          \
+                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                                       \
+                               sh ? (const uint16_t*)sh->data : nullptr, sh ? (const uint16_t*)sg->data : nullptr,     \
+                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
+            if (f32w) {
+                if (var == 1) R4D_GW_LAUNCH(true, 1, gw, tg);
+                else if (var == 2) R4D_GW_LAUNCH(true, 2, tg, 1);
+                else R4D_GW_LAUNCH(true, 0, tg, gw);
+            } else {
+                if (var == 1) R4D_GW_LAUNCH(false, 1, gw, tg);
+                else R4D_GW_LAUNCH(false, 2, tg, 1);
+            }
+#undef R4D_GW_LAUNCH
+            R4D_MOE_CHK();
+            return RAD_OK;
+        }
         hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
                            dim3(NW * kWave), 0, (hipStream_t)s,
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
+                           (const uint16_t*)ye->data, (const void*)ew->data, inv,
                            (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
                            (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
                            sh ? (const uint16_t*)sh->data : nullptr,
