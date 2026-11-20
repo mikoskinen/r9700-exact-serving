@@ -3572,8 +3572,16 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK(fn4::check("pp_lead_seg", 546, &err));      /* 34 + 512 */
     CHECK(fn4::check("pp_lead_seg", 1023 - 5, &err)); /* 1018 = 2 + 8 + 16 x 15 + 256 + 512 */
     CHECK(!fn4::check("pp_lead_seg", 11, &err));
-    CHECK(!fn4::check("pp_lead_seg", 1024, &err));
     CHECK(err.find("+ 8 = the tail whole, + 512 = the SP word") != std::string::npos);
+    /* tp8 loop D49b: + 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N sequences; the
+     * form bits keep their rule (1027 = form 3 + 1024 refused); 65536 refused */
+    CHECK(fn4::check("pp_lead_seg", 1024, &err));     /* form 0 + N 1: whole anyway */
+    CHECK(fn4::check("pp_lead_seg", 1026, &err));     /* decode first, N 1 */
+    CHECK(fn4::check("pp_lead_seg", 2 + 1024 * 12, &err));
+    CHECK(fn4::check("pp_lead_seg", 65535 - 5, &err));   /* 65530 = 1018 + 1024 x 63 */
+    CHECK(!fn4::check("pp_lead_seg", 1027, &err));
+    CHECK(!fn4::check("pp_lead_seg", 65536, &err));
+    CHECK(err.find("+ 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N") != std::string::npos);
     CHECK(!fn4::check("pp_lead_seg", -1, &err));
     fn4::lead_seg_register(false);
     CHECK(fn4::check("pp_lead_seg", 0, &err));

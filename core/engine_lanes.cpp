@@ -826,17 +826,20 @@ int Engine::step_loop_lanes() {
         if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_FORM"); v && *v) {
             const int x = std::atoi(v);
             /* tp8 loop D36: + 256 = no band passes; D40: + 8 = the tail whole, + 512 = SP in the head's segments */
-            if (x >= 0 && x <= 1023 && (x & 7) <= 2) lsp_start = x;
+            /* tp8 loop D49b: + 1024 x N = segments only while the decode lanes' last steps decoded <= N sequences */
+            if (x >= 0 && x <= 65535 && (x & 7) <= 2) lsp_start = x;
             else RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG_FORM=%s is not taken: form + 8 x tail-whole + 16 x stride (+ 256, "
-                          "+ 512), form 0 / 1 / 2 (tp8 loop D32 / D40); 1 (M9 as built)", v);
+                          "+ 512, + 1024 x N), form 0 / 1 / 2 (tp8 loop D32 / D40 / D49b); 1 (M9 as built)", v);
         }
         RAD_INFO("two-node pipeline: fn4 pp_lead_seg starts at %d (form %d%s, stride %d%s%s; RADIANCE_PP_LEAD_SEG_FORM, tp8 loop D32): 0 "
                  "= a BG step's leader parts whole, 1 = M9 as built, 2 = decode first (a decode tail whose X2 landed and its lane's "
                  "next head go before the BG step's next segment, one segment in the stream, parts whole while no decode lane is "
                  "busy); + 8 = the tail whole (D40); + 16 x s = every s-th declared boundary; + 256 = no band passes (D36); + 512 = "
-                 "the head's segments may run the plugin's SP plan (D40, RADIANCE_DS41_SPHC_LSEG=1)", lsp_start, lsp_start & 7,
+                 "the head's segments may run the plugin's SP plan (D40, RADIANCE_DS41_SPHC_LSEG=1); + 1024 x N = segments only while "
+                 "the decode lanes' last steps decoded <= N sequences, the parts whole above (D49b)%s", lsp_start, lsp_start & 7,
                  (lsp_start & 7) == 0 ? ": whole" : (lsp_start & 7) == 1 ? ": M9" : ": decode first",
-                 std::max(1, (lsp_start >> 4) & 15), (lsp_start & 8) ? ", tail whole" : "", (lsp_start & 512) ? ", SP word" : "");
+                 std::max(1, (lsp_start >> 4) & 15), (lsp_start & 8) ? ", tail whole" : "", (lsp_start & 512) ? ", SP word" : "",
+                 (lsp_start >> 10) ? fmt("; starts with N = %d", (lsp_start >> 10) & 63).c_str() : "");
     }
     fn4::lead_seg_register(lseg);
     auto lsp_now = [&]() {
@@ -854,6 +857,7 @@ int Engine::step_loop_lanes() {
     };
     int64_t lsp_first = 0, lsp_whole = 0, lsp_wtail = 0;
     int64_t lsp_spseg = 0, lsp_tw8 = 0;   /* tp8 loop D40: head segments issued with the SP word; steps whose tail + 8 kept whole */
+    int64_t lsp_load = 0;                 /* tp8 loop D49b: BG steps whose parts ran whole by + 1024 x N (decode load above N) */
     /* tp8 loop D32 (RADIANCE_PP_LEAD_SEG_RINGS=2, the leader; its plugin reads the same env and declares a second ring): a BG
      * step's segments use ring lane % rings, so the two BG lanes of B2L (lanes 2 / 3) each segment while the other does */
     int lseg_rings = 1;
@@ -986,13 +990,14 @@ int Engine::step_loop_lanes() {
                  "(RADIANCE_PP_LEAD_SEG, tp8 dev M9)%s%s; pp_lead_seg %d now (tp8 loop D32): %lld tails taken first while a BG "
                  "step was in segments, %lld BG steps ran their head whole and %lld their tail whole with no decode lane busy; %d "
                  "boundary ring(s), %lld BG parts began their segments beside another BG step's; %lld head segments carried "
-                 "the SP word (+ 512), %lld BG steps kept their tail whole by + 8 (tp8 loop D40)",
+                 "the SP word (+ 512), %lld BG steps kept their tail whole by + 8 (tp8 loop D40), %lld BG steps ran their parts "
+                 "whole by the decode load rule (+ 1024 x N, tp8 loop D49b)",
                  (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
                  (long long)lseg_inside, (long long)lseg_polls,
                  lseg_mixed ? fmt("; %lld MIXED newcomer steps of decode lanes among them (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)",
                                   (long long)lseg_msteps).c_str() : "", when, lsp_now(), (long long)lsp_first,
                  (long long)lsp_whole, (long long)lsp_wtail, lseg_rings, (long long)lsp_both, (long long)lsp_spseg,
-                 (long long)lsp_tw8);
+                 (long long)lsp_tw8, (long long)lsp_load);
         if (lseg_ship_)
             RAD_INFO("two-node pipeline: %lld segmented heads' frames shipped after their last segment ran (RADIANCE_PP_LEAD_SEG_SHIP=1, "
                      "tp8 loop P27)%s: held past the last segment's issue %.2f ms on average, the longest %.2f; %lld other frames went "
@@ -1165,6 +1170,14 @@ int Engine::step_loop_lanes() {
         for (int q = 0; q < n_lanes_; ++q)
             if (!lanes_.is_bg(q) && busy[(size_t)q]) return true;
         return false;
+    };
+    /* tp8 loop D49b: the decode load pp_lead_seg + 1024 x N is judged by -- the sequences the decode lanes' last steps decoded
+     * (Scheduler::decoded_seqs, the load --draft-short-from reads) */
+    auto decode_seqs = [&]() {
+        int n = 0;
+        for (int q = 0; q < n_lanes_; ++q)
+            if (!lanes_.is_bg(q)) n += sched_of(q).decoded_seqs();
+        return n;
     };
     /* ... and whether a step that is no BG step in segments may take its tail now (the pick below's rule for those) */
     auto decode_ready = [&]() {
@@ -1501,8 +1514,15 @@ int Engine::step_loop_lanes() {
                 seg_step = false;
                 ++lsp_whole;
             }
-            if (lseg && lform != 0 && lseg_mixed && !seg_step && !(pm & 8) && (lform == 1 || !lanes_.is_bg(l)) && b->n_tok >= rf_rows &&
-                b->phase == RAD_PHASE_MIXED) {
+            /* tp8 loop D49b: + 1024 x N -- above N decoded sequences the parts run whole (form 0's program for this step) */
+            const int lrows = (lsv >> 10) & 63;
+            const bool load_whole = lseg && lform != 0 && lrows > 0 && decode_seqs() > lrows;
+            if (seg_step && load_whole) {
+                seg_step = false;
+                ++lsp_load;
+            }
+            if (lseg && lform != 0 && lseg_mixed && !seg_step && !load_whole && !(pm & 8) && (lform == 1 || !lanes_.is_bg(l)) &&
+                b->n_tok >= rf_rows && b->phase == RAD_PHASE_MIXED) {
                 seg_step = true;
                 for (const StepEntry& e : lsched().plan().e) seg_step = seg_step && e.home < 0;
                 for (int m2 = 0; m2 < n_lanes_; ++m2) seg_step = seg_step && lanes_.inbox_n(m2) <= inbox0[(size_t)m2];
