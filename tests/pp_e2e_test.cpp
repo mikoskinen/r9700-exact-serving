@@ -2159,6 +2159,91 @@ TEST(async_crossings_serve_one_process_tokens_and_plan) {
     }
 }
 
+/* tp8 loop P46 (RADIANCE_PP_SEND_ASH=N, both nodes; fn4 pp_send_ash): every rank's staging buffer for its share of a row-sharded
+ * payload (the budget keeps it), the send rings name them, passes of >= N rows are issued live, and the switch turns the path
+ * on / off between steps on both nodes. The tiny model's crossings are not row-sharded (deepseek41's SP passes are) and one rank
+ * a node sends no share, so here the plumbing is what is proven: a cold multi-chunk prompt at 2 lanes W(1,3) serves one
+ * process's tokens and chunk plan with the env, after POSTing pp_send_ash 0, and after 1 again; both nodes say the start line
+ * and the stop line (0 shares: none row-sharded); without the env 1 is refused naming it and nothing is said.
+ * (The sharded share's bytes through the staging buffer: ref_test op_stage_send_row_shards_through_rank_staging_world4.) */
+TEST(p46_send_ash_staging_and_switch_serve_one_process_tokens_and_plan) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(4646, 1000);
+    std::vector<int32_t> ref;
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        ref = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);
+    auto post = [](int port, int v, int want, const char* named) {
+        std::string out;
+        Call c;
+        const int st = c.send(port, "/admin/fn4", json{ { "pp_send_ash", v } }.dump()) ? c.read(&out) : -1;
+        CHECK_EQ(st, want);
+        if (named) CHECK(out.find(named) != std::string::npos);
+        if (st != want) fprintf(stderr, "    POST pp_send_ash %d: %d %s\n", v, st, out.c_str());
+    };
+    {
+        Serving sv;
+        REQUIRE(sv.start("1,3", kLanes2, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_SEND_ASH=32" }));
+        const std::vector<int32_t> a = complete(sv.port, p, 24);
+        post(sv.port, 0, 200, nullptr);
+        const std::vector<int32_t> b = complete(sv.port, p, 24);
+        post(sv.port, 1, 200, nullptr);
+        const std::vector<int32_t> c = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        const std::string llog = sv.lead.output(), flog = sv.fol.output();
+        const std::vector<std::pair<int, int>> plan = chunks_of(llog);
+        const bool plan_ok = plan.size() >= ref_plan.size() && std::equal(ref_plan.begin(), ref_plan.end(), plan.begin());
+        const bool ls = llog.find("RADIANCE_PP_SEND_ASH=32 -- a row-sharded X1 payload of >= 32 rows") != std::string::npos;
+        const bool fs = flog.find("RADIANCE_PP_SEND_ASH=32 -- a row-sharded X2 payload of >= 32 rows") != std::string::npos;
+        const bool le = llog.find("shares from the side streams by rank 0, 0 share(s) over the staging buffer") != std::string::npos;
+        const bool fe = flog.find("shares from the side streams by rank 0, 0 share(s) over the staging buffer") != std::string::npos;
+        const bool l01 = llog.find("fn4 pp_send_ash 1 -> 0 on this node's send rings") != std::string::npos &&
+                         llog.find("fn4 pp_send_ash 0 -> 1 on this node's send rings") != std::string::npos;
+        const bool f01 = flog.find("fn4 pp_send_ash 1 -> 0 on this node's send rings") != std::string::npos &&
+                         flog.find("fn4 pp_send_ash 0 -> 1 on this node's send rings") != std::string::npos;
+        fprintf(stderr, "    RADIANCE_PP_SEND_ASH=32, 2 lanes W(1,3): tokens %s / %s / %s (env, switch 0, switch 1), plan %s (%zu chunks); "
+                        "start lines leader %d follower %d, stop lines %d / %d, switch lines %d / %d\n",
+                a == ref ? "identical" : "DIFFERENT", b == ref ? "identical" : "DIFFERENT", c == ref ? "identical" : "DIFFERENT",
+                plan_ok ? "identical" : "DIFFERENT", ref_plan.size(), ls, fs, le, fe, l01, f01);
+        if (a != ref || !plan_ok || !ls || !fs || !le || !fe)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(!ref.empty());
+        CHECK(a == ref);
+        CHECK(b == ref);
+        CHECK(c == ref);
+        CHECK(plan_ok);
+        CHECK(ls);
+        CHECK(fs);
+        CHECK(le);
+        CHECK(fe);
+        CHECK(l01);
+        CHECK(f01);
+    }
+    {   /* without the env: 1 refused by name, 0 taken; no line */
+        Serving sv;
+        REQUIRE(sv.start("1,3", kLanes2));
+        post(sv.port, 1, 400, "RADIANCE_PP_SEND_ASH=N");
+        post(sv.port, 0, 200, nullptr);
+        CHECK(complete(sv.port, p, 24) == ref);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        /* (the refusal names the env in the leader's log; the start / stop lines are absent) */
+        CHECK(sv.lead.output().find("a row-sharded X1 payload") == std::string::npos);
+        CHECK(sv.lead.output().find("shares from the side streams") == std::string::npos);
+        CHECK(sv.fol.output().find("RADIANCE_PP_SEND_ASH") == std::string::npos);
+    }
+}
+
 /* ------------------------------------------------------------------ tp8 dev M8 */
 /* RADIANCE_PP_BG_LANE=1 (the last lane holds no sequence; a newcomer planned whole beside decoders is lent whole to it) with
  * the follower's segments for that lane's passes (RADIANCE_PP_SEG_LAYERS=1, no RADIANCE_PP_SEG_PREFILL) and ready-first tails:

@@ -300,7 +300,7 @@ TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
     const int i = fn4::switch_index("sched_lane_room");
     REQUIRE(i == (int)fn4::kSchedLaneRoom);
     CHECK_EQ(i, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it */
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -312,6 +312,27 @@ TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
     CHECK_EQ(taken[(size_t)i], 1u);
     CHECK(skipped.empty());
     CHECK_EQ(fn4::sched_lane_room(), 0);
+}
+
+/* tp8 loop P46: pp_send_ash is switch 105, after sched_lane_room, BOTH nodes' (each its own send rings): a follower asks for the
+ * leader's request; a follower started without RADIANCE_PP_SEND_ASH refuses 1 by name (skipped, never a failure) and keeps 0. */
+TEST(pp_send_ash_follows_the_leaders_request_after_sched_lane_room) {
+    const int i = fn4::switch_index("pp_send_ash");
+    REQUIRE(i == (int)fn4::kPpSendAsh);
+    CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(fn4::follower_switch(i));
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 1;
+    std::vector<std::string> skipped;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 0);
+    CHECK_EQ(taken[(size_t)i], 1u);
+    REQUIRE_EQ(skipped.size(), (size_t)1);
+    CHECK(skipped[0].find("pp_send_ash=1") != std::string::npos);
+    CHECK(skipped[0].find("RADIANCE_PP_SEND_ASH=N") != std::string::npos);
+    CHECK_EQ(fn4::pp_send_ash(), 0);
 }
 
 }  /* namespace */
