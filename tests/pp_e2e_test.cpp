@@ -2244,6 +2244,71 @@ TEST(p46_send_ash_staging_and_switch_serve_one_process_tokens_and_plan) {
     }
 }
 
+/* tp8 loop W1s (fn4 aql_waitk = switch 106, lever WAITK in process): POSTed to the leader between requests, the switch reaches BOTH
+ * nodes (each applies it to its own AQL waits: a follower switch) and a cold multi-chunk prompt at 2 lanes W(1,3) serves one
+ * process's tokens and chunk plan at 1, 2 and 0 again; 3 is refused by name. The host backend issues no AQL packet, so here the
+ * switch's path is what is proven; the wait kernel's ordering is device_test's card cases (RAD_TEST_FILTER=waitk), its effect a
+ * card start's arm. */
+TEST(w1s_aql_waitk_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
+    REQUIRE(world().ok);
+    /* three different cold prompts (no prefix hit between them), one a switch value */
+    std::vector<std::vector<int32_t>> ps, ref;
+    for (int k = 0; k < 3; ++k) ps.push_back(prompt_ids(1061 + 7 * k, 1000));
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        for (const std::vector<int32_t>& p : ps) ref.push_back(complete(sv.port, p, 24));
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);   /* (position pairs, sorted and unique over the three: chunks_of) */
+    auto post = [](int port, int v, int want) {
+        std::string out;
+        Call c;
+        const int st = c.send(port, "/admin/fn4", json{ { "aql_waitk", v } }.dump()) ? c.read(&out) : -1;
+        CHECK_EQ(st, want);
+        if (want == 400) CHECK(out.find("aql_waitk takes 0") != std::string::npos);
+        if (st != want) fprintf(stderr, "    POST aql_waitk %d: %d %s\n", v, st, out.c_str());
+    };
+    Serving sv;
+    REQUIRE(sv.start("1,3", kLanes2, { "RADIANCE_LOG_STEPS=1" }));
+    std::vector<std::vector<int32_t>> got;
+    const int vals[3] = { 1, 2, 0 };
+    for (int k = 0; k < 3; ++k) {
+        post(sv.port, vals[k], 200);
+        got.push_back(complete(sv.port, ps[(size_t)k], 24));
+    }
+    post(sv.port, 3, 400);
+    kill(sv.lead.child.pid, SIGTERM);
+    CHECK_EQ(sv.lead.finish(60), 0);
+    CHECK_EQ(sv.fol.finish(30), 0);
+    const std::string llog = sv.lead.output(), flog = sv.fol.output();
+    const std::vector<std::pair<int, int>> plan = chunks_of(llog);
+    /* the three requests plan one process's chunks */
+    const bool plan_ok = plan == ref_plan;
+    int lsw = 0, fsw = 0;
+    for (const char* w : { "aql_waitk=1", "aql_waitk=2", "aql_waitk=0" }) {
+        const std::string line = std::string("fn4: switches ") + w + " applied at step ";
+        lsw += llog.find(line) != std::string::npos;
+        fsw += flog.find(line) != std::string::npos;
+    }
+    fprintf(stderr, "    fn4 aql_waitk 1 / 2 / 0, 2 lanes W(1,3): tokens %s / %s / %s, plan %s (%zu chunks one process, %zu here); "
+                    "switch lines leader %d / 3, follower %d / 3\n",
+            got[0] == ref[0] ? "identical" : "DIFFERENT", got[1] == ref[1] ? "identical" : "DIFFERENT",
+            got[2] == ref[2] ? "identical" : "DIFFERENT", plan_ok ? "identical" : "DIFFERENT", ref_plan.size(), plan.size(), lsw, fsw);
+    if (!plan_ok || lsw != 3 || fsw != 3)
+        fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    for (int k = 0; k < 3; ++k) {
+        CHECK(!ref[(size_t)k].empty());
+        CHECK(got[(size_t)k] == ref[(size_t)k]);
+    }
+    CHECK(plan_ok);
+    CHECK_EQ(lsw, 3);
+    CHECK_EQ(fsw, 3);
+}
+
 /* ------------------------------------------------------------------ tp8 dev M8 */
 /* RADIANCE_PP_BG_LANE=1 (the last lane holds no sequence; a newcomer planned whole beside decoders is lent whole to it) with
  * the follower's segments for that lane's passes (RADIANCE_PP_SEG_LAYERS=1, no RADIANCE_PP_SEG_PREFILL) and ready-first tails:
