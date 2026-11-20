@@ -43,7 +43,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
-                                        "sched_srf" };
+                                        "sched_srf", "aql_hdp" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -332,6 +332,15 @@ int env_tail_grid() {
     return env;
 }
 
+/* tp8 loop U1 (upstream 8f2e511f): RADIANCE_AQL_HDP_FLUSH=1 at start (anything else, or unset, is 0). */
+int env_aql_hdp() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_AQL_HDP_FLUSH");
+        return e && !std::strcmp(e, "1") ? 1 : 0;
+    }();
+    return env;
+}
+
 /* tp8 loop P44: RADIANCE_SCHED_SRF=1 / 2 at start (anything else, or unset, is 0). */
 int env_sched_srf() {
     static const int env = [] {
@@ -372,6 +381,10 @@ int reported(State& s, int i) {
     if (i == kSchedSrf) {          /* tp8 loop P44: set, else RADIANCE_SCHED_SRF (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_sched_srf();
+    }
+    if (i == kAqlHdp) {            /* tp8 loop U1: set, else RADIANCE_AQL_HDP_FLUSH (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_aql_hdp();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -501,6 +514,10 @@ int sched_tail_inner() {
 int sched_srf() {
     const int v = st().val[kSchedSrf].load(std::memory_order_acquire);
     return v >= 0 ? v : env_sched_srf();
+}
+int aql_hdp() {
+    const int v = st().val[kAqlHdp].load(std::memory_order_relaxed);
+    return v >= 0 ? v : env_aql_hdp();
 }
 int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     State& s = st();
@@ -919,7 +936,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1486,6 +1503,15 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kAqlHdp) {            /* tp8 loop U1: the AQL backend's, read at every doorbell */
+        if (v != 0 && v != 1) {
+            if (err) *err = "aql_hdp takes 0 (a store fence in front of a doorbell, as before) or 1 (the fence, then a store to the "
+                            "card's host data path flush register, so the kernel arguments written through the BAR are in VRAM before "
+                            "the packets that read them are announced: upstream 8f2e511f; tp8 loop U1)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedSrf) {          /* tp8 loop P44: the scheduler's, read at every step it plans */
         if (v < 0 || v > 2) {
             if (err) *err = "sched_srf takes 0 (today's plan), 1 (running prompts with no decode row and no admission possible take "
@@ -1612,7 +1638,7 @@ PeerCheck& peer_fn() { static PeerCheck f; return f; }
 
 bool follower_switch(int i) {
     if (i < 0 || i >= kSwitches) return false;
-    return plugin_switch(i) || i == kAqlAcq || i == kRouteCopyOv || i == kPlaceLf || i == kPlaceSwapLent ||
+    return plugin_switch(i) || i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kPlaceLf || i == kPlaceSwapLent ||
            i == kHeatMinGainX100 || i == kHeatHystX100 || i == kPlaceHb ||
            i == kPpFolReserve ||   /* tp8 loop IDEAS #9: the follower's own loop reads it */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
@@ -1756,7 +1782,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)

@@ -522,6 +522,13 @@
  *                   others sit out or stay queued, a waiting one is admitted into a step of its own -- and its chunks go over the
  *                   lanes as a lone cold prompt's (a wide span piece too: the borrowers' prompts sit out). Each prompt's chunks are
  *                   its lone plan (exact as a lone prompt's). Unset: the start's RADIANCE_SCHED_SRF (0 / 1 / 2).
+ *   aql_hdp         core, the AQL backend (tp8 loop U1 = upstream 8f2e511f's first half; 102 here, after sched_srf): 0 -- a store
+ *                   fence in front of a doorbell, as before; 1 -- the fence, then a store to the card's host data path flush register
+ *                   (HSA_AMD_AGENT_INFO_HDP_FLUSH) in front of every doorbell (a live packet's publish and a played run's ring), so the
+ *                   kernel arguments and chain records written into VRAM through the BAR are there before the packets that read them
+ *                   are announced. Order of host writes only: no packet, argument or kernel changes (rule A). A card whose arguments
+ *                   live in host memory, or whose driver gives no register, flushes nothing. Both nodes of a pipeline (a follower
+ *                   switch). Unset: the start's RADIANCE_AQL_HDP_FLUSH (0 / 1).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -758,7 +765,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -882,6 +889,8 @@ void note_sched_tail_grid(const int64_t* v);
 int  sched_tail_inner();
 /* tp8 loop P44 (sched_srf): the switch once set, else RADIANCE_SCHED_SRF at start (0 = off); read at every step planned. */
 int  sched_srf();
+/* tp8 loop U1 (aql_hdp): the switch once set, else RADIANCE_AQL_HDP_FLUSH at start (0 = off); read at every doorbell. */
+int  aql_hdp();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
