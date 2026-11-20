@@ -1192,6 +1192,19 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
     const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P, wl);
     if (pro) {   /* the folds (bf16 out): the (KP, WL) their K allows (q_b K 1280: P 2; shexp down 768 / 512: P 2 / 4) */
         if (f32out) return R4D_WK_DECLINE;
+        if constexpr (T == GG_Q6_K) {   /* round 43 bench: the folds on IL-B (R4D_WK3_AB 384) */
+            static const int abf = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
+            if ((abo >= 0 ? abo : abf) == 384) {
+#define GG_WK_FIL(KPV, WLV, PV, DPV)                                                                                \
+                if (kp == KPV && wl == WLV && pro == PV && dp2 == (DPV == 2)) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t, PV, DPV, 384>), grid, dim3(256), lds, A);
+                GG_WK_FIL(1, false, 1, 1) GG_WK_FIL(2, false, 1, 1) GG_WK_FIL(1, true, 1, 1) GG_WK_FIL(2, true, 1, 1)
+                GG_WK_FIL(1, false, 2, 1) GG_WK_FIL(2, false, 2, 1) GG_WK_FIL(4, false, 2, 1) GG_WK_FIL(1, true, 2, 1) GG_WK_FIL(2, true, 2, 1)
+                GG_WK_FIL(4, true, 2, 1) GG_WK_FIL(1, false, 1, 2) GG_WK_FIL(2, false, 1, 2) GG_WK_FIL(1, false, 2, 2) GG_WK_FIL(2, false, 2, 2)
+                GG_WK_FIL(4, false, 2, 2)
+#undef GG_WK_FIL
+                return R4D_WK_DECLINE;
+            }
+        }
 #define GG_WK_F(KPV, WLV, PV)                                                                                     \
         if (kp == KPV && wl == WLV && pro == PV) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t, PV>), grid, dim3(256), lds, A);
 #define GG_WK_F2(KPV, PV)                                                                                         \
@@ -1217,6 +1230,7 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
             if (dp2) {                                                                                                           \
                 if (kp == 1 && !f32out) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 2, ABV>), grid, dim3(256), lds, A); \
                 if (kp == 2 && !f32out) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 2, ABV>), grid, dim3(256), lds, A); \
+                if (kp == 4 && !f32out) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 2, ABV>), grid, dim3(256), lds, A); \
                 return R4D_WK_DECLINE;                                                                                           \
             }                                                                                                                    \
             if (wl) {                                                                                                            \
@@ -1233,6 +1247,8 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
             }                                                                                                                    \
             if (f32out) {                                                                                                        \
                 if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, float, 0, 1, ABV>), grid, dim3(256), lds, A);         \
+                if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, float, 0, 1, ABV>), grid, dim3(256), lds, A);         \
+                if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, float, 0, 1, ABV>), grid, dim3(256), lds, A);         \
                 return R4D_WK_DECLINE;                                                                                           \
             }                                                                                                                    \
             if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);          \
@@ -1377,6 +1393,17 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
     }
     if (pro) {   /* the folds (bf16 out) at the K their shapes have: q_b K 1280 (P 2: KP 1, q5_K / q6_K), shexp down 768 / 512 (KP 1 / 2) */
         if (f32out) return R4D_WK_DECLINE;
+        if constexpr (T == GG_Q6_K) {   /* round 43 bench: the folds on IL-B (R4D_WK3_AB 384) */
+            if (abo < 0 && ab == 384) {
+#define GG_WK3_FIL(KPV, NMV, NTV, PV)                                                                                   \
+                if (kp == KPV && nmt == NMV && nt == NTV && pro == PV && !dp2) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV, 1, 384>), grid, dim3(256), lds, A);
+                GG_WK3_FIL(1, 2, 2, 1) GG_WK3_FIL(1, 3, 1, 1) GG_WK3_FIL(1, 2, 1, 1)
+                GG_WK3_FIL(1, 2, 2, 2) GG_WK3_FIL(1, 3, 1, 2) GG_WK3_FIL(1, 2, 1, 2)
+                GG_WK3_FIL(2, 2, 2, 2) GG_WK3_FIL(2, 3, 1, 2) GG_WK3_FIL(2, 2, 1, 2)
+#undef GG_WK3_FIL
+                return R4D_WK_DECLINE;
+            }
+        }
 #define GG_WK3_F(KPV, NMV, NTV, PV)                                                                                     \
         if (kp == KPV && nmt == NMV && nt == NTV && pro == PV) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV>), grid, dim3(256), lds, A);
         if constexpr (T != GG_Q8_0) { GG_WK3_F(1, 2, 2, 1) GG_WK3_F(1, 3, 1, 1) GG_WK3_F(1, 2, 1, 1) }
@@ -1406,21 +1433,24 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
  * an 8 KiB check; a pack is followed by a 256 MiB read so the timed launch starts cold. Shared by G1 (r4d_gg_wk_run) and G2. */
 static bool gg_il_swap(GgWkArgs& A, int ty, const GgWkFold* fo, int tlab, int nm, const uint8_t* const* wd, const long long* Nv, long long K,
                        long long w_ld) {
-    if ((tlab & 384) && ty == GG_Q6_K && !fo) {   /* round 42 bench: the weights' tile-interleaved copies (cached by pointer + 8 KiB check) */
+    if ((tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384)) {   /* round 42 bench: the weights' tile-interleaved copies (cached by pointer + 8 KiB check); round 43: folds at IL-B */
+        static const int ilfast = [] { const char* e = std::getenv("R4D_WK3_ILFAST"); return e && e[0] == '1' ? 1 : 0; }();   /* round 43: key = pointer only, no D2H check (chain timing) */
         struct Il { const void* src; long long N, K, ld; int mode; std::vector<uint8_t> chk; uint8_t* dst; };
         const int ilm = (tlab & 256) ? 2 : 1;
         bool packed = false;
         static std::vector<Il> cache;
         for (int i = 0; i < nm; ++i) {
             const long long N_ = Nv[i], S_ = K / kWmS, bytes = N_ * w_ld;
-            std::vector<uint8_t> chk(8192);
-            (void)hipMemcpy(chk.data(), wd[i], 4096, hipMemcpyDeviceToHost);
-            (void)hipMemcpy(chk.data() + 4096, (const uint8_t*)wd[i] + bytes - 4096, 4096, hipMemcpyDeviceToHost);
+            std::vector<uint8_t> chk(ilfast ? 0 : 8192);
+            if (!ilfast) {
+                (void)hipMemcpy(chk.data(), wd[i], 4096, hipMemcpyDeviceToHost);
+                (void)hipMemcpy(chk.data() + 4096, (const uint8_t*)wd[i] + bytes - 4096, 4096, hipMemcpyDeviceToHost);
+            }
             uint8_t* dst = nullptr;
             for (auto& c : cache)
                 if (c.src == wd[i] && c.N == N_ && c.K == K && c.ld == w_ld && c.mode == ilm && c.chk == chk) dst = c.dst;
             if (!dst) {
-                if (cache.size() >= 64) { (void)hipFree(cache.front().dst); cache.erase(cache.begin()); }
+                if (cache.size() >= (ilfast ? 512u : 64u)) { (void)hipFree(cache.front().dst); cache.erase(cache.begin()); }
                 const long long tiles = (N_ + 15) / 16;
                 if (hipMalloc((void**)&dst, (size_t)(tiles * S_ * kIl6)) != hipSuccess) return false;
                 const long long th = tiles * S_ * (ilm == 2 ? 32 : 16);
@@ -1514,7 +1544,7 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     default: rc = gg_launch_wk3_t<GG_Q5_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
     }
     static const int ilchk = [] { const char* e = std::getenv("R4D_WK3_ILCHK"); return e && e[0] == '1' ? 1 : 0; }();
-    if (ilchk && (tlab & 384) && ty == GG_Q6_K && !fo && rc != R4D_WK_DECLINE) {   /* round 42: the IL launch's bytes vs the stock kernel on the stored layout */
+    if (ilchk && (tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384) && rc != R4D_WK_DECLINE) {   /* round 42: the IL launch's bytes vs the stock kernel on the stored layout */
         (void)hipDeviceSynchronize();
         const size_t ob = f32out ? 4 : 2;
         GgWkArgs B = A0;
@@ -1632,7 +1662,7 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
     default: rc = gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, pro, A, grid); break;
     }
     static const int ilchk1 = [] { const char* e = std::getenv("R4D_WK3_ILCHK"); return e && e[0] == '1' ? 1 : 0; }();
-    if (ilchk1 && (tlab & 384) && ty == GG_Q6_K && !fo && rc == 0) {   /* round 43: G1's IL launch bytes vs the stock kernel on the stored layout */
+    if (ilchk1 && (tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384) && rc == 0) {   /* round 43: G1's IL launch bytes vs the stock kernel on the stored layout */
         (void)hipDeviceSynchronize();
         const size_t ob = f32out ? 4 : 2;
         GgWkArgs B = A0;
