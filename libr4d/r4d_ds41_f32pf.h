@@ -36,6 +36,7 @@ int r4d_f32pf_known(int v);
  * chain). The runtime switch "ds41_f32dec" (libr4d's rad_fn4_*, RADIANCE_DS41_F32DEC at load): 0 the stock rule (today),
  * 1 the decode band (rows <= 63) of both in the forms r4d_f32dec_*_form picks, 2 the router's only, 3 gemm_nt_f32's only.
  * tp8 loop D28 (19.11.2026): 4 .. 7 = 1 with the router's 17..48 rows in the 2-D wave map form 15 .. 18 (r4d_ds41_elem.hip).
+ * Lever RGP (DRAFTER round 17): 8 = 1 with the router's 17..64 rows in form 19; lever RGK (DRAFTER round 39): 9 = form 21 at 1..64 rows.
  * Every form keeps the stock per-output arithmetic (lane l folds k = l, l + 32, .. ascending with fmaf, then the xor
  * butterfly: r4d_gemm_f32_tile.h / the GPF-b note above), so the bytes are the stock rule's at every form. */
 int r4d_f32dec_get();

@@ -302,7 +302,7 @@ static void f32dec_note(int kind, int rows, int form) {
                  rows);
 }
 
-int r4d_f32dec_known(int v) { return v >= 0 && v <= 8 ? 1 : 0; }   /* 4 .. 7: tp8 loop D28; 8: lever RGP */
+int r4d_f32dec_known(int v) { return v >= 0 && v <= 9 ? 1 : 0; }   /* 4 .. 7: tp8 loop D28; 8: lever RGP; 9: lever RGK */
 int r4d_f32dec_set(int v) {
     if (!r4d_f32dec_known(v)) return -1;
     g_f32dec.store(v, std::memory_order_relaxed);
@@ -371,8 +371,9 @@ int r4d_f32dec_gemm_form(int rows, int n) {
     else {
         const int v = g_f32dec.load(std::memory_order_relaxed);
         /* 4 .. 7: 1's gemm rule (D28); 8 (lever RGP) too -- F74 (DRAFTER round 20): without it RGP's value sent the compressor's
-         * 17..63-row calls to the stock form (lq190: gemm_nt_f32_tile<8,1,8> 363-500 us vs form 4's 60-87, L +0.31 ms at c16) */
-        if (v == 1 || v == 3 || (v >= 4 && v <= 8)) f = r4d_f32dec_rule_gemm(rows, n);
+         * 17..63-row calls to the stock form (lq190: gemm_nt_f32_tile<8,1,8> 363-500 us vs form 4's 60-87, L +0.31 ms at c16);
+         * 9 (lever RGK) too */
+        if (v == 1 || v == 3 || (v >= 4 && v <= 9)) f = r4d_f32dec_rule_gemm(rows, n);
     }
     if (f > 0) {
         g_f32dec_n[1].fetch_add(1, std::memory_order_relaxed);
@@ -385,13 +386,17 @@ int r4d_f32dec_rgs_form(int rows) {
     const int p = g_f32dec_pin_rgs.load(std::memory_order_relaxed);
     const int v = g_f32dec.load(std::memory_order_relaxed);
     /* above 48 rows (only under the core's RADIANCE_RGS_ROWS=64): a pin or lever RGP's value, else the stock form as before */
-    if (rows > 48 && p < 0 && v != 8) return 0;
+    if (rows > 48 && p < 0 && v != 8 && v != 9) return 0;
     int f = 0;
     if (p >= 0) f = p;
     else {
         /* lever RGP (DRAFTER track round 17): 8 = 1 with the router's 17..64 rows in form 19 (the selection a row group at a
          * time; the stock bytes) */
         if (v == 8) f = rows > 16 ? 19 : r4d_f32dec_rule_rgs(rows);
+        /* lever RGK (DRAFTER track round 39): 9 = form 21 at 1..64 rows (form 19's map + the scores / keys in the GEMM epilogue; the
+         * stock bytes; xeon card 1 r39t read-cold us a call vs 1's rule: 1 / 8 rows 24.0 / 24.9 vs 25.7 / 26.0, 16 24.9 vs 30.0,
+         * 32 28.6 vs 41.2, 48 38.5 vs 56.0, 64 43.9 vs 91.4) */
+        else if (v == 9) f = 21;
         else if (v == 1 || v == 2) f = r4d_f32dec_rule_rgs(rows);
         /* tp8 loop D28 (DECODE round 22): 4 .. 7 = 1 with the router's 17..48 rows in the 2-D wave map form 15 .. 18 (a workgroup
          * = row groups x expert groups, so each weight row is read by fewer workgroups; the stock bytes) */

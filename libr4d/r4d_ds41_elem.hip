@@ -1926,6 +1926,137 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowsel_kernel(
     r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k), (uint32_t)n_local, sl, inv);
 }
 
+/* Lever RGK (DRAFTER track round 39, tp8 loop 20.11.2026; ds41_f32dec 9, form 21): RGP with the selection's PER-EXPERT part moved
+ * into the GEMM workgroups' epilogue. router_scored_row spends most of a row's time on its 12 scores a lane (the score's exp / log1p
+ * with their table reads, then the rank key) before the 6 rounds; here, once a workgroup's logits are written (tile_wave, the stock
+ * bytes), its threads form each of them's score and rank key with the same element functions (ds_exp_n / ds_log1p_n / sqrtf /
+ * ds_rank_key: the same bits whichever thread forms them) into a scratch [rows][n_expert], and the row group's last arriver runs
+ * router_keyed_row: the stock 6 rounds over the keys, the weights from the chosen experts' scores, the sum in round order. So every
+ * output -- logits, ids, weights, sorted_tok, expert_offset, expert_count (and the inverse) -- is the stock launch's bytes at any M
+ * (tools/dbench/rbench r39d: logits / ids / weights / the sort byte-identical to the served form 19 at 16 / 32 / 48 / 64 rows, each
+ * launched twice). The scratch is libr4d's own, one per (stream, logits buffer), made at that buffer's first form-21 launch
+ * (r4d_8a8_split_ctr's pattern; 64 x 384 x 12 B = 288 KiB); every key / score the tail reads is written earlier in the same launch.
+ * One card (xeon GPU1, K 5120, 384 experts, bf16; cold = after a 256 MiB read, us a call, form 19 -> 21): 16 rows 30.6 -> 25.1,
+ * 32 33.2 -> 28.6, 48 44.3 -> 38.2, 64 51.1 -> 43.8 (form 8, ds41_f32dec 1's rule at 17..48 rows: 56.2 at 48 rows). */
+template <int SCORE>
+__device__ __forceinline__ float router_score_one(float x) {
+    static_assert(SCORE == kSqrtSoftplus || SCORE == kSigmoid, "a per-expert score (the softmax needs its row)");
+    float t[1];
+    if (SCORE == kSigmoid) {
+        t[0] = -x;
+        ds_exp_n(t);
+        return 1.0f / (1.0f + t[0]);
+    }
+    t[0] = x;
+    ds_exp_n(t);
+    ds_log1p_n(t);
+    return sqrtf(x > 20.0f ? x : t[0]);
+}
+/* router_scored_row from the 6 rounds on: the rank keys and scores come from the epilogue (keys / sc, pitch kp) */
+template <int OWN>
+__device__ __forceinline__ int router_keyed_row(const unsigned long long* keys, const float* sc, long kp, int32_t* ids,
+                                                long ip, float* weights, long wp, long r, int ne, int k, int norm,
+                                                float factor, int lane) {
+    unsigned long long key[OWN];
+#pragma unroll
+    for (int i = 0; i < OWN; ++i) {
+        const int e = lane + 32 * i;
+        key[i] = e < ne ? keys[r * kp + e] : 0ull;
+    }
+    unsigned long long below = ~0ull, mine = 0;
+    for (int j = 0; j < k; ++j) {
+        unsigned long long best = 0;
+#pragma unroll
+        for (int i = 0; i < OWN; ++i) {
+            const unsigned long long c = key[i] < below ? key[i] : 0ull;
+            best = c > best ? c : best;
+        }
+        best = ds_wave_max_u64(best);
+        if (lane == j) mine = best;
+        below = best;
+    }
+    const int e = mine ? (int)~(uint32_t)mine : 0;
+    const float chosen = sc[r * kp + e];
+    float total = 0;
+    for (int j = 0; j < k; ++j)
+        total += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(chosen), j));
+    const float mult = norm ? factor / (total + 1e-20f) : factor;
+    if (lane < k) {
+        ids[r * ip + lane] = e;
+        weights[r * wp + lane] = chosen * mult;
+    }
+    return e;
+}
+template <int R, int C, int U, typename WT, int OWN, int SCORE, uint32_t NW, bool INV>
+__global__ __launch_bounds__(NW * 32) void router_gemm_rowkey_kernel(
+    const uint16_t* x, long xp, const WT* wt, long wtp, float* lg, long lp, int m, int ne, int K,
+    const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
+    int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
+    r4d_moesort::Protect prot, unsigned* ctr, unsigned long long* keys, float* sc) {
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int cb = (int)blockIdx.x * (int)NW * C, c0 = cb + wave * C, r0 = (int)blockIdx.y * R;
+    if (c0 < ne && r0 < m) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
+    __syncthreads();   /* the workgroup's logits (each wave's lane 0 wrote its tile) */
+    for (int q = threadIdx.x; q < R * (int)NW * C; q += (int)NW * 32) {
+        const int row = r0 + q / ((int)NW * C), col = cb + q % ((int)NW * C);
+        if (row < m && col < ne) {
+            const float p = router_score_one<SCORE>(lg[(long)row * lp + col]);
+            sc[(long)row * ne + col] = p;
+            keys[(long)row * ne + col] = ds_rank_key(p + bias[(long)col * bp], col);
+        }
+    }
+    __shared__ unsigned s_last;
+    __threadfence();   // this workgroup's logits, scores and keys, device-wide, before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned* gc = ctr + 1 + blockIdx.y;
+        const unsigned old = __hip_atomic_fetch_add(gc, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.x ? 1u : 0u;
+        if (s_last) __hip_atomic_store(gc, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // the row group's keys from its other workgroups
+    for (int r = r0 + wave; r < r0 + R && r < m; r += (int)NW) {
+        const int e = router_keyed_row<OWN>(keys, sc, ne, ids, ip, weights, wp, r, ne, k, norm, factor, lane) - base;
+        if (lane < k)
+            sorted[r * k + lane] = e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+    }
+    __threadfence();   // this row group's slots (and ids / weights) before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.y ? 1u : 0u;
+        if (s_last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // every row group's slots
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int i = threadIdx.x; i < m * k; i += (int)(NW * 32)) sl.e[i] = sorted[i];
+    lds_barrier();   // the slot list is in LDS before the sort writes `sorted`
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k), (uint32_t)n_local, sl, inv);
+}
+/* lever RGK's scratch: keys [64][384] u64 then scores [64][384] f32, one per (stream, logits buffer); nullptr = form 19 serves */
+constexpr long kRgkRows = 64, kRgkExperts = 384;
+unsigned long long* rgk_scratch(RadStream s, const void* lg) {
+#ifdef R4D_EMU_HOST
+    (void)s; (void)lg;
+    return nullptr;
+#else
+    static std::mutex mu;
+    static std::map<std::pair<RadStream, const void*>, unsigned long long*> blocks;
+    const auto key = std::make_pair(s, lg);
+    std::lock_guard<std::mutex> lk(mu);
+    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+    void* p = nullptr;
+    if (hipMalloc(&p, (size_t)kRgkRows * kRgkExperts * (8 + 4)) != hipSuccess) return nullptr;
+    blocks.emplace(key, (unsigned long long*)p);
+    return (unsigned long long*)p;
+#endif
+}
+
 /* The op instance's arrival counter (router_gemm_topk_scatter's rule, r4d_moe.hip): taken at init -- once per resolved
  * instance during declare, before the engine measures free VRAM -- never on the launch path; zeroed, and zeroed again by
  * each launch's last arriver. One 64-byte slot an instance (op, band, domain, rank); each routed layer declares its own
@@ -2008,6 +2139,24 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
         /* lever RGP (DRAFTER track round 17): form 3's 4 x 4 U8 tile at 8 waves (19) / U 16 (20), the selection a row group at a time */
         case 19: return RGP_I(4, 4, 8, 8u);
         case 20: return RGP_I(4, 4, 16, 8u);
+        /* lever RGK (DRAFTER track round 39): form 19's map with the scores / keys in the GEMM epilogue (form 19 when the scratch
+         * cannot be made or the expert count exceeds it) */
+        case 21: {
+            unsigned long long* sk = (SCORE == kSqrtSoftplus || SCORE == kSigmoid) && m <= kRgkRows && ne <= kRgkExperts
+                                         ? rgk_scratch(stream, lg.data) : nullptr;
+            if (!sk) return RGP_I(4, 4, 8, 8u);
+            float* sc = (float*)(sk + kRgkRows * kRgkExperts);
+#define RGK_L(R, C, U, NW, INV)                                                                                   \
+    R4D_EMIT(stream, (router_gemm_rowkey_kernel<R, C, U, WT, 12, (SCORE == kSigmoid ? kSigmoid : kSqrtSoftplus), NW, INV>), \
+             dim3((unsigned)((ne + (NW) * (C) - 1) / ((NW) * (C))), (unsigned)((m + (R) - 1) / (R))),             \
+             dim3((NW) * 32), 0, (const uint16_t*)x.data, (long)x.stride[0], (const WT*)w.data, (long)w.stride[0],  \
+             (float*)lg.data, (long)lg.stride[0], m, ne, K, (const float*)bias.data, (long)bias.stride[0],         \
+             (int32_t*)ids.data, (long)ids.stride[0], (float*)wts.data, (long)wts.stride[0], (int32_t*)sorted.data, \
+             (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
+             factor, base, prot, ctr, sk, sc)
+            return inv ? RGK_L(4, 4, 8, 8u, true) : RGK_L(4, 4, 8, 8u, false);
+#undef RGK_L
+        }
         default: break;
     }
     /* the stock gemm_f32_body's tile form for the height (2x2 with 16 steps up to 16 rows, 8x1 with 8 steps below
