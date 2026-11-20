@@ -7257,7 +7257,16 @@ TEST(a_bg_lanes_builder_carves_its_block_tables_for_its_rows_and_refuses_more) {
     CHECK(ref.build(p, f.kv, 1) != nullptr);
     bb.fini();
     ref.fini();
-    struct Env { ~Env() { unsetenv("RADIANCE_PP_BG_ROWS"); } } env;
+    /* tp8 loop D47b: a decode lane's rows = its cards + M below max_seqs, else max_seqs; RADIANCE_PP_LANE_ROWS takes 1 .. 256 */
+    CHECK_EQ(LaneSet::lane_rows(16, 4, 32), (int64_t)20);
+    CHECK_EQ(LaneSet::lane_rows(16, 0, 32), (int64_t)32);
+    CHECK_EQ(LaneSet::lane_rows(16, 16, 32), (int64_t)32);
+    CHECK_EQ(LaneSet::lane_rows(3, 1, 10), (int64_t)4);
+    struct Env { ~Env() { unsetenv("RADIANCE_PP_BG_ROWS"); unsetenv("RADIANCE_PP_LANE_ROWS"); } } env;
+    for (const auto& [v, want] : std::vector<std::pair<const char*, int64_t>>{ { "4", 4 }, { "256", 256 }, { "0", 0 }, { "999", 0 }, { "", 0 } }) {
+        setenv("RADIANCE_PP_LANE_ROWS", v, 1);
+        CHECK_EQ(LaneSet::lane_rows_env(), want);
+    }
     for (const auto& [v, want] : std::vector<std::pair<const char*, int64_t>>{ { "4", 4 }, { "1", 1 }, { "256", 256 }, { "0", 0 },
                                                                                { "257", 0 }, { "x", 0 }, { "-3", 0 } }) {
         setenv("RADIANCE_PP_BG_ROWS", v, 1);

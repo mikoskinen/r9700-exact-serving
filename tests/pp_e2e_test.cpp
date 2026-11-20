@@ -3751,9 +3751,9 @@ TEST(bg_rows_cap_the_bg_lanes_slabs_and_serve_one_process_tokens) {
         if (const size_t at = llog.rfind(kk); at != std::string::npos) kept = std::atoll(llog.c_str() + at + kk.size());
         if (kept > 0) kept_all += kept;
         const std::string rows_s = std::to_string(a.rows);
-        const bool slab_l = llog.find("block tables for " + rows_s + " rows, not 10 (a BG lane's, RADIANCE_PP_BG_ROWS") != std::string::npos;
-        const bool slab_f = flog.find("block tables for " + rows_s + " rows, not 10 (a BG lane's, RADIANCE_PP_BG_ROWS") != std::string::npos;
-        const bool budget = llog.find("BG lanes' step slabs at " + rows_s + " block-table rows (RADIANCE_PP_BG_ROWS") != std::string::npos;
+        const bool slab_l = llog.find("block tables for " + rows_s + " rows, not 10 (RADIANCE_PP_BG_ROWS") != std::string::npos;
+        const bool slab_f = flog.find("block tables for " + rows_s + " rows, not 10 (RADIANCE_PP_BG_ROWS") != std::string::npos;
+        const bool budget = llog.find("the lanes' step slabs at their block-table rows (RADIANCE_PP_BG_ROWS " + rows_s + " / ") != std::string::npos;
         fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s BG_ROWS=%d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; "
                         "BG steps %lld, %lld with >= 2 newcomers, %lld with >= 3; %lld lends turned away; slab line leader %d follower %d, "
                         "budget line %d\n", a.bg ? a.bg : "-", a.room ? a.room : "off", a.rows, a.lanes, a.cut, differ, ref.size(), bg,
@@ -3781,6 +3781,108 @@ TEST(bg_rows_cap_the_bg_lanes_slabs_and_serve_one_process_tokens) {
     }
     fprintf(stderr, "    all BG_ROWS arms: %lld lends turned away by a BG lane's rows\n", kept_all);
     CHECK(kept_all > 0);
+}
+
+/* tp8 loop D47b: RADIANCE_PP_LANE_ROWS=M -- a decode lane's step slab carves its block tables for its own cards + M rows and
+ * lane_split_own lends a piece into it only below M pieces. lane_set (seven alone, then eight at once: newcomers' chunks cut
+ * over the lanes in 16-row pieces) at 3 lanes W(0,2) / W(1,3), M 1 and 2: tokens = one process; the slab lines on both nodes
+ * name the rows (2 cards + M at --max-num-seqs 6), the start line names M, the run-end line counts the lends M turned away;
+ * + M 1 beside RADIANCE_PP_BG_ROWS=1 at 4 lanes W(1,3) with a BG lane (bg_room_set). */
+TEST(lane_rows_cap_the_decode_lanes_slabs_and_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "6" }));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    long long kept_all = 0;
+    struct Arm { int lanes; int m; const char* cut; bool rr; };
+    for (const Arm a : { Arm{ 3, 1, "0,2", true }, Arm{ 3, 1, "1,3", true }, Arm{ 3, 2, "0,2", true }, Arm{ 2, 1, "0,2", false },
+                         Arm{ 2, 1, "1,3", false }, Arm{ 2, 2, "1,3", false } }) {
+        const int m = a.m;
+        const char* cut = a.cut;
+        {
+            std::vector<std::string> env = a.rr ? kSplitEnv : std::vector<std::string>{ "RADIANCE_PP_SPLIT_MIN=16" };
+            env.push_back("RADIANCE_PP_LANE_ROWS=" + std::to_string(m));
+            Serving pp;
+            REQUIRE(pp.start(cut, lane_shape(a.lanes), env));
+            const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output(), flog = pp.fol.output();
+            REQUIRE_EQ(ref.size(), got.size());
+            int differ = 0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                CHECK(!ref[i].empty());
+                if (ref[i] != got[i]) ++differ;
+            }
+            const std::string rows_s = std::to_string(6 / a.lanes + m);   /* the lane's cards (6 over the lanes) + M */
+            const bool slab_l = llog.find("block tables for " + rows_s + " rows, not 6 (RADIANCE_PP_BG_ROWS / RADIANCE_PP_LANE_ROWS") != std::string::npos;
+            const bool slab_f = flog.find("block tables for " + rows_s + " rows, not 6 (RADIANCE_PP_BG_ROWS / RADIANCE_PP_LANE_ROWS") != std::string::npos;
+            const long long lent = log_count(llog, "newcomer split: ");
+            const long long kept = log_count(llog, "tp8 loop D47b) turned away ");
+            if (kept > 0) kept_all += kept;
+            fprintf(stderr, "    LANE_ROWS=%d, %d lanes W(%s)%s: %d of %zu prompts differ; pieces lent %lld, %lld lends turned away; slab "
+                            "line leader %d follower %d\n", m, a.lanes, cut, a.rr ? " rr" : "", differ, ref.size(), lent, kept, (int)slab_l,
+                    (int)slab_f);
+            CHECK_EQ(differ, 0);
+            if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+            CHECK(llog.find("RADIANCE_PP_LANE_ROWS=" + std::to_string(m) + " (tp8 loop D47b) -- a decode lane's step slab carves") != std::string::npos);
+            CHECK(llog.find("the lanes' step slabs at their block-table rows (RADIANCE_PP_BG_ROWS 0 / RADIANCE_PP_LANE_ROWS " +
+                            std::to_string(m)) != std::string::npos);
+            CHECK(slab_l);
+            CHECK(slab_f);
+            CHECK(lent > 0);
+            CHECK(kept >= 0);
+            CHECK(llog.find("lent pieces in its inbox beside") == std::string::npos);
+        }
+    }
+    /* lane_split_own put at most one piece in a decode lane's inbox a step in every arm (0 turned away at M = 1): the cap's
+     * refusal is D47's lend-time check form (bg_rows_cap... turns lends away), its take-time guard never fired */
+    fprintf(stderr, "    all LANE_ROWS arms: %lld lends turned away by a decode lane's rows\n", kept_all);
+    CHECK(kept_all >= 0);
+    /* + beside RADIANCE_PP_BG_ROWS=1 with a BG lane (bg_room_set's newcomers under BG_ROOM) */
+    const std::vector<std::string> ext = { "--max-num-seqs", "10", "--max-num-batched-tokens", "2112", "--max-model-len", "2048",
+                                           "--prefill-span", "2", "--checkpoint-interval", "1024" };
+    std::vector<std::vector<int32_t>> ref2;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref2 = bg_room_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    std::vector<std::string> env = kSplitEnv;
+    for (const char* v : { "RADIANCE_PP_BG_LANE=1", "RADIANCE_PP_BG_ROOM=2112", "RADIANCE_PP_BG_ROWS=1", "RADIANCE_PP_LANE_ROWS=1",
+                           "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                           "RADIANCE_PP_READY_FIRST=1" })
+        env.push_back(v);
+    std::vector<std::string> ex = ext;
+    ex.push_back("--pp-lanes");
+    ex.push_back("4");
+    Serving pp;
+    REQUIRE(pp.start("1,3", ex, env));
+    const std::vector<std::vector<int32_t>> got = bg_room_set(pp.port);
+    kill(pp.lead.child.pid, SIGTERM);
+    CHECK_EQ(pp.lead.finish(60), 0);
+    CHECK_EQ(pp.fol.finish(30), 0);
+    const std::string llog = pp.lead.output();
+    REQUIRE_EQ(ref2.size(), got.size());
+    int differ = 0;
+    for (size_t i = 0; i < ref2.size(); ++i) if (ref2[i] != got[i]) ++differ;
+    /* 3 decode lanes over 10 cards: 3 / 3 / 4 cards + 1; the BG lane 1 row */
+    const bool s4 = llog.find("block tables for 4 rows, not 10") != std::string::npos, s5 = llog.find("block tables for 5 rows, not 10") != std::string::npos,
+               s1 = llog.find("block tables for 1 rows, not 10") != std::string::npos;
+    fprintf(stderr, "    BG_ROWS=1 + LANE_ROWS=1, 4 lanes W(1,3) BG 1: %d of %zu requests differ; slab lines 4 rows %d, 5 rows %d, 1 row %d\n", differ,
+            ref2.size(), (int)s4, (int)s5, (int)s1);
+    CHECK_EQ(differ, 0);
+    CHECK(s4);
+    CHECK(s5);
+    CHECK(s1);
 }
 
 /* tp8 loop D15: RADIANCE_PP_FOL_ORDER (the follower) -- between a split pass's segments, bit 1: another lane's decode frame is
