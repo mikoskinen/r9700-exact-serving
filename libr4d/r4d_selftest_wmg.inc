@@ -1275,10 +1275,18 @@ static void q6il(const Plugin& pl, const char* tlist) {
             hipEvent_t e0, e1;
             st_ev_create(&e0); st_ev_create(&e1);
             const int pin = [] { const char* e = std::getenv("R4D_Q6IL_PIN"); return e ? std::atoi(e) : 0; }();   /* a launch code for both arms (bench pin) */
+            bool warm = false;   /* round 45: one untimed ~0.1 s burst before the first timed cell (r45a / r45d: the first M timed in a process read 3-15 us high) */
             for (int64_t mode : modes) {
                 set_dec(h);
                 h.sw("ds41_wmk", (int)mode);
                 if (pin) h.wk_pin(pin);
+                if (!warm && !PM.empty()) {
+                    warm = true;
+                    const int64_t Mw = std::min<int64_t>(PM[0], RB);
+                    for (int w = 0; w < 64; ++w)
+                        for (int c = 0; c < NC; ++c) (void)launch(nan_, cw[(size_t)c], hw.size(), rb, Mw);
+                    (void)st_stream_sync(nullptr);
+                }
                 std::string line;
                 for (int64_t M : PM) {
                     if (M > RB) continue;
