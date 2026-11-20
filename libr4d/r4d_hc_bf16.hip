@@ -2522,12 +2522,43 @@ void r4dchain_hc_read_g_down(const unsigned short* __restrict__ h, const float* 
     r4d_chain_done();
 }
 
+/* qfn-on-ds lever HCO bit 4 (Qwen loop round 4, 21.11.2026; READY R6: A''s prologue + norm is 59-69 % of a block, the norm loop
+ * one row at a time -- 10 loads, wait for all, sum, wave sum, store -- behind the W_down fragment loads issued first): the norm
+ * rows with their loads DEPTH rows ahead (fully unrolled, static buffers), before the W_down loads. Every row's sum is the same
+ * expression in the same order (a thread's ten values in order, the wave sum, s_part[wave][r]); only when the loads are issued
+ * moves. */
+template <int RG, int DEPTH>
+__device__ __forceinline__ void hc_g_norm_rows_np(const unsigned short* __restrict__ h, long hrow, int c, int rr,
+                                                  int tid, int lane, int wave, float (*s_part)[RG]) {
+    uint32_t hv[DEPTH][kHcGPer];
+#pragma unroll
+    for (int d = 0; d < DEPTH && d < RG; ++d) {
+        const unsigned short* hr = h + (long)(d < rr ? d : rr - 1) * hrow + (long)c * kHcGN;
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) hv[d][p] = bfw(hr + tid + (long)p * kThreads);
+    }
+#pragma unroll
+    for (int r = 0; r < RG; ++r) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) { const float v = bfw_f(hv[r % DEPTH][p]); acc += v * v; }
+        if (r + DEPTH < RG) {
+            const int rn = r + DEPTH;
+            const unsigned short* hr = h + (long)(rn < rr ? rn : rr - 1) * hrow + (long)c * kHcGN;
+#pragma unroll
+            for (int p = 0; p < kHcGPer; ++p) hv[r % DEPTH][p] = bfw(hr + tid + (long)p * kThreads);
+        }
+        acc = wave_sum(acc);
+        if (lane == 0) s_part[wave][r] = acc;
+    }
+}
+
 /* fn4 BI (hc_bi 5, 12.11.2026; 204: the one-launch read +24..35 % at 64 rows): form G's kernel A' at 16 rows a block -- the
  * WMMA's full A height, half the blocks and half the weight loads of 8-row groups -- with N built in registers from h and
  * the norm weight (staged in LDS) instead of an [RG][n] LDS plane (16 rows would not fit). Every element of N is the same
  * expression in the same order (bf16(bf16(h) * scale * (w + wadd))), the scales the same per-row sums, the dots the same
  * WMMA sequence a row: each row's bytes are form G's (and its alone read's). Rows h must be 16-byte aligned. */
-template <int RG, bool CH, bool TL = false>
+template <int RG, bool CH, bool TL = false, bool NP = false>
 __device__ __forceinline__ void hc_read_g16_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2559,6 +2590,10 @@ __device__ __forceinline__ void hc_read_g16_down_body(
     const long kslice = (long)c * kHcGN + (long)wave * kHcGSlice;   /* the wave's first K */
     const long kl = kslice + 16 * hh;                                /* the lane half's */
 
+    /* lever HCO bit 4: the norm rows first, their loads ahead (hc_g_norm_rows_np), then the constant operands (unchained
+     * only: h is read before the chain wait's place) */
+    static_assert(!(NP && CH), "the NP norm reads h before the chain wait");
+    if constexpr (NP) hc_g_norm_rows_np<RG, 4>(h, hrow, c, rr, tid, lane, wave, s_part);
     /* ---- constant operands, before the chain wait */
     uint4 wc[kHcGChunks];
     float wsc[3] = { 0.0f, 0.0f, 0.0f };
@@ -2587,6 +2622,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
 
     /* ---- the grouped norm of stream c for every row: form G's sums (a thread's ten elements in order, the wave sum,
      * the waves in order) */
+    if constexpr (!NP)
     for (int r = 0; r < RG; ++r) {
         const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
         uint32_t hv[kHcGPer];
@@ -2730,7 +2766,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
  * half the h reads), the two tiles' WMMAs fed by the same A fragments. Per tile the arithmetic is G16's (the same chunk
  * order, the same group-scale folds, the same wave and stream sums), so every row's bytes are G16's = form G's. The inject
  * tile (bf16 gains) keeps a block of its own: blocks p < ntd / 2 take tiles 2p, 2p + 1; block ntd / 2 the inject tile. */
-template <int RG, bool CH, bool PRE = false, int NTB = 2, bool TL = false>
+template <int RG, bool CH, bool PRE = false, int NTB = 2, bool TL = false, bool NP = false>
 __device__ __forceinline__ void hc_read_g16p_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2766,6 +2802,9 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
     const long kslice = (long)c * kHcGN + (long)wave * kHcGSlice;
     const long kl = kslice + 16 * hh;
 
+    /* lever HCO bit 4: the norm rows first, their loads ahead (hc_g_norm_rows_np), then the constant operands */
+    static_assert(!(NP && CH), "the NP norm reads h before the chain wait");
+    if constexpr (NP && !PRE) hc_g_norm_rows_np<RG, 4>(h, hrow, c, rr, tid, lane, wave, s_part);
     /* ---- constant operands, before the chain wait */
     uint4 wc[NTB][kHcGChunks];
     float wsc[NTB][3];
@@ -2803,6 +2842,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         __syncthreads();
     } else {
     /* ---- the grouped norm: G16's (= form G's) sums */
+        if constexpr (!NP)
         for (int r = 0; r < RG; ++r) {
             const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
             uint32_t hv[kHcGPer];
@@ -3025,6 +3065,27 @@ void hc_read_g16p_down_o_kernel(const unsigned short* __restrict__ h, const floa
     hc_read_g16p_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                       hrow, irow, eps, wadd, ntd, rows);
 }
+/* qfn-on-ds lever HCO bit 4: A' with the norm rows' loads ahead (NP), at today's budget (np) or with bit 1's (onp); G16 np */
+#define HC_G16_ARGS_DECL const unsigned short* __restrict__ h, const float* __restrict__ w,                              \
+                         const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,     \
+                         unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,                            \
+                         float* __restrict__ scaleout, float* __restrict__ part, unsigned int* __restrict__ tctr, long lr, \
+                         long hrow, long irow, float eps, float wadd, int ntd, long rows
+#define HC_G16_ARGS h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows
+template <int RG>
+__global__ __launch_bounds__(kThreads) void hc_read_g16p_down_np_kernel(HC_G16_ARGS_DECL) {
+    hc_read_g16p_down_body<RG, false, false, 2, false, true>(HC_G16_ARGS);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_read_g16p_down_onp_kernel(HC_G16_ARGS_DECL) {
+    hc_read_g16p_down_body<RG, false, false, 2, false, true>(HC_G16_ARGS);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads) void hc_read_g16_down_np_kernel(HC_G16_ARGS_DECL) {
+    hc_read_g16_down_body<RG, false, false, true>(HC_G16_ARGS);
+}
+#undef HC_G16_ARGS
+#undef HC_G16_ARGS_DECL
 /* qfn-on-ds Q17 (bench only, r4d_hc_tl): A' G16 / G16p with the phase timeline, region 0 */
 template <int RG>
 __global__ __launch_bounds__(kThreads)
@@ -4522,18 +4583,20 @@ static std::atomic<int> g_hc_pf2_stages{31};
 /* qfn-on-ds Q17 (bench only): r4d_hc_tl(1) = the bi_dec read's A' (G16 / G16p) and B3 (16-row groups) launch their TL copies */
 static std::atomic<int> g_hc_tl{0};
 /* qfn-on-ds lever HCO: RADIANCE_FN4_HC_OCC bit mask (read once; r4d_hc_occ sets it): 1 A' G16p, 2 B3 at 16-row groups in their
- * occupancy instances (hc_read_g16p_down_o_kernel / hc_up_w_o_kernel). 0 / unset = today's kernels. -1 until read. */
+ * occupancy instances (hc_read_g16p_down_o_kernel / hc_up_w_o_kernel); 4 A' G16 / G16p with the norm rows' loads ahead
+ * (hc_g_norm_rows_np; with 1: G16p's onp instance). 0 / unset = today's kernels. -1 until read. */
 static std::atomic<int> g_hc_occ{-1};
 static int hc_occ() {
     int v = g_hc_occ.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_OCC");
         int want = -1;
-        g_hc_occ.compare_exchange_strong(want, (e && *e) ? (std::atoi(e) & 3) : 0, std::memory_order_relaxed);
+        g_hc_occ.compare_exchange_strong(want, (e && *e) ? (std::atoi(e) & 7) : 0, std::memory_order_relaxed);
         v = g_hc_occ.load(std::memory_order_relaxed);
-        if (v > 0) std::fprintf(stderr, "radiance: libr4d: lever HCO (RADIANCE_FN4_HC_OCC=%d): the bi_dec read's %s at the occupancy "
-                                        "register budget (the same bytes)\n", v,
-                                v == 1 ? "A' G16p" : v == 2 ? "B3 (16-row groups)" : "A' G16p and B3 (16-row groups)");
+        if (v > 0) std::fprintf(stderr, "radiance: libr4d: lever HCO (RADIANCE_FN4_HC_OCC=%d): the bi_dec read's%s%s%s (the same "
+                                        "bytes)\n", v, (v & 1) ? " A' G16p at the occupancy register budget;" : "",
+                                (v & 2) ? " B3 (16-row groups) at the occupancy register budget;" : "",
+                                (v & 4) ? " A' G16 / G16p with the norm rows' loads ahead" : "");
     }
     return v;
 }
@@ -7953,6 +8016,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         fc_add(kFcG16p, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16>
                                : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16p_down_tl_kernel<16>
+                               : (hc_occ() & 4) ? ((hc_occ() & 1) ? &hc_read_g16p_down_onp_kernel<16>
+                                                                  : &hc_read_g16p_down_np_kernel<16>)
                                : (hc_occ() & 1) ? &hc_read_g16p_down_o_kernel<16>
                                : &hc_read_g16p_down_kernel<16>),
                            dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
@@ -7965,6 +8030,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         fc_add(kFcG16, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16>
                                : g_hc_tl.load(std::memory_order_relaxed) ? &hc_read_g16_down_tl_kernel<16>
+                               : (hc_occ() & 4) ? &hc_read_g16_down_np_kernel<16>
                                : &hc_read_g16_down_kernel<16>),
                            dim3((unsigned)((hcg_nt + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
@@ -8136,7 +8202,7 @@ extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (
 static unsigned long long* g_hc_tl_buf = nullptr;   /* the bench's device buffer (r4d_hc_tl) */
 constexpr size_t kHcTlBytes = (size_t)2 * kHcTlMax * kHcTlW * sizeof(unsigned long long);
 /* qfn-on-ds lever HCO (bench / test hook): the occupancy instances' mask, as RADIANCE_FN4_HC_OCC */
-extern "C" void r4d_hc_occ(int m) { g_hc_occ.store(m < 0 ? 0 : (m & 3), std::memory_order_relaxed); }
+extern "C" void r4d_hc_occ(int m) { g_hc_occ.store(m < 0 ? 0 : (m & 7), std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
     if (on && !g_hc_tl_buf) {
         void* p = nullptr;
