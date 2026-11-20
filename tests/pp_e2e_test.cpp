@@ -3451,6 +3451,17 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         dec_all += std::max(0LL, dec);
         CHECK(dclean >= 0);   /* tp8 loop D50: the run line's counters */
         CHECK(dlow >= 0);
+        {   /* ... and the tail band line (periodic at RADIANCE_PP_BGRATE_LINE_S, here the run's end): the same counts + the judged steps */
+            long long judged = -1, tbn = -1, tbc = -1;
+            const char* tkey = "two-node pipeline: tail band over the run (tp8 loop D46 / D50): ";
+            if (const size_t at = llog.rfind(tkey); at != std::string::npos)
+                (void)std::sscanf(llog.c_str() + at + std::strlen(tkey), "%lld decode lanes' steps judged, %lld ran as tail band passes (%lld",
+                                  &judged, &tbn, &tbc);
+            CHECK(judged >= dec);
+            CHECK(judged > 0);
+            CHECK_EQ(tbn, dec);
+            CHECK_EQ(tbc, dclean);
+        }
         if (a.tv == 4) CHECK(dclean > 0);   /* 4: decode band passes with no BG step in flight */
         if (a.tv < 0 && std::strcmp(a.tb, "3") == 0) {
             CHECK_EQ(dclean, 0LL);   /* 3: only while a BG step is in flight */

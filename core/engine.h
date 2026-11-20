@@ -531,6 +531,8 @@ private:
      * and the load */
     int64_t pp_tband_dec_clean_ = 0; /* decode lanes' band passes with no BG step in flight (pp_tband 4) */
     int64_t pp_tband_dec_low_ = 0;   /* clean-stretch decode steps 4 + 1024 x N kept W(h, t)'s at a load <= N */
+    int64_t pp_tband_dec_seen_ = 0;  /* decode lanes' steps pp_tband_step judged (the cell's denominator) */
+    std::string tband_text(const char* when) const;   /* the periodic / run-end counters line */
     std::unordered_map<uint64_t, int64_t> pp_tcopy_seq_;   /* core/sched/tcopy.h Gap: -1 all written, p the last gap */
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();

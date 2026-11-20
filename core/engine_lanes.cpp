@@ -448,6 +448,7 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
      * layer below the published one, W(h, t + 1), that is W(h, t)'s decode -- the in-process control); 4 + 1024 x N (N 1 .. 63) =
      * 3's band in a BG stretch, and in a clean one only while the decode lanes' last steps decoded > N sequences (the load
      * --draft-short-from reads): a clean stretch at low load keeps the band layer on the follower */
+    if (count && !lanes_.is_bg(lane)) ++pp_tband_dec_seen_;   /* tp8 loop D50: every decode lane's step judged here */
     if (sv >= 3 && !lanes_.is_bg(lane)) {
         if (!pp_tband_copy_) return 0;
         bool on = pp_tband_bg_;
@@ -495,6 +496,17 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
     }
     if (count && later) ++pp_tband_cont_n_;
     return j;
+}
+
+/* tp8 loop D50: the tail band's counters, cumulative (a cell = two lines' difference; kit d50cell.py), at the D32 line's period
+ * (RADIANCE_PP_BGRATE_LINE_S) and at the run's end -- with the plugin's copy only */
+std::string Engine::tband_text(const char* when) const {
+    const int sv0 = fn4::get(fn4::kPpTband);
+    return fmt("two-node pipeline: tail band%s (tp8 loop D46 / D50): %lld decode lanes' steps judged, %lld ran as tail band passes (%lld "
+               "with no BG step in flight), %lld kept W(h, t)'s for a sequence not held, %lld clean ones kept W(h, t)'s by the load rule; "
+               "%lld lane steps ran as tail band passes in all; pp_tband %d", when, (long long)pp_tband_dec_seen_, (long long)pp_tband_dec_n_,
+               (long long)pp_tband_dec_clean_, (long long)pp_tband_dec_skip_, (long long)pp_tband_dec_low_, (long long)pp_tband_n_,
+               sv0 < 0 ? pp_tband_start_ : sv0);
 }
 
 /* tp8 loop D39b: after a step's head decided its tail band -- which sequences have run every chunk as a tail band pass */
@@ -1872,6 +1884,7 @@ int Engine::step_loop_lanes() {
             }
             if (now - bgr_line_ns >= bgr_every) {
                 bgr_line(" so far");
+                if (pp_tband_copy_) RAD_INFO("%s", tband_text(" so far").c_str());   /* tp8 loop D50: the tail band by cell */
                 bgr_line_ns = now;
             }
         }
@@ -1980,6 +1993,7 @@ int Engine::step_loop_lanes() {
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
     if (lseg) lseg_line("");
     if (bgr_on) bgr_line(" over the run");   /* tp8 loop D32 */
+    if (bgr_on && pp_tband_copy_) RAD_INFO("%s", tband_text(" over the run").c_str());   /* tp8 loop D50 */
     if (pp_link_ && dch_n_ > 0)                /* tp8 loop D35 */
         RAD_INFO("two-node pipeline: decode chain on the leader host over the run (tp8 loop D35): %s", dch_text().c_str());
     if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39); "
