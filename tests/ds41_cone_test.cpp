@@ -1196,10 +1196,21 @@ TEST(pf_ops_fold_into_the_layer_lines_and_name_the_groups) {
         CHECK(has(out[3], "10 [rx 8.00/8.00 in 0.50/0.50 n 2.00/2.00 q 4.00/4.00 i 6.00/6.00 f 8.00/8.00]"));
         CHECK(has(out[3], "; by group: rx 8.00/8.00, in 1.50/1.50, n 4.00/4.00, q 8.00/8.00, i 6.00/6.00, a 6.00/6.00, f 16.00/16.00"));
     }
-    /* a short prompt's records with group marks go to the summary (folded), no ops line */
-    Acc s(8192, 1);
-    const std::vector<std::string> o = s.add(pass(0, 1100, 1.0f, true)), o2 = s.flush();
-    CHECK(o.empty());
-    CHECK_EQ(o2.size(), (size_t)1);
-    if (o2.size() == 1) CHECK(has(o2[0], "1 prompts under 8192 rows (1100 rows): ms a 1k rows by layer: "));
+    /* short prompts' records with group marks: the summary (folded) and, beside it, an ops summary every `every` prompts */
+    Acc s(8192, 2);
+    CHECK(s.add(pass(0, 1000, 1.0f, true)).empty());
+    CHECK(s.flush().empty());   /* the first short prompt: no line yet (every 2) */
+    CHECK(s.add(pass(0, 1000, 3.0f, true)).empty());
+    const std::vector<std::string> o2 = s.flush();
+    CHECK_EQ(o2.size(), (size_t)2);
+    if (o2.size() == 2) {
+        CHECK(has(o2[0], "2 prompts under 8192 rows (2000 rows): ms a 1k rows by layer: "));
+        CHECK(has(o2[0], ", 10 2.00, 11 10.50, rx10 10.25; layers sum"));
+        CHECK(has(o2[1], "2 prompts under 8192 rows, ops (RADIANCE_DS41_PF_OPS): ms a 1k rows by layer: "));
+        CHECK(has(o2[1], "10 [rx 2.00 in 0.25 n 1.00 q 2.00 i 3.00 f 4.00], 11 [in 0.50 n 1.00 q 2.00 a 3.00 f 4.00]; by group: rx 2.00,"));
+    }
+    /* without group marks: no ops summary */
+    Acc u(8192, 1);
+    CHECK(u.add(pass(0, 1100, 1.0f, false)).empty());
+    CHECK_EQ(u.flush().size(), (size_t)1);
 }

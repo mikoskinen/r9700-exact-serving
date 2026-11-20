@@ -159,6 +159,7 @@ public:
         for (const auto& c : chunks) rows = std::max(rows, c.first + c.second);
         if (rows < min_rows_) {
             for (const Rec& r : recs_) small_.add(r);
+            for (const Rec& r : ops_) small_ops_.add(r);   /* P42 step 2: the short prompts' groups (BG newcomers) */
             small_rows_ += rows;
             ++small_n_;
             if (every_ > 0 && small_n_ % every_ == 0) {
@@ -166,6 +167,11 @@ public:
                 std::snprintf(b, sizeof b, "%lld prompts under %lld rows (%lld rows): ms a 1k rows by layer: ", (long long)small_n_,
                               (long long)min_rows_, (long long)small_rows_);
                 out.push_back(std::string(b) + by_layer(small_, true) + "; layers sum " + sum_per1k(small_));
+                if (!small_ops_.ms.empty()) {
+                    std::snprintf(b, sizeof b, "%lld prompts under %lld rows, ops (RADIANCE_DS41_PF_OPS): ms a 1k rows by layer: ",
+                                  (long long)small_n_, (long long)min_rows_);
+                    out.push_back(std::string(b) + ops_line(&small_ops_, nullptr, true));
+                }
             }
             recs_.clear();
             ops_.clear();
@@ -320,6 +326,7 @@ private:
     std::vector<Rec> recs_;
     std::vector<Rec> ops_;   /* P42 step 2: the open prompt's records with group marks, as read */
     Sums small_;
+    Sums small_ops_;   /* P42 step 2: the short prompts' records with group marks, as read */
     int64_t small_rows_ = 0, small_n_ = 0;
 };
 
