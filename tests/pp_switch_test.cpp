@@ -273,6 +273,37 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
     CHECK(named);
 }
 
+/* qfn-on-ds (Qwen loop round 1, 20.11.2026): the core's range check for the Qwen line's plugin switches takes what the
+ * merged libr4d / qwen4exp serve -- hc_readv 0..8191 (bits 11-12: lever B3R), att_bi 0..5, bi_seg 0..3 (round 3) -- and
+ * refuses one past each, naming the range; a refused value is never queued. */
+TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
+    std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
+    std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
+    std::string why;
+    struct R { const char* name; int hi; };
+    for (const R& r : { R{ "hc_readv", 8191 }, R{ "att_bi", 5 }, R{ "bi_seg", 3 } }) {
+        const int i = fn4::switch_index(r.name);
+        REQUIRE(i >= 0);
+        fn4::requests(n0.data(), v0.data());
+        why.clear();
+        CHECK(fn4::request(r.name, r.hi, &why));
+        CHECK(why.empty());
+        why.clear();
+        CHECK(!fn4::request(r.name, r.hi + 1, &why));
+        CHECK(why == std::string(r.name) + " takes 0.." + std::to_string(r.hi));
+        CHECK(!fn4::request(r.name, -1, &why));
+        int sw[fn4::kSwitches];
+        (void)fn4::apply_pending(7, sw);
+        fn4::requests(n1.data(), v1.data());
+        CHECK_EQ(n1[(size_t)i], n0[(size_t)i] + 1);   /* the in-range request only */
+        CHECK_EQ(v1[(size_t)i], r.hi);
+    }
+    /* the published hc_readv (331) with each B3R field value */
+    for (int f : { 0, 1, 2, 3 }) CHECK(fn4::request("hc_readv", 331 | (f << 11), &why));
+    int sw[fn4::kSwitches];
+    (void)fn4::apply_pending(8, sw);
+}
+
 }  /* namespace */
 
 RAD_TEST_MAIN()
