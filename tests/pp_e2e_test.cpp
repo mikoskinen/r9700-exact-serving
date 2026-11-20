@@ -6189,3 +6189,122 @@ TEST(conversations_whose_turns_grow_over_their_answers_serve_one_process_tokens)
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
     }
 }
+
+/* tp8 loop D54c: SUBAGENTS -- requests that share a long COLD prefix (Claude Code's system prompt + tools) arriving at once, as a
+ * session's parallel subagents do: six at once over a 700-byte common prefix nobody computed yet (the lanes may admit them side by
+ * side, each prefilling the prefix or waiting on another's blocks), then four more 150 ms later while the first wave decodes (a
+ * prefix hit over blocks that may still be in flight in another lane); greedy and seeded, every third streamed. Each request's
+ * tokens = one process's for that request ALONE (and one process's at once = alone), at 2 lanes W(0,2), 3 lanes W(1,3), BEST's
+ * shape (KV copy checked) and the drafted fixture at BEST's shape. */
+namespace {
+json subagent_body(int k) {
+    std::vector<int32_t> p = prompt_ids(300, 700);
+    const std::vector<int32_t> own = prompt_ids(310 + (uint64_t)k, 30 + 7 * (size_t)k);
+    p.insert(p.end(), own.begin(), own.end());
+    json b = { { "prompt", p }, { "n_predict", 24 }, { "ignore_eos", true }, { "return_tokens", true }, { "temperature", 0.0 } };
+    if (k % 2) { b["temperature"] = 0.8; b["seed"] = 3000 + k; }
+    if (k % 3 == 0) b["stream"] = true;
+    return b;
+}
+std::vector<std::vector<int32_t>> subagents(int port, bool together) {
+    std::vector<Reply> r(10);
+    if (together) {
+        std::vector<std::future<Reply>> f;
+        for (int k = 0; k < 6; ++k) f.push_back(std::async(std::launch::async, [port, k] { return ask(port, subagent_body(k)); }));
+        const char* dl = std::getenv("PP_E2E_SUB_DELAY_MS");   /* a debugging aid: the second wave's delay (default 150 ms) */
+        std::this_thread::sleep_for(std::chrono::milliseconds(dl && *dl ? std::atoi(dl) : 150));
+        for (int k = 6; k < 10; ++k) f.push_back(std::async(std::launch::async, [port, k] { return ask(port, subagent_body(k)); }));
+        for (int k = 0; k < 10; ++k) r[(size_t)k] = f[(size_t)k].get();
+    } else {
+        for (int k = 0; k < 10; ++k) r[(size_t)k] = ask(port, subagent_body(k));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (int k = 0; k < 10; ++k) {
+        if (!r[(size_t)k].why.empty()) fprintf(stderr, "    subagent %d: %s\n", k, r[(size_t)k].why.c_str());
+        out.push_back(r[(size_t)k].why.empty() && r[(size_t)k].tok.size() == 1 ? r[(size_t)k].tok[0] : std::vector<int32_t>{});
+    }
+    return out;
+}
+}  /* namespace */
+
+TEST(subagents_sharing_a_cold_prefix_at_once_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "12" };
+    std::map<int, std::vector<std::vector<int32_t>>> refs;
+    for (int ds = 0; ds < 2; ++ds) {
+        std::vector<std::vector<int32_t>> at_once;
+        double hit = -1;
+        for (int pass = 0; pass < 2; ++pass) {   /* a fresh start each: alone, then at once */
+            Serving one;
+            if (ds) one.model = worldds().llama_rad;
+            REQUIRE(one.start("", ds ? cat(spec, seqs) : seqs));
+            if (pass == 0) refs[ds] = subagents(one.port, false);
+            else {
+                at_once = subagents(one.port, true);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* the idle publish of the metrics */
+                hit = metric(get(one.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            }
+            kill(one.lead.child.pid, SIGTERM);
+            CHECK_EQ(one.lead.finish(60), 0);
+        }
+        int empty = 0;
+        for (const auto& a : refs[ds]) empty += a.empty();
+        fprintf(stderr, "    one process (%s): 10 subagents alone %s at once; %d empty; at once: attention-cached prompt tokens %.0f\n",
+                ds ? "drafted" : "plain", at_once == refs[ds] ? "=" : "!=", empty, hit);
+        CHECK(at_once == refs[ds]);
+        CHECK_EQ(empty, 0);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, ds, kv; };
+    for (const Arm a : { Arm{ "1 lane", "0,2", 1, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, true, true } }) {
+        if (const char* only = std::getenv("PP_E2E_SUB_ARM"); only && !std::strstr(a.name, only)) continue;   /* a debugging aid */
+        std::vector<std::string> env = kSplitEnv;
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        if (const char* xe = std::getenv("PP_E2E_SUB_ENV"); xe && *xe) env.push_back(xe);   /* a debugging aid: one more env */
+        Serving pp;
+        if (a.ds) pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(a.ds ? cat(spec, seqs) : seqs, { "--pp-lanes", std::to_string(a.lanes) }), env));
+        const std::vector<std::vector<int32_t>> got = subagents(pp.port, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+        const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        const auto& ref = refs[a.ds ? 1 : 0];
+        REQUIRE_EQ(got.size(), ref.size());
+        int differ = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i] == ref[i]) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < got[i].size() && j < ref[i].size() && got[i][j] == ref[i][j]) ++j;
+            fprintf(stderr, "    %s subagent %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", a.name, i, got[i].size(),
+                    ref[i].size(), j);
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        if (const char* dd = std::getenv("PP_E2E_PROD_LOGS")) {
+            const std::string tag = std::string(dd) + "/sub-" + std::to_string(a.lanes) + "-" + a.cut + (a.ds ? "-ds" : "") + (a.best ? "-best" : "");
+            tiny::write_text(tag + "-leader.log", llog);
+            tiny::write_text(tag + "-follower.log", flog);
+        }
+        fprintf(stderr, "    SUB %-34s W(%s): %d of %zu subagents differ from one process alone; attention-cached prompt tokens %.0f; KV-copy "
+                        "checks %lld, %lld differ; %zu E lines\n",
+                a.name, a.cut, differ, got.size(), hit, checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(elines, (size_t)0);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (differ || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
