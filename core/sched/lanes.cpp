@@ -1096,6 +1096,7 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
         return;
     }
     r.n_computed += e.n_tokens;
+    publish_chunk_done(s);   /* tp8 loop D55b (RADIANCE_SCHED_PUB_PROMPT=2; else nothing) */
     /* tp8 loop F22 (LaneSet::bg_draft_floor): the drafter's range as this lane's block_end records it for a chunk it ran --
      * the borrower's context pass wrote the piece's drafter rows (the same rows one lane writes: lever PSK-DS's last
      * window + 1 of the entry). Without it a newcomer lent whole has no range at its first block_begin here. */
