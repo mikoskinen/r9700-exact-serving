@@ -1264,13 +1264,16 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain);
     if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain);
+    /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
+     * bookkeeping to the next real packet; everything else as for any dispatch. */
+    const bool aside = (fence & kFenceAside) != 0;
     /* Attach the ride after the tape copied the packet: a recorded packet carries no signal, and
      * a play attaches whichever ride is pending then (PlayRun::put). */
-    if (s->ride.handle) {
+    if (s->ride.handle && !aside) {
         p->completion_signal = s->ride;
         s->ride.handle = 0;
     }
-    const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
+    const int acq = aside ? HSA_FENCE_SCOPE_AGENT : acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
      * the bit, since its completion must cover everything before it. */
@@ -1716,10 +1719,17 @@ int a_stream_create(RadStream* out, int high_priority) {
     }
     g_queue_id_at[slot].store(s->id, std::memory_order_release);
     g_queue_by_id[slot].store(s->q, std::memory_order_release);
+    size_t live = 0;
     {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         G().streams.push_back(s.get());
+        for (const Stream* x : G().streams) live += x->ord == ord ? 1 : 0;
     }
+    /* lever WAITK's companion (DRAFTER round 49): RADIANCE_AQL_QLOG=1 logs each HSA queue the process creates, with the card's live
+     * count (creation order decides which queues share a CP pipe: 4 a card map cleanly, 8 do not -- drafter/kit/mes r49d / r49g) */
+    static const bool qlog = [] { const char* e = std::getenv("RADIANCE_AQL_QLOG"); return e && e[0] == '1'; }();
+    if (qlog) std::fprintf(stderr, "aql: queue created card %d stream id %u slot %u hp %d (live on the card %zu)\n", ord, s->id, slot,
+                           high_priority, live);
     *out = (RadStream)s.release();
     return RAD_OK;
 }
@@ -1966,6 +1976,61 @@ int a_event_record(RadEvent re, RadStream rs) {
     return RAD_OK;
 }
 
+/* Lever WAITK (DRAFTER track 21.11.2026 round 49; RADIANCE_AQL_WAITK, read once: 0 / unset = off, 1 = event waits, 2 = + ride waits):
+ * a wait whose signal is not yet 0 when it is enqueued gets a one-wave wait kernel (aql_blit.hip aql_wait_signal) on the same stream
+ * AHEAD of its barrier-AND, which then stays exactly as without the lever (packet, acquire scope, `waiters`): the barrier is processed
+ * after the kernel completes, so its dependency is already met. Why: a barrier-AND whose dependency is pending slows every packet of the
+ * other queues on its CP pipe by ~+40 us (FINDINGS DRAFTER note 00:18 21.11.; drafter/kit/mes). Not while a tape is captured (the
+ * recorded wait kernel would poll a retired signal at play; a played tape calls a_event_wait, which adds it then). Scheduling only:
+ * every kernel's bytes are unchanged.
+ * tp8 loop W1 (DECODE review): the kernel goes out as a kFenceAside packet (aql.h) -- without it, it was an ordinary dispatch, so
+ * (a) it took the system acquire owed after a host wait / a lap (acquire_scope) from the next real packet, which then ran at agent
+ * scope: host writes made between this wait's enqueue and that packet's were no longer covered; (b) it would complete a ride pending
+ * on the stream (the reason for the round-49 form's skip, now dropped: an aside packet leaves the ride to the next real dispatch,
+ * as the barrier does). One stderr line a minute (at most) counts what the lever did, so a card run can read that it acted. */
+std::atomic<int> g_waitk_test{-1};
+std::atomic<int64_t> g_waitk_kernels{0}, g_waitk_met{0}, g_waitk_captured{0};
+int waitk_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_AQL_WAITK");
+        const int v = waitk_mode_of(e);
+        if (v > 0) std::fprintf(stderr, "aql: wait-ahead kernels on (RADIANCE_AQL_WAITK=%s: mode %d, %s)\n", e, v,
+                                v >= 2 ? "event and ride waits" : "event waits");
+        return v;
+    }();
+    const int t = g_waitk_test.load(std::memory_order_relaxed);
+    return t >= 0 ? t : m;
+}
+void waitk_line(int mode) {
+    using clk = std::chrono::steady_clock;
+    static std::atomic<int64_t> next_ms{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now().time_since_epoch()).count();
+    int64_t n = next_ms.load(std::memory_order_relaxed);
+    if (now < n || !next_ms.compare_exchange_strong(n, now + 60000, std::memory_order_relaxed)) return;
+    if (n == 0) return;                               /* the first wait arms the minute */
+    std::fprintf(stderr, "aql: WAITK %d since start: %lld wait kernels, %lld waits met at enqueue, %lld in a tape capture (tp8 loop W1)\n",
+                 mode, (long long)g_waitk_kernels.load(std::memory_order_relaxed),
+                 (long long)g_waitk_met.load(std::memory_order_relaxed),
+                 (long long)g_waitk_captured.load(std::memory_order_relaxed));
+}
+void wait_ahead(Stream* s, hsa_signal_t h, int need) {
+    const int mode = waitk_mode();
+    if (mode < need || !h.handle) return;
+    const int plan = waitk_plan(mode, need, capturing(), (int64_t)hsa_signal_load_relaxed(h));
+    if (plan == kWaitkOff) {
+        g_waitk_captured.fetch_add(1, std::memory_order_relaxed);
+    } else if (plan == kWaitkMet) {
+        g_waitk_met.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const void* v = (const void*)&reinterpret_cast<const amd_signal_t*>(h.handle)->value;
+        set_next_fence(kFenceAside);
+        const int rc = rad_aql_blit_wait(v, s);
+        set_next_fence(0);
+        if (rc == 0) g_waitk_kernels.fetch_add(1, std::memory_order_relaxed);
+    }
+    waitk_line(mode);
+}
+
 /* The event lock is held across the enqueue so the signal cannot retire before this wait is
  * noted against it. */
 int a_event_wait(RadStream rs, RadEvent re) {
@@ -1986,6 +2051,7 @@ int a_event_wait(RadStream rs, RadEvent re) {
      * or the host needs system scope. */
     const int acq = e->cur->agent.handle == s->agent.handle ? HSA_FENCE_SCOPE_AGENT
                                                             : HSA_FENCE_SCOPE_SYSTEM;
+    wait_ahead(s, e->cur->h, 1);   /* lever WAITK */
     RAD_TRY(barrier(s, e->cur->h, hsa_signal_t{0}, acq, HSA_FENCE_SCOPE_NONE, &idx));
     e->cur->waiters.emplace_back(s->id, idx);
     return RAD_OK;
@@ -3143,6 +3209,7 @@ int a_ride_wait(RadStream rs, void* token) {
     Sig* g = (Sig*)token;
     if (!s || !g) return RAD_E_INVAL;
     uint64_t idx = 0;
+    wait_ahead(s, g->h, 2);   /* lever WAITK */
     const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_NONE, &idx);
     if (rc == RAD_OK) g->waiters.emplace_back(s->id, idx);
     sig_retire(g);
@@ -4215,6 +4282,14 @@ bool ride_reusable(void* token) {
     std::lock_guard<std::mutex> lk(pool().mu);
     return reusable(g);
 }
+WaitkCounts waitk_counts() {
+    WaitkCounts c;
+    c.kernels = g_waitk_kernels.load(std::memory_order_relaxed);
+    c.met = g_waitk_met.load(std::memory_order_relaxed);
+    c.captured = g_waitk_captured.load(std::memory_order_relaxed);
+    return c;
+}
+void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4631,6 +4706,9 @@ namespace rad {
 namespace aql {
 /* A build without the AQL backend hands out no ride. */
 bool ride_reusable(void*) { return false; }
+/* ... and issues no wait kernel (tp8 loop W1). */
+WaitkCounts waitk_counts() { return WaitkCounts{}; }
+void waitk_set_for_test(int) {}
 }  // namespace aql
 }  // namespace rad
 

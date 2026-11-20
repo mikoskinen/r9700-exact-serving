@@ -725,6 +725,165 @@ TEST(waiting_on_an_unrecorded_event_is_a_no_op) {
     CHECK_OK(rad_stream_sync(st.s));
 }
 
+/* ------------------------------------------------------------------ lever WAITK (tp8 loop W1)
+ *
+ * RADIANCE_AQL_WAITK puts a one-wave wait kernel ahead of a pending wait's unchanged barrier-AND (core/device/aql.h).
+ * The start value and the per-wait choice are pure and run on any backend; the card cases switch the lever on for
+ * this process (rad::aql::waitk_set_for_test) and check that the waiting stream is still held behind the producer,
+ * that the kernel goes out only for a wait pending at enqueue, and that it never takes a ride pending on the waiting
+ * stream (a ride is completed by the next REAL dispatch). On a card: RAD_TEST_FILTER=waitk tests/device_test. */
+struct WaitkScope {
+    explicit WaitkScope(int mode) { rad::aql::waitk_set_for_test(mode); }
+    ~WaitkScope() { rad::aql::waitk_set_for_test(-1); }
+};
+
+TEST(waitk_reads_its_start_value_and_plans_a_kernel_only_for_a_pending_wait) {
+    using namespace rad::aql;
+    CHECK_EQ(waitk_mode_of(nullptr), 0);
+    CHECK_EQ(waitk_mode_of(""), 0);
+    CHECK_EQ(waitk_mode_of("0"), 0);
+    CHECK_EQ(waitk_mode_of("-1"), 0);
+    CHECK_EQ(waitk_mode_of("on"), 0);
+    CHECK_EQ(waitk_mode_of("1"), 1);
+    CHECK_EQ(waitk_mode_of("2"), 2);
+    CHECK_EQ(waitk_mode_of("7"), 2);
+    /* need 1 = an event wait, 2 = a ride wait; value = the awaited signal's value at enqueue */
+    for (int mode = 0; mode <= 2; ++mode)
+        for (int need = 1; need <= 2; ++need)
+            for (int cap = 0; cap <= 1; ++cap)
+                for (int64_t value : {int64_t(0), int64_t(1)}) {
+                    const int p = waitk_plan(mode, need, cap != 0, value);
+                    const int want = (mode < need || cap) ? kWaitkOff : value == 0 ? kWaitkMet : kWaitkKernel;
+                    CHECK_EQ(p, want);
+                }
+    /* the off state is every start without the env: no wait kernel for any wait */
+    CHECK_EQ(waitk_plan(0, 1, false, 1), kWaitkOff);
+    CHECK_EQ(waitk_plan(1, 2, false, 1), kWaitkOff);
+    CHECK_EQ(waitk_plan(2, 2, false, 1), kWaitkKernel);
+}
+
+TEST(a_waitk_wait_on_a_pending_event_or_ride_holds_the_waiting_stream_behind_the_producer) {
+    if (rad::device_is_host()) SKIP("a card only");
+    const int64_t n = 1 << 20;
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> mid(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> dst(n, RAD_MEM_HOST_PINNED);
+    REQUIRE(src && mid && dst);
+    for (int mode = 0; mode <= 2; ++mode) {
+        WaitkScope on(mode);
+        for (int ride = 0; ride <= 1; ++ride) {
+            Stream a, b;
+            Event ea;
+            REQUIRE(a.s && b.s && ea.e);
+            fill(src, n, 0x3A170000u + (uint32_t)(mode * 2 + ride));
+            CHECK_OK(rad_memset_async(dst, 0xEE, n, b.s));
+            CHECK_OK(rad_stream_sync(b.s));
+            /* the producer is held behind a closed gate, so the wait is pending when it is enqueued */
+            void* gate = nullptr;
+            REQUIRE_EQ(rad_stream_gate(a.s, &gate), RAD_OK);
+            const rad::aql::WaitkCounts c0 = rad::aql::waitk_counts();
+            if (ride) {
+                void* mark = nullptr;
+                REQUIRE_EQ(rad_ride(a.s, &mark), RAD_OK);
+                CHECK_OK(rad_memcpy_async(mid, src, n, a.s));     /* completes the ride */
+                CHECK_OK(rad_ride_wait(b.s, mark));
+            } else {
+                CHECK_OK(rad_memcpy_async(mid, src, n, a.s));
+                CHECK_OK(rad_event_record(ea.e, a.s));
+                CHECK_OK(rad_event_wait(b.s, ea.e));
+            }
+            CHECK_OK(rad_memcpy_async(dst, mid, n, b.s));
+            const rad::aql::WaitkCounts c1 = rad::aql::waitk_counts();
+            const bool covered = mode >= (ride ? 2 : 1);
+            CHECK_EQ(c1.kernels - c0.kernels, covered ? 1 : 0);
+            CHECK_EQ(c1.met - c0.met, 0);
+            /* b runs nothing of the copy before the gate opens */
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            CHECK_EQ(dst.p[0], 0xEE);
+            CHECK_EQ(dst.p[n - 1], 0xEE);
+            CHECK_OK(rad_gate_open(gate));
+            CHECK_OK(rad_stream_sync(b.s));
+            CHECK_OK(rad_stream_sync(a.s));
+            CHECK_EQ(std::memcmp(dst, src, (size_t)n), 0);
+        }
+        /* a wait met at enqueue is only the barrier */
+        Stream a, b;
+        Event ea;
+        CHECK_OK(rad_event_record(ea.e, a.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        const rad::aql::WaitkCounts c0 = rad::aql::waitk_counts();
+        CHECK_OK(rad_event_wait(b.s, ea.e));
+        CHECK_OK(rad_stream_sync(b.s));
+        const rad::aql::WaitkCounts c1 = rad::aql::waitk_counts();
+        CHECK_EQ(c1.kernels - c0.kernels, 0);
+        CHECK_EQ(c1.met - c0.met, mode >= 1 ? 1 : 0);
+    }
+}
+
+TEST(a_waitk_wait_kernel_leaves_a_ride_pending_on_the_waiting_stream_to_its_next_dispatch) {
+    if (rad::device_is_host()) SKIP("a card only");
+    WaitkScope on(1);
+    Stream a, b, c;
+    Event ea;
+    DevBuf<uint8_t> x(4096, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> flag(64, RAD_MEM_HOST_PINNED);
+    REQUIRE(a.s && b.s && c.s && ea.e && x && flag);
+    std::memset(flag.p, 0, 64);
+    void* g1 = nullptr;
+    REQUIRE_EQ(rad_stream_gate(a.s, &g1), RAD_OK);
+    CHECK_OK(rad_event_record(ea.e, a.s));                       /* pending behind g1 */
+    void* mark = nullptr;
+    REQUIRE_EQ(rad_ride(b.s, &mark), RAD_OK);                   /* b's next real dispatch completes it */
+    const int64_t k0 = rad::aql::waitk_counts().kernels;
+    CHECK_OK(rad_event_wait(b.s, ea.e));                         /* pending: a wait kernel, which must not take the ride */
+    CHECK_EQ(rad::aql::waitk_counts().kernels - k0, 1);
+    void* g2 = nullptr;
+    REQUIRE_EQ(rad_stream_gate(b.s, &g2), RAD_OK);              /* holds b's next real dispatch */
+    CHECK_OK(rad_memset_async(x, 3, 4096, b.s));                /* takes the ride */
+    CHECK_OK(rad_ride_wait(c.s, mark));
+    CHECK_OK(rad_memset_async(flag, 1, 64, c.s));
+    CHECK_OK(rad_gate_open(g1));
+    CHECK_OK(rad_stream_sync(a.s));
+    /* the event is met and b's wait kernel is done; the ride must still wait for the memset behind g2 */
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_EQ(((volatile uint8_t*)flag.p)[0], 0);
+    CHECK_OK(rad_gate_open(g2));
+    CHECK_OK(rad_stream_sync(b.s));
+    CHECK_OK(rad_stream_sync(c.s));
+    CHECK_EQ(((volatile uint8_t*)flag.p)[0], 1);
+}
+
+TEST(two_streams_joining_hundreds_of_times_under_waitk_neither_deadlock_nor_reorder) {
+    if (rad::device_is_host()) SKIP("a card only");
+    const int64_t big = 1 << 20, small = 4096;
+    const int     joins = 400;
+    WaitkScope on(2);
+    Stream a, b;
+    Event ea, eb;
+    DevBuf<uint8_t> d0(big, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> d1(big, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> h(big, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> r(small, RAD_MEM_HOST_PINNED);
+    REQUIRE(d0 && d1 && h && r);
+    fill(h, big, 0x5EEE);
+    const int64_t k0 = rad::aql::waitk_counts().kernels;
+    CHECK_OK(rad_memcpy_async(d0, h, big, a.s));
+    for (int i = 0; i < joins; ++i) {
+        CHECK_OK(rad_event_record(ea.e, a.s));
+        CHECK_OK(rad_event_wait(b.s, ea.e));
+        CHECK_OK(rad_memcpy_async(d1, d0, big, b.s));
+        CHECK_OK(rad_event_record(eb.e, b.s));
+        CHECK_OK(rad_event_wait(a.s, eb.e));
+        CHECK_OK(rad_memcpy_async(d0, d1, small, a.s));
+    }
+    CHECK_OK(rad_memcpy_async(r, d0, small, a.s));
+    CHECK_OK(rad_stream_sync(a.s));
+    CHECK_OK(rad_stream_sync(b.s));
+    CHECK_EQ(std::memcmp(r, h, (size_t)small), 0);
+    /* the host runs far ahead, so most of the 800 waits are pending at enqueue */
+    CHECK(rad::aql::waitk_counts().kernels - k0 > 0);
+}
+
 /* An advance runs at its place in stream order. The sampled token it accepts is the last thing a
  * step copies into place, and the advance is issued behind that copy without a host wait. On the
  * host backend each stream is a queue with a worker thread, so an advance run on the issuing
