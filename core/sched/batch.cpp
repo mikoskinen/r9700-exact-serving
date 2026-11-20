@@ -374,7 +374,7 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
              humanb(ring_.bytes).c_str(), humanb(set_.dev_bytes).c_str(),
              humanb(set_.dev_bytes - set_.bt_base).c_str(), (int)prog.kv_groups.size(),
              (int)derived_.size(),
-             bt_rows() < max_seqs_ ? fmt("; block tables for %lld rows, not %lld (a BG lane's, RADIANCE_PP_BG_ROWS, "
+             bt_rows() < max_seqs_ ? fmt("; block tables for %lld rows, not %lld (RADIANCE_PP_BG_ROWS / RADIANCE_PP_LANE_ROWS, "
                                          "tp8 loop D47)", (long long)bt_rows(), (long long)max_seqs_).c_str() : "");
     return RAD_OK;
 }

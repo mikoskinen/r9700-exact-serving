@@ -2394,18 +2394,23 @@ int Engine::plan() {
                 /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N with RADIANCE_PP_BG_LANE=k): the k BG lanes' slabs carve N block-table
                  * rows (Scheduler::init); the other lanes' as before. Unset: every lane's slab, today. */
                 const int nl = cfg_.pp_lanes_now(), kbg = LaneSet::bg_env() < nl ? LaneSet::bg_env() : 0;
-                const int64_t bgr = LaneSet::bg_rows_env();
-                if (kbg > 0 && bgr > 0 && bgr < cfg_.max_seqs) {
-                    const int64_t bgs = BatchBuilder::device_bytes(r->program, cfg_, kg, bgr);
-                    if (bgs < 0) return RAD_E_INVAL;
-                    if (r->index == 0)
-                        RAD_INFO("VRAM budget: the %d BG lanes' step slabs at %lld block-table rows (RADIANCE_PP_BG_ROWS, tp8 loop D47): "
-                             "%.1f MiB a card each instead of %.1f MiB, %.1f MiB a card freed", kbg, (long long)bgr,
-                             (double)bgs / (1 << 20), (double)f.staging / (1 << 20), (double)(f.staging - bgs) * kbg / (1 << 20));
-                    f.staging = f.staging * (nl - kbg) + bgs * kbg;
-                } else {
-                    f.staging *= nl;
+                const int64_t bgr = LaneSet::bg_rows_env(), lm = LaneSet::lane_rows_env(), one = f.staging;
+                int64_t sum = 0;
+                for (int l = 0; l < nl; ++l) {   /* each lane's slab at the rows Scheduler::init gives it */
+                    const bool bgl = kbg > 0 && l >= nl - kbg;
+                    const int64_t nd = nl - kbg, cards = bgl ? 0 : ((int64_t)l + 1) * cfg_.max_seqs / nd - (int64_t)l * cfg_.max_seqs / nd;
+                    const int64_t rows = bgl ? (bgr > 0 && bgr < cfg_.max_seqs ? bgr : 0) : LaneSet::lane_rows(cards, lm, cfg_.max_seqs);
+                    int64_t b = one;
+                    if (rows > 0 && rows < cfg_.max_seqs && (b = BatchBuilder::device_bytes(r->program, cfg_, kg, rows)) < 0)
+                        return RAD_E_INVAL;
+                    sum += b;
                 }
+                if (sum != one * nl && r->index == 0)
+                    RAD_INFO("VRAM budget: the lanes' step slabs at their block-table rows (RADIANCE_PP_BG_ROWS %lld / RADIANCE_PP_LANE_ROWS "
+                             "%lld, tp8 loop D47): %.1f MiB a card for %d lanes instead of %.1f MiB, %.1f MiB a card freed",
+                             (long long)bgr, (long long)lm, (double)sum / (1 << 20), nl, (double)(one * nl) / (1 << 20),
+                             (double)(one * nl - sum) / (1 << 20));
+                f.staging = sum;
             }
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
             /* tp8 loop P10: RADIANCE_PP_SEND_ASYNC's card staging buffer, on the sending rank only (pp_serve_setup

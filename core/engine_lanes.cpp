@@ -260,6 +260,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
             RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROWS=%lld is not taken (tp8 loop D47): %s", (long long)bgr,
                      lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not below --max-num-seqs");
     }
+    if (const int64_t lm = LaneSet::lane_rows_env(); lm > 0)   /* tp8 loop D47b */
+        RAD_INFO("two-node pipeline: RADIANCE_PP_LANE_ROWS=%lld (tp8 loop D47b) -- a decode lane's step slab carves its block tables for "
+                 "its own cards + %lld rows (%lld at --max-num-seqs %lld over %d decode lanes), and takes a lent piece only while its "
+                 "inbox holds fewer than %lld", (long long)lm, (long long)lm,
+                 (long long)LaneSet::lane_rows(cfg_.max_seqs / std::max(1, n_lanes_ - lanes_.bg_n()), lm, cfg_.max_seqs),
+                 (long long)cfg_.max_seqs, n_lanes_ - lanes_.bg_n(), (long long)lm);
     if (lanes_.bg_lane() >= 0)
         RAD_INFO("two-node pipeline: a lent piece's commit opens its home request's drafter range as the home's own chunk would, so "
                  "a newcomer the BG lane ran whole drafts from its second token on (tp8 loop F22)");
@@ -552,6 +558,9 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
                                        "dev M5)", (long long)c.dpieces).c_str()
              : lanes_.lend_split() ? fmt("; %lld newcomers split on the 512 grid beside decode rows (RADIANCE_PP_LEND_MIXED=2, tp8 "
                                          "dev M5b)", (long long)c.dpieces).c_str() : "");
+    if (lanes_.lane_rows_m() > 0)   /* tp8 loop D47b */
+        RAD_INFO("two-node pipeline: a decode lane's rows (RADIANCE_PP_LANE_ROWS=%lld, tp8 loop D47b) turned away %lld lends over the run",
+                 (long long)lanes_.lane_rows_m(), (long long)lanes_.lane_rows_kept());
     if (lanes_.bg_lane() >= 0)
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
                  "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "

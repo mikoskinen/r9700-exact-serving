@@ -56,6 +56,7 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     lend_mixed_ = lm && !std::strcmp(lm, "1") ? 1 : lm && !std::strcmp(lm, "2") ? 2 : 0;
     bg_ = bg_env();
     bg_rows_n_ = bg_rows_env();   /* tp8 loop D47 */
+    lane_rows_m_ = lane_rows_env();   /* tp8 loop D47b */
     const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
     bg_split_ = bs && !std::strcmp(bs, "1");
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh) {
@@ -89,6 +90,14 @@ int LaneSet::bg_env() {
 
 int64_t LaneSet::bg_rows_env() {   /* tp8 loop D47 */
     const char* v = std::getenv("RADIANCE_PP_BG_ROWS");
+    if (!v || !*v) return 0;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    return end && !*end && n >= 1 && n <= 256 ? (int64_t)n : 0;
+}
+
+int64_t LaneSet::lane_rows_env() {   /* tp8 loop D47b */
+    const char* v = std::getenv("RADIANCE_PP_LANE_ROWS");
     if (!v || !*v) return 0;
     char* end = nullptr;
     const long long n = std::strtoll(v, &end, 10);
@@ -517,6 +526,12 @@ void Scheduler::lane_split_own() {
             /* the borrower's entries: its own cards' beside the inbox (the S5 review's rule) */
             if (lanes_->inbox_rows_locked(to) + n > (wide ? cfg_.max_tok : rows_cap) ||
                 (int64_t)lanes_->inbox_n_locked(to) + 1 + (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_ > cfg_.max_seqs) {
+                why = LaneSet::kRoom;
+                break;
+            }
+            /* tp8 loop D47b (RADIANCE_PP_LANE_ROWS=M): a decode lane's block tables hold its own cards + M rows */
+            if (lanes_->lane_rows_m() > 0 && (int64_t)lanes_->inbox_n_locked(to) + 1 > lanes_->lane_rows_m()) {
+                lanes_->note_lane_rows_kept_locked();
                 why = LaneSet::kRoom;
                 break;
             }

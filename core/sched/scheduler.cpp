@@ -596,7 +596,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * carry only lent newcomers, lane_split_bg lends into it only below N pieces) carves its block tables for N rows */
     if (lanes_ && n_lanes_ > 1) {
         const int kbg = LaneSet::bg_env() < n_lanes_ ? LaneSet::bg_env() : 0;
-        builder_.set_bt_rows(kbg > 0 && lane_ >= n_lanes_ - kbg ? LaneSet::bg_rows_env() : 0);
+        const bool bgl = kbg > 0 && lane_ >= n_lanes_ - kbg;
+        /* tp8 loop D47b (RADIANCE_PP_LANE_ROWS=M): a decode lane's own cards (the split below) + M lent pieces */
+        const int64_t nd = n_lanes_ - kbg, cards = bgl ? 0 : ((int64_t)lane_ + 1) * cfg.max_seqs / nd - (int64_t)lane_ * cfg.max_seqs / nd;
+        const int64_t m = LaneSet::lane_rows_env();
+        builder_.set_bt_rows(bgl ? LaneSet::bg_rows_env() : m > 0 ? LaneSet::lane_rows(cards, m, cfg.max_seqs) : 0);
     }
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
     /* tp8 prefill P0: a lane's window rows from their own window (BatchBuilder::win_row) */
