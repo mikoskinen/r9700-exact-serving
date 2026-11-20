@@ -36,4 +36,14 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
 int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w,
                     long long w_ld, void* y, long long y_ld, long long M, long long N, long long K, int form);
 
+/* Lever Q6IL (DRAFTER track 20.11.2026 round 44): the same calls on a q6_K weight stored tile-interleaved (type "q6_K_il16b", tag
+ * "r4d_q6k_il16b"; r4d_ds41_ggml.hip Wq6Il2): only the IL-B instances read it -- the decode band's G1 / G2 forms under `code`
+ * (r4d_gg_wk_run_il; R4D_WK_DECLINE where no IL instance has the geometry) and the prefill form 326 at any M (r4d_gg_wkpf_run_il,
+ * N a multiple of 16). Every output: the part order (the native weight's bytes in the same form). */
+int r4d_gg_wk_run_il(RadStream s, int code, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld, const int* x_al,
+                     const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
+                     long long K, const GgWkFold* fo);
+int r4d_gg_wkpf_run_il(RadStream s, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w, void* y,
+                       long long y_ld, long long M, long long N, long long K);
+
 #endif  /* R4D_DS41_WMK_H */

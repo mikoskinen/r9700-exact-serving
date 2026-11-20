@@ -1228,6 +1228,7 @@ struct TwinSet {
     TwinSet(const TwinSet&) = delete;
     TwinSet& operator=(const TwinSet&) = delete;
 };
+static const char* q6il_type(const char* ty, int64_t rows, const char* name);   /* lever Q6IL (below) */
 static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
                      bool mapped = false, int access = RAD_ACCESS_PER_TOKEN);
@@ -1408,7 +1409,7 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
                 (long long)hi);
         return 0;
     }
-    if (ty) m.wty[w] = ty;
+    if (ty) m.wty[w] = q6il_type(ty, n, name);   /* lever Q6IL: q6_K_il16b where RADIANCE_DS41_Q6IL asks */
     if (ty && twin_env() && !twin_decl(b, m, w, name, n, k, grp, shard, lo, hi, access)) return 0;   /* tp8 loop P30t */
     return w;
 }
@@ -1830,6 +1831,32 @@ static int dsp_dep_env() {
  * outputs are drafter_mx 2 / 4 / 5's byte for byte (exact: no reference change); drafter_mx no longer picks these calls'
  * form. xeon dbench (lever DEP's shapes, lq168 records, 300 passes): the experts' pass 1,091 -> 1,047 us at 32 tokens,
  * 902 -> 848 at 40. Unset / 0: moe_gemm_ggml as published. Needs a kernel plugin serving moe_gemm_mxil (libr4d). */
+/* Lever Q6IL (DRAFTER track 20.11.2026 round 44): RADIANCE_DS41_Q6IL=1 (or on) at start gives every q6_K GGUF linear whose rows
+ * on this rank are whole 16s (not the token table: embed_lookup_ggml reads native rows) the type "q6_K_il16b": libr4d stores it
+ * TILE-INTERLEAVED at load (its relayout hook: per 16-row tile and 128-value slab the rows' 1,696 bytes in the order a wave loads
+ * them; the native blocks' bytes moved, 106 K / 128 bytes a row, +0.95 %) and reads it with the IL-B forms of the same kernels:
+ * the same words into the same registers, so every output is the native weight's bytes under ds41_wmk >= 1 (rule A). Covers the
+ * trunk's attention / shared-expert / Engram q6_K linears (gemm_nt_ggml, the pairs, folds a / e) and the head (logits_gemm_ggml,
+ * the trunk's and the DSpark drafter's). xeon r43d (in chain, us a call at 1 / 16 / 32 / 48 / 64 rows): head 238.7 / 258.6 / 298.4
+ * / 339.2 / 443.3 -> 226.7 / 237.5 / 254.8 / 287.2 / 403.1, q_a + kv pair 21.9 / 23.2 / 26.6 / 36.2 / 38.0 -> 18.5 / 19.2 / 21.2 /
+ * 28.8 / 33.5. Unset / 0: the native rows as published. Needs libr4d (and libref) serving q6_K_il16b. */
+static int q6il_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_Q6IL");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
+static std::atomic<int> g_q6il_n{0};
+static const char* q6il_type(const char* ty, int64_t rows, const char* name) {
+    if (q6il_env() != 1 || !ty || std::strcmp(ty, "q6_K") || rows <= 0 || rows % 16) return ty;
+    const size_t ln = name ? std::strlen(name) : 0, ls = std::strlen("token_embd.weight");
+    if (ln >= ls && !std::strcmp(name + ln - ls, "token_embd.weight")) return ty;
+    g_q6il_n.fetch_add(1, std::memory_order_relaxed);
+    return "q6_K_il16b";
+}
 static int dsp_wil_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_WIL");
@@ -3623,6 +3650,7 @@ static void gq_oa_issue(RadCtx* x, const Model& m, const Layer& L, int64_t n, Ra
 /* Lever 1U-E2 (ds41-int11): a GGUF weight row's stored bytes (gemm_nt_ggml's native blocks: the row step of a row view);
  * 0 for a type this build cannot name. */
 static int64_t ggml_row_bytes(const char* ty, int64_t k) {
+    if (ty && !std::strcmp(ty, "q6_K_il16b")) return k % 256 ? 0 : k / 128 * 106;   /* lever Q6IL: a stored row (16-row views only) */
 #ifdef RAD_ARCH_HAVE_GGML
     for (uint32_t t = 0; ty && t < 64; ++t) {
         const lq::ggml::PlaneKind* pk = lq::ggml::plane_kind(t);
@@ -3644,6 +3672,7 @@ static int e2_layer(RadBuilder* b, Model& m, Layer& L, int64_t T, int64_t n, int
     const auto& g = m.g;
     const auto ty = m.wty.find(L.e_kv);
     if (ty == m.wty.end() || m.wsc.count(L.e_kv) || n % g.world || ((n / g.world) * 2) % 16) return RAD_OK;
+    if (!std::strcmp(ty->second, "q6_K_il16b") && (n / g.world) % 16) return RAD_OK;   /* lever Q6IL: a part of whole 16-row tiles */
     const int64_t P = n / g.world, R = std::min<int64_t>(T, kBiBand), rb = ggml_row_bytes(ty->second, k);
     if (rb <= 0) return RAD_OK;
     if (!m.ekv_p) {
@@ -6481,6 +6510,13 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
+    if (q6il_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_Q6IL=%s is not 0 / off or 1 / on\n", std::getenv("RADIANCE_DS41_Q6IL"));
+        return RAD_E_INVAL;
+    }
+    rad_ggml_type_hook = q6il_env() == 1 ? q6il_type : nullptr;   /* lever Q6IL: the shared experts' GGUF linears (rad_fp8.h) too */
+    if (q6il_env() == 1 && !ctx->shape_probe)
+        rad_note(b, "lever Q6IL (RADIANCE_DS41_Q6IL): q6_K GGUF linears of whole 16-row tiles as q6_K_il16b (libr4d's tile-interleaved form)");
     if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16) {
         fprintf(stderr, "radiance: deepseek41: its caches hold bf16 (lossless for the fp8 and fp4 "
                         "values the model writes); run with --kv-cache-dtype bf16\n");

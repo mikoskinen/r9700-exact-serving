@@ -1102,6 +1102,199 @@ static void route(const Plugin& pl, const char* tlist) {
                 keys == 0 ? "NO DATA" : bad_keys ? "FAIL" : "PASS (every dense op row in the part order at M 1..130, row bytes M-invariant across the decode and prefill forms, = the bench pin)");
 }
 
+/* --q6ilcheck (lever Q6IL, DRAFTER track 20.11.2026 round 44): every dense q6_K op row on the weight stored tile-interleaved
+ * (type q6_K_il16b, the bytes r4d_q6k_il16b_pack makes from the native rows = the layout hook's move) against the same row on the
+ * native weight (type q6_K), byte for byte (y, and h for the folds), at the engine path's modes (R4D_Q6IL_MODES, default 15,17)
+ * and M 1..64 + the prefill heights 65 .. 2048 (the head to 256); the IL call must not fail (no form declines it: the il path has
+ * no native fallback). The pack's inverse gives the native rows back. R4D_Q6IL_PERF=1: + a chain of NC weight copies (>= 256 MiB,
+ * >= 4) back to back, native and IL alternated, median of 10 chains, us a call at R4D_Q6IL_PM (default 1,16,32,48,64). */
+static void q6il(const Plugin& pl, const char* tlist) {
+    Hk h;
+    if (!hooks(pl, h, "--q6ilcheck")) return;
+    auto pack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, "r4d_q6k_il16b_pack");
+    auto unpack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, "r4d_q6k_il16b_unpack");
+    auto wst = (int (*)(long long*, int))dlsym(pl.h, "rad_wmk_stats");
+    if (!pack || !unpack || !wst) { std::printf("--q6ilcheck: r4d_q6k_il16b_pack / unpack / rad_wmk_stats absent (not a Q6IL libr4d)\n"); ++g_fail; return; }
+    const std::vector<int64_t> modes = ilist(std::getenv("R4D_Q6IL_MODES"), "15,17");
+    std::vector<int64_t> Ms;
+    for (int64_t m = 1; m <= 64; ++m) Ms.push_back(m);
+    for (int64_t m : { 65, 80, 97, 130, 192, 256, 1000, 2048 }) Ms.push_back(m);
+    if (const char* e = std::getenv("R4D_Q6IL_MS")) Ms = ilist(e, "1");
+    const bool perf_on = [] { const char* e = std::getenv("R4D_Q6IL_PERF"); return e && e[0] == '1'; }();
+    const std::vector<int64_t> PM = ilist(std::getenv("R4D_Q6IL_PM"), "1,16,32,48,64");
+    const std::string want = tlist && *tlist ? tlist : "";
+    struct Op { const char* name; int kind; int64_t N, N2, K; bool a2; int64_t mmax; };   /* kind 0 gemm, 1 logits, 2 pair, 3 fold a, 4 fold e */
+    const Op ops[] = {
+        { "attn_q_b(fold a)", 3, 8192, 0, 1280, false, 2048 },  { "attn_q_b", 0, 8192, 0, 1280, false, 2048 },
+        { "q_a+attn_kv(pair)", 2, 1280, 512, 5120, false, 2048 }, { "attn_output_a g0+g1(pair a2)", 2, 1024, 1024, 4096, true, 2048 },
+        { "attn_output_b", 0, 5120, 0, 2048, false, 2048 },     { "shexp_gate_up", 0, 1536, 0, 5120, false, 2048 },
+        { "shexp_gate_up_w512", 0, 1024, 0, 5120, false, 2048 }, { "shexp_down(fold e)", 4, 5120, 0, 768, false, 2048 },
+        { "shexp_down_w512(fold e)", 4, 5120, 0, 512, false, 2048 }, { "engram_kv", 0, 6400, 0, 6144, false, 2048 },
+        { "engram_kv_e2part", 0, 1600, 0, 6144, false, 2048 },  { "head", 1, 32320, 0, 5120, false, 256 },
+    };
+    const MrTy& ty = kMrTypes[1];   /* q6_K */
+    long long keys = 0, bad_keys = 0, calls = 0;
+    std::printf("Q6IL check: q6_K_il16b (tile-interleaved, r4d_q6k_il16b_pack) vs q6_K (native rows) through each op row, modes");
+    for (int64_t m : modes) std::printf(" %lld", (long long)m);
+    std::printf(", %zu row counts\n", Ms.size());
+    for (const Op& op : ops) {
+        if (!want.empty() && !mr_in(want.c_str(), op.name)) continue;
+        const char* rn = op.kind == 0 ? "gemm_nt_ggml_qk256_tiled" : op.kind == 1 ? "logits_gemm_ggml_qk256_tiled"
+                       : op.kind == 2 ? "gemm_nt_ggml_pair_qk256" : op.kind == 3 ? "rmsnorm_gemm_nt_ggml_qk256" : "swiglu_clamped_gemm_nt_ggml_qk256";
+        const RadKernelInfo* row = find(pl, rn);
+        if (!row) { std::printf("  Q6IL %s: row %s absent\n", op.name, rn); ++g_fail; ++bad_keys; ++keys; continue; }
+        dfree_all();
+        const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, rbi = K / 128 * 106, xc = op.kind == 4 ? 2 * K : K;
+        const int64_t NY = N + N2, hw_ = op.kind >= 3 ? K : 0, RB = op.mmax;
+        std::vector<uint8_t> hw, hw2, hil, hil2, back;
+        mr_weights(hw, ty, N, K, 0x6A10001ull ^ (uint64_t)(N * 7 + K));
+        if (N2) mr_weights(hw2, ty, N2, K, 0x6A10002ull ^ (uint64_t)(N2 * 7 + K));
+        hil.resize((size_t)(N * rbi)); hil2.resize((size_t)(N2 * rbi));
+        long long rt_bad = 0;
+        if (pack(hw.data(), hil.data(), N, K) != RAD_OK || (N2 && pack(hw2.data(), hil2.data(), N2, K) != RAD_OK)) ++rt_bad;
+        back.resize(hw.size());
+        if (unpack(hil.data(), back.data(), N, K) != RAD_OK || back != hw) ++rt_bad;
+        std::vector<uint16_t> hx, hx2;
+        mr_acts(hx, xc, 0x6AACull ^ (uint64_t)(xc + op.kind));
+        hx.resize((size_t)(RB * xc));
+        for (int64_t i = 48; i < RB; ++i) std::memcpy(&hx[(size_t)(i * xc)], &hx[(size_t)(((i * 7) % 48) * xc)], (size_t)xc * 2);
+        if (op.a2) {
+            mr_acts(hx2, K, 0x6AADull ^ (uint64_t)K);
+            hx2.resize((size_t)(RB * K));
+            for (int64_t i = 48; i < RB; ++i) std::memcpy(&hx2[(size_t)(i * K)], &hx2[(size_t)(((i * 5) % 48) * K)], (size_t)K * 2);
+        }
+        std::vector<float> g((size_t)K);
+        for (int64_t k = 0; k < K; ++k) g[(size_t)k] = (k % 7 == 0) ? 0.0f : (k % 5 == 0) ? -0.25f : 0.8f + 0.001f * (float)(k % 97);
+        const size_t ob = op.kind == 1 ? 4 : 2, yrow = (size_t)NY * ob, hrow = (size_t)hw_ * 2;
+        void* d_w = dalloc(hw.size() + hw2.size());
+        void* d_wi = dalloc(hil.size() + hil2.size());
+        void* d_x = dalloc(hx.size() * 2);
+        void* d_x2 = op.a2 ? dalloc(hx2.size() * 2) : nullptr;
+        void* d_g = dalloc((size_t)K * 4);
+        void* d_y = dalloc((size_t)RB * yrow);
+        void* d_h = hrow ? dalloc((size_t)RB * hrow) : nullptr;
+        if (!d_w || !d_wi || !d_x || !d_g || !d_y || (op.a2 && !d_x2) || (hrow && !d_h)) { std::printf("  Q6IL %s: alloc\n", op.name); ++g_fail; continue; }
+        st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+        if (N2) st_memcpy((uint8_t*)d_w + hw.size(), hw2.data(), hw2.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_wi, hil.data(), hil.size(), hipMemcpyHostToDevice);
+        if (N2) st_memcpy((uint8_t*)d_wi + hil.size(), hil2.data(), hil2.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        if (op.a2) st_memcpy(d_x2, hx2.data(), hx2.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_g, g.data(), (size_t)K * 4, hipMemcpyHostToDevice);
+        /* one call of M rows on weight base w (w2 = w + off2) of row bytes wrb under type tn; sync = false: no copy back */
+        auto launch = [&](const char* tn, void* w, size_t off2, int64_t wrb, int64_t M) -> int {
+            const uint16_t* x = (const uint16_t*)d_x;
+            if (op.kind == 0)
+                return k1_launch(row, { T((void*)x, RAD_BF16, { M, K }), T(w, RAD_U8, { N, wrb }), T(d_y, RAD_BF16, { M, N }) },
+                                 { PI("M", M), PI("N", N), PI("K", K), PS("type", tn), PS("dtype", "bf16") });
+            if (op.kind == 1)
+                return k1_launch(row, { T((void*)x, RAD_BF16, { M, K }), T(w, RAD_U8, { N, wrb }), T(d_y, RAD_F32, { M, N }) },
+                                 { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("type", tn), PS("dtype", "bf16") });
+            if (op.kind == 2) {
+                std::vector<RadTensor> t = { gqst::TP((void*)x, RAD_BF16, M, K, K), T(w, RAD_U8, { N, wrb }),
+                                             gqst::TP(op.a2 ? d_x2 : (void*)x, RAD_BF16, M, K, K), T((uint8_t*)w + off2, RAD_U8, { N2, wrb }),
+                                             gqst::TP(d_y, RAD_BF16, M, N, NY), gqst::TP((uint16_t*)d_y + N, RAD_BF16, M, N2, NY) };
+                if (!op.a2) absent(t[2]);
+                return k1_launch(row, t, { PI("M", M), PI("N", N), PI("N2", N2), PI("K", K), PS("type", tn), PS("dtype", "bf16") });
+            }
+            if (op.kind == 3)
+                return k1_launch(row, { T((void*)x, RAD_BF16, { M, K }), T(w, RAD_U8, { N, wrb }), T(d_g, RAD_F32, { K }),
+                                        T(d_h, RAD_BF16, { M, K }), T(d_y, RAD_BF16, { M, N }) },
+                                 { PI("M", M), PI("N", N), PI("K", K), PS("type", tn), PS("dtype", "bf16"), PF("eps", 1e-6) });
+            return k1_launch(row, { T((void*)x, RAD_BF16, { M, 2 * K }), T(w, RAD_U8, { N, wrb }), T(d_h, RAD_BF16, { M, K }),
+                                    T(d_y, RAD_BF16, { M, N }) },
+                             { PI("M", M), PI("N", N), PI("K", K), PS("type", tn), PS("dtype", "bf16"), PF("limit", 10.0) });
+        };
+        auto call = [&](bool il, int64_t M, std::vector<uint8_t>& out) -> int {
+            st_memset(d_y, 0xff, (size_t)M * yrow);
+            if (hrow) st_memset(d_h, 0x5a, (size_t)M * hrow);
+            const int rc = il ? launch("q6_K_il16b", d_wi, hil.size(), rbi, M) : launch("q6_K", d_w, hw.size(), rb, M);
+            ++calls;
+            if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : -999;
+            out.resize((size_t)M * (yrow + hrow));
+            st_memcpy(out.data(), d_y, (size_t)M * yrow, hipMemcpyDeviceToHost);
+            if (hrow) st_memcpy(out.data() + (size_t)M * yrow, d_h, (size_t)M * hrow, hipMemcpyDeviceToHost);
+            return RAD_OK;
+        };
+        for (int64_t mode : modes) {
+            set_dec(h);
+            h.sw("ds41_wmk", (int)mode);
+            long long cmp = 0, diff = 0, rc_bad = 0, ndecl = 0;
+            std::string fails;
+            for (int64_t M : Ms) {
+                if (M > RB) continue;
+                long long v0[4] = {}, v1[4] = {};
+                std::vector<uint8_t> on, oi;
+                const int rn_ = call(false, M, on);
+                wst(v0, 4);
+                const int ri = call(true, M, oi);
+                wst(v1, 4);
+                ndecl += v1[3] - v0[3];
+                if (rn_ != RAD_OK || ri != RAD_OK) { ++rc_bad; if (fails.size() < 300) fails += fmt(" M=%lld rc %d/%d;", (long long)M, rn_, ri); continue; }
+                ++cmp;
+                if (on != oi) { ++diff; if (fails.size() < 300) fails += fmt(" M=%lld differ;", (long long)M); }
+            }
+            const bool kb = rt_bad || rc_bad || diff || ndecl;
+            ++keys;
+            if (kb) { ++bad_keys; ++g_fail; }
+            std::printf("Q6IL %s %lldx%lld%s mode %lld | pack inverse %s | calls compared %lld, IL != native %lld, rc bad %lld, WMK declines on IL %lld -> %s%s\n",
+                        op.name, (long long)NY, (long long)K, op.kind == 1 ? " f32" : "", (long long)mode, rt_bad ? "NO" : "ok", cmp, diff, rc_bad, ndecl,
+                        kb ? "FAIL" : "ok", fails.c_str());
+            std::fflush(stdout);
+        }
+        if (perf_on) {   /* a chain of NC copies back to back, native / IL alternated, median of 10 */
+            const size_t wb = hw.size() + hw2.size(), wbi = hil.size() + hil2.size();
+            const int NC = (int)std::max<int64_t>(4, std::min<int64_t>(128, (int64_t)((256ull << 20) / wb) + 1));
+            std::vector<void*> cw, ci;
+            for (int c = 0; c < NC; ++c) {
+                void* a = dalloc(wb); void* b = dalloc(wbi);
+                if (!a || !b) break;
+                st_memcpy(a, d_w, wb, hipMemcpyDeviceToDevice);
+                st_memcpy(b, d_wi, wbi, hipMemcpyDeviceToDevice);
+                cw.push_back(a); ci.push_back(b);
+            }
+            if ((int)cw.size() < NC) { std::printf("  Q6IL %s perf: alloc of %d copies\n", op.name, NC); continue; }
+            hipEvent_t e0, e1;
+            st_ev_create(&e0); st_ev_create(&e1);
+            for (int64_t mode : modes) {
+                set_dec(h);
+                h.sw("ds41_wmk", (int)mode);
+                std::string line;
+                for (int64_t M : PM) {
+                    if (M > RB) continue;
+                    std::vector<float> tn_, ti_;
+                    g_k1_sync = false;
+                    for (int rep = 0; rep < 11; ++rep)
+                        for (int arm = 0; arm < 2; ++arm) {
+                            const bool il = (rep + arm) & 1;
+                            st_ev_record(e0, nullptr);
+                            for (int c = 0; c < NC; ++c)
+                                (void)(il ? launch("q6_K_il16b", ci[(size_t)c], hil.size(), rbi, M) : launch("q6_K", cw[(size_t)c], hw.size(), rb, M));
+                            st_ev_record(e1, nullptr);
+                            st_ev_sync(e1);
+                            float ms = 0;
+                            st_ev_elapsed(&ms, e0, e1);
+                            if (rep > 0) (il ? ti_ : tn_).push_back(ms * 1000.0f / (float)NC);
+                        }
+                    g_k1_sync = true;
+                    std::sort(tn_.begin(), tn_.end()); std::sort(ti_.begin(), ti_.end());
+                    const float a = tn_[tn_.size() / 2], b = ti_[ti_.size() / 2];
+                    line += fmt(" M %lld %.1f -> %.1f (%+.1f %%);", (long long)M, a, b, 100.0 * (b - a) / a);
+                }
+                std::printf("Q6ILPERF %s %lldx%lld mode %lld chain %d copies, us a call native -> IL:%s\n", op.name, (long long)NY, (long long)K,
+                            (long long)mode, NC, line.c_str());
+                std::fflush(stdout);
+            }
+            st_ev_destroy(e0); st_ev_destroy(e1);
+        }
+    }
+    clear(h);
+    dfree_all();
+    if (keys == 0) ++g_fail;
+    std::printf("WMGVERDICT q6ilcheck: %lld (op, mode) keys, %lld calls, %lld bad -> %s\n", keys, calls, bad_keys,
+                keys == 0 ? "NO DATA" : bad_keys ? "FAIL" : "PASS (every q6_K dense op row on the tile-interleaved weight = the native weight's bytes)");
+}
+
 /* --wmkref [types] (ds41-wmk2, FINDINGS F2): the dense ops against an f64 HOST REFERENCE, so the part-order form is held to the
  * true value, not only to itself (rows = alone) or to the decode band. Weights: GGUF blocks with realistic scales (q6_K d
  * 2^-11 .. 2^-8, int8 sub-scales; q5_K d / dmin 2^-11 .. 2^-8, 6-bit scales / mins; q8_0 d 2^-9 .. 2^-6; random quants);

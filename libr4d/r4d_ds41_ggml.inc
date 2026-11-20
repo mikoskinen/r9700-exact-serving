@@ -37,10 +37,13 @@ static const RadOperandSpec oDs41EmbedGgml[] = {
 
 #define R4D_DS41_GG_T256 "q5_K q6_K iq2_xxs iq1_s"
 #define R4D_DS41_GG_T32  "q8_0 iq4_nl"
+/* + lever Q6IL's "q6_K_il16b" (q6_K stored tile-interleaved, r4d_ds41_ggml_layout.cpp): the dense rows only (gemm_nt_ggml,
+ * logits_gemm_ggml, the folds, the pair), never the grouped GEMM or the embedding */
+#define R4D_DS41_GG_T256D "q5_K q6_K iq2_xxs iq1_s q6_K_il16b"
 /* The decode band: up to 16 activation rows (two passes of eight over the streamed weight). */
 static const RadConstraint cDs41GgGemv256[] = {
     C_GE("M", 1), C_LE("M", 16), C_GE("N", 1), C_GE("K", 256), C_DIV("K", 256),
-    C_IN("type", R4D_DS41_GG_T256), C_IN("dtype", "bf16"),
+    C_IN("type", R4D_DS41_GG_T256D), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDs41GgGemv32[] = {
     C_GE("M", 1), C_LE("M", 16), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32),
@@ -48,7 +51,7 @@ static const RadConstraint cDs41GgGemv32[] = {
 };
 static const RadConstraint cDs41GgTiled256[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("K", 256), C_DIV("K", 256),
-    C_IN("type", R4D_DS41_GG_T256), C_IN("dtype", "bf16"),
+    C_IN("type", R4D_DS41_GG_T256D), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDs41GgTiled32[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32),
@@ -77,7 +80,7 @@ static const RadConstraint cDs41GgMoeTiled32[] = {
 };
 static const RadConstraint cDs41GgLogitsGemv256[] = {
     C_GE("M", 1), C_LE("M", 16), C_GE("n_vocab", 1), C_GE("n_embd", 256), C_DIV("n_embd", 256),
-    C_IN("type", R4D_DS41_GG_T256), C_IN("dtype", "bf16"),
+    C_IN("type", R4D_DS41_GG_T256D), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDs41GgLogitsGemv32[] = {
     C_GE("M", 1), C_LE("M", 16), C_GE("n_vocab", 1), C_GE("n_embd", 32), C_DIV("n_embd", 32),
@@ -85,7 +88,7 @@ static const RadConstraint cDs41GgLogitsGemv32[] = {
 };
 static const RadConstraint cDs41GgLogitsTiled256[] = {
     C_GE("M", 1), C_GE("n_vocab", 1), C_GE("n_embd", 256), C_DIV("n_embd", 256),
-    C_IN("type", R4D_DS41_GG_T256), C_IN("dtype", "bf16"),
+    C_IN("type", R4D_DS41_GG_T256D), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDs41GgLogitsTiled32[] = {
     C_GE("M", 1), C_GE("n_vocab", 1), C_GE("n_embd", 32), C_DIV("n_embd", 32),
@@ -114,7 +117,7 @@ static const RadOperandSpec oDs41SwiGemmGgml[] = {
     { "gate_up", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "h", RAD_OPD_OUT, 0 }, { "y", RAD_OPD_OUT, 0 },
 };
 static const RadConstraint cDs41GgFold256[] = {
-    C_GE("M", 1), C_GE("N", 1), C_GE("K", 256), C_DIV("K", 256), C_IN("type", "q5_K q6_K"), C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_GE("N", 1), C_GE("K", 256), C_DIV("K", 256), C_IN("type", "q5_K q6_K q6_K_il16b"), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDs41GgFold32[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32), C_IN("type", "q8_0"), C_IN("dtype", "bf16"),
@@ -129,13 +132,14 @@ static const RadOperandSpec oDs41GemmGgmlPair[] = {
     { "y", RAD_OPD_OUT, 0 }, { "y2", RAD_OPD_OUT, 0 },
 };
 static const RadConstraint cDs41GgPair256[] = {
-    C_GE("M", 1), C_GE("N", 1), C_GE("N2", 1), C_GE("K", 256), C_DIV("K", 256), C_IN("type", "q5_K q6_K"),
+    C_GE("M", 1), C_GE("N", 1), C_GE("N2", 1), C_GE("K", 256), C_DIV("K", 256), C_IN("type", "q5_K q6_K q6_K_il16b"),
     C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDs41GgPair32[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("N2", 1), C_GE("K", 32), C_DIV("K", 32), C_IN("type", "q8_0"), C_IN("dtype", "bf16"),
 };
 #undef R4D_DS41_GG_T256
+#undef R4D_DS41_GG_T256D
 #undef R4D_DS41_GG_T32
 
 #elif defined(R4D_DS41_SCHEMAS)

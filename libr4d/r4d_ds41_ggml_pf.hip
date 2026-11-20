@@ -62,9 +62,14 @@
 
 namespace {
 
+/* FI bit 4 (16, lever Q6IL, DRAFTER track 20.11.2026 round 44): the weight is q6_K TILE-INTERLEAVED (Wq6Il2, r4d_ds41_ggml.hip): a
+ * lane's row pointer is its 16-row tile's base and the prefetch walks the wave's tiles; Wq6Il2 loads the same words into the same
+ * registers as Wq<GG_Q6_K>, so every output's operations and bytes are the native form's. */
 template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
 __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
-    using W = Wq<T>;
+    constexpr bool IL = (FI & 16) != 0;
+    static_assert(!IL || T == GG_Q6_K, "gg_pf_kernel: the tile-interleaved form is q6_K's");
+    using W = std::conditional_t<IL, Wq6Il2, Wq<T>>;
     using Pf = typename W::Pf;
     constexpr int NTH = WN * 32;
     constexpr int BM = 16 * MT, BN = 16 * NT * WN, WC = 16 * NT;   /* WC weight rows a wave */
@@ -103,7 +108,9 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
         const int n = n0 + wave * WC + nt * 16 + c16;
-        wr[nt] = wb + (long long)(n < A.N ? n : A.N - 1) * A.w_ld;
+        const long long nn = n < A.N ? n : A.N - 1;
+        if constexpr (IL) wr[nt] = wb + (nn >> 4) * (long long)(A.K / kWmS) * kIl6;
+        else wr[nt] = wb + nn * A.w_ld;
     }
     /* Activation staging as the stock's: XC 16-byte chunks a thread a slab (row q >> 4, values 8 (q & 15)). */
     const uint16_t* xsrc[XC];
@@ -144,6 +151,13 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
     const long long psb = A.w_ld / S;
     const int pfl = (int)min(31LL, (2 * psb + 127) / 128);
     auto prefetch = [&](int s) {
+        if constexpr (IL) {   /* Q6IL: the wave's NT tiles' slab s + 3 (1,696 contiguous bytes a tile) */
+            const long long t0 = (long long)(n0 + __builtin_amdgcn_readfirstlane(wave) * WC) >> 4, tl = (long long)(A.N - 1) >> 4;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+                __builtin_amdgcn_s_prefetch_data(gg_sptr(wb + ((t0 + nt < tl ? t0 + nt : tl) * (long long)S + min(s + 3, S - 1)) * kIl6), 27);
+            return;
+        }
         const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;
 #pragma unroll 1
         for (int i = 0; i < WC; ++i) {

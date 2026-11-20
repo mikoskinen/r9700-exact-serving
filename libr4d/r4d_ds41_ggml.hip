@@ -2800,6 +2800,53 @@ template <> struct Wq<GG_Q6_K> : WqBase {
     __device__ static __forceinline__ void table(uint8_t*) {}
 };
 
+/* Lever Q6IL (DRAFTER track 20.11.2026 round 44): the q6_K weight stored TILE-INTERLEAVED (type "q6_K_il16b", tag
+ * "r4d_q6k_il16b", r4d_ds41_ggml_layout.cpp): for 16-row tile t and slab s (half a block, 128 K values) the 16 rows' slab pieces
+ * are kIl6 = 1,696 contiguous bytes at (t S + s) kIl6 (S = K / 128) in the order a wave loads them (Wq6Il2 below); a row's slab
+ * piece is kIl6R = 106 bytes (64 ql + 32 qh + 8 scales + d, d in both slabs), so the stored row is S kIl6R = 106 K / 128 bytes
+ * (210 K / 256 native: +0.95 %) and a 16-row tile's rows are 16 S kIl6R bytes from the tile's base: a row view at a multiple of
+ * 16 rows is the native view's arithmetic with that row step. Round 42 bench (AB bit 256); moved here from r4d_ds41_wmk.hip so
+ * gg_pf_kernel (the prefill rows) reads it too. */
+constexpr int kIl6 = 1696, kIl6R = 106;
+/* Round 42 (bench, AB bit 256): IL-B, the tile-slab's 1,696 bytes in LOAD order -- ql load i (i 0..3) of lane L (= 16 h + c16) at
+ * 256 i + 8 L, qh load i (0..1) at 1024 + 256 i + 8 L, the row's 8 scales at 1536 + 8 c16, d at 1664 + 2 c16: every ql / qh load
+ * instruction of a wave reads 256 contiguous bytes. The same words into the same registers as Wq<GG_Q6_K>. The row pointer is the
+ * tile's base. */
+struct Wq6Il2 : Wq<GG_Q6_K> {
+    __device__ static __forceinline__ void load(const uint8_t* tb, int s, int h, uint32_t* r) {
+        const int L = (int)(threadIdx.x & 31), c = L & 15;
+        const uint8_t* b = tb + (long long)s * kIl6;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * i + 8 * L);
+            r[2 * i] = q.x;
+            r[2 * i + 1] = q.y;
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 1024 + 256 * i + 8 * L);
+            r[8 + 2 * i] = q.x;
+            r[9 + 2 * i] = q.y;
+        }
+        const gg_u32x2 sc = *(const gg_u32x2*)(const void*)(b + 1536 + 8 * c);
+        r[12] = sc.x;
+        r[13] = sc.y;
+        r[14] = gg_u16(b + 1664 + 2 * c);
+    }
+    template <int J>
+    __device__ static __forceinline__ void reload(const uint8_t* tb, int s, int h, uint32_t* r) {
+        const int L = (int)(threadIdx.x & 31), c = L & 15;
+        const uint8_t* b = tb + (long long)s * kIl6;
+        if constexpr (J >= 4) {
+            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * (J - 4) + 8 * L);
+            r[2 * (J - 4)] = q.x;
+            r[2 * (J - 4) + 1] = q.y;
+        }
+        if constexpr (J == 3) r[12] = *(const uint32_t*)(const void*)(b + 1536 + 8 * c);
+        if constexpr (J == 7) r[13] = *(const uint32_t*)(const void*)(b + 1540 + 8 * c);
+    }
+};
+
 /* Q5_K. Slab s is the chunk pair c = s & 1 of block s >> 1 (64-value chunks j = 2c, 2c + 1);
  * 32-value group g = J >> 1 (chunk j = 2c + (g >> 1), nibble hi = g & 1), l = 16 (J & 1) + 8h + t.
  * The WMMA sees 128 + q5, so P = sum x (128 + q5) and y = d1 P - (128 d1 + m1) sum x: one fma on
@@ -3329,11 +3376,15 @@ __global__ __launch_bounds__(kGgThreads) void gg_embed_kernel(const int32_t* tok
 struct GgType {
     const char* name;
     int t, qk, bb, tb;
+    int il;   /* lever Q6IL: the weight is q6_K stored tile-interleaved (r4d_ds41_ggml_layout.cpp, tag r4d_q6k_il16b) */
 };
+/* "q6_K_il16b" (lever Q6IL, DRAFTER track 20.11.2026 round 44): q6_K's values and arithmetic, stored tile-interleaved; only the IL-B
+ * forms read it (gg_gemm_run's il path): gemm_nt_ggml, logits_gemm_ggml, gemm_nt_ggml_pair and the folds a / e. */
 constexpr GgType kGgTypes[] = {
-    { "q8_0", GG_Q8_0, 32, 34, 0 },        { "q5_K", GG_Q5_K, 256, 176, 0 },
-    { "q6_K", GG_Q6_K, 256, 210, 0 },      { "iq4_nl", GG_IQ4_NL, 32, 18, 64 },
-    { "iq2_xxs", GG_IQ2_XXS, 256, 66, 2048 }, { "iq1_s", GG_IQ1_S, 256, 50, 16384 },
+    { "q8_0", GG_Q8_0, 32, 34, 0, 0 },        { "q5_K", GG_Q5_K, 256, 176, 0, 0 },
+    { "q6_K", GG_Q6_K, 256, 210, 0, 0 },      { "iq4_nl", GG_IQ4_NL, 32, 18, 64, 0 },
+    { "iq2_xxs", GG_IQ2_XXS, 256, 66, 2048, 0 }, { "iq1_s", GG_IQ1_S, 256, 50, 16384, 0 },
+    { "q6_K_il16b", GG_Q6_K, 256, 210, 0, 1 },
 };
 const GgType* gg_type(const char* s) {
     if (!s) return nullptr;
@@ -4016,6 +4067,13 @@ int gg_launch_embed(RadStream s, int ty, const int32_t* tok, const uint8_t* w, l
  * float logical form [N, K]. Sets the kernel type and the row stride in bytes. */
 int gg_weight2(const RadTensor* w, const GgType* gt, long long N, long long K, int* ty, long long* ld) {
     if (!w || !w->data || w->rank != 2 || w->shape[0] != N) return R4D_NO(RAD_E_SHAPE);
+    if (gt->il) {   /* lever Q6IL: u8, its declared [N, K] (the engine's) or the stored [N, K / 128 * 106]; whole 16-row tiles, 8-byte loads */
+        const long long rbi = K / kWmS * kIl6R;
+        if (w->dtype != RAD_U8 || (w->shape[1] != rbi && w->shape[1] != K) || N % 16 || ((uintptr_t)w->data & 7u)) return R4D_NO(RAD_E_SHAPE);
+        *ty = GG_Q6_K;
+        *ld = rbi;
+        return RAD_OK;
+    }
     const long long rb = K / gt->qk * gt->bb;
     if (w->dtype == RAD_U8) {
         if (w->shape[1] != rb && w->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
@@ -4035,7 +4093,7 @@ int gg_weight2(const RadTensor* w, const GgType* gt, long long N, long long K, i
 }
 
 int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long x_ld, int x_al, const uint8_t* wd,
-                long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K);
+                long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K, int il = 0);
 
 /* gemm_nt_ggml and logits_gemm_ggml: y[M, N] = x[M, K] . w[N, K]^T. */
 int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool logits, bool gemv) {
@@ -4060,12 +4118,41 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
     const int x_al = gg_al16(x->data, x_ld) ? 1 : 0;
     (void)gemv;
     return gg_gemm_run(s, ty, logits, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data,
-                       y_ld, M, N, K);
+                       y_ld, M, N, K, gt->il);
 }
 
 /* gg_gemm's launch once its operands are resolved (also the second launch of the K1 folds' unfused passes). */
+std::atomic<long long> g_il_declines{0};
+int il_decline(const char* op, long long N, long long K, long long M, int x_al) {
+    const long long n = g_il_declines.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16)
+        std::fprintf(stderr, "radiance: libr4d: lever Q6IL: %s on a tile-interleaved q6_K weight (N %lld, K %lld, M %lld, x aligned %d): no "
+                             "form reads it (decline %lld)\n", op, N, K, M, x_al, n + 1);
+    return R4D_NO(RAD_E_SHAPE);
+}
 int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long x_ld, int x_al, const uint8_t* wd,
-                long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K) {
+                long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K, int il) {
+    /* Lever Q6IL (DRAFTER track 20.11.2026 round 44): a tile-interleaved q6_K weight -- the decode band's part-order form where
+     * lever WMK takes the call (with the switch off, its mode-0 table codes: the same bytes), else and where that form has no IL
+     * instance the IL prefill form; no other kernel reads the layout, so nothing falls to the native-row paths below. Under
+     * ds41_wmk >= 1 every output is the native weight's bytes (both run the part order in the same form at every M). */
+    if (il) {
+        if (g_gg_wk || wmk_take(M) || (wmk_now() < 1 && M <= kGgDecodeRows)) {
+            const long long Nv = N;
+            const int wk = r4d_gg_wk_run_il(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, logits), logits, 1, &xd, &x_ld, &x_al, &wd, w_ld,
+                                            &yd, &y_ld, &Nv, M, K, nullptr);
+            if (wk != R4D_WK_DECLINE) {
+                if (!g_gg_wk) wmk_count(M);
+                return wk;
+            }
+        }
+        const int wp = r4d_gg_wkpf_run_il(s, logits, xd, x_ld, x_al, wd, yd, y_ld, M, N, K);
+        if (wp != R4D_WK_DECLINE) {
+            wmk_count(M);
+            return wp;
+        }
+        return il_decline(logits ? "logits_gemm_ggml" : "gemm_nt_ggml", N, K, M, x_al);
+    }
     /* ds41-wmk: the bench pin (every M), else lever WMK (fn4 ds41_wmk 1, <= kGgDecodeRows rows): the part-order WMMA form */
     if (g_gg_wk || wmk_take(M)) {
         const long long Nv = N;
@@ -4169,7 +4256,7 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
     if (!A_ || !W || !so || !of || !Y || !A_->data || !W->data || !so->data || !of->data || !Y->data)
         return R4D_NO(RAD_E_INVAL);
     const GgType* gt = gg_type(r4d_gets(a, "type"));
-    if (!gt) return R4D_NO(RAD_E_DTYPE);
+    if (!gt || gt->il) return R4D_NO(RAD_E_DTYPE);   /* lever Q6IL's layout: the dense ops only */
     const long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
     const long long ne = r4d_geti_or(a, "n_expert", 0), top_k = r4d_geti_or(a, "top_k", 0);
     const char* ord = r4d_gets(a, "a_order");
@@ -4453,6 +4540,8 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
      * -> 31.4 / 31.6; at 40 / 48 rows the FPP G2 fold (three row tiles) 38.7-44.1 vs the two launches 34.4-37.3: not taken. Bench
      * pin: code bit 27 (134217728, no other meaning) asks pro 3 under r4d_gg_wk_pin. */
     const int wmode = wmk_now();
+    const GgType* gti = gg_type(r4d_gets(a, "type"));
+    const int il = gti ? gti->il : 0;   /* lever Q6IL: the IL fold forms, the IL GEMM in the tail; never lever D2's fold */
     const bool dmx_two = !g_gg_wk && M > (wmode >= 15 ? 32 : 16) && M <= kGgDecodeRows && (wmode >= 13 && wmode <= 17);
     if (dmx_two) {
         /* (the rmsnorm + gg_gemm_run tail below) */
@@ -4468,14 +4557,15 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
             const uint8_t* wp = (const uint8_t*)w->data;
             void* yp = y->data;
             const long long Nv = N;
-            const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false), ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
-                                     M, K, &fo);
+            const int wcode = g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false);
+            const int wk = il ? r4d_gg_wk_run_il(s, wcode, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo)
+                              : r4d_gg_wk_run(s, wcode, ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
                 return wk;
             }
         }
-    } else if (M <= kGgDecodeRows && g->dtype == RAD_F32 && r4d_gg_mr_on()) {
+    } else if (!il && M <= kGgDecodeRows && g->dtype == RAD_F32 && r4d_gg_mr_on()) {
         const R4dGgMrCall c{ ty, false, (const uint16_t*)x->data, x_ld, gg_al16(x->data, x_ld) ? 1 : 0,
                              (const uint8_t*)w->data, w_ld, y->data, y_ld, (int)M, (int)N, (int)K };
         R4dGgMrFold f{};
@@ -4492,7 +4582,7 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
                               (long)(uintptr_t)s) != 0)
         return R4D_NO(RAD_E_DEVICE);
     return gg_gemm_run(s, ty, false, (const uint16_t*)h->data, h_ld, h_al, (const uint8_t*)w->data, w_ld, y->data, y_ld,
-                       M, N, K);
+                       M, N, K, il);
 }
 
 extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s) {
@@ -4512,6 +4602,8 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
     const long long g_ld = M > 1 ? gu->stride[0] : 2 * K;
     if (g_ld < 2 * K || h_ld < K) return R4D_NO(RAD_E_SHAPE);
     const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
+    const GgType* gti = gg_type(r4d_gets(a, "type"));
+    const int il = gti ? gti->il : 0;   /* lever Q6IL: as fold a */
     /* lever WMK (or the bench pin): as fold a, swiglu_clamped in the staging; tp8 loop D22 (ds41_wmk 5): at 49..64 rows two launches */
     if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
         const uint16_t* gp = (const uint16_t*)gu->data;
@@ -4523,14 +4615,15 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
             const uint8_t* wp = (const uint8_t*)w->data;
             void* yp = y->data;
             const long long Nv = N;
-            const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false), ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
-                                     M, K, &fo);
+            const int wcode = g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false);
+            const int wk = il ? r4d_gg_wk_run_il(s, wcode, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo)
+                              : r4d_gg_wk_run(s, wcode, ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv, M, K, &fo);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
                 return wk;
             }
         }
-    } else if (M <= kGgDecodeRows && r4d_gg_mr_on()) {
+    } else if (!il && M <= kGgDecodeRows && r4d_gg_mr_on()) {
         const uint16_t* gp = (const uint16_t*)gu->data;
         const R4dGgMrCall c{ ty, false, gp, g_ld, gg_al16(gp, g_ld) ? 1 : 0, (const uint8_t*)w->data, w_ld, y->data,
                              y_ld, (int)M, (int)N, (int)K };
@@ -4552,7 +4645,7 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
     const int sr = r4d_rad_swiglu_clamped(&sa, s);
     if (sr != RAD_OK) return sr;
     return gg_gemm_run(s, ty, false, (const uint16_t*)h->data, h_ld, h_al, (const uint8_t*)w->data, w_ld, y->data, y_ld,
-                       M, N, K);
+                       M, N, K, il);
 }
 
 /* gemm_nt_ggml_pair (lever 1U-GQ, ds41-int11): y = a . w^T and y2 = a2 . w2^T (a2 absent: a), two GGUF weights of one
@@ -4593,19 +4686,22 @@ extern "C" int r4d_rad_gemm_nt_ggml_pair(const RadArgs* a, RadStream s) {
     /* ds41-wmk: the bench pin (every M) or lever WMK (<= kGgDecodeRows rows): the pair as ONE part-order WMMA launch; a pair
      * it declines runs as the two gemm_nt_ggml launches below, each of them in the part-order form where it takes them */
     const bool wmk = !g_gg_wk && wmk_take(M);
-    if ((g_gg_wk || wmk) && ty == ty2 && w_ld == w2_ld) {
+    const int il = gt->il;   /* lever Q6IL: one IL launch for both weights where the band's form takes them, else two IL gemm calls */
+    if ((g_gg_wk || wmk || (il && wmk_now() < 1 && M <= kGgDecodeRows)) && ty == ty2 && w_ld == w2_ld) {
         const uint16_t* xs2[2] = { (const uint16_t*)x->data, (const uint16_t*)x2->data };
         const long long xl2[2] = { x_ld, x2_ld }, yl2[2] = { y_ld, y2_ld }, nv2[2] = { N, N2 };
         const int xa2[2] = { x_al, x2_al };
         const uint8_t* ws2[2] = { (const uint8_t*)w->data, (const uint8_t*)w2->data };
         void* ys2[2] = { y->data, y2->data };
-        const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N + N2, K, M, false), ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr);
+        const int wcode = g_gg_wk ? g_gg_wk : wmk_code(ty, N + N2, K, M, false);
+        const int wk = il ? r4d_gg_wk_run_il(s, wcode, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr)
+                          : r4d_gg_wk_run(s, wcode, ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr);
         if (wk != R4D_WK_DECLINE) {
             if (wmk) wmk_count(M);
             return wk;
         }
     }
-    if (M <= kGgDecodeRows && ty == ty2 && r4d_gg_mr_on() && !g_gg_wk && !wmk) {
+    if (!il && M <= kGgDecodeRows && ty == ty2 && r4d_gg_mr_on() && !g_gg_wk && !wmk) {
         const R4dGgMrCall c1{ ty, false, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data,
                               y_ld, (int)M, (int)N, (int)K };
         const R4dGgMrCall c2{ ty2, false, (const uint16_t*)x2->data, x2_ld, x2_al, (const uint8_t*)w2->data, w2_ld,
@@ -4614,10 +4710,10 @@ extern "C" int r4d_rad_gemm_nt_ggml_pair(const RadArgs* a, RadStream s) {
         if (pr != R4D_GG_MR_DECLINE) return pr;
     }
     rc = gg_gemm_run(s, ty, false, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data, y_ld, M,
-                     N, K);
+                     N, K, il);
     if (rc != RAD_OK) return rc;
     return gg_gemm_run(s, ty2, false, (const uint16_t*)x2->data, x2_ld, x2_al, (const uint8_t*)w2->data, w2_ld,
-                       y2->data, y2_ld, M, N2, K);
+                       y2->data, y2_ld, M, N2, K, il);
 }
 
 /* embed_lookup_ggml: the id's row dequantised, times `mult`, rounded once. A negative id or one
@@ -4628,7 +4724,7 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
     const RadTensor *tok = r4d_opt(a, 0), *w = r4d_opt(a, 1), *x = r4d_opt(a, 2);
     if (!tok || !w || !x || !tok->data || !w->data || !x->data) return R4D_NO(RAD_E_INVAL);
     const GgType* gt = gg_type(r4d_gets(a, "type"));
-    if (!gt) return R4D_NO(RAD_E_DTYPE);
+    if (!gt || gt->il) return R4D_NO(RAD_E_DTYPE);   /* lever Q6IL's layout: the dense ops only */
     const long long E = r4d_geti_or(a, "n_embd", 0), V = r4d_geti_or(a, "n_vocab", 0);
     const long long voff = r4d_geti_or(a, "vocab_offset", 0);
     if (E <= 0 || V <= 0 || voff < 0 || E % gt->qk || E > 0x7fffffffLL || V > 0x7fffffffLL)

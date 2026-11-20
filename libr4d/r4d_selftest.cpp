@@ -39354,7 +39354,7 @@ int main(int argc, char** argv) {
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
-    bool wgc = false, wgp = false, wgk = false, wgr = false, wgf = false, wgq = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
+    bool wgc = false, wgp = false, wgk = false, wgr = false, wgf = false, wgq = false, wgi = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
     bool wgw = false; const char* wg_f = nullptr;   /* ds41-wmk2 stage 3: --perfwq */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
@@ -39665,6 +39665,10 @@ int main(int argc, char** argv) {
             /* ds41-wmk2 (FINDINGS F2): D and W against an f64 host reference (wmg::refcheck). */
             wgf = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--q6ilcheck")) {
+            /* lever Q6IL (DRAFTER round 44): the q6_K dense op rows on the tile-interleaved weight vs the native (wmg::q6il). */
+            wgi = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
         } else if (!std::strcmp(argv[i], "--wmkroute")) {
             /* ds41-wmk2: lever WMK's engine path (fn4 ds41_wmk 1) on every dense op row, M 1..49 (wmg::route). */
             wgr = true;
@@ -39959,13 +39963,14 @@ int main(int argc, char** argv) {
 #endif
         return g_fail ? 1 : 0;
     }
-    if (wgc || wgp || wgk || wgr || wgf || wgq || wgw) {
+    if (wgc || wgp || wgk || wgr || wgf || wgq || wgw || wgi) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (wgc) { if (wmg::g_wk_codes.empty()) wmg::check(pl, wg_t); else wmg::checkk(pl, wg_t); }
         if (wgp) wmg::perf(pl, wg_m, wg_it, wg_r, wg_t);
         if (wgk) wmg::scan(pl, wg_it, wg_r);
         if (wgr) wmg::route(pl, wg_t);
+        if (wgi) wmg::q6il(pl, wg_t);
         if (wgf) wmg::refcheck(pl, wg_t);
         if (wgq) wmg::wkpf_perf(pl, wg_m, wg_it, wg_t);
         if (wgw) wmg::wq_perf(pl, wg_m, wg_it, wg_t, wg_f);

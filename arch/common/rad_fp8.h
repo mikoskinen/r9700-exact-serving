@@ -1237,6 +1237,11 @@ inline rad_weight LinearFP8::decl_dense(RadBuilder* b, Names& nm, const char* ba
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
 }
 
+/* An architecture's choice of the GGUF `type` string a dense GGUF linear's gemm_nt_ggml carries, from the weight's own type, this
+ * rank's rows and the weight's name (null = the weight's type). deepseek41's lever Q6IL (DRAFTER track 20.11.2026 round 44) sets it
+ * to name q6_K weights "q6_K_il16b" (libr4d's tile-interleaved stored form). One per architecture plugin (each its own .so). */
+inline const char* (*rad_ggml_type_hook)(const char* ty, int64_t rows, const char* name) = nullptr;
+
 inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                               int64_t n_out, int64_t n_in, int shard, RadWeightGroup grp,
                               std::initializer_list<const char*> src,
@@ -1271,6 +1276,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * values run along K, so row parts and row slices apply as for bf16; a column slice (and this
      * rank's K) must be whole blocks. */
     ggml = known ? ggml_type_of(enc, &ggml_block) : nullptr;
+    if (ggml && rad_ggml_type_hook) ggml = rad_ggml_type_hook(ggml, N, wn);   /* an architecture's stored-form choice (deepseek41 lever Q6IL) */
     if (ggml) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear may\n", wn,

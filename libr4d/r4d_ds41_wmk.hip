@@ -137,7 +137,6 @@ struct Wk3Tl {
  * values) the 16 rows' slab pieces are 1,696 contiguous bytes, row r at 106 r: its 64 ql bytes (block offset 64 c), its 32 qh bytes
  * (128 + 32 c), its 8 scales (192 + 8 c) and d (208, both slabs carry it). A lane loads the same words into the same registers as
  * Wq<GG_Q6_K>::load / reload, so the decode, WMMA and scale fma (bfrag / scale, inherited) and every output byte are unchanged. */
-constexpr int kIl6 = 1696, kIl6R = 106;
 struct Wq6Il : Wq<GG_Q6_K> {
     __device__ static __forceinline__ void lql(const uint8_t* b, int h, int i, uint32_t* r) {
         const gg_u32x2 q = *(gg_gu64a2)(const void*)(b + 32 * (i >> 1) + 16 * (i & 1) + 8 * h);
@@ -166,44 +165,6 @@ struct Wq6Il : Wq<GG_Q6_K> {
         if constexpr (J >= 4) lql(b, h, J - 4, r);
         if constexpr (J == 3) r[12] = *(gg_gu32a2)(const void*)(b + 96);
         if constexpr (J == 7) r[13] = *(gg_gu32a2)(const void*)(b + 100);
-    }
-};
-/* Round 42 (bench, AB bit 256): IL-B, the tile-slab's 1,696 bytes in LOAD order -- ql load i (i 0..3) of lane L (= 16 h + c16) at
- * 256 i + 8 L, qh load i (0..1) at 1024 + 256 i + 8 L, the row's 8 scales at 1536 + 8 c16, d at 1664 + 2 c16: every ql / qh load
- * instruction of a wave reads 256 contiguous bytes. The same words into the same registers as Wq<GG_Q6_K>. The row pointer is the
- * tile's base. */
-struct Wq6Il2 : Wq<GG_Q6_K> {
-    __device__ static __forceinline__ void load(const uint8_t* tb, int s, int h, uint32_t* r) {
-        const int L = (int)(threadIdx.x & 31), c = L & 15;
-        const uint8_t* b = tb + (long long)s * kIl6;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * i + 8 * L);
-            r[2 * i] = q.x;
-            r[2 * i + 1] = q.y;
-        }
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 1024 + 256 * i + 8 * L);
-            r[8 + 2 * i] = q.x;
-            r[9 + 2 * i] = q.y;
-        }
-        const gg_u32x2 sc = *(const gg_u32x2*)(const void*)(b + 1536 + 8 * c);
-        r[12] = sc.x;
-        r[13] = sc.y;
-        r[14] = gg_u16(b + 1664 + 2 * c);
-    }
-    template <int J>
-    __device__ static __forceinline__ void reload(const uint8_t* tb, int s, int h, uint32_t* r) {
-        const int L = (int)(threadIdx.x & 31), c = L & 15;
-        const uint8_t* b = tb + (long long)s * kIl6;
-        if constexpr (J >= 4) {
-            const gg_u32x2 q = *(const gg_u32x2*)(const void*)(b + 256 * (J - 4) + 8 * L);
-            r[2 * (J - 4)] = q.x;
-            r[2 * (J - 4) + 1] = q.y;
-        }
-        if constexpr (J == 3) r[12] = *(const uint32_t*)(const void*)(b + 1536 + 8 * c);
-        if constexpr (J == 7) r[13] = *(const uint32_t*)(const void*)(b + 1540 + 8 * c);
     }
 };
 /* AB (DRAFTER round 35, BENCH ablation only, env R4D_WK3_AB as gg_wk3_kernel's; outputs NOT the part order under AB != 0): bit 1 no
@@ -1186,7 +1147,10 @@ constexpr unsigned gg_wk_lds(int kp, int P, bool wl = false) {
                       (kp > 1 ? (P - P / kp) * (8 / kp) * 32 * 64 : 0));
 }
 template <int T>
-int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid, int abo = -1) {
+/* il (lever Q6IL, round 44): the weight is the stored tile-interleaved q6_K (type q6_K_il16b): only the IL-B instances (template AB
+ * 384: Wq6Il2 + the tile pointers), never the native-row kernels; a geometry without one declines (the caller's IL fallback runs). */
+int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid, int abo = -1, bool il = false) {
+    if (il && T != GG_Q6_K) return R4D_WK_DECLINE;
     const bool wl = (code & 262144) != 0;
     const bool dp2 = (code & 8388608) != 0 && !wl;   /* bit 23: DP 2 (two slabs of raw words in flight; block staging only) */
     const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P, wl);
@@ -1194,7 +1158,7 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
         if (f32out) return R4D_WK_DECLINE;
         if constexpr (T == GG_Q6_K) {   /* round 43 bench: the folds on IL-B (R4D_WK3_AB 384) */
             static const int abf = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
-            if ((abo >= 0 ? abo : abf) == 384) {
+            if (il || (abo >= 0 ? abo : abf) == 384) {
 #define GG_WK_FIL(KPV, WLV, PV, DPV)                                                                                \
                 if (kp == KPV && wl == WLV && pro == PV && dp2 == (DPV == 2)) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t, PV, DPV, 384>), grid, dim3(256), lds, A);
                 GG_WK_FIL(1, false, 1, 1) GG_WK_FIL(2, false, 1, 1) GG_WK_FIL(1, true, 1, 1) GG_WK_FIL(2, true, 1, 1)
@@ -1225,7 +1189,7 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
     static const int ab0 = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
     const int ab = abo >= 0 ? abo : ab0;   /* round 43: the IL byte check's stock launch passes 0 */
     if constexpr (T == GG_Q6_K) {
-        if ((ab == 128 || ab == 384) && !pro) {
+        if ((il || ab == 128 || ab == 384) && !pro) {
 #define GG_WK_IL(ABV)                                                                                                            \
             if (dp2) {                                                                                                           \
                 if (kp == 1 && !f32out) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 2, ABV>), grid, dim3(256), lds, A); \
@@ -1255,7 +1219,7 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
             if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);          \
             if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 1, ABV>), grid, dim3(256), lds, A);          \
             return R4D_WK_DECLINE;
-            if (ab == 128) { GG_WK_IL(128) }
+            if (ab == 128 && !il) { GG_WK_IL(128) }
             GG_WK_IL(384)
 #undef GG_WK_IL
         }
@@ -1307,12 +1271,13 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
  * NT = 2 column tiles a wave at NM 2 where the partials fit 64 KiB (they reuse the staging), else 1 (NM 3; bit 22: always 1). */
 template <int T>
 static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, int pro, bool dp2, const GgWkArgs& A, dim3 grid,
-                           unsigned lds, int abo = -1) {   /* abo 0 (round 42 bench): the stock kernel whatever R4D_WK3_AB says */
+                           unsigned lds, int abo = -1, bool il = false) {   /* abo 0 (round 42 bench): the stock kernel whatever R4D_WK3_AB says */
+    if (il && T != GG_Q6_K) return R4D_WK_DECLINE;   /* lever Q6IL: as gg_launch_wk_t's il */
     /* DRAFTER round 30 bench ablation (env R4D_WK3_AB = 1..7, read once; outputs not the part order): the drafter's q8_0 G2 combos
      * (DP 1, bf16) and the head's q6_K (KP 1, f32; DP 2 at NM 2 NT 2, DP 1 at NM 3 NT 1) */
     static const int ab = [] { const char* e = std::getenv("R4D_WK3_AB"); const int v = e ? std::atoi(e) : 0;
                                if (v) std::fprintf(stderr, "libr4d: gg_wk3 ABLATION %d (bench only)\n", v); return v; }();
-    if (abo >= 0 ? false : (ab > 0 && ab < 512 && !pro)) {
+    if (abo >= 0 || il ? false : (ab > 0 && ab < 512 && !pro)) {
 #define GG_WK3_AB(KPV, NMV, NTV, OTV, DPV)                                                                                \
         if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2 && f32out == std::is_same<OTV, float>::value) {     \
             switch (ab) {                                                                                                  \
@@ -1357,7 +1322,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
     /* DRAFTER round 43 bench: IL-B (R4D_WK3_AB 384) at EVERY geometry the launch below serves for q6_K (bf16; f32 at KP 1, the head's),
      * no fold; a geometry without an IL-B instance declines (never the stock kernel on the interleaved copy) */
     if constexpr (T == GG_Q6_K) {
-        if (abo < 0 && ab == 384 && !pro) {
+        if ((il || (abo < 0 && ab == 384)) && !pro) {
 #define GG_WK3_IL(KPV, NMV, NTV, DPV)                                                                                     \
             if (kp == KPV && nmt == NMV && nt == NTV && (DPV == 2) == dp2) {                                              \
                 if (f32out) {                                                                                             \
@@ -1394,7 +1359,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
     if (pro) {   /* the folds (bf16 out) at the K their shapes have: q_b K 1280 (P 2: KP 1, q5_K / q6_K), shexp down 768 / 512 (KP 1 / 2) */
         if (f32out) return R4D_WK_DECLINE;
         if constexpr (T == GG_Q6_K) {   /* round 43 bench: the folds on IL-B (R4D_WK3_AB 384) */
-            if (abo < 0 && ab == 384) {
+            if (il || (abo < 0 && ab == 384)) {
 #define GG_WK3_FIL(KPV, NMV, NTV, PV)                                                                                   \
                 if (kp == KPV && nmt == NMV && nt == NTV && pro == PV) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV, 1, 384>), grid, dim3(256), lds, A);   /* DP 1 whatever bit 23 says: the stock fold path's rule */
                 GG_WK3_FIL(1, 2, 2, 1) GG_WK3_FIL(1, 3, 1, 1) GG_WK3_FIL(1, 2, 1, 1)
@@ -1475,7 +1440,7 @@ static bool gg_il_swap(GgWkArgs& A, int ty, const GgWkFold* fo, int tlab, int nm
 }
 static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
                const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
-               long long K, const GgWkFold* fo) {
+               long long K, const GgWkFold* fo, int il = 0) {
     const int P = gg_wk_parts(K);
     const int kp = (code & 16777216) || P < 2 ? 1 : P / 2;   /* bit 24: KP 1 (one run holds the running total; no LDS partials) */
     /* DRAFTER track round 36 (lever G2R): bit 26 = TWO row tiles a block and ceil(M / 32) block rows (grid x), 33..64 rows: KP P / 2
@@ -1532,19 +1497,19 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     static const int tl = [] { const char* e = std::getenv("R4D_WK3_TL"); return e && e[0] == '1' ? 1 : 0; }();
     static const int tlab = [] { const char* e = std::getenv("R4D_WK3_AB"); return e ? std::atoi(e) : 0; }();
     const GgWkArgs A0 = A;   /* round 42: the stored-layout arguments (the IL byte check) */
-    if (!gg_il_swap(A, ty, fo, tlab, nm, wd, Nv, K, w_ld)) return R4D_WK_DECLINE;
+    if (!il && !gg_il_swap(A, ty, fo, tlab, nm, wd, Nv, K, w_ld)) return R4D_WK_DECLINE;
     if (tl) {
         A.tl = 1;
         const unsigned long long z[5] = { ~0ull, 0ull, 0ull, 0ull, 0ull };
         (void)hipMemcpyToSymbol(HIP_SYMBOL(g_wk3_tl), z, sizeof z);
     }
     switch (ty) {
-    case GG_Q8_0: rc = gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
-    case GG_Q6_K: rc = gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
-    default: rc = gg_launch_wk3_t<GG_Q5_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds); break;
+    case GG_Q8_0: rc = gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds, -1, il != 0); break;
+    case GG_Q6_K: rc = gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds, -1, il != 0); break;
+    default: rc = gg_launch_wk3_t<GG_Q5_K>(s, kp, nmt, nt, f32out, pro, dp2, A, grid, lds, -1, il != 0); break;
     }
     static const int ilchk = [] { const char* e = std::getenv("R4D_WK3_ILCHK"); return e && e[0] == '1' ? 1 : 0; }();
-    if (ilchk && (tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384) && rc != R4D_WK_DECLINE) {   /* round 42: the IL launch's bytes vs the stock kernel on the stored layout */
+    if (!il && ilchk && (tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384) && rc != R4D_WK_DECLINE) {   /* round 42: the IL launch's bytes vs the stock kernel on the stored layout */
         (void)hipDeviceSynchronize();
         const size_t ob = f32out ? 4 : 2;
         GgWkArgs B = A0;
@@ -1583,11 +1548,12 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     return rc;
 }
 
-int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
-              const int* x_al, const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld,
-              const long long* Nv, long long M, long long K, const GgWkFold* fo) {
+static int gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
+                     const int* x_al, const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld,
+                     const long long* Nv, long long M, long long K, const GgWkFold* fo, int il) {
     if (!code || (ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) || K % (2 * kWmS) || M > 0x7fffff)
         return R4D_WK_DECLINE;
+    if (il && ty != GG_Q6_K) return R4D_WK_DECLINE;
     if (fo && (nm != 1 || f32out || ((fo->pro == 1 || fo->pro == 3) && (!fo->g || ((uintptr_t)fo->g & 15u))) || !fo->h))
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
@@ -1595,7 +1561,7 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
     /* bit 21: G2 (row tiles a block) at 17..48 rows, folds included; bit 25 (tp8 loop D22, ds41_wmk 5's head): G2 to 64 rows;
      * declined -> the rule below */
     if ((code & 2097152) && M > 16 && M <= ((code & (33554432 | 67108864)) ? 64 : 48)) {   /* bit 26 (lever G2R): to 64 rows too */
-        const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K, fo);
+        const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K, fo, il);
         if (g2 != R4D_WK_DECLINE) return g2;
     }
     const bool wl = (code & 262144) != 0;   /* bit 18: G1's wave-local staging (KP up to 8) */
@@ -1654,15 +1620,15 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
     }
     const int pro = fo ? (fo->pro == 3 ? 1 : fo->pro) : 0;
     const GgWkArgs A0 = A;   /* round 43: the stored-layout arguments (the IL byte check) */
-    if (!gg_il_swap(A, ty, fo, tlab, nm, wd, Nv, K, w_ld)) return R4D_WK_DECLINE;
+    if (!il && !gg_il_swap(A, ty, fo, tlab, nm, wd, Nv, K, w_ld)) return R4D_WK_DECLINE;
     int rc;
     switch (ty) {
-    case GG_Q8_0: rc = gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, pro, A, grid); break;
-    case GG_Q6_K: rc = gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, pro, A, grid); break;
-    default: rc = gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, pro, A, grid); break;
+    case GG_Q8_0: rc = gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, pro, A, grid, -1, il != 0); break;
+    case GG_Q6_K: rc = gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, pro, A, grid, -1, il != 0); break;
+    default: rc = gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, pro, A, grid, -1, il != 0); break;
     }
     static const int ilchk1 = [] { const char* e = std::getenv("R4D_WK3_ILCHK"); return e && e[0] == '1' ? 1 : 0; }();
-    if (ilchk1 && (tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384) && rc == 0) {   /* round 43: G1's IL launch bytes vs the stock kernel on the stored layout */
+    if (!il && ilchk1 && (tlab & 384) && ty == GG_Q6_K && (!fo || tlab == 384) && rc == 0) {   /* round 43: G1's IL launch bytes vs the stock kernel on the stored layout */
         (void)hipDeviceSynchronize();
         const size_t ob = f32out ? 4 : 2;
         GgWkArgs B = A0;
@@ -1695,6 +1661,16 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
                          (double)(r[1] - r[0]) / 100.0, (double)r[2] / (double)r[3] / 100.0, (double)(r[4] - r[0]) / 100.0);
     }
     return rc;
+}
+int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
+                  const int* x_al, const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld,
+                  const long long* Nv, long long M, long long K, const GgWkFold* fo) {
+    return gg_wk_run(s, code, ty, f32out, nm, xd, x_ld, x_al, wd, w_ld, yd, y_ld, Nv, M, K, fo, 0);
+}
+int r4d_gg_wk_run_il(RadStream s, int code, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld, const int* x_al,
+                     const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
+                     long long K, const GgWkFold* fo) {
+    return gg_wk_run(s, code, GG_Q6_K, f32out, nm, xd, x_ld, x_al, wd, w_ld, yd, y_ld, Nv, M, K, fo, 1);
 }
 
 extern "C" long long r4d_gg_wk_count() { return g_gg_wk_count.load(std::memory_order_relaxed); }
@@ -2217,6 +2193,26 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
     case GG_Q6_K: return wkpf_launch_t<GG_Q6_K>(s, form, f32out, A);
     default: return wkpf_launch_t<GG_Q5_K>(s, form, f32out, A);
     }
+}
+/* Lever Q6IL (round 44): the prefill rows (and every call the decode band's IL forms decline) on the tile-interleaved q6_K -- GPF
+ * form 326 (MT 3 NT 2 WN 8, the folds interleaved: the q6_K table's form at every DeepSeek-V4.1 shape) with the part fold and FI bit
+ * 16 (Wq6Il2 + the tile pointers): the part order, the bytes of the native form's 326 (and of every other part-order form). The
+ * bench pins (r4d_gg_wkpf_default / follow / ts) do not apply: one form. */
+int r4d_gg_wkpf_run_il(RadStream s, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w, void* y,
+                       long long y_ld, long long M, long long N, long long K) {
+    if (!x_al || K % (2 * kWmS) || M < 1 || M > 0x7fffffff || N > 0x7fffffff || N % 16) return R4D_WK_DECLINE;
+    GgTiledArgs A{};
+    A.x = x; A.x_ld = x_ld;
+    A.w = w; A.wtab = nullptr; A.w_ld = K / kWmS * kIl6R; A.w_es = 0;
+    A.y = y; A.y_ld = y_ld;
+    A.M = (int)M; A.N = (int)N; A.K = (int)K;
+    A.x_al = 1; A.tab_bytes = 0;
+    g_wkpf_last.store(pf_code(3, 2, 8, 1, 0) + 16000, std::memory_order_relaxed);
+    const dim3 grid((unsigned)((A.M + 47) / 48), (unsigned)((A.N + 255) / 256));
+    if (grid.y > 65535u) return R4D_WK_DECLINE;
+    const unsigned lds = pf_lds<GG_Q6_K>(3);
+    if (f32out) return R4D_EMIT(s, (gg_pf_kernel<GG_Q6_K, 3, 2, 8, float, 0, 17>), grid, dim3(256), lds, A);
+    return R4D_EMIT(s, (gg_pf_kernel<GG_Q6_K, 3, 2, 8, uint16_t, 0, 17>), grid, dim3(256), lds, A);
 }
 extern "C" int r4d_gg_wkpf_last() { return g_wkpf_last.load(std::memory_order_relaxed); }
 extern "C" void r4d_gg_wkpf_ts(int v) { g_wkpf_ts = v == 1 || v == 2 ? v : 0; }
