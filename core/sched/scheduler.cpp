@@ -292,6 +292,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         cap_now_ = fn4::sched_row_cap();
         for (int64_t& c : cap_n_) c = 0;
         cap_seq_noted_ = cap_over_noted_ = false;
+        {
+            const char* u = std::getenv("RADIANCE_DECODE_ROW_CAP_UNIFORM");
+            cap_uniform_ = u && !std::strcmp(u, "1");
+            if (cap_uniform_ && lane_ <= 0)
+                RAD_INFO("lever CAP48: RADIANCE_DECODE_ROW_CAP_UNIFORM=1 -- a capped step keeps one draft depth for every decode "
+                         "sequence (the rows left below the cap are not handed on; qfn-on-ds round 2)");
+        }
         if (cap_now_ > 0)
             RAD_INFO("lever CAP48: decode row cap %d (RADIANCE_DECODE_ROW_CAP, fn4 sched_row_cap): a step's decode rows (each "
                      "decoding sequence's own row + its drafts) are held to it by trimming drafts, the deepest first; prefill "
@@ -1859,7 +1866,8 @@ int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
             };
             int32_t L = top;
             while (L > 0 && kept(L) > room) --L;
-            int64_t left = room - kept(L);   /* fewer than the entries deeper than L, as kept(L + 1) > room */
+            /* fewer than the entries deeper than L, as kept(L + 1) > room; none under the uniform form (one depth a step) */
+            int64_t left = cap_uniform_ ? 0 : room - kept(L);
             for (StepEntry& e : p.e) {
                 if (e.is_prefill) continue;
                 int32_t k = std::min(e.n_spec, L);

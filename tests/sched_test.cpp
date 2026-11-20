@@ -12808,6 +12808,29 @@ TEST(cap48_the_step_issued_ahead_is_capped) {
     }
 }
 
+/* qfn-on-ds round 2 (Qwen: the batch-invariant forms take one verify depth a step): RADIANCE_DECODE_ROW_CAP_UNIFORM=1 at
+ * start -- 16 sequences proposing 5 under cap 50 (room 34 drafts): the deepest-first form verifies 2 at 14 sequences and 3 at
+ * the first 2 (50 rows); the uniform form 2 at all 16 (48 rows, the 2 left below the cap unused), in every step. */
+TEST(cap48_uniform_keeps_one_depth_for_every_decode_sequence) {
+    for (int uni : { 0, 1 }) {
+        if (uni) setenv("RADIANCE_DECODE_ROW_CAP_UNIFORM", "1", 1);
+        else unsetenv("RADIANCE_DECODE_ROW_CAP_UNIFORM");
+        CapCfg c;
+        c.cap = 50;
+        c.steps = 4;
+        const CapRun r = cap_run(c);
+        unsetenv("RADIANCE_DECODE_ROW_CAP_UNIFORM");
+        REQUIRE(!r.st.empty());
+        for (const CapStep& s : r.st) {
+            CHECK_EQ(s.dec_rows, uni ? (int64_t)48 : (int64_t)50);
+            REQUIRE(s.spec.size() == 16u);
+            for (size_t i = 0; i < s.spec.size(); ++i) CHECK_EQ(s.spec[i], uni ? 2 : (i < 2 ? 3 : 2));
+        }
+        CHECK_EQ(r.d("drafts_trimmed"), (int64_t)r.st.size() * (uni ? 48 : 46));
+        CHECK(uni == (r.log.find("RADIANCE_DECODE_ROW_CAP_UNIFORM=1") != std::string::npos));
+    }
+}
+
 /* qfn-on-ds round 2 (xeon s1-cap 20.11.: a sched_row_cap POSTed mid-load reached the steps only at the next full step; a
  * steady decode stretch is issued ahead step after step): a value set after step() planned is the one the step issued
  * ahead behind it holds to -- 0 -> 48 trims that step to 16 x 3 rows, 48 -> 0 gives it back its 16 x 6. */
