@@ -7122,7 +7122,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "many rows; up to 16777216 = none), ds41_sphc_attn 0..%d, ds41_sphc_seg 0..%d -- each at this "
                             "start's env, and lower only takes away what the env declared (this node issues P26 at %d, "
                             "segment SP at %d at most)\n",
-                    (long long)m.sphc, sphc_attn_env(), sphc_seg_env(), m.sp_ag_qr ? (m.sp_ag_kvs ? 2 : 1) : 0, m.sp_seg);
+                    (long long)m.sphc, sphc_attn_env(), sphc_seg_env(), m.sp_ag_qr ? (m.sp_ag_kvs ? (m.sp_ag_iw ? 3 : 2) : 1) : 0, m.sp_seg);
     }
     /* tp8 loop P30t: the twins this declare holds, and what ds41_twin may take (the env's classes this node twinned) */
     if (twin_env() && !ctx->shape_probe) {
