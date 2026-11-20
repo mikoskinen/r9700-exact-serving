@@ -9528,24 +9528,29 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* C: op by op across the segments; the never-flipping per-row ops once over the step (over `cur` / `runs`: P15
              * issues it over one piece at a time) */
             const auto a1_cheap = [&] {
+                /* tp8 loop D39c: the follower's key-chain layer of a tail band pass issues the window key's ops only -- q_a where it
+                 * rides kv's launch (1U-GQ), never q_b / the query norm / rope or the indexer's linears: nothing the store reads,
+                 * every kv-path op the same launch over the same rows (the stored bytes unchanged) */
+                const bool qp = !kvo;
                 /* lever WMK (dense(), ds41_wmk 1): the dense GGUF linears once over a mixed run; off: by segment, as before */
                 const bool qkv_gg = gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv);
                 if (!p26) {   /* tp8 loop P26: issued over the quarter above */
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
                     if (!tw_take(m, L.q_a) && gq_qkv_on(L, n))   /* tp8 loop P30t: a twin prompt segment: the twins */
                         gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
-                    else
+                    else if (qp)
                         lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
                 });
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {
                     if (tw_take(m, L.q_a) || !gq_qkv_on(L, n)) lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                 });
                 }
-                if (L.i_score)
+                if (L.i_score && qp)
                     dense(gguf_dense(m, L.iproj), true, [&](int64_t r0, int64_t n) {
                         lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
                     });
-                if (qfold)   /* rmsnorm_gemm_nt_ggml: rmsnorm's row arithmetic is the row's at any width (kR4dSumLanes) */
+                if (!qp) {
+                } else if (qfold)   /* rmsnorm_gemm_nt_ggml: rmsnorm's row arithmetic is the row's at any width (kR4dSumLanes) */
                     dense(gguf_dense(m, L.wq_b), true, [&](int64_t r0, int64_t n) {
                         if (tw_take(m, L.q_b)) {   /* tp8 loop P30t: the norm alone (the fold's qrn bytes), then q_b's twin */
                             RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
@@ -9564,23 +9569,23 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     whole([&](int64_t r0, int64_t n) {
                         RAD_ISSUE_N(x, L.kv_n, n, R(m.kv, r0, n), RAD_W(L.kv_norm), R(m.kvn, r0, n));
                     });
-                if (L.i_score)
+                if (L.i_score && qp)
                     dense(gguf_dense(m, L.iq_w), true, [&](int64_t r0, int64_t n) {
                         lin_issue(x, m, L.i_q, n, R(m.qrn, r0, n), L.iq_w, R(m.iq, r0, n));
                     });
-                if (!qfold)
+                if (!qfold && qp)
                     dense(gguf_dense(m, L.wq_b), true, [&](int64_t r0, int64_t n) {
                         lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
                     });
                 whole([&](int64_t r0, int64_t n) {
                     const RadOperand pn = P(batch->positions, r0, n);
                     if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, n, R(m.kvn, r0, n), brows(cs, g.max_ctx), pn);
-                    if (!L.src && L.i_score) {
+                    if (!L.src && L.i_score && qp) {
                         if (L.i_f) RAD_ISSUE_N(x, L.i_f, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), pn);
                         else RAD_ISSUE_N(x, L.i_rope, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), pn);
                         if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, n, R(m.iq, r0, n));
                     }
-                    RAD_ISSUE_N(x, L.q_rope, n, R(m.q, r0, n), brows(cs, g.max_ctx), pn);
+                    if (qp) RAD_ISSUE_N(x, L.q_rope, n, R(m.q, r0, n), brows(cs, g.max_ctx), pn);
                     if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, n, R(m.kvn, r0, n));
                     if (!kvfold) {
                         if (m.w8)
@@ -9616,12 +9621,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 if (!tw_take(m, L.q_a) && gq_qkv_on(L, n)) {   /* lever 1U-GQ */
                     gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
                 } else {
-                    lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
+                    if (!kvo) lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));   /* tp8 loop D39c: kv only */
                     lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
                 }
-                if (L.i_score) lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
+                if (L.i_score && !kvo) lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
                 const bool qf = qfold && !tw_take(m, L.q_b);   /* tp8 loop P30t: a twin q_b takes the norm alone */
-                if (qf)
+                if (kvo) {
+                } else if (qf)
                     RAD_ISSUE_N(x, L.q_bf, n, R(m.qr, r0, n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, r0, n), R(m.q, r0, n));
                 else
                     RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
@@ -9641,15 +9647,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     for (int64_t a = 0; a < n; a += kBiNorm) kvn(r0 + a, std::min(kBiNorm, n - a));
                 else
                     kvn(r0, n);
-                if (L.i_score) lin_issue(x, m, L.i_q, n, R(m.qrn, r0, n), L.iq_w, R(m.iq, r0, n));
-                if (!qf) lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
+                if (L.i_score && !kvo) lin_issue(x, m, L.i_q, n, R(m.qrn, r0, n), L.iq_w, R(m.iq, r0, n));
+                if (!qf && !kvo) lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
                 if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, n, R(m.kvn, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
-                if (!L.src && L.i_score) {
+                if (!L.src && L.i_score && !kvo) {
                     if (L.i_f) RAD_ISSUE_N(x, L.i_f, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), P(batch->positions, r0, n));
                     else RAD_ISSUE_N(x, L.i_rope, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), P(batch->positions, r0, n));
                     if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, n, R(m.iq, r0, n));
                 }
-                RAD_ISSUE_N(x, L.q_rope, n, R(m.q, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
+                if (!kvo) RAD_ISSUE_N(x, L.q_rope, n, R(m.q, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
                 if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, n, R(m.kvn, r0, n));
                 if (!kvfold) {
                     if (m.w8)
