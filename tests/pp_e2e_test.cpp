@@ -3095,6 +3095,9 @@ TEST(tail_band_passes_serve_one_process_tokens) {
         const std::vector<std::vector<int32_t>> got = split_set(pp.port);
         if (a.sw == 0) post(1, 200);
         const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        /* loop lq215 (DECODE round 32): the kit's arm undo POSTs the start's read-back, -1 = the start's RADIANCE_PP_TAIL_BAND --
+         * taken with and without a tail band */
+        if (a.sw >= 0) post(-1, 200);
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
