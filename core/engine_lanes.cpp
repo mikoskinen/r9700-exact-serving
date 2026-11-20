@@ -70,6 +70,7 @@ namespace rad {
 bool pp_x1_ids();   /* engine_node.cpp: the plugin declared X1's token-ids part (tp8 dev D10 round 2) */
 int pp_band_k();    /* engine_node.cpp: the band the plugin declared (tp8 loop P28) */
 int pp_tail_band_k();   /* engine_node.cpp: the tail band the plugin declared (tp8 loop D39) */
+int pp_rband_l();       /* engine_node.cpp: the reverse band layer the plugin declared (tp8 loop P41) */
 int pp_tail_copy();     /* engine_node.cpp: the plugin's tail band copy form, 0 none (D46, core/sched/tcopy.h) */
 std::vector<int32_t> pp_segments();   /* engine_node.cpp: the boundaries the plugin declared on this node (tp8 dev M4 / M9) */
 
@@ -521,6 +522,55 @@ void Engine::pp_tband_note(int lane, int tband) {
     if (pp_tband_seq_.size() > 4096) pp_tband_seq_.clear();   /* prompts never finished: forgotten (they run W(h, t)'s) */
 }
 
+/* tp8 loop P41: a lane step's reverse band layer l (0: not a reverse pass) -- fn4 pp_rband v (-1 = the start's
+ * RADIANCE_PP_RBAND_EVERY; 0 none): p = v & 15 (1..15), the chunk index i of its sequence reverses where i % p == (v >> 4) & 15;
+ * + 256: not the chunk before the last either (one whose end is within RADIANCE_PP_MAX_NUM_BATCHED-sized rows of the prompt's end,
+ * here the step's own row cap). The step: ONE prefill entry (no decode row, no draft, no restore, no replay), not the prompt's last
+ * chunk, and its sequence clean (its first chunk at ctx 0 without a restore, no decode entry since: pp_rband_note). Never a band /
+ * tail band step (the caller asks only without them). */
+int Engine::pp_rband_step(int lane, const RadBatch* b) {
+    const int l = pp_rband_l();
+    if (l <= 0 || !b || cfg_.pp_cut_h - 1 != l) return 0;
+    const int sv0 = fn4::get(fn4::kPpRband), v = sv0 < 0 ? pp_rband_start_ : sv0;
+    const int p = v & 15, ph = (v >> 4) & 15;
+    if (p <= 0) return 0;
+    const StepPlan& sp = sched_of(lane).plan();
+    if (sp.e.size() != 1) return 0;
+    const StepEntry& e = sp.e[0];
+    if (!e.is_prefill || e.n_spec > 0 || e.ckpt_restore >= 0 || e.cr_replay || e.produces_token || e.n_tokens != b->n_tok) return 0;
+    int32_t idx = 0;
+    if (e.ctx_len > 0) {
+        const auto it = pp_rband_seq_.find(e.seq);
+        if (it == pp_rband_seq_.end()) {
+            ++pp_rband_unclean_;
+            return 0;
+        }
+        idx = it->second;
+    }
+    if (idx % p != ph % p) return 0;
+    if ((v & 256) && e.req) {
+        const int64_t left = (int64_t)e.req->prompt.size() - (int64_t)e.ctx_len - (int64_t)e.n_tokens;
+        if (left <= (int64_t)std::max<int64_t>(b->n_tok, 1)) {
+            ++pp_rband_end_;
+            return 0;
+        }
+    }
+    return l;
+}
+
+/* tp8 loop P41: after a step's head decided -- which sequences keep the follower's copy of layer l's window whole */
+void Engine::pp_rband_note(int lane, int rband) {
+    if (pp_rband_l() <= 0) return;
+    for (const StepEntry& e : sched_of(lane).plan().e) {
+        if (!e.is_prefill || e.ckpt_restore >= 0 || e.cr_replay || e.n_spec > 0) { pp_rband_seq_.erase(e.seq); continue; }
+        if (e.ctx_len == 0) { pp_rband_seq_[e.seq] = 1; continue; }
+        const auto it = pp_rband_seq_.find(e.seq);
+        if (it != pp_rband_seq_.end()) ++it->second;
+    }
+    (void)rband;
+    if (pp_rband_seq_.size() > 4096) pp_rband_seq_.clear();   /* prompts never finished: forgotten (they run W(h, t)'s) */
+}
+
 int Engine::lane_head(int lane, const RadBatch* b) {
     lane_select(lane);
     /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1): this chunk's head, bracketed on rank 0's stream */
@@ -543,18 +593,27 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     const int band = band_pre >= 0 ? band_pre : pp_band_step(lane, b);
     /* tp8 loop D39: a tail band (never beside a head band); the frame says so, the lane keeps j for its tail part */
     const int tband = band > 0 ? 0 : pp_tband_step(lane, b, true);
+    /* tp8 loop P41: a reverse pass (never beside a band / tail band); the frame says so */
+    const int rband = band > 0 || tband > 0 ? 0 : pp_rband_step(lane, b);
     pp_ship_band_ = band;
     pp_ship_tband_ = tband;
+    pp_ship_rband_ = rband;
     const int ss = pp_ship(b, true, lane);
     pp_ship_band_ = 0;
     pp_ship_tband_ = 0;
+    pp_ship_rband_ = 0;
     if (ss < 0) return ss;
+    pp_rband_note(lane, rband);   /* tp8 loop P41 */
+    if (rband) {
+        ++pp_rband_n_;
+        pp_rband_rows_ += b->n_tok;
+    }
     if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = tband;
     if (tband) ++pp_tband_n_;
     pp_tband_note(lane, tband);   /* tp8 loop D39b */
     dch_note_head(lane, b);   /* tp8 loop D35 */
     if (band) ++pp_band_n_;
-    pp_set_pass(lane, RAD_PP_PART_HEAD, 0, 0, band);
+    pp_set_pass(lane, RAD_PP_PART_HEAD, 0, 0, band, 0, 0, rband);
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
@@ -980,6 +1039,27 @@ int Engine::step_loop_lanes() {
         }
     }
     fn4::tband_register(pp_tband_on_ ? (pp_tband_copy_ > 0 ? 2 : 1) : 0);   /* tp8 loop D39 step 2c: fn4 pp_tband 1 needs it taken; D46: 3 the copy */
+    /* tp8 loop P41 (RADIANCE_PP_RBAND_EVERY=v on the leader = fn4 pp_rband's start value; unset 0 = no reverse pass): with the plugin's
+     * reverse band (RADIANCE_DS41_PP_RBAND=1 / RADIANCE_LLAMA_PP_RBAND=1 on both nodes) */
+    pp_rband_start_ = 0;
+    pp_rband_n_ = pp_rband_rows_ = pp_rband_unclean_ = pp_rband_end_ = 0;
+    pp_rband_seq_.clear();
+    if (const char* rv = std::getenv("RADIANCE_PP_RBAND_EVERY"); rv && *rv) {
+        const int v = std::atoi(rv);
+        if (v < 0 || v > 511 || ((v & 15) == 0 && v != 0)) {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_RBAND_EVERY=%s is not taken: 0 .. 511 with p = v & 15 >= 1 (tp8 loop P41)", rv);
+        } else {
+            pp_rband_start_ = v;
+        }
+    }
+    if (pp_rband_l() > 0)
+        RAD_INFO("two-node pipeline: the plugin declared the reverse (head) band layer %d (tp8 loop P41): fn4 pp_rband %d at start "
+                 "(RADIANCE_PP_RBAND_EVERY; p = v & 15, phase (v >> 4) & 15, + 256 not the chunk before the last) runs a lone prompt "
+                 "chunk's head over [0, %d) + layer %d's key chain and the follower from %d%s", pp_rband_l(), pp_rband_start_,
+                 pp_rband_l(), pp_rband_l(), pp_rband_l(), cfg_.pp_cut_h - 1 != pp_rband_l() ? " -- NOT TAKEN: not h - 1 of the cut" : "");
+    else if (pp_rband_start_ > 0)
+        RAD_WARN("two-node pipeline: RADIANCE_PP_RBAND_EVERY=%d runs no reverse pass: the plugin declared no reverse band "
+                 "(RADIANCE_DS41_PP_RBAND=1 on both nodes; tp8 loop P41)", pp_rband_start_);
     /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader; default unset = a band step's head whole, as P28 built it): a band
      * step's head in LSP's segments too -- [0, b1) .. [b_last, h + k) at the head boundaries the plugin declared, the band word on
      * every segment, the held frame a band frame -- so the k layers a band pass adds to the leader's BG head no longer hold every
@@ -2025,6 +2105,11 @@ int Engine::step_loop_lanes() {
                                  "tp8 loop D50), %lld clean-stretch decode steps kept W(h, t)'s at a decode load <= N (4 + 1024 x N)",
                                  (long long)pp_tband_dec_n_, (long long)pp_tband_dec_skip_, pp_tcopy_seq_.size(),
                                  (long long)pp_tband_dec_clean_, (long long)pp_tband_dec_low_);
+    if (pp_rband_l() > 0)
+        RAD_INFO("two-node pipeline: %lld lane steps ran as reverse (head band) passes, %lld rows, the follower from layer %d (tp8 loop P41); "
+                 "%lld lone prompt chunks kept W(h, t)'s for a sequence the follower's layer-%d window copy may miss, %lld as the chunk "
+                 "before the last (pp_rband + 256)", (long long)pp_rband_n_, (long long)pp_rband_rows_, pp_rband_l(),
+                 (long long)pp_rband_unclean_, pp_rband_l(), (long long)pp_rband_end_);
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);
@@ -2090,6 +2175,7 @@ int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool firs
         pp_trunk_pending_[lane] = false;
         if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = 0;   /* tp8 loop D39: a segmented step is no tail band step */
         pp_tband_note(lane, 0);   /* tp8 loop D39b: its prompts' later chunks run W(h, t)'s */
+        pp_rband_note(lane, 0);   /* tp8 loop P41: a segmented step is no reverse pass (its rows cross in the keys form) */
         RAD_TRY(restore_checkpoints());
         /* tp8 loop D36: a band step's held frame says so (flags bit 2: the follower's parts start at h + k) */
         pp_ship_band_ = band;

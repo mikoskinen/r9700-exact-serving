@@ -506,6 +506,12 @@
  *                   from ONE word pair (decode_frags_x3d, the decode band's X3D-F form): the same f16 weights, each output's WMMA
  *                   order unchanged -- the same bytes (Xeon GPU2: y at M 17 / 64 / 1,150 / 4,096 identical to 0). -1 when no loaded
  *                   object serves it (an exl3r4d before 4fd50e4).
+ *   pp_rband        engine, the two-node LEADER (tp8 loop P41, the HEAD band on the follower; 100 here, after pp_merge_ms): v = p + 16 x
+ *                   phase (+ 256): a lone prompt chunk i of a sequence with i % p == phase runs as a REVERSE pass -- the leader's head over
+ *                   [0, h - 1) + layer h - 1's key chain, the follower from h - 1 (X1 of W(h - 1, t)); + 256: never the chunk before the
+ *                   last; 0 = none; -1 = the start's RADIANCE_PP_RBAND_EVERY. Needs the plugin's reverse band (RADIANCE_DS41_PP_RBAND=1 on
+ *                   both nodes, whose every prompt pass crosses layer h - 1's window keys); else no pass changes. Read at each lane step's
+ *                   head; the same TP4 functions on either node (rule A), the follower's window copy whole for every reversed chunk.
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -738,7 +744,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

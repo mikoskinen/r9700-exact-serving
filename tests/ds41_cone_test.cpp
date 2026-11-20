@@ -36,6 +36,7 @@
 #include "rad_test.h"
 
 #include "../arch/deepseek41/ds41_psk_cone.h"
+#include "../arch/deepseek41/ds41_pf_layers.h"   /* tp8 loop P42 */
 
 #include <algorithm>
 #include <cstdint>
@@ -1068,4 +1069,77 @@ TEST(tail_grid_controls_fail) {
     /* a turn started at the fine tail with nothing restored: its first rows read windows nobody wrote */
     CHECK(!tg_conv(fixed, 512, true, false, false, /*no_restore=*/true).err.empty());
     CHECK(!tg_conv(fixed, 512, false, true, false, /*no_restore=*/true).err.empty());
+}
+
+/* ------------------------------------------------------------------ tp8 loop P42: RADIANCE_DS41_PF_LAYERS's grouping and lines */
+namespace {
+ds41pfl::Rec pfl_rec(int64_t pos0, int64_t rows, float pre, int l0, int l1, float ms) {
+    ds41pfl::Rec r;
+    r.pos0 = pos0;
+    r.rows = rows;
+    r.pre_ms = pre;
+    for (int l = l0; l <= l1; ++l) r.lms.push_back({ l, ms });
+    return r;
+}
+bool has(const std::string& s, const char* t) {
+    if (s.find(t) != std::string::npos) return true;
+    std::fprintf(stderr, "  missing '%s' in: %s\n", t, s.c_str());
+    return false;
+}
+}  // namespace
+
+TEST(pf_layers_reads_a_leaders_cold_prompt_body_and_last_two_chunks) {
+    ds41pfl::Acc a(8192, 128);
+    /* four 2,048-row chunks; the leader's heads (layers 0-9, 12 ms a layer, 1 ms before layer 0) and tails (32-39, 0.25 ms a
+     * layer) in a lane order: h0 h1 t0 h2 t1 h3 t2 t3 */
+    const int64_t P[4] = { 0, 2048, 4096, 6144 };
+    auto head = [&](int i) { return pfl_rec(P[i], 2048, 1.0f, 0, 9, 12.0f); };
+    auto tail = [&](int i) { return pfl_rec(P[i], 2048, 0.0f, 32, 39, i == 3 ? 5.0f : 0.25f); };
+    std::vector<std::string> out;
+    for (const ds41pfl::Rec& r : { head(0), head(1), tail(0), head(2), tail(1), head(3), tail(2), tail(3) }) {
+        out = a.add(r);
+        CHECK(out.empty());   /* the same prompt: chunk 0's tail is no new prompt */
+    }
+    CHECK(a.open());
+    out = a.add(head(0));     /* the next prompt's first head closes this one */
+    CHECK_EQ(out.size(), (size_t)2);
+    if (out.size() == 2) {
+        CHECK(has(out[0], "prompt of 8192 rows, 4 chunks, 8 records; body 2 chunks / 4096 rows"));
+        CHECK(has(out[0], ", 0 5.86, "));       /* 12 ms a 2,048-row head = 5.86 ms a 1k rows */
+        CHECK(has(out[0], ", 32 0.12, "));      /* 0.25 ms a 2,048-row tail */
+        CHECK(has(out[0], "pre 0.24, "));       /* 2 x 1 ms over 4 records of 2,048 rows */
+        CHECK(has(out[1], "the last two chunks 2048@4096 / 2048@6144"));
+        CHECK(has(out[1], ", 9 12.00 / 12.00, "));
+        CHECK(has(out[1], ", 39 0.25 / 5.00; sums"));
+    }
+    CHECK_EQ(ds41pfl::lname(ds41pfl::kRx + 10), std::string("rx10"));   /* a receive's own bucket */
+    CHECK_EQ(ds41pfl::lname(ds41pfl::kPre), std::string("pre"));
+    CHECK(a.open());          /* the new prompt's head is in */
+    out = a.flush();          /* one chunk under 8,192 rows: the summary only (every 128) */
+    CHECK(out.empty());
+    CHECK(!a.open());
+}
+
+TEST(pf_layers_groups_follower_segments_and_short_prompts) {
+    ds41pfl::Acc a(8192, 2);
+    /* a follower pass in two layer segments ([10, 21), [21, 32)) is one chunk, not two prompts */
+    CHECK(a.add(pfl_rec(0, 1100, 0.0f, 10, 20, 6.0f)).empty());
+    CHECK(a.add(pfl_rec(0, 1100, 0.0f, 21, 31, 3.0f)).empty());
+    /* the next newcomer starts a new prompt; the first short prompt goes into the summary, no line yet */
+    CHECK(a.add(pfl_rec(0, 1100, 0.0f, 10, 20, 6.0f)).empty());
+    CHECK(a.add(pfl_rec(0, 1100, 0.0f, 21, 31, 3.0f)).empty());
+    const std::vector<std::string> out = a.flush();   /* the second short prompt: the summary line (every 2) */
+    CHECK_EQ(out.size(), (size_t)1);
+    if (out.size() == 1) {
+        CHECK(has(out[0], "2 prompts under 8192 rows (2200 rows): ms a 1k rows by layer: "));
+        CHECK(has(out[0], ", 10 5.45, "));      /* 6 ms a 1,100-row segment */
+        CHECK(has(out[0], ", 31 2.73; layers sum"));
+    }
+    /* a two-chunk prompt: no last-two line, both chunks are the body */
+    ds41pfl::Acc b(4096, 128);
+    CHECK(b.add(pfl_rec(0, 4096, 0.0f, 10, 31, 20.0f)).empty());
+    CHECK(b.add(pfl_rec(4096, 1000, 0.0f, 10, 31, 9.0f)).empty());
+    const std::vector<std::string> o2 = b.flush();
+    CHECK_EQ(o2.size(), (size_t)1);
+    if (o2.size() == 1) CHECK(has(o2[0], "prompt of 5096 rows, 2 chunks, 2 records; body 2 chunks / 5096 rows"));
 }

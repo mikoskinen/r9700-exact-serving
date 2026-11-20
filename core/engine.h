@@ -480,7 +480,7 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0, int rband = 0);
     /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
      * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
      * (StepHdr flags bit 2), the follower's parts start at h + k */
@@ -513,6 +513,17 @@ private:
     int64_t pp_tband_cont_n_ = 0;   /* tail band passes with a later chunk (ctx > 0) in them */
     std::unordered_map<uint64_t, uint8_t> pp_tband_seq_;
     void pp_tband_note(int lane, int tband);
+    /* tp8 loop P41 (fn4 pp_rband / RADIANCE_PP_RBAND_EVERY on the leader, with the plugin's reverse band, rad_pp_rband l = h - 1;
+     * unset: nothing): a lone prompt chunk's head may run as a REVERSE pass -- the leader's head over [0, l) (+ layer l's key chain),
+     * the follower from l (its frame says so: StepHdr flags bit 5). Only a chunk whose every earlier row of its sequence crossed X1
+     * in a prompt pass (the plugin's keys form) or ran a reverse pass, so the follower's copy of layer l's window is whole:
+     * pp_rband_seq_ = such sequences (KV keys) and their chunk count; a decode entry or a prefix restore drops one. */
+    int  pp_ship_rband_ = 0;      /* the frame pp_frame makes now is a reverse pass's (flags bit 5) */
+    int  pp_rband_start_ = 0;     /* RADIANCE_PP_RBAND_EVERY's value (fn4 pp_rband -1 reads it) */
+    int64_t pp_rband_n_ = 0, pp_rband_rows_ = 0, pp_rband_unclean_ = 0, pp_rband_end_ = 0;
+    std::unordered_map<uint64_t, int32_t> pp_rband_seq_;
+    int  pp_rband_step(int lane, const RadBatch* b);
+    void pp_rband_note(int lane, int rband);
     int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
     int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
     /* tp8 loop D46 (fn4 pp_tband 3 / RADIANCE_PP_TAIL_BAND=3, with the plugin's tail COPY, rad_pp_tail_copy): the leader holds the
