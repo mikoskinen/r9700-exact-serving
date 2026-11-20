@@ -744,10 +744,10 @@ static void i9b_collect(State& s, int64_t* out) {
             for (int i = 0; i < n && i < 6; ++i) out[i] = (int64_t)v[i];
             got_a = n > 0;
         }
-        if (k.ix_stats && !got_b) {
-            long long v[4] = { 0, 0, 0, 0 };
-            const int n = k.ix_stats(v, 4);
-            for (int i = 0; i < n && i < 4; ++i) out[6 + i] = (int64_t)v[i];
+        if (k.ix_stats && !got_b) {   /* a libr4d before tp8 loop P38 writes 4 (no BFR counter: out[10] stays 0) */
+            long long v[5] = { 0, 0, 0, 0, 0 };
+            const int n = k.ix_stats(v, 5);
+            for (int i = 0; i < n && i < 5; ++i) out[6 + i] = (int64_t)v[i];
             got_b = n > 0;
         }
     }
@@ -1821,7 +1821,8 @@ std::string state_json() {
              ", \"small\": " + std::to_string((long long)v[3]) + "}, \"ix\": {\"lds_launches\": " +
              std::to_string((long long)v[6]) + ", \"lds_rows\": " + std::to_string((long long)v[7]) +
              ", \"ni_launches\": " + std::to_string((long long)v[8]) + ", \"ni_cand_launches\": " +
-             std::to_string((long long)v[9]) + "}, \"ni\": {\"runs\": " + std::to_string((long long)v[4]) +
+             std::to_string((long long)v[9]) + ", \"bfr_launches\": " + std::to_string((long long)v[10]) +
+             "}, \"ni\": {\"runs\": " + std::to_string((long long)v[4]) +
              ", \"dead_bytes\": " + std::to_string((long long)v[5]) + "}}";
     }
     /* Lever ARC (ds41-int10): always present, 0s where no plugin serves it (arc_stats). */

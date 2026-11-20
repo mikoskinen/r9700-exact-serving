@@ -4607,7 +4607,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_known(value) ? 1 : -1;   /* tp8 loop D26: 0 the rule, N the decode attention's form N - 1 where the rule takes 4 at > 256 keys (r4d_ds41_sparse.hip says which N exist) */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
-    if (!std::strcmp(name, "ix_lds")) return value >= 0 && value <= 3 ? 1 : -1;   /* bit 0 IX-LDSR2, bit 1 IXW (the decode band in the WMMA forms, rule B) */
+    if (!std::strcmp(name, "ix_lds")) return value >= 0 && value <= 7 ? 1 : -1;   /* bit 0 IX-LDSR2, bit 1 IXW (the decode band in the WMMA forms, rule B), bit 2 BFR (tp8 loop P38: the roundings as selects, the same bits) */
     if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_arcoded")) return value >= 0 && value <= 1048576 ? 1 : -1;
     if (!std::strcmp(name, "ar_xpush")) return value == 0 || value == 1 ? 1 : -1;

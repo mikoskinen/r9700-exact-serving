@@ -26,6 +26,7 @@
 // bf16 hi + lo; index_score with only the dot's summation order changed (every rounding after it
 // is libref's). The decode band keeps the exact kernels, so speculative verify reproduces decode.
 // (fn4 ix_lds bit 1, lever IXW: index_score's decode band on the WMMA form too -- every height the same form.)
+// (fn4 ix_lds bit 2, lever BFR, tp8 loop P38: the WMMA forms' roundings without a branch -- the same bits.)
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -63,6 +64,29 @@ __device__ __forceinline__ uint32_t ds_bf16_bits(float f) {
 }
 __device__ __forceinline__ float ds_round_bf16(float f) { return __uint_as_float(ds_bf16_bits(f) << 16); }
 __device__ __forceinline__ float ds_bf(uint32_t h) { return __uint_as_float((h & 0xffffu) << 16); }
+/* tp8 loop P38 (lever BFR, fn4 ix_lds bit 2): ds_round_bf16 without a branch. ds_bf16_bits' NaN test is an early return,
+ * which clang keeps as a divergent if / else around every call (exec-mask saves + SALU + s_wait_alu, both sides issued):
+ * index_score's WMMA tile loop (HT 2, no keep, gfx1201) is 1,334 instructions for its 16 WMMAs, 159 of them exec saves and
+ * 270 s_wait_alu, for 33 roundings a tile. Here both words are formed and the quiet NaN is SELECTED when isnan(f) -- the
+ * same function for every input: NaN -> (u & 0xffff0000) | 0x00400000 = (((u >> 16) | 0x40) & 0xffff) << 16; otherwise
+ * (u + 0x7fff + lsb) & 0xffff0000 = ((u + 0x7fff + lsb) >> 16 & 0xffff) << 16 (no carry out of the word: the largest
+ * non-NaN word, -inf 0xff800000, + 0x8000 stays below 2^32). The loop becomes 522 instructions (VALU slots 458 -> 364,
+ * 2 exec saves, 51 waits). M 2 = the selftest's mutation 6 only (NOT exact): an infinity taken for a NaN, so a check
+ * whose data reaches the non-finite path (overflowing dots) must see it. */
+template <int M>
+__device__ __forceinline__ float ds_round_bf16_sel(float f) {
+    const uint32_t u = __float_as_uint(f);
+    const uint32_t rn = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+    const uint32_t qn = (u & 0xffff0000u) | 0x00400000u;
+    const bool nan = M == 2 ? (u & 0x7fffffffu) >= 0x7f800000u : __builtin_isnan(f);
+    return __uint_as_float(nan ? qn : rn);
+}
+/* BF 0: ds_round_bf16 (the program before); 1: the select form (lever BFR); 2: its mutation (tests only). */
+template <int BF>
+__device__ __forceinline__ float ds_rbf(float f) {
+    if constexpr (BF == 0) return ds_round_bf16(f);
+    else return ds_round_bf16_sel<BF>(f);
+}
 
 /* libref's seq_of_row: the s with cu[s] <= row < cu[s+1], by bisection. */
 __device__ __forceinline__ int ds_seq_of_row(const int* cu, long cs, int S, long row) {
@@ -3088,7 +3112,7 @@ constexpr int kIwEB = 128;                           /* entries a workgroup */
 constexpr int kIwKeepEB = 1024;                      /* ... with keep */
 static_assert(kIwKeepEB == 1024, "the keep words of a span, one a lane, assume 1024-entry spans");
 
-template <int HT, bool KEEP>
+template <int HT, bool KEEP, int BF = 0>   /* BF: ds_rbf's form (tp8 loop P38, lever BFR: 1 = every rounding as a select, the same bits) */
 __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a) {
     constexpr int DM = 128, EB = KEEP ? kIwKeepEB : kIwEB;
     const int lane = threadIdx.x & 31, hf = lane >> 4;
@@ -3136,7 +3160,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const int hh = t * 16 + 8 * hf + e;
-            wh[t][e] = hh < a.H ? ds_round_bf16(ds_bf(a.w[m * a.wr + (long)hh * a.wc]) * a.wscale) : 0.0f;
+            wh[t][e] = hh < a.H ? ds_rbf<BF>(ds_bf(a.w[m * a.wr + (long)hh * a.wc]) * a.wscale) : 0.0f;
         }
     }
     for (long j0 = jb; j0 < jend; j0 += 16) {
@@ -3196,12 +3220,12 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
                 if (t + half > 0) acc = ds_xor16(acc);
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    const float dot = ds_round_bf16(d[t][e]);
-                    acc = acc + ds_round_bf16((dot < 0.0f ? 0.0f : dot) * wh[t][e]);
+                    const float dot = ds_rbf<BF>(d[t][e]);
+                    acc = acc + ds_rbf<BF>((dot < 0.0f ? 0.0f : dot) * wh[t][e]);
                 }
             }
         }
-        if (hf == 1 && j < jend && !(a.ni && j >= dead)) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+        if (hf == 1 && j < jend && !(a.ni && j >= dead)) srow[j * a.scs] = kp ? ds_rbf<BF>(acc) : -kDsInf;
     }
 }
 
@@ -3479,18 +3503,19 @@ int64_t topk_split_bytes(long rows, long C, long K) {
  * 0 / 1, the start value RADIANCE_DS41_IX_LDS / RADIANCE_DS41_IX_NI = 1 (anything else or unset: 0); read at each launch.
  * Their counters (rad_ix_stats, every rank's launches summed; a recorded pass counts when it is recorded): LDS-form
  * launches and their rows, index_score launches under ix_ni, index_candidates launches under ix_ni. g_ix_mut: the
- * selftest's mutation controls (r4d_i9b_mutate 3 / 4 / 5), never set in production. */
+ * selftest's mutation controls (r4d_i9b_mutate 3 / 4 / 5 / 6), never set in production. */
 int ix_env(const char* name) {
     const char* e = std::getenv(name);
     return e && e[0] == '1' && !e[1] ? 1 : 0;
 }
-/* ix_lds's start value: RADIANCE_DS41_IX_LDS = 1 (as before), 2 or 3 (lever IXW below: bit 1); anything else 0. */
+/* ix_lds's start value: RADIANCE_DS41_IX_LDS = 1 (as before), 2 or 3 (lever IXW below: bit 1), 4 .. 7 (lever BFR, tp8 loop
+ * P38: bit 2); anything else 0. */
 int ix_lds_env() {
     const char* e = std::getenv("RADIANCE_DS41_IX_LDS");
-    return e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0;
+    return e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0;
 }
 std::atomic<int> g_ix_lds{-1}, g_ix_ni{-1}, g_ix_mut{0};
-std::atomic<long long> g_ix_lds_launch{0}, g_ix_lds_rows{0}, g_ix_ni_launch{0}, g_ix_ni_cand{0};
+std::atomic<long long> g_ix_lds_launch{0}, g_ix_lds_rows{0}, g_ix_ni_launch{0}, g_ix_ni_cand{0}, g_ix_bfr_launch{0};
 int ix_lds_on() {
     int v = g_ix_lds.load(std::memory_order_relaxed);
     if (v < 0) {
@@ -3622,13 +3647,27 @@ int index_score_body(const RadArgs* a, RadStream stream) {
             if (H > 16) return R4D_EMIT(stream, (ds41_index_score_lds_kernel<2, false>), grid, dim3(256), 0u, s);
             return R4D_EMIT(stream, (ds41_index_score_lds_kernel<1, false>), grid, dim3(256), 0u, s);
         }
+        /* tp8 loop P38 (lever BFR, ix_lds bit 2 = values 4-7): the WMMA forms with every rounding as a select (ds_rbf<1>: the
+         * same bits); mutation 6 (tests only, 32-head forms): an infinity rounded as a NaN. */
+        const int bfr = (ixl & 4) ? (mut == 6 && H > 16 ? 2 : 1) : 0;
+        if (bfr) g_ix_bfr_launch.fetch_add(1, std::memory_order_relaxed);
         if (keep) {
             const dim3 grid((unsigned)((s.C + kIwKeepEB - 1) / kIwKeepEB), (unsigned)((s.M + 7) / 8));
-            if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true>), grid, dim3(256), 0u, s);
+            if (H > 16) {
+                if (bfr == 2) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true, 2>), grid, dim3(256), 0u, s);
+                if (bfr) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true, 1>), grid, dim3(256), 0u, s);
+                return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true>), grid, dim3(256), 0u, s);
+            }
+            if (bfr) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, true, 1>), grid, dim3(256), 0u, s);
             return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, true>), grid, dim3(256), 0u, s);
         }
         const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 7) / 8));
-        if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, false>), grid, dim3(256), 0u, s);
+        if (H > 16) {
+            if (bfr == 2) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, false, 2>), grid, dim3(256), 0u, s);
+            if (bfr) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, false, 1>), grid, dim3(256), 0u, s);
+            return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, false>), grid, dim3(256), 0u, s);
+        }
+        if (bfr) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, false, 1>), grid, dim3(256), 0u, s);
         return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, false>), grid, dim3(256), 0u, s);
     }
     /* Head split: more workgroups while the grid is short of the card. The head sum is closed in
@@ -4581,18 +4620,21 @@ extern "C" int r4d_rad_ds41_index_score(const RadArgs* a, RadStream stream) {
  * selftest's mutation hook. */
 int r4d_ix_lds_get() { return ix_lds_on(); }
 int r4d_ix_ni_get() { return ix_ni_on(); }
-void r4d_ix_lds_set(int v) { g_ix_lds.store(v >= 0 && v <= 3 ? v : 0, std::memory_order_relaxed); }   /* bit 0 IX-LDSR2, bit 1 IXW */
+void r4d_ix_lds_set(int v) { g_ix_lds.store(v >= 0 && v <= 7 ? v : 0, std::memory_order_relaxed); }   /* bit 0 IX-LDSR2, bit 1 IXW, bit 2 BFR */
 void r4d_ix_ni_set(int v) { g_ix_ni.store(v ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_ix_mutate(int which) { g_ix_mut.store(which, std::memory_order_relaxed); }
 /* out[0] LDS-form launches, [1] their rows (the run rows each launch holds), [2] index_score launches under ix_ni, [3]
- * index_candidates launches under ix_ni; every rank's launches summed, cumulative. Returns how many it wrote (4). */
+ * index_candidates launches under ix_ni; every rank's launches summed, cumulative. Returns how many it wrote (4); with
+ * n >= 5 also [4] = WMMA-form launches under lever BFR (ix_lds bit 2, tp8 loop P38) and returns 5. */
 extern "C" int rad_ix_stats(long long* out, int n) {
     if (!out || n < 4) return 0;
     out[0] = g_ix_lds_launch.load(std::memory_order_relaxed);
     out[1] = g_ix_lds_rows.load(std::memory_order_relaxed);
     out[2] = g_ix_ni_launch.load(std::memory_order_relaxed);
     out[3] = g_ix_ni_cand.load(std::memory_order_relaxed);
-    return 4;
+    if (n < 5) return 4;
+    out[4] = g_ix_bfr_launch.load(std::memory_order_relaxed);
+    return 5;
 }
 extern "C" int r4d_rad_ds41_index_candidates(const RadArgs* a, RadStream stream) {
     return index_candidates_body(a, stream);

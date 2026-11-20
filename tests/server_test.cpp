@@ -5622,7 +5622,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         }
         const HttpResponse g9 = f.get("/admin/fn4");
         CHECK(has(g9.body, "\"i9b\": {\"mhc\": {\"declared\": 0, \"pairs\": 0, \"rows\": 0, \"small\": 0}, "
-                           "\"ix\": {\"lds_launches\": 0, \"lds_rows\": 0, \"ni_launches\": 0, \"ni_cand_launches\": 0}, "
+                           "\"ix\": {\"lds_launches\": 0, \"lds_rows\": 0, \"ni_launches\": 0, \"ni_cand_launches\": 0, \"bfr_launches\": 0}, "
                            "\"ni\": {\"runs\": 0, \"dead_bytes\": 0}}"));
         int64_t v[fn4::kI9bStats];
         fn4::i9b_stats(v);

@@ -339,7 +339,10 @@
  *   ix_lds          libr4d (lever IX-LDSR2): 0 / 1 -- index_score's prefill WMMA form without keep, over MXFP4 keys, with a
  *                   workgroup's keys unpacked once into LDS and two rows a wave (16 a workgroup); the stock form's
  *                   per-output arithmetic, so the same bytes. RADIANCE_DS41_IX_LDS=1 at load starts it at 1.
- *   ix_ni           libr4d (lever IX-NI) + deepseek41 (its count): 0 / 1 -- index_score writes no -inf past a row's reach
+ *                   Bit 1 (values 2 / 3, lever IXW): the decode band on the WMMA forms too. Bit 2 (values 4 .. 7, lever BFR,
+ *                   tp8 loop P38): the WMMA forms' roundings as selects instead of a branch each -- the same bytes by
+ *                   construction (ds_round_bf16_sel); RADIANCE_DS41_IX_LDS=N (1 .. 7) at load starts it at N.
+ *   ix_ni          libr4d (lever IX-NI) + deepseek41 (its count): 0 / 1 -- index_score writes no -inf past a row's reach
  *                   (index_topk reads a row only below its reach) and index_candidates reads a row only below its reach (a
  *                   -inf never moves a block maximum, so the same keep words). RADIANCE_DS41_IX_NI=1 starts it at 1.
  *                   GET "i9b" carries the three levers' counters (i9b_stats).
@@ -886,8 +889,9 @@ int  dspark_pfctx_stats(int64_t out[4]);
  * recorded pass when it is recorded): out[0..5] deepseek41's rad_i9b_stats (rank 0): M1 declared, fused launches, their
  * rows, launches left unfused below the switch's rows, index_score runs issued under ix_ni, the plane bytes they leave
  * unwritten; out[6..9] libr4d's rad_ix_stats (every rank summed): LDS-form launches, their rows, index_score launches under
- * ix_ni, index_candidates launches under ix_ni. 0s where no plugin serves them. */
-constexpr int kI9bStats = 10;
+ * ix_ni, index_candidates launches under ix_ni; out[10] (tp8 loop P38) WMMA-form index_score launches under lever BFR (ix_lds
+ * bit 2). 0s where no plugin serves them. */
+constexpr int kI9bStats = 11;
 void i9b_stats(int64_t out[kI9bStats]);
 /* Lever ARC's live counters (ds41-int10, GET /admin/fn4 "arc"; libr4d's rad_arc_stats, cumulative, launches of the
  * four-rank exact two-shot at overlap 0 counted when issued -- a recorded pass when it is recorded): [0] coded launches
