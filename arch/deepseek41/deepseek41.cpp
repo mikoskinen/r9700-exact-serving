@@ -39,6 +39,7 @@
 #include "ds41_walk_geom.h"
 #include "ds41_prefetch.h"   /* tp8 loop D24: the weight reads' pass / site rules */
 #include "ds41_dkv_held.h"   /* tp8 loop D25: the gathered latent rows held a decode band piece */
+#include "ds41_pf_layers.h"   /* tp8 loop P42: a lone cold prompt's card time by layer (RADIANCE_DS41_PF_LAYERS) */
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
 #include <algorithm>
@@ -50,7 +51,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <utility>
@@ -8762,7 +8765,148 @@ static void pf_pass_note(RadCtx* x, const RadBatch* b, int bits) {
 }
 
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
+/* tp8 loop P42 (RADIANCE_DS41_PF_LAYERS=1 / N, either node; unset: nothing here, no start line): a lone cold prompt's card time BY
+ * LAYER on this node's rank 0 (ds41_pf_layers.h), from card events step_bi records on rank 0's stream around every layer it
+ * issues in a lone PLANNED prefill pass (one prefill segment, no decode row, >= kPflRows rows; a planned pass is never recorded,
+ * rad_arch_pass_key) -- no sync: the records are read with rad_event_query at later passes, in order. One line pair a prompt of
+ * >= N rows (1 / on: 8,192), a summary line of the shorter ones (BG newcomers) every 128 prompts. The issue is the same with it
+ * on or off (an event record is no op of the pass): the same bytes. */
+static constexpr int64_t kPflRows = 256;
+static constexpr int64_t kPflEvents = 16384;   /* the event pool's cap (records hold ~45 a pass) */
+static std::atomic<long long> g_pfl_min{-2};   /* -2 unread, -1 off, else the rows of a prompt that gets its own lines */
+static long long pfl_min() {
+    long long v = g_pfl_min.load(std::memory_order_relaxed);
+    if (v != -2) return v;
+    const char* e = std::getenv("RADIANCE_DS41_PF_LAYERS");
+    long long n = -1;
+    if (e && *e) {
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) n = 8192;
+        else {
+            char* end = nullptr;
+            const long long q = std::strtoll(e, &end, 10);
+            n = end && *end == '\0' && q >= 2 ? q : -1;
+            if (n < 0)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_LAYERS=%s is not 1 / on or a row count >= 2: off\n", e);
+        }
+    }
+    long long unread = -2;
+    if (g_pfl_min.compare_exchange_strong(unread, n) && n > 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_LAYERS (tp8 loop P42): rank 0 times every layer of a lone planned "
+                        "prefill pass of >= %lld rows by card events (no sync); a line pair a prompt of >= %lld rows (the body in ms a "
+                        "1k rows by layer, the last two chunks in ms by layer), a summary of the shorter ones every 128\n",
+                (long long)kPflRows, n);
+    return g_pfl_min.load(std::memory_order_relaxed);
+}
+struct PflPend {
+    ds41pfl::Rec r;
+    RadEvent a = nullptr, end = nullptr;
+    std::vector<RadEvent> ev;
+    std::vector<int> ly;
+};
+static std::mutex g_pfl_mu;
+static std::deque<PflPend> g_pfl_pend;
+static std::vector<RadEvent> g_pfl_free;
+static long long g_pfl_made = 0, g_pfl_drop = 0;
+static ds41pfl::Acc* g_pfl_acc = nullptr;
+static const char* g_pfl_node = "one process";
+static RadEvent pfl_ev() {   /* g_pfl_mu held */
+    if (!g_pfl_free.empty()) {
+        RadEvent e = g_pfl_free.back();
+        g_pfl_free.pop_back();
+        return e;
+    }
+    RadEvent e = nullptr;
+    if (g_pfl_made >= kPflEvents || rad_event_create(&e) < 0 || !e) return nullptr;
+    ++g_pfl_made;
+    return e;
+}
+static void pfl_give_back(PflPend& p) {   /* g_pfl_mu held */
+    for (RadEvent e : p.ev) g_pfl_free.push_back(e);
+    if (p.a) g_pfl_free.push_back(p.a);
+    if (p.end) g_pfl_free.push_back(p.end);
+    p.ev.clear();
+    p.a = p.end = nullptr;
+}
+static void pfl_print(const std::vector<std::string>& v) {
+    for (const std::string& s : v)
+        fprintf(stderr, "radiance: deepseek41: PF layers (RADIANCE_DS41_PF_LAYERS, tp8 loop P42), %s rank 0: %s\n", g_pfl_node,
+                s.c_str());
+}
+/* every completed record into the accumulator, in order (one stream: a record's end completes after its marks); `lone`: the
+ * calling pass is a lone prefill pass -- any other with nothing pending closes the open prompt. g_pfl_mu held. */
+static void pfl_poll(bool lone) {
+    while (!g_pfl_pend.empty()) {
+        PflPend& p = g_pfl_pend.front();
+        if (rad_event_query(p.end) != 1) break;
+        float ms = 0.0f;
+        p.r.pre_ms = rad_event_elapsed_ms(p.a, p.ev.empty() ? p.end : p.ev[0], &ms) == 0 ? ms : 0.0f;
+        for (size_t i = 0; i < p.ev.size(); ++i) {
+            ms = 0.0f;
+            if (rad_event_elapsed_ms(p.ev[i], i + 1 < p.ev.size() ? p.ev[i + 1] : p.end, &ms) != 0) ms = 0.0f;
+            p.r.lms.push_back({ p.ly[i], ms });
+        }
+        pfl_give_back(p);
+        pfl_print(g_pfl_acc->add(p.r));
+        g_pfl_pend.pop_front();
+    }
+    if (!lone && g_pfl_pend.empty() && g_pfl_acc->open()) pfl_print(g_pfl_acc->flush());
+}
+/* step_bi's record: built at its start (the pass's start event), a mark at each layer it issues, the end at its return */
+struct PflScope {
+    bool on = false;
+    RadStream s = nullptr;
+    PflPend p;
+    PflScope(RadCtx* x, const Model& m, const RadBatch* b, const std::vector<BiSeg>& sg) {
+        const long long mn = pfl_min();
+        if (mn <= 0 || rad_rank(x) != 0 || !b) return;
+        std::lock_guard<std::mutex> lk(g_pfl_mu);
+        if (!g_pfl_acc) {
+            g_pfl_acc = new ds41pfl::Acc(mn, 128);
+            g_pfl_node = m.pp ? (m.pp_rank == 0 ? "leader" : "follower") : "one process";
+        }
+        const bool lone = b->draft_pass == 0 && sg.size() == 1 && !sg[0].dec && sg[0].r0 == 0 && sg[0].n >= kPflRows &&
+                          b->positions_h && psk_hint(b) != nullptr;
+        pfl_poll(lone);
+        if (!lone) return;
+        if (g_pfl_pend.size() >= 256 || !(p.a = pfl_ev())) {
+            ++g_pfl_drop;
+            return;
+        }
+        s = rad_stream(x);
+        rad_event_record(p.a, s);
+        p.r.pos0 = b->positions_h[0];
+        p.r.rows = sg[0].n;
+        on = true;
+    }
+    void layer(int l) {
+        if (!on) return;
+        std::lock_guard<std::mutex> lk(g_pfl_mu);
+        RadEvent e = pfl_ev();
+        if (!e) {
+            pfl_give_back(p);
+            ++g_pfl_drop;
+            on = false;
+            return;
+        }
+        rad_event_record(e, s);
+        p.ev.push_back(e);
+        p.ly.push_back(l);
+    }
+    ~PflScope() {
+        if (!on) return;
+        std::lock_guard<std::mutex> lk(g_pfl_mu);
+        if (!(p.end = pfl_ev())) {
+            pfl_give_back(p);
+            ++g_pfl_drop;
+            return;
+        }
+        rad_event_record(p.end, s);
+        g_pfl_pend.push_back(std::move(p));
+    }
+};
+
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
+    PflScope pfl(x, m, batch, sg);   /* tp8 loop P42: RADIANCE_DS41_PF_LAYERS (rank 0, a lone planned prefill pass) */
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start (each part of a lane step's pass too) */
     const int pfb = pf_bits(batch);   /* tp8 loop D24: 0 = no weight reads beside the all-reduces */
     pf_pass_note(x, batch, pfb);
@@ -9378,6 +9522,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const bool held = (m.lr.held(L.l) || band_l || tband_l) && (pp_part_layer(m, part, li_) || kvo);
         const int l = held ? L.l : (int)(&L - m.layers.data());
         const int64_t r = held ? L.r : c.ratio[(size_t)l];
+        if (held) pfl.layer(l);   /* tp8 loop P42: this layer's start on rank 0's stream (its receive counts in it) */
         /* tp8 S6: the receiver's first layer after the cut starts from the crossing: its live rows are the previous
          * layer's segments (`cur`, not yet this layer's), over which one process issues the boundary op at the end of the
          * previous layer -- issued the same here (rows(kBiNorm) as below), after this node's copy of the source's
