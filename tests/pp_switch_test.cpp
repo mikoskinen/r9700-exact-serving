@@ -273,6 +273,27 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
     CHECK(named);
 }
 
+/* tp8 loop P47: ds41_csplit is switch 103, right after aql_hdp, deepseek41's (the follower takes it with the leader's: the
+ * candidate layer it changes is the follower's); with no plugin serving it the follower's record of it is taken and named as
+ * skipped. */
+TEST(ds41_csplit_is_a_follower_plugin_switch_after_aql_hdp) {
+    const int i = fn4::switch_index("ds41_csplit");
+    REQUIRE(i == (int)fn4::kDs41Csplit);
+    CHECK_EQ(i, (int)fn4::kAqlHdp + 1);
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 0;
+    std::vector<std::string> skipped;
+    (void)fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped);
+    CHECK_EQ(taken[(size_t)i], 1u);
+    bool named = false;
+    for (const std::string& s : skipped) named = named || s.rfind("ds41_csplit", 0) == 0;
+    CHECK(named);
+}
+
 }  /* namespace */
 
 RAD_TEST_MAIN()

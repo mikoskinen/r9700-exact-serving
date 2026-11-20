@@ -17,6 +17,7 @@
 #include "rad_test.h"
 
 #include "../arch/deepseek41/ds41_sp_plan.h"
+#include "../arch/deepseek41/ds41_index_split.h"
 
 #include <cstdint>
 #include <string>
@@ -462,6 +463,162 @@ TEST(plan_control_without_the_lazy_gather_fails) {
     int failed = 0;
     for (const Pass& p : shapes()) failed += !run(p, plan_of(p), /*lazy_gather=*/false).empty();
     CHECK(failed >= 4);   /* every shape with a non-SP layer reading the streams after SP ones */
+}
+
+/* ---- tp8 loop P47 (RADIANCE_DS41_CAND_SPLIT): the candidate layer's indexer split where its keep words cross, its keep rows
+ * all-gathered (deepseek41 step_bi / the plain issue: index_candidates into the rank's keep_part at (p - p0) R, then keep_gather
+ * lays rank r's q R rows at s.r0 + r q R). A model of the keep rows, word = the row's own value: the unsplit layer (today's
+ * form where keep crosses: every rank every run not skipped by PSK) against the split + gather, at 4 ranks, for every deal
+ * the issue takes (irows 96 / 256, plain / balanced, the declared run ops), segment starts 0 / 48 (a BI step's decode rows
+ * first), and PSK cut rows at the candidate layer, a reindex layer and X2's boundary (cones shrink with the layer). Checked:
+ * every row a later reader takes -- a reindex layer's runs under the same deal (not skipped by its cut) on EVERY rank, X2's live
+ * rows [lo, end) on rank 0 -- holds the same word in both forms; the gather stays inside keep's declared rows (sel's rows) and
+ * the part / numel declared; rows before the segment are untouched. Controls that must fail: no gather (rank-local keep, today's
+ * split at a layer whose keep crosses), and the part laid at another rank's offset (ceil(T / world) rows a rank). */
+namespace p47 {
+
+constexpr int kWorld = 4;
+constexpr int64_t kStale = -7;   /* a word no run wrote */
+
+struct Deal { int64_t irows, max_tok, live; bool balance; };
+
+int64_t qmax_of(const Deal& d) {
+    const int64_t iparts = (d.max_tok + d.irows - 1) / d.irows;
+    return (iparts + kWorld - 1) / kWorld;
+}
+
+/* The keep rows each rank holds after the candidate layer; `form` 0 = unsplit (every rank, every run), 1 = split + gather,
+ * 2 = split without the gather (control), 3 = split, the part at r ceil(T / world) (control). Returns false when a gather
+ * leaves the declared rows (keep_rows) or the part (qmax irows). */
+bool candidate_layer(const Deal& d, int64_t s_r0, int64_t T, int64_t cut0, int form, int64_t keep_rows,
+                     std::vector<std::vector<int64_t>>& keep) {
+    keep.assign(kWorld, std::vector<int64_t>((size_t)keep_rows, kStale));
+    const int64_t qm = qmax_of(d), iparts = (d.max_tok + d.irows - 1) / d.irows;
+    std::vector<std::vector<int64_t>> part(kWorld, std::vector<int64_t>((size_t)(qm * d.irows), kStale));
+    std::vector<Ds41IdxRuns> rus(kWorld);
+    for (int r = 0; r < kWorld; ++r) {
+        const Ds41IdxRuns ru = ds41_idx_runs(T, d.irows, d.live, kWorld, r, form != 0, kDs41SplitMinLive,
+                                             form != 0 && d.balance, iparts);
+        rus[(size_t)r] = ru;
+        for (int64_t p = ru.p0; p < ru.p1; ++p) {
+            const int64_t q0 = p * ru.R, qn = std::min(ru.R, T - q0);
+            if (ds41_idx_run_skipped(s_r0, q0, qn, cut0)) continue;
+            for (int64_t i = 0; i < qn; ++i) {
+                if (ru.split && form != 2) {
+                    const int64_t at = (p - ru.p0) * ru.R + i;
+                    if (at >= (int64_t)part[(size_t)r].size()) return false;
+                    part[(size_t)r][(size_t)at] = s_r0 + q0 + i;
+                } else {
+                    keep[(size_t)r][(size_t)(s_r0 + q0 + i)] = s_r0 + q0 + i;
+                }
+            }
+        }
+    }
+    if (form == 1 || form == 3) {
+        const Ds41IdxRuns& r0 = rus[0];
+        if (!r0.split) return true;
+        const int64_t qR = r0.q * r0.R;
+        if (qR > qm * d.irows) return false;   /* the issued numel against the declared one */
+        const int64_t off = form == 1 ? qR : (T + kWorld - 1) / kWorld;
+        if (s_r0 + (int64_t)kWorld * qR > keep_rows) return false;
+        for (int dst = 0; dst < kWorld; ++dst)
+            for (int r = 0; r < kWorld; ++r)
+                for (int64_t j = 0; j < qR && s_r0 + r * off + j < keep_rows; ++j)
+                    keep[(size_t)dst][(size_t)(s_r0 + r * off + j)] = part[(size_t)r][(size_t)j];
+    }
+    return true;
+}
+
+/* The rows a reader takes: a reindex layer (cut c) reads its runs' rows on every rank under the same deal; X2 reads [lo, end)
+ * on rank 0. Returns the number of reads whose word differs from the row's own value. */
+int64_t bad_reads(const Deal& d, int64_t s_r0, int64_t T, int64_t cut_reindex, int64_t x2_lo,
+                  const std::vector<std::vector<int64_t>>& keep, bool split) {
+    int64_t bad = 0;
+    const int64_t iparts = (d.max_tok + d.irows - 1) / d.irows;
+    for (int r = 0; r < kWorld; ++r) {
+        const Ds41IdxRuns ru = ds41_idx_runs(T, d.irows, d.live, kWorld, r, split, kDs41SplitMinLive, split && d.balance, iparts);
+        for (int64_t p = ru.p0; p < ru.p1; ++p) {
+            const int64_t q0 = p * ru.R, qn = std::min(ru.R, T - q0);
+            if (ds41_idx_run_skipped(s_r0, q0, qn, cut_reindex)) continue;
+            for (int64_t i = 0; i < qn; ++i) bad += keep[(size_t)r][(size_t)(s_r0 + q0 + i)] != s_r0 + q0 + i;
+        }
+    }
+    for (int64_t t = x2_lo; t < s_r0 + T; ++t) bad += keep[0][(size_t)t] != t;
+    return bad;
+}
+
+}   // namespace p47
+
+TEST(p47_candidate_split_keep_gather_holds_every_read_row_as_unsplit) {
+    using namespace p47;
+    long long cases = 0, split_cases = 0, gathered_rows = 0;
+    const int64_t cones[4] = { 2592, 2080, 1568, 1056 };   /* C_l = 160 + (39 - l) 128 at layers 20 / 24 / 28 / 32 */
+    for (const int64_t irows : { 96, 256 })
+        for (const bool balance : { false, true })
+            for (const int64_t s_r0 : { 0, 48 })
+                for (int64_t T = 97; T <= 4160 - s_r0; T += (T < 600 ? 37 : 251)) {
+                    const Deal d{ irows, 4160, 70000, balance };
+                    const int64_t qm = qmax_of(d);
+                    /* keep's rows under the env = sel's rows (BI / PSK declared) */
+                    const int64_t keep_rows = std::max<int64_t>(4160, kWorld * qm * irows) + kWorld * irows + 64;
+                    for (int ahead = 0; ahead < 3; ++ahead) {
+                        /* the cut rows: the pass's end minus each layer's cone (ahead > 0: a second-to-last pass, its cone
+                         * rows shifted by a target past its end, as design 2 plans them; clamped to the segment) */
+                        const int64_t end = s_r0 + T, shift = ahead * 640;
+                        int64_t c[4];
+                        for (int k = 0; k < 4; ++k) c[k] = std::min(end - 1, std::max(s_r0, end + shift - cones[k]));
+                        std::vector<std::vector<int64_t>> ref, got;
+                        CHECK(candidate_layer(d, s_r0, T, c[0], 0, keep_rows, ref));
+                        CHECK(candidate_layer(d, s_r0, T, c[0], 1, keep_rows, got));
+                        const Ds41IdxRuns ru = ds41_idx_runs(T, irows, d.live, kWorld, 0, true, kDs41SplitMinLive, balance,
+                                                             (4160 + irows - 1) / irows);
+                        for (int k = 1; k < 4; ++k) {
+                            CHECK_EQ(bad_reads(d, s_r0, T, c[k], c[3], ref, true), 0);
+                            CHECK_EQ(bad_reads(d, s_r0, T, c[k], c[3], got, true), 0);
+                        }
+                        for (int r = 0; r < kWorld; ++r)
+                            for (int64_t t = 0; t < s_r0; ++t) CHECK_EQ(got[(size_t)r][(size_t)t], kStale);
+                        ++cases;
+                        if (ru.split) {
+                            ++split_cases;
+                            gathered_rows += kWorld * ru.q * ru.R;
+                        }
+                    }
+                }
+    CHECK(split_cases > 100);
+    fprintf(stderr, "p47: %lld cases (%lld split), %lld rows gathered\n", cases, split_cases, gathered_rows);
+}
+
+TEST(p47_control_without_the_gather_or_at_another_offset_fails) {
+    using namespace p47;
+    const Deal d{ 96, 4160, 70000, true };
+    const int64_t qm = qmax_of(d), keep_rows = std::max<int64_t>(4160, kWorld * qm * 96) + kWorld * 96 + 64;
+    int failed_local = 0, failed_off = 0, n = 0;
+    for (int64_t T : { 1441, 2048, 2162, 3001 }) {
+        const int64_t end = T, c0 = std::max<int64_t>(0, end - 2592), c3 = std::max<int64_t>(0, end - 1056),
+                      c1 = std::max<int64_t>(0, end - 2080);
+        std::vector<std::vector<int64_t>> local, off;
+        CHECK(candidate_layer(d, 0, T, c0, 2, keep_rows, local));
+        CHECK(candidate_layer(d, 0, T, c0, 3, keep_rows, off));
+        failed_local += bad_reads(d, 0, T, c1, c3, local, true) > 0;
+        failed_off += bad_reads(d, 0, T, c1, c3, off, true) > 0;
+        ++n;
+    }
+    CHECK_EQ(failed_local, n);   /* rank 0's X2 rows include other ranks' runs */
+    CHECK(failed_off >= 3);      /* the part at ceil(T / 4) a rank lands rows off their place */
+}
+
+TEST(p47_keep_pitch_pads_to_whole_16_byte_words_only_when_asked) {
+    CHECK_EQ(ds41_keep_pitch(4097, false), 4097);   /* 1M context, block 8: 16,388 B a row as X2 carries it today */
+    CHECK_EQ(ds41_keep_pitch(4097, true), 4100);
+    CHECK_EQ(ds41_keep_pitch(2048, true), 2048);
+    CHECK_EQ(ds41_keep_pitch(0, true), 0);
+    for (int64_t k = 1; k < 64; ++k) {
+        const int64_t p = ds41_keep_pitch(k, true);
+        CHECK(p >= k && p < k + 4 && (p * 4) % 16 == 0);
+    }
+    CHECK(ds41_idx_run_skipped(100, 0, 50, 150));
+    CHECK(!ds41_idx_run_skipped(100, 0, 51, 150));
 }
 
 RAD_TEST_MAIN()
