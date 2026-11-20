@@ -8768,7 +8768,8 @@ static void pf_pass_note(RadCtx* x, const RadBatch* b, int bits) {
 /* tp8 loop P42 (RADIANCE_DS41_PF_LAYERS=1 / N, either node; unset: nothing here, no start line): a lone cold prompt's card time BY
  * LAYER on this node's rank 0 (ds41_pf_layers.h), from card events step_bi records on rank 0's stream around every layer it
  * issues in a lone PLANNED prefill pass (one prefill segment, no decode row, >= kPflRows rows; a planned pass is never recorded,
- * rad_arch_pass_key) -- no sync: the records are read with rad_event_query at later passes, in order. One line pair a prompt of
+ * rad_arch_pass_key) -- card-LOCAL events (agent-scope release, no interrupt: the core's rad_event_create_local, as P22's line
+ * takes), no sync: the records are read with rad_event_query at later passes, in order. One line pair a prompt of
  * >= N rows (1 / on: 8,192), a summary line of the shorter ones (BG newcomers) every 128 prompts. The issue is the same with it
  * on or off (an event record is no op of the pass): the same bytes. */
 static constexpr int64_t kPflRows = 256;
@@ -8809,6 +8810,9 @@ static std::vector<RadEvent> g_pfl_free;
 static long long g_pfl_made = 0, g_pfl_drop = 0;
 static ds41pfl::Acc* g_pfl_acc = nullptr;
 static const char* g_pfl_node = "one process";
+/* the core's card-local event (core/device/device.h; the radiance binary exports it, as rad_dev_host_wrote above): an
+ * agent-scope release, no completion interrupt -- query and elapsed work, sync does not (none here). Without it: none. */
+extern "C" __attribute__((weak)) int rad_event_create_local(RadEvent* out);
 static RadEvent pfl_ev() {   /* g_pfl_mu held */
     if (!g_pfl_free.empty()) {
         RadEvent e = g_pfl_free.back();
@@ -8816,7 +8820,7 @@ static RadEvent pfl_ev() {   /* g_pfl_mu held */
         return e;
     }
     RadEvent e = nullptr;
-    if (g_pfl_made >= kPflEvents || rad_event_create(&e) < 0 || !e) return nullptr;
+    if (g_pfl_made >= kPflEvents || !rad_event_create_local || rad_event_create_local(&e) < 0 || !e) return nullptr;
     ++g_pfl_made;
     return e;
 }
