@@ -228,8 +228,16 @@ public:
         }
     }
 
-    void cancel(uint64_t id) override { at(id)->cancel(id); }
-    void reap(uint64_t id) override { at(id)->reap(id); }
+    /* tp8 MERGE: a request may move between lanes (LaneSet::merge_into / split_from) between at()'s lookup and the call: a
+     * NOTFOUND asks the owner again (a move takes the lanes' lock once, so the second lookup finds it) */
+    void cancel(uint64_t id) override {
+        for (int k = 0; k < 3; ++k)
+            if (at(id)->cancel(id) != RAD_E_NOTFOUND) break;
+    }
+    void reap(uint64_t id) override {
+        for (int k = 0; k < 3; ++k)
+            if (at(id)->reap(id) != RAD_E_NOTFOUND) break;
+    }
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 

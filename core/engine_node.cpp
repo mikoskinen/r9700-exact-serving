@@ -891,6 +891,7 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     if (run && pp_ship_ahead_) h.flags |= 2;   /* tp8 dev D10 round 2 */
     if (run && pp_ship_band_) h.flags |= 4;    /* tp8 loop P28: a band pass (the follower's parts start at h + k) */
     if (run && pp_ship_tband_) h.flags |= 8;   /* tp8 loop D39: a tail band pass (the follower's parts end at t - j) */
+    if (run && lane >= 0 && lane < 32 && ((pp_relay_mask_ >> lane) & 1u)) h.flags |= 16;   /* tp8 MERGE: a relay lane's BG step (bit 8 = D39's tail band on the dev line) */
     if (run) {
         h.n_fn4 = fn4::kSwitches;
         fn4::requests(h.fn4_n, h.fn4_v);
@@ -1878,7 +1879,8 @@ int Engine::follower_loop() {
         /* tp8 dev M4: the pass's parts -- [h, t) whole, or its segments at the declared boundaries */
         std::vector<std::pair<int, int>> parts;
         const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows &&
-                           (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0 || (seg_bg >= 0 && h.lane >= seg_bg));
+                           (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0 || (seg_bg >= 0 && h.lane >= seg_bg) ||
+                            (h.flags & 16));   /* tp8 MERGE bit 32: a relay lane's BG step, segmented as a BG lane's (header bit 16 here) */
         if (split) {
             /* tp8 loop D33: the set's boundaries (0 = every declared one: the program before D33) */
             const int sv = segset_now();

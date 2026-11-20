@@ -2399,7 +2399,8 @@ int Engine::plan() {
                 for (int l = 0; l < nl; ++l) {   /* each lane's slab at the rows Scheduler::init gives it */
                     const bool bgl = kbg > 0 && l >= nl - kbg;
                     const int64_t nd = nl - kbg, cards = bgl ? 0 : ((int64_t)l + 1) * cfg_.max_seqs / nd - (int64_t)l * cfg_.max_seqs / nd;
-                    const int64_t rows = bgl ? (bgr > 0 && bgr < cfg_.max_seqs ? bgr : 0) : LaneSet::lane_rows(cards, lm, cfg_.max_seqs);
+                    /* lane 0 keeps --max-num-seqs rows (the MERGE target, Scheduler::init) */
+                    const int64_t rows = bgl ? (bgr > 0 && bgr < cfg_.max_seqs ? bgr : 0) : l == 0 ? 0 : LaneSet::lane_rows(cards, lm, cfg_.max_seqs);
                     int64_t b = one;
                     if (rows > 0 && rows < cfg_.max_seqs && (b = BatchBuilder::device_bytes(r->program, cfg_, kg, rows)) < 0)
                         return RAD_E_INVAL;

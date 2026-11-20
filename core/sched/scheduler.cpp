@@ -599,7 +599,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         const bool bgl = kbg > 0 && lane_ >= n_lanes_ - kbg;
         /* tp8 loop D47b (RADIANCE_PP_LANE_ROWS=M): a decode lane's own cards (the split below) + M lent pieces */
         const int64_t nd = n_lanes_ - kbg, cards = bgl ? 0 : ((int64_t)lane_ + 1) * cfg.max_seqs / nd - (int64_t)lane_ * cfg.max_seqs / nd;
-        const int64_t m = LaneSet::lane_rows_env();
+        /* lane 0 keeps --max-num-seqs rows: the MERGE target (fn4 pp_merge 1 / 2: LaneSet::merge_into moves every decode
+         * lane's requests and free cards into lane 0, so it may hold every card) */
+        const int64_t m = lane_ == 0 ? 0 : LaneSet::lane_rows_env();
         builder_.set_bt_rows(bgl ? LaneSet::bg_rows_env() : m > 0 ? LaneSet::lane_rows(cards, m, cfg.max_seqs) : 0);
     }
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
@@ -4310,7 +4312,7 @@ int Scheduler::commit(StepResult& res) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
     /* tp8 loop P23b: a BG lane's step commits -- its plan-to-commit time a row (LaneSet::bg_remaining_us_locked) */
-    if (lanes_ && lanes_->is_bg(lane_)) lanes_->note_bg_commit_locked(lane_, mono_us());
+    if (lanes_ && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) lanes_->note_bg_commit_locked(lane_, mono_us());
     /* StepResult's counts describe this step only. */
     step_finished_ = 0;
     last_prefill_ids_.clear();
