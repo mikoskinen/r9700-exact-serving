@@ -179,7 +179,21 @@ inline bool aligned16(uint64_t v) { return (v & 15u) == 0; }
 
 inline int launched() { return hipGetLastError() == hipSuccess ? 0 : -1; }
 
+/* Lever WAITK (DRAFTER track 21.11.2026 round 49): a cross-queue wait polled by one wave, issued AHEAD of the unchanged barrier-AND on
+ * the same signal, so that barrier is never pending when the packet processor reaches it. A pending barrier-AND costs ~+40 us a packet
+ * on the other queues of its CP pipe (xeon R9700 microbench drafter/kit/mes: a dependent chain's step 7.5 -> 48 us; with this kernel
+ * ahead of the barrier 7.8 us). The condition is the barrier-AND's: the signal's value is 0. */
+__global__ __launch_bounds__(32) void aql_wait_signal(const int64_t* value) {
+    if (threadIdx.x != 0) return;
+    while (__hip_atomic_load(value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != 0) __builtin_amdgcn_s_sleep(16);
+}
+
 }  // namespace
+
+extern "C" int rad_aql_blit_wait(const void* value, void* stream) {
+    hipLaunchKernelGGL(aql_wait_signal, dim3(1), dim3(32), 0, (hipStream_t)stream, (const int64_t*)value);
+    return launched();
+}
 
 extern "C" int rad_aql_blit_copy(void* dst, const void* src, uint64_t bytes, void* stream,
                                  bool link) {
