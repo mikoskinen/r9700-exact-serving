@@ -16266,3 +16266,55 @@ TEST(srf_2_with_a_decoder_in_another_lane_acts_per_lane) {
         CHECK_EQ(k[Scheduler::kSrfHeld], 0ll);   /* nothing held: the rule across the lanes was off */
     }
 }
+
+/* sched_srf 2 with the window pool short (tp8 prefill P0's case: 8 / 10 / 12 blocks of 16 for a 16-key window, the window group's pool
+ * against the keep floor), two cold prompts sent together to lanes 0 / 1 at 2 and 3 lanes under --prefill-span 2: both complete, every
+ * window key read right, nothing fails, no plan carries both -- where the pool refuses the chosen one's chunk the KV valve lets the other
+ * run (order and lone plans then follow the pool). sched_srf 0's outcome printed beside it (at 8 blocks today's composition stalls both:
+ * neither has a first token after 1,200 rounds -- each holds window blocks the other's next chunk needs). */
+TEST(srf_2_two_cold_prompts_beside_a_short_window_pool) {
+    for (int64_t pool : { 8, 10, 12 })
+    for (int lanes : { 2, 3 }) {
+        std::vector<std::vector<std::pair<int, int>>> lone;
+        const std::vector<int> n = { 333, 200 };
+        for (size_t i = 0; i < n.size(); ++i) {
+            Lanes L;
+            L.win = 16;
+            L.win_pool = pool;
+            L.cfg.prefill_span = 2;   /* the rule acts only under a span (BEST: --prefill-span 2) */
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            const uint64_t s = L.submit(0, n[i], 1);
+            int64_t misses = 0;
+            int failed = 0;
+            lone.push_back(run_cold(L, lanes, s, &misses, &failed));
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+        }
+        for (int srf : { 0, 2 }) {
+            SrfSwitch on(srf);
+            Lanes L;
+            L.win = 16;
+            L.win_pool = pool;
+            L.cfg.prefill_span = 2;   /* the rule acts only under a span (BEST: --prefill-span 2) */
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            const uint64_t a = L.submit(0, n[0], 1), b = L.submit(1, n[1], 1);
+            REQUIRE(a != 0);
+            REQUIRE(b != 0);
+            const SrfRun r = run_multi(L, lanes, { a, b }, { 0, 1 });
+            const int off = (r.chunks[0] != lone[0]) + (r.chunks[1] != lone[1]);
+            fprintf(stderr, "    window pool %lld blocks, %d lanes, sched_srf %d: first tokens 333@%d 200@%d, %d failed, %lld window keys missed, "
+                            "%d plans with two prompts, %d of 2 off their lone plan, %lld window waits\n", (long long)pool, lanes, srf, r.first[0],
+                    r.first[1], r.failed, (long long)r.misses, r.two, off, (long long)L.set.counts().why[LaneSet::kWinWait]);
+            CHECK(L.set.broken().empty());
+            if (srf == 0) continue;
+            CHECK_EQ(r.failed, 0);
+            CHECK_EQ(r.misses, (int64_t)0);
+            CHECK(r.first[0] >= 0 && r.first[1] >= 0);
+            CHECK_EQ(r.two, 0);
+            if (pool >= 12) {   /* room for both: the shorter first, each its lone plan */
+                CHECK(r.first[1] <= r.first[0]);
+                CHECK_EQ(off, 0);
+            }
+        }
+    }
+}
