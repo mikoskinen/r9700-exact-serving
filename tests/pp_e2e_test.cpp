@@ -6645,7 +6645,7 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
     }
     struct Arm { const char* name; const char* cut; int lanes; bool best, kv; };
     const char* only = std::getenv("PP_E2E_D56_ARM");   /* a debugging aid: the arms whose name holds this text */
-    long long pre_all = 0, pre_form[4] = { 0, 0, 0, 0 };
+    long long pre_all = 0, pre_form[5] = { 0, 0, 0, 0, 0 };
     for (const Arm a : { Arm{ "one process", "", 0, false, false }, Arm{ "2 lanes", "0,2", 2, false, false },
                          Arm{ "3 lanes, wrap-around", "1,3", 3, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, true } }) {
         if (only && !std::strstr(a.name, only)) continue;
@@ -6674,14 +6674,24 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
         }
         if (phi >= kLongHi) fprintf(stderr, "    D56 %s: the smallest pool >= %lld is %lld tokens (%d MiB)\n", a.name, kLongLo, phi, hi);
         REQUIRE(phi < kLongHi);
-        for (int form = 0; form < 4; ++form) {
-            const bool pub = form & 1, room = form & 2;
+        /* form 4 (lane arms): fn4 sched_lane_room 1 POSTed in process on a start without the env (the card A/B's form) */
+        for (int form = 0; form < (a.lanes ? 5 : 4); ++form) {
+            const bool posted = form == 4, pub = (form & 1) && !posted, room = (form & 2) && !posted;
             std::vector<std::string> fenv = env;
             if (pub) fenv = cat(fenv, kPub);
             if (room) fenv.push_back("RADIANCE_SCHED_LANE_ROOM=1");
-            const char* fname = form == 0 ? "default  " : form == 1 ? "pub2+hold" : form == 2 ? "lane-room" : "room+pub ";
+            const char* fname = form == 0 ? "default  " : form == 1 ? "pub2+hold" : form == 2 ? "lane-room" : form == 3 ? "room+pub " : "posted 1 ";
             Serving pp;
             REQUIRE(pp.start(a.cut, ex, cat(fenv, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(hi) })));
+            if (posted) {
+                std::string out;
+                Call c;
+                const int st = c.send(pp.port, "/admin/fn4", json{ { "sched_lane_room", 1 } }.dump()) ? c.read(&out) : -1;
+                CHECK_EQ(st, 200);
+                if (st != 200) fprintf(stderr, "    POST sched_lane_room 1: %d %s\n", st, out.c_str());
+                CHECK(!complete(pp.port, prompt_ids(7, 12), 4).empty());   /* applied at the next step's release */
+                CHECK(get(pp.port, "/admin/fn4").find("\"sched_lane_room\": 1") != std::string::npos);
+            }
             const LongRun got = long_set(pp.port);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
             const std::string mt = get(pp.port, "/metrics");
@@ -6733,10 +6743,13 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
             pre_all += pre > 0 ? (long long)pre : 0;
         }
     }
-    fprintf(stderr, "    D56 preemptions, all arms: %lld; the lane arms by form: default %lld, pub2+hold %lld, lane-room %lld, room+pub %lld\n",
-            pre_all, pre_form[0], pre_form[1], pre_form[2], pre_form[3]);
+    fprintf(stderr, "    D56 preemptions, all arms: %lld; the lane arms by form: default %lld, pub2+hold %lld, lane-room %lld, room+pub %lld, "
+                    "posted 1 %lld\n", pre_all, pre_form[0], pre_form[1], pre_form[2], pre_form[3], pre_form[4]);
     /* the lever's own quantity, over the three lane arms: four runs read default + pub 13 / 19 / 27 vs lane-room + room+pub 6 / 8 / 7 */
-    if (!only) CHECK(pre_form[2] + pre_form[3] < pre_form[0] + pre_form[1]);
+    if (!only) {
+        CHECK(pre_form[2] + pre_form[3] < pre_form[0] + pre_form[1]);
+        CHECK(pre_form[4] < pre_form[0]);   /* the switch POSTed in process acts as the start env does */
+    }
 }
 
 /* tp8 loop D56b: the same long-prompt set under KV pressure on the DSpark-DRAFTED fixture (D38a's WorldDs, 3 speculative tokens):

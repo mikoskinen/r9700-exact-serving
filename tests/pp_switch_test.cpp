@@ -294,6 +294,26 @@ TEST(ds41_csplit_is_a_follower_plugin_switch_after_aql_hdp) {
     CHECK(named);
 }
 
+/* tp8 loop D56: sched_lane_room is switch 104, after ds41_csplit, the leader's scheduler's alone: a follower takes the leader's
+ * record of it (the count) without asking for it, and nothing is skipped. */
+TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
+    const int i = fn4::switch_index("sched_lane_room");
+    REQUIRE(i == (int)fn4::kSchedLaneRoom);
+    CHECK_EQ(i, (int)fn4::kDs41Csplit + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(!fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 1;
+    std::vector<std::string> skipped;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 0);
+    CHECK_EQ(taken[(size_t)i], 1u);
+    CHECK(skipped.empty());
+    CHECK_EQ(fn4::sched_lane_room(), 0);
+}
+
 }  /* namespace */
 
 RAD_TEST_MAIN()
