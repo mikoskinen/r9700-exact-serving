@@ -5599,3 +5599,120 @@ TEST(preemption_by_recompute_on_the_pipeline_serves_one_process_tokens) {
     }
     fprintf(stderr, "    preemptions, all arms: %lld\n", pre_all);
 }
+
+/* tp8 loop D53b: CLIENTS THAT GO AWAY MID-REQUEST, through the pipeline. Claude Code drops requests (an interrupt closes the
+ * connection): the server cancels at the scheduler while the request's step may be in flight on both nodes, a piece of its
+ * prompt lent to another lane, or its blocks about to be reused by a newcomer. Six requests that stay and six that are dropped
+ * 60-660 ms after they were sent (non-streaming /completion: the transport sees the closed socket), all at once, then two alone:
+ * every request that stayed answers one process's tokens, at 2 lanes W(0,2), 3 lanes W(1,3) (KV copy checked) and BEST's shape
+ * (4 lanes BG 2, READY_FIRST, FOL_ORDER 2, the follower's segments), at the default pool and at the preemption case's small one
+ * (cancels beside preemptions); both nodes exit 0, the KV-copy check 0 differ, no engine E line. */
+std::vector<std::vector<int32_t>> cancel_set(int port, int* dropped) {
+    std::vector<std::vector<int32_t>> out;
+    std::vector<std::future<std::vector<int32_t>>> f;
+    std::vector<std::thread> gone;
+    std::atomic<int> drops{0};
+    for (uint64_t k = 0; k < 6; ++k) {
+        gone.emplace_back([port, k, &drops] {
+            const json b = { { "prompt", prompt_ids(61 + k, 70 + 23 * k) }, { "n_predict", 400 }, { "temperature", 0.0 },
+                             { "ignore_eos", true }, { "return_tokens", true } };
+            Call c;
+            if (!c.send(port, "/completion", b.dump())) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(60 + 120 * k));
+            shutdown(c.fd, SHUT_RDWR);
+            ++drops;
+        });
+        f.push_back(std::async(std::launch::async, [port, k] { return complete(port, prompt_ids(51 + k, 60 + 21 * k), 90 + 7 * (int)k); }));
+    }
+    for (auto& x : f) out.push_back(x.get());
+    for (auto& t : gone) t.join();
+    for (uint64_t s : { 71, 72 }) out.push_back(complete(port, prompt_ids(s, 110), 40));
+    if (dropped) *dropped = drops.load();
+    return out;
+}
+
+TEST(clients_that_go_away_mid_request_leave_the_others_one_process_tokens) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "12" }));
+        ref = cancel_set(one.port, nullptr);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, small; };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    for (const Arm a : { Arm{ "2 lanes", "0,2", 2, false, false }, Arm{ "3 lanes, wrap-around", "1,3", 3, false, false },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false }, Arm{ "3 lanes, wrap-around, small pool", "1,3", 3, false, true },
+                         Arm{ "BEST's shape, small pool", "1,3", 4, true, true } }) {
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        const std::vector<std::string> ex = { "--max-num-seqs", "12", "--pp-lanes", std::to_string(a.lanes) };
+        int mib = 0;
+        if (a.small) {   /* the smallest device the pair starts on (its pool caps both nodes), as the preemption case finds it */
+            auto starts = [&](int m) -> long long {
+                Serving pr;
+                if (!pr.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(m) }))) return -1;
+                const long long p = pool_in(pr.lead.output());
+                kill(pr.lead.child.pid, SIGTERM);
+                pr.lead.finish(60);
+                pr.fol.finish(30);
+                return p;
+            };
+            int lo = 64, hi = 512;
+            REQUIRE(starts(lo) < 600 && starts(hi) >= 600);
+            while (hi - lo > 1) { const int m = (lo + hi) / 2; if (starts(m) >= 600) hi = m; else lo = m; }
+            mib = hi;
+            env.push_back("RADIANCE_HOST_VRAM_MIB=" + std::to_string(mib));
+        }
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        int dropped = 0;
+        const std::vector<std::vector<int32_t>> got = cancel_set(pp.port, &dropped);
+        const double pre = metric(get(pp.port, "/metrics"), "vllm:num_preemptions_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ref[i] == got[i]) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < ref[i].size() && j < got[i].size() && ref[i][j] == got[i][j]) ++j;
+            fprintf(stderr, "    request %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", i, got[i].size(),
+                    ref[i].size(), j);
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const bool notowner = flog.find("NOT the owner's bytes") != std::string::npos;
+        size_t cancelled = 0, elines = 0;
+        for (size_t at = 0; (at = llog.find(" done from ", at)) != std::string::npos; ++at) {
+            const size_t f = llog.find("finish=", at), nl = llog.find('\n', at);
+            if (f != std::string::npos && f < nl && llog.compare(f + 7, 6, "length") != 0) ++cancelled;
+        }
+        for (const std::string* lg : { &llog, &flog })
+            for (size_t at = 0; (at = lg->find("\nE ", at)) != std::string::npos; ++at) ++elines;
+        if (const char* dd = std::getenv("PP_E2E_PREEMPT_LOGS")) {
+            tiny::write_text(std::string(dd) + "/cancel-" + std::to_string(a.lanes) + "-" + a.cut + (a.small ? "-s" : "") + "-leader.log", llog);
+            tiny::write_text(std::string(dd) + "/cancel-" + std::to_string(a.lanes) + "-" + a.cut + (a.small ? "-s" : "") + "-follower.log", flog);
+        }
+        fprintf(stderr, "    CANCEL %-34s W(%s)%s: %d dropped, %zu ended other than by length, %.0f preemption(s); %d of %zu kept requests differ "
+                        "from one process; KV-copy checks %lld, %lld differ%s; %zu E lines\n",
+                a.name, a.cut, a.small ? (" (" + std::to_string(mib) + " MiB)").c_str() : "", dropped, cancelled, pre, differ, ref.size(), checks, kdiff,
+                notowner ? " (NOT the owner's bytes)" : "", elines);
+        CHECK_EQ(dropped, 6);
+        CHECK(cancelled > 0);
+        CHECK_EQ(differ, 0);
+        CHECK(!notowner);
+        if (std::strcmp(a.cut, "0,2") != 0) CHECK(checks > 0);
+        CHECK_EQ(elines, (size_t)0);
+        if (differ || notowner || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
