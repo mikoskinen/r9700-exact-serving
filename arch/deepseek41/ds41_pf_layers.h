@@ -60,12 +60,14 @@ struct Rec {
     int64_t pos0 = 0, rows = 0;
     float pre_ms = 0.0f;
     std::vector<std::pair<int, float>> lms;   /* (layer, ms) in issue order */
+    std::vector<std::pair<int, int64_t>> lrows;   /* P42 step 2 (PF_OPS): (layer, the rows it ran after lever PSK's cut) */
 };
 
 /* ms by layer summed over records, and the rows each layer ran in them (a layer's rows counted once a record) */
 struct Sums {
     std::map<int, double> ms;
     std::map<int, int64_t> rows;
+    std::map<int, int64_t> lrows;   /* P42 step 2: by layer, the rows it ran (summed over the records that told it) */
     void add(const Rec& r) {
         ms[kPre] += r.pre_ms;
         rows[kPre] += r.rows;
@@ -73,10 +75,12 @@ struct Sums {
             ms[p.first] += p.second;
             rows[p.first] += r.rows;
         }
+        for (const auto& p : r.lrows) lrows[p.first] += p.second;
     }
     void add(const Sums& o) {
         for (const auto& p : o.ms) ms[p.first] += p.second;
         for (const auto& p : o.rows) rows[p.first] += p.second;
+        for (const auto& p : o.lrows) lrows[p.first] += p.second;
     }
     double total() const {
         double t = 0;
@@ -128,6 +132,7 @@ public:
         f.pos0 = r.pos0;
         f.rows = r.rows;
         f.pre_ms = r.pre_ms;
+        f.lrows = r.lrows;
         for (const auto& p : r.lms) {
             int id = p.first;
             if (is_sub(id)) {
@@ -260,6 +265,11 @@ public:
         };
         std::map<int, std::map<int, std::pair<double, double>>> t;   /* layer -> slot -> (a, b) */
         std::map<int, std::pair<double, double>> tot;                  /* slot -> (a, b) */
+        /* the last two chunks: each layer's rows after lever PSK's cut first (slot -1, "rows a/b": a cut layer's fit F + r x rows) */
+        if (bb)
+            for (int k = 0; k < 2; ++k)
+                for (const auto& p : (k == 0 ? a : bb)->lrows)
+                    (k == 0 ? t[p.first][-1].first : t[p.first][-1].second) = (double)p.second;
         for (int k = 0; k < 2; ++k) {
             const Sums* s = k == 0 ? a : bb;
             if (!s) continue;
@@ -271,11 +281,18 @@ public:
                 (k == 0 ? tot[slot].first : tot[slot].second) += v;
             }
         }
-        const auto sname = [](int slot) { return slot == 0 ? std::string("rx") : slot == 1 ? std::string("in") : std::string(gname(slot - 2)); };
+        const auto sname = [](int slot) {
+            return slot == -1 ? std::string("rows") : slot == 0 ? std::string("rx") : slot == 1 ? std::string("in") : std::string(gname(slot - 2));
+        };
         const auto fv = [&](const std::pair<double, double>& v) {
             char c[48];
             if (bb) std::snprintf(c, sizeof c, "%.2f/%.2f", v.first, v.second);
             else std::snprintf(c, sizeof c, "%.2f", v.first);
+            return std::string(c);
+        };
+        const auto fr = [](const std::pair<double, double>& v) {
+            char c[48];
+            std::snprintf(c, sizeof c, "%lld/%lld", (long long)v.first, (long long)v.second);
             return std::string(c);
         };
         std::string o;
@@ -283,7 +300,7 @@ public:
             o += (o.empty() ? "" : ", ") + std::to_string(L.first) + " [";
             bool first = true;
             for (const auto& S : L.second) {
-                o += (first ? "" : " ") + sname(S.first) + " " + fv(S.second);
+                o += (first ? "" : " ") + sname(S.first) + " " + (S.first == -1 ? fr(S.second) : fv(S.second));
                 first = false;
             }
             o += "]";

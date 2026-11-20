@@ -9065,6 +9065,10 @@ struct PflScope {
     void sub(int l, int g) {
         if (ops) layer(ds41pfl::sub_id(l, g));
     }
+    /* tp8 loop P42 step 2: the rows layer l runs after lever PSK's cut (the ops lines' "rows a/b" of the last two chunks) */
+    void rows(int l, int64_t n) {
+        if (ops) p.r.lrows.push_back({ l, n });
+    }
     void layer(int l) {
         if (!on) return;
         std::lock_guard<std::mutex> lk(g_pfl_mu);
@@ -9845,6 +9849,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             set_runs();
         } else if (cut) {
             set_runs();
+        }
+        if (held) {   /* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS): the rows this layer runs (0 where the cut leaves none) */
+            int64_t nr = 0;
+            for (const BiSeg& s : *cur) nr += s.n;
+            pfl.rows(l, nr);
         }
         /* lever PSK-L20: the split layer cut (its cone part over fewer rows); none of its cone part when no segment has a
          * row there -- the all-row part still runs, every cone-part op below issues over the empty segments / runs */

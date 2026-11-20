@@ -1081,6 +1081,7 @@ ds41pfl::Rec pfl_rec(int64_t pos0, int64_t rows, float pre, int l0, int l1, floa
     for (int l = l0; l <= l1; ++l) r.lms.push_back({ l, ms });
     return r;
 }
+bool has_quiet(const std::string& s, const char* t) { return s.find(t) != std::string::npos; }
 bool has(const std::string& s, const char* t) {
     if (s.find(t) != std::string::npos) return true;
     std::fprintf(stderr, "  missing '%s' in: %s\n", t, s.c_str());
@@ -1168,6 +1169,7 @@ TEST(pf_ops_fold_into_the_layer_lines_and_name_the_groups) {
         r.lms.push_back({ 11, 0.5f * k });
         if (ops) {
             for (const auto& g : g11) r.lms.push_back({ sub_id(11, g.first), g.second * k });
+            r.lrows = { { 10, rows }, { 11, rows / 2 } };   /* layer 11 cut to half its rows */
         } else {
             r.lms.back().second += 10.0f * k;
         }
@@ -1193,7 +1195,9 @@ TEST(pf_ops_fold_into_the_layer_lines_and_name_the_groups) {
         CHECK(has(out[2], "10 [rx 14.50 in 0.25 n 1.00 q 2.00 i 3.00 f 4.00], 11 [in 0.50 n 1.00 q 2.00 a 3.00 f 4.00]"));
         CHECK(has(out[2], "; by group: rx 14.50, in 0.75, n 2.00, q 4.00, i 3.00, a 3.00, f 8.00"));
         CHECK(has(out[3], "the last two chunks 2000@4000 / 2000@6000, ms by layer (a / b): "));
-        CHECK(has(out[3], "10 [rx 8.00/8.00 in 0.50/0.50 n 2.00/2.00 q 4.00/4.00 i 6.00/6.00 f 8.00/8.00]"));
+        CHECK(has(out[3], "10 [rows 2000/2000 rx 8.00/8.00 in 0.50/0.50 n 2.00/2.00 q 4.00/4.00 i 6.00/6.00 f 8.00/8.00]"));
+        CHECK(has(out[3], "11 [rows 1000/1000 in 1.00/1.00 n 2.00/2.00"));   /* the rows the layer ran after the cut */
+        CHECK(!has_quiet(out[2], "[rows"));   /* the body line names no layer rows (every layer ran the chunk's) */
         CHECK(has(out[3], "; by group: rx 8.00/8.00, in 1.50/1.50, n 4.00/4.00, q 8.00/8.00, i 6.00/6.00, a 6.00/6.00, f 16.00/16.00"));
     }
     /* short prompts' records with group marks: the summary (folded) and, beside it, an ops summary every `every` prompts */
