@@ -3293,6 +3293,87 @@ static K1Attn k1_attn_fix(std::mt19937& rng, int ratio, int topk, const std::vec
     return f;
 }
 
+/* lever DOF (DRAFTER track 20.11.2026 round 46): the DSpark stage's attention output inverse rope + fp8 round trip
+ * (ds41_rope_rows then quant_roundtrip, two launches) against rope_rows_roundtrip (one launch, the trunk's o_f), at the
+ * drafter's TP4 rank geometry (16 heads x 512, rot 64 at off 448, inverse 1, fp8 e4m3 / ue8m0 blocks of 32) and every
+ * query-pass height M 1..48, 64, 80, 130, 160: every output bit; then us a call of each form at M 16 / 32 / 40 / 80,
+ * launched back to back on one stream (the ordered dependent-launch gaps included), A B A B. --dofcheck. */
+static void ds41_dof_case(const Plugin& pl) {
+    const char* name = "lever DOF: rope_rows_roundtrip is byte-identical to ds41_rope_rows + quant_roundtrip (DSpark o_rope + o_q)";
+    const RadKernelInfo* rr = find(pl, "rope_rows_roundtrip_fp8_bf16");
+    const RadKernelInfo* ro = find(pl, "rope_rows_bf16");
+    const RadKernelInfo* rq = find(pl, "quant_roundtrip_fp8_bf16");
+    if (!rr || !ro || !rq) { ok(name, false, "row absent"); return; }
+    const int64_t H = 16, D = 512, n = H * D, rot = 64, tab = 16384;
+    std::mt19937 rng(4646);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> cs((size_t)(tab * rot));
+    for (int64_t q = 0; q < tab; ++q)
+        for (int64_t i = 0; i < rot / 2; ++i) {
+            const float a = 6.4f * ((float)(rng() % 100000) / 100000.0f - 0.5f);
+            cs[(size_t)(q * rot + i)] = std::cos(a);
+            cs[(size_t)(q * rot + rot / 2 + i)] = std::sin(a);
+        }
+    void* dcs = dalloc(cs.size() * 4);
+    if (!dcs) { ok(name, false, "hipMalloc failed"); return; }
+    st_memcpy(dcs, cs.data(), cs.size() * 4, hipMemcpyHostToDevice);
+    const std::vector<RadParam> pr = { PI("n_head", H), PI("head_dim", D), PI("rot", rot), PI("off", D - rot), PS("mode", "gptj"),
+                                       PI("inverse", 1), PI("block", 32), PS("format", "fp8_e4m3"), PS("scale", "ue8m0"),
+                                       PS("dtype", "bf16") };
+    const std::vector<RadParam> po = { PI("n_head", H), PI("head_dim", D), PI("rot", rot), PI("off", D - rot), PS("mode", "gptj"),
+                                       PI("inverse", 1), PS("dtype", "bf16") };
+    const std::vector<RadParam> pq = { PI("n", n), PI("block", 32), PS("format", "fp8_e4m3"), PS("scale", "ue8m0"), PS("dtype", "bf16") };
+    auto withM = [](std::vector<RadParam> v, int64_t M) { v.insert(v.begin(), PI("M", M)); return v; };
+    std::vector<int64_t> Ms;
+    for (int64_t M = 1; M <= 48; ++M) Ms.push_back(M);
+    for (int64_t M : { 64, 80, 130, 160 }) Ms.push_back(M);
+    int64_t bad = 0, outs = 0, rcb = 0;
+    std::string first;
+    for (int64_t M : Ms) {
+        std::vector<uint16_t> x((size_t)(M * n));
+        for (size_t i = 0; i < x.size(); ++i) {
+            const int k = (int)(rng() % 100);
+            const float sc = k < 3 ? 1e-6f : k < 5 ? 0.0f : std::ldexp(1.0f, (int)(rng() % 41) - 20);
+            x[i] = rad_f32_to_bf16(nd(rng) * sc);
+        }
+        std::vector<int32_t> pos((size_t)M);
+        for (auto& v : pos) v = (int32_t)(rng() % 100 < 3 ? tab + 5 : rng() % tab);   /* a few past the table: rope skips them */
+        void* dA = dalloc(x.size() * 2); void* dB = dalloc(x.size() * 2); void* dp = dalloc(pos.size() * 4);
+        if (!dA || !dB || !dp) { ok(name, false, "hipMalloc failed"); return; }
+        st_memcpy(dA, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dB, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dp, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+        auto chain = [&](void* o) {
+            const int r1 = k1_launch(ro, { T(o, RAD_BF16, { M, n }), T(dcs, RAD_F32, { tab, rot }), T(dp, RAD_I32, { M }) }, withM(po, M));
+            const int r2 = k1_launch(rq, { T(o, RAD_BF16, { M, n }) }, withM(pq, M));
+            return r1 != RAD_OK ? r1 : r2;
+        };
+        auto fold = [&](void* o) {
+            return k1_launch(rr, { T(o, RAD_BF16, { M, n }), T(dcs, RAD_F32, { tab, rot }), T(dp, RAD_I32, { M }) }, withM(pr, M));
+        };
+        rcb += (chain(dA) != RAD_OK) + (fold(dB) != RAD_OK);
+        std::vector<uint16_t> a(x.size()), b(x.size());
+        st_memcpy(a.data(), dA, a.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(b.data(), dB, b.size() * 2, hipMemcpyDeviceToHost);
+        int64_t dd = 0;
+        for (size_t i = 0; i < a.size(); ++i) dd += a[i] != b[i];
+        if (dd && first.empty()) first = fmt(" (first at M %lld)", (long long)M);
+        bad += dd; outs += (int64_t)a.size();
+        if (M == 16 || M == 32 || M == 40 || M == 80) {
+            const double c0 = k1_time_us([&] { chain(dA); }), f0 = k1_time_us([&] { fold(dB); });
+            const double c1 = k1_time_us([&] { chain(dA); }), f1 = k1_time_us([&] { fold(dB); });
+            std::printf("  info  DOF M %lld: us a call (back to back, A B A B) chain ds41_rope_rows + quant_roundtrip %.2f / %.2f, "
+                        "rope_rows_roundtrip %.2f / %.2f = %+.2f us\n", (long long)M, c0, c1, f0, f1, 0.5 * (f0 + f1 - c0 - c1));
+        }
+        dfree_all();
+        dcs = dalloc(cs.size() * 4);
+        if (!dcs) { ok(name, false, "hipMalloc failed"); return; }
+        st_memcpy(dcs, cs.data(), cs.size() * 4, hipMemcpyHostToDevice);
+    }
+    ok(name, bad == 0 && rcb == 0, fmt("%lld of %lld outputs differ%s, %lld launch failures, %zu heights", (long long)bad,
+                                       (long long)outs, first.c_str(), (long long)rcb, Ms.size()));
+}
+
 static void ds41_ofold_case(const Plugin& pl) {
     const char* row = "ds41_attn_sparse_sink_rope_rt_d512_bf16";
     if (!sel(row)) return;
@@ -39354,6 +39435,7 @@ int main(int argc, char** argv) {
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
+    bool dofc = false;   /* lever DOF: --dofcheck */
     bool wgc = false, wgp = false, wgk = false, wgr = false, wgf = false, wgq = false, wgi = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
     bool wgw = false; const char* wg_f = nullptr;   /* ds41-wmk2 stage 3: --perfwq */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
@@ -39665,6 +39747,9 @@ int main(int argc, char** argv) {
             /* ds41-wmk2 (FINDINGS F2): D and W against an f64 host reference (wmg::refcheck). */
             wgf = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--dofcheck")) {
+            /* lever DOF (DRAFTER round 46): DSpark o_rope + o_q vs rope_rows_roundtrip, byte for byte + us a call (ds41_dof_case). */
+            dofc = true;
         } else if (!std::strcmp(argv[i], "--q6ilcheck")) {
             /* lever Q6IL (DRAFTER round 44): the q6_K dense op rows on the tile-interleaved weight vs the native (wmg::q6il). */
             wgi = true;
@@ -39963,7 +40048,7 @@ int main(int argc, char** argv) {
 #endif
         return g_fail ? 1 : 0;
     }
-    if (wgc || wgp || wgk || wgr || wgf || wgq || wgw || wgi) {
+    if (wgc || wgp || wgk || wgr || wgf || wgq || wgw || wgi || dofc) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (wgc) { if (wmg::g_wk_codes.empty()) wmg::check(pl, wg_t); else wmg::checkk(pl, wg_t); }
@@ -39971,6 +40056,7 @@ int main(int argc, char** argv) {
         if (wgk) wmg::scan(pl, wg_it, wg_r);
         if (wgr) wmg::route(pl, wg_t);
         if (wgi) wmg::q6il(pl, wg_t);
+        if (dofc) ds41_dof_case(pl);
         if (wgf) wmg::refcheck(pl, wg_t);
         if (wgq) wmg::wkpf_perf(pl, wg_m, wg_it, wg_t);
         if (wgw) wmg::wq_perf(pl, wg_m, wg_it, wg_t, wg_f);
