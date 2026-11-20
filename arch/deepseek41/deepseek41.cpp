@@ -8931,7 +8931,26 @@ static void pf_pass_note(RadCtx* x, const RadBatch* b, int bits) {
  * on or off (an event record is no op of the pass): the same bytes. */
 static constexpr int64_t kPflRows = 256;
 static constexpr int64_t kPflEvents = 16384;   /* the event pool's cap (records hold ~45 a pass) */
+static constexpr int64_t kPflEventsOps = 32768;   /* tp8 loop P42 step 2: with the group marks (~10 a layer: ~240 a follower pass) */
 static std::atomic<long long> g_pfl_min{-2};   /* -2 unread, -1 off, else the rows of a prompt that gets its own lines */
+/* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS=1, read with PF_LAYERS on): marks at each issued layer's op groups (ds41pfl::gname)
+ * -- events only, the issue the same; -2 unread, 0 off, 1 on */
+static std::atomic<int> g_pfl_ops{-2};
+static bool pfl_ops() {
+    int v = g_pfl_ops.load(std::memory_order_relaxed);
+    if (v != -2) return v > 0;
+    const char* e = std::getenv("RADIANCE_DS41_PF_OPS");
+    const int n = e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
+    if (e && *e && !n && std::strcmp(e, "0") && std::strcmp(e, "off"))
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=%s is not 1 / on or 0 / off: off\n", e);
+    int unread = -2;
+    if (g_pfl_ops.compare_exchange_strong(unread, n) && n > 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=1 (tp8 loop P42 step 2): with RADIANCE_DS41_PF_LAYERS, rank 0 also "
+                        "marks each issued layer's op groups (e Engram, n input norm / mix, q attention inputs + window store, c "
+                        "compressor chain + stores, i indexer, a attention + output projections, r attention all-reduce + FFN input, "
+                        "f MoE, o layer end); two more lines a prompt (ops by layer and group)\n");
+    return g_pfl_ops.load(std::memory_order_relaxed) > 0;
+}
 static long long pfl_min() {
     long long v = g_pfl_min.load(std::memory_order_relaxed);
     if (v != -2) return v;
@@ -8977,7 +8996,8 @@ static RadEvent pfl_ev() {   /* g_pfl_mu held */
         return e;
     }
     RadEvent e = nullptr;
-    if (g_pfl_made >= kPflEvents || !rad_event_create_local || rad_event_create_local(&e) < 0 || !e) return nullptr;
+    if (g_pfl_made >= (pfl_ops() ? kPflEventsOps : kPflEvents) || !rad_event_create_local || rad_event_create_local(&e) < 0 || !e)
+        return nullptr;
     ++g_pfl_made;
     return e;
 }
@@ -9015,6 +9035,7 @@ static void pfl_poll(bool lone) {
 /* step_bi's record: built at its start (the pass's start event), a mark at each layer it issues, the end at its return */
 struct PflScope {
     bool on = false;
+    bool ops = false;   /* tp8 loop P42 step 2: the group marks (RADIANCE_DS41_PF_OPS) */
     RadStream s = nullptr;
     PflPend p;
     PflScope(RadCtx* x, const Model& m, const RadBatch* b, const std::vector<BiSeg>& sg) {
@@ -9038,6 +9059,11 @@ struct PflScope {
         p.r.pos0 = b->positions_h[0];
         p.r.rows = sg[0].n;
         on = true;
+        ops = pfl_ops();
+    }
+    /* tp8 loop P42 step 2: op group g of layer l starts here */
+    void sub(int l, int g) {
+        if (ops) layer(ds41pfl::sub_id(l, g));
     }
     void layer(int l) {
         if (!on) return;
@@ -9893,6 +9919,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const bool tbo_a = (m.pipe2_tbo & 1) && !(m.pipe2_tbo & 4) && pa > 0 && L.pcn_f && !m.bt.on && moe_pc() == pa;
         /* P15 bit 2: a deferral for another layer, or one this layer cannot take in its order (never by design) */
         if (t_tbo.l >= 0 && (t_tbo.l != l || cut || !p2_layer || p0 != t_tbo.p0 || pn != t_tbo.pn)) tbo_flush();
+        if (L.e_ids) pfl.sub(l, 0);   /* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS): e = the Engram block */
         if (L.e_ids && sp_l) {
             /* tp8 loop P20: an SP Engram layer -- the gate (+ its copy back) over this rank's quarter of the streams; with
              * m.sphc_eng the lookup, the copy and the kv GEMM over the quarter too (each a row's own: the rows the gate
@@ -9951,6 +9978,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
+        pfl.sub(l, 1);   /* P42 step 2: n = the attention input's collapse + norm + mix (+ a DSpark tap) */
         bt_pt(x, m, m.h0, T, "h0", l);
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         const bool late = !m.zero;
@@ -9995,6 +10023,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (m.zero) {
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.attn_fill, n, R(m.attn_out, r0, n)); });
         } else {
+            pfl.sub(l, 2);   /* P42 step 2: q = the attention's input linears, norms, rope, the window-key store */
             /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, m.sp_ag_qr): an SP layer whose xn only q_a and kv read (no compressor
              * chain: L.src; no indexer projection: L.i_score) runs both over this rank's quarter and gathers their outputs
              * instead of xn; everything below reads qr / kv over every row as today (a1_cheap skips the two GEMMs) */
@@ -10243,6 +10272,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * all-replay pass stores no global KV (the cache holds every row's), so the chain is skipped whole; the
              * index query rope (A2) reads the angles rope_b_step wrote for the step's positions -- c_tab writes the
              * same rope_table bytes at the same positions (one pure function of the position, the same parameters) */
+            if (L.src) pfl.sub(l, 3);   /* P42 step 2: c = a kv source's compressor chain + stores */
             const bool chain = L.src && !cr_all;
             if (L.src && cr_all && rad_rank(x) == 0) g_cr_chains.fetch_add(1, std::memory_order_relaxed);
             /* tp8 loop P26b (RADIANCE_DS41_SPHC_ATTN=2, m.sp_ag_kvs): at an SP kv-source layer the compressor's kv | gate
@@ -10297,6 +10327,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (chain) RAD_ISSUE_N(x, L.l_st, crows, brows(m.lat, crows), page, kv_cache(m.comp[r], l));
             if (chain) RAD_ISSUE_N(x, L.k_st, crows, brows(m.ikn, crows), page, kv_cache(m.index[r], l));
             /* the indexer: score / candidates / selection by segment, each segment's runs from its own first row */
+            if (L.i_score) pfl.sub(l, 4);   /* P42 step 2: i = the indexer */
             if (L.i_score) {
                 const int src = c.src_of[(size_t)l];
                 const auto* ib = kv_batch(batch, m.index[r]);
@@ -10362,6 +10393,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 bt_pt(x, m, m.sel, T, "sel", l);
             }
             /* the attention by segment (its band at the segment's rows), its sequences' slices */
+            pfl.sub(l, 5);   /* P42 step 2: a = the attention + its output projections */
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
@@ -10488,6 +10520,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
          * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
+        pfl.sub(l, 6);   /* P42 step 2: r = the attention all-reduce + post / collapse / norm into the FFN input */
         if (L.ar_attn && (pfb & 3)) pf_attn(x, L, pfb);   /* tp8 loop D24: beside the attention all-reduce below */
         if (L.ar_attn && pa > 0 && tbo_a) {
             /* tp8 loop P15 bit 1: lane 0 behind piece 0's all-reduce (lane 1) for piece 0's pcn below; piece 1's
@@ -10559,6 +10592,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.act.x, T, "ffn_in", l);
         /* the MoE: one pass a segment (the router, the experts at the segment's rows, the shared arm, the gather and
          * the all-reduce over its rows); the ffn mix beside the first (r0 = 0) */
+        pfl.sub(l, 7);   /* P42 step 2: f = the MoE */
         MixBeside mb{ &L, &m, T };
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
@@ -10811,6 +10845,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.mw.ew, T, "ew", l);
         bt_pt(x, m, m.mw.sout, T, "sout", l);
         bt_pt(x, m, m.act.x, T, "moe_out", l);
+        pfl.sub(l, 8);   /* P42 step 2: o = the layer's end (a crossing's send, the next layer's post / collapse / norm) */
         /* tp8 S6: the sender's last layer before the cut ends at the boundary op's inputs, which the crossing carries over
          * this layer's live rows (the follower's t - 1: X2, then its pass ends; the leader's h - 1: X1, then its next
          * layer is t) */
