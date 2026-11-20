@@ -13609,6 +13609,8 @@ struct Lanes {
     int win_g = -1;
     /* tp8 loop M2: the step budget, context and stager floor (the DS line's 4160 / 1024 for lever DST's cases) */
     int64_t max_tok = 64, max_ctx = 1024, stage_rows = 0, kv_blocks = 4096;
+    /* tp8 loop D56: --prefill-room-gate (the fixture's default off, as before) */
+    bool room_gate = false;
     /* tp8 loop F22: --num-speculative-tokens (0: no drafter; with prog.drafter set before start(), a drafting deployment) */
     int n_spec = 0;
     ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
@@ -13644,7 +13646,7 @@ struct Lanes {
         cfg.max_seqs = seqs;
         cfg.max_ctx = max_ctx;
         cfg.prefix_cache = false;
-        cfg.prefill_room_gate = false;
+        cfg.prefill_room_gate = room_gate;
         cfg.n_spec = n_spec;
         kv.setup(prog.kv_groups, cfg.max_ctx, kv_blocks, 64);
         if (win > 0) {
@@ -16567,4 +16569,65 @@ TEST(d55_pub_prompt_publishes_at_the_last_chunk_and_d55b_holds_a_sibling_for_its
     held_steps(nullptr, "60000", &held, &at);   /* the hold needs a publish rule (else it would only delay): off */
     fprintf(stderr, "    hold, PUB_PROMPT unset (the hold is off): B planned with A's computed end at %lld, after %d step(s)\n", (long long)at, held);
     CHECK(at < 299);
+}
+
+/* tp8 loop D56: RADIANCE_SCHED_LANE_ROOM=1 -- the admission room gate counts the running requests of EVERY lane. Two 200-token
+ * prompts over a 24-block pool (384 tokens: one prompt + its 20 tokens = 14 blocks fits, two do not), one a lane, B arriving
+ * after A's first chunk. Unset: lane 1's gate counts only lane 1's runners (none), admits B beside A's unfinished prompt, both run out and one is
+ * preempted by recompute (the negative control: preemptions > 0). Set: B waits until A's rest and its own fit together -- here
+ * until A finishes -- and nothing is preempted. Both finish with all 20 tokens in every arm; with the newcomer split on, A's
+ * pieces run in lane 1's steps too (a no-harm arm: A's prompt is done before B is asked, either way). */
+TEST(d56_lane_room_counts_every_lanes_runners_at_admission) {
+    struct Out { long long pre = -1; int finished = 0; int64_t b_at = -1; };
+    auto run = [](bool room, bool split) {
+        Out o;
+        Lanes L;
+        L.room_gate = true;
+        if (room) setenv("RADIANCE_SCHED_LANE_ROOM", "1", 1); else unsetenv("RADIANCE_SCHED_LANE_ROOM");
+        const int rc = L.start(2);
+        unsetenv("RADIANCE_SCHED_LANE_ROOM");
+        if (rc != RAD_OK) return o;
+        L.set.set_split(split, 16);
+        L.kv.setup(L.prog.kv_groups, L.cfg.max_ctx, 24, 64);   /* 24 blocks of 16: one request's 14 fit, two do not */
+        const uint64_t a = L.submit(0, 200, 20);
+        uint64_t b = 0;
+        for (int round = 0; round < 800; ++round) {
+            bool any = false;
+            for (int l = 0; l < 2; ++l) {
+                if (!L.plan(l, { 1 - l })) continue;
+                any = true;
+                if (b && o.b_at < 0 && L.entry_of(1, b)) {
+                    const Request* ra = L.req(0, a);
+                    o.b_at = ra ? ra->n_computed : 999;
+                }
+                if (L.commit(l, 7) != RAD_OK) return o;
+            }
+            if (round == 0) b = L.submit(1, 200, 20, 5000);
+            const Request* ra = L.req(0, a);
+            const Request* rb = b ? L.req(1, b) : nullptr;
+            if (!any && ra && rb && ra->state != ReqState::Running && rb->state != ReqState::Running &&
+                ra->state != ReqState::Waiting && rb->state != ReqState::Waiting && ra->state != ReqState::Preempted &&
+                rb->state != ReqState::Preempted)
+                break;
+        }
+        o.pre = (long long)(L.at(0).metrics().preemptions + L.at(1).metrics().preemptions);
+        for (int l = 0; l < 2; ++l) {
+            const Request* r = L.req(l, l == 0 ? a : b);
+            if (r && r->state == ReqState::Finished && (int64_t)r->output.size() == 20) ++o.finished;
+        }
+        return o;
+    };
+    for (const bool split : { false, true }) {
+        const Out off = run(false, split), on = run(true, split);
+        fprintf(stderr, "    split %s: unset %lld preemption(s), %d of 2 finished (B first planned with A at %lld); LANE_ROOM=1 %lld preemption(s), "
+                        "%d of 2 finished (B first planned with A at %lld)\n",
+                split ? "on " : "off", off.pre, off.finished, (long long)off.b_at, on.pre, on.finished, (long long)on.b_at);
+        /* the negative control (split off): the lane-local gate admits B beside A's unfinished prompt; split on, A's pieces run in
+         * both lanes and its prompt is done before B's gate is asked (no preemption either way: a no-harm arm) */
+        if (!split) { CHECK(off.pre > 0); CHECK(off.b_at >= 0 && off.b_at < 200); }
+        CHECK_EQ(off.finished, 2);
+        CHECK_EQ(on.pre, 0);
+        CHECK_EQ(on.finished, 2);
+        CHECK(on.b_at < 0 || on.b_at >= 200);   /* B never runs beside A's unfinished prompt */
+    }
 }

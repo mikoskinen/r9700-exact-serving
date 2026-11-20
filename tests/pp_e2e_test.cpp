@@ -6565,3 +6565,174 @@ TEST(d55b_siblings_at_the_same_moment_wait_for_the_head_and_serve_one_process_to
         }
     }
 }
+
+/* tp8 loop D56: LONG PROMPTS OVER THE POOL'S FREE SHARE BESIDE DECODERS, through the pipeline. Production (Claude Code sessions
+ * of 100k+ tokens, 32 of them over the pair's 4.3 M-token pool) brings a long prompt while running sequences hold most of the
+ * pool: admission must wait or preempt, and every lane schedules over ONE shared pool while each lane's admission rule
+ * (fresh_prefill_can_fit / preempted_can_prefill) counts its own running sequences. Four decoders (prompts 200-290 tokens,
+ * 360-390 to decode) at once, then -- while they decode -- three long prompts at once (two siblings over one 900-token head,
+ * one alone, 1,160-1,500 tokens), then two short ones alone; a pool found as the preemption case's (the smallest device size
+ * whose pool holds >= kLongLo tokens: each request alone fits, all at once ~6,900 do not). Every request's greedy tokens = one
+ * process's on the default pool, in one process at the small pool, at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (the
+ * llama KV copy checked), each with and without START F's publishing envs (RADIANCE_SCHED_PUB_PROMPT=2 +
+ * RADIANCE_SCHED_PUB_HOLD_MS=5000: a held sibling and chunk-by-chunk entries under KV pressure); every request answered (200),
+ * within kLongWallS; both nodes exit 0, no E line, the KV-copy check 0 differ. Printed per arm: pool, preemptions, wall,
+ * attention-cached tokens -- the lanes' preemption count against one process's at its small pool is the thrash reading. */
+namespace {
+constexpr long long kLongLo = 2000, kLongHi = 4200;
+constexpr double kLongWallS = 240;
+std::vector<std::string> long_shape(int lanes) {
+    std::vector<std::string> a = { "--max-num-seqs", "8", "--max-model-len", "2048" };
+    if (lanes > 0) a = cat(a, { "--pp-lanes", std::to_string(lanes) });
+    return a;
+}
+std::vector<int32_t> long_prompt(int k) {
+    if (k == 2) return prompt_ids(560, 1500);
+    std::vector<int32_t> p = prompt_ids(550, 900);
+    const std::vector<int32_t> own = prompt_ids(551 + (uint64_t)k, 260 + 140 * (size_t)k);
+    p.insert(p.end(), own.begin(), own.end());
+    return p;
+}
+struct LongRun { std::vector<std::vector<int32_t>> tok; std::vector<int> status; double wall = 0; };
+LongRun long_set(int port) {
+    LongRun out;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::future<std::pair<int, std::vector<int32_t>>>> f;
+    for (uint64_t k = 0; k < 4; ++k)
+        f.push_back(std::async(std::launch::async, [port, k] {
+            int st = -1;
+            std::vector<int32_t> t = complete(port, prompt_ids(501 + k, 200 + 30 * k), 360 + 10 * (int)k, &st);
+            return std::make_pair(st, t);
+        }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));   /* the decoders' prompts are in; they decode */
+    for (int k = 0; k < 3; ++k)
+        f.push_back(std::async(std::launch::async, [port, k] {
+            int st = -1;
+            std::vector<int32_t> t = complete(port, long_prompt(k), 24 + 4 * k, &st);
+            return std::make_pair(st, t);
+        }));
+    for (auto& x : f) {
+        auto r = x.get();
+        out.status.push_back(r.first);
+        out.tok.push_back(std::move(r.second));
+    }
+    for (uint64_t s : { 571, 572 }) {
+        int st = -1;
+        out.tok.push_back(complete(port, prompt_ids(s, 120), 30, &st));
+        out.status.push_back(st);
+    }
+    out.wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+}  /* namespace */
+
+TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> kPub = { "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=5000" };
+    LongRun ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", long_shape(0)));
+        ref = long_set(one.port);
+        const double pre = metric(get(one.port, "/metrics"), "vllm:num_preemptions_total");
+        fprintf(stderr, "    D56 reference: one process, pool %lld tokens, %.0f preemption(s), wall %.2f s\n", pool_in(one.lead.output()), pre,
+                ref.wall);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        for (size_t i = 0; i < ref.tok.size(); ++i) { CHECK_EQ(ref.status[i], 200); CHECK(!ref.tok[i].empty()); }
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, kv; };
+    const char* only = std::getenv("PP_E2E_D56_ARM");   /* a debugging aid: the arms whose name holds this text */
+    long long pre_all = 0, pre_form[4] = { 0, 0, 0, 0 };
+    for (const Arm a : { Arm{ "one process", "", 0, false, false }, Arm{ "2 lanes", "0,2", 2, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, true } }) {
+        if (only && !std::strstr(a.name, only)) continue;
+        std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        const std::vector<std::string> ex = long_shape(a.lanes);
+        auto pool_at = [&](int mib) -> long long {
+            Serving pr;
+            if (!pr.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(mib) }))) return -1;
+            const long long p = pool_in(pr.lead.output());
+            kill(pr.lead.child.pid, SIGTERM);
+            pr.lead.finish(60);
+            if (a.lanes) pr.fol.finish(30);
+            return p;
+        };
+        int lo = 64, hi = 512;
+        long long plo = pool_at(lo), phi = pool_at(hi);
+        if (!(plo < kLongLo && phi >= kLongLo))
+            fprintf(stderr, "    D56 %s: pools %lld / %lld tokens at %d / %d MiB do not bracket %lld\n", a.name, plo, phi, lo, hi, kLongLo);
+        REQUIRE(plo < kLongLo && phi >= kLongLo);
+        while (hi - lo > 1) {
+            const int m = (lo + hi) / 2;
+            const long long p = pool_at(m);
+            if (p >= kLongLo) { hi = m; phi = p; } else { lo = m; plo = p; }
+        }
+        if (phi >= kLongHi) fprintf(stderr, "    D56 %s: the smallest pool >= %lld is %lld tokens (%d MiB)\n", a.name, kLongLo, phi, hi);
+        REQUIRE(phi < kLongHi);
+        for (int form = 0; form < 4; ++form) {
+            const bool pub = form & 1, room = form & 2;
+            std::vector<std::string> fenv = env;
+            if (pub) fenv = cat(fenv, kPub);
+            if (room) fenv.push_back("RADIANCE_SCHED_LANE_ROOM=1");
+            const char* fname = form == 0 ? "default  " : form == 1 ? "pub2+hold" : form == 2 ? "lane-room" : "room+pub ";
+            Serving pp;
+            REQUIRE(pp.start(a.cut, ex, cat(fenv, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(hi) })));
+            const LongRun got = long_set(pp.port);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+            const std::string mt = get(pp.port, "/metrics");
+            const double pre = metric(mt, "vllm:num_preemptions_total"), hit = metric(mt, "radiance:attn_cached_tokens_total");
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output(), flog = pp.fol.output();
+            REQUIRE_EQ(got.tok.size(), ref.tok.size());
+            int differ = 0, failed = 0;
+            for (size_t i = 0; i < ref.tok.size(); ++i) {
+                if (got.status[i] != 200 || got.tok[i].empty()) {
+                    ++failed;
+                    fprintf(stderr, "    D56 %s %s request %zu: HTTP %d, %zu tokens\n", a.name, fname, i, got.status[i],
+                            got.tok[i].size());
+                    continue;
+                }
+                if (got.tok[i] == ref.tok[i]) continue;
+                ++differ;
+                size_t j = 0;
+                while (j < ref.tok[i].size() && j < got.tok[i].size() && ref.tok[i][j] == got.tok[i][j]) ++j;
+                fprintf(stderr, "    D56 %s %s request %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", a.name,
+                        fname, i, got.tok[i].size(), ref.tok[i].size(), j);
+            }
+            long long checks = -1, kdiff = -1;
+            if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+                if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                    (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+            const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+            if (const char* dd = std::getenv("PP_E2E_D56_LOGS")) {
+                const std::string base = std::string(dd) + "/" + std::to_string(a.lanes) + "-f" + std::to_string(form);
+                tiny::write_text(base + "-leader.log", llog);
+                if (a.lanes) tiny::write_text(base + "-follower.log", flog);
+            }
+            fprintf(stderr, "    D56 %-26s %s: pool %lld tokens (%d MiB), %.0f preemption(s), wall %.2f s, attention-cached %.0f; %d of %zu "
+                            "differ, %d failed; KV-copy checks %lld, %lld differ; %zu E lines\n",
+                    a.name, fname, pool_in(llog), hi, pre, got.wall, hit, differ, ref.tok.size(), failed, checks, kdiff, elines);
+            const bool said = llog.find("RADIANCE_SCHED_LANE_ROOM=1 (tp8 loop D56)") != std::string::npos;
+            CHECK_EQ(said, room);
+            pre_form[form] += pre > 0 && a.lanes ? (long long)pre : 0;
+            CHECK_EQ(differ, 0);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(elines, (size_t)0);
+            if (form == 0) CHECK(pre > 0);   /* the set reaches the pool (the other forms may avoid it) */
+            CHECK(got.wall < kLongWallS);
+            if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+            if (differ || failed || elines)
+                fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+            pre_all += pre > 0 ? (long long)pre : 0;
+        }
+    }
+    fprintf(stderr, "    D56 preemptions, all arms: %lld; the lane arms by form: default %lld, pub2+hold %lld, lane-room %lld, room+pub %lld\n",
+            pre_all, pre_form[0], pre_form[1], pre_form[2], pre_form[3]);
+}

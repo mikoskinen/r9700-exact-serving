@@ -466,6 +466,26 @@ bool Scheduler::lane_others_hold() const {
  * token window) that their commits will give back. One lane: running_ empty, as before. The lock is held. */
 bool Scheduler::pool_idle() const { return running_.empty() && !lane_others_hold(); }
 
+/* tp8 loop D56: the running requests a room gate counts -- this lane's running_, and with `all_lanes` under lanes also the ones
+ * this lane's plan left out of it (lane_out_) and every other lane's running_ / lane_out_: the shared pool's runners, as one
+ * process's running set. The lock is held. */
+void Scheduler::room_runners(std::vector<const SchedReq*>* out, bool all_lanes) const {
+    out->clear();
+    auto add = [out](const Scheduler& L, bool with_out) {
+        for (int32_t slot : L.running_)
+            if (slot >= 0 && (size_t)slot < L.reqs_.size() && L.reqs_[(size_t)slot]) out->push_back(L.reqs_[(size_t)slot].get());
+        if (with_out)
+            for (int32_t slot : L.lane_out_)
+                if (slot >= 0 && (size_t)slot < L.reqs_.size() && L.reqs_[(size_t)slot] && L.reqs_[(size_t)slot]->running)
+                    out->push_back(L.reqs_[(size_t)slot].get());
+    };
+    const bool lanes = all_lanes && lanes_ && n_lanes_ > 1;
+    add(*this, lanes);
+    if (!lanes) return;
+    for (int l = 0; l < lanes_->n(); ++l)
+        if (const Scheduler* o = lanes_->lane(l); o && o != this) add(*o, true);
+}
+
 /* The budget this lane's own plan may take: the pieces lent to it run in this step whatever it
  * plans, so they come first; a step carrying another lane's piece is a shared step (no span). */
 int64_t Scheduler::lane_reserve(int64_t budget) {
