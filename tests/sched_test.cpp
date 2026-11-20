@@ -3617,9 +3617,11 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     CHECK(fn4::check("pp_tband", 0, &err));
     CHECK(fn4::check("pp_tband", 1, &err));   /* unregistered: the range only */
     CHECK(fn4::check("pp_tband", 2, &err));   /* tp8 loop D39b: + the later chunks of an all-band prompt */
-    CHECK(!fn4::check("pp_tband", 3, &err));
+    CHECK(fn4::check("pp_tband", 3, &err));   /* tp8 loop D46: + decode lanes' steps beside a BG step (unregistered: the range) */
+    CHECK(!fn4::check("pp_tband", 4, &err));
     CHECK(err.find("pp_tband takes -1 (back to the start's RADIANCE_PP_TAIL_BAND), 0 (no tail band passes") != std::string::npos);
     CHECK(err.find("2 (1 + the later chunks") != std::string::npos);
+    CHECK(err.find("3 (1 + a decode lane's step while a BG step is in flight") != std::string::npos);
     CHECK(fn4::check("pp_tband", -1, &err));    /* the never-set value, which the kit's arm undo POSTs back (loop lq215) */
     CHECK(!fn4::check("pp_tband", -2, &err));
     fn4::tband_register(false);
@@ -3628,10 +3630,18 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     CHECK(!fn4::check("pp_tband", 1, &err));
     CHECK(err.find("RADIANCE_PP_TAIL_BAND=1 on the leader at start") != std::string::npos);
     CHECK(!fn4::check("pp_tband", 2, &err));
+    CHECK(!fn4::check("pp_tband", 3, &err));
     fn4::tband_register(true);
     CHECK(fn4::check("pp_tband", 1, &err));
     CHECK(fn4::check("pp_tband", 2, &err));
     CHECK(fn4::check("pp_tband", 0, &err));
+    CHECK(!fn4::check("pp_tband", 3, &err));   /* tp8 loop D46: a tail band without the plugin's copy */
+    CHECK(err.find("the plugin declared no tail band copy") != std::string::npos);
+    fn4::tband_register(2);                    /* ... with it */
+    CHECK(fn4::check("pp_tband", 3, &err));
+    CHECK(fn4::check("pp_tband", 1, &err));
+    CHECK(fn4::check("pp_tband", -1, &err));
+    CHECK(!fn4::check("pp_tband", 4, &err));
     fn4::tband_register(false);
 }
 

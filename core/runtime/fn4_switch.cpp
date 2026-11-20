@@ -565,8 +565,8 @@ void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std:
 void lead_seg_register(bool capable) {   /* tp8 loop D32 */
     st().lseg_capable.store(capable ? 1 : 0, std::memory_order_release);
 }
-void tband_register(bool capable) {   /* tp8 loop D39 */
-    st().tband_capable.store(capable ? 1 : 0, std::memory_order_release);
+void tband_register(int level) {   /* tp8 loop D39; D46: 2 = with the plugin's tail copy */
+    st().tband_capable.store(level <= 0 ? 0 : level >= 2 ? 2 : 1, std::memory_order_release);
 }
 void segset_register(int n) {   /* tp8 loop D33 */
     st().segset_n.store(n < 0 ? 0 : n, std::memory_order_release);
@@ -1007,13 +1007,20 @@ static bool check_here(const std::string& name, int v, std::string* err) {
          * pp_tband_step): the read-back of a start that never named the switch, which the test kit's arm undo POSTs back
          * (loop lq215: the undo of {"pp_tband": 1} was refused and the start stopped, F67's case) -- taken everywhere */
         if (v == -1) return true;
-        if (v < 0 || v > 2) {
+        if (v < 0 || v > 3) {
             if (err) *err = "pp_tband takes -1 (back to the start's RADIANCE_PP_TAIL_BAND), 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's "
-                            "fresh BG steps run W(h, t)'s, the band layer stays declared), 1 (they run as tail band passes; tp8 loop D39) or 2 "
-                            "(1 + the later chunks of a prompt whose every chunk so far ran as one; D39b)";
+                            "fresh BG steps run W(h, t)'s, the band layer stays declared), 1 (they run as tail band passes; tp8 loop D39), 2 "
+                            "(1 + the later chunks of a prompt whose every chunk so far ran as one; D39b) or 3 (1 + a decode lane's step while a "
+                            "BG step is in flight, with the plugin's tail copy; D46)";
             return false;
         }
         const int cap = s.tband_capable.load(std::memory_order_acquire);
+        if (v == 3 && cap >= 0 && cap < 2) {   /* tp8 loop D46: registered without the copy (one machine / the follower: range only) */
+            if (err)
+                *err = "pp_tband=3 refused: the plugin declared no tail band copy (RADIANCE_DS41_PP_TBAND_COPY=1 / RADIANCE_LLAMA_PP_TBAND_COPY=1 "
+                       "on both nodes with the tail band: the leader then holds the band layers' state of every sequence)";
+            return false;
+        }
         if (v != 0 && cap == 0) {
             if (err)
                 *err = "pp_tband=1 refused: this node took no tail band (RADIANCE_PP_TAIL_BAND=1 on the leader at start, with the plugin's "

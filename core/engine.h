@@ -511,6 +511,18 @@ private:
     void pp_tband_note(int lane, int tband);
     int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
     int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
+    /* tp8 loop D46 (fn4 pp_tband 3 / RADIANCE_PP_TAIL_BAND=3, with the plugin's tail COPY, rad_pp_tail_copy): the leader holds the
+     * tail band layers' per-sequence state of EVERY sequence (each pass that is no tail band pass carries the band layers' KV rows
+     * in X2 and the leader stores them), so a DECODE lane's step runs as a tail band pass too while a BG step is in flight
+     * (pp_tband_bg_, set by the lane loop before each plan's head: a BG lane busy or holding a newcomer, D32 / D45's stretch) --
+     * the follower's decode passes one band lighter in the follower-bound stretches, W(h, t)'s in the leader-bound clean ones.
+     * pp_tcopy_seq_ = the sequences (KV keys) whose band state the leader holds from their first row (seen fresh at ctx 0, no
+     * snapshot restore, no cone replay since); a decode lane's step runs as such a band pass only when all of its do. */
+    bool pp_tband_copy_ = false;
+    bool pp_tband_bg_ = false;
+    int64_t pp_tband_dec_n_ = 0;     /* decode lanes' steps that ran as tail band passes (pp_tband 3) */
+    int64_t pp_tband_dec_skip_ = 0;  /* ... and those a BG step was in flight for that a sequence of kept W(h, t)'s */
+    std::unordered_map<uint64_t, uint8_t> pp_tcopy_seq_;
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);
