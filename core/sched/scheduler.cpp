@@ -796,6 +796,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.running = false;
     s.lent_hold = false;   /* tp8 M56 (lanes): a recycled slot holds nothing back */
     s.srf_kv = false;      /* tp8 loop P44 */
+    s.pub_prompt = false;  /* tp8 loop D55: a recycled slot's request has not published its prompt */
     s.drafter_reset();
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
