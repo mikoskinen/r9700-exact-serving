@@ -7078,7 +7078,9 @@ TEST(d57_the_scheduler_levers_together_serve_one_process_tokens) {
  * form alone: every reply's view (text, thinking, the calls' names and arguments / the tool_use blocks' names and inputs, finish /
  * stop reason, prompt and completion tokens) and, where a form asks logprobs, its token ids with their log-probabilities and top
  * alternatives; at 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape (the KV copy checked), BEST's shape with the morning candidate's
- * scheduler levers (SRF 2 + PUB_PROMPT 2 + HOLD + LANE_ROOM), and the DSpark-drafted fixture at BEST's shape: 0 differ, all 200, KV copy 0 differ, 0 E lines, the head
+ * scheduler levers (SRF 2 + PUB_PROMPT 2 + HOLD + LANE_ROOM), the same at BEST's own grid (4,160-token steps, span 2, interval
+ * 2048, 32 sequences, SPAN_SHORT / SPAN_TAIL / WIN_STEPS; RAD_TEST_LEVEL >= 2 only), and the DSpark-drafted fixture at BEST's
+ * shape: 0 differ, all 200, KV copy 0 differ, 0 E lines, the head
  * attention-cached. In one process: every form answered, a streamed form's tokens = its non-streamed sibling's (and its whole view
  * when the reply ended on its own), the forced ping calls complete. Ids (call_*, toolu_*) are minted at random per reply and are not
  * compared. ~5-6 min alone (the ~6,100-token head is prefilled once a process; the forms alone in one process ~50-60 s a fixture). */
@@ -7461,6 +7463,43 @@ size_t d58_form_of(size_t slot, size_t n) {
     if (slot < 2 + n) return slot - 2;
     return kD58Again[slot - 2 - n];
 }
+/* The start every D58 / D59 server takes (after shape()): 16 sequences, 512-token steps, room for the head, the Qwen3.6 template. */
+std::vector<std::string> d58_ext() {
+    return { "--max-num-seqs", "16", "--max-num-batched-tokens", "512", "--max-model-len", "16384",
+             "--override-chat-template", std::string(RAD_CHAT_FIXTURES) + "/qwen3.6/chat_template.jinja" };
+}
+const std::vector<std::string> kD58Spec = { "--num-speculative-tokens", "3" };
+const std::vector<std::string> kD58Best = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                            "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+const std::vector<std::string> kD58Sched = { "RADIANCE_SCHED_SRF=2", "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=5000",
+                                             "RADIANCE_SCHED_LANE_ROOM=1" };
+bool d58_same(const D58Reply& x, const D58Reply& y) { return x.view == y.view && x.ids == y.ids; }
+/* BEST S1P14F's own grid and lane envs (loop BEST.md): 4,160-token steps, prefill span 2, checkpoint interval 2048, 32 sequences, a
+ * lone prefill of <= 24,576 rows one interval a chunk, its last 8,192 rows too, 3 window steps -- the cache's hits on the 2,048 grid */
+const std::vector<std::string> kD58GridArgs = { "--max-num-batched-tokens", "4160", "--prefill-span", "2", "--checkpoint-interval", "2048",
+                                                "--max-num-seqs", "32" };
+const std::vector<std::string> kD58GridEnv = { "RADIANCE_PP_SPAN_SHORT=24576", "RADIANCE_PP_SPAN_TAIL=8192", "RADIANCE_PP_WIN_STEPS=3" };
+
+/* One process serving each form alone on the default pool (0: the plain fixture, 1: the drafted one), once a test binary: D58's
+ * reference and D59's. */
+struct D58Ref { bool ok = false; std::vector<D58Reply> alone; double t_alone = 0, hit = -1; };
+const D58Ref& d58_reference(int ds, const std::vector<D58Form>& forms) {
+    static std::map<int, D58Ref> memo;
+    auto it = memo.find(ds);
+    if (it != memo.end()) return it->second;
+    D58Ref& r = memo[ds];
+    Serving one;
+    if (ds) one.model = worldds().llama_rad;
+    if (!one.start("", ds ? cat(d58_ext(), kD58Spec) : d58_ext())) return r;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const D58Form& f : forms) r.alone.push_back(d58_ask(one.port, f));
+    r.t_alone = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    r.hit = metric(get(one.port, "/metrics"), "radiance:attn_cached_tokens_total");
+    kill(one.lead.child.pid, SIGTERM);
+    r.ok = one.lead.finish(60) == 0;
+    return r;
+}
+
 std::string d58_brief(const D58Reply& r) {
     json v = r.view;
     v.erase("logprobs");   /* the ids, below */
@@ -7478,29 +7517,17 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
     const std::vector<D58Form> forms = d58_forms();
     REQUIRE_EQ(forms.size(), (size_t)17);
     REQUIRE_EQ(forms[kD58HeadChat].body["tools"].size(), (size_t)13);
-    const std::vector<std::string> ext = { "--max-num-seqs", "16", "--max-num-batched-tokens", "512", "--max-model-len", "16384",
-                                           "--override-chat-template", std::string(RAD_CHAT_FIXTURES) + "/qwen3.6/chat_template.jinja" };
-    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
-    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
-                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
-    const std::vector<std::string> kSched = { "RADIANCE_SCHED_SRF=2", "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=5000",
-                                              "RADIANCE_SCHED_LANE_ROOM=1" };
+    const std::vector<std::string> ext = d58_ext(), &spec = kD58Spec, &kBest = kD58Best, &kSched = kD58Sched;
     const bool dump = std::getenv("PP_E2E_D58_DUMP") != nullptr;
     const char* only = std::getenv("PP_E2E_D58_ARM");   /* a debugging aid: the arms whose name holds this text */
-    auto same = [](const D58Reply& x, const D58Reply& y) { return x.view == y.view && x.ids == y.ids; };
+    auto same = [](const D58Reply& x, const D58Reply& y) { return d58_same(x, y); };
     std::map<int, std::vector<D58Reply>> refs;   /* 0: the plain fixture, 1: the drafted one; each form alone in one process */
     for (int ds = 0; ds < 2; ++ds) {
         const char* fx = ds ? "drafted" : "plain";
-        Serving one;
-        if (ds) one.model = worldds().llama_rad;
-        REQUIRE(one.start("", ds ? cat(ext, spec) : ext));
-        std::vector<D58Reply>& alone = refs[ds];
-        const auto t0 = std::chrono::steady_clock::now();
-        for (const D58Form& f : forms) alone.push_back(d58_ask(one.port, f));
-        const double t_alone = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        const double hit = metric(get(one.port, "/metrics"), "radiance:attn_cached_tokens_total");
-        kill(one.lead.child.pid, SIGTERM);
-        CHECK_EQ(one.lead.finish(60), 0);
+        const D58Ref& ref = d58_reference(ds, forms);
+        REQUIRE(ref.ok);
+        const std::vector<D58Reply>& alone = refs[ds] = ref.alone;
+        const double t_alone = ref.t_alone, hit = ref.hit;
         int bad = 0, cut_read = 0;
         for (size_t i = 0; i < forms.size(); ++i) {
             const D58Reply& a = alone[i];
@@ -7566,22 +7593,32 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
         CHECK(ptok > 4000);
         CHECK(hit > 4000);
     }
-    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv; };
+    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv, grid; };
     /* "one process" (the set in one process against its forms alone) runs only when PP_E2E_D58_ARM names it: a debugging aid for a
-     * lane arm that differs */
-    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false, false },
-                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true },
-                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, false, true },
-                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true },
-                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true, true } }) {
+     * lane arm that differs. "BEST's grid" = BEST's own steps / span / interval / lane envs (kD58GridArgs / kD58GridEnv) against the
+     * same reference (the arithmetic is row-independent: hits on another grid are the same bytes) */
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false, false },
+                         Arm{ "2 lanes", "0,2", 2, false, false, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true, false },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, false, false, true, false },
+                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true, false },
+                         Arm{ "BEST's shape + levers at BEST's grid", "1,3", 4, true, true, false, true, true },
+                         Arm{ "drafted, BEST's shape 4 lanes BG 2", "1,3", 4, true, false, true, true, false } }) {
         if ((only && !std::strstr(a.name, only)) || (!a.lanes && !only)) continue;
+        /* BEST's grid hits the head at 4,096 of 6,114 tokens, not 5,632: +~140 s of prefill (134 s of wall) -- RAD_TEST_LEVEL >= 2 */
+        if (a.grid && radtest::level() < 2) {
+            fprintf(stderr, "    D58 %s: at RAD_TEST_LEVEL >= 2 only (~2.5 min)\n", a.name);
+            continue;
+        }
         std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
         if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
         if (a.best) env = cat(env, kBest);
         if (a.sched) env = cat(env, kSched);
+        if (a.grid) env = cat(env, kD58GridEnv);
         Serving pp;
         if (a.ds) pp.model = worldds().llama_rad;
         std::vector<std::string> ex = a.ds ? cat(ext, spec) : ext;
+        if (a.grid) ex = cat(ex, kD58GridArgs);
         if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
         REQUIRE(pp.start(a.cut, ex, env));
         const auto t0 = std::chrono::steady_clock::now();
@@ -7618,7 +7655,7 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
         const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
         if (const char* dd = std::getenv("PP_E2E_D58_LOGS")) {
             const std::string base = std::string(dd) + "/d58-" + std::to_string(a.lanes) + (a.best ? "-best" : "") + (a.sched ? "-sched" : "") +
-                                     (a.ds ? "-ds" : "");
+                                     (a.grid ? "-grid" : "") + (a.ds ? "-ds" : "");
             tiny::write_text(base + "-leader.log", llog);
             tiny::write_text(base + "-follower.log", flog);
         }
@@ -7633,4 +7670,129 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
         if (differ || failed || elines)
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
     }
+}
+
+/* tp8 loop D59: D58's seventeen chat / messages forms with tools UNDER KV PRESSURE through the lanes -- Claude Code's sessions share
+ * one system + tools head and each grows its own tail; when the pool is short the scheduler preempts by recompute, and a preempted
+ * request here carries what D53 / D56's /completion cases never did: a tool-call grammar (lazy or whole-reply) part-way through its
+ * reply, a lazy trigger, logprobs collected so far, a reasoning block open, an Anthropic stream that has announced blocks, a drafter's
+ * state. Each arm starts at the largest host device size whose pool holds <= 8,700 tokens and >= 7,000 (one form of <= ~6,600
+ * tokens fits, the set -- the ~6,100-token head shared + seventeen tails, ~8,700 -- does not) and serves D58's set (both heads alone, all seventeen at once, two
+ * alone again); every reply = one process serving that form alone on the default pool (D58's reference): the view and the logprob
+ * ids / values / top-2. Arms: one process, 2 lanes W(0,2), 3 lanes W(1,3) and BEST's shape + the scheduler levers (SRF 2 +
+ * PUB_PROMPT 2 + HOLD 5000 + LANE_ROOM; the KV copy checked), the same at BEST's own grid, the DSpark-drafted fixture at BEST's
+ * shape + the levers. Checks: 0
+ * differ, all 200, KV copy 0 differ, 0 E lines, and the pool was reached (preemptions > 0 in the one-process arm). Runs at
+ * RAD_TEST_LEVEL >= 2 only (skipped in the default suite run). */
+namespace {
+/* the largest pool <= kD59Top (the set's own demand is ~8,700 tokens: the shared head + seventeen tails), and at least kD59Min (one
+ * form, <= ~6,600 tokens, fits); one MiB of host device moves the pool ~500 tokens in one process, ~800-900 at two lanes */
+constexpr long long kD59Top = 8700, kD59Min = 7000;
+}  /* namespace */
+
+TEST(d59_chat_and_anthropic_forms_with_tools_under_kv_pressure_serve_one_process_replies) {
+    /* ~15 min (the pool's thrash serialises the set: one process 14 preemptions, 134 s of wall): a pre-publication identity run, not
+     * every suite run's */
+    if (radtest::level() < 2) SKIP("a pre-publication identity case: RAD_TEST_LEVEL=2 RAD_TEST_FILTER=d59 runs it (~15 min)");
+    REQUIRE(world().ok);
+    REQUIRE(worldds().ok);
+    const std::vector<D58Form> forms = d58_forms();
+    REQUIRE_EQ(forms.size(), (size_t)17);
+    const char* only = std::getenv("PP_E2E_D59_ARM");   /* a debugging aid: the arms whose name holds this text */
+    struct Arm { const char* name; const char* cut; int lanes; bool best, sched, ds, kv, grid; };
+    long long pre_all = 0, pre_one = -1;
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false, false, false },
+                         Arm{ "2 lanes", "0,2", 2, false, false, false, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, false, false, true, false },
+                         Arm{ "BEST's shape + the scheduler levers", "1,3", 4, true, true, false, true, false },
+                         Arm{ "BEST's shape + levers at BEST's grid", "1,3", 4, true, true, false, true, true },
+                         Arm{ "drafted, BEST's shape + the scheduler levers", "1,3", 4, true, true, true, true, false } }) {
+        if (only && !std::strstr(a.name, only)) continue;
+        const D58Ref& ref = d58_reference(a.ds ? 1 : 0, forms);
+        REQUIRE(ref.ok);
+        std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kD58Best);
+        if (a.sched) env = cat(env, kD58Sched);
+        if (a.grid) env = cat(env, kD58GridEnv);
+        std::vector<std::string> ex = a.ds ? cat(d58_ext(), kD58Spec) : d58_ext();
+        if (a.grid) ex = cat(ex, kD58GridArgs);
+        if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
+        const std::string model = a.ds ? worldds().llama_rad : std::string();
+        auto pool_at = [&](int mib) -> long long {
+            Serving pr;
+            pr.model = model;
+            if (!pr.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(mib) }))) return -1;
+            const long long p = pool_in(pr.lead.output());
+            kill(pr.lead.child.pid, SIGTERM);
+            pr.lead.finish(60);
+            if (a.lanes) pr.fol.finish(30);
+            return p;
+        };
+        int lo = 96, hi = 256;   /* one process: 134 MiB held 8,688 tokens; two lanes: 127 MiB 9,200 */
+        long long plo = pool_at(lo), phi = pool_at(hi);
+        if (!(plo <= kD59Top && phi > kD59Top))
+            fprintf(stderr, "    D59 %s: pools %lld / %lld tokens at %d / %d MiB do not bracket %lld\n", a.name, plo, phi, lo, hi, kD59Top);
+        REQUIRE(plo <= kD59Top && phi > kD59Top);
+        while (hi - lo > 1) {
+            const int m = (lo + hi) / 2;
+            const long long p = pool_at(m);
+            if (p > kD59Top) { hi = m; phi = p; } else { lo = m; plo = p; }
+        }
+        if (plo < kD59Min) fprintf(stderr, "    D59 %s: the largest pool <= %lld is %lld tokens (%d MiB)\n", a.name, kD59Top, plo, lo);
+        REQUIRE(plo >= kD59Min);
+        Serving pp;
+        pp.model = model;
+        REQUIRE(pp.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(lo) })));
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<D58Reply> got = d58_set(pp.port, forms);
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+        const std::string mt = get(pp.port, "/metrics");
+        const double pre = metric(mt, "vllm:num_preemptions_total"), hit = metric(mt, "radiance:attn_cached_tokens_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = a.lanes ? pp.fol.output() : std::string();
+        int differ = 0, failed = 0;
+        for (size_t s = 0; s < got.size(); ++s) {
+            const size_t i = d58_form_of(s, forms.size());
+            if (got[s].status != 200 || !got[s].why.empty()) {
+                ++failed;
+                fprintf(stderr, "    D59 %s slot %zu form %zu '%s': HTTP %d %s\n", a.name, s, i, forms[i].name, got[s].status, got[s].why.c_str());
+                continue;
+            }
+            if (d58_same(got[s], ref.alone[i])) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < got[s].ids.size() && j < ref.alone[i].ids.size() && got[s].ids[j] == ref.alone[i].ids[j]) ++j;
+            fprintf(stderr, "    D59 %s slot %zu form %zu '%s' differs (token ids %zu vs %zu, the first difference at %zu):\n      %s\n      %s\n",
+                    a.name, s, i, forms[i].name, got[s].ids.size(), ref.alone[i].ids.size(), j, d58_brief(got[s]).c_str(),
+                    d58_brief(ref.alone[i]).c_str());
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        if (const char* dd = std::getenv("PP_E2E_D59_LOGS")) {
+            const std::string base = std::string(dd) + "/d59-" + std::to_string(a.lanes) + (a.best ? "-best" : "") + (a.grid ? "-grid" : "") +
+                                     (a.ds ? "-ds" : "");
+            tiny::write_text(base + "-leader.log", llog);
+            if (a.lanes) tiny::write_text(base + "-follower.log", flog);
+        }
+        fprintf(stderr, "    D59 %-44s W(%s): pool %lld tokens (%d MiB), %.0f preemption(s), wall %.1f s, attention-cached %.0f; %d of %zu "
+                        "replies differ from one process alone, %d not served; KV-copy checks %lld, %lld differ; %zu E lines\n",
+                a.name, a.cut, plo, lo, pre, wall, hit, differ, got.size(), failed, checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(failed, 0);
+        CHECK_EQ(elines, (size_t)0);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (!a.lanes) pre_one = (long long)pre;
+        pre_all += pre > 0 ? (long long)pre : 0;
+        if (differ || failed || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+    fprintf(stderr, "    D59 preemptions: one process %lld, all arms %lld\n", pre_one, pre_all);
+    if (!only) CHECK(pre_one > 0);   /* the set reaches the pool */
 }
