@@ -1862,9 +1862,27 @@ static int q8il_env() {
     }();
     return v;
 }
+/* Lever Q5IL (DRAFTER track 20.11.2026 round 45): RADIANCE_DS41_Q5IL=1 (or on) at start does the same for every q5_K GGUF linear of whole
+ * 16-row tiles (the trunk's q5_K attention layers: q_a, kv, q_b, o_a, o_b): type "q5_K_il16b", libr4d's tile-interleaved q5_K (16 rows x
+ * one 176-byte block = 2,816 bytes in the wave's load order; the native size), the same words into the same registers, so the native
+ * weight's bytes under ds41_wmk >= 1 (rule A). Unset / 0: native rows. */
+static int q5il_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_Q5IL");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
 static std::atomic<int> g_q6il_n{0};
 static const char* q6il_type(const char* ty, int64_t rows, const char* name) {
     const size_t ln8 = name ? std::strlen(name) : 0, ls8 = std::strlen("token_embd.weight");
+    if (q5il_env() == 1 && ty && !std::strcmp(ty, "q5_K") && rows > 0 && rows % 16 == 0 &&
+        !(ln8 >= ls8 && !std::strcmp(name + ln8 - ls8, "token_embd.weight"))) {
+        g_q6il_n.fetch_add(1, std::memory_order_relaxed);
+        return "q5_K_il16b";
+    }
     if (q8il_env() == 1 && ty && !std::strcmp(ty, "q8_0") && rows > 0 && rows % 16 == 0 &&
         !(ln8 >= ls8 && !std::strcmp(name + ln8 - ls8, "token_embd.weight"))) {
         g_q6il_n.fetch_add(1, std::memory_order_relaxed);
@@ -3671,6 +3689,7 @@ static void gq_oa_issue(RadCtx* x, const Model& m, const Layer& L, int64_t n, Ra
 static int64_t ggml_row_bytes(const char* ty, int64_t k) {
     if (ty && !std::strcmp(ty, "q6_K_il16b")) return k % 256 ? 0 : k / 128 * 106;   /* lever Q6IL: a stored row (16-row views only) */
     if (ty && !std::strcmp(ty, "q8_0_il16b")) return k % 128 ? 0 : k / 32 * 34;   /* lever Q8IL: the native row size (16-row views only) */
+    if (ty && !std::strcmp(ty, "q5_K_il16b")) return k % 256 ? 0 : k / 256 * 176;   /* lever Q5IL: the native row size (16-row views only) */
 #ifdef RAD_ARCH_HAVE_GGML
     for (uint32_t t = 0; ty && t < 64; ++t) {
         const lq::ggml::PlaneKind* pk = lq::ggml::plane_kind(t);
@@ -3692,7 +3711,8 @@ static int e2_layer(RadBuilder* b, Model& m, Layer& L, int64_t T, int64_t n, int
     const auto& g = m.g;
     const auto ty = m.wty.find(L.e_kv);
     if (ty == m.wty.end() || m.wsc.count(L.e_kv) || n % g.world || ((n / g.world) * 2) % 16) return RAD_OK;
-    if ((!std::strcmp(ty->second, "q6_K_il16b") || !std::strcmp(ty->second, "q8_0_il16b")) && (n / g.world) % 16) return RAD_OK;   /* Q6IL / Q8IL: whole 16-row tiles */
+    if ((!std::strcmp(ty->second, "q6_K_il16b") || !std::strcmp(ty->second, "q8_0_il16b") || !std::strcmp(ty->second, "q5_K_il16b")) && (n / g.world) % 16)
+        return RAD_OK;   /* Q6IL / Q8IL / Q5IL: whole 16-row tiles */
     const int64_t P = n / g.world, R = std::min<int64_t>(T, kBiBand), rb = ggml_row_bytes(ty->second, k);
     if (rb <= 0) return RAD_OK;
     if (!m.ekv_p) {
@@ -6530,12 +6550,15 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
-    if (q6il_env() < 0 || q8il_env() < 0) {
-        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_Q6IL=%s / RADIANCE_DS41_Q8IL=%s: each is 0 / off or 1 / on\n",
-                std::getenv("RADIANCE_DS41_Q6IL") ? std::getenv("RADIANCE_DS41_Q6IL") : "", std::getenv("RADIANCE_DS41_Q8IL") ? std::getenv("RADIANCE_DS41_Q8IL") : "");
+    if (q6il_env() < 0 || q8il_env() < 0 || q5il_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_Q6IL=%s / RADIANCE_DS41_Q8IL=%s / RADIANCE_DS41_Q5IL=%s: each is 0 / off or 1 / on\n",
+                std::getenv("RADIANCE_DS41_Q6IL") ? std::getenv("RADIANCE_DS41_Q6IL") : "", std::getenv("RADIANCE_DS41_Q8IL") ? std::getenv("RADIANCE_DS41_Q8IL") : "",
+                std::getenv("RADIANCE_DS41_Q5IL") ? std::getenv("RADIANCE_DS41_Q5IL") : "");
         return RAD_E_INVAL;
     }
-    rad_ggml_type_hook = q6il_env() == 1 || q8il_env() == 1 ? q6il_type : nullptr;   /* levers Q6IL / Q8IL: the shared experts' GGUF linears (rad_fp8.h) too */
+    rad_ggml_type_hook = q6il_env() == 1 || q8il_env() == 1 || q5il_env() == 1 ? q6il_type : nullptr;   /* levers Q6IL / Q8IL / Q5IL: the shared experts' GGUF linears (rad_fp8.h) too */
+    if (q5il_env() == 1 && !ctx->shape_probe)
+        rad_note(b, "lever Q5IL (RADIANCE_DS41_Q5IL): q5_K GGUF linears of whole 16-row tiles as q5_K_il16b (libr4d's tile-interleaved form)");
     if (q8il_env() == 1 && !ctx->shape_probe)
         rad_note(b, "lever Q8IL (RADIANCE_DS41_Q8IL): q8_0 GGUF linears of whole 16-row tiles as q8_0_il16b (libr4d's tile-interleaved form)");
     if (q6il_env() == 1 && !ctx->shape_probe)

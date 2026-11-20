@@ -1114,10 +1114,12 @@ static void q6il(const Plugin& pl, const char* tlist) {
     if (!hooks(pl, h, "--q6ilcheck")) return;
     /* R4D_IL_TYPE=q8_0 (lever Q8IL, round 44): the q8_0 dense shapes (the DSpark drafter's DLW linears + its context main_proj) on q8_0_il16b */
     const bool q8 = [] { const char* e = std::getenv("R4D_IL_TYPE"); return e && !std::strcmp(e, "q8_0"); }();
-    const char* iln = q8 ? "q8_0_il16b" : "q6_K_il16b";
-    const char* nan_ = q8 ? "q8_0" : "q6_K";
-    auto pack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, q8 ? "r4d_q8_0_il16b_pack" : "r4d_q6k_il16b_pack");
-    auto unpack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, q8 ? "r4d_q8_0_il16b_unpack" : "r4d_q6k_il16b_unpack");
+    /* R4D_IL_TYPE=q5_K (lever Q5IL, round 45): the trunk's q5_K attention shapes on q5_K_il16b */
+    const bool q5 = [] { const char* e = std::getenv("R4D_IL_TYPE"); return e && !std::strcmp(e, "q5_K"); }();
+    const char* iln = q8 ? "q8_0_il16b" : q5 ? "q5_K_il16b" : "q6_K_il16b";
+    const char* nan_ = q8 ? "q8_0" : q5 ? "q5_K" : "q6_K";
+    auto pack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, q8 ? "r4d_q8_0_il16b_pack" : q5 ? "r4d_q5_K_il16b_pack" : "r4d_q6k_il16b_pack");
+    auto unpack = (int (*)(const void*, void*, int64_t, int64_t))dlsym(pl.h, q8 ? "r4d_q8_0_il16b_unpack" : q5 ? "r4d_q5_K_il16b_unpack" : "r4d_q6k_il16b_unpack");
     auto wst = (int (*)(long long*, int))dlsym(pl.h, "rad_wmk_stats");
     if (!pack || !unpack || !wst) { std::printf("--q6ilcheck: r4d_q6k_il16b_pack / unpack / rad_wmk_stats absent (not a Q6IL libr4d)\n"); ++g_fail; return; }
     const std::vector<int64_t> modes = ilist(std::getenv("R4D_Q6IL_MODES"), "15,17");
@@ -1138,7 +1140,7 @@ static void q6il(const Plugin& pl, const char* tlist) {
         { "engram_kv_e2part", 0, 1600, 0, 6144, false, 2048 },  { "head", 1, 32320, 0, 5120, false, 256 },
         { "dspark_fc(main_proj)", 0, 5120, 0, 15360, false, 2048 }, { "dspark_fc_fcs_part", 0, 1280, 0, 15360, false, 2048 },
     };
-    const MrTy& ty = kMrTypes[q8 ? 2 : 1];   /* q6_K, or q8_0 under R4D_IL_TYPE=q8_0 */
+    const MrTy& ty = kMrTypes[q8 ? 2 : q5 ? 0 : 1];   /* q6_K, or q8_0 / q5_K under R4D_IL_TYPE */
     /* R4D_Q6IL_DECL=1: the IL weight handed at its DECLARED shape [N, K] (what the engine passes a relayouted weight), not [N, 106 K / 128] */
     const bool decl = [] { const char* e = std::getenv("R4D_Q6IL_DECL"); return e && e[0] == '1'; }();
     long long keys = 0, bad_keys = 0, calls = 0;
@@ -1148,13 +1150,14 @@ static void q6il(const Plugin& pl, const char* tlist) {
     for (const Op& op : ops) {
         if (!want.empty() && !mr_in(want.c_str(), op.name)) continue;
         if (q8 ? (op.kind == 1 || !std::strncmp(op.name, "engram", 6)) : !std::strncmp(op.name, "dspark", 6)) continue;   /* the type's own shapes */
+        if (q5 && (op.kind == 1 || op.kind == 4 || !std::strncmp(op.name, "engram", 6) || !std::strncmp(op.name, "shexp", 5))) continue;   /* q5_K: attention only */
         const char* rn = q8 ? (op.kind == 0 ? "gemm_nt_ggml_qk32_tiled" : op.kind == 2 ? "gemm_nt_ggml_pair_qk32" : op.kind == 3 ? "rmsnorm_gemm_nt_ggml_qk32" : "swiglu_clamped_gemm_nt_ggml_qk32")
                        : op.kind == 0 ? "gemm_nt_ggml_qk256_tiled" : op.kind == 1 ? "logits_gemm_ggml_qk256_tiled"
                        : op.kind == 2 ? "gemm_nt_ggml_pair_qk256" : op.kind == 3 ? "rmsnorm_gemm_nt_ggml_qk256" : "swiglu_clamped_gemm_nt_ggml_qk256";
         const RadKernelInfo* row = find(pl, rn);
         if (!row) { std::printf("  Q6IL %s: row %s absent\n", op.name, rn); ++g_fail; ++bad_keys; ++keys; continue; }
         dfree_all();
-        const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, rbi = q8 ? rb : K / 128 * 106, xc = op.kind == 4 ? 2 * K : K;
+        const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, rbi = q8 || q5 ? rb : K / 128 * 106, xc = op.kind == 4 ? 2 * K : K;
         const int64_t NY = N + N2, hw_ = op.kind >= 3 ? K : 0, RB = op.mmax;
         std::vector<uint8_t> hw, hw2, hil, hil2, back;
         mr_weights(hw, ty, N, K, 0x6A10001ull ^ (uint64_t)(N * 7 + K));
@@ -1226,9 +1229,13 @@ static void q6il(const Plugin& pl, const char* tlist) {
             if (hrow) st_memcpy(out.data() + (size_t)M * yrow, d_h, (size_t)M * hrow, hipMemcpyDeviceToHost);
             return RAD_OK;
         };
+        /* round 45: R4D_Q6IL_PIN applies to the byte check too (both arms under the pinned code: a pin the IL instances do not serve
+         * shows as rc bad, not as a fast empty call in the chain) */
+        const int pinc = [] { const char* e = std::getenv("R4D_Q6IL_PIN"); return e ? std::atoi(e) : 0; }();
         for (int64_t mode : modes) {
             set_dec(h);
             h.sw("ds41_wmk", (int)mode);
+            if (pinc) h.wk_pin(pinc);
             long long cmp = 0, diff = 0, rc_bad = 0, ndecl = 0;
             std::string fails;
             for (int64_t M : Ms) {
@@ -1244,6 +1251,7 @@ static void q6il(const Plugin& pl, const char* tlist) {
                 ++cmp;
                 if (on != oi) { ++diff; if (fails.size() < 300) fails += fmt(" M=%lld differ;", (long long)M); }
             }
+            if (pinc) h.wk_pin(0);
             const bool kb = rt_bad || rc_bad || diff || ndecl;
             ++keys;
             if (kb) { ++bad_keys; ++g_fail; }
@@ -1275,13 +1283,14 @@ static void q6il(const Plugin& pl, const char* tlist) {
                 for (int64_t M : PM) {
                     if (M > RB) continue;
                     std::vector<float> tn_, ti_;
+                    long long prc = 0;   /* round 45: failed launches in the chain (a declined pin) */
                     g_k1_sync = false;
                     for (int rep = 0; rep < 11; ++rep)
                         for (int arm = 0; arm < 2; ++arm) {
                             const bool il = (rep + arm) & 1;
                             st_ev_record(e0, nullptr);
                             for (int c = 0; c < NC; ++c)
-                                (void)(il ? launch(iln, ci[(size_t)c], hil.size(), rbi, M) : launch(nan_, cw[(size_t)c], hw.size(), rb, M));
+                                prc += (il ? launch(iln, ci[(size_t)c], hil.size(), rbi, M) : launch(nan_, cw[(size_t)c], hw.size(), rb, M)) != RAD_OK;
                             st_ev_record(e1, nullptr);
                             st_ev_sync(e1);
                             float ms = 0;
@@ -1291,7 +1300,7 @@ static void q6il(const Plugin& pl, const char* tlist) {
                     g_k1_sync = true;
                     std::sort(tn_.begin(), tn_.end()); std::sort(ti_.begin(), ti_.end());
                     const float a = tn_[tn_.size() / 2], b = ti_[ti_.size() / 2];
-                    line += fmt(" M %lld %.1f -> %.1f (%+.1f %%);", (long long)M, a, b, 100.0 * (b - a) / a);
+                    line += fmt(" M %lld %.1f -> %.1f (%+.1f %%)%s;", (long long)M, a, b, 100.0 * (b - a) / a, prc ? fmt(" [%lld launches FAILED]", prc).c_str() : "");
                 }
                 if (pin) { h.wk_pin(0); line += fmt(" (pin %d)", pin); }
                 std::printf("Q6ILPERF %s %s %lldx%lld mode %lld chain %d copies, us a call native -> IL:%s\n", nan_, op.name, (long long)NY, (long long)K,

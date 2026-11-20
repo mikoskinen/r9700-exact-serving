@@ -175,8 +175,9 @@ template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1, int AB =
 __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     const Wk3Tl wtl;
     /* lever Q8IL (round 44): AB 256 on q8_0 = its tile-interleaved form (Wq8Il) */
-    using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, Wq6Il2>, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;
-    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : kIl6;   /* bytes a tile-slab (IL-B) */
+    using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, std::conditional_t<T == GG_Q5_K, Wq5Il, Wq6Il2>>,
+                                 std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;   /* Q5IL (round 45): q5_K's */
+    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : T == GG_Q5_K ? kIl5 : kIl6;   /* bytes a tile-slab (IL-B) */
     using Pf = typename W::Pf;
     static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
@@ -703,8 +704,9 @@ __global__ __launch_bounds__(256) void gg_il6_flush_kernel(const uint4* p, long 
 template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1, int AB = 0>   /* DP: as gg_wk_kernel's */
 __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
     const Wk3Tl wtl;
-    using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, Wq6Il2>, std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;   /* round 42 bench: the tile-interleaved q6_K copies; Q8IL (round 44): q8_0's */
-    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : kIl6;
+    using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, std::conditional_t<T == GG_Q5_K, Wq5Il, Wq6Il2>>,
+                                 std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;   /* round 42 bench: the tile-interleaved q6_K copies; Q8IL (round 44): q8_0's; Q5IL (round 45): q5_K's */
+    constexpr long long ILB = T == GG_Q8_0 ? kIl8 : T == GG_Q5_K ? kIl5 : kIl6;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0 && !W::PIPE || W::TB == 0, "gg_wk3_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
@@ -1157,7 +1159,7 @@ template <int T>
 /* il (lever Q6IL, round 44): the weight is the stored tile-interleaved q6_K (type q6_K_il16b): only the IL-B instances (template AB
  * 384: Wq6Il2 + the tile pointers), never the native-row kernels; a geometry without one declines (the caller's IL fallback runs). */
 int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid, int abo = -1, bool il = false) {
-    if (il && T != GG_Q6_K && T != GG_Q8_0) return R4D_WK_DECLINE;   /* Q6IL / Q8IL */
+    /* (Q6IL / Q8IL / Q5IL: every type with a tile-interleaved form) */
     const bool wl = (code & 262144) != 0;
     const bool dp2 = (code & 8388608) != 0 && !wl;   /* bit 23: DP 2 (two slabs of raw words in flight; block staging only) */
     const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P, wl);
@@ -1177,6 +1179,41 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 #undef GG_WK_FIL8
                 return R4D_WK_DECLINE;
             }
+            if (dp2) {
+                if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
+                if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
+                if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
+                return R4D_WK_DECLINE;
+            }
+            if (wl) {
+                if (kp == 8) return R4D_EMIT(s, (gg_wk_kernel<T, 8, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, true, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+                return R4D_WK_DECLINE;
+            }
+            if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+            if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+            if (kp == 4) return R4D_EMIT(s, (gg_wk_kernel<T, 4, false, uint16_t, 0, 1, 384>), grid, dim3(256), lds, A);
+            return R4D_WK_DECLINE;
+        }
+    }
+    if constexpr (T == GG_Q5_K) {   /* lever Q5IL (round 45): the tile-interleaved q5_K (Wq5Il) in the stock q5_K G1 sets, bf16 only */
+        if (il) {
+            if (f32out) return R4D_WK_DECLINE;
+#define GG_WK_FIL5(KPV, WLV, PV, DPV)                                                                               \
+            if (kp == KPV && wl == WLV && pro == PV && dp2 == (DPV == 2)) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t, PV, DPV, 384>), grid, dim3(256), lds, A);
+            if (pro) {   /* the stock fold sets: PRO 1 DP 2 at KP 1 / 2; PRO 1 / 2 DP 1 */
+                if (dp2) {
+                    GG_WK_FIL5(1, false, 1, 2) GG_WK_FIL5(2, false, 1, 2)
+                    return R4D_WK_DECLINE;
+                }
+                GG_WK_FIL5(1, false, 1, 1) GG_WK_FIL5(2, false, 1, 1) GG_WK_FIL5(1, true, 1, 1) GG_WK_FIL5(2, true, 1, 1)
+                GG_WK_FIL5(1, false, 2, 1) GG_WK_FIL5(2, false, 2, 1) GG_WK_FIL5(4, false, 2, 1) GG_WK_FIL5(1, true, 2, 1) GG_WK_FIL5(2, true, 2, 1)
+                GG_WK_FIL5(4, true, 2, 1)
+                return R4D_WK_DECLINE;
+            }
+#undef GG_WK_FIL5
             if (dp2) {
                 if (kp == 1) return R4D_EMIT(s, (gg_wk_kernel<T, 1, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
                 if (kp == 2) return R4D_EMIT(s, (gg_wk_kernel<T, 2, false, uint16_t, 0, 2, 384>), grid, dim3(256), lds, A);
@@ -1314,7 +1351,7 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 template <int T>
 static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, int pro, bool dp2, const GgWkArgs& A, dim3 grid,
                            unsigned lds, int abo = -1, bool il = false) {   /* abo 0 (round 42 bench): the stock kernel whatever R4D_WK3_AB says */
-    if (il && T != GG_Q6_K && T != GG_Q8_0) return R4D_WK_DECLINE;   /* levers Q6IL / Q8IL: as gg_launch_wk_t's il */
+    /* levers Q6IL / Q8IL / Q5IL: as gg_launch_wk_t's il */
     if constexpr (T == GG_Q8_0) {   /* lever Q8IL (round 44): the stock q8_0 G2 sets on Wq8Il, bf16 only (the folds: PRO 2 at DP 1, the stock rule) */
         if (il) {
             if (f32out) return R4D_WK_DECLINE;
@@ -1336,6 +1373,30 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, in
             GG_WK3_IL8(2, 2, 2, 0, 1) GG_WK3_IL8(2, 3, 2, 0, 1) GG_WK3_IL8(2, 2, 1, 0, 1) GG_WK3_IL8(2, 3, 1, 0, 1)
             GG_WK3_IL8(4, 2, 2, 0, 1) GG_WK3_IL8(4, 3, 2, 0, 1) GG_WK3_IL8(4, 2, 1, 0, 1) GG_WK3_IL8(4, 3, 1, 0, 1)
 #undef GG_WK3_IL8
+            return R4D_WK_DECLINE;
+        }
+    }
+
+    if constexpr (T == GG_Q5_K) {   /* lever Q5IL (round 45): the stock q5_K G2 sets on Wq5Il, bf16 only (the folds: PRO 1 at DP 1, the stock rule) */
+        if (il) {
+            if (f32out) return R4D_WK_DECLINE;
+#define GG_WK3_IL5(KPV, NMV, NTV, PV, DPV)                                                                              \
+            if (kp == KPV && nmt == NMV && nt == NTV && pro == PV) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV, DPV, 384>), grid, dim3(256), lds, A);
+            if (pro) {
+                if (pro != 1) return R4D_WK_DECLINE;
+                GG_WK3_IL5(1, 2, 2, 1, 1) GG_WK3_IL5(1, 3, 1, 1, 1) GG_WK3_IL5(1, 2, 1, 1, 1)
+                return R4D_WK_DECLINE;
+            }
+            if (dp2) {
+                GG_WK3_IL5(1, 2, 2, 0, 2) GG_WK3_IL5(1, 3, 1, 0, 2) GG_WK3_IL5(1, 2, 1, 0, 2)
+                GG_WK3_IL5(2, 2, 2, 0, 2) GG_WK3_IL5(2, 3, 1, 0, 2) GG_WK3_IL5(2, 2, 1, 0, 2)
+                GG_WK3_IL5(4, 2, 2, 0, 2) GG_WK3_IL5(4, 3, 1, 0, 2) GG_WK3_IL5(4, 2, 1, 0, 2)
+                return R4D_WK_DECLINE;
+            }
+            GG_WK3_IL5(1, 2, 2, 0, 1) GG_WK3_IL5(1, 3, 2, 0, 1) GG_WK3_IL5(1, 2, 1, 0, 1) GG_WK3_IL5(1, 3, 1, 0, 1) GG_WK3_IL5(1, 4, 1, 0, 1)
+            GG_WK3_IL5(2, 2, 2, 0, 1) GG_WK3_IL5(2, 3, 2, 0, 1) GG_WK3_IL5(2, 2, 1, 0, 1) GG_WK3_IL5(2, 3, 1, 0, 1)
+            GG_WK3_IL5(4, 2, 2, 0, 1) GG_WK3_IL5(4, 3, 2, 0, 1) GG_WK3_IL5(4, 2, 1, 0, 1) GG_WK3_IL5(4, 3, 1, 0, 1)
+#undef GG_WK3_IL5
             return R4D_WK_DECLINE;
         }
     }
@@ -1620,7 +1681,6 @@ static int gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const u
                      const long long* Nv, long long M, long long K, const GgWkFold* fo, int il) {
     if (!code || (ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) || K % (2 * kWmS) || M > 0x7fffff)
         return R4D_WK_DECLINE;
-    if (il && ty != GG_Q6_K && ty != GG_Q8_0) return R4D_WK_DECLINE;
     if (fo && (nm != 1 || f32out || ((fo->pro == 1 || fo->pro == 3) && (!fo->g || ((uintptr_t)fo->g & 15u))) || !fo->h))
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
@@ -1761,7 +1821,11 @@ namespace {
  * blocks of 8 waves a WGP): what does not fit spills -- the running total, touched once a part (every S / P slabs), is the cheapest. */
 template <int T, int MT, int NT, int WN, typename OT, int FI = 0>
 __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2) ? 6 : 1))) void gg_wq_kernel(GgTiledArgs A) {
-    using W = Wq<T>;
+    /* FI 16 (lever Q5IL, DRAFTER track round 45): the weight is q5_K TILE-INTERLEAVED (Wq5Il): a lane's row pointer is its 16-row tile's
+     * base and the prefetch walks the wave's tiles; the same words into the same registers, so the bytes of the native form */
+    constexpr bool IL = (FI & 16) != 0;
+    static_assert(!IL || T == GG_Q5_K, "gg_wq_kernel: the tile-interleaved form here is q5_K's");
+    using W = std::conditional_t<IL, Wq5Il, Wq<T>>;
     using Pf = typename W::Pf;
     constexpr int BM = 16 * MT, BN = 16 * NT * WN;
     constexpr int XE = BM * kWmXP;
@@ -1796,7 +1860,9 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
         const int n = n0 + wave * 16 * NT + nt * 16 + c16;
-        wr[nt] = wb + (long long)(n < A.N ? n : A.N - 1) * A.w_ld;
+        const long long nn = n < A.N ? n : A.N - 1;
+        if constexpr (IL) wr[nt] = wb + (nn >> 4) * (long long)(A.K / kWmS) * kIl5;
+        else wr[nt] = wb + nn * A.w_ld;
     }
     const int tany = s_any;
     const uint16_t* xsrc[MT];
@@ -1838,6 +1904,13 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
     const long long psb = A.w_ld / S;
     const int pfl = (int)min(31LL, (2 * psb + 127) / 128);
     auto prefetch = [&](int s) {
+        if constexpr (IL) {   /* Q5IL: the wave's NT tiles' slab s + 3 (the tile-block's bytes in load order) */
+            const long long t0 = (long long)(n0 + __builtin_amdgcn_readfirstlane(wave) * 16 * NT) >> 4, tl = (long long)(A.N - 1) >> 4;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+                __builtin_amdgcn_s_prefetch_data(gg_sptr(wb + ((t0 + nt < tl ? t0 + nt : tl) * (long long)S + min(s + 3, S - 1)) * kIl5), 27);
+            return;
+        }
         const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;
 #pragma unroll 1
         for (int i = 0; i < 16 * NT; ++i) {
@@ -2152,7 +2225,7 @@ int wq_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
     const dim3 grid((unsigned)((A.M + BM - 1) / BM), (unsigned)((A.N + BN - 1) / BN));
     if (grid.y > 65535u) return R4D_WK_DECLINE;
     const unsigned lds = pf_lds<T>(MT);   /* = gg_wm_lds at BM 16 MT */
-    constexpr int F = T == GG_Q6_K ? (FI & 3) : (FI & 6);   /* bit 0 acts on Q6_K only, bit 2 on Q8_0 / Q5_K only */
+    constexpr int F = (T == GG_Q6_K ? (FI & 3) : (FI & 6)) | (FI & 16);   /* bit 0 acts on Q6_K only, bit 2 on Q8_0 / Q5_K only; 16 = Q5IL */
     if (f32out) return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, float, F>), grid, dim3(32 * WN), lds, A);
     return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, uint16_t, F>), grid, dim3(32 * WN), lds, A);
 }
@@ -2267,10 +2340,10 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
  * bench pins (r4d_gg_wkpf_default / follow / ts) do not apply: one form. */
 int r4d_gg_wkpf_run_il(RadStream s, int ty, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w, void* y,
                        long long y_ld, long long M, long long N, long long K) {
-    if ((ty != GG_Q6_K && ty != GG_Q8_0) || !x_al || K % (2 * kWmS) || M < 1 || M > 0x7fffffff || N > 0x7fffffff || N % 16) return R4D_WK_DECLINE;
+    if ((ty != GG_Q6_K && ty != GG_Q8_0 && ty != GG_Q5_K) || !x_al || K % (2 * kWmS) || M < 1 || M > 0x7fffffff || N > 0x7fffffff || N % 16) return R4D_WK_DECLINE;
     GgTiledArgs A{};
     A.x = x; A.x_ld = x_ld;
-    A.w = w; A.wtab = nullptr; A.w_ld = ty == GG_Q8_0 ? K / 32 * 34 : K / kWmS * kIl6R; A.w_es = 0;
+    A.w = w; A.wtab = nullptr; A.w_ld = ty == GG_Q8_0 ? K / 32 * 34 : ty == GG_Q5_K ? K / 256 * 176 : K / kWmS * kIl6R; A.w_es = 0;
     A.y = y; A.y_ld = y_ld;
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
@@ -2279,6 +2352,14 @@ int r4d_gg_wkpf_run_il(RadStream s, int ty, bool f32out, const uint16_t* x, long
         const bool f214 = K >= 4096 && N <= 2048 && M >= 49 && M <= 160;
         g_wkpf_last.store((f214 ? pf_code(2, 1, 16, 0, 0) : pf_code(4, 1, 16, 0, 0)) + 16000, std::memory_order_relaxed);
         return f214 ? wkpf_launch_f<GG_Q8_0, 2, 1, 16, 16>(s, false, A) : wkpf_launch_f<GG_Q8_0, 4, 1, 16, 16>(s, false, A);
+    }
+    if (ty == GG_Q5_K) {   /* lever Q5IL (round 45): the native q5_K table's forms (kWkpfTab) -- gg_wq 9221 (MT 2 NT 2) / 9411 (MT 4 NT 1) or GPF 326 */
+        if (f32out) return R4D_WK_DECLINE;
+        const int form = wkpf_form_tab(GG_Q5_K, N, K);
+        g_wkpf_last.store(form + 16000, std::memory_order_relaxed);
+        if (form == 9221) return wq_launch_f<GG_Q5_K, 2, 2, 8, 16>(s, false, A);
+        if (form == 9411) return wq_launch_f<GG_Q5_K, 4, 1, 8, 16>(s, false, A);
+        return wkpf_launch_f<GG_Q5_K, 3, 2, 8, 17>(s, false, A);
     }
     g_wkpf_last.store(pf_code(3, 2, 8, 1, 0) + 16000, std::memory_order_relaxed);
     const dim3 grid((unsigned)((A.M + 47) / 48), (unsigned)((A.N + 255) / 256));
