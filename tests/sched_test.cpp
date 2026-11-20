@@ -13946,8 +13946,10 @@ TEST(a_borrower_plans_its_inbox_first_within_its_budget) {
 }
 
 /* The engine names the lanes in the order they plan; a chunk taken out of that order (the third
- * before the second) would run out of position order, and the set names it. */
-TEST(a_piece_taken_out_of_position_order_is_named) {
+ * before the second) would run out of position order. Until tp8 loop D53 the set named it (and the engine stopped); now the
+ * piece waits in its lane's inbox until its predecessor is taken (lane_take_inbox), so nothing breaks and nothing runs out of
+ * order; the set names it only after a 30 s wait (a predecessor that is nowhere). */
+TEST(a_piece_taken_out_of_position_order_waits_for_its_predecessor) {
     Lanes L;
     REQUIRE_EQ(L.start(3), RAD_OK);
     const uint64_t s = L.submit(0, 200, 2);
@@ -13955,8 +13957,14 @@ TEST(a_piece_taken_out_of_position_order_is_named) {
     REQUIRE(L.plan(0, { 1, 2 }) != nullptr);        /* [0, 64) here, [64, 128) to 1, [128, 192) to 2 */
     CHECK_EQ(L.entry_of(0, s)->n_tokens, 64);
     CHECK(L.set.broken().empty());
-    REQUIRE(L.plan(2, { 1, 0 }) != nullptr);        /* lane 2 before lane 1: out of order */
-    CHECK(!L.set.broken().empty());
+    CHECK(L.plan(2, { 1, 0 }) == nullptr);          /* lane 2 before lane 1: its piece waits */
+    CHECK(L.set.broken().empty());
+    CHECK_EQ((int)L.set.inbox_n(2), 1);
+    REQUIRE(L.plan(1, { 2, 0 }) != nullptr);        /* [64, 128) */
+    CHECK_EQ((int)L.entry_of(1, s)->ctx_len, 64);
+    REQUIRE(L.plan(2, { 0, 1 }) != nullptr);        /* then [128, 192) */
+    CHECK_EQ((int)L.entry_of(2, s)->ctx_len, 128);
+    CHECK(L.set.broken().empty());
     if (!L.set.broken().empty()) fprintf(stderr, "    %s\n", L.set.broken().c_str());
 }
 
