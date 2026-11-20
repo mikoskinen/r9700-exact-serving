@@ -16225,3 +16225,44 @@ TEST(srf_2_prompts_over_the_lanes_one_at_a_time_shortest_first_each_its_lone_pla
         }
     }
 }
+
+/* sched_srf 2 with a DECODER in another lane: the rule across the lanes is off while any decode lane decodes, and each lane runs 1's rule
+ * (upstream's): two prompts sent to lane 0 beside lane 1's decoding request -- after the step that admits them (an admission makes a shared
+ * step) lane 0's plans carry one of them at a time, the shorter first; every request completes, window keys read right, nothing fails. */
+TEST(srf_2_with_a_decoder_in_another_lane_acts_per_lane) {
+    for (int lanes : { 2, 3 }) {
+        SrfSwitch on(2);
+        Lanes L;
+        srf_lanes(L, lanes, true);
+        const uint64_t d = L.submit(1, 32, 400, 1000);
+        REQUIRE(d != 0);
+        /* d alone until it decodes */
+        for (int k = 0; k < 4 && L.req(1, d) && L.req(1, d)->output.empty(); ++k) {
+            REQUIRE(L.plan(1, { 0 }) != nullptr);
+            CHECK_OK(L.commit(1, 5));
+        }
+        REQUIRE(L.req(1, d) != nullptr);
+        REQUIRE(!L.req(1, d)->output.empty());
+        const uint64_t a = L.submit(0, 9000, 1, 1000), b = L.submit(0, 5000, 1, 1000);
+        REQUIRE(a != 0);
+        REQUIRE(b != 0);
+        const SrfRun r = run_multi(L, lanes, { a, b }, { 0, 0 });
+        CHECK(L.set.broken().empty());
+        CHECK_EQ(r.failed, 0);
+        CHECK_EQ(r.misses, (int64_t)0);
+        CHECK(r.first[0] >= 0 && r.first[1] >= 0);
+        CHECK(r.first[1] <= r.first[0]);   /* b, the shorter, first */
+        CHECK(L.req(1, d) && L.req(1, d)->state == ReqState::Running);   /* still decoding all along */
+        int64_t k[Scheduler::kSrfN] = {}, one[Scheduler::kSrfN];
+        for (int l = 0; l < lanes; ++l) {
+            L.at(l).srf_counts(one);
+            for (int q = 0; q < Scheduler::kSrfN; ++q) k[q] += one[q];
+        }
+        fprintf(stderr, "    %d lanes, a decoder in lane 1: 9000@%d 5000@%d, %d plans with two prompts, rule plans %lld (alone %lld), sat out %lld, "
+                        "held %lld\n", lanes, r.first[0], r.first[1], r.two, (long long)k[Scheduler::kSrfSteps],
+                (long long)k[Scheduler::kSrfAlone], (long long)k[Scheduler::kSrfOut], (long long)k[Scheduler::kSrfHeld]);
+        CHECK(r.two <= 1);                       /* the admission step only */
+        CHECK(k[Scheduler::kSrfOut] > 0);        /* a sat out while b ran */
+        CHECK_EQ(k[Scheduler::kSrfHeld], 0ll);   /* nothing held: the rule across the lanes was off */
+    }
+}

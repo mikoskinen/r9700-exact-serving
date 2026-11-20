@@ -5413,23 +5413,31 @@ TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
     REQUIRE(world().ok);
     const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "2112", "--max-model-len", "4096",
                                            "--prefill-span", "2", "--checkpoint-interval", "1024" };
-    std::vector<std::vector<int32_t>> ref;
+    std::vector<std::vector<int32_t>> ref, ref_mix;
     {
         Serving one;
         REQUIRE(one.start("", ext));
         ref = srf_set(one.port, 12);
+        ref_mix = split_set(one.port);   /* decoders beside newcomers: the rule turns off and on as decode rows come and go */
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
     REQUIRE(ref.size() == 4);
     for (const auto& t : ref) CHECK_EQ(t.size(), (size_t)12);
-    struct Arm { int lanes; const char* cut; int srf; bool post; };
+    /* bg: BEST's shape -- 4 lanes, the last two BG lanes (RADIANCE_PP_BG_LANE=2) with the follower's one-layer segments and the leader's
+     * decode tails first; mix: the split set (decoders + newcomers) after the cold set, in the same start */
+    struct Arm { int lanes; const char* cut; int srf; bool post; bool bg = false; bool mix = false; };
     for (const Arm a : { Arm{ 2, "0,2", 0, false }, Arm{ 2, "0,2", 2, false }, Arm{ 2, "1,3", 2, false }, Arm{ 3, "0,3", 2, false },
-                         Arm{ 2, "0,2", 1, false }, Arm{ 2, "0,2", 2, true } }) {
+                         Arm{ 2, "0,2", 1, false }, Arm{ 2, "0,2", 2, true }, Arm{ 4, "1,3", 2, false, true, true },
+                         Arm{ 4, "0,2", 2, false, true, true }, Arm{ 3, "1,3", 1, false, false, true } }) {
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
         ex.push_back(std::to_string(a.lanes));
         std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_PP_SPAN_SHORT=24576" });
+        if (a.bg)
+            for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                                   "RADIANCE_PP_READY_FIRST=1" })
+                env.push_back(v);
         if (a.srf && !a.post) env.push_back("RADIANCE_SCHED_SRF=" + std::to_string(a.srf));
         Serving pp;
         REQUIRE(pp.start(a.cut, ex, env));
@@ -5440,18 +5448,24 @@ TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
             CHECK_EQ(st, 200);
             (void)complete(pp.port, prompt_ids(9, 8), 2);   /* a step release applies it */
         }
-        std::vector<std::vector<int32_t>> got = srf_set(pp.port, 12);
+        std::vector<std::vector<int32_t>> got = srf_set(pp.port, 12), got_mix;
         if (a.post) got = srf_set(pp.port, 12);   /* the in-process arm: a second set, the switch long applied */
+        if (a.mix) got_mix = split_set(pp.port);
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
         const std::string llog = pp.lead.output();
         int differ = 0;
         for (size_t i = 0; i < ref.size() && i < got.size(); ++i) differ += got[i] != ref[i];
+        if (a.mix) {
+            CHECK_EQ(got_mix.size(), ref_mix.size());
+            for (size_t i = 0; i < ref_mix.size() && i < got_mix.size(); ++i) differ += got_mix[i] != ref_mix[i];
+        }
         const long long plans = srf_field(llog, "lane plans under the rule"), held = srf_field(llog, "admissions held"),
                         out = srf_field(llog, "times a running prompt sat a plan out");
-        fprintf(stderr, "    %d lanes W(%s), sched_srf %d%s: %d of %zu prompts differ from one process; rule plans %lld, sat out %lld, "
-                        "held %lld\n", a.lanes, a.cut, a.srf, a.post ? " (POSTed)" : "", differ, ref.size(), plans, out, held);
+        fprintf(stderr, "    %d lanes%s W(%s), sched_srf %d%s%s: %d of %zu requests differ from one process; rule plans %lld, sat out %lld, "
+                        "held %lld\n", a.lanes, a.bg ? " (BG 2)" : "", a.cut, a.srf, a.post ? " (POSTed)" : "", a.mix ? " + the split set" : "",
+                differ, ref.size() + (a.mix ? ref_mix.size() : 0), plans, out, held);
         CHECK_EQ(got.size(), ref.size());
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
