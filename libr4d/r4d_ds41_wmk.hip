@@ -8,6 +8,7 @@
 #define R4D_GG_WM_SRC 1
 #define R4D_GG_WM_PARTFOLD 1   /* the stock WMMA kernel's template here carries the part fold (r4d_ds41_ggml.hip's unit: not) */
 #include "r4d_ds41_ggml.hip"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 /* Lever WMK's prefill rows (stage 3, G3): lever GPF's tile forms (gg_pf_kernel, the stock WMMA arithmetic in other
  * geometries) compiled here with the part fold -- the same part order as gg_wk_kernel's, so a row's bytes are the same in
  * a <= 48-row launch and in a prefill launch of any height. r4d_ds41_ggml_pf.hip's own unit keeps the stock order. */
@@ -172,7 +173,7 @@ struct Wq6Il : Wq<GG_Q6_K> {
 /* Round 43 (bench, AB bits 128 / 256 as gg_wk3_kernel's): G1 on the q6_K tile-interleaved copies IL-A / IL-B (Wq6Il / Wq6Il2: the
  * same words into the same registers, so the same bytes); the prefetch (pfm 0 / 2) takes a wave's two tile-slab pairs (2 x 3,392 B). */
 template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1, int AB = 0>
-__global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
+__global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) { R4D_IKA_ENTRY();
     const Wk3Tl wtl;
     /* lever Q8IL (round 44): AB 256 on q8_0 = its tile-interleaved form (Wq8Il) */
     using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, std::conditional_t<T == GG_Q5_K, Wq5Il, Wq6Il2>>,
@@ -656,7 +657,7 @@ std::atomic<int> g_gg_wk_last{0};
  * PRO 1 / 2 (stage 2, r5): lever K1's folds a / e in the staging exactly as gg_wk_kernel's (the producer's bf16 octet of each staged
  * chunk, rmsnorm's row scales from a block prologue in mr_norm_scales' order; grid row 0 also stores h) -- the same bytes as the
  * producer's launch then the GEMM. */
-__global__ __launch_bounds__(256) void gg_il6_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) {
+__global__ __launch_bounds__(256) void gg_il6_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) { R4D_IKA_ENTRY();
     const long long i = (long long)blockIdx.x * 256 + threadIdx.x;   /* (tile, slab, row) */
     const long long tiles = (N + 15) / 16;
     if (i >= tiles * S * 16) return;
@@ -672,7 +673,7 @@ __global__ __launch_bounds__(256) void gg_il6_pack_kernel(const uint8_t* src, lo
     d[104] = b[208];
     d[105] = b[209];
 }
-__global__ __launch_bounds__(256) void gg_il6b_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) {
+__global__ __launch_bounds__(256) void gg_il6b_pack_kernel(const uint8_t* src, long long w_ld, uint8_t* dst, long long N, int S) { R4D_IKA_ENTRY();
     const long long i = (long long)blockIdx.x * 256 + threadIdx.x;   /* (tile, slab, lane) */
     const long long tiles = (N + 15) / 16;
     if (i >= tiles * S * 32) return;
@@ -692,7 +693,7 @@ __global__ __launch_bounds__(256) void gg_il6b_pack_kernel(const uint8_t* src, l
         d[1664 + 2 * c16 + 1] = b[209];
     }
 }
-__global__ __launch_bounds__(256) void gg_il6_flush_kernel(const uint4* p, long long n, uint32_t* o) {
+__global__ __launch_bounds__(256) void gg_il6_flush_kernel(const uint4* p, long long n, uint32_t* o) { R4D_IKA_ENTRY();
     uint32_t a = 0;
     for (long long i = (long long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long long)gridDim.x * 256) { const uint4 v = p[i]; a ^= v.x ^ v.y ^ v.z ^ v.w; }
     if (a == 0x9e3779b9u) o[0] = a;
@@ -702,7 +703,7 @@ __global__ __launch_bounds__(256) void gg_il6_flush_kernel(const uint4* p, long 
  * staging (the two block barriers, the LDS store and the next slab's global load: slab 0's staging reused), bit 4 no math (no A
  * fragment reads, no decode, no WMMA, no scale fma; the raw words folded into one value so their loads stay). */
 template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1, int AB = 0>   /* DP: as gg_wk_kernel's */
-__global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
+__global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) { R4D_IKA_ENTRY();
     const Wk3Tl wtl;
     using W = std::conditional_t<(AB & 256) != 0, std::conditional_t<T == GG_Q8_0, Wq8Il, std::conditional_t<T == GG_Q5_K, Wq5Il, Wq6Il2>>,
                                  std::conditional_t<(AB & 128) != 0, Wq6Il, Wq<T>>>;   /* round 42 bench: the tile-interleaved q6_K copies; Q8IL (round 44): q8_0's; Q5IL (round 45): q5_K's */
@@ -1820,7 +1821,7 @@ namespace {
 /* FI 2 (bit 1): the stock occupancy asked of the compiler (amdgpu_waves_per_eu 6 = <= 240 VGPRs at 1536 a lane, granule 24, i.e. 3
  * blocks of 8 waves a WGP): what does not fit spills -- the running total, touched once a part (every S / P slabs), is the cheapest. */
 template <int T, int MT, int NT, int WN, typename OT, int FI = 0>
-__global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2) ? 6 : 1))) void gg_wq_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2) ? 6 : 1))) void gg_wq_kernel(GgTiledArgs A) { R4D_IKA_ENTRY();
     /* FI 16 (lever Q5IL, DRAFTER track round 45): the weight is q5_K TILE-INTERLEAVED (Wq5Il): a lane's row pointer is its 16-row tile's
      * base and the prefetch walks the wave's tiles; the same words into the same registers, so the bytes of the native form */
     constexpr bool IL = (FI & 16) != 0;

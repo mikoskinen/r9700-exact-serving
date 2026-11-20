@@ -46,6 +46,7 @@
 #define R4D_GG_BLOCKS_ONLY 1
 #define R4D_GG_WM_SRC 1
 #include "r4d_ds41_ggml.hip"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_ds41_ggml_pf.h"
 #endif
 /* R4D_GG_PF_KERNEL_ONLY (lever WMK, r4d_ds41_wmk.hip): this file's kernel template and its LDS / form helpers only, in a unit
@@ -66,7 +67,7 @@ namespace {
  * lane's row pointer is its 16-row tile's base and the prefetch walks the wave's tiles; Wq6Il2 loads the same words into the same
  * registers as Wq<GG_Q6_K>, so every output's operations and bytes are the native form's. */
 template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
-__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) { R4D_IKA_ENTRY();
     constexpr bool IL = (FI & 16) != 0;
     using W = std::conditional_t<IL, std::conditional_t<T == GG_Q8_0, Wq8Il, std::conditional_t<T == GG_Q5_K, Wq5Il, Wq6Il2>>, Wq<T>>;   /* Q8IL (round 44): q8_0's; Q5IL (round 45): q5_K's */
     constexpr long long ILB = T == GG_Q8_0 ? kIl8 : T == GG_Q5_K ? kIl5 : kIl6;

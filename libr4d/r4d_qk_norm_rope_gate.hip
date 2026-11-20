@@ -17,6 +17,7 @@
 // the load, which matches vLLM's `weight.float() + 1.0` without a per-layer fp32 copy.
 //
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_chain.h"
@@ -284,7 +285,7 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
     const void* __restrict__ WQ, const void* __restrict__ WK,
     const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
     int nq, int nkv, int rot, float eps, float wadd,
-    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
+    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) { R4D_IKA_ENTRY();
     r4d_qk_norm_rope_gate_kernel_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot, eps, wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
 }
 template <int HD, int KV = QK_KV_NONE>
@@ -317,7 +318,7 @@ __global__ __launch_bounds__(256) void r4dchain_qk_norm_rope_gate(
 // consumed in f32 by the caller. Changing any of it changes the model's output.
 __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
     const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den, float theta,
-    float rscale, int cs_f32, int pos_i64, RadYarn yarn) {
+    float rscale, int cs_f32, int pos_i64, RadYarn yarn) { R4D_IKA_ENTRY();
   const int m = blockIdx.x;
   const long pp = pos_i64 ? ((const long*)POS)[m] : (long)((const int*)POS)[m];
   // A padded row addresses no table row, and a position at or past the table's height writes

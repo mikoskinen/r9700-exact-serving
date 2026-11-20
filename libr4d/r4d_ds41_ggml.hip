@@ -35,6 +35,7 @@
  * grid + 1 so a value is an unsigned byte).
  */
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
@@ -1078,7 +1079,7 @@ __device__ __forceinline__ void gg_row(const GgGemvArgs& A, const uint8_t* wb, c
 }
 
 template <int T, int RPW, bool MOE, typename OT>
-__global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
+__global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) { R4D_IKA_ENTRY();
     using Q = Gg<T>;
 #ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
     uint8_t* const gg_smem = (uint8_t*)emu_dyn_lds();
@@ -2105,7 +2106,7 @@ __device__ __forceinline__ void md_stage(const GgMdArgs& A, float* xs, const int
 }
 
 template <int T, int RPW, int UF, int NW, int XMX, bool DOT = false>
-__global__ __launch_bounds__(NW * 32) void gg_md_kernel(GgMdArgs A) {
+__global__ __launch_bounds__(NW * 32) void gg_md_kernel(GgMdArgs A) { R4D_IKA_ENTRY();
     using Q = Gg<T>;
     constexpr int NT = NW * 32;
     extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
@@ -2317,7 +2318,7 @@ constexpr int kTN = 128, kTP = 132;   /* tile columns (weight rows), LDS row flo
  * output is the same chain at either height (slabs in order, the slab's 32 values in order), so
  * the bits do not depend on BM. */
 template <int T, int BM, bool MOE, typename OT>
-__global__ __launch_bounds__(kGgThreads) void gg_tiled_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(kGgThreads) void gg_tiled_kernel(GgTiledArgs A) { R4D_IKA_ENTRY();
     using Q = Gg<T>;
     static_assert(BM == 32 || BM == 128, "a tile is 32 or 128 rows");
     constexpr int TM = BM == 128 ? 8 : 4, TN = BM == 128 ? 8 : 4;
@@ -2997,7 +2998,7 @@ struct Wq5Il : Wq<GG_Q5_K> {
 };
 
 template <int T, int MT, bool MOE, typename OT>
-__global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) { R4D_IKA_ENTRY();
     using W = Wq<T>;
     using Pf = typename W::Pf;
     constexpr int BM = 16 * MT;
@@ -3416,7 +3417,7 @@ template <int T>
 __global__ __launch_bounds__(kGgThreads) void gg_embed_kernel(const int32_t* tok, const uint8_t* w,
                                                               long long w_ld, uint16_t* x,
                                                               long long x_ld, int M, int E, int V,
-                                                              long long voff, float mult) {
+                                                              long long voff, float mult) { R4D_IKA_ENTRY();
     using Q = Gg<T>;
     extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
     gg_load_table<T>(gg_smem);

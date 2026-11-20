@@ -277,7 +277,7 @@ endforeach()
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
 set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
-                    r4d_fuse.cpp)
+                    r4d_fuse.cpp r4d_ika.cpp)
 
 # The native-block GEMMs' layout (planes -> llama.cpp's blocks) uses libquant's one definition of the
 # blocks, compiled in when libquant's sources are beside libr4d (in radiance's tree).
@@ -293,6 +293,12 @@ rad_add_plugin(libr4d kernels
   HIP_SOURCES ${R4D_SRC}
   GPU_TARGETS ${R4D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
+# Lever IKA (r4d_ika.h, DRAFTER track round 50): the converted kernels acquire / release at agent scope themselves and list
+# themselves in r4d_ika_kernels, so the engine (RADIANCE_AQL_IKA=1) may drop their packets' fences. OFF = the kernels as before.
+option(R4D_IKA "libr4d: kernels acquire and release in-kernel (lever IKA)" OFF)
+if(R4D_IKA)
+  target_compile_definitions(libr4d PRIVATE R4D_IKA=1)
+endif()
 if(R4D_HAVE_GGML)
   target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
   target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})

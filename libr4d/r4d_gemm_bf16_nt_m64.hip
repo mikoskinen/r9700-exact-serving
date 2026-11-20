@@ -17,6 +17,7 @@
 // Fragment rows are clamped, not masked: rows past M or N re-read the last valid row and their
 // results are never stored.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_gemm_args.h"
 #include "r4d_bf16_gemm_rows.h"
 #include "r4d_gdn_wmma.h"
@@ -139,7 +140,7 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
 template <int MT>
 __global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) { R4D_IKA_ENTRY();
   r4d_gemm_bf16_nt_m64_body<MT, false>(A, W, C, M, K, N, WV, SK, LDA, LDC);
 }
 template <int MT>

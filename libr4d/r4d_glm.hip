@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
@@ -23,7 +24,7 @@ namespace {
 template <int R, int C, int U, typename WT = float>
 __global__ void __launch_bounds__(128)
     gemm_nt_f32_tile_kernel(const uint16_t* x, const WT* w, float* y, long xp, long wp, long yp,
-                            int m, int n, int k) {
+                            int m, int n, int k) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
               r0 = blockIdx.y * R;
     if (c0 >= n) return;
@@ -195,7 +196,7 @@ template <int OWN>
 __global__ void __launch_bounds__(128)
     router_group_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
                              long lp, long bp, long ip, long wp, int m, int ne, int k, int ng,
-                             int kg, int norm, float factor) {
+                             int kg, int norm, float factor) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (r >= m) return;
     const int gs = ne / ng;
@@ -277,7 +278,7 @@ template <int OWN>
 __global__ void __launch_bounds__(128)
     router_sigmoid_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
                                long lp, long bp, long ip, long wp, int m, int ne, int k, int norm,
-                               float factor) {
+                               float factor) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (r >= m) return;
     (void)router_sigmoid_row<OWN>(logits, bias, ids, weights, lp, bp, ip, wp, r, ne, k, norm,
@@ -294,7 +295,7 @@ __global__ void __launch_bounds__(NW * 32)
                                   int32_t* sorted, int32_t* off, int32_t* cnt, uint16_t* gate,
                                   int32_t* inv, long lp, long bp, long ip, long wp, long gp, int m,
                                   int ne, int n_local, int k, int norm, float factor, int base,
-                                  r4d_moesort::Protect prot) {
+                                  r4d_moesort::Protect prot) { R4D_IKA_ENTRY();
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
@@ -432,7 +433,7 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
 #undef R4D_RSS_I
 }
 __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long gp, long yp, int n,
-                                      float limit) {
+                                      float limit) { R4D_IKA_ENTRY();
     const long r = blockIdx.x;
     const int i = blockIdx.y * 256 + threadIdx.x;
     if (i >= n) return;
@@ -442,7 +443,7 @@ __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long gp, 
 }
 // swiglu_step: the SiLU first, its value clipped above (Ling-3.0; vLLM's SwigluStepAndMul).
 __global__ void swiglu_step_kernel(const uint16_t* gu, uint16_t* y, long gp, long yp, int n,
-                                   float limit) {
+                                   float limit) { R4D_IKA_ENTRY();
     const long r = blockIdx.x;
     const int i = blockIdx.y * 256 + threadIdx.x;
     if (i >= n) return;
@@ -476,7 +477,7 @@ int clamped_body(const RadArgs* a, RadStream stream, bool step = false) {
 // before the absmax because the separate quantiser reads the stored bf16 bytes.
 __global__ void __launch_bounds__(256)
     swiglu_clamped_quant_kernel(const uint16_t* gu, uint16_t* y, uint8_t* q, float* s, long gp,
-                                long yp, long qp, long sp, int n, int nkb, float limit) {
+                                long yp, long qp, long sp, int n, int nkb, float limit) { R4D_IKA_ENTRY();
     const long r = blockIdx.x;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int kb = wave; kb < nkb; kb += (int)(blockDim.x >> 5)) {
