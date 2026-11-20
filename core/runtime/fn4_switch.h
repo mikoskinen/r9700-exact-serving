@@ -537,6 +537,13 @@
  *                   at load on BOTH nodes (keep's pitch padded to 16-byte words, X2's keep part with it; the follower declares the
  *                   part + gather), which starts it at 1; without the env 1 is refused. Exact either way (lever I1's split + a word
  *                   gather). The follower takes it with the leader's; the leader holds nothing it changes.
+ *   sched_lane_room scheduler (tp8 loop D56; 104 here, after ds41_csplit): 0 -- a lane's admission room gates (a fresh prompt's whole
+ *                   rest, a preempted request's whole recompute, beside every runner's rest of prompt + a block each) count the asking
+ *                   lane's running requests, as before; 1 -- they count every lane's (each lane's running set and the ones its plan left
+ *                   out), as one process's gate counts its one running set: a long prompt in one lane waits instead of being admitted
+ *                   beside another lane's unfinished one (both then run out: a preemption by recompute). One lane / one process: the
+ *                   same either way. Admission order only (rule A). Read at every gate the scheduler asks; the leader's (not a follower
+ *                   switch, not handed over). Unset: the start's RADIANCE_SCHED_LANE_ROOM (0 / 1).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -773,7 +780,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -897,6 +904,8 @@ void note_sched_tail_grid(const int64_t* v);
 int  sched_tail_inner();
 /* tp8 loop P44 (sched_srf): the switch once set, else RADIANCE_SCHED_SRF at start (0 = off); read at every step planned. */
 int  sched_srf();
+/* tp8 loop D56 (sched_lane_room): the switch once set, else RADIANCE_SCHED_LANE_ROOM at start (0 = off); read at every room gate. */
+int  sched_lane_room();
 /* tp8 loop U1 (aql_hdp): the switch once set, else RADIANCE_AQL_HDP_FLUSH at start (0 = off); read at every doorbell. */
 int  aql_hdp();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the

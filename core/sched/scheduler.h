@@ -1302,12 +1302,11 @@ private:
      * running_ empty. What "nothing else is running" means for an overdue preempted request: its fail-instead-of-wait,
      * the forced admission and release_idle_states() (which drops EVERY sequence's state slots). */
     bool    pool_idle() const;
-    /* tp8 loop D56 (RADIANCE_SCHED_LANE_ROOM=1, lane_room_): the admission room gates (fresh_prefill_can_fit,
+    /* tp8 loop D56 (fn4 sched_lane_room 1 = RADIANCE_SCHED_LANE_ROOM=1 at start): the admission room gates (fresh_prefill_can_fit,
      * preempted_can_prefill) count the running requests of EVERY lane -- the shared pool's runners, each lane's running_ and
      * the ones a plan left out of it (lane_out_: pieces of them run elsewhere) -- as one process's gate counts its one running
      * set. Unset / 0: this lane's running_ only (a long prompt in one lane is admitted beside another lane's prefilling
      * prompt whose rest it then takes: both run out and preempt). One lane: running_ either way. The lock is held. */
-    bool    lane_room_ = false;
     void    room_runners(std::vector<const SchedReq*>* out, bool all_lanes) const;
     friend class LaneSet;
     /* A piece of one of this lane's sequences, run in lane `by`'s step, committed there: called by
@@ -1424,7 +1423,7 @@ private:
      * that prefill to zero — the loop. `preempt_wait_overdue` bounds the wait for every overdue
      * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
      * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
-    bool preempted_can_prefill(const SchedReq& s) const { return preempted_can_prefill(s, lane_room_); }
+    bool preempted_can_prefill(const SchedReq& s) const;   /* all_lanes = fn4 sched_lane_room (tp8 loop D56) */
     /* tp8 loop D56: `all_lanes` = the runners every lane holds the shared pool for (room_runners); false = this lane's
      * running_ (today's rule; the overdue reclaim loop keeps it: it can preempt only this lane's runners) */
     bool preempted_can_prefill(const SchedReq& s, bool all_lanes) const;

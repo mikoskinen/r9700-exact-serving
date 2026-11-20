@@ -43,7 +43,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
-                                        "sched_srf", "aql_hdp", "ds41_csplit" };
+                                        "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -351,6 +351,15 @@ int env_sched_srf() {
     return env;
 }
 
+/* tp8 loop D56: RADIANCE_SCHED_LANE_ROOM=1 at start (anything else, or unset, is 0). */
+int env_sched_lane_room() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_LANE_ROOM");
+        return e && !std::strcmp(e, "1") ? 1 : 0;
+    }();
+    return env;
+}
+
 /* Lever TI (ds41-pf2): RADIANCE_SCHED_TAIL_INNER=1 at start (anything else, or unset, is 0). */
 int env_tail_inner() {
     static const int env = [] {
@@ -386,6 +395,10 @@ int reported(State& s, int i) {
     if (i == kAqlHdp) {            /* tp8 loop U1: set, else RADIANCE_AQL_HDP_FLUSH (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_aql_hdp();
+    }
+    if (i == kSchedLaneRoom) {     /* tp8 loop D56: set, else RADIANCE_SCHED_LANE_ROOM (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_sched_lane_room();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -519,6 +532,10 @@ int sched_srf() {
 int aql_hdp() {
     const int v = st().val[kAqlHdp].load(std::memory_order_relaxed);
     return v >= 0 ? v : env_aql_hdp();
+}
+int sched_lane_room() {
+    const int v = st().val[kSchedLaneRoom].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_sched_lane_room();
 }
 int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     State& s = st();
@@ -937,7 +954,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1513,6 +1530,14 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedLaneRoom) {     /* tp8 loop D56: the scheduler's, read at every room gate */
+        if (v != 0 && v != 1) {
+            if (err) *err = "sched_lane_room takes 0 (a lane's admission room gates count its own running requests, as before) or 1 "
+                            "(they count every lane's running requests, as one process's gate counts its one running set; tp8 loop D56)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedSrf) {          /* tp8 loop P44: the scheduler's, read at every step it plans */
         if (v < 0 || v > 2) {
             if (err) *err = "sched_srf takes 0 (today's plan), 1 (running prompts with no decode row and no admission possible take "
@@ -1783,7 +1808,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)

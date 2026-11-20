@@ -277,13 +277,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                                "published that head waits for it, at most %lld ms from its arrival", (long long)kPubHoldMin, hm).c_str()
                          : "OFF: it needs RADIANCE_SCHED_PUB_PROMPT=1 or 2 (and the prefix cache)");
     }
-    {   /* tp8 loop D56: the room gates count every lane's runners (room_runners); unset / 0 = this lane's (today) */
-        const char* e = std::getenv("RADIANCE_SCHED_LANE_ROOM");
-        lane_room_ = e && !std::strcmp(e, "1");
-        if (lane_room_ && lane_ <= 0)
+    {   /* tp8 loop D56 (fn4 sched_lane_room, RADIANCE_SCHED_LANE_ROOM its start value): the room gates count every lane's runners
+         * (room_runners); 0 = this lane's (today). The switch is read at every gate; the start line once. */
+        if (fn4::sched_lane_room() > 0 && lane_ <= 0)
             RAD_INFO("scheduler: RADIANCE_SCHED_LANE_ROOM=1 (tp8 loop D56) -- under lanes a prompt (fresh or preempted) is admitted only "
                      "where its whole rest fits beside the rest of EVERY lane's running requests, as one process's gate counts its one "
-                     "running set; one lane: unchanged");
+                     "running set; one lane: unchanged (fn4 sched_lane_room 1)");
     }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
@@ -3038,6 +3037,8 @@ void Scheduler::undo_hit(SchedReq& s) {
  * past that. Counting only the next token admits this recompute against the loan those remaining
  * chunks still need; the next ensure then fails and preempt_back() resets that prefill to zero,
  * which is the loop. */
+bool Scheduler::preempted_can_prefill(const SchedReq& s) const { return preempted_can_prefill(s, fn4::sched_lane_room() > 0); }
+
 bool Scheduler::preempted_can_prefill(const SchedReq& s, bool all_lanes) const {
     const Request& r = *s.req;
     std::vector<const SchedReq*> run;
@@ -3089,7 +3090,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s, bool all_lanes) const {
 bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     const Request& r = *s.req;
     std::vector<const SchedReq*> run;
-    room_runners(&run, lane_room_);
+    room_runners(&run, fn4::sched_lane_room() > 0);
     const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
