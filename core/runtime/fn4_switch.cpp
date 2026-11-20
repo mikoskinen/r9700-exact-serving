@@ -1004,12 +1004,12 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpLeadSeg) {   /* tp8 loop D32 (LSP): the leader's */
-        if (v < 0 || v > 65535 || (v & 7) > 2) {
+        if (v < 0 || v > 131071 || (v & 7) > 2) {   /* tp8 loop F81: + 65536 = no position-order guard */
             if (err) *err = "pp_lead_seg takes form + 16 x stride (+ 256): form 0 (a BG step's leader parts whole), 1 (M9 segments as built) or 2 "
                             "(decode first), stride 0 .. 15 (every s-th declared boundary; 0 = 1); + 256 = no band passes (RADIANCE_PP_BAND's "
                             "fresh BG steps run W(h, t)'s, tp8 loop D36); + 8 = the tail whole, + 512 = the SP word on the head's segments "
                             "(tp8 loop D40); + 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N "
-                            "sequences (tp8 loop D49b)";
+                            "sequences (tp8 loop D49b); + 65536 = no position-order guard (tp8 loop F81)";
             return false;
         }
         const int cap = s.lseg_capable.load(std::memory_order_acquire);

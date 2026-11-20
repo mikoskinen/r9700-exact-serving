@@ -489,6 +489,10 @@
  *                   decoded <= N sequences (Scheduler::decoded_seqs summed over the decode lanes); above N the step's parts run
  *                   whole as under form 0 -- so ONE value segments at c8 (the leader's BG head stops both decode lanes there,
  *                   lq218) and keeps c16 / c32's whole parts (lq207: segments -1.7..-6.4 % there). 0 = no load rule.
+ *                   Position-order guard (tp8 loop F81, on unless + 65536): a step whose prompt entries are not all WHOLE FRESH
+ *                   prompts (context 0, the prompt's last row, no snapshot / replay) runs its parts whole -- a piece of a longer
+ *                   prompt in segments let a later piece's head / tail run before its remaining segments (lq225 'all': layer 8's
+ *                   compressed-KV copy differed). + 65536 = no guard (the F75 / F81 form, a negative control only).
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all

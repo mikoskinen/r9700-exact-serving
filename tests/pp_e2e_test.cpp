@@ -2853,6 +2853,8 @@ std::vector<std::vector<int32_t>> f75_set(int port) {
     return out;
 }
 
+/* tp8 loop F81: + the position-order guard's count (steps carrying a prompt piece that is not a whole fresh prompt run whole: > 0 over
+ * the guarded LSP arms, 0 in 'all-ng' = pp_lead_seg + 65536, the F75 / F81 form without the guard, which segments one step more) */
 TEST(f75_order_levers_alone_and_together_keep_the_kv_copy) {
     REQUIRE(world().ok);
     REQUIRE(world6().ok);
@@ -2866,18 +2868,20 @@ TEST(f75_order_levers_alone_and_together_keep_the_kv_copy) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { const char* name; bool lsp, p23, r9; };
+    /* tp8 loop F81: noguard = pp_lead_seg + 65536 (LSP without its position-order guard, the F75 / F81 form) */
+    struct Arm { const char* name; bool lsp, p23, r9; bool noguard = false; };
     int bad = 0;
+    long long guard_all = 0;
     for (const Arm a : { Arm{ "none", false, false, false }, Arm{ "LSP", true, false, false }, Arm{ "P23s", false, true, false },
                          Arm{ "R9", false, false, true }, Arm{ "LSP+P23s", true, true, false }, Arm{ "LSP+R9", true, false, true },
-                         Arm{ "P23s+R9", false, true, true }, Arm{ "all", true, true, true } }) {
+                         Arm{ "P23s+R9", false, true, true }, Arm{ "all", true, true, true }, Arm{ "all-ng", true, true, true, true } }) {
         std::vector<std::string> env = kSplitEnv;
         for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0",
                                "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
                                "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1", "RADIANCE_PP_LEAD_SEG=1",
                                "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_LEAD_SEG_RINGS=2" })
             env.push_back(v);
-        env.push_back(a.lsp ? "RADIANCE_PP_LEAD_SEG_FORM=2" : "RADIANCE_PP_LEAD_SEG_FORM=0");
+        env.push_back(a.lsp ? (a.noguard ? "RADIANCE_PP_LEAD_SEG_FORM=65538" : "RADIANCE_PP_LEAD_SEG_FORM=2") : "RADIANCE_PP_LEAD_SEG_FORM=0");
         if (a.p23) { env.push_back("RADIANCE_PP_BG_ROOM=700"); env.push_back("RADIANCE_PP_BG_JOIN_MS=250"); }
         if (a.r9) env.push_back("RADIANCE_PP_FOL_RESERVE=4");
         std::vector<std::string> ex = ext;
@@ -2919,10 +2923,20 @@ TEST(f75_order_levers_alone_and_together_keep_the_kv_copy) {
                 (void)std::sscanf(llog.c_str() + b, "): %lld steps with %lld newcomers; %lld steps", &bg_n, &bg_newc, &bg_b2);
         if (const size_t at = flog.rfind("follower: body reserve "); at != std::string::npos)
             if (const size_t b = flog.find("): ", at); b != std::string::npos) (void)std::sscanf(flog.c_str() + b, "): %lld BG bodies held", &held);
+        long long guard = -1;   /* tp8 loop F81: steps the position-order guard kept whole */
+        const char* gkey = " steps ran their parts whole by the position-order guard";
+        if (const size_t at = llog.rfind(gkey); at != std::string::npos)
+            if (const size_t b = llog.rfind(", ", at); b != std::string::npos) guard = std::atoll(llog.c_str() + b + 2);
         fprintf(stderr, "    %-9s: %d of %zu requests differ; KV-copy checks %lld, %lld differ%s; leader: %lld BG steps in %lld segments; "
-                        "%lld prompts planned by lanes, %lld chunks lent; P23: %lld BG steps, %lld newcomers, %lld with >= 2; R9: %lld bodies held\n",
+                        "%lld prompts planned by lanes, %lld chunks lent; P23: %lld BG steps, %lld newcomers, %lld with >= 2; R9: %lld bodies held; "
+                        "F81 guard kept %lld steps whole\n",
                 a.name, differ, ref.size(), checks, kdiff, notowner ? " (NOT the owner's bytes)" : "", steps, parts, cont, lent, bg_n, bg_newc,
-                bg_b2, held);
+                bg_b2, held, guard);
+        if (a.lsp) {
+            CHECK(guard >= 0);
+            if (!a.noguard) guard_all += std::max(0LL, guard);
+            if (a.noguard) CHECK_EQ(guard, 0LL);
+        }
         if (a.p23) CHECK(bg_n > 0);
         if (a.r9) CHECK(held >= 0);
         CHECK_EQ(differ, 0);
@@ -2933,6 +2947,8 @@ TEST(f75_order_levers_alone_and_together_keep_the_kv_copy) {
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         }
     }
+    fprintf(stderr, "    F81 position-order guard: %lld steps kept whole over the guarded LSP arms\n", guard_all);
+    CHECK(guard_all > 0);   /* steps carrying a piece of a longer prompt reach LSP here (P23s or not) */
     CHECK_EQ(bad, 0);
 }
 
