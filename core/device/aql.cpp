@@ -172,6 +172,11 @@ struct KernelRec {
     /* A chained form (RadKernelChainFn): its name carries "r4dchain". Only such a kernel gets a
      * chain record and may lose its barrier bit; a row's other kernels keep the bit. */
     bool        chained = false;
+    /* Lever IKA (RADIANCE_AQL_IKA=1): the kernel acquires and releases at agent scope ITSELF (libr4d R4D_IKA(): an agent
+     * acquire fence at entry, an agent release fence at every exit), so a played packet may drop the packet processor's
+     * acquire (when no line it reads can be stale in a scalar cache: Ctx::haz_mark) and its release. Set from the list
+     * the kernel's own library exports (r4d_ika_kernels), never guessed from a name alone. */
+    bool        ika = false;
 };
 
 struct ModuleImage {
@@ -524,6 +529,54 @@ struct ResolveClock {
     }
 };
 
+/* ---- lever IKA (DRAFTER track round 50): in-kernel acquire / release
+ *
+ * A dependent packet's agent-scope acquire (the packet processor invalidating every CU's caches) and release cost
+ * 1.2-2.2 us between two dependent kernels on this card (drafter/kit/mes/mesp.cpp: a 200-packet chain, host-timed, tiny
+ * kernel acquire + release agent 3.86 / 4.84 (two modes) -> none / none 2.63 us; 64 x 256 blocks 6.05 / 7.09 -> 4.75). A
+ * kernel that runs LLVM's agent acquire itself at entry (global_inv scope:SCOPE_DEV in each wave: only the CUs it runs
+ * on) and an agent release at every exit (s_wait_storecnt 0) needs neither from the packet, except for the scalar cache,
+ * which LLVM's acquire does not invalidate: the packet keeps its acquire where a line it reads was read and then written
+ * since the last one (the plain rule's set; Ctx::haz_mark). cohbench3 (drafter/kit/mes): 0 stale elements in 300 trials
+ * x 3 sizes with the kernel's own acquire and the packets' acquire + release none, vs 1.2 M - 1.9 G with none and no
+ * kernel acquire. RADIANCE_AQL_IKA=1 at start: a kernel is IKA when the shared object holding its code exports
+ * `const char* const* r4d_ika_kernels(int* n)` naming it (an identifier, matched as the mangled name's <length><name>). */
+bool ika_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_AQL_IKA");
+        const bool v = e && e[0] == '1';
+        if (v) RAD_INFO("aql: lever IKA on (RADIANCE_AQL_IKA=1): kernels their library names as self-acquiring play "
+                        "without the packet's release, and without its acquire where Ctx::haz_mark allows");
+        return v;
+    }();
+    return on;
+}
+
+bool ika_kernel(const Module* m, const std::string& name) {
+    if (!ika_on() || !m || !m->bundle) return false;
+    Dl_info di{};
+    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
+    void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+    if (!h) h = dlopen(nullptr, RTLD_LAZY);
+    if (!h) return false;
+    using ListFn = const char* const* (*)(int*);
+    auto fn = reinterpret_cast<ListFn>(dlsym(h, "r4d_ika_kernels"));
+    Dl_info fi{};
+    /* the list must be the module's own object's, not a dependency's */
+    if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return false;
+    int n = 0;
+    const char* const* v = fn(&n);
+    for (int i = 0; v && i < n; ++i) {
+        if (!v[i] || !*v[i]) continue;
+        const std::string key = std::to_string(std::strlen(v[i])) + v[i];
+        const size_t at = name.find(key);
+        /* <length><name> starts the identifier: the character before it is not a digit */
+        if (at != std::string::npos && (at == 0 || !std::isdigit((unsigned char)name[at - 1]))) return true;
+        if (name == v[i]) return true;   /* an extern "C" kernel: its symbol is its name */
+    }
+    return false;
+}
+
 KernelRec* resolve(Func* fn, int ord) {
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
     const ResolveClock rclk;   /* tp8 loop P31: from here on this is a first launch on the card (or a refused kernel) */
@@ -562,6 +615,7 @@ KernelRec* resolve(Func* fn, int ord) {
     auto k = std::make_unique<KernelRec>();
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
+    k->ika = ika_kernel(m, k->name);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                                    &k->kernarg_size);
@@ -1100,6 +1154,10 @@ struct TapeRec {
     /* A chained kernel (RadKernelChainFn): played from the queue's own argument slot with a chain
      * record, and without the barrier bit behind another chained kernel. */
     uint8_t  chain = 0;
+    /* Lever IKA: the kernel acquires / releases itself (KernelRec::ika, under RADIANCE_AQL_IKA=1), and haz_mark found no
+     * line it reads that a scalar cache could hold stale (tape_set_noacq bit 1): it plays without the packet's acquire. */
+    uint8_t  ika = 0;
+    uint8_t  ikaok = 0;
 };
 
 struct Tape {
@@ -1120,12 +1178,13 @@ inline bool capturing() { return t_tape && t_tape_pause == 0; }
 
 /* A dispatch just written at `p` on `s`, with its argument block `ka`. */
 void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16_t setup,
-                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain) {
+                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool ika = false) {
     Tape* t = t_tape;
     TapeRec r;
     r.kind = kTapeDispatch;
     r.fence = fence;
     r.chain = chain ? 1 : 0;
+    r.ika = ika ? 1 : 0;
     r.s = s;
     r.pkt = *p;
     r.pkt.header = 0;
@@ -1263,7 +1322,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain);
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
     const bool aside = (fence & kFenceAside) != 0;
@@ -1402,9 +1461,14 @@ struct PlayRun {
         /* The rule is read only for a marked packet: only a pass recorded under it has marks, and a
          * change of the switch re-records (the epoch), so the stock replay costs one constant test. */
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_none_() || (r.noacq && !r.chain && !foreign && aql_acq_mode() == 1)))
+            (aql_acq_none_() || (r.noacq && !r.chain && !foreign && aql_acq_mode() == 1) ||
+             (r.ika && r.ikaok && !r.chain && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
+        /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent
+         * release adds nothing; a packet a record or a ride completes keeps it (its signal orders other queues / the
+         * host after it). */
+        if (r.ika && rel == HSA_FENCE_SCOPE_AGENT && !done.handle) rel = HSA_FENCE_SCOPE_NONE;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
          * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
@@ -2229,11 +2293,20 @@ int a_tape_set_overlap(RadTape rt, int i, int on) {
     return RAD_OK;
 }
 
+int a_tape_rec_ika(RadTape rt, int i) {
+    const Tape* t = tape_of(rt);
+    if (!t || i < 0 || i >= (int)t->rec.size()) return RAD_E_INVAL;
+    const TapeRec& r = t->rec[(size_t)i];
+    return r.kind == kTapeDispatch && r.ika ? 1 : 0;
+}
+
 int a_tape_set_noacq(RadTape rt, int i, int on) {
     Tape* t = tape_of(rt);
     if (!t || i < 0 || i >= (int)t->rec.size() || t->rec[(size_t)i].kind != kTapeDispatch)
         return RAD_E_INVAL;
-    t->rec[(size_t)i].noacq = on ? 1 : 0;
+    /* bit 0: the acquire rule's mark (any kernel); bit 1: lever IKA's (only a self-acquiring kernel, TapeRec::ika) */
+    t->rec[(size_t)i].noacq = (on & 1) ? 1 : 0;
+    t->rec[(size_t)i].ikaok = (on & 2) ? 1 : 0;
     return RAD_OK;
 }
 
@@ -4478,6 +4551,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.code_runs = a_code_runs;
         g_aql.tape_set_overlap = a_tape_set_overlap;
         g_aql.tape_set_noacq = a_tape_set_noacq;
+        g_aql.tape_rec_ika = a_tape_rec_ika;
         g_aql.tape_destroy = a_tape_destroy;
         g_aql.stream_gate = a_stream_gate;
         g_aql.gate_open = a_gate_open;
