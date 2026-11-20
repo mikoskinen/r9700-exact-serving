@@ -288,7 +288,7 @@ public:
      * or always, under -1. */
     bool lend_wanted() const {
         if (lend_sw_ < 0) return true;
-        return adapt_ && depth0_ && lend_hold() > 0 && zero_ && zero_held_ >= lend_hold() &&
+        return adapt_ && depth0_ && lend_hold() > 0 && zero_ && zero_held_ >= lend_hold() && !merged_zero_ &&   /* tp8 MERGE */
                (probe_interval() >= kLendInterval || occ_on_);   /* lever Z0-O: occupancy's 0 runs no probe */
     }
     /* Plain steps measured while lent, for tests and the report. */
@@ -370,6 +370,15 @@ public:
     int64_t dcap_cycles() const { return n_dcap_; }
     int64_t dcap_moves() const { return n_dcap_moves_; }
     int64_t dcap_held_cycles() const { return n_dhold_; }   /* D20: cycles the hold set the depth */
+    /* tp8 MERGE (fn4 pp_merge; core/sched/lanes.h): while this controller's lane is the MERGED decode lane, the occupancy rule
+     * acts at once -- a cycle of >= occ() decode rows runs depth 0 without waiting occ_k() cycles (the merged lane's width is
+     * known: 32 rows at c32 are one undrafted pass) -- and a cycle under occ() rows chooses as today (c16's 16 rows draft).
+     * Such a forced cycle counts toward neither occupancy's runs nor the drafter slab's lend (lend_wanted false), so the
+     * split lanes draft at once and nothing is lent for a merge. Exact: it moves only what a step verifies. */
+    void    set_merged(bool on) { merged_ = on; }
+    bool    merged() const { return merged_; }
+    bool    merged_zero() const { return merged_zero_; }
+    int64_t merged_zero_cycles() const { return n_mzero_; }
     /* Whether occupancy holds depth 0 now; the cycles it held, and its moves (on and off). For tests and the report. */
     bool    occ_held() const { return occ_on_; }
     int64_t occ_cycles() const { return n_occ_; }
@@ -522,6 +531,9 @@ private:
     bool    occ_on_ = false;
     int32_t occ_hi_ = 0, occ_lo_ = 0;
     int64_t n_occ_ = 0, n_occ_moves_ = 0;
+    /* tp8 MERGE (set_merged): the lane is the merged one; this cycle's depth 0 is the merged rule's; its cycles */
+    bool    merged_ = false, merged_zero_ = false;
+    int64_t n_mzero_ = 0;
     /* SPB (dcap()): the switch, its row threshold, the counters. */
     int32_t dcap_d_ = 0;
     int32_t dcap_n_ = kDcapN;

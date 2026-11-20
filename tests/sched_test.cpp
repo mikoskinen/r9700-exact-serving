@@ -3548,6 +3548,11 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     REQUIRE(i == (int)fn4::kPpLeadSeg);
     CHECK_EQ(i, 94);
     CHECK_EQ(i + 1, (int)fn4::kPpSegSet);   /* tp8 loop D33: pp_seg_set after it */
+    /* tp8 MERGE (ds41-pp-merge merged on the dev line, round 34): pp_merge 98 / pp_merge_ms 99 after pp_tband 97, the leader's lanes'
+     * (sched_switch, as pp_bg_room) */
+    CHECK_EQ(fn4::switch_index("pp_merge"), 98);
+    CHECK_EQ(fn4::switch_index("pp_merge_ms"), 99);
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -3592,7 +3597,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 2, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it */
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3610,7 +3615,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3701,7 +3706,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97) */
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
@@ -11724,7 +11729,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12696,7 +12701,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
@@ -15691,4 +15696,166 @@ TEST(lanes_a_lent_chunk_carries_its_home_requests_psk_plan) {
         }
     }
 }
+
+/* tp8 MERGE (fn4 pp_merge; LaneSet::merge_into / split_from): lane membership in process. 4 lanes with 2 BG lanes (BEST's form), four
+ * decoders a decode lane. Merged, lane 0's every step carries all eight -- each on its own card, no card twice -- lane 1 holds none
+ * and is parked, and pick() names lane 0 for a request submitted meanwhile, which lane 0 admits beside them. Split, the live
+ * requests go back 5 / 4 over the decode lanes, every request in exactly one lane's step a round, cards distinct over both lanes.
+ * Every request's output is one token a step that produced one, through both moves (a move changes only the lane). */
+TEST(lanes_merge_moves_every_decoder_into_one_lane_and_splits_them_back) {
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); }
+    } env;
+    setenv("RADIANCE_PP_BG_LANE", "2", 1);
+    Lanes L;
+    L.seqs = 12;
+    L.max_tok = 256;
+    REQUIRE_EQ(L.start(4), RAD_OK);
+    CHECK_EQ(L.set.decode_n(), 2);
+    CHECK_EQ(L.set.merged_to(), -1);
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < 8; ++i) ids.push_back(L.submit(i % 2, 10, 400, 2000 + 100 * i));
+    std::map<uint64_t, int> produced;
+    int dup_cards = 0, twice = 0;
+    /* one round: the named decode lanes plan (each other's planners, then the BG lanes), then the BG lanes (a newcomer lent whole
+     * runs there), then every planned lane commits in that order */
+    auto round = [&](const std::vector<int>& run, std::vector<size_t>* dec) {
+        std::vector<int32_t> cards;
+        std::map<uint64_t, int> seen;
+        std::vector<int> planned, all = run;
+        all.push_back(2);
+        all.push_back(3);
+        for (int l : all) {
+            std::vector<int> order;
+            for (int m : all) if (m != l) order.push_back(m);
+            if (!L.plan(l, order)) continue;
+            planned.push_back(l);
+            size_t n = 0;
+            for (const StepEntry& e : L.at(l).plan().e) {
+                if (e.produces_token) ++produced[e.seq];
+                if (e.home >= 0) continue;
+                cards.push_back(e.card);
+                if (++seen[e.seq] > 1) ++twice;
+                if (!e.is_prefill) ++n;
+            }
+            if (dec && !L.set.is_bg(l)) dec->push_back(n);
+        }
+        std::sort(cards.begin(), cards.end());
+        for (size_t i = 1; i < cards.size(); ++i) dup_cards += cards[i] == cards[i - 1] && cards[i] >= 0;
+        for (int l : planned) CHECK_OK(L.commit(l, 7));
+    };
+    for (int r = 0; r < 4; ++r) round({ 0, 1 }, nullptr);
+    /* merge: every movable decoder of lane 1 and its free cards into lane 0 */
+    const LaneSet::MoveCounts m = L.set.merge_into(0);
+    CHECK_EQ(m.moved, (int64_t)4);
+    CHECK_EQ(m.lent + m.ctx + m.other + m.busy, (int64_t)0);
+    CHECK(m.cards > 0);
+    CHECK_EQ(L.set.merged_to(), 0);
+    CHECK(L.set.parked(1));
+    CHECK(!L.set.parked(0));
+    CHECK(!L.set.parked(2));
+    CHECK_EQ(L.set.parked_live(), (int64_t)0);
+    for (uint64_t id : ids) {
+        CHECK(L.req(0, id) != nullptr);
+        CHECK(L.at(1).find(id) == nullptr);
+        CHECK(L.set.owner(id) == &L.at(0));
+    }
+    for (int q = 0; q < 6; ++q) CHECK_EQ(L.set.pick(), 0);
+    std::vector<size_t> dec;
+    for (int r = 0; r < 5; ++r) round({ 0 }, &dec);
+    for (size_t n : dec) CHECK_EQ(n, (size_t)8);   /* one lane of eight decoders */
+    /* a newcomer while merged: lane 0 by pick(), admitted beside the eight */
+    const uint64_t nc = L.submit(L.set.pick(), 10, 30, 9000);
+    REQUIRE(nc != 0);
+    ids.push_back(nc);
+    dec.clear();
+    for (int r = 0; r < 4; ++r) round({ 0 }, &dec);
+    CHECK(L.req(0, nc) != nullptr && !L.req(0, nc)->output.empty());
+    CHECK_EQ(dec.back(), (size_t)9);
+    /* split: 9 live -> 5 stay, 4 to lane 1 (every other one in lane 0's running order), cards to an even share */
+    const LaneSet::MoveCounts s = L.set.split_from(0);
+    CHECK_EQ(s.moved, (int64_t)4);
+    CHECK_EQ(L.set.merged_to(), -1);
+    CHECK(!L.set.parked(1));
+    int in0 = 0, in1 = 0;
+    for (uint64_t id : ids) {
+        const bool a = L.at(0).find(id) != nullptr, b = L.at(1).find(id) != nullptr;
+        CHECK(a != b);
+        in0 += a;
+        in1 += b;
+    }
+    CHECK_EQ(in0, 5);
+    CHECK_EQ(in1, 4);
+    dec.clear();
+    for (int r = 0; r < 5; ++r) round({ 0, 1 }, &dec);
+    for (size_t i = 0; i < dec.size(); ++i) CHECK_EQ(dec[i], (size_t)(i % 2 == 0 ? 5 : 4));
+    CHECK_EQ(dup_cards, 0);
+    CHECK_EQ(twice, 0);
+    /* every request's output: one token a producing step it ran in, whichever lane ran it */
+    for (uint64_t id : ids) {
+        const Request* r = L.set.owner(id) ? L.set.owner(id)->find(id) : nullptr;
+        REQUIRE(r != nullptr);
+        CHECK_EQ((int)r->output.size(), produced[id]);
+        CHECK(r->n_computed == (int64_t)r->prompt.size() + (int64_t)r->output.size() - 1);
+    }
+    /* merged again with lane 0 and lane 1 both holding requests, then split: the same 5 / 4 */
+    CHECK_EQ(L.set.merge_into(0).moved, (int64_t)4);
+    round({ 0 }, nullptr);
+    CHECK_EQ(L.set.split_from(0).moved, (int64_t)4);
+    round({ 0, 1 }, nullptr);
+    CHECK_EQ(dup_cards, 0);
+    CHECK_EQ(twice, 0);
+    fprintf(stderr, "    merged 8 decoders into lane 0 (%lld free cards moved), 9 split 5 / 4 (%lld free cards back)\n",
+            (long long)m.cards, (long long)s.cards);
+}
+
+/* tp8 MERGE: the merged lane's occupancy rule acts at once. A controller drafting at 16 rows under draft_occ 17 (occupancy only,
+ * draft_depth0 3) runs depth 0 at its FIRST merged cycle of 32 rows (not after draft_occ_k cycles), holds it while merged with no
+ * occupancy run counted and no slab lend wanted, drafts at 16 merged rows (c16's merged lane), and drafts again at its first
+ * cycle after the split. */
+TEST(merged_lane_runs_depth_zero_at_once_from_draft_occ_rows_and_lends_nothing) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = 5;
+    p.adapt = true;
+    p.depth0 = true;
+    p.depth0_occ = true;
+    p.lend = 1;
+    CHECK_OK(c.configure(p));
+    DraftAdapt u[32];
+    DraftAdapt* f[32];
+    for (int i = 0; i < 32; ++i) { u[i] = estimate(c, 0.9, 0.9); f[i] = &u[i]; }
+    c.set_occ(17);
+    CHECK(c.depth0_occ_only());
+    for (int t = 0; t < 40; ++t) { (void)c.plan_step(f, 16, 16); CHECK(c.head_runs()); }
+    DraftController never = c;   /* the same controller, never merged */
+    c.set_merged(true);
+    CHECK(c.merged());
+    (void)c.plan_step(f, 32, 32);
+    CHECK(!c.head_runs());
+    CHECK(c.merged_zero());
+    CHECK_EQ(c.step_depth(), 0);
+    (void)never.plan_step(f, 32, 32);
+    CHECK(never.head_runs());   /* unmerged: draft_occ_k cycles first */
+    int want = 0;
+    for (int t = 0; t < 100; ++t) {
+        (void)c.plan_step(f, 32, 32);
+        CHECK(!c.head_runs());
+        if (!c.head_runs()) c.step_time(0, 32, 20.0);
+        want += c.lend_wanted() ? 1 : 0;
+    }
+    CHECK_EQ(want, 0);
+    CHECK_EQ(c.occ_cycles(), (int64_t)0);
+    CHECK_EQ(c.merged_zero_cycles(), (int64_t)101);
+    (void)c.plan_step(f, 16, 16);   /* c16's merged lane: 16 rows draft */
+    CHECK(c.head_runs());
+    CHECK(!c.merged_zero());
+    (void)c.plan_step(f, 32, 32);
+    CHECK(!c.head_runs());
+    c.set_merged(false);
+    (void)c.plan_step(f, 16, 16);   /* split: the lanes of 16 draft at once */
+    CHECK(c.head_runs());
+    CHECK(!c.merged_zero());
+}
+
 

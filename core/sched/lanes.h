@@ -200,7 +200,13 @@ public:
      * left out of its home's step -- the step goes out with its decode rows alone -- and planned again at the home's next step,
      * when a BG lane may take it whole; after N ms of holding it runs at home as today's MIXED step. A held newcomer has no
      * prefix restore planned (those stay home, kBgRestore). 0 (unset): off, today's MIXED step at once. */
-    int64_t bg_hold_ms() const { return bg_lane() >= 0 ? bg_hold_ms_ : 0; }
+    int64_t bg_hold_ms() const {
+        if (bg_lane() < 0) return 0;
+        /* tp8 MERGE (pp_merge bit 16 with the merge on): D11's hold at merge_hold_ms (RADIANCE_PP_MERGE_HOLD_MS) -- a newcomer the
+         * BG lanes have no room for waits for them (the lanes merge for the BG work in flight) instead of a MIXED step */
+        return bg_hold_ms_ > 0 ? bg_hold_ms_ : merge_hold_ms_;
+    }
+    void set_merge_hold_ms(int64_t ms) { merge_hold_ms_ = ms > 0 ? ms : 0; }
     void set_bg_hold_ms(int64_t ms) { bg_hold_ms_ = ms > 0 ? ms : 0; }
     /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N, 256 .. 65536 rows; with BG lanes): a BG lane's inbox -- and so its step -- may hold up to
      * N rows of lent newcomers (capped at --max-num-batched-tokens) instead of the shared budget (min(MNBT, ChunkGeometry::
@@ -259,6 +265,39 @@ public:
         hold_us_ += us;
         if (us > hold_max_us_) hold_max_us_ = us;
     }
+    /* ---- tp8 MERGE (fn4 pp_merge; Engine::step_loop_lanes): lane membership in process. The decode lanes (all but the BG lanes)
+     * run as ONE lane `to` while merged: the others are parked (never planned, never a planner), pick() names `to`, and their
+     * requests and free cards move to `to`. A MOVE is a request's SchedReq leaving one lane's tables for another's (a new slot,
+     * the same card, KV, drafter range, proposal and estimates), under the lock, between two IDLE lanes (no step open or issued
+     * ahead in either). Movable: in running_ / waiting_, in no step (no lent piece in flight or in an inbox, no held snapshot),
+     * not pending free or reap, no kept context rows (the depth-0 skip's rows live in their lane's ring region). Exact: a move
+     * changes only which lane's steps carry the sequence -- composition, as lanes themselves do. */
+    struct MoveCounts {
+        int64_t moved = 0, cards = 0;   /* requests moved, free cards moved */
+        int64_t lent = 0, ctx = 0, other = 0, busy = 0;   /* left where they were: a lent piece, kept rows, a step / free; a busy lane */
+    };
+    /* every movable request and free card of the decode lanes other than `to` into `to`; `to`'s drafter takes the merged rule */
+    MoveCounts merge_into(int to);
+    /* `from`'s movable requests over the decode lanes (live requests balanced, every other one in its running order first),
+     * free cards so every decode lane holds max_seqs / decode lanes (held + free); `from`'s drafter back to its own rule */
+    MoveCounts split_from(int from);
+    int  merged_to() const { return merged_to_.load(std::memory_order_acquire); }
+    bool parked(int l) const {
+        const int m = merged_to();
+        return m >= 0 && l != m && l >= 0 && l < (int)lanes_.size() && !is_bg(l);
+    }
+    /* requests a parked lane still holds (any state), read under the lock: 0 = nothing left to move */
+    int64_t parked_live() const;
+    /* lane l's live requests (running + waiting), under the lock */
+    int64_t live(int l) const;
+    /* tp8 MERGE bit 32 (the relay lane): while merged a PARKED decode lane with no request of its own takes whole newcomers as a
+     * BG lane does (lane_split_bg names it after the idle BG lanes), so a third newcomer's head can start beside the other two's
+     * parts instead of waiting for a BG lane's commit; never a cold prompt's chunk */
+    void set_relay(bool on) { relay_ = on; }
+    bool relay_bg(int l) const { return relay_ && parked(l); }
+    /* newcomers held out of their decode lane's steps for the BG lanes now (D11's hold: SchedReq::bg_hold_us), read under the lock */
+    int64_t held_now() const;
+    int  decode_n() const { return (int)lanes_.size() - bg_n(); }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -396,6 +435,12 @@ private:
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;
     int64_t why_[kWhyN] = {};
     std::string broken_;
+    std::atomic<int> merged_to_{ -1 };      /* tp8 MERGE: the merged decode lane, -1 split */
+    int64_t merge_hold_ms_ = 0;             /* tp8 MERGE bit 16: D11's hold while merged (bg_hold_ms) */
+    bool    relay_ = false;                 /* tp8 MERGE bit 32: parked lanes take whole newcomers (relay_bg) */
+    /* tp8 MERGE: why `q` (in `s`) may not move now (MoveCounts' fields 2..4 as 0 / 1 / 2), -1 movable; and the move itself */
+    int  unmovable_locked(const Scheduler& s, const SchedReq& q) const;
+    void move_locked(Scheduler& src, int32_t slot, Scheduler& dst);
 };
 
 }  /* namespace rad */

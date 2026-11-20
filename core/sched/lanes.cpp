@@ -111,6 +111,9 @@ int LaneSet::pick() const {
     /* tp8 dev M8: the BG lane takes no request of its own */
     const size_t nl = lanes_.size() - (size_t)bg_n();
     if (nl <= 1) return 0;
+    /* tp8 MERGE: while merged every new request goes to the merged lane (one that lands in a parked lane between this pick and
+     * its add is moved at the merged lane's next plan) */
+    if (const int m = merged_to(); m >= 0 && (size_t)m < nl) return m;
     std::vector<Load> ld(nl);
     for (size_t l = 0; l < nl; ++l) {
         const Scheduler& s = *lanes_[l];
@@ -144,6 +147,170 @@ Scheduler* LaneSet::owner(uint64_t id) const {
     for (Scheduler* s : lanes_)
         if (s->by_id_.count(id)) return s;
     return nullptr;
+}
+
+/* ================================================================== tp8 MERGE (lanes.h) */
+int LaneSet::unmovable_locked(const Scheduler& s, const SchedReq& q) const {
+    if (!q.req || q.pending_free || q.reap_pending) return 2;
+    if (q.lent > 0 || q.lent_pending > 0 || q.lent_hold || q.lent_next >= 0) return 0;   /* a piece of it runs or waits elsewhere */
+    if (q.entry >= 0 || q.entry_next >= 0) return 2;                                   /* in a step of its lane */
+    if (!q.ctx_kept.empty()) return 1;                                                 /* kept rows in its lane's ring region */
+    (void)s;
+    return -1;
+}
+
+void LaneSet::move_locked(Scheduler& src, int32_t slot, Scheduler& dst) {
+    std::unique_ptr<SchedReq> up = std::move(src.reqs_[(size_t)slot]);
+    src.reqs_[(size_t)slot] = std::make_unique<SchedReq>();   /* the source slot as a released one (add_locked reuses it) */
+    const uint64_t id = up->req->id;
+    const bool run = std::find(src.running_.begin(), src.running_.end(), slot) != src.running_.end();
+    Scheduler::queue_erase(src.running_, slot);
+    Scheduler::queue_erase(src.waiting_, slot);
+    src.by_id_.erase(id);
+    src.free_slots_.push_back(slot);
+    int32_t ns;
+    if (!dst.free_slots_.empty()) { ns = dst.free_slots_.back(); dst.free_slots_.pop_back(); }
+    else { ns = (int32_t)dst.reqs_.size(); dst.reqs_.emplace_back(); }
+    up->slot = ns;
+    dst.reqs_[(size_t)ns] = std::move(up);
+    dst.by_id_[id] = ns;
+    dst.queue_insert(run ? dst.running_ : dst.waiting_, ns);
+}
+
+LaneSet::MoveCounts LaneSet::merge_into(int to) {
+    MoveCounts mc;
+    if (lanes_.size() <= 1 || to < 0 || to >= decode_n()) return mc;
+    std::lock_guard<std::mutex> lk(*mu_);
+    Scheduler& d = *lanes_[(size_t)to];
+    merged_to_.store(to, std::memory_order_release);
+    d.draft_.set_merged(true);
+    if (d.step_open_ || d.next_open_) { ++mc.busy; return mc; }
+    std::vector<int32_t> slots;
+    for (int l = 0; l < decode_n(); ++l) {
+        if (l == to) continue;
+        Scheduler& s = *lanes_[(size_t)l];
+        s.draft_.set_merged(false);
+        if (s.running_.empty() && s.waiting_.empty() && s.free_cards_.empty()) continue;
+        if (s.step_open_ || s.next_open_) { ++mc.busy; continue; }
+        slots.assign(s.running_.begin(), s.running_.end());
+        slots.insert(slots.end(), s.waiting_.begin(), s.waiting_.end());
+        for (int32_t slot : slots) {
+            const SchedReq* q = slot >= 0 && (size_t)slot < s.reqs_.size() ? s.reqs_[(size_t)slot].get() : nullptr;
+            const int w = q ? unmovable_locked(s, *q) : 2;
+            if (w == 0) { ++mc.lent; continue; }
+            if (w == 1) { ++mc.ctx; continue; }
+            if (w >= 2) { ++mc.other; continue; }
+            move_locked(s, slot, d);
+            ++mc.moved;
+        }
+        for (int32_t c : s.free_cards_) d.free_cards_.push_back(c);
+        mc.cards += (int64_t)s.free_cards_.size();
+        s.free_cards_.clear();
+    }
+    return mc;
+}
+
+LaneSet::MoveCounts LaneSet::split_from(int from) {
+    MoveCounts mc;
+    if (lanes_.size() <= 1 || from < 0 || from >= decode_n()) return mc;
+    std::lock_guard<std::mutex> lk(*mu_);
+    merged_to_.store(-1, std::memory_order_release);
+    const int nd = decode_n();
+    for (int l = 0; l < nd; ++l) lanes_[(size_t)l]->draft_.set_merged(false);
+    Scheduler& f = *lanes_[(size_t)from];
+    if (nd <= 1) return mc;
+    if (f.step_open_ || f.next_open_) { ++mc.busy; return mc; }
+    for (int l = 0; l < nd; ++l)
+        if (l != from && (lanes_[(size_t)l]->step_open_ || lanes_[(size_t)l]->next_open_)) { ++mc.busy; return mc; }
+    /* live requests a lane, the target counts (the remainder to the lowest lanes) */
+    std::vector<int64_t> live((size_t)nd), want((size_t)nd);
+    int64_t total = 0;
+    for (int l = 0; l < nd; ++l) {
+        live[(size_t)l] = (int64_t)(lanes_[(size_t)l]->running_.size() + lanes_[(size_t)l]->waiting_.size());
+        total += live[(size_t)l];
+    }
+    for (int l = 0; l < nd; ++l) want[(size_t)l] = total / nd + (l < total % nd ? 1 : 0);
+    auto neediest = [&]() {
+        int best = -1;
+        int64_t gap = 0;
+        for (int l = 0; l < nd; ++l)
+            if (l != from && want[(size_t)l] - live[(size_t)l] > gap) { gap = want[(size_t)l] - live[(size_t)l]; best = l; }
+        return best;
+    };
+    std::vector<int32_t> slots(f.running_.begin(), f.running_.end());
+    slots.insert(slots.end(), f.waiting_.begin(), f.waiting_.end());
+    /* pass 0: every other request in the running order (old and new sequences in both lanes); pass 1: what still lacks */
+    for (int pass = 0; pass < 2; ++pass)
+        for (size_t k = 0; k < slots.size(); ++k) {
+            if (pass == 0 && (k % (size_t)nd) == 0) continue;
+            const int32_t slot = slots[k];
+            if (slot < 0 || (size_t)slot >= f.reqs_.size() || !f.reqs_[(size_t)slot] || !f.reqs_[(size_t)slot]->req) continue;
+            if (f.by_id_.count(f.reqs_[(size_t)slot]->req->id) == 0) continue;   /* moved in pass 0 (its struct was replaced) */
+            const int to = neediest();
+            if (to < 0) break;
+            const int w = unmovable_locked(f, *f.reqs_[(size_t)slot]);
+            if (w >= 0) {
+                if (pass == 1) ++(w == 0 ? mc.lent : w == 1 ? mc.ctx : mc.other);
+                continue;
+            }
+            move_locked(f, slot, *lanes_[(size_t)to]);
+            --live[(size_t)from];
+            ++live[(size_t)to];
+            ++mc.moved;
+        }
+    /* cards: every decode lane's capacity (held + free) back to an even share of all the decode lanes hold */
+    std::vector<int64_t> cap((size_t)nd);
+    int64_t cards = 0;
+    for (int l = 0; l < nd; ++l) {
+        const Scheduler& s = *lanes_[(size_t)l];
+        int64_t held = 0;
+        for (const auto& up : s.reqs_)
+            if (up && up->req && up->card >= 0) ++held;
+        cap[(size_t)l] = held + (int64_t)s.free_cards_.size();
+        cards += cap[(size_t)l];
+    }
+    for (int l = 0; l < nd; ++l) {
+        if (l == from) continue;
+        const int64_t share = cards / nd + (l < cards % nd ? 1 : 0);
+        Scheduler& s = *lanes_[(size_t)l];
+        while (cap[(size_t)l] < share && !f.free_cards_.empty()) {
+            s.free_cards_.push_back(f.free_cards_.back());
+            f.free_cards_.pop_back();
+            ++cap[(size_t)l];
+            --cap[(size_t)from];
+            ++mc.cards;
+        }
+    }
+    return mc;
+}
+
+int64_t LaneSet::parked_live() const {
+    if (merged_to() < 0) return 0;
+    std::lock_guard<std::mutex> lk(*mu_);
+    int64_t n = 0;
+    for (int l = 0; l < decode_n(); ++l)
+        if (parked(l)) n += (int64_t)(lanes_[(size_t)l]->running_.size() + lanes_[(size_t)l]->waiting_.size());
+    return n;
+}
+
+int64_t LaneSet::live(int l) const {
+    if (l < 0 || l >= (int)lanes_.size()) return 0;
+    std::lock_guard<std::mutex> lk(*mu_);
+    return (int64_t)(lanes_[(size_t)l]->running_.size() + lanes_[(size_t)l]->waiting_.size());
+}
+
+int64_t LaneSet::held_now() const {
+    if (lanes_.size() <= 1 || bg_lane() < 0) return 0;
+    std::lock_guard<std::mutex> lk(*mu_);
+    int64_t n = 0;
+    for (int l = 0; l < decode_n(); ++l) {
+        const Scheduler& s = *lanes_[(size_t)l];
+        for (int32_t slot : s.running_) {
+            const SchedReq* q = slot >= 0 && (size_t)slot < s.reqs_.size() ? s.reqs_[(size_t)slot].get() : nullptr;
+            if (q && q->req && q->bg_hold_us > 0) ++n;
+        }
+    }
+    return n;
 }
 
 bool LaneSet::prefill_pending(int l) const {
@@ -342,7 +509,7 @@ void Scheduler::lane_take_inbox() {
         got.resize(keep);
     }
     /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
-    if (!got.empty() && lanes_->is_bg(lane_)) {
+    if (!got.empty() && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) {
         int64_t newc = 0, rows = 0;
         for (const LaneSet::Piece& p : got) {
             newc += p.e.produces_token ? 1 : 0;
@@ -447,7 +614,7 @@ void Scheduler::lane_split_own() {
         }
         /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1): a newcomer's whole rest beside decode rows, lent whole to the BG lane (an inner
          * tail snapshot -- lever TI -- goes with it and commits there, as a lent cold chunk's does) */
-        if (bg && !lanes_->is_bg(lane_) && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
+        if (bg && !lanes_->is_bg(lane_) && !lanes_->relay_bg(lane_) && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
             e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->req &&
             !e.cr_replay && e.n_spec == 0 && (e.ckpt_slot < 0 || e.ckpt_tok >= 0)) {
             int bwhy = -1;
@@ -509,7 +676,7 @@ void Scheduler::lane_split_own() {
         size_t j = 0;
         for (; j < order.size() && p < (dpiece ? s.bi_end : target); ++j) {
             const int to = order[j];
-            if (lanes_->is_bg(to)) continue;   /* tp8 dev M8: a cold prompt's chunks keep to the decode lanes */
+            if (lanes_->is_bg(to) || lanes_->relay_bg(to)) continue;   /* tp8 dev M8: a cold prompt's chunks keep to the decode lanes (tp8 MERGE: and off a relay lane) */
             int64_t ck = -1;
             const int64_t n = dpiece ? lane_d_piece(s, p, &ck) : lane_alone_chunk(s, r, target, p, &ck);
             if (n <= 0) break;
@@ -618,7 +785,7 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     /* the BG lanes in this plan's planning order (the order they take their inboxes in) */
     std::vector<int> bgo;
     for (int l : order)
-        if (lanes_->is_bg(l)) bgo.push_back(l);
+        if (lanes_->is_bg(l) || lanes_->relay_bg(l)) bgo.push_back(l);   /* tp8 MERGE bit 32: a relay lane after the idle BG lanes */
     /* tp8 dev M8 (RADIANCE_PP_BG_SPLIT=1, two BG lanes or more): the entry cut at the 512-grid point nearest its middle (>= 128
      * rows a side: M5b's cut, answer-neutral by the cards' lq21 lid576), the first piece to the first BG lane in the order with
      * room, the rest (its first token, the snapshot when it lies there) to a later one: piece 1's leader tail runs beside piece
