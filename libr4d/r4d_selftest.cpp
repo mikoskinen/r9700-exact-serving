@@ -25124,20 +25124,22 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     auto maxi = [](const std::vector<int>& v) { int m = 0; for (int x : v) m = std::max(m, x); return m; };
     auto pct = [](std::vector<double> v, double q) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[(size_t)std::min<double>((double)v.size() - 1, q * (double)v.size())]; };
     static const char* const kPhA[5] = { "prologue + norm", "scale", "dots", "partials + fence + atomic", "finish" };
-    static const char* const kPhB[4] = { "operands + d stage", "up product + mix + x + fence", "atomic", "quantise" };
+    /* B3: word 4 = wave 0's up product done (after word 1, before word 2) */
+    static const char* const kPhB[5] = { "operands + d stage", "up product (wave 0)", "mix + x + fence", "atomic", "quantise" };
+    static const int kB3From[5] = { 0, 1, 4, 2, 3 }, kB3To[5] = { 1, 4, 2, 3, 5 };
     for (int g = 0; g < 2; ++g) {
         if (rec[g].empty()) { std::printf("HCTL M=%lld %s: no records\n", (long long)M, g ? "B3" : "A'"); continue; }
         std::vector<double> lat;
         for (const Rec& e : rec[g]) lat.push_back((double)(e.w[5] - e.w[0]) / 100.0);
         const double lm = mean(lat);
         std::string ph;
-        const int np = g ? 4 : 5;
+        const int np = 5;
         for (int k = 0; k < np; ++k) {
-            /* phase k: from stamp k to stamp k + 1; the last phase ends at word 5; B3's word 4 is unused */
+            /* phase k: A' from stamp k to stamp k + 1 (the last ends at word 5); B3 by kB3From / kB3To */
             std::vector<double> dl, dl_last, dl_rest;
             for (const Rec& e : rec[g]) {
-                const unsigned long long from = e.w[k];
-                const unsigned long long to = (g == 1 && k == 3) ? e.w[5] : (g == 0 && k == 4) ? e.w[5] : e.w[k + 1];
+                const unsigned long long from = g ? e.w[kB3From[k]] : e.w[k];
+                const unsigned long long to = g ? e.w[kB3To[k]] : (k == 4 ? e.w[5] : e.w[k + 1]);
                 if (!from || !to || to < from) continue;
                 const double d = (double)(to - from) / 100.0;
                 dl.push_back(d);

@@ -2236,6 +2236,7 @@ __device__ __forceinline__ void hc_up_w_body(
 #pragma unroll
         for (int e = 0; e < 8; ++e) U[e] = fmaf(D[e], s_usc[wave][8 * hh + e][qq], U[e]);
     }
+    hc_tl_put<TL>(1, 4);   /* Q17 timeline: wave 0's up product done (word 4, B3 only) */
 
     /* ---- sigmoid, narrowed; the mix in the lane (D row 8hh + e = channel 2hh + e/4, stream e%4) */
     const float inv_hc = 1.0f / (float)hc;
