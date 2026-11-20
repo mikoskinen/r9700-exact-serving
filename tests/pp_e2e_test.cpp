@@ -3356,14 +3356,17 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
     /* sw: 13 = POST pp_tband 1 before the first set and 3 before the second; nocopy = TBAND_COPY unset (3 runs as 1, POST 3 refused) */
     /* tp8 loop D50: tb = the start's RADIANCE_PP_TAIL_BAND (3; 1028 = 4 + 1024 x 1), tv = fn4 pp_tband POSTed before the first set
      * (4 = 3 in every stretch: decode band passes with no BG step in flight) */
+    /* tp8 loop D51: bound = RADIANCE_PP_TAIL_BAND=5 with the follower's load report (RADIANCE_PP_NODE_IDLE=1 + RADIANCE_PP_LOAD_REPORT_MS
+     * on both: the follower reports, the leader reads its own share) -- the band follows the measured bound */
     struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; int sw = -1; bool nocopy = false; const char* tb = "3";
-                 int tv = -1; };
+                 int tv = -1; bool bound = false; };
     long long dec_all = 0, clean_all = 0, low_all = 0;
     int skip_bad = 0;
     for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, true, false, false, 13 },
                          Arm{ 3, 1, false, false, false, -1, true }, Arm{ 3, 1, false, false, true },
                          Arm{ 3, 1, true, false, false, -1, false, "3", 4 }, Arm{ 4, 2, true, true, false, -1, false, "1028" },
-                         Arm{ 3, 1, false, false, false, -1, false, "64516" } }) {
+                         Arm{ 3, 1, false, false, false, -1, false, "64516" },
+                         Arm{ 3, 1, true, false, false, -1, false, "5", -1, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back(std::string("RADIANCE_PP_TAIL_BAND=") + a.tb);
@@ -3375,6 +3378,9 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
                 env.push_back(v);
         if (a.fo2) env.push_back("RADIANCE_PP_FOL_ORDER=2");
         if (a.skip) env.push_back("RADIANCE_PP_TEST_TCOPY_SKIP=1");
+        if (a.bound)
+            for (const char* v : { "RADIANCE_PP_NODE_IDLE=1", "RADIANCE_PP_LOAD_REPORT_MS=5", "RADIANCE_PP_TBAND_BOUND_MS=100" })
+                env.push_back(v);
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
         ex.push_back(std::to_string(a.lanes));
@@ -3463,7 +3469,7 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         }
         CHECK(copy2);
         CHECK(llog.find("the plugin keeps the tail band layers' state on the leader for every sequence") != std::string::npos);
-        CHECK(dec > 0);
+        CHECK(a.bound ? dec >= 0 : dec > 0);   /* tp8 loop D51: under 5 the measured bound may keep every step on the follower */
         dec_all += std::max(0LL, dec);
         CHECK(dclean >= 0);   /* tp8 loop D50: the run line's counters */
         CHECK(dlow >= 0);
@@ -3491,6 +3497,26 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
             CHECK(llog.find("RADIANCE_PP_TAIL_BAND=64516 from the start (N = 63)") != std::string::npos);
             CHECK(dlow > 0);
             CHECK_EQ(dclean, 0LL);
+        }
+        if (a.bound) {   /* tp8 loop D51: the follower's load reports reached the leader and decided decode steps */
+            long long jn = -1, jb = -1, jk = -1, jf = -1;
+            unsigned long long rep = 0;
+            const char* bkey = "two-node pipeline: the tail band by the measured bound over the run (fn4 pp_tband 5, tp8 loop D51): ";
+            if (const size_t at = llog.rfind(bkey); at != std::string::npos) {
+                (void)std::sscanf(llog.c_str() + at + std::strlen(bkey), "%lld decode lanes' steps judged by it, %lld banded (the follower "
+                                  "busier), %lld kept the band layer on the follower (the leader busier), %lld fell back", &jn, &jb, &jk, &jf);
+                if (const size_t r = llog.find("load reports came", at); r != std::string::npos)
+                    if (const size_t b = llog.rfind("; ", r); b != std::string::npos) rep = std::strtoull(llog.c_str() + b + 2, nullptr, 10);
+            }
+            fprintf(stderr, "    BOUND (pp_tband 5): %lld decode steps judged by the measured bound, %lld banded, %lld kept on the follower, "
+                            "%lld fell back to 3's rule; %llu load reports came\n", jn, jb, jk, jf, rep);
+            CHECK(flog.find("RADIANCE_PP_LOAD_REPORT_MS=5 -- this node's card working share") != std::string::npos);
+            CHECK(llog.find("fn4 pp_tband 5 runs a held decode lane's step as a tail band pass while the FOLLOWER's card") != std::string::npos);
+            CHECK(llog.find("RADIANCE_PP_TAIL_BAND=5 from the start") != std::string::npos);
+            CHECK(rep > 0);
+            CHECK(jn > 0);
+            CHECK_EQ(jn, jb + jk);
+            CHECK(jf >= 0);
         }
         clean_all += std::max(0LL, dclean);
         low_all += std::max(0LL, dlow);
