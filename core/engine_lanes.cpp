@@ -69,6 +69,7 @@ namespace rad {
 bool pp_x1_ids();   /* engine_node.cpp: the plugin declared X1's token-ids part (tp8 dev D10 round 2) */
 int pp_band_k();    /* engine_node.cpp: the band the plugin declared (tp8 loop P28) */
 int pp_tail_band_k();   /* engine_node.cpp: the tail band the plugin declared (tp8 loop D39) */
+bool pp_tail_copy();    /* engine_node.cpp: the plugin keeps the tail band layers' state on the leader for every sequence (D46) */
 std::vector<int32_t> pp_segments();   /* engine_node.cpp: the boundaries the plugin declared on this node (tp8 dev M4 / M9) */
 
 /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1; FINDINGS F6 22:37): where a lone cold prompt's time goes on the leader. The
@@ -399,6 +400,19 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
      * lends a BG lane only a newcomer's whole rest beside decode rows) and the later chunks of a prompt whose every chunk so far
      * ran as a tail band pass */
     const int sv0 = fn4::get(fn4::kPpTband), sv = sv0 < 0 ? pp_tband_start_ : sv0;
+    /* tp8 loop D46: 3 = 1's (a BG lane's steps below, as 2's) + a decode lane's step while a BG step is in flight, when every
+     * sequence in it has its band state on the leader (the plugin's copy since its first row); drafts, context, MIXED rows all go */
+    if (sv == 3 && !lanes_.is_bg(lane)) {
+        if (!pp_tband_copy_ || !pp_tband_bg_) return 0;
+        for (const StepEntry& e : p.e) {
+            if (e.ckpt_restore >= 0 || e.cr_replay || (!(e.is_prefill && e.ctx_len == 0) && !pp_tcopy_seq_.count(e.seq))) {
+                if (count) ++pp_tband_dec_skip_;
+                return 0;
+            }
+        }
+        if (count) ++pp_tband_dec_n_;
+        return j;
+    }
     if (!lanes_.is_bg(lane) && sv < 2) return 0;
     static const bool t_cont_only = [] {   /* RADIANCE_PP_TEST_TBAND_CONT_ONLY=1: later chunks only -- the negative control */
         const char* v = std::getenv("RADIANCE_PP_TEST_TBAND_CONT_ONLY");
@@ -426,6 +440,13 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
 /* tp8 loop D39b: after a step's head decided its tail band -- which sequences have run every chunk as a tail band pass */
 void Engine::pp_tband_note(int lane, int tband) {
     if (!pp_tband_on_) return;
+    if (pp_tband_copy_) {   /* tp8 loop D46: the sequences whose band state the leader holds from their first row */
+        for (const StepEntry& e : sched_of(lane).plan().e) {
+            if (e.ckpt_restore >= 0 || e.cr_replay) pp_tcopy_seq_.erase(e.seq);
+            else if (e.is_prefill && e.ctx_len == 0) pp_tcopy_seq_[e.seq] = 1;
+        }
+        if (pp_tcopy_seq_.size() > 65536) pp_tcopy_seq_.clear();   /* never finished: forgotten (they run W(h, t)'s) */
+    }
     for (const StepEntry& e : sched_of(lane).plan().e) {
         if (!e.is_prefill) { pp_tband_seq_.erase(e.seq); continue; }
         if (tband > 0 && (e.ctx_len == 0 || pp_tband_seq_.count(e.seq))) pp_tband_seq_[e.seq] = 1;
@@ -828,10 +849,13 @@ int Engine::step_loop_lanes() {
     }
     /* tp8 loop D39 (RADIANCE_PP_TAIL_BAND=1, the leader): fresh BG steps run as tail band passes of the plugin's tail band */
     pp_tband_on_ = false;
+    pp_tband_copy_ = false;
     pp_tband_lane_.assign((size_t)n_lanes_, 0);
     pp_tband_seq_.clear();
-    if (const char* tv = std::getenv("RADIANCE_PP_TAIL_BAND"); tv && (!std::strcmp(tv, "1") || !std::strcmp(tv, "2"))) {
-        pp_tband_start_ = std::atoi(tv);   /* tp8 loop D39b: 2 = the later chunks of an all-band prompt too */
+    pp_tcopy_seq_.clear();
+    if (const char* tv = std::getenv("RADIANCE_PP_TAIL_BAND");
+        tv && (!std::strcmp(tv, "1") || !std::strcmp(tv, "2") || !std::strcmp(tv, "3"))) {
+        pp_tband_start_ = std::atoi(tv);   /* tp8 loop D39b: 2 = the later chunks of an all-band prompt too; D46: 3 = + decode lanes */
         if (pp_tail_band_k() > 0 && lanes_.bg_lane() >= 0 && !pp_band_on_) {
             pp_tband_on_ = true;
             if (!std::getenv("RADIANCE_PP_BAND")) {   /* P28's row cap, read here when RADIANCE_PP_BAND did not read it */
@@ -843,13 +867,24 @@ int Engine::step_loop_lanes() {
                      "steps of <= %lld rows; tp8 loop D39)%s", pp_tband_start_, cfg_.pp_cut_h, cfg_.pp_cut_t - pp_tail_band_k(),
                      cfg_.pp_cut_t - pp_tail_band_k(), pp_tail_band_k(), (long long)pp_band_max_rows_,
                      pp_tband_start_ == 2 ? "; and so does a later chunk of a prompt whose every chunk so far ran as one (D39b)" : "");
+            /* tp8 loop D46: with the plugin's copy, pp_tband 3 (a decode lane's step while a BG step is in flight) may be set */
+            pp_tband_copy_ = pp_tail_copy();
+            if (pp_tband_copy_)
+                RAD_INFO("two-node pipeline: the plugin keeps the tail band layers' state on the leader for every sequence (its tail "
+                         "copy, tp8 loop D46): fn4 pp_tband 3 runs a decode lane's step as a tail band pass too while a BG step is in "
+                         "flight%s", pp_tband_start_ == 3 ? " -- on from the start (RADIANCE_PP_TAIL_BAND=3)" : "");
+            if (pp_tband_start_ == 3 && !pp_tband_copy_) {
+                RAD_WARN("two-node pipeline: RADIANCE_PP_TAIL_BAND=3 runs as 1: the plugin declared no tail band copy (tp8 loop D46: "
+                         "RADIANCE_DS41_PP_TBAND_COPY=1 / RADIANCE_LLAMA_PP_TBAND_COPY=1 on both nodes)");
+                pp_tband_start_ = 1;
+            }
         } else {
             RAD_WARN("two-node pipeline: RADIANCE_PP_TAIL_BAND=1 is not taken: %s (tp8 loop D39)",
                      pp_tail_band_k() <= 0 ? "the plugin declared no tail band" : pp_band_on_ ? "not beside RADIANCE_PP_BAND=1"
                                                                                           : "it needs RADIANCE_PP_BG_LANE");
         }
     }
-    fn4::tband_register(pp_tband_on_);   /* tp8 loop D39 step 2c: fn4 pp_tband 1 needs it taken */
+    fn4::tband_register(pp_tband_on_ ? (pp_tband_copy_ ? 2 : 1) : 0);   /* tp8 loop D39 step 2c: fn4 pp_tband 1 needs it taken; D46: 3 the copy */
     /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader; default unset = a band step's head whole, as P28 built it): a band
      * step's head in LSP's segments too -- [0, b1) .. [b_last, h + k) at the head boundaries the plugin declared, the band word on
      * every segment, the held frame a band frame -- so the k layers a band pass adds to the leader's BG head no longer hold every
@@ -1243,6 +1278,12 @@ int Engine::step_loop_lanes() {
             }
             if (!b) continue;
             if (t_on) phase_mark(PH_PLAN);
+            if (pp_tband_copy_) {   /* tp8 loop D46: the stretch this step's head sees (D32 / D45's: a BG lane busy or holding a newcomer) */
+                bool bgb = false;
+                for (int q = 0; q < n_lanes_; ++q)
+                    if (lanes_.is_bg(q) && (busy[(size_t)q] || lanes_.inbox_n(q) > 0)) bgb = true;
+                pp_tband_bg_ = bgb;
+            }
             /* tp8 dev M9: a BG lane's step (M9b, RADIANCE_PP_LEAD_SEG_MIXED=1: also a decode lane's MIXED newcomer step that
              * carries and lends no piece): its head's first segment only, or its whole head where no head boundary is declared
              * or another pass holds the boundary ring (then its tail may still run in segments) */
@@ -1637,6 +1678,10 @@ int Engine::step_loop_lanes() {
     if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39); "
                                "%lld fresh BG steps ran W(h, t)'s under fn4 pp_tband 0; %lld of the tail band passes carried a later chunk "
                                "(pp_tband 2, D39b)", (long long)pp_tband_n_, (long long)pp_tband_off_n_, (long long)pp_tband_cont_n_);
+    if (pp_tband_copy_) RAD_INFO("two-node pipeline: %lld decode lanes' steps ran as tail band passes while a BG step was in flight "
+                                 "(pp_tband 3, tp8 loop D46); %lld such steps kept W(h, t)'s for a sequence whose band state the leader "
+                                 "does not hold; %zu sequences held", (long long)pp_tband_dec_n_, (long long)pp_tband_dec_skip_,
+                                 pp_tcopy_seq_.size());
     if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
                               "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
                               (long long)g_band_min_seqs);

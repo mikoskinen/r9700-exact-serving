@@ -74,6 +74,8 @@ struct PpGlobal {
     std::atomic<int>     band_k{ 0 }, band{ 0 };
     /* tp8 loop D39: the tail band the plugin declared (rad_pp_tail_band) and the pass being issued's tail band word */
     std::atomic<int>     tband_k{ 0 }, tband{ 0 };
+    /* tp8 loop D46: the plugin keeps the tail band layers' state on the leader for every sequence (rad_pp_tail_copy) */
+    std::atomic<int>     tcopy{ 0 };
     /* tp8 loop D40: the leader head / tail segment being issued's RAD_PP_LSEG_* bits (0 every other pass) */
     std::atomic<int>     lflags{ 0 };
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
@@ -123,6 +125,7 @@ extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
 extern "C" void rad_pp_x1_ids(int on) { pp_g().x1_ids.store(on ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void rad_pp_band(int k) { pp_g().band_k.store(k > 0 ? k : 0, std::memory_order_relaxed); }
 extern "C" void rad_pp_tail_band(int j) { pp_g().tband_k.store(j > 0 ? j : 0, std::memory_order_relaxed); }
+extern "C" void rad_pp_tail_copy(int on) { pp_g().tcopy.store(on ? 1 : 0, std::memory_order_relaxed); }
 
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
@@ -149,6 +152,8 @@ bool pp_x1_ids() { return pp_g().x1_ids.load(std::memory_order_relaxed) != 0; }
 int pp_band_k() { return pp_g().band_k.load(std::memory_order_relaxed); }
 /* tp8 loop D39: the tail band the plugin declared on this node (rad_pp_tail_band), 0 none */
 int pp_tail_band_k() { return pp_g().tband_k.load(std::memory_order_relaxed); }
+/* tp8 loop D46: the plugin's tail band copy (rad_pp_tail_copy) on this node */
+bool pp_tail_copy() { return pp_g().tcopy.load(std::memory_order_relaxed) != 0; }
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {

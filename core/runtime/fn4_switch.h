@@ -741,8 +741,9 @@ void reserve_register(uint64_t mask);
  * with a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). */
 void lead_seg_register(bool capable);
 /* tp8 loop D39 (pp_tband): the leader's lane loop at its start -- whether it took RADIANCE_PP_TAIL_BAND=1 (the plugin's tail band,
- * a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). */
-void tband_register(bool capable);
+ * a BG lane); -1 until registered (one machine, the follower: the switch is the leader's, its range checked only). tp8 loop D46:
+ * level 2 = the tail band WITH the plugin's copy (rad_pp_tail_copy): pp_tband 3 taken; 1 = without (3 refused). */
+void tband_register(int level);
 /* tp8 loop D33 (pp_seg_set): the follower, at its loop's start -- how many declared segment boundaries lie inside its W(h, t)
  * (0: none: RADIANCE_PP_SEG_LAYERS unset / one lane); -1 until registered (the leader never registers: it checks the range, the
  * follower's verdict decides). */

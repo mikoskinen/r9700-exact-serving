@@ -1041,10 +1041,17 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     const unsigned xg = Wq<GG_Q6_K>::XG > 0 ? (unsigned)(kWmS / 16 * 16 * nmt * kp * 4) : 0u;   /* the widest group sums (q6_K) */
     const unsigned stage = (unsigned)(kp * 16 * nmt * kWmXP * 2) + xg;
     auto parts_lds = [&](int nt) { return (unsigned)((kp - 1) * (P / kp) * (8 / kp) * 32 * nmt * nt * 8 * 4); };
-    /* NT 2 at two row tiles; three tiles take NT 1 (NM 3 x NT 2 spills: 24-212 B of scratch in the 14.11. code object) */
-    int nt = (code & 4194304) || nmt >= 3 ? 1 : 2;
+    /* NT 2 at two row tiles; three tiles take NT 1 (NM 3 x NT 2 spills: 24-212 B of scratch in the 14.11. code object) -- except under
+     * bit 28 (DRAFTER track 20.11.2026 round 31, lever HRS): NT 2 at three row tiles too (the instantiated <KP 1, NM 3, NT 2> form: 256
+     * VGPRs + 3 spilled, 2 blocks a WGP; the head at 40 / 48 rows 321.3 / 322.2 -> 286.0 / 289.3 us card-timed, xeon r31d) */
+    int nt = (code & 4194304) || (nmt >= 3 && !(nmt == 3 && (code & 268435456))) ? 1 : 2;
     if (nt == 2 && std::max(stage, parts_lds(2)) > 65536u) nt = 1;
-    const unsigned lds = std::max(stage, parts_lds(nt));
+    /* Lever HRS (round 31): bits 29 / 30 pad the block's dynamic LDS so FEWER blocks are resident at once (fewer weight rows in flight:
+     * r30g gpat, the head's q6_K bytes slab-major over every row 483 GB/s, row group after row group 604): 29 alone 60 KiB (2 blocks a
+     * WGP of 128 KiB), 30 alone 40 KiB (3), both 30 KiB (4). Launch geometry only: a row's bytes as without the pad (--wmgcheck). */
+    const unsigned lpad = !(code & (536870912 | 1073741824)) ? 0u : (code & 536870912) && (code & 1073741824) ? 30720u
+                          : (code & 536870912) ? 61440u : 40960u;
+    const unsigned lds = std::max(std::max(stage, parts_lds(nt)), lpad);
     if (lds > 65536u) return R4D_WK_DECLINE;
     const int NS = 8 / kp;
     GgWkArgs A{};

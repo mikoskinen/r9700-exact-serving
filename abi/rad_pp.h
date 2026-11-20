@@ -268,6 +268,19 @@ static inline void rad_pp_declare_tail_band(int j) {
     if (rad_pp_tail_band) rad_pp_tail_band(j);
 }
 
+/* tp8 loop D46 (the tail band's COPY; unset: never called): beside rad_pp_tail_band, the plugin names (every rank; the last wins)
+ * that the leader holds the tail band layers' per-sequence state for EVERY sequence -- each pass that is no tail band pass
+ * carries the band layers' KV rows in X2 and the leader stores them where its own band layers would have -- so any lane step,
+ * a decode lane's too, may run as a tail band pass (fn4 pp_tband 3). on 0: no copy (only fresh prompts' steps may). Weak. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_tail_copy(int on);
+
+static inline void rad_pp_declare_tail_copy(int on) {
+    if (rad_pp_tail_copy) rad_pp_tail_copy(on);
+}
+
 /* tp8 loop D40 (the leader; zero from an engine before it): RadPpInfo.reserved[1]'s bits for the leader's head / tail SEGMENT
  * pass being issued (seg_l1 > 0), 0 on every other pass. RAD_PP_LSEG_SP: the step's segments may run the plugin's
  * sequence-parallel plan of the WHOLE part (fn4 pp_lead_seg + 512): every segment plans the same, the boundary op after an

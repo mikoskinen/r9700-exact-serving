@@ -54,6 +54,21 @@ static inline bool operand_fits(const RadTensor& t, int64_t offset, const RadTen
     return span < rad_tensor_numel(&decl);
 }
 
+/* A weight stored in GGUF native blocks (q8_0: 34 bytes a 32-element block, codes and scale side by side) is declared at its codes
+ * plane's element shape, so a stored row is LONGER than shape[1] x bits / 8 and operand_fits() under-counts the end of a row view
+ * near the weight's last rows (tp8 loop lq216: lever FCS's rank-3 quarter of the q8_0 dspark.fc, byte offset 3 x 1280 x 16,320,
+ * refused although it ends exactly at the stored end). For such a weight a ROW view is judged in stored bytes: whole rows (no
+ * column narrowing), its byte offset a whole number of stored rows, its rows ending inside the stored bytes. Only reached where
+ * operand_fits() refused, so every view it took before is taken as before. */
+static inline bool block_rows_fit(const rad::WeightInfo& wi, int bits, const RadTensor& decl, const RadOperand& o,
+                                  const RadTensor& t, int64_t byte_off) {
+    if (bits < 8 || decl.rank != 2 || t.rank != 2 || o.cols > 0 || decl.shape[0] <= 0 || wi.stored_bytes <= 0) return false;
+    if (wi.stored_bytes <= rad_tensor_numel(&decl) * (int64_t)(bits >> 3)) return false;   /* rows not longer than the shape */
+    if (wi.stored_bytes % decl.shape[0]) return false;
+    const int64_t rb = wi.stored_bytes / decl.shape[0], rows = t.shape[0];
+    return byte_off >= 0 && byte_off % rb == 0 && rows > 0 && rows <= decl.shape[0] && byte_off + rows * rb <= wi.stored_bytes;
+}
+
 std::string tensor_shape_str(const RadTensor& t) {
     std::string s = "[";
     for (uint32_t d = 0; d < t.rank; ++d)
@@ -814,6 +829,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                       fmt("weight '%s' has no pointer at issue: the load phase "
                                           "never bound it and no residency table claims it",
                                           program_->weights[wh].name.c_str()));
+            int64_t wd = 0;   /* the view's byte offset (block_rows_fit) */
             if (o.offset) {
                 int64_t d;
                 if (!byte_delta(w_bits_[wh], o.offset, &d))
@@ -823,14 +839,16 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                               program_->weights[wh].name.c_str(),
                                               (long long)o.offset, rad_dtype_name(tt.dtype)));
                 tt.data = static_cast<char*>(tt.data) + d;
+                wd = d;
             }
             if (o.rows > 0) tt.shape[0] = o.rows;
             narrow_cols(o, &tt);
             /* Same fit check as a buffer: an overrunning slice reads the next weight in the slab
              * and yields plausible numbers. Only a sliced operand can overrun, so whole-weight
-             * issues skip it. */
+             * issues skip it. A GGUF block weight's row view is judged in its stored bytes. */
             if ((o.offset || o.rows > 0 || o.cols > 0) &&
-                !operand_fits(tt, o.offset, w_tmpl_[wh]))
+                !operand_fits(tt, o.offset, w_tmpl_[wh]) &&
+                !block_rows_fit(program_->weights[wh], w_bits_[wh], w_tmpl_[wh], o, tt, wd))
                 return abort_step_msg(h, RAD_E_SHAPE,
                                       fmt("operand %d reaches past weight '%s': %s at offset "
                                           "%lld, declared %s", i,
