@@ -2090,14 +2090,18 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * split runs beside o_a and o_b goes unordered behind the finish. The same kernels on the same operands: nothing
  * between norm_a and o_b reads pre_a / post / comb or writes h0 (the mix reads h0, writes pre_a / post / comb, read
  * first by post_a / pcn_f after the attention's all-reduce), so the same bytes. Start env only (no core switch name):
- * RADIANCE_DS41_DSPARK_MHR=4. */
+ * RADIANCE_DS41_DSPARK_MHR=4.
+ * 5 (DRAFTER track 20.11.2026 round 46, lever DOF) = 4 + each stage's attention output inverse rope + fp8 round trip
+ * (o_rope, o_q: two dependent launches on the path to o_a) as the trunk's ONE op rope_rows_roundtrip (L.o_f, the trunk's
+ * default form; libr4d: byte-identical to the chain of rows, r4d_ds41_elem.hip 'fused chains'). Declared only when the
+ * start env RADIANCE_DS41_DSPARK_MHR is 5 (so MHR=4 -- BEST's start -- declares as before); dspark_mhr 4 / 5 in process. */
 static std::atomic<int> g_sw_dmr{-1};
 static int dmr_now() {
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '4' && !e[1] ? e[0] - '0' : 0);
+        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '5' && !e[1] ? e[0] - '0' : 0);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2912,7 +2916,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 4 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 5 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF) */
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
@@ -5076,6 +5080,12 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
         L.attn = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
         L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
         L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
+        /* lever DOF (dspark_mhr 5): o_rope + o_q as the trunk's rope_rows_roundtrip, beside them; declared only at the start env
+         * RADIANCE_DS41_DSPARK_MHR=5 (an MHR=4 / unset start declares the published program); 0 where no library serves it. */
+        {
+            const char* me = std::getenv("RADIANCE_DS41_DSPARK_MHR");
+            L.o_f = me && me[0] == '5' && !me[1] ? rope_rt(b, m, Q, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", d.o, m.cs_a) : 0;
+        }
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) {
             if (m.wsc.count(L.wo_a[(size_t)j])) {   /* tp8 loop P30f: the trunk's grouped form only */
@@ -8227,6 +8237,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const bool dmr = dmrv >= 1;
     const bool dmr3 = dmrv >= 3;   /* lever DMR 3: the pcn ops */
     const bool dml = dmrv >= 4;    /* lever DML (dspark_mhr 4): the attention mix between o_a and o_b */
+    const bool dof = dmrv >= 5;    /* lever DOF (dspark_mhr 5): o_rope + o_q as one launch where L.o_f is declared */
     for (const auto& L : d.st) {
         const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
         const Layer* nx = &L != &d.st.back() ? &L + 1 : nullptr;
@@ -8271,8 +8282,12 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, lo ? lo->attn[si] : L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
                         praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                         RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
-            RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
-            if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
+            if (dof && L.o_f) {   /* lever DOF: the trunk's o_f form and operands (its issue in step()) */
+                RAD_ISSUE_N(x, L.o_f, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
+            } else {
+                RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
+                if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
+            }
             const int64_t gd = HD / m.gr;
             if (gq_oa_on(L, T))   /* lever 1U-GQ */
                 gq_oa_issue(x, m, L, T, bcol(d.o, 0, gd, T), bcol(d.o, gd, gd, T), bcol(d.oa, 0, c.o_rank, T),
