@@ -929,6 +929,7 @@ struct Model {
     std::vector<char> rband_decl;
     rad_buf rband_key = 0;
     rad_op rband_cp = 0, rband_st = 0, pp_x1r = 0, pp_x1k = 0;
+    rad_op pp_x1k_sh = 0;   /* WIP step 3: pp_x1k row-sharded (an SP pass's X1 under RADIANCE_DS41_SPHC_X1) */
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -6020,6 +6021,15 @@ static std::vector<CutPart> ds41_rbandk_liveset(const Model& m) {
     v.push_back({ m.rband_key, "rkey", m.c.head_dim * 2, CutRows::Live, m.c.head_dim });
     return v;
 }
+/* tp8 loop P41 WIP step 3: whether a pass crosses X1 in the keys form -- a trunk pass with prompt rows (both nodes decide from
+ * the same batch; no band / tail band pass: RADIANCE_DS41_PP_RBAND is not taken beside them). A decode-only pass keeps W(h, t)'s. */
+static bool pp_rbandk_pass(const Model& m, const RadBatch* b) {
+    if (!m.rband || !b || b->draft_pass != 0 || b->n_tok <= 0) return false;
+    int64_t Dn = 0, DT = 0;
+    batch_split(b, &Dn, &DT);
+    return DT < b->n_tok;
+}
+static std::atomic<long long> g_rbk_passes{0}, g_rbk_rows{0};
 /* ... and whether a pass crosses in it: no tail band pass, every row a decode row (both nodes decide from the same batch) */
 static bool pp_tcopy_pass(const Model& m, const RadBatch* b, bool tband_pass) {
     if (!m.tcopy || tband_pass || !b || b->n_tok <= 0) return false;
@@ -6084,6 +6094,31 @@ static rad_op pp_stage_op_v(RadBuilder* b, const Model& m, int ring, const std::
     rad_op h = op(b, sends ? "stage_send" : "stage_recv",
                   { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
     if (!h) return h;
+    std::vector<rad_buf> bufs;
+    for (const CutPart& p : v)
+        if (p.b) bufs.push_back(p.b);
+    if (bufs.empty()) return h;
+    if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
+    else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
+    return h;
+}
+
+/* tp8 loop P41 WIP step 3: pp_stage_op's row-sharded form (P20 round 3 / 4) over an explicit parts list -- the residual parts
+ * (the Live rows of act.x / h1 / post / comb / pre_ffn) by quarter, every other part whole from rank 0; 0 where it does not
+ * resolve */
+static rad_op pp_stage_op_vs(RadBuilder* b, const Model& m, int ring, const std::vector<CutPart>& v) {
+    const bool sends = (ring == RAD_PP_X1) == (m.pp_rank == 0);
+    int64_t mask = 0;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].rows == CutRows::Live && (v[i].b == m.act.x || v[i].b == m.h1 || v[i].b == m.post || v[i].b == m.comb ||
+                                           v[i].b == m.pre_f))
+            mask |= (int64_t)1 << i;
+    if (mask == 0) return 0;
+    const char* nm = sends ? "stage_send" : "stage_recv";
+    const RadParam ps[] = { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()),
+                            RAD_INT("shard", mask) };
+    const rad_op h = rad_op_declared(b, nm) ? rad_decl_op(b, nm, ps, 4, nullptr, 0) : 0;
+    if (!h || !rad_op_resolved(b, h)) return 0;
     std::vector<rad_buf> bufs;
     for (const CutPart& p : v)
         if (p.b) bufs.push_back(p.b);
@@ -6870,6 +6905,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.rband && m.pp_rank == 1 && l == m.pp_h) {
             if (!(m.pp_x1k = pp_stage_op_v(b, m, RAD_PP_X1, ds41_rbandk_liveset(m)))) return RAD_E_INVAL;
             if (!(m.rband_st = window_key_store(b, T, c.head_dim, m.w8, m.rband_key))) return RAD_E_INVAL;
+            if (m.sphc > 0 && sphc_x1_env()) m.pp_x1k_sh = pp_stage_op_vs(b, m, RAD_PP_X1, ds41_rbandk_liveset(m));
         }
         /* tp8 loop D39 step 2b: the leader's receive of the tail band's X2 before layer t - 1 */
         if (m.tband_j > 0 && m.pp_rank == 0 && l == m.tband.at &&
@@ -6897,6 +6933,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.rband_cp = op(b, "cast", { RAD_RANGE("M", 1, T), RAD_INT("n", c.head_dim), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
                             {}, { m.kvn }, { m.rband_key });
             if (!m.rband_cp || !(m.pp_x1k = pp_stage_op_v(b, m, RAD_PP_X1, ds41_rbandk_liveset(m)))) return RAD_E_INVAL;
+            if (m.sphc > 0 && sphc_x1_env()) m.pp_x1k_sh = pp_stage_op_vs(b, m, RAD_PP_X1, ds41_rbandk_liveset(m));
         }
         /* tp8 loop D46 step 2: the follower's copy of layer t - 1's window-key rows and the copy-form send, beside W(h, t)'s */
         if (m.tcopy && m.pp_rank == 1 && l == m.pp_t - 1) {
@@ -8551,7 +8588,16 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
         rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_TBAND_COPY: X2's copy form is not declared or not whole (a plan defect)");
         return false;
     }
-    const rad_op op_ = bx ? m.pp_x1b : bt2 ? m.pp_x2t : tc ? m.pp_x2c
+    /* tp8 loop P41 WIP step 3: a pass with prompt rows under RADIANCE_DS41_PP_RBAND crosses X1 in the keys form -- W(h, t)'s
+     * parts + layer h - 1's window-key rows (the leader's m.kvn after that layer: never cut, whole after SP's kv gather) --
+     * row-sharded where the pass's X1 is; the follower stores the key rows into its own window pages of layer h - 1 */
+    const bool rk = ring == RAD_PP_X1 && !bx && pp_rbandk_pass(m, batch);
+    if (rk && (!(sh ? m.pp_x1k_sh : m.pp_x1k) || (m.pp_rank == 0 ? !m.rband_cp : !m.rband_st))) {
+        rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_RBAND: X1's keys form is not declared (or not row-sharded where the pass's "
+                         "X1 is)");
+        return false;
+    }
+    const rad_op op_ = bx ? m.pp_x1b : rk ? (sh ? m.pp_x1k_sh : m.pp_x1k) : bt2 ? m.pp_x2t : tc ? m.pp_x2c
                      : ring == RAD_PP_X1 ? (sh && m.pp_x1_sh ? m.pp_x1_sh : m.pp_x1)
                                          : (sh && m.pp_x2_sh ? m.pp_x2_sh : m.pp_x2);   /* P20 r3 / P36: `sh` */
     /* the ring read at every issue (tp8 S5: each lane has its own) */
@@ -8575,7 +8621,8 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
     o.push_back(praw(m.pp_ring[ring], RAD_U8, 1));
     /* tp8 loop D46 step 2: the follower's layer t - 1 window keys (m.kvn, every row: a decode pass is never cut) into tkey first */
     if (tc && m.pp_rank == 1) RAD_ISSUE_N(x, m.tcopy_cp, T, brows(m.kvn, T), brows(m.tkey, T));
-    for (const CutPart& p : bx ? ds41_band_liveset(m) : bt2 ? ds41_cut_liveset_cx(m, m.tband.x2)
+    if (rk && m.pp_rank == 0) RAD_ISSUE_N(x, m.rband_cp, T, brows(m.kvn, T), brows(m.rband_key, T));   /* tp8 loop P41 */
+    for (const CutPart& p : bx ? ds41_band_liveset(m) : rk ? ds41_rbandk_liveset(m) : bt2 ? ds41_cut_liveset_cx(m, m.tband.x2)
                             : tc ? ds41_tcopy_liveset(m) : ds41_cut_liveset(m, ring)) {
         if (p.rows == CutRows::Ids) o.push_back(praw(batch->token_ids, RAD_I32, T));   /* tp8 dev D10 round 2 */
         else if (p.rows == CutRows::Step) o.push_back(brows(p.b, T));
@@ -8583,6 +8630,27 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
         else o.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
     }
     rad_issue(x, op_, o.data(), (int)o.size(), T);
+    if (rk && m.pp_rank == 1) {   /* tp8 loop P41 WIP step 3: the follower's copy of layer h - 1's window keys (its own pages) */
+        const auto* wb = kv_batch(batch, m.win);
+        if (!wb || !wb->slot_mapping) {
+            rad_step_fail(x, "deepseek41: RADIANCE_DS41_PP_RBAND: the window group has no slot mapping");
+            return false;
+        }
+        const int64_t hd = m.c.head_dim;
+        if (m.w8)
+            RAD_ISSUE_N(x, m.rband_st, T, brows(m.rband_key, T), praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, m.rb.l));
+        else
+            RAD_ISSUE_N(x, m.rband_st, T, bcol(m.rband_key, 0, hd / 2, T), bcol(m.rband_key, hd / 2, hd / 2, T),
+                        praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, m.rb.l));
+        if (rad_rank(x) == 0) {
+            const long long n = g_rbk_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+            const long long r = g_rbk_rows.fetch_add(T, std::memory_order_relaxed) + T;
+            if (n == 1 || n % 1024 == 0)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PP_RBAND=1 (tp8 loop P41): %lld prompt passes crossed X1 with "
+                                "layer %d's window keys, %lld rows, stored into this follower's window pages of it (this one step "
+                                "%d%s)\n", n, m.rb.l, r, batch->step, sh ? ", row-sharded" : "");
+        }
+    }
     if (tc && m.pp_rank == 0) {   /* tp8 loop D46 step 2: the leader's copy of layer t - 1's window keys, the owner's store form */
         const auto* wb = kv_batch(batch, m.win);
         if (!wb || !wb->slot_mapping) {
@@ -11610,6 +11678,16 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
      * pass of the same batch and part, which no key holds: not recorded (0 on every pass the engine does not mark). A trunk pass
      * only: the word stays set through the band step's own drafter passes (no pp_set_pass between), which issue as ever. */
     if (deepseek41::g_tband_decl.load(std::memory_order_relaxed) && b && b->draft_pass == 0 && rad_pp_query().reserved[2] != 0) return 0;
+    /* tp8 loop P41 WIP step 3: under RADIANCE_DS41_PP_RBAND a pass with prompt rows crosses X1 in the keys form, which no key
+     * holds: not recorded (a planned one is not anyway) */
+    if (b && b->draft_pass == 0) {
+        const auto& mm = deepseek41::models[0];
+        if (mm && mm->rband) {
+            int64_t Dn = 0, DT = 0;
+            rad::arch::batch_split(b, &Dn, &DT);
+            if (DT < b->n_tok) return 0;
+        }
+    }
     /* Lever E1: a pass it may deduplicate issues row counts read from the step's ids at issue: not recorded */
     if (deepseek41::engdd_may_act(b)) return 0;
     if (b && b->draft_pass == 0 && deepseek41::g_sw_bi.load(std::memory_order_relaxed) > 0) {
