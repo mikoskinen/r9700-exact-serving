@@ -5477,3 +5477,125 @@ TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
         if (a.srf == 2) CHECK(held > 0);
     }
 }
+
+/* tp8 loop D53: PREEMPTION BY RECOMPUTE THROUGH THE PIPELINE. Eight requests at once whose prompts + outputs (3,600 tokens)
+ * overrun a KV pool of 600-2,600 tokens, then two alone: the leader's lane schedulers preempt by recompute (the blocks go
+ * back, the recompute re-prefills prompt ++ output, adopting the published prefix), and the follower's layers read and
+ * write the same block ids. Every request's greedy tokens are one process's (the default 512 MiB device: a pool that
+ * never preempts), at 1 / 2 / 3 lanes, a wrap-around cut with the llama KV copy checked (RADIANCE_PP_KV_CHECK=1), and
+ * BEST's shape (4 lanes BG 2, FOL_ORDER 2, the follower's segments). The pool is found, not fixed: the pair's own
+ * startup report at a device size (the leader caps at the follower's): the smallest size that starts with a pool >= kPreLo
+ * (on the host backend a MiB is ~2,000 tokens of this llama's pool at two layers a node, so the window is wide). */
+std::vector<std::vector<int32_t>> preempt_set(int port) {
+    std::vector<std::vector<int32_t>> out;
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t k = 0; k < 8; ++k)
+        f.push_back(std::async(std::launch::async, [port, k] {
+            return complete(port, prompt_ids(31 + k, 80 + 15 * k), 300 + 5 * (int)k);
+        }));
+    for (auto& x : f) out.push_back(x.get());
+    for (uint64_t s : { 41, 42 }) out.push_back(complete(port, prompt_ids(s, 90), 40));
+    return out;
+}
+/* The shape: eight sequences (prompts 80-185 tokens, outputs 300-335: 3,600 tokens at once, the longest 520), 64-token steps */
+std::vector<std::string> preempt_shape(int lanes) {
+    std::vector<std::string> a = { "--max-num-seqs", "8" };
+    if (lanes > 0) a = cat(a, { "--pp-lanes", std::to_string(lanes) });
+    return a;
+}
+/* The pool a startup report states (" a card: N tokens" -- the leader's, after the pair's cap), -1 when absent. */
+long long pool_in(const std::string& log) {
+    static const std::string kTag = " a card: ";
+    const size_t at = log.rfind(kTag);
+    return at == std::string::npos ? -1 : std::atoll(log.c_str() + at + kTag.size());
+}
+constexpr long long kPreLo = 600, kPreHi = 2600;
+
+TEST(preemption_by_recompute_on_the_pipeline_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", preempt_shape(0)));
+        ref = preempt_set(one.port);
+        const double pre = metric(get(one.port, "/metrics"), "vllm:num_preemptions_total");
+        fprintf(stderr, "    one process, pool %lld tokens: %.0f preemption(s)\n", pool_in(one.lead.output()), pre);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best; };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    long long pre_all = 0;
+    const char* only = std::getenv("PP_E2E_PREEMPT_ARM");   /* a debugging aid: the arms whose name holds this text */
+    for (const Arm a : { Arm{ "1 lane", "0,2", 1, false }, Arm{ "2 lanes", "0,2", 2, false }, Arm{ "3 lanes, wrap-around", "1,3", 3, false },
+                         Arm{ "2 lanes, wrap-around", "1,3", 2, false }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true } }) {
+        if (only && !std::strstr(a.name, only)) continue;
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        const std::vector<std::string> ex = preempt_shape(a.lanes);
+        /* the device size: bisect [64, 512) MiB on the pair's own pool (each probe a start and a stop) */
+        auto pool_at = [&](int mib) -> long long {
+            Serving pr;
+            if (!pr.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(mib) }))) return -1;
+            const long long p = pool_in(pr.lead.output());
+            kill(pr.lead.child.pid, SIGTERM);
+            pr.lead.finish(60);
+            pr.fol.finish(30);
+            return p;
+        };
+        int lo = 64, hi = 512;
+        long long plo = pool_at(lo), phi = pool_at(hi);
+        if (!(plo < kPreLo && phi >= kPreLo))
+            fprintf(stderr, "    %s W(%s): pools %lld / %lld tokens at %d / %d MiB do not bracket %lld\n", a.name, a.cut, plo, phi, lo,
+                    hi, kPreLo);
+        REQUIRE(plo < kPreLo && phi >= kPreLo);
+        while (hi - lo > 1) {
+            const int m = (lo + hi) / 2;
+            const long long p = pool_at(m);
+            if (p >= kPreLo) { hi = m; phi = p; } else { lo = m; plo = p; }
+        }
+        if (phi >= kPreHi) fprintf(stderr, "    %s W(%s): the smallest pool >= %lld is %lld tokens (%d MiB)\n", a.name, a.cut, kPreLo, phi, hi);
+        REQUIRE(phi < kPreHi);
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(hi) })));
+        const std::vector<std::vector<int32_t>> got = preempt_set(pp.port);
+        const double pre = metric(get(pp.port, "/metrics"), "vllm:num_preemptions_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0, empty = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (got[i].empty()) { ++empty; ++differ; continue; }
+            if (ref[i] == got[i]) continue;
+            ++differ;
+            size_t j = 0;
+            while (j < ref[i].size() && j < got[i].size() && ref[i][j] == got[i][j]) ++j;
+            fprintf(stderr, "    request %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", i, got[i].size(),
+                    ref[i].size(), j);
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const bool notowner = flog.find("NOT the owner's bytes") != std::string::npos;
+        const long long failed = (long long)[&] { size_t n = 0, at = 0; while ((at = llog.find("could not be admitted", at)) != std::string::npos) { ++n; ++at; } return n; }();
+        if (const char* dd = std::getenv("PP_E2E_PREEMPT_LOGS")) {
+            tiny::write_text(std::string(dd) + "/" + std::to_string(a.lanes) + "-" + a.cut + "-leader.log", llog);
+            tiny::write_text(std::string(dd) + "/" + std::to_string(a.lanes) + "-" + a.cut + "-follower.log", flog);
+        }
+        fprintf(stderr, "    PREEMPTION %-26s W(%s): pool %lld tokens (%d MiB), %.0f preemption(s); %d of %zu requests differ from one "
+                        "process (%d empty = failed: %lld 'could not be admitted' lines); KV-copy checks %lld, %lld differ%s\n",
+                a.name, a.cut, pool_in(llog), hi, pre, differ, ref.size(), empty, failed, checks, kdiff, notowner ? " (NOT the owner's bytes)" : "");
+        CHECK(pre > 0);
+        CHECK_EQ(differ, 0);
+        CHECK(!notowner);
+        if (std::strcmp(a.cut, "0,2") != 0) CHECK(checks > 0);
+        if (differ || notowner || !(pre > 0))
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        pre_all += pre > 0 ? (long long)pre : 0;
+    }
+    fprintf(stderr, "    preemptions, all arms: %lld\n", pre_all);
+}
