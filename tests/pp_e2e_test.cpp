@@ -5168,3 +5168,120 @@ TEST(relay_lane_serves_one_process_tokens) {
     fprintf(stderr, "    relay lane BG steps, all arms: %lld\n", relay_all);
     CHECK(relay_all > 0);
 }
+
+/* tp8 loop P41 step 4 (fn4 pp_rband / RADIANCE_PP_RBAND_EVERY on the leader, RADIANCE_LLAMA_PP_RBAND=1 on both): a lone cold prompt's
+ * chunks run as REVERSE passes -- the leader's head over [0, h - 1) + layer h - 1's k / v only, the follower from h - 1 (X1 of
+ * W(h - 1, t)) -- every p-th (from phase), and every other pass with prompt rows carries layer h - 1's q|k|v rows to the follower's
+ * own cache of that layer: cold multi-chunk prompts at 2 and 3 lanes (whole, + follower segments) on W(2,3) / W(3,4) of the four-layer
+ * llama are one process's tokens AND chunk plan; a prefix hit's sequence (its first chunk at ctx > 0) is never reversed (counted);
+ * the split / burst sets (BG lane, decode beside prompts) are one process's; fn4 pp_rband 0 in process = no reverse pass; negative
+ * control: the follower leaves the keys' store out (RADIANCE_PP_TEST_RBAND_SKIP=1) at p = 2 -> a reversed chunk reads keys it never
+ * got -> tokens differ. */
+TEST(reverse_band_passes_serve_one_process_tokens_and_plan) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "256", "--max-model-len", "4096" };
+    const std::vector<int32_t> p1 = prompt_ids(4101, 1300), p2 = prompt_ids(4102, 900);
+    std::vector<int32_t> p3 = p1;   /* a prefix hit: p1's rows, then its own */
+    for (int32_t t : prompt_ids(4103, 300)) p3.push_back(t);
+    std::vector<std::vector<int32_t>> ref, ref_s;
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext, { "RADIANCE_LOG_STEPS=1" }));
+        ref.push_back(complete(one.port, p1, 24));
+        ref_plan = chunks_of(one.lead.output());
+        ref.push_back(complete(one.port, p2, 24));
+        ref.push_back(complete(one.port, p3, 24));
+        ref_s = split_set(one.port);
+        for (auto& v : burst_set(one.port)) ref_s.push_back(v);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    /* every: fn4 pp_rband's start value; post0: POST pp_rband 0 before the cold prompts (the in-process control); sets: + split / burst */
+    struct Arm { int lanes; const char* cut; int every; bool fseg = false; bool skip = false; bool post0 = false; bool sets = false; int bg = 0; };
+    long long rev_all = 0, unclean_all = 0;
+    int skip_differ = 0;
+    for (const Arm a : { Arm{ 2, "2,3", 1 }, Arm{ 3, "2,3", 2, true }, Arm{ 2, "3,4", 2 + 16 }, Arm{ 3, "2,3", 2 + 256 },
+                         Arm{ 3, "2,3", 1, true, false, false, true, 1 }, Arm{ 2, "2,3", 1, false, false, true },
+                         Arm{ 2, "2,3", 2, false, true } }) {
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_LLAMA_PP_RBAND=1" });
+        env.push_back("RADIANCE_PP_RBAND_EVERY=" + std::to_string(a.every));
+        if (a.bg) env.push_back("RADIANCE_PP_BG_LANE=" + std::to_string(a.bg));
+        if (a.fseg)
+            for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
+                env.push_back(v);
+        if (a.skip) env.push_back("RADIANCE_PP_TEST_RBAND_SKIP=1");
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        if (a.post0) {
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_rband", 0 } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+        }
+        std::vector<std::vector<int32_t>> got;
+        got.push_back(complete(pp.port, p1, 24));
+        const std::vector<std::pair<int, int>> plan = chunks_of(pp.lead.output());
+        got.push_back(complete(pp.port, p2, 24));
+        got.push_back(complete(pp.port, p3, 24));
+        std::vector<std::vector<int32_t>> got_s;
+        if (a.sets) {
+            got_s = split_set(pp.port);
+            for (auto& v : burst_set(pp.port)) got_s.push_back(v);
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        int differ = 0;
+        REQUIRE_EQ(ref.size(), got.size());
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        if (a.sets) {
+            REQUIRE_EQ(ref_s.size(), got_s.size());
+            for (size_t i = 0; i < ref_s.size(); ++i)
+                if (ref_s[i] != got_s[i]) ++differ;
+        }
+        long long rev = -1, rows = -1, unclean = -1;
+        const char* key = " lane steps ran as reverse (head band) passes, ";
+        if (const size_t at = llog.rfind(key); at != std::string::npos) {
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                rev = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+            rows = std::atoll(llog.c_str() + at + std::strlen(key));
+            if (const size_t u = llog.find("(tp8 loop P41); ", at); u != std::string::npos)
+                unclean = std::atoll(llog.c_str() + u + std::strlen("(tp8 loop P41); "));
+        }
+        fprintf(stderr, "    REVERSE BAND (llama stand-in), %d lanes W(%s), pp_rband %d%s%s%s%s: %d of %zu requests differ; plan %s (%zu chunks); "
+                        "%lld reverse passes, %lld rows; %lld lone chunks kept W(h, t)'s (unclean sequence)\n", a.lanes, a.cut, a.every,
+                a.fseg ? " + follower segments" : "", a.post0 ? " + fn4 pp_rband 0 in process" : "", a.sets ? " + split / burst sets" : "",
+                a.skip ? " + the keys' store LEFT OUT (negative control)" : "", differ, ref.size() + (a.sets ? ref_s.size() : 0),
+                plan == ref_plan ? "= one process's" : "DIFFERENT", plan.size(), rev, rows, unclean);
+        CHECK(llog.find("the plugin declared the reverse (head) band layer") != std::string::npos);
+        CHECK(plan == ref_plan);
+        if (a.skip) {
+            skip_differ = differ;
+            CHECK(rev > 0);
+            continue;
+        }
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(differ, 0);
+        if (a.post0) {
+            CHECK_EQ(rev, 0LL);
+            continue;
+        }
+        CHECK(rev > 0);
+        CHECK(unclean > 0);   /* p3's chunks after its prefix hit */
+        CHECK(flog.find("reverse passes ran this follower from layer") == std::string::npos);   /* (llama: no plugin line; the engine's) */
+        rev_all += std::max(0LL, rev);
+        unclean_all += std::max(0LL, unclean);
+    }
+    fprintf(stderr, "    reverse passes, all arms: %lld; lone chunks kept W(h, t)'s for an unclean sequence: %lld; the negative control: %d "
+                    "requests differ\n", rev_all, unclean_all, skip_differ);
+    CHECK(rev_all > 0);
+    CHECK(skip_differ > 0);
+}
