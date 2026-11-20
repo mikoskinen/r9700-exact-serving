@@ -3837,7 +3837,10 @@ static int wmk_code48(int ty, long long Ntot, long long K, bool no_qb = false) {
  *                     q6_K shexp gate_up 1536 / 1024   42.5 / 29.9 -> 595012 39.5 / DP 2 27.4
  *                     every other shape mode 8's code (wmk_code64); the head four-tile G2 (D22).
  * Every code computes the part order (a row's bytes do not depend on M, its tile place or the geometry): the same bytes as every
- * mode (--wmkroute under R4D_WMKROUTE_MODE 13, --wmgcheck over 595012 / 8459332 / 52499524). <= 32 rows: mode 12 exactly. */
+ * mode (--wmkroute under R4D_WMKROUTE_MODE 13, --wmgcheck over 595012 / 8459332 / 52499524). <= 32 rows: mode 12's codes.
+ * The K1 fold a (rmsnorm into q_b's staging) runs as its two launches at 17..48 rows under 13 (r4d_rad_rmsnorm_gemm_nt_ggml: the
+ * fold's per-block norm prologue costs ~25-35 us a call more than rmsnorm's own launch); at 49..64 rows both folds stay two launches
+ * as in modes 5..10 (in the staging there they measured slower: r32d). */
 static int wmk_code13(int ty, long long Ntot, long long K, long long M) {
     constexpr int DP2 = kWmkCode | 8388608;   /* 8459332 */
     const bool kq = ty == GG_Q5_K || ty == GG_Q6_K;
@@ -4365,7 +4368,16 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
      * launch and then gg_gemm_run's part-order GEMM -- the same bytes. D2's in-staging fold is the decode band's. tp8 loop D22
      * (ds41_wmk 5): at 49..64 rows the fold stays two launches (rmsnorm's own at the call's M, then the part-order GEMM, which
      * mode 5 serves in the decode band's form) -- the in-staging norm is checked only within 48 rows. */
-    if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
+    /* Lever DMX (DRAFTER track 20.11.2026 round 32, ds41_wmk 13): at 17..48 rows fold a runs as its TWO launches (rmsnorm's own, then
+     * the part-order GEMM under mode 13's code) -- the same bytes (--wmkroute: fold == its two launches), and faster: the fold's
+     * per-block norm prologue costs more than the launch it saves. xeon GPU1 r32d (cold, us a call, q6_K / q5_K q_b 8192 x 1280):
+     * the fold at 40 / 48 rows 66.7-75.2 / 67.4-70.1 (every G1 code; G2 84-94) vs the plain GEMM 40.0 / 39.6 (r32b) + rmsnorm's
+     * launch (~3-5 us: the two-launch form at 56 / 64 rows is 42.8 / 39.1 with the G2 GEMM 37.7 / 34.1); served lq190 c32 F: the fold
+     * 62.3 / 60.4 us a call (22 a lane step). */
+    const bool dmx_two = !g_gg_wk && M > 16 && M <= kGgDecodeRows && wmk_now() == 13;
+    if (dmx_two) {
+        /* (the rmsnorm + gg_gemm_run tail below) */
+    } else if (g_gg_wk || (wmk_take(M) && M <= kGgDecodeRows)) {
         if (g->dtype == RAD_F32) {
             GgWkFold fo{};
             fo.pro = 1; fo.g = (const float*)g->data; fo.eps = eps; fo.wadd = wadd; fo.mult = mult;
