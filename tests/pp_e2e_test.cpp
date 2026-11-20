@@ -2654,6 +2654,91 @@ TEST(lead_seg_decode_first_serves_one_process_tokens) {
     CHECK(parts_all > 0);
 }
 
+/* tp8 loop D49b (DECODE round 35): fn4 pp_lead_seg + 1024 x N -- LSP's segments only while the decode lanes' last steps decoded
+ * <= N sequences (Scheduler::decoded_seqs summed over the decode lanes), the parts whole above. Every request's tokens are one
+ * process's at 4 lanes BG 2 (FOL_ORDER 2) W(2,3): form 2 + 1024 x 63 (above every load: segments as form 2, the rule never acts),
+ * form 2 + 1024 x 1 (the rule acts whenever two or more sequences decode) and the same POSTed back to 2 + 1024 x 63 between the
+ * request sets (in process); and at 3 lanes BG 1 with N 1. */
+TEST(lead_seg_load_rule_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { const char* form; const char* post; int lanes = 4; };
+    long long load_all = 0, steps_all = 0;
+    for (const Arm a : { Arm{ "64514", nullptr }, Arm{ "1026", nullptr }, Arm{ "1026", "64514" }, Arm{ "1026", nullptr, 3 } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.lanes == 3 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");   /* 3 lanes: one decode lane pair + BG 1 */
+        for (const char* v : { "RADIANCE_PP_LEAD_SEG=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0",
+                               "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        env.push_back(std::string("RADIANCE_PP_LEAD_SEG_FORM=") + a.form);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start("2,3", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        if (a.post) {
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_lead_seg", std::atoi(a.post) } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_lead_seg %s: %d %s\n", a.post, st, out.c_str());
+        }
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        if (a.post)   /* applied at the next step's release: one short request after it, so the run line reads the value */
+            CHECK(!complete(pp.port, prompt_ids(7, 12), 4).empty());
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) differ += ref[i] != got[i];
+        for (size_t i = 0; i < ref_b.size(); ++i) differ += ref_b[i] != got_b[i];
+        long long steps = -1, parts = -1, load = -1;
+        int now = -1;
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments", &steps,
+                                  &parts);
+        const char* key = " BG steps ran their parts whole by the decode load rule (+ 1024 x N, tp8 loop D49b)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind(", ", at); b != std::string::npos) (void)std::sscanf(llog.c_str() + b, ", %lld BG", &load);
+        if (const size_t nw = llog.rfind(" now (tp8 loop D32): "); nw != std::string::npos)
+            if (const size_t at = llog.rfind("pp_lead_seg ", nw); at != std::string::npos)
+                (void)std::sscanf(llog.c_str() + at, "pp_lead_seg %d now", &now);
+        fprintf(stderr, "    %d lanes W(2,3) pp_lead_seg %s%s: %d of %zu requests differ; leader: %lld BG steps in %lld segments, %lld BG "
+                        "steps whole by the load rule, pp_lead_seg %d at the end\n",
+                a.lanes, a.form, a.post ? (std::string(" + POST ") + a.post).c_str() : "", differ, ref.size() + ref_b.size(), steps,
+                parts, load, now);
+        CHECK_EQ(differ, 0);
+        if (differ || load < 0) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("; starts with N = ") != std::string::npos);
+        CHECK(load >= 0);
+        CHECK_EQ(now, std::atoi(a.post ? a.post : a.form));
+        if (std::strcmp(a.form, "64514") == 0) {   /* N 63 is above every load (8 sequences): the rule never acts, form 2's segments */
+            CHECK_EQ(load, 0LL);
+            CHECK(steps > 0);
+            CHECK(parts > steps);
+        }
+        load_all += std::max(0LL, load);
+        steps_all += std::max(0LL, steps);
+    }
+    fprintf(stderr, "    all arms: %lld BG steps whole by the load rule, %lld BG steps in segments\n", load_all, steps_all);
+    CHECK(load_all > 0);   /* N 1: the rule acted while two or more sequences decoded */
+}
+
 /* tp8 loop D40 (DECODE round 28): fn4 pp_lead_seg + 8 (a BG step's tail whole: no tail boundary kept) and + 512 (the engine's
  * SP word, RadPpInfo.reserved[1] = RAD_PP_LSEG_SP, on the step's HEAD segments only -- the llama stand-in fails any other pass
  * that carries it). Every request's tokens are one process's at 4 lanes BG 2 (FOL_ORDER 2) W(2,3) (a head boundary, no tail one)
