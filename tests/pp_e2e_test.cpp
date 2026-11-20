@@ -3062,6 +3062,80 @@ TEST(tail_band_passes_serve_one_process_tokens) {
     CHECK(skip_differ > 0);
 }
 
+/* tp8 loop D39j2 step 1 (DECODE round 32, QUEUE D39j2): the engine's tail band at DEPTH 2 -- RADIANCE_LLAMA_PP_TBAND=2 declares
+ * layers t - 2 and t - 1 on the leader too; a BG step of fresh prompts runs W(0,3) as the follower over [0, 1), X2 at 1, then layer 1
+ * whole and layer 2's k / v from its own rows (the decode owner's keys of both band layers; llama's attention is not windowed, so
+ * the stand-in saves nothing -- this proves the engine's j = 2 plumbing: frames, the follower's pass end, the leader's tail from
+ * t - 2, the KV of both layers on the owner), the leader's tail from 1: every request's tokens = one process's at 3 lanes BG 1
+ * (whole, + follower segments) and 4 lanes BG 2 (FOL_ORDER 2); negative control: the follower's stores left out -> requests differ. */
+TEST(tail_band_at_depth_two_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; };
+    long long tb_all = 0;
+    int skip_differ = 0;
+    for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, false, false, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_LLAMA_PP_TBAND=2");
+        env.push_back("RADIANCE_PP_TAIL_BAND=1");
+        env.push_back("RADIANCE_PP_READY_FIRST=1");
+        if (a.fseg)
+            for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
+                env.push_back(v);
+        if (a.fo2) env.push_back("RADIANCE_PP_FOL_ORDER=2");
+        if (a.skip) env.push_back("RADIANCE_PP_TEST_TBAND_SKIP=1");
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start("0,3", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (ref[i] != got[i]) ++differ;
+        for (size_t i = 0; i < ref_b.size(); ++i)
+            if (ref_b[i] != got_b[i]) ++differ;
+        long long tb = -1;
+        const char* key = " lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                tb = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        fprintf(stderr, "    TAIL BAND DEPTH 2 (llama stand-in), %d lanes BG %d W(0,3)%s%s%s: %d of %zu requests differ; %lld lane steps ran as "
+                        "tail band passes\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.fo2 ? " + FOL_ORDER 2" : "",
+                a.skip ? " + the k / v stores LEFT OUT (negative control)" : "", differ, ref.size() + ref_b.size(), tb);
+        CHECK(tb > 0);
+        if (a.skip) {
+            skip_differ = differ;
+            continue;
+        }
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK_EQ(differ, 0);
+        /* the engine's start line names the depth: the follower's pass ends at t - 2 = 1 */
+        CHECK(llog.find("RADIANCE_PP_TAIL_BAND=1 -- a BG lane's step of fresh prompts runs as a tail band pass") != std::string::npos);
+        tb_all += std::max(0LL, tb);
+    }
+    fprintf(stderr, "    depth-2 tail band passes, all arms: %lld; the negative control: %d requests differ\n", tb_all, skip_differ);
+    CHECK(tb_all > 0);
+    CHECK(skip_differ > 0);
+}
+
 /* tp8 loop D39 step 2c (DECODE round 31): the tail band in BEST's pipeline shape -- the six-layer llama at W(2,5) (the leader declares
  * layer 4 too), 4 lanes BG 2, FOL_ORDER 2, the follower's segments at every layer, the KV copy (X1 carries layer 1's KV = deepseek41's
  * source 8 at W(10,32)) with its check at EVERY trunk step, over F75's set (decoders, a burst of whole newcomers, long prompts of 3 / 4

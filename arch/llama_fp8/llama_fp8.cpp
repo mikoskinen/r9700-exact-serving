@@ -434,11 +434,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 m.band = 1;
                 if (m.pp_rank == 0) m.held[(size_t)m.pp_h] = 1;
             }
-            /* tp8 loop D39 test stand-in: the tail band of one layer (layer t - 1 declared on the leader too) */
-            if (const char* tb = std::getenv("RADIANCE_LLAMA_PP_TBAND"); tb && !std::strcmp(tb, "1") && !m.band &&
-                m.pp_t - 1 > m.pp_h && !m.fe && pp.lanes > 1) {
-                m.tband = 1;
-                if (m.pp_rank == 0) m.held[(size_t)m.pp_t - 1] = 1;
+            /* tp8 loop D39 test stand-in: the tail band of one layer (layer t - 1 declared on the leader too); DECODE round 32
+             * (QUEUE D39j2, the engine's bookkeeping at depth 2): =2 declares layers t - 2 and t - 1 there, and the follower of a
+             * tail band pass runs layer t - 2 whole after X2 (its k / v and layer t - 1's input: llama's attention is not windowed,
+             * so nothing is saved here -- deepseek41's form cuts that layer to the window's rows) and then layer t - 1's k / v */
+            if (const char* tb = std::getenv("RADIANCE_LLAMA_PP_TBAND"); tb && (!std::strcmp(tb, "1") || !std::strcmp(tb, "2")) &&
+                !m.band && m.pp_t - std::atoi(tb) > m.pp_h && !m.fe && pp.lanes > 1) {
+                m.tband = std::atoi(tb);
+                if (m.pp_rank == 0)
+                    for (int64_t l = m.pp_t - m.tband; l < m.pp_t; ++l) m.held[(size_t)l] = 1;
             }
             /* tp8 dev D10 round 2: beside the follower's own lookup, X1 is the step's token ids (the follower reads them) */
             const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
@@ -711,10 +715,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         rad_pp_declare_crossing(RAD_PP_X1, x1_row, x1_parts);
         }
-        if (m.tband) {   /* tp8 loop D39 stand-in: X2 at t - 1 may be the wider one */
-            m.parts_x2b = parts_at(m.pp_t - 1);
+        if (m.tband) {   /* tp8 loop D39 stand-in: X2 at t - j may be the wider one */
+            m.parts_x2b = parts_at(m.pp_t - m.tband);
             rad_pp_declare_crossing(RAD_PP_X2, row * std::max(m.parts_x2, m.parts_x2b), std::max(m.parts_x2, m.parts_x2b));
-            rad_pp_declare_tail_band(1);
+            rad_pp_declare_tail_band(m.tband);
         } else {
             rad_pp_declare_crossing(RAD_PP_X2, row * m.parts_x2, m.parts_x2);
         }
@@ -1032,8 +1036,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
             if (m.band && m.pp_rank == 0 && (int64_t)li >= m.pp_h && (int64_t)li < m.pp_h + m.band && !(bnd && run_head)) continue;
             /* ... and a band pass's follower starts at h + 1 */
             if (bnd && m.pp_rank == 1 && (int64_t)li < he) continue;
-            /* tp8 loop D39 stand-in: the leader's layer t - 1 runs only in a tail band pass's tail; that pass's follower ends at t - 1 */
-            if (m.tband && m.pp_rank == 0 && (int64_t)li == m.pp_t - 1 && !(tbd && run_tail)) continue;
+            /* tp8 loop D39 stand-in: the leader's layers [t - j, t) run only in a tail band pass's tail; that pass's follower ends at t - j */
+            if (m.tband && m.pp_rank == 0 && (int64_t)li >= m.pp_t - m.tband && (int64_t)li < m.pp_t && !(tbd && run_tail)) continue;
             if (tbd && m.pp_rank == 1 && (int64_t)li >= te) continue;
             /* tp8 S5: the tail part starts at X2; the head part ran the layers before h */
             if (m.pp_rank == 0 && !run_head && (int64_t)li < m.pp_h) continue;
@@ -1070,10 +1074,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
             cross(m.op_x2, RAD_PP_X2, m.parts_x2);
             return;
         }
-        /* tp8 loop D39 stand-in: X2 at t - 1, then layer t - 1's k / v from this node's own rows into its own cache (the
-         * owner's ops, as the whole layer issues them first) */
+        /* tp8 loop D39 stand-in: X2 at t - j, then (j = 2) layer t - 2 whole and layer t - 1's k / v from this node's own rows
+         * into its own cache (the owner's ops, as the whole layer issues them first) */
         cross(m.op_x2b, RAD_PP_X2, m.parts_x2b);
-        if (!m.tband_skip) m.layers[(size_t)te].attn.step_kv_only(c, batch);
+        if (!m.tband_skip) {
+            for (int64_t l = te; l < m.pp_t - 1; ++l) {
+                m.layers[(size_t)l].attn.step(c, batch);
+                m.layers[(size_t)l].mlp.step(c, batch);
+            }
+            m.layers[(size_t)(m.pp_t - 1)].attn.step_kv_only(c, batch);
+        }
         return;
     }
     /* A cut at the last layer: the leader's X2 arrives after the loop. */
