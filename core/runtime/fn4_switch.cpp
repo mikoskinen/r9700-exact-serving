@@ -1003,10 +1003,14 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kPpTband) {   /* tp8 loop D39: the leader's */
+        /* -1 = the value before any request (the engine then reads the start's RADIANCE_PP_TAIL_BAND, engine_lanes.cpp
+         * pp_tband_step): the read-back of a start that never named the switch, which the test kit's arm undo POSTs back
+         * (loop lq215: the undo of {"pp_tband": 1} was refused and the start stopped, F67's case) -- taken everywhere */
+        if (v == -1) return true;
         if (v < 0 || v > 2) {
-            if (err) *err = "pp_tband takes 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's fresh BG steps run W(h, t)'s, the band layer "
-                            "stays declared), 1 (they run as tail band passes; tp8 loop D39) or 2 (1 + the later chunks of a prompt whose "
-                            "every chunk so far ran as one; D39b)";
+            if (err) *err = "pp_tband takes -1 (back to the start's RADIANCE_PP_TAIL_BAND), 0 (no tail band passes: RADIANCE_PP_TAIL_BAND's "
+                            "fresh BG steps run W(h, t)'s, the band layer stays declared), 1 (they run as tail band passes; tp8 loop D39) or 2 "
+                            "(1 + the later chunks of a prompt whose every chunk so far ran as one; D39b)";
             return false;
         }
         const int cap = s.tband_capable.load(std::memory_order_acquire);
