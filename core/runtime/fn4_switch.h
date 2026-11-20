@@ -447,7 +447,8 @@
  *                   (start) = RADIANCE_DS41_SPHC's; N >= it: a lone prefill pass / a follower segment pass is sequence-
  *                   parallel from N rows (above --max-num-batched-tokens: none). Refused without RADIANCE_DS41_SPHC.
  *   ds41_sphc_attn  deepseek41 (tp8 loop P25s; 86): 0 .. RADIANCE_DS41_SPHC_ATTN (starts at it): 0 = an SP layer's q_a / kv
- *                   after xn's gather (P26 off), 1 P26, 2 + P26b.
+ *                   after xn's gather (P26 off), 1 P26, 2 + P26b, 3 + P26c (the kv / index sources of ratio > 1 without xn's
+ *                   gather: the indexer's projection over the quarter, iw gathered; tp8 loop PREFILL round 38).
  *   ds41_sphc_seg   deepseek41 (tp8 loop P25s; 87): 0 .. RADIANCE_DS41_SPHC_SEG (starts at it): 0 = the follower's segment
  *                   passes whole (P25 off), 1 / 2 P25, 3 + P25b. Each only takes away what the env declared; exact at every
  *                   value (SP is the replicated pass's fold and bytes; X1 / X2 carry every row whichever side shards).
