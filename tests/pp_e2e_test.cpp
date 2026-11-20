@@ -6861,3 +6861,113 @@ TEST(d56b_long_prompts_over_the_pool_with_a_drafter_serve_one_process_tokens) {
      * is narrower than the plain one's, so this case does not demand a strict drop; sched_test's d56 case is the strict control) */
     if (!only) CHECK(pre_form[1] <= pre_form[0]);
 }
+
+/* tp8 loop D57: THE MORNING CANDIDATE'S SCHEDULER LEVERS TOGETHER through the pipeline -- sched_srf 2 (P44), D55b's publishing +
+ * hold (RADIANCE_SCHED_PUB_PROMPT=2 + RADIANCE_SCHED_PUB_HOLD_MS=15000) and D56's room gate (RADIANCE_SCHED_LANE_ROOM=1) on at once.
+ * The pattern each was never run in together: a long prompt A (a 3,000-token head + 6,000 of its own) runs its prefill from an idle
+ * engine, then two siblings B / C over A's head (+ 200 / 260 tokens) arrive at once -- Claude Code's subagent fan-out beside the main
+ * agent's long turn. Every reply's greedy tokens = one process's for it alone with the levers off; at 2 lanes W(0,2), 3 lanes W(1,3)
+ * and BEST's shape (the llama KV copy checked) the burst ends well inside the hold's bound and B / C hit A's head; the negative
+ * control RADIANCE_SCHED_D57=0 (the forms before D57) at 2 lanes: sched_srf 2 chooses the held B, A sits out, the burst waits for
+ * the bound or until A's pieces lent to the other lane carry its committed end past the head (printed: + 3.4..6.8 s of wall; the strict
+ * negative controls are sched_test d57's). Printed per arm: wall, attention-cached tokens, the rule's plans / holds. */
+namespace {
+std::vector<int32_t> d57_prompt(int k) {
+    std::vector<int32_t> p = prompt_ids(701, 3000);
+    const std::vector<int32_t> own = prompt_ids(702 + (uint64_t)k, k == 0 ? 6000 : 200 + 60 * (size_t)(k - 1));
+    p.insert(p.end(), own.begin(), own.end());
+    return p;
+}
+struct D57Set { std::vector<std::vector<int32_t>> tok; std::vector<int> status; double wall = 0; };
+D57Set d57_set(int port) {
+    D57Set out;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::future<std::pair<int, std::vector<int32_t>>>> f;
+    for (int k = 0; k < 3; ++k) {
+        f.push_back(std::async(std::launch::async, [port, k] {
+            int st = -1;
+            std::vector<int32_t> t = complete(port, d57_prompt(k), 16, &st);
+            return std::make_pair(st, t);
+        }));
+        if (k == 0) std::this_thread::sleep_for(std::chrono::milliseconds(150));   /* A admitted and computing; B / C arrive */
+    }
+    for (auto& x : f) {
+        auto r = x.get();
+        out.status.push_back(r.first);
+        out.tok.push_back(std::move(r.second));
+    }
+    out.wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+}  /* namespace */
+
+TEST(d57_the_scheduler_levers_together_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "2112", "--max-model-len", "16384",
+                                           "--prefill-span", "2", "--checkpoint-interval", "1024" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> kAll = { "RADIANCE_SCHED_SRF=2", "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=15000",
+                                            "RADIANCE_SCHED_LANE_ROOM=1" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        for (int k = 0; k < 3; ++k) {
+            int st = -1;
+            ref.push_back(complete(one.port, d57_prompt(k), 16, &st));
+            CHECK_EQ(st, 200);
+            CHECK_EQ(ref.back().size(), (size_t)16);
+        }
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, kv, neg; };
+    double wall_d57_2 = -1, wall_neg = -1;
+    for (const Arm a : { Arm{ "one process", "", 0, false, false, false }, Arm{ "2 lanes", "0,2", 2, false, false, false },
+                         Arm{ "2 lanes, D57=0", "0,2", 2, false, false, true }, Arm{ "3 lanes, wrap-around", "1,3", 3, false, true, false },
+                         Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, true, false } }) {
+        std::vector<std::string> env = a.lanes ? cat(kSplitEnv, { "RADIANCE_PP_SPAN_SHORT=24576" }) : std::vector<std::string>{};
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        env = cat(env, kAll);
+        if (a.neg) env.push_back("RADIANCE_SCHED_D57=0");
+        std::vector<std::string> ex = ext;
+        if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const D57Set got = d57_set(pp.port);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+        const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = a.lanes ? pp.fol.output() : std::string();
+        int differ = 0, bad = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            differ += i >= got.tok.size() || got.tok[i] != ref[i];
+            bad += i >= got.status.size() || got.status[i] != 200;
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        const long long plans = srf_field(llog, "lane plans under the rule"), held = srf_field(llog, "admissions held");
+        fprintf(stderr, "    D57 %-28s: %d of 3 differ from one process alone, %d not answered; wall %.2f s; attention-cached prompt tokens %.0f; "
+                        "srf rule plans %lld, held %lld; KV-copy checks %lld, %lld differ; %zu E lines\n",
+                a.name, differ, bad, got.wall, hit, plans, held, checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(elines, (size_t)0);
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (a.lanes && !a.neg) CHECK(hit >= 2 * 2048);   /* B and C resume on A's head (a chunk start below 3,000) */
+        if (a.lanes == 2) (a.neg ? wall_neg : wall_d57_2) = got.wall;
+        if (differ || bad || elines)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+    /* a reading, not a check: the stall ends when A's pieces lent to the other lane carry its committed end past the head (sched_test d57
+     * holds the strict negative controls); three runs read +6.8 s (A 14,000, a 5-s bound), +3.4 s (A 9,000, 5 s), +4.8 s (A 9,000, 15 s) */
+    fprintf(stderr, "    D57 2 lanes: wall %.2f s with D57, %.2f s with D57=0 (the hold's bound 15 s)\n", wall_d57_2, wall_neg);
+    CHECK(wall_d57_2 >= 0 && wall_neg >= 0);
+}
