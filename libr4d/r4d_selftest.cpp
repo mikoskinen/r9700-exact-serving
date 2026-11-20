@@ -24739,6 +24739,9 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     if ((std::getenv("R4D_SELFTEST_BI_DEC") && M > 8) || std::getenv("R4D_SELFTEST_CMP_OR")) {
         auto grab = [&](int v, std::vector<uint8_t>& o) {
             pl.readv_hc(v);
+            /* qfn-on-ds: the outputs poisoned first, so a form that writes nothing cannot pass on the previous grab's bytes */
+            for (auto [p, b] : { std::pair<void*, size_t>{ d_x, xb }, { d_inj, ib }, { d_q, qb }, { d_qs, sb }, { d_rq, qb }, { d_rs, sb } })
+                st_memset(p, 0x5a, b);
             if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) return false;
             o.clear();
             for (auto [p, b] : { std::pair<void*, size_t>{ d_x, xb }, { d_inj, ib }, { d_q, qb }, { d_qs, sb }, { d_rq, qb }, { d_rs, sb } }) {
@@ -24748,14 +24751,17 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
             }
             return true;
         };
+        /* qfn-on-ds (lever B3R, 20.11.2026): R4D_SELFTEST_CMP_BASE the reference value (0 = the 8-row form G; past 64 rows
+         * form G exceeds kHcGTilesMax and refuses, so compare there against G16p, e.g. 331) */
+        const int cmp_base = std::getenv("R4D_SELFTEST_CMP_BASE") ? std::atoi(std::getenv("R4D_SELFTEST_CMP_BASE")) : 0;
         std::vector<uint8_t> g8, g16;
-        const bool okl = grab(0, g8) && grab(cmp_or, g16);
+        const bool okl = grab(cmp_base, g8) && grab(cmp_or, g16);
         size_t diff = 0;
         if (okl) for (size_t i = 0; i < g8.size() && i < g16.size(); ++i) diff += g8[i] != g16[i];
-        std::printf("hc_read_e4m3 M=%lld: hc_readv %d vs 0 (bi_dec %s): %s\n", (long long)M, cmp_or,
+        std::printf("hc_read_e4m3 M=%lld: hc_readv %d vs %d (bi_dec %s): %s\n", (long long)M, cmp_or, cmp_base,
                     std::getenv("R4D_SELFTEST_BI_DEC") ? "on" : "off",
                     !okl ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
-        ok((nm + fmt(" hc_readv %d = 0", cmp_or)).c_str(), okl && diff == 0);
+        ok((nm + fmt(" hc_readv %d = %d", cmp_or, cmp_base)).c_str(), okl && diff == 0);
     }
     /* fn4 (12.11.2026): under bi_dec, kernel A' alone (the stage mask's bit 1 + 0) against the whole read: A' and B3 apart */
     if (std::getenv("R4D_SELFTEST_BI_DEC") && pl.pf2_stages_hc) {
