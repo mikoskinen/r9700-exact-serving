@@ -6473,3 +6473,95 @@ TEST(d55_a_prompt_published_at_its_last_chunk_serves_its_siblings_one_process_to
     }
     CHECK_EQ(armed, 6);
 }
+
+/* tp8 loop D55b: siblings that arrive at the SAME moment. Four prompts over one 500-byte head sent at once (no wait for a first
+ * token): every lane admits its own before any prompt completes, so D55 alone cannot help (the head is computed four times);
+ * RADIANCE_SCHED_PUB_HOLD_MS holds a fresh prompt whose head a running prompt is computing, and RADIANCE_SCHED_PUB_PROMPT=2
+ * publishes that prompt chunk by chunk. Each request's tokens = one process's for it alone in every arm; cached tokens: off and
+ * D55 alone ~0 at 2 / 3 / 4 lanes, with the hold 3 x the head's blocks (1,488); a hold never past its bound (a 1 ms bound is
+ * printed: no request waits for it). */
+namespace {
+std::vector<std::vector<int32_t>> four_at_once(int port) {
+    std::vector<std::future<Reply>> f;
+    for (int k = 0; k < 4; ++k)
+        f.push_back(std::async(std::launch::async, [port, k] {
+            json b = sibling_body(k);
+            b["n_predict"] = 32;
+            b.erase("stream");
+            return ask(port, b);
+        }));
+    std::vector<std::vector<int32_t>> out;
+    for (int k = 0; k < 4; ++k) {
+        const Reply r = f[(size_t)k].get();
+        if (!r.why.empty()) fprintf(stderr, "    at once %d: %s\n", k, r.why.c_str());
+        out.push_back(r.tok.size() == 1 ? r.tok[0] : std::vector<int32_t>{});
+    }
+    return out;
+}
+}  /* namespace */
+
+TEST(d55b_siblings_at_the_same_moment_wait_for_the_head_and_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    const std::vector<std::string> seqs = { "--max-num-seqs", "8" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", seqs));
+        for (int k = 0; k < 4; ++k) {
+            json b = sibling_body(k);
+            b["n_predict"] = 32;
+            b.erase("stream");
+            const Reply r = ask(one.port, b);
+            ref.push_back(r.tok.size() == 1 ? r.tok[0] : std::vector<int32_t>{});
+            CHECK(!ref.back().empty());
+        }
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Form { const char* name; std::vector<std::string> env; bool hits; };
+    const std::vector<Form> forms = { { "off", {}, false }, { "D55 (=1)", { "RADIANCE_SCHED_PUB_PROMPT=1" }, false },
+                                      { "=1 + hold 5000 ms", { "RADIANCE_SCHED_PUB_PROMPT=1", "RADIANCE_SCHED_PUB_HOLD_MS=5000" }, true },
+                                      { "=2 + hold 5000 ms", { "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=5000" }, true },
+                                      { "=2 + hold 1 ms (bound)", { "RADIANCE_SCHED_PUB_PROMPT=2", "RADIANCE_SCHED_PUB_HOLD_MS=1" }, false } };
+    struct Arm { const char* name; const char* cut; int lanes; bool best, kv; };
+    for (const Arm a : { Arm{ "one process", "", 0, false, false }, Arm{ "2 lanes", "0,2", 2, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, true } }) {
+        for (const Form& fm : forms) {
+            std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+            if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+            if (a.best) env = cat(env, kBest);
+            env = cat(env, fm.env);
+            Serving pp;
+            std::vector<std::string> ex = seqs;
+            if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
+            REQUIRE(pp.start(a.cut, ex, env));
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::vector<std::vector<int32_t>> got = four_at_once(pp.port);
+            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
+            const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output(), flog = pp.fol.output();
+            int differ = 0;
+            for (size_t i = 0; i < got.size(); ++i) differ += got[i] != ref[i];
+            long long checks = -1, kdiff = -1;
+            if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+                if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                    (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+            const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+            fprintf(stderr, "    D55b %-28s %-24s: %d of 4 differ from one process alone; attention-cached prompt tokens %.0f; wall %.2f s; KV-copy "
+                            "checks %lld, %lld differ; %zu E lines\n",
+                    a.name, fm.name, differ, hit, wall, checks, kdiff, elines);
+            CHECK_EQ(differ, 0);
+            CHECK_EQ(elines, (size_t)0);
+            if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+            if (fm.hits) CHECK(hit >= 3 * 448);
+            if (differ || elines)
+                fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        }
+    }
+}

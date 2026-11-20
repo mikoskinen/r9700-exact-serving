@@ -16463,3 +16463,89 @@ TEST(srf_2_two_cold_prompts_beside_a_short_window_pool) {
         }
     }
 }
+
+/* tp8 loop D55 / D55b: RADIANCE_SCHED_PUB_PROMPT=1 publishes a request's prompt when its last chunk commits (it is still
+ * running), once; =2 also publishes the committed part at every prefill chunk; unset: only at its close. A recycled request slot
+ * publishes again. RADIANCE_SCHED_PUB_HOLD_MS holds a fresh request whose prompt shares the head a running prompt is computing:
+ * it is not admitted until that head is available (=1: the sibling's prompt done; =2: its computed end past the head), and
+ * never past the bound. */
+TEST(d55_pub_prompt_publishes_at_the_last_chunk_and_d55b_holds_a_sibling_for_its_head) {
+    auto published_while_running = [](const char* mode, int* n_pub, int* n_mid) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/128);
+        if (mode) setenv("RADIANCE_SCHED_PUB_PROMPT", mode, 1); else unsetenv("RADIANCE_SCHED_PUB_PROMPT");
+        CHECK_OK(f.start());
+        unsetenv("RADIANCE_SCHED_PUB_PROMPT");
+        *n_pub = *n_mid = 0;
+        for (int round = 0; round < 2; ++round) {   /* the second request takes the first one's recycled slot */
+            const uint64_t a = f.submit(400, 8, 0, /*ignore_eos=*/true);
+            for (int k = 0; k < 40; ++k) {
+                const size_t before = f.pc.published.size();
+                if (!f.sch.step()) break;
+                f.commit_plain();
+                const Request* r = f.sch.find(a);
+                for (size_t i = before; i < f.pc.published.size(); ++i)
+                    if (f.pc.published[i].seq == a && r && r->state == ReqState::Running) {
+                        if (f.pc.published[i].n_tokens == 400) ++*n_pub;
+                        else ++*n_mid;
+                    }
+            }
+            while (f.sch.step() != nullptr) f.commit_plain();
+        }
+    };
+    int pub = -1, mid = -1;
+    published_while_running(nullptr, &pub, &mid);
+    fprintf(stderr, "    unset: %d publish(es) of the whole prompt while running, %d of a part\n", pub, mid);
+    CHECK_EQ(pub, 0);
+    CHECK_EQ(mid, 0);
+    published_while_running("1", &pub, &mid);
+    fprintf(stderr, "    =1: %d publish(es) of the whole prompt while running (2 requests, the second in a recycled slot), %d of a part\n", pub, mid);
+    CHECK_EQ(pub, 2);
+    CHECK_EQ(mid, 0);
+    published_while_running("2", &pub, &mid);
+    fprintf(stderr, "    =2: %d publish(es) of the whole prompt while running, %d of a part (128-token chunks of 400)\n", pub, mid);
+    CHECK_EQ(pub, 2);
+    CHECK_EQ(mid, 2 * 3);
+
+    /* the hold: A runs (400 tokens in 128-token chunks), B shares A's first 300 tokens (Fixture prompts are 0..n-1: a shared head) */
+    auto held_steps = [](const char* mode, const char* hold_ms, int* held, int64_t* a_at_admit) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/128);
+        if (mode) setenv("RADIANCE_SCHED_PUB_PROMPT", mode, 1);
+        if (hold_ms) setenv("RADIANCE_SCHED_PUB_HOLD_MS", hold_ms, 1);
+        CHECK_OK(f.start());
+        unsetenv("RADIANCE_SCHED_PUB_PROMPT");
+        unsetenv("RADIANCE_SCHED_PUB_HOLD_MS");
+        const uint64_t a = f.submit(400, 8, 0, true);
+        REQUIRE(f.sch.step() != nullptr);   /* A's first chunk: A is running */
+        f.commit_plain();
+        const uint64_t b = f.submit(300, 8, 0, true);   /* B's prompt = A's first 300 tokens */
+        *held = 0;
+        *a_at_admit = -1;
+        for (int k = 0; k < 60; ++k) {
+            const Request* ra = f.sch.find(a);
+            const int64_t a_done = ra ? ra->n_computed : 400;
+            if (!f.sch.step()) break;
+            bool b_in = false;
+            for (const StepEntry& e : f.sch.plan().e) b_in = b_in || e.seq == b;
+            if (b_in && *a_at_admit < 0) *a_at_admit = a_done;
+            if (!b_in && *a_at_admit < 0) ++*held;
+            f.commit_plain();
+        }
+        while (f.sch.step() != nullptr) f.commit_plain();
+    };
+    int held = -1;
+    int64_t at = -1;
+    held_steps(nullptr, nullptr, &held, &at);
+    fprintf(stderr, "    no hold: B planned with A's computed end at %lld, after %d step(s)\n", (long long)at, held);
+    CHECK(at < 299);
+    held_steps("1", "60000", &held, &at);
+    fprintf(stderr, "    =1 + hold: B planned with A's computed end at %lld (its prompt 400), after %d step(s)\n", (long long)at, held);
+    CHECK_EQ(at, 400);
+    held_steps("2", "60000", &held, &at);
+    fprintf(stderr, "    =2 + hold: B planned with A's computed end at %lld (B's head 299), after %d step(s)\n", (long long)at, held);
+    CHECK(at >= 299 && at < 400);
+    held_steps(nullptr, "60000", &held, &at);   /* the hold needs a publish rule (else it would only delay): off */
+    fprintf(stderr, "    hold, PUB_PROMPT unset (the hold is off): B planned with A's computed end at %lld, after %d step(s)\n", (long long)at, held);
+    CHECK(at < 299);
+}
