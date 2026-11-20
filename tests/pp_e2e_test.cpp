@@ -6735,4 +6735,112 @@ TEST(d56_long_prompts_over_the_pools_free_share_beside_decoders_serve_one_proces
     }
     fprintf(stderr, "    D56 preemptions, all arms: %lld; the lane arms by form: default %lld, pub2+hold %lld, lane-room %lld, room+pub %lld\n",
             pre_all, pre_form[0], pre_form[1], pre_form[2], pre_form[3]);
+    /* the lever's own quantity, over the three lane arms: four runs read default + pub 13 / 19 / 27 vs lane-room + room+pub 6 / 8 / 7 */
+    if (!only) CHECK(pre_form[2] + pre_form[3] < pre_form[0] + pre_form[1]);
+}
+
+/* tp8 loop D56b: the same long-prompt set under KV pressure on the DSpark-DRAFTED fixture (D38a's WorldDs, 3 speculative tokens):
+ * BEST drafts, and a preemption by recompute through the lanes then also drops and rebuilds a drafter's state (its KV group is
+ * the same pool's) while other lanes' drafted sequences run. Every request's greedy tokens = the drafted one process's on the
+ * default pool (= the plain tokens: drafts are verified), in one process at the small pool, 2 lanes W(0,2), 3 lanes W(1,3) and
+ * BEST's shape (the KV copy checked), each with RADIANCE_SCHED_LANE_ROOM unset and =1; drafts proposed and accepted in every arm;
+ * all answered, KV-copy 0 differ, 0 E lines. */
+TEST(d56b_long_prompts_over_the_pool_with_a_drafter_serve_one_process_tokens) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
+                                             "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
+    LongRun ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, long_shape(0))));
+        ref = long_set(one.port);
+        fprintf(stderr, "    D56b reference: drafted one process, pool %lld tokens, wall %.2f s\n", pool_in(one.lead.output()), ref.wall);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        for (size_t i = 0; i < ref.tok.size(); ++i) { CHECK_EQ(ref.status[i], 200); CHECK(!ref.tok[i].empty()); }
+    }
+    struct Arm { const char* name; const char* cut; int lanes; bool best, kv; };
+    const char* only = std::getenv("PP_E2E_D56_ARM");
+    long long pre_form[2] = { 0, 0 };
+    for (const Arm a : { Arm{ "one process", "", 0, false, false }, Arm{ "2 lanes", "0,2", 2, false, false },
+                         Arm{ "3 lanes, wrap-around", "1,3", 3, false, true }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true, true } }) {
+        if (only && !std::strstr(a.name, only)) continue;
+        std::vector<std::string> env = a.lanes ? kSplitEnv : std::vector<std::string>{};
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.best) env = cat(env, kBest);
+        const std::vector<std::string> ex = cat(spec, long_shape(a.lanes));
+        auto pool_at = [&](int mib) -> long long {
+            Serving pr;
+            pr.model = worldds().llama_rad;
+            if (!pr.start(a.cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(mib) }))) return -1;
+            const long long p = pool_in(pr.lead.output());
+            kill(pr.lead.child.pid, SIGTERM);
+            pr.lead.finish(60);
+            if (a.lanes) pr.fol.finish(30);
+            return p;
+        };
+        int lo = 64, hi = 512;
+        long long plo = pool_at(lo), phi = pool_at(hi);
+        if (!(plo < kLongLo && phi >= kLongLo))
+            fprintf(stderr, "    D56b %s: pools %lld / %lld tokens at %d / %d MiB do not bracket %lld\n", a.name, plo, phi, lo, hi, kLongLo);
+        REQUIRE(plo < kLongLo && phi >= kLongLo);
+        while (hi - lo > 1) {
+            const int m = (lo + hi) / 2;
+            const long long p = pool_at(m);
+            if (p >= kLongLo) { hi = m; phi = p; } else { lo = m; plo = p; }
+        }
+        if (phi >= kLongHi) fprintf(stderr, "    D56b %s: the smallest pool >= %lld is %lld tokens (%d MiB)\n", a.name, kLongLo, phi, hi);
+        REQUIRE(phi < kLongHi);
+        for (int room = 0; room < 2; ++room) {
+            Serving pp;
+            pp.model = worldds().llama_rad;
+            std::vector<std::string> fenv = env;
+            if (room) fenv.push_back("RADIANCE_SCHED_LANE_ROOM=1");
+            REQUIRE(pp.start(a.cut, ex, cat(fenv, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(hi) })));
+            const LongRun got = long_set(pp.port);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const std::string mt = get(pp.port, "/metrics");
+            const double pre = metric(mt, "vllm:num_preemptions_total"), dr = metric(mt, "radiance:draft_tokens_total"),
+                         acc = metric(mt, "radiance:draft_accepted_total");
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output(), flog = pp.fol.output();
+            REQUIRE_EQ(got.tok.size(), ref.tok.size());
+            int differ = 0, failed = 0;
+            for (size_t i = 0; i < ref.tok.size(); ++i) {
+                if (got.status[i] != 200 || got.tok[i].empty()) { ++failed; continue; }
+                if (got.tok[i] == ref.tok[i]) continue;
+                ++differ;
+                size_t j = 0;
+                while (j < ref.tok[i].size() && j < got.tok[i].size() && ref.tok[i][j] == got.tok[i][j]) ++j;
+                fprintf(stderr, "    D56b %s room %d request %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n",
+                        a.name, room, i, got.tok[i].size(), ref.tok[i].size(), j);
+            }
+            long long checks = -1, kdiff = -1;
+            if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+                if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                    (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+            const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+            fprintf(stderr, "    D56b %-26s %s: pool %lld tokens (%d MiB), %.0f preemption(s), wall %.2f s, drafted %.0f / accepted %.0f; %d of "
+                            "%zu differ, %d failed; KV-copy checks %lld, %lld differ; %zu E lines\n",
+                    a.name, room ? "lane-room" : "default  ", pool_in(llog), hi, pre, got.wall, dr, acc, differ, ref.tok.size(), failed,
+                    checks, kdiff, elines);
+            CHECK_EQ(differ, 0);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(elines, (size_t)0);
+            CHECK(got.wall < kLongWallS);
+            CHECK(dr > 0);
+            CHECK(acc > 0);
+            if (!room) CHECK(pre > 0);
+            if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+            if (differ || failed || elines)
+                fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+            if (a.lanes) pre_form[room] += pre > 0 ? (long long)pre : 0;
+        }
+    }
+    fprintf(stderr, "    D56b lane-arm preemptions: default %lld, lane-room %lld\n", pre_form[0], pre_form[1]);
+    if (!only) CHECK(pre_form[1] < pre_form[0]);   /* the lever's own quantity: two runs read 10 / 12 vs 4 / 4 */
 }
