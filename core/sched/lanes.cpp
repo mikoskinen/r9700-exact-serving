@@ -686,7 +686,10 @@ void Scheduler::lane_split_own() {
                 break;
             }
             const bool wide = geo_.shared_tok > 0 && n > geo_.shared_tok;
-            if (wide && (!b || !b->running_.empty() || !b->waiting_.empty() || lanes_->inbox_n_locked(to) > 0)) {
+            /* tp8 loop P44 (fn4 sched_srf 2): the borrower's own prompts sit out for this one (no lane decodes) and a wide piece
+             * leaves its step no budget (lane_reserve): the step is this one sequence, as an idle lane's */
+            const bool srf_idle = srf_on_ && srf_hold_ && (e.slot == srf_slot_ || e.slot == srf_wslot_);
+            if (wide && (!b || (!srf_idle && (!b->running_.empty() || !b->waiting_.empty())) || lanes_->inbox_n_locked(to) > 0)) {
                 why = LaneSet::kWideBusy;
                 break;
             }
@@ -1117,10 +1120,14 @@ void Scheduler::lane_prompt_note(SchedReq& s) {
     const double adm_ms = s.arrived_us > 0 && s.admitted_us >= s.arrived_us ? (double)(s.admitted_us - s.arrived_us) / 1000.0 : -1.0;
     RAD_INFO("lanes: request %llu's prompt of %lld tokens: %d chunk(s) planned by its lane %d, %d lent to other lanes; "
              "%s; first chunk's plan to its first token %.1f ms; at the scheduler %.1f ms before that plan (admitted after %.1f "
-             "ms; -1 = not stamped)", (unsigned long long)s.req->id,
+             "ms; -1 = not stamped)%s", (unsigned long long)s.req->id,
              (long long)s.req->prompt.size(), (int)s.lst.home, lane_, (int)s.lst.lent,
              why.empty() ? "every chunk after a home chunk lent" : why.c_str(),
-             (double)(mono_us() - s.lst.t0_us) / 1000.0, wait_ms, adm_ms);
+             (double)(mono_us() - s.lst.t0_us) / 1000.0, wait_ms, adm_ms,
+             s.lst.srf_out || s.lst.srf_held
+                 ? fmt("; fn4 sched_srf (tp8 loop P44): sat out %d plan(s) of its lane, admission held %d", (int)s.lst.srf_out,
+                       (int)s.lst.srf_held).c_str()
+                 : "");
     s.lst.t0_us = 0;
 }
 

@@ -56,6 +56,10 @@ struct SchedReq {
     bool     noa_starved = false;
     /* A displacement step skipped this running prefill's chunk: it is not displaced again before it ran its next one. */
     bool     noa_displaced = false;
+    /* tp8 loop P44 (fn4 sched_srf): the KV valve -- the last plan that chose this prompt to run alone could not hold its chunk in
+     * the pool (it yielded / waited): until it plans a chunk again it chooses nobody, so the prompts sitting out for it may run
+     * (they hold KV this one cannot take from another lane; a pipeline lane preempts only its own). */
+    bool     srf_kv = false;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -176,6 +180,7 @@ struct SchedReq {
     struct LaneStats {
         int32_t home = 0, lent = 0;
         int32_t why[9] = {};
+        int32_t srf_out = 0, srf_held = 0;   /* tp8 loop P44: plans it sat out / its admission was held (fn4 sched_srf) */
         int64_t t0_us = 0;
     } lst;
     /* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS): when this newcomer was first held out of its home's MIXED step for the BG lanes'
@@ -788,6 +793,13 @@ public:
     /* Lever CBH, visible for tests: the clock a co-batch hold reads, in microseconds (default: the monotonic clock the live
      * request table reads). Set before the requests it is to time are added. */
     void    set_cbh_clock(std::function<int64_t()> now_us) { cbh_clock_ = std::move(now_us); }
+    /* tp8 loop P44 (fn4 sched_srf): steps the rule acted in, of them a prompt alone in a spanned step, plans that left a running
+     * prompt out (sat out), admissions held (sched_srf 2), choices skipped by the KV valve (SchedReq::srf_kv). Takes the lock. */
+    enum { kSrfSteps, kSrfAlone, kSrfOut, kSrfHeld, kSrfKv, kSrfN };
+    void    srf_counts(int64_t out[kSrfN]) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int k = 0; k < kSrfN; ++k) out[k] = srf_n_[k];
+    }
 
 private:
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -814,6 +826,46 @@ private:
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* tp8 loop P44 (fn4 sched_srf, upstream 67cf57b8; read at every step planned): the switch in force; whether the rule acts in
+     * this step's plan; this scheduler's running request planned alone (-1: none here); whether the chosen prompt is another
+     * lane's (sched_srf 2: every prompt of this lane sits out); the chosen's rows left to plan and its id (a lane under sched_srf 2
+     * holds a waiting prompt that is not ahead of it); a request finished beside others since the last step (the next step is
+     * planned as today: upstream's follow-up rule); the counts (kSrfN). */
+    int           srf_now_ = 0;
+    bool          srf_on_ = false;
+    int32_t       srf_slot_ = -1;
+    bool          srf_away_ = false;
+    bool          srf_hold_ = false;
+    int64_t       srf_left_ = 0;
+    uint64_t      srf_id_ = 0;
+    bool          finished_beside_ = false;
+    int64_t       srf_n_[kSrfN] = {};
+    /* The prompt the rule chooses: the fewest rows left to plan, then the lowest id; `dec` = a decode row was seen (the rule
+     * does not act). srf_scan adds this scheduler's running requests (`planning`: the one in step(), its running_ bumped past
+     * lent rows and lane_out_ beside it; else another lane's, read under the lanes' lock). */
+    struct SrfPick {
+        int      lane = -1;
+        int32_t  slot = -1;
+        int64_t  left = 0;
+        uint64_t id = 0;
+        bool     waiting = false;   /* the chosen is a waiting request (sched_srf 2: its whole prompt) */
+        bool     dec = false;
+        int64_t  kv = 0;   /* candidates the KV valve skipped */
+    };
+    /* `waiting`: waiting requests count too (sched_srf 2), by their whole prompt, where this scheduler could admit one */
+    void    srf_scan(bool planning, bool waiting, SrfPick& pk) const;
+    /* sched_srf 2: the waiting request chosen to run next, admitted this step (its lane's inbox empty: a step of its own) */
+    int32_t srf_wslot_ = -1;
+    /* sched_srf 2: whether waiting request `w` is held out of this step's admission (every one but the chosen; a preempted
+     * request's recompute is admitted as today) */
+    bool    srf_holds(const SchedReq& w) const {
+        if (!srf_on_ || !srf_hold_ || !w.req || w.req->state == ReqState::Preempted) return false;
+        return w.slot != srf_wslot_;
+    }
+    /* whether running request `slot` (a prefill) sits this step out under the rule */
+    bool    srf_sits_out(int32_t slot) const { return srf_on_ && slot != srf_slot_; }
+    /* sched_srf: the rule's choice for this step (step(), under the lock); sets srf_on_ / srf_slot_ / srf_away_ / srf_hold_ */
+    void    srf_choose(bool after_finish);
     /* Lever BI's chunking (RADIANCE_SCHED_BI_CHUNK at start; 0 = today): a prefill chunk whose rows do not depend on what
      * else is in the step, or none this step (bi_chunk_plan). */
     int           bi_chunk_ = 0;

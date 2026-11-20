@@ -727,6 +727,20 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
                                        "dev M5)", (long long)c.dpieces).c_str()
              : lanes_.lend_split() ? fmt("; %lld newcomers split on the 512 grid beside decode rows (RADIANCE_PP_LEND_MIXED=2, tp8 "
                                          "dev M5b)", (long long)c.dpieces).c_str() : "");
+    {   /* tp8 loop P44 (fn4 sched_srf): its counts summed over the lanes' schedulers */
+        int64_t t[Scheduler::kSrfN] = {}, one[Scheduler::kSrfN];
+        for (int l = 0; l < lanes_.n(); ++l)
+            if (const Scheduler* ls = lanes_.lane(l)) {
+                ls->srf_counts(one);
+                for (int k = 0; k < Scheduler::kSrfN; ++k) t[k] += one[k];
+            }
+        if (fn4::sched_srf() > 0 || t[Scheduler::kSrfSteps] > 0)
+            RAD_INFO("two-node pipeline: fn4 sched_srf %d (tp8 loop P44, prompts one at a time, the fewest rows left first): %lld lane "
+                     "plans under the rule, %lld of them a prompt alone in a spanned step; %lld times a running prompt sat a plan out, "
+                     "%lld admissions held, %lld choices skipped by the KV valve", fn4::sched_srf(), (long long)t[Scheduler::kSrfSteps],
+                     (long long)t[Scheduler::kSrfAlone], (long long)t[Scheduler::kSrfOut], (long long)t[Scheduler::kSrfHeld],
+                     (long long)t[Scheduler::kSrfKv]);
+    }
     if (lanes_.lane_rows_m() > 0)   /* tp8 loop D47b */
         RAD_INFO("two-node pipeline: a decode lane's rows (RADIANCE_PP_LANE_ROWS=%lld, tp8 loop D47b) turned away %lld lends over the run",
                  (long long)lanes_.lane_rows_m(), (long long)lanes_.lane_rows_kept());

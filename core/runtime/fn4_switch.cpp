@@ -42,7 +42,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_short_blk", "ds41_prefetch", "ds41_attn_dec", "ds41_sphc", "ds41_sphc_attn",
                                         "ds41_sphc_seg", "pp_bg_room", "pp_bg_join_ms", "ds41_twin",
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
-                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband" };
+                                        "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
+                                        "sched_srf" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -331,6 +332,15 @@ int env_tail_grid() {
     return env;
 }
 
+/* tp8 loop P44: RADIANCE_SCHED_SRF=1 / 2 at start (anything else, or unset, is 0). */
+int env_sched_srf() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_SRF");
+        return e && !std::strcmp(e, "1") ? 1 : e && !std::strcmp(e, "2") ? 2 : 0;
+    }();
+    return env;
+}
+
 /* Lever TI (ds41-pf2): RADIANCE_SCHED_TAIL_INNER=1 at start (anything else, or unset, is 0). */
 int env_tail_inner() {
     static const int env = [] {
@@ -358,6 +368,10 @@ int reported(State& s, int i) {
     if (i == kSchedTailInner) {    /* lever TI: set, else RADIANCE_SCHED_TAIL_INNER (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_tail_inner();
+    }
+    if (i == kSchedSrf) {          /* tp8 loop P44: set, else RADIANCE_SCHED_SRF (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_sched_srf();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -483,6 +497,10 @@ int sched_tail_grid() {
 int sched_tail_inner() {
     const int v = st().val[kSchedTailInner].load(std::memory_order_acquire);
     return v >= 0 ? v : env_tail_inner();
+}
+int sched_srf() {
+    const int v = st().val[kSchedSrf].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_sched_srf();
 }
 int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     State& s = st();
@@ -901,7 +919,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1468,6 +1486,15 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedSrf) {          /* tp8 loop P44: the scheduler's, read at every step it plans */
+        if (v < 0 || v > 2) {
+            if (err) *err = "sched_srf takes 0 (today's plan), 1 (running prompts with no decode row and no admission possible take "
+                            "the step one at a time, the fewest rows left first: upstream 67cf57b8, in each lane) or 2 (1, and across "
+                            "the decode lanes of a pipeline, a lane holding back a waiting prompt longer than that one's rest; tp8 loop P44)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedTailInner) {    /* lever TI (ds41-pf2): the scheduler's, read at every step it plans */
         if (v != 0 && v != 1) {
             if (err) *err = "sched_tail_inner takes 0 (off: lever G's fine tail snapshot cuts the prompt's last chunk there) or 1 "
@@ -1729,7 +1756,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)
