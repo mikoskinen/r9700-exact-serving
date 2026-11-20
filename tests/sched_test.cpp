@@ -13613,6 +13613,8 @@ struct Lanes {
     int64_t max_tok = 64, max_ctx = 1024, stage_rows = 0, kv_blocks = 4096;
     /* tp8 loop D56: --prefill-room-gate (the fixture's default off, as before) */
     bool room_gate = false;
+    /* tp8 loop D57: the prefix cache on (the fake indexes the attention group; publish order only, no hits) */
+    bool prefix = false;
     /* tp8 loop F22: --num-speculative-tokens (0: no drafter; with prog.drafter set before start(), a drafting deployment) */
     int n_spec = 0;
     ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
@@ -13647,10 +13649,11 @@ struct Lanes {
         cfg.max_tok = max_tok;
         cfg.max_seqs = seqs;
         cfg.max_ctx = max_ctx;
-        cfg.prefix_cache = false;
+        cfg.prefix_cache = prefix;
         cfg.prefill_room_gate = room_gate;
         cfg.n_spec = n_spec;
         kv.setup(prog.kv_groups, cfg.max_ctx, kv_blocks, 64);
+        if (prefix) pc.groups = { 0 };
         if (win > 0) {
             kv.slide = true;
             if (win_pool > 0) kv.resize_group(win_g, win_pool);
@@ -16236,6 +16239,7 @@ namespace {
  * prefill rows of two prompts or more, window misses and failed commits. */
 struct SrfRun {
     std::vector<std::vector<std::pair<int, int>>> chunks;
+    std::vector<std::vector<int>> chunk_round;   /* tp8 loop D57: the round each of `chunks` was planned in */
     std::vector<int> first;
     int two = 0, failed = 0, rounds = 0;
     int64_t misses = 0;
@@ -16243,6 +16247,7 @@ struct SrfRun {
 SrfRun run_multi(Lanes& L, int lanes, const std::vector<uint64_t>& ids, const std::vector<int>& home) {
     SrfRun out;
     out.chunks.resize(ids.size());
+    out.chunk_round.resize(ids.size());
     out.first.assign(ids.size(), -1);
     std::vector<int> fifo;
     std::vector<char> busy((size_t)lanes, 0);
@@ -16277,7 +16282,10 @@ SrfRun run_multi(Lanes& L, int lanes, const std::vector<uint64_t>& ids, const st
                 if (!e.is_prefill) continue;
                 if (std::find(seqs.begin(), seqs.end(), e.seq) == seqs.end()) seqs.push_back(e.seq);
                 for (size_t i = 0; i < ids.size(); ++i)
-                    if (e.seq == ids[i]) out.chunks[i].emplace_back(e.ctx_len, e.ctx_len + e.n_tokens);
+                    if (e.seq == ids[i]) {
+                        out.chunks[i].emplace_back(e.ctx_len, e.ctx_len + e.n_tokens);
+                        out.chunk_round[i].push_back(round);
+                    }
             }
             out.two += seqs.size() >= 2;
             busy[(size_t)l] = 1;
@@ -16571,6 +16579,182 @@ TEST(d55_pub_prompt_publishes_at_the_last_chunk_and_d55b_holds_a_sibling_for_its
     held_steps(nullptr, "60000", &held, &at);   /* the hold needs a publish rule (else it would only delay): off */
     fprintf(stderr, "    hold, PUB_PROMPT unset (the hold is off): B planned with A's computed end at %lld, after %d step(s)\n", (long long)at, held);
     CHECK(at < 299);
+}
+
+/* tp8 loop D57: sched_srf 2 (the fewest rows left first over the lanes; a WAITING prompt counts by its whole prompt) beside D55b's hold
+ * (RADIANCE_SCHED_PUB_PROMPT=2 + RADIANCE_SCHED_PUB_HOLD_MS), nothing decoding -- the subagent burst from an idle engine. A (12,000
+ * tokens, DeepSeek's grid) runs its first chunk, then B arrives (A's first 6,000 tokens: a shared head), in A's lane or another one.
+ * B's whole prompt is fewer rows than A's rest, so the rule chooses B, which the hold keeps out until A has computed that head:
+ * before D57 (RADIANCE_SCHED_SRF_PUBSKIP=0, the negative control) every running prompt sits out and nothing is planned until the
+ * hold's bound (no first token in 1,200 rounds at a 60-s bound). D57: the rule passes over the held B, A computes past the head,
+ * then B is planned (A's computed end at B's first chunk >= 5,999), both finish, nothing fails, the lanes' books stay whole.
+ * Controls: sched_srf 0 + the hold (D55b alone: the same order), sched_srf 2 without the hold (B first: it computes the head). */
+namespace {
+struct D57Run { int a_first = -1, b_first = -1, b_plan = -1, rounds = 0; int64_t a_at_b = -1; bool failed = false; };
+D57Run d57_run(Lanes& L, int lanes, int b_lane, int a_len, int b_len) {
+    D57Run out;
+    const uint64_t a = L.submit(0, a_len, 1, 1000);
+    CHECK(a != 0);
+    if (!a) { out.failed = true; return out; }
+    uint64_t b = 0;
+    std::vector<int> fifo;
+    std::vector<char> busy((size_t)lanes, 0);
+    int next = 0;
+    for (int round = 0; round < 1200; ++round) {
+        const Request* ra = L.req(0, a);
+        if (!b && ra && ra->n_computed > 0) {   /* A runs with computed rows: B arrives */
+            b = L.submit(b_lane, b_len, 1, 1000);
+            CHECK(b != 0);
+            if (!b) { out.failed = true; return out; }
+        }
+        const Request* rb = b ? L.req(b_lane, b) : nullptr;
+        if (out.a_first < 0 && (!ra || !ra->output.empty() || ra->state == ReqState::Finished)) out.a_first = round;
+        if (b && out.b_first < 0 && (!rb || !rb->output.empty() || rb->state == ReqState::Finished)) out.b_first = round;
+        out.failed = out.failed || (ra && ra->state == ReqState::Failed) || (rb && rb->state == ReqState::Failed);
+        if (out.a_first >= 0 && out.b_first >= 0) break;
+        out.rounds = round + 1;
+        std::vector<int> todo;
+        for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+        for (size_t at = 0; at < todo.size(); ++at) {
+            const int l = todo[at];
+            if (busy[(size_t)l]) continue;
+            std::vector<int> order, idle_after;
+            for (int j = 1; j < lanes; ++j)
+                if (!busy[(size_t)((l + j) % lanes)]) {
+                    order.push_back((l + j) % lanes);
+                    idle_after.push_back((l + j) % lanes);
+                }
+            for (int f : fifo) order.push_back(f);
+            if (!L.plan(l, order)) continue;
+            for (const StepEntry& e : L.at(l).plan().e)
+                if (b && e.seq == b && out.b_plan < 0) {
+                    out.b_plan = round;
+                    const Request* r = L.req(0, a);
+                    out.a_at_b = r ? r->n_computed : a_len;
+                }
+            busy[(size_t)l] = 1;
+            fifo.push_back(l);
+            next = (l + 1) % lanes;
+            todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+        }
+        if (fifo.empty()) continue;
+        const int l = fifo.front();
+        fifo.erase(fifo.begin());
+        if (L.commit(l, 5) < 0) out.failed = true;
+        busy[(size_t)l] = 0;
+    }
+    return out;
+}
+}  /* namespace */
+
+TEST(d57_srf_2_beside_the_d55b_hold_chooses_the_running_sibling_not_the_held_one) {
+    struct Form { const char* name; int srf; bool hold; const char* d57; };
+    const Form forms[] = { { "srf 2 + hold (D57)", 2, true, nullptr }, { "srf 2 + hold, D57=2 (bit 1 off)", 2, true, "2" },
+                           { "srf 0 + hold (D57)", 0, true, nullptr }, { "srf 0 + hold, D57=1 (bit 2 off)", 0, true, "1" },
+                           { "srf 2, no hold", 2, false, nullptr } };
+    for (const auto& [kA, kB] : std::vector<std::pair<int, int>>{ { 30000, 16000 }, { 12000, 6000 } })
+    for (int lanes : { 2, 3 })
+    for (int b_lane : { 0, 1 })
+    for (int f = 0; f < 5; ++f) {
+        const Form& fm = forms[f];
+        SrfSwitch on(fm.srf);
+        setenv("RADIANCE_SCHED_PUB_PROMPT", "2", 1);
+        if (fm.hold) setenv("RADIANCE_SCHED_PUB_HOLD_MS", "60000", 1);
+        if (fm.d57) setenv("RADIANCE_SCHED_D57", fm.d57, 1);
+        Lanes L;
+        L.prefix = true;
+        srf_lanes(L, lanes, false);
+        unsetenv("RADIANCE_SCHED_PUB_PROMPT");
+        unsetenv("RADIANCE_SCHED_PUB_HOLD_MS");
+        unsetenv("RADIANCE_SCHED_D57");
+        const D57Run r = d57_run(L, lanes, b_lane, kA, kB);
+        fprintf(stderr, "    A %d / B %d, %d lanes, B in lane %d, %-32s: first tokens A @%d B @%d, B's first chunk @%d with A's committed "
+                        "end %lld, %d rounds%s\n", kA, kB, lanes, b_lane, fm.name, r.a_first, r.b_first, r.b_plan, (long long)r.a_at_b,
+                r.rounds, r.failed ? ", a request FAILED" : "");
+        CHECK(!r.failed);
+        CHECK(L.set.broken().empty());
+        /* 30,000 / 16,000: B's whole prompt is fewer rows than A's rest when B arrives (the rule would choose B); 12,000 / 6,000:
+         * A's rest is fewer by then (the rule keeps A), and a piece of A runs in another lane while A's lane plans */
+        const bool big = kA == 30000;
+        if (f == 1 && big) {   /* negative control (bit 1): the rule chooses the held prompt -- nothing is planned within the bound */
+            CHECK(r.a_first < 0);
+            CHECK(r.b_first < 0);
+            CHECK(r.b_plan < 0);
+            continue;
+        }
+        CHECK(r.a_first >= 0);
+        CHECK(r.b_first >= 0);
+        CHECK(r.b_plan >= 0);
+        if (f == 3) {   /* negative control (bit 2): A in its lane's lane_out_ is invisible to the hold -- B before the head */
+            if (!big && b_lane == 0) CHECK(r.a_at_b < kB - 1);
+            continue;
+        }
+        if (!fm.hold) {   /* no hold: at 30,000 / 16,000 B (the fewer rows) first, computing the head itself */
+            if (big) CHECK(r.a_at_b < kB - 1);
+            continue;
+        }
+        CHECK(r.a_at_b >= kB - 1);   /* the hold: B only after A's committed end passed the head */
+        if (f == 0 && big) CHECK(r.a_first <= r.b_first);   /* the rule: A's rest is then fewer rows than B's whole prompt */
+    }
+}
+
+/* tp8 loop D57 (a cost reading, printed, no bound): what the D55b hold's scan costs a plan beside decoders. One process, 31 decoders
+ * whose prompts share a HEAD-token head with everyone (their prompts published: D55), a prompt A computing past that head in 512-token
+ * steps beside them, and 10 fresh siblings over A's head the hold keeps waiting: each admission walk asks the hold for each of the 10
+ * against every running prompt. Printed: us a step() while they are held (the mean over the held steps), HEAD 3,000 and 20,000. */
+TEST(d57_reading_the_holds_scan_beside_decoders) {
+    for (int head : { 3000, 20000 }) {
+        Fixture f;
+        const int64_t blocks = ((int64_t)31 * (head + 1100) + (head + 2000) + 10 * (int64_t)head) / 16 + 8192;
+        f.build(blocks, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/head + 4096, false, /*linear=*/false);
+        f.prog.meta.n_ctx_train = head + 4096;
+        f.cfg.max_seqs = 48;
+        setenv("RADIANCE_SCHED_PUB_PROMPT", "2", 1);
+        setenv("RADIANCE_SCHED_PUB_HOLD_MS", "600000", 1);
+        CHECK_OK(f.start());
+        unsetenv("RADIANCE_SCHED_PUB_PROMPT");
+        unsetenv("RADIANCE_SCHED_PUB_HOLD_MS");
+        std::vector<uint64_t> dec;
+        for (int k = 0; k < 31; ++k) dec.push_back(f.submit(head + 1000, 1000000, 0, true));
+        int steps = 0;
+        auto decoding = [&] {
+            for (uint64_t d : dec) {
+                const Request* r = f.sch.find(d);
+                if (!r || r->n_computed < (int64_t)r->prompt.size()) return false;
+            }
+            return true;
+        };
+        while (!decoding() && steps < 200000) {
+            if (!f.sch.step()) break;
+            f.commit_plain();
+            ++steps;
+        }
+        CHECK(decoding());
+        const uint64_t a = f.submit(head + 2000, 8, 0, true);
+        REQUIRE(f.sch.step() != nullptr);   /* A admitted beside the decoders */
+        f.commit_plain();
+        std::vector<uint64_t> sib;
+        for (int k = 0; k < 10; ++k) sib.push_back(f.submit(head, 8, 0, true));
+        int held = 0;
+        double us = 0;
+        for (int k = 0; k < 400; ++k) {
+            const Request* ra = f.sch.find(a);
+            if (!ra || ra->n_computed >= head - 1) break;
+            const auto t0 = std::chrono::steady_clock::now();
+            const RadBatch* b = f.sch.step();
+            us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (!b) break;
+            bool in = false;
+            for (const StepEntry& e : f.sch.plan().e)
+                for (uint64_t s2 : sib) in = in || e.seq == s2;
+            CHECK(!in);   /* the hold keeps every sibling out until A's committed end passes the head */
+            ++held;
+            f.commit_plain();
+        }
+        fprintf(stderr, "    HEAD %d: %d held step(s) beside 31 decoders + A, %.1f us a step() (the mean), %d steps to decode\n", head, held,
+                held ? us / held : -1.0, steps);
+        CHECK(held > 0);
+    }
 }
 
 /* tp8 loop D56: fn4 sched_lane_room 1 (RADIANCE_SCHED_LANE_ROOM=1 at start) -- the admission room gate counts the running

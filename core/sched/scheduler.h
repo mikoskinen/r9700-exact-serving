@@ -1417,7 +1417,14 @@ private:
     int64_t pub_hold_n_ = 0;   /* admission walks that held a request (a request counts once a walk) */
     static constexpr int64_t kPubHoldMin = 256;
     void publish_chunk_done(SchedReq& s);
-    bool pub_holds(const SchedReq& s) const;
+    /* `walk`: also this admission walk's own admissions (took_: only valid inside the walk) */
+    bool pub_holds(const SchedReq& s, bool walk = true) const;
+    /* tp8 loop D57 (RADIANCE_SCHED_D57=N, a bit mask, default 3; acts only with the D55b hold on): bit 1 -- sched_srf 2 passes over
+     * a waiting prompt the hold keeps out (srf_scan), so the running sibling it waits for is chosen and computes the head (else every
+     * running prompt sits out until the hold's bound); bit 2 -- the hold sees the planning lane's prompts whose piece runs in another
+     * lane (lane_out_) and reads a running prompt's COMMITTED end (n_computed less the rows lane_plan_begin bumped it by), so a sibling
+     * waits until the head is in the cache. 0 = the forms before D57 (the negative controls). */
+    int  d57_ = 3;
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets
