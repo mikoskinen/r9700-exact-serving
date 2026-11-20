@@ -6422,9 +6422,20 @@ TEST(d55_a_prompt_published_at_its_last_chunk_serves_its_siblings_one_process_to
             std::vector<std::string> ex = a.ds ? cat(spec, seqs) : seqs;
             if (a.lanes) ex = cat(ex, { "--pp-lanes", std::to_string(a.lanes) });
             REQUIRE(pp.start(a.cut, ex, env));
+            /* twice, the prefix cache reset in between: the second set runs in recycled request slots (SchedReq), which must
+             * publish again (a slot's flag from its last tenant once kept them from it) */
             const std::vector<std::vector<int32_t>> got = siblings(pp.port, false);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));   /* every lane's idle publish of its metrics */
-            const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            const double hit1 = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            {
+                Call rs;
+                std::string rb;
+                CHECK(rs.send(pp.port, "/reset_prefix_cache", "") && rs.read(&rb) == 200);
+            }
+            const std::vector<std::vector<int32_t>> again = siblings(pp.port, false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const double hit = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total") - hit1;
+            CHECK(again == got);
             kill(pp.lead.child.pid, SIGTERM);
             CHECK_EQ(pp.lead.finish(60), 0);
             if (a.lanes) CHECK_EQ(pp.fol.finish(30), 0);
@@ -6445,16 +6456,17 @@ TEST(d55_a_prompt_published_at_its_last_chunk_serves_its_siblings_one_process_to
                     (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
             const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
             const bool said = llog.find("RADIANCE_SCHED_PUB_PROMPT=1 (tp8 loop D55)") != std::string::npos;
-            fprintf(stderr, "    D55 %-34s %s: %d of 4 differ from one process alone; attention-cached prompt tokens %.0f; KV-copy checks %lld, "
-                            "%lld differ; %zu E lines%s\n",
-                    a.name, on ? "on " : "off", differ, hit, checks, kdiff, elines, on && !said ? "; the start line is MISSING" : "");
+            fprintf(stderr, "    D55 %-34s %s: %d of 4 differ from one process alone (the second set %s); attention-cached prompt tokens %.0f / "
+                            "%.0f (first / second set); KV-copy checks %lld, %lld differ; %zu E lines%s\n",
+                    a.name, on ? "on " : "off", differ, again == got ? "the same" : "DIFFERENT", hit1, hit, checks, kdiff, elines,
+                    on && !said ? "; the start line is MISSING" : "");
             CHECK_EQ(differ, 0);
             CHECK_EQ(elines, (size_t)0);
             CHECK_EQ(said, on == 1);
             if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
-            if (on) CHECK(hit >= 3 * 448);   /* each sibling at least the head's whole 64-token chunks below 500: 448 */
-            else CHECK_EQ(hit, 0.0);
-            if (on && hit > 0) ++armed;
+            if (on) { CHECK(hit1 >= 3 * 448); CHECK(hit >= 3 * 448); }   /* each sibling at least the head's whole 64-token chunks below 500 */
+            else { CHECK_EQ(hit1, 0.0); CHECK_EQ(hit, 0.0); }
+            if (on && hit1 > 0 && hit > 0) ++armed;
             if (differ || elines)
                 fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         }
