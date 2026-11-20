@@ -277,6 +277,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                                "published that head waits for it, at most %lld ms from its arrival", (long long)kPubHoldMin, hm).c_str()
                          : "OFF: it needs RADIANCE_SCHED_PUB_PROMPT=1 or 2 (and the prefix cache)");
     }
+    {   /* tp8 loop D56: the room gates count every lane's runners (room_runners); unset / 0 = this lane's (today) */
+        const char* e = std::getenv("RADIANCE_SCHED_LANE_ROOM");
+        lane_room_ = e && !std::strcmp(e, "1");
+        if (lane_room_ && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_LANE_ROOM=1 (tp8 loop D56) -- under lanes a prompt (fresh or preempted) is admitted only "
+                     "where its whole rest fits beside the rest of EVERY lane's running requests, as one process's gate counts its one "
+                     "running set; one lane: unchanged");
+    }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
         plan_reserved_ = e && !std::strcmp(e, "1");
@@ -3030,8 +3038,10 @@ void Scheduler::undo_hit(SchedReq& s) {
  * past that. Counting only the next token admits this recompute against the loan those remaining
  * chunks still need; the next ensure then fails and preempt_back() resets that prefill to zero,
  * which is the loop. */
-bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
+bool Scheduler::preempted_can_prefill(const SchedReq& s, bool all_lanes) const {
     const Request& r = *s.req;
+    std::vector<const SchedReq*> run;
+    room_runners(&run, all_lanes);
     const int64_t target = s.seq_len();
     /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
      * no new block. */
@@ -3046,8 +3056,8 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
                        (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
         if (need < 0) need = 0;
-        for (int32_t slot : running_) {
-            const SchedReq& rs = *reqs_[(size_t)slot];
+        for (const SchedReq* rp : run) {
+            const SchedReq& rs = *rp;
             if (!rs.req) continue;
             const Request& rr = *rs.req;
             int64_t goal = rr.n_computed + 1;
@@ -3065,10 +3075,8 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
      * keep the slot it already holds. A sequence the manager does not know is not a refusal:
      * admit_one adds it, and can_grow on a missing id is false forever. */
     if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
-    for (int32_t slot : running_) {
-        const SchedReq& rs = *reqs_[(size_t)slot];
-        if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
-    }
+    for (const SchedReq* rp : run)
+        if (rp->req && !kv_->can_grow(rp->req->id, rp->req->n_computed + 1)) return false;
     return true;
 }
 
@@ -3080,6 +3088,8 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
  * at zero. */
 bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     const Request& r = *s.req;
+    std::vector<const SchedReq*> run;
+    room_runners(&run, lane_room_);
     const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
@@ -3088,8 +3098,8 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
                        (int64_t)kv_->block_table(r.id, (int32_t)g).size();
         if (need < 0) need = 0;
-        for (int32_t slot : running_) {
-            const SchedReq& rs = *reqs_[(size_t)slot];
+        for (const SchedReq* rp : run) {
+            const SchedReq& rs = *rp;
             if (!rs.req) continue;
             const Request& rr = *rs.req;
             int64_t goal = rr.n_computed + 1;
@@ -3106,10 +3116,8 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     /* Stateful groups: the fresh prefill needs slots for its whole prompt plus the decode
      * position, and every running sequence must keep the slot it already holds. */
     if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
-    for (int32_t slot : running_) {
-        const SchedReq& rs = *reqs_[(size_t)slot];
-        if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
-    }
+    for (const SchedReq* rp : run)
+        if (rp->req && !kv_->can_grow(rp->req->id, rp->req->n_computed + 1)) return false;
     return true;
 }
 
@@ -3280,7 +3288,8 @@ const RadBatch* Scheduler::step() {
                 SchedReq& s = *reqs_[(size_t)slot];
                 if (!s.req || s.req->state != ReqState::Preempted || !preempt_wait_overdue(s))
                     continue;
-                if (preempted_can_prefill(s)) { fit = true; break; }
+                /* tp8 loop D56: this lane's runners (the only ones this loop can preempt), whatever RADIANCE_SCHED_LANE_ROOM says */
+                if (preempted_can_prefill(s, false)) { fit = true; break; }
             }
             if (fit) break;
             if (evict_rounds < kEvictRounds && pc_ && cfg_.prefix_cache &&
