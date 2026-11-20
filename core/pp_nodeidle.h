@@ -11,7 +11,19 @@
  * (RadPpRing::wait_on / wait_ticks, abi/rad_pp.h) and the line takes it out: "working" = parts - receive waits, as a
  * share of the covered time (parts + gaps; a gap > 5 s is the server without work, left out). One line a minute and the
  * run's at stop. Events come from a pool (at most kCap in flight) and are read in stream order with
- * rad_event_query, so nothing waits on them. */
+ * rad_event_query, so nothing waits on them.
+ *
+ * tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2; =1 is the line above alone): the same card time split BY STRETCH -- with a BG step
+ * in flight vs without -- in a second line beside each node-idle line. The engine says which stretch it is in: the leader
+ * by its round's state (a BG lane busy or holding a newcomer: the D32 BG-rate line's definition, so the two read the same
+ * stretches), the follower while a BG lane's frame is its pass (its body, segments and the passes run between them).
+ * A part goes to the stretch of its begin, a gap between parts to the stretch at the part's end before it, and rank 0's
+ * receive waits to the stretch at the mark before them (the rings' counters read at each mark: host time, so a wait that
+ * straddles a change goes to one side). Why: FINDINGS DECODE 19:23 read WHO IS BOUND WHEN (clean stretches leader-bound,
+ * BG stretches follower-bound with the leader 24-30 % idle) from stamped runs only (2.9 GB a node, stamps cost c16
+ * ~-3.8 %); D39 (the tail band) and every later BG-balancing lever targets exactly that split. RADIANCE_PP_NODE_IDLE_S=N
+ * (1..600, either value; default 60) sets the lines' period, so a 30-60 s cell holds whole windows ("the last N s"; the
+ * text stays "the last minute" at 60). */
 #pragma once
 
 #include "rad_internal.h"   /* RAD_INFO, rad_mono_ns, rad_device.h */
@@ -20,6 +32,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <string>
 #include <vector>
@@ -29,13 +42,26 @@ namespace rad {
 struct PpNodeIdle {
     static constexpr size_t kCap = 4096;
     static constexpr float kIdleMs = 5000.0f;   /* a gap this long is no work at all (between the test's cells) */
-    struct Rec { RadEvent ev; bool begin; };
+    struct Rec { RadEvent ev; bool begin; bool bg; };
     struct Win {
         uint64_t t0 = 0;
         double part_ms = 0, gap_ms = 0, gap_max = 0, idle_ms = 0;
         int64_t parts = 0, gaps_1ms = 0, idles = 0;
         uint64_t wait0 = 0, waits0 = 0;   /* the rings' counters at the window's start */
+        /* tp8 loop D45: by stretch, [0] without a BG step in flight, [1] with one */
+        double sp_part[2] = { 0, 0 }, sp_gap[2] = { 0, 0 };
+        int64_t sp_parts[2] = { 0, 0 };
+        uint64_t sp_wait[2] = { 0, 0 };    /* receive-wait ticks */
     };
+    /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2): the stretch the engine is in -- the leader sets `bg` each round, the follower
+     * counts BG frames in pass (`bg_depth`); split prints the second line; period_s the lines' period */
+    bool split = false;
+    int period_s = 60;
+    bool bg = false;
+    int bg_depth = 0;
+    bool sp_prev = false;
+    uint64_t sp_wt_last = 0;
+    bool bg_now() const { return bg || bg_depth > 0; }
     const char* node = "";                /* "leader" / "follower" */
     const char* crossing = "";            /* what rank 0 receives: "X2" / "X1" */
     RadStream s = nullptr;
@@ -101,6 +127,8 @@ struct PpNodeIdle {
             if (r) r->wait_on = 1;
         start(win);
         start(run);
+        uint64_t n = 0, tp = 0;
+        waits(&sp_wt_last, &n, &tp);
     }
     void waits(uint64_t* ticks, uint64_t* n, uint64_t* tpms) const {
         *ticks = *n = 0;
@@ -130,10 +158,20 @@ struct PpNodeIdle {
     void mark(bool begin) {
         drain();
         vram_sample();
+        const bool now_bg = bg_now();
+        if (split) {   /* tp8 loop D45: the receive waits since the last mark, to the stretch in effect since then */
+            uint64_t wt = 0, n = 0, tp = 0;
+            waits(&wt, &n, &tp);
+            const uint64_t d = wt >= sp_wt_last ? wt - sp_wt_last : 0;
+            sp_wt_last = wt;
+            win.sp_wait[sp_prev] += d;
+            run.sp_wait[sp_prev] += d;
+            sp_prev = now_bg;
+        }
         RadEvent e = take();
         if (!e) { ++dropped; return; }
         if (rad_event_record(e, s) < 0) { pool.push_back(e); ++dropped; return; }
-        recs.push_back({ e, begin });
+        recs.push_back({ e, begin, now_bg });
     }
     void begin() { mark(true); }
     void end() { mark(false); }
@@ -146,11 +184,17 @@ struct PpNodeIdle {
                 float ms = 0.0f;
                 if (rad_event_elapsed_ms(last.ev, r.ev, &ms) < 0) ++unread;
                 else if (last.begin) {   /* a part (a begin with no end before the next begin: still that part) */
-                    for (Win* w : { &win, &run }) { w->part_ms += ms; ++w->parts; }
+                    for (Win* w : { &win, &run }) {
+                        w->part_ms += ms;
+                        ++w->parts;
+                        w->sp_part[last.bg] += ms;   /* tp8 loop D45: the stretch at the part's begin */
+                        ++w->sp_parts[last.bg];
+                    }
                 } else if (r.begin) {    /* between two parts; one over kIdleMs is the server without work, left out */
                     for (Win* w : { &win, &run }) {
                         if (ms > kIdleMs) { w->idle_ms += ms; ++w->idles; continue; }
                         w->gap_ms += ms;
+                        w->sp_gap[last.bg] += ms;    /* tp8 loop D45: the stretch at the end of the part before */
                         if (ms > 1.0f) ++w->gaps_1ms;
                         w->gap_max = std::max(w->gap_max, (double)ms);
                     }
@@ -168,21 +212,36 @@ struct PpNodeIdle {
         const int64_t nw = (int64_t)(wn - w.waits0);
         const double cov = w.part_ms + w.gap_ms;   /* the time the card had parts to run or was between two of them */
         const auto pct = [&](double ms) { return cov > 0 ? ms * 100.0 / cov : 0.0; };
-        RAD_INFO("two-node pipeline, %s node idle (RADIANCE_PP_NODE_IDLE=1, tp8 dev D8): rank 0's card over %s (%.1f s wall, "
+        RAD_INFO("two-node pipeline, %s node idle (RADIANCE_PP_NODE_IDLE=%d, tp8 dev D8): rank 0's card over %s (%.1f s wall, "
                  "%.1f s covered; %lld gaps > %.0f s left out, %.1f s): in parts %.1f s (%.1f %%, %lld parts), of which waiting "
                  "on the card for the other node's %s %.1f s (%.1f %%, %lld receives); between parts %.1f s (%.1f %%: idle, or "
                  "work outside the parts; %lld gaps > 1 ms, the longest %.1f ms) -> working %.1f %%; events dropped %lld, unread "
-                 "%lld", node, what, wall / 1000.0, cov / 1000.0, (long long)w.idles, kIdleMs / 1000.0, w.idle_ms / 1000.0,
+                 "%lld", node, split ? 2 : 1, what, wall / 1000.0, cov / 1000.0, (long long)w.idles, kIdleMs / 1000.0, w.idle_ms / 1000.0,
                  w.part_ms / 1000.0, pct(w.part_ms), (long long)w.parts, crossing, wait_ms / 1000.0, pct(wait_ms), (long long)nw,
                  w.gap_ms / 1000.0, pct(w.gap_ms), (long long)w.gaps_1ms, w.gap_max, pct(w.part_ms - wait_ms),
                  (long long)dropped, (long long)unread);
+        if (!split) return;
+        std::string sp;
+        for (int k = 1; k >= 0; --k) {   /* no receive yet (no tick rate): its waits read 0 */
+            const double c = w.sp_part[k] + w.sp_gap[k], wm = tpms ? (double)w.sp_wait[k] / (double)tpms : 0.0;
+            const auto q = [&](double ms) { return c > 0 ? ms * 100.0 / c : 0.0; };
+            char b[400];
+            std::snprintf(b, sizeof b, "%s %.1f s covered (%.1f %% of it): in parts %.1f %% (%lld parts), waiting on the card for the "
+                          "other node's %s %.1f %%, between parts %.1f %% -> working %.1f %%", k ? "with a BG step in flight" : "; without",
+                          c / 1000.0, pct(c), q(w.sp_part[k]), (long long)w.sp_parts[k], crossing, q(wm), q(w.sp_gap[k]),
+                          q(w.sp_part[k] - wm));
+            sp += b;
+        }
+        RAD_INFO("two-node pipeline, %s node idle by stretch (RADIANCE_PP_NODE_IDLE=2, tp8 loop D45): rank 0's card over %s: %s", node,
+                 what, sp.c_str());
     }
     void minute() {
-        if (rad_mono_ns() - win.t0 < 60ull * 1000000000ull) return;
+        if (rad_mono_ns() - win.t0 < (uint64_t)period_s * 1000000000ull) return;
         drain();
-        note(win, "the last minute");
+        const std::string what = period_s == 60 ? std::string("the last minute") : "the last " + std::to_string(period_s) + " s";
+        note(win, what.c_str());
         vram_sample(true);
-        vram_note(wmin, "the last minute");
+        vram_note(wmin, what.c_str());
         std::fill(wmin.begin(), wmin.end(), (int64_t)-1);
         start(win);
     }

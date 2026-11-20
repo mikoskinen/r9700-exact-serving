@@ -1304,6 +1304,7 @@ int Engine::step_loop_lanes() {
             if (bgr.last) (bgr.last_bg ? bgr.bg_s : bgr.nobg_s) += (double)(now - bgr.last) / 1e9;
             bgr.last = now;
             bgr.last_bg = bg_busy;
+            if (pp_ni_) pp_ni_->bg = bg_busy;   /* tp8 loop D45: the node-idle line's stretch (RADIANCE_PP_NODE_IDLE=2), the same state */
         }
         const bool two_in_flight = fifo.size() >= 2;
         /* 2. the oldest lane step's tail, its drafter, its commit (tp8 dev M4 ready-first: or a later one's, above) */
