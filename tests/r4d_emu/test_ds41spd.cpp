@@ -218,11 +218,13 @@ void gemm(int64_t M, int64_t N, int64_t K, int wbf) {
 
 int main(int argc, char** argv) {
     const bool quick = argc > 1 && !std::strcmp(argv[1], "quick");
-    /* the switch: 0 .. 7 taken (4 .. 7: tp8 loop D28), 8 refused; under 0 (unpinned) no call takes a non-stock form */
+    /* the switch: 0 .. 12 taken (4 .. 7: tp8 loop D28; 8 RGP; 9 RGK; 10 RGM; 11 RGM + RGC; 12 + RGD -- the DRAFTER's rounds 39-41),
+     * 13 refused; under 0 (unpinned) no call takes a non-stock form */
     check(r4d_f32dec_set(1) == 1 && r4d_f32dec_get() == 1 && r4d_f32dec_set(3) == 1 && r4d_f32dec_get() == 3 &&
               r4d_f32dec_set(7) == 1 && r4d_f32dec_get() == 7 && r4d_f32dec_set(8) == 1 && r4d_f32dec_get() == 8 &&
-              r4d_f32dec_set(9) < 0 && r4d_f32dec_get() == 8 && r4d_f32dec_set(0) == 1 && r4d_f32dec_get() == 0,
-          "SPD-F switch ds41_f32dec (libr4d's r4d_f32dec_set / _get): 0 / 1 / 3 / 7 / 8 applied and read back, 9 refused");
+              r4d_f32dec_set(9) == 1 && r4d_f32dec_get() == 9 && r4d_f32dec_set(12) == 1 && r4d_f32dec_get() == 12 &&
+              r4d_f32dec_set(13) < 0 && r4d_f32dec_get() == 12 && r4d_f32dec_set(0) == 1 && r4d_f32dec_get() == 0,
+          "SPD-F switch ds41_f32dec (libr4d's r4d_f32dec_set / _get): 0 / 1 / 3 / 7 / 8 / 9 / 12 applied and read back, 13 refused");
     /* lever RGP (DRAFTER track round 17): 8 = 1 with the router's 17..64 rows in form 19; <= 16 rows 1's rule; 65+ 0; the other
      * values keep the stock form above 48 rows */
     {
