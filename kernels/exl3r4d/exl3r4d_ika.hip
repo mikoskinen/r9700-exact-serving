@@ -35,6 +35,11 @@ const char* const kExl3Ika[] = {
 #endif
     nullptr};
 }  // namespace
+#include <hip/hip_runtime.h>   // r4d_ika.h's device helpers use HIP's __forceinline__
+#include "r4d_ika.h"
+/* Form B (r4d_ika.h, Qwen loop round 8): the listed kernels fence themselves only when the engine sets their
+ * hidden_global_offset_z (a played dispatch). 0 without R4D_IKA (empty list). */
+extern "C" __attribute__((visibility("default"))) int r4d_ika_protocol(void) { return R4D_IKA ? R4D_IKA_PROTOCOL : 0; }
 extern "C" __attribute__((visibility("default"))) const char* const* r4d_ika_kernels(int* n) {
     if (n) *n = (int)(sizeof(kExl3Ika) / sizeof(kExl3Ika[0])) - 1;
     return kExl3Ika;
