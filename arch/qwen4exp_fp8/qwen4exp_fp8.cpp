@@ -508,8 +508,8 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: qwen4exp: fn4 BI's tracer ON (RADIANCE_FN4_BITRACE=%s): %zu traced buffers, %lld points a "
-                        "step at most, rows at positions %lld .. %lld of sequences first seen at 0 with at most %lld query "
-                        "rows; passes not recorded\n",
+                        "step at most, rows at positions %lld .. %lld of sequences first seen at 0 (or, with PMIN, at a prefix "
+                        "hit at or below PMIN) with at most %lld query rows; passes not recorded\n",
                 t.dir.c_str(), t.tb.size(), (long long)t.cap, (long long)t.pmin, (long long)t.pmax, (long long)t.plen);
     return RAD_OK;
 }
@@ -609,7 +609,12 @@ static void bt_flush(RadCtx* c, Model& m, const RadBatch* batch) {
         if (it == t.card.end() || cx < k.ctx || (prefill && (cx == 0 || cx != k.end))) {
             const int32_t r = cu[(size_t)s];
             k.serial = ++t.serials;
-            k.follow = cx == 0 && r >= 0 && r < T && pos[(size_t)r] == 0 && ql[(size_t)s] <= t.plen;
+            /* Qwen loop F25 (21.11.2026): with RADIANCE_FN4_BITRACE_PMIN set, a request whose first step starts at a prefix hit
+             * (0 < context <= PMIN, its first row at that context) is followed too, so a hit sibling's rows at PMIN.. are traced
+             * beside its cold twin's; PMIN unset (0) = the cold-only rule as before */
+            const bool cold0 = cx == 0 && r >= 0 && r < T && pos[(size_t)r] == 0;
+            const bool hit = t.pmin > 0 && cx > 0 && cx <= t.pmin && r >= 0 && r < T && pos[(size_t)r] == cx;
+            k.follow = (cold0 || hit) && ql[(size_t)s] <= t.plen;
         }
         k.ctx = cx;
         k.end = cx + ql[(size_t)s];
