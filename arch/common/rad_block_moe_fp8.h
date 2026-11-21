@@ -525,26 +525,24 @@ struct MoeFP8 {
     int64_t rs_fused_rows = 0, rgs_fused_rows = 0;
     const std::atomic<int>* rfuse_live = nullptr;
     std::atomic<long long>* rf_count = nullptr;
-    /* Lever RR1 (DRAFTER track 21.11.2026 round 54): a step's routing reported ONCE to the card. pass() reports its
-     * counts right after its router (r0 0: the file stager's trigger needs them before the expert weights), and the
-     * step's end reports again for the heat engine (step_rows, or the architecture's own route_report after its passes).
-     * After a step of ONE pass from row 0 the two reports name the same counts: nothing writes `ecnt` but a pass's
-     * router, so the end report's copy (ecnt -> the core's row, one copy dispatch a routed layer on the compute stream)
-     * moves the bytes the first one already put there. With `rr1_live` > 0 (the architecture's in-process switch, read
-     * at every report) such an end report names the core's row (rad_route_counts) instead, which the core takes in
-     * place: no copy; the rest of the report -- its count in the bank (the heat weight), the step, the tape's route
-     * step -- is the copying report's. A step of several passes, or any report the flag does not cover, copies as
-     * before. `rr1_fresh`: the last pass began at row 0 and reported, and no report or pass came since. A report that
-     * names the core's row makes the core hand THAT pointer to the file stager until the block's next report, so once
-     * the block has made one (`rr1_ever`; a recorded pass replays its reports too) a step whose FIRST pass does not
-     * begin at row 0 (a cut layer's prefill segment: today no report at all that step) reports that pass's counts at
-     * the point the pass at row 0 reports them, before its expert weights: the stager's trigger never reads an older
-     * step's counts. `rr1_end`: the step's end report came and no pass since (every issued step ends with one).
-     * `rr1_count` (optional, rank 0 counts): [0] end reports taken in place, [1] end reports that copied with the
-     * switch on, [2] such first-pass reports. */
+    /* Lever RR1 (DRAFTER track 21.11.2026 round 54; DECODE W5): a step's routing reported ONCE to the card. pass()
+     * reports its counts right after its router (r0 0: the file stager's trigger needs them before the expert weights),
+     * and the step's end reports again for the heat engine (step_rows, or the architecture's own route_report after its
+     * passes). After a step of ONE pass from row 0 the two reports name the same counts: nothing writes `ecnt` but a
+     * pass's router, so the end report's copy (ecnt -> the core's row, one copy dispatch a routed layer on the compute
+     * stream) moves the bytes the first one already put there. With `rr1_live` > 0 (the architecture's in-process
+     * switch, read at every report) such an end report names the core's row (rad_route_counts) instead: the core takes
+     * it in place (no copy) and, since the layer already reported in this step, keeps the step's earlier handoff -- the
+     * block's own `ecnt` -- for the file stager (core/runtime/ctx.cpp route_report_impl, tp8 loop W5), so its count in
+     * the bank, the step and the tape's route step are the copying report's. A step of several passes, a pass past row
+     * 0, or a core without the row: as before. `rr1_fresh`: the last pass began at row 0 and reported, and no report or
+     * pass came since -- a function of the passes this layer's issue makes, so a recording and its audit agree (DECODE
+     * W5: the first form's report for a first pass past row 0 depended on whether a row had ever been named, which a
+     * pass key does not carry). `rr1_count` (optional, rank 0 counts): [0] end reports taken in place, [1] end reports
+     * that copied with the switch on (no core row). */
     const std::atomic<int>* rr1_live = nullptr;
     std::atomic<long long>* rr1_count = nullptr;
-    mutable bool rr1_fresh = false, rr1_end = false, rr1_ever = false;
+    mutable bool rr1_fresh = false;
     void route_report_at(RadCtx* c, bool end) const;
     /* A second correction bias for some rows (DeepSeek-V4.1's `bias_vl`, model.py Gate: the rows of an image span pick
      * their experts with it; the weights still come from the raw scores). The architecture declares `select` (the
@@ -2509,9 +2507,8 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
                           const Beside* beside, bool dk, bool projected, bool piece) const {
-    /* lever RR1: this pass's router rewrites `ecnt` (fresh again after its report at r0 0); is it the step's first? */
-    const bool rr1_first = rr1_end;
-    rr1_fresh = rr1_end = false;
+    /* lever RR1: this pass's router rewrites `ecnt` (fresh again after its report at r0 0) */
+    rr1_fresh = false;
     /* lever P: the decode-band-bytes ops only where they are declared for this many rows */
     const bool xdk = dk && c.expert_exl3 && dk_takes(rows);
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
@@ -2653,11 +2650,6 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (r0 == 0) {
         route_report_at(c_, false);
         rr1_fresh = true;   /* lever RR1: the core's row now holds this pass's counts */
-    } else if (rr1_first && rr1_ever) {
-        /* lever RR1: the core may name its row (an end report took it in place) and no report at row 0 comes this
-         * step: this pass's counts, as the pass at row 0 reports them */
-        route_report_at(c_, false);
-        if (rr1_count && g.rank == 0) rr1_count[2].fetch_add(1, std::memory_order_relaxed);
     }
 
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
@@ -2978,13 +2970,10 @@ inline void MoeFP8::route_report_at(RadCtx* c_, bool end) const {
         const long long n = rr1_count[row ? 0 : 1].fetch_add(1, std::memory_order_relaxed) + 1;
         if (row && (n == 1 || n % 4096 == 0))
             std::fprintf(stderr, "radiance: lever RR1: %lld end-of-step routing reports taken in place (no copy), %lld "
-                                 "copied (no core row), %lld first-pass reports (counted at issue: a recorded pass once)\n",
-                         rr1_count[0].load(std::memory_order_relaxed), rr1_count[1].load(std::memory_order_relaxed),
-                         rr1_count[2].load(std::memory_order_relaxed));
+                                 "copied (no core row) (counted at issue: a recorded pass once; tp8 loop W5)\n",
+                         rr1_count[0].load(std::memory_order_relaxed), rr1_count[1].load(std::memory_order_relaxed));
     }
     rr1_fresh = false;
-    rr1_end = end;
-    if (row) rr1_ever = true;
     RadRouting r{};
     r.expert_ids    = (const int32_t*)rad_buf_ptr(c_, w.ids);
     r.expert_w      = nullptr;
