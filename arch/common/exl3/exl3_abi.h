@@ -876,7 +876,10 @@ static inline void exl3_gd_params(const RadParam* p, int n_p, RadParam* pg, int*
     int ng = 0, nd = 0;
     for (int i = 0; i < n_p; ++i) {
         const char* k = p[i].key;
-        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
+        /* qfn-on-ds lever DRZ-K (Qwen loop round 18, F53): drz_keep is not a shape parameter -- the halves' shape / layout
+         * hooks take exactly the nine / five below, which a tenth key could push one of off the fixed counts (the
+         * launcher hands drz_keep to both halves itself, exl3r4d launch_gd) */
+        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot") || !strcmp(k, "drz_keep")) continue;
         if (ng < 9) pg[ng++] = p[i];
         if (!strcmp(k, "N") || !strcmp(k, "K") || !strcmp(k, "N_odd") || !strcmp(k, "K_odd")) continue;
         if (nd < 6) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */
@@ -928,7 +931,7 @@ static inline void exl3_gd4_params(const RadParam* p, int n_p, RadParam* pg, int
     for (int i = 0; i < n_p; ++i) {
         const char* k = p[i].key;
         int shape = 0;
-        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
+        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot") || !strcmp(k, "drz_keep")) continue;   /* DRZ-K: as above */
         if (ng < 13) pg[ng++] = p[i];
         for (int c = 0; c < EXL3_MAX_CLS; ++c) shape |= !strcmp(k, nq[c]) || !strcmp(k, kq[c]);
         if (!shape && nd < 5) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */

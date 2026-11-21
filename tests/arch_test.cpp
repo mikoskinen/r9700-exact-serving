@@ -2977,6 +2977,34 @@ TEST(flashnext_drz_keep_declares_drz_keep_on_the_named_layers_only) {
     CHECK_EQ(n_prot, n_unset);
 }
 
+/* F53 (Qwen loop round 18): a resolved geometry carries M LAST (the band sets it after the declared keys), so drz_keep
+ * declared before it must not take one of exl3_gd_params' fixed nine / five places: both halves of the fused chain still
+ * parse, with the same parameters as without it (the start refused 'shape this kernel does not serve' when it did). */
+TEST(exl3_gd_params_leave_drz_keep_out_of_the_halves_shape_parameters) {
+    auto I = [](const char* k, long long v) { RadParam q{}; q.key = k; q.kind = RAD_P_INT; q.ival = v; return q; };
+    auto S = [](const char* k, const char* v) { RadParam q{}; q.key = k; q.kind = RAD_P_STR; q.sval = v; return q; };
+    const RadParam all[10] = { I("N", 1280), I("K", 2560), I("n_expert", 128), I("top_k", 10), S("dtype", "exl3k4"),
+                               S("codebook", "mul1"), I("N_odd", 1280), I("K_odd", 2560), I("drz_keep", 1), I("M", 16) };
+    int ng0 = 0, nd0 = 0;
+    for (int with = 0; with <= 1; ++with) {
+        RadParam q[10];
+        int n = 0;
+        for (const RadParam& x : all) if (with || std::strcmp(x.key, "drz_keep") != 0) q[n++] = x;
+        RadParam pg[15], pd[14];
+        int ng = 0, nd = 0;
+        exl3_gd_params(q, n, pg, &ng, pd, &nd);
+        Exl3Geom gg{}, gd{};
+        CHECK_EQ(exl3_geom_parse(pg, ng, EXL3_GATE_UP, exl3_geom_two_classes(pg, ng), &gg), RAD_OK);
+        CHECK_EQ(exl3_geom_parse(pd, nd, EXL3_DOWN, exl3_geom_two_classes(pd, nd), &gd), RAD_OK);
+        CHECK_EQ((long long)gg.M, 16LL);
+        CHECK_EQ((long long)gd.M, 16LL);
+        CHECK(rad_param_find(pg, ng, "drz_keep") == nullptr);
+        CHECK(rad_param_find(pd, nd, "drz_keep") == nullptr);
+        if (!with) { ng0 = ng; nd0 = nd; }
+        else { CHECK_EQ(ng, ng0); CHECK_EQ(nd, nd0); }
+    }
+}
+
 /* A quantised container may keep one linear as the checkpoint holds it. Flash-Next's recipe leaves
  * the QSA indexer's projection plain bf16 (its top-k is a hard choice between blocks), so in a
  * four-bit model with fp8 linears it is declared bf16 and read by `gemm_nt` over its input's bf16
