@@ -479,6 +479,16 @@ struct Dsp {
     rad_buf cpart = 0;
     int64_t fc_part = 0, fc_rb = 0, fc_rows = 0;
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
+    /* lever EMA (dspark_mhr 7, declared at RADIANCE_DS41_DSPARK_MHR=7; g_sw_dmr's comment): the embedding all-reduce over
+     * S + 1 rows -- ema_g gathers [mask row, anchors] from x into xa, ema_ar reduces xa, ema_e gathers xa into h0's strips.
+     * ema_blk: the block lengths (>= 2 rows) the index planes serve, in plane order; ema_ia / ema_ie [n x Q] i32 (persistent):
+     * plane k's compaction (ia[0] = 1, ia[1 + s] = s x blk) and expansion (ie[r] = r % blk ? 0 : 1 + r / blk) indices,
+     * uploaded at this rank's first EMA pass (ema_up). */
+    rad_op ema_g = 0, ema_ar = 0, ema_e = 0;
+    rad_buf xa = 0, ema_ia = 0, ema_ie = 0;
+    std::vector<int64_t> ema_blk;
+    std::vector<int32_t> ema_host;   /* the two planes, ia then ie, as uploaded */
+    bool ema_up = false;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
     /* lever W1, the full-vocabulary walk (RADIANCE_DS41_DSPARK_WALK; walk_read_env): world > 1, a dspark_walk_step a
      * step + the last merge, the keys a step [block * wseqs, 4] (a u64 in a 16-byte slot, ds41_walk_geom.h) zeroed by
@@ -2139,8 +2149,24 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * 5 (DRAFTER track 20.11.2026 round 46, lever DOF) = 4 + each stage's attention output inverse rope + fp8 round trip
  * (o_rope, o_q: two dependent launches on the path to o_a) as the trunk's ONE op rope_rows_roundtrip (L.o_f, the trunk's
  * default form; libr4d: byte-identical to the chain of rows, r4d_ds41_elem.hip 'fused chains'). Declared only when the
- * start env RADIANCE_DS41_DSPARK_MHR is 5 (so MHR=4 -- BEST's start -- declares as before); dspark_mhr 4 / 5 in process. */
+ * start env RADIANCE_DS41_DSPARK_MHR is 5 (so MHR=4 -- BEST's start -- declares as before); dspark_mhr 4 / 5 in process.
+ * (round 59: also declared at MHR=6 / 7, which name the levels below.)
+ * 6 (DRAFTER track 21.11.2026 round 59, lever SDD) = 5 + each stage's MoE issues its SHARED expert's down ahead of the routed
+ * down (the trunk's tp8 loop D42 SDF, MoeFP8 kMoeSdfBit, through the drafter MoE's own shexp_lane word g_dsp_sdf: the
+ * drafter's MoE had no word, so the trunk's ds41_shexp_lane 6 never reached it -- lq208: the shared down ends 5.2-6.6 us
+ * after the routed down and the ordered gather waits for it). Issue order only: the same ops over the same operands.
+ * 7 (round 59, lever EMA = DAR a) = 6 + the query pass's embedding all-reduce over S + 1 rows instead of T = S x block:
+ * the core stages every non-anchor row as the drafter's mask token (rad_builder.h RadDrafterDecl::mask_token: "an anchor
+ * followed by block - 1 copies of mask_token"; scheduler block_mask_), so after the per-rank lookup ema_g gathers row 1
+ * (sequence 0's first mask row) and the S anchor rows into d.xa, ema_ar reduces those S + 1 rows, and ema_e gathers each
+ * row's source (its anchor, or the mask row) into h0's hc strips in place of the hc expand casts. The all-reduce folds
+ * per element in rank order whatever the message (exact; with lever DAR b's fp8 wire every 16-byte word is coded alone),
+ * so every h0 row is the bytes of today's. Declared only at the start env MHR=7 (blocks >= 2 rows; a block of 1 row keeps
+ * the casts); issued only where every rank of the process declared it (g_ema_bad). */
 static std::atomic<int> g_sw_dmr{-1};
+static std::atomic<int> g_dsp_sdf{0};    /* lever SDD: the DSpark MoE's shexp_lane word (kMoeSdfBit or 0; set at each query pass) */
+static std::atomic<int> g_ema_bad{0};    /* lever EMA: a rank of this process could not declare it: off on every rank */
+static std::atomic<long long> g_ema_passes{0};
 /* Lever DHS (DRAFTER track 21.11.2026 round 57; Dsp::hs_*): switch "dspark_hs" (fn4, plugin; 0 = today's issue); its ops are
  * declared only under the start env RADIANCE_DS41_DSPARK_HS (0 / 1 = the switch's start value), and the issue reads 1 only where
  * every rank of the process declared them (hs_now). Read at issue. */
@@ -2166,7 +2192,7 @@ static int dmr_now() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '5' && !e[1] ? e[0] - '0' : 0);
+        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2981,7 +3007,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 5 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 7 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -5161,7 +5187,8 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
          * RADIANCE_DS41_DSPARK_MHR=5 (an MHR=4 / unset start declares the published program); 0 where no library serves it. */
         {
             const char* me = std::getenv("RADIANCE_DS41_DSPARK_MHR");
-            L.o_f = me && me[0] == '5' && !me[1] ? rope_rt(b, m, Q, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", d.o, m.cs_a) : 0;
+            L.o_f = me && me[0] >= '5' && me[0] <= '7' && !me[1]   /* 6 / 7 (round 59) include 5 */
+                        ? rope_rt(b, m, Q, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", d.o, m.cs_a) : 0;
         }
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) {
@@ -5234,6 +5261,8 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     gq.max_tok = std::max<int64_t>(g.max_tok, Q);
     DS_TRY(L.moe.declare(b, nm, gq, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
+    /* lever SDD (dspark_mhr 6): the drafter's own word, never a lane form (low bits 0) -- kMoeSdfBit or 0, set by dsp_query */
+    L.moe.shexp_lane = &g_dsp_sdf;
     L.moe.rr1_live = &g_sw_rr1;   /* lever RR1: the trunk's switch */
     L.moe.rr1_count = g_rr1_count;
     g_sw_rr1_ok.store(1, std::memory_order_relaxed);
@@ -5485,6 +5514,61 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     d.apos_op = op(b, "add", { RAD_RANGE("M", 1, Q), RAD_INT("n", 1), RAD_STR("dtype", "i32") }, {}, { d.poff },
                    { d.apos });
     if (!d.embed || !d.expand || !d.pre0 || !d.pre1 || !d.q_tab || !d.poff_op || !d.apos_op) return RAD_E_INVAL;
+    /* lever EMA (DRAFTER track round 59; g_sw_dmr's comment, level 7): declared at RADIANCE_DS41_DSPARK_MHR=7 where an
+     * all-reduce runs (world > 1) on every block length >= 2 rows (the drafter's own + the short ones the env names) */
+    d.ema_g = d.ema_ar = d.ema_e = 0;
+    d.ema_blk.clear();
+    d.ema_host.clear();
+    d.ema_up = false;
+    if (const char* me = std::getenv("RADIANCE_DS41_DSPARK_MHR"); me && me[0] == '7' && !me[1] && g.world > 1) {
+        if (d.block >= 2) d.ema_blk.push_back(d.block);
+        for (int64_t sb : d.sblks)
+            if (sb >= 2) d.ema_blk.push_back(sb);
+        const int64_t nb = (int64_t)d.ema_blk.size();
+        bool ok = nb > 0;
+        if (ok) {
+            d.xa = bf("dspark_embed_rows", { Q, D });
+            d.ema_ia = decl_b(b, nm.f("dspark_embed_rows_idx"), RAD_I32, { nb * Q, 1 }, RAD_BUF_PERSIST);
+            d.ema_ie = decl_b(b, nm.f("dspark_embed_expand_idx"), RAD_I32, { nb * Q, 1 }, RAD_BUF_PERSIST);
+            ok = d.xa && d.ema_ia && d.ema_ie;
+        }
+        if (ok) {
+            d.ema_g = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
+                         { d.x, d.ema_ia }, { d.xa });
+            std::vector<RadParam> ep = { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                                         RAD_INT("exact", 1) };
+            if (dspark_arf() >= 2) {   /* lever DAR b at 2: the same wire as embed_ar's */
+                ep.push_back(RAD_INT("wire", 1));
+                ep.push_back(RAD_INT("wire_nb", dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NB", 16, 1, 64)));
+                ep.push_back(RAD_INT("wire_nt", dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NT", 256, 64, 1024)));
+            }
+            d.ema_ar = op(b, "all_reduce", ep, {}, { d.xa }, { d.xa });
+            d.ema_e = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
+                         { d.xa, d.ema_ie }, { d.h0 });
+            ok = d.ema_g && d.ema_ar && d.ema_e;
+        }
+        if (ok) {
+            /* the planes: ia[k][0] = 1 (sequence 0's first mask row), ia[k][1 + s] = s x blk; ie[k][r] = 1 + r / blk at an
+             * anchor row, 0 (xa's mask row) elsewhere -- functions of the block alone, so one upload serves every pass */
+            d.ema_host.assign((size_t)(2 * nb * Q), 0);
+            for (int64_t k = 0; k < nb; ++k) {
+                const int64_t bl = d.ema_blk[(size_t)k];
+                int32_t* ia = d.ema_host.data() + k * Q;
+                int32_t* ie = d.ema_host.data() + (nb + k) * Q;
+                ia[0] = 1;
+                for (int64_t s = 0; s + 1 < Q; ++s) ia[1 + s] = (int32_t)(s * bl < Q ? s * bl : 0);
+                for (int64_t r = 0; r < Q; ++r) ie[r] = (int32_t)(r % bl ? 0 : 1 + r / bl);
+            }
+        } else {
+            d.ema_g = d.ema_ar = d.ema_e = 0;
+            d.ema_blk.clear();
+            g_ema_bad.store(1, std::memory_order_relaxed);
+            if (g.rank == 0)
+                fprintf(stderr, "radiance: deepseek41: lever EMA (RADIANCE_DS41_DSPARK_MHR=7) not declared: %s -- the "
+                                "embedding's all-reduce stays at the pass's rows\n",
+                        nb == 0 ? "no block of 2 or more rows" : "an op or buffer could not be declared");
+        }
+    }
     for (auto& L : d.st) DS_TRY(dsp_stage_ops(b, m, L));
 
     /* ---- the head: the last stage's ffn gates collapse the streams, its norm, the trunk's lm_head */
@@ -8363,9 +8447,44 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         return;
     }
 
+    /* lever SDD (dspark_mhr 6): the stages' MoE read this word at their issue below (the same value on every rank) */
+    g_dsp_sdf.store(dmr_now() >= 6 ? kMoeSdfBit : 0, std::memory_order_relaxed);
+    /* lever EMA (dspark_mhr 7): the plane of this pass's block, where every rank declared it (a function of the pass key and
+     * the switches; the all-reduce's shape is the same on every rank) */
+    int64_t ek = -1;
+    if (d.ema_g && dmr_now() >= 7 && !g_ema_bad.load(std::memory_order_relaxed) && blk >= 2 && S + 1 <= d.Q)
+        for (size_t k = 0; k < d.ema_blk.size(); ++k)
+            if (d.ema_blk[k] == blk) {
+                ek = (int64_t)k;
+                break;
+            }
+    if (ek >= 0 && !d.ema_up) {   /* the index planes, once, landed before the first gather is issued */
+        const int64_t nq = (int64_t)d.ema_blk.size() * d.Q;
+        void* pa = rad_buf_ptr(x, d.ema_ia);
+        void* pe = rad_buf_ptr(x, d.ema_ie);
+        if (!pa || !pe || rad_memcpy_async(pa, d.ema_host.data(), nq * 4, rad_stream(x)) < 0 ||
+            rad_memcpy_async(pe, d.ema_host.data() + nq, nq * 4, rad_stream(x)) < 0 || rad_stream_sync(rad_stream(x)) < 0) {
+            rad_step_fail(x, "deepseek41: lever EMA's index planes could not be copied to the card");
+            return;
+        }
+        d.ema_up = true;
+    }
+
     RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
-    if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
-    for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
+    if (ek >= 0) {
+        const int64_t o = ek * d.Q;
+        RAD_ISSUE_N(x, d.ema_g, S + 1, brows(d.x, T), brow_slice(d.ema_ia, o, S + 1, 1), brows(d.xa, S + 1));
+        RAD_ISSUE_N(x, d.ema_ar, (S + 1) * D, brows(d.xa, S + 1), RAD_NONE);
+        for (int64_t i = 0; i < c.hc; ++i)
+            RAD_ISSUE_N(x, d.ema_e, T, brows(d.xa, S + 1), brow_slice(d.ema_ie, o, T, 1), bcol(d.h0, i * D, D, T));
+        if (g.rank == 0 && g_ema_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+            fprintf(stderr, "radiance: deepseek41: lever EMA: first query pass issued with the embedding's all-reduce at %lld "
+                            "of %lld rows (%lld sequences x %lld + the mask row; counted at issue: a recorded pass once)\n",
+                    (long long)(S + 1), (long long)T, (long long)S, (long long)blk);
+    } else {
+        if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
+        for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
+    }
     RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
     RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
     RAD_ISSUE_N(x, d.q_tab, T, pos, brows(m.cs_a, g.max_ctx));
