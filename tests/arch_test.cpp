@@ -13090,6 +13090,82 @@ TEST(flashnext_psp_pairs_the_full_pieces_of_an_odd_step_and_keeps_the_last_singl
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
+ * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
+ * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's
+ * read once there -- then ONE all_gather_rows over the block input's 8,192 rows and its codes a piece at a time (four hc_codes);
+ * the embedding, its all-reduce and the K / V store stay whole. Control arms keep today's pass (gather + mtp_enter over 8,192
+ * rows, four piece reads, no gather of x): the bit off; the bit on with drafting rows in the pass; the bit on without the
+ * declare (RADIANCE_FN4_MSP unset: nothing declared). Every operand fits and no step fails. */
+TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int arm : { 0, 1, 2, 3 }) {   /* 0: bit off; 1: MSP; 2: bit on, drafting rows; 3: bit on, not declared */
+        if (arm == 3) unsetenv("RADIANCE_FN4_MSP"); else setenv("RADIANCE_FN4_MSP", "1", 1);
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.have_mtp);
+            CHECK_EQ(m.mtp.msp_ag != 0, arm != 3);
+            CHECK_EQ(m.mtp.msp_rows, arm != 3 ? (int64_t)2048 : (int64_t)0);
+            const int64_t HN = m.hccfg.hc * m.g.n_embd, D = m.g.n_embd;
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm == 0 ? 0 : 1024);
+            const auto pf = kit(b, {}, { 8192 }, 2048);
+            auto his = history_pass(b, *pf);
+            if (arm != 2) { his->b.n_draft_out = 0; his->b.draft_out_ids = nullptr; }
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get(), his.get() }, rank, 4);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[1];
+            CHECK(c.step_fail.empty());
+            int64_t enter_n = 0, enter_at = -1, gath_n = 0, gath_at = -1, rd_attn = 0, rd_at = -1, ag = 0, codes = 0, kv = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const int64_t nn = i.n == RAD_N_BATCH ? his->b.n_tok : i.n;   /* RAD_ISSUE: the batch's rows */
+                if (i.op == m.mtp.op_enter) { enter_n += nn; enter_at = i.opd.back().offset; }
+                if (i.op == m.mtp.op_gather) { gath_n += nn; gath_at = i.opd.back().offset; }
+                if (i.op == m.mtp.hc_attn.op_read) { ++rd_attn; rd_at = i.opd[0].offset; }
+                if (o->op == "all_gather_rows") { ++ag; CHECK_EQ(i.n, (int64_t)8192 * D); }
+                if (m.mtp.hc_attn.op_codes && i.op == m.mtp.hc_attn.op_codes) ++codes;
+                if (o->op == "kv_store" || o->op == "qk_norm_rope_gate_kv_store") ++kv;
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK(kv > 0);
+            if (arm == 1) {
+                CHECK_EQ(enter_n, (int64_t)2048);
+                CHECK_EQ(enter_at, (int64_t)rank * 2048 * HN);
+                CHECK_EQ(gath_n, (int64_t)2048);
+                CHECK_EQ(gath_at, (int64_t)rank * 2048 * HN);
+                CHECK_EQ(rd_attn, (int64_t)1);
+                CHECK_EQ(rd_at, (int64_t)rank * 2048 * HN);
+                CHECK_EQ(ag, (int64_t)1);
+                CHECK_EQ(codes, m.hccfg.quant ? (int64_t)4 : (int64_t)0);
+            } else {
+                CHECK_EQ(enter_n, (int64_t)8192);
+                CHECK_EQ(gath_n, (int64_t)8192);
+                CHECK_EQ(rd_attn, (int64_t)4);
+                CHECK_EQ(ag, (int64_t)0);
+                CHECK_EQ(codes, (int64_t)0);
+            }
+        }
+    }
+    unsetenv("RADIANCE_FN4_MSP");
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+}
+
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */
 
 namespace {

@@ -152,6 +152,25 @@ struct MtpHcBlock {
     /* The indexer's window bounds for a pass wider than its score plane (QsaIndexer::step), set by
      * the caller before step(); null where no pass is. */
     const int32_t* qsa_win_cu = nullptr;
+    /* qfn-on-ds lever MSP (Qwen loop round 20): a history pass with no drafting rows (a prompt's mid chunk, one sequence)
+     * of exactly world x msp_rows rows runs the head's replicated per-row work -- the gather of the trunk's rows,
+     * mtp_enter and the attention connection's read -- on this rank's piece only: rank r takes the read's piece r
+     * (HyperConn::read_pieces cuts a pass at read_rows), the very launch every rank runs today for it, and mtp_enter and
+     * the gather are per row. Then the block input is all-gathered (`msp_ag`, the plugin's raw all_gather_rows over
+     * w.x.x: rank r owns rows [r q, (r + 1) q) with q = msp_rows) and its codes redone on every row (HyperConn::codes, the
+     * codes the read writes for the same x, as SP-hc redoes them), so the head's K, V and indexer keys see the same bytes
+     * as today. The plugin sets msp_ag / msp_rows before declare (codes declared then) and msp_now before every step;
+     * msp_ag 0 = today. */
+    rad_op  msp_ag   = 0;
+    int64_t msp_rows = 0;
+    bool    msp_now  = false;
+    bool msp_takes(const RadBatch* batch) const {
+        return msp_now && msp_ag && msp_rows > 0 && g.world > 1 && batch->draft_pass < 0 && batch->n_draft_out <= 0 &&
+               batch->n_seq == 1 && !media && batch->n_tok == (int64_t)g.world * msp_rows &&
+               batch->n_out == batch->n_tok && batch->out_ids && hc_attn.c.read_rows == msp_rows &&
+               (!hc_attn.c.quant || hc_attn.op_codes);
+    }
+    void step_msp(RadCtx* c, const RadBatch* batch) const;
     MoeFP8       mlp{};
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
@@ -276,6 +295,9 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * order. */
     RAD_ARCH_TRY(hc_attn.declare(b, nm, g, nm.f("mtp.attn_hc"), hc, HyperConn::Wire{w.hw, w.x, w.inj},
                                  src.hc_attn));
+    /* lever MSP: the block input's codes redone after the gather (declared only when the plugin asks for MSP); a library that
+     * does not serve them leaves today's pass (msp_ag 0) */
+    if (msp_ag && msp_rows > 0 && hc_attn.declare_codes(b, msp_rows) != RAD_OK) { msp_ag = 0; msp_rows = 0; }
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv));
     attn.ar_out_take = hc_attn.ar_take();
     RAD_ARCH_TRY(attn.declare(b, nm, g, l, kv, rotary_dim, w.attn, src.attn,
@@ -493,6 +515,7 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
                          "the history pass (RadBatch::draft_out_ids) and has no pass of its own");
         return;
     }
+    if (msp_takes(batch)) { step_msp(c, batch); return; }   /* lever MSP */
     if (r < 0 && batch->n_out > 0)
         RAD_ISSUE_N(c, op_gather, batch->n_out,
                     RAD_B(w.src), praw(batch->out_ids, RAD_I32, batch->n_out),
@@ -586,6 +609,28 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
     } else {
         RAD_ISSUE_N(c, op_logits, L, brows(w.hout, L), RAD_W(w_lm), brows(w.logits, L));
     }
+}
+
+/* Lever MSP's history pass (msp_takes): the stores-only pass of step() above with the gather, mtp_enter and the attention
+ * connection's read on this rank's piece [q0, q0 + q) alone. The embedding and its all-reduce stay whole (mtp_enter's rows
+ * read their own `e` rows only). After the read, x's rows come to every rank by the raw all-gather (the owner's bytes) and
+ * the codes are redone a read piece at a time, so every op after it -- the indexer's store and the K / V store -- reads the
+ * rows the replicated pass would have left on every rank. */
+inline void MtpHcBlock::step_msp(RadCtx* c, const RadBatch* batch) const {
+    const int64_t T = batch->n_tok, q = msp_rows, q0 = (int64_t)g.rank * q, HN = hc_attn.hn();
+    RAD_ISSUE_N(c, op_gather, q, RAD_B(w.src), praw(batch->out_ids + q0, RAD_I32, q), brow_slice(w.hin, q0, q, HN));
+    RAD_ISSUE(c, op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.e, T));
+    mrows.step(c, batch, w.e, T);
+    if (op_embed_ar)
+        RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.e, T), RAD_NONE);
+    RAD_ISSUE_N(c, op_enter_flat && fn4_mtpflat_flag().load(std::memory_order_relaxed) ? op_enter_flat : op_enter, q,
+                brow_slice(w.hin, q0, q, HN), brow_slice(w.e, q0, q, g.n_embd), RAD_W(w_pre_h), RAD_W(w_pre_e),
+                RAD_W(w_fc_h), RAD_W(w_fc_e), brow_slice(w.hw, q0, q, HN));
+    hc_attn.read(c, T, q0, q, false);
+    RAD_ISSUE_N(c, msp_ag, T * g.n_embd, brows(w.x.x, T), RAD_NONE);
+    for (int64_t r0 = 0; r0 < T; r0 += q) hc_attn.codes(c, r0, q);
+    qsa.store(c, attn.w.h, batch);
+    attn.store_kv(c, batch);
 }
 
 }  /* namespace arch */
