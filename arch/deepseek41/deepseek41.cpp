@@ -354,6 +354,9 @@ struct Layer {
     std::vector<rad_op> i_runs;
     bool i_keep = false;
     rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
+    /* lever DQR (DRAFTER track round 69; the DSpark stages only): q_rope + attn as ONE libr4d attn_sparse_sink_dqr at out_rope 0
+     * (0 where not declared) */
+    rad_op attn_q = 0;
     /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): ar_attn declared a second time at `overlap` 1 (the narrow launch beside
      * compute) for piece 0 of a pipelined pass; 0 otherwise */
     rad_op ar_attn_ov = 0;
@@ -554,6 +557,7 @@ struct Dsp {
         int64_t S = 0;
         rad_op poff = 0, select = 0, wmarkov = 0, conf = 0;
         std::vector<rad_op> attn, wstep, sstep;
+        std::vector<rad_op> attn_q;   /* lever DQR: each stage's fused form at the short block's window (0: not declared) */
     };
     std::vector<int64_t> sblks;   /* the env's lengths, in its order */
     std::vector<Short> sh;        /* the declared sets (empty: none, or not served -- sbwhy) */
@@ -1715,6 +1719,22 @@ static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
     if (!h || !rad_op_resolved(b, h)) return 0;
     return rw(b, h, rd, wr);
 }
+/* lever DQR (DRAFTER track round 69): the DSpark stage's q_rope + attn_sparse_sink as libr4d's attn_sparse_sink_dqr at out_rope 0
+ * over the stage's attention parameters `dap` (wm_from 1 among them) and the drafter's rope geometry (rope_rows': gptj, the last
+ * c.rope columns of each head; block / format / block_scale = o_q's, unused at out_rope 0); 0 where no library declares or
+ * resolves it. Reads d.q, d.apos, m.cs_a (+ the rows' positions, raw), writes d.o. */
+static rad_op dqr_decl(RadBuilder* b, const Model& m, const std::vector<RadParam>& dap, rad_weight sinks) {
+    const auto& d = m.dsp;
+    std::vector<RadParam> ps = dap;
+    ps.push_back(RAD_INT("rot", m.c.rope));
+    ps.push_back(RAD_INT("off", m.c.head_dim - m.c.rope));
+    ps.push_back(RAD_STR("mode", "gptj"));
+    ps.push_back(RAD_INT("block", 32));
+    ps.push_back(RAD_STR("format", "fp8_e4m3"));
+    ps.push_back(RAD_STR("block_scale", "ue8m0"));
+    ps.push_back(RAD_INT("out_rope", 0));   /* q's rope only: the output's (out_rope 1) measured slower than o_f (r69h) */
+    return fused(b, "attn_sparse_sink_dqr", ps, { sinks }, { d.q, d.apos, m.cs_a }, { d.o });
+}
 /* rmsnorm (x, w -> y) then rope_rows and roundtrip over y, as one op: one head of n columns. */
 static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                            int64_t block, const char* fmt, const char* scale, rad_buf x, rad_buf y,
@@ -2184,7 +2204,17 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * stage boundaries' mhc_post_collapse_rmsnorm folds over r4d_act_threads(M, n) threads and is not, LEVERS BI item 4;
  * tools/dbench/dph: 0 of 45.5 M values differ); under lever DHS its y goes straight into the head's d.rows (hs_cf's copy
  * dropped). Rule A: the head reads the same bytes. Two / three launches and their gaps off the path before the head.
- * Declared where a kernel library declares the op (rad_op_declared: an older libr4d has none, nothing is declared). */
+ * Declared where a kernel library declares the op (rad_op_declared: an older libr4d has none, nothing is declared).
+ * + 32 (DRAFTER track 21.11.2026 round 69, lever DQR; 32..63 = the bits below + DQR, start env RADIANCE_DS41_DSPARK_DQR=1 adds it
+ * to the start value, =0 declares its ops with the bit off) = each stage's q_rope + attention as ONE libr4d attn_sparse_sink_dqr
+ * (out_rope 0): the WMMA attention (lever DAW's form, the drafter's at every height) with q's forward rope at the rows' own
+ * positions (q_rope's operand; the attention's are apos) formed by the workgroup into LDS and read by the Q^T load. Rule A: o's
+ * bytes are the chain's (tools/dbench/dqr); d.q stays unrotated (nothing past the attention reads it before DHS's gather
+ * overwrites it). One launch and a gap off each stage's path, and the window key's fold (kv_fs, unordered) then dispatches
+ * beside q_b instead of behind q_rope. o_rope / o_q (DOF: o_f) stay their own launches (the op's out_rope 1 form, the output's
+ * rope in the attention's epilogue, measured slower: tools/dbench/dqr r69h). Declared only with
+ * lever DAW (RADIANCE_DS41_DSPARK_AWM) and the bf16 window (no RADIANCE_DS41_KVWIN_FP8 for the drafter), where a library
+ * declares the op. */
 static std::atomic<int> g_sw_dmr{-1};
 static std::atomic<int> g_dsp_sdf{0};    /* lever SDD: the DSpark MoE's shexp_lane word (kMoeSdfBit or 0; set at each query pass) */
 static std::atomic<int> g_ema_bad{0};    /* lever EMA: a rank of this process could not declare it: off on every rank */
@@ -2222,8 +2252,12 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dq = q && q[0] == '1' && !q[1] ? 16 : 0;
         if (q && *q && !dq && std::strcmp(q, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DPH=%s is not 0 / 1: lever DPH not declared\n", q);
+        const char* r = std::getenv("RADIANCE_DS41_DSPARK_DQR");   /* lever DQR (round 69): 1 = on at start, 0 = declared, off */
+        const int dr = r && r[0] == '1' && !r[1] ? 32 : 0;
+        if (r && *r && !dr && std::strcmp(r, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DQR=%s is not 0 / 1: lever DQR not declared\n", r);
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq);
+        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2231,6 +2265,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
 static int dmr_now() { return dmr_raw() & 7; }
 static bool dpr_now() { return (dmr_raw() & 8) != 0; }   /* lever DPR (round 67) */
 static bool dph_now() { return (dmr_raw() & 16) != 0; }  /* lever DPH (round 68) */
+static bool dqr_now() { return (dmr_raw() & 32) != 0; }  /* lever DQR (round 69) */
+/* lever DQR: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
+static bool dqr_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_DQR");
+    return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
+}
+static std::atomic<long long> g_dqr_passes{0};   /* lever DQR (round 69): the first-pass line */
 /* lever DPH: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
 static bool dph_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_DPH");
@@ -3047,7 +3088,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 31 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 63 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3180,7 +3221,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5230,6 +5271,10 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
             L.o_f = me && me[0] >= '5' && me[0] <= '7' && !me[1]   /* 6 / 7 (round 59) include 5 */
                         ? rope_rt(b, m, Q, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", d.o, m.cs_a) : 0;
         }
+        /* lever DQR (dspark_mhr + 32, round 69): q_rope + attn as ONE attn_sparse_sink_dqr, beside them; declared
+         * only at the start env RADIANCE_DS41_DSPARK_DQR with lever DAW (its wm_from 1: the WMMA form at every height, the only
+         * form the op takes) and the bf16 window, where a library declares it (fused: 0 otherwise). */
+        L.attn_q = dqr_env() && dsp_awm_env() > 0 && !m.w8d ? dqr_decl(b, m, dap, L.sinks) : 0;
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) {
             if (m.wsc.count(L.wo_a[(size_t)j])) {   /* tp8 loop P30f: the trunk's grouped form only */
@@ -5899,6 +5944,8 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             const rad_op a = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
             if (!a || !rad_op_resolved(b, a)) sbwhy = "no kernel serves attn_sparse_sink at the short block's window";
             z.attn.push_back(a);
+            /* lever DQR: the fused form at the short block's window (0 where the stage's own form is not declared) */
+            z.attn_q.push_back(L.attn_q ? dqr_decl(b, m, dap, L.sinks) : 0);
         }
         if (!sbwhy) {
             z.select = op(b, "dflash_select",
@@ -6006,6 +6053,29 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             fprintf(stderr, "radiance: deepseek41: DSpark lever DHS (RADIANCE_DS41_DSPARK_HS, fn4 dspark_hs, now %d) %s%s: at a "
                             "DHD-cut query pass the last stage's post-attention ops run on the S x H head rows only\n",
                     hs_now(), d.hs_ok ? "declared" : "NOT declared: ", why ? why : "");
+    }
+
+    /* Lever DQR (Layer::attn_q, g_sw_dmr's comment + 32): declared beside each stage's attention above; one line here */
+    if (dqr_env() && !m.zero) {
+        size_t nq = 0, nzq = 0, nz = 0;
+        for (const auto& L : d.st) nq += L.attn_q != 0;
+        for (const auto& z : d.sh)
+            for (rad_op a : z.attn_q) { ++nz; nzq += a != 0; }
+        const char* why = dsp_awm_env() <= 0 ? "lever DAW (RADIANCE_DS41_DSPARK_AWM) is off: the op takes the WMMA form only"
+                          : m.w8d ? "the drafter's window is fp8 (RADIANCE_DS41_KVWIN_FP8): the op takes the bf16 window only"
+                          : !rad_op_declared(b, "attn_sparse_sink_dqr") ? "no kernel library here declares attn_sparse_sink_dqr (libr4d before round 69)"
+                          : nq != d.st.size() ? "attn_sparse_sink_dqr does not resolve at every stage" : nullptr;
+        if (why) {   /* all stages or none: a pass issues one form */
+            for (auto& L : d.st) L.attn_q = 0;
+            for (auto& z : d.sh) std::fill(z.attn_q.begin(), z.attn_q.end(), (rad_op)0);
+            nzq = 0;
+        }
+        rad_note(b, "DSpark lever DQR (RADIANCE_DS41_DSPARK_DQR): %s%s (%zu stages, short blocks %zu of %zu)", why ? "NOT declared: " : "declared",
+                 why ? why : "", why ? (size_t)0 : nq, nzq, nz);
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: DSpark lever DQR (RADIANCE_DS41_DSPARK_DQR, fn4 dspark_mhr + 32, now %s) %s%s: each "
+                            "stage's q_rope + attention as one attn_sparse_sink_dqr (the chain's bytes; short blocks %zu of %zu)\n",
+                    dqr_now() ? "on" : "off", why ? "NOT declared: " : "declared", why ? why : "", nzq, nz);
     }
 
     /* Lever DPH (Dsp::pcn_h / pcn_hr, g_sw_dmr's comment + 16): after every other DSpark op (liveness of what they touch
@@ -8624,7 +8694,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
             RAD_ISSUE_N(x, L.q_an, T, brows(d.qr, T), RAD_W(L.q_norm), brows(d.qrn, T));
             lin_issue(x, m, L.q_b, T, brows(d.qrn, T), L.wq_b, brows(d.q, T));
-            RAD_ISSUE_N(x, L.q_rope, T, brows(d.q, T), brows(m.cs_a, g.max_ctx), pos);
+            /* lever DQR (dspark_mhr + 32): q_rope and the attention as one op (a function of the switches
+             * and the declare alone: the same on every pass of a key; nothing in it is a collective) */
+            const rad_op aq = dqr_now() ? (lo ? (si < lo->attn_q.size() ? lo->attn_q[si] : 0) : L.attn_q) : 0;
+            if (!aq) RAD_ISSUE_N(x, L.q_rope, T, brows(d.q, T), brows(m.cs_a, g.max_ctx), pos);
             if (!gqp) lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));
             if (kvfold) {   /* lever DMR 2: kv_n + kv_rope + kv_q + kv_st as the trunk's fold c, one launch */
                 RAD_ISSUE_N(x, L.kv_fs, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos,
@@ -8640,9 +8713,19 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                     RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
                                 praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
             }
-            RAD_ISSUE_N(x, lo ? lo->attn[si] : L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
-                        praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
-                        RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
+            if (aq) {   /* lever DQR: q unrotated in (its rope inside the attention), o as attn_sparse_sink's (the chain's bytes) */
+                RAD_ISSUE_N(x, aq, T, brows(d.q, T), kv_cache(d.kv, L.l),
+                            praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
+                            RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T),
+                            brows(m.cs_a, g.max_ctx), pos);
+                if (g.rank == 0 && si == 0 && g_dqr_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+                    fprintf(stderr, "radiance: deepseek41: lever DQR: first query pass issued with q_rope + attention as one "
+                                    "attn_sparse_sink_dqr a stage at %lld rows (counted at issue: a recorded pass once)\n",
+                            (long long)T);
+            } else
+                RAD_ISSUE_N(x, lo ? lo->attn[si] : L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
+                            praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
+                            RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
             if (dof && L.o_f) {   /* lever DOF: the trunk's o_f form and operands (its issue in step()) */
                 RAD_ISSUE_N(x, L.o_f, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
             } else {
