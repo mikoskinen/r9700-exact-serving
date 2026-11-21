@@ -997,8 +997,16 @@ static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
     /* more than 48 rows (a decode / logits gather keeps the 2-byte body, as does the chained form), each of whole
-     * 16-byte words: 8 bf16 a word in every row, both pitches and both bases */
-    if (!chain && M > 48 && n % 8 == 0 && x_ld % 8 == 0 && y_ld % 8 == 0 && ((unsigned long)x & 15) == 0 &&
+     * 16-byte words: 8 bf16 a word in every row, both pitches and both bases.
+     * Lever GRW (DRAFTER track round 59): from R4D_GR_W16_MIN rows (a start env, read once; unset = 49 = the rule above,
+     * 1 = every height) -- the same bytes, a row of 5120 in 2.5 thread steps of 16 bytes instead of 20 of 2 (one card,
+     * tools/dbench/ema.cpp back to back incl. the launch: -0.4 us a call at 1 row, -0.6..-0.7 at 24..48 rows). */
+    static const int w16_min = [] {
+        const char* e = std::getenv("R4D_GR_W16_MIN");
+        const int v = e && *e ? std::atoi(e) : 49;
+        return v >= 1 ? v : 49;
+    }();
+    if (!chain && M >= w16_min && n % 8 == 0 && x_ld % 8 == 0 && y_ld % 8 == 0 && ((unsigned long)x & 15) == 0 &&
         ((unsigned long)y & 15) == 0)
         return R4D_EMIT(stream, gather_rows_w16_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                         (const uint4*)x, (const int32_t*)idx, (uint4*)y, (uint32_t)(n / 8), (int32_t)src_rows,
