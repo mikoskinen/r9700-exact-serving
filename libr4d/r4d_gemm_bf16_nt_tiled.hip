@@ -19,6 +19,7 @@
 // Fragment rows are clamped as in the skinny kernel: rows past M or N re-read the last valid row
 // and their results are never stored.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_gemm_args.h"
 #include "r4d_bf16_gemm_rows.h"
 #include "r4d_common.h"
@@ -38,7 +39,7 @@
 template <int TM, int TN, bool SPLIT>
 __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk, int LDA, int LDC) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk, int LDA, int LDC) { R4D_IKA_ENTRY();
   constexpr int BM = BT_WM * TM * 16, BN = BT_WN * TN * 16;
   constexpr int CPR = BT_BK / 8;                  // 16-byte chunks a staged row
   constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;

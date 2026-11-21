@@ -4,6 +4,7 @@
 // standalone sort place every slot alike; tests/r4d_emu runs it from here.
 #pragma once
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <cstdint>
 #include <cstdlib>
 
@@ -186,7 +187,7 @@ template <bool INV>
 __global__ __launch_bounds__(kScatWaves * kSortWave) void scatter_small_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ sorted, int32_t* __restrict__ off,
     int32_t* __restrict__ cnt, uint32_t T, uint32_t n_expert, int32_t base, Protect prot,
-    int32_t* __restrict__ inv) {
+    int32_t* __restrict__ inv) { R4D_IKA_ENTRY();
     __shared__ ScatterLds<kScatWaves> sl;
     const uint32_t tid = threadIdx.x;
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) sl.cnt[e] = 0;

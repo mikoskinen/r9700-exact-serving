@@ -33,6 +33,7 @@
 // Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_ar_seq.h"   // the all-reduce sequence step the fused all-reduce + norm takes
 #include "r4d_fp8_args.h"
 #include "r4d_emit.h"
@@ -155,7 +156,7 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n,
     uint32_t nkb, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld,
-    uint32_t q_ld, uint32_t s_ld) {
+    uint32_t q_ld, uint32_t s_ld) { R4D_IKA_ENTRY();
     __shared__ float lds[THR / kWave];
     const uint32_t row = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
@@ -257,7 +258,7 @@ template <int ACT, bool ROT = false, bool I8 = false>
 __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
     float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
-    uint32_t q_ld, uint32_t s_ld) {
+    uint32_t q_ld, uint32_t s_ld) { R4D_IKA_ENTRY();
     gated_quant_fp8_kernel_body<ACT, ROT, I8>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
 }
 template <int ACT, bool ROT = false, bool I8 = false>
@@ -337,7 +338,7 @@ template <int ACT, bool I8 = false, bool ROT = false>
 __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t g_ld,
-    uint32_t x_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) {
+    uint32_t x_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) { R4D_IKA_ENTRY();
     gate_quant_fp8_kernel_body<ACT, I8, ROT>(g, x, y, q, s, n, nkb, g_ld, x_ld, y_ld, q_ld, s_ld);
 }
 template <int ACT, bool I8 = false, bool ROT = false>
@@ -458,7 +459,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     int4* peer_base, const int4* my_base, unsigned int* peer_flags, unsigned int* my_flags,
     unsigned int* seq_ctrs, char* loc_pack, long loc_scale_off, int M, uint32_t n, uint32_t nkb,
     float eps, float wadd, uint32_t r_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld,
-    int slot_stride16, int drain, int acq, unsigned int nbw, long stage) {
+    int slot_stride16, int drain, int acq, unsigned int nbw, long stage) { R4D_IKA_ENTRY();
     __shared__ float lds[THR / kWave];
     __shared__ unsigned int s_seq, s_slot;
     const int b = (int)blockIdx.x, nb = (int)gridDim.x;

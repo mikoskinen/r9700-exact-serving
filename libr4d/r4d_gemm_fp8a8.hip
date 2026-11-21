@@ -26,6 +26,7 @@
 // plugin, and an exception must not cross the .so boundary.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_fp8_args.h"
 #include "r4d_emit.h"
 #include "r4d_chain.h"
@@ -702,7 +703,7 @@ void gemm_fp8a8_kernel(
     uint8_t* __restrict__ Q = nullptr, float* __restrict__ Sc = nullptr,
     uint16_t* __restrict__ Yb = nullptr,
     uint32_t q_ld = 0, uint32_t s_ld = 0, uint32_t y_ld = 0,
-    const uint16_t* __restrict__ Bias = nullptr, uint32_t c_ld = 0) {
+    const uint16_t* __restrict__ Bias = nullptr, uint32_t c_ld = 0) { R4D_IKA_ENTRY();
     gemm_fp8a8_body<Full, NT, MW, FK, GATED, I8, BIAS>(R4D_F8K_ARGS);
 }
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
@@ -727,7 +728,7 @@ void r4dchain_gemm_fp8a8(
 // Sum the split-K partials into bf16 C, in fixed z order with no atomics. Latency bound, so eight
 // loads are issued before their adds; the order of the adds is unchanged.
 __global__ void splitk_reduce_kernel(const float* __restrict__ ws, uint16_t* __restrict__ y,
-                                     uint32_t n_out, uint32_t ksplit) {
+                                     uint32_t n_out, uint32_t ksplit) { R4D_IKA_ENTRY();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t n = (size_t)n_out;
     if (i >= n) return;
@@ -751,7 +752,7 @@ __global__ __launch_bounds__(kPWaves * kWave) R4D_WAVES(6)
 void gemm_8a8_prefill_kernel(const uint8_t* __restrict__ A, const float* __restrict__ Sa,
                              const uint8_t* __restrict__ W, const uint16_t* __restrict__ Sw,
                              uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
-                             uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld) {
+                             uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld) { R4D_IKA_ENTRY();
     gemm_8a8_prefill_body<I8, RB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, PrefillPlain{});
 }
 
@@ -784,7 +785,7 @@ void gemm_8a8_gated_prefill_kernel(const uint8_t* __restrict__ A, const float* _
                                    uint8_t* __restrict__ Q, float* __restrict__ Sc,
                                    uint16_t* __restrict__ Yb, uint32_t M, uint32_t K,
                                    uint32_t nout, uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld,
-                                   uint32_t q_ld, uint32_t s_ld, uint32_t y_ld) {
+                                   uint32_t q_ld, uint32_t s_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     constexpr uint32_t P = lds_pitch<kPFK>();
     __shared__ __attribute__((aligned(16))) uint8_t s_a[2][kGBM * P];
     __shared__ float s_as[2][kGBM];

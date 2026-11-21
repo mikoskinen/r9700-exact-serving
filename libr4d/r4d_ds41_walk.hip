@@ -34,6 +34,7 @@
 // predecessor rows staged in LDS as f32); form 0: a thread reads its succ row once a pass in 16-byte pieces; form 1
 // (`form` 1, lever W1b): the block's rows come through LDS as whole 128-byte lines, the same chain a thread.
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -92,7 +93,7 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
     const unsigned long long* __restrict__ prev, long ppitch, int world,
     const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
     unsigned long long* __restrict__ keys, long kpitch, int* __restrict__ tokens, long tpitch,
-    int S, int step, int steps, int R, int V, int N, int voff) {
+    int S, int step, int steps, int R, int V, int N, int voff) { R4D_IKA_ENTRY();
     __shared__ float su[SEQS * (STAGED ? kStageMaxRank : kWalkMaxRank)];
     __shared__ int sprev[SEQS];
     __shared__ unsigned long long sbest[SEQS * kWalkWaves];
@@ -230,7 +231,7 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_wm_kernel(
     const unsigned long long* __restrict__ prev, long ppitch, int world,
     const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
     unsigned long long* __restrict__ keys, long kpitch, int* __restrict__ tokens, long tpitch,
-    int S, int step, int steps, int V, int N, int voff) {
+    int S, int step, int steps, int V, int N, int voff) { R4D_IKA_ENTRY();
     __shared__ int sprev[16];
     __shared__ unsigned long long sbest[16 * kWalkWaves];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, nl = lane & 15, h = lane >> 4;

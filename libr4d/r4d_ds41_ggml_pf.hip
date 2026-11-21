@@ -46,6 +46,7 @@
 #define R4D_GG_BLOCKS_ONLY 1
 #define R4D_GG_WM_SRC 1
 #include "r4d_ds41_ggml.hip"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_ds41_ggml_pf.h"
 #endif
 /* R4D_GG_PF_KERNEL_ONLY (lever WMK, r4d_ds41_wmk.hip): this file's kernel template and its LDS / form helpers only, in a unit
@@ -63,7 +64,7 @@
 namespace {
 
 template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
-__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) { R4D_IKA_ENTRY();
     using W = Wq<T>;
     using Pf = typename W::Pf;
     constexpr int NTH = WN * 32;

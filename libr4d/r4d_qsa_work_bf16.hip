@@ -19,6 +19,7 @@
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_chain.h"
@@ -127,7 +128,7 @@ __global__ __launch_bounds__(kThreads) void qsa_work_kernel(
     int32_t* __restrict__ nc,
     int n, int ratio, int ring, int seqs, int max_work, int k_ld, int s_slot, int s_row,
     int sidx_ld, int bt_ld, int g_ld, const int32_t* __restrict__ rope, int rplane,
-    int bstep) {
+    int bstep) { R4D_IKA_ENTRY();
     qsa_work_kernel_body<E>(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring, seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep);
 }
 template <typename E>

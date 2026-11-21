@@ -12,6 +12,7 @@
 // No fp8-P leg and no non-CONTIG alternative here; r4d_attn_prefill_h256_gqa6.hip documents the
 // full option set.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
@@ -692,7 +693,7 @@ template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
          int WIN = 0>
 __global__ __launch_bounds__(NWARPS * 32)
 void r4d_attn_decode_kernel(const R4DArgs a, int splits)
-{
+{ R4D_IKA_ENTRY();
     r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
 }
 template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
@@ -876,7 +877,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0, SPAN>(a, splits, tile,
                                                                          R4DGateQuant{});
 }
@@ -893,7 +894,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int tile,
                                             const R4DGateQuant gq)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, GQ>(a, splits, tile, gq);
 }
 
@@ -1022,7 +1023,7 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0, SPAN>(a, splits, tile, R4DGateQuant{});
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
@@ -1037,7 +1038,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
                                         const R4DGateQuant gq)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, GQ>(a, splits, tile, gq);
 }
 

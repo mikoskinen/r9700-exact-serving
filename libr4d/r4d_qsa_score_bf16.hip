@@ -18,6 +18,7 @@
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_chain.h"
@@ -65,7 +66,7 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
     const __hip_bfloat16* __restrict__ q, const __hip_bfloat16* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int n, int heads, int nb, int nseq, int q_ld, int bk_ld, int bt_ld, int out_ld) {
+    int n, int heads, int nb, int nseq, int q_ld, int bk_ld, int bt_ld, int out_ld) { R4D_IKA_ENTRY();
 
     __shared__ int sh_seq;
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
@@ -352,7 +353,7 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) { R4D_IKA_ENTRY();
     qsa_score_mx_kernel_body<HEADS>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec);
 }
 /* fn4 qsa_split: the rank's block range, plain and chained as the whole-range form. */
@@ -362,7 +363,7 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_part_kernel(
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
     int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec,
-    int parts, int part) {
+    int parts, int part) { R4D_IKA_ENTRY();
     qsa_score_mx_kernel_body<HEADS, true>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec,
                                           parts, part);
 }

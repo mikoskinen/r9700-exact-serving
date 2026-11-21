@@ -38,6 +38,7 @@
 // atomic cursor would make `sorted_tok`, and every row of the GEMM output, depend on scheduling,
 // breaking the byte-level reproducibility of spec §17.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_plugin.h"
@@ -276,7 +277,7 @@ __device__ __forceinline__ void router_topk_row(
 template <uint32_t NW, uint32_t MAXOWN>
 __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
-    uint32_t M, uint32_t n_expert, uint32_t top_k, uint32_t lg_ld, int norm) {
+    uint32_t M, uint32_t n_expert, uint32_t top_k, uint32_t lg_ld, int norm) { R4D_IKA_ENTRY();
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
     const uint32_t m = blockIdx.x * NW + wave;
     if (m >= M) return;
@@ -315,7 +316,7 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
     uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,
-    int32_t base, Protect prot) {
+    int32_t base, Protect prot) { R4D_IKA_ENTRY();
     __shared__ ScatterLds<NW> sl;
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
     for (uint32_t e = threadIdx.x; e < n_local; e += blockDim.x) sl.cnt[e] = 0;
@@ -332,7 +333,7 @@ constexpr uint32_t kScatterTile = 256;
 
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
-    int32_t base, Protect prot) {
+    int32_t base, Protect prot) { R4D_IKA_ENTRY();
 #ifdef R4D_EMU_HOST   // tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host)
     int32_t* const s_h = (int32_t*)emu_dyn_lds();
 #else
@@ -362,7 +363,7 @@ constexpr uint32_t kScanBatch = 16;
 
 __global__ __launch_bounds__(kMaxExpert) void scatter_scan_kernel(
     int32_t* __restrict__ bcnt, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
-    uint32_t n_tile, uint32_t n_expert) {
+    uint32_t n_tile, uint32_t n_expert) { R4D_IKA_ENTRY();
     constexpr uint32_t NW = kMaxExpert / kWave;
     __shared__ int32_t s_wt[NW];
     const uint32_t e = threadIdx.x, lane = e % kWave, wave = e / kWave;
@@ -408,7 +409,7 @@ template <bool INV>
 __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
     const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
     const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
-    uint32_t T, uint32_t n_expert, int32_t base, Protect prot, int32_t* __restrict__ inv) {
+    uint32_t T, uint32_t n_expert, int32_t base, Protect prot, int32_t* __restrict__ inv) { R4D_IKA_ENTRY();
     __shared__ int32_t s_id[kScatterTile];
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     const uint32_t i = b * kScatterTile + tid;
@@ -1449,7 +1450,7 @@ void moe_gemm_q_kernel(
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
     uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) { R4D_IKA_ENTRY();
     moe_gemm_q_kernel_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
 }
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
@@ -1813,7 +1814,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) { R4D_IKA_ENTRY();
     moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
 }
 template <int W4>
@@ -1843,7 +1844,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_w4_rows_kernel(
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
     uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) { R4D_IKA_ENTRY();
     const uint32_t row = blockIdx.x, n0 = blockIdx.y * 64u;
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     if (row >= T || n0 >= N) return;
@@ -1943,7 +1944,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
     uint16_t* __restrict__ Y,
     uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k, uint32_t a_sorted,
     uint32_t a_ld, uint32_t w_ld, uint32_t y_ld,
-    const uint32_t* __restrict__ map) {
+    const uint32_t* __restrict__ map) { R4D_IKA_ENTRY();
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
@@ -2167,13 +2168,13 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
  * The inverse permutation is built by its own pass: `sorted` permutes the live slots, so
  * `inv[sorted[i]] = i` is one scattered store per row. An unclaimed (dropped) slot keeps -1 and
  * contributes nothing. */
-__global__ void gather_inv_kernel(int32_t* __restrict__ inv, uint32_t T) {
+__global__ void gather_inv_kernel(int32_t* __restrict__ inv, uint32_t T) { R4D_IKA_ENTRY();
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < T) inv[i] = -1;
 }
 
 __global__ void gather_scatter_kernel(const int32_t* __restrict__ sorted,
-                                      int32_t* __restrict__ inv, uint32_t T) {
+                                      int32_t* __restrict__ inv, uint32_t T) { R4D_IKA_ENTRY();
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T) return;
     const int32_t f = sorted[i];
@@ -2207,7 +2208,7 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
-    uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    uint32_t sh_ld, uint32_t sg_ld, int sig) { R4D_IKA_ENTRY();
     const uint32_t lane = threadIdx.x % kWave;
     const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
     const uint32_t t = (VAR == 1 ? blockIdx.y : blockIdx.x) * NW + wave;
@@ -2308,7 +2309,7 @@ template <uint32_t NTHR>
 __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ sc,
     const uint16_t* __restrict__ ad, uint16_t* __restrict__ y,
-    uint32_t M, uint32_t n, uint32_t x_ld, uint32_t s_ld, uint32_t a_ld, uint32_t y_ld, int sig) {
+    uint32_t M, uint32_t n, uint32_t x_ld, uint32_t s_ld, uint32_t a_ld, uint32_t y_ld, int sig) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     if (m >= M) return;
     const float v0 = bf16_to_f32(sc[(size_t)m * s_ld]);
@@ -2702,7 +2703,7 @@ static inline long long r4d_blockmap_bytes(long long cap) {
  * waits for the map. Integer sums are order-independent. */
 __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
-    uint32_t* __restrict__ map) {
+    uint32_t* __restrict__ map) { R4D_IKA_ENTRY();
     constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
     __shared__ uint32_t s_cnt[kMaxExpert + 1];
     __shared__ int32_t  s_wt[kTiles][NW];
@@ -3673,7 +3674,7 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
     int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot) {
+    RgGeom g, Protect prot) { R4D_IKA_ENTRY();
     router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
 }
 template <uint32_t MAXOWN, uint32_t NW>
@@ -3694,7 +3695,7 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_inv_kerne
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
     int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot, int32_t* __restrict__ inv) {
+    RgGeom g, Protect prot, int32_t* __restrict__ inv) { R4D_IKA_ENTRY();
     router_gemm_topk_scatter_kernel_body<MAXOWN, NW, true>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot, inv);
 }
 template <uint32_t MAXOWN, uint32_t NW>

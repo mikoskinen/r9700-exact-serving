@@ -10,6 +10,7 @@
  */
 #include <hip/hip_runtime.h>
 
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <cstdint>
 
 #include "r4d_plugin.h"
@@ -31,7 +32,7 @@ __device__ __forceinline__ unsigned long long bi_mix(unsigned long long x) {
     return x;
 }
 
-__global__ __launch_bounds__(256) void bi_rowhash_kernel(BiArgs A) {
+__global__ __launch_bounds__(256) void bi_rowhash_kernel(BiArgs A) { R4D_IKA_ENTRY();
     __shared__ unsigned long long sh[256];
     for (long long r = blockIdx.x; r < A.rows; r += gridDim.x) {
         const uint16_t* p = (const uint16_t*)(A.x + r * A.xs);
@@ -63,7 +64,7 @@ struct BandArgs {
     int            ns, band;
 };
 
-__global__ __launch_bounds__(256) void bi_band_kernel(BandArgs A) {
+__global__ __launch_bounds__(256) void bi_band_kernel(BandArgs A) { R4D_IKA_ENTRY();
     const long long r = (long long)blockIdx.x * 256 + threadIdx.x;
     if (r >= A.rows) return;
     int lo = 0, hi = A.ns;   /* the last s with cu[s] <= r */

@@ -56,6 +56,7 @@
 // tolerance.
 #include <hip/hip_runtime.h>
 
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -444,7 +445,7 @@ __device__ __forceinline__ void hc_lds_barrier() {
  * weight is [vocab, n] and a wide output would need a different weight shape. */
 __global__ __launch_bounds__(kThreads)
 void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __restrict__ h,
-                     long rows, long n, int hc, long xrow, long hrow) {
+                     long rows, long n, int hc, long xrow, long hrow) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     if (r >= rows) return;
     const unsigned short* xp = x + r * xrow;
@@ -462,7 +463,7 @@ void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __res
 __global__ __launch_bounds__(kThreads)
 void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
                      unsigned short* __restrict__ h,
-                     long rows, long n, int hc, long yrow, long irow, long hrow) {
+                     long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     if (r >= rows) return;
     /* Gains go through LDS, not a register array: with a runtime `hc`, `g[c]` would be a dynamic
@@ -492,7 +493,7 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
 __global__ __launch_bounds__(kThreads)
 void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
                          unsigned short* __restrict__ h,
-                         long rows, long n, int hc, long yrow, long irow, long hrow) {
+                         long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
     const long wpr  = n >> 3;                                  /* 8-element words a row */
     const long item = (long)blockIdx.x * kThreads + threadIdx.x;
     if (item >= rows * wpr) return;
@@ -522,7 +523,7 @@ void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned sh
  * request's stream is the stock model's. */
 __global__ __launch_bounds__(kThreads)
 void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__ v,
-                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale) {
+                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     if (r >= rows || on[r] == 0) return;   /* a row's switch: the whole workgroup takes it */
     unsigned short* hp = h + r * hrow + (long)blockIdx.x * n;
@@ -795,7 +796,7 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
                       const unsigned short* __restrict__ fce,
                       unsigned short* __restrict__ x,
                       long rows, long n, int hc, int flat, float eps, float wadd,
-                      long hrow, long erow, long xrow) {
+                      long hrow, long erow, long xrow) { R4D_IKA_ENTRY();
     extern __shared__ unsigned short sM[];        /* [hc * n] nh, then [n] ne */
     __shared__ float s_part[kWaves][kHcMax];
     __shared__ float s_pe[kWaves];
@@ -1183,7 +1184,7 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                       float* __restrict__ scaleout,
                       long rows, long n, int hc, long lr, long ta, long hrow, long irow,
-                      float eps, float wadd) {
+                      float eps, float wadd) { R4D_IKA_ENTRY();
     hc_read_a_body<F8, HCP, PER>(h, w, downv, dld, injw, dout, inj, scaleout, rows, n, hc, lr, ta,
                                  hrow, irow, eps, wadd, blockIdx.x, blockIdx.y, gridDim.x - 1u);
 }
@@ -1244,7 +1245,7 @@ __device__ __forceinline__ void wave_dot_lds_rows(const float* __restrict__ sv, 
 template <int RG, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_up_kernel(const void* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
-                  unsigned short* __restrict__ ubuf, long rows, long hn, long lr) {
+                  unsigned short* __restrict__ ubuf, long rows, long hn, long lr) { R4D_IKA_ENTRY();
     const unsigned short* __restrict__ up = (const unsigned short*)upv;
     extern __shared__ __attribute__((aligned(16))) float sd[];   /* [RG * lr] */
     __shared__ unsigned short s_stage[kWaves][kWave * 8];   /* wave_dot_lds, one slot a wave */
@@ -1658,7 +1659,7 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                       float* __restrict__ qs, unsigned char* __restrict__ rq,
                       float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                       long rows, long n, int hc, long lr, long hrow, long xrow,
-                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                      long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     hc_up_mix_body<RG, F8, I8, RPT>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd, blockIdx.x, blockIdx.y);
 }
 
@@ -2294,7 +2295,7 @@ __device__ __forceinline__ void hc_up_w_body(
 #define R4D_HCW_ARGS upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, lr, hrow, xrow, \
     qrow, srow, rqrow, rsrow, wadd
 template <int RG, bool I8>
-__global__ __launch_bounds__(kThreads) void hc_up_w_kernel(R4D_HCW_PARAMS) {
+__global__ __launch_bounds__(kThreads) void hc_up_w_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_w_body<RG, false, I8>(R4D_HCW_ARGS);
 }
 template <int RG, bool I8>
@@ -2311,11 +2312,11 @@ __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_w(R4D_HCW_PARAMS) {
  * order (only the allocation moves): every output byte is hc_up_w_kernel<16>'s. R6 (hctl1): at 64 / 128 rows B3 runs 2.1 / 4.0
  * rounds of ~12 us blocks at 6 a WGP. */
 template <int RG, bool I8>
-__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(16, 16))) void hc_up_w_o_kernel(R4D_HCW_PARAMS) {
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(16, 16))) void hc_up_w_o_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_w_body<RG, false, I8>(R4D_HCW_ARGS);
 }
 template <int RG, bool I8>
-__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) void hc_up_w_tl_kernel(R4D_HCW_PARAMS) {
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) void hc_up_w_tl_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     asm volatile("" ::: "v117");
     hc_up_w_body<RG, false, I8, true>(R4D_HCW_ARGS);
 }
@@ -2331,7 +2332,7 @@ __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) voi
  * only (the chain wait sits before a single group's operands). */
 template <bool I8>
 __global__ __launch_bounds__(kThreads)
-void hc_up_w_gb_kernel(R4D_HCW_PARAMS, int gpb) {
+void hc_up_w_gb_kernel(R4D_HCW_PARAMS, int gpb) { R4D_IKA_ENTRY();
     constexpr int RG = 16;
     constexpr int hc = 4;
     constexpr int kLr = 320, kQ = kLr / 4, kStepsQ = kQ / 16;
@@ -2479,7 +2480,7 @@ void hc_read_s_down_kernel(const unsigned short* __restrict__ h, const float* __
                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                            float* __restrict__ scaleout, float* __restrict__ part,
                            unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                           float eps, float wadd, int ntd, long rows) {
+                           float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_s_down_body<MT, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                    hrow, irow, eps, wadd, ntd, rows);
 }
@@ -2505,7 +2506,7 @@ void hc_read_g_down_kernel(const unsigned short* __restrict__ h, const float* __
                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                            float* __restrict__ scaleout, float* __restrict__ part,
                            unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                           float eps, float wadd, int ntd, long rows) {
+                           float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                    hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3003,7 +3004,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
 /* fn4 BI (hc_readv bit 9): form G's per-row norm scales once a (stream, 16-row group), for G16p's PRE form -- the same
  * thread mapping (ten elements a thread in order), the wave sum, the waves in order, the same __frsqrt_rn. */
 __global__ __launch_bounds__(kThreads)
-void hc_g_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout, long hrow, float eps, long rows) {
+void hc_g_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout, long hrow, float eps, long rows) { R4D_IKA_ENTRY();
     __shared__ float s_part[kWaves][16];
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const int c = (int)blockIdx.x;
@@ -3036,7 +3037,7 @@ void hc_read_g16pp_down_kernel(const unsigned short* __restrict__ h, const float
                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                float* __restrict__ scaleout, float* __restrict__ part,
                                unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                               float eps, float wadd, int ntd, long rows) {
+                               float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                             hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3048,7 +3049,7 @@ void hc_read_g16q_down_kernel(const unsigned short* __restrict__ h, const float*
                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                               float* __restrict__ scaleout, float* __restrict__ part,
                               unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                              float eps, float wadd, int ntd, long rows) {
+                              float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, false, 4>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                 hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3063,7 +3064,7 @@ void hc_read_g16p_down_o_kernel(const unsigned short* __restrict__ h, const floa
                                 unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                 float* __restrict__ scaleout, float* __restrict__ part,
                                 unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                                float eps, float wadd, int ntd, long rows) {
+                                float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                       hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3075,15 +3076,15 @@ void hc_read_g16p_down_o_kernel(const unsigned short* __restrict__ h, const floa
                          long hrow, long irow, float eps, float wadd, int ntd, long rows
 #define HC_G16_ARGS h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows
 template <int RG>
-__global__ __launch_bounds__(kThreads) void hc_read_g16p_down_np_kernel(HC_G16_ARGS_DECL) {
+__global__ __launch_bounds__(kThreads) void hc_read_g16p_down_np_kernel(HC_G16_ARGS_DECL) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, false, 2, false, true>(HC_G16_ARGS);
 }
 template <int RG>
-__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_read_g16p_down_onp_kernel(HC_G16_ARGS_DECL) {
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_read_g16p_down_onp_kernel(HC_G16_ARGS_DECL) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, false, 2, false, true>(HC_G16_ARGS);
 }
 template <int RG>
-__global__ __launch_bounds__(kThreads) void hc_read_g16_down_np_kernel(HC_G16_ARGS_DECL) {
+__global__ __launch_bounds__(kThreads) void hc_read_g16_down_np_kernel(HC_G16_ARGS_DECL) { R4D_IKA_ENTRY();
     hc_read_g16_down_body<RG, false, false, true>(HC_G16_ARGS);
 }
 #undef HC_G16_ARGS
@@ -3097,7 +3098,7 @@ void hc_read_g16p_down_tl_kernel(const unsigned short* __restrict__ h, const flo
                                  unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                  float* __restrict__ scaleout, float* __restrict__ part,
                                  unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                                 float eps, float wadd, int ntd, long rows) {
+                                 float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     asm volatile("" ::: "v193");
     hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                       hrow, irow, eps, wadd, ntd, rows);
@@ -3112,7 +3113,7 @@ void hc_read_g16p_down_tl_o_kernel(const unsigned short* __restrict__ h, const f
                                    unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                    float* __restrict__ scaleout, float* __restrict__ part,
                                    unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                                   float eps, float wadd, int ntd, long rows) {
+                                   float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                       hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3124,7 +3125,7 @@ void hc_read_g16p_down_tl_np_kernel(const unsigned short* __restrict__ h, const 
                                     unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                     float* __restrict__ scaleout, float* __restrict__ part,
                                     unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                                    float eps, float wadd, int ntd, long rows) {
+                                    float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, false, 2, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                             hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3136,7 +3137,7 @@ void hc_read_g16_down_tl_np_kernel(const unsigned short* __restrict__ h, const f
                                    unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                    float* __restrict__ scaleout, float* __restrict__ part,
                                    unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                                   float eps, float wadd, int ntd, long rows) {
+                                   float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     asm volatile("" ::: "v125");
     hc_read_g16_down_body<RG, false, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                  hrow, irow, eps, wadd, ntd, rows);
@@ -3149,7 +3150,7 @@ void hc_read_g16_down_tl_kernel(const unsigned short* __restrict__ h, const floa
                                 unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                 float* __restrict__ scaleout, float* __restrict__ part,
                                 unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                                float eps, float wadd, int ntd, long rows) {
+                                float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     asm volatile("" ::: "v129");
     hc_read_g16_down_body<RG, false, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                            hrow, irow, eps, wadd, ntd, rows);
@@ -3162,7 +3163,7 @@ void hc_read_g16p_down_kernel(const unsigned short* __restrict__ h, const float*
                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                               float* __restrict__ scaleout, float* __restrict__ part,
                               unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                              float eps, float wadd, int ntd, long rows) {
+                              float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                       hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3188,7 +3189,7 @@ void hc_read_g16_down_kernel(const unsigned short* __restrict__ h, const float* 
                              unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                              float* __restrict__ scaleout, float* __restrict__ part,
                              unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                             float eps, float wadd, int ntd, long rows) {
+                             float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                      hrow, irow, eps, wadd, ntd, rows);
 }
@@ -3273,7 +3274,7 @@ void hc_read_fused_kernel(const unsigned short* __restrict__ h, const float* __r
                           long rows, long n, int hc, long lr, long hrow, long xrow,
                           long qrow, long srow, long rqrow, long rsrow, float wadd,
                           unsigned int* __restrict__ sync,
-                          unsigned na, unsigned gxa, unsigned gxb, unsigned nb_all) {
+                          unsigned na, unsigned gxa, unsigned gxb, unsigned nb_all) { R4D_IKA_ENTRY();
     hc_read_fused_kernel_body<RG, I8, RPT, HCP, PER>(h, w, downv, dld, injw, dbuf, inj, scale, ta, irow, eps, upv, uld, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd, sync, na, gxa, gxb, nb_all);
 }
 template <int RG, bool I8, int RPT, int HCP, int PER>
@@ -3366,7 +3367,7 @@ void hc_read_a_2grid_kernel(const unsigned short* __restrict__ h, const float* _
                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                       float* __restrict__ scaleout,
                       long rows, long n, int hc, long lr, long ta, long hrow, long irow,
-                      float eps, float wadd) {
+                      float eps, float wadd) { R4D_IKA_ENTRY();
     extern __shared__ unsigned short sN[];          /* [hc * n], transposed per 256-element chunk */
     __shared__ float s_part[kWaves][kHcMax];
     __shared__ float s_scale[kHcMax];
@@ -3511,7 +3512,7 @@ void hc_up_mix_2grid_kernel(const void* __restrict__ upv, long uld,
                       float* __restrict__ qs, unsigned char* __restrict__ rq,
                       float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                       long rows, long n, int hc, long lr, long hrow, long xrow,
-                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                      long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     extern __shared__ float sd[];                   /* [RG * lr] */
     __shared__ unsigned short s_stage[kWaves][kWave * 8];   /* wave_dot_lds, one slot a wave */
     __shared__ unsigned short s_u[RG * kUpRows];
@@ -3719,7 +3720,7 @@ void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict
                    float* __restrict__ qs, unsigned char* __restrict__ rq,
                    float* __restrict__ rqs,
                    long rows, long n, int hc, long hrow, long xrow,
-                   long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                   long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     __shared__ float s_x[kUpTB];
     __shared__ float s_amax[kWaves];
 
@@ -3842,7 +3843,7 @@ __device__ __forceinline__ void hc_norm_scale_kernel_body(const unsigned short* 
 /* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
 __global__ __launch_bounds__(kThreads)
 void hc_norm_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
-                          long rows, long n, long hrow, float eps) {
+                          long rows, long n, long hrow, float eps) { R4D_IKA_ENTRY();
     hc_norm_scale_kernel_body(h, scaleout, rows, n, hrow, eps);
 }
 __global__ __launch_bounds__(kThreads)
@@ -3990,7 +3991,7 @@ void hc_down_tiled_kernel(const unsigned short* __restrict__ h, const float* __r
                           unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                           float* __restrict__ part,
                           long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                          long kc, float wadd) {
+                          long kc, float wadd) { R4D_IKA_ENTRY();
     hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
 }
 template <int RT, int NT, bool F8>
@@ -4025,7 +4026,7 @@ void hc_down_tiled_pipe_kernel(const unsigned short* __restrict__ h, const float
                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                float* __restrict__ part,
                                long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                               long kc, float wadd) {
+                               long kc, float wadd) { R4D_IKA_ENTRY();
     constexpr int NT = kTNT;
     __shared__ unsigned short sA[RT * kTAP];
     __shared__ unsigned short sB[NT * kTAP];
@@ -4194,7 +4195,7 @@ __device__ __forceinline__ void hc_down_reduce_kernel_body(const float* __restri
 __global__ __launch_bounds__(kThreads)
 void hc_down_reduce_kernel(const float* __restrict__ part, unsigned short* __restrict__ dout,
                            unsigned short* __restrict__ inj, long rows, long lr, long ncol,
-                           long irow, int ksplit, float inv_hc) {
+                           long irow, int ksplit, float inv_hc) { R4D_IKA_ENTRY();
     hc_down_reduce_kernel_body(part, dout, inj, rows, lr, ncol, irow, ksplit, inv_hc);
 }
 __global__ __launch_bounds__(kThreads)
@@ -4286,7 +4287,7 @@ void hc_down_tiled_fr_kernel(const unsigned short* __restrict__ h, const float* 
                              unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                              float* __restrict__ part,
                              long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                             long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+                             long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) { R4D_IKA_ENTRY();
     hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
     hc_down_fold_reduce_tail<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
 }
@@ -4377,7 +4378,7 @@ void hc_down_tiled_fr2_kernel(const unsigned short* __restrict__ h, const float*
                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                               float* __restrict__ part,
                               long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                              long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+                              long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) { R4D_IKA_ENTRY();
     hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
     hc_down_fold_reduce_tail_v2<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
 }
@@ -4664,7 +4665,7 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
                          unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                          float* __restrict__ part,
                          long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                         long kc, float wadd) {
+                         long kc, float wadd) { R4D_IKA_ENTRY();
     constexpr int RT = kWideRT, NT16 = NT / 16;
     constexpr int kKV = kTKT / 8;                              /* 16-byte vectors a staged row */
     constexpr int kRS = kThreads / kKV;                        /* rows between a thread's A rows */
@@ -4834,7 +4835,7 @@ template <int RT, int NT, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_up_tiled_kernel(const void* __restrict__ upv, long uld,
                         const unsigned short* __restrict__ dbuf,
-                        unsigned short* __restrict__ ubuf, long rows, long hn, long lr) {
+                        unsigned short* __restrict__ ubuf, long rows, long hn, long lr) { R4D_IKA_ENTRY();
     __shared__ unsigned short sA[RT * kTAP];
     __shared__ unsigned short sB[NT * kTAP];
 
@@ -5214,7 +5215,7 @@ void hc_up_mix_tiled_p64_kernel(const void* __restrict__ upv, long uld,
                                 float* __restrict__ qs, unsigned char* __restrict__ rq,
                                 float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                                 long rows, long n, int hc, long lr, long hrow, long xrow,
-                                long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                                long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     hc_up_mix_tiled_kernel_body<RT, NT, F8, I8, true>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd);
 }
 /* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
@@ -5228,7 +5229,7 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
                             float* __restrict__ qs, unsigned char* __restrict__ rq,
                             float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                             long rows, long n, int hc, long lr, long hrow, long xrow,
-                            long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                            long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     hc_up_mix_tiled_kernel_body<RT, NT, F8, I8>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd);
 }
 template <int RT, int NT, bool F8, bool I8 = false>
@@ -5259,7 +5260,7 @@ void hc_up_mix_tiled_2grid_kernel(const void* __restrict__ upv, long uld,
                             float* __restrict__ qs, unsigned char* __restrict__ rq,
                             float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                             long rows, long n, int hc, long lr, long hrow, long xrow,
-                            long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                            long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     __shared__ unsigned short sA[RT * kTAP];
     __shared__ unsigned short sB[NT * kTAP];
     __shared__ unsigned short s_u[RT * NT];
@@ -5439,7 +5440,7 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
                            const unsigned short* __restrict__ h, const float* __restrict__ w,
                            const float* __restrict__ scalein,
                            unsigned short* __restrict__ x,
-                           long rows, long n, long lr, long hrow, long xrow, float wadd) {
+                           long rows, long n, long lr, long hrow, long xrow, float wadd) { R4D_IKA_ENTRY();
     constexpr int CH = kWideCH, NT = HC * CH;
     constexpr int MW = RT / 16 / kWaves;                        /* m-tiles a wave */
     static_assert(MW >= 1 && MW * 16 * kWaves == RT, "the waves cover the rows");
@@ -5603,7 +5604,7 @@ void hc_up_mix_pf3_kernel(const unsigned short* __restrict__ ub, long lr_,
                           const unsigned short* __restrict__ h, const float* __restrict__ w,
                           const float* __restrict__ scalein,
                           unsigned short* __restrict__ x,
-                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) { R4D_IKA_ENTRY();
     constexpr int HC = 4, NT = HC * CH, NTT = NT / 16, PPC = CH / 16;
     constexpr int MW = RT / 16 / kWaves;
     static_assert(MW >= 1 && MW * 16 * kWaves == RT && CH % 16 == 0, "the waves cover the rows");
@@ -5745,7 +5746,7 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
                           const unsigned short* __restrict__ h, const float* __restrict__ w,
                           const float* __restrict__ scalein,
                           unsigned short* __restrict__ x,
-                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) { R4D_IKA_ENTRY();
     constexpr int HC = 4, CH = 16, NT = HC * CH;
     constexpr int MW = RT / 16 / kWaves, KST = kTKT / 16;
     constexpr int NSL = LR / kTKT;   /* slices */
@@ -5886,7 +5887,7 @@ __global__ __launch_bounds__(kThreads)
 void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
                           float* __restrict__ qs, unsigned char* __restrict__ rq,
                           float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
-                          long srow, long rqrow, long rsrow) {
+                          long srow, long rqrow, long rsrow) { R4D_IKA_ENTRY();
     const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const long item = (long)blockIdx.x * kWaves + wave;
     if (item >= rows * ngrp) return;
@@ -5904,7 +5905,7 @@ __global__ __launch_bounds__(kThreads)
 void hc_quant_rows_g_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
                             float* __restrict__ qs, unsigned char* __restrict__ rq,
                             float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
-                            long srow, long rqrow, long rsrow) {
+                            long srow, long rqrow, long rsrow) { R4D_IKA_ENTRY();
     const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const long npr = ngrp / G;
     const long item = (long)blockIdx.x * kWaves + wave;
@@ -6221,7 +6222,7 @@ __device__ __forceinline__ float hc_write_scale_wave(unsigned short* hp, const u
 __global__ __launch_bounds__(kThreads)
 void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
                         unsigned short* __restrict__ h, float* __restrict__ ssout,
-                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
+                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) { R4D_IKA_ENTRY();
     __shared__ float s_t[kWaves][kThreads];
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long p = (long)blockIdx.x * kWaves + wave;
@@ -6240,7 +6241,7 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
                         const unsigned short* __restrict__ injw,
                         const unsigned char* __restrict__ up8, long uld,
                         uint4* __restrict__ plane, unsigned short* __restrict__ udec,
-                        long lr, long ncol, long ntt) {
+                        long lr, long ncol, long ntt) { R4D_IKA_ENTRY();
     __shared__ float s_t[kWaves][kThreads];
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long HN = (long)hc * n;
@@ -6467,7 +6468,7 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
                         unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                         float* __restrict__ part,
                         long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
-                        long irow, long kc, float wadd) {
+                        long irow, long kc, float wadd) { R4D_IKA_ENTRY();
     hc_down_pf2_body<kPf2RT>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                              irow, kc, wadd);
 }
@@ -6479,7 +6480,7 @@ void hc_down_pf2_fs_kernel(const unsigned short* __restrict__ h, const float* __
                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                            float* __restrict__ part,
                            long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
-                           long irow, long kc, float wadd, float* __restrict__ scaleout, float eps) {
+                           long irow, long kc, float wadd, float* __restrict__ scaleout, float eps) { R4D_IKA_ENTRY();
     hc_down_pf2_body<RT, true>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                                irow, kc, wadd, scaleout, eps);
 }
@@ -6489,7 +6490,7 @@ void hc_down_pf2_r32_kernel(const unsigned short* __restrict__ h, const float* _
                             unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                             float* __restrict__ part,
                             long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
-                            long irow, long kc, float wadd) {
+                            long irow, long kc, float wadd) { R4D_IKA_ENTRY();
     hc_down_pf2_body<32>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                          irow, kc, wadd);
 }
@@ -6535,7 +6536,7 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
                             const void* __restrict__ fchv, const void* __restrict__ fcev, long fld,
                             unsigned short* __restrict__ x,
                             long rows, long n, int hc, int flat, float eps, float wadd,
-                            long hrow, long erow, long xrow) {
+                            long hrow, long erow, long xrow) { R4D_IKA_ENTRY();
     __shared__ unsigned short sAh[RT * kTAP];
     __shared__ unsigned short sAe[RT * kTAP];
     __shared__ unsigned short sBh[NT * kTAP];
@@ -6805,7 +6806,7 @@ void mtp_prefill_scale_kernel(const unsigned short* __restrict__ h,
                               const unsigned short* __restrict__ e,
                               float* __restrict__ rs, float* __restrict__ re,
                               long rows, long n, int hc, int flat, float eps, long hrow,
-                              long erow) {
+                              long erow) { R4D_IKA_ENTRY();
     const int  lane = threadIdx.x & (kWave - 1);
     const long row  = (long)blockIdx.x * kWaves + threadIdx.x / kWave;
     const long R    = rows * hc;
@@ -6847,7 +6848,7 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
                              const float* __restrict__ gain, const float* __restrict__ rscale,
                              const void* __restrict__ fcv, long fld,
                              float* __restrict__ eterm, unsigned short* __restrict__ x,
-                             long rows, long n, int hc, float wadd, long xrow) {
+                             long rows, long n, int hc, float wadd, long xrow) { R4D_IKA_ENTRY();
     constexpr int BM = 2 * MP_TM * 16, BN = 4 * MP_TN * 16;
     constexpr int CPR = MP_BK / 8;                      /* 16-byte chunks a staged row */
     constexpr int AL = BM * CPR / kThreads, WL = BN * CPR / kThreads;

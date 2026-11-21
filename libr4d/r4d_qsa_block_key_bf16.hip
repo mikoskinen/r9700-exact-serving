@@ -27,6 +27,7 @@
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "rad_yarn.h"
 #include "r4d_emit.h"
@@ -131,7 +132,7 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
     const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
     uint16_t* __restrict__ out,
     int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
-    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
+    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) { R4D_IKA_ENTRY();
     qsa_block_key_kernel_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
 }
 __global__ __launch_bounds__(kMaxN) void r4dchain_qsa_block_key(

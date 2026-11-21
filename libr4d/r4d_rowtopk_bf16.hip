@@ -43,6 +43,7 @@
 // R=32, RC=8 and 64 chunks it takes nine of the 32 in one sixty-fourth of the row). A caller that
 // rescores exactly then loses a candidate, not correctness.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_emit.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
@@ -186,7 +187,7 @@ __device__ __forceinline__ void r4d_rowtopk_stage1_body(
 template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stage1_kernel(
     const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
-    int N, int RC, int NCH, int CH) {
+    int N, int RC, int NCH, int CH) { R4D_IKA_ENTRY();
     r4d_rowtopk_stage1_body<PT>(Y, P, N, RC, NCH, CH);
 }
 template <int PT>
@@ -241,7 +242,7 @@ __device__ __forceinline__ void r4d_rowtopk_stage2_body(
 }
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
-    float* __restrict__ OP, int off, int R, int n) {
+    float* __restrict__ OP, int off, int R, int n) { R4D_IKA_ENTRY();
     r4d_rowtopk_stage2_body(P, OV, OI, OP, off, R, n);
 }
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_stage2(
@@ -344,7 +345,7 @@ __device__ __forceinline__ void r4d_rowtopk_merge_body(
   }
 }
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
-    const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
+    const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) { R4D_IKA_ENTRY();
     r4d_rowtopk_merge_body(G, OV, OI, R, n);
 }
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_merge(
@@ -383,7 +384,7 @@ template <bool I8, uint32_t TB = 0>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rerank_kernel(
     const unsigned short* __restrict__ X, const int* __restrict__ IN,
     const unsigned char* __restrict__ W, int* __restrict__ OI, float* __restrict__ OV,
-    float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld) {
+    float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld) { R4D_IKA_ENTRY();
   __shared__ float s_sc[R4D_TOPK_PT2];
   __shared__ int   s_id[R4D_TOPK_PT2];
 
@@ -676,7 +677,7 @@ __device__ __forceinline__ unsigned long long tk_key_f32z(float v, unsigned idx)
 template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_f32_stage1_kernel(
     const float* __restrict__ X, unsigned long long* __restrict__ P, long long ld, int N, int R,
-    int NCH, int CH) {
+    int NCH, int CH) { R4D_IKA_ENTRY();
   const int m = blockIdx.y;
   const int c = blockIdx.x * R4D_TOPK_WPB + (int)(threadIdx.x >> 5);
   if (c >= NCH) return;
@@ -733,7 +734,7 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_f32_
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_f32_stage2_kernel(
     const unsigned long long* __restrict__ P, const float* __restrict__ X, long long ld,
     float* __restrict__ OV, int* __restrict__ OI, float* __restrict__ OP, long long off, int R,
-    int n) {
+    int n) { R4D_IKA_ENTRY();
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
 

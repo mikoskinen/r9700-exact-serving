@@ -28,6 +28,7 @@
  */
 #include <hip/hip_runtime.h>
 
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <cstdint>
 #include <cstring>
 
@@ -56,7 +57,7 @@ struct ConfArgs {
     float bias;
 };
 
-__global__ __launch_bounds__(256) void conf_kernel(ConfArgs A) {
+__global__ __launch_bounds__(256) void conf_kernel(ConfArgs A) { R4D_IKA_ENTRY();
     __shared__ float part[kThreads];
     __shared__ int spid;
     const int s = (int)blockIdx.x, j = (int)blockIdx.y, t = (int)threadIdx.x;
@@ -116,7 +117,7 @@ __device__ __forceinline__ void alt_score(const AltArgs& A, long long row, int p
     __syncthreads();
 }
 
-__global__ __launch_bounds__(256) void alt_kernel(AltArgs A) {
+__global__ __launch_bounds__(256) void alt_kernel(AltArgs A) { R4D_IKA_ENTRY();
     __shared__ float sa[kMaxR];
     __shared__ float p8[kThreads];
     __shared__ float sc[kMaxK];

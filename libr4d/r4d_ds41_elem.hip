@@ -17,6 +17,7 @@
 // log1pf or ref_exp (exp in double, rounded once); here each is the double routine rounded once,
 // which is the correctly rounded value glibc returns in all but near-tie cases.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
@@ -381,7 +382,7 @@ unsigned ds_dodge_gy(unsigned gx, unsigned gy, unsigned waves_per_wg) {
 
 __global__ __launch_bounds__(256) void token_map_kernel(const int32_t* ids, long is,
                                                         const int32_t* tab, long ts, int32_t* y,
-                                                        long ys, long M, long nv) {
+                                                        long ys, long M, long nv) { R4D_IKA_ENTRY();
     for (long m = (long)blockIdx.x * 256 + threadIdx.x; m < M; m += (long)gridDim.x * 256) {
         const long id = ids[m * is];
         y[m * ys] = id < 0 || id >= nv ? -1 : tab[id * ts];
@@ -413,7 +414,7 @@ __device__ __forceinline__ unsigned long long bi_mix(unsigned long long x) {
     return x;
 }
 __global__ __launch_bounds__(256) void bi_rowhash_kernel(const uint8_t* x, long xs, long nu, int odd, uint32_t* h,
-                                                         long hs, long rows) {
+                                                         long hs, long rows) { R4D_IKA_ENTRY();
     __shared__ unsigned long long sh[256];
     for (long r = blockIdx.x; r < rows; r += gridDim.x) {
         const uint16_t* p = (const uint16_t*)(x + r * xs);
@@ -465,7 +466,7 @@ __global__ __launch_bounds__(256) void stream_gate_kernel(const uint16_t* h, lon
                                                           const uint16_t* v, long vp,
                                                           const float* w, long wst, uint16_t* out,
                                                           long op, int n, long rows, float eps,
-                                                          float ge) {
+                                                          float ge) { R4D_IKA_ENTRY();
     __shared__ float red[3][8];
     __shared__ float gate_s;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, s = blockIdx.x;
@@ -541,7 +542,7 @@ __global__ __launch_bounds__(256) void rope_rows_kernel(uint16_t* x, long xp, co
                                                         long cp, long cst, const int32_t* pos,
                                                         long ps, long M, long tab_rows, int hd,
                                                         int half, int off, int pairs, int gptj,
-                                                        float sign) {
+                                                        float sign) { R4D_IKA_ENTRY();
     const int q = blockIdx.x * 256 + threadIdx.x;
     if (q >= pairs) return;
     const int hh = q / half, i = q - hh * half;
@@ -594,7 +595,7 @@ int rope_rows_body(const RadArgs* a, RadStream stream) {
 
 template <int B>
 __global__ __launch_bounds__(256) void quant_group_kernel(uint16_t* x, long xp, int n, long rows,
-                                                          int fmt, int sc) {
+                                                          int fmt, int sc) { R4D_IKA_ENTRY();
     const int col = blockIdx.x * 256 + threadIdx.x;
     const bool in = col < n;
     for (long r = blockIdx.y; r < rows; r += gridDim.y) {
@@ -616,7 +617,7 @@ __global__ __launch_bounds__(256) void quant_group_kernel(uint16_t* x, long xp, 
  * [32, 8192] 8.3, [4, 8192] 4.1) -- the drafter's o_q at its 16-row pass, 19-23 us a stage in serving (lq145). */
 template <int B>
 __global__ __launch_bounds__(256) void quant_group8_kernel(uint16_t* x, long xp, int n, long rows,
-                                                           int fmt, int sc) {
+                                                           int fmt, int sc) { R4D_IKA_ENTRY();
     static_assert(B == 8 || B == 16 || B == 32, "a block of whole 8-column pieces");
     const int c0 = (blockIdx.x * 256 + threadIdx.x) * 8;
     const bool in = c0 < n;   /* n % B == 0: a block's lanes are all in or all out */
@@ -647,7 +648,7 @@ __global__ __launch_bounds__(256) void quant_group8_kernel(uint16_t* x, long xp,
 std::atomic<int> g_qg8_pin{-1};
 
 __global__ __launch_bounds__(256) void quant_serial_kernel(uint16_t* x, long xp, int n, int block,
-                                                           long rows, int fmt, int sc) {
+                                                           long rows, int fmt, int sc) { R4D_IKA_ENTRY();
     const int b = blockIdx.x * 256 + threadIdx.x;
     if (b >= n / block) return;
     for (long r = blockIdx.y; r < rows; r += gridDim.y) {
@@ -913,7 +914,7 @@ template <int HC, int R, int WV, int TS, bool FIN = false>
 __global__ __launch_bounds__(32 * WV) void mix_split_kernel(const uint16_t* h, long hp,
                                                             const float* fn, long fp, float* part,
                                                             int width, int chunks, long rows,
-                                                            unsigned* ctr = nullptr, MixOut fo = {}) {
+                                                            unsigned* ctr = nullptr, MixOut fo = {}) { R4D_IKA_ENTRY();
     constexpr int MIX = HC * (HC + 2), S = MIX + 1, JW = (MIX + WV - 1) / WV;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, chunk = blockIdx.x;
     const int c0 = chunk * kMixCols;
@@ -1048,7 +1049,7 @@ __device__ __forceinline__ void mix_finish_row(const float* part, int chunks, co
 
 template <int HC>
 __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
-                                                         long rows) {
+                                                         long rows) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31;
     const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (row >= rows) return;
@@ -1058,7 +1059,7 @@ __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int 
 // Without scratch: one wave a row, the chunks in order, the same partials and the same sums.
 template <int HC>
 __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long hp, const float* fn,
-                                                        long fp, int chunks, MixOut o, long rows) {
+                                                        long fp, int chunks, MixOut o, long rows) { R4D_IKA_ENTRY();
     constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32;
     const int lane = threadIdx.x & 31;
     const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
@@ -1309,7 +1310,7 @@ int mhc_mix_body(const RadArgs* a, RadStream stream) {
 
 __global__ __launch_bounds__(256) void collapse_kernel(const uint16_t* h, long hp, const float* pre,
                                                        long pp, long ps, uint16_t* x, long xp,
-                                                       int n, int hc, long rows) {
+                                                       int n, int hc, long rows) { R4D_IKA_ENTRY();
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i >= n) return;
     for (long r = blockIdx.y; r < rows; r += gridDim.y) {
@@ -1322,7 +1323,7 @@ __global__ __launch_bounds__(256) void collapse_kernel(const uint16_t* h, long h
 __global__ __launch_bounds__(256) void collapse_vec_kernel(const uint16_t* h, long hp,
                                                            const float* pre, long pp, long ps,
                                                            uint16_t* x, long xp, int n, int hc,
-                                                           long rows) {
+                                                           long rows) { R4D_IKA_ENTRY();
     const int i = (blockIdx.x * 256 + threadIdx.x) * 8;
     if (i >= n) return;
     for (long r = blockIdx.y; r < rows; r += gridDim.y) {
@@ -1375,7 +1376,7 @@ int mhc_collapse_body(const RadArgs* a, RadStream stream) {
 
 __global__ __launch_bounds__(256) void softmax_pool_kernel(const float* st, long sp, uint16_t* out,
                                                            long op, const int32_t* page, long pgs,
-                                                           int n, int ratio, long W) {
+                                                           int n, int ratio, long W) { R4D_IKA_ENTRY();
     const int c = blockIdx.x * 256 + threadIdx.x;
     if (c >= n) return;
     for (long w = blockIdx.y; w < W; w += gridDim.y) {
@@ -1419,7 +1420,7 @@ int softmax_pool_body(const RadArgs* a, RadStream stream) {
 __global__ __launch_bounds__(256) void entry_store_kernel(const uint16_t* x, long xp,
                                                           const int32_t* page, long pgs,
                                                           uint16_t* cache, long blocks, int n,
-                                                          long W) {
+                                                          long W) { R4D_IKA_ENTRY();
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i >= n) return;
     for (long w = blockIdx.y; w < W; w += gridDim.y) {
@@ -1464,7 +1465,7 @@ int entry_store_body(const RadArgs* a, RadStream stream) {
  * columns (its scale from the wave's amax), a byte a thread. */
 __global__ __launch_bounds__(256) void window_store_kernel(const uint16_t* x, long xp, const int32_t* slot,
                                                            long ss, unsigned char* cache, long bs,
-                                                           long n_blocks, int n, long M) {
+                                                           long n_blocks, int n, long M) { R4D_IKA_ENTRY();
     const int sb = ds_w8_bytes(n);
     for (long m = blockIdx.x; m < M; m += gridDim.x) {
         const long s = slot[m * ss];
@@ -1623,7 +1624,7 @@ __global__ __launch_bounds__(128) void router_scored_kernel(const float* logits,
                                                             const float* bias, long bp, int32_t* ids,
                                                             long ip, float* weights, long wp,
                                                             long m, int ne, int k, int norm,
-                                                            float factor) {
+                                                            float factor) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31;
     const long r = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (r >= m) return;
@@ -1643,7 +1644,7 @@ __global__ void __launch_bounds__(NW * 32)
                                  int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
                                  int32_t* off, int32_t* cnt, uint16_t* gate, long gp, int32_t* inv,
                                  int m, int ne, int n_local, int k, int norm, float factor, int base,
-                                 r4d_moesort::Protect prot) {
+                                 r4d_moesort::Protect prot) { R4D_IKA_ENTRY();
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
@@ -1836,7 +1837,7 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_scored_scatter_kernel(
     const uint16_t* x, long xp, const WT* wt, long wtp, float* lg, long lp, int m, int ne, int K,
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
-    r4d_moesort::Protect prot, unsigned* ctr) {
+    r4d_moesort::Protect prot, unsigned* ctr) { R4D_IKA_ENTRY();
     static_assert(RW >= 1 && NW % RW == 0, "the 2-D map's row groups divide the waves");
     constexpr int CW = (int)NW / RW;   /* expert groups a workgroup */
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
@@ -1887,7 +1888,7 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowsel_kernel(
     const uint16_t* x, long xp, const WT* wt, long wtp, float* lg, long lp, int m, int ne, int K,
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
-    r4d_moesort::Protect prot, unsigned* ctr) {
+    r4d_moesort::Protect prot, unsigned* ctr) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     const int c0 = ((int)blockIdx.x * (int)NW + wave) * C, r0 = (int)blockIdx.y * R;
     if (c0 < ne && r0 < m) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
@@ -2084,7 +2085,7 @@ int router_gemm_scored_scatter_body(const RadArgs* a, RadStream stream) {
 __global__ __launch_bounds__(256) void embed_planes_kernel(
     const int32_t* tok, long ts, const uint8_t* codes, long rb, uint32_t cdt, const void* scale,
     uint32_t sdt, long sp, long ss, const void* table, uint32_t tdt, uint16_t* x, long xp, int E,
-    int G, long V, long voff, float mult, long M) {
+    int G, long V, long voff, float mult, long M) { R4D_IKA_ENTRY();
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i >= E) return;
     for (long m = blockIdx.y; m < M; m += gridDim.y) {
@@ -2267,7 +2268,7 @@ template <bool WF32, uint32_t THR, bool KV = false, bool W8 = false>
 __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
-    uint32_t M, FzRope r, int block, int fmt, int sc, std::conditional_t<KV, FzKv, FzKvNone> kv) {
+    uint32_t M, FzRope r, int block, int fmt, int sc, std::conditional_t<KV, FzKv, FzKvNone> kv) { R4D_IKA_ENTRY();
 #ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
     uint16_t* const fz_row = (uint16_t*)emu_dyn_lds();
 #else
@@ -2373,7 +2374,7 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
  * by a shuffle, forms its half of rope_rows' pair and rounds it as rope_rows stores it. */
 template <int B>
 __global__ __launch_bounds__(256) void rope_rt_kernel(uint16_t* x, long xp, int n, long rows,
-                                                      FzRope r, int fmt, int sc) {
+                                                      FzRope r, int fmt, int sc) { R4D_IKA_ENTRY();
     const int col = blockIdx.x * 256 + threadIdx.x;
     const bool in = col < n;
     const int hh = col / r.hd, d = col - hh * r.hd - r.off;
@@ -2404,7 +2405,7 @@ __global__ __launch_bounds__(256) void rope_rt_kernel(uint16_t* x, long xp, int 
  * (r4d_xor_max<4> of their 8-column maxima = the 32-lane butterfly's maximum: fmaxf of NaN-free non-negative values in any
  * grouping), every value the same expressions -- the same bytes. One card (P32's cell, the attention's fold at prefill heights):
  * the one-column form moved ~260 GB/s. Taken for blocks of 32 with n, the row pitch and the plane on 8 bf16. */
-__global__ __launch_bounds__(256) void rope_rt8_kernel(uint16_t* x, long xp, int n, long rows, FzRope r, int fmt, int sc) {
+__global__ __launch_bounds__(256) void rope_rt8_kernel(uint16_t* x, long xp, int n, long rows, FzRope r, int fmt, int sc) { R4D_IKA_ENTRY();
     const int c8 = (blockIdx.x * 256 + threadIdx.x) * 8;
     const bool in = c8 < n;
     const int hh = c8 / r.hd, d8 = c8 - hh * r.hd - r.off;
@@ -2474,7 +2475,7 @@ template <bool WF32, uint32_t THR, int HCM>
 __global__ __launch_bounds__(THR) void collapse_norm_kernel(
     const uint16_t* __restrict__ h, long hp, const float* __restrict__ pre, long pp, long pst,
     uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M) {
+    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M) { R4D_IKA_ENTRY();
     __shared__ float lds[THR / kFzWave];
     const uint32_t m = blockIdx.x;
     if (m >= M) return;
@@ -2550,7 +2551,7 @@ __global__ __launch_bounds__(THR) void post_collapse_norm_kernel(
     const float* __restrict__ post, long ptp, const float* __restrict__ comb, long cbp,
     uint16_t* __restrict__ out, long op, const float* __restrict__ pre, long pp, long pst,
     uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M) {
+    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M) { R4D_IKA_ENTRY();
     __shared__ float lds[THR / kFzWave];
     const uint32_t m = blockIdx.x;
     if (m >= M) return;
@@ -2879,7 +2880,7 @@ int collapse_norm_body(const RadArgs* a, RadStream stream) {
  * nb and block width. Here without the collective (x is the reduced input); tests/r4d_emu holds it to the norm kernel. */
 template <int HCM>
 __global__ __launch_bounds__(256) void pcn_words_kernel(const uint16_t* __restrict__ xin, long xp,
-                                                        r4d_ds41pcn::PcnArgs A) {
+                                                        r4d_ds41pcn::PcnArgs A) { R4D_IKA_ENTRY();
     __shared__ float vss[1024];          // the virtual threads' partial sums (THR <= 1024)
     __shared__ float wsum[32];
     __shared__ unsigned s_done;
@@ -3016,7 +3017,7 @@ struct PmArgs {
 std::atomic<int> g_i9b_mut{0};
 
 template <bool REV>
-__global__ __launch_bounds__(256) void pcn_mix_k1_kernel(PmArgs A) {
+__global__ __launch_bounds__(256) void pcn_mix_k1_kernel(PmArgs A) { R4D_IKA_ENTRY();
     constexpr int R = kPmR, WV = 8, NCG = WV / R, CPW = kPmSlab / NCG, UA = CPW / 32, JD = kPmMix / 2;
     static_assert(WV == 2 * kPmHC && WV % R == 0 && CPW % 32 == 0, "two waves a stream, R divides the 8 waves");
     __shared__ uint16_t ob[R][kPmHC][kPmSlab];
@@ -3109,7 +3110,7 @@ __global__ __launch_bounds__(256) void pcn_mix_k1_kernel(PmArgs A) {
 /* K2: the norm over the stored xc, a workgroup of 256 a row, in post_collapse_norm_kernel's order (tv = its THR) */
 __global__ __launch_bounds__(256) void pcn_mix_k2_kernel(const uint16_t* xc, long xcp, const float* w, uint16_t* y,
                                                          long yp, int n, int tv, float eps, float wadd, float mult,
-                                                         long M) {
+                                                         long M) { R4D_IKA_ENTRY();
     __shared__ float vss[1024];
     __shared__ float wsum[32];
     const long m = blockIdx.x;

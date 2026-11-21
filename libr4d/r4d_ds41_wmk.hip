@@ -8,6 +8,7 @@
 #define R4D_GG_WM_SRC 1
 #define R4D_GG_WM_PARTFOLD 1   /* the stock WMMA kernel's template here carries the part fold (r4d_ds41_ggml.hip's unit: not) */
 #include "r4d_ds41_ggml.hip"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 /* Lever WMK's prefill rows (stage 3, G3): lever GPF's tile forms (gg_pf_kernel, the stock WMMA arithmetic in other
  * geometries) compiled here with the part fold -- the same part order as gg_wk_kernel's, so a row's bytes are the same in
  * a <= 48-row launch and in a prefill launch of any height. r4d_ds41_ggml_pf.hip's own unit keeps the stock order. */
@@ -116,7 +117,7 @@ constexpr int gg_wk_parts(long long K) {
  * in place after their last use: half a slab of latency); 2 = every raw word of slab t + 2 loaded at slab t's start into a ring of
  * three register sets (two slabs of loads in flight, no in-place reloads). Only the load timing differs: the same operations. */
 template <int T, int KP, bool WL, typename OT, int PRO = 0, int DP = 1>
-__global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
+__global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) { R4D_IKA_ENTRY();
     using W = Wq<T>;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
@@ -557,7 +558,7 @@ std::atomic<int> g_gg_wk_last{0};
  * chunk, rmsnorm's row scales from a block prologue in mr_norm_scales' order; grid row 0 also stores h) -- the same bytes as the
  * producer's launch then the GEMM. */
 template <int T, int KP, int NM, int NT, typename OT, int PRO = 0, int DP = 1>   /* DP: as gg_wk_kernel's */
-__global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
+__global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) { R4D_IKA_ENTRY();
     using W = Wq<T>;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0 && !W::PIPE || W::TB == 0, "gg_wk3_kernel: the table types are not built");
@@ -1224,7 +1225,7 @@ namespace {
 /* FI 2 (bit 1): the stock occupancy asked of the compiler (amdgpu_waves_per_eu 6 = <= 240 VGPRs at 1536 a lane, granule 24, i.e. 3
  * blocks of 8 waves a WGP): what does not fit spills -- the running total, touched once a part (every S / P slabs), is the cheapest. */
 template <int T, int MT, int NT, int WN, typename OT, int FI = 0>
-__global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2) ? 6 : 1))) void gg_wq_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2) ? 6 : 1))) void gg_wq_kernel(GgTiledArgs A) { R4D_IKA_ENTRY();
     using W = Wq<T>;
     using Pf = typename W::Pf;
     constexpr int BM = 16 * MT, BN = 16 * NT * WN;
