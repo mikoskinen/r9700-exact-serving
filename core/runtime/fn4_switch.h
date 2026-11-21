@@ -552,6 +552,16 @@
  *                   ride waits (rad_ride_wait) too. Scheduling only: no kernel's bytes change (rule A). Read at every wait; nothing
  *                   is allocated, so 1 / 2 are taken without the env. Unset: the start's RADIANCE_AQL_WAITK (0 / 1 / 2, the parse of
  *                   rad::aql::waitk_mode_of). A follower switch (each node's own waits). A tape capture keeps its waits plain either way.
+ *   aql_ika         core, the AQL backend, BOTH nodes (tp8 loop IKc, PREFILL round 43; 107 here, after aql_waitk): lever IKA
+ *                   (DRAFTER round 50, reviewed in DECODE W3: core/device/aql.cpp ika_kernel) in process. 0 -- every recorded dispatch
+ *                   keeps the packet fences the acquire rule gives it, as before; 1 -- a recorded dispatch whose kernel acquires and
+ *                   releases at agent scope ITSELF (its library lists it in r4d_ika_kernels: a -DR4D_IKA=ON libr4d / exl3r4d, e.g.
+ *                   the image's second home /opt/radiance/share/radiance-ika) plays without the packet's release, and without its
+ *                   acquire where Ctx::haz_mark finds no line it reads that a scalar cache could hold stale. Fences only: no
+ *                   kernel's arithmetic or order changes (rule A). Read when a pass is RECORDED; a change re-records every pass (the
+ *                   epoch), so a tape always plays the fences it was recorded with. With a library that lists no kernel (the
+ *                   default home's) 1 changes nothing. Unset: the start's RADIANCE_AQL_IKA ('1...' = 1, else 0). A follower switch
+ *                   (each node's own tapes).
  *   sched_lane_room scheduler (tp8 loop D56; 104 here, after ds41_csplit): 0 -- a lane's admission room gates (a fresh prompt's whole
  *                   rest, a preempted request's whole recompute, beside every runner's rest of prompt + a block each) count the asking
  *                   lane's running requests, as before; 1 -- they count every lane's (each lane's running set and the ones its plan left
@@ -795,7 +805,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -929,6 +939,9 @@ int  pp_send_ash();
 /* tp8 loop W1s (aql_waitk): the switch once set, else RADIANCE_AQL_WAITK at start (0 / 1 / 2; unset = 0); read at every event / ride
  * wait the AQL backend enqueues (rad::aql's wait_ahead). */
 int  aql_waitk();
+/* tp8 loop IKc (aql_ika): the switch once set, else RADIANCE_AQL_IKA at start ('1...' = 1, else 0); read when a pass is recorded (a
+ * dispatch of a self-acquiring kernel is noted IKA only while it is 1: rad::aql's tape capture). */
+int  aql_ika();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
