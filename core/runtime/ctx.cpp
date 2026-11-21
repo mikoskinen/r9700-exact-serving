@@ -1256,8 +1256,10 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
         if (ika_recs > 0)
             RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- lever IKA: %d of the %d dispatches are "
                      "self-acquiring (packet release dropped unless a record or ride completes on one), %d "
-                     "of them without the acquire the rule keeps (tp8 loop W3)",
-                     b->draft_pass, (long long)b->n_tok, ika_recs, out->dispatches, out->ika_noacq);
+                     "of them without the acquire the rule keeps; under IKA's windows the rule drops %d (%d "
+                     "without the lever); fn4 aql_ika picks at play, now %d (tp8 loop W3 / W3s)",
+                     b->draft_pass, (long long)b->n_tok, ika_recs, out->dispatches, out->ika_noacq,
+                     out->ika_rule_noacq, out->noacq, fn4::aql_ika());
     }
     return 1;
 }
@@ -1325,7 +1327,13 @@ int Ctx::haz_mark(PassTape& t) {
         bool     unknown = true;
     };
     const bool acq_rule = acq_rule_on(), acq_w = acq_rule_mode() == 2;
-    std::vector<AW> aws;
+    /* tp8 loop W3s: two walks of the windows -- `aws` as without lever IKA (the rule's own marks, tape bit 0: what fn4 aql_ika 0
+     * plays) and `awsi` IKA's (bit 1 its drops of self-acquiring records, bit 2 the rule's marks under its windows: what 1 plays).
+     * A tape without a self-acquiring record (RADIANCE_AQL_IKA unset) walks once; its IKA marks are the rule's own. */
+    std::vector<AW> aws, awsi;
+    bool any_ika = false;
+    if (acq_rule)
+        for (int i = 0; i < n && !any_ika; ++i) any_ika = tape_rec_ika(t.dev, i) > 0;
     std::vector<uint8_t> stretch0((size_t)n + 1, 0);
     for (const TapeStep& st : t.steps)
         if (st.kind == kTapePlay && st.a >= 0 && st.a <= n) stretch0[(size_t)st.a] = 1;
@@ -1338,7 +1346,7 @@ int Ctx::haz_mark(PassTape& t) {
         return ls_merge(std::move(v));
     };
     t.noacq = t.noacq_ordered = 0;
-    t.ika_noacq = 0;
+    t.ika_noacq = t.ika_rule_noacq = 0;
     t.rco_copies = t.rco_freed = 0;
     for (const HazOp& o : haz_ops_)
         if (o.route_copy && o.rec0 >= 0 && o.rec1 <= n) ++t.rco_copies;
@@ -1351,10 +1359,18 @@ int Ctx::haz_mark(PassTape& t) {
         for (Q& x : qs) if (x.id == qid) { q = &x; break; }
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
         AW* aw = nullptr;
+        AW* awi = nullptr;
         if (acq_rule) {
-            if (stretch0[(size_t)i]) for (AW& x : aws) x.unknown = true;
+            if (stretch0[(size_t)i]) {
+                for (AW& x : aws) x.unknown = true;
+                for (AW& x : awsi) x.unknown = true;
+            }
             for (AW& x : aws) if (x.id == qid) { aw = &x; break; }
             if (!aw) { aws.push_back(AW{}); aw = &aws.back(); aw->id = qid; }
+            if (any_ika) {
+                for (AW& x : awsi) if (x.id == qid) { awi = &x; break; }
+                if (!awi) { awsi.push_back(AW{}); awi = &awsi.back(); awi->id = qid; }
+            }
         }
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
@@ -1362,6 +1378,7 @@ int Ctx::haz_mark(PassTape& t) {
             if (haz_dump_) fprintf(stderr, "TAPEDUMP r%d %d q%u event\n", rank_, i, qid);
             q->infl.clear(); q->opaque = true; q->run = 0;
             if (aw) aw->unknown = true;
+            if (awi) awi->unknown = true;
             continue;
         }
         ++t.dispatches;
@@ -1410,44 +1427,55 @@ int Ctx::haz_mark(PassTape& t) {
             /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it. */
             if (own < 0 || haz_ops_[(size_t)own].opaque || haz_ops_[(size_t)own].route_copy) {
                 aw->unknown = true;
+                if (awi) awi->unknown = true;
             } else {
                 const HazOp& h = haz_ops_[(size_t)own];
                 const LineSet rd = lines_of(h.rd, h.n_rd), wr = lines_of(h.wr, h.n_wr);
-                /* Lever IKA: a self-acquiring kernel the rule would hold to its packet acquire may still drop it
-                 * when no line it reads is in the scalar-cache set; then no invalidation happened for the window
-                 * (its own reached only its CUs' vector caches), so the window goes on as for a marked packet. */
-                const bool keep = aw->unknown || ls_meet(rd, aw->risky);
-                const bool ika_drop = keep && !aw->unknown && tape_rec_ika(t.dev, i) > 0 && !ls_meet(rd, aw->risky_rw);
-                if (keep && !ika_drop) {
-                    /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
-                     * it touch lines after the invalidation too. */
-                    aw->r = rd;
-                    aw->w = wr;
-                    if (ok)
-                        for (int32_t x : q->infl) {
-                            const HazOp& f = haz_ops_[(size_t)x];
-                            aw->r = ls_unite(aw->r, lines_of(f.rd, f.n_rd));
-                            aw->w = ls_unite(aw->w, lines_of(f.wr, f.n_wr));
-                        }
-                    aw->risky = acq_w ? aw->w : ls_inter(aw->r, aw->w);
-                    aw->risky_rw = ls_inter(aw->r, aw->w);
-                    aw->unknown = false;
-                } else {
-                    const int sc = ika_drop ? tape_set_noacq_bits(t.dev, i, 2) : tape_set_noacq(t.dev, i, true);
-                    if (sc < 0) return sc;
-                    if (ika_drop) {
-                        ++t.ika_noacq;
-                    } else {
-                        ++t.noacq;
-                        if (!ok) ++t.noacq_ordered;
+                const bool ika_rec = awi && tape_rec_ika(t.dev, i) > 0;
+                /* One window's decision for this dispatch: 0 keeps its acquire (a new window), 1 the rule drops it, 2 lever IKA
+                 * does (`with_ika` only). Lever IKA: a self-acquiring kernel the rule would hold to its packet acquire may still
+                 * drop it when no line it reads is in the scalar-cache set; then no invalidation happened for the window (its own
+                 * reached only its CUs' vector caches), so the window goes on as for a marked packet. */
+                auto walk = [&](AW* w, bool with_ika) -> int {
+                    const bool keep = w->unknown || ls_meet(rd, w->risky);
+                    const bool ika_drop = with_ika && keep && !w->unknown && ika_rec && !ls_meet(rd, w->risky_rw);
+                    if (keep && !ika_drop) {
+                        /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
+                         * it touch lines after the invalidation too. */
+                        w->r = rd;
+                        w->w = wr;
+                        if (ok)
+                            for (int32_t x : q->infl) {
+                                const HazOp& f = haz_ops_[(size_t)x];
+                                w->r = ls_unite(w->r, lines_of(f.rd, f.n_rd));
+                                w->w = ls_unite(w->w, lines_of(f.wr, f.n_wr));
+                            }
+                        w->risky = acq_w ? w->w : ls_inter(w->r, w->w);
+                        w->risky_rw = ls_inter(w->r, w->w);
+                        w->unknown = false;
+                        return 0;
                     }
-                    const LineSet cross = ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r));
-                    aw->risky_rw = ls_unite(aw->risky_rw, ls_unite(cross, ls_inter(rd, wr)));
-                    aw->risky = ls_unite(aw->risky, cross);
-                    aw->risky = ls_unite(aw->risky, acq_w ? wr : ls_inter(rd, wr));
-                    aw->r = ls_unite(aw->r, rd);
-                    aw->w = ls_unite(aw->w, wr);
+                    const LineSet cross = ls_unite(ls_inter(rd, w->w), ls_inter(wr, w->r));
+                    w->risky_rw = ls_unite(w->risky_rw, ls_unite(cross, ls_inter(rd, wr)));
+                    w->risky = ls_unite(w->risky, cross);
+                    w->risky = ls_unite(w->risky, acq_w ? wr : ls_inter(rd, wr));
+                    w->r = ls_unite(w->r, rd);
+                    w->w = ls_unite(w->w, wr);
+                    return ika_drop ? 2 : 1;
+                };
+                const int a = walk(aw, false);
+                const int b = awi ? walk(awi, true) : a;
+                const int bits = (a == 1 ? 1 : 0) | (b == 2 ? 2 : 0) | (b == 1 ? 4 : 0);
+                if (bits) {
+                    const int sc = tape_set_noacq_bits(t.dev, i, bits);
+                    if (sc < 0) return sc;
                 }
+                if (a == 1) {
+                    ++t.noacq;
+                    if (!ok) ++t.noacq_ordered;
+                }
+                if (b == 2) ++t.ika_noacq;
+                if (b == 1) ++t.ika_rule_noacq;
             }
         }
         if (ok) {

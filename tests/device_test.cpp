@@ -1846,6 +1846,28 @@ TEST(ika_names_a_kernel_by_its_own_identifier_in_the_mangled_symbol) {
     CHECK(!ika_listed("_Z4gemmv", list, 0));
 }
 
+/* tp8 loop W3s (fn4 aql_ika = switch 107): a recording makes the marks of both forms and the switch picks at play
+ * (core/device/aql.h ika_play_mark / ika_play_release_none). Off, a record plays exactly the rule's own mark and keeps its
+ * release whatever IKA marked (the packets of a start without the lever); on, IKA's marks -- the rule's mark under IKA's
+ * windows, or IKA's own drop of a self-acquiring record -- and a self-acquiring record's release goes unless a record or
+ * ride completes on its packet. */
+TEST(ika_play_picks_the_rule_marks_off_and_ikas_on) {
+    using rad::aql::ika_play_mark;
+    using rad::aql::ika_play_release_none;
+    for (int b = 0; b < 16; ++b) {
+        const bool noacq = b & 1, noacq_ika = b & 2, ika = b & 4, ikaok = b & 8;
+        CHECK_EQ(ika_play_mark(false, noacq, noacq_ika, ika, ikaok), noacq);
+        CHECK_EQ(ika_play_mark(true, noacq, noacq_ika, ika, ikaok), noacq_ika || (ika && ikaok));
+    }
+    CHECK(!ika_play_mark(true, true, false, false, true));    /* off-form mark only: on plays IKA's walk, which kept it */
+    CHECK(!ika_play_mark(true, false, false, false, true));   /* an IKA bit on a kernel that is not self-acquiring is ignored */
+    CHECK(ika_play_mark(true, false, false, true, true));
+    for (int b = 0; b < 8; ++b) {
+        const bool live = b & 1, ika = b & 2, completes = b & 4;
+        CHECK_EQ(ika_play_release_none(live, ika, completes), live && ika && !completes);
+    }
+}
+
 /* The source side of the same rule (libr4d/r4d_ika_list.inc is what libr4d built with R4D_IKA exports): every kernel
  * definition in libr4d whose identifier the list names starts with R4D_IKA_ENTRY(), and every definition that starts
  * with it is listed. A same-named kernel without the entry (another unit's anonymous namespace, say) would be treated as
