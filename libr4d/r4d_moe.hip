@@ -333,7 +333,11 @@ constexpr uint32_t kScatterTile = 256;
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
     int32_t base, Protect prot) {
+#ifdef R4D_EMU_HOST   // tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host)
+    int32_t* const s_h = (int32_t*)emu_dyn_lds();
+#else
     extern __shared__ int32_t s_h[];
+#endif
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) s_h[e] = 0;
     __syncthreads();
@@ -3554,7 +3558,11 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     RgGeom g, Protect prot, int32_t* __restrict__ inv = nullptr) {
     /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
      * shim sizes it for the larger. */
+#ifdef R4D_EMU_HOST   // tests/r4d_emu (r4d_emu_qrgt): the launch's dynamic LDS
+    unsigned char* const rg_smem = (unsigned char*)emu_dyn_lds();
+#else
     extern __shared__ __align__(16) unsigned char rg_smem[];
+#endif
     float* const red = (float*)rg_smem;
     const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
 

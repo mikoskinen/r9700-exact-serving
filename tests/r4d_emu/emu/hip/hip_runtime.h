@@ -39,6 +39,7 @@ inline const char* hipGetErrorString(hipError_t) { return "hipSuccess"; }
 /* one device, with the R9700's 64 KiB of LDS a workgroup, which launchers size dynamic LDS by */
 struct hipDeviceProp_t { size_t sharedMemPerBlock; int multiProcessorCount; };
 inline hipError_t hipGetDevice(int* d) { *d = 0; return hipSuccess; }
+inline hipError_t hipSetDevice(int) { return hipSuccess; }   /* one device (r4d_moe.hip's counter block fini) */
 /* no graphs: a stream never captures */
 enum hipStreamCaptureStatus { hipStreamCaptureStatusNone = 0 };
 inline hipError_t hipStreamIsCapturing(hipStream_t, hipStreamCaptureStatus* s) {

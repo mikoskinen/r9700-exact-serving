@@ -564,13 +564,14 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_dspark_extra.hip ${R4D_DIR}/r4d_ds41_mxfp4_mr.hip
                 ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16_nt_pf.hip
                 ${R4D_DIR}/r4d_ds41_ggml_pf.hip ${R4D_DIR}/r4d_ds41_f32pf.hip ${R4D_DIR}/r4d_ds41_walk.hip
-                ${R4D_DIR}/r4d_ds41_wsamp.hip ${R4D_DIR}/r4d_gemm_fp8a8.hip)
+                ${R4D_DIR}/r4d_ds41_wsamp.hip ${R4D_DIR}/r4d_gemm_fp8a8.hip
+                ${R4D_DIR}/r4d_moe.hip)   # qfn-on-ds lever RGT (r4d_emu_qrgt): the fused decode router
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
                   ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f
-                  ds41tw i8wide)
+                  ds41tw i8wide qrgt)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -621,7 +622,7 @@ else()
                 ${R4D_EMU}/test_ds41a4.cpp ${R4D_EMU}/test_ds41fuse.cpp ${R4D_EMU}/test_ds41p1.cpp
                 ${R4D_EMU}/test_ds41dkv.cpp
                 ${R4D_EMU}/test_ds41spd.cpp ${R4D_EMU}/test_ds41p30f.cpp ${R4D_EMU}/test_ds41tw.cpp
-                ${R4D_EMU}/test_i8wide.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_i8wide.cpp ${R4D_EMU}/test_qrgt.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -660,7 +661,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw qrgt)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
