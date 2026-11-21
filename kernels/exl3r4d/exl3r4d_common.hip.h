@@ -735,10 +735,11 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 #endif
 // qfn-on-ds lever DRZ (p.dz bit 2, the fn4 switch exl3_drz; Qwen loop round 13): the dead rows are read by nobody (down
 // reads h only in its runs; the gather skips a dropped slot, its inverse -1), so they are left as they are.
-// dz bit 3 (exl3_drz 8, a READING value, Qwen loop round 15): NaN (0xffff in f16 and bf16) instead of zeros.
+// dz bit 3 (exl3_drz 8, a READING value, Qwen loop round 15): NaN (0xffff in f16 and bf16) instead of zeros; dz bit 4 (exl3_drz 9,
+// round 16): 0x7bff (the largest finite f16, 2.6e36 as bf16).
 static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspare, int cb) {
   if (p.dz & 4) return;
-  const unsigned zv = (p.dz & 8) ? ~0u : 0u;
+  const unsigned zv = (p.dz & 8) ? ~0u : (p.dz & 16) ? 0x7bff7bffu : 0u;   // 8: NaN; 9 (bit 4): f16 65504 / bf16 2.6e36
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
 #if EXL3R4D_DZ

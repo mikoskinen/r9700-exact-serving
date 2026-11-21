@@ -1079,8 +1079,8 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
       // DRZ reading values (prefill.c): 4 both, 5 gate_up's h, 6 down's y -- NaN rows instead of zeros (F41's reader);
       // 7 both with the LARGEST FINITE value (h f16 0x7bff = 65504, y bf16 0x7f7f = 3.39e38): a reader that takes a max
       // (fmaxf drops a NaN) shows there
-      if (a.drz == 4 || a.drz == (MATS == 2 ? 5 : 6) || a.drz == 7 || a.drz == 8) {   // 8: NaN here AND in zero_dead_rows
-        const unsigned pv = a.drz == 7 ? (MATS == 2 ? 0x7bff7bffu : 0x7f7f7f7fu) : ~0u;
+      if (a.drz == 4 || a.drz == (MATS == 2 ? 5 : 6) || a.drz == 7 || a.drz == 8 || a.drz == 9) {   // 8: NaN here AND in zero_dead_rows; 9: 7 here AND in zero_dead_rows
+        const unsigned pv = a.drz == 7 || a.drz == 9 ? (MATS == 2 ? 0x7bff7bffu : 0x7f7f7f7fu) : ~0u;
         const int units = (r1 - r0) * 16;
         for (int u = threadIdx.x; u < units; u += blockDim.x) {
           const int r = r0 + u / 16, c = (int)blockIdx.x * 128 + (u % 16) * 8;

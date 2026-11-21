@@ -121,6 +121,7 @@ int     exl3r4d_fn4_dz(void);   /* ds41 eport: fn4 DZ's form for fill() (prefill
 int     exl3r4d_fn4_bi(void);   /* fn4 BI: the decode band as the prefill band computes a row (prefill.c, exl3_bi) */
 int     exl3r4d_fn4_drz(void);  /* lever DRZ: the dead rows nobody reads are not zeroed (prefill.c, exl3_drz) */
 int     exl3r4d_fn4_drz_nan(void);  /* DRZ reading value 8: every dead-row write stores NaN (prefill.c) */
+int     exl3r4d_fn4_drz_max(void);  /* DRZ reading value 9: every dead-row write stores the largest finite value (prefill.c) */
 int     exl3r4d_gemm4(const Exl3r4dGemm* d, const Exl3r4dCls hi[2], Exl3r4dGemm4* o);
 #endif
 

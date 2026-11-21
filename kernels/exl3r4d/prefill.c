@@ -52,16 +52,22 @@ int exl3r4d_fn4_bi(void) { return g_fn4_bi; }
  * readings never touched the run form or the decode band, where c768f87's exl3_drz 1 also skips the zeros): READING value 8 =
  * NaN rows (0xffff) in EVERY dead-row write -- the map form's ZERO entries (as 4) AND zero_dead_rows (the prefill run form, every
  * decode-band kernel: fill()'s dz bit 3). 8 = 0's texts -> no reader of any dead row anywhere (then a timing / order cause);
- * NaN or changed texts -> a reader in the run form / decode band (4 was clean in the map form). */
+ * NaN or changed texts -> a reader in the run form / decode band (4 was clean in the map form).
+ * Qwen loop round 16 (drz8 = 0's texts everywhere, but exl3_drz 1 moves the SAME tokens in three starts under fences 1 / 8 and
+ * aql_hdp 0 / 1: deterministic, not timing): READING value 9 = the LARGEST FINITE value in EVERY dead-row write -- the map form's ZERO
+ * entries as 7 (h f16 0x7bff, y bf16 0x7f7f) AND zero_dead_rows (0x7bff: f16 65504, bf16 2.6e36; dz bit 4). A reader that takes a
+ * max or compares values (fmaxf drops a NaN, a NaN compares false: 8 could not show it) turns texts to garbage here; 9 = 0's texts
+ * -> no value-reading reader in any form. */
 static volatile int g_fn4_drz = 0;
 int exl3r4d_fn4_drz(void) { return g_fn4_drz == 1; }
 int exl3r4d_fn4_drz_nan(void) { return g_fn4_drz == 8; }
+int exl3r4d_fn4_drz_max(void) { return g_fn4_drz == 9; }
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;
     if (!strcmp(name, "exl3_dz")) return EXL3R4D_DZ == 2 ? (value == 0 || value == 1 ? 1 : -1) : value == (EXL3R4D_DZ == 1) ? 1 : -1;
     if (!strcmp(name, "exl3_bi")) return value == 0 || value == 1 ? 1 : -1;
-    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 || (value >= 4 && value <= 8) ? 1 : -1;
+    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 || (value >= 4 && value <= 9) ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
