@@ -4643,6 +4643,20 @@ static int hc_occ() {
     return v;
 }
 
+/* qfn-on-ds (Qwen loop round 7, QUEUE Q17): RADIANCE_FN4_HC_PRE_MIN=N (read once) -- hc_readv bit 9's form (G16pp: the norm
+ * scales once a (stream, group), then G16p reading them) only for bi_dec reads of at least N rows; below it the read takes the
+ * form bits 8 / 6 give (G16p from 32 rows, else G16). G16 / G16p / G16pp give the same bytes (their notes), so the floor moves
+ * no answer. 0 / unset = no floor (bit 9 as before). */
+static int hc_pre_min() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_PRE_MIN");
+        const int n = (e && *e) ? std::atoi(e) : 0;
+        if (n > 0) std::fprintf(stderr, "radiance: libr4d: hc_readv bit 9 (G16pp) from %d rows (RADIANCE_FN4_HC_PRE_MIN)\n", n);
+        return n > 0 ? n : 0;
+    }();
+    return v;
+}
+
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
  * hc_down_tiled_kernel at RT 128 has three costs at a 2048-row chunk: a sixth 64-column tile
@@ -8039,7 +8053,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                            (int)hcg_nt, (long)rows);
-    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch) {
+    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch && rows >= hc_pre_min()) {
         /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them */
         fc_add(kFcG16pp, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, &hc_g_scale_kernel, dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
