@@ -683,7 +683,8 @@ static const RadOperandSpec oGatedNorm[] = { OPD("x"), OPD("z"), WGT("w"), OUT("
 /* ---- collectives -------------------------------------------------------------------------- */
 static const RadParamSpec pAllReduce[]   = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"),
                                              P_INT("exact"), P_INTO("min_bytes"), P_INTO("hops"),
-                                             P_INTO("overlap") };
+                                             P_INTO("overlap"), P_INTO("wire"), P_INTO("wire_nb"),
+                                             P_INTO("wire_nt") };   /* libr4d's fp8 wire (lever DAR b): ignored here */
 static const RadOperandSpec oAllReduce[] = { INOUT("x"), OUT_O("y") };
 
 static const RadParamSpec pAllGather[]   = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"),

@@ -732,6 +732,10 @@ static const RadParamSpec pAllReduce[] = {
     /* 1 when issued on the caller's second lane, beside compute (rad_lane). Picks the rows with a
      * narrow launch (tArLane); the result is unchanged. */
     { "overlap",    RAD_P_INT, RAD_OPTIONAL },
+    /* libr4d's fp8 wire (lever DAR b, DRAFTER round 58): declared so the schemas agree; ignored here */
+    { "wire",       RAD_P_INT, RAD_OPTIONAL },
+    { "wire_nb",    RAD_P_INT, RAD_OPTIONAL },
+    { "wire_nt",    RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md has `x` -> `x` (inout). Every kernel here is safe in place: the thread that
  * overwrites a word of the input is the one that read it (halo_ar_entry.hip). `y` is an optional

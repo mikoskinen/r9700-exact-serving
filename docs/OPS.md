@@ -2668,7 +2668,7 @@ or that slice; only the slice needs the token stride carried separately.
 
 | op | params | operands |
 |---|---|---|
-| `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt `overlap`/opt | `x`:inout, `y`:out? |
+| `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt `overlap`/opt `wire`/opt `wire_nb`/opt `wire_nt`/opt | `x`:inout, `y`:out? |
 | `all_gather` | `world_size` `numel` `dtype` `row`/opt | `x` → `y` |
 | `reduce_scatter_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt `bound`/opt | `x`:inout, `y`:out? |
 | `all_gather_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt `bound`/opt | `x`:inout, `y`:out? |
@@ -2694,6 +2694,16 @@ all-reduce kernel serves `y` absent, in place. `overlap` 1 says the caller issue
 its second lane, beside compute; libr4d then picks rows with a narrow launch (8 blocks of 256
 threads at two ranks, 4 of 1024 for the four-rank two-shots, exact and tiered-int8) that compute the
 same bits and leave the CUs to the kernels running beside them. libref ignores it.
+
+`wire` 1 is a caller's request BY NAME for libr4d's four-rank FP8 wire (lever DAR b, `r4d_ar_fp8.h`): a bf16
+two-shot whose pushes carry each 16-byte word as 8 OCP E4M3 bytes and an E8M0 scale (9 bytes instead of 16);
+every contribution is quantised, the owner's own too, the fold is fp32 in ascending rank and the sum is
+quantised once more, so the result is deterministic, the same on every rank and a function of the word's own
+row alone (batch-invariant), but NOT the exact sum. A caller passing it accepts that wire for that op whatever
+`exact` says (the DSpark drafter's reductions under RADIANCE_DS41_DSPARK_ARF: its proposals move, the verify
+keeps the served text); `wire_nb` x `wire_nt` is its grid (default 16 x 256). A message the form does not take
+(not bf16, not four ranks, outside the two-shot band) runs as without it. `moe_gather_all_reduce` takes the
+same three keys for its four-rank two-shot form. libref, libavx and libhalo accept and ignore them.
 
 libr4d serves these at 2, 3, 4 and 8 ranks:
 
@@ -2739,7 +2749,7 @@ device code.
 | `ar_mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `world_size` `dtype` `wire`/opt | `x`:inout, `h`, `post`, `comb`, `out`:out, `pre`, `xc`:out, `w`w, `y`:out |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
-| `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
+| `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt `wire`/opt `wire_nb`/opt `wire_nt`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
 

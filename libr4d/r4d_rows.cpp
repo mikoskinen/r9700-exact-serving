@@ -680,6 +680,7 @@ static const RadOperandSpec oArGatherHcWrite[] = {
  * written by the gather and reduced in place (moe_gather_all_reduce). */
 static const RadParamSpec pMoeGatherAr[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_INT("world_size"), P_STR("dtype"), P_STRO("act"),
+    P_INTO("wire"), P_INTO("wire_nb"), P_INTO("wire_nt"),   /* lever DAR b: as all_reduce's */
 };
 static const RadOperandSpec oMoeGatherAr[] = {
     { "y_expert", RAD_OPD_IN, 0 }, { "expert_w", RAD_OPD_IN, 0 }, { "sorted_tok", RAD_OPD_IN, 0 },
@@ -864,6 +865,12 @@ static const RadParamSpec pAllReduce[] = {
     /* 1 when issued on the caller's second lane, beside compute (rad_lane). Picks the rows with a
      * narrow launch (tArLane); the result is unchanged. */
     { "overlap",    RAD_P_INT, RAD_OPTIONAL },
+    /* Lever DAR b (DRAFTER track round 58): 1 = the four-rank two-shot on the FP8 wire (r4d_ar_fp8.h; NOT exact, rule B:
+     * deterministic, batch-invariant) where the message fits it, at a grid of wire_nb x wire_nt (default 16 x 256).
+     * Absent or 0: the wire the other parameters pick. libref / libavx / libhalo declare the same keys and ignore them. */
+    { "wire",       RAD_P_INT, RAD_OPTIONAL },
+    { "wire_nb",    RAD_P_INT, RAD_OPTIONAL },
+    { "wire_nt",    RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md has `x` -> `x` (inout). Every kernel here is safe in place: the thread that
  * overwrites a word of the input is the one that read it (r4d_ar_entry.hip). `y` is an optional
