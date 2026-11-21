@@ -1895,8 +1895,11 @@ int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
      * whose decode sequences verify at two depths leaves att_bi's per-sequence launches (rad_block_attn_gated_fp8.h:946 takes
      * only DT == D x qd; also bi_logits, hc_bi's bi_qd) and the newcomer's rows split their keys otherwise than alone. So under
      * the mask every decode entry is cut to the step's shallowest proposal; the threshold (mask 0: D non-increasing in the
-     * count, lb31: 0 mixed-depth steps in 11,933) and every other start plan as before. */
-    if (seqs > 1 && top > 0 && fn4::draft_dmask() != 0 && !draft_.adaptive()) {
+     * count, lb31: 0 mixed-depth steps in 11,933) and every other start plan as before.
+     * Qwen loop round 14 (QUEUE Q33, FINDINGS F42): the threshold still meets two depths in a step when a request reaches
+     * --max-model-len (scheduler's spare = ctx_limit - 1 - n_computed caps its drafts: q 4 beside q 5 at <= 6 sequences,
+     * lim2 2 of 8 passes differ) -- switch draft_uni 1 takes the same cut at every start. */
+    if (seqs > 1 && top > 0 && (fn4::draft_dmask() != 0 || fn4::draft_uni() != 0) && !draft_.adaptive()) {
         int32_t lo = top;
         for (const StepEntry& e : p.e)
             if (!e.is_prefill) lo = std::min(lo, e.n_spec);
@@ -1913,10 +1916,10 @@ int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
             dlm_uni_[1] += cut - before;
             if (!dlm_uni_noted_) {
                 dlm_uni_noted_ = true;
-                RAD_INFO("lever DLM: step %d planned its %lld decode sequences at two draft depths (the shallowest %d, a "
-                         "proposal drafted under another cycle's depth): every one cut to %d (one depth a step); every "
-                         "later such step is cut the same (RADIANCE_LOG_STEPS shows one q a step), this note is once",
-                         step_, (long long)seqs, lo, lo);
+                RAD_INFO("%s: step %d planned its %lld decode sequences at two draft depths (the shallowest %d): every "
+                         "one cut to %d (one depth a step); every later such step is cut the same (RADIANCE_LOG_STEPS "
+                         "shows one q a step), this note is once",
+                         fn4::draft_dmask() != 0 ? "lever DLM" : "draft_uni (Q33)", step_, (long long)seqs, lo, lo);
             }
         }
     }

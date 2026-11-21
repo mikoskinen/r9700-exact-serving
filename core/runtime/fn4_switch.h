@@ -896,8 +896,13 @@
  *   exl3_drz        exl3r4d (rad_fn4_switch; qfn-on-ds lever DRZ, Qwen loop round 13, X3P GO): 1 = the prefill band's map-form
  *                   ZERO entries (the rows no run owns -- under expert parallelism the other ranks' dropped slots, ~3/4 of
  *                   M x top_k at EP 4) write nothing instead of zero rows of h / y; every reader skips those rows (down's
- *                   ZERO entries, the gather's dropped slots), so the bytes any reader sees are today's; 0 today
+ *                   ZERO entries, the gather's dropped slots), so the bytes any reader sees are today's; 0 today;
+ *                   4..7 = readings (NaN / largest-finite rows where the zeros were, Qwen loop round 14)
  *                                                                                    RADIANCE_FN4_X3DRZ
+ *   draft_uni       core scheduler (qfn-on-ds, Qwen loop round 14, QUEUE Q33 / FINDINGS F42): 1 = one draft depth a step at
+ *                   every start -- when a step's decode entries carry proposals of two depths (the context-limit cut beside
+ *                   full-depth rows, a newcomer drafted in another cycle), every one is cut to the shallowest (cap_rows, the
+ *                   cut draft_dmask already takes); 0 today (mixed depths planned as drafted)        RADIANCE_FN4_DRAFT_UNI
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -947,6 +952,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftDmask,   /* qfn-on-ds lever DLM (Qwen loop round 7, COORD 05:36): the scheduler, DLH's depth by a mask of counts */
               kAqlChi,   /* qfn-on-ds lever CHI (Qwen loop round 8, COORD 05:43): core/device, chained records without the packet fences */
               kExl3Drz,  /* qfn-on-ds lever DRZ (Qwen loop round 13): exl3r4d, the prefill band's ZERO entries write nothing */
+              kDraftUni,   /* qfn-on-ds Qwen loop round 14 (F42 / Q33): the scheduler, one draft depth a step at every start */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
@@ -969,6 +975,7 @@ int  preempt_keep();
 int  kvs_bi();
 int  draft_dmask();                           /* lever DLM: the scheduler's mask of counts (0 = DLH's threshold) */
 int  aql_chi();                               /* lever CHI: chained records play without the packet fences under IKA */
+int  draft_uni();                             /* Q33: one draft depth a step (cap_rows' cut at every start) */
 /* Whether switch i is one of the Qwen line's (kQwenFirst on). */
 inline bool qwen_switch(int i) { return i >= kQwenFirst && i < kSwitches; }
 /* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by
