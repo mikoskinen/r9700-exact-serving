@@ -16991,7 +16991,7 @@ TEST(sched_lane_room_the_switch_takes_0_1_and_starts_off) {
     CHECK_EQ(fn4::sched_lane_room(), 0);
     CHECK_EQ(fn4::switch_index("sched_lane_room"), (int)fn4::kSchedLaneRoom);
     CHECK_EQ((int)fn4::kSchedLaneRoom, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ((int)fn4::kSchedLaneRoom + 10, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ((int)fn4::kSchedLaneRoom + 11, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(!fn4::sched_switch(fn4::kSchedLaneRoom));
     CHECK(!fn4::follower_switch(fn4::kSchedLaneRoom));
     CHECK(fn4::state_json().find("\"sched_lane_room\": 0") != std::string::npos);
