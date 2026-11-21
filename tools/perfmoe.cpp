@@ -9,7 +9,7 @@
 //           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //           [--ep N [--ep-rank r|-1]] [--fn4 name=value ...] [--x3map] [--split-seed --dump-sorted FILE --dump-y-r4d FILE]
-//           [--band LO:HI[,LO:HI...]]
+//           [--band LO:HI[,LO:HI...]] [--live-rows] [--dump-y-gd FILE]
 //
 // --band (fn4 BI-dual, interface v12; with --chain): the chain's down takes the `band` operand, i32 [M], 1 for the token
 // rows in the half-open ranges and 0 elsewhere -- those tokens' rows get the M <= 16 band's down arithmetic (EPIC's
@@ -203,6 +203,11 @@ struct Opts {
     std::vector<std::pair<int64_t, int64_t>> band;   // --band LO:HI,..: v12's marked token rows (fn4 BI-dual)
     bool split_seed = false;  // --split-seed: data reseeded after the draw (fn4 P2x pass-size byte compare)
     std::string dump_sorted, dump_y_r4d;   // --dump-sorted / --dump-y-r4d FILE
+    // Qwen loop round 16 (lever DRZ's reading, the decode band never compared): --live-rows counts GD-CHECK / WARM-CHECK
+    // differences only over layer 0's live rows [off[0], off[E]) (under exl3_drz 1 the dead rows are unwritten, so the
+    // poisons differ there by design); --dump-y-gd FILE writes the v5 row's (--gd) warm y as --dump-y writes the chain's.
+    bool live_rows = false;
+    std::string dump_y_gd;
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 or 2.5 (tagged; libr4d's side is its w4 form whatever K is)
     double limit = 0;         // --limit L (fn4 DS variant): gate_up's SwiGLU clamp (v8), and the fused op's (v11); 0 none
@@ -422,6 +427,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--gd") o.gd = true;
         else if (a == "--gd-nocheck") o.gd_nocheck = true;
+        else if (a == "--live-rows") o.live_rows = true;
+        else if (a == "--dump-y-gd") o.dump_y_gd = nx();
         else if (a == "--cu-pct") o.cu_pct = std::atoi(nx());
         else if (a == "--host-us") o.host_us = true;
         else if (a == "--skew") o.skew = std::atof(nx());
@@ -569,6 +576,23 @@ int main(int argc, char** argv) {
         for (int64_t e = 0; e < o.E; ++e) live_sum += route.back().rows[(size_t)e] > 0;
     }
     std::printf("perfmoe: %.1f live experts a dispatch (mean over layers)\n", live_sum / o.layers);
+    // --live-rows: the byte range of layer 0's live rows in y (bf16 rows of --hidden); the checks below count only there
+    size_t live_lo = 0, live_hi = ~(size_t)0;
+    if (o.live_rows) {
+        const int64_t Tr0 = o.M * o.topk;
+        auto cl = [&](int64_t v) { return v < 0 ? (int64_t)0 : v > Tr0 ? Tr0 : v; };
+        const int64_t r0 = cl(route[0].off[0]), r1 = cl(route[0].off[(size_t)o.E]);
+        live_lo = (size_t)r0 * (size_t)o.hidden * 2;
+        live_hi = (size_t)r1 * (size_t)o.hidden * 2;
+        std::printf("perfmoe: --live-rows: GD-CHECK / WARM-CHECK count layer 0's rows %lld .. %lld of %lld\n", (long long)r0,
+                    (long long)r1, (long long)Tr0);
+    }
+    auto ndiff = [&](const std::vector<char>& a, const std::vector<char>& b, size_t n) {
+        const size_t lo = o.live_rows ? std::min(live_lo, n) : 0, hi = o.live_rows ? std::min(live_hi, n) : n;
+        size_t d = 0;
+        for (size_t i = lo; i < hi; ++i) d += a[i] != b[i];
+        return d;
+    };
     if (!o.dump_sorted.empty()) {   // fn4 P2x: layer 0's sorted_tok
         FILE* f = std::fopen(o.dump_sorted.c_str(), "wb");
         if (!f || std::fwrite(route[0].sorted.data(), 4, route[0].sorted.size(), f) != route[0].sorted.size())
@@ -1117,9 +1141,9 @@ int main(int argc, char** argv) {
         ck(hipStreamSynchronize(stream), "check (gd)");
         ck(hipMemcpy(y0.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
         ck(hipMemcpy(y1.data(), g_gd_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
-        size_t dy = 0;
-        for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
-        std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)\n", dy, g_fu_yb);
+        const size_t dy = ndiff(y0, y1, g_fu_yb);
+        std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)%s\n", dy, g_fu_yb,
+                    o.live_rows ? " (live rows only)" : "");
         if (dy && !o.gd_nocheck) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
     }
     // WARM-CHECK (--chain): layer 0's y from the exl3r4d chain now -- its first launches -- and again after the timed
@@ -1307,8 +1331,7 @@ int main(int argc, char** argv) {
         (void)launch_layer(libs[0], 0);
         ck(hipStreamSynchronize(stream), "warm check (warm)");
         ck(hipMemcpy(y1.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
-        size_t dy = 0;
-        for (size_t i = 0; i < g_fu_yb; ++i) dy += wy0[i] != y1[i];
+        const size_t dy = ndiff(wy0, y1, g_fu_yb);
         if (!o.dump_h.empty() && g_fu_h) {   // fn4 BI: the h the warm launch left (layer 0's gate_up output)
             std::vector<char> hh(g_fu_hb);
             ck(hipMemcpy(hh.data(), g_fu_h, g_fu_hb, hipMemcpyDeviceToHost), "copy");
@@ -1337,14 +1360,21 @@ int main(int argc, char** argv) {
         size_t dg = 0;
         if (o.gd && g_gd_y && libs.size() > 1) {   // the v5 row, warm, against the serial chain's (warm) y
             std::vector<char> g1(g_fu_yb);
-            ck(hipMemset(g_gd_y, 0xa5, g_fu_yb), "poison");
+            // --dump-y-gd: the chain's poison (0x5a), so drzcmp.py reads the file as it reads --dump-y's
+            ck(hipMemset(g_gd_y, o.dump_y_gd.empty() ? 0xa5 : 0x5a, g_fu_yb), "poison");
             (void)launch_layer(libs[1], 0);
             ck(hipStreamSynchronize(stream), "warm check (gd)");
             ck(hipMemcpy(g1.data(), g_gd_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
-            for (size_t i = 0; i < g_fu_yb; ++i) dg += y1[i] != g1[i];
+            dg = ndiff(y1, g1, g_fu_yb);
+            if (!o.dump_y_gd.empty()) {
+                FILE* f = std::fopen(o.dump_y_gd.c_str(), "wb");
+                if (!f || std::fwrite(g1.data(), 1, g1.size(), f) != g1.size()) die("cannot write " + o.dump_y_gd);
+                std::fclose(f);
+            }
         }
-        std::printf("WARM-CHECK y %zu of %zu bytes differ (layer 0 after the timed passes vs its first launch)%s\n", dy,
-                    g_fu_yb, o.gd ? (dg ? "; gd vs chain DIFFER" : "; gd vs chain 0 bytes differ") : "");
+        std::printf("WARM-CHECK y %zu of %zu bytes differ (layer 0 after the timed passes vs its first launch)%s%s\n", dy,
+                    g_fu_yb, o.gd ? (dg ? "; gd vs chain DIFFER" : "; gd vs chain 0 bytes differ") : "",
+                    o.live_rows ? " (live rows only)" : "");
         if ((dy || dg) && !o.gd_nocheck) { std::printf("perfmoe: WARM-CHECK FAILED\n"); return 1; }
     }
     return 0;
