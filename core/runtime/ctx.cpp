@@ -8,6 +8,7 @@
 #include "xp_state.h"
 #include "../device/device.h"
 #include "fn4_switch.h"
+#include "wtab.h"
 
 #include <algorithm>
 #include <chrono>
@@ -95,6 +96,18 @@ int Ctx::init(const CtxDesc& d) {
      * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
     row_prefetch_on_ = d.row_prefetch;
     rowpf_.reserve(4096);
+    /* Lever TRB (ctx.h): RADIANCE_TABLE_BATCH=1 / 2 at init; unset, 0 or anything else = off (said once). */
+    {
+        const char* e = std::getenv("RADIANCE_TABLE_BATCH");
+        trb_mode_ = e && (!std::strcmp(e, "1") || !std::strcmp(e, "2")) ? e[0] - '0' : 0;
+        if (e && *e && std::strcmp(e, "0") && !trb_mode_ && rank_ <= 1)
+            RAD_WARN("RADIANCE_TABLE_BATCH=%s is not 0 / 1 / 2: lever TRB off", e);
+        if (trb_mode_) {
+            trb_pt_ = new WtabPatch();
+            trb_ev_[0].reserve(256);
+            trb_ev_[1].reserve(256);
+        }
+    }
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -129,6 +142,16 @@ void Ctx::shutdown() {
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
     if (lane1_) rad_stream_sync(lane1_);
+    if (trb_pt_) {
+        if (trb_n_[0] && rank_ <= 0)
+            RAD_INFO("lever TRB (RADIANCE_TABLE_BATCH=%d): %lld played passes refreshed tables -- %lld tables at the pass start, "
+                     "%lld at their steps, %lld held back to their steps (an event in flight); %lld stream waits put, %lld not "
+                     "put again (the same event this play); %lld patch kernels for %lld entries",
+                     trb_mode_, (long long)trb_n_[0], (long long)trb_n_[1], (long long)trb_n_[2], (long long)trb_n_[7],
+                     (long long)trb_n_[3], (long long)trb_n_[4], (long long)trb_n_[5], (long long)trb_n_[6]);
+        delete static_cast<WtabPatch*>(trb_pt_);
+        trb_pt_ = nullptr;
+    }
 
     for (PassTape& t : tapes_) tape_drop(t);
     tapes_.clear();
@@ -1612,11 +1635,86 @@ void Ctx::head_phase_line() {
     for (int k = 0; k < 5; ++k) ph_k_ns_[k] = ph_k_n_[k] = 0;
 }
 
+/* Lever TRB (ctx.h): the shared patch out on its lane's stream. */
+int Ctx::trb_flush() {
+    WtabPatch& pt = *static_cast<WtabPatch*>(trb_pt_);
+    if (!pt.n) return RAD_OK;
+    const int l0 = lane_;
+    lane_ = trb_pt_lane_;
+    const int rc = wtab_patch(pt, cur_stream());
+    lane_ = l0;
+    ++trb_n_[5];
+    trb_n_[6] += pt.n;
+    pt.n = 0;
+    return rc;
+}
+
+/* Lever TRB mode 2: every table this pass refreshes, refreshed here at the pass start on its step's lane, when every
+ * pending entry's weight is either not in transfer or its transfer's event has completed (rad_event_query); a table
+ * with an entry still in transfer is held back to its own step (where its wait orders only what follows it, as before).
+ * A table refreshed here has nothing pending at its step, which then issues nothing. */
+int Ctx::trb_hoist(const PassTape& t) {
+    const int l0 = lane_;
+    bool any = false;
+    for (const TapeStep& st : t.steps) {
+        if (st.kind != kTapeTable) continue;
+        WeightTable& wt = wtabs_[(size_t)st.a];
+        if (!wt.checked || !(wt.full || !wt.pend.empty())) continue;
+        bool ready = residency_ != nullptr;
+        if (ready) {
+            auto settled = [&](int64_t e) {
+                const WeightSlot* s = residency_->lookup((rad_weight)(wt.first + e));
+                return !s || !s->ready || rad_event_query(s->ready) == 1;
+            };
+            if (wt.full) {
+                for (int64_t e = 0; e < wt.n && ready; ++e) ready = settled(e);
+            } else {
+                for (int32_t e : wt.pend) if (!(ready = settled(e))) break;
+            }
+        }
+        if (!ready) { ++trb_n_[7]; continue; }
+        lane_ = st.lane;
+        const int rc = table_refresh((rad_op)st.b, st.opd, wt);
+        lane_ = l0;
+        if (rc < 0) return rc;
+        ++trb_n_[1];
+        any = true;
+    }
+    if (any) RAD_TRY(trb_flush());
+    return RAD_OK;
+}
+
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
     bool ph_first = ph_on_;   /* tp8 loop D41: the first recorded stretch of a timed head */
+    /* Lever TRB (ctx.h): this play's waited events start empty; mode 2 refreshes the settled tables first. */
+    trb_play_ = trb_mode_ >= 1;
+    if (trb_play_) {
+        trb_ev_[0].clear();
+        trb_ev_[1].clear();
+        trb_mark_ = trb_n_[1] + trb_n_[2];
+        if (trb_mode_ >= 2 && !staging_) {   /* a staged pass may change the residency between its ops */
+            const int hr = trb_hoist(t);
+            if (hr < 0) {
+                trb_play_ = false;
+                step_fail_ = fmt("lever TRB: a table refresh at the pass start failed: %s", rad_strerror(hr));
+                if (step_status_ >= 0) step_status_ = hr;
+                return hr;
+            }
+        }
+    }
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
+        /* Lever TRB: the shared patch goes out before anything but another table step (a played stretch reads it). */
+        if (trb_play_ && st.kind != kTapeTable) {
+            rc = trb_flush();
+            if (rc < 0) {
+                trb_play_ = false;
+                if (step_status_ >= 0) step_status_ = rc;
+                step_fail_ = fmt("lever TRB: a weight-table patch failed: %s", rad_strerror(rc));
+                return rc;
+            }
+        }
         /* tp8 loop D41b: a host step before the first recorded stretch of a timed head, timed by kind */
         const int pk = !ph_first || st.kind == kTapePlay ? -1
                        : st.kind == kTapeTable ? 0 : st.kind == kTapeHost ? 1 : st.kind == kTapeRoute ? 2
@@ -1633,9 +1731,11 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeTable: {
             WeightTable& wt = wtabs_[(size_t)st.a];
             if (wt.full || !wt.pend.empty()) {
+                /* Lever TRB: consecutive tables share the patch (table_refresh sends it on a lane change). */
                 lane_ = st.lane;
                 rc = table_refresh((rad_op)st.b, st.opd, wt);
                 lane_ = l0;
+                if (trb_play_) ++trb_n_[2];
             }
             break;
         }
@@ -1688,8 +1788,19 @@ int Ctx::play_pass(PassTape& t) {
         }
         if (pk >= 0) { ph_k_ns_[pk] += ph_now() - pk0; ++ph_k_n_[pk]; }   /* tp8 loop D41b */
         if (rc < 0) {
+            trb_play_ = false;
             if (step_status_ >= 0) step_status_ = rc;
             return rc;
+        }
+    }
+    if (trb_play_) {   /* lever TRB: a pass ending on a table step still sends its patch */
+        const int fr = trb_flush();
+        trb_play_ = false;
+        if (trb_n_[1] + trb_n_[2] != trb_mark_) ++trb_n_[0];
+        if (fr < 0) {
+            if (step_status_ >= 0) step_status_ = fr;
+            step_fail_ = fmt("lever TRB: a weight-table patch failed: %s", rad_strerror(fr));
+            return fr;
         }
     }
     n_issues_ += t.issues;

@@ -382,6 +382,10 @@ public:
     void        dump_profile() const;      /* spec §16, opt-in, with its caveat printed */
     const char* step_error() const { return step_fail_.c_str(); }
     int64_t     stream_waits() const { return n_stream_waits_; }
+    /* Lever TRB's counts (ctx.h trb_n_): passes, hoisted tables, step tables, waits put, waits not put again, patch kernels,
+     * entries, held back; tests read them. */
+    const int64_t* trb_counts() const { return trb_n_; }
+    int         trb_mode() const { return trb_mode_; }
     /* Lane 1 has work lane 0 has not joined (lane1_pending_). */
     bool        lane1_pending() const { return lane1_pending_; }
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
@@ -845,6 +849,22 @@ private:
      * still be waited on when lane 0 resolves it. Indexed by lane_, like the other per-lane state
      * here: set_lane admits lanes 0 and 1 only. */
     std::vector<uint32_t>  waited_gen_[2];
+    /* Lever TRB (DRAFTER track round 76; start env RADIANCE_TABLE_BATCH, read at init): a played pass's weight-table refreshes
+     * (kTapeTable steps: today each table's moved weights each get a stream wait and each table its own patch kernel, at its
+     * layer's play boundary). 1: inside play_pass, a stream wait on an event this play already waited on (on the same lane)
+     * is not put again (every weight of a moved unit names the unit's one event), and the patches of consecutive table steps
+     * go out as shared 24-entry patch kernels, flushed before the next played stretch; 2: 1 + every table of the pass whose
+     * moved weights' events have all completed is refreshed once at the pass start (its later steps find nothing pending),
+     * the rest at their steps as under 1. 0 / unset: as before. Play-time only (no recording changes). */
+    int                    trb_mode_ = 0;
+    bool                   trb_play_ = false;            /* inside play_pass with trb_mode_ >= 1 */
+    std::vector<RadEvent>  trb_ev_[2];                   /* events waited this play, by lane */
+    void*                  trb_pt_ = nullptr;            /* the shared WtabPatch (wtab.h), owned */
+    int                    trb_pt_lane_ = -1;
+    int  trb_flush();                                    /* the shared patch out on its lane's stream, if any */
+    int  trb_hoist(const PassTape& t);                   /* mode 2's pass-start refresh */
+    int64_t trb_mark_ = 0;                               /* hoisted + step tables at this play's start */
+    int64_t trb_n_[8] = {};                              /* passes, hoisted tables, step tables, waits put, waits deduped, patch kernels, entries, held back */
 
     std::vector<OpPlan>                 plans_;
     /* Ops not yet seen issued. flush_issued walks only these and drops each once it fires. */

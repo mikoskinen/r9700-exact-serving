@@ -165,13 +165,23 @@ void* Ctx::resolve_weight(rad_weight w) {
          * bumps `generation` per transfer (residency.h). */
         std::vector<uint32_t>& waited = waited_gen_[lane_];
         if (s->ready && waited[w] != s->generation) {
-            /* Kept out of a recording: it orders every later play too, and moving a weight a
-             * pass names directly re-keys the pass. */
-            if (rec_) tape_pause(true);
-            rad_event_wait(cur_stream(), s->ready);         /* the stream waits, not the host */
-            if (rec_) tape_pause(false);
+            /* Lever TRB (ctx.h): inside a play, an event this lane already waited on this play is not put again -- every
+             * weight of a moved unit names the unit's one event, and the mover (this thread, between passes) records none
+             * during a play, so the first wait already orders everything after it on this stream. */
+            std::vector<RadEvent>* tev = trb_play_ && !rec_ ? &trb_ev_[lane_] : nullptr;
+            const bool again = tev && std::find(tev->begin(), tev->end(), s->ready) != tev->end();
+            if (again) {
+                ++trb_n_[4];
+            } else {
+                /* Kept out of a recording: it orders every later play too, and moving a weight a
+                 * pass names directly re-keys the pass. */
+                if (rec_) tape_pause(true);
+                rad_event_wait(cur_stream(), s->ready);         /* the stream waits, not the host */
+                if (rec_) tape_pause(false);
+                if (tev) { tev->push_back(s->ready); ++trb_n_[3]; }
+                ++n_stream_waits_;
+            }
             waited[w] = s->generation;
-            ++n_stream_waits_;
         }
     }
     return p;
@@ -396,7 +406,17 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
     } else {
         /* Entries that may have moved: resolve each (which also orders the stream behind an
          * in-flight transfer) and patch only those whose pointer differs. */
-        WtabPatch pt;
+        WtabPatch own;
+        /* Lever TRB (ctx.h): inside a play the entries join the shared patch, which play_pass sends before the next
+         * played stretch (and here whenever it fills); its lane is this table's. */
+        const bool shared = trb_play_ && !rec_ && trb_pt_;
+        if (shared && trb_pt_lane_ != lane_) {   /* entries of another lane's tables go out on theirs first */
+            const int fr = trb_flush();
+            if (fr < 0)
+                return abort_step_msg(h, fr, fmt("operand %d: lever TRB's shared weight-table patch failed", operand));
+        }
+        if (shared) trb_pt_lane_ = lane_;
+        WtabPatch& pt = shared ? *static_cast<WtabPatch*>(trb_pt_) : own;
         auto one = [&](int64_t e) -> int {
             void* p = nullptr;
             RAD_TRY(resolve(e, &p));
@@ -406,7 +426,7 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
             pt.dst[pt.n] = static_cast<void**>(t.dev) + e;
             pt.val[pt.n] = p;
             if (++pt.n == (uint32_t)kWtabPatch) {
-                RAD_TRY(wtab_patch(pt, cur_stream()));
+                RAD_TRY(shared ? trb_flush() : wtab_patch(pt, cur_stream()));
                 pt.n = 0;
             }
             return RAD_OK;
@@ -416,7 +436,7 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         } else {
             for (int32_t e : t.pend) RAD_TRY(one(e));
         }
-        const int rc = wtab_patch(pt, cur_stream());
+        const int rc = shared ? RAD_OK : wtab_patch(pt, cur_stream());
         if (rc < 0)
             return abort_step_msg(h, rc,
                                   fmt("operand %d: the weight table could not be patched", operand));

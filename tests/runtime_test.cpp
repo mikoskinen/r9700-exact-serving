@@ -638,6 +638,99 @@ TEST(a_weight_table_resolves_only_the_entries_that_moved) {
     CHECK(v[2] == (void*)moved_expert);
 }
 
+/* Lever TRB (DRAFTER round 76, RADIANCE_TABLE_BATCH, ctx.h): a played pass's weight-table refreshes with each moved unit's
+ * event waited once a play and the tables' patches shared (1), and every settled table refreshed at the pass start (2). The
+ * device tables must hold what the residency table says after every step, the same under 0 / 1 / 2; on a card (which plays
+ * passes) the counts say the lever ran: one wait for a unit of two weights where 0 puts two. */
+TEST(lever_trb_keeps_every_played_table_entry_and_waits_once_a_unit) {
+    static uint16_t expert_bytes[8][32], moved_bytes[8][32];
+    std::vector<std::vector<void*>> seen[3];
+    int64_t waits[3] = {};
+    for (int mode = 0; mode < 3; ++mode) {
+        const std::string mv = std::to_string(mode);
+        setenv("RADIANCE_TABLE_BATCH", mv.c_str(), 1);
+        Fixture f;
+        std::vector<rad_weight> w;
+        for (int e = 0; e < 8; ++e)
+            w.push_back(f.add_weight(("blk.0.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4, expert_bytes[e]));
+        rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+        rad_op opa = f.add_op("moe_gemm", "M", { 8192 }, { k_pre }, { "prefill" }, &g_moe_schema, w);
+        rad_op opb = f.add_op("moe_gemm", "M", { 8192 }, { k_pre }, { "prefill" }, &g_moe_schema, w);
+        TableResidency res;
+        res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+        for (int e = 0; e < 8; ++e) res.slot[(size_t)w[(size_t)e]].ptr = expert_bytes[e];
+        CHECK_OK(f.start(&res, false, /*record=*/true));
+        CHECK_EQ(f.ctx.trb_mode(), mode);
+        RadEvent unit = nullptr;
+        CHECK_OK(rad_event_create(&unit));
+        void* tab[2] = { nullptr, nullptr };
+        auto body = [&](Ctx& c) {
+            RadOperand oa[3] = { RAD_B(x), RAD_WTAB(w[0], 8), RAD_B(y) };
+            RadOperand ob[3] = { RAD_B(x), RAD_WTAB(w[0], 8), RAD_B(y) };
+            g_rec.clear();
+            CHECK_OK(c.issue(opa, oa, 3, RAD_N_BATCH));
+            CHECK_OK(c.issue(opb, ob, 3, RAD_N_BATCH));
+            if (g_rec.size() == 2) { tab[0] = g_rec[0].t[1].data; tab[1] = g_rec[1].t[1].data; }
+        };
+        auto entries = [&](int k) {
+            std::vector<void*> v(8, nullptr);
+            CHECK_OK(rad_memcpy_async(v.data(), tab[k], 8 * sizeof(void*), f.ctx.stream()));
+            CHECK_OK(rad_stream_sync(f.ctx.stream()));
+            return v;
+        };
+        for (int i = 0; i < 4; ++i) CHECK_OK(f.step(1, i, body));   /* settle, record, audit, play */
+        const int64_t w0 = f.ctx.stream_waits();
+        for (int i = 4; i < 10; ++i) {
+            /* One unit of two weights moves (one event, completed: its copy landed), one weight goes back where it was. */
+            const int a = i % 8, b = (i + 3) % 8;
+            CHECK_OK(rad_event_record(unit, f.ctx.stream()));
+            CHECK_OK(rad_stream_sync(f.ctx.stream()));
+            res.move(w[(size_t)a], moved_bytes[a]);
+            res.move(w[(size_t)b], moved_bytes[b]);
+            res.slot[(size_t)w[(size_t)a]].ready = unit;
+            res.slot[(size_t)w[(size_t)b]].ready = unit;
+            const int back = (i + 5) % 8;
+            if (back != a && back != b) res.move(w[(size_t)back], expert_bytes[back]);
+            CHECK_OK(f.step(1, i, body));
+            REQUIRE(tab[0] != nullptr && tab[1] != nullptr);
+            for (int k = 0; k < 2; ++k) {
+                const std::vector<void*> v = entries(k);
+                for (int e = 0; e < 8; ++e) CHECK(v[(size_t)e] == res.slot[(size_t)w[(size_t)e]].ptr);
+                seen[mode].push_back(v);
+            }
+            res.slot[(size_t)w[(size_t)a]].ready = nullptr;
+            res.slot[(size_t)w[(size_t)b]].ready = nullptr;
+        }
+        waits[mode] = f.ctx.stream_waits() - w0;
+        {
+            const int64_t* n = f.ctx.trb_counts();
+            std::printf("lever TRB mode %d: played %lld; TRB passes %lld, hoisted %lld, step tables %lld, waits put %lld / not again "
+                        "%lld, patch kernels %lld for %lld entries, held back %lld\n", mode, (long long)f.ctx.pass_counts().played,
+                        (long long)n[0], (long long)n[1], (long long)n[2], (long long)n[3], (long long)n[4], (long long)n[5],
+                        (long long)n[6], (long long)n[7]);
+        }
+        if (f.ctx.records_passes() && f.ctx.pass_counts().played > 0) {
+            const int64_t* n = f.ctx.trb_counts();
+            if (mode == 0) {
+                CHECK_EQ(n[0], (int64_t)0);
+            } else {
+                CHECK(n[0] > 0);                       /* played passes refreshed tables under the lever */
+                CHECK(n[4] > 0);                       /* the unit's second weight was not waited on again */
+                CHECK(n[5] > 0 && n[6] >= n[5]);
+                if (mode == 2) CHECK(n[1] > 0);        /* settled tables refreshed at the pass start */
+            }
+        }
+        f.ctx.shutdown();
+        rad_event_destroy(unit);
+    }
+    unsetenv("RADIANCE_TABLE_BATCH");
+    CHECK(seen[0] == seen[1]);
+    CHECK(seen[0] == seen[2]);
+    std::printf("lever TRB: stream waits over 6 played steps: mode 0 %lld, 1 %lld, 2 %lld\n", (long long)waits[0],
+                (long long)waits[1], (long long)waits[2]);
+}
+
 /* A table's run is fixed by the declaration. The weights declared at a table position (OpInfo::
  * weight_opd) are bound as one table before the first step. A declared run with a gap is refused
  * there (the kernel strides from one base, so a gap reads the wrong expert), and an issue naming
