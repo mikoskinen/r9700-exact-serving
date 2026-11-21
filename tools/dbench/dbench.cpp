@@ -84,6 +84,9 @@ static constexpr int64_t kEG = 128;
 static int64_t kE = 32, kTopK = 3;
 
 static int g_pool = 6, g_pin10 = 7;   /* --pool / --pin10: a sequence's expert pool and the tenths of picks drawn from it */
+/* --keep K (DRAFTER round 56, lever DHS's oracle): draw the routing of `tokens` rows in blocks of 5 as ever, then keep only
+ * rows 0..K-1 of each block (renumbered (t / 5) * K + t % 5): the same sequences' picks at K rows a sequence */
+static int g_keep = 0;
 static Route route_synth(int64_t tokens, int rank, uint64_t seed) {
     uint64_t rs = seed;
     auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
@@ -98,7 +101,9 @@ static Route route_synth(int64_t tokens, int rank, uint64_t seed) {
             do { e = ((int)(rnd() % 10) < g_pin10) ? pool[(size_t)(rnd() % pool.size())] : (int32_t)(rnd() % kEG); }
             while ((e == pick[0] || e == pick[1] || e == pick[2]) && ++guard < 64);
             pick[j] = e;
-            by[(size_t)e].push_back((int32_t)(t * kTopK + j));
+            if (g_keep > 0 && t % 5 >= g_keep) continue;
+            const int64_t tt = g_keep > 0 ? (t / 5) * g_keep + t % 5 : t;
+            by[(size_t)e].push_back((int32_t)(tt * kTopK + j));
         }
     }
     Route r; r.off.assign((size_t)(kE + 1), 0);
@@ -110,7 +115,7 @@ static Route route_synth(int64_t tokens, int rank, uint64_t seed) {
         r.rmax = std::max<int64_t>(r.rmax, (int64_t)v.size());
     }
     r.live = (int64_t)r.sorted.size();
-    r.sorted.resize((size_t)(tokens * kTopK), -1);
+    r.sorted.resize((size_t)((g_keep > 0 ? tokens / 5 * g_keep : tokens) * kTopK), -1);
     return r;
 }
 
@@ -479,6 +484,7 @@ int main(int argc, char** argv) {
         else if (a == "--cap") cap = std::atoi(nx().c_str());
         else if (a == "--gemv-order") gemv_order = 1;
         else if (a == "--pool") g_pool = std::atoi(nx().c_str());
+        else if (a == "--keep") g_keep = std::atoi(nx().c_str());
         else if (a == "--rec-start") g_rec_start = std::atoi(nx().c_str());
         else if (a == "--pin10") g_pin10 = std::atoi(nx().c_str());
         else if (a == "--rb") g_rb = 1;
@@ -662,11 +668,12 @@ int main(int argc, char** argv) {
             for (int st = 0; st < stages; ++st) rts.push_back(route_counts(recs[(size_t)st], tk));
         }
         std::vector<Call> calls;
+        const int64_t tm = (g_keep > 0 && route == "synth") ? tk / 5 * g_keep : tk;   /* --keep: the rows the calls run */
         for (int st = 0; st < stages; ++st)
             for (int p = 0; p < 2; ++p) {
                 const Proj& P = kProj[p];
                 Call c; c.rt = rts[(size_t)st]; c.p = p; c.stage = st; c.wn = wtab[st][p]; c.wi = wtabil[st][p];
-                const int64_t TR = (int64_t)c.rt.sorted.size(), AR = P.sorted_rows ? TR : tk, rb = P.K / 32 * 17;
+                const int64_t TR = (int64_t)c.rt.sorted.size(), AR = P.sorted_rows ? TR : tm, rb = P.K / 32 * 17;
                 std::vector<uint16_t> hx((size_t)(AR * P.K));
                 uint64_t rs = 0x777ull + (uint64_t)tk + 7919ull * (uint64_t)(2 * st + p);
                 for (auto& v : hx) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; v = h_to_bf16((float)((int)(rs % 2001) - 1000) / 250.0f); }
@@ -679,10 +686,10 @@ int main(int argc, char** argv) {
                 c.ts = { T(dx, RAD_BF16, { AR, P.K }), T(wtab[st][p], RAD_U8, { kE, P.N, rb }), T(dso, RAD_I32, { TR }),
                          T(dof, RAD_I32, { kE + 1 }), T(dy, RAD_BF16, { TR, P.N }) };
                 c.ts[1].stride[0] = 0;   /* a table of expert pointers, as the engine hands them */
-                c.ps = { PI("M", tk), PI("N", P.N), PI("K", P.K), PI("n_expert", kE), PI("top_k", kTopK),
+                c.ps = { PI("M", tm), PI("N", P.N), PI("K", P.K), PI("n_expert", kE), PI("top_k", kTopK),
                          PS("a_order", P.sorted_rows ? "sorted" : "token"), PS("type", "mxfp4"), PS("dtype", "bf16") };
                 c.a.t = c.ts.data(); c.a.n_t = (int)c.ts.size(); c.a.p = c.ps.data(); c.a.n_p = (int)c.ps.size(); c.a.world_size = 1;
-                c.gemv = tk <= 16 || gemv_order;
+                c.gemv = tm <= 16 || gemv_order;
                 if (want_a8) {
                     c.AR = AR; c.K = P.K; c.N = P.N;
                     CK(hipMalloc(&c.aq, (size_t)(AR * P.K))); CK(hipMalloc(&c.as, (size_t)(AR * (P.K / 128)) * 4));
@@ -694,7 +701,7 @@ int main(int argc, char** argv) {
             }
         for (auto& c : calls) { c.a.t = c.ts.data(); c.a.p = c.ps.data(); }
         if (model == "main") std::printf("== tokens %lld (main model rows, %lld slots):", (long long)tk, (long long)(tk * kTopK));
-        else std::printf("== tokens %lld (%lld sequences x 5):", (long long)tk, (long long)(tk / 5));
+        else std::printf("== tokens %lld (%lld sequences x %d):", (long long)tm, (long long)(tk / 5), g_keep > 0 && route == "synth" ? g_keep : 5);
         for (int st = 0; st < stages; ++st) std::printf(" stage %d live %lld experts, %lld slots, run max %lld;", st, (long long)rts[(size_t)st].experts, (long long)rts[(size_t)st].live, (long long)rts[(size_t)st].rmax);
         std::printf("\n");
         std::vector<std::vector<uint8_t>> ref(calls.size()), outa8(calls.size()), outmx2(calls.size());
