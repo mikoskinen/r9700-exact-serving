@@ -5231,6 +5231,96 @@ TEST(d38a_a_drafted_pipeline_serves_one_process_tokens_at_one_two_and_three_lane
         CHECK(named);
     }
 }
+
+/* tp8 loop D60 (RADIANCE_PP_POST_PHASES=1, the leader; a log line only): D35's decode chain by phase on the DSpark-DRAFTED fixture
+ * -- every request's tokens are one process's with the line on (2 lanes W(1,3), 3 lanes W(0,3), BEST's shape 4 lanes
+ * BG 2 W(1,3) + READY_FIRST), the window lines (RADIANCE_PP_BGRATE_LINE_S=1) and the run's line count closed chains, the phases
+ * telescope (their means sum to 'collect -> head issued'; drafter finish .. ranks' issue sum to 'the drafter's end -> its next
+ * head issued'), and a start without the env (or with a value other than 1, refused by name) prints no D60 line. */
+TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    std::vector<Drafted> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int bg; const char* cut; const char* val; };
+    for (const Arm a : { Arm{ 2, -1, "1,3", "1" }, Arm{ 3, -1, "0,3", "1" }, Arm{ 4, 2, "1,3", "1" }, Arm{ 2, -1, "1,3", nullptr },
+                         Arm{ 2, -1, "1,3", "2" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_BGRATE_LINE_S=1");
+        if (a.val) env.push_back(std::string("RADIANCE_PP_POST_PHASES=") + a.val);
+        if (a.bg >= 0) {
+            env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
+            env.push_back("RADIANCE_PP_READY_FIRST=1");
+        }
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(spec, lane_shape(a.lanes)), env));
+        const std::vector<Drafted> got = drafted_set(pp.port);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));   /* one window line past the last request */
+        (void)drafted_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        long long drafted = 0, accepted = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ref[i].tok != got[i].tok) ++differ;
+            drafted += got[i].drafted;
+            accepted += got[i].accepted;
+        }
+        long long wins = 0;
+        for (size_t at = llog.find("by phase over the last "); at != std::string::npos; at = llog.find("by phase over the last ", at + 1))
+            ++wins;
+        const bool any = llog.find("by phase over") != std::string::npos;
+        const char* rkey = "by phase over the run (tp8 loop D60): ";
+        long long n = -1, drops = -1;
+        double m[10] = {}, p[10] = {}, ended = -1, x2w = -1;
+        int got_n = 0;
+        if (const size_t at = llog.rfind(rkey); at != std::string::npos)
+            got_n = std::sscanf(llog.c_str() + at + std::strlen(rkey),
+                                "%lld chains (%lld not closed); p50 / mean ms -- commit %lf / %lf, the drafter's end (card) %lf / %lf (%lf %% "
+                                "had ended before the wait), drafter finish %lf / %lf, bookkeeping %lf / %lf, the loop until the lane plans %lf "
+                                "/ %lf, plan %lf / %lf, release + ship %lf / %lf, the ranks' issue %lf / %lf; the drafter's end -> its next "
+                                "head issued %lf / %lf, collect -> head issued %lf / %lf; another lane's X2 had landed at the drafter's end in "
+                                "%lf",
+                                &n, &drops, &p[0], &m[0], &p[1], &m[1], &ended, &p[2], &m[2], &p[3], &m[3], &p[4], &m[4], &p[5], &m[5],
+                                &p[6], &m[6], &p[7], &m[7], &p[8], &m[8], &p[9], &m[9], &x2w);
+        double sum_all = 0, sum_host = 0;
+        for (int k = 0; k < 8; ++k) sum_all += m[k];
+        for (int k = 2; k < 8; ++k) sum_host += m[k];
+        fprintf(stderr, "    %d lanes%s W(%s) POST_PHASES=%s: %d of %zu prompts differ (%lld drafted, %lld accepted); D60 %lld chains (%lld "
+                        "not closed), %lld window lines; mean ms commit %.2f, drafter end %.2f (%.0f %% ended), finish %.2f, book %.2f, "
+                        "loop %.2f, plan %.2f, ship %.2f, issue %.2f; drafter end -> head %.2f (parts %.2f), collect -> head %.2f "
+                        "(parts %.2f); X2 landed %.1f %%\n",
+                a.lanes, a.bg >= 0 ? " BG 2" : "", a.cut, a.val ? a.val : "unset", differ, ref.size(), drafted, accepted, n, drops, wins,
+                m[0], m[1], ended, m[2], m[3], m[4], m[5], m[6], m[7], m[8], sum_host, m[9], sum_all, x2w);
+        CHECK_EQ(differ, 0);
+        CHECK(accepted > 0);
+        if (a.val && !std::strcmp(a.val, "1")) {
+            CHECK_EQ(got_n, 24);
+            CHECK(n > 0);
+            CHECK(wins > 0);
+            CHECK(ended >= 0 && ended <= 100);
+            for (int k = 0; k < 10; ++k) CHECK(m[k] >= 0 && p[k] >= 0);
+            CHECK(std::fabs(sum_all - m[9]) <= 0.05);    /* the parts telescope: 8 means printed to 0.01 ms */
+            CHECK(std::fabs(sum_host - m[8]) <= 0.04);
+            CHECK(m[9] + 0.01 >= m[8]);
+            if (got_n != 24) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        } else {
+            CHECK(!any);   /* no D60 phase line (a value other than 1: the refusal's warning only) */
+            if (a.val) CHECK(llog.find("RADIANCE_PP_POST_PHASES=2 is not taken") != std::string::npos);
+        }
+    }
+}
 /* ------------------------------------------------------------------ tp8 MERGE */
 /* Four long decoders, then newcomers in two waves with a pause between: each wave's BG steps merge the decode lanes into lane 0
  * while they are in flight, the pause splits them back, and the newcomers decode on in whichever lane form comes next. */
