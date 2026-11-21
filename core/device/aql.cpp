@@ -1153,6 +1153,9 @@ struct TapeRec {
      * line it reads that a scalar cache could hold stale (tape_set_noacq bit 1): it plays without the packet's acquire. */
     uint8_t  ika = 0;
     uint8_t  ikaok = 0;
+    /* tp8 loop W3s: the acquire rule's mark under IKA's windows (tape_set_noacq bit 2); `noacq` stays the rule's own (bit 0), so
+     * fn4 aql_ika 0 plays exactly the packets of a start without the lever and 1 IKA's (aql.h ika_play_mark). */
+    uint8_t  noacq_ika = 0;
 };
 
 struct Tape {
@@ -1455,15 +1458,19 @@ struct PlayRun {
          *   none  EXPERIMENT ONLY, unsafe in general: every agent-scope acquire becomes none. */
         /* The rule is read only for a marked packet: only a pass recorded under it has marks, and a
          * change of the switch re-records (the epoch), so the stock replay costs one constant test. */
+        /* Lever IKA (tp8 loop W3s): fn4 aql_ika picks the recording's marks at play -- 1 IKA's, 0 the rule's own (as without the
+         * lever); with RADIANCE_AQL_IKA unset no record is self-acquiring and the switch reads 0. */
+        const bool ika_live = ika_on() && rad::fn4::aql_ika() == 1;
+        const bool mark = ika_play_mark(ika_live, r.noacq != 0, r.noacq_ika != 0, r.ika != 0, r.ikaok != 0);
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_none_() || (r.noacq && !r.chain && !foreign && aql_acq_mode() == 1) ||
-             (r.ika && r.ikaok && !r.chain && !foreign && aql_acq_mode() == 1)))
+            (aql_acq_none_() || (mark && !r.chain && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent
          * release adds nothing; a packet a record or a ride completes keeps it (its signal orders other queues / the
          * host after it). */
-        if (r.ika && rel == HSA_FENCE_SCOPE_AGENT && !done.handle) rel = HSA_FENCE_SCOPE_NONE;
+        if (rel == HSA_FENCE_SCOPE_AGENT && ika_play_release_none(ika_live, r.ika != 0, done.handle != 0))
+            rel = HSA_FENCE_SCOPE_NONE;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
          * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
@@ -2289,9 +2296,11 @@ int a_tape_set_noacq(RadTape rt, int i, int on) {
     Tape* t = tape_of(rt);
     if (!t || i < 0 || i >= (int)t->rec.size() || t->rec[(size_t)i].kind != kTapeDispatch)
         return RAD_E_INVAL;
-    /* bit 0: the acquire rule's mark (any kernel); bit 1: lever IKA's (only a self-acquiring kernel, TapeRec::ika) */
+    /* bit 0: the acquire rule's mark (any kernel); bit 1: lever IKA's (only a self-acquiring kernel, TapeRec::ika); bit 2 (tp8 loop
+     * W3s): the rule's mark under IKA's windows */
     t->rec[(size_t)i].noacq = (on & 1) ? 1 : 0;
     t->rec[(size_t)i].ikaok = (on & 2) ? 1 : 0;
+    t->rec[(size_t)i].noacq_ika = (on & 4) ? 1 : 0;
     return RAD_OK;
 }
 

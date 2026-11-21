@@ -157,6 +157,19 @@ inline std::string ika_identifier(const std::string& sym) {
     if (!source_name(&id) || !abi_tags()) return std::string();
     return id;
 }
+/* Lever IKA at play (tp8 loop W3s: fn4 aql_ika = switch 107). A recording makes the marks of both forms (Ctx::haz_mark): `noacq`
+ * the acquire rule's own (its windows as without the lever), `noacq_ika` the rule's under IKA's windows (a dropped IKA acquire
+ * does not start a new window), `ikaok` IKA's own drop of a self-acquiring (`ika`) record. `live` = the switch at 1 (which needs
+ * RADIANCE_AQL_IKA=1 at start). Whether the record's agent-scope acquire may be dropped (the caller adds the rule's other
+ * conditions: an unchained record, not behind foreign packets, the rule on): live, IKA's marks; else the rule's own, exactly as
+ * without the lever. */
+inline bool ika_play_mark(bool live, bool noacq, bool noacq_ika, bool ika, bool ikaok) {
+    return live ? (noacq_ika || (ika && ikaok)) : noacq;
+}
+/* Whether a record's AGENT-scope release may be dropped: live only, a self-acquiring kernel's only (it released its writes before
+ * its waves ended), and only on a packet no record or ride completes (that signal orders other queues / the host after it). */
+inline bool ika_play_release_none(bool live, bool ika, bool completes) { return live && ika && !completes; }
+
 /* Whether `sym`'s own identifier is one of the `n` names of `list` (null / empty entries skipped). */
 inline bool ika_listed(const std::string& sym, const char* const* list, int n) {
     const std::string id = ika_identifier(sym);
