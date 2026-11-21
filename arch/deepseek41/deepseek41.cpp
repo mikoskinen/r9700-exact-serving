@@ -417,6 +417,10 @@ struct Layer {
     /* A DSpark stage's context pass: its window key from the projected trunk rows. */
     rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
     rad_op d_kvfs = 0;   /* lever DMR 2: the context key's d_kvn + d_kvrope + d_kvq + d_kvst as the trunk's fold c */
+    /* lever DKP (DRAFTER track round 72; g_sw_dmr's comment, + 64): the same d_kv / d_kvfs over this stage's OWN key rows
+     * (ckv2 / ckvn2), so the three stages' projections share no buffer and start together; 0 where not declared */
+    rad_op d_kv2 = 0, d_kvfs2 = 0;
+    rad_buf ckv2 = 0, ckvn2 = 0;
 };
 
 /* The DSpark block drafter (the checkpoint's mtp.0 .. mtp.{n-1}; official inference/model.py DSparkBlock,
@@ -2221,7 +2225,16 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * beside q_b instead of behind q_rope. o_rope / o_q (DOF: o_f) stay their own launches (the op's out_rope 1 form, the output's
  * rope in the attention's epilogue, measured slower: tools/dbench/dqr r69h). Declared only with
  * lever DAW (RADIANCE_DS41_DSPARK_AWM) and the bf16 window (no RADIANCE_DS41_KVWIN_FP8 for the drafter), where a library
- * declares the op. */
+ * declares the op.
+ * + 64 (DRAFTER track 21.11.2026 round 72, lever DKP; 64..127 = the bits below + DKP, start env RADIANCE_DS41_DSPARK_DKP=1 adds it
+ * to the start value, =0 declares its ops with the bit off) = the CONTEXT pass's window keys at level >= 2 (fold c, d_kvfs):
+ * every stage's d_kv first, then every stage's d_kvfs, each stage over its OWN key rows (Layer::ckv2 / ckvn2) instead of the
+ * shared d.ckv / d.ckvn. Today each stage's projection writes the d.ckv the previous stage's fold reads, and the fold's window
+ * store is opaque to the hazard marks, so the three projections (gg_wk, 512 x 5120 q8_0, ~15 us each at the served 43-48
+ * rows) and folds run as one dependent chain of six (lq231 c16: 57 us of launches + 5 ordered gaps); with their own rows the
+ * second and third projections play unordered beside the first (nothing they write is read or written in flight). The same
+ * ops, params and kernels over the same values: every window key's bytes are today's (rule A; tools/dbench/dkp: the
+ * projections' outputs equal at every M). Declared only where every stage's d_kvfs is (level 2 under the MHR env). */
 static std::atomic<int> g_sw_dmr{-1};
 static std::atomic<int> g_dsp_sdf{0};    /* lever SDD: the DSpark MoE's shexp_lane word (kMoeSdfBit or 0; set at each query pass) */
 static std::atomic<int> g_ema_bad{0};    /* lever EMA: a rank of this process could not declare it: off on every rank */
@@ -2263,8 +2276,12 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dr = r && r[0] == '1' && !r[1] ? 32 : 0;
         if (r && *r && !dr && std::strcmp(r, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DQR=%s is not 0 / 1: lever DQR not declared\n", r);
+        const char* k = std::getenv("RADIANCE_DS41_DSPARK_DKP");   /* lever DKP (round 72): 1 = on at start, 0 = declared, off */
+        const int dk = k && k[0] == '1' && !k[1] ? 64 : 0;
+        if (k && *k && !dk && std::strcmp(k, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DKP=%s is not 0 / 1: lever DKP not declared\n", k);
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr);
+        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2273,6 +2290,14 @@ static int dmr_now() { return dmr_raw() & 7; }
 static bool dpr_now() { return (dmr_raw() & 8) != 0; }   /* lever DPR (round 67) */
 static bool dph_now() { return (dmr_raw() & 16) != 0; }  /* lever DPH (round 68) */
 static bool dqr_now() { return (dmr_raw() & 32) != 0; }  /* lever DQR (round 69) */
+static bool dkp_now() { return (dmr_raw() & 64) != 0; }  /* lever DKP (round 72) */
+/* lever DKP: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
+static bool dkp_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_DKP");
+    return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
+}
+static std::atomic<int> g_dkp_ok{0}, g_dkp_bad{0};   /* lever DKP: declared on a rank / a rank of this process could not */
+static std::atomic<long long> g_dkp_passes{0};       /* lever DKP: the first-pass line */
 /* lever DQR: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
 static bool dqr_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_DQR");
@@ -3095,7 +3120,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 63 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 127 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3228,7 +3253,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5551,6 +5576,41 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
                                RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", m.w8d ? "fp8_e4m3" : "bf16") },
                              { L.kv_norm }, { d.ckv, m.cs_a }, { d.ckvn });
+    /* lever DKP (round 72; g_sw_dmr's comment, + 64): each stage's projection + fold over its own key rows, declared as all the
+     * projections, then all the folds (their issue order), so the planner keeps the stages' rows apart while they run together */
+    if (dkp_env() && std::getenv("RADIANCE_DS41_DSPARK_MHR") && !d.st.empty()) {
+        bool all = true;
+        for (const auto& L : d.st) all = all && L.d_kvfs;
+        int si = 0;
+        if (all)
+            for (auto& L : d.st) {
+                L.ckv2 = decl_b(b, nm.f("dspark_ctx_kv_dkp%d", si), RAD_BF16, { T, hd });
+                L.ckvn2 = decl_b(b, nm.f("dspark_ctx_kv_normed_dkp%d", si), RAD_BF16, { T, hd });
+                all = all && L.ckv2 && L.ckvn2;
+                ++si;
+            }
+        if (all)
+            for (auto& L : d.st) all = all && (L.d_kv2 = linear(b, m, T, L.wkv, hd, D, d.cn, L.ckv2)) != 0;
+        if (all)
+            for (auto& L : d.st)
+                all = all && (L.d_kvfs2 = fused(b, "rmsnorm_rope_roundtrip_kv_store",
+                                                { RAD_RANGE("M", 1, T), RAD_INT("n", hd), RAD_F64("eps", c.eps), RAD_INT("n_head", 1),
+                                                  RAD_INT("head_dim", hd), RAD_INT("rot", c.rope), RAD_INT("off", hd - c.rope),
+                                                  RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
+                                                  RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
+                                                  RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", m.w8d ? "fp8_e4m3" : "bf16") },
+                                                { L.kv_norm }, { L.ckv2, m.cs_a }, { L.ckvn2 })) != 0;
+        if (!ctx->shape_probe) {
+            if (all) g_dkp_ok.store(1, std::memory_order_relaxed);
+            else g_dkp_bad.store(1, std::memory_order_relaxed);
+            if (ctx->rank == 0)
+                fprintf(stderr, "radiance: deepseek41: DSpark lever DKP (RADIANCE_DS41_DSPARK_DKP, fn4 dspark_mhr + 64, now %s) %s: the "
+                                "context pass's %zu window-key projections + folds over each stage's own key rows, all the projections "
+                                "first (rule A: the same ops over the same values)\n",
+                        dkp_now() ? "on" : "off", all ? "declared" : "NOT declared (a stage has no fold c / an op is not served)",
+                        d.st.size());
+        }
+    }
     for (const auto& L : d.st) DS_TRY(rad_bind_layer_kv(b, L.l, d.kv));
     if (m.zero) DS_TRY(rad_kv_group_zero(b, d.kv));
 
@@ -8540,6 +8600,19 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
         lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
     const bool kvfold = dmr_now() >= 2;   /* lever DMR 2 */
+    /* lever DKP (round 72; g_sw_dmr's comment, + 64): every stage's projection into its own key rows, then every stage's fold;
+     * the same on every rank (switch + every rank's declare), so a function of the pass key and the switches */
+    if (kvfold && dkp_now() && g_dkp_ok.load(std::memory_order_relaxed) && !g_dkp_bad.load(std::memory_order_relaxed)) {
+        for (const auto& L : d.st) lin_issue(x, m, L.d_kv2, T, brows(d.cn, T), L.wkv, brows(L.ckv2, T));
+        for (const auto& L : d.st)
+            RAD_ISSUE_N(x, L.d_kvfs2, T, brows(L.ckv2, T), RAD_W(L.kv_norm), brows(L.ckvn2, T), brows(m.cs_a, g.max_ctx), pos,
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+        if (g.rank == 0 && g_dkp_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+            fprintf(stderr, "radiance: deepseek41: lever DKP: first context pass issued with the %zu stages' window-key projections "
+                            "first, each into its own rows, at %lld rows (counted at issue: a recorded pass once)\n", d.st.size(),
+                    (long long)T);
+        return;
+    }
     for (const auto& L : d.st) {
         lin_issue(x, m, L.d_kv, T, brows(d.cn, T), L.wkv, brows(d.ckv, T));
         if (kvfold && L.d_kvfs) {
