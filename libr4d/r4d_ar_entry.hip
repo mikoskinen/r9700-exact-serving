@@ -661,7 +661,14 @@ static int nb_for_shard(long shard16, int max_nb) {
 /* Lever DAR b (DRAFTER track round 58): a launch asking for the fp8 wire (`wire` 1, a parameter only the DSpark drafter's
  * declared reductions carry) takes r4d_ar_twoshot_4rank_fp8 where the message fits it (bf16, four ranks); its grid is
  * the launch's `wire_nb` x `wire_nt` (default 16 x 256: the codec's work over more CUs; tools/dbench/arf.cpp --phase).
- * NOT exact (rule B); every other launch is untouched. */
+ * NOT exact (rule B); every other launch is untouched.
+ * Round 59 (DEFECT of round 58's entry rule, found on reading): the one-shot entry and the gather entry took the fp8 form
+ * only inside their `ts_min` band (>= 32,768 elements, ~6.4 rows of 5120), so a drafter pass of <= 6 rows (one sequence
+ * at the 5-row block, <= 3 at the 2-row short block) reduced EXACT while a wider pass reduced on the fp8 wire: a row's
+ * bits depended on how many sequences shared its pass (rule B's batch invariance broken). Now a `wire` 1 launch takes the
+ * fp8 form FIRST, at every size the form accepts (r4d_ar_twoshot_fp8_ok / r4d_ar_gather_twoshot_fp8_ok: four ranks,
+ * whole 16-byte words, >= 32 elements, <= 256 gather rows; the DSpark drafter's messages are all inside), ahead of the
+ * band rules and the coded wire; a launch without `wire` 1 is untouched. */
 static std::atomic<long> g_arf_calls{0};
 static bool arf_take(const RadArgs* a, long numel, int dtype, int world, long slot16) {
     return r4d_geti_or(a, "wire", 0) == 1 && r4d_ar_twoshot_fp8_ok(numel, dtype, world, slot16);
@@ -1024,6 +1031,22 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
      * the same bytes, for half the bytes a rank (a 16-row verify's message, 516 KiB a card at
      * 3x, is what the link waits on). It shares the wide family's flags, counters and slots, and
      * a shard pair fits any slot that holds the whole message. */
+    /* lever DAR b, round 59: a `wire` 1 launch takes the fp8 form at every size it accepts, before the ts_min band (see
+     * arf_take: the band made a row's bits depend on the pass's row count) */
+    if (arf_take(a, c.numel, in->dtype, in->world, in->slot16)) {
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        int fnb = (int)r4d_geti_or(a, "wire_nb", 16);
+        if (fnb > in->max_blocks) fnb = in->max_blocks;
+        g_arf_calls.fetch_add(1, std::memory_order_relaxed);
+        R4D_TRY("ar_oneshot_4rank_exact (two-shot, fp8 wire)",
+            r4d_ar_twoshot_4rank_fp8(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                     in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                     in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                     c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s, fnb,
+                                     r4d_geti_or(a, "wire_nt", 256), c.drain, c.acq, c.pub, early,
+                                     early ? in->gate_ctr : 0L));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     const long ts_min = r4d_cfg_ar_ts_min(a);
     const long words16 = c.numel * in->esize / 16;
     if (ts_min > 0 && c.numel >= ts_min && words16 % in->world == 0 &&
@@ -1036,19 +1059,6 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                                  in->nb_cap > 24 ? 24 : in->nb_cap);
         if (nb > in->max_blocks) nb = in->max_blocks;
         const long gate = link_gate(a), early = in->host ? 0L : gate;
-        if (arf_take(a, c.numel, in->dtype, in->world, in->slot16)) {
-            int fnb = (int)r4d_geti_or(a, "wire_nb", 16);
-            if (fnb > in->max_blocks) fnb = in->max_blocks;
-            g_arf_calls.fetch_add(1, std::memory_order_relaxed);
-            R4D_TRY("ar_oneshot_4rank_exact (two-shot, fp8 wire)",
-                r4d_ar_twoshot_4rank_fp8(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
-                                         in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
-                                         in->my_scratch, in->my_flags, in->my_seq, in->slot16,
-                                         c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s, fnb,
-                                         r4d_geti_or(a, "wire_nt", 256), c.drain, c.acq, c.pub, early,
-                                         early ? in->gate_ctr : 0L));
-            return early ? RAD_LINK_ENDED : RAD_OK;
-        }
         R4D_TRY("ar_oneshot_4rank_exact (two-shot)",
             r4d_ar_twoshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                        in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
@@ -1175,6 +1185,21 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     if (words16 % c.in->world) return RAD_E_SHAPE;
     if (2 * (c.numel * c.in->esize) / c.in->world > c.in->slot_bytes) return RAD_E_SCRATCH;
     const ArInst* in = c.in;
+    /* lever DAR b, round 59: a `wire` 1 launch takes the fp8 form first, ahead of the coded wire (see arf_take) */
+    if (arf_take(a, c.numel, in->dtype, in->world, in->slot16)) {
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        int fnb = (int)r4d_geti_or(a, "wire_nb", 16);
+        if (fnb > in->max_blocks) fnb = in->max_blocks;
+        g_arf_calls.fetch_add(1, std::memory_order_relaxed);
+        R4D_TRY("ar_twoshot_4rank_exact (fp8 wire)",
+            r4d_ar_twoshot_4rank_fp8(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                     in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                     in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                     c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s, fnb,
+                                     r4d_geti_or(a, "wire_nt", 256), c.drain, c.acq, c.pub, early,
+                                     early ? in->gate_ctr : 0L));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     /* A reduction beside compute (overlap 1) carries its pushes coded at ~12.2 bits a bf16 value
      * (r4d_ar_twoshot_Nrank_exact.hip, the coded form), at 4 blocks of 1024 threads, wherever the
      * message fits that form; the same bytes either way. On 4x R9700 4 x 1024 gave the 31B's
@@ -1231,19 +1256,6 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     /* The kernel ends the hold after its second handshake (its reduce is fused with the phase-2
      * push); through the host mailbox early stays 0 and the engine releases by barrier. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
-    if (arf_take(a, c.numel, in->dtype, in->world, in->slot16)) {
-        int fnb = (int)r4d_geti_or(a, "wire_nb", 16);
-        if (fnb > in->max_blocks) fnb = in->max_blocks;
-        g_arf_calls.fetch_add(1, std::memory_order_relaxed);
-        R4D_TRY("ar_twoshot_4rank_exact (fp8 wire)",
-            r4d_ar_twoshot_4rank_fp8(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
-                                     in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
-                                     in->my_scratch, in->my_flags, in->my_seq, in->slot16,
-                                     c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s, fnb,
-                                     r4d_geti_or(a, "wire_nt", 256), c.drain, c.acq, c.pub, early,
-                                     early ? in->gate_ctr : 0L));
-        return early ? RAD_LINK_ENDED : RAD_OK;
-    }
     R4D_TRY("ar_twoshot_4rank_exact",
         r4d_ar_twoshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
@@ -2070,6 +2082,24 @@ extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
      * slot list past LDS) keeps the one-shot below, as every call under ts_min does. Blocks: the
      * plain two-shot's decode rule over a shard (nb_for_shard), at least one per 8192 words of the
      * message, since every block also gathers its share of all four shards (ceiling 16). */
+    /* lever DAR b, round 59: a `wire` 1 launch takes the fp8 gather form at every size it accepts, before the ts_min band
+     * (arf_take's comment: the band made a row's bits depend on the pass's row count) */
+    if (r4d_geti_or(a, "wire", 0) == 1 && r4d_ar_gather_twoshot_fp8_ok((long)M, (long)n, (long)top_k, in->slot16)) {
+        int fnb = (int)r4d_geti_or(a, "wire_nb", 16);
+        if (fnb > in->max_blocks) fnb = in->max_blocks;
+        g_arf_calls.fetch_add(1, std::memory_order_relaxed);
+        R4D_TRY("moe_gather_ar_4rank (two-shot, fp8 wire)",
+            r4d_ar_gather_twoshot_4rank_fp8(
+                in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                r4d_addr(y), (long)M, (long)n, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
+                sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld,
+                (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig | ewf, (long)in->rank,
+                (long)(uintptr_t)s, fnb, r4d_geti_or(a, "wire_nt", 256), cfgv.drain, cfgv.acq, cfgv.pub, early,
+                early ? in->gate_ctr : 0L));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     const long ts_min = r4d_cfg_ar_ts_min(a);
     if (ts_min > 0 && (long)(M * n) >= ts_min &&
         r4d_ar_gather_twoshot_ok((long)M, (long)n, (long)top_k, in->slot16)) {
@@ -2080,22 +2110,6 @@ extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
             if (nb < g) nb = g < 16 ? g : 16;
         }
         if (nb > in->max_blocks) nb = in->max_blocks;
-        if (r4d_geti_or(a, "wire", 0) == 1 && r4d_ar_gather_twoshot_fp8_ok((long)M, (long)n, (long)top_k, in->slot16)) {
-            int fnb = (int)r4d_geti_or(a, "wire_nb", 16);
-            if (fnb > in->max_blocks) fnb = in->max_blocks;
-            g_arf_calls.fetch_add(1, std::memory_order_relaxed);
-            R4D_TRY("moe_gather_ar_4rank (two-shot, fp8 wire)",
-                r4d_ar_gather_twoshot_4rank_fp8(
-                    in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
-                    in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
-                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
-                    r4d_addr(y), (long)M, (long)n, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
-                    sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld,
-                    (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig | ewf, (long)in->rank,
-                    (long)(uintptr_t)s, fnb, r4d_geti_or(a, "wire_nt", 256), cfgv.drain, cfgv.acq, cfgv.pub, early,
-                    early ? in->gate_ctr : 0L));
-            return early ? RAD_LINK_ENDED : RAD_OK;
-        }
         R4D_TRY("moe_gather_ar_4rank (two-shot)",
             r4d_ar_gather_twoshot_4rank(
                 in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
