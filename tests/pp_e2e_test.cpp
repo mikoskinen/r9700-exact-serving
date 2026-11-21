@@ -9451,15 +9451,20 @@ TEST(a_frozen_or_killed_node_takes_the_pair_down_within_seconds) {
 TEST(stuck_exit_ends_a_pair_whose_loop_hangs_and_without_it_everything_waits) {
     REQUIRE(world().ok);
     const std::vector<int32_t> p = prompt_ids(21, 50);
-    struct Arm { const char* name; const char* cut; const char* lanes; int hang; bool watch; };   /* hang: 0 leader / one process, 1 follower */
+    /* hang: 0 leader / one process, 1 follower; term: a SIGTERM to the stuck node right after its hang line (docker stop of a
+     * wedged node: lq230 / F66 needed SIGKILL) */
+    struct Arm { const char* name; const char* cut; const char* lanes; int hang; bool watch; bool term = false; };
     const Arm arms[] = {
         { "one process, watchdog 2 s", "", "", 0, true },
         { "leader W(0,2), watchdog 2 s", "0,2", "1", 0, true },
         { "follower W(0,2), watchdog 2 s", "0,2", "1", 1, true },
         { "leader W(1,3) 2 lanes, watchdog 2 s", "1,3", "2", 0, true },
         { "follower W(1,3) 3 lanes, watchdog 2 s", "1,3", "3", 1, true },
+        { "leader W(0,2) + SIGTERM, watchdog 2 s", "0,2", "1", 0, true, true },
+        { "follower W(1,3) 2 lanes + SIGTERM, wd 2 s", "1,3", "2", 1, true, true },
         { "leader W(0,2), no watchdog", "0,2", "1", 0, false },
         { "follower W(0,2), no watchdog", "0,2", "1", 1, false },
+        { "leader W(0,2) + SIGTERM, no watchdog", "0,2", "1", 0, false, true },
     };
     for (const Arm& a : arms) {
         Serving sv;
@@ -9480,6 +9485,7 @@ TEST(stuck_exit_ends_a_pair_whose_loop_hangs_and_without_it_everything_waits) {
         const auto t0 = std::chrono::steady_clock::now();
         CHECK(hung);
         if (!hung) { fprintf(stderr, "    %s: no hang line\n%s\n", a.name, tail(stuck.output()).c_str()); continue; }
+        if (a.term) ::kill(stuck.child.pid, SIGTERM);
         if (a.watch) {
             const Ended s = finish_from(stuck, t0, 20);
             const Ended o = pp ? finish_from(other, t0, 20) : Ended{};
@@ -9505,9 +9511,9 @@ TEST(stuck_exit_ends_a_pair_whose_loop_hangs_and_without_it_everything_waits) {
             const bool s_up = ::kill(stuck.child.pid, 0) == 0, o_up = !pp || ::kill(other.child.pid, 0) == 0;
             fprintf(stderr, "    %-40s: %.1f s after the hang the request %s, the stuck node %s, the other %s\n", a.name,
                     secs(t0, r.at), r.ended ? "ENDED" : "still waits", s_up ? "up" : "GONE", o_up ? "up" : "GONE");
-            CHECK(!r.ended);
+            if (!a.term) CHECK(!r.ended);   /* a SIGTERM stops the transport (its connections may close): the PROCESS is the point */
             CHECK(s_up);
-            CHECK(o_up);
+            if (!a.term) CHECK(o_up);
             CHECK(stuck.output().find("no progress for") == std::string::npos);
         }
     }
