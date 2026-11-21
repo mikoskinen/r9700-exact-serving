@@ -1042,7 +1042,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         rad_step_fail(c, "llama: the engine's SP word (tp8 loop D40) on a pass that is not a leader head segment");
         return;
     }
-    const bool lfirst = !lseg || l0 == (part == RAD_PP_PART_HEAD ? 0 : m.pp_t);
+    /* tp8 loop D64b: a tail band pass's tail starts at t - j -- its first segment is the one from te (X2's receive) */
+    const bool lfirst = !lseg || l0 == (part == RAD_PP_PART_HEAD ? 0 : te);
     /* tp8 loop D36: a band pass's head ends at h + 1 (its last segment [s, h + 1), RADIANCE_PP_LEAD_SEG_BAND=1) */
     const bool llast = !lseg || (part == RAD_PP_PART_HEAD ? l1 == he : l1 >= m.n_main);
     /* tp8 loop D32: the leader's ring of the pass's lane (lane % 2 with two rings; the engine pairs them the same way) */

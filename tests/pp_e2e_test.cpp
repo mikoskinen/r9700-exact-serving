@@ -4187,7 +4187,9 @@ TEST(d39_tail_band_keeps_one_process_tokens_and_the_kv_copy_in_bests_shape) {
  * (2 -> 131074 -> 2: the same tokens); D64's steps > 0 wherever the bit is on, 0 without it (the band steps then whole, the
  * tail band count > 0 in both); 1 lane (no BG lane: LSP not taken) = one process. Negative control: the bit on and the
  * follower's band key stores left out (RADIANCE_PP_TEST_TBAND_SKIP=1) -> requests differ (the segmented heads' steps are band
- * passes: the decode owner reads keys it never got). */
+ * passes: the decode owner reads keys it never got). tp8 loop D64b: + 262144 -- the band step's TAIL in segments too, from t - j:
+ * at W(2,4) (the tail [4, 6) declares boundary 5) a band pass's tail [3, 6) runs [3, 5) + [5, 6); the same tokens / copy at 4 lanes
+ * BG 2, 3 lanes BG 1 and with D51 + DC8's levers, tails in segments > 0 there and 0 without the bit; its own negative control. */
 TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
     REQUIRE(world().ok);
     REQUIRE(world6().ok);
@@ -4205,8 +4207,8 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
      * tb = RADIANCE_PP_TAIL_BAND (5 with the copy + the follower's load report: D51); xenv = START DC8's other levers */
     struct Arm { const char* name; int lanes; int k; const char* cut; const char* form; const char* tb = "1"; bool post = false;
                  bool skip = false; const char* xenv = nullptr; };
-    long long d64_all = 0, tb_all = 0;
-    int skip_differ = 0;
+    long long d64_all = 0, tb_all = 0, d64b_all = 0;
+    int skip_differ = -1;   /* the smallest differ count over the negative controls */
     for (const Arm a : { Arm{ "D64 4L BG2", 4, 2, "2,5", "131074" }, Arm{ "D64 3L BG1", 3, 1, "2,5", "131074" },
                          Arm{ "D64 2L BG1", 2, 1, "2,5", "131074" }, Arm{ "D64 W(3,5) 4L", 4, 2, "3,5", "131074" },
                          Arm{ "today (form 2)", 4, 2, "2,5", "2" }, Arm{ "in process 2/131074/2", 4, 2, "2,5", "2", "1", true },
@@ -4214,6 +4216,14 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
                               "RADIANCE_LLAMA_PP_TBAND_COPY=1 RADIANCE_PP_NODE_IDLE=1 RADIANCE_PP_LOAD_REPORT_MS=5 RADIANCE_PP_TBAND_BOUND_MS=100 "
                               "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1" },
                          Arm{ "D64 1 lane", 1, 0, "2,5", "131074" },
+                         /* tp8 loop D64b: + 262144 -- the band step's tail in segments too, from t - j: W(2,4)'s tail [4, 6) declares
+                          * boundary 5, so a band pass's tail [3, 6) runs [3, 5) + [5, 6) */
+                         Arm{ "D64b W(2,4) 4L BG2", 4, 2, "2,4", "393217" }, Arm{ "D64b W(2,4) 3L BG1", 3, 1, "2,4", "393217" },
+                         Arm{ "D64 W(2,4) tail whole", 4, 2, "2,4", "131074" },
+                         Arm{ "D64b + D51 + DC8 levers", 4, 2, "2,4", "393217", "5", false, false,
+                              "RADIANCE_LLAMA_PP_TBAND_COPY=1 RADIANCE_PP_NODE_IDLE=1 RADIANCE_PP_LOAD_REPORT_MS=5 RADIANCE_PP_TBAND_BOUND_MS=100 "
+                              "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1" },
+                         Arm{ "D64b, key stores LEFT OUT (ctl)", 4, 2, "2,4", "393217", "1", false, true },
                          Arm{ "D64, key stores LEFT OUT (ctl)", 4, 2, "2,5", "131074", "1", false, true } }) {
         std::vector<std::string> env = kSplitEnv;
         if (a.k > 0) env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
@@ -4272,20 +4282,25 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
         if (const size_t at = llog.rfind(key); at != std::string::npos)
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
                 tb = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
-        long long d64 = -1, steps = -1, parts = -1;
+        long long d64 = -1, steps = -1, parts = -1, d64b = -1;
         const char* dkey = " tail band BG steps ran their head in segments, their tail whole (+ 131072, tp8 loop D64)";
         if (const size_t at = llog.rfind(dkey); at != std::string::npos)
             if (const size_t b = llog.rfind(", ", at); b != std::string::npos) d64 = std::atoll(llog.c_str() + b + 2);
+        const char* tkey = " tail band BG steps ran their tail in segments from t - j (+ 262144, tp8 loop D64b)";
+        if (const size_t at = llog.rfind(tkey); at != std::string::npos)
+            if (const size_t b = llog.rfind(", ", at); b != std::string::npos) d64b = std::atoll(llog.c_str() + b + 2);
         if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
             if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
                 (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments", &steps,
                                   &parts);
         fprintf(stderr, "    D64 %-30s %d lanes W(%s), TAIL_BAND=%s, LEAD_SEG_FORM=%s: %d of %zu requests differ; KV-copy checks %lld, %lld "
-                        "differ%s; %lld tail band passes; leader: %lld BG steps in %lld segments, %lld of them tail band steps' heads (D64)\n",
+                        "differ%s; %lld tail band passes; leader: %lld BG steps in %lld segments, %lld of them tail band steps' heads (D64), "
+                        "%lld their tails too (D64b)\n",
                 a.name, a.lanes, a.cut, a.tb, a.form, differ, ref.size(), checks, kdiff, notowner ? " (NOT the owner's bytes)" : "", tb, steps,
-                parts, d64);
+                parts, d64, d64b);
         if (a.skip) {   /* the negative control: band passes whose keys the decode owner never stored */
-            skip_differ = differ + (notowner ? 1 : 0);
+            const int bad = differ + (notowner ? 1 : 0);
+            skip_differ = skip_differ < 0 ? bad : std::min(skip_differ, bad);   /* every control must differ */
             CHECK(d64 > 0);
             continue;
         }
@@ -4307,11 +4322,19 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
         }
         CHECK(llog.find("fn4 pp_lead_seg starts at ") != std::string::npos);
         if (!std::strcmp(a.form, "131074")) CHECK(llog.find("starts with tail band heads in segments (D64)") != std::string::npos);
+        if (!std::strcmp(a.form, "393217")) {   /* tp8 loop D64b: tails in segments from t - j (form 1: M9 as built, so the tail segments
+                                                     * do not wait for a busy decode lane on the stand-in's short set) */
+            CHECK(d64b > 0);
+            d64b_all += std::max(0LL, d64b);
+        } else {
+            CHECK_EQ(d64b, 0LL);
+        }
         tb_all += std::max(0LL, tb);
     }
-    fprintf(stderr, "    D64: %lld tail band steps' heads in segments over the arms, %lld tail band passes; the negative control: %d requests "
-                    "differ\n", d64_all, tb_all, skip_differ);
+    fprintf(stderr, "    D64: %lld tail band steps' heads in segments over the arms (%lld tails too, D64b), %lld tail band passes; the negative "
+                    "control: %d requests differ\n", d64_all, d64b_all, tb_all, skip_differ);
     CHECK(d64_all > 0);
+    CHECK(d64b_all > 0);
     CHECK(skip_differ > 0);
 }
 
