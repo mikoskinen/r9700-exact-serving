@@ -5321,6 +5321,145 @@ TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         }
     }
 }
+/* tp8 loop D61 (fn4 host_spin, both nodes; timing only): the DSpark-drafted pipeline with every critical-path wait spinning before it
+ * blocks -- the rank barrier, the leader's drafter-end wait, the follower's frame receive, the loops' naps -- serves one process's
+ * tokens at 2 lanes W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes, BG 2, READY_FIRST) from the start env, and in process at 2
+ * lanes (POST 20 -> 0, both nodes apply it); the leader's spin counts name the sites that waited; a bad env value is said and means
+ * 0. The D60 line beside it gives the host's means with and without the spin (the host backend: kernels run at issue). */
+TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    std::vector<Drafted> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    auto post = [](int port, int v, int want) {
+        std::string out;
+        Call c;
+        const int st = c.send(port, "/admin/fn4", json{ { "host_spin", v } }.dump()) ? c.read(&out) : -1;
+        CHECK_EQ(st, want);
+        if (want == 400) CHECK(out.find("host_spin takes N + 256 x M") != std::string::npos);
+        if (st != want) fprintf(stderr, "    POST host_spin %d: %d %s\n", v, st, out.c_str());
+    };
+    /* a site's waits over the run: the lines that partition it -- each change's 'before that change' line and the engine's end
+     * line ('since the last change of host_spin'); the periodic lines are running totals since the last change, not summed */
+    auto count = [](const std::string& log, const char* site, bool caught) {
+        long long sum = 0;
+        const std::string key = std::string(site) + " ";
+        for (size_t at = log.find("'s waits: "); at != std::string::npos; at = log.find("'s waits: ", at + 1)) {
+            const size_t b0 = log.rfind('\n', at), e0 = log.find('\n', at);
+            const std::string line = log.substr(b0 == std::string::npos ? 0 : b0 + 1,
+                                                e0 == std::string::npos ? std::string::npos : e0 - (b0 == std::string::npos ? 0 : b0 + 1));
+            if (line.find("since the last change of host_spin") == std::string::npos && line.find("before that change") == std::string::npos)
+                continue;
+            const size_t k = line.find(key);
+            if (k == std::string::npos) continue;
+            long long a = 0, b = 0;
+            if (std::sscanf(line.c_str() + k + key.size(), "%lld caught / %lld blocked", &a, &b) == 2) sum += caught ? a : b;
+        }
+        return sum;
+    };
+    struct Arm { int lanes; int bg; const char* cut; const char* env; bool post; };
+    for (const Arm a : { Arm{ 2, -1, "1,3", "20", false }, Arm{ 3, -1, "0,3", "20", false }, Arm{ 4, 2, "1,3", "20", false },
+                         Arm{ 2, -1, "1,3", nullptr, true }, Arm{ 2, -1, "1,3", "99999", false }, Arm{ 2, -1, "1,3", nullptr, false } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_BGRATE_LINE_S=1");
+        env.push_back("RADIANCE_PP_POST_PHASES=1");
+        if (a.env) env.push_back(std::string("RADIANCE_HOST_SPIN=") + a.env);
+        if (a.bg >= 0) {
+            env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
+            env.push_back("RADIANCE_PP_READY_FIRST=1");
+        }
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(spec, lane_shape(a.lanes)), env));
+        std::vector<Drafted> got;
+        if (a.post) {
+            post(pp.port, 20, 200);
+            got = drafted_set(pp.port);
+            post(pp.port, 0, 200);
+            post(pp.port, 4096, 400);
+            const std::vector<Drafted> again = drafted_set(pp.port);
+            int d2 = 0;
+            for (size_t i = 0; i < ref.size() && i < again.size(); ++i) d2 += ref[i].tok != again[i].tok;
+            CHECK_EQ(again.size(), ref.size());
+            CHECK_EQ(d2, 0);
+        } else {
+            got = drafted_set(pp.port);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));   /* one window line past the last request */
+        (void)drafted_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        long long accepted = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ref[i].tok != got[i].tok) ++differ;
+            accepted += got[i].accepted;
+        }
+        const long long lb = count(llog, "rank barrier", true), lbb = count(llog, "rank barrier", false);
+        const long long ld = count(llog, "drafter end", true), ldb = count(llog, "drafter end", false);
+        const long long fb = count(flog, "rank barrier", true), ff = count(flog, "frame receive", true);
+        const long long ffb = count(flog, "frame receive", false), naps = count(llog, "poll naps", true) + count(flog, "poll naps", true);
+        const long long fs = count(flog, "socket read", true), fsb = count(flog, "socket read", false);
+        double m[10] = {};
+        const char* rkey = "by phase over the run (tp8 loop D60): ";
+        if (const size_t at = llog.rfind(rkey); at != std::string::npos) {
+            double p[10], ended = 0;
+            long long n = 0, drops = 0;
+            (void)std::sscanf(llog.c_str() + at + std::strlen(rkey),
+                              "%lld chains (%lld not closed); p50 / mean ms -- commit %lf / %lf, the drafter's end (card) %lf / %lf (%lf %% "
+                              "had ended before the wait), drafter finish %lf / %lf, bookkeeping %lf / %lf, the loop until the lane plans %lf "
+                              "/ %lf, plan %lf / %lf, release + ship %lf / %lf, the ranks' issue %lf / %lf; the drafter's end -> its next "
+                              "head issued %lf / %lf, collect -> head issued %lf / %lf",
+                              &n, &drops, &p[0], &m[0], &p[1], &m[1], &ended, &p[2], &m[2], &p[3], &m[3], &p[4], &m[4], &p[5], &m[5],
+                              &p[6], &m[6], &p[7], &m[7], &p[8], &m[8], &p[9], &m[9]);
+        }
+        fprintf(stderr, "    %d lanes%s W(%s) %s: %d of %zu prompts differ (%lld accepted); leader barrier %lld caught / %lld blocked, "
+                        "drafter end %lld / %lld; follower barrier %lld caught, frames %lld / %lld, socket reads %lld / %lld; naps %lld; D60 mean ms drafter end "
+                        "%.3f, release + ship %.3f, issue %.3f, drafter end -> head %.3f\n",
+                a.lanes, a.bg >= 0 ? " BG 2" : "", a.cut, a.post ? "POST 20 -> 0" : a.env ? (std::string("RADIANCE_HOST_SPIN=") + a.env).c_str() : "unset",
+                differ, ref.size(), accepted, lb, lbb, ld, ldb, fb, ff, ffb, fs, fsb, naps, m[1], m[6], m[7], m[8]);
+        CHECK_EQ(differ, 0);
+        CHECK(accepted > 0);
+        const bool on = (a.env && !std::strcmp(a.env, "20")) || a.post;
+        if (on) {
+            CHECK(lb > 0);   /* the leader's rank barrier spun and caught releases / joins */
+            CHECK(fb > 0);   /* the follower's too */
+            CHECK(ff + ffb > 0);   /* the follower's frame receive took the spin */
+            CHECK(fs > 0);         /* its receive thread caught frames on the socket without blocking */
+            CHECK(ld + ldb > 0);   /* the drafter-end wait took the spin (the fixture drafts: so.early) */
+        } else {
+            CHECK_EQ(lb + lbb + ld + ldb + fb + ff + ffb + fs + fsb + naps, 0);   /* host_spin 0: no wait spun */
+        }
+        if ((a.post || (a.env && !std::strcmp(a.env, "20"))) && (fb == 0 || lb == 0)) {
+            for (const std::string* lg : { &llog, &flog })
+                for (size_t at = lg->find("host_spin"); at != std::string::npos; at = lg->find("host_spin", at + 1)) {
+                    const size_t b0 = lg->rfind('\n', at), e0 = lg->find('\n', at);
+                    fprintf(stderr, "      %s: %s\n", lg == &llog ? "leader" : "follower",
+                            lg->substr(b0 == std::string::npos ? 0 : b0 + 1, e0 - (b0 == std::string::npos ? 0 : b0 + 1)).c_str());
+                    at = e0 == std::string::npos ? lg->size() : e0;
+                }
+        }
+        if (a.post) {
+            CHECK(llog.find("fn4: switches host_spin=20 applied at step ") != std::string::npos);
+            CHECK(flog.find("fn4: switches host_spin=20 applied at step ") != std::string::npos);
+            CHECK(llog.find("fn4: switches host_spin=0 applied at step ") != std::string::npos);
+            CHECK(flog.find("fn4: switches host_spin=0 applied at step ") != std::string::npos);
+            CHECK(llog.find("before that change, host_spin 20's waits: ") != std::string::npos);
+        }
+        if (a.env && !std::strcmp(a.env, "99999"))
+            CHECK(llog.find("RADIANCE_HOST_SPIN=99999 is not 0 .. 4095") != std::string::npos);
+    }
+}
 /* ------------------------------------------------------------------ tp8 MERGE */
 /* Four long decoders, then newcomers in two waves with a pause between: each wave's BG steps merge the decode lanes into lane 0
  * while they are in flight, the pause splits them back, and the newcomers decode on in whichever lane form comes next. */

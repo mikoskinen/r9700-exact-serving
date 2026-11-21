@@ -1,5 +1,6 @@
 /* node_link.cpp -- the frames, the TCP transport and the rings of the two-node link (node_link.h). */
 #include "net/node_link.h"
+#include "runtime/fn4_switch.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -594,7 +595,21 @@ int NodeLink::read_exact(void* p, int64_t n, int idle_ms) {
     while (n > 0) {
         if (stopping_.load(std::memory_order_acquire)) return RAD_E_CANCELLED;
         pollfd pf{ fd_, POLLIN, 0 };
-        const int pr = poll(&pf, 1, 50);
+        /* tp8 loop D61 (fn4 host_spin site 4: the frame's way in): a socket with nothing to read is polled without blocking for up
+         * to the switch's bound before the blocking poll below (the receive thread then wakes on no interrupt); 0: the blocking
+         * poll at once, as before. Counted as 'socket read' on this node. */
+        int pr = 0;
+        if (const int64_t spin = fn4::host_spin_ns(fn4::kSpinFrame); spin > 0 && started_.load(std::memory_order_acquire)) {
+            const uint64_t s0 = now_ns();
+            uint64_t s1 = s0;
+            while ((pr = poll(&pf, 1, 0)) == 0 && !stopping_.load(std::memory_order_acquire) && (int64_t)((s1 = now_ns()) - s0) < spin) {
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+            }
+            fn4::note_spin(fn4::kSpinSock, pr > 0, (pr > 0 ? now_ns() : s1) - s0);
+        }
+        if (pr == 0) pr = poll(&pf, 1, 50);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return RAD_E_IO;
@@ -728,6 +743,7 @@ void NodeLink::rx_loop() {
         {
             std::lock_guard<std::mutex> lk(q_mu_);
             q_.push_back(std::move(m));
+            q_n_.store((uint32_t)q_.size(), std::memory_order_release);
         }
         q_cv_.notify_all();
     }
@@ -765,6 +781,24 @@ int NodeLink::recv(Msg* m, int timeout_ms) {
             return RAD_OK;
         }
     }
+    /* tp8 loop D61 (fn4 host_spin, site 4): spin on the queue first (a frame the receive thread pushed, or the link down), then wait
+     * on the condvar as before; host_spin 0: the wait at once, as before. A poll (timeout 0) never spins. */
+    if (timeout_ms != 0)
+        if (const int64_t spin = fn4::host_spin_ns(fn4::kSpinFrame); spin > 0 && q_n_.load(std::memory_order_acquire) == 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto t = t0;
+            bool seen = false;
+            for (uint32_t k = 1;; ++k) {
+                if (q_n_.load(std::memory_order_acquire) != 0 || !alive()) { seen = true; break; }
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+                if ((k & 63) == 0 && std::chrono::duration_cast<std::chrono::nanoseconds>((t = std::chrono::steady_clock::now()) - t0).count() >= spin)
+                    break;
+            }
+            if (seen) t = std::chrono::steady_clock::now();
+            fn4::note_spin(fn4::kSpinFrame, seen, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t - t0).count());
+        }
     std::unique_lock<std::mutex> lk(q_mu_);
     auto ready = [&] { return !q_.empty() || !alive(); };
     if (timeout_ms < 0) q_cv_.wait(lk, ready);
@@ -772,6 +806,7 @@ int NodeLink::recv(Msg* m, int timeout_ms) {
     if (q_.empty()) return RAD_E_IO;
     *m = std::move(q_.front());
     q_.pop_front();
+    q_n_.store((uint32_t)q_.size(), std::memory_order_release);
     return RAD_OK;
 }
 

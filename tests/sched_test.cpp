@@ -3577,7 +3577,8 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK_EQ(fn4::switch_index("ds41_rr1"), 108);        /* DRAFTER round 54, lever RR1 */
     CHECK_EQ(fn4::switch_index("dspark_mhr"), 109);      /* tp8 loop R45 (levers DMR / DML / DOF) */
     CHECK_EQ(fn4::switch_index("dspark_hs"), 110);       /* tp8 loop R45 (lever DHS) */
-    CHECK_EQ(i + 17, (int)fn4::kSwitches);
+    CHECK_EQ(fn4::switch_index("host_spin"), 111);       /* tp8 loop D61 */
+    CHECK_EQ(i + 18, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -3636,7 +3637,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 15, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 16, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3654,7 +3655,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 14, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 15, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3765,7 +3766,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 16, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101; U1: 102; P47: 103; D56: 104; P46: 105; W1s: 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 17, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101; U1: 102; P47: 103; D56: 104; P46: 105; W1s: 106; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
@@ -11788,7 +11789,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12760,7 +12761,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
@@ -13383,7 +13384,7 @@ TEST(ds41_csplit_is_a_follower_plugin_switch_after_aql_hdp) {
     REQUIRE(i == (int)fn4::kDs41Csplit);
     CHECK_EQ(i, (int)fn4::kAqlHdp + 1);
     CHECK_EQ(i, 103);
-    CHECK_EQ(i + 8, (int)fn4::kSwitches);   /* D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 9, (int)fn4::kSwitches);   /* D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "ds41_csplit");
@@ -13405,7 +13406,7 @@ TEST(dspark_mhr_and_dspark_hs_are_follower_plugin_switches_after_ds41_rr1) {
     CHECK_EQ(m, (int)fn4::kDs41Rr1 + 1);
     CHECK_EQ(m, 109);
     CHECK_EQ(h, 110);
-    CHECK_EQ(h + 1, (int)fn4::kSwitches);
+    CHECK_EQ(h + 2, (int)fn4::kSwitches);
     for (const int i : { m, h }) {
         CHECK(fn4::follower_switch(i));
         CHECK(!fn4::sched_switch(i));
@@ -16868,7 +16869,7 @@ TEST(sched_lane_room_the_switch_takes_0_1_and_starts_off) {
     CHECK_EQ(fn4::sched_lane_room(), 0);
     CHECK_EQ(fn4::switch_index("sched_lane_room"), (int)fn4::kSchedLaneRoom);
     CHECK_EQ((int)fn4::kSchedLaneRoom, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ((int)fn4::kSchedLaneRoom + 7, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ((int)fn4::kSchedLaneRoom + 8, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(!fn4::sched_switch(fn4::kSchedLaneRoom));
     CHECK(!fn4::follower_switch(fn4::kSchedLaneRoom));
     CHECK(fn4::state_json().find("\"sched_lane_room\": 0") != std::string::npos);
@@ -16887,7 +16888,7 @@ TEST(pp_send_ash_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, 105);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 6, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
+    CHECK_EQ(i + 7, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -16912,7 +16913,7 @@ TEST(aql_waitk_the_switch_takes_0_1_2_and_reads_its_env_unset) {
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, 106);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
     CHECK(std::string(fn4::switch_name(i)) == "aql_waitk");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -16947,7 +16948,7 @@ TEST(aql_ika_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kAqlIka);
     CHECK_EQ(i, 107);
     CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "aql_ika");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -16971,4 +16972,67 @@ TEST(aql_ika_the_switch_takes_0_1_needs_its_env_and_follows) {
     CHECK(DstSwitches::set("aql_ika", 0));
     CHECK_EQ(fn4::aql_ika(), 0);
     CHECK(fn4::state_json().find("\"aql_ika\": 0") != std::string::npos);
+}
+
+/* tp8 loop D61 (fn4 host_spin): 111, the last, the core's on BOTH nodes (a follower switch: each node's own waits), not the
+ * scheduler's; v = N + 256 x M in 0 .. 4095, anything else refused by name; unset (RADIANCE_HOST_SPIN unset here) = 0 = every wait
+ * blocks at once, as before. host_spin_ns(site) = N x 100 us where M is 0 (every site) or names the site, else 0; N 0 = off at every
+ * site whatever M. nap_us sleeps while its site is off (no count) and spins its length when on (counted 'caught'); the per-site counts
+ * are what spin_line prints, and a change of the switch prints and zeroes them (apply_pending -> spin_take). */
+TEST(host_spin_the_switch_takes_n_and_sites_and_starts_off) {
+    DstSwitches restore;
+    const int i = fn4::switch_index("host_spin");
+    REQUIRE(i == (int)fn4::kHostSpin);
+    CHECK_EQ(i, 111);
+    CHECK_EQ(i, (int)fn4::kDsparkHs + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(std::string(fn4::switch_name(i)) == "host_spin");
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    REQUIRE(std::getenv("RADIANCE_HOST_SPIN") == nullptr);
+    CHECK_EQ(fn4::host_spin(), 0);
+    CHECK(fn4::state_json().find("\"host_spin\": 0") != std::string::npos);
+    const int sites[4] = { fn4::kSpinBarrier, fn4::kSpinDrafterEnd, fn4::kSpinFrame, fn4::kSpinNap };
+    for (int s : sites) CHECK_EQ(fn4::host_spin_ns(s), (int64_t)0);
+    std::string err;
+    for (int v : { 0, 1, 255, 256, 4095 }) CHECK(fn4::check("host_spin", v, &err));
+    for (int v : { -1, 4096, 100000 }) {
+        CHECK(!fn4::check("host_spin", v, &err));
+        CHECK(err.find("host_spin takes N + 256 x M") != std::string::npos);
+    }
+    CHECK(DstSwitches::set("host_spin", 20));
+    CHECK_EQ(fn4::host_spin(), 20);
+    CHECK(fn4::state_json().find("\"host_spin\": 20") != std::string::npos);
+    for (int s : sites) CHECK_EQ(fn4::host_spin_ns(s), (int64_t)2000000);
+    CHECK(DstSwitches::set("host_spin", 5 + 256 * (fn4::kSpinBarrier | fn4::kSpinFrame)));
+    CHECK_EQ(fn4::host_spin_ns(fn4::kSpinBarrier), (int64_t)500000);
+    CHECK_EQ(fn4::host_spin_ns(fn4::kSpinFrame), (int64_t)500000);
+    CHECK_EQ(fn4::host_spin_ns(fn4::kSpinDrafterEnd), (int64_t)0);
+    CHECK_EQ(fn4::host_spin_ns(fn4::kSpinNap), (int64_t)0);
+    CHECK(DstSwitches::set("host_spin", 256 * fn4::kSpinAll));   /* N 0: off at every site */
+    for (int s : sites) CHECK_EQ(fn4::host_spin_ns(s), (int64_t)0);
+    /* the naps: off -> a sleep, nothing counted; on -> a spin of at least its length, counted */
+    CHECK(DstSwitches::set("host_spin", 0));
+    CHECK(fn4::spin_line().empty());
+    fn4::nap_us(20);
+    CHECK(fn4::spin_line().empty());
+    CHECK(DstSwitches::set("host_spin", 1 + 256 * fn4::kSpinNap));
+    const auto t0 = std::chrono::steady_clock::now();
+    fn4::nap_us(50);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::microseconds(50));
+    CHECK(fn4::spin_line().find("host_spin 2049's waits: poll naps 1 caught / 0 blocked") != std::string::npos);
+    fn4::note_spin(fn4::kSpinBarrier, false, 1000000);
+    fn4::note_spin(fn4::kSpinFrame, true, 0);
+    const std::string sl = fn4::spin_line();
+    CHECK(sl.find("rank barrier 0 caught / 1 blocked (spun 1.0 ms)") != std::string::npos);
+    CHECK(sl.find("frame receive 1 caught / 0 blocked") != std::string::npos);
+    CHECK(sl.find("drafter end") == std::string::npos);
+    fn4::note_spin(fn4::kSpinSock, true, 2000000);   /* the link's receive thread: site 4's bound, its own count */
+    CHECK(fn4::spin_line().find("socket read 1 caught / 0 blocked (spun 2.0 ms)") != std::string::npos);
+    CHECK(fn4::spin_line().find("frame receive 1 caught / 0 blocked") != std::string::npos);
+    /* a change prints the old value's counts and zeroes them */
+    CHECK(DstSwitches::set("host_spin", 0));
+    CHECK(fn4::spin_line().empty());
+    CHECK(!DstSwitches::set("host_spin", 4096));
+    CHECK_EQ(fn4::host_spin(), 0);
 }

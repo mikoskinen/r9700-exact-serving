@@ -590,6 +590,16 @@
  *                   1 is taken only where RADIANCE_DS41_DSPARK_HS=0 / 1 declared its ops (refused where a rank's declare
  *                   failed; a node without the env takes the value and issues as before). Proposals only. A plugin switch;
  *                   read at issue. Unset: the start's RADIANCE_DS41_DSPARK_HS (0 / 1).
+ *   host_spin       core, BOTH nodes (tp8 loop D61, DECODE round 48; 111 here, after dspark_hs): how a host thread waits on the
+ *                   pipeline's critical path. v = N + 256 x M: N 0..255 = spin up to N x 100 us (a pause loop on the condition)
+ *                   before blocking as before; 0 -- every wait blocks at once, as before (today's program); M 0..15 = the sites
+ *                   (0 = every site): 1 the rank barrier (a release and a join: core/runtime/rank_barrier.cpp), 2 the leader's
+ *                   wait for a lane's drafter passes (Engine::lane_tail_finish's step_end_), 4 a frame's way in (net::NodeLink:
+ *                   the receive thread's socket read, polled without blocking, and recv's queue wait), 8 the lane loops' poll naps (sleep_for 20 / 50 / 100 us: a spin of that length, so a
+ *                   poll lands every ~20 us instead of every ~80 with the default 50-us timer slack). Timing only: no issue
+ *                   order, step, byte or plan rule reads it (rule A). Read at every wait. Unset: the start's RADIANCE_HOST_SPIN
+ *                   (the same values; anything else = 0). A follower switch (each node's own threads); one machine takes it too
+ *                   (its rank barrier).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -826,7 +836,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -964,6 +974,23 @@ int  aql_waitk();
  * (rad::aql's PlayRun::put): 1 = lever IKA's fences, 0 = the packets without the lever; 2 (lever IKB) = 1 + core's copies / fills
  * in their self-acquiring forms (read at their launch: rad::aql::ikb_live_now). */
 int  aql_ika();
+/* tp8 loop D61 (host_spin): the switch once set, else RADIANCE_HOST_SPIN at start (0 = every wait blocks at once, as before). */
+int  host_spin();
+/* The sites host_spin's M names (bits); kSpinAll = every site. */
+static constexpr int kSpinBarrier = 1, kSpinDrafterEnd = 2, kSpinFrame = 4, kSpinNap = 8, kSpinAll = 15;
+/* Not a site of its own: the link's receive thread reading the socket (site 4's bound), counted apart ('socket read'). */
+static constexpr int kSpinSock = 16 | kSpinFrame;
+/* How long a wait at `site` spins before it blocks, ns (0 = it blocks at once: host_spin's N is 0 or M leaves the site out). */
+int64_t host_spin_ns(int site);
+/* One wait at `site` ended: `caught` when the spin saw the condition (no block), `ns` the time it spun. Counted per site. */
+void note_spin(int site, bool caught, uint64_t ns);
+/* "host_spin V's waits: rank barrier N caught / M blocked (spun S ms), ..." for the sites with any wait since the last change;
+ * empty while nothing spun. */
+std::string spin_line();
+/* spin_line's counts under host_spin = `label`, then zeroed (apply_pending prints them when host_spin changes). */
+std::string spin_take(int label);
+/* A pause-loop spin of `us` microseconds where host_spin_ns(kSpinNap) > 0, else std::this_thread::sleep_for(us) as before. */
+void nap_us(int us);
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
