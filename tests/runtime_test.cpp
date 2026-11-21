@@ -731,6 +731,153 @@ TEST(lever_trb_keeps_every_played_table_entry_and_waits_once_a_unit) {
                 (long long)waits[1], (long long)waits[2]);
 }
 
+/* Lever TRB's price on a card (DRAFTER round 76; a bench, not a check: run as `runtime_test perf_trb`): a played pass shaped
+ * like the one-machine DS trunk's MoE side -- 40 layers, each a blit, a gate_up op over FIVE expert tables, a blit, a down op
+ * over THREE, two blits (every op one real blit dispatch) -- and per step 27 units moved in (each unit = one expert's 8 table
+ * entries, one completed event) and 27 moved out (no event), as lq231's mover does (~27 promotions + 27 demotions a step a rank).
+ * Wall of step + stream sync, p50 over the steps, modes 0 / 1 / 2 in A B C C B A blocks; the device tables are compared with
+ * the residency table on the first steps of every block. */
+static int64_t g_trb_blit = 256;   /* perf_trb: bytes a blit (R76_BLIT) */
+static int k_blit(const RadArgs* a, RadStream s) {
+    return rad_memcpy_async(a->t[a->n_t - 1].data, a->t[0].data, g_trb_blit, s);
+}
+static int k_gu5(const RadArgs* a, RadStream s) { record("gu", a, s); return k_blit(a, s); }
+static int k_dn3(const RadArgs* a, RadStream s) { record("dn", a, s); return k_blit(a, s); }
+static const RadOperandSpec g_gu5_opds[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b0", RAD_OPD_WTAB, 0 }, { "b1", RAD_OPD_WTAB, 0 }, { "b2", RAD_OPD_WTAB, 0 },
+    { "b3", RAD_OPD_WTAB, 0 }, { "b4", RAD_OPD_WTAB, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOpSchema g_gu5_schema = { "moe_gemm5", g_gemm_params, 4, g_gu5_opds, 7, "five tables" };
+static const RadOperandSpec g_dn3_opds[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b0", RAD_OPD_WTAB, 0 }, { "b1", RAD_OPD_WTAB, 0 }, { "b2", RAD_OPD_WTAB, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOpSchema g_dn3_schema = { "moe_gemm3", g_gemm_params, 4, g_dn3_opds, 5, "three tables" };
+
+TEST(perf_trb_played_pass_table_refresh_cost) {
+    constexpr int L = 40, E = 16, T = 8, STEPS = 120, CHECKED = 3;
+    /* R76_UNITS (units in and out a step, default 27), R76_BLIT (bytes a blit, default 256; <= 4 MiB): the GPU's share of the wall */
+    const int UNITS = std::getenv("R76_UNITS") ? std::atoi(std::getenv("R76_UNITS")) : 27;
+    g_trb_blit = std::getenv("R76_BLIT") ? std::min<int64_t>(std::atoll(std::getenv("R76_BLIT")), 4 << 20) : 256;
+    const bool use_gate = std::getenv("R76_GATE") && std::getenv("R76_GATE")[0] == '1';
+    static uint16_t home[E][32], moved[E][32];
+    const char* order = "012210";
+    std::vector<double> p50[3];
+    std::vector<std::vector<void*>> first_tabs[3];
+    for (const char* m = order; *m; ++m) {
+        const int mode = *m - '0';
+        setenv("RADIANCE_TABLE_BATCH", std::string(1, *m).c_str(), 1);
+        Fixture f;
+        f.P.meta.n_layers = L;
+        f.P.meta.n_expert = E;
+        std::vector<rad_weight> w((size_t)L * T * E);
+        for (int l = 0; l < L; ++l)
+            for (int t = 0; t < T; ++t)
+                for (int e = 0; e < E; ++e)
+                    w[((size_t)l * T + t) * E + e] = f.add_weight(("blk." + std::to_string(l) + ".t" + std::to_string(t) + ".e" +
+                                                                   std::to_string(e)).c_str(), RAD_BF16, 8, 4, home[e]);
+        rad_buf x = f.add_buffer("x", RAD_BF16, 1024, 2048, 0);
+        rad_buf y = f.add_buffer("y", RAD_BF16, 1024, 2048, 4 << 20);
+        rad_op blit = f.add_op("blit", "M", { 8192 }, { k_blit }, { "blit" }, nullptr, {});
+        std::vector<rad_op> gu(L), dn(L);
+        for (int l = 0; l < L; ++l) {
+            std::vector<rad_weight> g, d;
+            for (int t = 0; t < 5; ++t) for (int e = 0; e < E; ++e) g.push_back(w[((size_t)l * T + t) * E + e]);
+            for (int t = 5; t < T; ++t) for (int e = 0; e < E; ++e) d.push_back(w[((size_t)l * T + t) * E + e]);
+            gu[(size_t)l] = f.add_op("moe_gemm5", "M", { 8192 }, { k_gu5 }, { "gu" }, &g_gu5_schema, g);
+            dn[(size_t)l] = f.add_op("moe_gemm3", "M", { 8192 }, { k_dn3 }, { "dn" }, &g_dn3_schema, d);
+        }
+        TableResidency res;
+        res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+        for (int l = 0; l < L; ++l)
+            for (int t = 0; t < T; ++t)
+                for (int e = 0; e < E; ++e) res.slot[(size_t)w[((size_t)l * T + t) * E + e]].ptr = home[e];
+        CHECK_OK(f.start(&res, false, /*record=*/true));
+        std::vector<RadEvent> ev((size_t)std::max(UNITS, 1), nullptr);
+        for (RadEvent& e : ev) CHECK_OK(rad_event_create(&e));
+        std::vector<void*> tabp;   /* every table's device array, in issue order (5 + 3 a layer) */
+        auto body = [&](Ctx& c) {
+            g_rec.clear();
+            for (int l = 0; l < L; ++l) {
+                const RadOperand ob[2] = { RAD_B(x), RAD_B(y) };
+                CHECK_OK(c.issue(blit, ob, 2, RAD_N_BATCH));
+                RadOperand og[7] = { RAD_B(x), RAD_WTAB(w[((size_t)l * T + 0) * E], E), RAD_WTAB(w[((size_t)l * T + 1) * E], E),
+                                     RAD_WTAB(w[((size_t)l * T + 2) * E], E), RAD_WTAB(w[((size_t)l * T + 3) * E], E),
+                                     RAD_WTAB(w[((size_t)l * T + 4) * E], E), RAD_B(y) };
+                CHECK_OK(c.issue(gu[(size_t)l], og, 7, RAD_N_BATCH));
+                CHECK_OK(c.issue(blit, ob, 2, RAD_N_BATCH));
+                RadOperand od[5] = { RAD_B(x), RAD_WTAB(w[((size_t)l * T + 5) * E], E), RAD_WTAB(w[((size_t)l * T + 6) * E], E),
+                                     RAD_WTAB(w[((size_t)l * T + 7) * E], E), RAD_B(y) };
+                CHECK_OK(c.issue(dn[(size_t)l], od, 5, RAD_N_BATCH));
+                CHECK_OK(c.issue(blit, ob, 2, RAD_N_BATCH));
+                CHECK_OK(c.issue(blit, ob, 2, RAD_N_BATCH));
+            }
+            if (tabp.empty())
+                for (const Rec& r : g_rec)
+                    if (r.kernel == std::string("gu") || r.kernel == std::string("dn"))
+                        for (int i = 1; i + 1 < r.n_t; ++i) tabp.push_back(r.t[i].data);
+        };
+        for (int i = 0; i < 4; ++i) CHECK_OK(f.step(1, i, body));   /* settle, record, audit, play */
+        REQUIRE_EQ(tabp.size(), (size_t)L * T);
+        uint32_t rng = 12345;
+        auto next = [&]() { rng = rng * 1103515245u + 12345u; return (rng >> 8) % (uint32_t)(L * E); };
+        std::vector<double> ms;
+        for (int i = 4; i < 4 + STEPS; ++i) {
+            for (int u = 0; u < UNITS; ++u) {   /* in: a completed event a unit; out: no event */
+                const uint32_t ui = next(), uo = next();
+                CHECK_OK(rad_event_record(ev[(size_t)u], f.ctx.stream()));
+                for (int t = 0; t < T; ++t) {
+                    rad::WeightSlot& si = res.slot[(size_t)w[((size_t)(ui / E) * T + t) * E + ui % E]];
+                    res.move(w[((size_t)(ui / E) * T + t) * E + ui % E], si.ptr == home[ui % E] ? moved[ui % E] : home[ui % E]);
+                    si.ready = ev[(size_t)u];
+                    rad::WeightSlot& so = res.slot[(size_t)w[((size_t)(uo / E) * T + t) * E + uo % E]];
+                    res.move(w[((size_t)(uo / E) * T + t) * E + uo % E], so.ptr == home[uo % E] ? moved[uo % E] : home[uo % E]);
+                    so.ready = nullptr;
+                }
+            }
+            CHECK_OK(rad_stream_sync(f.ctx.stream()));
+            /* R76_GATE=1: the pass is written behind a closed gate and timed from the gate's opening (the card's time alone,
+             * with the host's submission out of it, as in the served trunk pass where the host runs far ahead) */
+            void* gate = nullptr;
+            if (use_gate) CHECK_OK(rad_stream_gate(f.ctx.stream(), &gate));
+            auto t0 = std::chrono::steady_clock::now();
+            CHECK_OK(f.step(1, i, body));
+            if (gate) { t0 = std::chrono::steady_clock::now(); CHECK_OK(rad_gate_open(gate)); }
+            CHECK_OK(rad_stream_sync(f.ctx.stream()));
+            ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            if (i < 4 + CHECKED) {
+                std::vector<void*> all;
+                for (int k = 0; k < L * T; ++k) {
+                    std::vector<void*> v(E, nullptr);
+                    CHECK_OK(rad_memcpy_async(v.data(), tabp[(size_t)k], E * sizeof(void*), f.ctx.stream()));
+                    CHECK_OK(rad_stream_sync(f.ctx.stream()));
+                    for (int e = 0; e < E; ++e) {
+                        const int l = k / T, t = k % T;
+                        CHECK(v[(size_t)e] == res.slot[(size_t)w[((size_t)l * T + t) * E + e]].ptr);
+                    }
+                    all.insert(all.end(), v.begin(), v.end());
+                }
+                if (m - order < 3) first_tabs[mode].push_back(all);
+            }
+        }
+        std::sort(ms.begin(), ms.end());
+        p50[mode].push_back(ms[ms.size() / 2]);
+        const int64_t* n = f.ctx.trb_counts();
+        std::printf("perf_trb units %d blit %lld B gate %d block %c: played %lld, step p50 %.3f ms (p10 %.3f, p90 %.3f); stream waits %lld; TRB passes %lld, "
+                    "hoisted %lld, step tables %lld, waits put %lld / not again %lld, patch kernels %lld for %lld entries, held %lld\n",
+                    UNITS, (long long)g_trb_blit, (int)use_gate, *m, (long long)f.ctx.pass_counts().played, ms[ms.size() / 2], ms[ms.size() / 10], ms[ms.size() * 9 / 10],
+                    (long long)f.ctx.stream_waits(), (long long)n[0], (long long)n[1], (long long)n[2], (long long)n[3],
+                    (long long)n[4], (long long)n[5], (long long)n[6], (long long)n[7]);
+        f.ctx.shutdown();
+        for (RadEvent& e : ev) rad_event_destroy(e);
+    }
+    unsetenv("RADIANCE_TABLE_BATCH");
+    CHECK(first_tabs[0] == first_tabs[1]);
+    CHECK(first_tabs[0] == first_tabs[2]);
+    for (int mode = 0; mode < 3; ++mode)
+        std::printf("perf_trb mode %d: step p50 %.3f / %.3f ms (A / B block)\n", mode, p50[mode][0], p50[mode][1]);
+}
+
 /* A table's run is fixed by the declaration. The weights declared at a table position (OpInfo::
  * weight_opd) are bound as one table before the first step. A declared run with a gap is refused
  * there (the kernel strides from one base, so a gap reads the wrong expert), and an issue naming
