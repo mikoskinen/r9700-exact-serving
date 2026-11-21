@@ -13,7 +13,7 @@
  * today on the original), and one changed union position (a tile read from a wrong ring slot).
  *
  * Lever KRW (round 12): today's kernel at O_KRAW (arms 2 / 3 / 4 of r4d_attn_gq6_opt_bench) = today byte for byte, with a
- * negative control (arm 3 on the changed cache).
+ * negative control (arm 3 on the changed cache); and at the decode heights (q_len 4 / 5 = two waves, RADIANCE_FN4_GQ_KRAW_DEC).
  *
  *   r4d_emu_qwalk [quick] */
 #include <hip/hip_runtime.h>
@@ -159,6 +159,18 @@ std::vector<uint8_t> today_arm(const Sel& s, const Ops& o, int arm, const std::v
     return sc;
 }
 
+/* lever KRW at the decode heights (RADIANCE_FN4_GQ_KRAW_DEC=1): verify rows of QL = 4 / 5 queries a sequence (24 / 30 rows =
+ * two waves) over the first S / QL rows' tables, today's 2-wave word vs K in one round without the scheduling barrier */
+constexpr int kOptDec = 3429947, kOptDecKraw = (kOptDec | O_KRAW) & ~O_SGB;
+std::vector<uint8_t> verify(const Sel& s, const Ops& o, int QL, bool kraw, const std::vector<uint8_t>* kv_over = nullptr) {
+    std::vector<uint8_t> kv = kv_over ? *kv_over : o.kv, sc;
+    R4DArgs a = args(s, o, kv, sc);
+    a.num_seqs = s.S / QL; a.q_len = QL;
+    if (kraw) hipLaunchKernelGGL((r4d_attn_decode_kernel<2, 16, 256, 6, 4, 0, kOptDecKraw>), dim3(1, 1, a.num_seqs), dim3(64), 0, nullptr, a, 1);
+    else      hipLaunchKernelGGL((r4d_attn_decode_kernel<2, 16, 256, 6, 4, 0, kOptDec>),     dim3(1, 1, a.num_seqs), dim3(64), 0, nullptr, a, 1);
+    return sc;
+}
+
 void launch_walk(int R, int M, const R4DArgs& a, int groups, const int* ul, const int* uo, const int* up, int* ws) {
 #define WL(RR, MM) if (R == RR && M == MM) { hipLaunchKernelGGL((r4d_attn_walk_kernel<RR, MM>), dim3(groups, 1, 1), \
                                                                dim3((RR + r4dwalk::NLW) * 32), 0, nullptr, a, ul, uo, up, ws, 0); return; }
@@ -197,6 +209,14 @@ int main(int argc, char** argv) {
         const std::vector<uint8_t> ref = today(s, o);
         const std::vector<uint8_t> ref2 = today(s, o);
         check(ref == ref2, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, "today twice (the compare's control)"));
+        for (int QL : { 4, 5 }) {               /* lever KRW at the decode heights */
+            const std::vector<uint8_t> r0 = verify(s, o, QL, false), r1 = verify(s, o, QL, true);
+            size_t bad = 0;
+            for (size_t i = 0; i < r0.size(); ++i) bad += r0[i] != r1[i];
+            char tail[140];
+            std::snprintf(tail, sizeof tail, "KRW decode q_len %d (2 waves, K in one round) = today (%zu of %zu partial bytes differ)", QL, bad, r0.size());
+            check(bad == 0, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, tail));
+        }
         for (int arm = 2; arm <= 4; ++arm) {   /* lever KRW */
             const std::vector<uint8_t> got = today_arm(s, o, arm);
             size_t bad = 0;
@@ -228,6 +248,10 @@ int main(int argc, char** argv) {
             check(got != ref, fmt_case(c.S, c.P0, c.n, c.partial, 8, 15, "NEGATIVE: one cache code changed -> partials differ"));
             const std::vector<uint8_t> gk = today_arm(s, o, 3, &kv2);
             check(gk != ref, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, "NEGATIVE: KRW arm 3 on the changed cache -> partials differ"));
+            std::vector<uint8_t> kv3 = o.kv;   /* the verify sequences read rows 0 .. S / QL - 1's tables: change row 1's 4th page */
+            kv3[(size_t)s.table[(size_t)1 * s.W + 3] * BS * ROWB + 1 * ROWB + 17] ^= 0x10;
+            const std::vector<uint8_t> gd = verify(s, o, 4, true, &kv3);
+            check(gd != verify(s, o, 4, false), fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, "NEGATIVE: KRW decode on the changed cache -> partials differ"));
         }
         {
             int ws[2] = { 0, 0 };

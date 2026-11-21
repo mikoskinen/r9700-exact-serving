@@ -141,6 +141,19 @@ static int g8_gq_kraw_arm() {
     }();
     return v;
 }
+/* ... and its decode heights (RADIANCE_FN4_GQ_KRAW_DEC=1, read once): 2-4 waves; only the h256 fp8 instances */
+template <int HEAD_DIM, int KVP, int XOPT>
+static bool g8_gq_kraw_dec() {
+    if constexpr (HEAD_DIM != 256 || KVP != 0 || XOPT != 0) return false;
+    static const bool v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_GQ_KRAW_DEC");
+        const bool r = e && std::atoi(e) == 1;
+        if (r) std::fprintf(stderr, "radiance: libr4d: attn_decode h256 gqa6 bs4 fp8 2-4-wave rows with K in one round "
+                                    "(RADIANCE_FN4_GQ_KRAW_DEC=1, Qwen loop lever KRW)\n");
+        return r;
+    }();
+    return v;
+}
 #endif
 
 template <int HEAD_DIM, int KVP, int XOPT = 0>
@@ -189,6 +202,19 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
                                                        G8_D_OPT | O_V8 | XOPT>),
                            dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
     }
+#if R4D_ATTN_GQA == 6 && G8_BLOCK_SIZE == 4
+    /* lever KRW at the decode heights (RADIANCE_FN4_GQ_KRAW_DEC=1): 2-4 waves (17-64 rows: the verify rows) with K in one
+     * round and no scheduling barrier (arm 3's word without O_V8), the same bytes; fp8 cache only */
+    else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() && nw == 2)
+        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<2, G8_D_TILE, 256, 6, 4, 0, (G8_D_OPT | O_KRAW) & ~O_SGB>),
+                           dim3(splits, a->kv_heads, a->num_seqs), dim3(64), 0, *a, splits);
+    else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() && nw == 3)
+        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<3, G8_D_TILE, 256, 6, 4, 0, (G8_D_OPT | O_KRAW) & ~O_SGB>),
+                           dim3(splits, a->kv_heads, a->num_seqs), dim3(96), 0, *a, splits);
+    else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() && nw == 4)
+        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<4, G8_D_TILE, 256, 6, 4, 0, (G8_D_OPT | O_KRAW) & ~O_SGB>),
+                           dim3(splits, a->kv_heads, a->num_seqs), dim3(128), 0, *a, splits);
+#endif
     else if (nw == 2) G8_LAUNCH(2);
     else if (nw == 3) G8_LAUNCH(3);
 #if G8_MAX_DECODE_ROWS > 64
