@@ -315,6 +315,13 @@ if(R4D_IKA AND R4D_IKA_CHAIN AND R4D_IKA_CHAIN_X)
     set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${f}" APPEND PROPERTY COMPILE_DEFINITIONS R4D_IKA_CHAIN_X=1)
   endforeach()
 endif()
+# Lever CW7 (r4d_chain.h, DRAFTER track round 66): the chained WAIT in a form the compiler's uniform-load analysis does not take
+# as a memory clobber (lane 0 polls by a raw buffer load; the scalar data cache emptied by a non-volatile asm), so a kernel's body
+# compiles as without the wait. Applies to every chained form (CIK's entry and the named CHAIN=true forms). OFF = the wait as before.
+option(R4D_CHAIN_WAIT7 "libr4d: the chained wait's codegen-neutral form (lever CW7)" OFF)
+if(R4D_CHAIN_WAIT7)
+  target_compile_definitions(libr4d PRIVATE R4D_CHAIN_WAIT=7)
+endif()
 if(R4D_HAVE_GGML)
   target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
   target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})

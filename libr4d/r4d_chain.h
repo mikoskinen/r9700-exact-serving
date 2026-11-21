@@ -66,6 +66,52 @@ __device__ __forceinline__ void r4d_chain_acquire() {
     asm volatile("s_dcache_inv" ::: "memory");
 }
 
+#ifndef R4D_CHAIN_WAIT
+#define R4D_CHAIN_WAIT 1
+#endif
+#if R4D_CHAIN_WAIT == 7
+// Lever CW7 (DRAFTER track round 66; CMake R4D_CHAIN_WAIT7): the same wait and acquire in a form that does not change the body's
+// code. LLVM's uniform-load analysis (amdgpu.noclobber) takes an atomic load, an s_sleep, a volatile asm and the s_dcache_inv
+// builtin as memory clobbers (fences, s_barrier and sched_barrier not): behind form 1 every later load of a pointer read from
+// memory stops being a scalar load (exl3r4d's routed-expert GEMM: waterfall loops round each weight load, +56..+68 % at 16-48 rows,
+// DRAFTER round 65; this library: ds41_index_score's scalar forms 145-166 -> 256 VGPRs + spills, xm_seq / xm_gemv, post_collapse_norm
+// 8-stream, every IKA kernel's entry +2 vector loads -- PREFILL NOTE 13:20). Here lane 0 polls by a raw buffer load at device
+// scope (a read-only intrinsic), the loop kept by a sched_barrier (a side effect the analysis ignores); the load's own latency
+// (~0.5-1 us at L2) is the back-off. The scalar data cache is then emptied by the same wave through a NON-volatile asm with an
+// SGPR output (readnone to the IR: no MemoryDef), fed the last polled word (so it follows the loop) and kept by a branch on its
+// output; s_wait_kmcnt inside it, so the block barrier releases the other waves only after the invalidate completed. Every wave of
+// a block runs on the WGP whose scalar cache that wave emptied (cohbench3 r50d: wave 0 + barrier s_dcache_inv 0 stale; the chained
+// case: drafter/kit/mes/coh4.hip).
+__device__ __forceinline__ unsigned long long r4d_chain_peek(const unsigned long long* ctr, unsigned k) {
+    const __amdgpu_buffer_rsrc_t rs = __builtin_amdgcn_make_buffer_rsrc((void*)ctr, (short)0, 8, 0x31004000);
+    /* soffset (k >> 31): 0 for 2^31 polls but not provably so, so the load is not loop-invariant; past 8 bytes the bound reads 0 */
+    const auto v = __builtin_amdgcn_raw_buffer_load_b64(rs, 0, (int)(k >> 31), 0x10 /* SCOPE_DEV */);
+    return (unsigned long long)v[0] | ((unsigned long long)v[1] << 32);
+}
+__device__ __forceinline__ void r4d_chain_wait() {
+    const R4dChainRec* r = r4d_chain_rec();
+    if (!r) return;
+    if (r->target != 0) {
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            const unsigned long long target = r->target;
+            const unsigned long long* ctr = r->ctr;
+            unsigned long long v;
+            unsigned k = 0;
+            while ((v = r4d_chain_peek(ctr, k)) < target) {
+                ++k;
+                __builtin_amdgcn_sched_barrier(0);
+            }
+            unsigned z;
+            asm("s_dcache_inv\n\ts_wait_kmcnt 0x0\n\ts_mov_b32 %0, 0" : "=s"(z) : "s"((unsigned)v));
+            if (z) __builtin_amdgcn_sched_barrier(0);
+        }
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        return;
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+}
+#else
 __device__ __forceinline__ void r4d_chain_wait() {
     const R4dChainRec* r = r4d_chain_rec();
     if (!r) return;
@@ -91,6 +137,7 @@ __device__ __forceinline__ void r4d_chain_wait() {
     }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 }
+#endif  /* R4D_CHAIN_WAIT */
 
 // After the block's last write: release, then one add a block.
 __device__ __forceinline__ void r4d_chain_done() {
