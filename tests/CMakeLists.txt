@@ -572,7 +572,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
                   ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f
-                  ds41tw i8wide qrgt gnq8)
+                  ds41tw i8wide qrgt gnq8 qwalk)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -624,6 +624,7 @@ else()
                 ${R4D_EMU}/test_ds41dkv.cpp
                 ${R4D_EMU}/test_ds41spd.cpp ${R4D_EMU}/test_ds41p30f.cpp ${R4D_EMU}/test_ds41tw.cpp
                 ${R4D_EMU}/test_i8wide.cpp ${R4D_EMU}/test_qrgt.cpp ${R4D_EMU}/test_gnq8.cpp
+                ${R4D_EMU}/test_qwalk.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -663,9 +664,11 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw qrgt gnq8)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw qrgt gnq8 qwalk)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
+  # qfn-on-ds lever P-2 (Qwen loop round 11): the union walk's partials against today's sparse prefill attention row.
+  set_tests_properties(r4d_emu_qwalk PROPERTIES LABELS "r4d_emu" TIMEOUT 600)
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
   # ~2 min alone on the emulator (the 300k decode-form case), longer beside a parallel suite.
   set_tests_properties(r4d_emu_ds41idx PROPERTIES LABELS "r4d_emu" TIMEOUT 900

@@ -23,3 +23,7 @@
 #define R4D_ATTN_V4   1
 
 #include "r4d_attn_paged_gqa8.hip"
+
+// Lever P-2's bench form (Qwen loop round 11, QUEUE Q8): the q-tiled union walk over this unit's fp8 sparse prefill
+// geometry, reached only through r4d_attn_walk_gq6_bench (r4d_selftest --perfatwalk); no row, no engine path.
+#include "r4d_attn_walk.h"

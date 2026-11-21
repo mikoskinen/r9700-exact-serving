@@ -5762,6 +5762,181 @@ static void attn_sel_perf(const Plugin& pl, const char* path, int64_t rows_want,
     arm("real", 0);   /* again: the first arm's warm-up / clock drift */
 }
 
+/* --perfatwalk FILE [rows] [iters] (qfn-on-ds, Qwen loop round 11, QUEUE Q8 = lever P-2's bench form): today's sparse
+ * prefill attention (attn_decode_gq_h256_gqa6_bs4_fp8kv, one split a row) against the q-tiled union walk
+ * (r4d_attn_walk_gq6_bench, libr4d/r4d_attn_walk.h) over the same real selection dump, q, gate and cache as --perfatsel:
+ * the walk's o, int8 codes and scales byte for byte against today's (the walk writes today's partials and runs today's
+ * merge), us a call each, the tiles served from the ring vs the cache, and the bytes each form reads. Arms R (rows a
+ * workgroup) x M (pages a round; ring 2 M). The union lists are built here on the host (the engine form would build
+ * them on the card from the selection); their cost is not in the walk's time. */
+static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want, int iters) {
+    if (iters <= 0) iters = 20;
+    const char* rowname = "attn_decode_gq_h256_gqa6_bs4_fp8kv";
+    const RadKernelInfo* rk = find(pl, rowname);
+    typedef int (*WalkFn)(const RadArgs*, RadStream, const int*, const int*, const int*, int, int, int*);
+    const WalkFn wf = (WalkFn)dlsym(pl.h, "r4d_attn_walk_gq6_bench");
+    if (!rk || !wf) { std::printf("--perfatwalk: %s or r4d_attn_walk_gq6_bench absent\n", rowname); return; }
+    FILE* f = std::fopen(path, "rb");
+    if (!f) { std::printf("--perfatwalk: cannot open %s\n", path); return; }
+    int64_t hdr[3] = { 0, 0, 0 };
+    if (std::fread(hdr, 8, 3, f) != 3 || hdr[0] <= 0 || hdr[1] <= 0 || hdr[0] > (1 << 20) || hdr[1] > 4096) {
+        std::printf("--perfatwalk: bad header in %s\n", path); std::fclose(f); return;
+    }
+    const int64_t TR = hdr[0], W = hdr[1], P0 = hdr[2];
+    std::vector<int32_t> nsel((size_t)TR), sel((size_t)(TR * W));
+    const bool rd = std::fread(nsel.data(), 4, nsel.size(), f) == nsel.size() &&
+                    std::fread(sel.data(), 4, sel.size(), f) == sel.size();
+    std::fclose(f);
+    if (!rd) { std::printf("--perfatwalk: short file %s\n", path); return; }
+    const int64_t S = rows_want > 0 && rows_want < TR ? rows_want : TR;
+    const int64_t nq = 6, nkv = 1, hd = 256, bs = 4, rowb = 2 * hd;
+    int32_t bmax = 0;
+    for (int64_t r = 0; r < S; ++r)
+        for (int64_t b = 0; b < nsel[(size_t)r] && b < W; ++b) bmax = std::max(bmax, sel[(size_t)(r * W + b)]);
+    const int64_t nb = std::max<int64_t>((P0 + S) / bs + 1, (int64_t)bmax + 1);
+    std::printf("attn_walk_perf %s: %lld of %lld rows from position %lld, width %lld, %lld pages (%.1f MB of fp8 KV), %d launches a form\n",
+                path, (long long)S, (long long)TR, (long long)P0, (long long)W, (long long)nb, (double)(nb * bs * rowb) / 1e6, iters);
+    uint32_t st = 0x7a11u;   /* --perfatsel's operands, but the cache's E4M3 codes at magnitude 1/8 .. 2 (below) */
+    auto rnd = [&](float span) {
+        st = st * 1664525u + 1013904223u;
+        return ((float)(st >> 8) / 16777216.0f * 2.0f - 1.0f) * span;
+    };
+    std::vector<uint16_t> hq((size_t)(S * nq * hd)), hqg((size_t)(S * nq * 2 * hd));
+    for (auto& x : hq)  x = h_to_bf16(rnd(2.0f));
+    for (auto& x : hqg) x = h_to_bf16(rnd(6.0f));
+    const size_t cbytes = (size_t)(nb * nkv * bs * rowb);
+    std::vector<uint8_t> hc(cbytes);
+    /* magnitude 1/8 .. 2 (exponent field 4 .. 8): every key's score a few units, so every tile weighs in the softmax and
+     * the byte compare sees each one (random bytes reach 448 and leave one key a row) */
+    for (auto& x : hc) {
+        st = st * 1664525u + 1013904223u;
+        x = (uint8_t)(((st >> 31) << 7) | ((4 + (st >> 8) % 5) << 3) | ((st >> 16) & 7));
+    }
+    std::vector<float> hds((size_t)(S * nkv));
+    for (auto& x : hds) x = 0.75f + 0.25f * (rnd(1.0f) + 1.0f);
+    const size_t qb = hq.size() * 2, ob = (size_t)(S * nq * hd) * 2, q8b = (size_t)(S * nq * hd),
+                 sb = (size_t)(S * nq * (hd / 128)) * 4;
+    void* d_q = dalloc(qb); void* d_qg = dalloc(hqg.size() * 2); void* d_c = dalloc(cbytes);
+    void* d_kd = dalloc(hds.size() * 4); void* d_vd = dalloc(hds.size() * 4);
+    void* d_o = dalloc(ob); void* d_q8 = dalloc(q8b); void* d_s = dalloc(sb);
+    if (!d_q || !d_qg || !d_c || !d_kd || !d_vd || !d_o || !d_q8 || !d_s) { std::printf("  alloc failed\n"); return; }
+    st_memcpy(d_q, hq.data(), qb, hipMemcpyHostToDevice);
+    st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_c, hc.data(), cbytes, hipMemcpyHostToDevice);
+    st_memcpy(d_kd, hds.data(), hds.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_vd, hds.data(), hds.size() * 4, hipMemcpyHostToDevice);
+    RadTensor gate = T((uint8_t*)d_qg + hd * 2, RAD_BF16, { S, nq, hd });
+    gate.stride[0] = nq * 2 * hd;
+    gate.stride[1] = 2 * hd;
+    std::vector<int32_t> table((size_t)(S * W), 0), used((size_t)S, 0);
+    double kv = 0;
+    for (int64_t r = 0; r < S; ++r) {
+        const int64_t n = std::min<int64_t>(nsel[(size_t)r], W);
+        for (int64_t b = 0; b < n; ++b) table[(size_t)(r * W + b)] = sel[(size_t)(r * W + b)];
+        used[(size_t)r] = (int32_t)(n * bs);
+        kv += (double)(n * bs * rowb);
+    }
+    std::vector<RadTensor> ts = {
+        T(d_q, RAD_BF16, { S, nq, hd }), T(d_c, RAD_F8E4M3, { nb, nkv, bs, rowb }), TI32({ S, W }, table), TI32({ S }, used),
+        T(d_kd, RAD_F32, { S, nkv }), T(d_vd, RAD_F32, { S, nkv }), RadTensor{}, T(d_o, RAD_BF16, { S, nq * hd }),
+        gate, T(d_q8, RAD_I8, { S, nq * hd }), T(d_s, RAD_F32, { S, nq * hd / 128 }) };
+    std::vector<RadParam> ps = {
+        PI("q_len", 1), PI("head_dim", hd), PI("gqa", nq / nkv), PI("block_size", bs), PI("causal", 1), PI("window", 0),
+        PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"), PI("n_head", nq), PI("max_seqs", S), PI("max_ctx", W * bs),
+        PI("group", 128), PS("act", "sigmoid") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    if (rk->scratch) {
+        const int64_t need = rk->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    auto timed = [&](auto&& launch) {
+        hipEvent_t e0, e1;
+        st_ev_create(&e0);
+        st_ev_create(&e1);
+        st_ev_record(e0, nullptr);
+        for (int i = 0; i < iters; ++i) launch();
+        st_ev_record(e1, nullptr);
+        st_ev_sync(e1);
+        float ms = 0;
+        st_ev_elapsed(&ms, e0, e1);
+        st_ev_destroy(e0);
+        st_ev_destroy(e1);
+        return (double)ms * 1000.0 / iters;
+    };
+    std::vector<uint8_t> ref_o(ob), ref_q8(q8b), ref_s(sb), got_o(ob), got_q8(q8b), got_s(sb);
+    auto fetch = [&](std::vector<uint8_t>& o, std::vector<uint8_t>& q8, std::vector<uint8_t>& s8) {
+        st_memcpy(o.data(), d_o, ob, hipMemcpyDeviceToHost);
+        st_memcpy(q8.data(), d_q8, q8b, hipMemcpyDeviceToHost);
+        st_memcpy(s8.data(), d_s, sb, hipMemcpyDeviceToHost);
+    };
+    auto poison = [&]() {
+        st_memset(d_o, 0xab, ob); st_memset(d_q8, 0xab, q8b); st_memset(d_s, 0xab, sb);
+        if (a.scratch) st_memset(a.scratch, 0xab, (size_t)a.scratch_bytes);
+    };
+    poison();
+    int rc = rk->launch(&a, nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  today     rc=%d (not served)\n", rc); return; }
+    fetch(ref_o, ref_q8, ref_s);
+    rc = rk->launch(&a, nullptr);   /* today twice: its own determinism, the control of the compare */
+    st_stream_sync(nullptr);
+    fetch(got_o, got_q8, got_s);
+    const bool det = got_o == ref_o && got_q8 == ref_q8 && got_s == ref_s;
+    const double us0 = timed([&] { rk->launch(&a, nullptr); });
+    std::printf("  today     %9.1f us a call   %7.1f GB/s of per-row KV reads (%.1f MB a call)   repeat %s\n", us0,
+                kv / (us0 * 1e3), kv / 1e6, det ? "IDENTICAL" : "DIFFERENT");
+    void* d_ul = dalloc((size_t)S * W * 4); void* d_uo = dalloc((size_t)(S + 2) * 4); void* d_up = dalloc((size_t)S * W * 4);
+    void* d_ws = dalloc(16);
+    if (!d_ul || !d_uo || !d_up || !d_ws) { std::printf("  alloc failed\n"); return; }
+    const int cfg[][2] = { { 4, 15 }, { 8, 15 }, { 16, 15 }, { 8, 7 }, { 16, 7 } };
+    for (const auto& cf : cfg) {
+        const int R = cf[0], M = cf[1];
+        std::vector<int32_t> ulist, uoff, upos((size_t)(S * W), -1);
+        uoff.push_back(0);
+        for (int64_t r0 = 0; r0 < S; r0 += R) {
+            std::vector<int32_t> u;
+            for (int64_t r = r0; r < std::min<int64_t>(S, r0 + R); ++r) {
+                const int64_t n = used[(size_t)r] / bs;
+                u.insert(u.end(), table.begin() + r * W, table.begin() + r * W + n);
+            }
+            std::sort(u.begin(), u.end());
+            u.erase(std::unique(u.begin(), u.end()), u.end());
+            for (int64_t r = r0; r < std::min<int64_t>(S, r0 + R); ++r) {
+                const int64_t n = used[(size_t)r] / bs;
+                for (int64_t b = 0; b < n; ++b)
+                    upos[(size_t)(r * W + b)] = (int32_t)(std::lower_bound(u.begin(), u.end(), table[(size_t)(r * W + b)]) - u.begin());
+            }
+            ulist.insert(ulist.end(), u.begin(), u.end());
+            uoff.push_back((int32_t)ulist.size());
+        }
+        st_memcpy(d_ul, ulist.data(), ulist.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_uo, uoff.data(), uoff.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_up, upos.data(), upos.size() * 4, hipMemcpyHostToDevice);
+        st_memset(d_ws, 0, 16);
+        poison();
+        rc = wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, (int*)d_ws);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  walk R%-2d M%-2d rc=%d (not served)\n", R, M, rc); continue; }
+        fetch(got_o, got_q8, got_s);
+        int32_t ws[4] = { 0, 0, 0, 0 };
+        st_memcpy(ws, d_ws, 16, hipMemcpyDeviceToHost);
+        int64_t bo = 0, bq = 0, bsd = 0;
+        for (size_t i = 0; i < ob; ++i) bo += got_o[i] != ref_o[i];
+        for (size_t i = 0; i < q8b; ++i) bq += got_q8[i] != ref_q8[i];
+        for (size_t i = 0; i < sb; ++i) bsd += got_s[i] != ref_s[i];
+        const double us = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr); });
+        const double ub = (double)ulist.size() * bs * rowb;
+        std::printf("  walk R%-2d M%-2d %9.1f us a call (%+.1f %% vs today)   bytes vs today: o %lld / q8 %lld / s %lld differ -> %s   "
+                    "tiles ring %d / cache %d   union %.1f MB a call (per-row reads / union %.2f)\n",
+                    R, M, us, 100.0 * (us - us0) / us0, (long long)bo, (long long)bq, (long long)bsd,
+                    (bo || bq || bsd) ? "DIFFERENT" : "IDENTICAL", ws[0], ws[1], ub / 1e6, ub > 0 ? kv / ub : 0.0);
+    }
+    const double us1 = timed([&] { rk->launch(&a, nullptr); });
+    std::printf("  today     %9.1f us a call (again: drift)\n", us1);
+}
+
 /* kv_store, both widths, against an exactly representable set so the check is equality: halves
  * and integers up to 8 survive E4M3 (three mantissa bits) and bf16 unchanged, so `h_e4m3` or
  * `h_bf16` of what landed must equal what went in.
@@ -43179,7 +43354,9 @@ static void usage(void) {
                 "             comma list, default 1..64 and 65..4160).\n"
                 "  --perfatsel FILE [rows] [iters]: lever P-2's sizing (Qwen loop round 10): the TP4 sparse prefill\n"
                 "             attention (attn_decode_gq_h256_gqa6_bs4_fp8kv) over a QSA selection dump (RADIANCE_FN4_QSADUMP\n"
-                "             format), arms real / shared / disjoint / quarter, and the dump's union factors.\n");
+                "             format), arms real / shared / disjoint / quarter, and the dump's union factors.\n"
+                "  --perfatwalk FILE [rows] [iters]: lever P-2's bench form (Qwen loop round 11): the same attention\n"
+                "             against the q-tiled union walk (r4d_attn_walk_gq6_bench) over the dump, byte compare + us a call.\n");
 }
 
 #include "r4d_selftest_bi.inc"   /* --bicheck: lever BI, a row alone vs inside an M-row launch */
@@ -43206,6 +43383,7 @@ int main(int argc, char** argv) {
     const char* mla_fill = "prefill";
     int qsa_it = 200;
     const char* atsel_path = nullptr;   /* --perfatsel (lever P-2's sizing) */
+    bool atsel_walk = false;            /* --perfatwalk (lever P-2's bench form) */
     long long atsel_rows = 2048;
     int atsel_it = 20;
     long long hc_m = 0;
@@ -43387,7 +43565,8 @@ int main(int argc, char** argv) {
             dsa_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_it = (int)std::strtol(argv[++i], nullptr, 0);
-        } else if (!std::strcmp(argv[i], "--perfatsel")) {
+        } else if (!std::strcmp(argv[i], "--perfatsel") || !std::strcmp(argv[i], "--perfatwalk")) {
+            atsel_walk = !std::strcmp(argv[i], "--perfatwalk");
             /* lever P-2's sizing: the sparse prefill attention over a real QSA selection dump */
             if (i + 1 >= argc) { usage(); return 2; }
             atsel_path = argv[++i];
@@ -44125,7 +44304,8 @@ int main(int argc, char** argv) {
     if (atsel_path) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        attn_sel_perf(pl, atsel_path, atsel_rows, atsel_it);
+        if (atsel_walk) attn_walk_perf(pl, atsel_path, atsel_rows, atsel_it);
+        else            attn_sel_perf(pl, atsel_path, atsel_rows, atsel_it);
         dfree_all();
 #else
         skip("attention over a selection dump", "built without HIP");

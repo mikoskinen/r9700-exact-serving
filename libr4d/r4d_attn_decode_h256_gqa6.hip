@@ -906,7 +906,11 @@ template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu (test_qwalk): the host has no extern __shared__; the launch's dynamic LDS */
+    float* sw = (float*)emu_dyn_lds();
+#else
     extern __shared__ float sw[];
+#endif
     __shared__ float red[HEAD_DIM];
     const int job = blockIdx.x, d = threadIdx.x;
     const int tok = job / a.q_heads;
