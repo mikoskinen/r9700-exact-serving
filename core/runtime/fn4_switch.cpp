@@ -102,9 +102,10 @@ bool plugin_switch(int i) {
            i == kDs41Twin ||   /* tp8 loop P30t (90): deepseek41's twins */
            i == kDs41Tsk ||     /* ds41_tsk (91 here after PREFILL's 85-90; 83 on ds41-drafter round 15): libr4d (lever TSK) */
            i == kExl3X3dPf ||   /* exl3_x3d_pf (96, tp8 loop PX1): exl3r4d (A10) */
-           /* qfn-on-ds: the Qwen line's plugin switches (its apply_pending's hook list; no_route, resume_cold, preempt_keep
-            * and sp_ple are the core's / read at start) */
-           (qwen_switch(i) && i != kNoRoute && i != kResumeCold && i != kPreemptKeep && i != kSpPle && i != kDraftDmask &&
+           /* qfn-on-ds: the Qwen line's plugin switches (its apply_pending's hook list; no_route, resume_cold and
+            * preempt_keep are the core's / read at start). sp_ple is the plugins' (fn4-x3-spx f0c9a4a9, which the merge
+            * left out: a POST changed only the core's record, so the step kept the start value; Qwen loop round 10, F11) */
+           (qwen_switch(i) && i != kNoRoute && i != kResumeCold && i != kPreemptKeep && i != kDraftDmask &&
             i != kAqlChi);
 }
 
