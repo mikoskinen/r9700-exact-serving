@@ -570,7 +570,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
                   ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f
-                  ds41tw)
+                  ds41tw ds41dph)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -621,6 +621,7 @@ else()
                 ${R4D_EMU}/test_ds41a4.cpp ${R4D_EMU}/test_ds41fuse.cpp ${R4D_EMU}/test_ds41p1.cpp
                 ${R4D_EMU}/test_ds41dkv.cpp
                 ${R4D_EMU}/test_ds41spd.cpp ${R4D_EMU}/test_ds41p30f.cpp ${R4D_EMU}/test_ds41tw.cpp
+                ${R4D_EMU}/test_ds41dph.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -660,7 +661,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
