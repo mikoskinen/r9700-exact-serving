@@ -736,6 +736,22 @@ bool cik_module(const Module* m) {
 }
 
 bool ika_kernel_listed(const Module* m, const std::string& name);
+/* Lever CIK-X (tp8 loop R49c): whether the module holding `m`'s code lists `name` among the kernels that keep IKA's plain entry in
+ * its CHAIN build (`r4d_ika_nochain_kernels`, the module's OWN object's export; a module without it lists nothing). */
+bool ika_nochain_listed(const Module* m, const std::string& name) {
+    if (!m || !m->bundle) return false;
+    Dl_info di{};
+    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
+    void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+    if (!h) return false;
+    using ListFn = const char* const* (*)(int*);
+    auto fn = reinterpret_cast<ListFn>(dlsym(h, "r4d_ika_nochain_kernels"));
+    Dl_info fi{};
+    if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return false;
+    int n = 0;
+    const char* const* v = fn(&n);
+    return ika_listed(name, v, n);
+}
 bool ika_kernel(const Module* m, const std::string& name) { return ika_on() && ika_kernel_listed(m, name); }
 /* Whether the module holding `m`'s code lists `name` as self-acquiring (r4d_ika_kernels), whatever RADIANCE_AQL_IKA says. */
 bool ika_kernel_listed(const Module* m, const std::string& name) {
@@ -801,7 +817,11 @@ KernelRec* resolve(Func* fn, int ord) {
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
     k->ika = ika_kernel(m, k->name);
-    k->cikcap = !k->chained && ((cik_module(m) && ika_kernel_listed(m, k->name)) || core_cik_listed(m, k->name));
+    {   /* lever CIK-X (tp8 loop R49c): a CHAIN module's nochain-listed kernel is not chain-capable (its code has IKA's plain entry) */
+        const bool cmod = !k->chained && cik_module(m), listed = cmod && ika_kernel_listed(m, k->name);
+        k->cikcap = cik_capable(k->chained, cmod, listed, listed && ika_nochain_listed(m, k->name),
+                                !k->chained && core_cik_listed(m, k->name));
+    }
     k->cik = k->cikcap && k->ika && cik_on();   /* lever CIK (a named chained form keeps its own block-count done) */
     if (k->cik) k->chained = true;
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);

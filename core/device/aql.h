@@ -201,6 +201,15 @@ inline uint64_t cik_lanes_of(const char* env) {
  * chained form (r4dchain*, its own block-count done: `cik` false) is never bounded. */
 inline bool cik_too_wide(bool cik, uint64_t lanes, uint64_t max) { return cik && lanes > max; }
 
+/* Lever CIK-X (tp8 loop R49c, PREFILL round 49): whether a kernel is chain-capable under lever CIK. A named chained form (r4dchain*:
+ * its own block-count done) never is; an IKA-listed kernel of a CHAIN module (r4d_ika_chain() = 1) is unless the module also lists
+ * it in r4d_ika_nochain_kernels() (libr4d r4d_ika_x.h / r4d_ika_nochain.inc: built with IKA's plain entry in a CIK-X build, so it
+ * neither waits for a record nor adds to the counter -- it must be issued / played as a plain, ordered IKA kernel); core's listed
+ * blits are (lever CBL). A module without the nochain export lists nothing: today's decision. */
+inline bool cik_capable(bool named_chained, bool chain_module, bool ika_listed_here, bool nochain_listed, bool core_cik) {
+    return !named_chained && ((chain_module && ika_listed_here && !nochain_listed) || core_cik);
+}
+
 /* Whether `sym`'s own identifier is one of the `n` names of `list` (null / empty entries skipped). */
 inline bool ika_listed(const std::string& sym, const char* const* list, int n) {
     const std::string id = ika_identifier(sym);
