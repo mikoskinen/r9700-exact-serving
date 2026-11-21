@@ -352,6 +352,21 @@ __global__ void r4dchain_ar_twoshot_coded(R4D_ARTC_PARAMS) {
 #undef R4D_ARTC_ARGS
 #undef R4D_ARTC_PARAMS
 
+// ---- lever DAR b (DRAFTER track 21.11.2026 round 58): the FP8 WIRE (r4d_ar_fp8.h, its description there). NOT exact:
+// rule B (deterministic, batch-invariant: a codec group is one word of one row, every contribution quantised, the
+// owner's own too). Lockstep, one piece, any rank count of the wide family; taken only where a launch asks (`wire` 1).
+#define R4D_ARF_BODY 1
+#include "r4d_ar_fp8.h"
+template <int WS>
+__global__ void r4d_ar_twoshot_fp8_kernel(const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
+                                          const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
+                                          int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs,
+                                          R4DArShardOff<WS> sh, int slot_stride16, int rank, int drain, int acq,
+                                          int pub, long long* gate, unsigned int* gate_ctr) {
+  r4d_ar_twoshot_fp8_body<WS>(in4, peers, my_base, my_flags, out4, seq_ctrs, sh, slot_stride16, rank, drain, acq, pub,
+                              gate, gate_ctr);
+}
+
 // ---- moe_gather_all_reduce's two-shot form (four ranks, exact wire, bf16): the MoE gather in
 // front of the plain two-shot's reduce and assemble, for a message from the one-shot's `ts_min` on
 // (the unfused all-reduce goes two-shot there too).
@@ -460,6 +475,112 @@ __global__ void r4d_ar_gather_twoshot_kernel(
     const int len = sh.off[owner + 1] - sh.off[owner];
     const int lim = w1 < len ? w1 : len;
     for (int k = w0 + tid; k < lim; k += nt) dst[k] = srcB[k];
+  }
+}
+
+// ---- lever DAR b: moe_gather_all_reduce's two-shot form on the FP8 wire (the gather in front of r4d_ar_twoshot_fp8_body's
+// reduce and assemble): phase 1 gathers every word of the block's range once, as the exact form does; a word of my own
+// shard stays bf16 in y4 (the reduce codes it like every contribution), a peer's word goes coded into that owner's
+// region A. Then the fp8 body's reduce, phase-2 push and assemble. = moe_gather + the fp8-wire all-reduce, byte for byte
+// (tools/dbench/arf.cpp checks it against the two launches). In place as the exact form: y4 is written, never gathered from.
+template <int WS>
+__global__ void r4d_ar_gather_twoshot_fp8_kernel(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    R4DArShardOff<WS> sh, int wpr, int slot_stride16, int rank, int drain, int acq, int pub,
+    R4dArGather G, long long* gate, unsigned int* gate_ctr) {
+  constexpr int NPEERS = WS - 1;
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq, s_slot;
+  __shared__ int   s_i[R4D_ARGL_TAB];
+  __shared__ float s_w[R4D_ARGL_TAB];
+  __shared__ int   s_n[R4D_ARGL_ROWS];
+  __shared__ float s_g[R4D_ARGL_ROWS];
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
+  const unsigned int v0 = 2u * s_seq - 1u;
+  const int parity = (int)s_slot;
+  r4d_ar_gather_list(G, s_i, s_w, s_n, s_g);
+  const int K = G.top_k;
+  const int sh_max = sh.sh_max;
+  const long RB = r4d_arf_rb(sh_max);
+  const int w = (sh_max + nb - 1) / nb;
+  const int w0 = b * w;
+  int w1 = w0 + w; if (w1 > sh_max) w1 = sh_max;
+  const size_t slot_b = (size_t)slot_stride16 * 16u;
+  unsigned char* pa[NPEERS];
+#pragma unroll
+  for (int p = 0; p < NPEERS; ++p)
+    pa[p] = reinterpret_cast<unsigned char*>(peers.scratch[p]) + ((size_t)parity * WS + rank) * slot_b;
+  const unsigned char* mb = reinterpret_cast<const unsigned char*>(my_base) + (size_t)parity * WS * slot_b;
+
+  for (int o = 0; o < WS; ++o) {
+    const int off = sh.off[o], len = sh.off[o + 1] - off;
+    const int lim = w1 < len ? w1 : len;
+    if (o == rank) {
+      for (int k = w0 + tid; k < lim; k += nt) {
+        const int gw = off + k, row = gw / wpr, i0 = (gw - row * wpr) * 8;
+        y4[gw] = r4d_ar_gather_word_list(G, s_i + row * K, s_w + row * K, s_n[row], G.sh ? s_g[row] : 0.0f, row, i0);
+      }
+    } else {
+      unsigned char* ra = pa[o < rank ? o : o - 1];
+      int2* dd = reinterpret_cast<int2*>(ra);
+      unsigned char* ds = ra + (size_t)8 * sh_max;
+      for (int k = w0 + tid; k < lim; k += nt) {
+        const int gw = off + k, row = gw / wpr, i0 = (gw - row * wpr) * 8;
+        float v[8];
+        r4d_arf_bf16x8(r4d_ar_gather_word_list(G, s_i + row * K, s_w + row * K, s_n[row], G.sh ? s_g[row] : 0.0f, row, i0), v);
+        int2 d; unsigned sc; r4d_arf_enc8(v, d, sc);
+        dd[k] = d; ds[k] = (unsigned char)sc;
+      }
+    }
+  }
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0, drain, acq, pub);
+  {
+    int4* mine = y4 + (size_t)sh.off[rank];
+    const int my_len = sh.off[rank + 1] - sh.off[rank];
+    const int my_lim = w1 < my_len ? w1 : my_len;
+    for (int k = w0 + tid; k < my_lim; k += nt) {
+      float acc[8];
+#pragma unroll
+      for (int l = 0; l < 8; ++l) acc[l] = 0.0f;
+#pragma unroll
+      for (int r = 0; r < WS; ++r) {
+        int2 d; unsigned sc;
+        if (r == rank) {
+          float v[8]; r4d_arf_bf16x8(mine[k], v);
+          r4d_arf_enc8(v, d, sc);
+        } else {
+          const unsigned char* ra = mb + (size_t)r * slot_b;
+          d = reinterpret_cast<const int2*>(ra)[k];
+          sc = ra[(size_t)8 * sh_max + k];
+        }
+        float v[8]; r4d_arf_dec8(d, sc, v);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) acc[l] += v[l];
+      }
+      int2 d; unsigned sc; r4d_arf_enc8(acc, d, sc);
+      float o[8]; r4d_arf_dec8(d, sc, o);
+      mine[k] = r4d_arf_to_bf16x8(o);
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) {
+        reinterpret_cast<int2*>(pa[p] + RB)[k] = d;
+        pa[p][RB + (size_t)8 * sh_max + k] = (unsigned char)sc;
+      }
+    }
+  }
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0 + 1u, drain, acq, pub);
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+  for (int i = 0; i < NPEERS; ++i) {
+    const int owner = peers.rank[i];
+    const unsigned char* rb = mb + (size_t)owner * slot_b + RB;
+    int4* dst = y4 + (size_t)sh.off[owner];
+    const int len = sh.off[owner + 1] - sh.off[owner];
+    const int lim = w1 < len ? w1 : len;
+    for (int k = w0 + tid; k < lim; k += nt) {
+      float o[8]; r4d_arf_dec8(reinterpret_cast<const int2*>(rb)[k], rb[(size_t)8 * sh_max + k], o);
+      dst[k] = r4d_arf_to_bf16x8(o);
+    }
   }
 }
 
@@ -679,6 +800,60 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                        shard_weights, pieces, timeline, form);
 }
 
+/* Lever DAR b's fp8 wire fits: bf16, the wide family at 4 ranks, a word a rank, both fp8 regions of the longest shard
+ * in a slot (always where the exact wire's fit: 9 bytes a word against 16). */
+int r4d_ar_twoshot_fp8_ok(long n_elem, long dtype, long world, long slot_stride16) {
+  if (dtype != 0 || world != 4 || n_elem < 8 * world || n_elem % 8 || n_elem > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return 0;
+  long off[5];
+  const long sh_max = r4d_ar_shard_table(n_elem / 8, 4, nullptr, off);
+  return r4d_arf_slot_bytes(sh_max) <= slot_stride16 * 16 ? 1 : 0;
+}
+
+void r4d_ar_twoshot_4rank_fp8(long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
+                              long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
+                              long slot_stride16, long inp, long out, long n_elem, long rank, long stream,
+                              long nblocks, long nthreads, long drain, long acq, long pub, long gate,
+                              long gate_ctr) {
+  constexpr int WS = 4, NPEERS = 3;
+  if (!r4d_ar_twoshot_fp8_ok(n_elem, 0, WS, slot_stride16))
+    throw std::runtime_error("all_reduce (fp8 wire): message or slot outside the form");
+  if (rank < 0 || rank >= WS) throw std::runtime_error("all_reduce (fp8 wire): rank out of range");
+  long off[WS + 1];
+  const long sh_max = r4d_ar_shard_table(n_elem / 8, WS, nullptr, off);
+  R4DArShardOff<WS> sh{};
+  for (int s = 0; s <= WS; ++s) sh.off[s] = (int)off[s];
+  sh.sh_max = (int)sh_max;
+  int nb = (int)nblocks;
+  if (nb < 1) nb = 16;
+  if (nb > sh_max) nb = (int)sh_max;
+  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+  int nt = (int)nthreads;
+  if (nt < 64) nt = 64;
+  if (nt > 1024) nt = 1024;
+  R4DArWidePeers<int4, NPEERS> peers{};
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  for (int i = 0; i < NPEERS; ++i) {
+    if (!ps[i] || !pf[i]) throw std::runtime_error("all_reduce (fp8 wire): null peer pointer");
+    peers.scratch[i] = (int4*)ps[i];
+    peers.flags[i] = (unsigned int*)pf[i];
+    peers.rank[i] = (i < (int)rank) ? i : i + 1;
+  }
+  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
+  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  r4d_ar_check_extent(my_scratch, slot_bytes, "all_reduce (fp8 wire)", "my_scratch");
+  r4d_ar_check_extent(my_flags, flag_bytes, "all_reduce (fp8 wire)", "my_flags");
+  for (int i = 0; i < NPEERS; ++i) {
+    r4d_ar_check_extent(ps[i], slot_bytes, "all_reduce (fp8 wire)", "peer scratch");
+    r4d_ar_check_extent(pf[i], flag_bytes, "all_reduce (fp8 wire)", "peer flags");
+  }
+  hipStream_t st = (hipStream_t)stream;
+  r4d_ar_twoshot_fp8_kernel<WS><<<nb, nt, 0, st>>>((const int4*)inp, peers, (const int4*)my_scratch,
+                                                   (unsigned int*)my_flags, (int4*)out, (unsigned int*)seq_ctrs, sh,
+                                                   (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub,
+                                                   (long long*)gate, (unsigned int*)gate_ctr);
+}
+
 /* moe_gather_all_reduce's two-shot form fits: a slot list in the block's LDS (M rows, M * top_k
  * slots), a message of at least a word a rank, and both regions of its longest shard in a slot. */
 int r4d_ar_gather_twoshot_ok(long M, long n, long top_k, long slot_stride16) {
@@ -761,6 +936,73 @@ void r4d_ar_gather_twoshot_4rank(long peer_scratch0, long peer_scratch1, long pe
 
   hipStream_t st = (hipStream_t)stream;
   r4d_ar_gather_twoshot_kernel<WS><<<nb, nt, 0, st>>>(
+      (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,
+      shd, (int)(n / 8), (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
+      (long long*)gate, (unsigned int*)gate_ctr);
+}
+
+/* Lever DAR b: moe_gather_all_reduce's two-shot form on the fp8 wire; the exact form's conditions + the fp8 regions. */
+int r4d_ar_gather_twoshot_fp8_ok(long M, long n, long top_k, long slot_stride16) {
+  if (!r4d_ar_gather_twoshot_ok(M, n, top_k, slot_stride16)) return 0;
+  long off[5];
+  const long sh_max = r4d_ar_shard_table(M * n / 8, 4, nullptr, off);
+  return r4d_arf_slot_bytes(sh_max) <= slot_stride16 * 16 ? 1 : 0;
+}
+
+void r4d_ar_gather_twoshot_4rank_fp8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                     long peer_flags0, long peer_flags1, long peer_flags2,
+                                     long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                     long y, long M, long n, long ye, long ew, long sorted, long sh,
+                                     long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
+                                     long top_k, long sig, long rank, long stream, long nblocks,
+                                     long nthreads, long drain, long acq, long pub, long gate,
+                                     long gate_ctr) {
+  constexpr int WS = 4, NPEERS = 3;
+  if (rank < 0 || rank >= WS) throw std::runtime_error("moe_gather_ar (two-shot, fp8 wire): rank out of range");
+  if (!r4d_ar_gather_twoshot_fp8_ok(M, n, top_k, slot_stride16))
+    throw std::runtime_error("moe_gather_ar (two-shot, fp8 wire): the call is outside the form");
+  if (!ye || !ew || !sorted || ye_ld % 8 || (sh && sh_ld < n) || (sh != 0) != (sg != 0))
+    throw std::runtime_error("moe_gather_ar (two-shot, fp8 wire): the gather's operands are not 16B rows");
+  long off[WS + 1];
+  const long sh_max = r4d_ar_shard_table(M * n / 8, WS, nullptr, off);
+  R4DArShardOff<WS> shd{};
+  for (int s = 0; s <= WS; ++s) shd.off[s] = (int)off[s];
+  shd.sh_max = (int)sh_max;
+  int nb = (int)nblocks;
+  if (nb < 1) nb = 16;
+  if (nb > sh_max) nb = (int)sh_max;
+  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+  int nt = (int)nthreads;
+  if (nt < 64) nt = 64;
+  if (nt > 1024) nt = 1024;
+  R4DArWidePeers<int4, NPEERS> peers{};
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  for (int i = 0; i < NPEERS; ++i) {
+    if (!ps[i] || !pf[i]) throw std::runtime_error("moe_gather_ar (two-shot, fp8 wire): null peer pointer");
+    peers.scratch[i] = (int4*)ps[i];
+    peers.flags[i] = (unsigned int*)pf[i];
+    peers.rank[i] = (i < (int)rank) ? i : i + 1;
+  }
+  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
+  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  r4d_ar_check_extent(my_scratch, slot_bytes, "moe_gather_ar (fp8 wire)", "my_scratch");
+  r4d_ar_check_extent(my_flags, flag_bytes, "moe_gather_ar (fp8 wire)", "my_flags");
+  for (int i = 0; i < NPEERS; ++i) {
+    r4d_ar_check_extent(ps[i], slot_bytes, "moe_gather_ar (fp8 wire)", "peer scratch");
+    r4d_ar_check_extent(pf[i], flag_bytes, "moe_gather_ar (fp8 wire)", "peer flags");
+  }
+  R4dArGather G;
+  std::memset(&G, 0, sizeof G);
+  G.ye = (const unsigned short*)ye;
+  G.ew = (const unsigned short*)ew;
+  G.sorted = (const int*)sorted;
+  G.sh = (const unsigned short*)sh;
+  G.sg = (const unsigned short*)sg;
+  G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
+  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)(sig & 1); G.ew_f32 = (int)((sig >> 1) & 1);
+  hipStream_t st = (hipStream_t)stream;
+  r4d_ar_gather_twoshot_fp8_kernel<WS><<<nb, nt, 0, st>>>(
       (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,
       shd, (int)(n / 8), (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
       (long long*)gate, (unsigned int*)gate_ctr);

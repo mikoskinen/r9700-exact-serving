@@ -35848,6 +35848,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 
 #include "r4d_selftest_i9b.inc"   /* ds41-int9b: levers M1, IX-LDSR2, IX-NI byte for byte vs the stock forms */
 #include "r4d_selftest_arc.inc"   /* ds41-int10: lever ARC, the coded wire at overlap 0 on four cards (--case ar_arcoded) */
+#include "r4d_selftest_arf.inc"   /* DRAFTER round 58: lever DAR b, the fp8 wire of the drafter's all-reduces on four cards (--case ar_fp8) */
 #include "r4d_selftest_i11.inc"   /* ds41-int11: lever 1U-MX, mhc_mix's wide-wave decode form byte for byte (--case mix_wv) */
 #include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
 #include "r4d_selftest_fuse.inc"  /* ds41-fuse: levers FUSE-R / FUSE-M byte for byte vs the stock launches + per-call times (--case rfuse / mixfin) */
@@ -39072,6 +39073,7 @@ static void device_phase(const Plugin& pl) {
     /* ds41-int10 (r4d_selftest_arc.inc): --case ar_arcoded -- lever ARC, the four-rank two-shot at overlap 0 under fn4
      * ds41_arcoded 0 / 1024, every rank and size == the fold, the counters proving the wire */
     arc_cases(pl, devs);
+    arf_cases(pl, devs);
     /* ds41-int13 XPUSH: --case ar_xpush_perf -- the two-shot's lockstep and XPUSH forms timed at deepseek41's sizes (INFO) */
     if (sel("ar_xpush_perf")) {
         if (!g_case) std::printf("\ncross-rank, XPUSH timed (ar_xpush 0 / 1)\n");

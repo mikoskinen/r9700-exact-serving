@@ -483,6 +483,14 @@ void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, lo
                                       long rank, long stream, long nblocks, long nthreads,
                                       long drain, long acq, long pub, long gate, long gate_ctr,
                                       long chain);
+// Lever DAR b (DRAFTER track round 58): the four-rank two-shot on an FP8 wire (E4M3 + an E8M0 scale a 16-byte word, both
+// pushes; r4d_ar_fp8.h). NOT exact (rule B: deterministic, batch-invariant); taken where a launch passes `wire` 1.
+int r4d_ar_twoshot_fp8_ok(long n_elem, long dtype, long world, long slot_stride16);
+void r4d_ar_twoshot_4rank_fp8(long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
+                              long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
+                              long slot_stride16, long inp, long out, long n_elem, long rank, long stream,
+                              long nblocks, long nthreads, long drain, long acq, long pub, long gate,
+                              long gate_ctr);
 // moe_gather_all_reduce's two-shot form (four ranks, exact wire, bf16; r4d_ar_twoshot_Nrank_exact.hip):
 // the MoE gather (r4d_ar_gather_hc_write_4rank's gather operands, words and arithmetic) as the
 // plain two-shot's phase-1 source, then its reduce and assemble on the same instance (flags, seq,
