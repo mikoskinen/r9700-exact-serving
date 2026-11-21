@@ -581,12 +581,16 @@ bool chi_on() {
     return on;
 }
 
-/* Lever CIK (DRAFTER track round 62): start env RADIANCE_AQL_CIK=1, read only while lever IKA is on. */
+/* Lever CIK (DRAFTER track round 62): start env RADIANCE_AQL_CIK=1, read only while lever IKA is on. tp8 loop W8 (DECODE round
+ * 50): 1 chains CIK's kernels only (dispatch: a KernelRec::cik kernel chains whatever rad_dev_chain_enabled says); 2 = 1 + the
+ * engine's chain decision on (dispatch.cpp rad_dev_chain_decide: the plugins' chainable rows take their named chained forms --
+ * the DRAFTER's round-62 form of 1). */
 bool cik_on() {
     static const bool on = [] {
         const char* e = std::getenv("RADIANCE_AQL_CIK");
-        const bool v = e && e[0] == '1' && ika_on();
-        if (v) RAD_INFO("aql: lever CIK on (RADIANCE_AQL_CIK=1): a self-acquiring kernel of a chain-capable module is a chained kernel");
+        const bool v = e && (e[0] == '1' || e[0] == '2') && ika_on();
+        if (v) RAD_INFO("aql: lever CIK on (RADIANCE_AQL_CIK=%c): a self-acquiring kernel of a chain-capable module is a chained kernel%s",
+                        e[0], e[0] == '2' ? "; the plugins' chainable rows take their chained forms" : "");
         return v;
     }();
     return on;
@@ -1418,8 +1422,9 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     p->reserved2 = 0;
     p->completion_signal.handle = 0;
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
-    /* A chained kernel (RadKernelChainFn, named r4dchain*): its record in the slot's tail. */
-    const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
+    /* A chained kernel (RadKernelChainFn, named r4dchain*): its record in the slot's tail. A lever CIK kernel (KernelRec::cik)
+     * chains whatever the plugins were told (tp8 loop W8: RADIANCE_AQL_CIK=1 leaves rad_dev_chain_enabled to the engine). */
+    const bool chain = k->chained && (k->cik || rad_dev_chain_enabled()) && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika || (chain && ika_on() && chi_on()), k->cik);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire

@@ -1436,8 +1436,10 @@ int Engine::declare() {
         const bool pays = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.chain_pays;
         rad_dev_chain_infer(pays);
         const bool on = rad_dev_chain_enabled() != 0;
-        const char* why = on     ? "the model's plugin measured a gain with its speculative drafter"
-                          : pays ? "the device backend does not chain"
+        /* tp8 loop W8: RADIANCE_AQL_CIK=2 turns the decision on where nothing pays (lever CIK with the plugins' chained forms) */
+        const char* why = on && !pays ? "RADIANCE_AQL_CIK=2 (lever CIK with the plugins' chained forms)"
+                          : on        ? "the model's plugin measured a gain with its speculative drafter"
+                          : pays      ? "the device backend does not chain"
                                  : "no drafter whose plugin measured a gain with them decodes "
                                    "speculatively";
         RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);

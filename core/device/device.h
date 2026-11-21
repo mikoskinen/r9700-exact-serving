@@ -42,6 +42,10 @@ extern "C" void rad_dev_host_wrote(void);
  * plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter
  * decodes speculatively (rad_dev_chain_infer, from the engine before any row resolves). */
 extern "C" int  rad_dev_chain_enabled(void);
+/* The decision above from its inputs (tp8 loop W8): `pays` the engine's, `aql` whether the backend writes chain records,
+ * `cik` RADIANCE_AQL_CIK -- "2" turns it on too (lever CIK with the plugin's chained forms); "1" leaves it to `pays` (lever
+ * CIK's kernels chain inside the AQL backend either way). */
+extern "C" int  rad_dev_chain_decide(int pays, int aql, const char* cik);
 extern "C" void rad_dev_chain_infer(int pays);
 
 /* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all

@@ -640,16 +640,22 @@ void rad_dev_chain_infer(int pays) {
     g_chain_pays.store(pays ? 1 : 0, std::memory_order_relaxed);
     g_chain.store(-1, std::memory_order_relaxed);
 }
+/* tp8 loop W8 (DECODE round 50, review of lever CIK): the decision as a pure function of its inputs. `pays` = the engine's
+ * (rad_dev_chain_infer), `aql` = the backend writes chain records, `cik` = RADIANCE_AQL_CIK. CIK=1 chains lever CIK's kernels
+ * inside the AQL backend only (aql.cpp dispatch: a KernelRec::cik kernel chains whatever this says) and leaves THIS decision --
+ * the one the plugins see: select.cpp's `chain` geometry for every chainable row, rad_chain_on -- as the engine made it; CIK=2
+ * also turns it on, as the DRAFTER's round-62 form did with CIK=1 (on the DeepSeek line: the chainable libr4d rows' named
+ * chained forms, among them the 4-rank exact all-reduces at <= 524,288 elements = every decode all-reduce, r4d_ar_entry.hip
+ * ar_chain). */
+int rad_dev_chain_decide(int pays, int aql, const char* cik) {
+    return aql && (pays || (cik && cik[0] == '2')) ? 1 : 0;
+}
 int rad_dev_chain_enabled(void) {
     int on = g_chain.load(std::memory_order_relaxed);
     if (on < 0) {
-        /* Lever CIK (DRAFTER track round 62): RADIANCE_AQL_CIK=1 chains where the plugin measured nothing (the DeepSeek line):
-         * only kernels of a chain-capable module (aql.cpp cik_module) and the named chained forms the plugin asks for chain. */
-        const char* cik = std::getenv("RADIANCE_AQL_CIK");
-        on = (g_chain_pays.load(std::memory_order_relaxed) != 0 || (cik && cik[0] == '1')) &&
-                     std::strcmp(rad::device_backend_name(), "aql") == 0
-                 ? 1
-                 : 0;
+        on = rad_dev_chain_decide(g_chain_pays.load(std::memory_order_relaxed) != 0,
+                                  std::strcmp(rad::device_backend_name(), "aql") == 0,
+                                  std::getenv("RADIANCE_AQL_CIK"));
         g_chain.store(on, std::memory_order_relaxed);
     }
     return on;
