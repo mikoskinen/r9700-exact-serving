@@ -571,6 +571,13 @@
  *                   beside another lane's unfinished one (both then run out: a preemption by recompute). One lane / one process: the
  *                   same either way. Admission order only (rule A). Read at every gate the scheduler asks; the leader's (not a follower
  *                   switch, not handed over). Unset: the start's RADIANCE_SCHED_LANE_ROOM (0 / 1).
+ *   ds41_rr1        deepseek41 (DRAFTER round 54, lever RR1; 108 here, after aql_ika): 1 -- after a step's ONE MoE pass from row 0,
+ *                   the step's end routing report names the core's counts row (rad_route_counts), which that pass's own report
+ *                   (right after its router) already filled with the same counts, so the core takes it in place: one copy
+ *                   dispatch fewer a routed layer and step on the compute stream (trunk and DSpark layers); the report's count,
+ *                   step and tape route step are as before. 0 -- both reports copy, as before. Host bookkeeping and one
+ *                   op-less copy only: no kernel's bytes change (rule A). A plugin switch (the follower takes the leader's);
+ *                   read at issue (a flip re-records). Unset: the start's RADIANCE_DS41_RR1 (0 / 1).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -807,7 +814,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

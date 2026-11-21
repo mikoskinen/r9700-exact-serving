@@ -168,6 +168,11 @@ struct RadCtx {
     int             world = 1;
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
+    /* Lever RR1's test: each report's counts pointer, and a card-side counts row the fake hands out (rad_route_counts)
+     * when set: row `layer` at route_row + layer * route_n (null: no histogram, as before). */
+    std::vector<const int32_t*> routed_counts;
+    int32_t*              route_row = nullptr;
+    int64_t               route_n = 0;
     std::string           step_fail;
     int                   lane = 0;     /* where the next issue goes */
     std::vector<RecJoin>  joins;
@@ -537,14 +542,14 @@ extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
 extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }
 extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
-    (void)r;
     c->routed_layers.push_back(layer);
+    c->routed_counts.push_back(r ? r->expert_count : nullptr);
     return RAD_OK;
 }
-/* No card-side histogram here, so a router writes and reports its own buffer. */
+/* No card-side histogram here unless a test sets one (route_row), so a router writes and reports its own buffer. */
 extern "C" int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert) {
-    (void)c; (void)layer; (void)n_expert;
-    return nullptr;
+    if (!c || !c->route_row || layer < 0 || n_expert <= 0 || n_expert > c->route_n) return nullptr;
+    return c->route_row + (int64_t)layer * c->route_n;
 }
 /* No prefetch here: the three calls are no-ops, as in a core without one. */
 extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0,

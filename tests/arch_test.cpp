@@ -937,6 +937,99 @@ TEST(sdf_moves_only_the_shared_down_ahead_of_the_routed_down) {
     moe.shexp_lane = keep;
 }
 
+/* DRAFTER round 54 (lever RR1, rad_block_moe_fp8.h MoeFP8::rr1_live): with the switch on, the end routing report of a step of
+ * ONE pass from row 0 names the core's counts row (taken in place: no copy), every other report names the block's own counts
+ * buffer as before; the issued ops are the same list (the lever is the report's pointer only); a step of two passes, a core
+ * with no row, and the switch off report the buffer twice as today; once a row was named, a step whose first pass starts past
+ * row 0 reports that pass's counts before its experts (so the core never hands the file stager an older step's row). */
+TEST(rr1_end_report_names_the_core_row_after_one_pass_only) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    RadBuildCtx ctx = build_ctx();
+    RadBuilder b;
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_fp8::probe(&meta, &probe));
+    const int rc = hyv3_fp8::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    auto& moe = hyv3_fp8::models[0].layers[1].moe;
+    REQUIRE(moe.c.n_expert > 0);
+    static std::atomic<int> word{0};
+    const std::atomic<int>* const keep = moe.rr1_live;
+    moe.rr1_live = &word;
+    std::vector<int32_t> rows(64 * 512, 0);
+    const int64_t rn = 512;
+    REQUIRE(moe.c.n_expert <= rn);
+    auto same_issues = [](const std::vector<RecIssue>& x, const std::vector<RecIssue>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); ++i)
+            if (x[i].op != y[i].op || x[i].n != y[i].n || x[i].lane != y[i].lane || x[i].opd.size() != y[i].opd.size())
+                return false;
+        return true;
+    };
+    const int32_t* ecnt = nullptr;
+    /* a whole step through the model (MoeFP8::step: one pass at 4 rows) at switch v, with / without the core's row */
+    auto run = [&](int v, bool row, std::vector<RecIssue>* iss) {
+        word.store(v);
+        RadBatch batch = decode_batch();
+        RadCtx c{};
+        c.b = &b;
+        c.batch = &batch;
+        if (row) { c.route_row = rows.data(); c.route_n = rn; }
+        hyv3_fp8::step(&c, &batch);
+        if (iss) *iss = c.issues;
+        std::vector<std::pair<int, const int32_t*>> rep;
+        for (size_t i = 0; i < c.routed_layers.size(); ++i) rep.push_back({ c.routed_layers[i], c.routed_counts[i] });
+        return rep;
+    };
+    std::vector<RecIssue> i0, i1;
+    const auto r0 = run(0, true, &i0), r1 = run(1, true, &i1), r1n = run(1, false, nullptr);
+    CHECK(!r0.empty() && r0.size() % 2 == 0);
+    CHECK_EQ(r1.size(), r0.size());
+    CHECK_EQ(r1n.size(), r0.size());
+    CHECK(same_issues(i0, i1));
+    int taken = 0;
+    for (size_t i = 0; i + 1 < r0.size() && r1.size() == r0.size() && r1n.size() == r0.size(); i += 2) {
+        const int l = r0[i].first;
+        CHECK_EQ(r0[i + 1].first, l);
+        CHECK(r0[i].second != nullptr && r0[i + 1].second == r0[i].second);       /* off: the buffer twice */
+        CHECK(r1[i].second == r0[i].second);                                     /* on: the pass's own report as before */
+        CHECK(r1[i + 1].second == rows.data() + (int64_t)l * rn);                /* on: the end report names the row */
+        CHECK(r1n[i].second == r0[i].second && r1n[i + 1].second == r0[i].second);   /* no row: as off */
+        if (r1[i + 1].second == rows.data() + (int64_t)l * rn) ++taken;
+        if (l == moe.layer) ecnt = r0[i].second;
+    }
+    CHECK(taken > 0);
+    REQUIRE(ecnt != nullptr);
+    /* the block's own passes: two passes from row 0 -> the buffer twice; a first pass past row 0 after a row was named -> its
+     * own report, then the end report copies (the buffer) */
+    auto direct = [&](int v, const std::vector<std::pair<int64_t, int64_t>>& passes) {
+        word.store(v);
+        RadBatch batch = decode_batch();
+        RadCtx c{};
+        c.b = &b;
+        c.batch = &batch;
+        c.route_row = rows.data();
+        c.route_n = rn;
+        for (const auto& p : passes) moe.pass(&c, 4, p.first, p.second, true);
+        moe.route_report(&c);
+        return c.routed_counts;
+    };
+    const int32_t* const myrow = rows.data() + (int64_t)moe.layer * rn;
+    const auto d1 = direct(1, { { 0, 4 } });
+    CHECK(d1.size() == 2 && d1[0] == ecnt && d1[1] == myrow);
+    const auto d2 = direct(1, { { 0, 2 }, { 2, 2 } });
+    CHECK(d2.size() == 2 && d2[0] == ecnt && d2[1] == ecnt);
+    (void)direct(1, { { 0, 4 } });   /* the core names the row now */
+    const auto d3 = direct(1, { { 2, 2 } });
+    CHECK(d3.size() == 2 && d3[0] == ecnt && d3[1] == ecnt);
+    const auto d4 = direct(0, { { 2, 2 } });   /* the switch off after a row was named: still restored */
+    CHECK(d4.size() == 2 && d4[0] == ecnt && d4[1] == ecnt);
+    const auto d5 = direct(0, { { 0, 4 } });
+    CHECK(d5.size() == 2 && d5[0] == ecnt && d5[1] == ecnt);
+    word.store(0);
+    moe.rr1_live = keep;
+}
+
 TEST(hyv3_fp8_tensor_parallel_partitions_experts_and_shared_width) {
     RadModelMeta meta = hyv3_fp8_test_meta();
     for (int rank = 0; rank < 2; ++rank) {

@@ -2023,6 +2023,15 @@ static std::atomic<int> g_sw_one{0}, g_sw_one_ok{0}, g_sw_one_env{-1};
  *                 RADIANCE_DS41_SWFOLD=1 (or on). Trunk layers only, as fold f. */
 static std::atomic<int> g_sw_qnf{0}, g_sw_qnf_ok{0}, g_sw_qnf_env{-1};
 static std::atomic<int> g_sw_swf{0}, g_sw_swf_ok{0}, g_sw_swf_env{-1};
+/* Lever RR1 (DRAFTER track 21.11.2026 round 54; rad_block_moe_fp8.h MoeFP8::rr1_live): switch "ds41_rr1" (fn4, core switch
+ * 108), 1 = after a step's ONE MoE pass from row 0 the step's end routing report names the core's counts row, which that
+ * pass's own report (right after its router) already filled with the same counts -- the core takes it in place: no copy
+ * dispatch (served lq208 c32 drafter pass: 3 aql_copy16 right after r4d_ar_gather_twoshot, ~2.3 us + a ~4.2-us dependent gap
+ * each; the trunk's follower pass 22 of its 44 aql_copy16, tapeprof-lq150-F); 0 = today's two copies a layer. Every trunk
+ * and drafter MoE layer; the report's count in the heat bank, its step and the tape's route step are today's; no kernel,
+ * operand or order of the computation changes (rule A). RADIANCE_DS41_RR1=1 (or on) starts at 1. */
+static std::atomic<int> g_sw_rr1{0}, g_sw_rr1_ok{0}, g_sw_rr1_env{-1};
+static std::atomic<long long> g_rr1_count[3] = { {0}, {0}, {0} };
 /* 1 for "1" or "on", values up to `max` as themselves, else 0. */
 static int k1_env(const char* name, int max = 1) {
     const char* e = std::getenv(name);
@@ -2042,7 +2051,8 @@ static const K1Switch kK1Switches[] = { { "ds41_kvfold", &g_sw_kvf, &g_sw_kvf_ok
                                         { "ds41_ofold", &g_sw_of, &g_sw_of_ok, 1 },
                                         { "ds41_onefill", &g_sw_one, &g_sw_one_ok, 1 },
                                         { "ds41_qnfold", &g_sw_qnf, &g_sw_qnf_ok, 2 },
-                                        { "ds41_swfold", &g_sw_swf, &g_sw_swf_ok, 1 } };
+                                        { "ds41_swfold", &g_sw_swf, &g_sw_swf_ok, 1 },
+                                        { "ds41_rr1", &g_sw_rr1, &g_sw_rr1_ok, 1 } };
 static const K1Switch* k1_switch(const char* name) {
     for (const K1Switch& k : kK1Switches)
         if (!std::strcmp(name, k.name)) return &k;
@@ -2054,9 +2064,10 @@ static void k1_read_env() {
                                                             { &g_sw_of_env, "RADIANCE_DS41_OFOLD" },
                                                             { &g_sw_one_env, "RADIANCE_DS41_ONEFILL" },
                                                             { &g_sw_qnf_env, "RADIANCE_DS41_QNFOLD" },
-                                                            { &g_sw_swf_env, "RADIANCE_DS41_SWFOLD" } };
-    std::atomic<int>* const v[] = { &g_sw_kvf, &g_sw_of, &g_sw_one, &g_sw_qnf, &g_sw_swf };
-    for (int i = 0; i < 5; ++i) {
+                                                            { &g_sw_swf_env, "RADIANCE_DS41_SWFOLD" },
+                                                            { &g_sw_rr1_env, "RADIANCE_DS41_RR1" } };
+    std::atomic<int>* const v[] = { &g_sw_kvf, &g_sw_of, &g_sw_one, &g_sw_qnf, &g_sw_swf, &g_sw_rr1 };
+    for (int i = 0; i < 6; ++i) {
         int unread = -1;
         if (e[i].first->compare_exchange_strong(unread, k1_env(e[i].second, kK1Switches[i].max)))
             v[i]->store(e[i].first->load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -4741,6 +4752,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     }
     L.moe.swfold_live = &g_sw_swf;
     if (L.moe.op_swfold) g_sw_swf_ok.store(1, std::memory_order_relaxed);
+    L.moe.rr1_live = &g_sw_rr1;   /* lever RR1 */
+    L.moe.rr1_count = g_rr1_count;
+    g_sw_rr1_ok.store(1, std::memory_order_relaxed);
     if (rf_declared()) {
         L.moe.rfuse_live = &g_sw_rf;
         L.moe.rf_count = g_rf_count;
@@ -5147,6 +5161,9 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     gq.max_tok = std::max<int64_t>(g.max_tok, Q);
     DS_TRY(L.moe.declare(b, nm, gq, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
+    L.moe.rr1_live = &g_sw_rr1;   /* lever RR1: the trunk's switch */
+    L.moe.rr1_count = g_rr1_count;
+    g_sw_rr1_ok.store(1, std::memory_order_relaxed);
     if (s.cfg.rfuse_decl) L.moe.rfuse_live = &g_sw_rf;   /* lever DRF: the trunk's ds41_rfuse value picks the form */
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
