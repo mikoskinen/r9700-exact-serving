@@ -2280,7 +2280,7 @@ TEST(w1s_aql_waitk_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
         post(sv.port, vals[k], 200);
         got.push_back(complete(sv.port, ps[(size_t)k], 24));
     }
-    post(sv.port, 3, 400);
+    post(sv.port, 4, 400);   /* DRAFTER round 64: 3 = 2 + lever CBL is taken */
     kill(sv.lead.child.pid, SIGTERM);
     CHECK_EQ(sv.lead.finish(60), 0);
     CHECK_EQ(sv.fol.finish(30), 0);
@@ -2344,7 +2344,7 @@ TEST(iks_aql_ika_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
         post(sv.port, vals[k], 200);
         got.push_back(complete(sv.port, ps[(size_t)k], 24));
     }
-    post(sv.port, 3, 400);   /* DRAFTER round 53: 2 = 1 + lever IKB is taken */
+    post(sv.port, 4, 400);   /* DRAFTER round 53: 2 = 1 + lever IKB is taken; round 64: 3 = 2 + lever CBL too */
     kill(sv.lead.child.pid, SIGTERM);
     CHECK_EQ(sv.lead.finish(60), 0);
     CHECK_EQ(sv.fol.finish(30), 0);
@@ -2446,6 +2446,28 @@ TEST(w9_aql_cik_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
         CHECK_EQ(off.lead.finish(60), 0);
         CHECK_EQ(off.fol.finish(30), 0);
     }
+    {   /* tp8 loop W11: lever CBL -- fn4 aql_ika 3 with CIK on (core's copies / fills in their chain-capable forms), POSTed with
+         * aql_cik 1 to a CIK start, then aql_ika 4 refused: one process's tokens, both nodes apply it */
+        Serving cbl;
+        REQUIRE(cbl.start("1,3", kLanes2, { "RADIANCE_LOG_STEPS=1", "RADIANCE_AQL_IKA=1", "RADIANCE_AQL_CIK=1", "RADIANCE_AQL_CHI=1",
+                                            "RADIANCE_AQL_CTA=1", "RADIANCE_AQL_CRD=16" }));
+        auto post_ika = [&](int v, int want) {
+            std::string out;
+            Call c;
+            const int st = c.send(cbl.port, "/admin/fn4", json{ { "aql_ika", v } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, want);
+            if (want == 400) CHECK(out.find("aql_ika takes 0") != std::string::npos);
+            if (st != want) fprintf(stderr, "    POST aql_ika %d: %d %s\n", v, st, out.c_str());
+        };
+        post_ika(3, 200);
+        CHECK(complete(cbl.port, ps[1], 24) == ref[1]);
+        post_ika(4, 400);
+        kill(cbl.lead.child.pid, SIGTERM);
+        CHECK_EQ(cbl.lead.finish(60), 0);
+        CHECK_EQ(cbl.fol.finish(30), 0);
+        CHECK(cbl.lead.output().find("fn4: switches aql_ika=3 applied at step ") != std::string::npos);
+        CHECK(cbl.fol.output().find("fn4: switches aql_ika=3 applied at step ") != std::string::npos);
+    }
 }
 /* tp8 loop IKR (PREFILL round 44) for the DRAFTER's IKB2 (fn4 aql_ika 2 = lever IKA + lever IKB: core's copies / fills launched
  * self-acquiring) under DECODE W4: with RADIANCE_AQL_IKA=1 at start on both nodes, 2 / 1 / 0 POSTed to the leader between cold
@@ -2488,7 +2510,7 @@ TEST(ik2_aql_ika_2_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
             post(sv.port, vals[k], 200);
             got.push_back(complete(sv.port, ps[(size_t)k], 24));
         }
-        post(sv.port, 3, 400);
+        post(sv.port, 4, 400);   /* DRAFTER round 64: 3 = 2 + lever CBL is taken */
         kill(sv.lead.child.pid, SIGTERM);
         CHECK_EQ(sv.lead.finish(60), 0);
         CHECK_EQ(sv.fol.finish(30), 0);

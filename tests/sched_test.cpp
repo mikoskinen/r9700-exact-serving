@@ -17107,11 +17107,11 @@ TEST(aql_ika_the_switch_takes_0_1_needs_its_env_and_follows) {
     CHECK_EQ(fn4::aql_ika(), 0);
     CHECK(fn4::state_json().find("\"aql_ika\": 0") != std::string::npos);
     CHECK(fn4::check("aql_ika", 0, &err));
-    for (int v : { -1, 3, 256 }) {
+    for (int v : { -1, 4, 256 }) {
         CHECK(!fn4::check("aql_ika", v, &err));
         CHECK(err.find("aql_ika takes 0") != std::string::npos);
     }
-    for (int v : { 1, 2 }) {   /* DRAFTER round 53: 2 = 1 + lever IKB, the same env */
+    for (int v : { 1, 2, 3 }) {   /* DRAFTER round 53: 2 = 1 + lever IKB; round 64: 3 = 2 + lever CBL; the same env */
         CHECK(!fn4::check("aql_ika", v, &err));
         CHECK(err.find("RADIANCE_AQL_IKA=1") != std::string::npos);
         CHECK(err.find("aql_ika " + std::to_string(v) + " needs") != std::string::npos);
