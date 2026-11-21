@@ -186,6 +186,26 @@ inline bool ika_listed(const std::string& sym, const char* const* list, int n) {
     return false;
 }
 
+/* Lever CTA (DRAFTER track round 63; a pure function since tp8 loop W8, so the host checks the layout): the places, from the tape
+ * copy's CTA base, of the blocks of `n` chained records with argument lengths `len[i]` (each <= `rec_off`): a group's blocks start
+ * 64 bytes apart, every block's arguments end by `rec_off` past its group's start and its record (`rec_bytes`) sits at its own
+ * place + `rec_off`, so no block's arguments meet a record; a full group's successor starts past its last record. Returns the end
+ * of the last record (0 for none). */
+inline size_t cta_pack(const uint32_t* len, size_t n, size_t rec_off, size_t rec_bytes, size_t* off) {
+    size_t g = 0, o = 0, end = 0;   /* the group's start, the next block's place in it */
+    for (size_t i = 0; i < n; ++i) {
+        const size_t st = ((size_t)len[i] + 63) & ~size_t(63);
+        if (o && o + st > rec_off) {   /* the group is full: the next starts past its last record */
+            g = (g + o + rec_off + 63) & ~size_t(63);
+            o = 0;
+        }
+        off[i] = g + o;
+        if (g + o + rec_off + rec_bytes > end) end = g + o + rec_off + rec_bytes;
+        o += st ? st : 64;
+    }
+    return end;
+}
+
 }  // namespace aql
 }  // namespace rad
 

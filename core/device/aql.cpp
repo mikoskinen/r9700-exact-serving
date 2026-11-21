@@ -2369,19 +2369,12 @@ RadTape a_tape_end(int keep) {
         const size_t cta_base = ((t->karg_host.size() + kKargSlot + kKargSlot - 1) / kKargSlot) * kKargSlot;
         std::vector<size_t> cta_off;   /* a chained record's block, from cta_base, in rec order */
         size_t cta_end = 0;
-        if (cta_on()) {
-            size_t g = 0, o = 0;   /* the group's start, the next block's place in it */
-            for (const TapeRec& r : t->rec) {
-                if (!(r.kind == kTapeDispatch && r.chain && r.s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF)) continue;
-                const size_t st = ((size_t)r.karg_len + 63) & ~size_t(63);
-                if (o && o + st > RAD_CHAIN_KARG_OFF) {   /* the group is full: the next starts past its last record */
-                    g = (g + o + RAD_CHAIN_KARG_OFF + 63) & ~size_t(63);
-                    o = 0;
-                }
-                cta_off.push_back(g + o);
-                cta_end = std::max(cta_end, g + o + RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES);
-                o += st ? st : 64;
-            }
+        if (cta_on()) {   /* aql.h cta_pack (tp8 loop W8: the same places, checked on the host by device_test) */
+            std::vector<uint32_t> lens;
+            for (const TapeRec& r : t->rec)
+                if (r.kind == kTapeDispatch && r.chain && r.s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF) lens.push_back(r.karg_len);
+            cta_off.resize(lens.size());
+            cta_end = cta_pack(lens.data(), lens.size(), RAD_CHAIN_KARG_OFF, RAD_CHAIN_REC_BYTES, cta_off.data());
         }
         const size_t ncta = cta_off.size();
         const size_t kbytes = ncta ? cta_base + ((cta_end + 63) & ~size_t(63)) : t->karg_host.size() + kKargSlot;
@@ -2401,10 +2394,11 @@ RadTape a_tape_end(int keep) {
         }
         std::memcpy(ka, t->karg_host.data(), t->karg_host.size());
         t->karg = static_cast<char*>(ka);
-        /* Under lever CIK the pad past the packed blocks is zeroed: memory a freed tape's blocks or a freed queue's argument ring
-         * held may come back here, and a stale record in it would be accepted by an unchained play of the last packed record
-         * (its tail reads the pad). */
-        if (cik_on()) std::memset(t->karg + t->karg_host.size(), 0, (ncta ? cta_base : t->karg_host.size() + kKargSlot) - t->karg_host.size());
+        /* The pad past the packed blocks is zeroed: memory a freed tape's blocks or a freed queue's argument ring held may come
+         * back here, and a stale record in it would be accepted by an unchained play of the last packed record (its tail reads
+         * the pad). tp8 loop W8: always (was: under lever CIK only) -- a chain-capable module's kernel reads the tail with CIK
+         * off too, and so does a named chained form played unchained; ~1 KB a placed tape. */
+        std::memset(t->karg + t->karg_host.size(), 0, (ncta ? cta_base : t->karg_host.size() + kKargSlot) - t->karg_host.size());
         if (ncta) {
             std::vector<unsigned char> img((cta_end + 63) & ~size_t(63), 0);
             size_t j = 0;
