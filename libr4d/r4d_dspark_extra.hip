@@ -28,7 +28,7 @@
  */
 #include <hip/hip_runtime.h>
 
-#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
+#include "r4d_ika_x.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY(); lever CIK-X (tp8 loop R49c): R4D_IKA_ENTRY_X()
 #include <cstdint>
 #include <cstring>
 
@@ -117,7 +117,7 @@ __device__ __forceinline__ void alt_score(const AltArgs& A, long long row, int p
     __syncthreads();
 }
 
-__global__ __launch_bounds__(256) void alt_kernel(AltArgs A) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(256) void alt_kernel(AltArgs A) { R4D_IKA_ENTRY_X();
     __shared__ float sa[kMaxR];
     __shared__ float p8[kThreads];
     __shared__ float sc[kMaxK];

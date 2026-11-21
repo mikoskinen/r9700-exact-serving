@@ -17,7 +17,7 @@
 // log1pf or ref_exp (exp in double, rounded once); here each is the double routine rounded once,
 // which is the correctly rounded value glibc returns in all but near-tie cases.
 #include "r4d.h"
-#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
+#include "r4d_ika_x.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY(); lever CIK-X (tp8 loop R49c): R4D_IKA_ENTRY_X()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
@@ -1049,7 +1049,7 @@ __device__ __forceinline__ void mix_finish_row(const float* part, int chunks, co
 
 template <int HC>
 __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
-                                                         long rows) { R4D_IKA_ENTRY();
+                                                         long rows) { R4D_IKA_ENTRY_X();
     const int lane = threadIdx.x & 31;
     const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (row >= rows) return;
@@ -1059,7 +1059,7 @@ __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int 
 // Without scratch: one wave a row, the chunks in order, the same partials and the same sums.
 template <int HC>
 __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long hp, const float* fn,
-                                                        long fp, int chunks, MixOut o, long rows) { R4D_IKA_ENTRY();
+                                                        long fp, int chunks, MixOut o, long rows) { R4D_IKA_ENTRY_X();
     constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32;
     const int lane = threadIdx.x & 31;
     const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
@@ -2671,7 +2671,7 @@ template <bool WF32, uint32_t THR, bool KV = false, bool W8 = false>
 __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
-    uint32_t M, FzRope r, int block, int fmt, int sc, std::conditional_t<KV, FzKv, FzKvNone> kv) { R4D_IKA_ENTRY();
+    uint32_t M, FzRope r, int block, int fmt, int sc, std::conditional_t<KV, FzKv, FzKvNone> kv) { R4D_IKA_ENTRY_X();
 #ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
     uint16_t* const fz_row = (uint16_t*)emu_dyn_lds();
 #else

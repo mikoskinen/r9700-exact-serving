@@ -2,7 +2,7 @@
  * projects in parallel before one workgroup per token forms the Sinkhorn matrix.
  * Mixing weights are declared f32; activations are bf16, coefficients stay f32. */
 #include <hip/hip_runtime.h>
-#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
+#include "r4d_ika_x.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY(); lever CIK-X (tp8 loop R49c): R4D_IKA_ENTRY_X()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
@@ -391,7 +391,7 @@ __global__ void mhc_post_kernel(const uint16_t* x, const uint16_t* h, const floa
 // loaded once instead of once per output stream. Every output keeps mhc_post_kernel's order.
 __global__ void mhc_post_vec_kernel(const uint16_t* x, const uint16_t* h, const float* post,
                                     const float* comb, uint16_t* out, int n, long xp, long hp,
-                                    long pp, long cp, long op) { R4D_IKA_ENTRY();
+                                    long pp, long cp, long op) { R4D_IKA_ENTRY_X();
     const long r = blockIdx.y;
     const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i >= n) return;

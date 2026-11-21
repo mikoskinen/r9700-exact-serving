@@ -48,7 +48,7 @@
 #define R4D_MX_BLOCKS_ONLY 1
 #include "r4d_ds41_mxfp4.hip"
 
-#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
+#include "r4d_ika_x.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY(); lever CIK-X (tp8 loop R49c): R4D_IKA_ENTRY_X()
 #include <cstdio>
 
 namespace {
@@ -239,7 +239,7 @@ __device__ __forceinline__ void xm_stage_g(const MxMrArgs& A, float* xs, int r0,
 }
 
 template <int T, int H, int R, int MT>
-__global__ __launch_bounds__(kXmThreads) void xm_gemv_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(kXmThreads) void xm_gemv_kernel(MxMrArgs A) { R4D_IKA_ENTRY_X();
     using Q = Mx<T>;
     constexpr int LPR = 32 / H, VPS = 32 * LPR, PD = xm_pd<MT, R>();
     R4D_DYN_LDS(r4d_u32x4, xm_lds);
@@ -385,7 +385,7 @@ __device__ __forceinline__ void xm_stage_s(const MxMrArgs& A, float* xs, int r0,
 }
 
 template <int T, int R, int MT, int EX>
-__global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) { R4D_IKA_ENTRY_X();
     using Q = Mx<T>;
     constexpr int PD = MT * R >= 16 ? 2 : 4;
     R4D_DYN_LDS(r4d_u32x4, xm_lds);
@@ -1145,7 +1145,7 @@ __global__ __launch_bounds__(256) void xm_wq_kernel(MxMrArgs A) { R4D_IKA_ENTRY(
  * f32); the activations a stage at a time the same way. Only LDS barriers (no global_inv). AL: every row dword-aligned. */
 constexpr int kWlBN = 64, kWlSK = 8, kWlRS = kWlSK * 4 + 2;   /* rows a block, blocks a stage, dwords a staged row (+2: banks) */
 template <int NT, int AL, int PD>
-__global__ __launch_bounds__(128) void xm_wl_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(128) void xm_wl_kernel(MxMrArgs A) { R4D_IKA_ENTRY_X();
     constexpr int MT = 16 * NT;
     constexpr int NA = 4 * NT;                                   /* activation units (16 B) a thread a stage */
     __shared__ uint32_t xw_tab[256];
@@ -1475,7 +1475,7 @@ int xm_cu_count() {
 #include "r4d_mxfp4.h"
 namespace {
 constexpr int kA8SK = 256, kA8P = kA8SK + 8, kA8BN = 64, kA8KB = kA8SK / 128;
-__global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) { R4D_IKA_ENTRY_X();
     __shared__ __align__(16) uint8_t aa[16 * kA8P], bb[kA8BN * kA8P];
     __shared__ uint32_t ss[kA8BN * kA8KB];
     __shared__ float sa[16 * kA8KB];

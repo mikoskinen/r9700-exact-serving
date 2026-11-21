@@ -28,7 +28,7 @@
 // (fn4 ix_lds bit 1, lever IXW: index_score's decode band on the WMMA form too -- every height the same form.)
 // (fn4 ix_lds bit 2, lever BFR, tp8 loop P38: the WMMA forms' roundings without a branch -- the same bits.)
 #include "r4d.h"
-#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
+#include "r4d_ika_x.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY(); lever CIK-X (tp8 loop R49c): R4D_IKA_ENTRY_X()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_ds41_qrt.h"
@@ -427,7 +427,7 @@ __device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, co
  * q then uniform, read through scalar loads). A thread holds its key as 128 floats. Without keep
  * (the candidate restriction takes ds41_index_score_kept_kernel below). */
 template <int HS>
-__global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) { R4D_IKA_ENTRY_X();
     constexpr int EPB = 256 / HS;
     float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
     /* The wave index through readfirstlane, so a wave's head slice (and its q) is provably uniform
@@ -537,7 +537,7 @@ constexpr int kDsKeptSpan = 258;
  * does (same bits); every other position of the row, to C, is written -inf by a sweep the grid
  * shares. */
 template <int HS>
-__global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs a) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs a) { R4D_IKA_ENTRY_X();
     constexpr int EPB = 256 / HS;
     float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
     __shared__ uint32_t ws[33];
@@ -1961,7 +1961,7 @@ __device__ __forceinline__ void ds_ort_pair(uint32_t& lo, uint32_t& hi, bool rot
  * scored by ds_dec_dot_w8, their PV by ds_dec_pv4_w8 (direct: ds_dec_pvld_w8; tiled: the raw slot through the
  * LDS tile, decoded where it is read) -- the f32 values of the bf16 keys, the same chains. */
 template <int HG, int NT, int DPT, int P, bool PVD, bool NV, bool ORT = false, bool W8 = false>
-__global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) { R4D_IKA_ENTRY_X();
     static_assert(!NV || DPT == 2, "the packed latent's PV reads a column pair from one code byte");
     static_assert(!W8 || DPT == 2, "a packed window key's PV reads a column pair from one code pair");
     static_assert(!ORT || DPT == 2, "the fused round trip takes a column pair a thread");
@@ -2367,7 +2367,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
  * before, map = (m << 16) | j. Rows of a sequence at consecutive positions select (nearly) the same entries -- all of them
  * while the context has <= topk compressed entries -- so the gathered bytes written and read fall ~B-fold for B rows. */
 __global__ __launch_bounds__(256) void ds41_latent_gather_nv4_kernel(DsAttnArgs a, uint16_t* out, long rs,
-                                                                    int* __restrict__ map = nullptr) { R4D_IKA_ENTRY();
+                                                                    int* __restrict__ map = nullptr) { R4D_IKA_ENTRY_X();
     const long m = blockIdx.y;
     const int j = (int)blockIdx.x * 8 + (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31u);
     const int T = a.nk - a.win;
@@ -2415,7 +2415,7 @@ __global__ __launch_bounds__(256) void ds41_latent_gather_nv4_kernel(DsAttnArgs 
  * stride: entry c of sequence s (row off_s + (c - lo_s)) by NVG's gather expressions -- lane L block L: 8 code bytes at
  * 8 L, ds_e4m3_half of scale byte 256 + L, two ds_nv4_unpack8_fast into 32 bytes at 16 L. An entry whose block is
  * unmapped is not written (the attention reads the zero row for it, as over the cache). */
-__global__ __launch_bounds__(256) void ds41_latent_unpack_nv4_kernel(DsAttnArgsU a) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(256) void ds41_latent_unpack_nv4_kernel(DsAttnArgsU a) { R4D_IKA_ENTRY_X();
     __shared__ long soff[kLuSeqMax + 1];
     __shared__ long slo[kLuSeqMax];
     if (threadIdx.x == 0) {
@@ -3153,7 +3153,7 @@ constexpr int kIwKeepEB = 1024;                      /* ... with keep */
 static_assert(kIwKeepEB == 1024, "the keep words of a span, one a lane, assume 1024-entry spans");
 
 template <int HT, bool KEEP, int BF = 0>   /* BF: ds_rbf's form (tp8 loop P38, lever BFR: 1 = every rounding as a select, the same bits) */
-__global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a) { R4D_IKA_ENTRY();
+__global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a) { R4D_IKA_ENTRY_X();
     constexpr int DM = 128, EB = KEEP ? kIwKeepEB : kIwEB;
     const int lane = threadIdx.x & 31, hf = lane >> 4;
     const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));

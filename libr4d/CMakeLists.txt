@@ -305,6 +305,16 @@ option(R4D_IKA_CHAIN "libr4d: the IKA entry is chain-capable (lever CIK; needs R
 if(R4D_IKA AND R4D_IKA_CHAIN)
   target_compile_definitions(libr4d PRIVATE R4D_IKA_CHAIN=1)
 endif()
+# Lever CIK-X (r4d_ika_x.h R4D_IKA_ENTRY_X, r4d_ika_nochain.inc; tp8 loop R49c): in a CHAIN build the families whose CHAIN-compiled body
+# changes beyond the entry keep IKA's plain entry and are listed in r4d_ika_nochain_kernels(), so the engine keeps them off the
+# chain. Set on the files that include r4d_ika_x.h and on r4d_ika.cpp only (tp8/devpf/r49/cikxcheck.py checks the file list),
+# so the other units' code stays the CHAIN build's. OFF = the CHAIN build as before.
+option(R4D_IKA_CHAIN_X "libr4d: lever CIK-X -- r4d_ika_nochain.inc's families keep IKA's plain entry in a CHAIN build" OFF)
+if(R4D_IKA AND R4D_IKA_CHAIN AND R4D_IKA_CHAIN_X)
+  foreach(f r4d_ika.cpp r4d_ds41_elem.hip r4d_ds41_mxfp4_mr.hip r4d_ds41_sparse.hip r4d_dspark_extra.hip r4d_mhc.hip)
+    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${f}" APPEND PROPERTY COMPILE_DEFINITIONS R4D_IKA_CHAIN_X=1)
+  endforeach()
+endif()
 if(R4D_HAVE_GGML)
   target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
   target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})

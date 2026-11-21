@@ -21,3 +21,20 @@ extern "C" __attribute__((visibility("default"))) const char* const* r4d_ika_ker
 #define R4D_IKA_CHAIN 0
 #endif
 extern "C" __attribute__((visibility("default"))) int r4d_ika_chain(void) { return (R4D_IKA && R4D_IKA_CHAIN) ? 1 : 0; }
+/* Lever CIK-X (tp8 loop R49c): the listed kernels whose entry is IKA's plain one even in this CHAIN build (r4d_ika_x.h
+ * R4D_IKA_ENTRY_X, r4d_ika_nochain.inc); the engine keeps them off the chain (aql.cpp cikcap). Empty unless built with
+ * R4D_IKA + R4D_IKA_CHAIN + R4D_IKA_CHAIN_X. */
+#ifndef R4D_IKA_CHAIN_X
+#define R4D_IKA_CHAIN_X 0
+#endif
+namespace {
+const char* const kIkaNoChain[] = {
+#if R4D_IKA && R4D_IKA_CHAIN && R4D_IKA_CHAIN_X
+#include "r4d_ika_nochain.inc"
+#endif
+    nullptr};
+}  // namespace
+extern "C" __attribute__((visibility("default"))) const char* const* r4d_ika_nochain_kernels(int* n) {
+    if (n) *n = (int)(sizeof(kIkaNoChain) / sizeof(kIkaNoChain[0])) - 1;
+    return kIkaNoChain;
+}
