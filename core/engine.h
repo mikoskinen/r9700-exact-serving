@@ -422,7 +422,8 @@ private:
     std::string dch_text() const;
     /* tp8 loop D60 (RADIANCE_PP_POST_PHASES=1, the leader's lane loop; a log line only -- unset: nothing is timed, no line): D35's
      * chain by phase, from a decode lane's collect to its next decode head's issue (engine_lanes.cpp pph_*), and how often another
-     * lane's X2 had landed when this lane's drafter ended (that lane's tail then waits behind the whole host path) */
+     * lane's X2 had landed when this lane's drafter ended (that lane's tail then waits behind the whole host path; the ms from the
+     * drafter's end to the head's issue = the leader card's gap if nothing else was queued) */
     struct PostPhases {
         enum { kCommit, kDwait, kFinish, kBook, kLoop, kPlan, kShip, kIssue, kHost, kAll, kN };
         static constexpr int kBins = 1000;   /* 0.01-ms bins; the last one holds >= 9.99 ms */

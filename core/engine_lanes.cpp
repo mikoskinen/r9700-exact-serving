@@ -438,7 +438,7 @@ std::string Engine::dch_text() const {
 void Engine::PostPhases::Acc::add(const double* v, bool dend, bool x2w) {
     ++n;
     if (dend) ++n_dend;
-    if (x2w) { ++n_x2w; x2w_ms += v[kHost]; }
+    if (x2w) { ++n_x2w; x2w_ms += std::max(0.0, v[kHost] - v[kIssue]); }   /* the card's gap before this lane's next head */
     for (int k = 0; k < kN; ++k) {
         ms[k] += v[k];
         ++hist[k][std::min<size_t>(kBins - 1, (size_t)std::max(0.0, v[k] * 100.0))];
@@ -491,8 +491,8 @@ std::string Engine::pph_text(const PostPhases::Acc& a, int64_t drops, const char
                "p50 / mean ms -- "
                "commit %s, the drafter's end (card) %s (%.0f %% had ended before the wait), drafter finish %s, bookkeeping %s, the loop "
                "until the lane plans %s, plan %s, release + ship %s, the ranks' issue %s; the drafter's end -> its next head issued %s, "
-               "collect -> head issued %s; another lane's X2 had landed at the drafter's end in %.1f %% of chains: %.1f ms behind this "
-               "path%s",
+               "collect -> head issued %s; another lane's X2 had landed at the drafter's end in %.1f %% of chains: %.1f ms from their "
+               "drafter's end to their next head's issue (the leader card's gap if nothing else was queued)%s",
                when, (long long)a.n, (long long)drops, pm(PostPhases::kCommit).c_str(), pm(PostPhases::kDwait).c_str(), 100.0 * (double)a.n_dend / n,
                pm(PostPhases::kFinish).c_str(), pm(PostPhases::kBook).c_str(), pm(PostPhases::kLoop).c_str(),
                pm(PostPhases::kPlan).c_str(), pm(PostPhases::kShip).c_str(), pm(PostPhases::kIssue).c_str(),
