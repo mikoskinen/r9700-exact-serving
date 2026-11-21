@@ -2872,6 +2872,92 @@ TEST(a_lane_built_mid_step_starts_behind_lane_zero) {
     CHECK_EQ(dev_get(f, f.ctx.buf_ptr(y)), 4242);
 }
 
+namespace {
+/* A device op that copies operand 0 to operand 1 only after a chain of large copies on its stream: a slow middle link. */
+int k_late_copy(const RadArgs* a, RadStream s) {
+    for (int i = 0; i < 16; ++i) rad_memcpy_async(g_ord_big, g_ord_src, kOrdBytes, s);
+    rad_memcpy_async(a->t[1].data, a->t[0].data, sizeof(int32_t), s);
+    return record("late_copy", a, s);
+}
+}  /* namespace */
+
+/* tp8 loop W25 (DECODE review of the DRAFTER's lever EGL, deepseek41 egl_tok / egl_head / egl_gather): a decode pass puts
+ * each Engram layer's lookup -> copy -> part GEMM (they read the step's token ids alone) on the second lane right behind
+ * the ids (rad_lane_join(0, 1) once, then every chain), lane 0 runs the layers in between, and each Engram layer joins lane
+ * 1 into lane 0 in front of its all_gather; step 2 issues the ids' producers (token_map, ngram_ids) on lane 1 as well,
+ * behind that one join. The pattern on the host backend (a stream is a worker thread, so an unordered reader runs ahead):
+ * the producer is a late write (ids1, then ids2 from it), each chain = an immediate copy (reads the ids at once: a missing
+ * 0 -> 1 join reads the poison), a late copy (a missing 1 -> 0 join lets lane 0 read before it lands) and a copy into the
+ * layer's part; four unrelated lane-0 ops, the first layer's join + read (its join also covers the second chain), two
+ * more, the second layer's join (nothing new on lane 1) + read. Both forms, three steps each over the same persistent
+ * buffers with a new value and the poison every step; the lane is built mid-step in each form's first step. */
+TEST(w25_egl_chains_from_a_decode_pass_head_reach_lane_zero_at_their_joins) {
+    ord_setup();
+    for (int form = 0; form < 2; ++form) {   /* 0: the ids on lane 0 (EGL step 1); 1: on lane 1 too (step 2, egl_tok) */
+        Fixture f;
+        f.P.arena_bytes = 16384;
+        auto host_buf = [&](const char* nm, int64_t off) {
+            const rad_buf h = f.add_buffer(nm, RAD_I32, 4, 1, off);
+            f.P.buffers[h].decl.domain = RAD_DOMAIN_HOST;   /* L.ids / Layer::egl_emb are host domain */
+            return h;
+        };
+        const rad_buf ids1 = host_buf("blk.1.engram_ids", 0), ids2 = host_buf("blk.14.engram_ids", 256);
+        const rad_buf rows1 = host_buf("blk.1.egl_rows", 512), rows2 = host_buf("blk.14.egl_rows", 768);
+        const rad_buf rd1 = f.add_buffer("blk.1.egl_rows_dev", RAD_I32, 4, 1, 0);
+        const rad_buf rd2 = f.add_buffer("blk.14.egl_rows_dev", RAD_I32, 4, 1, 256);
+        const rad_buf pt1 = f.add_buffer("blk.1.egl_kv_part", RAD_I32, 4, 1, 512);
+        const rad_buf pt2 = f.add_buffer("blk.14.egl_kv_part", RAD_I32, 4, 1, 768);
+        const rad_buf kv1 = f.add_buffer("engram_kv_1", RAD_I32, 4, 1, 1024);
+        const rad_buf kv2 = f.add_buffer("engram_kv_14", RAD_I32, 4, 1, 1280);
+        const rad_buf da = f.add_buffer("act_a", RAD_I32, 4, 1, 1536), db = f.add_buffer("act_b", RAD_I32, 4, 1, 1792);
+        const rad_op prod = f.add_op("rope", "M", { 8192 }, { k_late_write }, { "late_write" }, nullptr, {});
+        const rad_op cp = f.add_op("rope", "M", { 8192 }, { k_copy }, { "copy" }, nullptr, {});
+        const rad_op slow = f.add_op("rope", "M", { 8192 }, { k_late_copy }, { "late_copy" }, nullptr, {});
+        for (rad_op o : { prod, cp, slow }) f.P.ops[o].bands[0].dom[RAD_DOMAIN_DEVICE].scratch_bytes = 0;   /* no scratch rule */
+        CHECK_OK(f.start());
+        const auto put = [&](Ctx& c, rad_op op, rad_buf a, rad_buf b) {
+            const RadOperand o2[2] = { RAD_B(a), RAD_B(b) };
+            CHECK_OK(c.issue(op, o2, 2, RAD_N_BATCH));
+        };
+        for (int round = 0; round < 3; ++round) {
+            const int32_t v = 7000 + 100 * form + round;
+            *g_ord_value = v;
+            for (rad_buf h : { ids1, ids2, rows1, rows2 }) *(int32_t*)f.ctx.buf_ptr(h) = -7;   /* the poison */
+            for (rad_buf d : { rd1, rd2, pt1, pt2, kv1, kv2 }) dev_put(f, f.ctx.buf_ptr(d), -7);
+            CHECK_OK(f.step(4, round, [&](Ctx& c) {
+                const RadOperand o1[1] = { RAD_B(ids1) };
+                if (form == 1) {   /* egl_tok: lane 1 behind lane 0 once, the ids' producers there */
+                    CHECK_OK(c.lane_join(0, 1));
+                    CHECK_OK(c.set_lane(1));
+                }
+                CHECK_OK(c.issue(prod, o1, 1, RAD_N_BATCH));   /* ngram_ids of layer 1 */
+                put(c, cp, ids1, ids2);                         /* ... and of layer 14 */
+                if (form == 0) {   /* egl_head: lane 1 behind the ids */
+                    CHECK_OK(c.lane_join(0, 1));
+                    CHECK_OK(c.set_lane(1));
+                }
+                put(c, cp, ids1, rows1);   /* layer 1: lookup, copy, part GEMM */
+                put(c, slow, rows1, rd1);
+                put(c, cp, rd1, pt1);
+                put(c, cp, ids2, rows2);   /* layer 14 */
+                put(c, slow, rows2, rd2);
+                put(c, cp, rd2, pt2);
+                CHECK_OK(c.set_lane(0));
+                for (int i = 0; i < 4; ++i) put(c, cp, da, db);   /* layer 0 */
+                CHECK_OK(c.lane_join(1, 0));                      /* egl_gather at layer 1 */
+                put(c, cp, pt1, kv1);
+                for (int i = 0; i < 2; ++i) put(c, cp, da, db);   /* layers 2 .. 13 */
+                CHECK_OK(c.lane_join(1, 0));                      /* egl_gather at layer 14: nothing new on lane 1 */
+                put(c, cp, pt2, kv2);
+            }));
+            CHECK_EQ(dev_get(f, f.ctx.buf_ptr(kv1)), v);
+            CHECK_EQ(dev_get(f, f.ctx.buf_ptr(kv2)), v);
+            CHECK_EQ(*(const int32_t*)f.ctx.buf_ptr(ids2), v);
+            CHECK_EQ(*(const int32_t*)f.ctx.buf_ptr(rows2), v);
+        }
+    }
+}
+
 /* A calibration tap's gram_accum sums across passes while its plugin counts the summed rows in
  * step; a played pass reissues the sum without calling step. A program holding one records
  * no passes; one without records them wherever the backend can. */
