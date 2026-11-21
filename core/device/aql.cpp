@@ -906,7 +906,8 @@ struct Stream {
      * launched since the last packet whose barrier bit held it behind everything before. A chained
      * kernel's wait covers only chained blocks, so while this is set the next one keeps its bit. */
     bool            plain_inflight = false;
-    /* Lever CRD (DRAFTER round 64): unordered chained packets since this queue's last ordered one. */
+    /* Lever CRD (DRAFTER round 64): unordered packets since this queue's last ordered one (a played plain overlap record counts too:
+     * it runs ahead as well); the cap applies to chained packets only. */
     int             chain_run = 0;
     uint64_t        chain_run_blocks = 0;   /* lever CRB: blocks of those packets */
 
@@ -1705,10 +1706,10 @@ struct PlayRun {
          * wave slots are full of blocks waiting on the counter, and the next wide kernel's blocks land where slots free up, unevenly:
          * drafter/kit/mes/ikh11.cpp (xeon GPU2, r64c, 64 x 256 kernels with a tiny chained kernel every third): up to 5 blocks of one
          * kernel on one WGP (2 when ordered or uniform), its body tail 3.5-4.2 us vs 2.3-2.6. */
-        if (!ordered && crd_cap() && s->chain_run >= crd_cap()) ordered = true;
+        if (chain && !ordered && crd_cap() && s->chain_run >= crd_cap()) ordered = true;
         /* Lever CRB (RADIANCE_AQL_CRB=B): the same with the run's blocks as the measure -- the next chained packet keeps its bit when the
          * unordered run's blocks with its own would exceed B. */
-        if (!ordered && crb_cap() && s->chain_run_blocks + blocks_of(&r.pkt) > crb_cap()) ordered = true;
+        if (chain && !ordered && crb_cap() && s->chain_run_blocks + blocks_of(&r.pkt) > crb_cap()) ordered = true;
         /* Lever CTA: an ordered chained record (target 0) plays from its block in the tape's copy (constant record), else from
          * the queue's slot with the record written now. */
         const bool cta = chain && ordered && r.karg_t0 && cta_on();
