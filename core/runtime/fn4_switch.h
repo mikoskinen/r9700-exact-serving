@@ -499,6 +499,9 @@
  *                   10,33 with D50 / D51) runs its HEAD in these segments, its tail whole -- the held frame keeps the tail band
  *                   flag, the follower's parts end at t - j and the leader's tail starts there, as lane_head's band step; without
  *                   it such a step runs its parts whole (D39), so LSP never segmented a BG step beside D51. Order only (rule A).
+ *                   + 262144 (tp8 loop D64b, with + 131072): that step's TAIL in segments too -- the first from t - j (X2's receive at
+ *                   the band layer), then at the declared tail boundaries (all above t), the last with the sampler; without it the
+ *                   tail runs whole.
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all
