@@ -6265,6 +6265,46 @@ TEST(op_collectives_world2) {
     CHECK_EQ(g1.at(1), 22.0f); CHECK_EQ(g1.at(3), 22.0f);
 }
 
+/* tp8 loop W23 (the sampler's lever SNW gathers the first 2 pairs of each row of the top-k's pair plane): a row-interleaved
+ * all_gather reads x [rows][row] at a wider row pitch, as libr4d admits it (r4d_ar_gather_admit.h) -- each rank's window
+ * of a row it computed wider, the junk past the window never moved -- at two and three ranks; a strided x whose width is
+ * not `row` stays refused (RAD_E_STRIDE), as on the card. */
+TEST(op_all_gather_reads_a_rows_window_at_its_pitch) {
+    for (int W : { 2, 3 }) {
+        const int64_t rows = 3, row = 4, pitch = 10;
+        std::vector<T> xs, ys;
+        xs.reserve((size_t)W);   /* each T's data points into its own vector: no reallocation */
+        ys.reserve((size_t)W);
+        for (int r = 0; r < W; ++r) {
+            xs.emplace_back(RAD_F32, std::vector<int64_t>{ rows, pitch });
+            ys.emplace_back(RAD_F32, std::vector<int64_t>{ rows, W * row });
+            for (int64_t m = 0; m < rows; ++m)
+                for (int64_t c = 0; c < pitch; ++c)
+                    xs.back().set(m * pitch + c, c < row ? (float)(1000 * r + 10 * m + c) : -7.0f);
+            xs.back().t.shape[1] = row;   /* the window: `row` columns, the declared pitch kept as the stride */
+        }
+        std::vector<int> st((size_t)W, 0), bad((size_t)W, 0);
+        auto body = [&](int r) {
+            A b; b.t(xs[(size_t)r]).t(ys[(size_t)r]).i("world_size", W).i("numel", rows * row).s("dtype", "f32").i("row", row);
+            st[(size_t)r] = run("all_gather", b, r, W);
+            /* the same window gathered as rows of 2: a strided x whose width is not `row` (not the card's form) */
+            A c; c.t(xs[(size_t)r]).t(ys[(size_t)r]).i("world_size", W).i("numel", rows * row).s("dtype", "f32").i("row", 2);
+            bad[(size_t)r] = run("all_gather", c, r, W);
+        };
+        std::vector<std::thread> th;
+        for (int r = 0; r < W; ++r) th.emplace_back(body, r);
+        for (auto& t : th) t.join();
+        for (int r = 0; r < W; ++r) {
+            CHECK_OK(st[(size_t)r]);
+            CHECK_EQ(bad[(size_t)r], RAD_E_STRIDE);
+            for (int64_t m = 0; m < rows; ++m)
+                for (int q = 0; q < W; ++q)
+                    for (int64_t c = 0; c < row; ++c)
+                        CHECK_EQ(ys[(size_t)r].at(m * W * row + q * row + c), (float)(1000 * q + 10 * m + c));
+        }
+    }
+}
+
 /* tp8 loop P20: reduce_scatter_rows then all_gather_rows at four ranks hold all_reduce's bytes on every rank, in place
  * over whole-row shards (q = ceil(rows / 4); 9 and 5 rows leave an uneven or empty-ish last shard); after the
  * reduce-scatter alone each rank's own rows are all_reduce's and the others its input. bf16 and f32 values whose

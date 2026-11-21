@@ -214,13 +214,32 @@ int ref_all_gather(const RadArgs* a, RadStream) {
         return RAD_OK;
     }
 
-    RAD_REF_TRY(publish(a->rank, world, x, nel));
-    Group& g = group();
     /* Placement. `row` absent (or the whole message) is plain concatenation; present, it is
      * row-interleaved, x [rows][row] into y [rows][world][row], the form the vocab-parallel
      * candidate merge reads (one row of candidates per sampled position at one stride). */
     const int64_t row = p_int(a, "row", 0);
     if (row < 0 || (row > 0 && nel % row)) return RAD_E_SHAPE;
+
+    /* x may be [rows][row] read at a wider row pitch, as libr4d's gather admits it (r4d_ar_gather_admit.h: a
+     * row-interleaved gather, rank 2, shape[1] == row): a rank's window of a row it computed wider -- the
+     * sampler's lever SNW gathers the first 2 pairs of each row of the served top-k's pair plane (tp8 loop W23).
+     * Peers read a published input as `nel` contiguous elements, so this rank packs the window tight first; the
+     * copy lives until the closing barrier, after every peer's read. Any other strided x stays refused. */
+    std::vector<char> packed;
+    RadTensor xt = *x;
+    if (!rad_tensor_is_contiguous(x)) {
+        if (row <= 0 || x->rank != 2 || x->shape[1] != row) return RAD_E_STRIDE;
+        packed.resize((size_t)(nel * esz));
+        for (int64_t i = 0; i < nel; ++i)
+            std::memcpy(packed.data() + i * esz, (const char*)x->data + offlin(x, i) * esz, (size_t)esz);
+        xt.data = packed.data();
+        xt.rank = 1;
+        xt.shape[0] = nel;
+        xt.stride[0] = 1;
+    }
+
+    RAD_REF_TRY(publish(a->rank, world, &xt, nel));
+    Group& g = group();
     for (int r = 0; r < world; ++r)
         for (int64_t i = 0; i < nel; ++i) {
             const int64_t o = (row > 0 && row < nel)
