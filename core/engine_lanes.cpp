@@ -584,17 +584,23 @@ int Engine::pp_tband_step(int lane, const RadBatch* b, bool count) {
  * flight). Order of where the band layer runs only: both forms are D50's (rule A). */
 bool Engine::pp_tband_by_bound(bool count) {
     int age = -1, lpm = -1;
+    /* tp8 loop D65: fn4 pp_tband_bound once a request set it (W + 10000 x H), else the start's window / hysteresis as before */
+    int wms = pp_bound_ms_, wh = pp_bound_h_;
+    pp_t5_sw_ = fn4::pp_tband_bound(&wms, &wh);
+    pp_t5_wms_ = wms;
+    pp_t5_wh_ = wh;
     const int fpm = pp_link_ ? pp_link_->peer_load(&age) : -1;
     if (pp_ni_) {
-        if (!pp_ni_->recent_keep_ns) pp_ni_->recent_keep_ns = 4ull * (uint64_t)pp_bound_ms_ * 1000000ull;
-        lpm = pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull);
+        /* the samples kept: 4 windows (at the start's window: what the first judge set, as before) */
+        if (const uint64_t keep = 4ull * (uint64_t)wms * 1000000ull; pp_ni_->recent_keep_ns != keep) pp_ni_->recent_keep_ns = keep;
+        lpm = pp_ni_->recent_pm((uint64_t)wms * 1000000ull);
     }
-    if (fpm < 0 || lpm < 0 || age < 0 || age > 4 * pp_bound_ms_) {
+    if (fpm < 0 || lpm < 0 || age < 0 || age > 4 * wms) {
         if (count) ++pp_t5_fb_;
         return pp_tband_bg_;
     }
-    if (fpm > lpm + pp_bound_h_) pp_t5_on_ = true;
-    else if (lpm > fpm + pp_bound_h_) pp_t5_on_ = false;
+    if (fpm > lpm + wh) pp_t5_on_ = true;
+    else if (lpm > fpm + wh) pp_t5_on_ = false;
     if (count) {
         ++(pp_t5_on_ ? pp_t5_band_ : pp_t5_keep_);
         pp_t5_lsum_ += lpm;
@@ -609,8 +615,9 @@ std::string Engine::t5_text(const char* when) const {
                "by it, %lld banded (the follower busier), %lld kept the band layer on the follower (the leader busier), %lld fell back to "
                "3's rule (no fresh load report); mean recent card working leader %.1f %% / follower %.1f %% over %d ms windows, hysteresis "
                "%d permille; %llu load reports came", when, (long long)n, (long long)pp_t5_band_, (long long)pp_t5_keep_,
-               (long long)pp_t5_fb_, n ? pp_t5_lsum_ / (double)n / 10.0 : 0.0, n ? pp_t5_fsum_ / (double)n / 10.0 : 0.0, pp_bound_ms_,
-               pp_bound_h_, pp_link_ ? (unsigned long long)pp_link_->load_reports_in() : 0ull);
+               (long long)pp_t5_fb_, n ? pp_t5_lsum_ / (double)n / 10.0 : 0.0, n ? pp_t5_fsum_ / (double)n / 10.0 : 0.0, pp_t5_wms_,
+               pp_t5_wh_, pp_link_ ? (unsigned long long)pp_link_->load_reports_in() : 0ull) +
+           (pp_t5_sw_ ? fmt(" (window / hysteresis from fn4 pp_tband_bound %d, tp8 loop D65)", pp_t5_wms_ + 10000 * pp_t5_wh_) : std::string());
 }
 
 /* tp8 loop D50: the tail band's counters, cumulative (a cell = two lines' difference; kit d50cell.py), at the D32 line's period

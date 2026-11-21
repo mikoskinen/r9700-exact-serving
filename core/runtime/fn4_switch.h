@@ -637,6 +637,15 @@
  *                   other rule unchanged (rule A: timing only). Once it was above 0, the covered sleeps are counted per site (asked
  *                   / slept us) and print beside host_spin's line. Read at every covered sleep. Unset: the start's RADIANCE_HOST_SLACK
  *                   (0 .. 1000; anything else = 0 with a line). A follower switch (each node's own threads); one machine takes it.
+ *   pp_tband_bound  engine, BOTH nodes (tp8 loop D65, DECODE round 53; 115 here, after host_slack): fn4 pp_tband 5's WINDOW and
+ *                   HYSTERESIS in process -- v = W + 10000 x H, W = 20 .. 5000 ms, H = 0 .. 500 permille: the leader judges the
+ *                   follower's recent card working share against its own over the last W ms and bands once the follower's is
+ *                   higher by > H (keeps the layer on the follower once the leader's is), a load report older than 4 W falls back
+ *                   to 3's rule; the follower's load report covers its last W ms. -1 / 0 = the start's RADIANCE_PP_TBAND_BOUND_MS /
+ *                   _H (defaults 200 / 20) on both, i.e. today's program (e.g. 200200 = the defaults as a value, 100 = 100 ms with
+ *                   H 0, 200050 = 50 ms with H 20). Read at every decode step pp_tband 5 judges (the leader) and at every load
+ *                   report (the follower: a follower switch, so both nodes use one window); inert at every other pp_tband. Where
+ *                   the band layer runs only (rule A, D50's forms). One machine takes it (no pipeline: nothing reads it).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -873,7 +882,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kAqlCik, kHostSlack, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kAqlCik, kHostSlack, kPpTbandBound, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -1046,6 +1055,9 @@ void slack_sleep_us(int us, int site);
 std::string slack_line();
 /* slack_line's counts under host_slack = `label`, then zeroed (apply_pending prints them when host_slack changes). */
 std::string slack_take(int label);
+/* tp8 loop D65 (pp_tband_bound): true with the window (ms) and hysteresis (permille) once a request set them (v = W + 10000 x H);
+ * false (both untouched) while unset / -1 / 0 = the start's RADIANCE_PP_TBAND_BOUND_MS / _H. */
+bool pp_tband_bound(int* ms, int* h);
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */

@@ -577,6 +577,8 @@ private:
      * band once the follower works more by > pp_bound_h_ permille over the last pp_bound_ms_, keep the layer on the follower once
      * the leader does, else the last decision; no fresh report -> 3's rule */
     int  pp_bound_ms_ = 200, pp_bound_h_ = 20;   /* RADIANCE_PP_TBAND_BOUND_MS / _H */
+    int  pp_t5_wms_ = 200, pp_t5_wh_ = 20;       /* tp8 loop D65: the window / hysteresis the last judge used (the line's) */
+    bool pp_t5_sw_ = false;                      /* ... from fn4 pp_tband_bound (else the start's) */
     int  pp_load_ms_ = 0;                        /* the follower: RADIANCE_PP_LOAD_REPORT_MS (0 = no report) */
     bool pp_t5_on_ = false;
     int64_t pp_t5_band_ = 0, pp_t5_keep_ = 0, pp_t5_fb_ = 0;

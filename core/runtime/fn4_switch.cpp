@@ -50,7 +50,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
                                         "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room", "pp_send_ash",
                                         "aql_waitk", "aql_ika", "ds41_rr1", "dspark_mhr", "dspark_hs",
-                                        "host_spin", "pp_bg_split", "aql_cik", "host_slack" };
+                                        "host_spin", "pp_bg_split", "aql_cik", "host_slack",
+                                        "pp_tband_bound" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -681,6 +682,13 @@ int host_slack() {
     const int v = st().val[kHostSlack].load(std::memory_order_relaxed);
     return v >= 0 ? v : env_host_slack();
 }
+bool pp_tband_bound(int* ms, int* h) {   /* tp8 loop D65 */
+    const int v = st().val[kPpTbandBound].load(std::memory_order_relaxed);
+    if (v <= 0) return false;
+    if (ms) *ms = v % 10000;
+    if (h) *h = v / 10000;
+    return true;
+}
 namespace {
 /* tp8 loop D63: whether host_slack was ever above 0 in this process (counting and prctl calls only from then on), the value this
  * thread applied last (0 = its default, which it has at creation), and per site the sleeps, the time asked and the time slept */
@@ -1208,7 +1216,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, host_slack, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, host_slack, pp_tband_bound, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1841,6 +1849,17 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kPpTbandBound) {      /* tp8 loop D65: fn4 pp_tband 5's window / hysteresis, read on each node */
+        const int w = v % 10000, h = v / 10000;
+        if (v != -1 && v != 0 && (v < 0 || w < 20 || w > 5000 || h > 500)) {
+            if (err) *err = "pp_tband_bound takes -1 / 0 (the start's RADIANCE_PP_TBAND_BOUND_MS / _H, defaults 200 / 20: as before) or W + "
+                            "10000 x H with W = 20 .. 5000 ms and H = 0 .. 500 permille (fn4 pp_tband 5 judges the follower's recent card "
+                            "working share against the leader's over the last W ms with hysteresis H; the follower's load report covers its "
+                            "last W ms; tp8 loop D65)";
+            return false;
+        }
+        return true;
+    }
     if (i == kHostSlack) {         /* tp8 loop D63: read at every sleep it covers, on each node */
         if (v < 0 || v > 1000) {
             if (err) *err = "host_slack takes 0 (every covered thread back to its default timer slack, as before) or 1 .. 1000 (the "
@@ -2006,6 +2025,7 @@ bool follower_switch(int i) {
            i == kAqlCik ||         /* tp8 loop W9: each node's own issued / played packets */
            i == kHostSpin ||       /* tp8 loop D61: each node's own waits */
            i == kHostSlack ||      /* tp8 loop D63: each node's own threads' sleeps */
+           i == kPpTbandBound ||   /* tp8 loop D65: the leader's judge and the follower's load report, one window */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
 }
 
