@@ -5,6 +5,8 @@
 //   q2bench --exl3 <exl3r4d.so> --r4d <libr4d.so> [--fn4x NAME=V ...] [--fn4r NAME=V ...] [--MA 1100] [--LA 22]
 //           [--MB 16,32] [--LB 22] [--experts 384] [--topk 6] [--hidden 5120] [--widths 640,512] [--bits 2] [--h-rot 1]
 //           [--pools 2] [--reps 3] [--warm-ms 600] [--dense 0|1] [--arms n16,h16,n32,h32,l16,x16] [--plan] [--check]
+//           [--dense-shapes N:K,...] [--dense-ar N]   (Qwen loop round 9: another model's dense shapes, q6_K stand-ins, the
+//           first all-reduce after the first N of them; e.g. Qwen Flash-Next tp4 rank shapes 4096:2560,2560:1536,512:2560 / 2)
 //
 // WHAT RUNS. Four host threads, one a card (HIP devices 0..3), each its rank of a TP4 node. Every card has four streams:
 // qa (normal priority), qal (the lowest), qb (normal), qbh (the highest). A "layer" is the launches a deepseek41 layer issues
@@ -160,10 +162,13 @@ struct Opt {
 // The dense shapes a layer (rank 0 of TP4; tools: r4d_selftest ds_gg_perf's list), q6_K, in issue order; the attention
 // all-reduce goes after index 4 (attn_output_b).
 struct Dense { const char* name; int64_t N, K; };
-const Dense kDense[] = { { "attn_q_a", 1280, 5120 }, { "attn_kv", 512, 5120 }, { "attn_q_b", 8192, 1280 },
-                         { "attn_output_a", 1024, 4096 }, { "attn_output_b", 5120, 2048 },
-                         { "shexp_gate_up", 1536, 5120 }, { "shexp_down", 5120, 768 } };
-constexpr int kNDense = 7, kQ6Blk = 210;   // q6_K: 210 bytes a 256-value block, its fp16 d at byte 208
+/* --dense-shapes N:K,... (Qwen loop round 9, QUEUE Q5b): another model's dense shapes as q6_K stand-ins (the same launch form,
+ * ~0.82 bytes a weight), the attention / mixer all-reduce after the first --dense-ar of them; default the DeepSeek list. */
+std::vector<Dense> kDense = { { "attn_q_a", 1280, 5120 }, { "attn_kv", 512, 5120 }, { "attn_q_b", 8192, 1280 },
+                              { "attn_output_a", 1024, 4096 }, { "attn_output_b", 5120, 2048 },
+                              { "shexp_gate_up", 1536, 5120 }, { "shexp_down", 5120, 768 } };
+int kNDense = 7, g_dense_ar = 5;
+constexpr int kQ6Blk = 210;   // q6_K: 210 bytes a 256-value block, its fp16 d at byte 208
 int64_t dense_bytes(const Dense& d) { return d.N * (d.K / 256) * kQ6Blk; }
 
 // One launch of a layer: the row, its parameters and operands, its instance and scratch.
@@ -276,7 +281,7 @@ const char* kdt_of(int bits) {
 struct Pool {
     std::array<std::array<RadTensor, 5>, 2> g;
     std::array<std::array<RadTensor, 3>, 2> d;
-    std::array<void*, kNDense> w{};   // the dense weights
+    std::array<void*, 16> w{};   // the dense weights (--dense-shapes: at most 16)
 };
 Pool make_pool(Ctx& c, const int64_t* Rg, const int64_t* Cg, const int64_t* Rd, const int64_t* Cd, const int64_t* nec) {
     const Opt& o = *c.o;
@@ -462,9 +467,9 @@ Work make_work(Ctx& c, const std::string& name, int64_t M, int L, const std::vec
             k.t = { T(xbf, RAD_BF16, { M, kDense[i].K }), T(P.w[(size_t)i], RAD_U8, { kDense[i].N, rb }), T(ybf, RAD_BF16, { M, kDense[i].N }) };
             calls.push_back(k);
         };
-        if (o.dense) for (int i = 0; i < 5; ++i) dense(i);
+        if (o.dense) for (int i = 0; i < g_dense_ar; ++i) dense(i);
         calls.push_back(ar);
-        if (o.dense) for (int i = 5; i < kNDense; ++i) dense(i);
+        if (o.dense) for (int i = g_dense_ar; i < kNDense; ++i) dense(i);
         Call G, D;
         G.row = gr; G.p = gp;
         G.t.assign((size_t)gpos->n_opd, RadTensor{});
@@ -741,7 +746,12 @@ void print_plan(const Opt& o) {
     std::printf("PLAN q2bench: TP4 (ranks = HIP devices 0..3), rank-0 widths %lld/%lld on every rank, hidden %lld, %lld experts top-%lld, K %d, h_rot %d\n",
                 (long long)o.widths[0], (long long)o.widths[1], (long long)o.hidden, (long long)o.E, (long long)o.topk, o.bits, o.h_rot);
     std::printf("PLAN a layer: %d launches (%s2 x exl3r4d, 2 x all-reduce); weights a pool %.1f MB experts + %.1f MB dense\n", lpl,
-                o.dense ? "7 x gemm_nt_ggml q6_K, " : "", eb / 1e6, db / 1e6);
+                o.dense ? (std::to_string(kNDense) + " x gemm_nt_ggml q6_K, ").c_str() : "", eb / 1e6, db / 1e6);
+    if (o.dense) {
+        std::printf("PLAN dense (q6_K):");
+        for (int i = 0; i < kNDense; ++i) std::printf("%s %lldx%lld", i == g_dense_ar ? " | AR |" : "", (long long)kDense[(size_t)i].N, (long long)kDense[(size_t)i].K);
+        std::printf("%s\n", g_dense_ar == kNDense ? " | AR" : "");
+    }
     std::printf("PLAN pools: %d for A + %d for B, %.2f GB a card of weights\n", o.pools, o.pools, 2.0 * o.pools * (eb + db) / 1e9);
     std::printf("PLAN A: %lld rows x %d layers (band %s, all-reduce %s %lld elements)\n", (long long)o.MA, o.LA, exl3_band(o.MA),
                 ar_row(o.MA * o.hidden), (long long)(o.MA * o.hidden));
@@ -787,6 +797,20 @@ int main(int argc, char** argv) {
         else if (a == "--reps") o.reps = std::atoi(nx());
         else if (a == "--warm-ms") o.warm_ms = (float)std::atof(nx());
         else if (a == "--dense") o.dense = std::atoi(nx()) != 0;
+        else if (a == "--dense-shapes") {   // N:K,... (q6_K stand-ins), replacing the DeepSeek list
+            kDense.clear();
+            for (auto& v : list(nx())) {
+                const size_t c2 = v.find(':');
+                if (c2 == std::string::npos) die("--dense-shapes N:K,...");
+                const int64_t N = std::atoll(v.c_str()), K = std::atoll(v.c_str() + c2 + 1);
+                if (N <= 0 || K <= 0 || K % 256 || N > 8192 || K > 8192) die("--dense-shapes: N <= 8192, K a multiple of 256 <= 8192: " + v);
+                kDense.push_back({ "dense", N, K });
+            }
+            if (kDense.empty() || kDense.size() > 16) die("--dense-shapes: 1..16 shapes");
+            kNDense = (int)kDense.size();
+            if (g_dense_ar > kNDense) g_dense_ar = kNDense;
+        }
+        else if (a == "--dense-ar") { g_dense_ar = std::atoi(nx()); if (g_dense_ar < 0 || g_dense_ar > kNDense) die("--dense-ar is 0..the dense shapes"); }
         else if (a == "--arms") o.arms = list(nx());
         else if (a == "--plan") o.plan = true;
         else if (a == "--check") return host_check();
