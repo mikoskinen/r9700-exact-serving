@@ -41,15 +41,20 @@ int exl3r4d_fn4_bi(void) { return g_fn4_bi; }
  * owns: [0, off[0]) and [off[n_expert], T) -- under expert parallelism the other ranks' dropped slots, ~3/4 of T at EP 4)
  * write nothing instead of zeros. Nobody reads those rows: down's ZERO entries do not read h, and the gather skips a
  * dropped slot (libr4d moe_gather / moe_gather_inv: its inverse stays -1), so every row any reader sees is today's bytes.
- * A protected expert's rows (served by the protected GEMM pair) are written by that pair. 0 at start = today. */
+ * A protected expert's rows (served by the protected GEMM pair) are written by that pair. 0 at start = today.
+ * Qwen loop round 14 (F41: exl3_drz 1 moves answers, so SOMETHING reads those rows): READING values, never a form to keep --
+ * 4 / 5 / 6 = today's paths (today's chunk table, every ZERO entry processed) but the map form's ZERO entries write a NaN
+ * row (0xffff: NaN as f16 and as bf16) instead of zeros: 4 in gate_up's h and down's y, 5 in h only, 6 in y only. If no
+ * reader exists, every answer is today's (exl3_drz 0's); a reader turns its rows to NaN. The decode band (fill()'s dz bit 2)
+ * and the run form keep their zeros at 4..6. */
 static volatile int g_fn4_drz = 0;
-int exl3r4d_fn4_drz(void) { return g_fn4_drz; }
+int exl3r4d_fn4_drz(void) { return g_fn4_drz == 1; }
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;
     if (!strcmp(name, "exl3_dz")) return EXL3R4D_DZ == 2 ? (value == 0 || value == 1 ? 1 : -1) : value == (EXL3R4D_DZ == 1) ? 1 : -1;
     if (!strcmp(name, "exl3_bi")) return value == 0 || value == 1 ? 1 : -1;
-    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 ? 1 : -1;
+    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 || (value >= 4 && value <= 6) ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {

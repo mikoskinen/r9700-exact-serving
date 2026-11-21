@@ -255,7 +255,7 @@ __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) 
     }
     return lo;
   };
-  if (a.drz) {
+  if (a.drz == 1) {
     // lever DRZ (prefill.c g_fn4_drz): the ZERO entries write nothing, so the chunks cover only the rows a run owns,
     // [off[0], off[n_expert]) -- the fewest chunks of at most R rows, balanced; the chunks past them are empty (their
     // launches exit at the head). Each live entry is today's (its rows, its prep rows from its chunk's rbase): the same
@@ -1075,7 +1075,16 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
     PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, ent.x == EXL3R4D_PF_ZERO ? 3u : ent.x % (unsigned)EXL3R4D_NCLS);
     constexpr int GD = MATS == 1 && AM == 0 ? EXL3R4D_PF_DN_G : 1;
     if (ent.x == EXL3R4D_PF_ZERO) {
-      if (a.drz) return;   // lever DRZ (prefill.c g_fn4_drz): rows nobody reads stay as they are
+      if (a.drz == 1) return;   // lever DRZ (prefill.c g_fn4_drz): rows nobody reads stay as they are
+      // DRZ reading values (prefill.c): 4 both, 5 gate_up's h, 6 down's y -- NaN rows instead of zeros (F41's reader)
+      if (a.drz == 4 || a.drz == (MATS == 2 ? 5 : 6)) {
+        const int units = (r1 - r0) * 16;
+        for (int u = threadIdx.x; u < units; u += blockDim.x) {
+          const int r = r0 + u / 16, c = (int)blockIdx.x * 128 + (u % 16) * 8;
+          *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){~0u, ~0u, ~0u, ~0u};
+        }
+        return;
+      }
       if constexpr (GD == 1)
         zero_rows(p, r0, r1, blockIdx.x);
       else
