@@ -2601,6 +2601,55 @@ TEST(d62_pp_bg_split_in_process_serves_one_process_tokens) {
     }
 }
 
+/* tp8 loop W8 (DECODE review of the DRAFTER's levers CHI + CIK + CTA, core/device): their start env on both nodes -- RADIANCE_AQL_IKA=1
+ * RADIANCE_AQL_CHI=1 RADIANCE_AQL_CTA=1 with RADIANCE_AQL_CIK=1 or 2 -- on the DSpark-drafted pipeline at 1 lane and 2 lanes at the
+ * wrap-around cut W(1,3), 3 lanes W(0,3): every request's tokens are one process's, and the engine's chain decision stays off on both
+ * nodes ('chained launches: off'): the host backend writes no chain records, so the plugins never take a chained form there (on the
+ * AQL backend CIK=2 turns it on, CIK=1 not: device_test cik_one_leaves_the_plugins_chain_decision_to_the_engine). The packets
+ * themselves are the AQL backend's (aql.cpp) and run only on a card. */
+TEST(w8_cik_chi_cta_start_env_keeps_one_process_tokens_and_the_chain_decision) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    std::vector<Drafted> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; const char* cik; };
+    for (const Arm a : { Arm{ 1, "1,3", "2" }, Arm{ 2, "1,3", "2" }, Arm{ 3, "0,3", "2" }, Arm{ 2, "1,3", "1" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        for (const char* v : { "RADIANCE_AQL_IKA=1", "RADIANCE_AQL_CHI=1", "RADIANCE_AQL_CTA=1" }) env.push_back(v);
+        env.push_back(std::string("RADIANCE_AQL_CIK=") + a.cik);
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(spec, lane_shape(a.lanes)), env));
+        const std::vector<Drafted> got = drafted_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        long long accepted = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ref[i].tok != got[i].tok) ++differ;
+            accepted += got[i].accepted;
+        }
+        fprintf(stderr, "    CIK=%s + IKA / CHI / CTA, %d lane(s) W(%s): %d of %zu requests differ, %lld drafts accepted\n", a.cik, a.lanes,
+                a.cut, differ, ref.size(), accepted);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 20).c_str());
+        CHECK_EQ(differ, 0);
+        CHECK(accepted > 0);
+        CHECK(llog.find("chained launches: off") != std::string::npos);
+        CHECK(llog.find("chained launches: on") == std::string::npos);
+        CHECK(flog.find("chained launches: on") == std::string::npos);
+    }
+}
+
 /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2 + RADIANCE_PP_NODE_IDLE_S=1 on both nodes): the node-idle time BY STRETCH -- with a BG
  * step in flight or without -- beside D8's line, with newcomers lent whole to a BG lane (3 lanes, BG_LANE=1, W(1,3), the
  * follower's one-layer segments): every request's tokens are one process's; each node's run line is D8's (the same text, so

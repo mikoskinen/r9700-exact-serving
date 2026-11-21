@@ -14,6 +14,7 @@
 #include "device/directio.h"
 #include "sched/advance.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -1844,6 +1845,80 @@ TEST(ika_names_a_kernel_by_its_own_identifier_in_the_mangled_symbol) {
     CHECK(!ika_listed("", list, n));
     CHECK(!ika_listed("_Z4gemmv", nullptr, 0));
     CHECK(!ika_listed("_Z4gemmv", list, 0));
+}
+
+/* tp8 loop W8 (DECODE review of the DRAFTER's lever CIK): RADIANCE_AQL_CIK=1 chains lever CIK's kernels inside the AQL backend only;
+ * the engine's chain decision -- the one the plugins see (select.cpp gives every chainable row its `chain` geometry, rad_chain_on) --
+ * stays the engine's (`pays`). CIK=2 turns it on too (the DRAFTER's round-62 form of 1: on the DeepSeek line the chainable libr4d
+ * rows' named chained forms, the 4-rank exact all-reduces at decode sizes among them). Only the AQL backend ever chains. */
+TEST(cik_one_leaves_the_plugins_chain_decision_to_the_engine) {
+    struct C { int pays, aql; const char* cik; int want; };
+    const C cases[] = {
+        { 0, 1, nullptr, 0 }, { 0, 1, "1", 0 }, { 0, 1, "2", 1 }, { 0, 1, "0", 0 }, { 0, 1, "", 0 }, { 0, 1, "3", 0 },
+        { 1, 1, nullptr, 1 }, { 1, 1, "1", 1 }, { 1, 1, "2", 1 }, { 1, 1, "0", 1 },
+        { 0, 0, "2", 0 }, { 1, 0, nullptr, 0 }, { 1, 0, "2", 0 },
+    };
+    for (const C& c : cases) {
+        const int got = rad_dev_chain_decide(c.pays, c.aql, c.cik);
+        if (got != c.want) fprintf(stderr, "    pays %d aql %d CIK=%s -> %d (want %d)\n", c.pays, c.aql, c.cik ? c.cik : "(unset)", got, c.want);
+        CHECK_EQ(got, c.want);
+    }
+    /* the live decision on this backend: on only where the backend is "aql" */
+    const char* had = std::getenv("RADIANCE_AQL_CIK");
+    const std::string keep = had ? had : "";
+    setenv("RADIANCE_AQL_CIK", "2", 1);
+    rad_dev_chain_infer(0);
+    const int live = rad_dev_chain_enabled();
+    CHECK_EQ(live, std::strcmp(rad::device_backend_name(), "aql") == 0 ? 1 : 0);
+    if (had) setenv("RADIANCE_AQL_CIK", keep.c_str(), 1);
+    else unsetenv("RADIANCE_AQL_CIK");
+    rad_dev_chain_infer(0);
+    CHECK_EQ(rad_dev_chain_enabled(), 0);
+}
+
+/* tp8 loop W8: lever CTA's block layout (core/device/aql.h cta_pack, the DRAFTER's round-63 placement): for argument lengths 0 .. 992,
+ * every block starts on 64 bytes, no block's arguments [o, o + len) meet any block's record [o' + 992, o' + 1024), the records are
+ * disjoint and in order, the end is the last record's; 15 blocks of 64-byte arguments share a group (2 KB, not 15 KB). */
+TEST(cta_blocks_never_put_arguments_over_a_record) {
+    using rad::aql::cta_pack;
+    const size_t R = RAD_CHAIN_KARG_OFF, B = RAD_CHAIN_REC_BYTES;
+    {
+        std::vector<uint32_t> len(16, 64);
+        std::vector<size_t> off(16);
+        const size_t end = cta_pack(len.data(), 15, R, B, off.data());
+        CHECK_EQ(off[14], (size_t)896);
+        CHECK_EQ(end, (size_t)(896 + R + B));
+        (void)cta_pack(len.data(), 16, R, B, off.data());
+        CHECK_EQ(off[15], (size_t)((960 + R + 63) & ~size_t(63)));
+        CHECK_EQ(cta_pack(len.data(), 0, R, B, off.data()), (size_t)0);
+    }
+    const uint32_t pick[] = { 0, 1, 8, 32, 48, 63, 64, 65, 120, 128, 200, 256, 500, 928, 960, 961, 991, 992 };
+    uint64_t z = 0x9e3779b97f4a7c15ull;
+    int bad = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        z = z * 6364136223846793005ull + 1442695040888963407ull;
+        const size_t n = 1 + (size_t)((z >> 33) % 60);
+        std::vector<uint32_t> len(n);
+        for (size_t i = 0; i < n; ++i) {
+            z = z * 6364136223846793005ull + 1442695040888963407ull;
+            len[i] = (z >> 40) % 3 == 0 ? (uint32_t)((z >> 20) % (R + 1)) : pick[(z >> 33) % (sizeof pick / sizeof pick[0])];
+        }
+        std::vector<size_t> off(n);
+        const size_t end = cta_pack(len.data(), n, R, B, off.data());
+        size_t last = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (off[i] % 64) ++bad;
+            if (i && off[i] <= off[i - 1]) ++bad;
+            last = std::max(last, off[i] + R + B);
+            for (size_t j = 0; j < n; ++j) {
+                const size_t a0 = off[j], a1 = off[j] + len[j], r0 = off[i] + R, r1 = r0 + B;
+                if (a0 < r1 && r0 < a1) ++bad;                                   /* arguments over a record */
+                if (i != j && off[j] + R < r1 && r0 < off[j] + R + B) ++bad;     /* two records overlap */
+            }
+        }
+        if (end != last) ++bad;
+    }
+    CHECK_EQ(bad, 0);
 }
 
 /* tp8 loop W3s (fn4 aql_ika = switch 107): a recording makes the marks of both forms and the switch picks at play
