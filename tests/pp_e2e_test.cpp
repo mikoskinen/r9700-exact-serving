@@ -396,6 +396,7 @@ struct Serving {
     Proc fol, lead;
     int port = 0, pp_port = 0;
     std::string model;   /* tp8 loop D36: another model file (empty: world()'s four-layer llama) */
+    std::vector<std::string> lenv_more, fenv_more;   /* tp8 loop item 7: one node's own env beside `env` */
     bool start(const std::string& cut, const std::vector<std::string>& extra = {},
                const std::vector<std::string>& env = {}) {
         World& w = world();
@@ -404,11 +405,11 @@ struct Serving {
         a = cat(a, extra);
         if (!cut.empty()) {
             pp_port = free_port();
-            if (!fol.start(engine_argv(mp, cat(a, pp_args(1, pp_port, cut))), engine_env(env))) return false;
+            if (!fol.start(engine_argv(mp, cat(a, pp_args(1, pp_port, cut))), engine_env(cat(env, fenv_more)))) return false;
             if (!fol.wait_for("waiting on", 60)) return false;
             a = cat(a, pp_args(0, pp_port, cut));
         }
-        if (!lead.start(engine_argv(mp, a), engine_env(env))) return false;
+        if (!lead.start(engine_argv(mp, a), engine_env(cat(env, lenv_more)))) return false;
         static const std::string kTag = "listening on http://127.0.0.1:";
         if (!lead.wait_for(kTag, 120)) {
             fprintf(stderr, "    the leader did not start:\n%s\n    follower:\n%s\n", tail(lead.output()).c_str(),
@@ -9353,4 +9354,215 @@ TEST(d59_chat_and_anthropic_forms_with_tools_under_kv_pressure_serve_one_process
     }
     fprintf(stderr, "    D59 preemptions: one process %lld, all arms %lld\n", pre_one, pre_all);
     if (!only) CHECK(pre_one > 0);   /* the set reaches the pool */
+}
+
+/* ================================================================== tp8 loop item 7: the failure bound
+ * (a) a frozen or killed node takes the pair down within seconds (the link's heartbeat: RADIANCE_PP_DEAD_MS, 2 s here);
+ * (b) RADIANCE_STUCK_EXIT_S: a node whose step / follower loop waits forever (RADIANCE_DEBUG_HANG_STEP stands in for a
+ *     card wait that never returns) keeps its heartbeat alive -- without the watchdog the request and both processes hang
+ *     for good, with it the stuck node ends with exit 70, the other goes down with it, the request ends;
+ * (c) the watchdog set but not firing changes nothing: one process's tokens and KL recordings at 1 / 2 / 3 lanes and at a
+ *     wrap-around cut, an idle pair past the limit stays up, a clean stop exits 0. */
+namespace {
+
+/* /completion with a bound on the wait: `ended` false when nothing (not even a close) came within `timeout_s` */
+struct Timed { int status = -2; size_t n = 0; bool ended = false; std::chrono::steady_clock::time_point at; };
+Timed complete_timed(int port, const std::vector<int32_t>& prompt, int n, int timeout_s) {
+    const json b = { { "prompt", prompt }, { "n_predict", n }, { "temperature", 0.0 }, { "ignore_eos", true },
+                     { "return_tokens", true } };
+    Call c;
+    Timed t;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    if (!c.send(port, "/completion", b.dump())) { t.ended = true; t.status = -1; t.at = std::chrono::steady_clock::now(); return t; }
+    std::string raw;
+    char buf[16384];
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
+        if (left <= 0) break;
+        pollfd pf{ c.fd, POLLIN, 0 };
+        const int pr = ::poll(&pf, 1, (int)std::min<long long>(left, 200));
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) continue;
+        const ssize_t r = ::recv(c.fd, buf, sizeof buf, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { t.ended = true; break; }
+        raw.append(buf, (size_t)r);
+    }
+    t.at = std::chrono::steady_clock::now();
+    if (!t.ended) return t;
+    const size_t h = raw.find("\r\n\r\n");
+    t.status = raw.compare(0, 9, "HTTP/1.1 ") == 0 && h != std::string::npos ? std::atoi(raw.c_str() + 9) : -1;
+    if (h != std::string::npos) {
+        const json j = json::parse(raw.substr(h + 4), nullptr, false);
+        if (j.is_object() && j.contains("tokens")) t.n = j["tokens"].size();
+    }
+    return t;
+}
+
+double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+}
+
+/* A Proc's exit with the time it took from `t0`; `timed_out` when it had to be killed (it did not end by itself). */
+struct Ended { int status = -1; double s = 0; bool timed_out = false; };
+Ended finish_from(Proc& p, std::chrono::steady_clock::time_point t0, int timeout_s) {
+    const auto a = std::chrono::steady_clock::now();
+    Ended e;
+    e.status = p.finish(timeout_s);
+    const auto b = std::chrono::steady_clock::now();
+    e.timed_out = secs(a, b) >= (double)timeout_s - 0.05;
+    e.s = secs(t0, b);
+    return e;
+}
+
+}  /* namespace */
+
+TEST(a_frozen_or_killed_node_takes_the_pair_down_within_seconds) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(21, 50);
+    struct Arm { const char* name; bool leader; int sig; };
+    for (const Arm a : { Arm{ "follower SIGSTOP", false, SIGSTOP }, Arm{ "leader SIGKILL", true, SIGKILL },
+                         Arm{ "leader SIGSTOP", true, SIGSTOP } }) {
+        Serving sv;
+        REQUIRE(sv.start("0,2"));
+        std::future<Timed> req = std::async(std::launch::async, [&] { return complete_timed(sv.port, p, 4000, 30); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        Proc& hit = a.leader ? sv.lead : sv.fol;
+        Proc& other = a.leader ? sv.fol : sv.lead;
+        const auto t0 = std::chrono::steady_clock::now();
+        ::kill(hit.child.pid, a.sig);
+        const Ended o = finish_from(other, t0, 20);
+        if (a.leader && a.sig == SIGSTOP) ::kill(hit.child.pid, SIGKILL);   /* a frozen leader holds its clients' sockets */
+        const Timed r = req.get();
+        fprintf(stderr, "    %-17s: the other node exited %d after %.2f s%s; the request %s after %.2f s (status %d, %zu tokens)\n",
+                a.name, o.status, o.s, o.timed_out ? " (KILLED by the test: it did not end)" : "",
+                r.ended ? "ended" : "DID NOT END", secs(t0, r.at), r.status, r.n);
+        CHECK(!o.timed_out);
+        CHECK(o.status != 0);
+        CHECK(o.s < 10.0);   /* RADIANCE_PP_DEAD_MS 2000 + the loop's notice */
+        CHECK(r.ended);
+        CHECK(r.status != 200 || r.n < 4000);
+        if (!a.leader) CHECK(secs(t0, r.at) < 10.0);   /* the leader answers it (a killed / frozen leader cannot) */
+        if (!a.leader && a.sig == SIGSTOP) ::kill(hit.child.pid, SIGKILL);
+        (void)hit.finish(10);
+    }
+}
+
+TEST(stuck_exit_ends_a_pair_whose_loop_hangs_and_without_it_everything_waits) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(21, 50);
+    struct Arm { const char* name; const char* cut; const char* lanes; int hang; bool watch; };   /* hang: 0 leader / one process, 1 follower */
+    const Arm arms[] = {
+        { "one process, watchdog 2 s", "", "", 0, true },
+        { "leader W(0,2), watchdog 2 s", "0,2", "1", 0, true },
+        { "follower W(0,2), watchdog 2 s", "0,2", "1", 1, true },
+        { "leader W(1,3) 2 lanes, watchdog 2 s", "1,3", "2", 0, true },
+        { "follower W(1,3) 3 lanes, watchdog 2 s", "1,3", "3", 1, true },
+        { "leader W(0,2), no watchdog", "0,2", "1", 0, false },
+        { "follower W(0,2), no watchdog", "0,2", "1", 1, false },
+    };
+    for (const Arm& a : arms) {
+        Serving sv;
+        const bool pp = *a.cut != 0;
+        const std::string hang = "RADIANCE_DEBUG_HANG_STEP=20";
+        std::vector<std::string> env;
+        if (a.watch) env.push_back("RADIANCE_STUCK_EXIT_S=2");
+        (a.hang == 0 ? sv.lenv_more : sv.fenv_more).push_back(hang);
+        /* one lane at the shape's two sequences (the kill case's form); more lanes as the lanes cases run them */
+        std::vector<std::string> extra;
+        if (!pp) extra = { "--max-num-seqs", "6" };
+        else if (std::strcmp(a.lanes, "1") != 0) extra = { "--max-num-seqs", "6", "--pp-lanes", a.lanes };
+        REQUIRE(sv.start(a.cut, extra, env));
+        std::future<Timed> req = std::async(std::launch::async, [&] { return complete_timed(sv.port, p, 4000, a.watch ? 30 : 8); });
+        Proc& stuck = a.hang == 0 ? sv.lead : sv.fol;
+        Proc& other = a.hang == 0 ? sv.fol : sv.lead;
+        const bool hung = stuck.wait_for("stops here after", 30);
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(hung);
+        if (!hung) { fprintf(stderr, "    %s: no hang line\n%s\n", a.name, tail(stuck.output()).c_str()); continue; }
+        if (a.watch) {
+            const Ended s = finish_from(stuck, t0, 20);
+            const Ended o = pp ? finish_from(other, t0, 20) : Ended{};
+            const Timed r = req.get();
+            fprintf(stderr, "    %-40s: the stuck node exited %d after %.2f s%s, the other %d after %.2f s%s; the request %s after "
+                            "%.2f s (status %d, %zu tokens)\n", a.name, s.status, s.s, s.timed_out ? " (KILLED)" : "",
+                    o.status, o.s, o.timed_out ? " (KILLED)" : "", r.ended ? "ended" : "DID NOT END", secs(t0, r.at), r.status, r.n);
+            CHECK(!s.timed_out);
+            CHECK_EQ(s.status, 70);
+            CHECK(s.s < 6.0);   /* 2 s + a poll of 250 ms + the link fail's bound */
+            CHECK(stuck.output().find("no progress for") != std::string::npos);
+            if (pp) {
+                CHECK(!o.timed_out);
+                CHECK(o.status != 0);
+                CHECK(o.s < 8.0);
+            }
+            CHECK(r.ended);
+            CHECK(r.status != 200 || r.n < 4000);
+            CHECK(secs(t0, r.at) < 8.0);
+        } else {
+            /* the negative control: the hook really hangs, and nothing else ends it */
+            const Timed r = req.get();
+            const bool s_up = ::kill(stuck.child.pid, 0) == 0, o_up = !pp || ::kill(other.child.pid, 0) == 0;
+            fprintf(stderr, "    %-40s: %.1f s after the hang the request %s, the stuck node %s, the other %s\n", a.name,
+                    secs(t0, r.at), r.ended ? "ENDED" : "still waits", s_up ? "up" : "GONE", o_up ? "up" : "GONE");
+            CHECK(!r.ended);
+            CHECK(s_up);
+            CHECK(o_up);
+            CHECK(stuck.output().find("no progress for") == std::string::npos);
+        }
+    }
+}
+
+TEST(stuck_exit_set_but_not_firing_serves_one_process_tokens_and_stops_cleanly) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }));
+        ref = greedy_set(sv.port);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+    }
+    REQUIRE(!ref.empty());
+    for (const auto& r : ref) REQUIRE(!r.empty());
+    struct Arm { const char* cut; const char* lanes; };
+    for (const Arm a : { Arm{ "", "" }, Arm{ "0,2", "1" }, Arm{ "1,3", "1" }, Arm{ "1,3", "2" }, Arm{ "1,3", "3" } }) {
+        Serving sv;
+        const bool pp = *a.cut != 0;
+        /* one lane at the shape's two sequences (the kill case's form); more lanes as the lanes cases run them */
+        std::vector<std::string> extra;
+        if (!pp) extra = { "--max-num-seqs", "6" };
+        else if (std::strcmp(a.lanes, "1") != 0) extra = { "--max-num-seqs", "6", "--pp-lanes", a.lanes };
+        REQUIRE(sv.start(a.cut, extra, { "RADIANCE_STUCK_EXIT_S=2" }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));   /* idle past the limit: an idle loop iterates */
+        const auto got = greedy_set(sv.port);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        const auto again = greedy_set(sv.port);
+        kill(sv.lead.child.pid, SIGTERM);
+        const int ls = sv.lead.finish(60), fs = pp ? sv.fol.finish(30) : 0;
+        const std::string llog = sv.lead.output();
+        fprintf(stderr, "    %s%s lanes %s, RADIANCE_STUCK_EXIT_S=2: tokens %s / %s (after 3 s / 2.5 s idle); exits %d / %d\n",
+                pp ? "W(" : "one process", pp ? (std::string(a.cut) + ")").c_str() : "", pp ? a.lanes : "-",
+                got == ref ? "identical" : "DIFFERENT", again == ref ? "identical" : "DIFFERENT", ls, fs);
+        CHECK(got == ref);
+        CHECK(again == ref);
+        CHECK_EQ(ls, 0);
+        CHECK_EQ(fs, 0);
+        CHECK(llog.find("RADIANCE_STUCK_EXIT_S=2: the ") != std::string::npos);
+        CHECK(llog.find("no progress for") == std::string::npos);
+        if (pp) CHECK(sv.fol.output().find("RADIANCE_STUCK_EXIT_S=2: the follower loop's watchdog") != std::string::npos);
+    }
+    /* KL recordings: the pipeline with the watchdog on both nodes = one process */
+    tiny::TempDir d("pp_stuck");
+    const std::string one = record_single(d / "single");
+    REQUIRE(!one.empty());
+    for (const char* cut : { "1,3", "0,2" }) {
+        const std::string out = d / (std::string("pp") + cut[0]);
+        const PipeRun pr = record_pipeline(out, cut, { "RADIANCE_STUCK_EXIT_S=2" }, {}, {}, { "RADIANCE_STUCK_EXIT_S=2" });
+        std::string why;
+        const bool same = pr.leader == 0 && pr.follower == 0 && same_recording(one, out, &why);
+        fprintf(stderr, "    KL W(%s) with the watchdog on both: %s%s (exits %d / %d)\n", cut, same ? "identical" : "DIFFERENT ",
+                same ? "" : why.c_str(), pr.leader, pr.follower);
+        CHECK(same);
+    }
 }
