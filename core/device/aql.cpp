@@ -592,6 +592,23 @@ bool cik_on() {
     return on;
 }
 
+/* Lever CTA (DRAFTER track round 63): start env RADIANCE_AQL_CTA=1, read only while lever CIK is on. A chained record that plays
+ * WITH its barrier bit (target 0 under CIK: behind a plain kernel, the first of a run) reads its arguments and its record from a
+ * block of the tape's own copy, written once when the tape is placed, instead of from the queue's argument slot the host writes
+ * at every play: the first read of a slot line the host just wrote through the BAR is on the critical path of an ordered dispatch
+ * (drafter/kit/mes/ikh9.cpp, xeon GPU2, r63b: the gap from the previous kernel's end to a chained kernel's first instruction is
+ * 2.60-2.88 us behind an IKA kernel vs 1.88-1.96 for an IKA kernel behind one; 2.04 when the same kernel plays unchained from
+ * the tape). The block's record is constant (target 0, the queue's counter), so concurrent plays may share it. */
+bool cta_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_AQL_CTA");
+        const bool v = e && e[0] == '1' && cik_on();
+        if (v) RAD_INFO("aql: lever CTA on (RADIANCE_AQL_CTA=1): an ordered chained record plays its arguments from the tape's copy");
+        return v;
+    }();
+    return on;
+}
+
 /* Whether the module holding `m`'s code was built with the chain-capable IKA entry: its OWN object exports
  * `int r4d_ika_chain(void)` returning 1 (libr4d / exl3r4d built with R4D_IKA_CHAIN). Core's own blit kernels never are. */
 bool cik_module(const Module* m) {
@@ -1231,6 +1248,9 @@ struct TapeRec {
     /* Lever CIK: a chained record whose kernel counts LANES (KernelRec::cik) -- its share of the chain counter is its grid's
      * work-items, not its blocks; and an overlap record (haz_mark: touches nothing in flight) plays unchained (stays unordered). */
     uint8_t  lanes = 0;
+    /* Lever CTA (RADIANCE_AQL_CTA=1): a chained record's block in the tape's copy -- its arguments and, at RAD_CHAIN_KARG_OFF, a
+     * chain record with target 0 on its queue's counter -- played when the record goes out with its barrier bit. */
+    char*    karg_t0 = nullptr;
 };
 
 struct Tape {
@@ -1523,14 +1543,31 @@ struct PlayRun {
          * this one runs. */
         bool chain = false;
         if (r.chain && tape) {
-            char* slot = s->karg + (size_t)(idx & s->mask) * kKargSlot;
             chain = s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
             /* Lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's
              * copy (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel. */
             if (r.lanes && r.overlap && !foreign && !done.handle) chain = false;
-            if (chain) {
+        }
+        /* A dispatch carrying a record keeps the bit: its completion must cover everything before
+         * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
+         * on this queue waits in its prologue instead. */
+        bool ordered = foreign || !r.overlap || done.handle;
+        /* Not while a plain packet may still run: a played plain kernel the overlap analysis let
+         * start early (it touched nothing in flight) adds nothing to the counter, so a chained
+         * kernel that reads its output and sits behind a chained one (a cache read beside a
+         * collective, say) would wait for the chained blocks only. */
+        if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
+        /* Lever CTA: an ordered chained record (target 0) plays from its block in the tape's copy (constant record), else from
+         * the queue's slot with the record written now. */
+        const bool cta = chain && ordered && r.karg_t0 && cta_on();
+        if (chain) {
+            char* slot = s->karg + (size_t)(idx & s->mask) * kKargSlot;
+            if (cta) {
+                p->kernarg_address = r.karg_t0;
+            } else {
                 std::memcpy(slot, tape->karg_host.data() + r.karg_off, r.karg_len);
                 p->kernarg_address = slot;
+                chain_record(s, slot, true, ordered);
             }
         }
         int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
@@ -1551,8 +1588,9 @@ struct PlayRun {
          * scalar-cache lines of the slot cannot be stale); the rule's marks never drop a chained record's acquire, as before. */
         const bool chi_ok = ika_live && r.chain && chain && chi_on() && r.ika && r.ikaok &&
                             (int64_t)idx - (int64_t)(s->mask + 1) < s->last_oacq;
+        /* Lever CTA: a record played from the tape's copy (never rewritten) takes lever IKA's own drop, as an IKA record does. */
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_none_() || (((mark && !r.chain) || chi_ok) && !foreign && aql_acq_mode() == 1)))
+            (aql_acq_none_() || (((mark && (!r.chain || (cta && ika_live))) || chi_ok) && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent
@@ -1561,16 +1599,6 @@ struct PlayRun {
         if (rel == HSA_FENCE_SCOPE_AGENT && ika_play_release_none(ika_live, r.ika != 0, done.handle != 0))
             rel = HSA_FENCE_SCOPE_NONE;
         if (rel < rel_min) rel = rel_min;
-        /* A dispatch carrying a record keeps the bit: its completion must cover everything before
-         * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
-         * on this queue waits in its prologue instead. */
-        bool ordered = foreign || !r.overlap || done.handle;
-        /* Not while a plain packet may still run: a played plain kernel the overlap analysis let
-         * start early (it touched nothing in flight) adds nothing to the counter, so a chained
-         * kernel that reads its output and sits behind a chained one (a cache read beside a
-         * collective, say) would wait for the chained blocks only. */
-        if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
-        if (chain) chain_record(s, s->karg + (size_t)(idx & s->mask) * kKargSlot, true, ordered);
         if (stamp) {
             stamp->ordered = ordered;
             stamp->chained = chain;
@@ -2330,11 +2358,33 @@ RadTape a_tape_end(int keep) {
     if (!t->karg_host.empty()) {
         const Dev& d = G().dev[(size_t)ord];
         void* ka = nullptr;
+        /* Lever CTA: a block a chained record past the packed blocks (and their pad slot), packed densely: a group's blocks start
+         * 64 bytes apart (o_j), each one's arguments end by RAD_CHAIN_KARG_OFF and its record sits at o_j + RAD_CHAIN_KARG_OFF, so
+         * no block's arguments meet another's record (15 blocks of <= 64-byte arguments in 2 KB, not 15 KB: fewer pages read). */
+        const size_t cta_base = ((t->karg_host.size() + kKargSlot + kKargSlot - 1) / kKargSlot) * kKargSlot;
+        std::vector<size_t> cta_off;   /* a chained record's block, from cta_base, in rec order */
+        size_t cta_end = 0;
+        if (cta_on()) {
+            size_t g = 0, o = 0;   /* the group's start, the next block's place in it */
+            for (const TapeRec& r : t->rec) {
+                if (!(r.kind == kTapeDispatch && r.chain && r.s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF)) continue;
+                const size_t st = ((size_t)r.karg_len + 63) & ~size_t(63);
+                if (o && o + st > RAD_CHAIN_KARG_OFF) {   /* the group is full: the next starts past its last record */
+                    g = (g + o + RAD_CHAIN_KARG_OFF + 63) & ~size_t(63);
+                    o = 0;
+                }
+                cta_off.push_back(g + o);
+                cta_end = std::max(cta_end, g + o + RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES);
+                o += st ? st : 64;
+            }
+        }
+        const size_t ncta = cta_off.size();
+        const size_t kbytes = ncta ? cta_base + ((cta_end + 63) & ~size_t(63)) : t->karg_host.size() + kKargSlot;
         /* Padded by a slot: a chained kernel played from here reads its record's place
          * (RAD_CHAIN_KARG_OFF) past its own arguments. */
         hsa_amd_memory_pool_t pool = d.host_kargs ? G().host_fine : d.vram;
         hsa_agent_t peer = d.host_kargs ? d.agent : G().cpu;
-        if (hsa_amd_memory_pool_allocate(pool, t->karg_host.size() + kKargSlot, 0, &ka) !=
+        if (hsa_amd_memory_pool_allocate(pool, kbytes, 0, &ka) !=
                 HSA_STATUS_SUCCESS ||
             hsa_amd_agents_allow_access(1, &peer, nullptr, ka) != HSA_STATUS_SUCCESS) {
             if (ka) hsa_amd_memory_pool_free(ka);
@@ -2345,9 +2395,30 @@ RadTape a_tape_end(int keep) {
             return nullptr;
         }
         std::memcpy(ka, t->karg_host.data(), t->karg_host.size());
-        _mm_sfence();
         t->karg = static_cast<char*>(ka);
-        note_alloc(ka, (int64_t)t->karg_host.size(), -1);
+        /* Under lever CIK the pad past the packed blocks is zeroed: memory a freed tape's blocks or a freed queue's argument ring
+         * held may come back here, and a stale record in it would be accepted by an unchained play of the last packed record
+         * (its tail reads the pad). */
+        if (cik_on()) std::memset(t->karg + t->karg_host.size(), 0, (ncta ? cta_base : t->karg_host.size() + kKargSlot) - t->karg_host.size());
+        if (ncta) {
+            std::vector<unsigned char> img((cta_end + 63) & ~size_t(63), 0);
+            size_t j = 0;
+            for (TapeRec& r : t->rec) {
+                if (!(r.kind == kTapeDispatch && r.chain && r.s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF)) continue;
+                const size_t o = cta_off[j++];
+                std::memcpy(img.data() + o, t->karg_host.data() + r.karg_off, r.karg_len);
+                uint64_t rec[4];
+                rec[0] = RAD_CHAIN_MAGIC;
+                rec[1] = 0;
+                rec[2] = (uint64_t)(uintptr_t)r.s->chain_ctr;
+                rec[3] = rec[0] ^ rec[1] ^ rec[2] ^ RAD_CHAIN_CHECK;
+                std::memcpy(img.data() + o + RAD_CHAIN_KARG_OFF, rec, sizeof rec);
+                r.karg_t0 = t->karg + cta_base + o;
+            }
+            std::memcpy(t->karg + cta_base, img.data(), img.size());
+        }
+        _mm_sfence();
+        note_alloc(ka, (int64_t)(ncta ? kbytes : t->karg_host.size()), -1);
         for (TapeRec& r : t->rec)
             if (r.kind == kTapeDispatch) r.pkt.kernarg_address = t->karg + r.karg_off;
     }
