@@ -496,8 +496,13 @@ struct Dsp {
      * (contiguous), declared beside EMA where the start env names lever DPR (0 / 1) and the wire is exact */
     rad_op ema_x = 0;
     rad_buf xa = 0, ema_ia = 0, ema_ie = 0;
+    /* lever EMG (round 74; g_sw_dmr's comment, + 128 on an EMA pass): ema_e's hc strip gathers as ONE gather_rows over h0 seen
+     * as [hc x T, D] rows, by ema_ie4 [n x hc x Q] i32 (persistent): ie4[k][hc r + i] = ie[k][r]; declared beside EMA where the
+     * start env names RADIANCE_DS41_DSPARK_EMG (0 / 1) */
+    rad_op ema_eh = 0;
+    rad_buf ema_ie4 = 0;
     std::vector<int64_t> ema_blk;
-    std::vector<int32_t> ema_host;   /* the two planes, ia then ie, as uploaded */
+    std::vector<int32_t> ema_host;   /* the planes, ia then ie (then ie4 under EMG), as uploaded */
     bool ema_up = false;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
     /* lever W1, the full-vocabulary walk (RADIANCE_DS41_DSPARK_WALK; walk_read_env): world > 1, a dspark_walk_step a
@@ -2234,7 +2239,13 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * rows) and folds run as one dependent chain of six (lq231 c16: 57 us of launches + 5 ordered gaps); with their own rows the
  * second and third projections play unordered beside the first (nothing they write is read or written in flight). The same
  * ops, params and kernels over the same values: every window key's bytes are today's (rule A; tools/dbench/dkp: the
- * projections' outputs equal at every M). Declared only where every stage's d_kvfs is (level 2 under the MHR env). */
+ * projections' outputs equal at every M). Declared only where every stage's d_kvfs is (level 2 under the MHR env).
+ * + 128 (DRAFTER track 21.11.2026 round 74, lever EMG; 128..255 = the bits below + EMG, start env RADIANCE_DS41_DSPARK_EMG=1 adds
+ * it to the start value, =0 declares its op with the bit off) = on an EMA pass (level 7), ema_e's hc strip gathers (xa -> h0's
+ * column strips, hc launches) as ONE gather_rows over h0 seen as [hc x T, D] rows (h0 is [Q, hc x D] packed, so row hc r + i
+ * IS strip i of row r) by a plane ie4[hc r + i] = ie[r]: the same kernel copying the same rows (rule A; tools/dbench/ema r74:
+ * h0 equal byte for byte at 16 x 2 / 8 x 5 / 16 x 5 / 32 x 5 / 1 x 5 / 3 x 2), hc - 1 launches and their ordered gaps off the
+ * pass's head. Declared only beside EMA under the start env. */
 static std::atomic<int> g_sw_dmr{-1};
 static std::atomic<int> g_dsp_sdf{0};    /* lever SDD: the DSpark MoE's shexp_lane word (kMoeSdfBit or 0; set at each query pass) */
 static std::atomic<int> g_ema_bad{0};    /* lever EMA: a rank of this process could not declare it: off on every rank */
@@ -2280,8 +2291,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dk = k && k[0] == '1' && !k[1] ? 64 : 0;
         if (k && *k && !dk && std::strcmp(k, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DKP=%s is not 0 / 1: lever DKP not declared\n", k);
+        const char* gq = std::getenv("RADIANCE_DS41_DSPARK_EMG");   /* lever EMG (round 74): 1 = on at start, 0 = declared, off */
+        const int dg = gq && gq[0] == '1' && !gq[1] ? 128 : 0;
+        if (gq && *gq && !dg && std::strcmp(gq, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_EMG=%s is not 0 / 1: lever EMG not declared\n", gq);
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk);
+        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk |
+                                                     dg);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2298,6 +2314,14 @@ static bool dkp_env() {
 }
 static std::atomic<int> g_dkp_ok{0}, g_dkp_bad{0};   /* lever DKP: declared on a rank / a rank of this process could not */
 static std::atomic<long long> g_dkp_passes{0};       /* lever DKP: the first-pass line */
+static bool emg_now() { return (dmr_raw() & 128) != 0; }  /* lever EMG (round 74) */
+/* lever EMG: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
+static bool emg_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_EMG");
+    return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
+}
+static std::atomic<int> g_emg_bad{0};             /* lever EMG: a rank of this process could not declare it: off on every rank */
+static std::atomic<long long> g_emg_passes{0};    /* lever EMG: the first-pass line */
 /* lever DQR: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
 static bool dqr_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_DQR");
@@ -3120,7 +3144,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 127 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 255 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3253,7 +3277,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5703,11 +5727,32 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             if (ok && pe && (!std::strcmp(pe, "0") || !std::strcmp(pe, "1")) && dspark_arf() < 2)
                 d.ema_x = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
                              { d.xa, d.ema_ie }, { d.x });
+            /* lever EMG (round 74): the strips' gather as one, over h0 seen as [hc x T, D] rows (issued on a raw view of h0's
+             * own pointer, so the hazard marks see h0's first T rows written; liveness declared on h0 here) */
+            d.ema_eh = 0;
+            d.ema_ie4 = 0;
+            if (ok && emg_env()) {
+                d.ema_ie4 = decl_b(b, nm.f("dspark_embed_expand_idx4"), RAD_I32, { nb * c.hc * Q, 1 }, RAD_BUF_PERSIST);
+                if (d.ema_ie4)
+                    d.ema_eh = op(b, "gather_rows", { RAD_RANGE("M", 1, c.hc * Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
+                                  {}, { d.xa, d.ema_ie4 }, { d.h0 });
+                if (!d.ema_eh) {
+                    d.ema_ie4 = 0;
+                    g_emg_bad.store(1, std::memory_order_relaxed);
+                }
+                if (g.rank == 0)
+                    fprintf(stderr, "radiance: deepseek41: DSpark lever EMG (RADIANCE_DS41_DSPARK_EMG, fn4 dspark_mhr + 128, now %s) "
+                                    "%s: the embedding's %lld strip gathers as one gather_rows of up to %lld rows\n",
+                            emg_now() ? "on" : "off", d.ema_eh ? "declared" : "NOT declared", (long long)c.hc,
+                            (long long)(c.hc * Q));
+            }
         }
         if (ok) {
             /* the planes: ia[k][0] = 1 (sequence 0's first mask row), ia[k][1 + s] = s x blk; ie[k][r] = 1 + r / blk at an
-             * anchor row, 0 (xa's mask row) elsewhere -- functions of the block alone, so one upload serves every pass */
-            d.ema_host.assign((size_t)(2 * nb * Q), 0);
+             * anchor row, 0 (xa's mask row) elsewhere -- functions of the block alone, so one upload serves every pass;
+             * lever EMG: ie4[k][hc r + i] = ie[k][r] after them */
+            const int64_t n4 = d.ema_ie4 ? nb * c.hc * Q : 0;
+            d.ema_host.assign((size_t)(2 * nb * Q + n4), 0);
             for (int64_t k = 0; k < nb; ++k) {
                 const int64_t bl = d.ema_blk[(size_t)k];
                 int32_t* ia = d.ema_host.data() + k * Q;
@@ -5715,8 +5760,15 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 ia[0] = 1;
                 for (int64_t s = 0; s + 1 < Q; ++s) ia[1 + s] = (int32_t)(s * bl < Q ? s * bl : 0);
                 for (int64_t r = 0; r < Q; ++r) ie[r] = (int32_t)(r % bl ? 0 : 1 + r / bl);
+                if (n4) {
+                    int32_t* ie4 = d.ema_host.data() + 2 * nb * Q + k * c.hc * Q;
+                    for (int64_t r = 0; r < Q; ++r)
+                        for (int64_t i = 0; i < c.hc; ++i) ie4[r * c.hc + i] = ie[r];
+                }
             }
         } else {
+            d.ema_eh = 0;
+            d.ema_ie4 = 0;
             d.ema_g = d.ema_ar = d.ema_e = d.ema_x = 0;
             d.ema_blk.clear();
             g_ema_bad.store(1, std::memory_order_relaxed);
@@ -8688,8 +8740,11 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         const int64_t nq = (int64_t)d.ema_blk.size() * d.Q;
         void* pa = rad_buf_ptr(x, d.ema_ia);
         void* pe = rad_buf_ptr(x, d.ema_ie);
-        if (!pa || !pe || rad_memcpy_async(pa, d.ema_host.data(), nq * 4, rad_stream(x)) < 0 ||
-            rad_memcpy_async(pe, d.ema_host.data() + nq, nq * 4, rad_stream(x)) < 0 || rad_stream_sync(rad_stream(x)) < 0) {
+        void* p4 = d.ema_ie4 ? rad_buf_ptr(x, d.ema_ie4) : nullptr;   /* lever EMG's plane */
+        if (!pa || !pe || (d.ema_ie4 && !p4) || rad_memcpy_async(pa, d.ema_host.data(), nq * 4, rad_stream(x)) < 0 ||
+            rad_memcpy_async(pe, d.ema_host.data() + nq, nq * 4, rad_stream(x)) < 0 ||
+            (p4 && rad_memcpy_async(p4, d.ema_host.data() + 2 * nq, nq * c.hc * 4, rad_stream(x)) < 0) ||
+            rad_stream_sync(rad_stream(x)) < 0) {
             rad_step_fail(x, "deepseek41: lever EMA's index planes could not be copied to the card");
             return;
         }
@@ -8706,8 +8761,17 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         const int64_t o = ek * d.Q;
         RAD_ISSUE_N(x, d.ema_g, S + 1, brows(d.x, T), brow_slice(d.ema_ia, o, S + 1, 1), brows(d.xa, S + 1));
         RAD_ISSUE_N(x, d.ema_ar, (S + 1) * D, brows(d.xa, S + 1), RAD_NONE);
-        for (int64_t i = 0; i < c.hc; ++i)
-            RAD_ISSUE_N(x, d.ema_e, T, brows(d.xa, S + 1), brow_slice(d.ema_ie, o, T, 1), bcol(d.h0, i * D, D, T));
+        void* h0p = d.ema_eh && emg_now() && !g_emg_bad.load(std::memory_order_relaxed) ? rad_buf_ptr(x, d.h0) : nullptr;
+        if (h0p) {   /* lever EMG (round 74): h0 [T, hc x D] packed = [hc x T, D] rows; ie4[hc r + i] = ie[r] */
+            RAD_ISSUE_N(x, d.ema_eh, c.hc * T, brows(d.xa, S + 1), brow_slice(d.ema_ie4, o * c.hc, c.hc * T, 1),
+                        praw2(h0p, RAD_BF16, c.hc * T, D));
+            if (g.rank == 0 && g_emg_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+                fprintf(stderr, "radiance: deepseek41: lever EMG: first query pass issued with the embedding's %lld strip gathers "
+                                "as one gather_rows of %lld rows (counted at issue: a recorded pass once)\n",
+                        (long long)c.hc, (long long)(c.hc * T));
+        } else
+            for (int64_t i = 0; i < c.hc; ++i)
+                RAD_ISSUE_N(x, d.ema_e, T, brows(d.xa, S + 1), brow_slice(d.ema_ie, o, T, 1), bcol(d.h0, i * D, D, T));
         if (dpr) RAD_ISSUE_N(x, d.ema_x, T, brows(d.xa, S + 1), brow_slice(d.ema_ie, o, T, 1), brows(d.x, T));
         if (g.rank == 0 && g_ema_passes.fetch_add(1, std::memory_order_relaxed) == 0)
             fprintf(stderr, "radiance: deepseek41: lever EMA: first query pass issued with the embedding's all-reduce at %lld "
