@@ -22,6 +22,16 @@ int r4d_dispatch_n = 0;
 extern "C" int r4d_rad_dspark_walk_step(const RadArgs* a, RadStream s);
 extern "C" void r4d_walk_seqs(int n);
 extern "C" void r4d_walk_wm(int on);
+extern "C" void r4d_walk_geo(int le, int pf, int tpw);   /* lever WKG (round 60) */
+
+/* round 60: --cold = a 256 MiB read before each pass's step 0 (the served step 0 follows the head's 136 MB stream: succ is
+ * not in the 64 MiB LLC there; steps 1.. find it), and the empty-launch event cost of this stream as the offset */
+__global__ void wb_flush_kernel(const uint4* __restrict__ p, size_t n, unsigned* out) {
+    unsigned acc = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) acc ^= p[i].x ^ p[i].w;
+    if (acc == 0x12345678u) *out = acc;
+}
+__global__ void wb_empty_kernel() {}
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
 
@@ -39,17 +49,25 @@ static uint16_t bf(float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16
 static int g_bi = 0;
 int main(int argc, char** argv) {
     std::vector<int> Ss = { 8, 16 };
-    int iters = 50;
+    int iters = 50, cold = 0;
+    int64_t steps = 5;
+    std::vector<std::string> geos;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
+        else if (a == "--cold") cold = 1;
+        else if (a == "--steps" && i + 1 < argc) steps = std::atoi(argv[++i]);
+        else if (a == "--geo" && i + 1 < argc) {   /* <le><pf><tpw>,... : the WMMA form's WKG geometries (004 = as before) */
+            std::string v = argv[++i]; size_t p = 0;
+            while (p < v.size()) { size_t q = v.find(',', p); if (q == std::string::npos) q = v.size(); geos.push_back(v.substr(p, q - p)); p = q + 1; }
+        }
         else if (a == "--bi") g_bi = 1;
         else if (a == "--seqs" && i + 1 < argc) {
             Ss.clear(); std::string v = argv[++i]; size_t p = 0;
             while (p < v.size()) { size_t q = v.find(',', p); if (q == std::string::npos) q = v.size(); Ss.push_back(std::atoi(v.substr(p, q - p).c_str())); p = q + 1; }
         }
     }
-    const int64_t V = 129280, N = 32320, R = 256, steps = 5;
+    const int64_t V = 129280, N = 32320, R = 256;
     std::vector<uint16_t> hp((size_t)(V * R)), hs((size_t)(V * R));
     uint64_t rs = 0x5eedull;
     auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
@@ -60,6 +78,21 @@ int main(int argc, char** argv) {
     CK(hipMalloc(&dsu, hs.size() * 2)); CK(hipMemcpy(dsu, hs.data(), hs.size() * 2, hipMemcpyHostToDevice));
     hipStream_t s; CK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
     int fails = 0;
+    const size_t nfl = (256u << 20) / 16;
+    void *dfl = nullptr, *dfo = nullptr;
+    CK(hipMalloc(&dfl, nfl * 16)); CK(hipMemset(dfl, 1, nfl * 16)); CK(hipMalloc(&dfo, 16));
+    {   /* the empty launch between two events on this stream: the offset every step row carries */
+        std::vector<float> w;
+        for (int it = 0; it < 60; ++it) {
+            hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
+            CK(hipEventRecord(e0, s)); hipLaunchKernelGGL(wb_empty_kernel, dim3(1), dim3(32), 0, s); CK(hipEventRecord(e1, s));
+            CK(hipStreamSynchronize(s)); float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1)); if (it >= 10) w.push_back(ms * 1000.f);
+            CK(hipEventDestroy(e0)); CK(hipEventDestroy(e1));
+        }
+        std::sort(w.begin(), w.end());
+        std::printf("empty launch between events: p50 %.1f us (p10 %.1f, p90 %.1f)\n", w[w.size() / 2], w[w.size() / 10], w[w.size() * 9 / 10]);
+    }
+    std::printf("steps %lld, %s, iters %d\n", (long long)steps, cold ? "COLD (256 MiB read before each step 0)" : "warm", iters);
     if (g_bi) {
         const int S0 = 16;
         std::vector<float> hl((size_t)(S0 * steps * N));
@@ -92,10 +125,18 @@ int main(int argc, char** argv) {
             tok.resize((size_t)(S * steps)); CK(hipMemcpy(tok.data(), dtok, tok.size() * 4, hipMemcpyDeviceToHost));
             hipFree(dl); hipFree(da); hipFree(dprev); hipFree(dkeys); hipFree(dtok);
         };
-        for (int wm = 0; wm < 2; ++wm) {
+        /* round 60: with --geo every geometry's WMMA form, each against its own full-batch run AND the first geometry's */
+        std::vector<std::string> bg = geos.empty() ? std::vector<std::string>{ "f0", "004" } : geos;
+        if (!geos.empty()) bg.insert(bg.begin(), "f0");
+        std::vector<int32_t> tg0;
+        for (size_t gi = 0; gi < bg.size(); ++gi) {
+            const int wm = bg[gi] == "f0" ? 0 : 1;
             r4d_walk_wm(wm);
+            if (wm) r4d_walk_geo(bg[gi][0] - '0', bg[gi][1] - '0', bg[gi][2] - '0');
             std::vector<int> full; for (int q = 0; q < S0; ++q) full.push_back(q);
             std::vector<int32_t> t0; runw(full, t0);
+            if (wm && tg0.empty()) tg0 = t0;
+            else if (wm && t0 != tg0) { std::printf("geometry %s: full-batch tokens DIFFER from %s's\n", bg[gi].c_str(), bg[1].c_str()); ++fails; }
             int bad = 0, cmpn = 0;
             for (int pre : { 1, 3, 4, 8, 12 }) {
                 std::vector<int> o(full.begin(), full.begin() + pre); std::vector<int32_t> t; runw(o, t);
@@ -104,10 +145,10 @@ int main(int argc, char** argv) {
             { std::vector<int> o(full.rbegin(), full.rend()); std::vector<int32_t> t; runw(o, t);
               for (int q = 0; q < S0; ++q) for (int l = 0; l < steps; ++l) { ++cmpn; bad += t[(size_t)(q * steps + l)] != t0[(size_t)((S0 - 1 - q) * steps + l)]; } }
             std::printf("batch invariance (%s): prefixes 1 / 3 / 4 / 8 / 12 of 16 + the reversed order: %d of %d tokens differ\n",
-                        wm ? "wmma" : "form 0", bad, cmpn);
+                        wm ? ("wmma geo " + bg[gi]).c_str() : "form 0", bad, cmpn);
             fails += bad != 0;
         }
-        r4d_walk_wm(0);
+        r4d_walk_wm(0); r4d_walk_geo(0, 0, 4);
     }
     for (int S : Ss) {
         std::vector<float> hl((size_t)(S * steps * N));
@@ -119,11 +160,18 @@ int main(int argc, char** argv) {
         CK(hipMalloc(&da, (size_t)S * 4)); CK(hipMemcpy(da, ha.data(), (size_t)S * 4, hipMemcpyHostToDevice));
         CK(hipMalloc(&dprev, (size_t)S * 16)); CK(hipMalloc(&dkeys, (size_t)S * 16)); CK(hipMalloc(&dtok, (size_t)S * steps * 4));
         std::vector<int32_t> ref, wmref;
-        struct V_ { const char* nm; int form, seqs, wm; };
-        const V_ vs[] = { { "form0 seqs8", 0, 8, 0 }, { "form0 seqs16", 0, 16, 0 }, { "wmma", 0, 0, 1 }, { "wmma again", 0, 0, 1 } };
+        struct V_ { std::string nm; int form, seqs, wm, le, pf, tpw; };
+        std::vector<V_> vs = { { "form0 seqs8", 0, 8, 0, 0, 0, 4 }, { "form0 seqs16", 0, 16, 0, 0, 0, 4 }, { "wmma", 0, 0, 1, 0, 0, 4 }, { "wmma again", 0, 0, 1, 0, 0, 4 } };
+        if (!geos.empty()) {
+            vs.clear();
+            for (int rep = 0; rep < 2; ++rep)   /* A B .. then the same list again */
+                for (const std::string& g : geos)
+                    vs.push_back({ "geo " + g + (rep ? "'" : ""), 0, 0, 1, g[0] - '0', g[1] - '0', g[2] - '0' });
+        }
         for (const V_& v : vs) {
             r4d_walk_seqs(v.seqs);
             r4d_walk_wm(v.wm);
+            r4d_walk_geo(v.le, v.pf, v.tpw);
             std::vector<std::vector<float>> us((size_t)steps + 1);
             std::vector<int32_t> got((size_t)(S * steps));
             for (int it = 0; it < iters + 3; ++it) {
@@ -135,12 +183,13 @@ int main(int argc, char** argv) {
                                                  PI("vocab_off", 0), PI("world", 1), PI("anchor_stride", 1), PI("form", v.form) };
                     RadArgs a{}; a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
                     if (st < steps) CK(hipMemsetAsync(dkeys, 0, (size_t)S * 16, s));
+                    if (cold && st == 0) hipLaunchKernelGGL(wb_flush_kernel, dim3(1024), dim3(256), 0, s, (const uint4*)dfl, nfl, (unsigned*)dfo);
                     hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
                     CK(hipEventRecord(e0, s));
                     const int rc = r4d_rad_dspark_walk_step(&a, (RadStream)s);
                     CK(hipEventRecord(e1, s));
                     CK(hipStreamSynchronize(s));
-                    if (rc != 0) { std::printf("  %s step %lld rc %d\n", v.nm, (long long)st, rc); ++fails; break; }
+                    if (rc != 0) { std::printf("  %s step %lld rc %d\n", v.nm.c_str(), (long long)st, rc); ++fails; break; }
                     float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1));
                     if (it >= 3) us[(size_t)st].push_back(ms * 1000.f);
                     CK(hipEventDestroy(e0)); CK(hipEventDestroy(e1));
@@ -151,11 +200,11 @@ int main(int argc, char** argv) {
             bool same = true;
             int ndiff = 0;
             if (ref.empty()) ref = got; else { same = got == ref; for (size_t q = 0; q < got.size(); ++q) ndiff += got[q] != ref[q]; }
-            if (!same && !v.wm) ++fails;
+            if (!same && (!v.wm || !geos.empty())) ++fails;
             if (v.wm && !wmref.empty() && got != wmref) { std::printf("  wmma NOT DETERMINISTIC\n"); ++fails; }
             if (v.wm && wmref.empty()) wmref = got;
             double tot = 0;
-            std::printf("S %2d %-12s tokens %s (%d of %zu differ) |", S, v.nm, same ? "IDENTICAL" : "DIFFER", ndiff, got.size());
+            std::printf("S %2d %-12s tokens %s (%d of %zu differ) |", S, v.nm.c_str(), same ? "IDENTICAL" : "DIFFER", ndiff, got.size());
             for (int64_t st = 0; st <= steps; ++st) {
                 auto w = us[(size_t)st]; std::sort(w.begin(), w.end());
                 const double m = w.empty() ? 0 : w[w.size() / 2];
