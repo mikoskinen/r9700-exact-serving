@@ -2423,7 +2423,16 @@ int Engine::follower_loop() {
                 RAD_INFO("follower: %s, since its last change (tp8 loop D63)", sl.c_str());
         }
         if (pp_ni_) pp_ni_->minute();
-        if (pp_load_ms_ > 0 && pp_ni_) pp_link_->set_load(pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull));   /* tp8 loop D51 */
+        if (pp_load_ms_ > 0 && pp_ni_) {   /* tp8 loop D51; D65: over fn4 pp_tband_bound's window once a request set it (the leader's) */
+            int wms = pp_bound_ms_;
+            fn4::pp_tband_bound(&wms, nullptr);
+            if (const uint64_t keep = 4ull * (uint64_t)wms * 1000000ull; pp_ni_->recent_keep_ns != keep) {
+                pp_ni_->recent_keep_ns = keep;
+                RAD_INFO("follower: the load report now covers this node's last %d ms (fn4 pp_tband_bound%s, tp8 loop D65)", wms,
+                         wms == pp_bound_ms_ ? ": the start's window" : "");
+            }
+            pp_link_->set_load(pp_ni_->recent_pm((uint64_t)wms * 1000000ull));
+        }
         if (!segs.empty() && seg_passes > 0 && (seg_passes == 1 || seg_passes % 256 == 0) && steps % 64 == 0)
             RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, %lld held "
                      "in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts, (long long)seg_between,

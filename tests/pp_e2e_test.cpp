@@ -3879,8 +3879,10 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
      * on both: the follower reports, the leader reads its own share) -- the band follows the measured bound */
     /* tp8 loop D63: xenv = more start env on both nodes (space-separated): START DC8's all-levers arm on the stand-in -- form 5 + D62's
      * idle-lane split + D61's 1812 (barrier / drafter end / frame) + D63's 1-us timer slack */
+    /* tp8 loop D65: bsw = fn4 pp_tband_bound POSTed before the first set (then 3000 = a 3-s window with H 0 before the second, -1 at
+     * the end): the window / hysteresis in process on both nodes */
     struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; int sw = -1; bool nocopy = false; const char* tb = "3";
-                 int tv = -1; bool bound = false; const char* xenv = nullptr; };
+                 int tv = -1; bool bound = false; const char* xenv = nullptr; int bsw = 0; };
     long long dec_all = 0, clean_all = 0, low_all = 0;
     int skip_bad = 0;
     for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, true, false, false, 13 },
@@ -3888,7 +3890,9 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
                          Arm{ 3, 1, true, false, false, -1, false, "3", 4 }, Arm{ 4, 2, true, true, false, -1, false, "1028" },
                          Arm{ 3, 1, false, false, false, -1, false, "64516" },
                          Arm{ 3, 1, true, false, false, -1, false, "5", -1, true },
-                         Arm{ 4, 2, true, true, false, -1, false, "5", -1, true, "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1" } }) {
+                         Arm{ 4, 2, true, true, false, -1, false, "5", -1, true, "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1" },
+                         Arm{ 3, 1, true, false, false, -1, false, "5", -1, true, nullptr, 20 },
+                         Arm{ 4, 2, true, true, false, -1, false, "5", -1, true, "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1", 200050 } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back(std::string("RADIANCE_PP_TAIL_BAND=") + a.tb);
@@ -3926,11 +3930,25 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         if (a.nocopy) post(3, 400, "the plugin declared no tail band copy");
         if (a.nocopy) post(4, 400, "the plugin declared no tail band copy");   /* tp8 loop D50 */
         if (a.tv > 0) post(a.tv, 200, nullptr);
+        auto postb = [&](int v, int want) {   /* tp8 loop D65 */
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_tband_bound", v } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, want);
+            if (st != want) fprintf(stderr, "    POST pp_tband_bound %d: %d %s\n", v, st, out.c_str());
+            if (want == 400) CHECK(out.find("pp_tband_bound takes -1 / 0") != std::string::npos);
+        };
+        if (a.bsw > 0) {
+            postb(19, 400);
+            postb(a.bsw, 200);
+        }
         const std::vector<std::vector<int32_t>> got = split_set(pp.port);
         long long dec_mid = -1;
         if (a.sw == 13) post(3, 200, nullptr);
+        if (a.bsw > 0) postb(3000, 200);
         const std::vector<std::vector<int32_t>> got_b = burst_set(pp.port);
         if (a.sw >= 0 || a.tv > 0) post(-1, 200, nullptr);
+        if (a.bsw > 0) postb(-1, 200);
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -4046,6 +4064,23 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
             CHECK(jn > 0);
             CHECK_EQ(jn, jb + jk);
             CHECK(jf >= 0);
+        }
+        if (a.bsw > 0) {   /* tp8 loop D65: both nodes applied each value; the leader's last judge used 3000 / 0, the follower's report followed */
+            const std::string bs = std::to_string(a.bsw);
+            CHECK(llog.find("fn4: switches pp_tband_bound=" + bs + " applied") != std::string::npos);
+            CHECK(llog.find("fn4: switches pp_tband_bound=3000 applied") != std::string::npos);
+            CHECK(flog.find("fn4: switches pp_tband_bound=" + bs + " applied") != std::string::npos);
+            CHECK(flog.find("fn4: switches pp_tband_bound=3000 applied") != std::string::npos);
+            CHECK(flog.find("follower: the load report now covers this node's last " + std::to_string(a.bsw % 10000) + " ms (fn4 pp_tband_bound") !=
+                  std::string::npos);
+            CHECK(flog.find("follower: the load report now covers this node's last 3000 ms (fn4 pp_tband_bound") != std::string::npos);
+            CHECK(llog.find("over 3000 ms windows, hysteresis 0 permille") != std::string::npos);
+            CHECK(llog.find("(window / hysteresis from fn4 pp_tband_bound 3000, tp8 loop D65)") != std::string::npos);
+            fprintf(stderr, "    + fn4 pp_tband_bound %d (first set) / 3000 (second) / -1, both nodes (tp8 loop D65)\n", a.bsw);
+        } else if (a.bound) {   /* tp8 loop D65: unset = the start's window, no D65 line on either node */
+            CHECK(llog.find("over 100 ms windows, hysteresis 20 permille") != std::string::npos);
+            CHECK(llog.find("tp8 loop D65") == std::string::npos);
+            CHECK(flog.find("tp8 loop D65") == std::string::npos);
         }
         if (a.xenv) {   /* tp8 loop D63: the three start values reached both nodes (each node's own threads / the leader's lanes) */
             CHECK(llog.find("'s sleeps: ") != std::string::npos);   /* host_slack 1 counted the leader's sleeps */
