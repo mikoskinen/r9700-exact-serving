@@ -733,7 +733,10 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 #ifndef EXL3R4D_DZ
 #define EXL3R4D_DZ 0
 #endif
+// qfn-on-ds lever DRZ (p.dz bit 2, the fn4 switch exl3_drz; Qwen loop round 13): the dead rows are read by nobody (down
+// reads h only in its runs; the gather skips a dropped slot, its inverse -1), so they are left as they are.
 static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspare, int cb) {
+  if (p.dz & 4) return;
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
 #if EXL3R4D_DZ

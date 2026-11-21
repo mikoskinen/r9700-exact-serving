@@ -43,6 +43,7 @@ int exl3r4d_fn4_bi(void) { return g_fn4_bi; }
  * dropped slot (libr4d moe_gather / moe_gather_inv: its inverse stays -1), so every row any reader sees is today's bytes.
  * A protected expert's rows (served by the protected GEMM pair) are written by that pair. 0 at start = today. */
 static volatile int g_fn4_drz = 0;
+int exl3r4d_fn4_drz(void) { return g_fn4_drz; }
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;

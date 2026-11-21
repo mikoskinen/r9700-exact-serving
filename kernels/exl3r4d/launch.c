@@ -242,7 +242,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
             d->band = (const int32_t*)bt->data;
         }
     }
-    d->dz = (int32_t)(exl3r4d_fn4_dz() | (exl3r4d_fn4_bi() ? 2 : 0));   /* bit 0 DZ, bit 1 BI (fn4) */   /* ds41 eport: fn4 DZ's form at run time (prefill.c; 0 unless EXL3R4D_DZ 1 / 2) */
+    d->dz = (int32_t)(exl3r4d_fn4_dz() | (exl3r4d_fn4_bi() ? 2 : 0) | (exl3r4d_fn4_drz() ? 4 : 0));   /* bit 0 DZ, bit 1 BI (fn4), bit 2 DRZ */   /* ds41 eport: fn4 DZ's form at run time (prefill.c; 0 unless EXL3R4D_DZ 1 / 2) */
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
