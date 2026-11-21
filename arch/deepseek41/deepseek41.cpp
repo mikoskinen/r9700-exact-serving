@@ -10174,7 +10174,10 @@ static void egl_head(RadCtx* x, Model& m, const RadBatch* b, int part, int64_t T
     t_egl = 0;
     bool all = false;
     if (egl_count(m, b, part, T, after_l, &all) == 0) {
-        if (on1) rad_lane(x, 0);
+        if (on1) {   /* the switch went off since egl_tok: lane 0 behind the ids lane 1 wrote, as without the lever */
+            rad_lane(x, 0);
+            rad_lane_join(x, 1, 0);
+        }
         return;
     }
     const int64_t H = m.c.ple_heads;
