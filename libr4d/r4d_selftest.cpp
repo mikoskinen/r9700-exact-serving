@@ -5889,8 +5889,33 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
     const double us0 = timed([&] { rk->launch(&a, nullptr); });
     std::printf("  today     %9.1f us a call   %7.1f GB/s of per-row KV reads (%.1f MB a call)   repeat %s\n", us0,
                 kv / (us0 * 1e3), kv / 1e6, det ? "IDENTICAL" : "DIFFERENT");
+    /* lever P-2's other form (Qwen loop round 12, r4d_attn_gq6_opt_bench): today's kernel, its loads in fewer rounds */
+    typedef int (*OptFn)(const RadArgs*, RadStream, int);
+    const OptFn of = (OptFn)dlsym(pl.h, "r4d_attn_gq6_opt_bench");
+    if (of) {
+        static const char* const arm_name[5] = { "today's option word (control)", "PF 8 (K in 2 rounds)",
+                                                 "KRAW (K in 1 round)", "KRAW, no sched barrier", "KRAW + PF 4" };
+        for (int arm = 0; arm < 5; ++arm) {
+            poison();
+            const int orc = of(&a, nullptr, arm);
+            if (orc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  arm %d %s rc=%d (not served)\n", arm, arm_name[arm], orc); continue; }
+            fetch(got_o, got_q8, got_s);
+            int64_t bo = 0, bq = 0, bsd = 0;
+            for (size_t i = 0; i < ob; ++i) bo += got_o[i] != ref_o[i];
+            for (size_t i = 0; i < q8b; ++i) bq += got_q8[i] != ref_q8[i];
+            for (size_t i = 0; i < sb; ++i) bsd += got_s[i] != ref_s[i];
+            const double ua = timed([&] { of(&a, nullptr, arm); });
+            std::printf("  arm %d %-30s %9.1f us a call (%+.1f %% vs today)   bytes vs today: o %lld / q8 %lld / s %lld differ -> %s\n",
+                        arm, arm_name[arm], ua, 100.0 * (ua - us0) / us0, (long long)bo, (long long)bq, (long long)bsd,
+                        (bo || bq || bsd) ? "DIFFERENT" : "IDENTICAL");
+        }
+    } else {
+        std::printf("  r4d_attn_gq6_opt_bench absent (an older libr4d): the option arms are skipped\n");
+    }
     void* d_ul = dalloc((size_t)S * W * 4 * 2); void* d_uo = dalloc((size_t)(S + 2) * 4); void* d_up = dalloc((size_t)S * W * 4);
-    void* d_ws = dalloc(16);
+    /* 16 bytes of tile counters + the stamp records (8 words a wave, R4 / R8 / R16 groups of R + 4 waves) */
+    const size_t ws_bytes = 16 + (size_t)((S + 3) / 4) * 8 * 8 * 8;
+    void* d_ws = dalloc(ws_bytes);
     if (!d_ul || !d_uo || !d_up || !d_ws) { std::printf("  alloc failed\n"); return; }
     /* R, M, the load list (0 the plain union, 1 with re-loads: r4d_attn_walk_sched.h) */
     const int cfg[][3] = { { 4, 15, 0 }, { 8, 15, 0 }, { 16, 15, 0 }, { 8, 7, 0 }, { 16, 7, 0 }, { 8, 15, 1 }, { 16, 15, 1 } };
@@ -5930,6 +5955,53 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
             const double uc = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr, 2); });
             std::printf("  walk R%-2d M%-2d re-load ORACLES (bytes not compared): no loads %9.1f us a call (compute + sync floor), "
                         "no tile math %9.1f us a call (load rounds floor)\n", R, M, un, uc);
+            /* the stamped walk (wflags 4, Qwen loop COORD 12:06): the bytes compared again, then each wave's phases */
+            const int ngr = (int)((S + R - 1) / R), nw = R + 4;
+            st_memset(d_ws, 0, ws_bytes);
+            poison();
+            const int src = wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, (int*)d_ws, 4);
+            if (src != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  walk R%-2d M%-2d re-load STAMPS rc=%d\n", R, M, src); continue; }
+            fetch(got_o, got_q8, got_s);
+            const bool same = got_o == ref_o && got_q8 == ref_q8 && got_s == ref_s;
+            std::vector<unsigned long long> tr((size_t)ngr * nw * 8);
+            st_memcpy(tr.data(), (char*)d_ws + 16, tr.size() * 8, hipMemcpyDeviceToHost);
+            const double ut = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, (int*)d_ws, 4); });
+            unsigned long long t_lo = ~0ull, t_hi = 0;
+            double gsum = 0, c[8] = { 0 }, l[8] = { 0 };
+            int nc = 0, nl = 0;
+            for (int g = 0; g < ngr; ++g) {
+                unsigned long long g0 = ~0ull, g1 = 0;
+                for (int w = 0; w < nw; ++w) {
+                    const unsigned long long* x = &tr[((size_t)g * nw + w) * 8];
+                    if (!x[1]) continue;
+                    g0 = std::min(g0, x[0]); g1 = std::max(g1, x[1]);
+                    double* s = w < R ? c : l;
+                    if (w < R && !x[7]) continue;   /* a wave without a row */
+                    s[0] += (double)(x[1] - x[0]);
+                    for (int k = 2; k < 8; ++k) s[k] += (double)x[k];
+                    (w < R ? nc : nl)++;
+                }
+                if (g1 > g0) { gsum += (double)(g1 - g0); t_lo = std::min(t_lo, g0); t_hi = std::max(t_hi, g1); }
+            }
+            const double tk = 0.01;   /* us a tick (100 MHz) */
+            auto mc = [&](int k) { return nc ? c[k] / nc * tk : 0.0; };
+            auto ml = [&](int k) { return nl ? l[k] / nl * tk : 0.0; };
+            const double rounds = nl ? l[7] / nl : 0.0, tiles = nc ? c[7] / nc : 0.0;
+            std::printf("  walk R%-2d M%-2d re-load STAMPS: %9.1f us a call stamped (%+.1f %% vs unstamped), bytes %s; span %.1f us, "
+                        "group %.1f us mean (%d groups, %.1f at once), %.1f rounds a group (%.2f us a round)\n",
+                        R, M, ut, 100.0 * (ut - us) / us, same ? "IDENTICAL" : "DIFFERENT", (double)(t_hi - t_lo) * tk,
+                        gsum / ngr * tk, ngr, t_hi > t_lo ? gsum / (double)(t_hi - t_lo) : 0.0, rounds,
+                        rounds > 0 ? ml(0) / rounds : 0.0);
+            std::printf("    compute wave (%d, us a wave): total %.1f = wait A (round's other rows) %.1f + wait B (the loaders' store) %.1f"
+                        " + tile math ring %.1f + cache %.1f + prologue %.1f + rest %.1f; %.1f tiles a row (%.3f us a tile of math)\n",
+                        nc, mc(0), mc(2), mc(3), mc(4), mc(5), mc(6), mc(0) - mc(2) - mc(3) - mc(4) - mc(5) - mc(6), tiles,
+                        tiles > 0 ? (mc(4) + mc(5)) / tiles : 0.0);
+            std::printf("    loader wave  (%d, us a wave): total %.1f = wait A (the rows' math) %.1f + wait B %.1f + issue (list read +"
+                        " addresses + loads out) %.1f + load wait %.1f + LDS store %.1f + rest %.1f; a round: A %.3f / B %.3f /"
+                        " issue %.3f / load wait %.3f / store %.3f us\n",
+                        nl, ml(0), ml(2), ml(3), ml(4), ml(5), ml(6), ml(0) - ml(2) - ml(3) - ml(4) - ml(5) - ml(6),
+                        rounds > 0 ? ml(2) / rounds : 0.0, rounds > 0 ? ml(3) / rounds : 0.0, rounds > 0 ? ml(4) / rounds : 0.0,
+                        rounds > 0 ? ml(5) / rounds : 0.0, rounds > 0 ? ml(6) / rounds : 0.0);
         }
     }
     const double us1 = timed([&] { rk->launch(&a, nullptr); });

@@ -30,8 +30,18 @@ __device__ __forceinline__ int pick4(const int* v, int i) {
 }
 __device__ __forceinline__ uint32_t u4get(r4d_u32x4 v, int q) { return v[q]; }
 }
+// the bench stamps' primitives (wflags 4); the host emulator (tests/r4d_emu) has no clock and no counters: zeros there
+#ifdef R4D_EMU_HOST
+#define R4DW_NOW() 0ull
+#define R4DW_WAIT_LOAD() ((void)0)
+#define R4DW_WAIT_DS() ((void)0)
+#else
+#define R4DW_NOW() ((unsigned long long)wall_clock64())
+#define R4DW_WAIT_LOAD() asm volatile("s_wait_loadcnt 0x0" ::: "memory")
+#define R4DW_WAIT_DS() asm volatile("s_wait_dscnt 0x0" ::: "memory")
+#endif
 
-template<int R, int M>
+template<int R, int M, int TL = 0>
 __global__ __launch_bounds__((R + r4dwalk::NLW) * 32)
 void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const int* __restrict__ uoff,
                           const int* __restrict__ upos, int* __restrict__ wstat, int wflags)
@@ -50,6 +60,13 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
     const int u0 = uoff[grp], nu = uoff[grp + 1] - u0;
     const int nr = (nu + M - 1) / M;
     const uint8_t* __restrict__ kvb = (const uint8_t*)a.kv + (size_t)kvc * a.kv_head_stride;
+    // bench stamps (wflags bit 3, value 4; Qwen loop COORD 12:06: where the walk's time goes): every wave sums its phases in
+    // 100 MHz ticks and lane 0 writes 8 words at wstat + 4 (8-byte words, [group][kv head][wave]); the bytes are the walk's
+    // TL: the stamped instance (its own kernel, so the walk's instances keep their code); u32 sums of 100 MHz ticks
+    constexpr bool tl = TL != 0;
+    unsigned long long* const trec = tl ? (unsigned long long*)(wstat + 4)
+                                          + ((size_t)(grp * gridDim.y + kvh) * (R + NLW) + warp) * 8 : nullptr;
+    const unsigned long long t_ent = tl ? R4DW_NOW() : 0ull;
 
     if (warp >= R) {
         // ---- the loader waves: round j's pages into ring slots p mod NS (K rows, V transposed to [dim][token])
@@ -108,11 +125,37 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
         // bench oracle (wflags bit 1): no loads and no stores, the rounds' barriers only -- the compute + sync floor (bytes wrong)
         const bool noload = (wflags & 1) != 0;
         if (nr > 0 && !noload) issue(0);
+        if constexpr (!tl) {
+            for (int j = 0; j < nr; ++j) {
+                if (!noload) store(j);
+                lds_barrier();                       // B_j: round j's pages visible
+                if (j + 1 < nr && !noload) issue(j + 1);   // in flight during round j's compute
+                lds_barrier();                       // A_j: round j computed; round j + 1 may overwrite round j - 1's slots
+            }
+            return;
+        }
+        // the same loop, stamped: load wait (the round's KV loads not yet back), LDS store, wait at B_j, issue (the list
+        // read + address chain + the loads' issue), wait at A_j
+        unsigned s_lw = 0, s_st = 0, s_wb = 0, s_is = 0, s_wa = 0;
         for (int j = 0; j < nr; ++j) {
+            const unsigned long long ta = R4DW_NOW();
+            R4DW_WAIT_LOAD();
+            const unsigned long long tw = R4DW_NOW();
             if (!noload) store(j);
-            lds_barrier();                       // B_j: round j's pages visible
-            if (j + 1 < nr && !noload) issue(j + 1);   // in flight during round j's compute
-            lds_barrier();                       // A_j: round j computed; round j + 1 may overwrite round j - 1's slots
+            R4DW_WAIT_DS();
+            const unsigned long long tb = R4DW_NOW();
+            lds_barrier();
+            const unsigned long long tc = R4DW_NOW();
+            if (j + 1 < nr && !noload) issue(j + 1);
+            const unsigned long long td = R4DW_NOW();
+            lds_barrier();
+            const unsigned long long te = R4DW_NOW();
+            s_lw += (unsigned)(tw - ta); s_st += (unsigned)(tb - tw); s_wb += (unsigned)(tc - tb); s_is += (unsigned)(td - tc);
+            s_wa += (unsigned)(te - td);
+        }
+        if (lane == 0) {
+            trec[0] = t_ent; trec[1] = R4DW_NOW(); trec[2] = s_wa; trec[3] = s_wb;
+            trec[4] = s_is; trec[5] = s_lw; trec[6] = s_st; trec[7] = (unsigned long long)nr;
         }
         return;
     }
@@ -130,8 +173,14 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
     const bool act = seq < a.num_seqs && ctx > 0 && qlen > 0;
     if (!act) {                                               // no row: only the rounds' barriers
         for (int j = 0; j < nr; ++j) { lds_barrier(); lds_barrier(); }
+        if constexpr (tl) if (lane == 0) {
+            trec[0] = t_ent; trec[1] = R4DW_NOW();
+            for (int k = 2; k < 8; ++k) trec[k] = 0;
+        }
         return;
     }
+    // stamps (tl): wait at A_j (round j's other rows), wait at B_j (the loaders' store), tile math from the ring / the cache
+    unsigned s_wa = 0, s_wb = 0, s_mr = 0, s_mc = 0, t_pro = 0;
     const int ntl = act ? r4d_attn_tiles(ctx, TILE) : 0;
     const int qi = c / GQA, hi = c - qi * GQA;
     const bool live = act && (qi < qlen);
@@ -164,6 +213,7 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
     for (int t = 0; t < NKS; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
     const int lastb = (ctx - 1) / BS;
     int n_lds = 0, n_glb = 0;
+    if constexpr (tl) { R4DW_WAIT_LOAD(); t_pro = (unsigned)(R4DW_NOW() - t_ent); }
 
     // one tile: QK, the lazy max, P, PV -- today's sequence; `lds` = every page of the tile is in the ring (slots sl[4])
     auto tile = [&](bool lds, int ti, const int* e, const int* sl) __attribute__((always_inline)) {
@@ -274,6 +324,18 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
     // ring if all four pages are still resident there, else the cache; the partial last tile reads the cache. Round j holds
     // ring positions [(j - 1) M, (j + 1) M) between its barriers B_j (barrier 2 j + 1) and A_j (2 j + 2).
     int nb = 0;                                               // barriers passed
+    // barrier nb + 1: B_j when nb is even (the round's pages), A_j when odd (the round's other rows)
+    auto bar = [&]() __attribute__((always_inline)) {
+        if constexpr (tl) {
+            const unsigned long long x = R4DW_NOW();
+            lds_barrier();
+            const unsigned long long y = R4DW_NOW();
+            if (nb & 1) s_wa += (unsigned)(y - x); else s_wb += (unsigned)(y - x);
+        } else {
+            lds_barrier();
+        }
+        ++nb;
+    };
     for (int ti = 0; ti < ntl; ++ti) {
         const int t0 = ti * (TILE / BS);
         const bool full = (ti + 1) * TILE <= ctx;
@@ -289,18 +351,29 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
                 sl[i] = p % NS;
             }
             const int need = min(mx / M, nr - 1);
-            while (nb < 2 * need + 1) { lds_barrier(); ++nb; }
+            while (nb < 2 * need + 1) bar();
             const int jc = (nb - 1) >> 1;
             res = nb > 0 && (nb & 1) && mn >= (jc - 1) * M && mx < (jc + 1) * M;
         } else {
             #pragma unroll
             for (int i = 0; i < 4; ++i) e[i] = bt[min(t0 + i, lastb)];
         }
-        if (!(wflags & 2)) tile(res, ti, e, sl);   // bench oracle (wflags bit 2): no tile math -- the load rounds' floor (bytes wrong)
+        if constexpr (tl) {
+            const unsigned long long x = R4DW_NOW();
+            if (!(wflags & 2)) tile(res, ti, e, sl);
+            const unsigned long long y = R4DW_NOW();
+            if (__builtin_amdgcn_readfirstlane((int)res)) s_mr += (unsigned)(y - x); else s_mc += (unsigned)(y - x);
+        } else if (!(wflags & 2)) {
+            tile(res, ti, e, sl);   // bench oracle (wflags bit 2): no tile math -- the load rounds' floor (bytes wrong)
+        }
         if (res) ++n_lds; else ++n_glb;
     }
-    while (nb < 2 * nr) { lds_barrier(); ++nb; }
+    while (nb < 2 * nr) bar();
     if (wstat && lane == 0 && act) { atomicAdd(&wstat[0], n_lds); atomicAdd(&wstat[1], n_glb); }
+    if constexpr (tl) if (lane == 0) {
+        trec[0] = t_ent; trec[1] = R4DW_NOW(); trec[2] = s_wa; trec[3] = s_wb;
+        trec[4] = s_mr; trec[5] = s_mc; trec[6] = t_pro; trec[7] = (unsigned long long)(n_lds + n_glb);
+    }
 
     if (!live) return;
     const float lrow = l_i + swap16_fi(l_i);
@@ -326,7 +399,8 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
 /* The bench entry (r4d_selftest --perfatwalk): attn_decode_gq_h256_gqa6_bs4_fp8kv's RadArgs, plus the union lists
  * (`ulist` page ids of group g at [uoff[g], uoff[g + 1]), groups of R consecutive rows; `upos` [rows][max_blocks] each
  * entry's place in its group's union), R in {4, 8, 16}, M in {7, 15}; `wstat` (2 ints, may be null) counts tiles from
- * the ring / from the cache; `wflags` 0 = the walk, bench oracles (wrong bytes, timing only): bit 1 no loads, bit 2 no tile math. The walk writes today's f16 partials at splits 1; the merge is today's gated one.
+ * the ring / from the cache; `wflags` 0 = the walk, bench oracles (wrong bytes, timing only): bit 1 no loads, bit 2 no tile math;
+ * value 4 = the stamped instance (R 8 / 16 at M 15 only; wstat then holds 16 bytes + 64 a wave, the bytes the walk's). The walk writes today's f16 partials at splits 1; the merge is today's gated one.
  * Returns RAD_OK, a refusal (splits != 1, a geometry it does not serve) or -100 - hipError_t. */
 extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const int* ulist, const int* uoff,
                                        const int* upos, int R, int M, int* wstat, int wflags) {
@@ -345,13 +419,20 @@ extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const
     int emit_rc = RAD_OK;
 #define WALK_LAUNCH(RR, MM) emit_rc = R4D_EMIT(stream, (r4d_attn_walk_kernel<RR, MM>), dim3(groups, r.kv_heads, 1), \
                                                dim3((RR + r4dwalk::NLW) * 32), 0, r, ulist, uoff, upos, wstat, wflags)
-    if      (R == 4  && M == 15) WALK_LAUNCH(4, 15);
+#define WALK_LAUNCH_TL(RR, MM) emit_rc = R4D_EMIT(stream, (r4d_attn_walk_kernel<RR, MM, 1>), dim3(groups, r.kv_heads, 1), \
+                                                  dim3((RR + r4dwalk::NLW) * 32), 0, r, ulist, uoff, upos, wstat, wflags)
+    if ((wflags & 4) && !wstat) return R4D_NO(RAD_E_SHAPE);
+    if      ((wflags & 4) && R == 8  && M == 15) WALK_LAUNCH_TL(8, 15);
+    else if ((wflags & 4) && R == 16 && M == 15) WALK_LAUNCH_TL(16, 15);
+    else if (wflags & 4) return R4D_NO(RAD_E_UNSUPPORTED);
+    else if (R == 4  && M == 15) WALK_LAUNCH(4, 15);
     else if (R == 8  && M == 15) WALK_LAUNCH(8, 15);
     else if (R == 16 && M == 15) WALK_LAUNCH(16, 15);
     else if (R == 8  && M == 7)  WALK_LAUNCH(8, 7);
     else if (R == 16 && M == 7)  WALK_LAUNCH(16, 7);
     else return R4D_NO(RAD_E_UNSUPPORTED);
 #undef WALK_LAUNCH
+#undef WALK_LAUNCH_TL
     if (emit_rc != RAD_OK) return -5;
     CHK8();
     const int jobs3 = r4d_q_total(r) * r.q_heads;
@@ -367,6 +448,59 @@ extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const
                         : R4D_EMIT(stream, (r4d_attn_splitkv_combine_gq_kernel<256, 4, 1, 0, 1>), dim3(jobs3), dim3(256),
                                    splits * sizeof(float), r, splits, G8_D_TILE, gq);
     }
+    if (emit_rc != RAD_OK) return -5;
+    CHK8();
+    return RAD_OK;
+}
+
+/* Lever P-2's other form (Qwen loop round 12): TODAY's one-wave kernel with its loads in fewer rounds, the same arithmetic.
+ * At NWARPS 1 the row's K comes from the paged cache in PF 2 groups (G8_D_OPT: KLDS0, CONTIG, PF2, SGB), i.e. HEAD_DIM / 32 = 8
+ * serial round trips a tile, after the V tile's own round trip (GPREV is gated off at NWARPS 1: it spills) -- 9 dependent
+ * global round trips a 16-key tile. An arm keeps every WMMA, conversion and their order (s accumulates over t = 0 .. 15 as
+ * today; PF and KRAW change only when loads are issued and converted: r4d_attn_decode_h256_gqa6.hip O_KRAW's note), so the
+ * bytes are today's; the bench compares them. arm 0 = today's option word (the control), 1 = PF 8 (2 K rounds, 8 converted
+ * fragments held), 2 = O_KRAW (all 16 raw K fragments in ONE round, converted just before each WMMA: +32 VGPRs), 3 = O_KRAW
+ * without the scheduling barrier (the compiler may interleave the conversions with the WMMAs), 4 = O_KRAW + PF 4.
+ * The same grid, split law and merge as attn_decode_gq_h256_gqa6_bs4_fp8kv; only rows of q_len x gqa <= 16 (one wave). */
+#define R4D_GQ6_ARM0 (G8_D_OPT | O_V8)
+#define R4D_GQ6_ARM1 ((R4D_GQ6_ARM0 & ~3072) | 3072)
+#define R4D_GQ6_ARM2 (R4D_GQ6_ARM0 | O_KRAW)
+#define R4D_GQ6_ARM3 (R4D_GQ6_ARM2 & ~O_SGB)
+#define R4D_GQ6_ARM4 ((R4D_GQ6_ARM2 & ~3072) | 2048)
+extern "C" int r4d_attn_gq6_opt_bench(const RadArgs* a, RadStream stream, int arm) {
+    R4DArgs r;
+    const int rc = g8_decode_common(a, &r, 256);
+    if (rc != RAD_OK) return rc;
+    R4DGateQuant gq{};
+    const int gc = g8_gate_quant_args(a, r, &gq);
+    if (gc != RAD_OK) return gc;
+    if (r.head_dim != 256 || r.block_size != 4 || r.q_heads != 6 * r.kv_heads || r.q_len * 6 > 16) return R4D_NO(RAD_E_SHAPE);
+    const int splits = r4d_decode_splits(&r, G8_D_TILE);
+    int emit_rc = RAD_OK;
+#define GQ6_ARM(OPTV) emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, 256, 6, 4, 0, (OPTV)>), \
+                                         dim3(splits, r.kv_heads, r.num_seqs), dim3(32), 0, r, splits)
+    switch (arm) {
+        case 0: GQ6_ARM(R4D_GQ6_ARM0); break;
+        case 1: GQ6_ARM(R4D_GQ6_ARM1); break;
+        case 2: GQ6_ARM(R4D_GQ6_ARM2); break;
+        case 3: GQ6_ARM(R4D_GQ6_ARM3); break;
+        case 4: GQ6_ARM(R4D_GQ6_ARM4); break;
+        default: return R4D_NO(RAD_E_UNSUPPORTED);
+    }
+#undef GQ6_ARM
+    if (emit_rc != RAD_OK) return -5;
+    CHK8();
+    const int jobs3 = r4d_q_total(r) * r.q_heads;
+    if (splits <= 64 && jobs3 >= G8_D_VECMIN)
+        emit_rc = gq.i8 ? R4D_EMIT(stream, (r4d_attn_splitkv_combine_vec_gq_kernel<256, 4, 1, G8_D_JPB, 0, 2>),
+                                   dim3((jobs3 + G8_D_JPB - 1) / G8_D_JPB), dim3(32 * G8_D_JPB), 0, r, splits, G8_D_TILE, gq)
+                        : R4D_EMIT(stream, (r4d_attn_splitkv_combine_vec_gq_kernel<256, 4, 1, G8_D_JPB, 0, 1>),
+                                   dim3((jobs3 + G8_D_JPB - 1) / G8_D_JPB), dim3(32 * G8_D_JPB), 0, r, splits, G8_D_TILE, gq);
+    else
+        emit_rc = gq.i8 ? R4D_EMIT(stream, (r4d_attn_splitkv_combine_gq_kernel<256, 4, 1, 0, 2>), dim3(jobs3), dim3(256),
+                                   splits * sizeof(float), r, splits, G8_D_TILE, gq)
+                        : R4D_EMIT(stream, (r4d_attn_splitkv_combine_gq_kernel<256, 4, 1, 0, 1>), dim3(jobs3), dim3(256),
+                                   splits * sizeof(float), r, splits, G8_D_TILE, gq);
     if (emit_rc != RAD_OK) return -5;
     CHK8();
     return RAD_OK;
