@@ -853,13 +853,15 @@ void Engine::rank_loop(int index) {
                     t.seq = te->seq;
                     t.ck = te->ckpt_slot;
                     t.fail = 0;
+                    /* the sequence's slots are rank 0's (it hands out the ids; every rank's pools are laid out alike:
+                     * state_slots_of, as save_checkpoints takes them -- a follower's own manager does not hold the sequence) */
                     const KVManager& kv = r.kv;
-                    t.slots.assign((size_t)kv.n_groups(), -1);
+                    if (!state_slots_of(te->seq, &t.slots)) t.slots.assign((size_t)kv.n_groups(), -1);
+                    t.slots.resize((size_t)kv.n_groups(), -1);
                     t.staged.assign((size_t)kv.n_groups(), {});
                     for (int32_t g = 0; g < kv.n_groups(); ++g) {
                         const KVGroupPlan* p = kv.plan(g);
                         if (!p || !p->stateful()) continue;
-                        t.slots[(size_t)g] = kv.state_slot(te->seq, g);
                         t.staged[(size_t)g].assign((size_t)std::max<int64_t>(p->n_layers, 0), 0);
                     }
                     if (fn4::tip_set(index, (long long)tip_row, &Engine::tip_stage, &t) <= 0) {
