@@ -2037,7 +2037,7 @@ int Engine::step_loop_lanes() {
             if (want == SIZE_MAX) {
                 if (adv == 0) {
                     ++lseg_polls;
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                    fn4::nap_us(20);   /* tp8 loop D61: a spin of 20 us under host_spin site 8 */
                 }
                 continue;
             }
@@ -2064,7 +2064,7 @@ int Engine::step_loop_lanes() {
                 if ((pm & 64) && x2_landed(fifo.front().first)) break;
                 if (stopping_.load(std::memory_order_acquire) || (pp_link_ && !pp_link_->alive())) break;
                 waited = true;
-                std::this_thread::sleep_for(std::chrono::microseconds(20));
+                fn4::nap_us(20);   /* tp8 loop D61: a spin of 20 us under host_spin site 8 */
             }
             if (waited) ++rf_waits;
             if (pick) ++rf_taken;
@@ -2168,6 +2168,8 @@ int Engine::step_loop_lanes() {
             if (now - dch_line_ns >= bgr_every) {
                 RAD_INFO("two-node pipeline: decode chain on the leader host so far (tp8 loop D35): %s", dch_text().c_str());
                 dch_line_ns = now;
+                if (const std::string sl = fn4::spin_line(); !sl.empty())   /* tp8 loop D61 */
+                    RAD_INFO("two-node pipeline: %s, since its last change (tp8 loop D61)", sl.c_str());
                 if (pph_) {   /* tp8 loop D60: the window since the last line */
                     const double ws = (double)(now - pph_->win_t0) / 1e9;
                     RAD_INFO("%s", pph_text(pph_->win, pph_->win_drop, fmt(" over the last %.1f s", ws).c_str(), ws).c_str());
@@ -2642,6 +2644,21 @@ int Engine::lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on
         pph_->dend[lane] = !so.early || rad_event_query(step_end_) == 1;
     }
     if (so.early) {
+        /* tp8 loop D61 (host_spin site 2): spin on the drafter's end first, then block as before (a no-op wait when it ended) */
+        if (const int64_t spin = fn4::host_spin_ns(fn4::kSpinDrafterEnd); spin > 0) {
+            const uint64_t s0 = rad_mono_ns();
+            uint64_t s1 = s0;
+            int q = 0;
+            for (uint32_t k = 1;; ++k) {
+                if ((q = rad_event_query(step_end_)) != 0) break;
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+                if ((k & 15) == 0 && (int64_t)((s1 = rad_mono_ns()) - s0) >= spin) break;
+            }
+            if (q < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step, rad_strerror(q)); return q; }
+            fn4::note_spin(fn4::kSpinDrafterEnd, q == 1, (q == 1 ? rad_mono_ns() : s1) - s0);
+        }
         st = rad_event_sync(step_end_);
         if (st < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step, rad_strerror(st)); return st; }
         so.early = false;

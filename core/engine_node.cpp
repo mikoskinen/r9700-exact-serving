@@ -2166,7 +2166,7 @@ int Engine::follower_loop() {
                         if (grace && !fo_in_grace) { fo_in_grace = true; ++fo_graced; }
                     }
                     if (dev_done && waited && !grace) { fo_in_grace = false; return RAD_OK; }
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    fn4::nap_us(50);   /* tp8 loop D61: a spin of 50 us under host_spin site 8 */
                     continue;
                 }
                 if (rs < 0) {
@@ -2266,7 +2266,7 @@ int Engine::follower_loop() {
                         if (rad_mono_ns() - r0 >= fol_reserve_ns) { how = 2; break; }
                         if (const int bs = between(nullptr); bs != 0) return bs;   /* < 0 failed, 1 stop */
                         if (other_bg()) { how = 1; break; }
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        fn4::nap_us(100);   /* tp8 loop D61: a spin of 100 us under host_spin site 8 */
                     }
                     ++res_n;
                     if (how == 1) ++res_frame;
@@ -2415,8 +2415,11 @@ int Engine::follower_loop() {
         /* The host backend runs every launch on this thread's rank; a card's stream is drained by the
          * next step's waits. Nothing else is read back here: the follower samples nothing. */
         ++steps;
-        if (steps == 1 || steps % 1024 == 0)
+        if (steps == 1 || steps % 1024 == 0) {
             RAD_INFO("follower: %lld steps run, %lld builds replayed", (long long)steps, (long long)builds);
+            if (const std::string sl = fn4::spin_line(); !sl.empty())   /* tp8 loop D61 */
+                RAD_INFO("follower: %s, since its last change (tp8 loop D61)", sl.c_str());
+        }
         if (pp_ni_) pp_ni_->minute();
         if (pp_load_ms_ > 0 && pp_ni_) pp_link_->set_load(pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull));   /* tp8 loop D51 */
         if (!segs.empty() && seg_passes > 0 && (seg_passes == 1 || seg_passes % 256 == 0) && steps % 64 == 0)

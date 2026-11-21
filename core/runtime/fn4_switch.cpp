@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -44,7 +46,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
                                         "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room", "pp_send_ash",
-                                        "aql_waitk", "aql_ika", "ds41_rr1", "dspark_mhr", "dspark_hs" };
+                                        "aql_waitk", "aql_ika", "ds41_rr1", "dspark_mhr", "dspark_hs",
+                                        "host_spin" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -391,6 +394,23 @@ int env_aql_ika() {
     return env;
 }
 
+/* tp8 loop D61: RADIANCE_HOST_SPIN=v at start, v = N + 256 x M as the switch takes (0 .. 4095); unset / empty = 0; anything else is
+ * said once and means 0 (every wait blocks at once, as before). */
+int env_host_spin() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_HOST_SPIN");
+        if (!e || !*e) return 0;
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (!std::isdigit((unsigned char)e[0]) || (end && *end) || v < 0 || v > 4095) {
+            std::fprintf(stderr, "radiance: RADIANCE_HOST_SPIN=%s is not 0 .. 4095 (N + 256 x M): every wait blocks at once (tp8 loop D61)\n", e);
+            return 0;
+        }
+        return (int)v;
+    }();
+    return env;
+}
+
 /* tp8 loop D56: RADIANCE_SCHED_LANE_ROOM=1 at start (anything else, or unset, is 0). */
 int env_sched_lane_room() {
     static const int env = [] {
@@ -451,6 +471,10 @@ int reported(State& s, int i) {
     if (i == kSchedLaneRoom) {     /* tp8 loop D56: set, else RADIANCE_SCHED_LANE_ROOM (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_sched_lane_room();
+    }
+    if (i == kHostSpin) {          /* tp8 loop D61: set, else RADIANCE_HOST_SPIN (0 = every wait blocks at once) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_host_spin();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -600,6 +624,66 @@ int aql_waitk() {
 int aql_ika() {
     const int v = st().val[kAqlIka].load(std::memory_order_relaxed);
     return v >= 0 ? v : env_aql_ika();
+}
+int host_spin() {
+    const int v = st().val[kHostSpin].load(std::memory_order_relaxed);
+    return v >= 0 ? v : env_host_spin();
+}
+int64_t host_spin_ns(int site) {
+    const int v = host_spin();
+    const int n = v & 255, m = (v >> 8) & 15;
+    if (n == 0 || (m != 0 && !(m & site))) return 0;
+    return (int64_t)n * 100000;
+}
+namespace {
+/* tp8 loop D61: per site (barrier, drafter end, frame, nap) the waits the spin caught / that blocked after it, and the time spun */
+struct SpinCounts {
+    std::atomic<uint64_t> caught[4] = {}, blocked[4] = {}, ns[4] = {};
+};
+SpinCounts& spin_counts() { static SpinCounts c; return c; }
+int spin_site_index(int site) { return site == kSpinBarrier ? 0 : site == kSpinDrafterEnd ? 1 : site == kSpinFrame ? 2 : 3; }
+}  // namespace
+void note_spin(int site, bool caught, uint64_t ns) {
+    SpinCounts& c = spin_counts();
+    const int k = spin_site_index(site);
+    (caught ? c.caught[k] : c.blocked[k]).fetch_add(1, std::memory_order_relaxed);
+    c.ns[k].fetch_add(ns, std::memory_order_relaxed);
+}
+static std::string spin_text(int label, bool reset) {
+    SpinCounts& c = spin_counts();
+    static const char* const nm[4] = { "rank barrier", "drafter end", "frame receive", "poll naps" };
+    std::string out;
+    for (int k = 0; k < 4; ++k) {
+        const uint64_t a = c.caught[k].load(std::memory_order_relaxed), b = c.blocked[k].load(std::memory_order_relaxed);
+        if (a + b == 0) continue;
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "%s%s %llu caught / %llu blocked (spun %.1f ms)", out.empty() ? "" : ", ", nm[k],
+                      (unsigned long long)a, (unsigned long long)b, (double)c.ns[k].load(std::memory_order_relaxed) / 1e6);
+        out += buf;
+    }
+    if (reset)
+        for (int k = 0; k < 4; ++k) {
+            c.caught[k].store(0, std::memory_order_relaxed);
+            c.blocked[k].store(0, std::memory_order_relaxed);
+            c.ns[k].store(0, std::memory_order_relaxed);
+        }
+    if (out.empty()) return out;
+    return "host_spin " + std::to_string(label) + "'s waits: " + out;
+}
+std::string spin_line() { return spin_text(host_spin(), false); }
+std::string spin_take(int label) { return spin_text(label, true); }
+void nap_us(int us) {
+    if (host_spin_ns(kSpinNap) <= 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(us));
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now(), t1 = t0 + std::chrono::microseconds(us);
+    while (std::chrono::steady_clock::now() < t1) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+    note_spin(kSpinNap, true, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
 }
 int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     State& s = st();
@@ -1018,7 +1102,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1603,6 +1687,15 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kHostSpin) {          /* tp8 loop D61: read at every wait it names, on each node */
+        if (v < 0 || v > 4095) {
+            if (err) *err = "host_spin takes N + 256 x M, N 0 .. 255 (spin up to N x 100 us before a wait blocks; 0 = every wait blocks at "
+                            "once, as before) and M 0 .. 15 (the sites: 1 rank barrier, 2 the leader's drafter-end wait, 4 the follower's "
+                            "frame receive, 8 the loops' poll naps; 0 = every site; tp8 loop D61)";
+            return false;
+        }
+        return true;
+    }
     if (i == kAqlIka) {            /* tp8 loop W3s: the AQL backend's, read at every packet it plays from a tape */
         if (v != 0 && v != 1 && v != 2) {
             if (err) *err = "aql_ika takes 0 (every played packet keeps the fences it has without the lever), 1 (lever IKA: a "
@@ -1771,6 +1864,7 @@ bool follower_switch(int i) {
            i == kPpSendAsh ||      /* tp8 loop P46: each node's own send rings (the follower's X2) */
            i == kAqlWaitk ||       /* tp8 loop W1s: each node's own AQL waits */
            i == kAqlIka ||         /* tp8 loop W3s: each node's own played packets */
+           i == kHostSpin ||       /* tp8 loop D61: each node's own waits */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
 }
 
@@ -1878,7 +1972,7 @@ bool apply_pending(int step, int* sched) {
     if (!s.any_pending) return false;
     s.any_pending = false;
     bool changed = false;
-    std::string what;
+    std::string what, spin_before;
     for (int i = 0; i < kSwitches; ++i) {
         if (!s.pend[i]) continue;
         s.pend[i] = false;
@@ -1912,7 +2006,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kHostSpin || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)
@@ -1939,6 +2033,7 @@ bool apply_pending(int step, int* sched) {
             if (const int got = plugin_value(s, i); got >= 0) v = got;
         }
         if (sched_switch(i) && sched) sched[i] = v;
+        if (i == kHostSpin) spin_before = spin_take(reported(s, i));   /* tp8 loop D61: the waits under the old value */
         s.val[i].store(v, std::memory_order_release);
         changed = true;
         what += std::string(what.empty() ? "" : ", ") + kNames[i] + "=" + std::to_string(v);
@@ -1954,6 +2049,7 @@ bool apply_pending(int step, int* sched) {
         s.applied_step.store(step, std::memory_order_release);
         RAD_INFO("fn4: switches %s applied at step %d (epoch %llu)", what.c_str(), step,
                  (unsigned long long)s.epoch.load(std::memory_order_relaxed));
+        if (!spin_before.empty()) RAD_INFO("fn4: before that change, %s (tp8 loop D61)", spin_before.c_str());
     }
     return changed;
 }

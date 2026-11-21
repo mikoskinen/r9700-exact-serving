@@ -289,6 +289,8 @@ Engine::~Engine() {
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
+    /* tp8 loop D61: host_spin's waits since its last change (nothing while it was 0 throughout) */
+    if (const std::string sl = fn4::spin_line(); !sl.empty()) RAD_INFO("%s, since the last change of host_spin (tp8 loop D61)", sl.c_str());
     if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);

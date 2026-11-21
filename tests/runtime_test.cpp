@@ -23,6 +23,7 @@
 #include "kvstream/plan.h"
 #include "kvstream/stage.h"
 #include "runtime/rank_barrier.h"
+#include "runtime/fn4_switch.h"
 #include "runtime/residency.h"
 #include "runtime/rowprefetch.h"
 #include "runtime/wtab.h"
@@ -35,6 +36,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -2355,6 +2357,66 @@ TEST(no_rank_passes_a_barrier_round_before_every_rank_reached_it) {
         });
     for (auto& t : th) t.join();
     CHECK_EQ(bad.load(), 0);
+}
+
+/* tp8 loop D61 (fn4 host_spin site 1): the barrier's rounds and its abort hold with the waiters spinning on the generation -- the
+ * round rule above at a spin long enough to catch every flip and at one too short to (blocking after it), each rank's write before
+ * its arrival seen by every rank after the round (the flip's release / acquire), and abort() releasing spinners and sleepers. */
+TEST(the_rank_barrier_keeps_its_rounds_and_abort_while_waiters_spin) {
+    auto set = [](int v) {
+        std::string err;
+        REQUIRE(rad::fn4::request("host_spin", v, &err));
+        int sw[rad::fn4::kSwitches];
+        (void)rad::fn4::apply_pending(0, sw);
+        CHECK_EQ(rad::fn4::host_spin(), v);
+    };
+    for (int v : { 50 + 256 * rad::fn4::kSpinBarrier, 1 + 256 * rad::fn4::kSpinBarrier }) {   /* 5 ms; 100 us */
+        set(v);
+        const int n = 5, rounds = 3000;
+        rad::RankBarrier b(n);
+        std::atomic<int> arrived[5];
+        int data[5] = {};
+        for (auto& a : arrived) a.store(0);
+        std::atomic<int> bad{0}, stale{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < n; ++t)
+            th.emplace_back([&, t] {
+                for (int r = 0; r < rounds; ++r) {
+                    data[t] = r + 1;   /* a plain write before the arrival */
+                    arrived[t].store(r + 1, std::memory_order_relaxed);
+                    if (t == 0 && (r % 97) == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
+                    b.arrive_and_wait();
+                    for (int j = 0; j < n; ++j) {
+                        const int a = arrived[j].load(std::memory_order_relaxed);
+                        if (a < r + 1 || a > r + 2) bad.fetch_add(1);
+                        if (data[j] < r + 1) stale.fetch_add(1);   /* every write before round r's arrivals is seen after it */
+                    }
+                    b.arrive_and_wait();   /* nobody writes round r + 1's data while a peer still reads round r's */
+                }
+            });
+        for (auto& t : th) t.join();
+        CHECK_EQ(bad.load(), 0);
+        CHECK_EQ(stale.load(), 0);
+        const std::string sl = rad::fn4::spin_line();
+        CHECK(sl.find("rank barrier") != std::string::npos);
+        std::fprintf(stderr, "    runtime_test D61 host_spin %d: %s\n", v, sl.c_str());
+    }
+    set(200 + 256 * rad::fn4::kSpinBarrier);   /* 20 ms: three waiters spin, abort() flips the generation */
+    {
+        rad::RankBarrier b(4);
+        std::atomic<int> entered{0}, left{0};
+        std::vector<std::thread> th;
+        for (int i = 0; i < 3; ++i)
+            th.emplace_back([&] { entered.fetch_add(1); b.arrive_and_wait(); left.fetch_add(1); });
+        while (entered.load() < 3) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        b.abort();
+        for (auto& t : th) t.join();
+        CHECK_EQ(left.load(), 3);
+        for (int i = 0; i < 5; ++i) b.arrive_and_wait();
+    }
+    set(0);
+    CHECK(rad::fn4::spin_line().empty());
 }
 
 /* ================================================================== host-site ops and new lanes

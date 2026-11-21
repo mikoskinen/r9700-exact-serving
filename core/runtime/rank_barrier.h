@@ -8,10 +8,16 @@
  *
  * Generation-based (sense reversal), so a fast rank re-entering for the next step cannot slip
  * through a barrier its slower peers have not left yet.
+ *
+ * tp8 loop D61 (fn4 host_spin, site 1): a waiter may first spin on the generation for up to the
+ * switch's bound and return without blocking when it flips (the flip is a release store, read with
+ * acquire: the same happens-before as the mutex gives); otherwise it blocks on the condvar as
+ * before. host_spin 0 (unset): it blocks at once, as before.
  */
 #pragma once
 #include "../rad_core.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -37,7 +43,7 @@ private:
     std::condition_variable cv_;
     int                     n_;
     int                     waiting_;
-    uint64_t                gen_;
+    std::atomic<uint64_t>   gen_;      /* written under m_; a spinning waiter reads it without (tp8 loop D61) */
     bool                    aborted_ = false;
 };
 

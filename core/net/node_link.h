@@ -246,6 +246,7 @@ private:
     std::mutex              q_mu_;
     std::condition_variable q_cv_;
     std::deque<Msg>         q_;
+    std::atomic<uint32_t>   q_n_{0};   /* q_'s size, kept under q_mu_: what recv's spin reads (tp8 loop D61) */
 
     std::atomic<uint64_t>   last_rx_ns_{ 0 }, last_tx_ns_{ 0 };
     /* Robustness 1: a writer in a frame (holding tx_mu_) and when it last moved a byte. */
