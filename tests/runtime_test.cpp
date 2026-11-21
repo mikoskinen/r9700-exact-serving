@@ -2890,9 +2890,13 @@ int k_late_copy(const RadArgs* a, RadStream s) {
  * 0 -> 1 join reads the poison), a late copy (a missing 1 -> 0 join lets lane 0 read before it lands) and a copy into the
  * layer's part; four unrelated lane-0 ops, the first layer's join + read (its join also covers the second chain), two
  * more, the second layer's join (nothing new on lane 1) + read. Both forms, three steps each over the same persistent
- * buffers with a new value and the poison every step; the lane is built mid-step in each form's first step. */
+ * buffers with a new value and the poison every step; the lane is built mid-step in each form's first step. Then the same
+ * as recorded decode passes (record_passes on, one row, eight steps: recorded, audited, played -- a card's tape with a
+ * lane-1 stretch and its two joins; the host backend records nothing, so there it is the same run again and the line
+ * says played 0). */
 TEST(w25_egl_chains_from_a_decode_pass_head_reach_lane_zero_at_their_joins) {
     ord_setup();
+    for (int rec = 0; rec < 2; ++rec)
     for (int form = 0; form < 2; ++form) {   /* 0: the ids on lane 0 (EGL step 1); 1: on lane 1 too (step 2, egl_tok) */
         Fixture f;
         f.P.arena_bytes = 16384;
@@ -2914,17 +2918,17 @@ TEST(w25_egl_chains_from_a_decode_pass_head_reach_lane_zero_at_their_joins) {
         const rad_op cp = f.add_op("rope", "M", { 8192 }, { k_copy }, { "copy" }, nullptr, {});
         const rad_op slow = f.add_op("rope", "M", { 8192 }, { k_late_copy }, { "late_copy" }, nullptr, {});
         for (rad_op o : { prod, cp, slow }) f.P.ops[o].bands[0].dom[RAD_DOMAIN_DEVICE].scratch_bytes = 0;   /* no scratch rule */
-        CHECK_OK(f.start());
+        CHECK_OK(f.start(nullptr, false, rec == 1));
         const auto put = [&](Ctx& c, rad_op op, rad_buf a, rad_buf b) {
             const RadOperand o2[2] = { RAD_B(a), RAD_B(b) };
             CHECK_OK(c.issue(op, o2, 2, RAD_N_BATCH));
         };
-        for (int round = 0; round < 3; ++round) {
-            const int32_t v = 7000 + 100 * form + round;
+        for (int round = 0; round < (rec ? 8 : 3); ++round) {
+            const int32_t v = 7000 + 1000 * rec + 100 * form + round;
             *g_ord_value = v;
             for (rad_buf h : { ids1, ids2, rows1, rows2 }) *(int32_t*)f.ctx.buf_ptr(h) = -7;   /* the poison */
             for (rad_buf d : { rd1, rd2, pt1, pt2, kv1, kv2 }) dev_put(f, f.ctx.buf_ptr(d), -7);
-            CHECK_OK(f.step(4, round, [&](Ctx& c) {
+            CHECK_OK(f.step(rec ? 1 : 4, round, [&](Ctx& c) {
                 const RadOperand o1[1] = { RAD_B(ids1) };
                 if (form == 1) {   /* egl_tok: lane 1 behind lane 0 once, the ids' producers there */
                     CHECK_OK(c.lane_join(0, 1));
@@ -2954,6 +2958,12 @@ TEST(w25_egl_chains_from_a_decode_pass_head_reach_lane_zero_at_their_joins) {
             CHECK_EQ(dev_get(f, f.ctx.buf_ptr(kv2)), v);
             CHECK_EQ(*(const int32_t*)f.ctx.buf_ptr(ids2), v);
             CHECK_EQ(*(const int32_t*)f.ctx.buf_ptr(rows2), v);
+        }
+        if (rec) {
+            const Ctx::PassCounts pc = f.ctx.pass_counts();
+            fprintf(stderr, "w25: recorded decode passes, form %d: %lld played, %lld recorded, %lld audited (a card plays; "
+                            "the host backend records none)\n", form, (long long)pc.played, (long long)pc.recorded,
+                    (long long)pc.audited);
         }
     }
 }
