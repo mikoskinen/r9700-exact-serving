@@ -3174,7 +3174,6 @@ int norm_rope_rt_launch(const RadArgs* a, RadStream stream, bool w1k = false) {
 }
 int norm_rope_rt_body(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<false>(a, stream); }
 int norm_rope_rt_kv_body(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<true>(a, stream); }
-int norm_rope_rt_body_w1k(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<false>(a, stream, true); }
 int norm_rope_rt_kv_body_w1k(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<true>(a, stream, true); }
 
 /* x [M, n_head*head_dim] in place, cos_sin, positions. The lane-group form needs a gptj pair on
