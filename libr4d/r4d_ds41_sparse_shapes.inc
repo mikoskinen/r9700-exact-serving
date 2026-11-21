@@ -60,6 +60,24 @@ extern "C" int r4d_shape_attn_sparse_sink_rope_roundtrip(const RadParam* p, int 
     R4D_PICK(l);
 }
 
+/* lever DQR (DRAFTER track round 69): attn_sparse_sink's operands, then the rope's cos_sin (a rope_table plane of M rows) and
+ * the rows' own positions (rope_rows' positions operand: q's and out's rope). */
+extern "C" int r4d_shape_attn_sparse_sink_dqr(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 11) return r4d_shape_attn_sparse_sink(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
+    const int64_t rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1), block = pi(p, n_p, "block");
+    if (M <= 0 || H < 1 || rot < 2 || (rot & 1) || off < 0 || (off & 1) || off + rot > Dm || block != 32 || (H * Dm) % block ||
+        pi(p, n_p, "ratio") != 0)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_F32, M, rot),   /* cos_sin */
+        opd_idx(M, 0, M),                 /* the rows' own positions */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
     const int64_t ratio = pi(p, n_p, "ratio"), C = pi(p, n_p, "width"), block = pi(p, n_p, "block");

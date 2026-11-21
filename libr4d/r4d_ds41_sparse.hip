@@ -1055,6 +1055,17 @@ struct DsAttnArgsOrt : DsAttnArgs {
 };
 template <bool ORT>
 using DsAttnArgsT = std::conditional_t<ORT, DsAttnArgsOrt, DsAttnArgs>;
+/* attn_sparse_sink_dqr (lever DQR, DRAFTER track 21.11.2026 round 69): the WMMA form (ds41_attn_sparse_sink_wm_kernel QO)
+ * with q's FORWARD rope on load and the output's INVERSE rope + round trip in its epilogue -- the DSpark stage's q_rope ->
+ * attention -> o_rope / o_q (or DOF's o_f) as one launch. Both ropes at the ROWS' OWN positions (qpos: rope_rows' operand),
+ * not the attention's (pos = each row at its block's last position); o.sign the output's (-1), qsign q's (+1). */
+struct DsAttnArgsQo : DsAttnArgs {
+    DsOrt o;
+    const int* qpos;
+    long qps;
+    float qsign;
+    int abl;   /* bench only (r4d_dqr_abl_pin): bit 0 skips q's rope, bit 1 the output's (the bytes then differ); 0 served */
+};
 
 /* Lever DKV-U (RADIANCE_DS41_LATUNPACK, 14.11.2026): a prefill pass's packed compressed entries, unpacked once by
  * latent_unpack into `lu` ([lucap][D] bf16, the operand `unpacked`): sequence s's entries [lo_s, hi_s) at rows
@@ -2560,11 +2571,17 @@ __device__ __forceinline__ uint4 ds_gld16(const void* p) {
     const ds_u32x4 v = *(const __attribute__((address_space(1))) ds_u32x4*)p;
     return make_uint4(v.x, v.y, v.z, v.w);
 }
-template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false, bool NL = false, bool GL = false>
-__global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::conditional_t<UX, DsAttnArgsU, DsAttnArgs> a,
-                                                                       float sl2, int skp = 0) { R4D_IKA_ENTRY();
+/* QO (lever DQR, attn_sparse_sink_dqr, DsAttnArgsQo; bit 0 q's rope, bit 1 the output's rope + round trip): q's forward rope applied to the loaded Q^T words (rope_rows_kernel's
+ * expressions on the bf16 pairs it would have stored: a' = bf16(a c - b s), b' = bf16(a s + b c) at the row's qpos; a gptj pair
+ * is one lane's column pair), and after the plain epilogue's store, behind a workgroup barrier, rope_rt8_kernel's loop over the
+ * workgroup's 16 heads of the row (the inverse rope + round trip on the bf16 values just stored). The same bytes as the chain;
+ * nothing else changes (q in memory stays unrotated). */
+template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false, bool NL = false, bool GL = false, int QO = 0>
+__global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(
+    std::conditional_t<UX, DsAttnArgsU, std::conditional_t<(QO != 0), DsAttnArgsQo, DsAttnArgs>> a, float sl2, int skp = 0) { R4D_IKA_ENTRY();
     static_assert(!UX || (NV && !W8), "the unpacked plan reads the packed latent beside a bf16 window");
     static_assert(!NL || UX, "the LDS-free packed tile is the unpacked plan's fallback");
+    static_assert(!QO || (!UX && !NV && !W8), "lever DQR: the plain bf16 window form only");
     constexpr int D = kDsAttnD;
     constexpr float kL2e = 1.4426950408889634f;
     const int nkt = (a.nk + 15) >> 4, nkk = nkt * 16;
@@ -2635,6 +2652,33 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
          * previous row ended at a barrier) -> `allpl`, the row's every tile plain: no tile word read in the loop */
         if constexpr (UX)
             if (lane == 0) ((uint32_t*)(sbuf + kWmWaves * 64))[wave] = wpk;
+        if constexpr ((QO & 1) != 0) {
+            /* lever DQR: q's rope over the workgroup's 16 heads x the rot columns, every thread a few pairs (rope_rows_kernel's
+             * expressions on q's bf16 pairs; a row off the table copies them), into LDS (qrl: [16][2 half] bf16), ordered for
+             * the Q^T load by the barrier below. The per-lane form (one wave's 16 lanes x 32 pairs) cost +3 us a row (r69g). */
+            namespace q = r4d_ds41q;
+            const long rp = a.qpos[m * a.qps];
+            const bool pin = rp >= 0 && rp < a.o.tab_rows;
+            const float* csr = a.o.cs + (pin ? rp : 0) * a.o.cp;
+            uint32_t* qrl = (uint32_t*)(r4d_ds41_sparse_dyn + ds_wm_sbuf_off(nkt) + kWmSbufBytes + kWmNvBytes);
+            const int hb = blockIdx.x * 16, np = 16 * a.o.half;
+            int pp0 = tid;
+            asm volatile("" : "+v"(pp0));   /* redefined each row: the pairs' index math is not hoisted across the tile loop */
+            for (int pp = pp0; pp < np; pp += 128) {
+                const int h = pp / a.o.half, ii = pp - h * a.o.half;
+                uint32_t w = 0u;
+                if (hb + h < a.H) {
+                    w = *(const uint32_t*)(a.q + m * a.qr + (long)(hb + h) * D + a.o.off + 2 * ii);
+                    if (pin) {
+                        const float c = csr[(long)ii * a.o.cst];
+                        const float sn = a.qsign * csr[(long)(a.o.half + ii) * a.o.cst];
+                        const float va = q::ds_bf((uint16_t)(w & 0xffffu)), vb = q::ds_bf((uint16_t)(w >> 16));
+                        w = (uint32_t)q::ds_bf16(va * c - vb * sn) | ((uint32_t)q::ds_bf16(va * sn + vb * c) << 16);
+                    }
+                }
+                qrl[pp] = w;
+            }
+        }
         __syncthreads();
         [[maybe_unused]] bool allpl = false;
         if constexpr (UX) {
@@ -2647,9 +2691,23 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         uint4 qf[8];
         {
             const uint16_t* qp = a.q + m * a.qr + (long)(hok ? hl : 0) * D + c0 + 64 * hf;
+            [[maybe_unused]] int qcb = 0;   /* lever DQR: the lane's first column - off, redefined each row (asm) */
+            if constexpr ((QO & 1) != 0) {
+                qcb = c0 + 64 * hf - a.o.off;
+                asm volatile("" : "+v"(qcb));
+            }
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                qf[i] = *(const uint4*)(qp + 8 * i);
+                if constexpr ((QO & 1) != 0) {   /* lever DQR: a chunk of rope columns (the op takes off, rot % 8 == 0) from LDS */
+                    const int cr = qcb + 8 * i;
+                    if (cr >= 0 && cr < 2 * a.o.half)
+                        qf[i] = *(const uint4*)(r4d_ds41_sparse_dyn + ds_wm_sbuf_off(nkt) + kWmSbufBytes + kWmNvBytes +
+                                                ((long)(lane & 15) * 2 * a.o.half + cr) * 2);
+                    else
+                        qf[i] = *(const uint4*)(qp + 8 * i);
+                } else {
+                    qf[i] = *(const uint4*)(qp + 8 * i);
+                }
                 if (!hok) qf[i] = make_uint4(0u, 0u, 0u, 0u);
             }
         }
@@ -2853,6 +2911,60 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 for (int q = 0; q < 4; ++q)
                     w[q] = ds_bf16_bits(o[j][2 * q] / dt) | (ds_bf16_bits(o[j][2 * q + 1] / dt) << 16);
                 *(uint4*)(op + 16 * j) = make_uint4(w[0], w[1], w[2], w[3]);
+            }
+        }
+        if constexpr ((QO & 2) != 0) if (!(a.abl & 2)) {
+            /* lever DQR: rope_rt8_kernel's work (rope_rows_roundtrip at blocks of 32, eight columns a thread; the same
+             * expressions, so the same bytes as rope_rt_kernel<32> and as o_rope + o_q) over the workgroup's part of row m (its 16
+             * heads x 512 columns) as the plain epilogue stored it -- behind the workgroup barrier (gfx12: its fences order the
+             * waves' stores for the re-read). A loop of eight 16-byte steps a thread: compact code (r69b: the 64-value per-lane
+             * form unrolled to 28.7 k instructions, 126 us a launch). The op takes heads % 16 == 0: every step a whole wave. */
+            namespace q = r4d_ds41q;
+            __syncthreads();
+            const long rp = a.qpos[m * a.qps];
+            const bool pin = rp >= 0 && rp < a.o.tab_rows;
+            const float* csr = a.o.cs + (pin ? rp : 0) * a.o.cp;
+            uint16_t* row = a.out + m * a.outr + (long)blockIdx.x * 16 * D;
+#pragma unroll 2
+            for (int c8 = tid * 8; c8 < 16 * D; c8 += 128 * 8) {
+                const uint4 w = *(const uint4*)(row + c8);
+                const uint32_t ww[4] = { w.x, w.y, w.z, w.w };
+                float v[8];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    v[2 * e] = q::ds_bf((uint16_t)(ww[e] & 0xffffu));
+                    v[2 * e + 1] = q::ds_bf((uint16_t)(ww[e] >> 16));
+                }
+                const int d8 = (c8 & (D - 1)) - a.o.off;
+                if (pin && d8 + 8 > 0 && d8 < 2 * a.o.half) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {   /* unconditional loads, the result selected (as the prologue) */
+                        const int d = d8 + 2 * e;
+                        const bool r = d >= 0 && d < 2 * a.o.half;
+                        const int ii = r ? d >> 1 : 0;
+                        const float c = csr[(long)ii * a.o.cst];
+                        const float sn = a.o.sign * csr[(long)(a.o.half + ii) * a.o.cst];
+                        const float va = v[2 * e], vb = v[2 * e + 1];
+                        const float ra = q::ds_bf(q::ds_bf16(va * c - vb * sn)), rb = q::ds_bf(q::ds_bf16(va * sn + vb * c));
+                        v[2 * e] = r ? ra : va;
+                        v[2 * e + 1] = r ? rb : vb;
+                    }
+                }
+                float am = 0.0f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    float t = fabsf(v[e]);
+                    t = t == t ? t : 0.0f;
+                    am = fmaxf(am, t);
+                }
+                am = r4d_xor_max<4>(am);
+                const float bs = q::block_scale(am, a.o.fmt, a.o.sc);
+                uint32_t ov[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    ov[e] = (uint32_t)q::ds_bf16(q::roundtrip(v[2 * e], bs, a.o.fmt)) |
+                            ((uint32_t)q::ds_bf16(q::roundtrip(v[2 * e + 1], bs, a.o.fmt)) << 16);
+                *(uint4*)(row + c8) = make_uint4(ov[0], ov[1], ov[2], ov[3]);
             }
         }
         __syncthreads();
@@ -4569,6 +4681,92 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
     return r4d_rad_rope_rows_roundtrip(&ra, stream);
 }
 
+std::atomic<int> g_dqr_abl{0};   /* bench only: r4d_dqr_abl_pin */
+/* attn_sparse_sink_dqr (lever DQR, DRAFTER track 21.11.2026 round 69): ds41_rope_rows (forward) over q at qpos (operand 12),
+ * then attn_sparse_sink (operands 0-10), then rope_rows_roundtrip (inverse) over out at qpos with cos_sin (operand 11) -- the
+ * DSpark stage's q_rope -> attention -> o_rope / o_q (DOF: o_f) as ONE launch of the WMMA form (ds41_attn_sparse_sink_wm_kernel
+ * QO). Served only where that form takes every pass: the plain bf16 window (ratio 0, no latent / window format), wm_from >= 1
+ * at M >= wm_from (lever DAW) or M above the decode band, gptj, off even, block 32, the kernel's alignment and LDS. Anything
+ * else is refused (q is the op's input: the chain's in-place rope of q has no place here; the arch declares it only where
+ * this holds). Parameters: attn_sparse_sink's, then rot / off / mode (n_head = heads, head_dim = dim; q forward, out inverse),
+ * block / format / block_scale (quant_roundtrip's). */
+int attn_dqr_body(const RadArgs* a, RadStream stream) {
+    namespace q = r4d_ds41q;
+    if (!a || a->n_t < 13 || !a->t) return RAD_E_INVAL;
+    const RadTensor &qt = a->t[0], &out = a->t[10], &cs = a->t[11], &qpos = a->t[12];
+    const long long rot = r4d_geti_or(a, "rot", 0), off = r4d_geti_or(a, "off", -1), block = r4d_geti_or(a, "block", 0);
+    const long long orp = r4d_geti_or(a, "out_rope", -1);   /* 1: + the output's rope / round trip; 0: q's rope only */
+    const bool ort = orp == 1;
+    const char* mode = r4d_gets(a, "mode");
+    const char* fs = r4d_gets(a, "format");
+    const char* ss = r4d_gets(a, "block_scale");
+    if (!mode || !fs || !ss || std::strcmp(mode, "gptj") || (orp != 0 && orp != 1)) return R4D_NO(RAD_E_UNSUPPORTED);
+    int fmt, sc;   /* quant_rt_body's names */
+    if (!std::strcmp(fs, "fp8_e4m3")) fmt = q::kFp8;
+    else if (!std::strcmp(fs, "fp4_e2m1")) fmt = q::kFp4;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    if (!std::strcmp(ss, "ue8m0")) sc = q::kUe8m0;
+    else if (!std::strcmp(ss, "e4m3") && fmt == q::kFp4) sc = q::kE4m3;
+    else if (!std::strcmp(ss, "f32") && fmt == q::kFp8) sc = q::kScaleF32;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    DsAttnArgs s{};
+    {
+        const int rc = attn_setup(a, &s);
+        if (rc != RAD_OK) return rc;
+    }
+    const long long D = kDsAttnD;
+    /* heads % 16: the epilogue's loop runs every step over whole waves (r4d_xor_max<4>'s DPP) */
+    if (rot < 2 || (rot & 1) || off < 0 || (off & 1) || off + rot > D || block != 32 || s.cnv || s.wf8 || s.nk != s.win || s.H % 16)
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    if (!cs.data || cs.dtype != RAD_F32 || cs.rank != 2 || cs.shape[1] != rot || !qpos.data || qpos.dtype != RAD_I32 ||
+        r4d_numel(&qpos) != s.M)
+        return R4D_NO(RAD_E_SHAPE);
+    const long qps = lin_stride(qpos);
+    if (qps < 0) return R4D_NO(RAD_E_SHAPE);
+    const long band = dec_band(a);
+    const int nkt = (s.nk + 15) / 16;
+    /* the plain form's LDS + the NV transposing region it never touches (the q table sits past it) + q's roped columns */
+    const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes + kWmNvBytes + 16 * rot * 2;
+    const int wpin = g_wm_from_pin.load(std::memory_order_relaxed);
+    const long long wfrom = wpin > 0 ? wpin : r4d_geti_or(a, "wm_from", 0);
+    const bool wlow = wfrom >= 1 && s.M >= wfrom;
+    if ((off & 7) || (rot & 7)) return R4D_NO(RAD_E_UNSUPPORTED);   /* Q^T's 8-column chunks wholly in or out of the rope */
+    if (!(s.M > band || wlow) || s.qr % 8 || s.outr % 8 || !aligned(qt.data, 16) || !aligned(out.data, 16) || lds > 65536 ||
+        (s.H + 15) / 16 > 65535)
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    DsAttnArgsQo so{};
+    static_cast<DsAttnArgs&>(so) = s;
+    so.o.cs = (const float*)cs.data;
+    so.o.cp = (long)cs.stride[0];
+    so.o.cst = (long)cs.stride[1];
+    so.o.tab_rows = (long)cs.shape[0];
+    so.o.off = (int)off;
+    so.o.half = (int)(rot / 2);
+    so.o.fmt = fmt;
+    so.o.sc = sc;
+    so.o.sign = -1.0f;   /* out: rope_rows inverse 1 */
+    so.qsign = 1.0f;     /* q: rope_rows inverse 0 */
+    so.qpos = (const int*)qpos.data;
+    so.qps = qps;
+    so.abl = g_dqr_abl.load(std::memory_order_relaxed);
+    const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
+    const dim3 grid((unsigned)((s.H + 15) / 16), gy);
+    const float sl2 = (float)((double)s.scale * 1.4426950408889634);
+    const int skp = attn_skip_now();   /* tp8 loop P32 */
+    if (ort) {   /* out_rope 1: q's rope + the output's rope / round trip (QO 3) */
+        if (skp & 4)   /* tp8 loop P32b: GL */
+            return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false, false, false, false, false, true, 3>), grid, dim3(128),
+                            (uint32_t)lds, so, sl2, skp);
+        return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false, false, false, false, false, false, 3>), grid, dim3(128),
+                        (uint32_t)lds, so, sl2, skp);
+    }
+    if (skp & 4)   /* out_rope 0: q's rope only (QO 1); out = attn_sparse_sink's */
+        return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false, false, false, false, false, true, 1>), grid, dim3(128),
+                        (uint32_t)lds, so, sl2, skp);
+    return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false, false, false, false, false, false, 1>), grid, dim3(128),
+                    (uint32_t)lds, so, sl2, skp);
+}
+
 /* Levers DKV-U / DKV-G: the packed compressed cache, its block table and cu_seqlens as attn_sparse_sink's operands
  * 4 / 5 / 8 (dim 512, latent_format nvfp4, `ratio`) into s; RAD_OK or the refusal. */
 int lat_setup(const RadArgs* a, const RadTensor& cc, const RadTensor& cbt, const RadTensor& cu, DsAttnArgs* res) {
@@ -4796,6 +4994,9 @@ extern "C" void r4d_attn_skip_pin(int v) { g_attn_skip_pin.store(v < 0 ? -1 : (v
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs* a, RadStream stream) {
     return attn_ort_body(a, stream);
 }
+/* lever DQR (DRAFTER track round 69): the DSpark stage's q rope + attention + output rope / round trip, one WMMA launch */
+extern "C" int r4d_rad_ds41_attn_sparse_sink_dqr(const RadArgs* a, RadStream stream) { return attn_dqr_body(a, stream); }
+extern "C" void r4d_dqr_abl_pin(int v) { g_dqr_abl.store(v & 3, std::memory_order_relaxed); }   /* bench only (tools/dbench/dqr) */
 /* Levers DKV-U / DKV-G (14.11.2026): latent_unpack / latent_gather and the attentions over their rows (the op's operands,
  * then `unpacked` / `gathered`: operand 11 of attn_sparse_sink's forms, 12 of the rope_roundtrip fold's). */
 extern "C" int r4d_rad_ds41_latent_unpack(const RadArgs* a, RadStream stream) { return lu_body(a, stream); }

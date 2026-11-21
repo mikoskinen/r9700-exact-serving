@@ -1011,6 +1011,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt `window_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
 | `attn_sparse_sink_rope_roundtrip` | `attn_sparse_sink`'s, then `rot` `off` `mode` `inverse` `block` `format`:str `block_scale`:str | `attn_sparse_sink`'s operands, then `cos_sin` (device-only: attn_sparse_sink, then rope_rows_roundtrip over `out` with n_head = heads, head_dim = dim, scale = block_scale, at the attention's positions) |
+| `attn_sparse_sink_dqr` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `wm_from` `rot` `off` `mode` `block` `format`:str `block_scale`:str `out_rope` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out`; `cos_sin`, `row_positions` (device-only: ds41_rope_rows inverse 0 over q at row_positions, attn_sparse_sink, then with out_rope 1 rope_rows_roundtrip inverse 1 over `out` at row_positions; q is not written; ratio 0, the WMMA form only) |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
@@ -1307,6 +1308,11 @@ rows, as the decode kernel with the inverse rope and the round trip in its epilo
 as the two ops' launches). Both are bit-identical to their chains; DeepSeek-V4.1 declares them beside
 the chains under RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD and picks per step (the ds41_kvfold /
 ds41_ofold switches). `kv_dtype` `fp8_e4m3` takes `window_store`'s fp8 window slot (above) as the cache.
+**`attn_sparse_sink_dqr`** (device-only, DSpark lever DQR) is `ds41_rope_rows` (forward) over
+`q` at `row_positions`, `attn_sparse_sink`, then (`out_rope` 1) `rope_rows_roundtrip` (inverse) over its output at
+`row_positions`: libr4d serves it only as the WMMA form (window alone, `wm_from` >= 1) with q's rope applied to the Q words it
+loads and (`out_rope` 1) the output's rope and round trip after its epilogue; `q` itself is left unrotated. It is bit-identical to its chain (tools/dbench/dqr); DeepSeek-V4.1's
+DSpark stages issue it under RADIANCE_DS41_DSPARK_DQR (fn4 dspark_mhr + 32).
 
 **`rmsnorm_gemm_nt_ggml`** and **`swiglu_clamped_gemm_nt_ggml`** (device-only) are an activation's producer
 (`rmsnorm`, `swiglu_clamped`) followed by `gemm_nt_ggml` over its output `h`; both outputs are the chain's. libr4d

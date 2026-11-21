@@ -13,6 +13,8 @@ int     r4d_rad_ds41_attn_sparse_sink(const RadArgs*, RadStream);
 int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs*);
 /* attn_sparse_sink + rope_rows_roundtrip over its output (lever K1 fold d) */
 int     r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs*, RadStream);
+/* lever DQR (DRAFTER track round 69): q's rope + attn_sparse_sink + rope_rows_roundtrip of its output, one WMMA launch */
+int     r4d_rad_ds41_attn_sparse_sink_dqr(const RadArgs*, RadStream);
 /* levers DKV-U / DKV-G (RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER): the packed latent's entries unpacked once a
  * pass and kv source / once a step and index source, and the two attentions over those rows */
 int     r4d_rad_ds41_latent_unpack(const RadArgs*, RadStream);
@@ -28,6 +30,7 @@ int r4d_shape_index_candidates(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_index_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_attn_sparse_sink(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_attn_sparse_sink_rope_roundtrip(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_attn_sparse_sink_dqr(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_latent_unpack(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_latent_gather(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_attn_sparse_sink_unpacked(const RadParam*, int, int, RadOpdDesc*);

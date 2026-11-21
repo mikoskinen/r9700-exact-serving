@@ -26,6 +26,20 @@ static const RadOperandSpec oDs41AttnSparseSinkRt[] = {
     { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
     { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
 };
+/* lever DQR (DRAFTER track 21.11.2026 round 69; device-only, no libref schema): q's forward rope, attn_sparse_sink, then the
+ * inverse rope + round trip of its out, one launch -- the attention's parameters (wm_from: lever DAW, the WMMA form at every
+ * height; the op is served only there), then rope_rows' rot / off / mode (q forward, out inverse: no `inverse`) and
+ * quant_roundtrip's block / format / block_scale; the attention's operands, then cos_sin and the rows' own positions. */
+static const RadParamSpec pDs41AttnSparseSinkDqr[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_INT("wm_from"), P_INT("rot"),
+    P_INT("off"), P_STR("mode"), P_INT("block"), P_STR("format"), P_STR("block_scale"), P_INT("out_rope") };
+static const RadOperandSpec oDs41AttnSparseSinkDqr[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
+    { "row_positions", RAD_OPD_IN, 0 },
+};
 /* Levers DKV-U / DKV-G (RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER; device-only, no libref schema): the packed
  * latent's entries unpacked (latent_unpack: the plan's rows of a pass; latent_gather: a decode-band pass's selections),
  * and the two attentions with the rows they read appended. */
@@ -120,6 +134,12 @@ static const RadConstraint cDs41AttnSparseSinkRt[] = {
     C_LE("inverse", 1), C_IN("mode", "gptj neox"), C_GE("block", 1), C_IN("format", "fp8_e4m3 fp4_e2m1"),
     C_IN("block_scale", "ue8m0 e4m3 f32"),
 };
+static const RadConstraint cDs41AttnSparseSinkDqr[] = {
+    C_GE("M", 1),       C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_EQ("ratio", 0),   C_EQ("topk", 0),  C_IN("dtype", "bf16"), C_GE("wm_from", 1), C_GE("rot", 2), C_DIV("rot", 2),
+    C_GE("off", 0), C_DIV("off", 2), C_IN("mode", "gptj"), C_EQ("block", 32), C_IN("format", "fp8_e4m3 fp4_e2m1"),
+    C_IN("block_scale", "ue8m0 e4m3 f32"), C_GE("out_rope", 0), C_LE("out_rope", 1),
+};
 /* 128-wide index keys held in registers, a slot dim/ratio wide read 16 bytes at a time. */
 static const RadConstraint cDs41IndexScore[] = {
     C_GE("M", 1),     C_GE("heads", 1), C_EQ("dim", 128),      C_GE("ratio", 1), C_LE("ratio", 16),
@@ -189,6 +209,11 @@ SCHEMA("attn_sparse_sink_rope_roundtrip", pDs41AttnSparseSinkRt, oDs41AttnSparse
        "heads, head_dim = dim, rot, off, mode, inverse, block, format, scale = block_scale) with cos_sin at "
        "the attention's positions: out as the two ops leave it. DeepSeek-V4.1's attention output, "
        "de-rotated and quantise-dequantised before wo_a."),
+SCHEMA("attn_sparse_sink_dqr", pDs41AttnSparseSinkDqr, oDs41AttnSparseSinkDqr,
+       "ds41_rope_rows (n_head = heads, head_dim = dim, rot, off, mode, inverse 0) over q at row_positions, then "
+       "attn_sparse_sink (operands q .. out, its parameters; ratio 0: the window alone), then with out_rope 1 "
+       "rope_rows_roundtrip (inverse 1, block, format, scale = block_scale) over out at row_positions with cos_sin: out as "
+       "those ops leave it; q is not written. The DSpark drafter stage's query rope, attention (and output rope / round trip)."),
 SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
        "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
@@ -258,6 +283,16 @@ SCHEMA("attn_sparse_sink_rope_roundtrip_gathered", pDs41AttnSparseSinkRtG, oDs41
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkRt), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip, r4d_rad_ds41_attn_sparse_sink_scratch, nullptr, nullptr,
   r4d_shape_attn_sparse_sink_rope_roundtrip, nullptr, r4d_fuse_attn_sparse_sink_rope_roundtrip },
+/* lever DQR (DRAFTER track 21.11.2026 round 69). No `replaces`: the arch issues it in place of the chain (deepseek41, the DSpark
+ * stages; RADIANCE_DS41_DSPARK_DQR). tools/dbench/dqr holds it to the chain byte for byte and batch-invariant. */
+{ "ds41_attn_sparse_sink_dqr_d512_bf16", "attn_sparse_sink_dqr", "attn",
+  "the WMMA attention (ds41_attn_sparse_sink_wm_kernel, lever DAW's form) with q's rope applied to its loaded Q words and the "
+  "output's inverse rope + round trip in its epilogue: one launch, the three ops' bytes",
+  "dim 512, any heads, window <= 1024, ratio 0, wm_from >= 1, gptj, off even, block 32; the plain bf16 window only",
+  "bf16 q, window cache and out; f32 sinks and cos_sin; i32 tables and positions",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkDqr), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_dqr, nullptr, nullptr, nullptr,
+  r4d_shape_attn_sparse_sink_dqr },
 { "ds41_index_score_d128_bf16", "index_score", "attn",
   "indexer score sum_h relu(q_h.k_j) w_h over a paged index cache, libref's roundings and order "
   "(> 48 rows: the dot on WMMA, its summation order the only change)",
