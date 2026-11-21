@@ -515,6 +515,17 @@ static void cross_check(const Plugin& pl) {
            drain(131071, 4, true) == 3 && drain(5376, 4, true) == 3 &&
            drain(1 << 22, 2, true) == 3 && drain(1 << 22, 2, false) == 3 &&
            drain(1 << 22, 8, true) == 3 && drain(1 << 22, 3, true) == 3);
+        /* lever FAS (qfn-on-ds Qwen loop round 15): ar_fence 8 = the full fence at EVERY four-rank size (the four-rank kernels
+         * have no push check); other widths unchanged; ar_fence 0 restores the rule */
+        int (*fence_set)(int) = nullptr;
+        if (sym(pl.h, "r4d_ar_fence_set", &fence_set)) {
+            const int on = fence_set(8);
+            const bool all4 = drain(5376, 4, true) == 1 && drain(131071, 4, true) == 1 && drain(1 << 22, 4, true) == 1;
+            const bool others = drain(5376, 2, true) == 3 && drain(1 << 22, 2, true) == 3 && drain(5376, 8, true) == 3;
+            const int off = fence_set(0);
+            ok("r4d_cfg_ar under ar_fence 8 (lever FAS): every four-rank message takes drain 1, other widths keep drain 3",
+               on == 1 && all4 && others && off == 1 && drain(5376, 4, true) == 3 && fence_set(9) == -1);
+        }
     }
     /* The OCP-MXFP4 rows by row count: the bands overlap, and the priority picks. */
     {
