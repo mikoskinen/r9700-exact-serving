@@ -2894,6 +2894,89 @@ TEST(exl3_experts_issue_each_op_at_its_schema_count_split_and_fused) {
     fn4_exl3_gd_flag().store(saved);
 }
 
+/* qfn-on-ds lever DRZ-K (Qwen loop round 18): RADIANCE_FN4_DRZ_KEEP names the layers whose EXL3 ops are declared with
+ * drz_keep 1 (exl3r4d then keeps their dead-row stores under exl3_drz 1). A listed layer's gate_up, down and fused chain
+ * carry it; an unlisted layer, the variable unset, and "prot" on a layer without a protected expert declare exactly
+ * today's parameters (the negative controls). */
+TEST(flashnext_drz_keep_declares_drz_keep_on_the_named_layers_only) {
+    using namespace rad::arch;
+    RadEncoding gu{}, dn{};
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 1, &gu), RAD_OK);
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 0, &dn), RAD_OK);
+    const int64_t D = 256, F = 128, NE = 8, TK = 2, ROWS = 32;
+    const char* saved_env = std::getenv("RADIANCE_FN4_DRZ_KEEP");
+    const std::string saved = saved_env ? saved_env : "";
+    /* the EXL3 ops' parameter lists of layer 3 declared under `env` (nullptr: unset): {op -> its drz_keep, -1 absent} */
+    auto declare_with = [&](const char* env, std::vector<std::pair<std::string, long long>>* out, size_t* n_params) {
+        if (env) setenv("RADIANCE_FN4_DRZ_KEEP", env, 1); else unsetenv("RADIANCE_FN4_DRZ_KEEP");
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", gu }, { "ffn_down_exps", dn } };
+        Names nm("");
+        Geom g{};
+        g.n_embd = D;
+        g.max_tok = ROWS;
+        g.world = 1;
+        g.rank = 0;
+        MoeFP8::Src src{};
+        src.router = "mlp.gate.weight";
+        src.experts = "mlp.experts";
+        src.cfg.n_expert = src.cfg.n_expert_all = NE;
+        src.cfg.top_k = TK;
+        src.cfg.n_ff_exp = F;
+        src.cfg.rows = ROWS;
+        REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+        src.cfg.exl3_v12 = 1;
+        MoeFP8::Wire w{};
+        auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
+            return decl_b(&b, name, dt, { rows, cols });
+        };
+        w.h.x = buf("h", RAD_BF16, ROWS, D);
+        REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", D), RAD_OK);
+        w.logits = buf("logits", RAD_BF16, ROWS, NE);
+        w.ids = buf("ids", RAD_I32, ROWS, TK);
+        w.ew = buf("ew", RAD_BF16, ROWS, TK);
+        w.eoff = decl_b(&b, "offset", RAD_I32, { NE + 1 });
+        w.ecnt = decl_b(&b, "count", RAD_I32, { NE });
+        w.sorted = decl_b(&b, "sorted", RAD_I32, { ROWS * TK });
+        w.egu = buf("gate_up", RAD_BF16, ROWS * TK, 2 * F);
+        w.eff.x = buf("ff", RAD_BF16, ROWS * TK, F);
+        REQUIRE_EQ(w.eff.declare_qs(&b, nm, g, "ff", F, ROWS * TK), RAD_OK);
+        w.edn = buf("down", RAD_BF16, ROWS * TK, D);
+        MoeFP8 moe;
+        REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+        REQUIRE(moe.op_x3gd != 0u);
+        out->clear();
+        *n_params = 0;
+        for (const RecOp& op : b.ops) {
+            if (op.op.rfind("moe_exl3_", 0) != 0) continue;
+            long long v = -1;
+            for (const RecParam& q : op.p) if (q.key == "drz_keep") v = q.ival;
+            out->push_back({ op.op, v });
+            *n_params += op.p.size();
+        }
+    };
+    std::vector<std::pair<std::string, long long>> unset_ops, keep_ops, other_ops, prot_ops;
+    size_t n_unset = 0, n_keep = 0, n_other = 0, n_prot = 0;
+    declare_with(nullptr, &unset_ops, &n_unset);
+    declare_with("34,3,44", &keep_ops, &n_keep);
+    declare_with("34,44,46,47", &other_ops, &n_other);
+    declare_with("prot", &prot_ops, &n_prot);   /* the fake container keeps no bf16 expert */
+    if (saved_env) setenv("RADIANCE_FN4_DRZ_KEEP", saved.c_str(), 1); else unsetenv("RADIANCE_FN4_DRZ_KEEP");
+    REQUIRE_EQ(unset_ops.size(), (size_t)3);   /* gate_up, down, the fused chain */
+    REQUIRE_EQ(keep_ops.size(), unset_ops.size());
+    for (size_t i = 0; i < unset_ops.size(); ++i) {
+        CHECK_EQ(unset_ops[i].second, -1LL);
+        CHECK_EQ(other_ops[i].second, -1LL);
+        CHECK_EQ(prot_ops[i].second, -1LL);
+        CHECK(keep_ops[i].first == unset_ops[i].first);
+        CHECK_EQ(keep_ops[i].second, 1LL);
+    }
+    /* the named layer adds exactly one parameter an op; every control declares today's lists */
+    CHECK_EQ(n_keep, n_unset + unset_ops.size());
+    CHECK_EQ(n_other, n_unset);
+    CHECK_EQ(n_prot, n_unset);
+}
+
 /* A quantised container may keep one linear as the checkpoint holds it. Flash-Next's recipe leaves
  * the QSA indexer's projection plain bf16 (its top-k is a hard choice between blocks), so in a
  * four-bit model with fp8 linears it is declared bf16 and read by `gemm_nt` over its input's bf16
