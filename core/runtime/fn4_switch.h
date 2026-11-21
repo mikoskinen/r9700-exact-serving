@@ -578,6 +578,18 @@
  *                   step and tape route step are as before. 0 -- both reports copy, as before. Host bookkeeping and one
  *                   op-less copy only: no kernel's bytes change (rule A). A plugin switch (the follower takes the leader's);
  *                   read at issue (a flip re-records). Unset: the start's RADIANCE_DS41_RR1 (0 / 1).
+ *   dspark_mhr      deepseek41 (levers DMR / DML / DOF; 109 here, after ds41_rr1 -- tp8 loop R45): the DSpark drafter's mHC
+ *                   forms 0..5 (1 lever DMR, 2 + fold c, 3 + pcn, 4 + DML (the late attention mix), 5 + DOF (o_rope + o_q in
+ *                   one launch where RADIANCE_DS41_DSPARK_MHR=5 declared it)); the plugin serves the name, but before 109
+ *                   the core did not list it, so every POST naming it was refused as an unknown switch (a kit arm with it
+ *                   was skipped). Proposals only. A plugin switch (the follower takes the leader's); read at issue (a flip
+ *                   re-records). Unset: the start's RADIANCE_DS41_DSPARK_MHR (0..5).
+ *   dspark_hs       deepseek41 (lever DHS, DRAFTER round 57; 110 here -- tp8 loop R45): 1 -- at a DHD-cut DSpark query pass the
+ *                   last stage's post-attention ops run on the S x H head rows only (gather_rows after its attention, the
+ *                   stage's stream buffers swapped, the head reads the compacted rows); 0 -- the whole block's rows as before.
+ *                   1 is taken only where RADIANCE_DS41_DSPARK_HS=0 / 1 declared its ops (refused where a rank's declare
+ *                   failed; a node without the env takes the value and issues as before). Proposals only. A plugin switch;
+ *                   read at issue. Unset: the start's RADIANCE_DS41_DSPARK_HS (0 / 1).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -814,7 +826,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
