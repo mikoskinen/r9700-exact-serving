@@ -30,6 +30,8 @@
 
 #include "r4d_ika_x.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY(); lever CIK-X (tp8 loop R49c): R4D_IKA_ENTRY_X()
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "r4d_plugin.h"
@@ -78,6 +80,48 @@ __global__ __launch_bounds__(256) void conf_kernel(ConfArgs A) { R4D_IKA_ENTRY()
         __syncthreads();
     }
     if (t == 0) A.out[(long long)s * A.o_ld + j] = part[0] + A.bias;
+}
+
+/* Lever CNF (DRAFTER track 21.11.2026 round 67; start env RADIANCE_DS41_DSPARK_CNF=1, bench hook r4d_conf_cnf): conf_kernel's
+ * arithmetic with fewer barriers -- every thread reads the predecessor id itself (no LDS slot + barrier), the x terms' loads
+ * four at a time ahead of the same sums in the same k order, the tree's levels 128 / 64 / 32 through LDS as before and its
+ * levels 16 .. 1 inside wave 0 by __shfl_down (lane t adds lane t + o: the tree's own pairs, the same order). Bytes =
+ * conf_kernel's at every shape (tools/dbench/dpr part C: 14 shapes x random inputs incl. out-of-range predecessors, 0 of 664
+ * outputs differ; this unit's -ffp-contract=off kept); xeon GPU1 10.7 -> 6.6-7.1 us a launch back to back (-36..-44 %). */
+__global__ __launch_bounds__(256) void conf_cnf_kernel(ConfArgs A) { R4D_IKA_ENTRY();
+    __shared__ float part[kThreads];
+    const int s = (int)blockIdx.x, j = (int)blockIdx.y, t = (int)threadIdx.x;
+    const int pid = j == 0 ? A.anchor[(long long)s * A.astr] : A.tok[(long long)s * A.t_ld + j - 1];
+    const u16* xr = A.x + ((long long)s * A.steps + j) * A.x_ld;
+    float acc = 0.0f;
+    int k = t;
+    for (; k + 3 * kThreads < A.D; k += 4 * kThreads) {
+        const float w0 = A.w[k], w1 = A.w[k + kThreads], w2 = A.w[k + 2 * kThreads], w3 = A.w[k + 3 * kThreads];
+        const u16 x0 = xr[k], x1 = xr[k + kThreads], x2 = xr[k + 2 * kThreads], x3 = xr[k + 3 * kThreads];
+        acc += w0 * bf2f(x0);
+        acc += w1 * bf2f(x1);
+        acc += w2 * bf2f(x2);
+        acc += w3 * bf2f(x3);
+    }
+    for (; k < A.D; k += kThreads) acc += A.w[k] * bf2f(xr[k]);
+    if (pid >= 0 && pid < A.V) {
+        const u16* pr = A.pred + (long long)pid * A.R;
+        for (int r = t; r < A.R; r += kThreads) acc += A.w[A.D + r] * bf2f(pr[r]);
+    }
+    part[t] = acc;
+    __syncthreads();
+    for (int o = kThreads / 2; o >= 32; o >>= 1) {
+        if (t < o) part[t] += part[t + o];
+        __syncthreads();
+    }
+    if (t < 32) {
+        float v = part[t];
+        for (int o = 16; o > 0; o >>= 1) {
+            const float u = __shfl_down(v, o, 32);
+            if (t < o) v += u;
+        }
+        if (t == 0) A.out[(long long)s * A.o_ld + j] = v + A.bias;
+    }
 }
 
 struct AltArgs {
@@ -184,6 +228,19 @@ static long long numel(const RadTensor* t) {
 
 }  /* namespace r4d_dspx */
 
+static int cnf_env() {   /* lever CNF: RADIANCE_DS41_DSPARK_CNF=1 at start; unset / 0 = conf_kernel as before */
+    const char* v = std::getenv("RADIANCE_DS41_DSPARK_CNF");
+    if (!v || !*v || !std::strcmp(v, "0")) return 0;
+    if (!std::strcmp(v, "1")) {
+        std::fprintf(stderr, "radiance: libr4d: dspark_conf takes conf_cnf_kernel (RADIANCE_DS41_DSPARK_CNF=1, lever CNF: the same bytes)\n");
+        return 1;
+    }
+    std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DSPARK_CNF=%s is not 0 / 1: conf_kernel as before\n", v);
+    return 0;
+}
+static int g_cnf = cnf_env();
+extern "C" void r4d_conf_cnf(int on) { g_cnf = on ? 1 : 0; }
+
 /* x, anchor, tokens, pred w, w, out. M is the output's row count (the band's bound arrives as the
  * parameter), steps rows of x a sequence. */
 extern "C" int r4d_rad_dspark_conf(const RadArgs* a, RadStream stream) {
@@ -222,8 +279,12 @@ extern "C" int r4d_rad_dspark_conf(const RadArgs* a, RadStream stream) {
     A.out = (float*)out->data; A.o_ld = o_ld;
     A.steps = (int)steps; A.D = (int)D; A.R = (int)R; A.V = (int)V;
     A.bias = (float)bias;
-    R4D_KLAUNCH(R4D_KNAME(r4d_dspx::conf_kernel), dim3((unsigned)M, (unsigned)steps), dim3(kThreads),
-                (hipStream_t)stream, A);
+    if (g_cnf)
+        R4D_KLAUNCH(R4D_KNAME(r4d_dspx::conf_cnf_kernel), dim3((unsigned)M, (unsigned)steps), dim3(kThreads),
+                    (hipStream_t)stream, A);
+    else
+        R4D_KLAUNCH(R4D_KNAME(r4d_dspx::conf_kernel), dim3((unsigned)M, (unsigned)steps), dim3(kThreads),
+                    (hipStream_t)stream, A);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

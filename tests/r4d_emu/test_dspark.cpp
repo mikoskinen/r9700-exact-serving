@@ -214,10 +214,15 @@ static int alt_cases(std::mt19937& rng, int& cases) {
     return fails;
 }
 
+extern "C" void r4d_conf_cnf(int on);   /* lever CNF (DRAFTER round 67): conf_cnf_kernel, the same bytes */
+
 int main() {
     std::mt19937 rng(41);
     int cases = 0;
-    const int f1 = conf_cases(rng, cases);
+    int f1 = conf_cases(rng, cases);
+    r4d_conf_cnf(1);
+    f1 += conf_cases(rng, cases);   /* lever CNF's kernel on fresh draws of the same shapes */
+    r4d_conf_cnf(0);
     const int f2 = alt_cases(rng, cases);
     std::printf("dspark_conf / dspark_alt: %d cases, %d failure(s)\n", cases, f1 + f2);
     return (f1 + f2) != 0;

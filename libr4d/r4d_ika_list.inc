@@ -11,6 +11,7 @@
     "collapse_kernel",
     "collapse_norm_kernel",
     "collapse_vec_kernel",
+    "conf_cnf_kernel",
     "conf_kernel",
     "conv1d_direct_kernel",
     "conv1d_f32_direct_kernel",
