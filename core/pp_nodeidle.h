@@ -23,7 +23,19 @@
  * BG stretches follower-bound with the leader 24-30 % idle) from stamped runs only (2.9 GB a node, stamps cost c16
  * ~-3.8 %); D39 (the tail band) and every later BG-balancing lever targets exactly that split. RADIANCE_PP_NODE_IDLE_S=N
  * (1..600, either value; default 60) sets the lines' period, so a 30-60 s cell holds whole windows ("the last N s"; the
- * text stays "the last minute" at 60). */
+ * text stays "the last minute" at 60).
+ *
+ * tp8 loop D68 (RADIANCE_PP_NODE_IDLE_PARTS=1 beside NODE_IDLE=1 / 2, either node; unset: nothing below is kept or printed): the
+ * same parts' card time BY KIND AND SEQUENCES -- the engine tags each part before its begin with what it is (the leader's head,
+ * head segment, tail model part, tail segment, tail = the tail's model part + its sampler + drafter + step end; the follower's
+ * pass or segment), its batch's phase (D decode only / P prefill / M mixed) and sequences / rows; a part's ms goes to (stretch,
+ * kind, phase, sequences) and one more line a period prints each key's p50 / p25 / p75 ms, count and mean rows (keys with >= 3
+ * parts), clean stretch first. Why: DECODE round 54 (lq229's step log) found the bound node's lane part growing with SEQUENCES
+ * more than with rows (c4 -> c8: ~+2.3 ms a lane part a sequence beyond rows and context) and could name it only with a stamped
+ * start; this splits it at zero card cost on any start -- the leader's head (trunk layers [0, h)) against its tail (trunk
+ * layers [t, n) + the head's logits + sampler + drafter), and the follower's pass (trunk layers [h, t) only). A part's card
+ * time holds the card's wait for the other node's crossing (as above): the leader's head part receives nothing. Log only: the
+ * issue is the same. */
 #pragma once
 
 #include "rad_internal.h"   /* RAD_INFO, rad_mono_ns, rad_device.h */
@@ -35,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,7 +56,11 @@ namespace rad {
 struct PpNodeIdle {
     static constexpr size_t kCap = 4096;
     static constexpr float kIdleMs = 5000.0f;   /* a gap this long is no work at all (between the test's cells) */
-    struct Rec { RadEvent ev; bool begin; bool bg; };
+    struct Rec { RadEvent ev; bool begin; bool bg; uint32_t tag = 0; int32_t rows = 0; };
+    /* tp8 loop D68: a part's kind (the tag's low byte), set by the engine before the part's begin */
+    enum : uint32_t { kPartOther = 0, kPartHead = 1, kPartHeadSeg = 2, kPartTailModel = 3, kPartTailSeg = 4, kPartTail = 5,
+                      kPartPass = 6, kPartSeg = 7, kPartSampler = 8 };
+    struct PAcc { std::vector<float> ms; double rows = 0; };
     struct Win {
         uint64_t t0 = 0;
         double part_ms = 0, gap_ms = 0, gap_max = 0, idle_ms = 0;
@@ -53,7 +70,20 @@ struct PpNodeIdle {
         double sp_part[2] = { 0, 0 }, sp_gap[2] = { 0, 0 };
         int64_t sp_parts[2] = { 0, 0 };
         uint64_t sp_wait[2] = { 0, 0 };    /* receive-wait ticks */
+        std::map<uint32_t, PAcc> pt;       /* tp8 loop D68: (stretch << 31 | phase << 24 | sequences << 8 | kind) -> the parts' ms */
     };
+    /* tp8 loop D68 (RADIANCE_PP_NODE_IDLE_PARTS=1): parts_on keeps the parts by kind; tag() names the next begin's part */
+    bool parts_on = false;
+    uint32_t next_tag = 0;
+    int32_t next_rows = 0;
+    static constexpr size_t kPartKeep = 65536;   /* ms kept a key and window (the run's too): past it only the count grows */
+    void tag(uint32_t kind, int phase, int64_t n_seq, int64_t n_tok) {
+        if (!parts_on) return;
+        const uint32_t ph = phase == 1 ? 1u : phase == 2 ? 2u : 0u;   /* RAD_PHASE_DECODE 1 / MIXED 2 / PREFILL 0 */
+        const uint32_t ns = (uint32_t)std::min<int64_t>(std::max<int64_t>(n_seq, 0), 65535);
+        next_tag = (ph << 24) | (ns << 8) | (kind & 0xffu);
+        next_rows = (int32_t)std::min<int64_t>(std::max<int64_t>(n_tok, 0), 1 << 30);
+    }
     /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2): the stretch the engine is in -- the leader sets `bg` each round, the follower
      * counts BG frames in pass (`bg_depth`); split prints the second line; period_s the lines' period */
     bool split = false;
@@ -200,7 +230,8 @@ struct PpNodeIdle {
         RadEvent e = take();
         if (!e) { ++dropped; return; }
         if (rad_event_record(e, s) < 0) { pool.push_back(e); ++dropped; return; }
-        recs.push_back({ e, begin, now_bg });
+        recs.push_back({ e, begin, now_bg, begin ? next_tag : 0u, begin ? next_rows : 0 });
+        if (begin) next_tag = 0, next_rows = 0;   /* tp8 loop D68: an untagged part is 'other' */
     }
     void begin() { mark(true); }
     void end() { mark(false); }
@@ -219,6 +250,11 @@ struct PpNodeIdle {
                         ++w->parts;
                         w->sp_part[last.bg] += ms;   /* tp8 loop D45: the stretch at the part's begin */
                         ++w->sp_parts[last.bg];
+                        if (parts_on) {   /* tp8 loop D68 */
+                            PAcc& a = w->pt[(last.bg ? 1u << 31 : 0u) | last.tag];
+                            if (a.ms.size() < kPartKeep) a.ms.push_back(ms);
+                            a.rows += last.rows;
+                        }
                     }
                 } else if (r.begin) {    /* between two parts; one over kIdleMs is the server without work, left out */
                     if (ms <= kIdleMs) cum_gap += ms;   /* tp8 loop D51 */
@@ -266,11 +302,50 @@ struct PpNodeIdle {
         RAD_INFO("two-node pipeline, %s node idle by stretch (RADIANCE_PP_NODE_IDLE=2, tp8 loop D45): rank 0's card over %s: %s", node,
                  what, sp.c_str());
     }
+    /* tp8 loop D68: "head D 4 seq: p50 20.31 ms (p25 19.90, p75 20.88; 494 parts, 23.6 rows)" for each key with >= 3 parts */
+    static const char* kind_name(uint32_t k) {
+        switch (k) {
+        case kPartHead: return "head";
+        case kPartHeadSeg: return "head segment";
+        case kPartTailModel: return "tail model part";
+        case kPartTailSeg: return "tail segment";
+        case kPartTail: return "tail (+ sampler, drafter, step end)";
+        case kPartPass: return "pass";
+        case kPartSeg: return "segment";
+        case kPartSampler: return "sampler + drafter + step end";
+        default: return "other";
+        }
+    }
+    void parts_note(Win& w, const char* what) const {
+        if (!parts_on) return;
+        for (int bg = 0; bg <= 1; ++bg) {
+            std::string o;
+            int64_t n_all = 0;
+            for (auto& [key, a] : w.pt) {
+                if ((key >> 31) != (uint32_t)bg || a.ms.size() < 3) continue;
+                std::vector<float> v = a.ms;
+                std::sort(v.begin(), v.end());
+                const auto q = [&](double f) { return (double)v[std::min(v.size() - 1, (size_t)(f * (double)(v.size() - 1) + 0.5))]; };
+                const uint32_t k = key & 0xffu, ns = (key >> 8) & 0xffffu, ph = (key >> 24) & 0x3u;
+                char b[256];
+                std::snprintf(b, sizeof b, "%s%s %c %u seq: p50 %.2f ms (p25 %.2f, p75 %.2f; %zu parts, %.1f rows)", o.empty() ? "" : "; ",
+                              kind_name(k), ph == 1 ? 'D' : ph == 2 ? 'M' : 'P', ns, q(0.5), q(0.25), q(0.75), v.size(),
+                              a.rows / (double)v.size());
+                o += b;
+                n_all += (int64_t)v.size();
+            }
+            if (o.empty()) continue;
+            RAD_INFO("two-node pipeline, %s node parts by kind and sequences (RADIANCE_PP_NODE_IDLE_PARTS=1, tp8 loop D68): rank 0's card "
+                     "over %s, %s (%lld parts; D decode only, P prefill, M mixed; a part's ms holds its wait for the other node's %s): %s",
+                     node, what, bg ? "with a BG step in flight" : "without a BG step in flight", (long long)n_all, crossing, o.c_str());
+        }
+    }
     void minute() {
         if (rad_mono_ns() - win.t0 < (uint64_t)period_s * 1000000000ull) return;
         drain();
         const std::string what = period_s == 60 ? std::string("the last minute") : "the last " + std::to_string(period_s) + " s";
         note(win, what.c_str());
+        parts_note(win, what.c_str());   /* tp8 loop D68 */
         vram_sample(true);
         vram_note(wmin, what.c_str());
         std::fill(wmin.begin(), wmin.end(), (int64_t)-1);
@@ -279,6 +354,7 @@ struct PpNodeIdle {
     void stop() {
         drain();
         note(run, "the run");
+        parts_note(run, "the run");   /* tp8 loop D68 */
         vram_sample(true);
         vram_note(rmin, "the run");
     }
