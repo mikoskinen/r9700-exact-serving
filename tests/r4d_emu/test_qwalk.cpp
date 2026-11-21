@@ -12,6 +12,9 @@
  * NEGATIVE CONTROLS: the compare finds a one-code change in one selected page of the cache (walk on the changed cache vs
  * today on the original), and one changed union position (a tile read from a wrong ring slot).
  *
+ * Lever KRW (round 12): today's kernel at O_KRAW (arms 2 / 3 / 4 of r4d_attn_gq6_opt_bench) = today byte for byte, with a
+ * negative control (arm 3 on the changed cache).
+ *
  *   r4d_emu_qwalk [quick] */
 #include <hip/hip_runtime.h>
 
@@ -144,6 +147,18 @@ std::vector<uint8_t> today(const Sel& s, const Ops& o) {
     return sc;
 }
 
+/* lever KRW (round 12, RADIANCE_FN4_GQ_KRAW = r4d_attn_gq6_opt_bench's arms 2 / 3 / 4): today's kernel with K's 16 raw fragments
+ * of a tile in one round (O_KRAW), without the scheduling barrier (3), at PF 4 (4) -- the same WMMA / conversion sequence */
+constexpr int kOptKraw2 = kOptToday | O_KRAW, kOptKraw3 = kOptKraw2 & ~O_SGB, kOptKraw4 = (kOptKraw2 & ~3072) | 2048;
+std::vector<uint8_t> today_arm(const Sel& s, const Ops& o, int arm, const std::vector<uint8_t>* kv_over = nullptr) {
+    std::vector<uint8_t> kv = kv_over ? *kv_over : o.kv, sc;
+    R4DArgs a = args(s, o, kv, sc);
+    if (arm == 2) hipLaunchKernelGGL((r4d_attn_decode_kernel<1, 16, 256, 6, 4, 0, kOptKraw2>), dim3(1, 1, s.S), dim3(32), 0, nullptr, a, 1);
+    if (arm == 3) hipLaunchKernelGGL((r4d_attn_decode_kernel<1, 16, 256, 6, 4, 0, kOptKraw3>), dim3(1, 1, s.S), dim3(32), 0, nullptr, a, 1);
+    if (arm == 4) hipLaunchKernelGGL((r4d_attn_decode_kernel<1, 16, 256, 6, 4, 0, kOptKraw4>), dim3(1, 1, s.S), dim3(32), 0, nullptr, a, 1);
+    return sc;
+}
+
 void launch_walk(int R, int M, const R4DArgs& a, int groups, const int* ul, const int* uo, const int* up, int* ws) {
 #define WL(RR, MM) if (R == RR && M == MM) { hipLaunchKernelGGL((r4d_attn_walk_kernel<RR, MM>), dim3(groups, 1, 1), \
                                                                dim3((RR + r4dwalk::NLW) * 32), 0, nullptr, a, ul, uo, up, ws, 0); return; }
@@ -182,6 +197,14 @@ int main(int argc, char** argv) {
         const std::vector<uint8_t> ref = today(s, o);
         const std::vector<uint8_t> ref2 = today(s, o);
         check(ref == ref2, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, "today twice (the compare's control)"));
+        for (int arm = 2; arm <= 4; ++arm) {   /* lever KRW */
+            const std::vector<uint8_t> got = today_arm(s, o, arm);
+            size_t bad = 0;
+            for (size_t i = 0; i < ref.size(); ++i) bad += got[i] != ref[i];
+            char tail[120];
+            std::snprintf(tail, sizeof tail, "KRW arm %d (K in one round) = today (%zu of %zu partial bytes differ)", arm, bad, ref.size());
+            check(bad == 0, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, tail));
+        }
         for (const auto& cf : cfg) {
             int ws[2] = { 0, 0 };
             const std::vector<uint8_t> got = walk(s, o, cf[0], cf[1], cf[2] != 0, ws);
@@ -203,6 +226,8 @@ int main(int argc, char** argv) {
             int ws[2] = { 0, 0 };
             const std::vector<uint8_t> got = walk(s, o, 8, 15, true, ws, &kv2);
             check(got != ref, fmt_case(c.S, c.P0, c.n, c.partial, 8, 15, "NEGATIVE: one cache code changed -> partials differ"));
+            const std::vector<uint8_t> gk = today_arm(s, o, 3, &kv2);
+            check(gk != ref, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, "NEGATIVE: KRW arm 3 on the changed cache -> partials differ"));
         }
         {
             int ws[2] = { 0, 0 };
