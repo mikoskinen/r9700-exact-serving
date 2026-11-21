@@ -760,6 +760,10 @@ TEST(perf_trb_played_pass_table_refresh_cost) {
     const int UNITS = std::getenv("R76_UNITS") ? std::atoi(std::getenv("R76_UNITS")) : 27;
     g_trb_blit = std::getenv("R76_BLIT") ? std::min<int64_t>(std::atoll(std::getenv("R76_BLIT")), 4 << 20) : 256;
     const bool use_gate = std::getenv("R76_GATE") && std::getenv("R76_GATE")[0] == '1';
+    /* R76_EVENTS=0 (DECODE review W21): every move published with no event = the served mover's form (Mover::republish at
+     * retire, after its copy landed: the run phase puts no stream wait for it), so only the patch kernels' count and place
+     * differ between the modes; default 1 = a completed event a moved-in unit (start_stage's form, tests' prefetch_to_op). */
+    const bool use_ev = !(std::getenv("R76_EVENTS") && std::getenv("R76_EVENTS")[0] == '0');
     static uint16_t home[E][32], moved[E][32];
     const char* order = "012210";
     std::vector<double> p50[3];
@@ -829,7 +833,7 @@ TEST(perf_trb_played_pass_table_refresh_cost) {
                 for (int t = 0; t < T; ++t) {
                     rad::WeightSlot& si = res.slot[(size_t)w[((size_t)(ui / E) * T + t) * E + ui % E]];
                     res.move(w[((size_t)(ui / E) * T + t) * E + ui % E], si.ptr == home[ui % E] ? moved[ui % E] : home[ui % E]);
-                    si.ready = ev[(size_t)u];
+                    si.ready = use_ev ? ev[(size_t)u] : nullptr;
                     rad::WeightSlot& so = res.slot[(size_t)w[((size_t)(uo / E) * T + t) * E + uo % E]];
                     res.move(w[((size_t)(uo / E) * T + t) * E + uo % E], so.ptr == home[uo % E] ? moved[uo % E] : home[uo % E]);
                     so.ready = nullptr;
@@ -863,9 +867,9 @@ TEST(perf_trb_played_pass_table_refresh_cost) {
         std::sort(ms.begin(), ms.end());
         p50[mode].push_back(ms[ms.size() / 2]);
         const int64_t* n = f.ctx.trb_counts();
-        std::printf("perf_trb units %d blit %lld B gate %d block %c: played %lld, step p50 %.3f ms (p10 %.3f, p90 %.3f); stream waits %lld; TRB passes %lld, "
+        std::printf("perf_trb units %d events %d blit %lld B gate %d block %c: played %lld, step p50 %.3f ms (p10 %.3f, p90 %.3f); stream waits %lld; TRB passes %lld, "
                     "hoisted %lld, step tables %lld, waits put %lld / not again %lld, patch kernels %lld for %lld entries, held %lld\n",
-                    UNITS, (long long)g_trb_blit, (int)use_gate, *m, (long long)f.ctx.pass_counts().played, ms[ms.size() / 2], ms[ms.size() / 10], ms[ms.size() * 9 / 10],
+                    UNITS, (int)use_ev, (long long)g_trb_blit, (int)use_gate, *m, (long long)f.ctx.pass_counts().played, ms[ms.size() / 2], ms[ms.size() / 10], ms[ms.size() * 9 / 10],
                     (long long)f.ctx.stream_waits(), (long long)n[0], (long long)n[1], (long long)n[2], (long long)n[3],
                     (long long)n[4], (long long)n[5], (long long)n[6], (long long)n[7]);
         f.ctx.shutdown();
