@@ -12749,6 +12749,95 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
         }
 }
 
+/* qfn-on-ds lever P2S (Qwen loop round 17): at four ranks under SP-hc in its hc_sp 2 order, moe_pair puts two pipelined pieces'
+ * routed experts through ONE pass. An 8,192-row step of one sequence = four 2,048-row pieces: at 0 and 3 (the pair ORDER, each
+ * piece's own pass) every routed GEMM and sort is a piece tall; at 1 every one is two pieces tall (two pairs a layer, half the
+ * issues); at 4 only the first pair is joint (pieces 2 and 3 alone). Every mode issues the same gathers (a piece each) and the
+ * same reduce-scatters, every operand fits its buffer (CHECK_PASSES), and no step fails. 0 is the control. The published
+ * start's RADIANCE_FN4_GATHER_INV=1 (the joint pass needs the inverse sort and gather: MoeFP8::pair_ok). */
+TEST(flashnext_p2s_pairs_pieces_routed_experts_under_hc_sp_2) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);   /* the published start's: the joint pass gathers through the inverse table */
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    int64_t g0 = -1, rs0 = -1, ga0 = -1;
+    for (int mode : { 0, 3, 1, 4 })
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            CHECK(m.pipe_on);
+            CHECK(m.sp_on);
+            CHECK_EQ(m.moecfg.rows, 4096);
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(mode);
+            const auto pf = kit(b, {}, { 8192 }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int64_t gemm1 = 0, gemm2 = 0, gemm_other = 0, sort2 = 0, rs = 0, gather = 0, gather_wide = 0;
+            int64_t sort2_hi = 0, inv_past = 0;   /* the second pair's sort reads ids rows [4096, 8192); no gather's slot
+                                                   * table starts past its pass's scratch (2 x 2048 x top_k entries) */
+            const int64_t k = m.moecfg.top_k;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const bool routed = o->op.rfind("moe_gemm", 0) == 0 || o->op.rfind("moe_exl3", 0) == 0;
+                if (routed && o->op.find("shexp") == std::string::npos) {
+                    if (i.n == 2048) ++gemm1; else if (i.n == 4096) ++gemm2; else ++gemm_other;
+                }
+                if (o->op.rfind("moe_scatter", 0) == 0 && i.n == 4096) {
+                    ++sort2;
+                    sort2_hi += !i.opd.empty() && i.opd[0].offset == 4096 * k;
+                }
+                if (o->op == "moe_gather_inv" && i.opd.size() > 2 && i.opd[2].offset + 2048 * k > 2 * 2048 * k) ++inv_past;
+                if (o->op == "reduce_scatter_rows") ++rs;
+                if (o->op.rfind("moe_gather", 0) == 0) { ++gather; gather_wide += i.n != 2048; }
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK_EQ(gemm_other, 0);
+            CHECK_EQ(gather_wide, 0);
+            if (mode == 0) {
+                CHECK(gemm1 > 0);
+                CHECK_EQ(gemm2, 0);
+                CHECK_EQ(sort2, 0);
+                g0 = gemm1, rs0 = rs, ga0 = gather;
+                continue;
+            }
+            CHECK_EQ(rs, rs0);
+            CHECK_EQ(gather, ga0);
+            if (mode == 3) {            /* the order alone: today's passes */
+                CHECK_EQ(gemm1, g0);
+                CHECK_EQ(gemm2, 0);
+                CHECK_EQ(sort2, 0);
+            } else if (mode == 1) {     /* two pairs a layer: the second at rows [4096, 8192) */
+                CHECK_EQ(gemm1, 0);
+                CHECK_EQ(gemm2 * 2, g0);
+                CHECK(sort2 > 0);
+                CHECK_EQ(sort2_hi * 2, sort2);
+            } else {                    /* the first pair joint, pieces 2 and 3 alone */
+                CHECK_EQ(gemm2 * 4, g0);
+                CHECK_EQ(gemm1 * 2, g0);
+                CHECK(sort2 > 0);
+                CHECK_EQ(sort2_hi, 0);
+            }
+            CHECK_EQ(inv_past, 0);
+        }
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */
 
 namespace {
