@@ -153,6 +153,15 @@ inline std::atomic<int>& fn4_exl3_gd_flag() {
     }()};
     return f;
 }
+/* fn4 PF probe X3P (Qwen loop round 11, 21.11.2026; qwen4exp switch sp_route bit 128): the routed EXL3 experts of a pass of at
+ * least kX3ProbeRows rows (prefill pieces, a mixed step's prompt rows) issued twice -- gate_up (with the shared routing map it
+ * rebuilds) and down each re-run over the same inputs, rewriting the same h and edn, so the bytes are today's -- to read the
+ * experts' marginal cost on the prefill critical path (PF probe ATP's form, rad_block_attn_gated_fp8.h). 0 = today. */
+inline std::atomic<int>& fn4_x3probe_flag() {
+    static std::atomic<int> f{0};
+    return f;
+}
+constexpr int64_t kX3ProbeRows = 512;
 /* qfn-on-ds lever X3GD (Qwen loop round 5, 21.11.2026; QUEUE Q24): the fused decode chain past 16 rows. At 16 -> 20 rows
  * the trunk's EXL3 cost goes from the chain's 108.4 us a layer to the M > 16 band's gate_up 117.7 + down 54.7 us (prof4,
  * LEVERS QFN-TP4-EDGE). RADIANCE_FN4_X3GD_HI=N (17..32, read at declare) declares the chain over EXL3_GD_MIN_ROWS..N
@@ -2992,11 +3001,14 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool x3gd = c.expert_exl3 && op_x3gd && rows >= EXL3_GD_MIN_ROWS &&
                       (rows <= x3gd_hi16 || (rows <= x3gd_hi && step_qmax <= 16)) &&
                       fn4_exl3_gd_flag().load(std::memory_order_relaxed);
+    /* fn4 PF probe X3P (sp_route bit 128): a prefill-height pass's EXL3 experts twice (the same bytes) */
+    const int x3rep = c.expert_exl3 && rows >= kX3ProbeRows && fn4_x3probe_flag().load(std::memory_order_relaxed) ? 2 : 1;
     if (x3gd)
         issue_exl3(c_, op_x3gd, EXL3_GU_DN, rows, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
     else if (c.expert_exl3)
-        issue_exl3(c_, xdk ? op_gu_dk : op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
-                   brows(b_x3h, rows * k));
+        for (int rep = 0; rep < x3rep; ++rep)
+            issue_exl3(c_, xdk ? op_gu_dk : op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                       brows(b_x3h, rows * k));
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK),
@@ -3046,7 +3058,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (x3gd) {
         /* moe_exl3_gate_up_down wrote edn */
     } else if (c.expert_exl3)
-        issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), r0);
+        for (int rep = 0; rep < x3rep; ++rep)
+            issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), r0);
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_dn, rows, brows(iqr_d.q8, rows * k), brows(iqr_d.s8, rows * k),
                     RAD_WTAB(w_dn[0], ne), RAD_WTAB(w_dns[0], ne),
@@ -3220,8 +3233,11 @@ inline void MoeFP8::pair_routed(RadCtx* c_, int64_t T, int64_t R, bool shared_in
     const int64_t n4[4] = { (n_reg + 3) / 4, (n_reg + 2) / 4, (n_reg + 1) / 4, n_reg / 4 };
     (void)rad_expert_prefetch_step(c_, layer);
     const int64_t rows = T;
+    /* fn4 PF probe X3P (sp_route bit 128): the pair's EXL3 experts twice (the same bytes), as pass() */
+    const int x3rep = c.expert_exl3 && rows >= kX3ProbeRows && fn4_x3probe_flag().load(std::memory_order_relaxed) ? 2 : 1;
     if (c.expert_exl3)
-        issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, 0, rows, g.n_embd), brows(b_x3h, rows * k));
+        for (int rep = 0; rep < x3rep; ++rep)
+            issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, 0, rows, g.n_embd), brows(b_x3h, rows * k));
     else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, 0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
@@ -3251,7 +3267,8 @@ inline void MoeFP8::pair_routed(RadCtx* c_, int64_t T, int64_t R, bool shared_in
     if (shared && shared_in)
         for (int q = 0; q < 2; ++q) gq_sh.step(c_, w.sgu, T, pr0[q], prn[q]);
     if (c.expert_exl3)
-        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), 0);
+        for (int rep = 0; rep < x3rep; ++rep)
+            issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), 0);
     else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
