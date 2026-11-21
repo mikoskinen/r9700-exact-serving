@@ -639,6 +639,7 @@ private:
     size_t                tape_seen_at_ = 0;
     std::vector<uint64_t> tape_refused_;       /* keys whose pass could not be recorded */
     uint64_t              tape_told_ = 0;      /* draft passes whose first recording was logged */
+    uint64_t              tape_told_epoch_ = 0; /* the fn4 epoch tape_told_ is for: a switch change logs each kind again */
     bool                  tape_on_ = false;    /* the backend can, and nothing needs every issue */
     bool                  record_passes_ = true;   /* CtxDesc::record_passes */
     PassTape*             rec_ = nullptr;      /* the tape being recorded, while one is */

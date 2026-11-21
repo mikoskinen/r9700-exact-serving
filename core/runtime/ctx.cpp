@@ -1275,6 +1275,13 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->touch_pending[1] = host_touch_pending_[1];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
+    /* Qwen loop round 7 (FINDINGS F20): the "recorded pass" lines (the acquire rule's and lever IKA's counts) once a draft pass
+     * kind AND fn4 epoch -- a switch change re-records every pass (its key mixes the epoch), and its counts are the A / B
+     * reading of an in-process switch (aql_acq); before this they were logged at the first epoch only. */
+    if (const uint64_t fe = fn4::epoch(); fe != tape_told_epoch_) {
+        tape_told_epoch_ = fe;
+        tape_told_ = 0;
+    }
     {
         /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches
          * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
