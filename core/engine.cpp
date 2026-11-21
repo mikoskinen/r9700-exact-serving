@@ -1162,8 +1162,11 @@ int Engine::issue_ahead(const RadBatch** out) {
     RAD_TRY(prepare_release(nb));
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
+    const int pf1_ci = pf1_mark_a(nb);   /* qfn-on-ds RADIANCE_PF_TIMELINE (the plan is nb's; the ranks are parked) */
+    const uint64_t pf1_t = pf1_ci >= 0 ? rad_mono_ns() : 0;
     barrier_->arrive_and_wait();
     barrier_->arrive_and_wait();
+    pf1_mark_b(nb, pf1_ci, pf1_t);
     const int st = step_status_.load(std::memory_order_acquire);
     if (st < 0) {
         RAD_ERR("step %d, issued ahead, failed: %s -- the engine cannot continue", nb->step,
@@ -1232,6 +1235,9 @@ int Engine::step_loop() {
                  "commit, so the harness's ids replace the head's proposals before each verify is "
                  "built (a verify-path test at the head's own shape, not a speed)", drafter_.name);
     early_ids_ = !cfg_.kld() && !embedding_;
+    /* qfn-on-ds (Qwen loop round 18): RADIANCE_PF_TIMELINE=1, a lone prefill's chunks on rank 0's card (engine_lanes.cpp) */
+    pf1_open();
+    struct Pf1Close { Engine* e; ~Pf1Close() { e->pf1_close(); } } pf1_close_at_return{ this };
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
      * it keeps a tree from running unverified should another path turn pipelining off. */
@@ -1308,6 +1314,9 @@ int Engine::step_loop() {
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
+        /* qfn-on-ds RADIANCE_PF_TIMELINE: this step is a lone prefill chunk with its prompt's first token (the plan is b's here) */
+        const bool pf1_tok = pf_tl_ && b->phase == RAD_PHASE_PREFILL && plan.e.size() == 1 && plan.e[0].is_prefill &&
+                             plan.e[0].produces_token;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
         kv_test_prepare(plan, b->step, ranks_);
 #endif
@@ -1434,6 +1443,8 @@ int Engine::step_loop() {
             step_batch_.store(b, std::memory_order_release);
             /* tp8 S5: the stage busy stamps (RADIANCE_PP_STAMPS on a pipeline node; null otherwise) */
             const uint64_t pp_t0 = pp_stamps_ ? rad_mono_ns() : 0;
+            const int pf1_ci = pf1_mark_a(b);   /* qfn-on-ds RADIANCE_PF_TIMELINE (the ranks are parked) */
+            const uint64_t pf1_t = pf1_ci >= 0 ? rad_mono_ns() : 0;
             barrier_->arrive_and_wait();      /* release the ranks */
             {
                 /* Stage the sampler while the ranks enqueue and the device runs the pass. */
@@ -1446,6 +1457,7 @@ int Engine::step_loop() {
                 build_cv_.notify_all();
             }
             barrier_->arrive_and_wait();      /* wait for them */
+            pf1_mark_b(b, pf1_ci, pf1_t);
             if (pp_stamps_) {
                 /* one lane: the pass is the head (to X1's publish) and the tail (from X2's arrival) */
                 const uint64_t t1 = rad_mono_ns();
@@ -1504,6 +1516,7 @@ int Engine::step_loop() {
         /* Behind the step's last resolve and before its end event, so collect_step's wait covers it. */
         st = stream_probe_issue(b);
         if (st < 0) return fail_loop(st);
+        pf1_mark_c(b);   /* qfn-on-ds RADIANCE_PF_TIMELINE: the step's own sampler / snapshots / drafter passes end here */
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
@@ -1511,6 +1524,7 @@ int Engine::step_loop() {
          * commit. The card runs straight on while the host waits, commits and stages. */
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
+        const uint64_t pf1_f0 = pf_tl_ ? rad_mono_ns() : 0;
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
@@ -1586,6 +1600,7 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        pf1_finish(b, pf1_f0, pf1_tok);   /* qfn-on-ds RADIANCE_PF_TIMELINE: a prompt's line at its first token */
         /* ds41-acc: the verifies against the confidence plane and the shadow tree's branches. */
         dconf_commit(plan, so, b->step);
         /* The step has drained, so its counters are readable. A chunk that produced no row did not

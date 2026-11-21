@@ -677,6 +677,25 @@ TEST(qwen35_a_prefill_span_changes_no_logit) {
     CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
 }
 
+/* qfn-on-ds (Qwen loop round 18): RADIANCE_PF_TIMELINE=1 times a lone prefill's chunks with card-local events on rank 0's
+ * stream (before / after each model pass, after the step's own sampler / snapshots / drafter) and prints one line a prompt at
+ * its first token; it records events only and changes no logit. */
+TEST(qwen35_the_prefill_timeline_changes_no_logit_and_says_each_prompts_chunks) {
+    std::string log;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4" },
+                            { "RADIANCE_LOG_STEPS=1", "RADIANCE_PF_TIMELINE=1" }, &log);
+    CHECK(log.find("RADIANCE_PF_TIMELINE=1: a lone prefill's chunks are timed") != std::string::npos);
+    CHECK(log.find("prefill timeline (RADIANCE_PF_TIMELINE=1, one machine): request") != std::string::npos);
+    CHECK(log.find("rows@context: between | model pass + own sampler") != std::string::npos);
+    for (size_t a = log.find("prefill timeline"); a != std::string::npos; a = log.find("prefill timeline", a + 1)) {
+        const size_t e = log.find('\n', a);
+        std::fprintf(stderr, "  | %s\n", log.substr(a, e == std::string::npos ? std::string::npos : e - a).c_str());
+        if (e == std::string::npos) break;
+    }
+}
+
 /* Documents batched together share every step's GEMMs and occupy other state slots and KV
  * blocks; each one's logits stay exactly those it gets alone. */
 TEST(qwen35_batching_documents_together_changes_no_logit) {

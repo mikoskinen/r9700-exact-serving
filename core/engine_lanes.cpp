@@ -103,6 +103,7 @@ struct PfTimeline {
     std::map<int, std::pair<uint64_t, int>> by_step;   /* step -> (seq, chunk) between its head and its tail */
     double plan_ms = 0;                                /* the loop's last plan, for the head that follows it */
     int64_t dropped = 0, unread = 0;
+    bool one = false;   /* qfn-on-ds: the one-machine step loop's (RADIANCE_PF_TIMELINE=1): A / B / C a chunk, no tails */
 
     ~PfTimeline() {
         for (RadEvent e : pool) rad_event_destroy(e);
@@ -179,6 +180,42 @@ static void pf_finish(PfTimeline* tl, const RadBatch* b, uint64_t t0, bool tok) 
         }
     }
     const double nh = std::max<int64_t>(P.nh, 1), nt = std::max<int64_t>(P.nt, 1);
+    if (tl->one) {
+        /* qfn-on-ds (Qwen loop round 18): gap_a = rank 0's card from the chunk before's C to this A (idle, or work outside
+         * the brackets); head = A -> B (the model pass); gap_c = B -> C (the step's own sampler, snapshot copies and drafter
+         * passes: the last chunk's holds the first token and the first drafts) */
+        double extra = 0, emax = -1, amax = -1;
+        size_t emax_at = 0, amax_at = 0;
+        for (size_t k = 0; k < n; ++k) {
+            if (P.ch[k].gap_c >= 0) {
+                extra += P.ch[k].gap_c;
+                if (P.ch[k].gap_c > emax) { emax = P.ch[k].gap_c; emax_at = k; }
+            }
+            if (P.ch[k].gap_a > amax) { amax = P.ch[k].gap_a; amax_at = k; }
+        }
+        RAD_INFO("prefill timeline (RADIANCE_PF_TIMELINE=1, one machine): request %llu, %zu chunks, %lld rows; rank 0's card: "
+                 "model passes %.1f ms (%d; %.2f ms a 1k rows), the steps' own sampler + snapshots + drafter %.1f ms (the "
+                 "longest %.1f at chunk %zu; the last chunk's %.1f), between chunks %.1f ms in %d (the longest %.1f before "
+                 "chunk %zu); host a chunk: the ranks' issue %.2f ms (the first chunk's %.2f, the longest %.2f at chunk %zu), "
+                 "collect + commit %.2f ms; events dropped %lld, unread %lld", (unsigned long long)seq, n, (long long)rows, head,
+                 nhead, rows > 0 ? head * 1000.0 / (double)rows : 0.0, extra, emax < 0 ? 0.0 : emax, emax_at,
+                 n ? (double)P.ch[n - 1].gap_c : -1.0, ga, nga, amax < 0 ? 0.0 : amax, amax_at, P.issue / nh,
+                 n ? (double)P.ch[0].issue : -1.0, imax, imax_at, P.fin / std::max<double>((double)n, 1.0),
+                 (long long)tl->dropped, (long long)tl->unread);
+        for (size_t k0 = 0; k0 < n; k0 += 16) {
+            std::string t;
+            for (size_t k = k0; k < n && k < k0 + 16; ++k) {
+                const PfTimeline::Chunk& c = P.ch[k];
+                t += fmt("%s%zu:%lld@%lld %.1f|%.1f+%.1f", k > k0 ? "  " : "", k, (long long)c.rows, (long long)c.ctx,
+                         (double)c.gap_a, (double)c.head, (double)c.gap_c);
+            }
+            RAD_INFO("prefill timeline request %llu chunks %zu-%zu (rows@context: between | model pass + own sampler, "
+                     "snapshots, drafter ms; -1 = not read): %s", (unsigned long long)seq, k0, std::min(n, k0 + 16) - 1,
+                     t.c_str());
+        }
+        tl->by_seq.erase(pit);
+        return;
+    }
     const float last = n ? P.ch[n - 1].tail : -1.0f;
     RAD_INFO("prefill timeline (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P7): request %llu, %zu chunks, %lld rows; the leader's "
              "rank-0 card: heads %.1f ms (%d; %.2f ms a 1k rows), tails %.1f ms (%d before the last; a tail waits on the card "
@@ -203,6 +240,67 @@ static void pf_finish(PfTimeline* tl, const RadBatch* b, uint64_t t0, bool tok) 
                  "-1 = not read): %s", (unsigned long long)seq, k0, std::min(n, k0 + 16) - 1, t.c_str());
     }
     tl->by_seq.erase(pit);
+}
+
+/* qfn-on-ds (Qwen loop round 18, the Qwen tp4 loop's cold-prompt read): the one-machine step loop's lone-prefill timeline
+ * (RADIANCE_PF_TIMELINE=1). The step lines say a cold prompt's last two chunks take 0.76-1.02 s for 2,600-5,296 rows where a
+ * span step runs 0.08-0.105 ms a row; the card stamps do not see an unrecorded (prefill) pass and --profile-ops synchronises
+ * the lanes. Card-local events on rank 0's stream, read in stream order without waiting (PfTimeline). */
+static const StepEntry* pf_entry(const RadBatch* b, const StepPlan& plan);   /* below (tp8 loop P7) */
+void Engine::pf1_open() {
+    const char* v = std::getenv("RADIANCE_PF_TIMELINE");
+    if (pf_tl_ || !v || std::strcmp(v, "1") != 0 || ranks_.empty()) return;
+    PfTimeline* t = new PfTimeline();
+    t->s = ranks_[0]->ctx.stream();
+    t->one = true;
+    pf_tl_ = t;
+    RAD_INFO("RADIANCE_PF_TIMELINE=1: a lone prefill's chunks are timed on rank 0's card (card-local events before and after "
+             "each model pass and after the step's own sampler / snapshots / drafter passes): one line a prompt at its first "
+             "token");
+}
+void Engine::pf1_close() {
+    if (pf_tl_ && pf_tl_->one) {
+        delete pf_tl_;
+        pf_tl_ = nullptr;
+    }
+}
+int Engine::pf1_mark_a(const RadBatch* b) {
+    if (!pf_tl_ || !pf_tl_->one) return -1;
+    const StepEntry* pfe = pf_entry(b, lsched().plan());
+    if (!pfe) return -1;
+    if (pf_tl_->by_seq.size() > 64) pf_tl_->by_seq.erase(pf_tl_->by_seq.begin());   /* prompts never finished */
+    if (pf_tl_->by_step.size() > 256) pf_tl_->by_step.erase(pf_tl_->by_step.begin());
+    PfTimeline::Prompt& P = pf_tl_->by_seq[pfe->seq];
+    const int ci = (int)P.ch.size();
+    PfTimeline::Chunk c;
+    c.rows = pfe->n_tokens;
+    c.ctx = pfe->ctx_len;
+    P.ch.push_back(c);
+    pf_tl_->by_step[b->step] = { pfe->seq, ci };
+    pf_tl_->mark(PfTimeline::kA, pfe->seq, ci);
+    return ci;
+}
+void Engine::pf1_mark_b(const RadBatch* b, int ci, uint64_t t_release) {
+    if (!pf_tl_ || !pf_tl_->one || ci < 0) return;
+    const auto it = pf_tl_->by_step.find(b->step);
+    if (it == pf_tl_->by_step.end()) return;
+    const auto pit = pf_tl_->by_seq.find(it->second.first);
+    if (pit == pf_tl_->by_seq.end()) return;
+    pf_tl_->mark(PfTimeline::kB, it->second.first, ci);
+    const double iss = (double)(rad_mono_ns() - t_release) / 1e6;
+    pit->second.issue += iss;
+    if ((size_t)ci < pit->second.ch.size()) pit->second.ch[(size_t)ci].issue = (float)iss;
+    ++pit->second.nh;
+}
+void Engine::pf1_mark_c(const RadBatch* b) {
+    if (!pf_tl_ || !pf_tl_->one) return;
+    const auto it = pf_tl_->by_step.find(b->step);
+    if (it == pf_tl_->by_step.end()) return;
+    pf_tl_->mark(PfTimeline::kC, it->second.first, it->second.second);
+}
+void Engine::pf1_finish(const RadBatch* b, uint64_t t_collect, bool tok) {
+    if (!pf_tl_ || !pf_tl_->one) return;
+    pf_finish(pf_tl_, b, t_collect, tok);
 }
 
 void Engine::lane_select(int l) {

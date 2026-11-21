@@ -618,6 +618,16 @@ private:
      * times around every head and tail part, the host's time a chunk -- one line a prompt at its first token
      * (engine_lanes.cpp). Owned by step_loop_lanes; null when off. */
     struct PfTimeline* pf_tl_ = nullptr;
+    /* qfn-on-ds (Qwen loop round 18): the same timeline in the one-machine step loop (RADIANCE_PF_TIMELINE=1; off = nothing
+     * recorded): per lone-prefill chunk on rank 0's stream, before its model pass is released (A), after the ranks issued it
+     * (B) and after the step's own sampler / snapshots / drafter passes (C); one line a prompt at its first token
+     * (engine_lanes.cpp). Owned by step_loop. */
+    void pf1_open();
+    void pf1_close();
+    int  pf1_mark_a(const RadBatch* b);
+    void pf1_mark_b(const RadBatch* b, int ci, uint64_t t_release);
+    void pf1_mark_c(const RadBatch* b);
+    void pf1_finish(const RadBatch* b, uint64_t t_collect, bool tok);
     /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1, either node): rank 0's card in parts / between parts / waiting for the other
      * node's crossing, a line a minute (core/pp_nodeidle.h). Owned by the node's step loop; null when off. */
     struct PpNodeIdle* pp_ni_ = nullptr;
