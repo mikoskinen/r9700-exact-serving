@@ -2692,7 +2692,15 @@ struct Stamps {
     bool         drain_th = false;
     std::atomic<bool> th_stop{ false };
     std::thread  th;
+    /* DRAFTER round 77 (lever STG, RADIANCE_AQL_STAMP_GATE=PATH): a pass is stamped only while PATH exists, so one start can
+     * hold stamped and unstamped cells. A stamp costs its dispatch +2.5..+3.4 us of card time when the dispatch waits for the
+     * one before it (r77: the packet's completion signal; out/r77a / r77c), so a stamped cell is not a speed cell. Looked at
+     * when a pass begins, at most once in kGateNs; -1 = not looked at yet. */
+    std::string  gate;
+    int          gate_open = -1;
+    uint64_t     gate_next_ns = 0;
 };
+constexpr uint64_t kGateNs = 20000000;   /* 20 ms */
 
 void stamps_at_exit();
 void stamps_drain_loop(Stamps* st);
@@ -2714,6 +2722,12 @@ Stamps& stamps() {
                 x->th = std::thread(stamps_drain_loop, x);
                 RAD_WARN("device: RADIANCE_AQL_STAMP_DRAIN=1 -- a thread of its own reads the stamps' signals and writes the "
                          "lines; card 0's plays only take signals (tp8 loop D43)");
+            }
+            const char* g = std::getenv("RADIANCE_AQL_STAMP_GATE");
+            if (g && *g) {
+                x->gate = g;
+                RAD_WARN("device: RADIANCE_AQL_STAMP_GATE=%s -- a pass is stamped only while that file exists (looked at once "
+                         "in 20 ms at most; DRAFTER round 77, lever STG)", g);
             }
             std::atexit(stamps_at_exit);
         }
@@ -2756,6 +2770,23 @@ const std::string& stamps_kernel(Stamps& st, uint64_t obj) {
         n = q + "\"";
     }
     return st.names.emplace(obj, std::move(n)).first->second;
+}
+
+/* With st.mu held (lever STG): whether the pass that begins now may be stamped. No gate = always; else the gate file's
+ * presence, looked at once in kGateNs at most; each change is told with the pass count, so a reader can split the cells. */
+bool stamps_gate(Stamps& st) {
+    if (st.gate.empty()) return true;
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (st.gate_open < 0 || now >= st.gate_next_ns) {
+        const int open = ::access(st.gate.c_str(), F_OK) == 0 ? 1 : 0;
+        if (open != st.gate_open)
+            RAD_WARN("device: RADIANCE_AQL_STAMP_GATE %s: stamps %s at pass %" PRIu64, st.gate.c_str(),
+                     open ? "ON" : "OFF", st.passes);
+        st.gate_open = open;
+        st.gate_next_ns = now + kGateNs;
+    }
+    return st.gate_open == 1;
 }
 
 uint64_t stamps_ns(uint64_t t) {
@@ -2869,7 +2900,7 @@ struct StampRun {
         std::lock_guard<std::mutex> lk(st.mu);
         if (!st.drain_th) stamps_read(st, false);   /* tp8 loop D43: with the drain thread, the thread reads them */
         if (from == 0) {
-            st.tape = ++st.passes % (uint64_t)st.every == 0 ? t : nullptr;
+            st.tape = ++st.passes % (uint64_t)st.every == 0 && stamps_gate(st) ? t : nullptr;
             st.play = 0;
         }
         if (!st.tape || st.tape != t) return;
