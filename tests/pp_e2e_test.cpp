@@ -3877,15 +3877,18 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
      * (4 = 3 in every stretch: decode band passes with no BG step in flight) */
     /* tp8 loop D51: bound = RADIANCE_PP_TAIL_BAND=5 with the follower's load report (RADIANCE_PP_NODE_IDLE=1 + RADIANCE_PP_LOAD_REPORT_MS
      * on both: the follower reports, the leader reads its own share) -- the band follows the measured bound */
+    /* tp8 loop D63: xenv = more start env on both nodes (space-separated): START DC8's all-levers arm on the stand-in -- form 5 + D62's
+     * idle-lane split + D61's 1812 (barrier / drafter end / frame) + D63's 1-us timer slack */
     struct Arm { int lanes; int k; bool fseg; bool fo2 = false; bool skip = false; int sw = -1; bool nocopy = false; const char* tb = "3";
-                 int tv = -1; bool bound = false; };
+                 int tv = -1; bool bound = false; const char* xenv = nullptr; };
     long long dec_all = 0, clean_all = 0, low_all = 0;
     int skip_bad = 0;
     for (const Arm a : { Arm{ 3, 1, false }, Arm{ 3, 1, true }, Arm{ 4, 2, true, true }, Arm{ 3, 1, true, false, false, 13 },
                          Arm{ 3, 1, false, false, false, -1, true }, Arm{ 3, 1, false, false, true },
                          Arm{ 3, 1, true, false, false, -1, false, "3", 4 }, Arm{ 4, 2, true, true, false, -1, false, "1028" },
                          Arm{ 3, 1, false, false, false, -1, false, "64516" },
-                         Arm{ 3, 1, true, false, false, -1, false, "5", -1, true } }) {
+                         Arm{ 3, 1, true, false, false, -1, false, "5", -1, true },
+                         Arm{ 4, 2, true, true, false, -1, false, "5", -1, true, "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1" } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back(std::string("RADIANCE_PP_TAIL_BAND=") + a.tb);
@@ -3900,6 +3903,12 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
         if (a.bound)
             for (const char* v : { "RADIANCE_PP_NODE_IDLE=1", "RADIANCE_PP_LOAD_REPORT_MS=5", "RADIANCE_PP_TBAND_BOUND_MS=100" })
                 env.push_back(v);
+        if (a.xenv) {
+            std::string w;
+            for (const char* c = a.xenv;; ++c) {
+                if (*c == ' ' || !*c) { if (!w.empty()) env.push_back(w); w.clear(); if (!*c) break; } else w += *c;
+            }
+        }
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
         ex.push_back(std::to_string(a.lanes));
@@ -3962,6 +3971,7 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
                 (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
         const bool notowner = flog.find("NOT the owner's bytes") != std::string::npos;
         const bool copy2 = flog.find("layer 2,") != std::string::npos;   /* the check named the band layer's copy */
+        if (a.xenv) fprintf(stderr, "    + %s (START DC8's t5all on the stand-in, tp8 loop D63)\n", a.xenv);
         fprintf(stderr, "    TAIL COPY (llama stand-in), %d lanes BG %d W(1,3), TAIL_BAND=%s%s%s%s%s%s%s: %d of %zu requests differ; %lld lane steps "
                         "ran as tail band passes, %lld of them decode lanes' (pp_tband 3 / 4), %lld kept W(1,3)'s for a sequence not held, %lld "
                         "held; %lld band passes with no BG step in flight, %lld clean steps kept W(1,3)'s at a load <= N (D50); KV-copy checks "
@@ -4036,6 +4046,11 @@ TEST(tail_band_copy_runs_decode_lane_steps_as_band_passes_with_one_process_token
             CHECK(jn > 0);
             CHECK_EQ(jn, jb + jk);
             CHECK(jf >= 0);
+        }
+        if (a.xenv) {   /* tp8 loop D63: the three start values reached both nodes (each node's own threads / the leader's lanes) */
+            CHECK(llog.find("'s sleeps: ") != std::string::npos);   /* host_slack 1 counted the leader's sleeps */
+            CHECK(flog.find("'s sleeps: ") != std::string::npos);
+            CHECK(llog.find("host_spin 1812's waits: ") != std::string::npos);
         }
         clean_all += std::max(0LL, dclean);
         low_all += std::max(0LL, dlow);
