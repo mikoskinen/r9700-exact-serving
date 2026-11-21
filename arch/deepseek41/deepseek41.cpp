@@ -12865,6 +12865,35 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 /* DSML tool calls with typed argument tags, which the template analysis cannot state. */
 static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch::deepseek41_chat_format(); }
+
+/* DRAFTER round 80, lever EUP: whether this rank's query pass `b` makes one of dsp_query's one-time uploads -- lever EMA's
+ * index planes (`ek >= 0 && !ema_up`) or the confidence head's weights (`conf && dspark_conf && !cw_up`), each copied from a
+ * pageable host vector and synchronised. Inside a recording that copy refuses the tape (aql.cpp pageable_copy: "the pass
+ * cannot be recorded"), and Ctx::record_pass keeps the key refused for the process: lq231's engine log 15:58:45, 'draft pass 1
+ * at 5 tokens is issued in full every step: ... a copy of 1280 bytes' = EMA's ia plane, 2 blocks x Q 160 x 4 B. The tests
+ * below are dsp_query's own (its block from T / S as it picks `lo`; EMA's plane lookup; the conf switch), so the predicate
+ * is true exactly on the passes that upload, and false on every pass once both flags moved. RADIANCE_DS41_EUP=0: off. */
+static std::atomic<long long> g_eup_n{0};
+static bool eup_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_EUP"); return !(e && !std::strcmp(e, "0")); }();
+    return on;
+}
+static bool dsp_upload_pending(const Model& m, const RadBatch* b) {
+    if (!b || b->draft_pass <= 0 || !eup_env()) return false;
+    const Dsp& d = m.dsp;
+    if (!d.on) return false;
+    const int64_t T = b->n_tok, S = b->n_seq;
+    if (T <= 0 || S <= 0) return false;
+    const Dsp::Short* lo = nullptr;
+    for (const Dsp::Short& z : d.sh)
+        if (z.S != d.block && T == S * z.S) { lo = &z; break; }
+    const int64_t blk = lo ? lo->S : d.block;
+    if (!d.ema_up && d.ema_g && dmr_now() >= 7 && !g_ema_bad.load(std::memory_order_relaxed) && blk >= 2 && S + 1 <= d.Q)
+        for (size_t k = 0; k < d.ema_blk.size(); ++k)
+            if (d.ema_blk[k] == blk) return true;
+    if (!d.cw_up && (lo ? lo->conf : d.conf_op) && ds41_switch("dspark_conf") > 0) return true;
+    return false;
+}
 }  // namespace deepseek41
 
 #ifndef RAD_ARCH_NO_EXPORTS
@@ -12872,9 +12901,22 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch:
  * ds41_bi 1) is not recorded -- the key below does not hold those lengths; every other pass keys as before (a constant).
  * No DeepSeek kernel reads RadArgs::kv_used_max_h, the one thing the callback's presence changes in the issue path. */
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_t* kv_used_max_h) {
-    (void)c;
     (void)kv_used_max_h;
     uint64_t geo = 1;   /* the pass's geometry beyond the core's key: a constant, or (tp8 loop F58) its band pieces */
+    /* DRAFTER round 80, lever EUP: a query pass that makes a one-time upload from pageable memory is issued live, not
+     * recorded (a 0 key: Ctx::run_pass issues it, no recording is tried, so the key is not refused); the next pass of its key,
+     * after the upload, records as any other. Every other pass keys as before. */
+    if (b && b->draft_pass > 0 && c) {
+        const int r = rad_rank(c);
+        if (r >= 0 && r < rad::arch::MAX_RANKS && deepseek41::models[r] && deepseek41::dsp_upload_pending(*deepseek41::models[r], b)) {
+            if (deepseek41::g_eup_n.fetch_add(1, std::memory_order_relaxed) == 0 && r == 0)
+                fprintf(stderr, "radiance: deepseek41: lever EUP: a DSpark query pass (%lld tokens) that copies its one-time planes "
+                                "(lever EMA's index planes / the confidence head's weights) from host memory is issued live, not "
+                                "recorded, so its key records on its next pass (RADIANCE_DS41_EUP=0: off)\n",
+                        (long long)b->n_tok);
+            return 0;
+        }
+    }
     /* Lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is shaped by its targets, which no key holds: not
      * recorded */
     if (deepseek41::psk_hint(b)) return 0;
