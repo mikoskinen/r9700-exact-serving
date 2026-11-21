@@ -27785,6 +27785,45 @@ static void bf16_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int ite
                      tp.label.c_str());
         }
     }
+    /* Qwen loop round 12, QUEUE Q29: the SK slices as separate blocks + an ascending fold (r4d_gemm_bf16_slb_bench) against
+     * today's 128 x 128 launch at the same SK, bytes compared; the same weight copy for both forms (warm, not rotated) */
+    typedef int (*SlbFn)(long, long, long, long, int, int, int, int, int, long);
+    const SlbFn slb = rt ? (SlbFn)dlsym(pl.h, "r4d_gemm_bf16_slb_bench") : nullptr;
+    if (slb) {
+        void* d_p = dalloc((size_t)8 * M * N * 4);
+        void* d_y2 = dalloc((size_t)M * N * 2);
+        if (!d_p || !d_y2) { std::printf("  SLB: alloc failed\n"); return; }
+        std::vector<uint16_t> y0((size_t)M * N), y1((size_t)M * N);
+        auto tm = [&](int sk, int mode, void* y) {
+            hipEvent_t e0, e1;
+            st_ev_create(&e0); st_ev_create(&e1);
+            for (int i = 0; i < 3; ++i) slb((long)d_a, (long)d_w, (long)y, (long)d_p, (int)M, (int)K, (int)N, sk, mode, 0);
+            st_ev_record(e0, nullptr);
+            for (int i = 0; i < iters; ++i) slb((long)d_a, (long)d_w, (long)y, (long)d_p, (int)M, (int)K, (int)N, sk, mode, 0);
+            st_ev_record(e1, nullptr);
+            st_ev_sync(e1);
+            float ms = 0;
+            st_ev_elapsed(&ms, e0, e1);
+            st_ev_destroy(e0); st_ev_destroy(e1);
+            return (double)ms * 1000.0 / iters;
+        };
+        for (int sk : { 2, 4, 8 }) {
+            if (K % (sk * 64)) continue;
+            st_memset(d_y, 0xab, (size_t)M * N * 2); st_memset(d_y2, 0xcd, (size_t)M * N * 2);
+            const int r0 = slb((long)d_a, (long)d_w, (long)d_y, (long)d_p, (int)M, (int)K, (int)N, sk, 0, 0);
+            const int r1 = slb((long)d_a, (long)d_w, (long)d_y2, (long)d_p, (int)M, (int)K, (int)N, sk, 1, 0);
+            st_stream_sync(nullptr);
+            if (r0 || r1) { std::printf("  SLB SK %d: rc %d / %d (not served)\n", sk, r0, r1); continue; }
+            st_memcpy(y0.data(), d_y, y0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(y1.data(), d_y2, y1.size() * 2, hipMemcpyDeviceToHost);
+            size_t bad = 0;
+            for (size_t i = 0; i < y0.size(); ++i) bad += y0[i] != y1[i];
+            const double u0 = tm(sk, 0, d_y), u1 = tm(sk, 1, d_y2);
+            std::printf("  SLB SK %d: today 128 x 128 %8.1f us a call (%d blocks) | slices as blocks + fold %8.1f us (%+.1f %%, %d blocks + fold)"
+                        "   bytes vs today: %zu of %zu differ -> %s\n", sk, u0, (int)(((N + 127) / 128) * ((M + 127) / 128)), u1,
+                        100.0 * (u1 - u0) / u0, (int)(((N + 127) / 128) * ((M + 127) / 128) * sk), bad, y0.size(), bad ? "DIFFERENT" : "IDENTICAL");
+        }
+    }
 }
 /* The int2 draft head at every variant. rad-tune never reaches this row (on the DFlash2
  * container its requests are `gemm_nt` and `all_reduce`), and it runs well under the part's

@@ -248,6 +248,131 @@ static int bt_tile_forced() {
   return v;
 }
 
+// ============================================================== Qwen loop round 12, QUEUE Q29 (bench only)
+// The SK slices as separate BLOCKS (SLB): today a 128 x 128 block walks all K alone, its SK slices one after the other into
+// `tot` (tot = 0; tot += slice z's acc, z ascending), so at the router's prefill shape (N 512, K 2560, 2,048 rows) the grid is
+// 64 blocks, one a CU, each a dependent chain of K / 64 staged tiles. Here block (x, y, z) walks only slice z -- the same
+// staging, the same fragments, the same WMMA a 16 K step from acc = 0 -- and stores its f32 acc to a workspace; a fold kernel
+// then forms v = 0.f; v += P[0]; .. v += P[SK - 1] in ascending z and rounds to bf16 as today's store: the same f32 adds in the
+// same order, so the same bytes. SK x more blocks (4 a CU at SK 4), SK x M x N x 4 bytes of partials written and read once.
+template <int TM, int TN>
+__global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_slb_kernel(
+    const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
+    float* __restrict__ P, int M, int K, int N, int nks, int LDA) {   // bench only: not an IKA-listed kernel
+  constexpr int BM = BT_WM * TM * 16, BN = BT_WN * TN * 16;
+  constexpr int CPR = BT_BK / 8;
+  constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
+  __shared__ __attribute__((aligned(16))) unsigned short sA[BM * BT_PITCH];
+  __shared__ __attribute__((aligned(16))) unsigned short sW[BN * BT_PITCH];
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const int wm = wave / BT_WN, wn = wave % BT_WN;
+  constexpr unsigned kGroupM = 8;
+  const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+  const unsigned first = lin / per * kGroupM, r = lin % per;
+  const unsigned gm = min(gridDim.y - first, kGroupM);
+  const int m0 = (int)(first + r % gm) * BM, n0 = (int)(r / gm) * BN;
+  const int z = (int)blockIdx.z, kt0 = z * nks;
+  unsigned aoff[AL], woff[WL];
+  unsigned short* adst[AL];
+  unsigned short* wdst[WL];
+#pragma unroll
+  for (int i = 0; i < AL; ++i) {
+    const int c = tid + 256 * i, rr = c / CPR, e = (c % CPR) * 8;
+    const int gr = m0 + rr < M ? m0 + rr : M - 1;
+    aoff[i] = (unsigned)gr * (unsigned)LDA + (unsigned)e;
+    adst[i] = sA + rr * BT_PITCH + e;
+  }
+#pragma unroll
+  for (int i = 0; i < WL; ++i) {
+    const int c = tid + 256 * i, rr = c / CPR, e = (c % CPR) * 8;
+    const int gr = n0 + rr < N ? n0 + rr : N - 1;
+    woff[i] = (unsigned)gr * (unsigned)K + (unsigned)e;
+    wdst[i] = sW + rr * BT_PITCH + e;
+  }
+  const unsigned short* fa = sA + (wm * TM * 16 + (lane & 15)) * BT_PITCH + 4 * (lane >> 4);
+  const unsigned short* fw = sW + (wn * TN * 16 + (lane & 15)) * BT_PITCH + 4 * (lane >> 4);
+  v8f acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
+  r4d_u32x4 ra[AL], rw[WL];
+  const unsigned kb0 = (unsigned)kt0 * BT_BK;
+#pragma unroll
+  for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i] + kb0);
+#pragma unroll
+  for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(W + woff[i] + kb0);
+  for (int kt = kt0; kt < kt0 + nks; ++kt) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < AL; ++i) *(r4d_u32x4*)adst[i] = ra[i];
+#pragma unroll
+    for (int i = 0; i < WL; ++i) *(r4d_u32x4*)wdst[i] = rw[i];
+    __syncthreads();
+    if (kt + 1 < kt0 + nks) {
+      const unsigned k1 = (unsigned)(kt + 1) * BT_BK;
+#pragma unroll
+      for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i] + k1);
+#pragma unroll
+      for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(W + woff[i] + k1);
+    }
+#pragma unroll
+    for (int s = 0; s < BT_BK / 16; ++s) {
+      v8bf af[TM], bf[TN];
+#pragma unroll
+      for (int i = 0; i < TM; ++i) af[i] = fragP(fa + i * 16 * BT_PITCH + s * 16);
+#pragma unroll
+      for (int j = 0; j < TN; ++j) bf[j] = fragP(fw + j * 16 * BT_PITCH + s * 16);
+#pragma unroll
+      for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+      __builtin_amdgcn_sched_group_barrier(0x100, TM + TN, 0);
+      __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);
+    }
+  }
+  float* Pz = P + (size_t)z * (size_t)M * (size_t)N;
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+      const int mb = m0 + (wm * TM + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = mb + e;
+        if (n < N && m < M) Pz[(size_t)m * N + n] = acc[i][j][e];
+      }
+    }
+}
+__global__ __launch_bounds__(256) void r4d_gemm_bf16_slb_fold_kernel(const float* __restrict__ P, __hip_bfloat16* __restrict__ C,
+                                                                     int M, int N, int SK, int LDC) {
+  const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+  if (i >= (long long)M * N) return;
+  const int m = (int)(i / N), n = (int)(i % N);
+  float v = 0.f;
+  for (int z = 0; z < SK; ++z) v += P[(size_t)z * (size_t)M * (size_t)N + (size_t)i];
+  C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
+}
+/* r4d_selftest --perfbf16's Q29 arm: mode 0 = today's tiled launch at the 128 x 128 tile and this SK (the reference), mode 1 =
+ * the slices as blocks + the fold (ws: SK x M x N floats). Dense pitches (lda = K, ldc = N), one row chunk. */
+extern "C" int r4d_gemm_bf16_slb_bench(long a, long w, long c, long ws, int M, int K, int N, int SK, int mode, long stream) {
+  if (mode == 0) return gemm_bf16_tiled_p(a, w, c, M, K, N, SK, 1, stream, K, N);
+  if (SK < 2 || K % (SK * BT_BK) || M < 1 || N < 1 || !ws) return -1;
+  if (r4d_bf16_gemm_chunk_rows(M, N, K, 128, 128) < M) return -1;
+  hipStream_t st = (hipStream_t)stream;
+  dim3 grid((N + 127) / 128, (M + 127) / 128, SK);
+  hipLaunchKernelGGL((r4d_gemm_bf16_nt_slb_kernel<4, 2>), grid, dim3(256), 0, st, (const unsigned short*)a,
+                     (const unsigned short*)w, (float*)ws, M, K, N, K / SK / BT_BK, K);
+  hipError_t e = hipGetLastError();
+  if (e != hipSuccess) return (int)e;
+  const long long tot = (long long)M * N;
+  hipLaunchKernelGGL(r4d_gemm_bf16_slb_fold_kernel, dim3((unsigned)((tot + 255) / 256)), dim3(256), 0, st, (const float*)ws,
+                     (__hip_bfloat16*)c, M, N, SK, N);
+  e = hipGetLastError();
+  return e == hipSuccess ? 0 : (int)e;
+}
+
 // ============================================================== the plugin ABI entry point
 extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   GemmOps g;
