@@ -3587,7 +3587,7 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK_EQ(fn4::switch_index("host_slack"), 114);      /* tp8 loop D63 (each node's own threads) */
     CHECK(fn4::sched_switch(fn4::kPpBgSplit));
     CHECK(!fn4::follower_switch(fn4::kPpBgSplit));
-    CHECK_EQ(i + 22, (int)fn4::kSwitches);
+    CHECK_EQ(i + 23, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -3657,7 +3657,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 20, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 21, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3675,7 +3675,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 19, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 20, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3786,7 +3786,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 21, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101; U1: 102; P47: 103; D56: 104; P46: 105; W1s: 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 22, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101; U1: 102; P47: 103; D56: 104; P46: 105; W1s: 106; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
@@ -13404,7 +13404,7 @@ TEST(ds41_csplit_is_a_follower_plugin_switch_after_aql_hdp) {
     REQUIRE(i == (int)fn4::kDs41Csplit);
     CHECK_EQ(i, (int)fn4::kAqlHdp + 1);
     CHECK_EQ(i, 103);
-    CHECK_EQ(i + 13, (int)fn4::kSwitches);   /* D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 14, (int)fn4::kSwitches);   /* D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "ds41_csplit");
@@ -13426,7 +13426,7 @@ TEST(dspark_mhr_and_dspark_hs_are_follower_plugin_switches_after_ds41_rr1) {
     CHECK_EQ(m, (int)fn4::kDs41Rr1 + 1);
     CHECK_EQ(m, 109);
     CHECK_EQ(h, 110);
-    CHECK_EQ(h + 6, (int)fn4::kSwitches);
+    CHECK_EQ(h + 7, (int)fn4::kSwitches);
     for (const int i : { m, h }) {
         CHECK(fn4::follower_switch(i));
         CHECK(!fn4::sched_switch(i));
@@ -17002,7 +17002,7 @@ TEST(sched_lane_room_the_switch_takes_0_1_and_starts_off) {
     CHECK_EQ(fn4::sched_lane_room(), 0);
     CHECK_EQ(fn4::switch_index("sched_lane_room"), (int)fn4::kSchedLaneRoom);
     CHECK_EQ((int)fn4::kSchedLaneRoom, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ((int)fn4::kSchedLaneRoom + 12, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ((int)fn4::kSchedLaneRoom + 13, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(!fn4::sched_switch(fn4::kSchedLaneRoom));
     CHECK(!fn4::follower_switch(fn4::kSchedLaneRoom));
     CHECK(fn4::state_json().find("\"sched_lane_room\": 0") != std::string::npos);
@@ -17021,7 +17021,7 @@ TEST(pp_send_ash_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, 105);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 11, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
+    CHECK_EQ(i + 12, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -17046,7 +17046,7 @@ TEST(aql_waitk_the_switch_takes_0_1_2_and_reads_its_env_unset) {
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, 106);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 10, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
+    CHECK_EQ(i + 11, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
     CHECK(std::string(fn4::switch_name(i)) == "aql_waitk");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17080,7 +17080,7 @@ TEST(aql_cik_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kAqlCik);
     CHECK_EQ(i, 113);
     CHECK_EQ(i, (int)fn4::kPpBgSplit + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "aql_cik");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17114,7 +17114,7 @@ TEST(host_slack_the_switch_takes_0_to_1000_us_and_sets_each_threads_timer_slack)
     REQUIRE(i == (int)fn4::kHostSlack);
     CHECK_EQ(i, 114);
     CHECK_EQ(i, (int)fn4::kAqlCik + 1);
-    CHECK_EQ(i + 2, (int)fn4::kSwitches);
+    CHECK_EQ(i + 3, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "host_slack");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17198,7 +17198,7 @@ TEST(pp_tband_bound_the_switch_takes_w_plus_10000_h_and_follows) {
     REQUIRE(i == (int)fn4::kPpTbandBound);
     CHECK_EQ(i, 115);
     CHECK_EQ(i, (int)fn4::kHostSlack + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband_bound");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17250,7 +17250,7 @@ TEST(aql_ika_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kAqlIka);
     CHECK_EQ(i, 107);
     CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
-    CHECK_EQ(i + 9, (int)fn4::kSwitches);
+    CHECK_EQ(i + 10, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "aql_ika");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17287,7 +17287,7 @@ TEST(host_spin_the_switch_takes_n_and_sites_and_starts_off) {
     REQUIRE(i == (int)fn4::kHostSpin);
     CHECK_EQ(i, 111);
     CHECK_EQ(i, (int)fn4::kDsparkHs + 1);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "host_spin");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
