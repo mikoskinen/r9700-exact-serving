@@ -13041,6 +13041,72 @@ TEST(dlh_the_fixed_window_drafts_the_held_cap_from_its_decode_rows) {
     CHECK(DstSwitches::set("draft_dmask", 0));
 }
 
+/* Lever DLM, Qwen loop FINDINGS F24 (dlm1 / dlm2: `decode n_seq=5 n_tok=24`, a newcomer's first proposal of 3 drafted in its
+ * lone prefill step's cycle at 4 sequences, beside four of 4 drafted at 5, planned in a cycle of 5 = depth 4): under the mask
+ * one depth a step -- every decode entry cut to the shallowest proposal, on the full step and on the step issued ahead; the
+ * threshold (mask 0) plans as before (the mixed step stays: the control that this is the shape). */
+TEST(dlm_one_depth_a_step_when_a_proposal_is_shallower_than_the_cycle) {
+    for (int mask : { 55, 0 }) {
+        DstSwitches restore;
+        CHECK(DstSwitches::set("draft_dmask", mask));
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        (void)f.sch.set_draft_dcap(3);
+        (void)f.sch.set_draft_dcap_n(107);
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 5; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        /* five decoding sequences: bit 4 of 55 set and 5 < 7 -> the cycle drafts 4; the last proposal is 3 deep */
+        for (size_t i = 0; i < ids.size(); ++i) CHECK_OK(f.sch.set_draft(ids[i], draft, i + 1 < ids.size() ? 4 : 3));
+        REQUIRE(f.sch.step() != nullptr);
+        int64_t rows = 0;
+        for (const StepEntry& e : f.sch.plan().e) {
+            const bool last = e.seq == ids.back();
+            CHECK_EQ(e.n_spec, mask ? 3 : (last ? 3 : 4));
+            CHECK_EQ(e.n_tokens, 1 + e.n_spec);
+            CHECK_EQ(f.sch.find(e.seq)->n_draft, e.n_spec);
+            rows += e.n_tokens;
+        }
+        CHECK_EQ(rows, mask ? (int64_t)20 : (int64_t)24);
+        CHECK_EQ((int)f.sch.plan().n_spec, mask ? 3 : 4);
+        CHECK_EQ(f.sch.dlm_uniform_steps(), mask ? (int64_t)1 : (int64_t)0);
+        CHECK_EQ(f.sch.dlm_uniform_cut(), mask ? (int64_t)4 : (int64_t)0);
+        /* the step issued ahead: the drafter's counts 4, 4, 4, 4, 3 again */
+        for (size_t i = 0; i < ids.size(); ++i) {
+            f.sch.find(ids[i])->speculation_fixed = true;
+            f.sch.expect_draft(ids[i], i + 1 < ids.size() ? 4 : 3);
+        }
+        const RadBatch* nb = f.sch.step_next();
+        REQUIRE(nb != nullptr);
+        CHECK_EQ((int)nb->n_tok, mask ? 20 : 24);
+        CHECK_EQ((int)nb->n_spec, mask ? 3 : 4);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int n = i + 1 < ids.size() ? 4 : 3;
+            CHECK_OK(f.sch.set_draft(ids[i], draft, n));
+            CHECK_EQ(f.sch.find(ids[i])->n_draft, mask ? 3 : n);
+        }
+        f.sch.promote_next();
+        for (const StepEntry& e : f.sch.plan().e) {
+            CHECK_EQ(e.n_spec, mask ? 3 : (e.seq == ids.back() ? 3 : 4));
+            CHECK_EQ(e.n_tokens, 1 + e.n_spec);
+        }
+        CHECK_EQ(f.sch.dlm_uniform_steps(), mask ? (int64_t)2 : (int64_t)0);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        /* every proposal 4 deep again: nothing to cut */
+        for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, 4);
+        CHECK_EQ(f.sch.dlm_uniform_steps(), mask ? (int64_t)2 : (int64_t)0);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+    }
+    CHECK(DstSwitches::set("draft_dmask", 0));
+}
+
 
 /* ================================================== lever CBH (ds41-int10b): the co-batch hold
  * fn4 sched_cb_hold_ms H (RADIANCE_SCHED_CB_HOLD_MS at start) / sched_cb_hold_k K: while >= 2 sequences decode, a fresh

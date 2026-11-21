@@ -928,6 +928,13 @@ private:
     int           cap_now_ = 0;
     int64_t       cap_n_[7] = {};
     bool          cap_seq_noted_ = false, cap_over_noted_ = false;
+    /* lever DLM (F24): steps whose decode rows cap_rows cut to one depth under draft_dmask, and the drafts cut */
+    int64_t       dlm_uni_[2] = {};
+    bool          dlm_uni_noted_ = false;
+public:
+    int64_t dlm_uniform_steps() const { return dlm_uni_[0]; }
+    int64_t dlm_uniform_cut() const { return dlm_uni_[1]; }
+private:
     /* qfn-on-ds round 2 (Qwen, xeon s1-cap / s3-lev 20.11.): RADIANCE_DECODE_ROW_CAP_UNIFORM=1 at start -- the cap keeps ONE
      * depth for every decode sequence of the step (the largest common depth L the room holds; the rows left over below the
      * cap are not handed on), because the Qwen line's batch-invariant forms take one verify depth a step (att_bi, bi_logits,

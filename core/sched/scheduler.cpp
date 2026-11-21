@@ -1863,6 +1863,63 @@ int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
     if (seqs == 0) return 0;
     ++cap_n_[6];
     int64_t rows = seqs + drafts, cut = 0;
+    /* One decode entry's drafts cut to its first k (a prefix of the drafter's proposal, as the window caps cut it); the
+     * request's window kept equal to the entry's on the running path, set_draft's count on the step issued ahead. */
+    auto trim = [&](StepEntry& e, int32_t k) {
+        cut += e.n_spec - k;
+        e.n_spec = k;
+        e.n_draft = k;
+        e.n_tokens = 1 + k;
+        if (k == 0) e.ngram = false;
+        if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) return;
+        SchedReq& s = *reqs_[(size_t)e.slot];
+        if (ahead) {
+            s.draft_next = k;        /* what set_draft cuts the proposal published for it to */
+            s.cap_cut_next = true;
+        } else {
+            /* as the running loop keeps them: the request's window equal to the entry's (Sampler::build_step) */
+            s.n_draft = k;
+            s.sched_tokens = 1 + k;
+            if (s.req) {
+                s.req->n_draft = k;
+                s.req->draft = k ? s.draft : nullptr;
+                s.req->draft_parent = k ? e.draft_parent : nullptr;
+            }
+        }
+    };
+    /* Lever DLM (Qwen loop FINDINGS F24): one draft depth a step under a mask of counts. A mask with a hole is not
+     * non-increasing in the count, so a proposal drafted under one cycle's D can be planned under a deeper one: a newcomer's
+     * first proposal is drafted in its lone prefill step's cycle (k decoding sequences, itself not yet one of them) while the
+     * others drafted in the cycle before (k + 1: the sequence that ended there still counted), and the next cycle opens at
+     * k + 1 (mask 55: k = 4 -> D 3, k + 1 = 5 -> D 4: dlm1 / dlm2 step `n_seq=5 n_tok=24`, one q 4 beside four q 5). A step
+     * whose decode sequences verify at two depths leaves att_bi's per-sequence launches (rad_block_attn_gated_fp8.h:946 takes
+     * only DT == D x qd; also bi_logits, hc_bi's bi_qd) and the newcomer's rows split their keys otherwise than alone. So under
+     * the mask every decode entry is cut to the step's shallowest proposal; the threshold (mask 0: D non-increasing in the
+     * count, lb31: 0 mixed-depth steps in 11,933) and every other start plan as before. */
+    if (seqs > 1 && top > 0 && fn4::draft_dmask() != 0 && !draft_.adaptive()) {
+        int32_t lo = top;
+        for (const StepEntry& e : p.e)
+            if (!e.is_prefill) lo = std::min(lo, e.n_spec);
+        if (lo < top) {
+            const int64_t before = cut;
+            for (StepEntry& e : p.e)
+                if (!e.is_prefill && e.n_spec > lo) trim(e, lo);
+            p.n_tok -= cut - before;
+            rows -= cut - before;
+            drafts -= cut - before;
+            top = lo;
+            p.n_spec = lo;
+            ++dlm_uni_[0];
+            dlm_uni_[1] += cut - before;
+            if (!dlm_uni_noted_) {
+                dlm_uni_noted_ = true;
+                RAD_INFO("lever DLM: step %d planned its %lld decode sequences at two draft depths (the shallowest %d, a "
+                         "proposal drafted under another cycle's depth): every one cut to %d (one depth a step); every "
+                         "later such step is cut the same (RADIANCE_LOG_STEPS shows one q a step), this note is once",
+                         step_, (long long)seqs, lo, lo);
+            }
+        }
+    }
     const int64_t cap = cap_now_;
     if (cap > 0 && rows > cap) {
         if (seqs > cap) {   /* even depth 0 exceeds it: left as planned */
@@ -1885,39 +1942,21 @@ int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
             while (L > 0 && kept(L) > room) --L;
             /* fewer than the entries deeper than L, as kept(L + 1) > room; none under the uniform form (one depth a step) */
             int64_t left = cap_uniform_ ? 0 : room - kept(L);
+            const int64_t before = cut;
             for (StepEntry& e : p.e) {
                 if (e.is_prefill) continue;
                 int32_t k = std::min(e.n_spec, L);
                 if (e.n_spec > L && left > 0) { ++k; --left; }
                 if (k == e.n_spec) continue;
-                cut += e.n_spec - k;
-                e.n_spec = k;
-                e.n_draft = k;
-                e.n_tokens = 1 + k;
-                if (k == 0) e.ngram = false;
-                if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) continue;
-                SchedReq& s = *reqs_[(size_t)e.slot];
-                if (ahead) {
-                    s.draft_next = k;        /* what set_draft cuts the proposal published for it to */
-                    s.cap_cut_next = true;
-                } else {
-                    /* as the running loop keeps them: the request's window equal to the entry's (Sampler::build_step) */
-                    s.n_draft = k;
-                    s.sched_tokens = 1 + k;
-                    if (s.req) {
-                        s.req->n_draft = k;
-                        s.req->draft = k ? s.draft : nullptr;
-                        s.req->draft_parent = k ? e.draft_parent : nullptr;
-                    }
-                }
+                trim(e, k);
             }
-            p.n_tok -= cut;
-            rows -= cut;
+            p.n_tok -= cut - before;
+            rows -= cut - before;
             p.n_spec = 0;
             for (const StepEntry& e : p.e)
                 if (!e.is_prefill) p.n_spec = std::max(p.n_spec, e.n_spec);
             ++cap_n_[0];
-            cap_n_[1] += cut;
+            cap_n_[1] += cut - before;
             if (ahead) ++cap_n_[2];
         }
     }
