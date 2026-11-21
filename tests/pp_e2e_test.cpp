@@ -6809,6 +6809,298 @@ TEST(clients_that_go_away_mid_request_leave_the_others_one_process_tokens) {
     }
 }
 
+/* tp8 loop D67: THE FIRST DECODE CARD START'S LEVERS (START DC8L65) UNDER CLIENT CANCELS AND KV-PRESSURE PREEMPTION. D53 / D53b
+ * above run BEST's shape without the levers built since (D61 host_spin, D62 pp_bg_split, D63 host_slack, D64 / D64b: a tail band
+ * BG step's head / tail in LSP segments, D65 pp_tband_bound in process), and no speed cell cancels or preempts. Here they ride
+ * together at the six-layer llama's W(2,4) (the tail [4, 6) declares boundary 5, so a band step's tail runs [3, 5) + [5, 6) over
+ * two leader rounds), 4 lanes BG 2, READY_FIRST, FOL_ORDER 2, the follower's segments, D51's t5 (TAIL_BAND 5 with the copy and the
+ * follower's load report) and D65's window POSTed IN PROCESS while the load runs (50 ms with H 0 at once, 3000 ms 400 ms in, -1 at
+ * the end): the load below at the default pool and at a pool that preempts (it holds the longest request, not the set at once).
+ * Every kept request answers one process's tokens, the llama KV copy is checked at every trunk step (0 differ, the owner's bytes),
+ * both nodes exit 0, no engine E line, and the levers acted (tail band passes, tail band BG steps' heads AND tails in segments).
+ * The negative control (the tail band's key stores left out, RADIANCE_PP_TEST_TBAND_SKIP) must differ under the same load.
+ *
+ * D67's load: D64's shape (decoders first, a burst of whole newcomers 200 ms later, two long prompts in 3 / 4 chunks of 700, newcomers
+ * beside them -- the tail band BG steps whose heads / tails LSP segments) with clients that go away at each stage: two newcomers of
+ * the burst 15 / 45 ms after they were sent (their BG step in flight), a long prompt between its chunks (250 ms), two late newcomers
+ * 10 / 30 ms in, a decoder mid-decode (700 ms); then two alone. The kept requests' tokens are the set's answer. */
+std::vector<std::vector<int32_t>> d67_set(int port, int* dropped) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    std::vector<std::thread> gone;
+    std::atomic<int> drops{0};
+    auto drop = [&](std::vector<int32_t> prompt, int n, int after_ms) {
+        gone.emplace_back([port, prompt, n, after_ms, &drops] {
+            const json b = { { "prompt", prompt }, { "n_predict", n }, { "temperature", 0.0 }, { "ignore_eos", true },
+                             { "return_tokens", true } };
+            Call c;
+            if (!c.send(port, "/completion", b.dump())) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(after_ms));
+            shutdown(c.fd, SHUT_RDWR);
+            ++drops;
+        });
+    };
+    for (uint64_t s : { 71, 72, 73, 74 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 12), 160); }));
+    drop(prompt_ids(75, 14), 400, 700);   /* a decoder that goes away mid-decode */
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for (uint64_t s : { 81, 82, 83 }) {   /* a burst of whole newcomers, two of them dropped while their BG step runs */
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 220 + 60 * (s - 81)), 12); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    drop(prompt_ids(87, 260), 40, 15);
+    drop(prompt_ids(88, 310), 40, 45);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (uint64_t s : { 91, 92 }) {       /* long prompts: 3 / 4 chunks */
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 1500 + 700 * (s - 91)), 12); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    drop(prompt_ids(93, 1800), 12, 250);   /* a long prompt that goes away between its chunks */
+    for (uint64_t s : { 84, 85, 86 }) {   /* newcomers beside the long ones */
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 300 + 50 * (s - 84)), 12); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+    drop(prompt_ids(89, 280), 30, 10);
+    drop(prompt_ids(90, 330), 30, 30);
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    for (auto& t : gone) t.join();
+    gone.clear();
+    f.clear();
+    /* D62's form: whole newcomers of 650-690 rows (>= 128 rows each side of the 512-grid cut) lent beside decode rows while both BG
+     * lanes are idle -> two pieces in two BG lanes at once; three of them go away 25 / 70 / 120 ms in (a piece may be in flight on
+     * each BG lane when the home lane closes the request) */
+    for (uint64_t s : { 78, 79 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 12), 120); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    f.push_back(std::async(std::launch::async, [port] { return complete(port, prompt_ids(101, 680), 8); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    drop(prompt_ids(102, 660), 20, 25);
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    f.push_back(std::async(std::launch::async, [port] { return complete(port, prompt_ids(103, 690), 8); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    drop(prompt_ids(104, 670), 20, 70);
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    drop(prompt_ids(105, 650), 20, 120);
+    for (auto& x : f) out.push_back(x.get());
+    for (auto& t : gone) t.join();
+    for (uint64_t s : { 76, 77 }) out.push_back(complete(port, prompt_ids(s, 110), 40));
+    if (dropped) *dropped = drops.load();
+    return out;
+}
+
+/* D67's preemption load for the small pool: twelve requests at once (prompts 80-245 tokens, outputs 300-355: ~5,900 tokens against a
+ * pool of ~2,900), so running sequences outgrow the pool and are preempted by recompute beside the lanes' BG steps */
+std::vector<std::vector<int32_t>> d67_pre(int port) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t k = 0; k < 12; ++k)
+        f.push_back(std::async(std::launch::async, [port, k] { return complete(port, prompt_ids(131 + k, 80 + 15 * k), 300 + 5 * (int)k); }));
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
+TEST(d67_the_dc8l65_levers_under_cancels_and_preemption_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    REQUIRE(world6().ok);
+    /* D64's shape (chunks of 700) with room for the set's 19 requests at once */
+    const std::vector<std::string> ext = { "--max-num-seqs", "16", "--max-num-batched-tokens", "700", "--max-model-len", "4096" };
+    std::vector<std::vector<int32_t>> ref, ref_pre;
+    {
+        Serving one;
+        one.model = world6().llama_rad;
+        REQUIRE(one.start("", ext));
+        ref = d67_set(one.port, nullptr);
+        ref_pre = d67_pre(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    const char* cut = "2,4";
+    const std::vector<std::string> ex = cat(ext, { "--pp-lanes", "4" });
+    std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+    for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0",
+                           "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                           "RADIANCE_LLAMA_PP_TBAND=1", "RADIANCE_PP_TAIL_BAND=5", "RADIANCE_LLAMA_PP_TBAND_COPY=1", "RADIANCE_PP_NODE_IDLE=1",
+                           "RADIANCE_PP_LOAD_REPORT_MS=5", "RADIANCE_PP_TBAND_BOUND_MS=100", "RADIANCE_PP_LEAD_SEG=1",
+                           "RADIANCE_PP_LEAD_SEG_FORM=393217", "RADIANCE_PP_LEAD_SEG_RINGS=2", "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15",
+                           "RADIANCE_PP_BG_SPLIT=2", "RADIANCE_HOST_SPIN=1812", "RADIANCE_HOST_SLACK=1", "RADIANCE_PP_POST_PHASES=1" })
+        env.push_back(v);
+    /* the small pool: the smallest device size the pair starts on with a pool that holds the set's longest request (2,212
+     * tokens) with room -- kLo -- while the set at once (~7,000 tokens) overruns it (D53's bisection on the pair's own report) */
+    constexpr long long kLo = 2600, kHi = 5200;
+    int mib = 0;
+    {
+        auto pool_at = [&](int m) -> long long {
+            Serving pr;
+            pr.model = world6().llama_rad;
+            if (!pr.start(cut, ex, cat(env, { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(m) }))) return -1;
+            const long long p = pool_in(pr.lead.output());
+            kill(pr.lead.child.pid, SIGTERM);
+            pr.lead.finish(60);
+            pr.fol.finish(30);
+            return p;
+        };
+        int lo = 64, hi = 512;
+        const long long plo = pool_at(lo), phi0 = pool_at(hi);
+        if (!(plo < kLo && phi0 >= kLo))
+            fprintf(stderr, "    D67 W(%s): pools %lld / %lld tokens at %d / %d MiB do not bracket %lld\n", cut, plo, phi0, lo, hi, kLo);
+        REQUIRE(plo < kLo && phi0 >= kLo);
+        long long phi = phi0;
+        while (hi - lo > 1) {
+            const int m = (lo + hi) / 2;
+            const long long p = pool_at(m);
+            if (p >= kLo) { hi = m; phi = p; } else lo = m;
+        }
+        fprintf(stderr, "    D67 W(%s): the small pool %lld tokens at %d MiB\n", cut, phi, hi);
+        REQUIRE(phi < kHi);
+        mib = hi;
+    }
+    struct Arm { const char* name; bool small, skip; };
+    long long d64_all = 0, d64b_all = 0, tb_all = 0, pre_all = 0, split_all = 0;
+    size_t cancelled_all = 0;
+    int ctl_differ = -1;
+    for (const Arm a : { Arm{ "cancels, default pool", false, false }, Arm{ "cancels + preemption, small pool", true, false },
+                         Arm{ "cancels, key stores LEFT OUT (ctl)", false, true } }) {
+        std::vector<std::string> e = env;
+        if (a.small) e.push_back("RADIANCE_HOST_VRAM_MIB=" + std::to_string(mib));
+        if (a.skip) e.push_back("RADIANCE_PP_TEST_TBAND_SKIP=1");
+        Serving pp;
+        pp.model = world6().llama_rad;
+        REQUIRE(pp.start(cut, ex, e));
+        auto postb = [&](int v) {   /* D65: both nodes take the window in process */
+            std::string out;
+            Call c;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_tband_bound", v } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_tband_bound %d: %d %s\n", v, st, out.c_str());
+        };
+        postb(50);
+        int dropped = 0;
+        std::thread mid([&] { std::this_thread::sleep_for(std::chrono::milliseconds(400)); postb(3000); });
+        const std::vector<std::vector<int32_t>> got = d67_set(pp.port, &dropped);
+        mid.join();
+        /* the small pool: the preemption load after the cancels (its tokens compared too) */
+        const std::vector<std::vector<int32_t>> got_pre = a.small ? d67_pre(pp.port) : std::vector<std::vector<int32_t>>{};
+        postb(-1);
+        const double pre = metric(get(pp.port, "/metrics"), "vllm:num_preemptions_total");
+        /* nothing held after the set: the prefix cache dropped, one short request through (the gauges move at a step), then the
+         * pool's use and the running count as /metrics states them (a cancelled piece whose blocks never came back stays here) */
+        {
+            std::string rb;
+            Call rs;
+            CHECK(rs.send(pp.port, "/reset_prefix_cache", "") && rs.read(&rb) == 200);
+        }
+        CHECK(!complete(pp.port, prompt_ids(111, 20), 4).empty());
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const std::string mt = get(pp.port, "/metrics");
+        const double kv_use = metric(mt, "vllm:kv_cache_usage_perc"), running = metric(mt, "vllm:num_requests_running");
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        std::vector<std::vector<int32_t>> want = ref, have = got;
+        if (a.small) {
+            REQUIRE_EQ(ref_pre.size(), got_pre.size());
+            want.insert(want.end(), ref_pre.begin(), ref_pre.end());
+            have.insert(have.end(), got_pre.begin(), got_pre.end());
+        }
+        const long long pool = pool_in(llog);
+        const double held = kv_use * (double)pool;   /* tokens the pool still holds after the set (one short prompt's block expected) */
+        int differ = 0, empty = 0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            const std::vector<int32_t>& r = want[i];
+            const std::vector<int32_t>& g = have[i];
+            if (g.empty()) ++empty;
+            if (r == g) continue;
+            ++differ;
+            if (a.skip) continue;
+            size_t j = 0;
+            while (j < r.size() && j < g.size() && r[j] == g[j]) ++j;
+            fprintf(stderr, "    request %zu: %zu tokens vs one process's %zu, the first difference at token %zu\n", i, g.size(), r.size(), j);
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const bool notowner = flog.find("NOT the owner's bytes") != std::string::npos;
+        size_t cancelled = 0, elines = 0;
+        for (size_t at = 0; (at = llog.find(" done from ", at)) != std::string::npos; ++at) {
+            const size_t f = llog.find("finish=", at), nl = llog.find('\n', at);
+            if (f != std::string::npos && f < nl && llog.compare(f + 7, 6, "length") != 0) ++cancelled;
+        }
+        for (const std::string* lg : { &llog, &flog })
+            for (size_t at = 0; (at = lg->find("\nE ", at)) != std::string::npos; ++at) ++elines;
+        long long tb = -1, d64 = -1, d64b = -1, steps = -1, parts = -1;
+        const char* key = " lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                tb = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        const char* dkey = " tail band BG steps ran their head in segments, their tail whole (+ 131072, tp8 loop D64)";
+        if (const size_t at = llog.rfind(dkey); at != std::string::npos)
+            if (const size_t b = llog.rfind(", ", at); b != std::string::npos) d64 = std::atoll(llog.c_str() + b + 2);
+        const char* tkey = " tail band BG steps ran their tail in segments from t - j (+ 262144, tp8 loop D64b)";
+        if (const size_t at = llog.rfind(tkey); at != std::string::npos)
+            if (const size_t b = llog.rfind(", ", at); b != std::string::npos) d64b = std::atoll(llog.c_str() + b + 2);
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments", &steps,
+                                  &parts);
+        const bool d65 = llog.find("fn4: switches pp_tband_bound=3000 applied") != std::string::npos &&
+                         flog.find("fn4: switches pp_tband_bound=3000 applied") != std::string::npos;
+        long long lent = -1, split = -1;   /* D62: newcomers lent whole to the BG lanes, those in two pieces */
+        if (const size_t at = llog.rfind(" newcomers lent whole beside decode rows ("); at != std::string::npos)
+            if (const size_t b = llog.rfind("): ", at); b != std::string::npos) {
+                lent = std::atoll(llog.c_str() + b + 3);
+                if (const size_t c = llog.find("; ", at); c != std::string::npos) split = std::atoll(llog.c_str() + c + 2);
+            }
+        if (const char* dd = std::getenv("PP_E2E_PREEMPT_LOGS")) {
+            const std::string n = std::string(dd) + "/d67-" + (a.small ? "s" : "d") + (a.skip ? "x" : "");
+            tiny::write_text(n + "-leader.log", llog);
+            tiny::write_text(n + "-follower.log", flog);
+        }
+        fprintf(stderr, "    D67 %-34s W(%s)%s: %d dropped, %zu ended other than by length, %.0f preemption(s); %d of %zu kept requests "
+                        "differ from one process (%d empty); KV-copy checks %lld, %lld differ%s; %zu E lines; %lld tail band passes; leader: "
+                        "%lld BG steps in %lld segments, %lld / %lld tail band BG steps' heads / tails in segments (D64 / D64b); %lld newcomers "
+                        "lent whole to the BG lanes, %lld of them in two pieces (D62); D65 window in process on both nodes: %s; after the set the pool "
+                        "holds %.0f of %lld tokens, %.0f running\n",
+                a.name, cut, a.small ? (" (" + std::to_string(mib) + " MiB)").c_str() : "", dropped, cancelled, pre, differ, want.size(), empty,
+                checks, kdiff, notowner ? " (NOT the owner's bytes)" : "", elines, tb, steps, parts, d64, d64b, lent, split, d65 ? "yes" : "NO", held, pool, running);
+        if (a.skip) {   /* the negative control: band passes whose keys the decode owner never stored */
+            ctl_differ = differ + (notowner ? 1 : 0) + (kdiff > 0 ? 1 : 0);
+            continue;
+        }
+        CHECK_EQ(dropped, 9);
+        CHECK(cancelled >= 9);
+        if (a.small) CHECK(pre > 0);
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(empty, 0);
+        CHECK(!notowner);
+        CHECK(checks > 0);
+        CHECK_EQ(kdiff, 0LL);
+        CHECK_EQ(elines, (size_t)0);
+        CHECK(tb > 0);
+        CHECK(d64 > 0);
+        CHECK(d64b > 0);
+        CHECK(split > 0);
+        CHECK(d65);
+        CHECK(pool > 0);
+        CHECK(held <= 32.5);   /* nothing a cancelled request or piece kept: at most the short prompt's published block */
+        CHECK_EQ(running, 0.0);
+        if (differ || notowner || elines || kdiff != 0)
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        d64_all += std::max(0LL, d64);
+        d64b_all += std::max(0LL, d64b);
+        tb_all += std::max(0LL, tb);
+        pre_all += pre > 0 ? (long long)pre : 0;
+        cancelled_all += cancelled;
+        split_all += std::max(0LL, split);
+    }
+    fprintf(stderr, "    D67 all arms: %zu cancelled, %lld preemption(s), %lld tail band passes, %lld / %lld segmented BG heads / tails, %lld "
+                    "newcomers in two BG pieces; the negative control: %d\n", cancelled_all, pre_all, tb_all, d64_all, d64b_all, split_all,
+            ctl_differ);
+    CHECK(ctl_differ > 0);
+}
+
 /* tp8 loop D54: PRODUCTION REQUEST FORMS through the pipeline. Every case above is greedy (temperature 0); the production client
  * (Claude Code through LiteLLM) samples, streams and stops on strings. One request set of the forms a client sends -- seeded
  * sampling with and without the cut stages (top-k / top-p / min-p), penalties sampled and greedy, DRY, a GBNF grammar greedy and
