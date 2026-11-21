@@ -134,23 +134,24 @@ static int g8_gq_kraw_arm() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_FN4_GQ_KRAW");
         const int t = e ? std::atoi(e) : 0;
-        const int r = (t >= 2 && t <= 4) ? t : 0;
+        const int r = (t >= 2 && t <= 6) ? t : 0;
         if (r) std::fprintf(stderr, "radiance: libr4d: attn_decode h256 gqa6 bs4 fp8 one-wave rows at K-in-one-round arm %d "
                                     "(RADIANCE_FN4_GQ_KRAW=%d, Qwen loop lever KRW)\n", r, r);
         return r;
     }();
     return v;
 }
-/* ... and its decode heights (RADIANCE_FN4_GQ_KRAW_DEC=1, read once): 2-4 waves; only the h256 fp8 instances */
+/* ... and its decode heights (RADIANCE_FN4_GQ_KRAW_DEC=1, read once; 2 = with O_KFIRST): 2-4 waves; only the h256 fp8 instances */
 template <int HEAD_DIM, int KVP, int XOPT>
-static bool g8_gq_kraw_dec() {
-    if constexpr (HEAD_DIM != 256 || KVP != 0 || XOPT != 0) return false;
-    static const bool v = [] {
+static int g8_gq_kraw_dec() {
+    if constexpr (HEAD_DIM != 256 || KVP != 0 || XOPT != 0) return 0;
+    static const int v = [] {
         const char* e = std::getenv("RADIANCE_FN4_GQ_KRAW_DEC");
-        const bool r = e && std::atoi(e) == 1;
-        if (r) std::fprintf(stderr, "radiance: libr4d: attn_decode h256 gqa6 bs4 fp8 2-4-wave rows with K in one round "
-                                    "(RADIANCE_FN4_GQ_KRAW_DEC=1, Qwen loop lever KRW)\n");
-        return r;
+        const int r = e ? std::atoi(e) : 0;
+        const int rv = (r == 1 || r == 2) ? r : 0;
+        if (rv) std::fprintf(stderr, "radiance: libr4d: attn_decode h256 gqa6 bs4 fp8 2-4-wave rows with K in one round%s "
+                                     "(RADIANCE_FN4_GQ_KRAW_DEC=%d, Qwen loop lever KRW)\n", rv == 2 ? ", issued before the V fetch" : "", rv);
+        return rv;
     }();
     return v;
 }
@@ -179,9 +180,10 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
      * cache stages V widened (the kernel drops O_V8 under O_V4). */
     if      (nw == 1) {
 #if R4D_ATTN_GQA == 6 && G8_BLOCK_SIZE == 4
-        /* Lever KRW (Qwen loop round 12): RADIANCE_FN4_GQ_KRAW=2 / 3 / 4 at start runs the one-wave rows (every sparse
-         * prefill row of a QSA layer, q_len 1-2 decode rows) at r4d_attn_gq6_opt_bench's arm 2 / 3 / 4 -- K's 16 raw
-         * fragments of a tile in one round instead of 8 PF-2 rounds (3: without the scheduling barrier, 4: PF 4). The same
+        /* Lever KRW (Qwen loop round 12): RADIANCE_FN4_GQ_KRAW=2 .. 6 at start runs the one-wave rows (every sparse
+         * prefill row of a QSA layer, q_len 1-2 decode rows) at r4d_attn_gq6_opt_bench's arm 2 .. 6 -- K's 16 raw
+         * fragments of a tile in one round instead of 8 PF-2 rounds (3: without the scheduling barrier, 4: PF 4; 5 / 6 = 3 / 2
+         * with the K round issued before the V fetch, O_KFIRST). The same
          * WMMA / conversion sequence: the same bytes. Unset / other values: today's word. fp8 cache only. */
         int karm = 0;
         if constexpr (KVP == 0 && XOPT == 0 && HEAD_DIM == 256) karm = g8_gq_kraw_arm();
@@ -195,6 +197,13 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
             emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, 256, 6, 4, 0,
                                                                ((G8_D_OPT | O_V8 | O_KRAW) & ~3072) | 2048>),
                                dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
+        else if (karm == 5)
+            emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, 256, 6, 4, 0,
+                                                               ((G8_D_OPT | O_V8 | O_KRAW) & ~O_SGB) | O_KFIRST>),
+                               dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
+        else if (karm == 6)
+            emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, 256, 6, 4, 0, G8_D_OPT | O_V8 | O_KRAW | O_KFIRST>),
+                               dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
         else
 #endif
         emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, HEAD_DIM, G8_GQA,
@@ -205,6 +214,15 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
 #if R4D_ATTN_GQA == 6 && G8_BLOCK_SIZE == 4
     /* lever KRW at the decode heights (RADIANCE_FN4_GQ_KRAW_DEC=1): 2-4 waves (17-64 rows: the verify rows) with K in one
      * round and no scheduling barrier (arm 3's word without O_V8), the same bytes; fp8 cache only */
+    else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() == 2 && nw == 2)
+        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<2, G8_D_TILE, 256, 6, 4, 0, ((G8_D_OPT | O_KRAW) & ~O_SGB) | O_KFIRST>),
+                           dim3(splits, a->kv_heads, a->num_seqs), dim3(64), 0, *a, splits);
+    else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() == 2 && nw == 3)
+        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<3, G8_D_TILE, 256, 6, 4, 0, ((G8_D_OPT | O_KRAW) & ~O_SGB) | O_KFIRST>),
+                           dim3(splits, a->kv_heads, a->num_seqs), dim3(96), 0, *a, splits);
+    else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() == 2 && nw == 4)
+        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<4, G8_D_TILE, 256, 6, 4, 0, ((G8_D_OPT | O_KRAW) & ~O_SGB) | O_KFIRST>),
+                           dim3(splits, a->kv_heads, a->num_seqs), dim3(128), 0, *a, splits);
     else if (g8_gq_kraw_dec<HEAD_DIM, KVP, XOPT>() && nw == 2)
         emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<2, G8_D_TILE, 256, 6, 4, 0, (G8_D_OPT | O_KRAW) & ~O_SGB>),
                            dim3(splits, a->kv_heads, a->num_seqs), dim3(64), 0, *a, splits);

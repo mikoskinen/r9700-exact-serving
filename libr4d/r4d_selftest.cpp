@@ -5893,9 +5893,10 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
     typedef int (*OptFn)(const RadArgs*, RadStream, int);
     const OptFn of = (OptFn)dlsym(pl.h, "r4d_attn_gq6_opt_bench");
     if (of) {
-        static const char* const arm_name[5] = { "today's option word (control)", "PF 8 (K in 2 rounds)",
-                                                 "KRAW (K in 1 round)", "KRAW, no sched barrier", "KRAW + PF 4" };
-        for (int arm = 0; arm < 5; ++arm) {
+        static const char* const arm_name[7] = { "today's option word (control)", "PF 8 (K in 2 rounds)",
+                                                 "KRAW (K in 1 round)", "KRAW, no sched barrier", "KRAW + PF 4",
+                                                 "KRAW + KFIRST, no sched barrier", "KRAW + KFIRST" };
+        for (int arm = 0; arm < 7; ++arm) {
             poison();
             const int orc = of(&a, nullptr, arm);
             if (orc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  arm %d %s rc=%d (not served)\n", arm, arm_name[arm], orc); continue; }

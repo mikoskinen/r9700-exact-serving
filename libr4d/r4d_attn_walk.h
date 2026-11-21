@@ -460,13 +460,16 @@ extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const
  * today; PF and KRAW change only when loads are issued and converted: r4d_attn_decode_h256_gqa6.hip O_KRAW's note), so the
  * bytes are today's; the bench compares them. arm 0 = today's option word (the control), 1 = PF 8 (2 K rounds, 8 converted
  * fragments held), 2 = O_KRAW (all 16 raw K fragments in ONE round, converted just before each WMMA: +32 VGPRs), 3 = O_KRAW
- * without the scheduling barrier (the compiler may interleave the conversions with the WMMAs), 4 = O_KRAW + PF 4.
+ * without the scheduling barrier (the compiler may interleave the conversions with the WMMAs), 4 = O_KRAW + PF 4, 5 = arm 3 +
+ * O_KFIRST (the K round issued before the V tile's fetch: one round trip a tile), 6 = arm 2 + O_KFIRST.
  * The same grid, split law and merge as attn_decode_gq_h256_gqa6_bs4_fp8kv; only rows of q_len x gqa <= 16 (one wave). */
 #define R4D_GQ6_ARM0 (G8_D_OPT | O_V8)
 #define R4D_GQ6_ARM1 ((R4D_GQ6_ARM0 & ~3072) | 3072)
 #define R4D_GQ6_ARM2 (R4D_GQ6_ARM0 | O_KRAW)
 #define R4D_GQ6_ARM3 (R4D_GQ6_ARM2 & ~O_SGB)
 #define R4D_GQ6_ARM4 ((R4D_GQ6_ARM2 & ~3072) | 2048)
+#define R4D_GQ6_ARM5 (R4D_GQ6_ARM3 | O_KFIRST)
+#define R4D_GQ6_ARM6 (R4D_GQ6_ARM2 | O_KFIRST)
 extern "C" int r4d_attn_gq6_opt_bench(const RadArgs* a, RadStream stream, int arm) {
     R4DArgs r;
     const int rc = g8_decode_common(a, &r, 256);
@@ -485,6 +488,8 @@ extern "C" int r4d_attn_gq6_opt_bench(const RadArgs* a, RadStream stream, int ar
         case 2: GQ6_ARM(R4D_GQ6_ARM2); break;
         case 3: GQ6_ARM(R4D_GQ6_ARM3); break;
         case 4: GQ6_ARM(R4D_GQ6_ARM4); break;
+        case 5: GQ6_ARM(R4D_GQ6_ARM5); break;
+        case 6: GQ6_ARM(R4D_GQ6_ARM6); break;
         default: return R4D_NO(RAD_E_UNSUPPORTED);
     }
 #undef GQ6_ARM

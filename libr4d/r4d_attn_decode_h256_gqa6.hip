@@ -54,6 +54,10 @@
 // fragment for fp8, 16 for bf16), costing 2 or 4 x HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold
 // converted fragments and cost occupancy. Results are unchanged.
 #define O_KRAW  16777216
+// O_KFIRST (Qwen loop round 12, lever KRW): with O_KRAW at TILE 16 (one m-tile), the tile's raw K round is issued BEFORE the
+// V tile's fetch, so the V and K loads of a tile are in flight together (one round trip a tile instead of two); the raw K
+// is held across the V staging (+32 VGPRs over O_KRAW alone). Results are unchanged (the same conversions and WMMAs).
+#define O_KFIRST 1073741824
 // O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), and with O_K6 the
 // k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V4    33554432
@@ -130,6 +134,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
+    constexpr int KFIRST = ((OPT & O_KFIRST) && KRAW && TILE == 16) ? 1 : 0;
     static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
     static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
                   "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
@@ -430,6 +435,19 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
         if (BTS && ti + 1 < t_hi) {
             load_bt((ti + 1) * NB, blkn);
         }
+        // KFIRST: this tile's raw K round goes out before the V fetch (MT == 1: the m-tile loop's only row block)
+        typedef typename std::conditional<KVP != 0, uint4, uint2>::type krawf_t;
+        krawf_t krawf[KFIRST ? NKS : 1];
+        if constexpr (KFIRST) {
+            int kk = min(k0 + c, ctx - 1);
+            if (WIN && kk < wlo0) kk = wlo0;
+            const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
+            const uint8_t* growf = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
+                                 + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB) * (KVP ? 2 : 1);
+            #pragma unroll
+            for (int t = 0; t < NKS; ++t)
+                krawf[t] = *(const krawf_t*)(growf + (16 * t + 8 * h) * (KVP ? 2 : 1));
+        }
         if (LDSB) lds_barrier(); else __syncthreads();
 
         if (KLDS) {
@@ -473,7 +491,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
             // A fragment's raw K: 8 elements of 1 byte (fp8) or 2 (bf16).
             typedef typename std::conditional<KVP != 0, uint4, uint2>::type kraw_t;
             kraw_t kraw[KRAW ? NKS : 1];
-            if constexpr (KRAW) {
+            if constexpr (KFIRST) {
+                #pragma unroll
+                for (int t = 0; t < NKS; ++t) kraw[t] = krawf[t];
+            } else if constexpr (KRAW) {
                 #pragma unroll
                 for (int t = 0; t < NKS; ++t)
                     kraw[t] = *(const kraw_t*)(grow + (16 * t + 8 * h) * (KVP ? 2 : 1));
