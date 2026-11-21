@@ -5,7 +5,7 @@
 //   q2bench --exl3 <exl3r4d.so> --r4d <libr4d.so> [--fn4x NAME=V ...] [--fn4r NAME=V ...] [--MA 1100] [--LA 22]
 //           [--MB 16,32] [--LB 22] [--experts 384] [--topk 6] [--hidden 5120] [--widths 640,512] [--bits 2] [--h-rot 1]
 //           [--pools 2] [--reps 3] [--warm-ms 600] [--dense 0|1] [--arms n16,h16,n32,h32,l16,x16] [--plan] [--check]
-//           [--dense-shapes N:K,...] [--dense-ar N]   (Qwen loop round 9: another model's dense shapes, q6_K stand-ins, the
+//           [--dense-shapes N:K,...] [--dense-ar N] [--rows-only]   (Qwen loop round 9: another model's dense shapes, q6_K stand-ins, the
 //           first all-reduce after the first N of them; e.g. Qwen Flash-Next tp4 rank shapes 4096:2560,2560:1536,512:2560 / 2)
 //
 // WHAT RUNS. Four host threads, one a card (HIP devices 0..3), each its rank of a TP4 node. Every card has four streams:
@@ -155,7 +155,7 @@ struct Opt {
     std::vector<int64_t> MB = { 16, 32 };
     std::vector<int64_t> widths = { 640, 512 };
     float warm_ms = 600;
-    bool dense = true, plan = false;
+    bool dense = true, plan = false, rows_only = false;   // rows_only (Qwen loop round 9): the host row check, then exit
     std::vector<std::string> arms = { "n16", "h16", "n32", "h32", "l16", "x16" };
 };
 
@@ -813,6 +813,7 @@ int main(int argc, char** argv) {
         else if (a == "--dense-ar") { g_dense_ar = std::atoi(nx()); if (g_dense_ar < 0 || g_dense_ar > kNDense) die("--dense-ar is 0..the dense shapes"); }
         else if (a == "--arms") o.arms = list(nx());
         else if (a == "--plan") o.plan = true;
+        else if (a == "--rows-only") o.rows_only = true;
         else if (a == "--check") return host_check();
         else if (a == "--rows") {   // --rows LIB PREFIX: the rows of a library whose name starts with PREFIX, with their constraints
             const std::string lib = nx(), pre = nx();
@@ -874,6 +875,7 @@ int main(int argc, char** argv) {
             std::printf("q2bench: M %lld rows (constraints + parse checked): %s\n", (long long)m, line.c_str());
         }
         if (bad) die(std::to_string(bad) + " row(s) refuse the configuration");
+        if (o.rows_only) { std::printf("q2bench: --rows-only: every row resolved and accepted, no HIP call made\n"); return 0; }
     }
     for (int lib = 0; lib < 2; ++lib)
         for (const auto& f : lib ? o.fn4r : o.fn4x) {
