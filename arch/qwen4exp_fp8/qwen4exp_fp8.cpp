@@ -1742,6 +1742,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
     for (size_t l = 0; l + 1 < m.layers.size(); ++l) m.layers[l].mlp.xp_next = &m.layers[l + 1].mlp;
+    /* qfn-on-ds P2S: with the two-piece buffers declared, say at start whether a layer's MoE takes a joint pass of two
+     * pieces (MoeFP8::pair_ok) and, if not, the first condition that refuses it */
+    if (fn4_env_on("RADIANCE_FN4_P2X") && g.rank == 0 && !m.layers.empty() && m.pass_rows > 0) {
+        const char* why = m.layers[0].mlp.pair_why(2 * m.pass_rows, m.pass_rows);
+        fprintf(stderr, "radiance: qwen4exp: P2S: a joint routed pass of two %lld-row pieces (MoE rows %lld): %s\n",
+                (long long)m.pass_rows, (long long)m.moecfg.rows, why ? why : "allowed");
+    }
 
     /* fn4 SP-hc (test builds): declared only on request, at four ranks under the pipelined prefill. */
     /* fn4 KVCAP C1: the wide stream's all-gather bounded by the rows one launch carries (Model::sp_agh_rows) */
