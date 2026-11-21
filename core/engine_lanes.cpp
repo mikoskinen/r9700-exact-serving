@@ -968,6 +968,7 @@ int Engine::step_loop_lanes() {
         int band = 0;               /* tp8 loop D36: the step's band k (its head's last segment ends at h + k), 0 none */
         int lflags = 0;             /* tp8 loop D40: RAD_PP_LSEG_SP on its head segments (pp_lead_seg + 512) */
         int ring = 0;               /* tp8 loop D32: the plugin's boundary ring the step's segments use (its lane % rings) */
+        int tband = 0;              /* tp8 loop D64: the step's tail band j (its tail starts at t - j), 0 none */
         int64_t ship_s0 = 0, ship_s1 = 0;   /* P27: frames shipped by then since the first segment / at the last one's issue */
     };
     std::vector<LSeg> lsg((size_t)n_lanes_);
@@ -1063,9 +1064,9 @@ int Engine::step_loop_lanes() {
             /* tp8 loop D36: + 256 = no band passes; D40: + 8 = the tail whole, + 512 = SP in the head's segments */
             /* tp8 loop D49b: + 1024 x N = segments only while the decode lanes' last steps decoded <= N sequences */
             /* tp8 loop F81: + 65536 = no position-order guard; D64: + 131072 = a tail band BG step's head in segments */
-            if (x >= 0 && x <= 262143 && (x & 7) <= 2) lsp_start = x;
+            if (x >= 0 && x <= 524287 && (x & 7) <= 2) lsp_start = x;
             else RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG_FORM=%s is not taken: form + 8 x tail-whole + 16 x stride (+ 256, "
-                          "+ 512, + 1024 x N, + 65536, + 131072), form 0 / 1 / 2 (tp8 loop D32 / D40 / D49b / F81 / D64); 1 (M9 as built)", v);
+                          "+ 512, + 1024 x N, + 65536, + 131072, + 262144), form 0 / 1 / 2 (tp8 loop D32 / D40 / D49b / F81 / D64); 1 (M9 as built)", v);
         }
         RAD_INFO("two-node pipeline: fn4 pp_lead_seg starts at %d (form %d%s, stride %d%s%s; RADIANCE_PP_LEAD_SEG_FORM, tp8 loop D32): 0 "
                  "= a BG step's leader parts whole, 1 = M9 as built, 2 = decode first (a decode tail whose X2 landed and its lane's "
@@ -1074,7 +1075,8 @@ int Engine::step_loop_lanes() {
                  "the head's segments may run the plugin's SP plan (D40, RADIANCE_DS41_SPHC_LSEG=1); + 1024 x N = segments only while "
                  "the decode lanes' last steps decoded <= N sequences, the parts whole above (D49b); a step carrying a prompt entry "
                  "that is not a whole fresh prompt runs its parts whole (the position-order guard, F81; + 65536 = none); + 131072 = "
-                 "a tail band BG step's head in these segments, its tail whole (D64; else such a step runs whole)%s%s", lsp_start,
+                 "a tail band BG step's head in these segments, its tail whole (D64; else such a step runs whole), + 262144 = its tail in "
+                 "segments too, from t - j (D64b)%s%s", lsp_start,
                  lsp_start & 7, (lsp_start & 7) == 0 ? ": whole" : (lsp_start & 7) == 1 ? ": M9" : ": decode first",
                  std::max(1, (lsp_start >> 4) & 15), (lsp_start & 8) ? ", tail whole" : "", (lsp_start & 512) ? ", SP word" : "",
                  ((lsp_start >> 10) & 63) ? fmt("; starts with N = %d", (lsp_start >> 10) & 63).c_str() : "",
@@ -1099,6 +1101,7 @@ int Engine::step_loop_lanes() {
     int64_t lsp_load = 0;                 /* tp8 loop D49b: BG steps whose parts ran whole by + 1024 x N (decode load above N) */
     int64_t lsp_pos = 0;                  /* tp8 loop F81: steps whose parts ran whole by the position-order guard */
     int64_t lsp_tbh = 0;                  /* tp8 loop D64: tail band BG steps whose head ran in segments (+ 131072) */
+    int64_t lsp_tbt = 0;                  /* tp8 loop D64b: ... whose tail ran in segments from t - j (+ 262144) */
     /* tp8 loop D32 (RADIANCE_PP_LEAD_SEG_RINGS=2, the leader; its plugin reads the same env and declares a second ring): a BG
      * step's segments use ring lane % rings, so the two BG lanes of B2L (lanes 2 / 3) each segment while the other does */
     int lseg_rings = 1;
@@ -1279,13 +1282,14 @@ int Engine::step_loop_lanes() {
                  "the SP word (+ 512), %lld BG steps kept their tail whole by + 8 (tp8 loop D40), %lld BG steps ran their parts "
                  "whole by the decode load rule (+ 1024 x N, tp8 loop D49b), %lld steps ran their parts whole by the position-order "
                  "guard (a prompt entry that is not a whole fresh prompt; + 65536 = no guard, tp8 loop F81), %lld tail band BG steps "
-                 "ran their head in segments, their tail whole (+ 131072, tp8 loop D64)",
+                 "ran their head in segments, their tail whole (+ 131072, tp8 loop D64), %lld tail band BG steps ran their tail in "
+                 "segments from t - j (+ 262144, tp8 loop D64b)",
                  (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
                  (long long)lseg_inside, (long long)lseg_polls,
                  lseg_mixed ? fmt("; %lld MIXED newcomer steps of decode lanes among them (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)",
                                   (long long)lseg_msteps).c_str() : "", when, lsp_now(), (long long)lsp_first,
                  (long long)lsp_whole, (long long)lsp_wtail, lseg_rings, (long long)lsp_both, (long long)lsp_spseg,
-                 (long long)lsp_tw8, (long long)lsp_load, (long long)lsp_pos, (long long)lsp_tbh);
+                 (long long)lsp_tw8, (long long)lsp_load, (long long)lsp_pos, (long long)lsp_tbh, (long long)lsp_tbt);
         if (lseg_ship_)
             RAD_INFO("two-node pipeline: %lld segmented heads' frames shipped after their last segment ran (RADIANCE_PP_LEAD_SEG_SHIP=1, "
                      "tp8 loop P27)%s: held past the last segment's issue %.2f ms on average, the longest %.2f; %lld other frames went "
@@ -1871,7 +1875,9 @@ int Engine::step_loop_lanes() {
                 s.mixed = !lanes_.is_bg(l) && !relay_step;
                 s.form = lform;
                 s.stride = lstride;
-                s.whole_tail = stband > 0 || ltail_whole || lsp_kept(lseg_tb, lstride).empty();   /* tp8 loop D64: a band tail whole */
+                /* tp8 loop D64: a band step's tail whole -- + 262144 (D64b): in segments too, the first from t - j (X2's receive) */
+                s.whole_tail = (stband > 0 && !(lsv & 262144)) || ltail_whole || lsp_kept(lseg_tb, lstride).empty();
+                s.tband = stband;
                 if (ltail_whole && !lsp_kept(lseg_tb, lstride).empty()) ++lsp_tw8;   /* tp8 loop D40 */
                 s.lflags = llflags;
                 s.ring = l % lseg_rings;
@@ -2015,7 +2021,8 @@ int Engine::step_loop_lanes() {
                         ++lsp_wtail;
                         continue;
                     }
-                    int a = cfg_.pp_cut_t;
+                    int a = cfg_.pp_cut_t - s.tband;   /* tp8 loop D64b: a tail band step's tail from t - j */
+                    if (s.tband > 0) ++lsp_tbt;
                     for (int32_t x : lsp_kept(lseg_tb, s.stride)) { s.parts.emplace_back(a, (int)x); a = x; }
                     s.parts.emplace_back(a, RAD_PP_SEG_END);
                     if (const int rs = lane_tail_seg(l, s.b, s.parts[0].first, s.parts[0].second); rs < 0) return fail_loop(rs);
