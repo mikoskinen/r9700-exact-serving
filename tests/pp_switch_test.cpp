@@ -301,7 +301,7 @@ TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
     const int i = fn4::switch_index("sched_lane_room");
     REQUIRE(i == (int)fn4::kSchedLaneRoom);
     CHECK_EQ(i, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106 */
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; IKc: aql_ika 107 */
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -321,7 +321,7 @@ TEST(pp_send_ash_follows_the_leaders_request_after_sched_lane_room) {
     const int i = fn4::switch_index("pp_send_ash");
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 2, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it */
+    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; IKc: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
     std::vector<int32_t> value(fn4::kSwitches, 0);
@@ -343,7 +343,7 @@ TEST(aql_waitk_follows_the_leaders_request_after_pp_send_ash) {
     const int i = fn4::switch_index("aql_waitk");
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);   /* tp8 loop IKc: aql_ika 107 after it */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -370,6 +370,44 @@ TEST(aql_waitk_follows_the_leaders_request_after_pp_send_ash) {
     (void)fn4::apply_pending(2, sw);
     CHECK_EQ(fn4::aql_waitk(), 0);
     CHECK_EQ(rad::aql::waitk_mode_now(), 0);
+}
+
+/* tp8 loop IKc: aql_ika is switch 107, after aql_waitk, BOTH nodes' (each node's own tapes): a follower takes the leader's request and
+ * applies it (nothing is allocated, so 1 needs no env), and its undo too; nothing is skipped. Whether the AQL backend's next capture
+ * notes a self-acquiring kernel's dispatch as IKA (rad::aql::ika_mode_now) follows the switch; a test value (ika_set_for_test) wins. */
+TEST(aql_ika_follows_the_leaders_request_after_aql_waitk) {
+    const int i = fn4::switch_index("aql_ika");
+    REQUIRE(i == (int)fn4::kAqlIka);
+    CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    std::vector<std::string> skipped;
+    int sw[fn4::kSwitches];
+    REQUIRE(std::getenv("RADIANCE_AQL_IKA") == nullptr);
+    CHECK_EQ(fn4::aql_ika(), 0);
+    CHECK_EQ(rad::aql::ika_mode_now(), 0);
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 1;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
+    CHECK(skipped.empty());
+    const uint64_t e = fn4::epoch();
+    (void)fn4::apply_pending(1, sw);
+    CHECK(fn4::epoch() > e);   /* every pass re-records under the new value */
+    CHECK_EQ(fn4::aql_ika(), 1);
+    CHECK_EQ(rad::aql::ika_mode_now(), 1);
+    rad::aql::ika_set_for_test(0);
+    CHECK_EQ(rad::aql::ika_mode_now(), 0);
+    rad::aql::ika_set_for_test(-1);
+    CHECK_EQ(rad::aql::ika_mode_now(), 1);
+    count[(size_t)i] = 2;
+    value[(size_t)i] = 0;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
+    (void)fn4::apply_pending(2, sw);
+    CHECK_EQ(fn4::aql_ika(), 0);
+    CHECK_EQ(rad::aql::ika_mode_now(), 0);
 }
 
 }  /* namespace */

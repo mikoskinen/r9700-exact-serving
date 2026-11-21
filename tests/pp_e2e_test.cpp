@@ -2309,6 +2309,70 @@ TEST(w1s_aql_waitk_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
     CHECK_EQ(fsw, 3);
 }
 
+/* tp8 loop IKc (fn4 aql_ika = switch 107, lever IKA in process): POSTed to the leader between requests, the switch reaches BOTH nodes
+ * (each applies it to its own tapes: a follower switch; every applied change re-records every pass, the epoch) and a cold multi-chunk
+ * prompt at 2 lanes W(1,3) serves one process's tokens and chunk plan at 1, 0 and 1 again; 2 is refused by name. The host backend
+ * records no AQL tape and its libraries list no self-acquiring kernel, so here the switch's path is what is proven; the packets'
+ * fences are a card start's (the INFO line 'lever IKA: N of the M dispatches are self-acquiring' per recorded pass). */
+TEST(iks_aql_ika_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ps, ref;
+    for (int k = 0; k < 3; ++k) ps.push_back(prompt_ids(1163 + 7 * k, 1000));
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        for (const std::vector<int32_t>& p : ps) ref.push_back(complete(sv.port, p, 24));
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);
+    auto post = [](int port, int v, int want) {
+        std::string out;
+        Call c;
+        const int st = c.send(port, "/admin/fn4", json{ { "aql_ika", v } }.dump()) ? c.read(&out) : -1;
+        CHECK_EQ(st, want);
+        if (want == 400) CHECK(out.find("aql_ika takes 0") != std::string::npos);
+        if (st != want) fprintf(stderr, "    POST aql_ika %d: %d %s\n", v, st, out.c_str());
+    };
+    Serving sv;
+    REQUIRE(sv.start("1,3", kLanes2, { "RADIANCE_LOG_STEPS=1" }));
+    std::vector<std::vector<int32_t>> got;
+    const int vals[3] = { 1, 0, 1 };
+    for (int k = 0; k < 3; ++k) {
+        post(sv.port, vals[k], 200);
+        got.push_back(complete(sv.port, ps[(size_t)k], 24));
+    }
+    post(sv.port, 2, 400);
+    kill(sv.lead.child.pid, SIGTERM);
+    CHECK_EQ(sv.lead.finish(60), 0);
+    CHECK_EQ(sv.fol.finish(30), 0);
+    const std::string llog = sv.lead.output(), flog = sv.fol.output();
+    const std::vector<std::pair<int, int>> plan = chunks_of(llog);
+    const bool plan_ok = plan == ref_plan;
+    auto count = [](const std::string& log, const std::string& what) {
+        int n = 0;
+        for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++n;
+        return n;
+    };
+    const int lsw = count(llog, "fn4: switches aql_ika=1 applied at step ") + count(llog, "fn4: switches aql_ika=0 applied at step ");
+    const int fsw = count(flog, "fn4: switches aql_ika=1 applied at step ") + count(flog, "fn4: switches aql_ika=0 applied at step ");
+    fprintf(stderr, "    fn4 aql_ika 1 / 0 / 1, 2 lanes W(1,3): tokens %s / %s / %s, plan %s (%zu chunks one process, %zu here); "
+                    "switch lines leader %d / 3, follower %d / 3\n",
+            got[0] == ref[0] ? "identical" : "DIFFERENT", got[1] == ref[1] ? "identical" : "DIFFERENT",
+            got[2] == ref[2] ? "identical" : "DIFFERENT", plan_ok ? "identical" : "DIFFERENT", ref_plan.size(), plan.size(), lsw, fsw);
+    if (!plan_ok || lsw != 3 || fsw != 3)
+        fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    for (int k = 0; k < 3; ++k) {
+        CHECK(!ref[(size_t)k].empty());
+        CHECK(got[(size_t)k] == ref[(size_t)k]);
+    }
+    CHECK(plan_ok);
+    CHECK_EQ(lsw, 3);
+    CHECK_EQ(fsw, 3);
+}
+
 /* ------------------------------------------------------------------ tp8 dev M8 */
 /* RADIANCE_PP_BG_LANE=1 (the last lane holds no sequence; a newcomer planned whole beside decoders is lent whole to it) with
  * the follower's segments for that lane's passes (RADIANCE_PP_SEG_LAYERS=1, no RADIANCE_PP_SEG_PREFILL) and ready-first tails:
