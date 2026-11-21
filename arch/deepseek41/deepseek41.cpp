@@ -2119,8 +2119,9 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * default form; libr4d: byte-identical to the chain of rows, r4d_ds41_elem.hip 'fused chains'). Declared only when the
  * start env RADIANCE_DS41_DSPARK_MHR is 5 (so MHR=4 -- BEST's start -- declares as before); dspark_mhr 4 / 5 in process. */
 static std::atomic<int> g_sw_dmr{-1};
-/* Lever DHS (DRAFTER track 21.11.2026 round 57; Dsp::hs_*): switch "dspark_hs" (fn4, plugin; 0 = today's issue), accepted at 1
- * only where the start env RADIANCE_DS41_DSPARK_HS=1 declared its ops (the env also starts the switch at 1). Read at issue. */
+/* Lever DHS (DRAFTER track 21.11.2026 round 57; Dsp::hs_*): switch "dspark_hs" (fn4, plugin; 0 = today's issue); its ops are
+ * declared only under the start env RADIANCE_DS41_DSPARK_HS (0 / 1 = the switch's start value), and the issue reads 1 only where
+ * every rank of the process declared them (hs_now). Read at issue. */
 static std::atomic<int> g_sw_hs{0}, g_sw_hs_ok{0}, g_sw_hs_env{-2};   /* env: -2 unread, -1 unset, else 0 / 1 */
 static std::atomic<int> g_sw_hs_bad{0};   /* a rank of this process could not declare it: off on every rank (its all-reduces) */
 static bool hs_env() {
@@ -2959,8 +2960,10 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 5 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF) */
-    if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: 1 only where RADIANCE_DS41_DSPARK_HS=1 declared its ops */
-        return value == 0 || (value == 1 && hs_ok_all()) ? 1 : -1;
+    if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
+                                              * that never declared it (the pipeline's follower: no drafter) takes the value and
+                                              * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
+        return value == 0 || (value == 1 && !g_sw_hs_bad.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
