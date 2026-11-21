@@ -790,6 +790,65 @@ TEST(the_counts_source_declines_a_transient_buffer) {
     CHECK_OK(rad_stream_sync(f.ctx.stream()));
 }
 
+/* tp8 loop W5 (lever RR1, fn4 ds41_rr1): a layer's second report in a step naming the layer's own card-side row (rad_route_counts)
+ * is a block's end report right after its pass report copied the same counts there: it copies nothing and keeps the step's
+ * earlier handoff (the block's own buffer, which its router rewrites every pass) for the file stager and the mover, and the
+ * bank is credited for both reports, as the copying end report did. A step's FIRST report naming the row (a router that
+ * writes the row itself) is the handoff as before, and the next step's own buffer replaces it. */
+TEST(a_report_naming_the_layers_row_after_its_report_this_step_copies_nothing_and_keeps_the_handoff) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    CHECK_OK(f.start());
+    int32_t* const row0 = f.ctx.route_counts(0, 4);
+    REQUIRE(row0 != nullptr);
+    int32_t ecnt[4] = { 5, 0, 2, 1 };
+    RadRouting r{};
+    r.n_expert = 4;
+    r.top_k = 2;
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        r.expert_count = ecnt;
+        CHECK_OK(c.route_report(0, &r));             /* the pass's report: ecnt -> the row */
+        CHECK_OK(rad_stream_sync(c.stream()));
+        ecnt[0] = 99;                                /* a copy from here on would carry it */
+        r.expert_count = row0;
+        CHECK_OK(c.route_report(0, &r));             /* the end report names the row */
+    }));
+    int64_t n = -1;
+    CHECK(f.ctx.route_counts_device(0, &n) == ecnt);   /* the stager's handoff: the block's buffer */
+    CHECK_EQ(n, (int64_t)4);
+    CHECK(f.ctx.last_routing(0) != nullptr && f.ctx.last_routing(0)->expert_count == ecnt);
+    int b0 = -1;
+    while ((b0 = f.ctx.next_histogram(0, -1, 2)) < 0) std::this_thread::yield();
+    CHECK_EQ(f.ctx.last_histogram_step(0, b0), 0);
+    CHECK_EQ(f.ctx.last_histogram_reports(0, b0), 2);   /* both reports credited */
+    const int32_t* h0 = f.ctx.last_histogram(0, b0);
+    CHECK(h0 != nullptr);
+    if (h0) { CHECK_EQ(h0[0], 5); CHECK_EQ(h0[2], 2); CHECK_EQ(h0[3], 1); }   /* the first copy's bytes only */
+
+    /* a step whose first report names the row: the handoff is the row, as before; the next step's buffer replaces it */
+    CHECK_OK(f.step(4, 1, [&](Ctx& c) {
+        r.expert_count = row0;
+        CHECK_OK(c.route_report(0, &r));
+    }));
+    CHECK(f.ctx.route_counts_device(0, &n) == row0);
+    CHECK_OK(f.step(4, 2, [&](Ctx& c) {
+        r.expert_count = ecnt;
+        CHECK_OK(c.route_report(0, &r));
+    }));
+    CHECK(f.ctx.route_counts_device(0, &n) == ecnt);
+    /* another layer's row is not this layer's: copied and handed over as any buffer */
+    int32_t* const row1 = f.ctx.route_counts(1, 4);
+    REQUIRE(row1 != nullptr);
+    CHECK_OK(f.step(4, 3, [&](Ctx& c) {
+        r.expert_count = ecnt;
+        CHECK_OK(c.route_report(0, &r));
+        r.expert_count = row1;
+        CHECK_OK(c.route_report(0, &r));
+    }));
+    CHECK(f.ctx.route_counts_device(0, &n) == row1);
+    CHECK_OK(rad_stream_sync(f.ctx.stream()));
+}
+
 /* A step that drafts reports the same layer once per pass, all into the step's one bank. The drain
  * runs before every pass, so it must not take that bank until the step is over; taken early, it
  * would cover only the passes so far and miss the rest. */

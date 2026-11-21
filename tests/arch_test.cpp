@@ -940,8 +940,9 @@ TEST(sdf_moves_only_the_shared_down_ahead_of_the_routed_down) {
 /* DRAFTER round 54 (lever RR1, rad_block_moe_fp8.h MoeFP8::rr1_live): with the switch on, the end routing report of a step of
  * ONE pass from row 0 names the core's counts row (taken in place: no copy), every other report names the block's own counts
  * buffer as before; the issued ops are the same list (the lever is the report's pointer only); a step of two passes, a core
- * with no row, and the switch off report the buffer twice as today; once a row was named, a step whose first pass starts past
- * row 0 reports that pass's counts before its experts (so the core never hands the file stager an older step's row). */
+ * with no row, and the switch off report the buffer twice as today; a pass past row 0 reports only at the step's end, copying,
+ * whatever came before (tp8 loop W5: the core keeps the block's own buffer as the file stager's handoff when the end report
+ * names its row -- runtime_test a_report_naming_the_layers_row_after_its_report_this_step_copies_nothing_and_keeps_the_handoff). */
 TEST(rr1_end_report_names_the_core_row_after_one_pass_only) {
     RadModelMeta meta = hyv3_fp8_test_meta();
     RadBuildCtx ctx = build_ctx();
@@ -966,6 +967,25 @@ TEST(rr1_end_report_names_the_core_row_after_one_pass_only) {
                 return false;
         return true;
     };
+    /* the block's own passes: two passes from row 0 -> the buffer twice; a pass past row 0 alone -> the end report only,
+     * copying (the buffer), whatever came before (tp8 loop W5: a recording and its audit issue the same reports -- the
+     * first form reported such a pass again once a row had been named, which no pass key carries) */
+    auto direct = [&](int v, const std::vector<std::pair<int64_t, int64_t>>& passes, std::vector<RecIssue>* iss = nullptr) {
+        word.store(v);
+        RadBatch batch = decode_batch();
+        RadCtx c{};
+        c.b = &b;
+        c.batch = &batch;
+        c.route_row = rows.data();
+        c.route_n = rn;
+        for (const auto& p : passes) moe.pass(&c, 4, p.first, p.second, true);
+        moe.route_report(&c);
+        if (iss) *iss = c.issues;
+        return c.routed_counts;
+    };
+    /* this block's first issue in the process (no row named yet): a pass past row 0 alone, the switch on */
+    std::vector<RecIssue> ipre;
+    const auto pre = direct(1, { { 2, 2 } }, &ipre);
     const int32_t* ecnt = nullptr;
     /* a whole step through the model (MoeFP8::step: one pass at 4 rows) at switch v, with / without the core's row */
     auto run = [&](int v, bool row, std::vector<RecIssue>* iss) {
@@ -1000,30 +1020,21 @@ TEST(rr1_end_report_names_the_core_row_after_one_pass_only) {
     }
     CHECK(taken > 0);
     REQUIRE(ecnt != nullptr);
-    /* the block's own passes: two passes from row 0 -> the buffer twice; a first pass past row 0 after a row was named -> its
-     * own report, then the end report copies (the buffer) */
-    auto direct = [&](int v, const std::vector<std::pair<int64_t, int64_t>>& passes) {
-        word.store(v);
-        RadBatch batch = decode_batch();
-        RadCtx c{};
-        c.b = &b;
-        c.batch = &batch;
-        c.route_row = rows.data();
-        c.route_n = rn;
-        for (const auto& p : passes) moe.pass(&c, 4, p.first, p.second, true);
-        moe.route_report(&c);
-        return c.routed_counts;
-    };
     const int32_t* const myrow = rows.data() + (int64_t)moe.layer * rn;
+    std::vector<RecIssue> ib;
+    CHECK(pre.size() == 1 && pre[0] == ecnt);       /* the end report only, copying */
     const auto d1 = direct(1, { { 0, 4 } });
     CHECK(d1.size() == 2 && d1[0] == ecnt && d1[1] == myrow);
     const auto d2 = direct(1, { { 0, 2 }, { 2, 2 } });
     CHECK(d2.size() == 2 && d2[0] == ecnt && d2[1] == ecnt);
-    (void)direct(1, { { 0, 4 } });   /* the core names the row now */
-    const auto d3 = direct(1, { { 2, 2 } });
-    CHECK(d3.size() == 2 && d3[0] == ecnt && d3[1] == ecnt);
-    const auto d4 = direct(0, { { 2, 2 } });   /* the switch off after a row was named: still restored */
-    CHECK(d4.size() == 2 && d4[0] == ecnt && d4[1] == ecnt);
+    (void)direct(1, { { 0, 4 } });   /* a row named just before */
+    const auto d3 = direct(1, { { 2, 2 } }, &ib);
+    CHECK(d3 == pre);                 /* the same pass after rows were named: the same reports (a recording = its audit) */
+    CHECK(same_issues(ipre, ib));     /* and the same issue list */
+    const auto d3b = direct(1, { { 2, 2 }, { 0, 2 } });   /* the last pass from row 0: its report filled the row */
+    CHECK(d3b.size() == 2 && d3b[0] == ecnt && d3b[1] == myrow);
+    const auto d4 = direct(0, { { 2, 2 } });   /* the switch off after a row was named: as today */
+    CHECK(d4 == pre);
     const auto d5 = direct(0, { { 0, 4 } });
     CHECK(d5.size() == 2 && d5[0] == ecnt && d5[1] == ecnt);
     word.store(0);
