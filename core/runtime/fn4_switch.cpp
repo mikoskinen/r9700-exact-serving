@@ -76,7 +76,7 @@ int qwen_hi(int i) {
          : i == kHcReadV ? 8191 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
          : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 6 : i == kBiSeg ? 3
          : i == kArwRows ? 4096 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3
-         : i == kArFence ? 7 : i == kSpRoute ? 255 : i == kRgTail ? 128 : i == kDraftDmask ? (1 << 30) - 1 : 1;
+         : i == kArFence ? 7 : i == kSpRoute ? 511 : i == kRgTail ? 128 : i == kDraftDmask ? (1 << 30) - 1 : 1;
 }
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {

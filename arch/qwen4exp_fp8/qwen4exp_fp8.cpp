@@ -252,6 +252,7 @@ struct Model {
     HyperConn mixer;            /* the 97th connection: no write half */
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
     bool      pipe_noted = false;
+    bool      nowait_noted = false;   /* PF probe NOWAIT (sp_route bit 256) said once */
     int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
@@ -2292,6 +2293,14 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const bool spo_tail = spo && (fn4_sproute_flag().load(std::memory_order_relaxed) & 16) != 0;
     /* fn4 PF-ORDER (sp_route bit 32): see the layer loop */
     const bool pford = (fn4_sproute_flag().load(std::memory_order_relaxed) & 32) != 0;
+    /* PF probe NOWAIT (qfn-on-ds, Qwen loop round 13, QUEUE Q9's upper-bound read; sp_route bit 256; WRONG BYTES, timed
+     * only): inside this step lane 0 never waits for lane 1 (wait1 / waitm issue no join); lane 1 still orders every
+     * collective behind the lane-0 mark it reads (on1's join 0 -> 1, the handed pieces' mix_ar_piece), and the step ends
+     * with one join 1 -> 0. So a step takes max(lane 0's own chain, lane 1's chain behind it): what lane 0 costs if its
+     * waits on the collectives were filled -- the ceiling of a second prompt's pieces in the step (Q9) and of every form
+     * that hides the comm lane's waits. Lane 0 reads x before its reduction lands (garbage rows, finite); a start that
+     * takes it reads timing only (no identity cell, nonce prompts). */
+    const bool nowait = (fn4_sproute_flag().load(std::memory_order_relaxed) & 256) != 0;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2338,7 +2347,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         issue();
         rad_lane(c, 0);
     };
-    auto wait1 = [&] { rad_lane_join(c, 1, 0); };
+    auto wait1 = [&] { if (!nowait) rad_lane_join(c, 1, 0); };
+    if (nowait && !m.nowait_noted && g.rank == 0) {
+        m.nowait_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: PF probe NOWAIT (sp_route bit 256): a pipelined prefill step's lane 0 does not wait "
+                        "for lane 1 (one join at the step's end); WRONG BYTES, timing only\n");
+    }
     if (!m.pipe_noted) {
         m.pipe_noted = true;
         if (g.rank == 0)
@@ -2403,7 +2417,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         /* A block that handed nothing leaves the first piece's all-reduce to be issued here. */
         if (pc.handed == 0) on1(true, [&] { ar_mix(0); });
         auto mark1 = [&](int k) { if (k < 16 && rad_lane_join(c, 1, 0x100 + k) == RAD_OK) mk |= 1u << k; };
-        auto waitm = [&](int k) { if (k < 16 && (mk & (1u << k))) { rad_lane_join(c, 0x200 + k, 0); mk &= ~(1u << k); } else wait1(); };
+        auto waitm = [&](int k) {
+            if (k < 16 && (mk & (1u << k))) { if (!nowait) rad_lane_join(c, 0x200 + k, 0); mk &= ~(1u << k); } else wait1();
+        };
         if (pmk_l && pc.handed == 0) mark1(0);
         if (!pmk_l) wait1();   /* fn4 PF marks: the spo branch below waits piece by piece */
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
@@ -2620,6 +2636,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             if (sp_p(p)) on1(true, [&] { agh_p(p); });
         wait1();
     }
+    if (nowait) rad_lane_join(c, 1, 0);   /* PF probe NOWAIT: the step's one wait for lane 1 */
 }
 
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
@@ -3270,7 +3287,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 255) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice) */
+        if (value < 0 || value > 511) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);
