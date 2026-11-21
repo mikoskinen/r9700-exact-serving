@@ -1426,7 +1426,7 @@ int Ctx::haz_mark(PassTape& t) {
             const int32_t own = part_of[(size_t)i];
             /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it -- except in IKA's walk when its
              * kernel is a self-acquiring copy (lever IKB, DRAFTER rounds 51 / 53: aql_copy16_ika, launched only while fn4 aql_ika
-             * is 1): there its exact ranges go through the rule as any op's and IKA's window stays known for the dispatch after
+             * is 2): there its exact ranges go through the rule as any op's and IKA's window stays known for the dispatch after
              * it. The rule's own walk (`aws`, what aql_ika 0 plays) treats it as before. */
             const bool rcopy = own >= 0 && !haz_ops_[(size_t)own].opaque && haz_ops_[(size_t)own].route_copy;
             const bool rcopy_ika = rcopy && awi && tape_rec_ika(t.dev, i) > 0;

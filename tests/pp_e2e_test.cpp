@@ -2344,7 +2344,7 @@ TEST(iks_aql_ika_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
         post(sv.port, vals[k], 200);
         got.push_back(complete(sv.port, ps[(size_t)k], 24));
     }
-    post(sv.port, 2, 400);
+    post(sv.port, 3, 400);   /* DRAFTER round 53: 2 = 1 + lever IKB is taken */
     kill(sv.lead.child.pid, SIGTERM);
     CHECK_EQ(sv.lead.finish(60), 0);
     CHECK_EQ(sv.fol.finish(30), 0);

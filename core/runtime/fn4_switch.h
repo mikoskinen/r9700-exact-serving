@@ -559,8 +559,11 @@
  *                   record or ride completes on it, and the acquire where haz_mark's IKA walk allows; the other packets take that
  *                   walk's rule marks. Both mark sets are made when a pass is recorded, so the switch picks at play: no re-recording,
  *                   and 0 is exactly the packets of a start without RADIANCE_AQL_IKA. Fences only: no kernel's bytes change (rule A).
+ *                   2 (DRAFTER round 53, lever IKB) -- 1, and core's own device-local copies / fills (core/device/aql_blit.hip) are
+ *                   LAUNCHED in their self-acquiring forms (the same loads / stores), so a routing copy also goes through haz_mark's
+ *                   IKA walk on its exact ranges; the kernel is picked at launch, so a pass re-records (the epoch) as at every change.
  *                   Needs RADIANCE_AQL_IKA=1 at start (which kernels are self-acquiring is read at their first launch), which starts
- *                   it at 1; without the env 1 is refused and it reads 0. A follower switch (each node's own played packets).
+ *                   it at 1; without the env 1 / 2 are refused and it reads 0. A follower switch (each node's own played packets).
  *   sched_lane_room scheduler (tp8 loop D56; 104 here, after ds41_csplit): 0 -- a lane's admission room gates (a fresh prompt's whole
  *                   rest, a preempted request's whole recompute, beside every runner's rest of prompt + a block each) count the asking
  *                   lane's running requests, as before; 1 -- they count every lane's (each lane's running set and the ones its plan left
@@ -939,7 +942,8 @@ int  pp_send_ash();
  * wait the AQL backend enqueues (rad::aql's wait_ahead). */
 int  aql_waitk();
 /* tp8 loop W3s (aql_ika): the switch once set, else 1 where RADIANCE_AQL_IKA=1 at start (0 = off); read at every played packet
- * (rad::aql's PlayRun::put): 1 = lever IKA's fences, 0 = the packets without the lever. */
+ * (rad::aql's PlayRun::put): 1 = lever IKA's fences, 0 = the packets without the lever; 2 (lever IKB) = 1 + core's copies / fills
+ * in their self-acquiring forms (read at their launch: rad::aql::ikb_live_now). */
 int  aql_ika();
 /* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`

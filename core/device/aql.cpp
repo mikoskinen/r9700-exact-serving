@@ -1467,7 +1467,7 @@ struct PlayRun {
          * change of the switch re-records (the epoch), so the stock replay costs one constant test. */
         /* Lever IKA (tp8 loop W3s): fn4 aql_ika picks the recording's marks at play -- 1 IKA's, 0 the rule's own (as without the
          * lever); with RADIANCE_AQL_IKA unset no record is self-acquiring and the switch reads 0. */
-        const bool ika_live = ika_on() && rad::fn4::aql_ika() == 1;
+        const bool ika_live = ika_on() && rad::fn4::aql_ika() >= 1;   /* 2 = 1 + lever IKB (launch-time only) */
         const bool mark = ika_play_mark(ika_live, r.noacq != 0, r.noacq_ika != 0, r.ika != 0, r.ikaok != 0);
         if (acq == HSA_FENCE_SCOPE_AGENT &&
             (aql_acq_none_() || (mark && !r.chain && !foreign && aql_acq_mode() == 1)))
@@ -4379,7 +4379,8 @@ WaitkCounts waitk_counts() {
 }
 void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
 int waitk_mode_now() { return waitk_mode(); }
-bool ika_live_now() { return ika_on() && rad::fn4::aql_ika() == 1; }
+bool ika_live_now() { return ika_on() && rad::fn4::aql_ika() >= 1; }
+bool ikb_live_now() { return ika_on() && rad::fn4::aql_ika() == 2; }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4802,6 +4803,7 @@ WaitkCounts waitk_counts() { return WaitkCounts{}; }
 void waitk_set_for_test(int) {}
 int waitk_mode_now() { return 0; }
 bool ika_live_now() { return false; }
+bool ikb_live_now() { return false; }
 }  // namespace aql
 }  // namespace rad
 

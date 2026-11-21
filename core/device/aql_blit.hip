@@ -42,7 +42,7 @@ __global__ __launch_bounds__(kThreads) void aql_copy16(const u32x4* __restrict__
 
 /* Lever IKA (DRAFTER track round 51; core/device/aql.cpp ika_kernel): the device-local copies and fills also exist in a form that
  * runs the agent acquire at entry and the agent release at every exit itself, as libr4d R4D_IKA_ENTRY() does, launched only while
- * lever IKA plays its marks (RADIANCE_AQL_IKA=1 at start + fn4 aql_ika 1: rad::aql::ika_live_now) and never across the link (system scope stays the
+ * lever IKB is on (RADIANCE_AQL_IKA=1 at start + fn4 aql_ika 2: rad::aql::ikb_live_now) and never across the link (system scope stays the
  * packet's). Same loads and stores as the plain form. */
 struct AqlIka {
     __device__ __forceinline__ AqlIka() { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); }
@@ -280,13 +280,13 @@ extern "C" int rad_aql_blit_copy(void* dst, const void* src, uint64_t bytes, voi
             hipLaunchKernelGGL(aql_copy_link, dim3(1), dim3(kLinkThreads), 0, s,
                                (const u32x4*)src, (u32x4*)dst, n);
         else
-            hipLaunchKernelGGL(rad::aql::ika_live_now() ? aql_copy16_ika : aql_copy16, dim3(blocks_for(n, 4 * kThreads)),
+            hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_copy16_ika : aql_copy16, dim3(blocks_for(n, 4 * kThreads)),
                                dim3(kThreads), 0, s, (const u32x4*)src, (u32x4*)dst, n);
     } else {
         /* Unaligned: byte copies have one byte per thread in flight, so across the link they
          * use 16 workgroups instead of the aligned path's one. */
         const uint64_t cap = link ? kLinkByteBlocks : kMaxBlocks;
-        hipLaunchKernelGGL(!link && rad::aql::ika_live_now() ? aql_copy1_ika : aql_copy1, dim3(blocks_for(bytes, 4 * kThreads, cap)), dim3(kThreads),
+        hipLaunchKernelGGL(!link && rad::aql::ikb_live_now() ? aql_copy1_ika : aql_copy1, dim3(blocks_for(bytes, 4 * kThreads, cap)), dim3(kThreads),
                            0, s, (const unsigned char*)src, (unsigned char*)dst, bytes);
     }
     return launched();
@@ -299,10 +299,10 @@ extern "C" int rad_aql_blit_copy2d(void* dst, uint64_t dpitch, const void* src, 
     const unsigned by = (unsigned)(height < 65535 ? height : 65535);
     if (aligned16((uint64_t)(uintptr_t)dst | (uint64_t)(uintptr_t)src | dpitch | spitch | width)) {
         const uint64_t w16 = width / 16;
-        hipLaunchKernelGGL(rad::aql::ika_live_now() ? aql_copy2d16_ika : aql_copy2d16, dim3(blocks_for(w16, kThreads), by), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_copy2d16_ika : aql_copy2d16, dim3(blocks_for(w16, kThreads), by), dim3(kThreads), 0, s,
                            (const u32x4*)src, (u32x4*)dst, spitch / 16, dpitch / 16, w16, height);
     } else {
-        hipLaunchKernelGGL(rad::aql::ika_live_now() ? aql_copy2d1_ika : aql_copy2d1, dim3(blocks_for(width, kThreads), by), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_copy2d1_ika : aql_copy2d1, dim3(blocks_for(width, kThreads), by), dim3(kThreads), 0, s,
                            (const unsigned char*)src, (unsigned char*)dst, spitch, dpitch, width,
                            height);
     }
@@ -326,10 +326,10 @@ extern "C" int rad_aql_blit_fill(void* dst, int value, uint64_t bytes, void* str
     if (aligned16((uint64_t)(uintptr_t)dst | bytes)) {
         const unsigned v = 0x01010101u * b;
         const uint64_t n = bytes / 16;
-        hipLaunchKernelGGL(rad::aql::ika_live_now() ? aql_fill16_ika : aql_fill16, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_fill16_ika : aql_fill16, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0, s,
                            (u32x4*)dst, v, n);
     } else {
-        hipLaunchKernelGGL(rad::aql::ika_live_now() ? aql_fill1_ika : aql_fill1, dim3(blocks_for(bytes, 4 * kThreads)), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_fill1_ika : aql_fill1, dim3(blocks_for(bytes, 4 * kThreads)), dim3(kThreads), 0, s,
                            (unsigned char*)dst, b, bytes);
     }
     return launched();

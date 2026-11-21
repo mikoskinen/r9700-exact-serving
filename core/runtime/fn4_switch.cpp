@@ -1601,15 +1601,16 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kAqlIka) {            /* tp8 loop W3s: the AQL backend's, read at every packet it plays from a tape */
-        if (v != 0 && v != 1) {
-            if (err) *err = "aql_ika takes 0 (every played packet keeps the fences it has without the lever) or 1 (lever IKA: a "
+        if (v != 0 && v != 1 && v != 2) {
+            if (err) *err = "aql_ika takes 0 (every played packet keeps the fences it has without the lever), 1 (lever IKA: a "
                             "self-acquiring kernel's played packet drops the packet release, and the acquire where the recording's IKA "
-                            "marks allow; tp8 loop W3s)";
+                            "marks allow; tp8 loop W3s) or 2 (1, and core's own device-local copies / fills launched in their "
+                            "self-acquiring forms: lever IKB, DRAFTER round 53)";
             return false;
         }
-        if (v == 1 && env_aql_ika() == 0) {
-            if (err) *err = "aql_ika 1 needs RADIANCE_AQL_IKA=1 at start (which kernels are self-acquiring is read at their first "
-                            "launch; unset here: tp8 loop W3s)";
+        if (v >= 1 && env_aql_ika() == 0) {
+            if (err) *err = "aql_ika " + std::to_string(v) + " needs RADIANCE_AQL_IKA=1 at start (which kernels are self-acquiring is "
+                            "read at their first launch; unset here: tp8 loop W3s)";
             return false;
         }
         return true;
