@@ -304,8 +304,11 @@ if(R4D_IKA)
   target_compile_definitions(libr4d PRIVATE R4D_IKA=1)
 endif()
 # Lever CW7 (r4d_chain.h, qfn-on-ds Qwen loop round 14 / DS DRAFTER round 66): the chained wait empties the scalar data cache and
-# leaves the body's code as the unchained build's. OFF = the wait as before.
-option(R4D_CHAIN_WAIT7 "libr4d: the chained wait in lever CW7's form (scalar cache emptied, codegen-neutral)" OFF)
+# leaves the body's code as the unchained build's. OFF = the wait as before (r4d_chain.h's R4D_CHAIN_WAIT 1).
+# Default ON since Qwen loop round 15 (COORD 21.11. 16:16: CW7 joins BEST as an exactness fix -- cw7b = ms11's bytes on every
+# cell, cw7c +0.01..+0.14 ms a step, prefill +0.07..+0.10 %; one base image, not a layered libr4d). A build dir configured before
+# this keeps its cached OFF: configure it with -DR4D_CHAIN_WAIT7=ON.
+option(R4D_CHAIN_WAIT7 "libr4d: the chained wait in lever CW7's form (scalar cache emptied, codegen-neutral)" ON)
 if(R4D_CHAIN_WAIT7)
   target_compile_definitions(libr4d PRIVATE R4D_CHAIN_WAIT=7)
 endif()

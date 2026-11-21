@@ -58,7 +58,7 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 #endif
 #if R4D_CHAIN_WAIT == 7
 // Lever CW7 (qfn-on-ds Qwen loop round 14, QUEUE Q36; ported from the DeepSeek DRAFTER track, ds41-drafter-cw7 628bc72f; CMake
-// R4D_CHAIN_WAIT7, default OFF): the same wait in a form that (a) empties the WGP's scalar data cache behind the wait -- a chained
+// R4D_CHAIN_WAIT7, default ON since Qwen loop round 15 -- the header's own default stays 1 for its other includers): the same wait in a form that (a) empties the WGP's scalar data cache behind the wait -- a chained
 // kernel launches before its predecessor ends, so a line an earlier kernel left in that cache can be older than what the predecessor
 // wrote (DRAFTER kit/mes/coh4.hip on an R9700: with the poll above and no invalidate EVERY scalar read of a rewritten buffer was
 // stale, 0 with one) -- and (b) does not change the body's code: LLVM's uniform-load analysis takes the atomic poll and s_sleep as
