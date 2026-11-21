@@ -74,6 +74,15 @@ inline std::atomic<int>& fn4_attbi_flag() {
                                    return v >= 6 ? 6 : v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
+/* fn4 PF probe ATP (Qwen loop round 9, 21.11.2026, QUEUE Q8's upper-bound read; qwen4exp switch sp_route bit 64): every
+ * gated sparse attention launch of a PREFILL step (op_attn_gq over a chunk of prompt rows, the pipelined pieces' and the
+ * plain form) issued twice -- the repeat reads the same q, KV, selection and gate and rewrites the same output, codes and
+ * scales, so the bytes are today's -- to read the attention's marginal cost on the prefill critical path (QPF-PROBE's form
+ * for the gathers / reads): what a P-2 union walk that removes part of its KV traffic can win at most. 0 = today. */
+inline std::atomic<int>& fn4_attprobe_flag() {
+    static std::atomic<int> f{0};
+    return f;
+}
 /* fn4 kvs_bi (15.11.2026, qwen/KV-STREAM-EXACT.md; switch kvs_bi / RADIANCE_FN4_KVS_BI, a mask; 0 = today): KV streaming
  * (--kv-resident) exact under load. Bit 1 (this block): a decode sequence of a STREAMED group takes its alone step's attention
  * in every pass. Alone, a streamed decode step is ring-bound, so every context decodes sparse (the dense path cannot read
@@ -1058,6 +1067,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * attention and out projection can finish a piece's rows and hand off its reduction while the
      * next piece's attention runs. Each piece is launched as a step of the piece's width would
      * launch it. */
+    /* fn4 PF probe ATP (sp_route bit 64): a prefill step's gated sparse launches issued twice (the same bytes) */
+    const int atp_n = batch->phase == RAD_PHASE_PREFILL && batch->draft_pass == 0 &&
+                      fn4_attprobe_flag().load(std::memory_order_relaxed) ? 2 : 1;
     if (gated && !own_ar && pieces && pieces->cuts(T) && !op_add) {
         const int64_t chunk = qsa_gq_rows();
         const int64_t qw = g.q_dim(), hd = g.head_dim;
@@ -1066,6 +1078,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             for (int64_t off = p0; off < p0 + pn; off += chunk) {
                 const int64_t rows = (p0 + pn - off) < chunk ? (p0 + pn - off) : chunk;
                 resolve_sel(off, rows);
+                for (int rep = 0; rep < atp_n; ++rep)
                 RAD_ISSUE_N(c, op_attn_gq, 1,
                             brow_slice(w.q, off, rows, qw),
                             kv_cache(kv, layer),
@@ -1090,6 +1103,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
             resolve_sel(off, rows);
+            for (int rep = 0; rep < atp_n; ++rep)
             RAD_ISSUE_N(c, op_attn_gq, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
