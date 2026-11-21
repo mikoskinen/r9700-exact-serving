@@ -4646,7 +4646,7 @@ void Scheduler::draft_cycle() {
                 if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
                 ++n_rows;
             }
-        draft_.fixed_cycle(n_rows);
+        draft_.fixed_cycle(n_rows, fn4::draft_dmask());   /* lever DLM: the mask of counts when set (0: DLH's threshold) */
         return;
     }
     draft_.fixed_cycle(0);

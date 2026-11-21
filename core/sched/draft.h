@@ -230,8 +230,13 @@ public:
      * hysteresis). Off while the adaptive policy runs, draft_dcap is 0, the hold is unset (1 .. 64) or D is not under the
      * configured depth. Exact as far as a row's bytes do not move with its depth (Qwen: att_bi 6). */
     bool fixed_hold_wanted() const { return !adapt_ && dcap_hold_ && dcap_d_ > 0 && dcap_d_ < p_.max_depth; }
-    void fixed_cycle(int n_rows) {
-        fix_d_ = fixed_hold_wanted() && n_rows >= dcap_n_ ? dcap_d_ : 0;
+    /* lever DLM (Qwen loop round 7, COORD 05:36; fn4 draft_dmask): with `mask` non-zero the hold's threshold N gives way to the
+     * mask -- k = 1 .. 30 decoding sequences draft the configured depth when bit k - 1 is set, else D (no row: the configured
+     * depth; above 30: D). One depth a step by the count alone, as DLH; mask 0 = the threshold, word for word. */
+    void fixed_cycle(int n_rows, int mask = 0) {
+        const bool deep = mask ? (n_rows < 1 || (n_rows <= 30 && ((mask >> (n_rows - 1)) & 1)))
+                               : n_rows < dcap_n_;
+        fix_d_ = fixed_hold_wanted() && !deep ? dcap_d_ : 0;
         if (fix_d_ > 0) ++n_dhold_;
     }
 

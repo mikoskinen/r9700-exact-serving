@@ -12970,6 +12970,25 @@ TEST(dlh_the_fixed_window_drafts_the_held_cap_from_its_decode_rows) {
         c.set_dcap(0);
         c.fixed_cycle(32);
         CHECK_EQ(c.next_depth(), 4);
+        /* lever DLM: a mask of counts (55 = 1-3 and 5-6 deep) in place of the threshold; mask 0 = the threshold */
+        c.set_dcap(3);
+        c.set_dcap_n(107);
+        const int want55[9] = { 4, 4, 4, 4, 3, 4, 4, 3, 3 };   /* n = 0 .. 8 */
+        for (int n = 0; n <= 8; ++n) {
+            c.fixed_cycle(n, 55);
+            CHECK_EQ(c.next_depth(), want55[n]);
+            c.fixed_cycle(n, 0);
+            CHECK_EQ(c.next_depth(), n >= 7 ? 3 : 4);
+        }
+        c.fixed_cycle(31, (1 << 30) - 1);   /* past bit 29: the cap */
+        CHECK_EQ(c.next_depth(), 3);
+        c.fixed_cycle(30, (1 << 30) - 1);
+        CHECK_EQ(c.next_depth(), 4);
+        c.set_dcap_n(7);                    /* no hold: the mask does nothing */
+        c.fixed_cycle(4, 55);
+        CHECK_EQ(c.next_depth(), 4);
+        c.fixed_cycle(5, 55);
+        CHECK_EQ(c.next_depth(), 4);
     }
     struct Arm { int seqs, dcap, dcap_n, want; };
     for (const Arm a : { Arm{ 6, 3, 106, 3 }, Arm{ 4, 3, 106, 4 }, Arm{ 6, 3, 6, 4 }, Arm{ 6, 0, 106, 4 } }) {
@@ -12996,6 +13015,30 @@ TEST(dlh_the_fixed_window_drafts_the_held_cap_from_its_decode_rows) {
             CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
         }
     }
+    /* lever DLM through the scheduler: draft_dmask 55 (deep at 1-3, 5-6) with the hold at 107 -- 4 sequences draft the cap
+     * (bit 3 clear) where the threshold alone would draft 4, 5 the configured depth; the switch back to 0 = the threshold */
+    struct MArm { int seqs, mask, want; };
+    for (const MArm a : { MArm{ 4, 55, 3 }, MArm{ 5, 55, 4 }, MArm{ 7, 55, 3 }, MArm{ 4, 0, 4 } }) {
+        CHECK(DstSwitches::set("draft_dmask", a.mask));
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        (void)f.sch.set_draft_dcap(3);
+        (void)f.sch.set_draft_dcap_n(107);
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < a.seqs; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        for (int round = 0; round < 2; ++round) {
+            for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, draft, 4));
+            REQUIRE(f.sch.step() != nullptr);
+            for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, a.want);
+            CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        }
+    }
+    CHECK(DstSwitches::set("draft_dmask", 0));
 }
 
 
