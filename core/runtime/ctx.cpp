@@ -1322,12 +1322,22 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
                  (size_t)std::count_if(out->steps.begin(), out->steps.end(),
                                        [](const TapeStep& st) { return st.kind == kTapeTable; }),
                  out->route.size());
+        /* Lever IKA (tp8 loop W3): the pass's self-acquiring dispatches, which play without their packet's release
+         * unless a record or a ride completes on them; 0 (and no line) unless RADIANCE_AQL_IKA=1 and a module names
+         * its kernels. */
+        int ika_recs = 0;
+        for (int i = 0, nr = tape_len(t); i < nr; ++i) ika_recs += tape_rec_ika(t, i) > 0 ? 1 : 0;
         if (acq_rule_on())
             RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- the acquire rule plays %d of the %d "
                      "dispatches (%d of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=%s)"
                      "; lever IKA %d more",
                      b->draft_pass, (long long)b->n_tok, out->noacq, out->dispatches, out->noacq_ordered,
                      acq_rule_mode() == 2 ? "rule-w" : "rule", out->ika_noacq);
+        if (ika_recs > 0)
+            RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- lever IKA: %d of the %d dispatches are "
+                     "self-acquiring (packet release dropped unless a record or ride completes on one), %d "
+                     "of them without the acquire the rule keeps (tp8 loop W3)",
+                     b->draft_pass, (long long)b->n_tok, ika_recs, out->dispatches, out->ika_noacq);
     }
     return 1;
 }
