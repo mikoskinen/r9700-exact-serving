@@ -53,6 +53,7 @@
 #include "exl3/exl3_abi.h"   /* EXL3 experts (radiance-exl3): the encoding, op schemas, operand positions */
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -151,6 +152,21 @@ inline std::atomic<int>& fn4_exl3_gd_flag() {
         return e && *e && std::strcmp(e, "0") != 0 ? 1 : 0;
     }()};
     return f;
+}
+/* qfn-on-ds lever X3GD (Qwen loop round 5, 21.11.2026; QUEUE Q24): the fused decode chain past 16 rows. At 16 -> 20 rows
+ * the trunk's EXL3 cost goes from the chain's 108.4 us a layer to the M > 16 band's gate_up 117.7 + down 54.7 us (prof4,
+ * LEVERS QFN-TP4-EDGE). RADIANCE_FN4_X3GD_HI=N (17..32, read at declare) declares the chain over EXL3_GD_MIN_ROWS..N
+ * (an exl3r4d whose chain row reaches N: EXL3R4D_GD_M_MAX); the chain then also takes a pass of 17..N rows when every
+ * sequence of the step has at most 16 rows (the step's max_q_len, set_qmax) -- exactly the rows fn4 BI-dual's bi_band
+ * gives the M <= 16 band's arithmetic in today's M > 16 launch, so each row keeps its band. Unset / out of range = 16
+ * (today's declare). */
+inline int64_t fn4_x3gd_hi_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_X3GD_HI");
+        const long n = e && *e ? std::strtol(e, nullptr, 10) : 16;
+        return (int64_t)(n >= 17 && n <= 32 ? n : 16);
+    }();
+    return v;
 }
 inline std::atomic<int>& fn4_exl3_map_flag() {
     static std::atomic<int> f{[] {
@@ -688,7 +704,12 @@ struct MoeFP8 {
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
     rad_buf     b_x3map = 0;    /* fn4 v10: the pass's shared routing map, i32 [exl3_map_words(rows * top_k, n_reg)] */
     rad_op      op_x3gd = 0;    /* fn4 E10: moe_exl3_gate_up_down over the decode band, or 0 */
-    int64_t     x3gd_hi = 0;    /* ...its declared top (min(16, rows)) */
+    int64_t     x3gd_hi = 0;    /* ...its declared top (min(16, rows); lever X3GD: min(RADIANCE_FN4_X3GD_HI, rows)) */
+    int64_t     x3gd_hi16 = 0;  /* lever X3GD: the top a pass with a sequence of more than 16 rows keeps (min(16, rows)) */
+    /* lever X3GD: the step's longest sequence in rows (the architecture's set_qmax before each trunk step); a block it is
+     * never set for (the MTP head) keeps the chain to 16 rows */
+    mutable int32_t step_qmax = INT32_MAX;
+    void set_qmax(int32_t q) const { step_qmax = q; }
     /* The DeepSeek line's EXL3 declare (Config::exl3_v12 0: ETP slices, lever P's dk pair, interface v9 `bi` / v10 `xring`)
      * and the Qwen line's (exl3_v12 1: protected bf16 experts by place in the sort, the shared routing map, the fused decode
      * chain). Kept as two functions so each line declares exactly what it declared before the merge (qfn-on-ds). */
@@ -2685,7 +2706,8 @@ inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::ve
     /* fn4 E10: the decode chain as one op over EXL3_GD_MIN_ROWS..16 tokens, when a row serves it, both projections
      * share a dtype and there is no swiglu limit (the fused op takes none). Its tables: each class's gate_up five, then
      * down's codes and svh (exl3_positions(EXL3_GU_DN)). */
-    x3gd_hi = c.rows < 16 ? c.rows : 16;
+    x3gd_hi16 = c.rows < 16 ? c.rows : 16;
+    x3gd_hi = c.rows < fn4_x3gd_hi_env() ? c.rows : fn4_x3gd_hi_env();
     if (x3gd_hi >= EXL3_GD_MIN_ROWS && rad_op_declared(b, EXL3_OP_GU_DN) && std::strcmp(x3_dtype[0], x3_dtype[1]) == 0 &&
         !(c.swiglu_limit > 0)) {
         tab.clear();
@@ -2701,7 +2723,10 @@ inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::ve
         op_x3gd = rw(b, rad_decl_op(b, EXL3_OP_GU_DN, gdp.data(), (int)gdp.size(), tab.data(), (int)tab.size()),
                      {w.h.x, w.sorted, w.eoff}, {w.edn});
     }
-    if (!op_x3gd) x3gd_hi = 0;
+    if (!op_x3gd) x3gd_hi = x3gd_hi16 = 0;
+    else if (x3gd_hi > 16)
+        rad_note(b, "layer %d: lever X3GD: the fused EXL3 decode chain declared over %d..%lld rows (RADIANCE_FN4_X3GD_HI)", l,
+                 (int)EXL3_GD_MIN_ROWS, (long long)x3gd_hi);
     rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank (%zu more kept plain bf16), swiglu "
                 "limit %g", l, x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, prot.size(), c.swiglu_limit);
     return RAD_OK;
@@ -2964,7 +2989,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
     /* fn4 E10: the decode band's fused chain, in place of the split gate_up here and down below */
-    const bool x3gd = c.expert_exl3 && op_x3gd && rows >= EXL3_GD_MIN_ROWS && rows <= x3gd_hi &&
+    const bool x3gd = c.expert_exl3 && op_x3gd && rows >= EXL3_GD_MIN_ROWS &&
+                      (rows <= x3gd_hi16 || (rows <= x3gd_hi && step_qmax <= 16)) &&
                       fn4_exl3_gd_flag().load(std::memory_order_relaxed);
     if (x3gd)
         issue_exl3(c_, op_x3gd, EXL3_GU_DN, rows, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
@@ -3163,7 +3189,7 @@ inline bool MoeFP8::pair_ok(int64_t T, int64_t R) const {
     const int64_t small = R < T - R ? R : T - R;
     return R > 0 && T > R && T <= c.rows && ext_in && !c.sigmoid_router && !op_sigmoid_scatter && op_router &&
            op_topk && small > router_fused_rows && small > topk_scatter_rows && small > sigmoid_scatter_rows &&
-           small > x3gd_hi && (scatter_inv || inv_now) && (gather_inv || inv_now) &&
+           small > x3gd_hi16 && (scatter_inv || inv_now) && (gather_inv || inv_now) &&
            (inv_now ? op_scatter_inv2 && op_gather_inv2 : op_scatter && op_gather) &&
            !op_gram_gu && !op_combine && !op_moe_ar && !op_shared_ar && !op_add &&
            !gather_taken(g, T, gather_out_rows, gather_out_rows6);

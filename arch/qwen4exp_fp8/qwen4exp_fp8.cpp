@@ -3018,6 +3018,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (m.op_band)
             for (const Layer& l : m.layers) l.mlp.set_band(dual ? m.b_band : 0);
     }
+    /* qfn-on-ds lever X3GD: the step's longest sequence, for the fused EXL3 chain past 16 rows (rad_block_moe_fp8.h) */
+    for (const Layer& l : m.layers) l.mlp.set_qmax(batch->max_q_len);
     const int32_t* pcu = pipe_bounds(c, batch, m);
     SpSer sp;
     if (pipelined(m, T))               step_pipelined(c, batch, m, pcu);
