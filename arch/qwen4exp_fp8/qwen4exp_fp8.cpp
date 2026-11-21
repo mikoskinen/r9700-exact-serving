@@ -253,6 +253,7 @@ struct Model {
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
     bool      pipe_noted = false;
     bool      nowait_noted = false;   /* PF probe NOWAIT (sp_route bit 256) said once */
+    bool      psp_noted = false;      /* lever PSP (sp_route bit 512) said once */
     int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted; P2S: 1000 (mode + 1) + layers paired */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
@@ -2316,6 +2317,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * that hides the comm lane's waits. Lane 0 reads x before its reduction lands (garbage rows, finite); a start that
      * takes it reads timing only (no identity cell, nonce prompts). */
     const bool nowait = (fn4_sproute_flag().load(std::memory_order_relaxed) & 256) != 0;
+    /* qfn-on-ds lever PSP (Qwen loop round 19, sp_route bit 512; QUEUE Q39): the step's PARTIAL last piece takes SP too, so the
+     * hc_sp 2 order (and P2S's pairs: a full piece with the partial one in one routed pass) covers every prompt's last cold
+     * chunk (the prefill timeline, R42: a chunk with a partial piece 109-121 ms a 1k rows against 95-96 for span chunks). Its
+     * quarter's reads go through the SP-serial twins (HyperConn::read_kt, the K split pinned to the PIECE's own row tiles), which
+     * is what reading the partial piece whole gives (spser_run's rule: every rank's part more than 64 rows, a twin for the
+     * piece's tiles); the other ops are per row. So the same bytes as today; off = today. */
+    const bool psp = (fn4_sproute_flag().load(std::memory_order_relaxed) & 512) != 0;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2323,7 +2331,14 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const int64_t spl0 = sp && fn4_spple_flag().load(std::memory_order_relaxed) > 0 && m.ple_layer > 0 ? m.ple_layer : 0;
     auto lsp = [&](int64_t li) { return sp && li >= spl0; };
     bool spL = sp;
-    auto sp_pm = [&](int64_t p, bool on) { return on && rn(p) == R && rn(p) >= kSpMinRows; };
+    auto psp_ok = [&](int64_t p) {   /* lever PSP: the partial last piece's SP, where its parts read as the piece whole */
+        if (!psp || p != K - 1 || p == 0 || rn(p) >= R || rn(p) % g.world != 0 || rn(p) / g.world <= 64) return false;
+        if (m.layers.empty()) return false;
+        for (const Layer* l : { &m.layers.front(), &m.layers.back() })   /* every connection declares the same twins */
+            if (!l->hc_mix.read_kt_op(rn(p)) || !l->hc_ffn.read_kt_op(rn(p))) return false;
+        return true;
+    };
+    auto sp_pm = [&](int64_t p, bool on) { return on && rn(p) >= kSpMinRows && (rn(p) == R || psp_ok(p)); };
     auto sp_p = [&](int64_t p) { return sp_pm(p, spL); };
     auto hq0m = [&](int64_t p, bool on) {
         if (!(spp || sp_pm(p, on))) return r0(p);
@@ -2342,7 +2357,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
     auto hrm = [&](const HyperConn& h, int64_t p, bool ss, bool on) {
         if (hqnm(p, on) <= 0) return;
-        if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
+        if (sp_pm(p, on) && rn(p) != R) h.read_kt(c, hq0m(p, on), hqnm(p, on), rn(p), ss);   /* lever PSP: the piece's own split */
+        else if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
         else h.read(c, T, hq0m(p, on), hqnm(p, on), ss);
     };
     auto hr = [&](const HyperConn& h, int64_t p, bool ss) { hrm(h, p, ss, spL); };
@@ -2363,6 +2379,15 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         rad_lane(c, 0);
     };
     auto wait1 = [&] { if (!nowait) rad_lane_join(c, 1, 0); };
+    if (psp && !m.psp_noted && g.rank == 0 && K >= 2 && rn(K - 1) < R) {
+        m.psp_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: lever PSP (sp_route bit 512): a %lld-row step's partial last piece of %lld rows %s\n",
+                (long long)T, (long long)rn(K - 1),
+                psp_ok(K - 1) ? "takes SP (its quarter's reads pinned to the piece's own K split, the SP-serial twins), so the "
+                                "hc_sp 2 order and P2S's pairs cover it"
+                              : "stays whole (a part of 64 rows or fewer, a row count the four ranks do not share evenly, or no "
+                                "SP-serial twin for its tiles: RADIANCE_FN4_SPSERIAL=1 at start declares them)");
+    }
     if (nowait && !m.nowait_noted && g.rank == 0) {
         m.nowait_noted = true;
         fprintf(stderr, "radiance: qwen4exp: PF probe NOWAIT (sp_route bit 256): a pipelined prefill step's lane 0 does not wait "
@@ -2421,7 +2446,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const bool pair_sp_now = pair_sp && spo &&
                                  !(m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) &&
                                  [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }() &&
-                                 (pmode == 3 || l.mlp.pair_ok(2 * R, R));
+                                 (pmode == 3 || (l.mlp.pair_ok(2 * R, R) &&
+                                                 (rn(K - 1) == R || l.mlp.pair_ok(R + rn(K - 1), R))));   /* PSP's partial pair */
         /* F50: counted over the step's layers and noted after the loop (layer 0 runs without SP under sp_ple 1, so a note
          * read at layer 0 alone said "today's order" while layers 1-47 paired) */
         if (pair_sp && g.rank == 0) {
@@ -2540,10 +2566,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 l.hc_ffn.codes(c, r0(p), rn(p));
                 if (first) continue;
                 if (second && pmode != 3) {
-                    const int64_t P0 = r0(p - 1);
-                    l.mlp.pair_routed_at(c, T, P0, 2 * R, R, pmode == 2);
-                    l.mlp.pair_finish(c, T, P0, R, pmode != 2, P0, 2 * R);
-                    l.mlp.pair_finish(c, T, r0(p), R, pmode != 2, P0, 2 * R);
+                    /* PN: the pair's rows -- 2 R, or R + the partial last piece under lever PSP (pair_routed_at's second piece
+                     * is N - R rows) */
+                    const int64_t P0 = r0(p - 1), PN = rn(p - 1) + rn(p);
+                    l.mlp.pair_routed_at(c, T, P0, PN, R, pmode == 2);
+                    l.mlp.pair_finish(c, T, P0, rn(p - 1), pmode != 2, P0, PN);
+                    l.mlp.pair_finish(c, T, r0(p), rn(p), pmode != 2, P0, PN);
                 } else {
                     if (second) l.mlp.pass(c, T, r0(p - 1), rn(p - 1), false);
                     l.mlp.pass(c, T, r0(p), rn(p), false);
@@ -3403,7 +3431,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 511) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes) */
+        if (value < 0 || value > 1023) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);

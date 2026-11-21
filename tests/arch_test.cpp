@@ -12949,6 +12949,80 @@ TEST(flashnext_p2s_pairs_pieces_routed_experts_under_hc_sp_2) {
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds lever PSP (Qwen loop round 19): sp_route bit 512 lets a pipelined step's PARTIAL last piece take SP, so P2S pairs it
+ * with the full piece before it. A 2,560-row step of one sequence = a 2,048-row piece + a 512-row partial one, at moe_pair 1
+ * under hc_sp 2: at sp_route 0 (control) the partial piece keeps today's whole forms (two routed passes, 2,048 + 512 rows; no
+ * read pinned to 512 rows); at 512 one joint routed pass of 2,560 rows, more reduce-scatters (the partial piece's own), and
+ * its connection reads through the SP-serial twin pinned to the piece's tiles (kc_rows 512: the K split reading it whole
+ * gives). Every operand fits its buffer and no step fails at both. RADIANCE_FN4_SPSERIAL=1 declares the twins (BEST's start);
+ * without them the bit changes nothing (third arm). */
+TEST(flashnext_psp_pairs_a_partial_last_piece_under_hc_sp_2) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    int64_t rs0 = -1, g0 = -1;
+    for (int arm : { 0, 1, 2 }) {   /* 0: sp_route 0; 1: sp_route 512; 2: 512 without the SP-serial twins */
+        if (arm == 2) unsetenv("RADIANCE_FN4_SPSERIAL"); else setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            CHECK(m.pipe_on);
+            CHECK(m.sp_on);
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm == 0 ? 0 : 512);
+            const auto pf = kit(b, {}, { 2560 }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int64_t g2048 = 0, g512 = 0, g2560 = 0, g_other = 0, rs = 0, kc512 = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const bool routed = o->op.rfind("moe_gemm", 0) == 0 || o->op.rfind("moe_exl3", 0) == 0;
+                if (routed && o->op.find("shexp") == std::string::npos) {
+                    if (i.n == 2048) ++g2048; else if (i.n == 512) ++g512; else if (i.n == 2560) ++g2560; else ++g_other;
+                }
+                if (o->op == "reduce_scatter_rows") ++rs;
+                if (o->op == "hc_read")
+                    for (const RecParam& q : o->p) if (q.key == "kc_rows" && q.ival == 512) ++kc512;
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK_EQ(g_other, 0);
+            if (arm != 1) {             /* today's forms: two routed passes a layer, no read pinned to the partial piece */
+                CHECK(g2048 > 0);
+                CHECK_EQ(g512, g2048);
+                CHECK_EQ(g2560, 0);
+                CHECK_EQ(kc512, 0);
+                if (arm == 0) { rs0 = rs; g0 = g2048; } else { CHECK_EQ(rs, rs0); CHECK_EQ(g2048, g0); }
+            } else {                    /* PSP: one joint pass a layer, the partial piece's reduce-scatters, its pinned reads */
+                CHECK_EQ(g2048, 0);
+                CHECK_EQ(g512, 0);
+                CHECK_EQ(g2560, g0);
+                CHECK(rs > rs0);
+                CHECK(kc512 > 0);
+            }
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */
 
 namespace {
