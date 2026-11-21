@@ -2006,8 +2006,9 @@ std::string ika_strip_comments(const std::string& s) {
     return o;
 }
 bool ika_ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
-/* The __global__ definitions of a source text: (identifier, whether the body's first statement is R4D_IKA_ENTRY). */
-std::vector<std::pair<std::string, bool>> ika_kernel_defs(const std::string& t) {
+/* The __global__ definitions of a source text: (identifier, whether the body's first statement is R4D_IKA_ENTRY -- or `macro`:
+ * lever CIK-X's test asks for R4D_IKA_ENTRY_X). */
+std::vector<std::pair<std::string, bool>> ika_kernel_defs(const std::string& t, const char* macro = "R4D_IKA_ENTRY") {
     std::vector<std::pair<std::string, bool>> out;
     for (size_t at = t.find("__global__"); at != std::string::npos; at = t.find("__global__", at + 10)) {
         if ((at > 0 && ika_ident_char(t[at - 1])) || (at + 10 < t.size() && ika_ident_char(t[at + 10]))) continue;
@@ -2044,7 +2045,7 @@ std::vector<std::pair<std::string, bool>> ika_kernel_defs(const std::string& t) 
         if (p >= t.size() || t[p] == ';') continue;   /* a declaration */
         size_t b = p + 1;
         while (b < t.size() && std::isspace((unsigned char)t[b])) ++b;
-        out.emplace_back(name, t.compare(b, 13, "R4D_IKA_ENTRY") == 0);
+        out.emplace_back(name, t.compare(b, std::strlen(macro), macro) == 0);
     }
     return out;
 }
@@ -2102,6 +2103,117 @@ TEST(ika_libr4d_lists_exactly_the_kernels_that_hold_the_in_kernel_fences) {
     }
     fprintf(stderr, "    %zu listed names, %d definitions of them, %d definitions with the entry, %zu kernel definitions scanned\n",
             names.size(), listed_defs, entry_defs, defs.size());
+}
+
+/* Lever CIK-X (tp8 loop R49c): the capability rule as a pure function -- a CHAIN module's nochain-listed kernel is not chain-capable
+ * (its code holds IKA's plain entry: it neither waits for a record nor adds to the counter), everything else as before. */
+TEST(cikx_keeps_a_nochain_listed_kernel_off_the_chain_and_changes_nothing_else) {
+    using rad::aql::cik_capable;
+    int n = 0;
+    for (int b = 0; b < 32; ++b) {
+        const bool named = b & 1, cmod = b & 2, listed = b & 4, nochain = b & 8, core = b & 16;
+        const bool before = !named && ((cmod && listed) || core);   /* the rule before CIK-X (aql.cpp resolve) */
+        const bool now = cik_capable(named, cmod, listed, nochain, core);
+        if (!nochain) CHECK_EQ(now, before);                         /* no nochain list = today's decision */
+        if (nochain && !core) CHECK(!now);                           /* a listed plain-entry kernel never chains */
+        if (named) CHECK(!now);                                      /* a named chained form keeps its own done */
+        n += now ? 1 : 0;
+    }
+    CHECK_EQ(n, 9);   /* !named && (core || (cmod && listed && !nochain)): the 8 combinations with core + 1 without */
+}
+
+/* The source side of CIK-X: r4d_ika_nochain.inc names exactly the kernels whose definitions start with R4D_IKA_ENTRY_X(), each is
+ * IKA-listed (r4d_ika_list.inc), and every file holding one includes r4d_ika_x.h and is in libr4d/CMakeLists.txt's CIK-X file list
+ * (the files that get R4D_IKA_CHAIN_X=1). A plain-entry kernel missing from the list would be made chain-capable by the engine and
+ * run unordered without waiting; a listed kernel holding the chain entry is only slower (no record: IKA's entry + two checks). */
+TEST(cikx_libr4d_lists_exactly_the_kernels_that_keep_the_plain_entry) {
+    const std::string root = std::string(RAD_CHAT_FIXTURES) + "/../../../libr4d";
+    auto slurp = [](const std::string& f, std::string* out) {
+        std::FILE* fp = std::fopen(f.c_str(), "rb");
+        if (!fp) return false;
+        out->clear();
+        for (int c; (c = std::fgetc(fp)) != EOF;) *out += (char)c;
+        std::fclose(fp);
+        return true;
+    };
+    std::string nt, lt, cm;
+    if (!slurp(root + "/r4d_ika_nochain.inc", &nt)) SKIP("no libr4d source tree at %s", root.c_str());
+    CHECK(slurp(root + "/r4d_ika_list.inc", &lt));
+    CHECK(slurp(root + "/CMakeLists.txt", &cm));
+    auto quoted = [](const std::string& t) {
+        std::vector<std::string> v;
+        const std::string u = ika_strip_comments(t);
+        for (size_t q = u.find('"'); q != std::string::npos; q = u.find('"', q + 1)) {
+            const size_t e = u.find('"', q + 1);
+            if (e == std::string::npos) break;
+            v.push_back(u.substr(q + 1, e - q - 1));
+            q = e;
+        }
+        return v;
+    };
+    const std::vector<std::string> nochain = quoted(nt), ika = quoted(lt);
+    CHECK(nochain.size() >= 1);
+    for (const std::string& k : nochain) {
+        bool in = false;
+        for (const std::string& i : ika) in = in || i == k;
+        if (!in) fprintf(stderr, "    nochain %s is not IKA-listed\n", k.c_str());
+        CHECK(in);
+    }
+    /* the CIK-X file list in CMakeLists.txt: the words between "foreach(f" and ")" of the R4D_IKA_CHAIN_X block */
+    std::vector<std::string> cfiles;
+    {
+        const size_t o = cm.find("R4D_IKA AND R4D_IKA_CHAIN AND R4D_IKA_CHAIN_X");
+        const size_t f = o == std::string::npos ? o : cm.find("foreach(f", o);
+        const size_t e = f == std::string::npos ? f : cm.find(')', f);
+        CHECK(e != std::string::npos);
+        if (e != std::string::npos) {
+            std::string w;
+            for (size_t i = f + 9; i <= e; ++i) {
+                if (i < e && !std::isspace((unsigned char)cm[i])) { w += cm[i]; continue; }
+                if (!w.empty()) cfiles.push_back(w);
+                w.clear();
+            }
+        }
+    }
+    CHECK(!cfiles.empty());
+    std::vector<std::string> xdefs;
+    int files_x = 0;
+    if (DIR* d = opendir(root.c_str())) {
+        while (dirent* de = readdir(d)) {
+            const std::string f = de->d_name;
+            const bool src = (f.size() > 4 && f.compare(f.size() - 4, 4, ".hip") == 0) ||
+                             (f.size() > 2 && f.compare(f.size() - 2, 2, ".h") == 0);
+            if (!src) continue;
+            std::string st;
+            if (!slurp(root + "/" + f, &st)) continue;
+            const std::string t = ika_strip_comments(st);
+            int here = 0;
+            for (auto& x : ika_kernel_defs(t, "R4D_IKA_ENTRY_X(")) if (x.second) { xdefs.push_back(x.first); ++here; }
+            if (!here) continue;
+            ++files_x;
+            const bool inc = t.find("#include \"r4d_ika_x.h\"") != std::string::npos;
+            bool listed = false;
+            for (const std::string& c : cfiles) listed = listed || c == f;
+            if (!inc || !listed) fprintf(stderr, "    %s holds R4D_IKA_ENTRY_X(): includes r4d_ika_x.h %d, in the CIK-X file list %d\n", f.c_str(), inc, listed);
+            CHECK(inc);
+            CHECK(listed);
+        }
+        closedir(d);
+    }
+    for (const std::string& k : nochain) {
+        int found = 0;
+        for (const std::string& x : xdefs) found += x == k ? 1 : 0;
+        if (found == 0) fprintf(stderr, "    nochain %s: no definition with R4D_IKA_ENTRY_X()\n", k.c_str());
+        CHECK(found > 0);
+    }
+    for (const std::string& x : xdefs) {
+        bool in = false;
+        for (const std::string& k : nochain) in = in || k == x;
+        if (!in) fprintf(stderr, "    %s holds R4D_IKA_ENTRY_X() but is not in r4d_ika_nochain.inc\n", x.c_str());
+        CHECK(in);
+    }
+    fprintf(stderr, "    %zu nochain names, %zu definitions with R4D_IKA_ENTRY_X() in %d files, %zu files in the CIK-X list\n",
+            nochain.size(), xdefs.size(), files_x, cfiles.size());
 }
 
 RAD_TEST_MAIN_HOST_KARGS()
