@@ -2512,6 +2512,95 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* tp8 loop D62 (fn4 pp_bg_split = core switch 112, the leader's lanes): RADIANCE_PP_BG_SPLIT in process, + 2 = cut a BG newcomer
+ * only where both BG lanes are idle. Two BG lanes (RADIANCE_PP_BG_LANE=2) at 3 lanes W(0,2) and 4 lanes W(1,3) (the wrap-around
+ * cut), one start each: split_set under pp_bg_split 2, then 1, then 0 (POST /admin/fn4) -- every request's tokens are one
+ * process's in every set; the leader's switch lines count the newcomers cut so far, so each set's own count is a difference:
+ * 1 cuts, 0 cuts none, 2 cuts at least the set's first newcomer (both BG lanes idle at its arrival). */
+TEST(d62_pp_bg_split_in_process_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; };
+    for (const Arm a : { Arm{ 3, "0,2" }, Arm{ 4, "1,3" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        for (const char* v : { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        int differ[3] = { 0, 0, 0 };
+        const int modes[3] = { 2, 1, 0 };
+        for (int m = 0; m < 3; ++m) {
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_bg_split", modes[m] } }.dump()) ? c.read(&out) : -1;
+            CHECK_EQ(st, 200);
+            if (st != 200) fprintf(stderr, "    POST pp_bg_split %d: %d %s\n", modes[m], st, out.c_str());
+            const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+            REQUIRE_EQ(ref.size(), got.size());
+            for (size_t i = 0; i < ref.size(); ++i) {
+                CHECK(!ref[i].empty());
+                if (ref[i] != got[i]) ++differ[m];
+            }
+        }
+        {   /* a value out of range is refused by name, the switch unchanged */
+            Call c;
+            std::string out;
+            const int st = c.send(pp.port, "/admin/fn4", json{ { "pp_bg_split", 3 } }.dump()) ? c.read(&out) : -1;
+            CHECK(st != 200);
+            CHECK(out.find("pp_bg_split takes 0") != std::string::npos);
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        /* the switch lines: '(tp8 loop D62): so far N newcomers lent to the BG lanes, S of them in two pieces, R whole for want of
+         * two lanes' room, B whole for a busy BG lane' at 0 -> 2, 2 -> 1, 1 -> 0; then the run's M8 line */
+        std::vector<long long> sp, busy;
+        const char* key = "(tp8 loop D62): so far ";
+        for (size_t at = llog.find(key); at != std::string::npos; at = llog.find(key, at + 1)) {
+            long long n = -1, s2 = -1, r = -1, b = -1;
+            (void)std::sscanf(llog.c_str() + at + std::strlen(key), "%lld newcomers lent to the BG lanes, %lld of them in two pieces, "
+                                                                    "%lld whole for want of two lanes' room, %lld", &n, &s2, &r, &b);
+            sp.push_back(s2);
+            busy.push_back(b);
+        }
+        long long split_end = -1, busy_end = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            if (const size_t r = llog.find(" rows; ", at); r != std::string::npos) {
+                split_end = std::atoll(llog.c_str() + r + 7);
+                if (const char* w = std::strstr(llog.c_str() + r, "room, ")) busy_end = std::atoll(w + 6);
+            }
+        const bool lines_ok = sp.size() == 3 && split_end >= 0;
+        const long long s_2 = lines_ok ? sp[1] - sp[0] : -1, s_1 = lines_ok ? sp[2] - sp[1] : -1, s_0 = lines_ok ? split_end - sp[2] : -1;
+        fprintf(stderr, "    pp_bg_split 2 / 1 / 0 in process, BG lanes 2, %d lanes W(%s): %d / %d / %d of %zu requests differ; newcomers cut "
+                        "%lld / %lld / %lld (kept whole for a busy BG lane under 2: %lld)\n", a.lanes, a.cut, differ[0], differ[1],
+                differ[2], ref.size(), s_2, s_1, s_0, lines_ok && busy.size() == 3 ? busy[1] - busy[0] : -1);
+        if (!lines_ok || differ[0] || differ[1] || differ[2])
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 20).c_str());
+        CHECK_EQ(differ[0], 0);
+        CHECK_EQ(differ[1], 0);
+        CHECK_EQ(differ[2], 0);
+        CHECK(lines_ok);
+        CHECK(s_2 >= 1);
+        CHECK(s_1 >= 1);
+        CHECK_EQ(s_0, 0LL);
+        CHECK(busy_end >= 0);
+        CHECK(llog.find("two-node pipeline: RADIANCE_PP_BG_SPLIT=") == std::string::npos);   /* no start env: the switch alone */
+    }
+}
+
 /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2 + RADIANCE_PP_NODE_IDLE_S=1 on both nodes): the node-idle time BY STRETCH -- with a BG
  * step in flight or without -- beside D8's line, with newcomers lent whole to a BG lane (3 lanes, BG_LANE=1, W(1,3), the
  * follower's one-layer segments): every request's tokens are one process's; each node's run line is D8's (the same text, so
