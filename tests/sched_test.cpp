@@ -27,6 +27,9 @@
 #include <string>
 
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>   /* tp8 loop D63: the thread's timer slack */
+#endif
 
 using namespace rad;
 
@@ -3581,9 +3584,10 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK_EQ(fn4::switch_index("host_spin"), 111);       /* tp8 loop D61 */
     CHECK_EQ(fn4::switch_index("pp_bg_split"), 112);     /* tp8 loop D62 (the leader's lanes, as pp_bg_room) */
     CHECK_EQ(fn4::switch_index("aql_cik"), 113);         /* tp8 loop W9 (the AQL backend, both nodes) */
+    CHECK_EQ(fn4::switch_index("host_slack"), 114);      /* tp8 loop D63 (each node's own threads) */
     CHECK(fn4::sched_switch(fn4::kPpBgSplit));
     CHECK(!fn4::follower_switch(fn4::kPpBgSplit));
-    CHECK_EQ(i + 20, (int)fn4::kSwitches);
+    CHECK_EQ(i + 21, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -3642,7 +3646,7 @@ TEST(exl3_x3d_pf_is_the_exl3r4d_plugins_switch_after_pp_seg_set) {
     REQUIRE(i == (int)fn4::kExl3X3dPf);
     CHECK_EQ(i, 96);
     CHECK_EQ(i, (int)fn4::kPpSegSet + 1);
-    CHECK_EQ(i + 18, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 19, (int)fn4::kSwitches);   /* tp8 loop D39: pp_tband (97) after it; tp8 MERGE: pp_merge 98 / pp_merge_ms 99; P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(std::string(fn4::switch_name(i)) == "exl3_x3d_pf");
     CHECK(!fn4::sched_switch(i));
     CHECK(fn4::follower_switch(i));
@@ -3660,7 +3664,7 @@ TEST(pp_tband_is_the_leaders_switch_after_exl3_x3d_pf) {
     REQUIRE(i == (int)fn4::kPpTband);
     CHECK_EQ(i, 97);
     CHECK_EQ(i, (int)fn4::kExl3X3dPf + 1);
-    CHECK_EQ(i + 17, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 18, (int)fn4::kSwitches);   /* tp8 MERGE: pp_merge 98 / pp_merge_ms 99 after it; tp8 loop P41: pp_rband 100; P44: sched_srf 101; U1: aql_hdp 102; P47: ds41_csplit 103; D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(std::string(fn4::switch_name(i)) == "pp_tband");
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -3771,7 +3775,7 @@ TEST(pp_seg_set_is_the_followers_switch_n_and_stride) {
     const int i = fn4::switch_index("pp_seg_set");
     REQUIRE(i == (int)fn4::kPpSegSet);
     CHECK_EQ(i, 95);
-    CHECK_EQ(i + 19, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101; U1: 102; P47: 103; D56: 104; P46: 105; W1s: 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 20, (int)fn4::kSwitches);   /* tp8 loop PX1: exl3_x3d_pf (96) after it; tp8 loop D39: pp_tband (97); tp8 MERGE: 98 / 99; P41: 100; P44: 101; U1: 102; P47: 103; D56: 104; P46: 105; W1s: 106; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "pp_seg_set");
@@ -11794,7 +11798,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, host_slack, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12766,7 +12770,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, host_slack, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
@@ -13389,7 +13393,7 @@ TEST(ds41_csplit_is_a_follower_plugin_switch_after_aql_hdp) {
     REQUIRE(i == (int)fn4::kDs41Csplit);
     CHECK_EQ(i, (int)fn4::kAqlHdp + 1);
     CHECK_EQ(i, 103);
-    CHECK_EQ(i + 11, (int)fn4::kSwitches);   /* D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 12, (int)fn4::kSwitches);   /* D56: sched_lane_room 104; P46: pp_send_ash 105; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     CHECK(std::string(fn4::switch_name(i)) == "ds41_csplit");
@@ -13411,7 +13415,7 @@ TEST(dspark_mhr_and_dspark_hs_are_follower_plugin_switches_after_ds41_rr1) {
     CHECK_EQ(m, (int)fn4::kDs41Rr1 + 1);
     CHECK_EQ(m, 109);
     CHECK_EQ(h, 110);
-    CHECK_EQ(h + 4, (int)fn4::kSwitches);
+    CHECK_EQ(h + 5, (int)fn4::kSwitches);
     for (const int i : { m, h }) {
         CHECK(fn4::follower_switch(i));
         CHECK(!fn4::sched_switch(i));
@@ -17006,7 +17010,7 @@ TEST(pp_send_ash_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, 105);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 9, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
+    CHECK_EQ(i + 10, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::string err;
@@ -17031,7 +17035,7 @@ TEST(aql_waitk_the_switch_takes_0_1_2_and_reads_its_env_unset) {
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, 106);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 8, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
+    CHECK_EQ(i + 9, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
     CHECK(std::string(fn4::switch_name(i)) == "aql_waitk");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17065,7 +17069,7 @@ TEST(aql_cik_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kAqlCik);
     CHECK_EQ(i, 113);
     CHECK_EQ(i, (int)fn4::kPpBgSplit + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "aql_cik");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17087,6 +17091,92 @@ TEST(aql_cik_the_switch_takes_0_1_needs_its_env_and_follows) {
     CHECK(fn4::state_json().find("\"aql_cik\": 0") != std::string::npos);
 }
 
+/* tp8 loop D63 (fn4 host_slack): 114, the last, the core's on BOTH nodes (a follower switch: each node's own threads), not the
+ * scheduler's; 0 .. 1000 (us), anything else refused by name; unset (RADIANCE_HOST_SLACK unset here) = 0. While it was never above 0
+ * a covered sleep is a plain sleep_for (no count, no prctl: the thread keeps its default slack); at v > 0 the thread's timer slack is
+ * v x 1000 ns before its next covered sleep (prctl PR_GET_TIMERSLACK reads it back), each thread its own; back at 0 the thread's
+ * default again. Sleeps are counted per site once it was above 0 (asked / slept), slack_line prints them, a change prints and zeroes
+ * them (apply_pending -> slack_take). M (printed): 200 sleeps of 20 us at the default slack and at 1 us on this host. */
+TEST(host_slack_the_switch_takes_0_to_1000_us_and_sets_each_threads_timer_slack) {
+    DstSwitches restore;
+    const int i = fn4::switch_index("host_slack");
+    REQUIRE(i == (int)fn4::kHostSlack);
+    CHECK_EQ(i, 114);
+    CHECK_EQ(i, (int)fn4::kAqlCik + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(std::string(fn4::switch_name(i)) == "host_slack");
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    REQUIRE(std::getenv("RADIANCE_HOST_SLACK") == nullptr);
+    CHECK_EQ(fn4::host_slack(), 0);
+    CHECK(fn4::state_json().find("\"host_slack\": 0") != std::string::npos);
+    std::string err;
+    for (int v : { 0, 1, 50, 1000 }) CHECK(fn4::check("host_slack", v, &err));
+    for (int v : { -1, 1001, 100000 }) {
+        CHECK(!fn4::check("host_slack", v, &err));
+        CHECK(err.find("host_slack takes 0") != std::string::npos);
+    }
+#if defined(__linux__)
+    auto slack_ns = [] { return (long)prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0); };
+    const long d0 = slack_ns();
+    CHECK(d0 > 0);
+    auto mean_us = [](int n) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < n; ++k) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count() / 1e3 / n;
+    };
+    /* never above 0: a plain sleep, nothing counted, the slack untouched */
+    fn4::slack_sleep_us(20, fn4::kSlackNap);
+    fn4::nap_us(20);
+    CHECK(fn4::slack_line().empty());
+    CHECK_EQ(slack_ns(), d0);
+    const double at_default = mean_us(200);
+    CHECK(DstSwitches::set("host_slack", 1));
+    CHECK_EQ(fn4::host_slack(), 1);
+    CHECK(fn4::state_json().find("\"host_slack\": 1") != std::string::npos);
+    CHECK_EQ(slack_ns(), d0);   /* set at the thread's next covered sleep, not by the switch */
+    fn4::slack_apply();
+    CHECK_EQ(slack_ns(), 1000L);
+    const double at_one = mean_us(200);
+    fprintf(stderr, "    M: sleep_for(20 us) x 200 on this host: %.1f us mean at the thread's default slack (%ld ns), %.1f us at "
+                    "host_slack 1\n", at_default, d0, at_one);
+    const auto t0 = std::chrono::steady_clock::now();
+    fn4::slack_sleep_us(50, fn4::kSlackNap);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::microseconds(50));
+    fn4::nap_us(20);   /* host_spin 0: the nap sleeps, counted as a lane nap */
+    fn4::slack_sleep_us(20, fn4::kSlackLinkSend);
+    fn4::slack_sleep_us(20, fn4::kSlackLinkRecv);
+    fn4::slack_sleep_us(20, fn4::kSlackRing);
+    std::string sl = fn4::slack_line();
+    CHECK(sl.find("host_slack 1's sleeps: lane naps 2 (asked 35.0 us, slept ") != std::string::npos);
+    CHECK(sl.find("link send proxy 1 (asked 20.0 us") != std::string::npos);
+    CHECK(sl.find("link receive completions 1 (asked 20.0 us") != std::string::npos);
+    CHECK(sl.find("ring waits 1 (asked 20.0 us") != std::string::npos);
+    /* each thread its own: another thread at 7 us, this one still at 1 until it applies */
+    CHECK(DstSwitches::set("host_slack", 7));
+    long other = -1;
+    std::thread t([&] {
+        fn4::slack_sleep_us(20, fn4::kSlackRing);
+        other = (long)prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    });
+    t.join();
+    CHECK_EQ(other, 7000L);
+    CHECK_EQ(slack_ns(), 1000L);
+    CHECK(fn4::slack_line().find("host_slack 7's sleeps: ring waits 1 (asked 20.0 us") != std::string::npos);   /* 1's counts taken */
+    fn4::slack_apply();
+    CHECK_EQ(slack_ns(), 7000L);
+    /* back to 0: the thread's default at its next covered sleep; the counts go with the change */
+    CHECK(DstSwitches::set("host_slack", 0));
+    CHECK(fn4::slack_line().empty());
+    fn4::slack_sleep_us(20, fn4::kSlackNap);
+    CHECK_EQ(slack_ns(), d0);
+    CHECK(fn4::slack_line().find("host_slack 0's sleeps: lane naps 1 (asked 20.0 us") != std::string::npos);   /* counted once it was on */
+#endif
+    CHECK(!DstSwitches::set("host_slack", 1001));
+    CHECK_EQ(fn4::host_slack(), 0);
+    (void)fn4::slack_take(0);
+}
+
 /* tp8 loop W3s (fn4 aql_ika): 107, the last, the AQL backend's on BOTH nodes (a follower switch: each node's own played packets),
  * not the scheduler's; 0 / 1, anything else refused by name; 1 needs RADIANCE_AQL_IKA=1 at start (which kernels are self-acquiring is
  * read at their first launch), so with the env unset here 1 is refused naming it, 0 is taken and the switch reads 0. That the
@@ -17098,7 +17188,7 @@ TEST(aql_ika_the_switch_takes_0_1_needs_its_env_and_follows) {
     REQUIRE(i == (int)fn4::kAqlIka);
     CHECK_EQ(i, 107);
     CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
-    CHECK_EQ(i + 7, (int)fn4::kSwitches);
+    CHECK_EQ(i + 8, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "aql_ika");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
@@ -17135,7 +17225,7 @@ TEST(host_spin_the_switch_takes_n_and_sites_and_starts_off) {
     REQUIRE(i == (int)fn4::kHostSpin);
     CHECK_EQ(i, 111);
     CHECK_EQ(i, (int)fn4::kDsparkHs + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);
     CHECK(std::string(fn4::switch_name(i)) == "host_spin");
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));

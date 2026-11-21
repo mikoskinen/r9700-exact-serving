@@ -5697,6 +5697,129 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
             CHECK(llog.find("RADIANCE_HOST_SPIN=99999 is not 0 .. 4095") != std::string::npos);
     }
 }
+/* tp8 loop D63 (fn4 host_slack, both nodes; timing only): the DSpark-drafted pipeline with every covered poll sleep under a 1-us
+ * timer slack -- the lane loops' naps, the link's send proxy, the ring waits (the verbs receive-completion thread needs an RDMA device:
+ * cards only) -- serves one process's tokens at 1 lane and 2 lanes at the wrap-around cut W(1,3), 3 lanes W(0,3) and BEST's shape
+ * (4 lanes, BG 2, READY_FIRST) from the start env, and in process at 2 lanes (POST 1 -> 0 -> 20, both nodes apply it, 1001 refused);
+ * the sleep counts name the sites on both nodes; unset / a bad env value = no prctl, no count, no line. */
+TEST(d63_host_slack_on_the_drafted_pipeline_keeps_one_process_tokens) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    std::vector<Drafted> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    auto post = [](int port, int v, int want) {
+        std::string out;
+        Call c;
+        const int st = c.send(port, "/admin/fn4", json{ { "host_slack", v } }.dump()) ? c.read(&out) : -1;
+        CHECK_EQ(st, want);
+        if (want == 400) CHECK(out.find("host_slack takes 0") != std::string::npos);
+        if (st != want) fprintf(stderr, "    POST host_slack %d: %d %s\n", v, st, out.c_str());
+    };
+    /* a site's sleeps over the run: the lines that partition it -- each change's 'before that change' line and the engine's end line
+     * ('since the last change of host_slack'); the periodic lines are running totals since the last change, not summed */
+    auto count = [](const std::string& log, const char* site) {
+        long long sum = 0;
+        const std::string key = std::string(site) + " ";
+        for (size_t at = log.find("'s sleeps: "); at != std::string::npos; at = log.find("'s sleeps: ", at + 1)) {
+            const size_t b0 = log.rfind('\n', at), e0 = log.find('\n', at);
+            const std::string line = log.substr(b0 == std::string::npos ? 0 : b0 + 1,
+                                                e0 == std::string::npos ? std::string::npos : e0 - (b0 == std::string::npos ? 0 : b0 + 1));
+            if (line.find("since the last change of host_slack") == std::string::npos && line.find("before that change") == std::string::npos)
+                continue;
+            const size_t k = line.find(key);
+            if (k == std::string::npos) continue;
+            long long n = 0;
+            if (std::sscanf(line.c_str() + k + key.size(), "%lld (asked", &n) == 1) sum += n;
+        }
+        return sum;
+    };
+    struct Arm { int lanes; int bg; const char* cut; const char* env; bool post; };
+    for (const Arm a : { Arm{ 1, -1, "1,3", "1", false }, Arm{ 2, -1, "1,3", "1", false }, Arm{ 3, -1, "0,3", "1", false }, Arm{ 4, 2, "1,3", "1", false },
+                         Arm{ 2, -1, "1,3", nullptr, true }, Arm{ 2, -1, "1,3", "abc", false }, Arm{ 2, -1, "1,3", nullptr, false } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_BGRATE_LINE_S=1");
+        if (a.env) env.push_back(std::string("RADIANCE_HOST_SLACK=") + a.env);
+        if (a.bg >= 0) {
+            env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
+            env.push_back("RADIANCE_PP_READY_FIRST=1");
+        }
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(spec, lane_shape(a.lanes)), env));
+        std::vector<Drafted> got;
+        int d2 = 0;
+        if (a.post) {
+            post(pp.port, 1, 200);
+            got = drafted_set(pp.port);
+            post(pp.port, 0, 200);
+            const std::vector<Drafted> again = drafted_set(pp.port);
+            post(pp.port, 20, 200);
+            post(pp.port, 1001, 400);
+            const std::vector<Drafted> third = drafted_set(pp.port);
+            CHECK_EQ(again.size(), ref.size());
+            CHECK_EQ(third.size(), ref.size());
+            for (size_t i = 0; i < ref.size() && i < again.size() && i < third.size(); ++i)
+                d2 += (ref[i].tok != again[i].tok) + (ref[i].tok != third[i].tok);
+            CHECK_EQ(d2, 0);
+        } else {
+            got = drafted_set(pp.port);
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        long long accepted = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ref[i].tok != got[i].tok) ++differ;
+            accepted += got[i].accepted;
+        }
+        const long long lsend = count(llog, "link send proxy"), fsend = count(flog, "link send proxy");
+        const long long lring = count(llog, "ring waits"), fring = count(flog, "ring waits");
+        const long long lnap = count(llog, "lane naps"), fnap = count(flog, "lane naps");
+        const bool any_line = llog.find("host_slack") != std::string::npos && llog.find("'s sleeps: ") != std::string::npos;
+        fprintf(stderr, "    %d lanes%s W(%s) %s: %d of %zu prompts differ (%lld accepted)%s; sleeps counted -- leader send proxy %lld, ring "
+                        "waits %lld, naps %lld; follower send proxy %lld, ring waits %lld, naps %lld\n",
+                a.lanes, a.bg >= 0 ? " BG 2" : "", a.cut, a.post ? "POST 1 -> 0 -> 20" : a.env ? (std::string("RADIANCE_HOST_SLACK=") + a.env).c_str() : "unset",
+                differ, ref.size(), accepted, a.post ? (d2 ? ", repeats DIFFER" : ", repeats at 0 / 20 the same") : "", lsend, lring, lnap,
+                fsend, fring, fnap);
+        CHECK_EQ(differ, 0);
+        CHECK(accepted > 0);
+        const bool on = (a.env && !std::strcmp(a.env, "1")) || a.post;
+        for (const std::string* lg : { &llog, &flog }) {   /* the end lines: what a covered sleep asked and slept (M, host backend) */
+            const size_t at = lg->rfind("since the last change of host_slack");
+            if (at == std::string::npos) continue;
+            const size_t b0 = lg->rfind('\n', at);
+            fprintf(stderr, "      %s: %s\n", lg == &llog ? "leader" : "follower", lg->substr(b0 == std::string::npos ? 0 : b0 + 1, at - (b0 == std::string::npos ? 0 : b0 + 1)).c_str());
+        }
+        if (on) {
+            CHECK(lsend > 0);   /* the leader's send proxy slept between its frames' payloads, counted */
+            CHECK(fsend > 0);   /* the follower's too (its X2) */
+        } else {
+            CHECK_EQ(lsend + fsend + lring + fring + lnap + fnap, 0);   /* never above 0: no count */
+            CHECK(!any_line);
+        }
+        if (a.post) {
+            for (const std::string* lg : { &llog, &flog }) {
+                CHECK(lg->find("fn4: switches host_slack=1 applied at step ") != std::string::npos);
+                CHECK(lg->find("fn4: switches host_slack=0 applied at step ") != std::string::npos);
+                CHECK(lg->find("fn4: switches host_slack=20 applied at step ") != std::string::npos);
+            }
+            CHECK(llog.find("before that change, host_slack 1's sleeps: ") != std::string::npos);
+            CHECK(flog.find("before that change, host_slack 1's sleeps: ") != std::string::npos);
+        }
+        if (a.env && !std::strcmp(a.env, "abc"))
+            CHECK(llog.find("RADIANCE_HOST_SLACK=abc is not 0 .. 1000") != std::string::npos);
+    }
+}
 /* ------------------------------------------------------------------ tp8 MERGE */
 /* Four long decoders, then newcomers in two waves with a pause between: each wave's BG steps merge the decode lanes into lane 0
  * while they are in flight, the pause splits them back, and the newcomers decode on in whichever lane form comes next. */
