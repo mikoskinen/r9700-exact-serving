@@ -5844,17 +5844,22 @@ TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
             }
             return keys;
         };
-        long long hp = 0, tp = 0, fp = 0;
-        int hb = 0, tb = 0, fb = 0;
+        long long hp = 0, tp = 0, fp = 0, dp = 0;
+        int hb = 0, tb = 0, fb = 0, db = 0;
         const int hk = run_keys(llog, "head D", &hp, &hb);
-        const int tk = run_keys(llog, "tail (+ sampler, drafter, step end) D", &tp, &tb);
+        const int tk = run_keys(llog, "tail (+ logits, sampler) D", &tp, &tb);
+        const int dk = run_keys(llog, "drafter + step end D", &dp, &db);
         const int fk = run_keys(flog, "pass D", &fp, &fb);
+        /* the D8 line's parts over the run: a tail is two parts with the setting on (the drafter's own) */
+        long long d8parts = -1;
+        if (const size_t at = llog.rfind("node idle (RADIANCE_PP_NODE_IDLE="); at != std::string::npos)
+            if (const size_t q = llog.find(" %, ", llog.find("in parts ", at)); q != std::string::npos) d8parts = std::atoll(llog.c_str() + q + 4);
         const long long lw = count(llog, key), fw = count(flog, key);
         fprintf(stderr, "    D68 %d lanes%s W(%s) NODE_IDLE=%s PARTS=%s: %d of %zu prompts differ (%lld accepted); lines leader %lld / follower "
-                        "%lld; the run's clean keys: leader head D %d (%lld parts), tail D %d (%lld parts), follower pass D %d (%lld parts); "
-                        "malformed %d\n",
+                        "%lld; the run's clean keys: leader head D %d (%lld parts), tail D %d (%lld parts), drafter D %d (%lld parts), follower "
+                        "pass D %d (%lld parts); malformed %d; the D8 line's parts over the run %lld\n",
                 a.lanes, a.bg >= 0 ? " BG 2" : "", a.cut, a.idle ? a.idle : "unset", a.parts ? a.parts : "unset", differ, ref.size(), accepted,
-                lw, fw, hk, hp, tk, tp, fk, fp, hb + tb + fb);
+                lw, fw, hk, hp, tk, tp, dk, dp, fk, fp, hb + tb + fb + db, d8parts);
         CHECK_EQ(differ, 0);
         CHECK(accepted > 0);
         if (a.idle && a.parts && !std::strcmp(a.parts, "1")) {
@@ -5862,8 +5867,10 @@ TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
             CHECK(fw >= 2);
             CHECK(hk > 0);
             CHECK(tk > 0);
+            CHECK(dk > 0);
             CHECK(fk > 0);
-            CHECK_EQ(hb + tb + fb, 0);
+            CHECK(dp > 0 && dp <= tp + 4);   /* a drafter part a tail (the run's clean keys) */
+            CHECK_EQ(hb + tb + fb + db, 0);
             CHECK(llog.find("RADIANCE_PP_NODE_IDLE_PARTS=1 -- + the parts' card time by kind") != std::string::npos);
             if (a.lanes == 4)   /* the lines as a start prints them */
                 for (const std::string* lg : { &llog, &flog })
