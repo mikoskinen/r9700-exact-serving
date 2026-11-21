@@ -13094,7 +13094,8 @@ TEST(flashnext_psp_pairs_the_full_pieces_of_an_odd_step_and_keeps_the_last_singl
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's
  * read once there -- then ONE all_gather_rows over the block input's 8,192 rows and its codes a piece at a time (four hc_codes);
- * the embedding, its all-reduce and the K / V store stay whole. Control arms keep today's pass (gather + mtp_enter over 8,192
+ * the embedding, its all-reduce and the K / V store stay whole; with bit 2048 too (3072) the embedding's all-reduce is one raw
+ * reduce_scatter_rows over the 8,192 rows instead. Control arms keep today's pass (gather + mtp_enter over 8,192
  * rows, four piece reads, no gather of x): the bit off; the bit on with drafting rows in the pass; the bit on without the
  * declare (RADIANCE_FN4_MSP unset: nothing declared). Every operand fits and no step fails. */
 TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
@@ -13102,7 +13103,10 @@ TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
     setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
-    for (int arm : { 0, 1, 2, 3 }) {   /* 0: bit off; 1: MSP; 2: bit on, drafting rows; 3: bit on, not declared */
+    /* 0: bit off; 1: MSP; 2: bit on, drafting rows; 3: bit on, not declared; 4: MSP + 2048; 5: MSP on a model with a media path
+     * (Flash-Next declares a vision tower: line 74 read a no-op while the condition refused such a model); 6: bit on, media rows
+     * in the pass (today's path) */
+    for (int arm : { 0, 1, 2, 3, 4, 5, 6 }) {
         if (arm == 3) unsetenv("RADIANCE_FN4_MSP"); else setenv("RADIANCE_FN4_MSP", "1", 1);
         for (int rank = 0; rank < 4; ++rank) {
             RadBuilder b;
@@ -13115,12 +13119,16 @@ TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
             REQUIRE(m.have_mtp);
             CHECK_EQ(m.mtp.msp_ag != 0, arm != 3);
             CHECK_EQ(m.mtp.msp_rows, arm != 3 ? (int64_t)2048 : (int64_t)0);
+            CHECK_EQ(m.mtp.msp_rs != 0, arm != 3);
             const int64_t HN = m.hccfg.hc * m.g.n_embd, D = m.g.n_embd;
+            if (arm == 5) m.mtp.media = true;
             qwen4exp_fp8::fn4_sp_flag().store(2);
-            qwen4exp_fp8::fn4_sproute_flag().store(arm == 0 ? 0 : 1024);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm == 0 ? 0 : arm == 4 ? 3072 : 1024);
             const auto pf = kit(b, {}, { 8192 }, 2048);
             auto his = history_pass(b, *pf);
             if (arm != 2) { his->b.n_draft_out = 0; his->b.draft_out_ids = nullptr; }
+            static const int32_t mm_row0 = 0;
+            if (arm == 6) { his->b.n_mm_rows = 1; his->b.mm_rows = &mm_row0; }
             const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get(), his.get() }, rank, 4);
             qwen4exp_fp8::fn4_sproute_flag().store(0);
             qwen4exp_fp8::fn4_sp_flag().store(0);
@@ -13128,6 +13136,7 @@ TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
             const RadCtx& c = *v[1];
             CHECK(c.step_fail.empty());
             int64_t enter_n = 0, enter_at = -1, gath_n = 0, gath_at = -1, rd_attn = 0, rd_at = -1, ag = 0, codes = 0, kv = 0;
+            int64_t e_ar = 0, e_rs = 0;
             for (const RecIssue& i : c.issues) {
                 const RecOp* o = b.op_of(i.op);
                 if (!o) continue;
@@ -13137,13 +13146,18 @@ TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
                 if (i.op == m.mtp.hc_attn.op_read) { ++rd_attn; rd_at = i.opd[0].offset; }
                 if (o->op == "all_gather_rows") { ++ag; CHECK_EQ(i.n, (int64_t)8192 * D); }
                 if (m.mtp.hc_attn.op_codes && i.op == m.mtp.hc_attn.op_codes) ++codes;
+                if (m.mtp.op_embed_ar && i.op == m.mtp.op_embed_ar) ++e_ar;
+                if (m.mtp.msp_rs && i.op == m.mtp.msp_rs) { ++e_rs; CHECK_EQ(i.n, (int64_t)8192 * D); }
                 if (o->op == "kv_store" || o->op == "qk_norm_rope_gate_kv_store") ++kv;
             }
             rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
             m.pipe_cu_h = nullptr;
             m.pipe_cu_tried = false;
             CHECK(kv > 0);
-            if (arm == 1) {
+            CHECK_EQ(e_ar + e_rs, (int64_t)1);   /* the embedding's one collective: the reduce-scatter at 3072 only */
+            CHECK_EQ(e_rs, arm == 4 ? (int64_t)1 : (int64_t)0);
+            m.mtp.media = false;
+            if (arm == 1 || arm == 4 || arm == 5) {
                 CHECK_EQ(enter_n, (int64_t)2048);
                 CHECK_EQ(enter_at, (int64_t)rank * 2048 * HN);
                 CHECK_EQ(gath_n, (int64_t)2048);

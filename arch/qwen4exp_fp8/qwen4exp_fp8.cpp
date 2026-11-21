@@ -2055,10 +2055,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    m.w_tok, m.w_lm_head, m.hccfg, g.max_spec, tw, ts));
         if (fn4_env_on("RADIANCE_FN4_MSP") && g.rank == 0 && !ctx->shape_probe)
             fprintf(stderr, "radiance: qwen4exp: lever MSP (RADIANCE_FN4_MSP; sp_route bit 1024): %s\n",
-                    m.mtp.msp_ag ? "a prompt's mid-chunk MTP history pass of four read pieces runs its gather, mtp_enter and "
-                                   "connection read on this rank's piece, then gathers the block input raw and redoes its codes"
-                                 : "NOT served -- needs four ranks, SP-hc / SP-serial served (RADIANCE_FN4_SPHC or _SPSERIAL), "
-                                   "the exact wire, a read piece (--prefill-span) and the connection's codes op");
+                    !m.mtp.msp_ag ? "NOT served -- needs four ranks, SP-hc / SP-serial served (RADIANCE_FN4_SPHC or _SPSERIAL), "
+                                    "the exact wire, a read piece (--prefill-span) and the connection's codes op"
+                    : m.mtp.msp_rs ? "a prompt's mid-chunk MTP history pass of four read pieces runs its gather, mtp_enter and "
+                                     "connection read on this rank's piece, then gathers the block input raw and redoes its codes "
+                                     "(bit 2048: its embedding by a raw reduce-scatter onto the piece)"
+                                   : "a prompt's mid-chunk MTP history pass of four read pieces runs its gather, mtp_enter and "
+                                     "connection read on this rank's piece, then gathers the block input raw and redoes its codes "
+                                     "(bit 2048 not served: the embedding's reduce-scatter did not resolve)");
         /* A head pass refills the rope table ahead of the head's ops (step), while the carry
          * `mtp_hin` still holds the rows the previous pass left. The refill is the trunk's
          * `rope_table` op, so the table's planned life would end at its last declared reader,
@@ -3187,7 +3191,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
             RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
         m.mtp.qsa_win_cu = pipe_bounds(c, batch, m);
-        m.mtp.msp_now = (fn4_sproute_flag().load(std::memory_order_relaxed) & 1024) != 0;   /* lever MSP */
+        m.mtp.msp_now    = (fn4_sproute_flag().load(std::memory_order_relaxed) & 1024) != 0;   /* lever MSP */
+        m.mtp.msp_rs_now = (fn4_sproute_flag().load(std::memory_order_relaxed) & 2048) != 0;   /* MSP's embedding reduce-scatter */
         m.mtp.step(c, batch);
         return;
     }
@@ -3449,7 +3454,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 2047) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares) */
+        if (value < 0 || value > 4095) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);

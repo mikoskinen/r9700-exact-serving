@@ -164,9 +164,14 @@ struct MtpHcBlock {
     rad_op  msp_ag   = 0;
     int64_t msp_rows = 0;
     bool    msp_now  = false;
+    /* MSP's embedding as a raw reduce-scatter onto the rank's piece instead of the all-reduce (mtp_enter reads only its own
+     * rows' `e`): the all-reduce's per-element fold (fp32, ascending source rank, one rounding; r4d_ar_entry.hip sp_rows) on
+     * half its link bytes; declared with msp_ag at the plugin's reduce-scatter bound (one shared instance), picked by msp_rs_now. */
+    rad_op  msp_rs     = 0;
+    bool    msp_rs_now = false;
     bool msp_takes(const RadBatch* batch) const {
         return msp_now && msp_ag && msp_rows > 0 && g.world > 1 && batch->draft_pass < 0 && batch->n_draft_out <= 0 &&
-               batch->n_seq == 1 && !media && batch->n_tok == (int64_t)g.world * msp_rows &&
+               batch->n_seq == 1 && batch->n_mm_rows <= 0 && batch->n_tok == (int64_t)g.world * msp_rows &&
                batch->n_out == batch->n_tok && batch->out_ids && hc_attn.c.read_rows == msp_rows &&
                (!hc_attn.c.quant || hc_attn.op_codes);
     }
@@ -298,6 +303,13 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     /* lever MSP: the block input's codes redone after the gather (declared only when the plugin asks for MSP); a library that
      * does not serve them leaves today's pass (msp_ag 0) */
     if (msp_ag && msp_rows > 0 && hc_attn.declare_codes(b, msp_rows) != RAD_OK) { msp_ag = 0; msp_rows = 0; }
+    if (msp_ag && g.world == 4)
+        msp_rs = rw(b, RAD_OP(b, "reduce_scatter_rows",
+                        RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, rows * g.n_embd),
+                                   RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", 1),
+                                   RAD_INT("overlap", 1)),
+                        RAD_NOWEIGHTS),
+                    {w.e}, {w.e});
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv));
     attn.ar_out_take = hc_attn.ar_take();
     RAD_ARCH_TRY(attn.declare(b, nm, g, l, kv, rotary_dim, w.attn, src.attn,
@@ -621,7 +633,9 @@ inline void MtpHcBlock::step_msp(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE_N(c, op_gather, q, RAD_B(w.src), praw(batch->out_ids + q0, RAD_I32, q), brow_slice(w.hin, q0, q, HN));
     RAD_ISSUE(c, op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.e, T));
     mrows.step(c, batch, w.e, T);
-    if (op_embed_ar)
+    if (msp_rs && msp_rs_now)   /* rank r's piece of `e` whole, the other rows left partial (nothing reads them) */
+        RAD_ISSUE_N(c, msp_rs, (int64_t)T * g.n_embd, brows(w.e, T), RAD_NONE);
+    else if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.e, T), RAD_NONE);
     RAD_ISSUE_N(c, op_enter_flat && fn4_mtpflat_flag().load(std::memory_order_relaxed) ? op_enter_flat : op_enter, q,
                 brow_slice(w.hin, q0, q, HN), brow_slice(w.e, q0, q, g.n_embd), RAD_W(w_pre_h), RAD_W(w_pre_e),

@@ -275,14 +275,14 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
 
 /* qfn-on-ds (Qwen loop round 1, 20.11.2026): the core's range check for the Qwen line's plugin switches takes what the
  * merged libr4d / qwen4exp serve -- hc_readv 0..16383 (bits 11-12: lever B3R; bit 13: lever HWC, loop round 19), att_bi 0..6 (6: loop
- * round 3), bi_seg 0..3, sp_route 0..2047 (bit 1024: lever MSP, loop round 20) -- and
+ * round 3), bi_seg 0..3, sp_route 0..4095 (bits 1024 / 2048: lever MSP, loop round 20) -- and
  * refuses one past each, naming the range; a refused value is never queued. */
 TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
     std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
     std::string why;
     struct R { const char* name; int hi; };
-    for (const R& r : { R{ "hc_readv", 16383 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 2047 } }) {
+    for (const R& r : { R{ "hc_readv", 16383 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 4095 } }) {
         const int i = fn4::switch_index(r.name);
         REQUIRE(i >= 0);
         fn4::requests(n0.data(), v0.data());
