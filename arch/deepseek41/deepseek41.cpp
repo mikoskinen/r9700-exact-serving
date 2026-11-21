@@ -517,6 +517,11 @@ struct Dsp {
      * rows' bytes are the uncut pass's. Declared after every other DSpark op (liveness of what they touch stays to here). */
     rad_op hs_go = 0, hs_gh = 0, hs_cf = 0;
     std::vector<rad_op> hs_conf;
+    /* DRAFTER track round 68, lever DPH (dspark_mhr + 16; declared at the start env RADIANCE_DS41_DSPARK_DPH, g_sw_dmr's
+     * comment): the last stage's post_f + contract + fnorm as ONE mhc_post_collapse_rmsnorm_l256 (the norm in rmsnorm's own
+     * partition: out, x and fin are the three ops' bytes at every M); pcn_hr = the same with its y into the head's d.rows
+     * (lever DHS's passes: in place of hs_cf's copy). Declared after every other DSpark op (liveness to the end). */
+    rad_op pcn_h = 0, pcn_hr = 0;
     bool hs_ok = false;
     /* lever SD, sampled drafting (--draft-coupling on; fn4 draft_sample, the engine's): the walk of W1 sampled, a
      * dspark_walk_sample_step a step + the last merge (libr4d r4d_ds41_wsamp.hip). The coupling planes the engine finds
@@ -2171,7 +2176,15 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * element from +0.0f (r4d_ar_{one,two}shot_Nrank_exact.hip: acc = 0.0f, acc += each rank's), so d.x holds no -0.0, and the
  * embedding holds no NaN: col_a's output is d.x byte for byte and pre_f (read by nothing else before stage 0's mix_f writes
  * it) is dead. Three launches and two cross-queue hops off the pass's head (lq208 c32: rmsnorm at 104.8 us after the
- * lookup, ~86.8 without them). The same ops on the other passes; the walk, head and every stage past 0 as before. */
+ * lookup, ~86.8 without them). The same ops on the other passes; the walk, head and every stage past 0 as before.
+ * + 16 (DRAFTER track 21.11.2026 round 68, lever DPH; 16..31 = the bits below + DPH, start env RADIANCE_DS41_DSPARK_DPH=1 adds
+ * it to the start value, =0 declares its ops with the bit off) = the pass's tail before the head as ONE op: the last stage's
+ * post_f, d.contract and d.fnorm as ONE mhc_post_collapse_rmsnorm_l256 (libr4d round 68: mhc_post_collapse_rmsnorm with the
+ * norm's sum of squares in rmsnorm_bf16's own 256-lane partition, so out / x / fin are the three ops' bytes at every M -- the
+ * stage boundaries' mhc_post_collapse_rmsnorm folds over r4d_act_threads(M, n) threads and is not, LEVERS BI item 4;
+ * tools/dbench/dph: 0 of 45.5 M values differ); under lever DHS its y goes straight into the head's d.rows (hs_cf's copy
+ * dropped). Rule A: the head reads the same bytes. Two / three launches and their gaps off the path before the head.
+ * Declared where a kernel library declares the op (rad_op_declared: an older libr4d has none, nothing is declared). */
 static std::atomic<int> g_sw_dmr{-1};
 static std::atomic<int> g_dsp_sdf{0};    /* lever SDD: the DSpark MoE's shexp_lane word (kMoeSdfBit or 0; set at each query pass) */
 static std::atomic<int> g_ema_bad{0};    /* lever EMA: a rank of this process could not declare it: off on every rank */
@@ -2197,7 +2210,7 @@ static bool hs_env() {
 static bool hs_ok_all() { return g_sw_hs_ok.load(std::memory_order_relaxed) && !g_sw_hs_bad.load(std::memory_order_relaxed); }
 static int hs_now() { return hs_ok_all() ? g_sw_hs.load(std::memory_order_relaxed) : 0; }
 static std::atomic<long long> g_hs_passes{0};
-static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 8 */
+static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 8 + lever DPH's bit 16 */
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
@@ -2205,14 +2218,25 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dp = p && p[0] == '1' && !p[1] ? 8 : 0;
         if (p && *p && !dp && std::strcmp(p, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DPR=%s is not 0 / 1: lever DPR off at start\n", p);
+        const char* q = std::getenv("RADIANCE_DS41_DSPARK_DPH");   /* lever DPH (round 68): 1 = on at start, 0 = declared, off */
+        const int dq = q && q[0] == '1' && !q[1] ? 16 : 0;
+        if (q && *q && !dq && std::strcmp(q, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DPH=%s is not 0 / 1: lever DPH not declared\n", q);
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp);
+        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
 }
 static int dmr_now() { return dmr_raw() & 7; }
 static bool dpr_now() { return (dmr_raw() & 8) != 0; }   /* lever DPR (round 67) */
+static bool dph_now() { return (dmr_raw() & 16) != 0; }  /* lever DPH (round 68) */
+/* lever DPH: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
+static bool dph_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_DPH");
+    return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
+}
+static std::atomic<long long> g_dph_passes{0};   /* lever DPH (round 68): the first-pass line */
 static void walk_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_DSPARK_WALK");
@@ -3023,7 +3047,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 15 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 31 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3156,7 +3180,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5984,6 +6008,37 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                     hs_now(), d.hs_ok ? "declared" : "NOT declared: ", why ? why : "");
     }
 
+    /* Lever DPH (Dsp::pcn_h / pcn_hr, g_sw_dmr's comment + 16): after every other DSpark op (liveness of what they touch
+     * stays to here). Its operands: the last stage's post_f (act.x, the streams, post, comb -> the other streams), then
+     * d.contract's (pre_f -> d.x) and d.fnorm's (d.norm -> d.fin); pcn_hr writes y into d.rows (DHS's passes). The issue
+     * passes the stage's own stream buffers (DHS swaps them) as post_f does. Only where the stage pcn ops are (MHR set). */
+    d.pcn_h = d.pcn_hr = 0;
+    if (dph_env() && !m.zero && std::getenv("RADIANCE_DS41_DSPARK_MHR")) {
+        const char* why = nullptr;
+        const std::vector<RadParam> pcp = { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
+                                            RAD_STR("dtype", "bf16") };
+        if (!rad_op_declared(b, "mhc_post_collapse_rmsnorm_l256"))
+            why = "no kernel library here declares mhc_post_collapse_rmsnorm_l256 (libr4d before round 68)";
+        if (!why) {
+            d.pcn_h = fused(b, "mhc_post_collapse_rmsnorm_l256", pcp, { d.norm }, { d.act.x, d.h1, d.post, d.comb, d.pre_f },
+                            { d.h0, d.x, d.fin });
+            if (!d.pcn_h || !rad_op_resolved(b, d.pcn_h)) why = "mhc_post_collapse_rmsnorm_l256 does not resolve here";
+        }
+        if (!why && d.hs_ok) {
+            d.pcn_hr = fused(b, "mhc_post_collapse_rmsnorm_l256", pcp, { d.norm }, { d.act.x, d.h0, d.post, d.comb, d.pre_f },
+                             { d.h1, d.x, d.rows });
+            if (!d.pcn_hr || !rad_op_resolved(b, d.pcn_hr)) d.pcn_hr = 0;   /* DHS's passes keep post_f + contract + fnorm + hs_cf */
+        }
+        if (why) d.pcn_h = d.pcn_hr = 0;
+        rad_note(b, "DSpark lever DPH (RADIANCE_DS41_DSPARK_DPH): %s%s%s", why ? "NOT declared: " : "declared", why ? why : "",
+                 !why && d.pcn_hr ? " (+ the DHS form into the head's rows)" : "");
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: DSpark lever DPH (RADIANCE_DS41_DSPARK_DPH, fn4 dspark_mhr + 16, now %s) %s%s%s: the "
+                            "last stage's post_f + contract + fnorm as one mhc_post_collapse_rmsnorm_l256 (the three ops' "
+                            "bytes)\n", dph_now() ? "on" : "off", why ? "NOT declared: " : "declared", why ? why : "",
+                    !why && d.pcn_hr ? ", under DHS straight into the head's rows" : "");
+    }
+
     RadDrafterDecl drf{};
     drf.name = "dspark";
     drf.kind = RAD_DRAFT_BLOCK;
@@ -8537,6 +8592,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                 (long long)hsN, (long long)T, (long long)S, (long long)hsH);
     int64_t Tf = T;      /* rows of the streams after the last stage: N under DHS */
     rad_buf hF = d.h0;   /* the streams contract reads (lever DHS: d.h1) */
+    rad_buf hFb = d.h1;  /* lever DPH: the streams the last stage's post_f reads (lever DHS: d.h0) */
+    /* lever DPH (round 68; g_sw_dmr's comment, + 16): the last stage's post_f + contract + fnorm as one op (a function of the
+     * switches and the declare alone: the same on every pass; nothing in it is a collective) */
+    const bool dph = dph_now() && dmr3 && d.pcn_h;
     for (const auto& L : d.st) {
         const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
         const Layer* nx = &L != &d.st.back() ? &L + 1 : nullptr;
@@ -8638,20 +8697,33 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         } else {
             L.moe.step(x, batch);
         }
-        if (!(dmr3 && nx && nx->pcn_a))   /* else the next stage's pcn_a runs this post_f */
+        if (!(dmr3 && nx && nx->pcn_a) && !(dph && !nx))   /* else the next stage's pcn_a (lever DPH: the tail's op) runs it */
             RAD_ISSUE_N(x, L.post_f, Tq, brows(d.act.x, Tq), brows(hB, Tq), brows(d.post, Tq), brows(d.comb, Tq),
                         brows(hA, Tq));
         if (!nx) {
             Tf = Tq;
             hF = hA;
+            hFb = hB;
         }
     }
 
-    RAD_ISSUE_N(x, d.contract, Tf, brows(hF, Tf), brows(d.pre_f, Tf), brows(d.x, Tf));
-    RAD_ISSUE_N(x, d.fnorm, Tf, brows(d.x, Tf), RAD_W(d.norm), brows(d.fin, Tf));
     const int64_t N = batch->n_out;
+    /* lever DPH: under DHS (Tf = N, d.fin = the head rows in out_ids order) y goes straight into d.rows */
+    const bool dphr = dph && hs && d.pcn_hr && N > 0 && N == Tf;
+    if (dph) {
+        RAD_ISSUE_N(x, dphr ? d.pcn_hr : d.pcn_h, Tf, brows(d.act.x, Tf), brows(hFb, Tf), brows(d.post, Tf), brows(d.comb, Tf),
+                    brows(hF, Tf), brows(d.pre_f, Tf), brows(d.x, Tf), RAD_W(d.norm), brows(dphr ? d.rows : d.fin, Tf));
+        if (g.rank == 0 && g_dph_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+            fprintf(stderr, "radiance: deepseek41: lever DPH: first query pass issued with post_f + contract + fnorm as one op at %lld "
+                            "rows%s (counted at issue: a recorded pass once)\n", (long long)Tf, dphr ? ", into the head's rows" : "");
+    } else {
+        RAD_ISSUE_N(x, d.contract, Tf, brows(hF, Tf), brows(d.pre_f, Tf), brows(d.x, Tf));
+        RAD_ISSUE_N(x, d.fnorm, Tf, brows(d.x, Tf), RAD_W(d.norm), brows(d.fin, Tf));
+    }
     if (N <= 0) return;
-    if (hs)   /* lever DHS: d.fin already holds the head rows in out_ids order */
+    if (dphr) {
+        /* lever DPH: d.rows already holds the head rows */
+    } else if (hs)   /* lever DHS: d.fin already holds the head rows in out_ids order */
         RAD_ISSUE_N(x, d.hs_cf, N, brows(d.fin, N), brows(d.rows, N));
     else
         RAD_ISSUE_N(x, d.gather, N, brows(d.fin, T), praw(batch->out_ids, RAD_I32, N), brows(d.rows, N));
