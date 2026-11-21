@@ -460,10 +460,10 @@ void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __res
  *
  * h[c][i] += inj[c] * y[i], in place on the unnormed stream: the read's normalisation feeds the
  * block input and gates only, never the residual. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
-                     unsigned short* __restrict__ h,
-                     long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
+__device__ __forceinline__
+void hc_write_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                          unsigned short* __restrict__ h,
+                          long rows, long n, int hc, long yrow, long irow, long hrow) {
     const long r = blockIdx.y;
     if (r >= rows) return;
     /* Gains go through LDS, not a register array: with a runtime `hc`, `g[c]` would be a dynamic
@@ -481,6 +481,21 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
         }
     }
 }
+/* The plain and chained forms (r4d_chain.h; qfn-on-ds lever HWC, hc_readv bit 13): every block leaves through the wrapper. */
+__global__ __launch_bounds__(kThreads)
+void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                     unsigned short* __restrict__ h,
+                     long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
+    hc_write_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+}
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_write(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                       unsigned short* __restrict__ h,
+                       long rows, long n, int hc, long yrow, long irow, long hrow) {
+    r4d_chain_wait();
+    hc_write_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+    r4d_chain_done();
+}
 
 /* The same write, eight elements a thread (fn4 hcw, rebased 9.11.2026 from the 1.15.1 line's b9ebe5f):
  * 16-byte loads and stores of `y` and every stream of `h` where the plain form moves 2 bytes a thread
@@ -490,10 +505,10 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
  * form's. One work item = (row, 8-element word); a row's gains are read per stream from `inj`
  * (8 bytes, cached), not staged: rows of one workgroup differ. Taken under hc_write_vec() when n,
  * both row pitches and both bases are 16-byte multiples. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
-                         unsigned short* __restrict__ h,
-                         long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
+__device__ __forceinline__
+void hc_write_vec_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                              unsigned short* __restrict__ h,
+                              long rows, long n, int hc, long yrow, long irow, long hrow) {
     const long wpr  = n >> 3;                                  /* 8-element words a row */
     const long item = (long)blockIdx.x * kThreads + threadIdx.x;
     if (item >= rows * wpr) return;
@@ -512,6 +527,20 @@ void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned sh
         for (int k = 0; k < 8; ++k) o[k] = hv[k] + g * yv[k];
         *p = f2bf8(o);
     }
+}
+__global__ __launch_bounds__(kThreads)
+void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                         unsigned short* __restrict__ h,
+                         long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
+    hc_write_vec_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+}
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_write_vec(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                           unsigned short* __restrict__ h,
+                           long rows, long n, int hc, long yrow, long irow, long hrow) {
+    r4d_chain_wait();
+    hc_write_vec_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+    r4d_chain_done();
 }
 
 /* ============================================================== hc_project
@@ -4475,20 +4504,24 @@ static bool hc_write_vec(long rows) {
  * optional `ss` output, the read's optional `ss` input, both [rows][kHcMax] f32, used from kHcSsMinRows rows;
  * see hc_ss_on), bits 4-5 the codes stage's groups a wave (W2, hc_quant_rows_g_kernel: 0 one, 1 two, 2 four, 3 five);
  * bits 6-10 the bi_dec kernel-A' forms (G16, PF2 column split, G16p, scales once, G16q); bits 11-12 (qfn-on-ds lever B3R)
- * kernel B3 under bi_dec past 16 rows with 1 (0, today), 2 (1), 4 (2) or every (3) 16-row group a block (b3r_gpb).
- * -1 until the environment is read. */
+ * kernel B3 under bi_dec past 16 rows with 1 (0, today), 2 (1), 4 (2) or every (3) 16-row group a block (b3r_gpb); bit 13
+ * (qfn-on-ds lever HWC) hc_write in its chained forms (hc_write_chain). -1 until the environment is read. */
 static std::atomic<int> g_hc_readv{-1};
 static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 8191) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 16383) : 0;
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
     }
     return v;
 }
+/* qfn-on-ds lever HWC (hc_readv bit 13, Qwen loop round 19): hc_write in its chained forms where its row chains, up to
+ * kHcWriteChainRows rows (the decode steps past arw_rows: the hc reads behind it chain at these heights too). */
+constexpr long kHcWriteChainRows = 128;
+static bool hc_write_chain() { return (hc_readv() & 8192) != 0; }
 /* qfn-on-ds lever B3R: 16-row groups a block of kernel B3 under bi_dec at `rows` decode rows (hc_readv bits 11-12) */
 static int b3r_gpb(long rows) {
     const int code = (hc_readv() >> 11) & 3;
@@ -6233,10 +6266,10 @@ __device__ __forceinline__ float hc_write_scale_wave(unsigned short* hp, const u
 /* hc_write with the next read's norm scales (fn4 hc_readv bit 3): one wave a (row, stream), a workgroup two rows'
  * four streams (so the four waves of a row read its `y` together, from cache after the first). `ssout` is
  * [rows][kHcMax], the read's scale layout. n a multiple of 256, every base and pitch 16-byte aligned. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
-                        unsigned short* __restrict__ h, float* __restrict__ ssout,
-                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) { R4D_IKA_ENTRY();
+__device__ __forceinline__
+void hc_write_ss_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                             unsigned short* __restrict__ h, float* __restrict__ ssout,
+                             long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
     __shared__ float s_t[kWaves][kThreads];
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long p = (long)blockIdx.x * kWaves + wave;
@@ -6246,6 +6279,20 @@ void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned sho
     const float g  = bf2f(inj[r * irow + c]);
     const float sc = hc_write_scale_wave(h + r * hrow + (long)c * n, y + r * yrow, g, n, eps, lane, s_t[wave]);
     if (lane == 0) ssout[r * kHcMax + c] = sc;
+}
+__global__ __launch_bounds__(kThreads)
+void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                        unsigned short* __restrict__ h, float* __restrict__ ssout,
+                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) { R4D_IKA_ENTRY();
+    hc_write_ss_kernel_body(y, inj, h, ssout, rows, n, hc, yrow, irow, hrow, eps);
+}
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_write_ss(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                          unsigned short* __restrict__ h, float* __restrict__ ssout,
+                          long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
+    r4d_chain_wait();
+    hc_write_ss_kernel_body(y, inj, h, ssout, rows, n, hc, yrow, irow, hrow, eps);
+    r4d_chain_done();
 }
 
 __global__ __launch_bounds__(kThreads)
@@ -7328,6 +7375,11 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
      * (hc_norm_scale_kernel) into `ss`, so a read handed `ss` always finds them. `eps` is the read's; a write asked
      * for scales without it is refused rather than guessed. */
     const RadTensor* ss = hc_ss_operand(r4d_opt(a, HCW_SS), (long)rows);
+    /* qfn-on-ds lever HWC (hc_readv bit 13, Qwen loop round 19): the write's chained forms (r4d_chain.h: the same bodies between
+     * a wait and an add) where the row chains and the step holds at most kHcWriteChainRows rows. Past arw_rows the write
+     * sits between two chained kernels (the two-shot all-reduce before it, the read after it); its plain form kept the
+     * barrier bit on both sides (Qwen loop prof5 stamps: 96 + 85-94 ordered gaps a trunk pass at 32-128 rows). */
+    const bool ch = hc_write_chain() && r4d_geti_or(a, "chain", 0) != 0 && (long)rows <= kHcWriteChainRows;
     float eps = 0.0f;
     if (ss) {
         const double e = r4d_getf(a, "eps", -1.0);
@@ -7336,7 +7388,7 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
         if ((n % kThreads) == 0 && (yrow % 8) == 0 && (hrow % 8) == 0 &&
             ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
             const long nb = ((long)rows * hc + kWaves - 1) / kWaves;
-            return R4D_EMIT(stream, hc_write_ss_kernel, dim3((unsigned)nb), dim3(kThreads), 0,
+            return R4D_EMIT(stream, (ch ? &r4dchain_hc_write_ss : &hc_write_ss_kernel), dim3((unsigned)nb), dim3(kThreads), 0,
                             (const unsigned short*)y->data, (const unsigned short*)inj->data,
                             (unsigned short*)h->data, (float*)ss->data, (long)rows, (long)n, (int)hc,
                             (long)yrow, (long)irow, (long)hrow, eps);
@@ -7349,21 +7401,21 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
         ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
         const long items = (long)rows * (long)(n / 8);
         const unsigned vblocks = (unsigned)((items + kThreads - 1) / kThreads);
-        const int wrc = R4D_EMIT(stream, hc_write_vec_kernel, dim3(vblocks), dim3(kThreads), 0,
+        const int wrc = R4D_EMIT(stream, (ch ? &r4dchain_hc_write_vec : &hc_write_vec_kernel), dim3(vblocks), dim3(kThreads), 0,
                                  (const unsigned short*)y->data,
                                  (const unsigned short*)inj->data, (unsigned short*)h->data,
                                  (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
         if (wrc != RAD_OK || !ss) return wrc;
     } else {
         const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
-        const int wrc = R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
+        const int wrc = R4D_EMIT(stream, (ch ? &r4dchain_hc_write : &hc_write_kernel), dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
                                  (const unsigned short*)y->data,
                                  (const unsigned short*)inj->data, (unsigned short*)h->data,
                                  (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
         if (wrc != RAD_OK || !ss) return wrc;
     }
     /* The scales the fused form could not take: the read's own pass, into `ss`. */
-    return R4D_EMIT(stream, hc_norm_scale_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0,
+    return R4D_EMIT(stream, (ch ? &r4dchain_hc_norm_scale : &hc_norm_scale_kernel), dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0,
                     (const unsigned short*)h->data, (float*)ss->data, (long)rows, (long)n, (long)hrow, eps);
 }
 
@@ -8297,7 +8349,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 8191) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R */
+        if (value < 0 || value > 16383) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained) */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }

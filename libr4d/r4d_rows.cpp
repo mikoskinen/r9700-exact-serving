@@ -11899,6 +11899,9 @@ extern "C" int rad_kernel_chain(int i) {
         "router_gemm_topk_scatter_bf16", "moe_gemm_fp8a8", "moe_gemm_fp8a8_mod4", "gated_quant_fp8",
         /* ...and the rest of a delta-net layer */
         "hc_read_bf16", "hc_read_e4m3", "gdn_recurrent_update_k128_v128_bf16_fp32state",
+        /* qfn-on-ds lever HWC (Qwen loop round 19): the write between the two-shot all-reduce and the next read; its
+         * launch picks the chained forms only under hc_readv bit 13 (r4d_hc_bf16.hip hc_write_chain) */
+        "hc_write_bf16",
         "gdn_conv_recurrent_update_k128_v128_bf16", "ar_hc_write", "ar_gather_hc_write",
         /* fn4 10.11.: the four-rank fused all-reduce + write at width (r4d_ar_wide_chain.h: r4dchain_
          * wrappers around the unchanged kernel bodies, chained at <= r4d_chain_rows_ok rows) */
