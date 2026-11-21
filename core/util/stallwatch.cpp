@@ -322,10 +322,9 @@ void StuckExit::run() {
         lk.unlock();
         const double silent = (double)(now - last) / 1e9;
         const pid_t h = holder_.load(std::memory_order_relaxed);
-        RAD_ERR("%s: no progress for %.1f s -- ending the process with exit %d (RADIANCE_STUCK_EXIT_S: a loop that "
-                "waits this long waits on something that will not come; a supervisor restarts the process). The %s "
-                "loop's thread is %s", what_.c_str(), silent, code_, what_.c_str(),
-                h > 0 ? stall_describe_thread(h, true).c_str() : "not known");
+        RAD_ERR("%s: no progress for %.1f s -- ending the process with exit %d (a loop that waits this long waits on "
+                "something that will not come; a supervisor restarts the process). Its thread is %s", what_.c_str(),
+                silent, code_, h > 0 ? stall_describe_thread(h, true).c_str() : "not known");
         /* The callback (a pipeline's link fail: the other node goes down with this one) on a thread of its own, at
          * most fire_ms: it must not hold the exit behind a lock the stuck loop holds. */
         if (on_fire_) {
