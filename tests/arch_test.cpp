@@ -13023,6 +13023,73 @@ TEST(flashnext_psp_pairs_a_partial_last_piece_under_hc_sp_2) {
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* The same lever at an odd piece count: a 5,120-row step = 2,048 + 2,048 + a 1,024-row partial piece. Control: the step leaves the
+ * hc_sp 2 order (a partial piece), no joint pass (P2S takes even counts only), three routed passes a layer. PSP: the pair (0, 1)
+ * in one 4,096-row pass and the partial piece single in the SP order, its reads pinned to 1,024 rows. */
+TEST(flashnext_psp_pairs_the_full_pieces_of_an_odd_step_and_keeps_the_last_single) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    int64_t rs0 = -1, g0 = -1;
+    for (int arm : { 0, 1 })
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm ? 512 : 0);
+            const auto pf = kit(b, {}, { 5120 }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int64_t g2048 = 0, g1024 = 0, g4096 = 0, g_other = 0, rs = 0, kc1024 = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const bool routed = o->op.rfind("moe_gemm", 0) == 0 || o->op.rfind("moe_exl3", 0) == 0;
+                if (routed && o->op.find("shexp") == std::string::npos) {
+                    if (i.n == 2048) ++g2048; else if (i.n == 1024) ++g1024; else if (i.n == 4096) ++g4096; else ++g_other;
+                }
+                if (o->op == "reduce_scatter_rows") ++rs;
+                if (o->op == "hc_read")
+                    for (const RecParam& q : o->p) if (q.key == "kc_rows" && q.ival == 1024) ++kc1024;
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK_EQ(g_other, 0);
+            if (!arm) {
+                CHECK(g2048 > 0);
+                CHECK_EQ(g2048, 2 * g1024);
+                CHECK_EQ(g4096, 0);
+                CHECK_EQ(kc1024, 0);
+                rs0 = rs; g0 = g1024;
+            } else {
+                CHECK_EQ(g2048, 0);
+                CHECK_EQ(g4096, g0);
+                CHECK_EQ(g1024, g0);
+                CHECK(rs > rs0);
+                CHECK(kc1024 > 0);
+            }
+        }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */
 
 namespace {

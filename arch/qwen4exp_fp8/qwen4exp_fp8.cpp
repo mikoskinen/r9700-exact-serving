@@ -2287,8 +2287,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const int pmode = fn4_pair_flag().load(std::memory_order_relaxed);
     /* qfn-on-ds P2S: under hc_sp 2 the pairs ride the SP order (pair_sp, the branch below); the K = 2 form above keeps the
      * stock order (SP off) and takes only modes 1 / 2 when hc_sp is not 2 */
+    /* qfn-on-ds lever PSP (sp_route bit 512, below): also an odd piece count -- pairs (0, 1), (2, 3), .. and the last piece
+     * single (the loop's paired(); moe_pair 4's tail runs the same mix of joint and single passes) */
+    const bool psp_k = (fn4_sproute_flag().load(std::memory_order_relaxed) & 512) != 0;
     const bool pair_sp = pmode > 0 && m.sp_on && g.world == 4 && fn4_sp_flag().load(std::memory_order_relaxed) == 2 &&
-                         K >= 2 && K % 2 == 0 && (pmode == 3 || m.moecfg.rows >= 2 * R);
+                         K >= 2 && (K % 2 == 0 || psp_k) && (pmode == 3 || m.moecfg.rows >= 2 * R);
     const bool pair_on = pmode > 0 && pmode < 3 && !pair_sp && K == 2 && m.moecfg.rows >= T;
     /* fn4 SP-hc: sp, the real sequence-parallel residual (reduce-scatter, the connections on this rank's quarter, the
      * all-gather and the codes redone); spp, the speed probe (the quarter only, all-reduces kept, wrong output). A
@@ -2323,7 +2326,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * quarter's reads go through the SP-serial twins (HyperConn::read_kt, the K split pinned to the PIECE's own row tiles), which
      * is what reading the partial piece whole gives (spser_run's rule: every rank's part more than 64 rows, a twin for the
      * piece's tiles); the other ops are per row. So the same bytes as today; off = today. */
-    const bool psp = (fn4_sproute_flag().load(std::memory_order_relaxed) & 512) != 0;
+    const bool psp = psp_k;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2447,7 +2450,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                                  !(m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) &&
                                  [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }() &&
                                  (pmode == 3 || (l.mlp.pair_ok(2 * R, R) &&
-                                                 (rn(K - 1) == R || l.mlp.pair_ok(R + rn(K - 1), R))));   /* PSP's partial pair */
+                                                 (rn(K - 1) == R || K % 2 != 0 || l.mlp.pair_ok(R + rn(K - 1), R))));   /* PSP's partial pair */
         /* F50: counted over the step's layers and noted after the loop (layer 0 runs without SP under sp_ple 1, so a note
          * read at layer 0 alone said "today's order" while layers 1-47 paired) */
         if (pair_sp && g.rank == 0) {
