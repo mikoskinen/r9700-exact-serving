@@ -888,6 +888,11 @@
  *                   cycle opening with k = 1 .. 30 decoding sequences drafts the configured depth when bit k - 1 is set,
  *                   else D (k > 30: D); e.g. 55 = depth 4 at 1-3 and 5-6 sequences; 0 = the threshold (today)
  *                                                                                    RADIANCE_FN4_DRAFT_DMASK
+ *   aql_chi         core/device (qfn-on-ds lever CHI, Qwen loop round 8, COORD 05:43; the DRAFTER's r53 form): while lever IKA
+ *                   plays (RADIANCE_AQL_IKA=1) a CHAINED record (chained launches on: RADIANCE_FN4_CHAIN=1) is recorded as
+ *                   self-acquiring and plays with the packet's release none, and its acquire none where Ctx::haz_mark allows
+ *                   and its argument slot's previous use lies before the queue's last ordered packet with an acquire;
+ *                   0 today                                                          RADIANCE_FN4_AQL_CHI
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -935,6 +940,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRgTail,   /* qfn-on-ds lever RGT (Qwen loop round 5, 21.11.2026): libr4d, the fused router ranks per row tile */
               kGnq8,     /* qfn-on-ds lever GNQ8 (Qwen loop round 7, 21.11.2026): qwen4exp, the GDN prefill gated norm writes the codes */
               kDraftDmask,   /* qfn-on-ds lever DLM (Qwen loop round 7, COORD 05:36): the scheduler, DLH's depth by a mask of counts */
+              kAqlChi,   /* qfn-on-ds lever CHI (Qwen loop round 8, COORD 05:43): core/device, chained records without the packet fences */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
@@ -956,6 +962,7 @@ int  resume_cold();
 int  preempt_keep();
 int  kvs_bi();
 int  draft_dmask();                           /* lever DLM: the scheduler's mask of counts (0 = DLH's threshold) */
+int  aql_chi();                               /* lever CHI: chained records play without the packet fences under IKA */
 /* Whether switch i is one of the Qwen line's (kQwenFirst on). */
 inline bool qwen_switch(int i) { return i >= kQwenFirst && i < kSwitches; }
 /* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by

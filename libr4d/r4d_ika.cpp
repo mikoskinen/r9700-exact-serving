@@ -11,6 +11,10 @@ const char* const kIka[] = {
 #endif
     nullptr};
 }  // namespace
+#include "r4d_ika.h"
+/* Form B (r4d_ika.h): the listed kernels fence themselves only when the engine sets their hidden_global_offset_z (a played
+ * dispatch). 0 without R4D_IKA (empty list). */
+extern "C" __attribute__((visibility("default"))) int r4d_ika_protocol(void) { return R4D_IKA ? R4D_IKA_PROTOCOL : 0; }
 extern "C" __attribute__((visibility("default"))) const char* const* r4d_ika_kernels(int* n) {
     if (n) *n = (int)(sizeof(kIka) / sizeof(kIka[0])) - 1;
     return kIka;

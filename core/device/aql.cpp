@@ -177,6 +177,10 @@ struct KernelRec {
      * acquire (when no line it reads can be stale in a scalar cache: Ctx::haz_mark) and its release. Set from the list
      * the kernel's own library exports (r4d_ika_kernels), never guessed from a name alone. */
     bool        ika = false;
+    /* Lever IKA form B (Qwen loop round 8; libr4d r4d_ika.h, r4d_ika_protocol() == 2): the kernel fences itself only when its
+     * hidden_global_offset_z reads non-zero; this is that argument's offset in the kernel's arguments (the tape's copy of a
+     * played dispatch gets 1 there, tape_note_dispatch), or -1 for a protocol-1 library (fences in every dispatch). */
+    int32_t     ika_flag = -1;
 };
 
 struct ModuleImage {
@@ -555,21 +559,28 @@ bool ika_on() {
     return on;
 }
 
-bool ika_kernel(const Module* m, const std::string& name) {
-    if (!ika_on() || !m || !m->bundle) return false;
+/* 0: not listed; 1: listed by a library whose kernels fence in every dispatch (protocol 1); 2: listed by a library of form B
+ * (r4d_ika_protocol() == 2: the kernel fences only when its hidden_global_offset_z is non-zero). */
+int ika_kernel(const Module* m, const std::string& name) {
+    if (!ika_on() || !m || !m->bundle) return 0;
     Dl_info di{};
-    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
+    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return 0;
     void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
     if (!h) h = dlopen(nullptr, RTLD_LAZY);
-    if (!h) return false;
+    if (!h) return 0;
     using ListFn = const char* const* (*)(int*);
     auto fn = reinterpret_cast<ListFn>(dlsym(h, "r4d_ika_kernels"));
     Dl_info fi{};
     /* the list must be the module's own object's, not a dependency's */
-    if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return false;
+    if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return 0;
     int n = 0;
     const char* const* v = fn(&n);
-    return ika_listed(name, v, n);
+    if (!ika_listed(name, v, n)) return 0;
+    using ProtoFn = int (*)(void);
+    auto pf = reinterpret_cast<ProtoFn>(dlsym(h, "r4d_ika_protocol"));
+    Dl_info pi{};
+    if (!pf || !dladdr(reinterpret_cast<void*>(pf), &pi) || pi.dli_fbase != di.dli_fbase) return 1;
+    return pf() >= 2 ? 2 : 1;
 }
 
 KernelRec* resolve(Func* fn, int ord) {
@@ -610,7 +621,7 @@ KernelRec* resolve(Func* fn, int ord) {
     auto k = std::make_unique<KernelRec>();
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
-    k->ika = ika_kernel(m, k->name);
+    const int ika_form = ika_kernel(m, k->name);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                                    &k->kernarg_size);
@@ -646,6 +657,18 @@ KernelRec* resolve(Func* fn, int ord) {
         }
     }
     k->n_explicit = (uint16_t)k->ex_off.size();
+    /* Lever IKA: a protocol-1 library's listed kernel fences in every dispatch; a form-B (protocol 2) one only when told through
+     * its hidden_global_offset_z -- without that argument in its metadata it cannot be told, so it is not self-acquiring. */
+    if (ika_form == 1) {
+        k->ika = true;
+    } else if (ika_form == 2) {
+        const int32_t off = k->hid[(int)Hidden::GlobalOffsetZ];
+        k->ika = off >= 0 && k->hid_size[(int)Hidden::GlobalOffsetZ] == 8 && (uint32_t)off + 8u <= k->kernarg_size;
+        k->ika_flag = k->ika ? off : -1;
+        if (!k->ika)
+            RAD_WARN("aql: lever IKA: kernel %s is listed by a form-B library but takes no 8-byte hidden_global_offset_z: "
+                     "it keeps every packet fence", k->name.c_str());
+    }
     {
         std::lock_guard<std::mutex> nl(g_names_mu);
         g_names[k->object] = k->name;
@@ -692,6 +715,10 @@ struct Stream {
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
     int64_t         last_sys_acq = -(int64_t)kQueuePackets;
+    /* Lever CHI (DRAFTER round 52, Qwen loop round 8): the latest packet that went out ORDERED (barrier bit) with an acquire of
+     * agent scope or wider -- the packet processor ran its acquire after everything before it had completed, so no scalar cache
+     * line of an argument slot written before it can survive it. */
+    int64_t         last_oacq = -2 * (int64_t)kQueuePackets;
     uint64_t        epoch = 0;                /* host epoch at the last system acquire */
     hsa_signal_t    ride{};                   /* rad_ride: the next dispatch's completion signal */
     bool            agent_only = false;       /* rad_xp_stream_create: never a system-scope acquire */
@@ -1106,6 +1133,9 @@ inline void host_writes_out(Stream* s) {
 }
 
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
+    if (((header >> HSA_PACKET_HEADER_BARRIER) & 1u) &&
+        ((header >> HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) & 3u) >= HSA_FENCE_SCOPE_AGENT)
+        s->last_oacq = (int64_t)idx;   /* lever CHI */
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
     host_writes_out(s);                 /* the argument slot, written before the header */
@@ -1173,7 +1203,8 @@ inline bool capturing() { return t_tape && t_tape_pause == 0; }
 
 /* A dispatch just written at `p` on `s`, with its argument block `ka`. */
 void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16_t setup,
-                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool ika = false) {
+                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool ika = false,
+                        int32_t ika_flag = -1) {
     Tape* t = t_tape;
     TapeRec r;
     r.kind = kTapeDispatch;
@@ -1187,6 +1218,12 @@ void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16
     const size_t off = (t->karg_host.size() + 63) & ~size_t(63);
     t->karg_host.resize(off + n);
     std::memcpy(t->karg_host.data() + off, ka, n);
+    /* Lever IKA form B: the played copy of a form-B kernel's arguments says "fence yourself" (the issued packet, written from
+     * `ka`, keeps 0 and its packet fences) */
+    if (ika && ika_flag >= 0 && (uint32_t)ika_flag + 8u <= n) {
+        const uint64_t one = 1;
+        std::memcpy(t->karg_host.data() + off + (uint32_t)ika_flag, &one, sizeof one);
+    }
     r.karg_off = (uint32_t)off;
     r.karg_len = n;
     t->rec.push_back(r);
@@ -1317,7 +1354,12 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika);
+    /* Lever CHI (fn4 aql_chi, under RADIANCE_AQL_IKA=1): a chained record (its record on) fences itself (r4d_chain.h: an agent
+     * acquire after its wait, an agent release before its add), so it is recorded as self-acquiring; it is not a listed kernel
+     * and gets no form-B flag. */
+    if (capturing())
+        tape_note_dispatch(s, p, setup, ka, n, fence, chain,
+                           k->ika || (chain && ika_on() && rad::fn4::aql_chi() >= 1), k->ika ? k->ika_flag : -1);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
     const bool aside = (fence & kFenceAside) != 0;
@@ -1455,15 +1497,22 @@ struct PlayRun {
          *   none  EXPERIMENT ONLY, unsafe in general: every agent-scope acquire becomes none. */
         /* The rule is read only for a marked packet: only a pass recorded under it has marks, and a
          * change of the switch re-records (the epoch), so the stock replay costs one constant test. */
+        /* Lever CHI (DRAFTER r53 form; fn4 aql_chi): a chained record that plays chained takes IKA's acquire drop too, when
+         * haz_mark allows it (ikaok) and its argument slot's previous use (one ring ago) is older than the queue's last ordered
+         * packet with an acquire (no scalar-cache line of the rewritten slot can be stale); the plain rule never drops a
+         * chained record's acquire, as before. */
+        const bool chi_ok = r.chain && chain && r.ika && r.ikaok && ika_on() && rad::fn4::aql_chi() >= 1 &&
+                            (int64_t)idx - (int64_t)(s->mask + 1) < s->last_oacq;
         if (acq == HSA_FENCE_SCOPE_AGENT &&
             (aql_acq_none_() || (r.noacq && !r.chain && !foreign && aql_acq_mode() == 1) ||
-             (r.ika && r.ikaok && !r.chain && !foreign && aql_acq_mode() == 1)))
+             (r.ika && r.ikaok && (!r.chain || chi_ok) && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent
          * release adds nothing; a packet a record or a ride completes keeps it (its signal orders other queues / the
          * host after it). */
-        if (r.ika && rel == HSA_FENCE_SCOPE_AGENT && !done.handle) rel = HSA_FENCE_SCOPE_NONE;
+        /* (lever CHI: a chained record fences itself only while its record is on, so only when it plays chained) */
+        if (r.ika && rel == HSA_FENCE_SCOPE_AGENT && !done.handle && (!r.chain || chain)) rel = HSA_FENCE_SCOPE_NONE;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
          * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
@@ -1479,6 +1528,7 @@ struct PlayRun {
             stamp->chained = chain;
         }
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
+        if (ordered && acq >= HSA_FENCE_SCOPE_AGENT) s->last_oacq = (int64_t)idx;   /* lever CHI */
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
@@ -2292,7 +2342,8 @@ int a_tape_rec_ika(RadTape rt, int i) {
     const Tape* t = tape_of(rt);
     if (!t || i < 0 || i >= (int)t->rec.size()) return RAD_E_INVAL;
     const TapeRec& r = t->rec[(size_t)i];
-    return r.kind == kTapeDispatch && r.ika ? 1 : 0;
+    /* 2: a chained record recorded self-acquiring by lever CHI (fn4 aql_chi; callers test > 0) */
+    return r.kind == kTapeDispatch && r.ika ? (r.chain ? 2 : 1) : 0;
 }
 
 int a_tape_set_noacq(RadTape rt, int i, int on) {
