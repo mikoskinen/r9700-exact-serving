@@ -5783,6 +5783,7 @@ TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     struct Arm { int lanes; int bg; const char* cut; const char* idle; const char* parts; };
+    std::vector<long long> d8_by_arm;   /* the D8 line's parts over the run, arm by arm (D68b: the same with the setting on) */
     for (const Arm a : { Arm{ 2, -1, "1,3", "1", "1" }, Arm{ 3, -1, "0,3", "2", "1" }, Arm{ 4, 2, "1,3", "2", "1" },
                          Arm{ 2, -1, "1,3", "2", nullptr }, Arm{ 2, -1, "1,3", "2", "0" }, Arm{ 2, -1, "1,3", "2", "2" },
                          Arm{ 2, -1, "1,3", nullptr, "1" } }) {
@@ -5850,10 +5851,11 @@ TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         const int tk = run_keys(llog, "tail (+ logits, sampler) D", &tp, &tb);
         const int dk = run_keys(llog, "drafter + step end D", &dp, &db);
         const int fk = run_keys(flog, "pass D", &fp, &fb);
-        /* the D8 line's parts over the run: a tail is two parts with the setting on (the drafter's own) */
+        /* the D8 line's parts over the run: the drafter's own part is a continuation there (the same count as without the setting) */
         long long d8parts = -1;
         if (const size_t at = llog.rfind("node idle (RADIANCE_PP_NODE_IDLE="); at != std::string::npos)
             if (const size_t q = llog.find(" %, ", llog.find("in parts ", at)); q != std::string::npos) d8parts = std::atoll(llog.c_str() + q + 4);
+        d8_by_arm.push_back(d8parts);
         const long long lw = count(llog, key), fw = count(flog, key);
         fprintf(stderr, "    D68 %d lanes%s W(%s) NODE_IDLE=%s PARTS=%s: %d of %zu prompts differ (%lld accepted); lines leader %lld / follower "
                         "%lld; the run's clean keys: leader head D %d (%lld parts), tail D %d (%lld parts), drafter D %d (%lld parts), follower "
@@ -5888,6 +5890,12 @@ TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         }
         if (a.idle) CHECK(llog.find("node idle (RADIANCE_PP_NODE_IDLE=") != std::string::npos);   /* the D8 lines as before */
     }
+    /* D68b: the drafter's part is a continuation in the D8 count -- arm 0 (2 lanes, PARTS 1) counts what arm 3 (2 lanes, unset) does
+     * on the same load, within the run-to-run spread (an end + begin split would add one part a tail: ~+45 %) */
+    REQUIRE(d8_by_arm.size() >= 4);
+    fprintf(stderr, "    D68 the D8 line's parts: 2 lanes PARTS 1 %lld vs unset %lld\n", d8_by_arm[0], d8_by_arm[3]);
+    CHECK(d8_by_arm[0] > 0 && d8_by_arm[3] > 0);
+    CHECK(std::llabs(d8_by_arm[0] - d8_by_arm[3]) * 10 <= d8_by_arm[3]);
 }
 /* tp8 loop D69: DRAFTED REQUESTS THAT RUN INTO THE CONTEXT LIMIT, through the pipeline. A long Claude Code session can reach
  * --max-model-len; with a DSpark drafter the verify rows of a step near the limit must stop at it on both nodes (the follower
