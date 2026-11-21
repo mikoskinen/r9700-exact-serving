@@ -236,6 +236,16 @@ public:
     /* The verify op the last build resolved, for naming its kernel in a log line. */
     rad_op staged_couple_op() const { return op_couple_; }
 
+    /* Lever SNW (DRAFTER track round 79; RADIANCE_SAMPLE_NARROW=1 at start, fn4 sample_narrow in process): whether the
+     * narrow chain was declared (a split vocabulary only), and whether `run` would issue it for the rows the last build
+     * staged -- every row a top-1 chain row (a greedy row over the split vocabulary, every row of a greedy build), none
+     * asking for logprobs, no late temperature, no coupled verify: the token is each rank's argmax merged, so kSnwWidth
+     * candidates a rank give the served width's token (sample_topk's k = 1 path writes the one live candidate first).
+     * Lets the choice be checked without a device. */
+    bool narrow_declared() const { return snw_decl_; }
+    bool narrow_step() const;
+    static constexpr int64_t kSnwWidth = 2;   /* the gather moves whole 16-byte words: two (id, logit) pairs a row */
+
     /* What build_step staged for the coupled verify. build_greedy, which runs between that build
      * and the step's wait, clears any_couple_ but leaves this snapshot. */
     struct CoupleBuild {
@@ -302,6 +312,13 @@ private:
     rad_op op_argmax_    = RAD_NULL_HANDLE;
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
+    /* Lever SNW: the gather, merge and pick at kSnwWidth candidates a rank (the served top-k; the gather reads its pair
+     * plane's first kSnwWidth pairs a row). */
+    rad_op op_allgather_n_ = RAD_NULL_HANDLE;
+    rad_op op_merge_n_   = RAD_NULL_HANDLE;
+    rad_op op_pick_n_    = RAD_NULL_HANDLE;
+    bool   snw_decl_     = false;
+    int64_t snw_steps_   = 0;   /* narrow chains issued (the first one says so) */
     rad_op op_couple_    = RAD_NULL_HANDLE;   /* --draft-coupling only */
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
@@ -320,6 +337,7 @@ private:
     rad_buf buf_cand_v_  = RAD_NULL_HANDLE;
     rad_buf buf_gather_  = RAD_NULL_HANDLE;
     rad_buf buf_pairs_   = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
+    rad_buf buf_gather_n_ = RAD_NULL_HANDLE;  /* lever SNW: [rows, world x 2 kSnwWidth], tight (the merge reads it so) */
     rad_buf buf_lp_      = RAD_NULL_HANDLE;   /* sample_logprobs' stats, [rows, lp_width()] */
     rad_buf buf_lp_g_    = RAD_NULL_HANDLE;   /* and every rank's side by side */
     rad_buf buf_couple_  = RAD_NULL_HANDLE;   /* [rows, RAD_MTP_COUPLE_STATE_WORDS], flag only */

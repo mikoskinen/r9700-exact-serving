@@ -51,7 +51,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room", "pp_send_ash",
                                         "aql_waitk", "aql_ika", "ds41_rr1", "dspark_mhr", "dspark_hs",
                                         "host_spin", "pp_bg_split", "aql_cik", "host_slack",
-                                        "pp_tband_bound" };
+                                        "pp_tband_bound", "sample_narrow" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -407,6 +407,13 @@ int env_aql_cik() {
     return env;
 }
 
+/* DRAFTER round 79 (lever SNW): RADIANCE_SAMPLE_NARROW=1 (anything else, or unset, is 0). Read where it is asked (a sampler's
+ * declare, a run while the switch was never set: once a step), not cached, so a host test can declare both ways in one process. */
+int env_sample_narrow() {
+    const char* e = std::getenv("RADIANCE_SAMPLE_NARROW");
+    return e && e[0] == '1' && !e[1] ? 1 : 0;
+}
+
 /* tp8 loop D63: RADIANCE_HOST_SLACK=v at start, v = 0 .. 1000 (a thread's timer slack in us; 0 = its default); unset / empty = 0;
  * anything else is said once and means 0 (every thread keeps its default slack, as before). */
 int env_host_slack() {
@@ -505,6 +512,10 @@ int reported(State& s, int i) {
     if (i == kHostSlack) {         /* tp8 loop D63: set, else RADIANCE_HOST_SLACK (0 = every thread's default slack) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_host_slack();
+    }
+    if (i == kSampleNarrow) {      /* DRAFTER round 79: set, else RADIANCE_SAMPLE_NARROW (0 = the served width) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_sample_narrow();
     }
     if (i == kSchedLaneRoom) {     /* tp8 loop D56: set, else RADIANCE_SCHED_LANE_ROOM (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -682,6 +693,11 @@ int host_slack() {
     const int v = st().val[kHostSlack].load(std::memory_order_relaxed);
     return v >= 0 ? v : env_host_slack();
 }
+int sample_narrow() {   /* DRAFTER round 79, lever SNW */
+    const int v = st().val[kSampleNarrow].load(std::memory_order_relaxed);
+    return v >= 0 ? v : env_sample_narrow();
+}
+int sample_narrow_env() { return env_sample_narrow(); }
 bool pp_tband_bound(int* ms, int* h) {   /* tp8 loop D65 */
     const int v = st().val[kPpTbandBound].load(std::memory_order_relaxed);
     if (v <= 0) return false;
@@ -1860,6 +1876,19 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSampleNarrow) {      /* DRAFTER round 79, lever SNW: read at every sampler run, on each node */
+        if (v != 0 && v != 1) {
+            if (err) *err = "sample_narrow takes 0 (the vocabulary-parallel chain at the served candidate width, as before) or 1 (lever "
+                            "SNW: an all-top-1 step's chain at 2 candidates a rank, the same token; DRAFTER track round 79)";
+            return false;
+        }
+        if (v == 1 && env_sample_narrow() == 0) {
+            if (err) *err = "sample_narrow 1 needs RADIANCE_SAMPLE_NARROW=1 at start (the narrow chain is declared then; unset here: "
+                            "DRAFTER track round 79)";
+            return false;
+        }
+        return true;
+    }
     if (i == kHostSlack) {         /* tp8 loop D63: read at every sleep it covers, on each node */
         if (v < 0 || v > 1000) {
             if (err) *err = "host_slack takes 0 (every covered thread back to its default timer slack, as before) or 1 .. 1000 (the "
@@ -2025,6 +2054,7 @@ bool follower_switch(int i) {
            i == kAqlCik ||         /* tp8 loop W9: each node's own issued / played packets */
            i == kHostSpin ||       /* tp8 loop D61: each node's own waits */
            i == kHostSlack ||      /* tp8 loop D63: each node's own threads' sleeps */
+           i == kSampleNarrow ||   /* DRAFTER round 79 (lever SNW): each node's own sampler */
            i == kPpTbandBound ||   /* tp8 loop D65: the leader's judge and the follower's load report, one window */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
 }
@@ -2167,7 +2197,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kAqlCik || i == kHostSpin || i == kHostSlack || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kAqlCik || i == kHostSpin || i == kHostSlack || i == kSampleNarrow || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)

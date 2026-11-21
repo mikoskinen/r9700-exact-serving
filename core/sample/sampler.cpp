@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "gbnf.h"
 #include "../sched/draft.h"   /* RAD_SCHED_MAX_SPEC */
+#include "../runtime/fn4_switch.h"   /* lever SNW: fn4 sample_narrow */
 
 #include <algorithm>
 #include <chrono>
@@ -307,6 +308,47 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         };
         op_allgather_ = rad_decl_op(b, "all_gather", ag, 4, nullptr, 0);
         op_merge_     = op_cand("sample_merge_topk");
+
+        /* Lever SNW (DRAFTER track round 79; RADIANCE_SAMPLE_NARROW=1 at start, fn4 sample_narrow in process): a step
+         * whose every row is a top-1 chain row (a greedy row over this split vocabulary, every row of a greedy build)
+         * needs one live candidate a rank: sample_topk's k = 1 path writes the shard's argmax and holes, the merge keeps
+         * the best of the gathered pairs and the pick takes it. At the served width the gather moves rows x 1024 pairs x
+         * 8 B to every peer (384 KiB at 48 rows) and the merge sorts 4096 words a row for that one token; this chain moves
+         * kSnwWidth pairs a row (the gather's whole 16-byte word) and merges world x kSnwWidth. The top-k stays the
+         * served launch (its k = 1 path writes the best pair first and holes behind it, sorted): the gather reads the
+         * first kSnwWidth pairs of each row of the served pair plane at its pitch (r79e: a top-k launch over narrow planes
+         * costs +5.6 us at 48 rows on one card -- the launch, not the width). The same token by construction (each rank's
+         * best (key, ~id) word is in both sets; the merge's max is the global argmax with the lower id on a tie); the
+         * transient candidate planes past column kSnwWidth are not rewritten by the merge, and only the logprobs copy
+         * reads them (such a step keeps the served chain). Declared beside the served chain, which stays as it was;
+         * nothing is declared without the env. */
+        if (fn4::sample_narrow_env() && ncand > kSnwWidth) {
+            buf_gather_n_ = decl("sampler.cand_gathered_n", RAD_U32, rows, kSnwWidth * cfg_.world_size * 2,
+                                 RAD_BUF_TRANSIENT);
+            RadParam agn[4] = {
+                RadParam{ "world_size", RAD_P_INT, (long long)cfg_.world_size, 0, nullptr },
+                RadParam{ "numel", RAD_P_INT, (long long)(rows * kSnwWidth * 2), 0, nullptr },
+                RadParam{ "dtype", RAD_P_STR, 0, 0, "f32" },
+                RadParam{ "row", RAD_P_INT, (long long)(kSnwWidth * 2), 0, nullptr },
+            };
+            op_allgather_n_ = rad_decl_op(b, "all_gather", agn, 4, nullptr, 0);
+            auto op_cand_n = [&](const char* name) -> rad_op {
+                RadParam p[2] = {
+                    RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+                    RadParam{ "n_cand", RAD_P_INT, (long long)kSnwWidth, 0, nullptr },
+                };
+                return rad_decl_op(b, name, p, 2, nullptr, 0);
+            };
+            op_merge_n_ = op_cand_n("sample_merge_topk");
+            op_pick_n_  = op_cand_n("sample_pick");
+            snw_decl_ = buf_pairs_ && buf_gather_n_ && op_allgather_n_ && op_merge_n_ && op_pick_n_ && op_topk_;
+            RAD_INFO("sampler: lever SNW %s: an all-top-1 step's chain at %lld candidates a rank (gather %lld B a row a peer "
+                     "instead of %lld, merge of %lld pairs instead of %lld) while fn4 sample_narrow is 1 (now %d; "
+                     "RADIANCE_SAMPLE_NARROW, DRAFTER track round 79)",
+                     snw_decl_ ? "declared" : "NOT declared (an op or buffer did not resolve)", (long long)kSnwWidth,
+                     (long long)(kSnwWidth * 8), (long long)(ncand * 8), (long long)(kSnwWidth * cfg_.world_size),
+                     (long long)(ncand * cfg_.world_size), fn4::sample_narrow());
+        }
     }
 
     /* The raw-distribution summary, at a width that fits every request's top_logprobs. If it
@@ -1103,6 +1145,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     bool any_mask = false, any_greedy = false, any_chain = false;
     bool any_penalty = false, any_dry = false, any_xtc = false;
     bool any_topp = false, any_minp = false, any_typ = false, any_temp = false;
+    bool all_k1 = true;   /* lever SNW: every chain row top-1, none asking for logprobs */
     for (int64_t i = 0; i < n_seq_; ++i) {
         const DeviceSampleParams& p = cur_stage_[i];
         any_mask    |= (p.flags & RAD_SP_MASK)    != 0;
@@ -1111,6 +1154,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         if (p.flags & RAD_SP_GREEDY) any_greedy = true;
         else {
             any_chain = true;
+            all_k1 &= p.top_k == 1 && !(p.flags & RAD_SP_LOGPROBS);   /* lever SNW */
             /* sample_temp leaves a row at temperature <= 0 or exactly 1 as it is */
             any_temp |= p.temp > 0.0f && p.temp != 1.0f;
             /* The cuts only remove candidates, and a top-1 row has one: a greedy row over a split
@@ -1244,6 +1288,28 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
      * it is per shard and the sets are merged below (spec §9). Always issued when the chain runs:
      * top_k = 0 means the full candidate width, and the transient candidate planes hold stale
      * bytes otherwise. */
+    /* Lever SNW: an all-top-1 step's chain at kSnwWidth candidates a rank (see declare): the served top-k, the gather of
+     * the first kSnwWidth pairs of each row of its pair plane, the merge into the planes' first kSnwWidth columns, the
+     * pick over them. */
+    const bool snw = snw_decl_ && all_k1 && !any_greedy && !lp && !late && !any_couple_ && !any_topp && !any_minp &&
+                     !any_typ && !any_xtc && fn4::sample_narrow() > 0;
+    if (snw) {
+        RadOperand o_cin = o_ci, o_cvn = o_cv;
+        o_cin.cols = kSnwWidth;
+        o_cvn.cols = kSnwWidth;
+        const RadOperand o_p = opd_rows(buf_pairs_, n_seq_);
+        RadOperand o_pn = o_p;
+        o_pn.cols = kSnwWidth * 2;
+        const RadOperand o_gn = opd_rows(buf_gather_n_, n_seq_);
+        RAD_TRY(issue(op_topk_,        { o_logits, o_params, o_ci, o_cv, o_p }));
+        RAD_TRY(issue(op_allgather_n_, { o_pn, o_gn }));
+        RAD_TRY(issue(op_merge_n_,     { o_gn, o_params, o_cin, o_cvn }));
+        RAD_TRY(issue(op_pick_n_,      { o_cin, o_cvn, o_params, o_tok }));
+        if (snw_steps_++ == 0 && cfg_.rank == 0)
+            RAD_INFO("sampler: lever SNW: first all-top-1 chain issued at %lld candidates a rank (%lld rows)",
+                     (long long)kSnwWidth, (long long)n_seq_);
+        return RAD_OK;
+    }
     if (vocab_parallel()) {
         /* The fifth operand is the pair plane (global ids), which is what is gathered.
          * cand_idx/cand_val come back local and the merge overwrites both. */
@@ -1289,6 +1355,17 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         RAD_TRY(rad_memcpy_async(lp_cv_host_ + lp_lo_ * nc, cv + lp_lo_ * nc * 4, n * nc * 4, s));
     }
     return RAD_OK;
+}
+
+/* Lever SNW: run()'s choice for the rows the last build staged (its device-free half: the switch, the staged rows). */
+bool Sampler::narrow_step() const {
+    if (!snw_decl_ || n_seq_ == 0 || any_late_ || any_couple_ || fn4::sample_narrow() <= 0) return false;
+    if (!lp_rows_.empty() && cur_stage_ == params_stage_ && op_logprobs_) return false;
+    for (int64_t i = 0; i < n_seq_; ++i) {
+        const DeviceSampleParams& p = cur_stage_[i];
+        if ((p.flags & RAD_SP_GREEDY) || p.top_k != 1 || (p.flags & RAD_SP_LOGPROBS)) return false;
+    }
+    return true;
 }
 
 /* ================================================================== logprobs */

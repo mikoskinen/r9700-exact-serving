@@ -2206,6 +2206,63 @@ TEST(the_candidate_width_over_a_split_vocabulary_is_what_the_merge_holds) {
     }
 }
 
+/* Lever SNW (DRAFTER track round 79): with RADIANCE_SAMPLE_NARROW=1 a split vocabulary declares the narrow chain beside the
+ * served one (nothing without the env), and a step runs it only when every row is a top-1 chain row with no logprobs:
+ * greedy rows and a greedy build do; a row at the default top_k (the whole candidate width), one at top_k 5 or one asking for
+ * logprobs keeps the served width. */
+TEST(the_narrow_chain_is_declared_by_its_env_and_taken_only_by_all_top1_steps) {
+    Registry reg;
+    (void)reg.load_plugin(home() + "/kernels/libref.so", 0);
+    for (int on : { 0, 1 }) {
+        if (on) setenv("RADIANCE_SAMPLE_NARROW", "1", 1);
+        else unsetenv("RADIANCE_SAMPLE_NARROW");
+        RadModelMeta meta{};
+        meta.arch_id = "sampler_split";
+        meta.name = "sampler_split";
+        RadBuildCtx bc{};
+        bc.world_size = 4;
+        bc.max_seqs = 2;
+        bc.max_tok = 2;
+        bc.max_ctx = 64;
+        bc.scope = "";
+        Builder b(reg, meta, bc);
+        Sampler s;
+        SamplerConfig cfg;
+        cfg.n_vocab = 4 * 2048;
+        cfg.n_vocab_local = 2048;
+        cfg.max_seqs = 2;
+        cfg.world_size = 4;
+        cfg.rank = 2;
+        cfg.vocab_off = 2 * 2048;
+        cfg.max_hist = 16;
+        CHECK_OK(s.declare(&b, cfg));
+        CHECK_EQ(s.narrow_declared(), on == 1);
+
+        Request g1 = make_req(1, { 3 }, greedy_params()), g2 = make_req(2, { 4 }, greedy_params());
+        CHECK_OK(s.build_step({ &g1, &g2 }));
+        CHECK_EQ(s.narrow_step(), on == 1);
+        CHECK_OK(s.build_greedy(2));
+        CHECK_EQ(s.narrow_step(), on == 1);
+
+        SamplingParams wide;
+        wide.temp = 1.0f;                                    /* top_k 0: the whole candidate width */
+        Request w = make_req(3, { 5 }, wide);
+        CHECK_OK(s.build_step({ &g1, &w }));
+        CHECK(!s.narrow_step());
+        SamplingParams k5 = wide;
+        k5.top_k = 5;
+        Request r5 = make_req(4, { 5 }, k5);
+        CHECK_OK(s.build_step({ &r5 }));
+        CHECK(!s.narrow_step());
+        SamplingParams lp = greedy_params();
+        lp.n_probs = 2;
+        Request rl = make_req(5, { 5 }, lp);
+        CHECK_OK(s.build_step({ &g1, &rl }));
+        CHECK(!s.narrow_step());
+    }
+    unsetenv("RADIANCE_SAMPLE_NARROW");
+}
+
 /* Triggers are resolved at admission, with special tokens recognised: a one-token word becomes an
  * id, a longer word is scanned for as bytes, a token trigger that is not one token is a bad
  * request, and a regular expression is refused by name (it would be matched over the reply once

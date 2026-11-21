@@ -301,7 +301,7 @@ TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
     const int i = fn4::switch_index("sched_lane_room");
     REQUIRE(i == (int)fn4::kSchedLaneRoom);
     CHECK_EQ(i, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ(i + 12, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 13, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -321,7 +321,7 @@ TEST(pp_send_ash_follows_the_leaders_request_after_sched_lane_room) {
     const int i = fn4::switch_index("pp_send_ash");
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 11, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
+    CHECK_EQ(i + 12, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
     std::vector<int32_t> value(fn4::kSwitches, 0);
@@ -343,7 +343,7 @@ TEST(aql_waitk_follows_the_leaders_request_after_pp_send_ash) {
     const int i = fn4::switch_index("aql_waitk");
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 10, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
+    CHECK_EQ(i + 11, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -381,7 +381,7 @@ TEST(aql_ika_follows_the_leaders_request_after_aql_waitk) {
     const int i = fn4::switch_index("aql_ika");
     REQUIRE(i == (int)fn4::kAqlIka);
     CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
-    CHECK_EQ(i + 9, (int)fn4::kSwitches);
+    CHECK_EQ(i + 10, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_AQL_IKA") == nullptr);
@@ -416,7 +416,7 @@ TEST(dspark_mhr_and_dspark_hs_follow_the_leaders_request_after_ds41_rr1) {
     REQUIRE(h == (int)fn4::kDsparkHs);
     CHECK_EQ(m, (int)fn4::kDs41Rr1 + 1);
     CHECK_EQ(h, m + 1);
-    CHECK_EQ(h + 6, (int)fn4::kSwitches);
+    CHECK_EQ(h + 7, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(m));
     CHECK(fn4::follower_switch(h));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -444,7 +444,7 @@ TEST(host_spin_follows_the_leaders_request_after_dspark_hs) {
     const int i = fn4::switch_index("host_spin");
     REQUIRE(i == (int)fn4::kHostSpin);
     CHECK_EQ(i, (int)fn4::kDsparkHs + 1);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
     std::vector<int32_t> value(fn4::kSwitches, 0);
@@ -478,7 +478,7 @@ TEST(pp_bg_split_is_the_leaders_and_the_follower_leaves_it) {
     const int i = fn4::switch_index("pp_bg_split");
     REQUIRE(i == (int)fn4::kPpBgSplit);
     CHECK_EQ(i, (int)fn4::kHostSpin + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(fn4::sched_switch(i));
     std::string e;
@@ -504,7 +504,7 @@ TEST(aql_cik_follows_the_leaders_request_after_pp_bg_split) {
     const int i = fn4::switch_index("aql_cik");
     REQUIRE(i == (int)fn4::kAqlCik);
     CHECK_EQ(i, (int)fn4::kPpBgSplit + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_AQL_CIK") == nullptr);
@@ -536,7 +536,7 @@ TEST(host_slack_follows_the_leaders_request_after_aql_cik) {
     const int i = fn4::switch_index("host_slack");
     REQUIRE(i == (int)fn4::kHostSlack);
     CHECK_EQ(i, (int)fn4::kAqlCik + 1);
-    CHECK_EQ(i + 2, (int)fn4::kSwitches);
+    CHECK_EQ(i + 3, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_HOST_SLACK") == nullptr);
@@ -568,7 +568,7 @@ TEST(pp_tband_bound_follows_the_leaders_request_after_host_slack) {
     const int i = fn4::switch_index("pp_tband_bound");
     REQUIRE(i == (int)fn4::kPpTbandBound);
     CHECK_EQ(i, (int)fn4::kHostSlack + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -593,6 +593,39 @@ TEST(pp_tband_bound_follows_the_leaders_request_after_host_slack) {
     std::string e;
     CHECK(!fn4::check("pp_tband_bound", 5001, &e));
     CHECK(e.find("pp_tband_bound takes -1 / 0") != std::string::npos);
+}
+
+/* DRAFTER track round 79 (lever SNW): sample_narrow is switch 116, after pp_tband_bound, BOTH nodes' (each node's own sampler): 0 / 1;
+ * 1 needs RADIANCE_SAMPLE_NARROW=1 at start (the narrow chain is declared then), so without it the leader refuses 1 and a follower
+ * skips it; 0 is taken (the served width, as before). */
+TEST(sample_narrow_follows_the_leaders_request_after_pp_tband_bound) {
+    const int i = fn4::switch_index("sample_narrow");
+    REQUIRE(i == (int)fn4::kSampleNarrow);
+    CHECK_EQ(i, (int)fn4::kPpTbandBound + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    REQUIRE(std::getenv("RADIANCE_SAMPLE_NARROW") == nullptr);
+    CHECK_EQ(fn4::sample_narrow(), 0);
+    std::string e;
+    CHECK(!fn4::check("sample_narrow", 1, &e));
+    CHECK(e.find("needs RADIANCE_SAMPLE_NARROW=1") != std::string::npos);
+    CHECK(!fn4::check("sample_narrow", 2, &e));
+    CHECK(e.find("sample_narrow takes 0") != std::string::npos);
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    std::vector<std::string> skipped;
+    int sw[fn4::kSwitches];
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 0;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
+    CHECK(skipped.empty());
+    (void)fn4::apply_pending(1, sw);
+    CHECK_EQ(fn4::sample_narrow(), 0);
+    setenv("RADIANCE_SAMPLE_NARROW", "1", 1);
+    CHECK_EQ(fn4::sample_narrow(), 0);   /* set to 0 above: the switch, not the env */
+    CHECK(fn4::check("sample_narrow", 1, &e));
+    unsetenv("RADIANCE_SAMPLE_NARROW");
 }
 
 RAD_TEST_MAIN()
