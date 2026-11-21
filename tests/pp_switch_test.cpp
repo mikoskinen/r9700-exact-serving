@@ -301,7 +301,7 @@ TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
     const int i = fn4::switch_index("sched_lane_room");
     REQUIRE(i == (int)fn4::kSchedLaneRoom);
     CHECK_EQ(i, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 7, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -321,7 +321,7 @@ TEST(pp_send_ash_follows_the_leaders_request_after_sched_lane_room) {
     const int i = fn4::switch_index("pp_send_ash");
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
     std::vector<int32_t> value(fn4::kSwitches, 0);
@@ -343,7 +343,7 @@ TEST(aql_waitk_follows_the_leaders_request_after_pp_send_ash) {
     const int i = fn4::switch_index("aql_waitk");
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -381,7 +381,7 @@ TEST(aql_ika_follows_the_leaders_request_after_aql_waitk) {
     const int i = fn4::switch_index("aql_ika");
     REQUIRE(i == (int)fn4::kAqlIka);
     CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
-    CHECK_EQ(i + 2, (int)fn4::kSwitches);
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_AQL_IKA") == nullptr);
@@ -405,6 +405,37 @@ TEST(aql_ika_follows_the_leaders_request_after_aql_waitk) {
     CHECK(skipped.empty());
     (void)fn4::apply_pending(2, sw);
     CHECK_EQ(fn4::aql_ika(), 0);
+}
+
+/* tp8 loop R45: dspark_mhr (109) and dspark_hs (110), deepseek41's, are follower plugin switches: the follower asks for the
+ * leader's request (before 109 / 110 no node could: an unknown name). With no plugin serving them (this process) both are skipped
+ * by name -- never a failure -- and nothing is queued. */
+TEST(dspark_mhr_and_dspark_hs_follow_the_leaders_request_after_ds41_rr1) {
+    const int m = fn4::switch_index("dspark_mhr"), h = fn4::switch_index("dspark_hs");
+    REQUIRE(m == (int)fn4::kDsparkMhr);
+    REQUIRE(h == (int)fn4::kDsparkHs);
+    CHECK_EQ(m, (int)fn4::kDs41Rr1 + 1);
+    CHECK_EQ(h, m + 1);
+    CHECK_EQ(h + 1, (int)fn4::kSwitches);
+    CHECK(fn4::follower_switch(m));
+    CHECK(fn4::follower_switch(h));
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    std::vector<std::string> skipped;
+    count[(size_t)m] = 1;
+    value[(size_t)m] = 4;
+    count[(size_t)h] = 1;
+    value[(size_t)h] = 1;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 0);
+    CHECK_EQ(taken[(size_t)m], 1u);
+    CHECK_EQ(taken[(size_t)h], 1u);
+    REQUIRE_EQ(skipped.size(), (size_t)2);
+    CHECK(skipped[0].find("dspark_mhr=4") != std::string::npos);
+    CHECK(skipped[1].find("dspark_hs=1") != std::string::npos);
+    for (const std::string& k : skipped) {
+        CHECK(k.find("unknown switch") == std::string::npos);
+        CHECK(k.find("no loaded plugin serves it") != std::string::npos);
+    }
 }
 
 RAD_TEST_MAIN()

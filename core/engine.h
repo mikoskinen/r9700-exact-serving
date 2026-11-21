@@ -420,6 +420,31 @@ private:
     uint32_t   dch_hist_[512] = {};
     void       dch_note_head(int lane, const RadBatch* b);
     std::string dch_text() const;
+    /* tp8 loop D60 (RADIANCE_PP_POST_PHASES=1, the leader's lane loop; a log line only -- unset: nothing is timed, no line): D35's
+     * chain by phase, from a decode lane's collect to its next decode head's issue (engine_lanes.cpp pph_*), and how often another
+     * lane's X2 had landed when this lane's drafter ended (that lane's tail then waits behind the whole host path; the ms from the
+     * drafter's end to the head's issue = the leader card's gap if nothing else was queued) */
+    struct PostPhases {
+        enum { kCommit, kDwait, kFinish, kBook, kLoop, kPlan, kShip, kIssue, kHost, kAll, kN };
+        static constexpr int kBins = 1000;   /* 0.01-ms bins; the last one holds >= 9.99 ms */
+        struct Acc {
+            int64_t  n = 0, n_dend = 0, n_x2w = 0;
+            double   ms[kN] = {}, x2w_ms = 0;
+            uint32_t hist[kN][kBins] = {};
+            void add(const double* v, bool dend, bool x2w);
+            double p50(int k) const;
+        };
+        /* a lane's open chain (ns): 0 collect, 1 commit, 2 the drafter's end seen, 3 drafter finish, 4 bookkeeping, 5 plan start,
+         * 6 plan end, 7 shipped; 0 = no chain open */
+        uint64_t t[RAD_PP_MAX_LANES][8] = {};
+        bool     dend[RAD_PP_MAX_LANES] = {}, x2w[RAD_PP_MAX_LANES] = {};
+        Acc      win, run;
+        int64_t  win_drop = 0, run_drop = 0;   /* chains opened and not closed (the lane's plan found nothing, a BG step's head) */
+        uint64_t win_t0 = 0;
+    };
+    std::unique_ptr<PostPhases> pph_;
+    void        pph_close(int lane);                 /* after the lane's head was issued */
+    std::string pph_text(const PostPhases::Acc& a, int64_t drops, const char* when, double window_s) const;
     bool       pp_closed_ = false;
     /* tp8 dev D10 round 2: the step being shipped was issued ahead of its lane's collect (its frame's flags bit 1): its X1
      * lands only after the leader's tail of the step before it, so the follower issues its pass once X1 has landed */
