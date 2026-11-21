@@ -7,7 +7,8 @@
  *   Selections like the real ones: consecutive rows share a sliding band of pages plus a few scattered ones, ascending, with
  *   one entry out of order near the end and the row's own page last; contexts = full pages (a full last tile) or the own
  *   page partly used (a partial last tile: the cache path's clamps); rows not a multiple of R; R 4 / 8 / 16, M 7 / 15
- *   (the ring's spill-over: tiles read from the cache because a page left the ring or came out of order).
+ *   (the ring's spill-over: tiles read from the cache because a page left the ring or came out of order); the plain union and
+ *   the re-load lists (every full tile from the ring).
  * NEGATIVE CONTROLS: the compare finds a one-code change in one selected page of the cache (walk on the changed cache vs
  * today on the original), and one changed union position (a tile read from a wrong ring slot).
  *
@@ -18,6 +19,7 @@
 #include "r4d_attn_decode_h256_gqa6.hip"
 #define R4D_WALK_KERNEL_ONLY 1
 #include "r4d_attn_walk.h"
+#include "r4d_attn_walk_sched.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -112,24 +114,12 @@ R4DArgs args(const Sel& s, const Ops& o, std::vector<uint8_t>& kv, std::vector<u
     return a;
 }
 
-/* the union lists of groups of R rows: page ids ascending, each entry's place in its group's union */
-void unions(const Sel& s, int R, std::vector<int32_t>& ul, std::vector<int32_t>& uo, std::vector<int32_t>& up) {
+/* the load lists of groups of R rows (libr4d/r4d_attn_walk_sched.h): the plain union, or with re-loads */
+void unions(const Sel& s, int R, int M, bool rl, std::vector<int32_t>& ul, std::vector<int32_t>& uo, std::vector<int32_t>& up) {
+    static std::vector<int32_t> lastp;
     ul.clear(); uo.assign(1, 0); up.assign((size_t)s.S * s.W, -1);
     for (int r0 = 0; r0 < s.S; r0 += R) {
-        std::vector<int32_t> u;
-        for (int r = r0; r < std::min(s.S, r0 + R); ++r) {
-            const int n = (s.used[r] + BS - 1) / BS;
-            u.insert(u.end(), s.table.begin() + (size_t)r * s.W, s.table.begin() + (size_t)r * s.W + n);
-        }
-        std::sort(u.begin(), u.end());
-        u.erase(std::unique(u.begin(), u.end()), u.end());
-        for (int r = r0; r < std::min(s.S, r0 + R); ++r) {
-            const int n = (s.used[r] + BS - 1) / BS;
-            for (int b = 0; b < n; ++b)
-                up[(size_t)r * s.W + b] =
-                    (int32_t)(std::lower_bound(u.begin(), u.end(), s.table[(size_t)r * s.W + b]) - u.begin());
-        }
-        ul.insert(ul.end(), u.begin(), u.end());
+        r4d_walk_group_list(s.table.data(), s.W, s.used.data(), r0, std::min(s.S, r0 + R), M, rl, ul, up, lastp);
         uo.push_back((int32_t)ul.size());
     }
 }
@@ -162,12 +152,12 @@ void launch_walk(int R, int M, const R4DArgs& a, int groups, const int* ul, cons
     std::printf("  no instance R %d M %d\n", R, M);
 }
 
-std::vector<uint8_t> walk(const Sel& s, const Ops& o, int R, int M, int* ws, const std::vector<uint8_t>* kv_over = nullptr,
-                          int mutate_up = -1) {
+std::vector<uint8_t> walk(const Sel& s, const Ops& o, int R, int M, bool rl, int* ws,
+                          const std::vector<uint8_t>* kv_over = nullptr, int mutate_up = -1) {
     std::vector<uint8_t> kv = kv_over ? *kv_over : o.kv, sc;
     R4DArgs a = args(s, o, kv, sc);
     std::vector<int32_t> ul, uo, up;
-    unions(s, R, ul, uo, up);
+    unions(s, R, M, rl, ul, uo, up);
     if (mutate_up >= 0) {   /* row mutate_up's entries one place off in its union: its ring tiles read wrong slots */
         for (int b = 0; b < s.W; ++b)
             if (up[(size_t)mutate_up * s.W + b] > 0) up[(size_t)mutate_up * s.W + b] -= 1;
@@ -184,7 +174,8 @@ int main(int argc, char** argv) {
     struct C { int S, P0, n; bool partial; };
     std::vector<C> cs = { { 21, 900, 60, false }, { 37, 1500, 90, true } };
     if (!quick) cs.push_back({ 33, 2600, 130, true });
-    const int cfg[][2] = { { 4, 15 }, { 8, 15 }, { 16, 15 }, { 8, 7 }, { 16, 7 } };
+    const int cfg[][3] = { { 4, 15, 0 }, { 8, 15, 0 }, { 16, 15, 0 }, { 8, 7, 0 }, { 16, 7, 0 }, { 8, 15, 1 }, { 16, 15, 1 },
+                           { 16, 7, 1 } };
     for (const C& c : cs) {
         const Sel s = make_sel(c.S, c.P0, c.n, c.partial);
         const Ops o = make_ops(s);
@@ -193,13 +184,16 @@ int main(int argc, char** argv) {
         check(ref == ref2, fmt_case(c.S, c.P0, c.n, c.partial, 0, 0, "today twice (the compare's control)"));
         for (const auto& cf : cfg) {
             int ws[2] = { 0, 0 };
-            const std::vector<uint8_t> got = walk(s, o, cf[0], cf[1], ws);
+            const std::vector<uint8_t> got = walk(s, o, cf[0], cf[1], cf[2] != 0, ws);
             size_t bad = 0;
             for (size_t i = 0; i < ref.size(); ++i) bad += got[i] != ref[i];
             char tail[160];
-            std::snprintf(tail, sizeof tail, "walk = today (%zu of %zu partial bytes differ; tiles ring %d / cache %d)", bad,
-                          ref.size(), ws[0], ws[1]);
-            check(bad == 0 && ws[0] > 0 && ws[1] > 0, fmt_case(c.S, c.P0, c.n, c.partial, cf[0], cf[1], tail));
+            /* the re-load lists leave the cache only the partial last tiles (one a row whose context is not whole tiles) */
+            int part = 0;
+            for (int r = 0; r < s.S; ++r) part += s.used[r] % 16 != 0;
+            std::snprintf(tail, sizeof tail, "walk%s = today (%zu of %zu partial bytes differ; tiles ring %d / cache %d)",
+                          cf[2] ? " re-load" : "", bad, ref.size(), ws[0], ws[1]);
+            check(bad == 0 && ws[0] > 0 && (cf[2] ? ws[1] == part : ws[1] > 0), fmt_case(c.S, c.P0, c.n, c.partial, cf[0], cf[1], tail));
         }
         /* negative controls */
         {
@@ -207,12 +201,12 @@ int main(int argc, char** argv) {
             const int pg = s.table[(size_t)5 * s.W + 3];
             kv2[(size_t)pg * BS * ROWB + 1 * ROWB + 17] ^= 0x10;   /* a K code of row 5's 4th page, token 1 */
             int ws[2] = { 0, 0 };
-            const std::vector<uint8_t> got = walk(s, o, 8, 15, ws, &kv2);
+            const std::vector<uint8_t> got = walk(s, o, 8, 15, true, ws, &kv2);
             check(got != ref, fmt_case(c.S, c.P0, c.n, c.partial, 8, 15, "NEGATIVE: one cache code changed -> partials differ"));
         }
         {
             int ws[2] = { 0, 0 };
-            const std::vector<uint8_t> got = walk(s, o, 8, 15, ws, nullptr, 3);
+            const std::vector<uint8_t> got = walk(s, o, 8, 15, true, ws, nullptr, 3);
             check(got != ref, fmt_case(c.S, c.P0, c.n, c.partial, 8, 15, "NEGATIVE: one union position off -> partials differ"));
         }
     }

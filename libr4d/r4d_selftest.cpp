@@ -85,6 +85,7 @@ extern char** environ;
 
 #ifdef RAD_HAVE_HIP
 #include <hip/hip_runtime.h>
+#include "r4d_attn_walk_sched.h"   /* --perfatwalk: lever P-2's load lists (host) */
 #endif
 
 static int g_fail = 0;
@@ -5888,37 +5889,29 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
     const double us0 = timed([&] { rk->launch(&a, nullptr); });
     std::printf("  today     %9.1f us a call   %7.1f GB/s of per-row KV reads (%.1f MB a call)   repeat %s\n", us0,
                 kv / (us0 * 1e3), kv / 1e6, det ? "IDENTICAL" : "DIFFERENT");
-    void* d_ul = dalloc((size_t)S * W * 4); void* d_uo = dalloc((size_t)(S + 2) * 4); void* d_up = dalloc((size_t)S * W * 4);
+    void* d_ul = dalloc((size_t)S * W * 4 * 2); void* d_uo = dalloc((size_t)(S + 2) * 4); void* d_up = dalloc((size_t)S * W * 4);
     void* d_ws = dalloc(16);
     if (!d_ul || !d_uo || !d_up || !d_ws) { std::printf("  alloc failed\n"); return; }
-    const int cfg[][2] = { { 4, 15 }, { 8, 15 }, { 16, 15 }, { 8, 7 }, { 16, 7 } };
+    /* R, M, the load list (0 the plain union, 1 with re-loads: r4d_attn_walk_sched.h) */
+    const int cfg[][3] = { { 4, 15, 0 }, { 8, 15, 0 }, { 16, 15, 0 }, { 8, 7, 0 }, { 16, 7, 0 }, { 8, 15, 1 }, { 16, 15, 1 } };
+    std::vector<int32_t> lastp;
     for (const auto& cf : cfg) {
         const int R = cf[0], M = cf[1];
+        const bool rl = cf[2] != 0;
         std::vector<int32_t> ulist, uoff, upos((size_t)(S * W), -1);
         uoff.push_back(0);
         for (int64_t r0 = 0; r0 < S; r0 += R) {
-            std::vector<int32_t> u;
-            for (int64_t r = r0; r < std::min<int64_t>(S, r0 + R); ++r) {
-                const int64_t n = used[(size_t)r] / bs;
-                u.insert(u.end(), table.begin() + r * W, table.begin() + r * W + n);
-            }
-            std::sort(u.begin(), u.end());
-            u.erase(std::unique(u.begin(), u.end()), u.end());
-            for (int64_t r = r0; r < std::min<int64_t>(S, r0 + R); ++r) {
-                const int64_t n = used[(size_t)r] / bs;
-                for (int64_t b = 0; b < n; ++b)
-                    upos[(size_t)(r * W + b)] = (int32_t)(std::lower_bound(u.begin(), u.end(), table[(size_t)(r * W + b)]) - u.begin());
-            }
-            ulist.insert(ulist.end(), u.begin(), u.end());
+            r4d_walk_group_list(table.data(), W, used.data(), r0, std::min<int64_t>(S, r0 + R), M, rl, ulist, upos, lastp);
             uoff.push_back((int32_t)ulist.size());
         }
+        if (ulist.size() > (size_t)(S * W * 2)) { std::printf("  walk R%-2d M%-2d%s: list past its buffer\n", R, M, rl ? " re-load" : ""); continue; }
         st_memcpy(d_ul, ulist.data(), ulist.size() * 4, hipMemcpyHostToDevice);
         st_memcpy(d_uo, uoff.data(), uoff.size() * 4, hipMemcpyHostToDevice);
         st_memcpy(d_up, upos.data(), upos.size() * 4, hipMemcpyHostToDevice);
         st_memset(d_ws, 0, 16);
         poison();
         rc = wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, (int*)d_ws);
-        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  walk R%-2d M%-2d rc=%d (not served)\n", R, M, rc); continue; }
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  walk R%-2d M%-2d%s rc=%d (not served)\n", R, M, rl ? " re-load" : "", rc); continue; }
         fetch(got_o, got_q8, got_s);
         int32_t ws[4] = { 0, 0, 0, 0 };
         st_memcpy(ws, d_ws, 16, hipMemcpyDeviceToHost);
@@ -5928,9 +5921,9 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
         for (size_t i = 0; i < sb; ++i) bsd += got_s[i] != ref_s[i];
         const double us = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr); });
         const double ub = (double)ulist.size() * bs * rowb;
-        std::printf("  walk R%-2d M%-2d %9.1f us a call (%+.1f %% vs today)   bytes vs today: o %lld / q8 %lld / s %lld differ -> %s   "
-                    "tiles ring %d / cache %d   union %.1f MB a call (per-row reads / union %.2f)\n",
-                    R, M, us, 100.0 * (us - us0) / us0, (long long)bo, (long long)bq, (long long)bsd,
+        std::printf("  walk R%-2d M%-2d%s %9.1f us a call (%+.1f %% vs today)   bytes vs today: o %lld / q8 %lld / s %lld differ -> %s   "
+                    "tiles ring %d / cache %d   list %.1f MB a call (per-row reads / list %.2f)\n",
+                    R, M, rl ? " re-load" : "", us, 100.0 * (us - us0) / us0, (long long)bo, (long long)bq, (long long)bsd,
                     (bo || bq || bsd) ? "DIFFERENT" : "IDENTICAL", ws[0], ws[1], ub / 1e6, ub > 0 ? kv / ub : 0.0);
     }
     const double us1 = timed([&] { rk->launch(&a, nullptr); });
