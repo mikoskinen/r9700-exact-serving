@@ -617,6 +617,66 @@ bool cta_on() {
     return on;
 }
 
+/* tp8 loop R48 (PREFILL round 48): lever CIK's width bound (aql.h cik_lanes_of) and what CIK did, so one card run reads it. */
+uint64_t cik_lanes_max() {
+    static const uint64_t m = [] {
+        const uint64_t v = cik_lanes_of(std::getenv("RADIANCE_AQL_CIK_LANES"));
+        if (cik_on() && v != UINT64_MAX)
+            RAD_INFO("aql: lever CIK chains a dispatch of at most %llu work-items (RADIANCE_AQL_CIK_LANES; tp8 loop R48): a wider one "
+                     "plays as lever IKA's", (unsigned long long)v);
+        return v;
+    }();
+    return m;
+}
+/* Per thread (a rank's issue thread owns its counts: no shared line on the issue path), summed by the minute line. */
+struct CikTl {
+    std::atomic<int64_t>  live{0}, live_lanes{0}, wide{0}, wide_lanes{0}, played{0}, played_lanes{0};
+    std::atomic<uint64_t> widest{0};
+    uint32_t              tick = 0;
+};
+std::mutex            g_cik_tl_mu;
+std::vector<CikTl*>   g_cik_tls;   /* never freed: a thread's counts outlive it until the process ends */
+CikTl& cik_tl() {
+    thread_local CikTl* t = [] {
+        CikTl* c = new CikTl();
+        std::lock_guard<std::mutex> lk(g_cik_tl_mu);
+        g_cik_tls.push_back(c);
+        return c;
+    }();
+    return *t;
+}
+inline void cik_bump(std::atomic<int64_t>& a, int64_t v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); }
+/* One stderr line a minute at most, while CIK is on: dispatches issued live chained (their work-items = the chain counter's adds
+ * at one a lane; wave adds = work-items / 32), kept unchained by RADIANCE_AQL_CIK_LANES, and tape plays chained. */
+void cik_line() {
+    using clk = std::chrono::steady_clock;
+    static std::atomic<int64_t> next_ms{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now().time_since_epoch()).count();
+    int64_t n = next_ms.load(std::memory_order_relaxed);
+    if (now < n || !next_ms.compare_exchange_strong(n, now + 60000, std::memory_order_relaxed)) return;
+    if (n == 0) return;   /* the first call arms the minute */
+    int64_t live = 0, live_lanes = 0, wide = 0, wide_lanes = 0, played = 0, played_lanes = 0;
+    uint64_t widest = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_cik_tl_mu);
+        for (const CikTl* c : g_cik_tls) {
+            live += c->live.load(std::memory_order_relaxed);
+            live_lanes += c->live_lanes.load(std::memory_order_relaxed);
+            wide += c->wide.load(std::memory_order_relaxed);
+            wide_lanes += c->wide_lanes.load(std::memory_order_relaxed);
+            played += c->played.load(std::memory_order_relaxed);
+            played_lanes += c->played_lanes.load(std::memory_order_relaxed);
+            widest = std::max(widest, c->widest.load(std::memory_order_relaxed));
+        }
+    }
+    const uint64_t b = cik_lanes_max();
+    std::fprintf(stderr,
+                 "aql: CIK since start: %lld dispatches issued live chained (%lld work-items, widest %llu), %lld kept unchained "
+                 "by the bound (%lld work-items; bound %s), %lld chained tape plays (%lld work-items) (tp8 loop R48)\n",
+                 (long long)live, (long long)live_lanes, (unsigned long long)widest, (long long)wide, (long long)wide_lanes,
+                 b == UINT64_MAX ? "none" : std::to_string(b).c_str(), (long long)played, (long long)played_lanes);
+}
+
 /* Whether the module holding `m`'s code was built with the chain-capable IKA entry: its OWN object exports
  * `int r4d_ika_chain(void)` returning 1 (libr4d / exl3r4d built with R4D_IKA_CHAIN). Core's own blit kernels never are. */
 bool cik_module(const Module* m) {
@@ -1427,12 +1487,28 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     p->completion_signal.handle = 0;
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
     /* A chained kernel (RadKernelChainFn, named r4dchain*): its record in the slot's tail. A lever CIK kernel (KernelRec::cik)
-     * chains whatever the plugins were told (tp8 loop W8: RADIANCE_AQL_CIK=1 leaves rad_dev_chain_enabled to the engine). */
-    const bool chain_cap = k->chained && (k->cik || rad_dev_chain_enabled()) && s->chain_ctr &&
+     * chains whatever the plugins were told (tp8 loop W8: RADIANCE_AQL_CIK=1 leaves rad_dev_chain_enabled to the engine).
+     * tp8 loop R48: a CIK kernel's dispatch wider than RADIANCE_AQL_CIK_LANES goes out with its record off (cik_too_wide; unset =
+     * no bound), as an IKA kernel -- a property of the dispatch, so its recording holds it unchained too. */
+    const bool wide = cik_too_wide(k->cik, gx * gy * gz, cik_lanes_max());
+    const bool chain_cap = k->chained && !wide && (k->cik || rad_dev_chain_enabled()) && s->chain_ctr &&
                            n <= RAD_CHAIN_KARG_OFF;
     /* tp8 loop W9: fn4 aql_cik 0 -- a chain-capable kernel issues as the IKA kernel it also is; a tape records the capability and
      * its plays read the switch (PlayRun::put) */
     const bool chain = chain_cap && (!k->cik || cik_live());
+    if (k->cik) {   /* tp8 loop R48: CIK's counts (live chained / kept unchained by the bound) */
+        CikTl& c = cik_tl();
+        const int64_t lanes = (int64_t)(gx * gy * gz);
+        if (chain) {
+            cik_bump(c.live, 1);
+            cik_bump(c.live_lanes, lanes);
+            if ((uint64_t)lanes > c.widest.load(std::memory_order_relaxed)) c.widest.store((uint64_t)lanes, std::memory_order_relaxed);
+        } else if (wide) {
+            cik_bump(c.wide, 1);
+            cik_bump(c.wide_lanes, lanes);
+        }
+        if ((++c.tick & 255u) == 0) cik_line();
+    }
     if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain_cap, k->ika || (chain_cap && ika_on() && chi_on()), k->cik);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
@@ -1626,6 +1702,12 @@ struct PlayRun {
                          __ATOMIC_RELEASE);
         foreign = false;
         if (chain) s->chain_issued += r.lanes ? lanes_of(p) : blocks_of(p);
+        if (chain && r.lanes) {   /* tp8 loop R48: CIK's counts */
+            CikTl& c = cik_tl();
+            cik_bump(c.played, 1);
+            cik_bump(c.played_lanes, (int64_t)lanes_of(p));
+            if ((++c.tick & 255u) == 0) cik_line();
+        }
         s->prev_chained = chain;
         s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
         s->wr = idx + 1;

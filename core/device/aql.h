@@ -177,6 +177,24 @@ inline bool ika_play_mark(bool live, bool noacq, bool noacq_ika, bool ika, bool 
  * its waves ended), and only on a packet no record or ride completes (that signal orders other queues / the host after it). */
 inline bool ika_play_release_none(bool live, bool ika, bool completes) { return live && ika && !completes; }
 
+/* tp8 loop R48 (PREFILL round 48) -- lever CIK's width bound. A chain-capable IKA kernel (libr4d R4D_IKA_CHAIN, DRAFTER round
+ * 62) adds to its queue's ONE chain counter at every lane's exit: one atomic add a wave, all on one address. A decode dispatch
+ * is a few thousand waves; a prefill chunk's per-row kernels are hundreds of thousands (quant_group_kernel over 4,096 rows x
+ * 5,120 columns: 21 M work-items = 655 k wave adds, its QG8 form 82 k), which the L2 serialises at the counter's line.
+ * RADIANCE_AQL_CIK_LANES=N (start env, read only while CIK is on): a CIK kernel's dispatch of more than N work-items goes out
+ * with its record OFF -- it plays as lever IKA's self-acquiring kernel (ordered, no wait, no add), the same kernel and bytes.
+ * Unset / empty / 0 / negative / not a number = no bound (every CIK dispatch chains: the DRAFTER's form). */
+inline uint64_t cik_lanes_of(const char* env) {
+    if (!env || !*env) return UINT64_MAX;
+    char* end = nullptr;
+    const long long v = std::strtoll(env, &end, 10);
+    if (end == env || v <= 0) return UINT64_MAX;
+    return (uint64_t)v;
+}
+/* Whether a dispatch of `lanes` work-items of a kernel that chains under CIK (`cik`) is kept unchained by the bound `max`. A named
+ * chained form (r4dchain*, its own block-count done: `cik` false) is never bounded. */
+inline bool cik_too_wide(bool cik, uint64_t lanes, uint64_t max) { return cik && lanes > max; }
+
 /* Whether `sym`'s own identifier is one of the `n` names of `list` (null / empty entries skipped). */
 inline bool ika_listed(const std::string& sym, const char* const* list, int n) {
     const std::string id = ika_identifier(sym);

@@ -1943,6 +1943,35 @@ TEST(ika_play_picks_the_rule_marks_off_and_ikas_on) {
     }
 }
 
+/* tp8 loop R48 (PREFILL round 48): lever CIK's width bound (core/device/aql.h cik_lanes_of / cik_too_wide). Unset or not a
+ * positive number = no bound: every CIK dispatch chains as in the DRAFTER's form; set, a CIK kernel's dispatch of more than N
+ * work-items keeps its record off (plays as an IKA kernel), one of N or fewer chains; a named chained form is never bounded. The
+ * DeepSeek shapes: a decode lane's quant at 16 rows x 5,120 columns (81,920 work-items) chains under the arm's 262,144, a prefill
+ * chunk's at 4,096 rows (20,971,520) and a ~1.1k-row BG newcomer's (5,632,000) do not. */
+TEST(cik_bound_keeps_only_wide_cik_dispatches_unchained_and_unset_bounds_nothing) {
+    using rad::aql::cik_lanes_of;
+    using rad::aql::cik_too_wide;
+    CHECK_EQ(cik_lanes_of(nullptr), UINT64_MAX);
+    CHECK_EQ(cik_lanes_of(""), UINT64_MAX);
+    CHECK_EQ(cik_lanes_of("0"), UINT64_MAX);
+    CHECK_EQ(cik_lanes_of("-5"), UINT64_MAX);
+    CHECK_EQ(cik_lanes_of("on"), UINT64_MAX);
+    CHECK_EQ(cik_lanes_of("1"), (uint64_t)1);
+    CHECK_EQ(cik_lanes_of("262144"), (uint64_t)262144);
+    CHECK_EQ(cik_lanes_of("8589934592"), (uint64_t)8589934592ull);   /* beyond 32 bits */
+    const uint64_t none = cik_lanes_of(nullptr), b = cik_lanes_of("262144");
+    for (uint64_t lanes : {uint64_t(1), uint64_t(81920), uint64_t(262144), uint64_t(262145), uint64_t(5632000),
+                           uint64_t(20971520), uint64_t(UINT32_MAX) * 3}) {
+        CHECK(!cik_too_wide(true, lanes, none));     /* unset: the DRAFTER's form, every CIK dispatch chains */
+        CHECK(!cik_too_wide(false, lanes, none));
+        CHECK(!cik_too_wide(false, lanes, b));       /* a named chained form keeps its own rule */
+        CHECK_EQ(cik_too_wide(true, lanes, b), lanes > 262144);
+    }
+    CHECK(!cik_too_wide(true, 81920, b));            /* decode lane quant chains */
+    CHECK(cik_too_wide(true, 20971520, b));          /* prefill chunk quant plays as IKA */
+    CHECK(cik_too_wide(true, 5632000, b));           /* BG newcomer quant plays as IKA */
+}
+
 /* The source side of the same rule (libr4d/r4d_ika_list.inc is what libr4d built with R4D_IKA exports): every kernel
  * definition in libr4d whose identifier the list names starts with R4D_IKA_ENTRY(), and every definition that starts
  * with it is listed. A same-named kernel without the entry (another unit's anonymous namespace, say) would be treated as
