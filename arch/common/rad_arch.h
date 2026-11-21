@@ -1138,8 +1138,11 @@ struct TipStage {
     int  (*stage)(void* u, int group, int layer, void* stream) = nullptr;
     void* u = nullptr;
     bool on() const { return row > 0 && cu && stage; }
+    /* A refusal is not this rank's step failure: the engine counts it and refuses the snapshot at its save (the engine then
+     * stops with the reason). Failing the step here on one rank would leave the others inside a collective (test tip1 / F60: rank 0
+     * waited in an all-reduce its peers had left). */
     void put(RadCtx* c, rad_kvgroup g, int layer) const {
-        if (stage && stage(u, (int)g, layer, rad_stream(c)) < 0) rad_step_fail(c, "lever TIP: the engine refused a state row's staging copy");
+        if (stage) (void)stage(u, (int)g, layer, rad_stream(c));
     }
 };
 /* fn4 kvs_apart (qwen/KV-STREAM-EXACT.md): a streamed group's RING whatever view the pass is on -- `cols` -1 on a KV operand
