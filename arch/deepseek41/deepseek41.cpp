@@ -12911,7 +12911,8 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
     if (b && b->draft_pass > 0 && c) {
         const int r = rad_rank(c);
         if (r >= 0 && r < rad::arch::MAX_RANKS && deepseek41::models[r] && deepseek41::dsp_upload_pending(*deepseek41::models[r], b)) {
-            if (deepseek41::g_eup_n.fetch_add(1, std::memory_order_relaxed) == 0 && r == 0)
+            /* rank 0 counts alone: the rank threads key concurrently, so a process-wide first could be another rank's (PREFILL NOTE 00:20) */
+            if (r == 0 && deepseek41::g_eup_n.fetch_add(1, std::memory_order_relaxed) == 0)
                 fprintf(stderr, "radiance: deepseek41: lever EUP: a DSpark query pass (%lld tokens) that copies its one-time planes "
                                 "(lever EMA's index planes / the confidence head's weights) from host memory is issued live, not "
                                 "recorded, so its key records on its next pass (RADIANCE_DS41_EUP=0: off)\n",
