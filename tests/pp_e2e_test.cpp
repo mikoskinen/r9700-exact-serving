@@ -6463,10 +6463,12 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         /* tp8 loop R56f (PREFILL NOTE 19:06): whether a burst finds the lanes merged with no BG room depends on when its requests
          * arrive -- under load ~20-30 + swap every bit-16 arm held 0 (tokens 0 of 17 differ; alone 1 + 1). A bit-16 arm whose
          * merge line still says 0 held sends the same burst again (the prefix cache dropped first: cold newcomers as the first
-         * time), up to twice; each retry's tokens are held to the reference burst's too. */
+         * time), up to twice; each retry's tokens are held to the reference burst's too. tp8 loop R60f (DECODE round 60): up to FIVE
+         * times -- at 3e1d62d5 under load ~23 (two plugin builds beside two tracks' suites) both bit-16 arms still held 0 after two
+         * retries (tokens 0 of 17 differ); a retry costs only where the first burst held nothing. */
         int retries = 0, retry_differ = 0;
         const size_t nb = hold_burst_set_size();
-        for (int r = 0; (a.merge & 16) && r < 2; ++r) {
+        for (int r = 0; (a.merge & 16) && r < 5; ++r) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1300));
             long long h = -1;
             {
