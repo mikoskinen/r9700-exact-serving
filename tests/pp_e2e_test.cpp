@@ -5323,7 +5323,8 @@ TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
 }
 /* tp8 loop D61 (fn4 host_spin, both nodes; timing only): the DSpark-drafted pipeline with every critical-path wait spinning before it
  * blocks -- the rank barrier, the leader's drafter-end wait, the follower's frame receive, the loops' naps -- serves one process's
- * tokens at 2 lanes W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes, BG 2, READY_FIRST) from the start env, and in process at 2
+ * tokens at 1 lane and 2 lanes at the wrap-around cut W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes, BG 2, READY_FIRST) from the
+ * start env, and in process at 2
  * lanes (POST 20 -> 0, both nodes apply it); the leader's spin counts name the sites that waited; a bad env value is said and means
  * 0. The D60 line beside it gives the host's means with and without the spin (the host backend: kernels run at issue). */
 TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
@@ -5365,7 +5366,7 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
         return sum;
     };
     struct Arm { int lanes; int bg; const char* cut; const char* env; bool post; };
-    for (const Arm a : { Arm{ 2, -1, "1,3", "20", false }, Arm{ 3, -1, "0,3", "20", false }, Arm{ 4, 2, "1,3", "20", false },
+    for (const Arm a : { Arm{ 1, -1, "1,3", "20", false }, Arm{ 2, -1, "1,3", "20", false }, Arm{ 3, -1, "0,3", "20", false }, Arm{ 4, 2, "1,3", "20", false },
                          Arm{ 2, -1, "1,3", nullptr, true }, Arm{ 2, -1, "1,3", "99999", false }, Arm{ 2, -1, "1,3", nullptr, false } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back("RADIANCE_PP_BGRATE_LINE_S=1");
@@ -5407,7 +5408,7 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
         }
         const long long lb = count(llog, "rank barrier", true), lbb = count(llog, "rank barrier", false);
         const long long ld = count(llog, "drafter end", true), ldb = count(llog, "drafter end", false);
-        const long long fb = count(flog, "rank barrier", true), ff = count(flog, "frame receive", true);
+        const long long fb = count(flog, "rank barrier", true), fbb = count(flog, "rank barrier", false), ff = count(flog, "frame receive", true);
         const long long ffb = count(flog, "frame receive", false), naps = count(llog, "poll naps", true) + count(flog, "poll naps", true);
         const long long fs = count(flog, "socket read", true), fsb = count(flog, "socket read", false);
         double m[10] = {};
@@ -5433,12 +5434,14 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
         const bool on = (a.env && !std::strcmp(a.env, "20")) || a.post;
         if (on) {
             CHECK(lb > 0);   /* the leader's rank barrier spun and caught releases / joins */
-            CHECK(fb > 0);   /* the follower's too */
+            CHECK(fb + fbb > 0);                /* the follower's spun too */
+            if (a.lanes > 1) CHECK(fb > 0);     /* and caught releases (one lane: one step in flight, its waits outlast 2 ms) */
             CHECK(ff + ffb > 0);   /* the follower's frame receive took the spin */
             CHECK(fs > 0);         /* its receive thread caught frames on the socket without blocking */
-            CHECK(ld + ldb > 0);   /* the drafter-end wait took the spin (the fixture drafts: so.early) */
+            if (a.lanes > 1) CHECK(ld + ldb > 0);   /* the lane loop's drafter-end wait took the spin (the fixture drafts: so.early);
+                                                      * one lane runs step_loop, which has no such wait site */
         } else {
-            CHECK_EQ(lb + lbb + ld + ldb + fb + ff + ffb + fs + fsb + naps, 0);   /* host_spin 0: no wait spun */
+            CHECK_EQ(lb + lbb + ld + ldb + fb + fbb + ff + ffb + fs + fsb + naps, 0);   /* host_spin 0: no wait spun */
         }
         if ((a.post || (a.env && !std::strcmp(a.env, "20"))) && (fb == 0 || lb == 0)) {
             for (const std::string* lg : { &llog, &flog })
