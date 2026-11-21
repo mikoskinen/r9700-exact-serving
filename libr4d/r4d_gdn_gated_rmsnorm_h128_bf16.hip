@@ -64,6 +64,93 @@ void r4d_gdn_gated_rmsnorm_kernel(const unsigned short* __restrict__ x,
   *(ushort4*)(o + r * orow + d0) = make_ushort4(out[0], out[1], out[2], out[3]);
 }
 
+/* qfn-on-ds lever GNQ8 (Qwen loop round 7, 21.11.2026; RADIANCE_FN4_GNQ8 declares, switch gnq8): the kernel above, word
+ * for word, plus the int8 codes and scales of its bf16 output that quant_act_i8g writes next for the out projection
+ * (r4d_quant_act_fp8.hip quant_act_fp8_body<false, true>). A row here is one (token, head) of 128 channels = one
+ * 128-column scale group of the token's flattened row, and a lane's four channels are the four columns quant_act_i8g's
+ * lane takes (lane * 4 of the group), so the codes are its expression on the same bf16 values in the same lanes: the
+ * amax over the lane's four, the wave max, amax / 127 (1 for an all-zero group), the reciprocal, the clamped rintf, the
+ * byte packing -- the same bytes, without the standalone pass (it re-read the plane at ~70 GB/s beside the collectives:
+ * 135 us a 2048-row call at 128k, prof2p). Row r = token t * hpt + head h; q [tokens][hpt * 128] at qrow bytes a token,
+ * qs [tokens][hpt] at srow floats a token. The bf16 output is still written (its readers do not change). */
+template <int ACT>
+__global__ __launch_bounds__(GN_NW * 32)
+void r4d_gdn_gated_rmsnorm_i8g_kernel(const unsigned short* __restrict__ x,
+                                      const unsigned short* __restrict__ z,
+                                      const float* __restrict__ w,
+                                      unsigned short* __restrict__ o,
+                                      unsigned char* __restrict__ q,
+                                      float* __restrict__ qs,
+                                      long rows, long xrow, long zrow, long orow,
+                                      long zheads, long ztok, long qrow, long srow, long hpt, float eps)
+{
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const long r = (long)blockIdx.x * GN_NW + warp;
+  if (r >= rows) return;
+  const int d0 = lane * GN_DPL;
+  const long zoff = zheads > 0 ? (r / zheads) * ztok + (r % zheads) * zrow : r * zrow;
+
+  const ushort4 xv = *(const ushort4*)(x + r * xrow + d0);
+  float v[GN_DPL] = {bf2f(xv.x), bf2f(xv.y), bf2f(xv.z), bf2f(xv.w)};
+
+  float ss = 0.0f;
+#pragma unroll
+  for (int c = 0; c < GN_DPL; ++c) ss += v[c] * v[c];
+  ss = r4d_wave_sum(ss);
+  const float scale = __frsqrt_rn(ss * (1.0f / GN_D) + eps);
+
+  const ushort4 zv = *(const ushort4*)(z + zoff + d0);
+  const float zz[GN_DPL] = {bf2f(zv.x), bf2f(zv.y), bf2f(zv.z), bf2f(zv.w)};
+  const float4 ww = *(const float4*)(w + d0);
+  const float wv[GN_DPL] = {ww.x, ww.y, ww.z, ww.w};
+
+  unsigned short out[GN_DPL];
+#pragma unroll
+  for (int c = 0; c < GN_DPL; ++c)
+    out[c] = f2bf(v[c] * scale * wv[c] * gn_act(zz[c], ACT));
+  *(ushort4*)(o + r * orow + d0) = make_ushort4(out[0], out[1], out[2], out[3]);
+
+  /* quant_act_i8g's group on the stored bf16 values, read back as it reads them */
+  const long t = r / hpt, h = r % hpt;
+  float u[GN_DPL];
+#pragma unroll
+  for (int c = 0; c < GN_DPL; ++c) u[c] = __uint_as_float((uint32_t)out[c] << 16);
+  float m = 0.0f;
+#pragma unroll
+  for (int c = 0; c < GN_DPL; ++c) m = fmaxf(m, fabsf(u[c]));
+  m = r4d_wave_max(m);
+  const float sc = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+  if (lane == 0) qs[t * srow + h] = sc;
+  const float inv = 1.0f / sc;
+  uint32_t b = 0;
+#pragma unroll
+  for (int c = 0; c < GN_DPL; ++c) {
+    const int k = (int)rintf(fminf(fmaxf(u[c] * inv, -127.0f), 127.0f));
+    b |= ((uint32_t)k & 0xFFu) << (8 * c);
+  }
+  *(uint32_t*)(q + t * qrow + h * GN_D + d0) = b;
+}
+
+extern "C" int r4d_gdn_gated_rmsnorm_i8g_h128(const void* x, const void* z, const void* w, void* o,
+                                              void* q, void* qs, long rows, long xrow, long zrow,
+                                              long orow, long zheads, long ztok, long qrow, long srow,
+                                              long hpt, int width, float eps, int act, void* stream)
+{
+  if (width != GN_D || hpt <= 0 || rows % hpt) return -1;
+  dim3 grid((unsigned)((rows + GN_NW - 1) / GN_NW)), blk(GN_NW * 32);
+  if (act)
+    hipLaunchKernelGGL((r4d_gdn_gated_rmsnorm_i8g_kernel<1>), grid, blk, 0, (hipStream_t)stream,
+                       (const unsigned short*)x, (const unsigned short*)z, (const float*)w,
+                       (unsigned short*)o, (unsigned char*)q, (float*)qs, rows, xrow, zrow, orow,
+                       zheads, ztok, qrow, srow, hpt, eps);
+  else
+    hipLaunchKernelGGL((r4d_gdn_gated_rmsnorm_i8g_kernel<0>), grid, blk, 0, (hipStream_t)stream,
+                       (const unsigned short*)x, (const unsigned short*)z, (const float*)w,
+                       (unsigned short*)o, (unsigned char*)q, (float*)qs, rows, xrow, zrow, orow,
+                       zheads, ztok, qrow, srow, hpt, eps);
+  return (int)hipGetLastError();
+}
+
 extern "C" int r4d_gdn_gated_rmsnorm_h128_bf16(const void* x, const void* z, const void* w,
                                                void* o, long rows, long xrow, long zrow,
                                                long orow, long zheads, long ztok, int width,
@@ -137,5 +224,53 @@ extern "C" int r4d_rad_gdn_gated_rmsnorm(const RadArgs* a, RadStream s) {
                                                    (long)rows, (long)xrow, (long)zrow,
                                                    (long)orow, (long)zheads, (long)ztok,
                                                    (int)width, eps, act, s));
+}
+
+/* lever GNQ8: gdn_gated_rmsnorm_i8g = gdn_gated_rmsnorm + quant_act_i8g over its output in one pass. Operands x, z, w, o
+ * as gdn_gated_rmsnorm's, then q [tokens][n] int8 and scale [tokens][n / 128] f32 as quant_act_i8g's; x and o hold each
+ * token's heads at the channel pitch (the (token, head) rows evenly spaced), q / scale a row a token. */
+enum { GNQ_X = 0, GNQ_Z, GNQ_W, GNQ_O, GNQ_Q, GNQ_S };
+
+extern "C" int r4d_rad_gdn_gated_rmsnorm_i8g(const RadArgs* a, RadStream s) {
+    const RadTensor* x  = r4d_opt(a, GNQ_X);
+    const RadTensor* z  = r4d_opt(a, GNQ_Z);
+    const RadTensor* w  = r4d_opt(a, GNQ_W);
+    const RadTensor* o  = r4d_opt(a, GNQ_O);
+    const RadTensor* q  = r4d_opt(a, GNQ_Q);
+    const RadTensor* qs = r4d_opt(a, GNQ_S);
+    if (!x || !z || !w || !o || !q || !qs) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(x, RAD_BF16); R4D_DT(z, RAD_BF16); R4D_DT(o, RAD_BF16); R4D_DT(w, RAD_F32);
+    R4D_DT(q, RAD_I8); R4D_DT(qs, RAD_F32);
+    if (x->rank < 2 || z->rank < 2 || o->rank < 2 || q->rank != 2 || qs->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
+    const long long width = r4d_geti_or(a, "channels", x->shape[x->rank - 1]);
+    if (width != GN_D || r4d_numel(x) % width) return R4D_NO(RAD_E_SHAPE);
+    const long long rows = r4d_numel(x) / width;
+    const long long tok = q->shape[0], n = q->shape[1];
+    if (n % width || tok <= 0 || rows != tok * (n / width)) return R4D_NO(RAD_E_SHAPE);
+    const long long hpt = n / width;
+    if (qs->shape[0] != tok || qs->shape[1] != hpt) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(z) < rows * width || r4d_numel(o) < rows * width) return R4D_NO(RAD_E_SHAPE);
+    const long long xrow = gn_row_pitch(x, width);
+    const long long orow = gn_row_pitch(o, width);
+    if (xrow != width || orow != width) return R4D_NO(RAD_E_STRIDE);   /* heads at the channel pitch: row r = t * hpt + h */
+    const long long qrow = r4d_row_pitch(q), srow = r4d_row_pitch(qs);
+    if (qrow < n || srow < hpt) return R4D_NO(RAD_E_STRIDE);
+    long long zrow = gn_row_pitch(z, width), zheads = 0, ztok = 0;
+    if (zrow < 0 && z->rank == 2 && z->stride[1] == 1 && z->shape[1] % width == 0) {
+        zheads = z->shape[1] / width;
+        ztok   = z->stride[0];
+        zrow   = width;
+        if (zheads <= 0 || rows % zheads) return R4D_NO(RAD_E_SHAPE);
+        if (x->rank >= 3 && x->shape[x->rank - 2] != zheads) return R4D_NO(RAD_E_SHAPE);
+    }
+    if (zrow < 0) return R4D_NO(RAD_E_STRIDE);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6);
+    const int   act = r4d_act_code(a, "act", nullptr, -1);
+    if (act != 0 && act != 1) return R4D_NO(RAD_E_INVAL);
+    return R4D_RAW(r4d_gdn_gated_rmsnorm_i8g_h128(x->data, z->data, w->data, o->data, q->data, qs->data,
+                                                  (long)rows, (long)xrow, (long)zrow, (long)orow,
+                                                  (long)zheads, (long)ztok, (long)qrow, (long)srow,
+                                                  (long)hpt, (int)width, eps, act, s));
 }
 

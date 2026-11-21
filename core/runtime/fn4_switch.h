@@ -880,6 +880,9 @@
  *   rg_tail         libr4d (qfn-on-ds lever RGT, 21.11.2026): the fused decode router (router_gemm_topk_scatter) ranks
  *                   each 16-row tile's rows in that tile's last block and sorts in the last tile's, from N rows (at
  *                   least two tiles); the same bytes; 0 today (the grid's last block ranks every row)  RADIANCE_FN4_RG_TAIL
+ *   gnq8            qwen4exp (qfn-on-ds lever GNQ8, 21.11.2026): a delta-net layer's prefill rows take gdn_gated_rmsnorm_i8g
+ *                   (the gated norm writes quant_act_i8g's codes of its output in the same pass; the pair's bytes) instead
+ *                   of gdn_gated_rmsnorm + quant_act_i8g; RADIANCE_FN4_GNQ8 declares it; 0 today        RADIANCE_FN4_GNQ8
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -925,6 +928,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kHcSpProbe, kHcSp, kMtpFlat, kArSdma, kBiWide, kSpSerial, kHcPinPf2,
               kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kQsaSplit, kSpPle, kArFence, kSpRoute,
               kRgTail,   /* qfn-on-ds lever RGT (Qwen loop round 5, 21.11.2026): libr4d, the fused router ranks per row tile */
+              kGnq8,     /* qfn-on-ds lever GNQ8 (Qwen loop round 7, 21.11.2026): qwen4exp, the GDN prefill gated norm writes the codes */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it

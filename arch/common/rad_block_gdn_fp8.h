@@ -121,6 +121,9 @@ struct GdnFP8 {
 
     rad_op op_ab = 0;
     rad_op op_conv_prep = 0, op_kkt = 0, op_scan = 0, op_gnorm = 0;   /* prefill */
+    /* lever GNQ8 (rad_fp8.h fn4_gnq8_declared): op_gnorm + q_o in one op for the prefill rows; 0 unless declared and
+     * resolved (then the pair runs) */
+    rad_op op_gnq8 = 0;
     rad_op op_conv_update = 0, op_recur = 0;                          /* decode */
     /* `gdn_conv_recurrent_update`, if it resolves: the pair above in one launch, with the
      * convolution in the recurrent update's prologue. The pair is declared either way; cr_rows is
@@ -149,6 +152,24 @@ struct GdnFP8 {
      * trailing add, which would read the delta before the reduction. */
     void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
               ArPieces* pieces = nullptr) const;
+    /* The prefill rows [r0, r0 + n) of T: the gated norm (in place on o.x, the gate from in.x's z part) and q_o's codes of
+     * its output -- one op under lever GNQ8 (op_gnq8 declared and switch gnq8 on), else the pair. */
+    void gnorm_q(RadCtx* c, int64_t T, int64_t r0, int64_t n) const {
+        const int64_t conv_dim = cfg.conv_dim(), v_dim = cfg.v_dim(), in_w = conv_dim + v_dim;
+        if (op_gnq8 && fn4_gnq8_flag().load(std::memory_order_relaxed)) {
+            RAD_ISSUE_N(c, op_gnq8, n,
+                        brow_slice(w.o.x, r0, n, v_dim),
+                        bcol_at(w.in.x, r0, in_w, conv_dim, v_dim, n),
+                        RAD_W(w_out_norm), brow_slice(w.o.x, r0, n, v_dim),
+                        brow_slice(w.o.cq(), r0, n, v_dim), brow_slice(w.o.cs(), r0, n, v_dim / RAD_FP8_BLOCK));
+            return;
+        }
+        RAD_ISSUE_N(c, op_gnorm, n,
+                    brow_slice(w.o.x, r0, n, v_dim),
+                    bcol_at(w.in.x, r0, in_w, conv_dim, v_dim, n),
+                    RAD_W(w_out_norm), brow_slice(w.o.x, r0, n, v_dim));
+        q_o.step(c, T, r0, n);
+    }
     /* Whether step() with `own_ar` false runs the whole block a piece at a time over `pieces`
      * (its piece path), asked by a caller that must know before it commits to a schedule. */
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
@@ -357,6 +378,15 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     }
 
     RAD_ARCH_TRY(q_o.declare(b, g, w.o, v_dim));
+    /* lever GNQ8: where q_o is quant_act_i8g (an int8 out projection fed plain int8 codes), the gated norm and it in one
+     * op. Optional (no RAD_ARCH_TRY): a plugin without the row leaves the pair. */
+    if (fn4_gnq8_declared() && q_o.op && !g.w_bf16 && w.o.q8_fed && !w.o.q8_rot && w.o.cq() && w.o.cs())
+        op_gnq8 = rw(b, RAD_OP(b, "gdn_gated_rmsnorm_i8g",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", v_dim),
+                                    RAD_INT("channels", cfg.head_v), RAD_INT("group", RAD_FP8_BLOCK),
+                                    RAD_F64("eps", g.eps), RAD_STR("act", cfg.act)),
+                         RAD_WEIGHTS(w_out_norm)),
+                     {w.o.x, w.in.x}, {w.o.x, w.o.cq(), w.o.cs()});
     RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.ssm_out", l), g.n_embd, v_dim,
                              RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x, 0, {},
                              cfg.uneven() ? cfg.v_first * cfg.head_v : 0,
@@ -416,7 +446,6 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * piece passes its own context length, its first row's position: the step's would tell the
      * second piece of a prompt's first chunk that it has none. */
     if (!own_ar && takes_pieces(batch, pieces)) {
-        const int64_t in_w = conv_dim + v_dim;
         for (int64_t p = 0; p < 2; ++p) {
             const int64_t r0 = p * pieces->rows;
             const int64_t n  = p == 0 ? pieces->rows : T - pieces->rows;
@@ -440,11 +469,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         kv_cache(kv_state, layer), praw(cu, RAD_I32, 2),
                         brows(w.o.x, T), kv_cache(kv_state, layer),
                         praw2(st_idx, RAD_I32, 1, st_w));
-            RAD_ISSUE_N(c, op_gnorm, n,
-                        brow_slice(w.o.x, r0, n, v_dim),
-                        bcol_at(w.in.x, r0, in_w, conv_dim, v_dim, n),
-                        RAD_W(w_out_norm), brow_slice(w.o.x, r0, n, v_dim));
-            q_o.step(c, T, r0, n);
+            gnorm_q(c, T, r0, n);
             out.step(c, w.o, w.h.x, T, r0, n);
             if (p == 0) pieces->hand(r0, n);
         }
@@ -486,7 +511,6 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int32_t qd = batch->phase == RAD_PHASE_MIXED ? batch->max_q_len_decode : batch->max_q_len;
     const int64_t P  = S - D;
     const int64_t PT = T - DT;
-    const int64_t in_w = conv_dim + v_dim;      /* w.in.x's declared row width */
 
     /* The recurrent update at decode heights runs one workgroup per (sequence, head) and leaves the
      * card's memory mostly idle, so the out-projection's weight is read into the on-die cache
@@ -551,11 +575,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (cut) {
             for (int64_t r0 = 0; r0 < T; r0 += pieces->rows) {
                 const int64_t n = T - r0 < pieces->rows ? T - r0 : pieces->rows;
-                RAD_ISSUE_N(c, op_gnorm, n,
-                            brow_slice(w.o.x, r0, n, v_dim),
-                            bcol_at(w.in.x, r0, in_w, conv_dim, v_dim, n),
-                            RAD_W(w_out_norm), brow_slice(w.o.x, r0, n, v_dim));
-                q_o.step(c, T, r0, n);
+                gnorm_q(c, T, r0, n);
                 out.step(c, w.o, w.h.x, T, r0, n);
                 if (r0 + n < T) pieces->hand(r0, n);
             }
@@ -563,14 +583,10 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         }
         /* Per token, so a row slice over the prefill rows only; the recurrent kernel already
          * gated the decode rows. */
-        RAD_ISSUE_N(c, op_gnorm, PT,
-                    brow_slice(w.o.x, DT, PT, v_dim),
-                    bcol_at(w.in.x, DT, in_w, conv_dim, v_dim, PT),
-                    RAD_W(w_out_norm), brow_slice(w.o.x, DT, PT, v_dim));
         /* Only the prefill rows are quantised here; the decode kernel quantises in its epilogue.
          * The chunked scan cannot: its workgroup is a chunk, not a row, so it cannot reduce a
-         * row group's amax. */
-        q_o.step(c, T, DT, PT);
+         * row group's amax. (Lever GNQ8: the gated norm writes them, gnorm_q.) */
+        gnorm_q(c, T, DT, PT);
     }
 
     out.step(c, w.o, w.h.x, T);

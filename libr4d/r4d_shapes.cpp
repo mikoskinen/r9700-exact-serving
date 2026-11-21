@@ -1337,6 +1337,26 @@ extern "C" int r4d_shape_gdn_gated_rmsnorm(const RadParam* p, int n_p, int opera
     R4D_PICK(l);
 }
 
+/* qfn-on-ds lever GNQ8: `M` tokens, `n` = heads x channels; x / z / o as one [M, n] plane (the (token, head) rows of
+ * gdn_gated_rmsnorm), the codes and scales as quant_act_i8g's. */
+extern "C" int r4d_shape_gdn_gated_rmsnorm_i8g(const RadParam* p, int n_p, int operand,
+                                               RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t n  = pi(p, n_p, "n");
+    const int64_t ch = pi(p, n_p, "channels");
+    const int64_t gr = pi(p, n_p, "group");
+    if (ch <= 0 || gr <= 0 || n % ch || n % gr) return RAD_E_SHAPE;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_F32,  ch),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_I8,   M, n),
+        opd((uint32_t)RAD_F32,  M, n / gr),
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * Collectives (shims in r4d_ar_entry.hip).
  *

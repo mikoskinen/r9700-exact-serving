@@ -468,6 +468,7 @@ int r4d_rad_gdn_recurrent_update(const RadArgs*, RadStream);
 int r4d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
 int r4d_rad_gdn_conv_recurrent_update_had(const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
+int r4d_rad_gdn_gated_rmsnorm_i8g(const RadArgs*, RadStream);   /* qfn-on-ds lever GNQ8 */
 int r4d_rad_dflash_conv         (const RadArgs*, RadStream);
 int r4d_rad_dflash_select       (const RadArgs*, RadStream);
 
@@ -1045,6 +1046,7 @@ int r4d_shape_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, int oper
                                                   RadOpdDesc*);
 int r4d_shape_rope_table        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gdn_gated_rmsnorm (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_gdn_gated_rmsnorm_i8g(const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_all_reduce           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_all_gather           (const RadParam*, int, int operand, RadOpdDesc*);

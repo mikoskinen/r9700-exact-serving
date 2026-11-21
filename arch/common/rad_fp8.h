@@ -126,6 +126,19 @@ inline std::atomic<int>& fn4_biwide_flag() {
     return f;
 }
 inline bool fn4_biwide(int bit) { return (fn4_biwide_flag().load(std::memory_order_relaxed) & bit) != 0; }
+/* qfn-on-ds lever GNQ8 (Qwen loop round 7, 21.11.2026): a delta-net layer's prefill rows take gdn_gated_rmsnorm_i8g (the
+ * gated norm writing quant_act_i8g's codes of its output in the same pass, the pair's bytes) instead of gdn_gated_rmsnorm +
+ * quant_act_i8g. RADIANCE_FN4_GNQ8 non-zero at start declares the op (and is the switch's start value); switch gnq8 0 / 1
+ * picks at every issue; unset = today's declare and issue. */
+inline bool fn4_gnq8_declared() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_FN4_GNQ8"); return e && *e && *e != '0'; }();
+    return v;
+}
+inline std::atomic<int>& fn4_gnq8_flag() {
+    static std::atomic<int> f{fn4_gnq8_declared() ? 1 : 0};
+    return f;
+}
+
 /* The fused forms' ceiling under bi_wide bits 2 / 4 / 8: 32 sequences at depth 3 (the hc read's form G16 counters hold
  * 21 x 8 tile-groups at 128 rows, kHcGTilesMax 192). */
 constexpr int64_t kBiWideRows = 128;

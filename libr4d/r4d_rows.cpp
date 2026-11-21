@@ -757,6 +757,24 @@ static const RadOperandSpec oGdnGatedRmsNorm[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
     { "o", RAD_OPD_OUT,    0 },
 };
+/* qfn-on-ds lever GNQ8 (Qwen loop round 7): gdn_gated_rmsnorm with quant_act_i8g's codes of its output in the same pass.
+ * `M` is tokens here (the codes' rows), `n` the token's heads x channels. */
+static const RadParamSpec pGdnGatedRmsNormI8g[] = {
+    P_INT("M"),
+    P_INT("n"),
+    P_INT("channels"),
+    P_INT("group"),
+    P_F64("eps"),
+    P_STR("act"),
+};
+static const RadOperandSpec oGdnGatedRmsNormI8g[] = {
+    { "x",     RAD_OPD_IN,     0 },
+    { "z",     RAD_OPD_IN,     0 },
+    { "w",     RAD_OPD_WEIGHT, 0 },
+    { "o",     RAD_OPD_OUT,    0 },
+    { "q",     RAD_OPD_OUT,    0 },
+    { "scale", RAD_OPD_OUT,    0 },
+};
 
 /* Not in docs/OPS.md: the DFlash2 drafter's grouped dynamic depthwise convolution. It has no
  * unfused equivalent and no ref implementation, so the drafter has no fallback (spec §17). */
@@ -3809,6 +3827,8 @@ static const RadOpSchema kSchemas[] = {
            "unfused spelling cannot be written at all."),
     SCHEMA("gdn_gated_rmsnorm", pGdnGatedRmsNorm, oGdnGatedRmsNorm,
            "out = rms(x) . w . act(z) over a row."),
+    SCHEMA("gdn_gated_rmsnorm_i8g", pGdnGatedRmsNormI8g, oGdnGatedRmsNormI8g,
+           "gdn_gated_rmsnorm, then quant_act_i8g over its output, in one pass (the bytes of the pair)."),
     SCHEMA("dflash_conv", pDflashConv, oDflashConv,
            "DFlash2 grouped dynamic depthwise convolution, coefficient add and both taps in one "
            "pass."),
@@ -5075,6 +5095,10 @@ static const RadConstraint cGdnConvRecurrentUpdate[] = {
 };
 static const RadConstraint cGdnGatedRmsNorm[] = {
     C_EQ("channels", 128),
+};
+static const RadConstraint cGdnGatedRmsNormI8g[] = {
+    C_EQ("channels", 128),
+    C_EQ("group", 128),
 };
 
 /* ---- all-gather -------------------------------------------------------------------------------
@@ -8782,6 +8806,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cGdnGatedRmsNorm), NOTUNE,
   nullptr, nullptr, r4d_rad_gdn_gated_rmsnorm, nullptr, nullptr, nullptr,
   r4d_shape_gdn_gated_rmsnorm },
+
+{ "gdn_gated_rmsnorm_i8g_h128", "gdn_gated_rmsnorm_i8g", "gdn",
+  "qfn-on-ds lever GNQ8: the prefill gated rms norm and quant_act_i8g over its output in one pass",
+  "128 channels per (token, head) row, one wave a row = one 128-column scale group; silu or sigmoid gate",
+  "bf16 x / z / out, fp32 weight, int8 codes + f32 scale per (token, 128 columns): the pair's bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGdnGatedRmsNormI8g), NOTUNE,
+  nullptr, nullptr, r4d_rad_gdn_gated_rmsnorm_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_gdn_gated_rmsnorm_i8g },
 
 /* ---------------------------------------------------------------------------- all-reduce ----
  * The two-shot rows outrank the one-shots (see the all-reduce constraints above). */

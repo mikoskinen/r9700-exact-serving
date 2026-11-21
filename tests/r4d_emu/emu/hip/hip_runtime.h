@@ -356,6 +356,12 @@ struct alignas(4) uchar4 { unsigned char x, y, z, w; };
 inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, unsigned char d) {
     return uchar4{a, b, c, d};
 }
+/* qfn-on-ds (r4d_emu_gnq8): the GDN gated norm's operands and its scale */
+struct alignas(8) ushort4 { unsigned short x, y, z, w; };
+inline ushort4 make_ushort4(unsigned short a, unsigned short b, unsigned short c, unsigned short d) {
+    return ushort4{a, b, c, d};
+}
+inline float __frsqrt_rn(float a) { return (float)(1.0 / std::sqrt((double)a)); }
 /* v_cvt_pk_f32_fp8 (gfx12): two E4M3 codes of `w`'s low (hi false) or high half to f32, exact */
 typedef float emu_v2f __attribute__((ext_vector_type(2)));
 emu_v2f emu_cvt_pk_f32_fp8(int w, bool hi);
