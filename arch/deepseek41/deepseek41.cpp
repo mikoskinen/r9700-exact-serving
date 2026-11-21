@@ -12891,7 +12891,9 @@ static bool dsp_upload_pending(const Model& m, const RadBatch* b) {
     if (!d.ema_up && d.ema_g && dmr_now() >= 7 && !g_ema_bad.load(std::memory_order_relaxed) && blk >= 2 && S + 1 <= d.Q)
         for (size_t k = 0; k < d.ema_blk.size(); ++k)
             if (d.ema_blk[k] == blk) return true;
-    if (!d.cw_up && (lo ? lo->conf : d.conf_op) && ds41_switch("dspark_conf") > 0) return true;
+    /* the confidence head's upload sits behind dsp_query's `if (N <= 0) return;` (N = n_out): tested here too, so a pass
+     * that ends before the head never keys 0 (tp8 loop W24; every query pass the scheduler builds has n_out > 0) */
+    if (!d.cw_up && b->n_out > 0 && (lo ? lo->conf : d.conf_op) && ds41_switch("dspark_conf") > 0) return true;
     return false;
 }
 }  // namespace deepseek41
