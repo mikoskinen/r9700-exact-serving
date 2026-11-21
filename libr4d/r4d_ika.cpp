@@ -15,3 +15,9 @@ extern "C" __attribute__((visibility("default"))) const char* const* r4d_ika_ker
     if (n) *n = (int)(sizeof(kIka) / sizeof(kIka[0])) - 1;
     return kIka;
 }
+/* Lever CIK (DRAFTER track round 62): 1 when every listed kernel's entry is chain-capable (R4D_IKA_CHAIN, r4d_ika.h); the engine
+ * (RADIANCE_AQL_CIK=1) chains this object's listed kernels only then (aql.cpp cik_module). */
+#ifndef R4D_IKA_CHAIN
+#define R4D_IKA_CHAIN 0
+#endif
+extern "C" __attribute__((visibility("default"))) int r4d_ika_chain(void) { return (R4D_IKA && R4D_IKA_CHAIN) ? 1 : 0; }

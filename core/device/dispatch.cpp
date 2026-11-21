@@ -643,7 +643,10 @@ void rad_dev_chain_infer(int pays) {
 int rad_dev_chain_enabled(void) {
     int on = g_chain.load(std::memory_order_relaxed);
     if (on < 0) {
-        on = g_chain_pays.load(std::memory_order_relaxed) != 0 &&
+        /* Lever CIK (DRAFTER track round 62): RADIANCE_AQL_CIK=1 chains where the plugin measured nothing (the DeepSeek line):
+         * only kernels of a chain-capable module (aql.cpp cik_module) and the named chained forms the plugin asks for chain. */
+        const char* cik = std::getenv("RADIANCE_AQL_CIK");
+        on = (g_chain_pays.load(std::memory_order_relaxed) != 0 || (cik && cik[0] == '1')) &&
                      std::strcmp(rad::device_backend_name(), "aql") == 0
                  ? 1
                  : 0;

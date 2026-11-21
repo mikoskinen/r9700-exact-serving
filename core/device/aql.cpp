@@ -177,6 +177,14 @@ struct KernelRec {
      * acquire (when no line it reads can be stale in a scalar cache: Ctx::haz_mark) and its release. Set from the list
      * the kernel's own library exports (r4d_ika_kernels), never guessed from a name alone. */
     bool        ika = false;
+    /* Lever CIK (DRAFTER track round 62, RADIANCE_AQL_CIK=1 while lever IKA is on): a self-acquiring kernel whose module was built
+     * with the chain-capable IKA entry (libr4d R4D_IKA_CHAIN: exports r4d_ika_chain() = 1) is a chained kernel too: its entry waits
+     * on the queue's chain counter when its record is on, every lane adds 1 at its exit -- so its record's unit is LANES. */
+    bool        cik = false;
+    /* The kernel's code READS the chain record (a chain-capable module's listed kernel, whatever the env): every live dispatch of
+     * it writes a record, off unless it chains -- else its exit would act on a record an earlier chained kernel left in the slot
+     * (r62e-h: such adds ran the queue counter ahead and let named chained kernels start early). */
+    bool        cikcap = false;
 };
 
 struct ModuleImage {
@@ -573,8 +581,37 @@ bool chi_on() {
     return on;
 }
 
-bool ika_kernel(const Module* m, const std::string& name) {
-    if (!ika_on() || !m || !m->bundle) return false;
+/* Lever CIK (DRAFTER track round 62): start env RADIANCE_AQL_CIK=1, read only while lever IKA is on. */
+bool cik_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_AQL_CIK");
+        const bool v = e && e[0] == '1' && ika_on();
+        if (v) RAD_INFO("aql: lever CIK on (RADIANCE_AQL_CIK=1): a self-acquiring kernel of a chain-capable module is a chained kernel");
+        return v;
+    }();
+    return on;
+}
+
+/* Whether the module holding `m`'s code was built with the chain-capable IKA entry: its OWN object exports
+ * `int r4d_ika_chain(void)` returning 1 (libr4d / exl3r4d built with R4D_IKA_CHAIN). Core's own blit kernels never are. */
+bool cik_module(const Module* m) {
+    if (!m || !m->bundle) return false;
+    Dl_info di{};
+    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
+    void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+    if (!h) return false;
+    using FlagFn = int (*)(void);
+    auto fn = reinterpret_cast<FlagFn>(dlsym(h, "r4d_ika_chain"));
+    Dl_info fi{};
+    if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return false;
+    return fn() == 1;
+}
+
+bool ika_kernel_listed(const Module* m, const std::string& name);
+bool ika_kernel(const Module* m, const std::string& name) { return ika_on() && ika_kernel_listed(m, name); }
+/* Whether the module holding `m`'s code lists `name` as self-acquiring (r4d_ika_kernels), whatever RADIANCE_AQL_IKA says. */
+bool ika_kernel_listed(const Module* m, const std::string& name) {
+    if (!m || !m->bundle) return false;
     Dl_info di{};
     if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
     /* DRAFTER round 51: a fat binary of core's own object (aql_blit.hip's copies / fills) is named by core's list */
@@ -636,6 +673,9 @@ KernelRec* resolve(Func* fn, int ord) {
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
     k->ika = ika_kernel(m, k->name);
+    k->cikcap = !k->chained && cik_module(m) && ika_kernel_listed(m, k->name);
+    k->cik = k->cikcap && k->ika && cik_on();   /* lever CIK (a named chained form keeps its own block-count done) */
+    if (k->cik) k->chained = true;
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                                    &k->kernarg_size);
@@ -1188,6 +1228,9 @@ struct TapeRec {
     /* tp8 loop W3s: the acquire rule's mark under IKA's windows (tape_set_noacq bit 2); `noacq` stays the rule's own (bit 0), so
      * fn4 aql_ika 0 plays exactly the packets of a start without the lever and 1 IKA's (aql.h ika_play_mark). */
     uint8_t  noacq_ika = 0;
+    /* Lever CIK: a chained record whose kernel counts LANES (KernelRec::cik) -- its share of the chain counter is its grid's
+     * work-items, not its blocks; and an overlap record (haz_mark: touches nothing in flight) plays unchained (stays unordered). */
+    uint8_t  lanes = 0;
 };
 
 struct Tape {
@@ -1208,13 +1251,14 @@ inline bool capturing() { return t_tape && t_tape_pause == 0; }
 
 /* A dispatch just written at `p` on `s`, with its argument block `ka`. */
 void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16_t setup,
-                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool ika = false) {
+                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool ika = false, bool lanes = false) {
     Tape* t = t_tape;
     TapeRec r;
     r.kind = kTapeDispatch;
     r.fence = fence;
     r.chain = chain ? 1 : 0;
     r.ika = ika ? 1 : 0;
+    r.lanes = lanes ? 1 : 0;
     r.s = s;
     r.pkt = *p;
     r.pkt.header = 0;
@@ -1262,10 +1306,12 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
 
 /* The chain record of a chained launch (RadKernelChainFn) at `slot`: wait for every chained
  * block issued before it on `s`. `on` false writes a record no kernel accepts. */
-inline void chain_record(Stream* s, char* slot, bool on) {
+inline void chain_record(Stream* s, char* slot, bool on, bool ordered = false) {
     uint64_t rec[4];
     rec[0] = on ? RAD_CHAIN_MAGIC : 0;
-    rec[1] = s->chain_issued;
+    /* Lever CIK (DRAFTER round 62): a chained kernel issued WITH its barrier bit starts behind everything before it, so its record
+     * names target 0 (r4d_chain_wait: no poll) -- only under RADIANCE_AQL_CIK=1, else the record as before. */
+    rec[1] = (ordered && cik_on()) ? 0 : s->chain_issued;
     rec[2] = (uint64_t)(uintptr_t)s->chain_ctr;
     rec[3] = rec[0] ^ rec[1] ^ rec[2] ^ RAD_CHAIN_CHECK;
     std::memcpy(slot + RAD_CHAIN_KARG_OFF, rec, sizeof rec);
@@ -1274,6 +1320,10 @@ inline uint64_t blocks_of(const hsa_kernel_dispatch_packet_t* p) {
     auto n = [](uint32_t g, uint16_t b) { return b ? (uint64_t)((g + b - 1u) / b) : 1u; };
     return n(p->grid_size_x, p->workgroup_size_x) * n(p->grid_size_y, p->workgroup_size_y) *
            n(p->grid_size_z, p->workgroup_size_z);
+}
+/* Lever CIK: a chain-capable IKA kernel adds one a work-item (its lanes' exits), so its share of the counter is the grid's size. */
+inline uint64_t lanes_of(const hsa_kernel_dispatch_packet_t* p) {
+    return (uint64_t)p->grid_size_x * p->grid_size_y * p->grid_size_z;
 }
 static_assert(RAD_CHAIN_KARG_OFF >= kKargMax && RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES <= kKargSlot,
               "the chain record sits in an argument slot's tail, past every kernel's arguments");
@@ -1351,8 +1401,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     /* A chained kernel (RadKernelChainFn, named r4dchain*): its record in the slot's tail. */
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
-    if (k->chained) chain_record(s, slot, chain);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika || (chain && ika_on() && chi_on()));
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika || (chain && ika_on() && chi_on()), k->cik);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
     const bool aside = (fence & kFenceAside) != 0;
@@ -1367,8 +1416,9 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
      * the bit, since its completion must cover everything before it. */
     const bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
+    if (k->chained || k->cikcap) chain_record(s, slot, chain, keep);
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
-    if (chain) s->chain_issued += blocks_of(p);
+    if (chain) s->chain_issued += k->cik ? lanes_of(p) : blocks_of(p);
     s->prev_chained = chain;
     s->plain_inflight = keep ? !chain : s->plain_inflight || !chain;
     s->unlock();
@@ -1475,10 +1525,12 @@ struct PlayRun {
         if (r.chain && tape) {
             char* slot = s->karg + (size_t)(idx & s->mask) * kKargSlot;
             chain = s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
+            /* Lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's
+             * copy (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel. */
+            if (r.lanes && r.overlap && !foreign && !done.handle) chain = false;
             if (chain) {
                 std::memcpy(slot, tape->karg_host.data() + r.karg_off, r.karg_len);
                 p->kernarg_address = slot;
-                chain_record(s, slot, true);
             }
         }
         int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
@@ -1518,6 +1570,7 @@ struct PlayRun {
          * kernel that reads its output and sits behind a chained one (a cache read beside a
          * collective, say) would wait for the chained blocks only. */
         if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
+        if (chain) chain_record(s, s->karg + (size_t)(idx & s->mask) * kKargSlot, true, ordered);
         if (stamp) {
             stamp->ordered = ordered;
             stamp->chained = chain;
@@ -1527,7 +1580,7 @@ struct PlayRun {
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
-        if (chain) s->chain_issued += blocks_of(p);
+        if (chain) s->chain_issued += r.lanes ? lanes_of(p) : blocks_of(p);
         s->prev_chained = chain;
         s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
         s->wr = idx + 1;

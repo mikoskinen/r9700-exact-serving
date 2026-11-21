@@ -56,20 +56,24 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 __device__ __forceinline__ void r4d_chain_wait() {
     const R4dChainRec* r = r4d_chain_rec();
     if (!r) return;
-    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-        const unsigned long long target = r->target;
-        unsigned long long* ctr = r->ctr;
-        int n = 0;
-        while (__hip_atomic_load(ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < target) {
-            if (n < R4D_CHAIN_FAST) {
-                __builtin_amdgcn_s_sleep(1);
-                ++n;
-            } else {
-                __builtin_amdgcn_s_sleep(R4D_CHAIN_SLOW);
+    /* Target 0 = nothing to wait for (the queue's first chained kernel, or -- lever CIK, DRAFTER round 62 -- a chained kernel the
+     * engine issued WITH its barrier bit, whose packet already started behind everything before it): no poll, no block barrier. */
+    if (r->target != 0) {
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            const unsigned long long target = r->target;
+            unsigned long long* ctr = r->ctr;
+            int n = 0;
+            while (__hip_atomic_load(ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < target) {
+                if (n < R4D_CHAIN_FAST) {
+                    __builtin_amdgcn_s_sleep(1);
+                    ++n;
+                } else {
+                    __builtin_amdgcn_s_sleep(R4D_CHAIN_SLOW);
+                }
             }
         }
+        __syncthreads();
     }
-    __syncthreads();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 }
 

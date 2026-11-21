@@ -299,6 +299,12 @@ option(R4D_IKA "libr4d: kernels acquire and release in-kernel (lever IKA)" OFF)
 if(R4D_IKA)
   target_compile_definitions(libr4d PRIVATE R4D_IKA=1)
 endif()
+# Lever CIK (r4d_ika.h, DRAFTER track round 62): the IKA entry chain-capable (a wait at entry, one add a lane at exit when the
+# engine wrote a chain record), exported as r4d_ika_chain() = 1 for RADIANCE_AQL_CIK=1. OFF = IKA's entry as before.
+option(R4D_IKA_CHAIN "libr4d: the IKA entry is chain-capable (lever CIK; needs R4D_IKA)" OFF)
+if(R4D_IKA AND R4D_IKA_CHAIN)
+  target_compile_definitions(libr4d PRIVATE R4D_IKA_CHAIN=1)
+endif()
 if(R4D_HAVE_GGML)
   target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
   target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})
