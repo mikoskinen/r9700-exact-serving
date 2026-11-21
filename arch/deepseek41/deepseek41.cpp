@@ -2162,11 +2162,21 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * row's source (its anchor, or the mask row) into h0's hc strips in place of the hc expand casts. The all-reduce folds
  * per element in rank order whatever the message (exact; with lever DAR b's fp8 wire every 16-byte word is coded alone),
  * so every h0 row is the bytes of today's. Declared only at the start env MHR=7 (blocks >= 2 rows; a block of 1 row keeps
- * the casts); issued only where every rank of the process declared it (g_ema_bad). */
+ * the casts); issued only where every rank of the process declared it (g_ema_bad).
+ * + 8 (DRAFTER track 21.11.2026 round 67, lever DPR; a bit beside the level: 8..15 = level v & 7 + DPR, start env
+ * RADIANCE_DS41_DSPARK_DPR=1 adds it to the start value) = the query pass's prologue without pre0 / pre1 / stage 0's col_a
+ * where the stage's collapse is the identity: after the embedding's EXACT all-reduce (world > 1, no fp8 wire: dspark_arf()
+ * < 2; not an EMA pass) h0's hc strips are hc casts of d.x and pre_f is one-hot on stream 0, so col_a writes
+ * bf16(0 + 1 x + 0 x + 0 x + 0 x) = x for every x but -0.0 (-> +0.0) and NaN payloads; the exact all-reduce folds every
+ * element from +0.0f (r4d_ar_{one,two}shot_Nrank_exact.hip: acc = 0.0f, acc += each rank's), so d.x holds no -0.0, and the
+ * embedding holds no NaN: col_a's output is d.x byte for byte and pre_f (read by nothing else before stage 0's mix_f writes
+ * it) is dead. Three launches and two cross-queue hops off the pass's head (lq208 c32: rmsnorm at 104.8 us after the
+ * lookup, ~86.8 without them). The same ops on the other passes; the walk, head and every stage past 0 as before. */
 static std::atomic<int> g_sw_dmr{-1};
 static std::atomic<int> g_dsp_sdf{0};    /* lever SDD: the DSpark MoE's shexp_lane word (kMoeSdfBit or 0; set at each query pass) */
 static std::atomic<int> g_ema_bad{0};    /* lever EMA: a rank of this process could not declare it: off on every rank */
 static std::atomic<long long> g_ema_passes{0};
+static std::atomic<long long> g_dpr_passes{0};   /* lever DPR (round 67): the first-pass line */
 /* Lever DHS (DRAFTER track 21.11.2026 round 57; Dsp::hs_*): switch "dspark_hs" (fn4, plugin; 0 = today's issue); its ops are
  * declared only under the start env RADIANCE_DS41_DSPARK_HS (0 / 1 = the switch's start value), and the issue reads 1 only where
  * every rank of the process declared them (hs_now). Read at issue. */
@@ -2187,16 +2197,22 @@ static bool hs_env() {
 static bool hs_ok_all() { return g_sw_hs_ok.load(std::memory_order_relaxed) && !g_sw_hs_bad.load(std::memory_order_relaxed); }
 static int hs_now() { return hs_ok_all() ? g_sw_hs.load(std::memory_order_relaxed) : 0; }
 static std::atomic<long long> g_hs_passes{0};
-static int dmr_now() {
+static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 8 */
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
+        const char* p = std::getenv("RADIANCE_DS41_DSPARK_DPR");
+        const int dp = p && p[0] == '1' && !p[1] ? 8 : 0;
+        if (p && *p && !dp && std::strcmp(p, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DPR=%s is not 0 / 1: lever DPR off at start\n", p);
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0);
+        g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
 }
+static int dmr_now() { return dmr_raw() & 7; }
+static bool dpr_now() { return (dmr_raw() & 8) != 0; }   /* lever DPR (round 67) */
 static void walk_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_DSPARK_WALK");
@@ -3007,7 +3023,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 7 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 15 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3140,7 +3156,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_now();
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -8485,8 +8501,17 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
         for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
     }
-    RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
-    RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
+    /* lever DPR (round 67; g_sw_dmr's comment, + 8): stage 0's collapse is the identity after the exact all-reduce -> no
+     * pre0 / pre1 and no stage-0 col_a (a function of the pass key and the switches: the same on every pass of a key) */
+    const bool dpr = dpr_now() && !m.zero && g.world > 1 && d.embed_ar && ek < 0 && dspark_arf() < 2 && !d.st.empty() &&
+                     !(dmr_now() >= 3 && d.st[0].pcn_a);
+    if (dpr && g.rank == 0 && g_dpr_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+        fprintf(stderr, "radiance: deepseek41: lever DPR: first query pass issued without pre0 / pre1 / stage 0's collapse at %lld "
+                        "rows (counted at issue: a recorded pass once)\n", (long long)T);
+    if (!dpr) {
+        RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
+        RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
+    }
     RAD_ISSUE_N(x, d.q_tab, T, pos, brows(m.cs_a, g.max_ctx));
     RAD_ISSUE_N(x, lo ? lo->poff : d.poff_op, T, brows(d.poff, T));
     RAD_ISSUE_N(x, d.apos_op, T, pos, brows(d.poff, T), brows(d.apos, T));
@@ -8528,7 +8553,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         if (pa)
             RAD_ISSUE_N(x, L.pcn_a, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T), brows(d.h0, T),
                         brows(d.pre_f, T), brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
-        else
+        else if (!(dpr && si == 0))   /* lever DPR: stage 0's collapse would write d.x's own bytes */
             RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
