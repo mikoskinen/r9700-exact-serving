@@ -334,7 +334,10 @@ extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const
     R4DGateQuant gq{};
     const int gc = g8_gate_quant_args(a, r, &gq);
     if (gc != RAD_OK) return gc;
-    if (r.splits != 1 || r.q_len != 1 || r.head_dim != 256 || r.block_size != 4 || r.q_heads != 6 * r.kv_heads)
+    /* the split count today's launch takes (g8_decode_launch: the law, or a tuned `splits`); g8_decode_common leaves r.splits
+     * at the tuned value (0 = the law), so the law is asked here -- the walk serves only the one-split form (Qwen loop F33) */
+    const int law = r4d_decode_splits(&r, G8_D_TILE);
+    if (law != 1 || r.q_len != 1 || r.head_dim != 256 || r.block_size != 4 || r.q_heads != 6 * r.kv_heads)
         return R4D_NO(RAD_E_SHAPE);
     const int groups = (r.num_seqs + R - 1) / R;
     int emit_rc = RAD_OK;
