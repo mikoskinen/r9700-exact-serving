@@ -596,6 +596,10 @@ bool cik_on() {
     return on;
 }
 
+/* tp8 loop W9 (fn4 aql_cik = core switch 113): whether a chain-capable kernel (KernelRec::cik) chains NOW -- lever CIK on at start and
+ * the switch at 1 (its start value where RADIANCE_AQL_CIK=1 / 2); at 0 it issues and plays as the IKA kernel it also is (record off). */
+bool cik_live() { return cik_on() && rad::fn4::aql_cik() >= 1; }
+
 /* Lever CTA (DRAFTER track round 63): start env RADIANCE_AQL_CTA=1, read only while lever CIK is on. A chained record that plays
  * WITH its barrier bit (target 0 under CIK: behind a plain kernel, the first of a run) reads its arguments and its record from a
  * block of the tape's own copy, written once when the tape is placed, instead of from the queue's argument slot the host writes
@@ -1424,9 +1428,12 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
     /* A chained kernel (RadKernelChainFn, named r4dchain*): its record in the slot's tail. A lever CIK kernel (KernelRec::cik)
      * chains whatever the plugins were told (tp8 loop W8: RADIANCE_AQL_CIK=1 leaves rad_dev_chain_enabled to the engine). */
-    const bool chain = k->chained && (k->cik || rad_dev_chain_enabled()) && s->chain_ctr &&
-                       n <= RAD_CHAIN_KARG_OFF;
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika || (chain && ika_on() && chi_on()), k->cik);
+    const bool chain_cap = k->chained && (k->cik || rad_dev_chain_enabled()) && s->chain_ctr &&
+                           n <= RAD_CHAIN_KARG_OFF;
+    /* tp8 loop W9: fn4 aql_cik 0 -- a chain-capable kernel issues as the IKA kernel it also is; a tape records the capability and
+     * its plays read the switch (PlayRun::put) */
+    const bool chain = chain_cap && (!k->cik || cik_live());
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain_cap, k->ika || (chain_cap && ika_on() && chi_on()), k->cik);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
     const bool aside = (fence & kFenceAside) != 0;
@@ -1552,6 +1559,8 @@ struct PlayRun {
             /* Lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's
              * copy (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel. */
             if (r.lanes && r.overlap && !foreign && !done.handle) chain = false;
+            /* tp8 loop W9: fn4 aql_cik 0 -- a chain-capable record plays as the IKA kernel it also is (unchained, from the tape's copy) */
+            if (r.lanes && !cik_live()) chain = false;
         }
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
          * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
@@ -1593,9 +1602,12 @@ struct PlayRun {
          * scalar-cache lines of the slot cannot be stale); the rule's marks never drop a chained record's acquire, as before. */
         const bool chi_ok = ika_live && r.chain && chain && chi_on() && r.ika && r.ikaok &&
                             (int64_t)idx - (int64_t)(s->mask + 1) < s->last_oacq;
-        /* Lever CTA: a record played from the tape's copy (never rewritten) takes lever IKA's own drop, as an IKA record does. */
+        /* Lever CTA: a record played from the tape's copy (never rewritten) takes lever IKA's own drop, as an IKA record does; so does
+         * a chain-capable (IKA) record played unchained (tp8 loop W9: the overlap rule, fn4 aql_cik 0) -- it reads the tape's copy too
+         * and acquires itself. A named chained form played unchained keeps the acquire (no in-kernel fence with its record off). */
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_none_() || (((mark && (!r.chain || (cta && ika_live))) || chi_ok) && !foreign && aql_acq_mode() == 1)))
+            (aql_acq_none_() || (((mark && (!r.chain || (r.lanes && !chain) || (cta && ika_live))) || chi_ok) && !foreign &&
+                                 aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent

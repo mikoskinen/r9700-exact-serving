@@ -608,6 +608,14 @@
  *                   flight), else whole (the low-load form: the follower starts on the first piece's body while the leader runs
  *                   the second piece's head). Read at each lend. Unset: the start's RADIANCE_PP_BG_SPLIT (0 / 1 / 2). The
  *                   leader's own (the follower skips it by name).
+ *   aql_cik         core, the AQL backend, BOTH nodes (tp8 loop W9, DECODE round 50; 113 here, after pp_bg_split): lever CIK (DRAFTER
+ *                   round 62) in process -- 1 = a chain-capable kernel (KernelRec::cik: RADIANCE_AQL_CIK=1 / 2 at start with lever IKA
+ *                   and a module exporting r4d_ika_chain() = 1) chains: it waits in-kernel on its queue's counter and adds a lane at
+ *                   its exit (with CHI / CTA where their env is on); 0 = it issues and plays as the IKA kernel it also is (its record
+ *                   off: no wait, no add; the packets lever IKA gives it). Read at every live issue and every played packet (a tape
+ *                   records the capability; a change bumps the epoch anyway). The plugins' named chained forms (RADIANCE_AQL_CIK=2)
+ *                   are chosen at start and do not follow it. Unset: 1 where RADIANCE_AQL_CIK=1 / 2 at start, else 0; 1 needs that env
+ *                   (which kernels are chain-capable is read at their first launch). Rule A: the launch-order mechanism only.
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -844,7 +852,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kAqlCik, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -984,6 +992,9 @@ int  aql_waitk();
 int  aql_ika();
 /* tp8 loop D61 (host_spin): the switch once set, else RADIANCE_HOST_SPIN at start (0 = every wait blocks at once, as before). */
 int  host_spin();
+/* tp8 loop W9 (aql_cik): the switch once set, else 1 where RADIANCE_AQL_CIK=1 / 2 at start (0 = off); read at every live issue and
+ * played packet of a chain-capable kernel (rad::aql's dispatch / PlayRun::put, with lever CIK on). */
+int  aql_cik();
 /* The sites host_spin's M names (bits); kSpinAll = every site. */
 static constexpr int kSpinBarrier = 1, kSpinDrafterEnd = 2, kSpinFrame = 4, kSpinNap = 8, kSpinAll = 15;
 /* Not a site of its own: the link's receive thread reading the socket (site 4's bound), counted apart ('socket read'). */
