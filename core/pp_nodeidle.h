@@ -27,13 +27,15 @@
  *
  * tp8 loop D68 (RADIANCE_PP_NODE_IDLE_PARTS=1 beside NODE_IDLE=1 / 2, either node; unset: nothing below is kept or printed): the
  * same parts' card time BY KIND AND SEQUENCES -- the engine tags each part before its begin with what it is (the leader's head,
- * head segment, tail model part, tail segment, tail = the tail's model part + its sampler + drafter + step end; the follower's
- * pass or segment), its batch's phase (D decode only / P prefill / M mixed) and sequences / rows; a part's ms goes to (stretch,
+ * head segment, tail model part, tail segment, tail = the tail's model part + the head's logits + its sampler (or the sampler
+ * alone when the model part went ahead), then the drafter + step end as a part of its own -- the one place the setting changes
+ * the parts: with it on, a tail is two parts, so the D8 / D45 lines count one part more a tail and the card's time between the
+ * sampler and the drafter's first kernel as a gap; the follower's pass or segment), its batch's phase (D decode only / P prefill / M mixed) and sequences / rows; a part's ms goes to (stretch,
  * kind, phase, sequences) and one more line a period prints each key's p50 / p25 / p75 ms, count and mean rows (keys with >= 3
  * parts), clean stretch first. Why: DECODE round 54 (lq229's step log) found the bound node's lane part growing with SEQUENCES
  * more than with rows (c4 -> c8: ~+2.3 ms a lane part a sequence beyond rows and context) and could name it only with a stamped
- * start; this splits it at zero card cost on any start -- the leader's head (trunk layers [0, h)) against its tail (trunk
- * layers [t, n) + the head's logits + sampler + drafter), and the follower's pass (trunk layers [h, t) only). A part's card
+ * start; this splits it at zero card cost on any start -- the leader's head (trunk layers [0, h)), its tail (trunk layers
+ * [t, n) + the head's logits + sampler) and its drafter, and the follower's pass (trunk layers [h, t) only). A part's card
  * time holds the card's wait for the other node's crossing (as above): the leader's head part receives nothing. Log only: the
  * issue is the same. */
 #pragma once
@@ -59,7 +61,7 @@ struct PpNodeIdle {
     struct Rec { RadEvent ev; bool begin; bool bg; uint32_t tag = 0; int32_t rows = 0; };
     /* tp8 loop D68: a part's kind (the tag's low byte), set by the engine before the part's begin */
     enum : uint32_t { kPartOther = 0, kPartHead = 1, kPartHeadSeg = 2, kPartTailModel = 3, kPartTailSeg = 4, kPartTail = 5,
-                      kPartPass = 6, kPartSeg = 7, kPartSampler = 8 };
+                      kPartPass = 6, kPartSeg = 7, kPartSampler = 8, kPartDrafter = 9 };
     struct PAcc { std::vector<float> ms; double rows = 0; };
     struct Win {
         uint64_t t0 = 0;
@@ -309,10 +311,11 @@ struct PpNodeIdle {
         case kPartHeadSeg: return "head segment";
         case kPartTailModel: return "tail model part";
         case kPartTailSeg: return "tail segment";
-        case kPartTail: return "tail (+ sampler, drafter, step end)";
+        case kPartTail: return "tail (+ logits, sampler)";
         case kPartPass: return "pass";
         case kPartSeg: return "segment";
-        case kPartSampler: return "sampler + drafter + step end";
+        case kPartSampler: return "sampler";
+        case kPartDrafter: return "drafter + step end";
         default: return "other";
         }
     }
