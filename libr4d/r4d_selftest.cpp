@@ -5620,6 +5620,148 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     ok(name.c_str(), n_o == 0 && n_q == 0 && n_s == 0 && live > 0, msg);
 }
 
+/* --perfatsel FILE [rows] [iters] (qfn-on-ds, Qwen loop round 10, QUEUE Q8 = lever P-2's sizing): the TP4 sparse prefill attention
+ * as the engine runs it -- attn_decode_gq_h256_gqa6_bs4_fp8kv (6 queries over the rank's one KV head of 256, 4-token pages, ONE
+ * query row a "sequence", each row's table = its own QSA selection, the gate + int8 codes in the merge) -- timed on one card over
+ * a real selection dump (fn4-c16 7302cad9's RADIANCE_FN4_QSADUMP format: int64 {rows, width, first position}, int32 nsel[rows],
+ * int32 sel[rows][width], ascending block ids; gpu02 runs/fn4/stats163/qsa), with three artificial arms that bound a q-tiled
+ * union walk before anyone writes it:
+ *   real     each row its dumped blocks (today)
+ *   shared   every row the LAST row's blocks: every repeat an L2 hit, the same per-row reads and math (DRAM floor of today's form)
+ *   disjoint each row's blocks shifted by row x 997 pages: little sharing (the L2-miss ceiling)
+ *   quarter  each row every 4th of its blocks: a quarter of the per-row KV reads AND of the math (below what a walk can reach)
+ * plus the union factor R x blocks a row / union for R = 4 / 8 / 16 consecutive rows (LEVERS P-2 row 104's reading). The cache is
+ * random E4M3 (NaN codes avoided) over every page up to the dump's last position; q, the gate and the descales are random. The
+ * engine also tunes `splits` (tAttnSplit); this bench takes the row's defaults, so compare ARMS with each other, not with the
+ * engine's 1,473 us. Prints one line an arm: us a call, KV GB/s over the per-row reads. */
+static void attn_sel_perf(const Plugin& pl, const char* path, int64_t rows_want, int iters) {
+    if (iters <= 0) iters = 20;
+    const char* rowname = "attn_decode_gq_h256_gqa6_bs4_fp8kv";
+    const RadKernelInfo* rk = find(pl, rowname);
+    if (!rk) { std::printf("--perfatsel: %s absent\n", rowname); return; }
+    FILE* f = std::fopen(path, "rb");
+    if (!f) { std::printf("--perfatsel: cannot open %s\n", path); return; }
+    int64_t hdr[3] = { 0, 0, 0 };
+    if (std::fread(hdr, 8, 3, f) != 3 || hdr[0] <= 0 || hdr[1] <= 0 || hdr[0] > (1 << 20) || hdr[1] > 4096) {
+        std::printf("--perfatsel: bad header in %s\n", path); std::fclose(f); return;
+    }
+    const int64_t TR = hdr[0], W = hdr[1], P0 = hdr[2];
+    std::vector<int32_t> nsel((size_t)TR), sel((size_t)(TR * W));
+    const bool rd = std::fread(nsel.data(), 4, nsel.size(), f) == nsel.size() &&
+                    std::fread(sel.data(), 4, sel.size(), f) == sel.size();
+    std::fclose(f);
+    if (!rd) { std::printf("--perfatsel: short file %s\n", path); return; }
+    const int64_t S = rows_want > 0 && rows_want < TR ? rows_want : TR;
+    const int64_t nq = 6, nkv = 1, hd = 256, bs = 4, rowb = 2 * hd;
+    int32_t bmax = 0;
+    for (int64_t r = 0; r < S; ++r)
+        for (int64_t b = 0; b < nsel[(size_t)r] && b < W; ++b) bmax = std::max(bmax, sel[(size_t)(r * W + b)]);
+    const int64_t nb = std::max<int64_t>((P0 + S) / bs + 1, (int64_t)bmax + 1);
+    std::printf("attn_sel_perf %s: %lld of %lld rows from position %lld, width %lld, %lld pages of %lld tokens (%.1f MB of fp8 KV), "
+                "%s, %d launches an arm\n", path, (long long)S, (long long)TR, (long long)P0, (long long)W, (long long)nb,
+                (long long)bs, (double)(nb * bs * rowb) / 1e6, rowname, iters);
+    /* the union factor (how many of R rows' table reads a q-tiled walk would not repeat) */
+    for (int64_t R : { 4, 8, 16 }) {
+        double reads = 0, uni = 0;
+        for (int64_t r0 = 0; r0 + R <= S; r0 += R) {
+            std::vector<int32_t> u;
+            for (int64_t r = r0; r < r0 + R; ++r) {
+                const int64_t n = std::min<int64_t>(nsel[(size_t)r], W);
+                reads += (double)n;
+                u.insert(u.end(), sel.begin() + r * W, sel.begin() + r * W + n);
+            }
+            std::sort(u.begin(), u.end());
+            uni += (double)(std::unique(u.begin(), u.end()) - u.begin());
+        }
+        std::printf("  union factor R%-2lld %.2f\n", (long long)R, uni > 0 ? reads / uni : 0.0);
+    }
+    uint32_t st = 0x7a11u;
+    auto rnd = [&](float span) {
+        st = st * 1664525u + 1013904223u;
+        return ((float)(st >> 8) / 16777216.0f * 2.0f - 1.0f) * span;
+    };
+    std::vector<uint16_t> hq((size_t)(S * nq * hd)), hqg((size_t)(S * nq * 2 * hd));
+    for (auto& x : hq)  x = h_to_bf16(rnd(2.0f));
+    for (auto& x : hqg) x = h_to_bf16(rnd(6.0f));
+    const size_t cbytes = (size_t)(nb * nkv * bs * rowb);
+    std::vector<uint8_t> hc(cbytes);
+    for (auto& x : hc) {
+        x = (uint8_t)(rnd(128.0f) + 128.0f);
+        if ((x & 0x7f) == 0x7f) x ^= 1;   /* E4M3's NaN codes */
+    }
+    std::vector<float> hds((size_t)(S * nkv));
+    for (auto& x : hds) x = 0.75f + 0.25f * (rnd(1.0f) + 1.0f);
+    const size_t qb = hq.size() * 2, ob = (size_t)(S * nq * hd) * 2, q8b = (size_t)(S * nq * hd),
+                 sb = (size_t)(S * nq * (hd / 128)) * 4;
+    void* d_q = dalloc(qb); void* d_qg = dalloc(hqg.size() * 2); void* d_c = dalloc(cbytes);
+    void* d_kd = dalloc(hds.size() * 4); void* d_vd = dalloc(hds.size() * 4);
+    void* d_o = dalloc(ob); void* d_q8 = dalloc(q8b); void* d_s = dalloc(sb);
+    if (!d_q || !d_qg || !d_c || !d_kd || !d_vd || !d_o || !d_q8 || !d_s) { std::printf("  alloc failed\n"); return; }
+    st_memcpy(d_q, hq.data(), qb, hipMemcpyHostToDevice);
+    st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_c, hc.data(), cbytes, hipMemcpyHostToDevice);
+    st_memcpy(d_kd, hds.data(), hds.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_vd, hds.data(), hds.size() * 4, hipMemcpyHostToDevice);
+    RadTensor gate = T((uint8_t*)d_qg + hd * 2, RAD_BF16, { S, nq, hd });
+    gate.stride[0] = nq * 2 * hd;
+    gate.stride[1] = 2 * hd;
+    /* one arm: its per-row tables (W wide, a row's first `used / 4` entries live) */
+    auto arm = [&](const char* label, int mode) {
+        std::vector<int32_t> table((size_t)(S * W), 0), used((size_t)S, 0);
+        double kv = 0;
+        for (int64_t r = 0; r < S; ++r) {
+            const int64_t src = mode == 1 ? S - 1 : r;
+            const int64_t n = std::min<int64_t>(nsel[(size_t)src], W);
+            int64_t k = 0;
+            for (int64_t b = 0; b < n; ++b) {
+                if (mode == 3 && (b & 3) != 3 && b + 1 != n) continue;   /* every 4th + the last (the row's own page) */
+                int64_t pg = sel[(size_t)(src * W + b)];
+                if (mode == 2) pg = (pg + r * 997) % nb;
+                table[(size_t)(r * W + k++)] = (int32_t)pg;
+            }
+            used[(size_t)r] = (int32_t)(k * bs);
+            kv += (double)(k * bs * rowb);
+        }
+        std::vector<RadTensor> ts = {
+            T(d_q, RAD_BF16, { S, nq, hd }), T(d_c, RAD_F8E4M3, { nb, nkv, bs, rowb }), TI32({ S, W }, table), TI32({ S }, used),
+            T(d_kd, RAD_F32, { S, nkv }), T(d_vd, RAD_F32, { S, nkv }), RadTensor{}, T(d_o, RAD_BF16, { S, nq * hd }),
+            gate, T(d_q8, RAD_I8, { S, nq * hd }), T(d_s, RAD_F32, { S, nq * hd / 128 }) };
+        std::vector<RadParam> ps = {
+            PI("q_len", 1), PI("head_dim", hd), PI("gqa", nq / nkv), PI("block_size", bs), PI("causal", 1), PI("window", 0),
+            PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"), PI("n_head", nq), PI("max_seqs", S), PI("max_ctx", W * bs),
+            PI("group", 128), PS("act", "sigmoid") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (rk->scratch) {
+            const int64_t need = rk->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = rk->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  %-9s rc=%d (not served)\n", label, rc); return; }
+        hipEvent_t e0, e1;
+        st_ev_create(&e0);
+        st_ev_create(&e1);
+        st_ev_record(e0, nullptr);
+        for (int i = 0; i < iters; ++i) rk->launch(&a, nullptr);
+        st_ev_record(e1, nullptr);
+        st_ev_sync(e1);
+        float ms = 0;
+        st_ev_elapsed(&ms, e0, e1);
+        st_ev_destroy(e0);
+        st_ev_destroy(e1);
+        const double us = (double)ms * 1000.0 / iters;
+        std::printf("  %-9s %9.1f us a call   %7.1f GB/s of per-row KV reads (%.1f MB a call)\n", label, us, kv / (us * 1e3), kv / 1e6);
+    };
+    arm("real", 0);
+    arm("shared", 1);
+    arm("disjoint", 2);
+    arm("quarter", 3);
+    arm("real", 0);   /* again: the first arm's warm-up / clock drift */
+}
+
 /* kv_store, both widths, against an exactly representable set so the check is equality: halves
  * and integers up to 8 survive E4M3 (three mantissa bits) and bf16 unchanged, so `h_e4m3` or
  * `h_bf16` of what landed must equal what went in.
@@ -43034,7 +43176,10 @@ static void usage(void) {
                 "             proposes, so its output bits change acceptance, not text.\n"
                 "  --bicheck-fn4 [cl] [Ms]: fn4 BI: per op, a row alone (M = 1) vs the same row inside an\n"
                 "             M-row launch, byte for byte, Flash-Next's TP4 shapes (classes hc,gemm or all; Ms a\n"
-                "             comma list, default 1..64 and 65..4160).\n");
+                "             comma list, default 1..64 and 65..4160).\n"
+                "  --perfatsel FILE [rows] [iters]: lever P-2's sizing (Qwen loop round 10): the TP4 sparse prefill\n"
+                "             attention (attn_decode_gq_h256_gqa6_bs4_fp8kv) over a QSA selection dump (RADIANCE_FN4_QSADUMP\n"
+                "             format), arms real / shared / disjoint / quarter, and the dump's union factors.\n");
 }
 
 #include "r4d_selftest_bi.inc"   /* --bicheck: lever BI, a row alone vs inside an M-row launch */
@@ -43060,6 +43205,9 @@ int main(int argc, char** argv) {
     int mla_it = 20;
     const char* mla_fill = "prefill";
     int qsa_it = 200;
+    const char* atsel_path = nullptr;   /* --perfatsel (lever P-2's sizing) */
+    long long atsel_rows = 2048;
+    int atsel_it = 20;
     long long hc_m = 0;
     long long hcw_m = 0;
     int hcw_it = 50;
@@ -43239,6 +43387,12 @@ int main(int argc, char** argv) {
             dsa_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfatsel")) {
+            /* lever P-2's sizing: the sparse prefill attention over a real QSA selection dump */
+            if (i + 1 >= argc) { usage(); return 2; }
+            atsel_path = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) atsel_rows = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) atsel_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfqsa")) {
             /* The indexer at a real context length (the only decode op that grows with it). */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -43965,6 +44119,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("dsa indexer timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (atsel_path) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        attn_sel_perf(pl, atsel_path, atsel_rows, atsel_it);
+        dfree_all();
+#else
+        skip("attention over a selection dump", "built without HIP");
 #endif
         return 0;
     }
