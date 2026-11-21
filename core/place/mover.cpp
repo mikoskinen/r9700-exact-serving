@@ -8,7 +8,9 @@
 #include "../device/device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <queue>
@@ -80,6 +82,7 @@ Mover::~Mover() {
         rad_stream_destroy(mover_);
     }
     for (Move& m : moves_) if (m.ev) rad_event_destroy(m.ev);
+    for (RadEvent e : qev_) if (e) rad_event_destroy(e);
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
     if (gate_) rad_event_destroy(gate_);
@@ -454,6 +457,20 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     const int64_t n_records = std::max<int64_t>(2 * (total_shadow + total_turn), 4);
     moves_.assign((size_t)n_records, Move{});
     for (Move& m : moves_) RAD_TRY(rad_event_create_local(&m.ev));
+    /* Lever MQB: one quarantine record a retire (mover.h qev_). */
+    {
+        const char* q = std::getenv("RADIANCE_MOVER_QB");
+        qb_ = q && q[0] == '1' && q[1] == 0;
+        if (qb_) {
+            qev_.assign(8, nullptr);
+            for (RadEvent& e : qev_) RAD_TRY(rad_event_create_local(&e));
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true))
+                RAD_INFO("mover: lever MQB on (RADIANCE_MOVER_QB=1): the moves one retire quarantines share ONE "
+                         "compute-stream record (a ring of %zu local events) instead of one record a move",
+                         qev_.size());
+        }
+    }
 
     /* ---- publish the initial addresses ------------------------------------------------------ */
     res_.init(prog);
@@ -2638,6 +2655,9 @@ int Mover::retire(HeatEngine* heat) {
      * slot. Re-recording the move's event on the compute stream is the barrier: when it signals,
      * every launch made before the publish has retired and the slot is safe to write. It must be
      * downstream of the publish in stream order, so it is not folded into the loop above. */
+    /* Lever MQB (qb_): the first published move records the retire's one quarantine point, a slot
+     * of qev_; every later one this retire names the same slot (mover.h). */
+    int qs = -1;
     for (Move& m : moves_) {
         if (m.state != Move::State::Published) continue;
         if (!compute_) {
@@ -2645,14 +2665,25 @@ int Mover::retire(HeatEngine* heat) {
                     (int)m.unit);
             return RAD_E_STATE;
         }
-        RAD_TRY(rad_event_record(m.ev, compute_));
+        if (qb_) {
+            if (qs < 0) {
+                qs = qev_next_;
+                qev_next_ = (qev_next_ + 1) % (int)qev_.size();
+                RAD_TRY(rad_event_record(qev_[(size_t)qs], compute_));
+                ++stats_.quarantine_points;
+            }
+            m.qslot = qs;
+        } else {
+            RAD_TRY(rad_event_record(m.ev, compute_));
+            ++stats_.quarantine_points;
+        }
         m.state = Move::State::Quarantine;
         ++stats_.quarantined;
     }
 
     for (Move& m : moves_) {
         if (m.state != Move::State::Quarantine) continue;
-        const int q = rad_event_query(m.ev);
+        const int q = rad_event_query(m.qslot >= 0 ? qev_[(size_t)m.qslot] : m.ev);
         if (q < 0) return RAD_E_DEVICE;
         if (q == 0) continue;
 
@@ -2686,6 +2717,9 @@ std::string Mover::report() const {
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
+    if (qb_)   /* lever MQB: so a card run reads that it acted */
+        s += fmt("  lever MQB: %llu quarantine records for %llu quarantined moves\n",
+                 (unsigned long long)stats_.quarantine_points, (unsigned long long)stats_.quarantined);
     if (stats_.donated)
         s += fmt("  %llu host copies given by lent units to budgeted victims, %llu such units moved "
                  "by a recall, %llu left past one with no free slot\n",

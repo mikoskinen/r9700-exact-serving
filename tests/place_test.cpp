@@ -2572,6 +2572,136 @@ struct ComputeHold {
     }
 };
 
+/* Lever MQB (RADIANCE_MOVER_QB=1, DRAFTER track round 73): every move one retire() quarantines shares
+ * ONE compute-stream record. Checked: (1) the swap loop converges with no unit left busy, and the
+ * records number at most the moves (one a retire), against the unset form's one a move; (2) no slot
+ * leaves quarantine before the compute stream passes the point: moves published while the stream
+ * is held behind a long copy stay busy until the hold's event has signalled. */
+namespace {
+struct MqbRun {
+    uint64_t quarantined = 0, points = 0, held_busy = 0, early_free = 0, held_set = 0, one_retire_moves = 0, one_retire_points = 0, bad_points = 0;
+    int dispatches = 0;
+    bool swapped = false;
+};
+void mqb_run(bool qb, MqbRun* out) {
+    const bool qb_on_ = qb;
+    if (qb) setenv("RADIANCE_MOVER_QB", "1", 1);
+    else unsetenv("RADIANCE_MOVER_QB");
+    HeatFixture hf(32, 24);   /* several shadow slots, so one round promotes several units at once */
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc));
+    unsetenv("RADIANCE_MOVER_QB");
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    ComputeWork work;
+    const int32_t ids[4] = {4, 5, 6, 7};
+    const int32_t counts[4] = {10, 10, 10, 10};
+    int d = 0;
+    for (Deadline dl; !dl.passed(); ++d) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        work.run(compute);
+        h.observe_ids(0, ids, counts, 4);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        for (const Swap& s : sw) m.issue(s, &h);
+        if (d >= 200) break;   /* a warm-up: whatever these experts' heat moves first */
+    }
+    /* (2): settle (no swaps, the stream drained, every quarantine cleared); then ONE round of swaps
+     * (other experts hot), the compute stream held behind a long copy, and dispatches until those
+     * moves are quarantined -- behind the hold. While the hold is pending each of them must stay busy. */
+    CHECK_OK(rad_stream_sync(compute));
+    for (Deadline dl; any_busy(h, hf.plan) && !dl.passed(); ++d) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        CHECK_OK(rad_stream_sync(compute));
+    }
+    const int32_t ids2[4] = {20, 21, 22, 23};
+    bool swapped = false;
+    for (Deadline dl(30); !swapped && !dl.passed(); ++d) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        h.observe_ids(0, ids2, counts, 4);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        for (const Swap& s : sw) m.issue(s, &h);
+        swapped = !sw.empty();
+    }
+    out->swapped = swapped;
+    if (swapped) {
+        /* The round's copies landed before the hold, so ONE retire publishes them all (a swap is a
+         * promotion and a demotion) and quarantines them behind the hold. */
+        ComputeHold hold;
+        CHECK_OK(hold.hold(compute, 128));
+        /* issue() only lists the copies; the next retire sends them (flush_moves) and may publish
+         * some; after the transfer stream drains, the one after publishes the rest. Each retire's
+         * moves and records are kept: under MQB a retire with moves has exactly one record. */
+        for (int k = 0; k < 2; ++k) {
+            if (k == 1) CHECK_OK(rad_stream_sync(m.transfer_stream()));
+            const uint64_t q0 = m.stats().quarantined, p0 = m.stats().quarantine_points;
+            CHECK_OK(m.begin_dispatch(d++, &h));
+            const uint64_t mv = m.stats().quarantined - q0, pt = m.stats().quarantine_points - p0;
+            if (mv > out->one_retire_moves) { out->one_retire_moves = mv; out->one_retire_points = pt; }
+            if (qb_on_ && mv > 0 && pt != 1) ++out->bad_points;
+            if (!qb_on_ && pt != mv) ++out->bad_points;
+        }
+        std::vector<int32_t> busy;
+        for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) if (h.busy(u)) busy.push_back(u);
+        out->held_set = busy.size();
+        for (int i = 0; i < 4 && rad_event_query(hold.e) == 0; ++i, ++d) {
+            CHECK_OK(m.begin_dispatch(d, &h));
+            if (rad_event_query(hold.e) != 0) break;   /* the point may have passed during the call */
+            for (int32_t u : busy) {
+                if (h.busy(u)) ++out->held_busy;
+                else ++out->early_free;
+            }
+        }
+        CHECK_OK(rad_stream_sync(compute));
+    }
+    for (Deadline dl; any_busy(h, hf.plan) && !dl.passed(); ++d) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        work.run(compute);
+    }
+    for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) CHECK(!h.busy(u));
+    out->quarantined = m.stats().quarantined;
+    out->points = m.stats().quarantine_points;
+    out->dispatches = d;
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+}  /* namespace */
+
+TEST(lever_mqb_quarantines_a_retires_moves_behind_one_record) {
+    MqbRun a, b;
+    mqb_run(false, &a);
+    mqb_run(true, &b);
+    std::printf("    MQB: unset %llu moves quarantined by %llu records over %d dispatches (held set %llu, busy %llu, early %llu, swapped %d, one retire %llu moves / %llu records); "
+                "on %llu by %llu over %d (held set %llu, busy %llu, early %llu, swapped %d, one retire %llu moves / %llu records)\n",
+                (unsigned long long)a.quarantined, (unsigned long long)a.points, a.dispatches,
+                (unsigned long long)a.held_set, (unsigned long long)a.held_busy, (unsigned long long)a.early_free, (int)a.swapped,
+                (unsigned long long)a.one_retire_moves, (unsigned long long)a.one_retire_points,
+                (unsigned long long)b.quarantined, (unsigned long long)b.points, b.dispatches,
+                (unsigned long long)b.held_set, (unsigned long long)b.held_busy, (unsigned long long)b.early_free, (int)b.swapped,
+                (unsigned long long)b.one_retire_moves, (unsigned long long)b.one_retire_points);
+    CHECK_EQ(a.points, a.quarantined);              /* unset: one record a move, as before */
+    CHECK(b.quarantined >= 2);
+    CHECK(b.points >= 1);
+    CHECK(b.points <= b.quarantined);
+    CHECK(b.points <= (uint64_t)b.dispatches);      /* at most one a retire */
+    CHECK(b.swapped);
+    CHECK(b.held_set >= 1);
+    CHECK(b.held_busy >= 1);                         /* the hold was still pending: the check ran */
+    CHECK(b.one_retire_moves >= 2);                  /* a swap's two moves in one retire ... */
+    CHECK_EQ(b.one_retire_points, (uint64_t)1);      /* ... behind ONE record */
+    CHECK_EQ(a.one_retire_points, a.one_retire_moves);
+    CHECK_EQ(a.bad_points, (uint64_t)0);
+    CHECK_EQ(b.bad_points, (uint64_t)0);
+    CHECK_EQ(b.early_free, (uint64_t)0);            /* no slot left quarantine before the stream passed */
+    CHECK_EQ(a.early_free, (uint64_t)0);
+}
+
 /* A recall right after a donation, with the card behind: the swap's copies have landed but the
  * slots they freed (the victim's budgeted slot, the promoted unit's pool slot) are still in
  * quarantine behind the compute stream. The donor is owed those slots (donor_slot), so the recall

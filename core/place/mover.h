@@ -348,6 +348,8 @@ struct MoverStats {
      * starved mover from a satisfied one. */
     uint64_t no_record = 0, starved_slab = 0, starved_pool = 0;
     uint64_t quarantined = 0;
+    /* Lever MQB: the compute-stream records that quarantined them (one a retire with moves). */
+    uint64_t quarantine_points = 0;
     /* Demotions out of a lent slot that copied nothing (the unit kept its host copy). Also
      * counted in `demotions`. */
     uint64_t dropped = 0;
@@ -394,7 +396,8 @@ struct MoverCounters {
                       staged_units, staged_bytes, stage_overflow, stage_copies, ssd_staging_bytes,
                       ssd_promotions, ssd_promoted_bytes, ssd_deposits, ssd_deposit_bytes,
                       pool_evictions, ssd_layers, ssd_units, ssd_read_bytes, ssd_preads,
-                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes;
+                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes,
+                      quarantine_points;   /* lever MQB */
 
     MoverStats snapshot() const {
         MoverStats s;
@@ -434,6 +437,7 @@ struct MoverCounters {
         s.ssd_wait_ns        = ssd_wait_ns;
         s.ssd_skipped_units  = ssd_skipped_units;
         s.ssd_skipped_bytes  = ssd_skipped_bytes;
+        s.quarantine_points  = quarantine_points;
         return s;
     }
 };
@@ -835,11 +839,15 @@ private:
         int64_t  pool_slot = -1;
         int64_t  to_slot = -1;
         RadEvent ev = nullptr;
+        /* Lever MQB (RADIANCE_MOVER_QB=1): the slot in qev_ whose record is this move's quarantine
+         * point, shared by every move one retire() quarantined; -1: ev's own record (unset form). */
+        int32_t  qslot = -1;
 
         void clear() {
             state = State::Free;
             unit = -1;
             slab_slot = pool_slot = to_slot = -1;
+            qslot = -1;
         }
         /* Whether the move hands `slab_slot` back once its quarantine clears. An Admit keeps
          * its slot: the unit becomes the slot's resident. */
@@ -1023,6 +1031,18 @@ private:
      * max_lead_dispatches ago. */
     std::vector<RadEvent> lead_;
     int                   lead_next_ = 0;
+    /* Lever MQB (DRAFTER track 21.11.2026 round 73; start env RADIANCE_MOVER_QB=1, read once at setup;
+     * unset / 0 = one record a move, as before): retire() quarantines every move it publishes behind
+     * ONE compute-stream record, a ring slot of qev_, instead of one record a move. The records sat
+     * back to back at one stream point (nothing is issued between them), so the one record signals
+     * where the last of them did; a slot recorded again later only moves a waiting move's point
+     * later, never earlier. Why: a record is a barrier-AND packet with its own completion signal
+     * (aql.cpp a_event_record), ~5.3 us each on an idle link and 16-24 us beside SDMA copies
+     * (drafter/kit/mes/mesb.cpp, xeon GPU1); one-machine serving publishes ~12 moves a rank a step,
+     * between the sampler's pick and the DSpark context pass. */
+    std::vector<RadEvent> qev_;
+    int                   qev_next_ = 0;
+    bool                  qb_ = false;
     int32_t               prefetch_cursor_ = 0;
     int32_t               last_op_ = -1;
     int                   dispatch_ = 0;
