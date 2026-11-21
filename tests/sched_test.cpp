@@ -3719,6 +3719,25 @@ TEST(draft_short_blk_takes_only_a_declared_short_block) {
     CHECK_EQ(fn4::value(i), 0);
 }
 
+/* Qwen loop round 10 (F28 / F11's root cause): sp_ple is the Qwen plugins' switch (fn4-x3-spx f0c9a4a9, which the merge left out:
+ * the core kept it, so a POST read back 1 while the plugins kept the start value). Now the core hands it on like sp_serial:
+ * a follower takes it, the scheduler does not own it, and with no loaded object serving it (this host test) a request is
+ * refused at the step release and the value stays. resume_cold stays the core's (the negative control: not handed on). */
+TEST(sp_ple_is_a_qwen_plugin_switch_the_core_hands_on) {
+    const int i = fn4::switch_index("sp_ple");
+    REQUIRE(i == (int)fn4::kSpPle);
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    CHECK(fn4::follower_switch(fn4::switch_index("sp_serial")));
+    CHECK(!fn4::follower_switch(fn4::switch_index("resume_cold")));
+    const int before = fn4::value(i);
+    std::string err;
+    REQUIRE(fn4::request("sp_ple", 1, &err));
+    int sw[fn4::kSwitches];
+    (void)fn4::apply_pending(0, sw);
+    CHECK_EQ(fn4::value(i), before);
+}
+
 /* tp8 loop D26 (DECODE round 22): ds41_attn_dec is switch 84, right after ds41_prefetch, a plugin's (libr4d) that the follower
  * takes with the leader's and the scheduler does not own; with no loaded object serving it a request is refused at the step
  * release and the value stays (the published build: nothing reads it). */
