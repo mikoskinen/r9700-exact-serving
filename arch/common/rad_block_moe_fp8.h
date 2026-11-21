@@ -131,6 +131,10 @@ static const int kMoeSdfBit = 4;
 
 struct MoeFP8 {
     struct Config {
+        /* Lever DAR b (DRAFTER track round 58): the block's all-reduce / moe_gather_all_reduce declared with libr4d's
+         * fp8 wire (`wire` 1, `wire_nb` x `wire_nt`; NOT exact, rule B) -- the DSpark drafter's MoE only, under its start
+         * env; 0 = the params are not declared at all (every other caller's graph unchanged). */
+        int ar_wire = 0, ar_wire_nb = 16, ar_wire_nt = 256;
         /* Routed experts this rank owns. Equal to `n_expert_all` unless experts are split across
          * ranks, which only a calibration run does (a Hessian spans an expert's whole K); otherwise
          * each rank holds a slice of every expert (see ff_lo). */
@@ -2196,6 +2200,15 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
 
     if (g.world > 1 && !c.no_reduce) {
         const auto all_reduce = [&](const char* dtype, rad_buf buffer) {
+            if (c.ar_wire)
+                return rw(b, RAD_OP(b, "all_reduce",
+                             RAD_PARAMS(RAD_INT("world_size", g.world),
+                                        RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                        RAD_STR("dtype", dtype), RAD_INT("exact", g.wire_exact),
+                                        RAD_INT("min_bytes", g.wire_min_bytes), RAD_INT("wire", c.ar_wire),
+                                        RAD_INT("wire_nb", c.ar_wire_nb), RAD_INT("wire_nt", c.ar_wire_nt)),
+                             RAD_NOWEIGHTS),
+                         {buffer}, {buffer});
             return rw(b, RAD_OP(b, "all_reduce",
                          RAD_PARAMS(RAD_INT("world_size", g.world),
                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -2221,7 +2234,16 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const int64_t mf = std::min<int64_t>(c.gather_ar_rows, c.rows);
         const rad_buf grd[6] = { w.edn, w.ew, w.sorted, w.h.x, w.sout, w.sgate };
         const rad_buf gwr[1] = { w.h.x };
-        op_gar = RAD_OP(b, "moe_gather_all_reduce",
+        op_gar = c.ar_wire
+                     ? RAD_OP(b, "moe_gather_all_reduce",
+                              RAD_PARAMS(RAD_RANGE("M", 1, mf), RAD_INT("n", g.n_embd),
+                                         RAD_INT("top_k", c.top_k), RAD_INT("world_size", g.world),
+                                         RAD_STR("dtype", g.dtype),
+                                         RAD_STR("act", gfold && !c.shared_ungated ? "sigmoid" : "none"),
+                                         RAD_INT("wire", c.ar_wire), RAD_INT("wire_nb", c.ar_wire_nb),
+                                         RAD_INT("wire_nt", c.ar_wire_nt)),
+                              RAD_NOWEIGHTS)
+                     : RAD_OP(b, "moe_gather_all_reduce",
                         RAD_PARAMS(RAD_RANGE("M", 1, mf), RAD_INT("n", g.n_embd),
                                    RAD_INT("top_k", c.top_k), RAD_INT("world_size", g.world),
                                    RAD_STR("dtype", g.dtype),

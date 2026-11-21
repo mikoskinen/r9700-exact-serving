@@ -1965,6 +1965,28 @@ static int64_t xring_env() {
     }();
     return v;
 }
+/* Lever DAR b (DRAFTER track round 58): the DSpark drafter's all-reduces on libr4d's FP8 WIRE (r4d_ar_fp8.h: E4M3 + an
+ * E8M0 scale a 16-byte word on both pushes, 56 % of the exact wire's bytes; every contribution quantised, the owner's too,
+ * the fp32 fold in ascending rank, the sum quantised once more: deterministic and batch-invariant, NOT exact -- the
+ * drafter's proposals move, the trunk's verify keeps the served text). Start env RADIANCE_DS41_DSPARK_ARF (leader, where
+ * the drafter runs; read at declare): 1 = the stages' attention all-reduces + the drafter MoE's (moe_gather_all_reduce /
+ * all_reduce), 2 = + the embedding's; unset / 0 = today's graph (no op carries the params). Grid
+ * RADIANCE_DS41_DSPARK_ARF_NB x _NT (default 16 x 256: tools/dbench/arf.cpp --phase, the codec over more CUs). */
+static int dspark_arf() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DSPARK_ARF");
+        if (!e || !*e) return 0;
+        const int n = std::atoi(e);
+        return n == 1 || n == 2 ? n : 0;
+    }();
+    return v;
+}
+static int dspark_arf_geo(const char* name, int dflt, int lo, int hi) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return dflt;
+    const int n = std::atoi(e);
+    return n >= lo && n <= hi ? n : dflt;
+}
 static int64_t gather_ar_rows() {
     const char* e = std::getenv("RADIANCE_DS41_ARGATHER");
     if (!e || !*e) return 0;
@@ -5156,11 +5178,16 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
             !L.kv_st || !L.attn || !L.o_rope || !L.o_b)
             return RAD_E_INVAL;
     }
-    if (g.world > 1)
-        L.ar_attn = op(b, "all_reduce",
-                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
-                         RAD_INT("exact", g.wire_exact), RAD_INT("min_bytes", g.wire_min_bytes) },
-                       {}, { d.attn_out }, { d.attn_out });
+    if (g.world > 1) {
+        std::vector<RadParam> ap = { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                                     RAD_INT("exact", g.wire_exact), RAD_INT("min_bytes", g.wire_min_bytes) };
+        if (dspark_arf() >= 1) {   /* lever DAR b */
+            ap.push_back(RAD_INT("wire", 1));
+            ap.push_back(RAD_INT("wire_nb", dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NB", 16, 1, 64)));
+            ap.push_back(RAD_INT("wire_nt", dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NT", 256, 64, 1024)));
+        }
+        L.ar_attn = op(b, "all_reduce", ap, {}, { d.attn_out }, { d.attn_out });
+    }
     L.post_a = op(b, "mhc_post", hcp, {}, { d.attn_out, d.h0, d.post, d.comb }, { d.h1 });
     L.mix_f = op(b, "mhc_mix", mixp, { L.hc_f_fn, L.hc_f_scale, L.hc_f_base }, { d.h1 }, { d.pre_f, d.post, d.comb });
     L.col_f = op(b, "mhc_collapse", hcp, {}, { d.h1, d.pre_a }, { d.x });
@@ -5192,6 +5219,11 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
     s.cfg.rfuse_decl = dsp_rf_env() > 0 && rf_declared() ? 1 : 0;   /* lever DRF */
+    if (dspark_arf() >= 1) {   /* lever DAR b: the drafter MoE's reduction on the fp8 wire */
+        s.cfg.ar_wire = 1;
+        s.cfg.ar_wire_nb = dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NB", 16, 1, 64);
+        s.cfg.ar_wire_nt = dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NT", 256, 64, 1024);
+    }
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     /* Lever Z0-A (ds41-z0): the block's sigmoid router refuses rows above its geometry's max_tok
      * (rad_block_glm_router.h, GlmRouter::declare: c.rows > g.max_tok -> RAD_E_INVAL). A sizing declare below Q (the
@@ -5426,11 +5458,16 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                      { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
                        RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
                      { m.token }, {}, { d.x });
-    if (g.world > 1)
-        d.embed_ar = op(b, "all_reduce",
-                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
-                          RAD_INT("exact", 1) },
-                        {}, { d.x }, { d.x });
+    if (g.world > 1) {
+        std::vector<RadParam> ep = { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                                     RAD_INT("exact", 1) };
+        if (dspark_arf() >= 2) {   /* lever DAR b at 2: the embedding's reduction too */
+            ep.push_back(RAD_INT("wire", 1));
+            ep.push_back(RAD_INT("wire_nb", dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NB", 16, 1, 64)));
+            ep.push_back(RAD_INT("wire_nt", dspark_arf_geo("RADIANCE_DS41_DSPARK_ARF_NT", 256, 64, 1024)));
+        }
+        d.embed_ar = op(b, "all_reduce", ep, {}, { d.x }, { d.x });
+    }
     d.expand = op(b, "cast", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
                   {}, { d.x }, { d.h0 });
     d.pre0 = op(b, "fill", { RAD_RANGE("M", 1, Q), RAD_INT("n", c.hc), RAD_STR("dtype", "f32"), RAD_F64("value", 0.0) },
