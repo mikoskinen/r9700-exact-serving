@@ -26,6 +26,8 @@
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #define BT_BK 64                // K per staged tile: four WMMA k steps
 // LDS row pitch in elements (144 bytes). A fragment read is sixteen lanes on sixteen rows, 8 bytes
@@ -230,6 +232,22 @@ static int gemm_bf16_tiled_p(long a, long w, long c, int M, int K, int N, int SK
   return 0;
 }
 
+// Qwen loop round 8 (QUEUE Q29): RADIANCE_FN4_BT_TILE=1 / 2 at start forces the 128 x 128 / 64 x 64 tile for every op that
+// names none (unset / 0 = the arm above). At prefill the router's GEMM (N 512, K 2560, 2,048 rows) is 64 blocks of 128 x 128,
+// one a CU, each walking K alone, and it runs 205 us a call beside the comm lane (prof2p) against ~40 us for a block's walk: 64 x 64
+// gives 256 shorter blocks. The same bytes at either tile (the contract above: the same WMMA sequence a 16 x 16 tile, the same SK).
+static int bt_tile_forced() {
+  static const int v = [] {
+    const char* e = std::getenv("RADIANCE_FN4_BT_TILE");
+    const int t = e ? std::atoi(e) : 0;
+    const int r = t == 1 || t == 2 ? t : 0;
+    if (r) std::fprintf(stderr, "radiance: libr4d: gemm_bf16_nt_tiled at the %s tile for every op that names none "
+                                "(RADIANCE_FN4_BT_TILE=%d, Qwen loop Q29)\n", r == 1 ? "128 x 128" : "64 x 64", r);
+    return r;
+  }();
+  return v;
+}
+
 // ============================================================== the plugin ABI entry point
 extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   GemmOps g;
@@ -242,6 +260,7 @@ extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);
   if (rc != RAD_OK) return rc;
   int tile = (int)r4d_geti_or(a, "tile", 0);
+  if (tile == 0) tile = bt_tile_forced();
   if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
   const int e = gemm_bf16_tiled_p(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
                                   (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s, g.lda, g.ldc);
