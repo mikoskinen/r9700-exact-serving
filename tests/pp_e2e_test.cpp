@@ -6511,6 +6511,7 @@ TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
     /* bg: BEST's shape -- 4 lanes, the last two BG lanes (RADIANCE_PP_BG_LANE=2) with the follower's one-layer segments and the leader's
      * decode tails first; mix: the split set (decoders + newcomers) after the cold set, in the same start */
     struct Arm { int lanes; const char* cut; int srf; bool post; bool bg = false; bool mix = false; };
+    long long srf2_held = 0;   /* admissions held over the srf 2 arms (tp8 loop R50) */
     for (const Arm a : { Arm{ 2, "0,2", 0, false }, Arm{ 2, "0,2", 2, false }, Arm{ 2, "1,3", 2, false }, Arm{ 3, "0,3", 2, false },
                          Arm{ 2, "0,2", 1, false }, Arm{ 2, "0,2", 2, true }, Arm{ 4, "1,3", 2, false, true, true },
                          Arm{ 4, "0,2", 2, false, true, true }, Arm{ 3, "1,3", 1, false, false, true } }) {
@@ -6558,8 +6559,15 @@ TEST(srf_concurrent_cold_prompts_one_at_a_time_serve_one_process_tokens) {
             continue;
         }
         CHECK(plans > 0);
-        if (a.srf == 2) CHECK(held > 0);
+        /* tp8 loop R50: whether an admission is held in ONE arm depends on when the four requests arrive (21.11. 16:4x, load
+         * ~20-30 + swap: 3 lanes W(0,3) planned 5, sat out 1, held 0, tokens 0 of 4 differ; alone held 1) -- each srf 2 arm
+         * must show the rule acting (a hold or a plan sat out), and the start as a whole must hold one */
+        if (a.srf == 2) {
+            CHECK(held > 0 || out > 0);
+            srf2_held += held > 0 ? held : 0;
+        }
     }
+    CHECK(srf2_held > 0);
 }
 
 /* tp8 loop D53: PREEMPTION BY RECOMPUTE THROUGH THE PIPELINE. Eight requests at once whose prompts + outputs (3,600 tokens)
