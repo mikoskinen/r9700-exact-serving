@@ -6414,6 +6414,7 @@ TEST(merged_decode_lanes_serve_one_process_tokens) {
  * BG inbox holds one): at 3 lanes BG 1 the BG lane takes one at a time, the rest are held; every request's tokens are one process's. */
 /* four decoders, then six ~600-row newcomers at once: a BG inbox holds one (700 rows a step), so beside a busy BG lane the rest have
  * no room -- held under bit 16, MIXED steps of the merged lane without it */
+size_t hold_burst_set_size() { return 10; }   /* hold_burst_set's requests: four decoders + six newcomers */
 std::vector<std::vector<int32_t>> hold_burst_set(int port) {
     std::vector<std::future<std::vector<int32_t>>> f;
     for (uint64_t s : { 41, 42, 43, 44 })
@@ -6448,7 +6449,8 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         env.push_back("RADIANCE_PP_MERGE=" + std::to_string(a.merge));
         if (a.ms) env.push_back("RADIANCE_PP_MERGE_MS=" + std::to_string(a.ms));
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
-                               "RADIANCE_PP_SEG_TEST_WAIT_MS=40", "RADIANCE_PP_READY_FIRST=1" })
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=40", "RADIANCE_PP_READY_FIRST=1",
+                               "RADIANCE_PP_MERGE_LINE_S=1" })   /* tp8 loop R56f: the merge line each second (the retry below reads it) */
             env.push_back(v);
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
@@ -6457,6 +6459,32 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         REQUIRE(pp.start(a.cut, ex, env));
         std::vector<std::vector<int32_t>> got = split_set(pp.port);
         for (auto& v : hold_burst_set(pp.port)) got.push_back(v);
+        /* tp8 loop R56f (PREFILL NOTE 19:06): whether a burst finds the lanes merged with no BG room depends on when its requests
+         * arrive -- under load ~20-30 + swap every bit-16 arm held 0 (tokens 0 of 17 differ; alone 1 + 1). A bit-16 arm whose
+         * merge line still says 0 held sends the same burst again (the prefix cache dropped first: cold newcomers as the first
+         * time), up to twice; each retry's tokens are held to the reference burst's too. */
+        int retries = 0, retry_differ = 0;
+        const size_t nb = hold_burst_set_size();
+        for (int r = 0; (a.merge & 16) && r < 2; ++r) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+            long long h = -1;
+            {
+                const std::string lg = pp.lead.output();
+                if (const size_t at = lg.rfind("held for the BG lanes "); at != std::string::npos)
+                    (void)std::sscanf(lg.c_str() + at, "held for the BG lanes %lld", &h);
+            }
+            if (h > 0) break;
+            {
+                std::string rb;
+                Call rs;
+                CHECK(rs.send(pp.port, "/reset_prefix_cache", "") && rs.read(&rb) == 200);
+            }
+            const std::vector<std::vector<int32_t>> again = hold_burst_set(pp.port);
+            ++retries;
+            REQUIRE_EQ(again.size(), nb);
+            for (size_t i = 0; i < nb; ++i)
+                if (again[i] != ref[ref.size() - nb + i]) ++retry_differ;
+        }
         kill(pp.lead.child.pid, SIGTERM);
         CHECK_EQ(pp.lead.finish(60), 0);
         CHECK_EQ(pp.fol.finish(30), 0);
@@ -6483,10 +6511,12 @@ TEST(merge_holds_and_lingers_serve_one_process_tokens) {
         if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
             fprintf(stderr, "    %s\n", llog.substr(at, std::min<size_t>(300, llog.find('\n', at) - at)).c_str());
         fprintf(stderr, "    pp_merge %d, pp_merge_ms %d, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld merges, %lld splits; "
-                        "held %lld newcomers over %lld steps (%lld lent, %lld home), rounds merged by a hold %lld / by pp_merge_ms %lld\n",
+                        "held %lld newcomers over %lld steps (%lld lent, %lld home), rounds merged by a hold %lld / by pp_merge_ms %lld; "
+                        "burst retries %d (%d of %d requests differ)\n",
                 a.merge, a.ms, a.k, a.lanes, a.cut, differ, ref.size(), merges, splits, held, hsteps, hlent, hhome, hold_rounds,
-                hyst_rounds);
+                hyst_rounds, retries, retry_differ, retries * (int)nb);
         CHECK_EQ(differ, 0);
+        CHECK_EQ(retry_differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 40).c_str(), tail(flog, 30).c_str());
         CHECK_EQ(pm, a.merge);
         CHECK_EQ(ms, a.ms);
