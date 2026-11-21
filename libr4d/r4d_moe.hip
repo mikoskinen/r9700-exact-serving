@@ -54,6 +54,7 @@
 #include <cstring>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -3532,6 +3533,15 @@ struct RgGeom {
      * `mt` 16-row tiles a block, one after the other (1 = today's grid; each tile's items, chains and split sums are
      * today's, so the bytes are), `notail` 1 = return after the GEMM part (no arrival, no ranking: a timing split). */
     uint32_t mt, notail;
+    /* qfn-on-ds lever RGT (Qwen loop round 5, 21.11.2026; QUEUE Q11, FINDINGS F12): `tail` 1 = the ranking per row tile.
+     * Today the LAST block of the whole grid ranks every row (rows m = wave, wave + NW, ...: 3 / 4 rows a wave at 96 / 128
+     * rows) and sorts; F12 measured that tail at 9.1 / 38.2 / 38.5 us cold at 64 / 96 / 128 rows. Under `tail` each row
+     * tile (blockIdx.y) counts its own blocks on word 1 + blockIdx.y of the instance's counter slot; the tile's last block
+     * ranks the tile's rows (router_topk_row, per row and wave-local: the same ids / w bytes) and stages each slot's sort
+     * place in `sorted` (M x top_k int32, the op's own output, the index today's LDS list uses); word 0 counts the tiles
+     * done, and the last tile's block loads the staged list into the sort's LDS and runs today's sort over it (the same
+     * input in the same order: the same sorted / off / cnt / inverse bytes). */
+    uint32_t tail;
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
@@ -3587,12 +3597,48 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     }   /* the block's row tiles */
     if (g.notail) return;   /* bench split (rg_notail): the GEMM part only */
 
+    __shared__ unsigned int s_arrived;
+    if (g.tail) {
+        /* lever RGT (RgGeom note): the tile's last block ranks the tile's rows, the last tile sorts. The same release /
+         * acquire pattern as below, once on the tile's word and once on word 0. */
+        __threadfence();
+        __syncthreads();
+        unsigned int* const tctr = ctr + 1u + blockIdx.y;
+        if (tid == 0)
+            s_arrived = __hip_atomic_fetch_add(tctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+        if (s_arrived + 1u != gridDim.x) return;
+        if (tid == 0) __hip_atomic_store(tctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const uint32_t r0 = blockIdx.y * MT * 16u;
+        const uint32_t r1 = r0 + MT * 16u < g.M ? r0 + MT * 16u : g.M;
+        const SlotSink stg{sorted, g.base, g.n_local, prot};   /* staged at today's LDS index m * top_k + lane */
+        for (uint32_t m = r0 + wave; m < r1; m += NW)
+            router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, stg);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0)
+            s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+        if (s_arrived + 1u != gridDim.y) return;
+        if (tid == 0) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        ScatterLds<NW>& sl = *reinterpret_cast<ScatterLds<NW>*>(rg_smem);
+        for (uint32_t e = tid; e < g.n_local; e += blockDim.x) sl.cnt[e] = 0;
+        const uint32_t T = g.M * g.top_k;
+        /* every staged value is in a register (and in LDS) before the barrier, so the sort's stores to `sorted` below
+         * cannot overtake a load of the staged list */
+        for (uint32_t i = tid; i < T; i += blockDim.x) sl.e[i] = sorted[i];
+        lds_barrier();
+        scatter_small_place<NW, INV>(sorted, off, cnt, T, g.n_local, sl, inv);
+        return;
+    }
+
     /* ---- the last block ranks. Every store is made visible device-wide before the arrival is
      * published; the block completing the count resets it for the next launch and acquires the
      * other blocks' logits. */
     __threadfence();
     __syncthreads();
-    __shared__ unsigned int s_arrived;
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
@@ -3733,6 +3779,31 @@ extern "C" void r4d_rad_router_gemm_topk_scatter_fini(void* inst) {
     delete in;
 }
 
+/* qfn-on-ds lever RGT (Qwen loop round 5; RgGeom note): the fused decode router ranks per row tile from this many rows
+ * (0 = today's form at every height). RADIANCE_FN4_RG_TAIL at start, switch rg_tail between steps (r4d_rg_tail_set,
+ * reached through r4d_hc_bf16.hip's r4d_fn4_switch_fn). -1 until the environment is read. */
+static std::atomic<int> g_rg_tail{-1};
+static int rg_tail_rows() {
+    int v = g_rg_tail.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_RG_TAIL");
+        int on = (e && *e) ? std::atoi(e) : 0;
+        on = on < 0 ? 0 : on > (int)kRgMaxM ? (int)kRgMaxM : on;
+        int want = -1;
+        if (g_rg_tail.compare_exchange_strong(want, on, std::memory_order_relaxed) && on > 0)
+            std::fprintf(stderr, "radiance: libr4d: lever RGT (RADIANCE_FN4_RG_TAIL=%d): the fused decode router ranks per "
+                                 "16-row tile from %d rows (the same bytes)\n", on, on);
+        v = g_rg_tail.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_rg_tail_set(int value) {
+    if (value < 0 || value > (int)kRgMaxM) return -1;
+    g_rg_tail.store(value, std::memory_order_relaxed);
+    return 1;
+}
+extern "C" int r4d_rg_tail_get() { return rg_tail_rows(); }
+
 /* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
  * expert_offset, expert_count, gate?. The two optional ones come together or not at all. The
  * replaced shims' checks are all made here, plus the row bound. */
@@ -3833,6 +3904,10 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
     const long long rg_mt = r4d_geti_or(a, "rg_mt", 1);
     g.mt = rg_mt >= 2 && rg_mt <= 8 ? (uint32_t)rg_mt : 1u;
     g.notail = r4d_geti_or(a, "rg_notail", 0) != 0 ? 1u : 0u;
+    /* lever RGT: the ranking per row tile from `rg_tail` rows (the op param for the bench, else the switch / start
+     * variable); at least two row tiles, else today's one-tile form is the same work with one arrival fewer */
+    const long long rg_tail = r4d_geti_or(a, "rg_tail", (long long)rg_tail_rows());
+    g.tail = rg_tail > 0 && M >= rg_tail && M > 16 * (long long)g.mt ? 1u : 0u;
     const long long rtiles = (M + 15) / 16;
     const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((rtiles + g.mt - 1) / g.mt));
     /* The chained form (r4d_chain.h) where the row resolved with `chain`. */

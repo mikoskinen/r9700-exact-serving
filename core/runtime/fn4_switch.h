@@ -877,6 +877,9 @@
  *   sp_ple          qwen4exp (16.11.2026, qwen/SP-SERIAL-EXACT.md): a pipelined SP-hc step keeps the layers before the
  *                   PLE's replicated (their all-reduces, whole-row reads and writes), so the PLE reads the whole stream
  *                   on every rank and every rank leaves the same convolution window; 0 today            RADIANCE_FN4_SP_PLE
+ *   rg_tail         libr4d (qfn-on-ds lever RGT, 21.11.2026): the fused decode router (router_gemm_topk_scatter) ranks
+ *                   each 16-row tile's rows in that tile's last block and sorts in the last tile's, from N rows (at
+ *                   least two tiles); the same bytes; 0 today (the grid's last block ranks every row)  RADIANCE_FN4_RG_TAIL
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -920,7 +923,9 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kArLaneThreads, kHcUpMix, kArLaneBlocks, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair,
               kExl3Dz, kExl3Bi, kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows,
               kHcSpProbe, kHcSp, kMtpFlat, kArSdma, kBiWide, kSpSerial, kHcPinPf2,
-              kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kQsaSplit, kSpPle, kArFence, kSpRoute, kSwitches };
+              kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kQsaSplit, kSpPle, kArFence, kSpRoute,
+              kRgTail,   /* qfn-on-ds lever RGT (Qwen loop round 5, 21.11.2026): libr4d, the fused router ranks per row tile */
+              kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */

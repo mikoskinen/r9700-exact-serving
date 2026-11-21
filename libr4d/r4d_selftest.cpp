@@ -4812,10 +4812,13 @@ static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
      * an rg_mt 1 vs 1 control first). */
     {
         const L& f = ls[0];
+        /* Qwen loop round 5 (lever RGT, QUEUE Q11): `mt` < 0 = rg_mt 1 with rg_tail 1 (the ranking per row tile; the
+         * launch keeps today's form below two row tiles) */
         auto run = [&](long long mt, long long notail, bool timed, const char* what) -> bool {
             std::vector<RadParam> ps = f.ps;
             if (mt > 1) ps.push_back(PI("rg_mt", mt));
             if (notail) ps.push_back(PI("rg_notail", 1));
+            ps.push_back(PI("rg_tail", mt < 0 ? 1 : 0));   /* explicit 0: the bench never takes RADIANCE_FN4_RG_TAIL */
             RadArgs a;
             std::memset(&a, 0, sizeof(a));
             std::vector<RadTensor> ts = f.ts;
@@ -4834,6 +4837,8 @@ static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
             (void)run(mt, 1, true, fmt("fused, GEMM part only (rg_notail), rg_mt %lld", mt).c_str());
         for (long long mt : { 2LL, 4LL })
             (void)run(mt, 0, true, fmt("fused, whole launch, rg_mt %lld (row tiles a block)", mt).c_str());
+        (void)run(1, 0, true, "fused, whole launch, today's tail (rg_tail 0; = the first line)");
+        (void)run(-1, 0, true, "fused, whole launch, RGT: ranking per row tile (rg_tail 1)");
         struct B { void* d; size_t n; const char* name; };
         const B outs[] = { { d_lg, (size_t)(M * ne * 2), "logits" }, { d_g, (size_t)(M * 2), "gate" },
                            { d_id, (size_t)(NS * 4), "ids" }, { d_ew, (size_t)(NS * 2), "weights" },
@@ -4842,7 +4847,7 @@ static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
         auto grab = [&](long long mt, std::vector<std::vector<uint8_t>>& h) -> bool {
             for (const B& b : outs) st_memset(b.d, 0x5a, b.n);
             if (st_stream_sync(nullptr) != hipSuccess) return false;
-            if (!run(mt, 0, false, fmt("fused, rg_mt %lld (bytes)", mt).c_str())) return false;
+            if (!run(mt, 0, false, fmt("fused, rg_mt %lld (bytes)", mt).c_str())) return false;   /* mt -1: RGT */
             h.assign(sizeof(outs) / sizeof(outs[0]), {});
             for (size_t i = 0; i < h.size(); ++i) {
                 h[i].resize(outs[i].n);
@@ -4852,13 +4857,14 @@ static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
         };
         std::vector<std::vector<uint8_t>> ref, got;
         if (grab(1, ref)) {
-            for (long long mt : { 1LL, 2LL, 4LL }) {
+            for (long long mt : { 1LL, 2LL, 4LL, -1LL, -1LL }) {
                 if (!grab(mt, got)) continue;
                 std::string diff;
                 for (size_t i = 0; i < ref.size() && diff.empty(); ++i)
                     for (size_t j = 0; j < ref[i].size(); ++j)
                         if (ref[i][j] != got[i][j]) { diff = fmt("%s byte %zu (0x%02x vs 0x%02x)", outs[i].name, j, ref[i][j], got[i][j]); break; }
-                const std::string what = fmt("router_gemm_topk_scatter_inv M=%lld: rg_mt %lld vs 1", (long long)M, mt);
+                const std::string what = mt < 0 ? fmt("router_gemm_topk_scatter_inv M=%lld: RGT (rg_tail 1) vs today", (long long)M)
+                                                : fmt("router_gemm_topk_scatter_inv M=%lld: rg_mt %lld vs 1", (long long)M, mt);
                 std::printf("  %s: %s\n", what.c_str(), diff.empty() ? "every output byte identical" : ("DIFFERENT at " + diff).c_str());
                 ok(what.c_str(), diff.empty(), diff.c_str());
             }

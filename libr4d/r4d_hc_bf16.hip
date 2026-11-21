@@ -8272,6 +8272,7 @@ extern "C" int r4d_hc_tl_read(unsigned long long* out, int region, int max) {
  * parked): hc_read's two forms, hc_write's eight-wide form, hc_read's faster forms (hc_readv) and the
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */
 extern "C" int r4d_ar_sdma_set(int on);   /* fn4 SDMA-AR (r4d_ar_entry.hip) */
+extern "C" int r4d_rg_tail_set(int value);   /* qfn-on-ds lever RGT (r4d_moe.hip): the router's ranking per row tile */
 /* qfn-on-ds: the Qwen line's libr4d switches, reached through libr4d's one rad_fn4_switch (r4d_ds41_ggml.hip), which takes
  * the ds41 line's names first and hands every other name here. */
 extern "C" void r4d_fn4_fc_dump_if_on() { if (fc_on()) fc_dump(); }
@@ -8297,6 +8298,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "kvs_vic")) return r4d_kv_vic_set(value);   /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md) */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
+    if (!std::strcmp(name, "rg_tail")) return r4d_rg_tail_set(value);   /* qfn-on-ds lever RGT (r4d_moe.hip) */
     if (!std::strcmp(name, "hc_pinpf2")) {   /* fn4 SP-serial: pinned parts below kPf2MinRows through PF2 */
         if (value < 0 || value > 1) return -1;
         g_hc_pinpf2.store(value, std::memory_order_relaxed);
