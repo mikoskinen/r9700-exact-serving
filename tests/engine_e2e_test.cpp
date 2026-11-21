@@ -1940,6 +1940,111 @@ TEST(concurrent_requests_return_what_each_returns_alone) {
     }
 }
 
+/* tp8 loop W23 (the DRAFTER's lever SNW, DRAFTER track round 79): under a split vocabulary (two host ranks)
+ * RADIANCE_SAMPLE_NARROW=1 declares a second sampler chain at 2 candidates a rank and runs it for a step whose rows are
+ * all top-1 chain rows (temperature 0 under tensor parallel): the served top-k, the gather of the first 2 pairs of each
+ * row of its pair plane (a column window, read at the plane's pitch), the merge of world x 2 pairs and the pick over 2.
+ * Every token must be the served chain's: greedy requests alone and four at a time, with speculation (verify rows and the
+ * drafter's greedy passes) and without; a seeded sampled request and a greedy one asking for logprobs keep the served
+ * chain (their replies equal too, the probabilities included); the switch at 1, then 0 and back to 1 in process; a
+ * start without the env refuses 1. */
+TEST(the_narrow_sampler_chain_returns_the_served_tokens_at_two_ranks) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(230 + i, 40 + 29 * i));
+    struct Out {
+        std::vector<std::vector<int32_t>> alone, together;
+        json sampled, lp, mixed_greedy, mixed_sampled;
+    };
+    auto run = [&](Server& s) -> Out {   /* CHECK, not REQUIRE: a lambda that returns a value */
+        Out o;
+        for (const auto& p : prompts) {
+            int st = 0;
+            o.alone.push_back(tokens_of(post(s.port, "/completion", completion(p, 24), &st)));
+            CHECK_EQ(st, 200);
+        }
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            CHECK(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 24).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            o.together.push_back(tokens_of(json::parse(body, nullptr, false)));
+        }
+        o.sampled = post(s.port, "/completion", completion(prompts[1], 24, 0.9, 77));
+        o.lp = post(s.port, "/completion", completion(prompts[2], 16, 0.0, 0, 2));
+        /* A greedy row beside a sampled one: such a step keeps the served chain, the greedy row its argmax. */
+        Call m[2];
+        CHECK(m[0].send(s.port, "POST", "/completion", completion(prompts[3], 24).dump()));
+        CHECK(m[1].send(s.port, "POST", "/completion", completion(prompts[0], 24, 0.9, 78).dump()));
+        std::string b0, b1;
+        CHECK_EQ(m[0].read(&b0), 200);
+        CHECK_EQ(m[1].read(&b1), 200);
+        o.mixed_greedy = json::parse(b0, nullptr, false);
+        o.mixed_sampled = json::parse(b1, nullptr, false);
+        return o;
+    };
+    auto same = [&](const Out& a, const Out& b, const std::string& what) {
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            CHECK_EQ(a.alone[i].size(), (size_t)24);
+            if (a.alone[i] != b.alone[i] || a.together[i] != b.together[i])
+                fprintf(stderr, "    %s prompt %zu\n    served alone %s\n    alone        %s\n    together     %s\n",
+                        what.c_str(), i, show(a.alone[i]).c_str(), show(b.alone[i]).c_str(), show(b.together[i]).c_str());
+            CHECK(a.alone[i] == b.alone[i]);
+            CHECK(a.together[i] == b.together[i]);
+            CHECK(b.together[i] == b.alone[i]);
+        }
+        CHECK_EQ(tokens_of(a.sampled).size(), (size_t)24);
+        CHECK(tokens_of(a.sampled) == tokens_of(b.sampled));
+        REQUIRE(a.lp.contains("completion_probabilities"));
+        CHECK(a.lp["completion_probabilities"] == b.lp["completion_probabilities"]);
+        CHECK(tokens_of(a.lp) == tokens_of(b.lp));
+        CHECK(tokens_of(a.mixed_greedy) == tokens_of(b.mixed_greedy));
+        CHECK(tokens_of(b.mixed_greedy) == b.alone[3]);
+        CHECK(tokens_of(a.mixed_sampled) == tokens_of(b.mixed_sampled));
+    };
+    auto fn4get = [](Server& s) {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    for (const char* n_spec : { "0", "4" }) {
+        const std::vector<std::string> args = { "--tp", "2", "--num-speculative-tokens", n_spec, "--no-prefix-cache",
+                                                "--max-num-seqs", "4" };
+        Out served;
+        {
+            Server s;
+            REQUIRE(s.start(world().qwen35, args, { "RADIANCE_HOST_DEVICES=2" }));
+            CHECK(!has(s.output(), "lever SNW"));
+            CHECK_EQ(fn4get(s)["switches"].value("sample_narrow", -9), 0);
+            int st = 0;
+            (void)post(s.port, "/admin/fn4", json{ { "sample_narrow", 1 } }, &st);
+            CHECK_EQ(st, 400);
+            served = run(s);
+            CHECK(!has(s.output(), "lever SNW"));
+            CHECK_EQ(s.stop(), 0);
+        }
+        Server s;
+        REQUIRE(s.start(world().qwen35, args, { "RADIANCE_HOST_DEVICES=2", "RADIANCE_SAMPLE_NARROW=1" }));
+        CHECK(has(s.output(), "sampler: lever SNW declared"));
+        CHECK_EQ(fn4get(s)["switches"].value("sample_narrow", -9), 1);
+        const Out on = run(s);
+        CHECK(has(s.output(), "lever SNW: first all-top-1 chain issued at 2 candidates a rank"));
+        same(served, on, std::string("n_spec ") + n_spec + " sample_narrow 1");
+        int st = 0;
+        (void)post(s.port, "/admin/fn4", json{ { "sample_narrow", 0 } }, &st);
+        CHECK_EQ(st, 200);
+        same(served, run(s), std::string("n_spec ") + n_spec + " sample_narrow 0");
+        CHECK_EQ(fn4get(s)["switches"].value("sample_narrow", -9), 0);
+        (void)post(s.port, "/admin/fn4", json{ { "sample_narrow", 1 } }, &st);
+        CHECK_EQ(st, 200);
+        same(served, run(s), std::string("n_spec ") + n_spec + " sample_narrow 0 -> 1");
+        CHECK_EQ(fn4get(s)["switches"].value("sample_narrow", -9), 1);
+        CHECK_EQ(s.stop(), 0);
+    }
+}
+
 /* A prompt that shares a head with an earlier one resumes from the prefix cache: attention from
  * the cached blocks, the gated delta net from the linear-state checkpoint the earlier request wrote
  * at the end of the shared head, never from that request's later state. The reply, and every
