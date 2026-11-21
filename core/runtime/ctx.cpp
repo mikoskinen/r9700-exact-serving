@@ -1503,38 +1503,6 @@ int Ctx::haz_mark(PassTape& t) {
                 }
             }
         }
-        if (aw) {
-            const int32_t own = part_of[(size_t)i];
-            if (own < 0 || haz_ops_[(size_t)own].opaque) {
-                aw->unknown = true;
-            } else {
-                const HazOp& h = haz_ops_[(size_t)own];
-                const LineSet rd = lines_of(h.rd, h.n_rd), wr = lines_of(h.wr, h.n_wr);
-                if (aw->unknown || ls_meet(rd, aw->risky)) {
-                    /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
-                     * it touch lines after the invalidation too. */
-                    aw->r = rd;
-                    aw->w = wr;
-                    if (ok)
-                        for (int32_t x : q->infl) {
-                            const HazOp& f = haz_ops_[(size_t)x];
-                            aw->r = ls_unite(aw->r, lines_of(f.rd, f.n_rd));
-                            aw->w = ls_unite(aw->w, lines_of(f.wr, f.n_wr));
-                        }
-                    aw->risky = acq_w ? aw->w : ls_inter(aw->r, aw->w);
-                    aw->unknown = false;
-                } else {
-                    const int sc = tape_set_noacq(t.dev, i, true);
-                    if (sc < 0) return sc;
-                    ++t.noacq;
-                    if (!ok) ++t.noacq_ordered;
-                    aw->risky = ls_unite(aw->risky, ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r)));
-                    aw->risky = ls_unite(aw->risky, acq_w ? wr : ls_inter(rd, wr));
-                    aw->r = ls_unite(aw->r, rd);
-                    aw->w = ls_unite(aw->w, wr);
-                }
-            }
-        }
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);
             if (sc < 0) return sc;
