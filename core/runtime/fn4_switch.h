@@ -824,7 +824,10 @@
  *                   bands)                                                                            RADIANCE_FN4_X3DUAL
  *   moe_pair        architecture plugin (rad_fn4_switch): fn4 P2x, a pipelined prefill step's two pieces through
  *                   ONE routed-expert pass (0 off, 1 the shared arm a piece after it, 2 the shared arms inside it);
- *                   needs RADIANCE_FN4_P2X=1 at start (the expert buffers declared two pieces tall)  RADIANCE_FN4_MOE_PAIR
+ *                   needs RADIANCE_FN4_P2X=1 at start (the expert buffers declared two pieces tall). qfn-on-ds lever
+ *                   P2S: under hc_sp 2 a step of an even number of full pieces pairs them ((0, 1), (2, 3)) in the SP
+ *                   order; 3 = that order with each piece's own pass (exact, no P2X), 4 = the joint pair only where two
+ *                   pieces follow it (K = 4: (0, 1) joint, 2 and 3 single)                         RADIANCE_FN4_MOE_PAIR
  *   ar_sdma         libr4d (rad_fn4_switch): fn4 SDMA-AR -- a prefill piece's lane all-reduce and SP's raw
  *                   reduce-scatter / all-gather move their peer bytes on the SDMA copy engines (the same fold, the
  *                   same bytes); needs RADIANCE_FN4_AR_SDMA set at start (0 / 1: builds the copy-engine contexts; such

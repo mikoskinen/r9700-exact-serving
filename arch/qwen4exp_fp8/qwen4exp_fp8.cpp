@@ -2199,12 +2199,16 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
 /* fn4 P2x (declared with RADIANCE_FN4_P2X=1: the expert buffers two pieces tall): switch "moe_pair" 0 / 1 / 2 puts a
  * pipelined prefill step's two pieces through ONE routed-expert pass (MoeFP8::pair_routed) -- 1 with each piece's
  * shared arm after it (beside piece 0's MoE all-reduce), 2 with the shared arms inside it (pass()'s interleave);
- * RADIANCE_FN4_MOE_PAIR=<n> starts it at n. */
+ * RADIANCE_FN4_MOE_PAIR=<n> starts it at n.
+ * qfn-on-ds lever P2S (Qwen loop round 17, QUEUE Q38): under hc_sp 2 (every piece SP) a step of an EVEN number of full pieces
+ * runs its pieces' routed experts in PAIRS ((0, 1), (2, 3)): 1 / 2 the joint pass (as above; RADIANCE_FN4_P2X=1 declares the
+ * MoE two pieces tall), 3 = the pair ORDER with each piece's own pass (exact by construction, no P2X needed: the order's own
+ * cost, the arm that splits the joint form's net into its order and its kernel saving). See step_pipelined's P2S branch. */
 static std::atomic<int>& fn4_pair_flag() {
     static std::atomic<int> f{[] {
         const char* v = std::getenv("RADIANCE_FN4_MOE_PAIR");
         const int n = v && *v ? std::atoi(v) : 0;
-        return n >= 0 && n <= 2 ? n : 0;
+        return n >= 0 && n <= 4 ? n : 0;
     }()};
     return f;
 }
@@ -2273,7 +2277,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };
     /* fn4 P2x: the two pieces' routed experts in one pass (moe_pair 1 / 2), where the MoE was declared for it */
     const int pmode = fn4_pair_flag().load(std::memory_order_relaxed);
-    const bool pair_on = pmode > 0 && K == 2 && m.moecfg.rows >= T;
+    /* qfn-on-ds P2S: under hc_sp 2 the pairs ride the SP order (pair_sp, the branch below); the K = 2 form above keeps the
+     * stock order (SP off) and takes only modes 1 / 2 when hc_sp is not 2 */
+    const bool pair_sp = pmode > 0 && m.sp_on && g.world == 4 && fn4_sp_flag().load(std::memory_order_relaxed) == 2 &&
+                         K >= 2 && K % 2 == 0 && (pmode == 3 || m.moecfg.rows >= 2 * R);
+    const bool pair_on = pmode > 0 && pmode < 3 && !pair_sp && K == 2 && m.moecfg.rows >= T;
     /* fn4 SP-hc: sp, the real sequence-parallel residual (reduce-scatter, the connections on this rank's quarter, the
      * all-gather and the codes redone); spp, the speed probe (the quarter only, all-reduces kept, wrong output). A
      * piece takes SP when it has kSpMinRows rows; its quarter is the reduce-scatter's shard: q = ceil(rn / world),
@@ -2397,7 +2405,23 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         if (spL) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
         /* fn4 PF marks: this layer runs the hc_sp 2 order (every piece SP) and the switch asks for the precise waits */
         uint32_t mk = 0;
-        const bool pmk_l = pmk && spo && !pair_on && K >= 2 && K <= 8 &&
+        /* qfn-on-ds P2S (QUEUE Q38): this layer runs the hc_sp 2 order with paired routed passes -- every piece SP and full,
+         * not under SP-route (sp_route bit 1), and the MoE block's forms allow a joint pass (modes 1 / 2) */
+        const bool pair_sp_now = pair_sp && spo &&
+                                 !(m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) &&
+                                 [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }() &&
+                                 (pmode == 3 || l.mlp.pair_ok(2 * R, R));
+        if (pair_sp && li == 0 && g.rank == 0 && m.pair_noted != (pair_sp_now ? 10 + pmode : -10 - pmode)) {
+            m.pair_noted = pair_sp_now ? 10 + pmode : -10 - pmode;
+            fprintf(stderr, pair_sp_now ? "radiance: qwen4exp: P2S: moe_pair %d under hc_sp 2: a %lld-row step's %lld pieces' routed "
+                                          "experts in pairs (%s)\n"
+                                        : "radiance: qwen4exp: P2S: moe_pair %d asked under hc_sp 2, but this %lld-row step (%lld "
+                                          "pieces) or the MoE block's forms do not allow it (%s): today's order\n",
+                    pmode, (long long)T, (long long)K,
+                    pmode == 3 ? "the pair order, each piece's own pass" : pmode == 4 ? "one joint pass, the last two pieces single"
+                                                                         : "one joint pass a pair");
+        }
+        const bool pmk_l = pmk && spo && !pair_on && !pair_sp_now && K >= 2 && K <= 8 &&
                            [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }();
         if (pmk_l) { ms.mk = &mk; ms.rows = R; }
         ArPieces pc{};
@@ -2424,6 +2448,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         if (!pmk_l) wait1();   /* fn4 PF marks: the spo branch below waits piece by piece */
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
         int64_t sp_pend = -1;   /* fn4 SP-hc: a piece whose MoE reduce-scatter is still to be issued */
+        int64_t pp_lo = 0, pp_n = 0;   /* qfn-on-ds P2S: the last pass's pieces [pp_lo, pp_lo + pp_n) still to be reduce-scattered */
+        bool pp_mark = false;          /* P2S: the writes wait for piece K - 2's reduce-scatter by mark 15 */
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
         const bool pair_now = pair_on && l.mlp.pair_ok(T, R);
         if (pair_on && li == 0 && g.rank == 0 && m.pair_noted != (pair_now ? pmode : -1)) {
@@ -2458,6 +2484,58 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             l.mlp.pair_finish(c, T, r0(1), rn(1), pmode != 2);
             wait1();
             on1(true, [&] { l.mlp.issue_ar(c, r0(1), rn(1)); });
+        } else if (pair_sp_now) {
+            /* qfn-on-ds lever P2S (QUEUE Q38): the hc_sp 2 order (the branch below) with the pieces' routed experts in pairs. Per
+             * piece p: piece p + 1's connections beside piece p's gather, the wait, piece p + 1's gather, piece p's codes; a
+             * pair's first piece then waits, and at its second the pending MoE reduce-scatters (the previous pass's pieces) go
+             * out beside this pass -- one routed pass over both pieces (moe_pair 1 / 2: every touched expert read and decoded
+             * once for 2 R rows), or each piece's own pass in the same order (3: exact by construction, the order's own cost).
+             * 4: the joint pair only where two more pieces follow it (K = 4: (0, 1), then 2 and 3 single), so the last
+             * pieces keep today's tail. The last pass's reduce-scatters go out after the loop; with two, the writes wait for
+             * the first by a mark. The same ops on the same rows as the branch below; a joint pass's slot outputs are the
+             * per-piece pass's bytes (perfmoe --split-seed, LEVERS P2x row 134 (162)). */
+            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
+            {
+                const bool ss0 = hw(l.hc_mix, 0);
+                bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
+                hr(l.hc_ffn, 0, ss0);
+                bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
+            }
+            wait1();
+            on1(true, [&] { ag_p(0); });
+            auto paired = [&](int64_t q) {   /* pieces q (even) and q + 1 share a pass */
+                return q % 2 == 0 && q + 1 < K && (pmode != 4 || q + 3 < K);
+            };
+            for (int64_t p = 0; p < K; ++p) {
+                if (p + 1 < K) {
+                    if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
+                    const bool ss = hw(l.hc_mix, p + 1);
+                    bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
+                    hr(l.hc_ffn, p + 1, ss);
+                    bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
+                }
+                wait1();
+                if (p + 1 < K) on1(true, [&] { ag_p(p + 1); });
+                const bool first = paired(p), second = p >= 1 && paired(p - 1);
+                if (!first && pp_n > 0) {   /* the previous pass's reduce-scatters beside this pass */
+                    const int64_t q = pp_lo, nq = pp_n;
+                    on1(true, [&] { for (int64_t j = 0; j < nq; ++j) rs_p(q + j); });
+                    pp_n = 0;
+                }
+                l.hc_ffn.codes(c, r0(p), rn(p));
+                if (first) continue;
+                if (second && pmode != 3) {
+                    const int64_t P0 = r0(p - 1);
+                    l.mlp.pair_routed_at(c, T, P0, 2 * R, R, pmode == 2);
+                    l.mlp.pair_finish(c, T, P0, R, pmode != 2, P0, 2 * R);
+                    l.mlp.pair_finish(c, T, r0(p), R, pmode != 2, P0, 2 * R);
+                } else {
+                    if (second) l.mlp.pass(c, T, r0(p - 1), rn(p - 1), false);
+                    l.mlp.pass(c, T, r0(p), rn(p), false);
+                }
+                pp_lo = second ? p - 1 : p;
+                pp_n = second ? 2 : 1;
+            }
         } else if (spo && [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return K >= 2; }()) {
             /* fn4 hc_sp 2: every piece SP. Piece 0's connections (piece 1's mixer reduce-scatter beside them), one wait for
              * both reduce-scatters (hw of piece 1 reads piece 1's), then per piece p: piece p + 1's connections beside piece
@@ -2588,6 +2666,17 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             on1(true, [&] { l.mlp.issue_ar(c, r0(p), rn(p)); });
         }
         if (sp_pend >= 0) { wait1(); const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
+        if (pp_n > 0) {   /* P2S: the last pass's reduce-scatters; with two, mark the first for the writes below */
+            wait1();
+            const int64_t q = pp_lo;
+            on1(true, [&] { rs_p(q); });
+            if (pp_n == 2) {
+                mark1(15);   /* waitm(15) below falls back to the whole-lane wait if the mark was not taken */
+                pp_mark = true;
+                on1(true, [&] { rs_p(q + 1); });
+            }
+            pp_n = 0;
+        }
         l.mlp.route_report(c);
         bt_moe(c, m, T, (int)li);   /* lane 1 reduces only `x` */
         /* The writes, and the next layer's reads beside the last piece's all-reduce. PLE adds into
@@ -2595,6 +2684,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const Layer* nx = li + 1 < n ? &m.layers[(size_t)li + 1] : nullptr;
         const bool ple_next = nx && li + 1 == m.ple_layer;
         for (int64_t p = 0; p < K; ++p) {
+            if (pp_mark && p == K - 2) { waitm(15); pp_mark = false; }   /* P2S: piece K - 2's reduce-scatter */
             if (p == K - 1) wait1();
             const bool ss_ffn = hw(l.hc_ffn, p);
             /* The projection of this piece, before the next layer reads it. */
@@ -3216,8 +3306,9 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
 extern "C" int rad_fn4_accepts(const char*, int) { return 0; }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (step_pipelined; RADIANCE_FN4_P2X=1 declares) */
-        if (value < 0 || value > 2) return -1;
-        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
+        if (value < 0 || value > 4) return -1;
+        /* qfn-on-ds P2S: 3 (the pair order, each piece's own pass) needs no two-piece buffers; 1 / 2 / 4 run a joint pass */
+        if (value && value != 3 && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
