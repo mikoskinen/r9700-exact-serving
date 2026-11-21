@@ -23,8 +23,8 @@ RAD_ARCH_PLUGIN(qwen4exp_x3, "qwen4exp", "exl3", "0.1.0",
                 "Qwen4-Exp (Qwen3.8-Flash-Next) from an EXL3 checkpoint: qwen4exp_fp8 under the exl3 "
                 "descriptor (EXL3 routed experts, bf16 elsewhere)")
 /* fn4 runtime switches (the core's runtime/fn4_switch.h, between steps, every rank parked): "exl3_dual" 0 / 1 -- fn4
- * BI-dual (the EXL3 downs take the step's row bands; RADIANCE_FN4_X3DUAL=1 declares); "moe_pair" 0 / 1 / 2 --
- * fn4 P2x (qwen4exp_fp8's step_pipelined); "exl3_mapshare" 0 / 1 --
+ * BI-dual (the EXL3 downs take the step's row bands; RADIANCE_FN4_X3DUAL=1 declares); "moe_pair" 0 .. 4 --
+ * fn4 P2x / qfn-on-ds P2S (qwen4exp_fp8's step_pipelined); "exl3_mapshare" 0 / 1 --
  * MoeFP8's EXL3 ops with or without the pass's shared routing map (fn4_exl3_map_flag); "exl3_gd" 0 / 1 -- the decode
  * band's fused moe_exl3_gate_up_down in place of the split pair (fn4_exl3_gd_flag; rad_block_moe_fp8.h). Every other
  * name is not this plugin's (0). */
@@ -34,8 +34,10 @@ extern "C" int rad_fn4_accepts(const char*, int) { return 0; }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
     if (std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (qwen4exp_fp8's step_pipelined; RADIANCE_FN4_P2X=1 declares) */
-        if (value < 0 || value > 2) return -1;
-        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
+        if (value < 0 || value > 4) return -1;
+        /* qfn-on-ds P2S (Qwen loop round 17): 3 (the pair order, each piece's own pass) needs no two-piece buffers; 1 / 2 / 4 a
+         * joint pass -- the same rule as qwen4exp_fp8's own rad_fn4_switch (before this, 3 / 4 were refused here: p2s1) */
+        if (value && value != 3 && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

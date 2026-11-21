@@ -806,6 +806,8 @@ struct MoeFP8 {
      * rows (162, 10.11.: 4096 vs 2048 rows byte-identical, libr4d and exl3r4d incl. EP4). The caller issues the
      * all-reduces. */
     bool pair_ok(int64_t T, int64_t R) const;
+    /* qfn-on-ds P2S: the first of pair_ok's conditions that refuses (for the engine's note), or nullptr */
+    const char* pair_why(int64_t T, int64_t R) const;
     void pair_routed(RadCtx* c, int64_t T, int64_t R, bool shared_in) const { pair_routed_at(c, T, 0, T, R, shared_in); }
     /* qfn-on-ds lever P2S (Qwen loop round 17, QUEUE Q38): the pair at rows [P0, P0 + N) of a T-row step (pieces [P0, P0 + R)
      * and [P0 + R, P0 + N)), so a four-piece step runs two pairs. The step-tall buffers (h.x, logits, ids, ew, the shared
@@ -3213,6 +3215,30 @@ inline bool MoeFP8::pair_ok(int64_t T, int64_t R) const {
            (inv_now ? op_scatter_inv2 && op_gather_inv2 : op_scatter && op_gather) &&
            !op_gram_gu && !op_combine && !op_moe_ar && !op_shared_ar && !op_add &&
            !gather_taken(g, T, gather_out_rows, gather_out_rows6);
+}
+
+inline const char* MoeFP8::pair_why(int64_t T, int64_t R) const {
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    const int64_t small = R < T - R ? R : T - R;
+    if (!(R > 0 && T > R)) return "rows";
+    if (T > c.rows) return "T > the MoE's rows (RADIANCE_FN4_P2X=1 at start?)";
+    if (!ext_in) return "ext_in";
+    if (c.sigmoid_router || op_sigmoid_scatter) return "sigmoid router";
+    if (!op_router || !op_topk) return "no separate router / top-k";
+    if (small <= router_fused_rows) return "router_fused_rows";
+    if (small <= topk_scatter_rows) return "topk_scatter_rows";
+    if (small <= sigmoid_scatter_rows) return "sigmoid_scatter_rows";
+    if (small <= x3gd_hi16) return "x3gd_hi16";
+    if (!(scatter_inv || inv_now)) return "no inverse sort";
+    if (!(gather_inv || inv_now)) return "no inverse gather";
+    if (inv_now ? !(op_scatter_inv2 && op_gather_inv2) : !(op_scatter && op_gather)) return "sort / gather ops";
+    if (op_gram_gu) return "calibration tap";
+    if (op_combine) return "op_combine";
+    if (op_moe_ar) return "op_moe_ar";
+    if (op_shared_ar) return "op_shared_ar";
+    if (op_add) return "op_add";
+    if (gather_taken(g, T, gather_out_rows, gather_out_rows6)) return "gather taken by the hc write";
+    return nullptr;
 }
 
 inline void MoeFP8::pair_routed_at(RadCtx* c_, int64_t T, int64_t P0, int64_t N, int64_t R, bool shared_in) const {

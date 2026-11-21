@@ -2416,10 +2416,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             fprintf(stderr, pair_sp_now ? "radiance: qwen4exp: P2S: moe_pair %d under hc_sp 2: a %lld-row step's %lld pieces' routed "
                                           "experts in pairs (%s)\n"
                                         : "radiance: qwen4exp: P2S: moe_pair %d asked under hc_sp 2, but this %lld-row step (%lld "
-                                          "pieces) or the MoE block's forms do not allow it (%s): today's order\n",
+                                          "pieces) or the MoE block's forms do not allow it (%s; %s): today's order\n",
                     pmode, (long long)T, (long long)K,
                     pmode == 3 ? "the pair order, each piece's own pass" : pmode == 4 ? "one joint pass, the last two pieces single"
-                                                                         : "one joint pass a pair");
+                                                                         : "one joint pass a pair",
+                    pair_sp_now ? "" : !spo ? "not the hc_sp 2 order" : (m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1))
+                                             ? "SP-route" : [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }()
+                                             ? (l.mlp.pair_why(2 * R, R) ? l.mlp.pair_why(2 * R, R) : "?") : "a piece not SP");
         }
         const bool pmk_l = pmk && spo && !pair_on && !pair_sp_now && K >= 2 && K <= 8 &&
                            [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }();
