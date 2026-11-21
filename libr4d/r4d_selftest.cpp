@@ -5896,6 +5896,7 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
         static const char* const arm_name[7] = { "today's option word (control)", "PF 8 (K in 2 rounds)",
                                                  "KRAW (K in 1 round)", "KRAW, no sched barrier", "KRAW + PF 4",
                                                  "KRAW + KFIRST, no sched barrier", "KRAW + KFIRST" };
+        double arm_us[7] = { 0 };
         for (int arm = 0; arm < 7; ++arm) {
             poison();
             const int orc = of(&a, nullptr, arm);
@@ -5906,9 +5907,55 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
             for (size_t i = 0; i < q8b; ++i) bq += got_q8[i] != ref_q8[i];
             for (size_t i = 0; i < sb; ++i) bsd += got_s[i] != ref_s[i];
             const double ua = timed([&] { of(&a, nullptr, arm); });
+            arm_us[arm] = ua;
             std::printf("  arm %d %-30s %9.1f us a call (%+.1f %% vs today)   bytes vs today: o %lld / q8 %lld / s %lld differ -> %s\n",
                         arm, arm_name[arm], ua, 100.0 * (ua - us0) / us0, (long long)bo, (long long)bq, (long long)bsd,
                         (bo || bq || bsd) ? "DIFFERENT" : "IDENTICAL");
+        }
+        /* arm 7 = today's word stamped (O_TLS, COORD 13:06): where a row's time goes, per phase, a wave's mean */
+        typedef int (*TlSet)(unsigned long long*);
+        const TlSet tset = (TlSet)dlsym(pl.h, "r4d_attn_gq6_tl_set");
+        const int nsp = 1;   /* the law's one split at a prefill launch (r4d_attn_walk_gq6_bench's check) */
+        unsigned long long* d_tr = tset ? (unsigned long long*)dalloc((size_t)S * nsp * 64) : nullptr;
+        if (tset && d_tr) {
+            st_memset(d_tr, 0, (size_t)S * nsp * 64);
+            tset(d_tr);
+            poison();
+            const int trc = of(&a, nullptr, 7);
+            st_stream_sync(nullptr);
+            tset(nullptr);
+            if (trc != RAD_OK) {
+                std::printf("  arm 7 (stamped) rc=%d\n", trc);
+            } else {
+                fetch(got_o, got_q8, got_s);
+                const bool same = got_o == ref_o && got_q8 == ref_q8 && got_s == ref_s;
+                std::vector<unsigned long long> tr((size_t)S * nsp * 8);
+                st_memcpy(tr.data(), d_tr, tr.size() * 8, hipMemcpyDeviceToHost);
+                double sum[8] = { 0 }; long long nt = 0; int nw = 0;
+                unsigned long long t_lo = ~0ull, t_hi = 0;
+                for (int64_t w = 0; w < S * nsp; ++w) {
+                    const unsigned long long* x = &tr[(size_t)w * 8];
+                    if (!x[1]) continue;
+                    ++nw; t_lo = std::min(t_lo, x[0]); t_hi = std::max(t_hi, x[1]);
+                    sum[0] += (double)(x[1] - x[0]);
+                    for (int k = 2; k < 7; ++k) sum[k] += (double)x[k];
+                    sum[7] += (double)(x[7] & 0xffffffffull); nt += (long long)(x[7] >> 32);
+                }
+                const double tk = 0.01, n = nw > 0 ? nw : 1, tiles = nt / n;
+                tset(d_tr);
+                const double ut = timed([&] { of(&a, nullptr, 7); });
+                tset(nullptr);
+                const double rest = sum[0] - sum[2] - sum[3] - sum[4] - sum[5] - sum[6] - sum[7];
+                std::printf("  arm 7 STAMPS (today's word + O_TLS): %.1f us a call stamped (%+.1f %% vs arm 0), bytes %s; "
+                            "%d waves, span %.1f us, %.1f tiles a row\n", ut, arm_us[0] > 0 ? 100.0 * (ut - arm_us[0]) / arm_us[0] : 0.0,
+                            same ? "IDENTICAL" : "DIFFERENT", nw,
+                            (double)(t_hi - t_lo) * tk, tiles);
+                std::printf("    a wave (us): total %.1f = prologue (q in) %.1f + block table + barriers %.1f + V fetch + LDS store %.1f + QK (K loads, "
+                            "cvt, WMMA chain) %.1f + softmax %.1f + PV (LDS V, cvt, WMMA issue) %.1f + epilogue %.1f;  a tile: bar %.3f / V %.3f / "
+                            "QK %.3f / softmax %.3f / PV %.3f us\n", sum[0] / n * tk, sum[7] / n * tk, sum[2] / n * tk, sum[3] / n * tk,
+                            sum[4] / n * tk, sum[5] / n * tk, sum[6] / n * tk, rest / n * tk, sum[2] / n / tiles * tk,
+                            sum[3] / n / tiles * tk, sum[4] / n / tiles * tk, sum[5] / n / tiles * tk, sum[6] / n / tiles * tk);
+            }
         }
     } else {
         std::printf("  r4d_attn_gq6_opt_bench absent (an older libr4d): the option arms are skipped\n");

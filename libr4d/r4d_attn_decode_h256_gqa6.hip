@@ -58,6 +58,19 @@
 // V tile's fetch, so the V and K loads of a tile are in flight together (one round trip a tile instead of two); the raw K
 // is held across the V staging (+32 VGPRs over O_KRAW alone). Results are unchanged (the same conversions and WMMAs).
 #define O_KFIRST 1073741824
+// O_TLS (Qwen loop round 12, COORD 13:06; bench instance only): each wave sums its phases in 100 MHz ticks -- the tile's
+// block-table + barriers, the V tile's fetch + LDS store, QK (K loads, conversions, the WMMA chain up to its result), the
+// softmax (mask, max, rescale, P), PV (V reads from LDS, conversions, WMMA issue) -- and lane 0 writes 8 words at
+// g_attn_tlp[(seq * kv_heads + kvh) * splits + split]; the arithmetic is the option word's without O_TLS
+#define O_TLS 4
+#ifdef R4D_EMU_HOST
+#define R4DT_NOW() 0ull
+#define R4DT_USE(x) ((void)(x))
+#else
+#define R4DT_NOW() ((unsigned long long)wall_clock64())
+#define R4DT_USE(x) asm volatile("" :: "s"(x))   /* the value read: the stamp after it waits for its producer */
+#endif
+static __device__ unsigned long long* g_attn_tlp;
 // O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), and with O_K6 the
 // k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V4    33554432
@@ -135,6 +148,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
     constexpr int KFIRST = ((OPT & O_KFIRST) && KRAW && TILE == 16) ? 1 : 0;
+    constexpr bool TLS  = (OPT & O_TLS) != 0;
     static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
     static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
                   "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
@@ -206,6 +220,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     const int t_lo = tb + sp * tps;
     if (t_lo >= ntl) return;
     const int t_hi = min(t_lo + tps, ntl);
+    const unsigned long long tl_ent = TLS ? R4DT_NOW() : 0ull;
+    unsigned tl_bar = 0, tl_v = 0, tl_qk = 0, tl_sm = 0, tl_pv = 0, tl_pro = 0;
 
     // TREE: the block's parents staged once, so each row's walk below reads LDS rather than a
     // chain of dependent global loads. Every early return above is uniform across the block.
@@ -428,8 +444,15 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     int blk[NB];
     if (BTS) load_bt(t_lo * NB, blk);
     if (GPREV) fetchV(t_lo * TILE, blk);
+    if constexpr (TLS) {   /* the q fragments in: the prologue ends here */
+        uint32_t qw; __builtin_memcpy(&qw, &qf[NKS - 1], 4);
+        R4DT_USE(__builtin_amdgcn_readfirstlane((int)qw));
+        tl_pro = (unsigned)(R4DT_NOW() - tl_ent);
+    }
 
     for (int ti = t_lo; ti < t_hi; ++ti) {
+        const unsigned long long tl_a = TLS ? R4DT_NOW() : 0ull;
+        unsigned long long tl_b = 0, tl_c = 0, tl_d = 0, tl_e = 0, tl_f = 0;
         const int k0 = ti * TILE;
         int blkn[NB];
         if (BTS && ti + 1 < t_hi) {
@@ -449,6 +472,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 krawf[t] = *(const krawf_t*)(growf + (16 * t + 8 * h) * (KVP ? 2 : 1));
         }
         if (LDSB) lds_barrier(); else __syncthreads();
+        if constexpr (TLS) tl_b = R4DT_NOW();
 
         if (KLDS) {
             #pragma unroll 1
@@ -474,7 +498,9 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
         }
         if constexpr (V4) { fetchV4(k0, blk); storeV4(); }
         else { if (!GPREV) fetchV(k0, blk); storeV(); }
+        if constexpr (TLS) tl_c = R4DT_NOW();
         if (LDSB) lds_barrier(); else __syncthreads();
+        if constexpr (TLS) tl_d = R4DT_NOW();
         if (GPREV && ti + 1 < t_hi) fetchV(k0 + TILE, blkn);
 
         #pragma unroll 1
@@ -553,6 +579,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 #pragma unroll
                 for (int j = 0; j < PF; ++j) s = D::wmma(kb[j], qf[g + j], s);
             }
+            if constexpr (TLS) {   /* the WMMA chain's result in: QK ends here */
+                R4DT_USE(__builtin_amdgcn_readfirstlane((int)__builtin_bit_cast(uint32_t, s[0])));
+                tl_e = R4DT_NOW();
+            }
             float sc[8];
             #pragma unroll
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
@@ -615,6 +645,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 // plus 32 (G & 1) + 8 ((G >> 1) & 1) + 128 (G >> 1), a compile-time offset below.
                 const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0)
                                       + (VSK ? 16 * (c >> 3) : 0);
+                if constexpr (TLS) {   /* P packed: the softmax ends here */
+                    R4DT_USE(__builtin_amdgcn_readfirstlane((int)pw[3]));
+                    tl_f = R4DT_NOW();
+                }
                 #pragma unroll
                 for (int g = 0; g < NKS; g += PF) {
                     frag16 vb[PF];
@@ -645,6 +679,18 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
         if (BTS) {
             #pragma unroll
             for (int i = 0; i < NB; ++i) blk[i] = blkn[i];
+        }
+        if constexpr (TLS) {   /* PV issued (its tail completes in the next tile's first phase) */
+            const unsigned long long tl_g = R4DT_NOW();
+            tl_bar += (unsigned)((tl_b - tl_a) + (tl_d - tl_c)); tl_v += (unsigned)(tl_c - tl_b);
+            tl_qk += (unsigned)(tl_e - tl_d); tl_sm += (unsigned)(tl_f - tl_e); tl_pv += (unsigned)(tl_g - tl_f);
+        }
+    }
+    if constexpr (TLS) {
+        if (lane == 0 && g_attn_tlp) {
+            unsigned long long* rr = g_attn_tlp + (((size_t)seq * gridDim.y + kvh) * gridDim.x + sp) * 8;
+            rr[0] = tl_ent; rr[1] = R4DT_NOW(); rr[2] = tl_bar; rr[3] = tl_v; rr[4] = tl_qk; rr[5] = tl_sm; rr[6] = tl_pv;
+            rr[7] = ((unsigned long long)(t_hi - t_lo) << 32) | tl_pro;
         }
     }
 
