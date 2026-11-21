@@ -203,6 +203,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
 | `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
 | `mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: mhc_post, mhc_collapse over out, rmsnorm over xc; each rounded before the next reads it; out must not alias h) |
+| `mhc_post_collapse_rmsnorm_l256` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: `mhc_post_collapse_rmsnorm` with the norm's sum of squares in `rmsnorm`'s 256-lane partition; the chain's bytes at every M) |
 | `mhc_post_collapse_rmsnorm_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`:inout, `comb`:inout → `out`; `pre` → `xc`; `w`w → `y`; `fn`w, `scale`w, `base`w → `pre_o` (device-only: mhc_post_collapse_rmsnorm, then mhc_mix over out writing pre_o, post and comb; hc 4, n a multiple of 1024) |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
@@ -264,8 +265,15 @@ does it. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.m
 **`mhc_collapse_rmsnorm`** and **`mhc_post_collapse_rmsnorm`** (device-only) are DeepSeek-V4.1's
 sublayer entry in one launch: `mhc_collapse` then `rmsnorm`, and `mhc_post`, `mhc_collapse` over its
 `out` and `rmsnorm`. Each step stores its output in the activation dtype before the next reads it,
-so they are bit-identical to the chain. libr4d declares them with `replaces`, and `rad-kbench`'s
-fusion oracle holds each to libr4d's own chain byte for byte. libref has no row: an architecture
+so `out` and `x` / `xc` are the chain's bytes. The norm's sum of squares is folded over the launch's
+workgroup width (r4d_act_threads(M, n): 1024 / 512 / 256 threads at n 5120), not over `rmsnorm`'s
+fixed 256-lane partition, so by default `y` can differ from the chain's in the last bit of rare values
+and from the same row at another M (`r4d_selftest --bicheck`, LEVERS BI item 4). libr4d declares them
+with `replaces`, and `rad-kbench`'s fusion oracle holds each to libr4d's own chain.
+**`mhc_post_collapse_rmsnorm_l256`** (device-only) is `mhc_post_collapse_rmsnorm` with the norm's sum
+of squares in `rmsnorm`'s own 256-lane partition, so `out`, `xc` and `y` are the chain's bytes at
+every M; it has no `replaces`: an architecture declares it in place of the chain where it wants the
+chain's bytes in one launch (DeepSeek-V4.1's DSpark drafter before its head). libref has no row: an architecture
 asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not resolve, so a
 host deployment runs the chain.
 

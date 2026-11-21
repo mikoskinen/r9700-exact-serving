@@ -357,6 +357,10 @@ static const RadConstraint cDs41PcnMix[] = {
            "mhc_post (x, h, post, comb -> out), then mhc_collapse (out, pre -> xc), then rmsnorm (xc, "
            "w -> y): out, xc and y as the three ops leave them, each rounded to dtype before the next "
            "step reads it. out must not alias h."),
+    SCHEMA("mhc_post_collapse_rmsnorm_l256", pDs41CollapseNorm, oDs41PostCollapseNorm,
+           "mhc_post_collapse_rmsnorm with the norm's sum of squares in rmsnorm's own 256-lane partition: out, xc "
+           "and y are the three ops' bytes at every M (mhc_post_collapse_rmsnorm folds the norm over its workgroup, "
+           "whose width follows M). out must not alias h."),
     SCHEMA("mhc_post_collapse_rmsnorm_mix", pDs41PcnMix, oDs41PcnMix,
            "mhc_post_collapse_rmsnorm (x, h, post, comb -> out; out, pre -> xc; xc, w -> y), then mhc_mix over out "
            "(fn, scale, base -> pre_o, post, comb): every output as the two ops leave them. post and comb are read "
@@ -507,6 +511,17 @@ static const RadConstraint cDs41PcnMix[] = {
   "bf16 x, h, out, xc and y, f32 post, comb and pre, f32 or bf16 w", RAD_DOMAIN_DEVICE,
   R4D_PRIO_ONLY, ROW(cDs41PostCollapseNorm), NOTUNE, nullptr, nullptr,
   r4d_rad_mhc_post_collapse_rmsnorm, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_post_collapse_rmsnorm, nullptr, r4d_fuse_mhc_post_collapse_rmsnorm },
+/* lever DPH (DRAFTER track 21.11.2026 round 68). No `replaces`: the arch issues it in place of the chain (deepseek41, the
+ * DSpark pass's tail; RADIANCE_DS41_DSPARK_DPH). tools/dbench/dph holds it to the chain byte for byte (45.5 M values at
+ * M 1..96) and batch-invariant (rows at M = k vs M = 96). */
+{ "mhc_post_collapse_rmsnorm_l256_bf16", "mhc_post_collapse_rmsnorm_l256", "norm",
+  "mhc_post_collapse_rmsnorm, the norm's sum of squares in rmsnorm_bf16's 256-lane partition (behind a barrier, over the "
+  "xc the workgroup stored)",
+  "M 1..65535, n 1..16384, hc 2..8; rmsnorm_bf16's workgroup a row (r4d_act_threads), its sum in kR4dSumLanes' order",
+  "bf16 x, h, out, xc and y, f32 post, comb and pre, f32 or bf16 w", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41PostCollapseNorm), NOTUNE, nullptr, nullptr,
+  r4d_rad_mhc_post_collapse_rmsnorm_l256, nullptr, nullptr, nullptr,
   r4d_shape_mhc_post_collapse_rmsnorm, nullptr, r4d_fuse_mhc_post_collapse_rmsnorm },
 /* lever M1 (ds41-int9b). No `replaces`: the arch issues it in place of the pair (deepseek41, RADIANCE_DS41_MHC_FUSE /
  * fn4 mhc_fuse). r4d_selftest --case mhc_pcn_mix and tests/r4d_emu ds41i9b hold it to the two rows byte for byte. */

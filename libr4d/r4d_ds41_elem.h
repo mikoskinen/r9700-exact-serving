@@ -34,6 +34,8 @@ int r4d_rad_rmsnorm_rope_roundtrip_kv_store(const RadArgs* a, RadStream stream);
 int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream stream);
+/* lever DPH (DRAFTER track round 68): the same op with the norm in rmsnorm_bf16's 256-lane partition (the chain's bytes) */
+int r4d_rad_mhc_post_collapse_rmsnorm_l256(const RadArgs* a, RadStream stream);
 /* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm + mhc_mix over its out, one op (three launches), and its scratch */
 int r4d_rad_mhc_post_collapse_rmsnorm_mix(const RadArgs* a, RadStream stream);
 int64_t r4d_rad_mhc_post_collapse_rmsnorm_mix_scratch(const RadArgs* a);

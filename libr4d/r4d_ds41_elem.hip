@@ -2947,8 +2947,14 @@ __global__ __launch_bounds__(THR) void collapse_norm_kernel(
 /* mhc_post_collapse_rmsnorm: collapse_norm_kernel with mhc_post in front, column-local. For each of
  * its columns a thread forms every output stream k as mhc_post_kernel does (from zero, comb[j][k] *
  * h[j] over the source streams in order, then + post[k] * x, f32_to_bf16), stores it, and collapses
- * the stored values (collapse_kernel's sum over k, ds_bf16); the norm is collapse_norm_kernel's. */
-template <bool WF32, uint32_t THR, int HCM>
+ * the stored values (collapse_kernel's sum over k, ds_bf16); the norm is collapse_norm_kernel's.
+ *
+ * L256 (DRAFTER track round 68, lever DPH; the op mhc_post_collapse_rmsnorm_l256): the norm's sum of squares in
+ * rmsnorm_bf16's own partition instead -- behind a barrier, lane v < kR4dSumLanes adds the stored xc's columns v,
+ * v + 256, .. in order (r4d_lanes_sumsq over the row this block just wrote, as add_rmsnorm_body's wide form), then the
+ * same block_sum -- so out, xc AND y are mhc_post -> mhc_collapse -> rmsnorm's bytes at every M (the default fold
+ * over r4d_act_threads(M, n) threads is not: LEVERS BI item 4, r4d_selftest --bicheck FLIPS). */
+template <bool WF32, uint32_t THR, int HCM, bool L256 = false>
 __global__ __launch_bounds__(THR) void post_collapse_norm_kernel(
     const uint16_t* __restrict__ xin, long xp, const uint16_t* __restrict__ h, long hp,
     const float* __restrict__ post, long ptp, const float* __restrict__ comb, long cbp,
@@ -3006,9 +3012,13 @@ __global__ __launch_bounds__(THR) void post_collapse_norm_kernel(
             xv[c] = bf16_to_f32(b);
             if (i < n) {
                 xr[i] = b;
-                ss += xv[c] * xv[c];
+                if constexpr (!L256) ss += xv[c] * xv[c];
             }
         }
+    }
+    if constexpr (L256) {   /* lever DPH: rmsnorm_bf16's partition over the xc this block stored */
+        __syncthreads();
+        ss = r4d_lanes_sumsq(xr, n, [](uint16_t q) { return bf16_to_f32(q); });
     }
     ss = fz_block_sum<THR / kFzWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
@@ -3329,7 +3339,7 @@ int pcn_words_body(const RadArgs* a, RadStream stream, int nb, unsigned* ctr) {
                     (long)xi.stride[0], A);
 }
 
-int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
+int post_collapse_norm_body(const RadArgs* a, RadStream stream, bool l256) {
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
     if (n <= 0 || n > 16384 || hc < 2 || hc > 8) return R4D_NO(RAD_E_SHAPE);
@@ -3356,6 +3366,28 @@ int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     const int thr = r4d_act_threads((int)rows, (int)n);
+    /* lever DPH (DRAFTER track round 68): l256 (the op mhc_post_collapse_rmsnorm_l256) = the norm in rmsnorm_bf16's
+     * 256-lane partition (the three ops' bytes at every M); else the fold over thr threads, as before */
+    if (l256) {
+#define FZ_PCNL(WF, T, HM)                                                                         \
+    R4D_EMIT(stream, (post_collapse_norm_kernel<WF, T, HM, true>),                                 \
+             dim3(r4d_cliff_rows((uint32_t)rows, 1, T / kFzWave)), dim3(T), 0,                     \
+             (const uint16_t*)xi.data, (long)xi.stride[0], (const uint16_t*)h.data,                \
+             (long)h.stride[0], (const float*)po.data, (long)po.stride[0],                         \
+             (const float*)cb.data, (long)cb.stride[0], (uint16_t*)o.data, (long)o.stride[0],      \
+             (const float*)pre.data, (long)pre.stride[0], (long)pre.stride[1], (uint16_t*)x.data,  \
+             (uint32_t)x.stride[0], (const void*)w.data, (uint16_t*)y.data, (uint32_t)y_ld,        \
+             (uint32_t)n, (int)hc, eps, wadd, mult, (uint32_t)rows)
+#define FZ_PCNL_T(WF, HM)                                                                          \
+    return thr == 1024 ? FZ_PCNL(WF, 1024, HM) : thr == 512 ? FZ_PCNL(WF, 512, HM) : FZ_PCNL(WF, 256, HM)
+#define FZ_PCNL_W(WF)                                                                              \
+    do { if (hc <= 4) FZ_PCNL_T(WF, 4); FZ_PCNL_T(WF, 8); } while (0)
+        if (w.dtype == RAD_F32) FZ_PCNL_W(true);
+        FZ_PCNL_W(false);
+#undef FZ_PCNL_W
+#undef FZ_PCNL_T
+#undef FZ_PCNL
+    }
 #define FZ_PCN(WF, T, HM)                                                                          \
     R4D_EMIT(stream, (post_collapse_norm_kernel<WF, T, HM>),                                       \
              dim3(r4d_cliff_rows((uint32_t)rows, 1, T / kFzWave)), dim3(T), 0,                     \
@@ -3761,7 +3793,12 @@ extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return collapse_norm_body(a, s);
 }
 extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) {
-    return post_collapse_norm_body(a, s);
+    return post_collapse_norm_body(a, s, false);
+}
+/* lever DPH (DRAFTER track round 68): mhc_post_collapse_rmsnorm with the norm's sum of squares in rmsnorm_bf16's own
+ * 256-lane partition -- out, xc and y the chain's bytes at every M (tools/dbench/dph) */
+extern "C" int r4d_rad_mhc_post_collapse_rmsnorm_l256(const RadArgs* a, RadStream s) {
+    return post_collapse_norm_body(a, s, true);
 }
 /* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm + mhc_mix over its out, one op (pcn_mix_body); its scratch is mhc_mix's
  * partials for M rows */
