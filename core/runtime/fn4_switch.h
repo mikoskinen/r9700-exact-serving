@@ -857,7 +857,9 @@
  *                   resumes only at a snapshot where this prompt's idle cold prefill starts a chunk (Scheduler::cold_starts:
  *                   its own pieces from 0 with the alone span, keep_at 0), the deepest such at or below the hit
  *                   (HitCap::resume_at), and a head other prompts share (CacheHit::branch_at) takes no snapshot cut
- *                   (Request::checkpoint_at stays 0); 0 today                                       RADIANCE_FN4_RESUME_COLD
+ *                   (Request::checkpoint_at stays 0); 2 (qfn-on-ds lever TIP): as 1, and every piece start inside a
+ *                   spanned chunk is a resume point too (a next turn that crosses a span resumes at the earlier prompt's
+ *                   last piece start); 0 today                                                    RADIANCE_FN4_RESUME_COLD
  *   preempt_keep    core scheduler + KV manager (15.11.2026, qwen/EXACT-PRESSURE.md): a decoding request preempted for
  *                   KV is not recomputed -- 1: it publishes its prefix as today, gives up its whole blocks only
  *                   (KVManager::preempt_keep), keeps its state slots (linear with the replay copies, conv, QSA tail, PLE),

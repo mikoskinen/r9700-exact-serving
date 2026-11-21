@@ -1990,8 +1990,15 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
         /* qfn-on-ds lever TIP (Qwen loop round 21): lever TI's snapshot inside the chunk (taken there, not cut) at the start
          * of one of the chunk's pieces -- a resume there computes the rest in the cold run's own pieces, as at a chunk start
          * (a piece computes the bytes its own chunk would: step_pipelined); an inside snapshot off the piece grid is not */
-        if (ck > n && ck < n + w && geo_.checkpoint_interval > 0 && (ck - n) % geo_.checkpoint_interval == 0)
+        /* resume_cold 2 (lever TIP's second half): every piece start inside a spanned chunk too -- a later, longer prompt
+         * whose last span chunk crossed into a new one resumes at the earlier prompt's last piece start (its TIP snapshot), and
+         * runs to that cold piece's end (plan_chunk's off-grid rule) as its own cold run cuts it */
+        const int64_t I = geo_.checkpoint_interval;
+        if (I > 0 && fn4::resume_cold() >= 2 && w > I) {
+            for (int64_t p = n + I; p < n + w; p += I) out->push_back(p);
+        } else if (ck > n && ck < n + w && I > 0 && (ck - n) % I == 0) {
             out->push_back(ck);
+        }
         n += w;
         if (n < end) out->push_back(n);
     }

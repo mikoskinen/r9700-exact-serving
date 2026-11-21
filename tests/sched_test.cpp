@@ -927,8 +927,8 @@ TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold
     std::string err;
     int da[rad::fn4::kSwitches];
     struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
-    auto go = [&](int ti, int64_t lin, int grid = 256, int n = 1700, bool pieces = true) {
-        CHECK(rad::fn4::request("resume_cold", 1, &err));
+    auto go = [&](int ti, int64_t lin, int grid = 256, int n = 1700, bool pieces = true, int rc = 1) {
+        CHECK(rad::fn4::request("resume_cold", rc, &err));
         CHECK(rad::fn4::request("sched_tail_grid", grid, &err));
         CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
         rad::fn4::apply_pending(0, da);
@@ -983,6 +983,20 @@ TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold
     CHECK_EQ(g128_tip.pc.back().first, (int64_t)1408);
     const Run g128_ti = go(1, 0, 128, 1650, false);
     CHECK_EQ(g128_ti.inner, (int64_t)1408);
+    /* resume_cold 2: a snapshot at a spanned chunk's MID piece start (1024 of [768, 1280): an earlier prompt's last piece start)
+     * is a resume point -- the hit runs that cold piece [1024, 1280), then the cold run's own last chunk (whole, its snapshot
+     * inside at 1536); resume_cold 1 steps back to the chunk start 768 */
+    const Run mid2 = go(1, 1024, 256, 1700, true, 2);
+    CHECK_EQ(mid2.resumed, (int64_t)1024);
+    REQUIRE(mid2.pc.size() >= 2);
+    CHECK_EQ(mid2.pc[0].second, (int32_t)256);
+    CHECK_EQ(mid2.pc[1].first, (int64_t)1280);
+    CHECK_EQ(mid2.pc[1].second, (int32_t)420);
+    CHECK_EQ(mid2.inner, (int64_t)1536);
+    const Run mid1 = go(1, 1024, 256, 1700, true, 1);
+    CHECK_EQ(mid1.resumed, (int64_t)768);
+    const Run hit2 = go(1, 1536, 256, 1700, true, 2);   /* the TIP snapshot itself under 2 as under 1 */
+    CHECK_EQ(hit2.resumed, (int64_t)1536);
     CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
     CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
     CHECK(rad::fn4::request("resume_cold", 0, &err));
