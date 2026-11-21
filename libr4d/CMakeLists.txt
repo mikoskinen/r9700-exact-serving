@@ -303,6 +303,12 @@ option(R4D_IKA "libr4d: kernels acquire and release in-kernel (lever IKA)" OFF)
 if(R4D_IKA)
   target_compile_definitions(libr4d PRIVATE R4D_IKA=1)
 endif()
+# Lever CW7 (r4d_chain.h, qfn-on-ds Qwen loop round 14 / DS DRAFTER round 66): the chained wait empties the scalar data cache and
+# leaves the body's code as the unchained build's. OFF = the wait as before.
+option(R4D_CHAIN_WAIT7 "libr4d: the chained wait in lever CW7's form (scalar cache emptied, codegen-neutral)" OFF)
+if(R4D_CHAIN_WAIT7)
+  target_compile_definitions(libr4d PRIVATE R4D_CHAIN_WAIT=7)
+endif()
 if(R4D_HAVE_GGML)
   target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
   target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})
