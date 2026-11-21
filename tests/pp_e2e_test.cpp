@@ -2373,6 +2373,80 @@ TEST(iks_aql_ika_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
     CHECK_EQ(fsw, 3);
 }
 
+/* tp8 loop W9 (fn4 aql_cik = switch 113, lever CIK in process): with RADIANCE_AQL_IKA=1 RADIANCE_AQL_CIK=1 RADIANCE_AQL_CHI=1
+ * RADIANCE_AQL_CTA=1 at start on both nodes (the switch starts at 1), POSTed to the leader between requests, 0 / 1 / 0 reach BOTH nodes
+ * (each applies it to its own issued / played packets: a follower switch) and a cold multi-chunk prompt at 2 lanes W(1,3) serves one
+ * process's tokens and chunk plan at each; 2 is refused by name; without RADIANCE_AQL_CIK at start 1 is refused naming the env. The
+ * host backend chains nothing, so the switch's path is what is proven here; the packets are a card start's. */
+TEST(w9_aql_cik_reaches_both_nodes_and_serves_one_process_tokens_and_plan) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ps, ref;
+    for (int k = 0; k < 3; ++k) ps.push_back(prompt_ids(1171 + 7 * k, 1000));
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        for (const std::vector<int32_t>& p : ps) ref.push_back(complete(sv.port, p, 24));
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);
+    auto post = [](int port, int v, int want, const char* says) {
+        std::string out;
+        Call c;
+        const int st = c.send(port, "/admin/fn4", json{ { "aql_cik", v } }.dump()) ? c.read(&out) : -1;
+        CHECK_EQ(st, want);
+        if (says) CHECK(out.find(says) != std::string::npos);
+        if (st != want) fprintf(stderr, "    POST aql_cik %d: %d %s\n", v, st, out.c_str());
+    };
+    Serving sv;
+    REQUIRE(sv.start("1,3", kLanes2, { "RADIANCE_LOG_STEPS=1", "RADIANCE_AQL_IKA=1", "RADIANCE_AQL_CIK=1", "RADIANCE_AQL_CHI=1",
+                                       "RADIANCE_AQL_CTA=1" }));
+    std::vector<std::vector<int32_t>> got;
+    const int vals[3] = { 0, 1, 0 };
+    for (int k = 0; k < 3; ++k) {
+        post(sv.port, vals[k], 200, nullptr);
+        got.push_back(complete(sv.port, ps[(size_t)k], 24));
+    }
+    post(sv.port, 2, 400, "aql_cik takes 0");
+    kill(sv.lead.child.pid, SIGTERM);
+    CHECK_EQ(sv.lead.finish(60), 0);
+    CHECK_EQ(sv.fol.finish(30), 0);
+    const std::string llog = sv.lead.output(), flog = sv.fol.output();
+    const std::vector<std::pair<int, int>> plan = chunks_of(llog);
+    const bool plan_ok = plan == ref_plan;
+    auto count = [](const std::string& log, const std::string& what) {
+        int n = 0;
+        for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++n;
+        return n;
+    };
+    const int lsw = count(llog, "fn4: switches aql_cik=0 applied at step ") + count(llog, "fn4: switches aql_cik=1 applied at step ");
+    const int fsw = count(flog, "fn4: switches aql_cik=0 applied at step ") + count(flog, "fn4: switches aql_cik=1 applied at step ");
+    fprintf(stderr, "    fn4 aql_cik 0 / 1 / 0 (RADIANCE_AQL_CIK=1 + IKA / CHI / CTA both), 2 lanes W(1,3): tokens %s / %s / %s, plan %s (%zu "
+                    "chunks one process, %zu here); switch lines leader %d / 3, follower %d / 3\n",
+            got[0] == ref[0] ? "identical" : "DIFFERENT", got[1] == ref[1] ? "identical" : "DIFFERENT",
+            got[2] == ref[2] ? "identical" : "DIFFERENT", plan_ok ? "identical" : "DIFFERENT", ref_plan.size(), plan.size(), lsw, fsw);
+    if (!plan_ok || lsw != 3 || fsw != 3)
+        fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    for (int k = 0; k < 3; ++k) {
+        CHECK(!ref[(size_t)k].empty());
+        CHECK(got[(size_t)k] == ref[(size_t)k]);
+    }
+    CHECK(plan_ok);
+    CHECK_EQ(lsw, 3);
+    CHECK_EQ(fsw, 3);
+    {   /* without the env at start: 1 is refused naming it, 0 taken */
+        Serving off;
+        REQUIRE(off.start("1,3", kLanes2, { "RADIANCE_LOG_STEPS=1", "RADIANCE_AQL_IKA=1" }));
+        post(off.port, 1, 400, "aql_cik 1 needs RADIANCE_AQL_CIK=1 or 2");
+        post(off.port, 0, 200, nullptr);
+        CHECK(complete(off.port, ps[0], 24) == ref[0]);
+        kill(off.lead.child.pid, SIGTERM);
+        CHECK_EQ(off.lead.finish(60), 0);
+        CHECK_EQ(off.fol.finish(30), 0);
+    }
+}
 /* tp8 loop IKR (PREFILL round 44) for the DRAFTER's IKB2 (fn4 aql_ika 2 = lever IKA + lever IKB: core's copies / fills launched
  * self-acquiring) under DECODE W4: with RADIANCE_AQL_IKA=1 at start on both nodes, 2 / 1 / 0 POSTed to the leader between cold
  * multi-chunk prompts reach BOTH nodes (a follower switch) and every prompt serves one process's tokens and chunk plan, at 2 lanes
