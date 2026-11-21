@@ -5882,6 +5882,103 @@ TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         if (a.idle) CHECK(llog.find("node idle (RADIANCE_PP_NODE_IDLE=") != std::string::npos);   /* the D8 lines as before */
     }
 }
+/* tp8 loop D69: DRAFTED REQUESTS THAT RUN INTO THE CONTEXT LIMIT, through the pipeline. A long Claude Code session can reach
+ * --max-model-len; with a DSpark drafter the verify rows of a step near the limit must stop at it on both nodes (the follower
+ * computes the rows the leader planned). At --max-model-len 256 with the drafted fixture: a repetitive 144-token prompt (the
+ * drafter follows it) asking 200, then at once prompts of 200 / 230 / 250 / 255 tokens asking 100, one of 256 (no room for a
+ * token) and one of 300 (over the limit); each reply's status and tokens are one process's (the near-limit ones end at the
+ * limit: 256 - prompt tokens), at 2 lanes W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes BG 2, READY_FIRST, FOL_ORDER 2)
+ * with the DC8L65 levers (TAIL_BAND 5 + the copy, LSP 393217, BG_SPLIT 2, HOST_SPIN, HOST_SLACK) and the llama KV copy
+ * checked; both nodes exit 0. */
+struct Lim { int status = -1; std::vector<int32_t> tok; long long accepted = 0; };
+Lim complete_lim(int port, const std::vector<int32_t>& prompt, int n) {
+    const json b = { { "prompt", prompt }, { "n_predict", n }, { "temperature", 0.0 }, { "ignore_eos", true },
+                     { "return_tokens", true } };
+    Call c;
+    std::string out;
+    Lim r;
+    r.status = c.send(port, "/completion", b.dump()) ? c.read(&out) : -1;
+    const json j = json::parse(out, nullptr, false);
+    if (j.is_object() && j.contains("tokens")) r.tok = j["tokens"].get<std::vector<int32_t>>();
+    if (j.is_object()) r.accepted = j.value(json::json_pointer("/timings/draft_n_accepted"), (long long)0);
+    return r;
+}
+std::vector<Lim> lim_set(int port) {
+    std::vector<Lim> out;
+    std::vector<int32_t> rep;
+    for (int k = 0; k < 6; ++k) for (int32_t t : prompt_ids(21, 24)) rep.push_back(t);
+    out.push_back(complete_lim(port, rep, 200));
+    std::vector<std::future<Lim>> f;
+    for (size_t n : { 200, 230, 250, 255, 256, 300 })
+        f.push_back(std::async(std::launch::async, [port, n] { return complete_lim(port, prompt_ids(300 + n, n), 100); }));
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+TEST(d69_drafted_requests_that_reach_the_context_limit_serve_one_process_replies) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3", "--max-model-len", "256" };
+    std::vector<Lim> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = lim_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    REQUIRE_EQ(ref.size(), (size_t)7);
+    fprintf(stderr, "    D69 one process: statuses / tokens");
+    for (const Lim& r : ref) fprintf(stderr, " %d/%zu", r.status, r.tok.size());
+    fprintf(stderr, " (%lld accepted on the repetitive one)\n", ref[0].accepted);
+    CHECK_EQ(ref[0].status, 200);
+    CHECK_EQ(ref[0].tok.size(), (size_t)(256 - 144));   /* the context limit, not n_predict */
+    CHECK(ref[0].accepted > 0);
+    for (size_t i = 1; i <= 4; ++i) CHECK_EQ(ref[i].status, 200);
+    const std::vector<std::string> dc8 = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0",
+                                           "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_LLAMA_PP_TBAND=1", "RADIANCE_PP_TAIL_BAND=5",
+                                           "RADIANCE_LLAMA_PP_TBAND_COPY=1", "RADIANCE_PP_NODE_IDLE=2", "RADIANCE_PP_NODE_IDLE_PARTS=1",
+                                           "RADIANCE_PP_LOAD_REPORT_MS=5", "RADIANCE_PP_LEAD_SEG=1", "RADIANCE_PP_LEAD_SEG_FORM=393217",
+                                           "RADIANCE_PP_LEAD_SEG_RINGS=2", "RADIANCE_PP_BG_SPLIT=2", "RADIANCE_HOST_SPIN=1812", "RADIANCE_HOST_SLACK=1",
+                                           "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" };
+    struct Arm { const char* name; int lanes; const char* cut; bool dc8; };
+    for (const Arm a : { Arm{ "2 lanes", 2, "1,3", false }, Arm{ "3 lanes", 3, "0,3", false }, Arm{ "BEST's shape + DC8L65 levers", 4, "1,3", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        if (a.dc8) env = cat(env, dc8);
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(spec, lane_shape(a.lanes)), env));
+        const std::vector<Lim> got = lim_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(got.size(), ref.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (got[i].status != ref[i].status || got[i].tok != ref[i].tok) {
+                ++differ;
+                fprintf(stderr, "    request %zu: status %d, %zu tokens vs one process's %d, %zu\n", i, got[i].status, got[i].tok.size(),
+                        ref[i].status, ref[i].tok.size());
+            }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        size_t elines = 0;
+        for (const std::string* lg : { &llog, &flog })
+            for (size_t at = 0; (at = lg->find("\nE ", at)) != std::string::npos; ++at) ++elines;
+        fprintf(stderr, "    D69 %-30s %d lanes W(%s): %d of %zu replies differ from one process (status or tokens); %lld accepted on the "
+                        "repetitive one; KV-copy checks %lld, %lld differ; %zu E lines\n",
+                a.name, a.lanes, a.cut, differ, ref.size(), got[0].accepted, checks, kdiff, elines);
+        CHECK_EQ(differ, 0);
+        CHECK(got[0].accepted > 0);
+        if (a.dc8) {
+            CHECK(checks > 0);
+            CHECK_EQ(kdiff, 0LL);
+        }
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 20).c_str(), tail(flog, 20).c_str());
+    }
+}
 /* tp8 loop D61 (fn4 host_spin, both nodes; timing only): the DSpark-drafted pipeline with every critical-path wait spinning before it
  * blocks -- the rank barrier, the leader's drafter-end wait, the follower's frame receive, the loops' naps -- serves one process's
  * tokens at 1 lane and 2 lanes at the wrap-around cut W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes, BG 2, READY_FIRST) from the
