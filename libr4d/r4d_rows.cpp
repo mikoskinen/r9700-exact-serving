@@ -12031,6 +12031,9 @@ extern "C" void r4d_cfg_split(const RadArgs* a, R4dSplitCfg* out) {
  * four-rank prefill about 0.5-0.8%. Two ranks have their own handshake and never take it. The
  * bytes are the same either way; only when the flag goes out moves. */
 static constexpr long long kArFenceFromElems = 131072;
+/* lever FAS (qfn-on-ds Qwen loop round 15): ar_fence 8 (r4d_ar_entry.hip) = the rule at every size -- the four-rank kernels
+ * have no push check (r4d_ar_seq.h), so below the threshold only timing keeps a reader behind a peer's bytes */
+extern "C" int r4d_ar_fence_every(const RadArgs* a);
 
 extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->nblocks  = TUNE(a, tAr, "nblocks");
@@ -12042,7 +12045,8 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
      * [M, n] input, all_gather's source). */
     /* fn4 RSF (12.11.2026): a launch parameter `drain_force` 1 keeps the `drain` given (r4d_selftest --perfar4's fence
      * A/B and stale-read stress); no declaration carries it. */
-    if (a && a->t && a->n_t > 0 && rad_tensor_numel(&a->t[0]) >= kArFenceFromElems &&
+    if (a && a->t && a->n_t > 0 &&
+        (rad_tensor_numel(&a->t[0]) >= kArFenceFromElems || r4d_ar_fence_every(a)) &&
         r4d_geti_or(a, "world_size", a->world_size) == 4 && r4d_geti_or(a, "drain_force", 0) == 0)
         out->drain = 1;
 }

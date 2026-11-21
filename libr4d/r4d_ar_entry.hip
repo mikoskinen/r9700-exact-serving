@@ -1129,6 +1129,13 @@ static int ar_xpush(const RadArgs* a, long long numel) {
  *   4  (7, 4)  SP's raw rows: the pushes as system-scope stores, every wave's store wait, device-scope invalidates
  *              (other kernels: form 3);
  *   5  (7, 3)  as 4 with form 2's acquire (other kernels: form 2).
+ *   8  lever FAS (qfn-on-ds Qwen loop round 15, 21.11.2026): the drain-1 rule at EVERY four-rank size, and no form above
+ *      for the >= 1048576-element messages -- every four-rank collective's flag goes out behind every thread's
+ *      __threadfence_system() (r4d_rows.cpp r4d_cfg_ar reads it through r4d_ar_fence_every). Why: the four-rank wide /
+ *      two-shot / SP-rows kernels carry no push check (r4d_ar_seq.h's archk, which the two-rank family has: a peer's P2P
+ *      push can land after its release flag, so a reader can find the slot's previous bytes), so below 131072 elements
+ *      (Qwen: < 52 rows -- decode and short prompt passes) and, under forms 1..7, at prefill sizes, only timing keeps the
+ *      reader behind the bytes. The same bytes when the push has landed; a stale read becomes impossible.
  * The bytes each launch moves and folds are the same in every form; what changes is when the flag may go out and what an
  * acquire drops. A launch parameter `fence` overrides it (r4d_selftest's stress / contention arms). Only messages that
  * the drain-1 rule caught (drain 1 at >= 131072 elements) move. -1 until the environment is read. */
@@ -1138,7 +1145,7 @@ static int ar_fence(const RadArgs* a) {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_AR_FENCE");
         int on = (e && *e) ? std::atoi(e) : 0;
-        if (on < 0 || on > 7) on = 0;
+        if (on < 0 || on > 8) on = 0;
         int want = -1;
         g_ar_fence.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_ar_fence.load(std::memory_order_relaxed);
@@ -1160,8 +1167,10 @@ static void ar_fence_apply(const RadArgs* a, ArCall* c, bool sys_push) {
         default: break;
     }
 }
+/* lever FAS (ar_fence 8): r4d_cfg_ar takes the drain-1 rule at every four-rank size */
+extern "C" int r4d_ar_fence_every(const RadArgs* a) { return ar_fence(a) == 8 ? 1 : 0; }
 extern "C" int r4d_ar_fence_set(int v) {
-    if (v < 0 || v > 7) return -1;
+    if (v < 0 || v > 8) return -1;
     g_ar_fence.store(v, std::memory_order_relaxed);
     return 1;
 }
