@@ -44,7 +44,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_tsk", "draft_head_cut", "pp_fol_reserve", "pp_lead_seg", "pp_seg_set",
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
                                         "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room", "pp_send_ash",
-                                        "aql_waitk", "aql_ika" };
+                                        "aql_waitk" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -379,16 +379,6 @@ int env_aql_waitk() {
     return env;
 }
 
-/* tp8 loop IKc: RADIANCE_AQL_IKA at start, the AQL backend's parse (aql.cpp ika_on): a value starting with '1' = 1, anything else (or
- * unset) = 0. */
-int env_aql_ika() {
-    static const int env = [] {
-        const char* e = std::getenv("RADIANCE_AQL_IKA");
-        return e && e[0] == '1' ? 1 : 0;
-    }();
-    return env;
-}
-
 /* tp8 loop D56: RADIANCE_SCHED_LANE_ROOM=1 at start (anything else, or unset, is 0). */
 int env_sched_lane_room() {
     static const int env = [] {
@@ -441,10 +431,6 @@ int reported(State& s, int i) {
     if (i == kAqlWaitk) {          /* tp8 loop W1s: set, else RADIANCE_AQL_WAITK (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_aql_waitk();
-    }
-    if (i == kAqlIka) {            /* tp8 loop IKc: set, else RADIANCE_AQL_IKA (0 = off) */
-        const int v = s.val[i].load(std::memory_order_acquire);
-        return v >= 0 ? v : env_aql_ika();
     }
     if (i == kSchedLaneRoom) {     /* tp8 loop D56: set, else RADIANCE_SCHED_LANE_ROOM (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -594,10 +580,6 @@ int pp_send_ash() {
 int aql_waitk() {
     const int v = st().val[kAqlWaitk].load(std::memory_order_relaxed);
     return v >= 0 ? v : env_aql_waitk();
-}
-int aql_ika() {
-    const int v = st().val[kAqlIka].load(std::memory_order_relaxed);
-    return v >= 0 ? v : env_aql_ika();
 }
 int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     State& s = st();
@@ -1016,7 +998,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1592,16 +1574,6 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
-    if (i == kAqlIka) {            /* tp8 loop IKc: the AQL backend's, read when a pass is recorded */
-        if (v != 0 && v != 1) {
-            if (err) *err = "aql_ika takes 0 (every recorded dispatch keeps the packet fences the acquire rule gives it, as before) or 1 "
-                            "(a dispatch whose kernel acquires and releases itself -- its library lists it in r4d_ika_kernels -- plays "
-                            "without the packet's release, and without its acquire where haz_mark allows: lever IKA, RADIANCE_AQL_IKA; "
-                            "tp8 loop IKc)";
-            return false;
-        }
-        return true;
-    }
     if (i == kAqlWaitk) {          /* tp8 loop W1s: the AQL backend's, read at every event / ride wait it enqueues */
         if (v < 0 || v > 2) {
             if (err) *err = "aql_waitk takes 0 (an event / ride wait is its barrier-AND alone, as before), 1 (an event wait still pending "
@@ -1763,7 +1735,6 @@ bool follower_switch(int i) {
            i == kPpFolReserve ||   /* tp8 loop IDEAS #9: the follower's own loop reads it */
            i == kPpSendAsh ||      /* tp8 loop P46: each node's own send rings (the follower's X2) */
            i == kAqlWaitk ||       /* tp8 loop W1s: each node's own AQL waits */
-           i == kAqlIka ||         /* tp8 loop IKc: each node's own tapes */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
 }
 
@@ -1905,7 +1876,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)

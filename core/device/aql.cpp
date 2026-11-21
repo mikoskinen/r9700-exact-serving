@@ -159,8 +159,6 @@ std::atomic<bool> g_hip_streams_used{false};
 
 /* ------------------------------------------------------------------ kernels */
 
-struct Module;
-
 struct KernelRec {
     uint64_t    object = 0;
     uint32_t    kernarg_size = 0;
@@ -177,11 +175,8 @@ struct KernelRec {
     /* Lever IKA (RADIANCE_AQL_IKA=1): the kernel acquires and releases at agent scope ITSELF (libr4d R4D_IKA(): an agent
      * acquire fence at entry, an agent release fence at every exit), so a played packet may drop the packet processor's
      * acquire (when no line it reads can be stale in a scalar cache: Ctx::haz_mark) and its release. Set from the list
-     * the kernel's own library exports (r4d_ika_kernels), never guessed from a name alone. tp8 loop IKc: looked up at the
-     * first capture that wants it (ika_of: fn4 aql_ika / RADIANCE_AQL_IKA on), so with the lever off no kernel is ever looked
-     * up; -1 = not yet, 0 / 1. */
-    mutable std::atomic<int8_t> ika{-1};
-    const Module* mod = nullptr;
+     * the kernel's own library exports (r4d_ika_kernels), never guessed from a name alone. */
+    bool        ika = false;
 };
 
 struct ModuleImage {
@@ -560,20 +555,8 @@ bool ika_on() {
     return on;
 }
 
-/* tp8 loop IKc (PREFILL round 43): the lever in process -- fn4 aql_ika (107) once set, else RADIANCE_AQL_IKA at start (the same
- * '1...' parse as ika_on: fn4_switch.cpp env_aql_ika); a test value (rad::aql::ika_set_for_test) wins. Read when a dispatch is
- * captured: a tape notes a self-acquiring kernel's dispatch as IKA only while this is on, and every applied fn4 change re-records
- * every pass (the epoch), so a tape always plays the fences it was recorded with. Off (the default) no kernel is looked up. */
-std::atomic<int> g_ika_test{-1};
-bool ika_now() {
-    const int t = g_ika_test.load(std::memory_order_relaxed);
-    if (t >= 0) return t > 0;
-    (void)ika_on();   /* the start line, once, when the env is set */
-    return rad::fn4::aql_ika() > 0;
-}
-
 bool ika_kernel(const Module* m, const std::string& name) {
-    if (!m || !m->bundle) return false;
+    if (!ika_on() || !m || !m->bundle) return false;
     Dl_info di{};
     if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
     void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
@@ -587,17 +570,6 @@ bool ika_kernel(const Module* m, const std::string& name) {
     int n = 0;
     const char* const* v = fn(&n);
     return ika_listed(name, v, n);
-}
-
-/* tp8 loop IKc: KernelRec::ika, looked up once (the first capture with the lever on); the card's kernel record is shared by the threads
- * that issue on that card, so the answer is published atomically (a race looks it up twice and stores the same value). */
-bool ika_of(const KernelRec* k) {
-    int8_t v = k->ika.load(std::memory_order_acquire);
-    if (v < 0) {
-        v = ika_kernel(k->mod, k->name) ? 1 : 0;
-        k->ika.store(v, std::memory_order_release);
-    }
-    return v > 0;
 }
 
 KernelRec* resolve(Func* fn, int ord) {
@@ -638,7 +610,7 @@ KernelRec* resolve(Func* fn, int ord) {
     auto k = std::make_unique<KernelRec>();
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
-    k->mod = m;   /* lever IKA: looked up at the first capture that wants it (ika_of, tp8 loop IKc) */
+    k->ika = ika_kernel(m, k->name);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                                    &k->kernarg_size);
@@ -1345,7 +1317,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, ika_now() && ika_of(k));
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika);
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
     const bool aside = (fence & kFenceAside) != 0;
@@ -4391,8 +4363,6 @@ WaitkCounts waitk_counts() {
 }
 void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
 int waitk_mode_now() { return waitk_mode(); }
-void ika_set_for_test(int on) { g_ika_test.store(on < 0 ? -1 : on > 0 ? 1 : 0, std::memory_order_relaxed); }
-int ika_mode_now() { return ika_now() ? 1 : 0; }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4814,9 +4784,6 @@ bool ride_reusable(void*) { return false; }
 WaitkCounts waitk_counts() { return WaitkCounts{}; }
 void waitk_set_for_test(int) {}
 int waitk_mode_now() { return 0; }
-/* ... and records no tape (tp8 loop IKc). */
-void ika_set_for_test(int) {}
-int ika_mode_now() { return 0; }
 }  // namespace aql
 }  // namespace rad
 

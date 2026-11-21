@@ -110,11 +110,6 @@ void waitk_set_for_test(int mode);
 /* The mode the next wait runs at: the test value, else fn4 aql_waitk once set (tp8 loop W1s), else RADIANCE_AQL_WAITK's start value
  * (0 in a build without the AQL backend). */
 int waitk_mode_now();
-/* Lever IKA in process (tp8 loop IKc, fn4 aql_ika = switch 107): whether the next tape capture notes a self-acquiring kernel's dispatch
- * as IKA (1) or not (0) -- the test value of ika_set_for_test, else fn4 aql_ika once set, else RADIANCE_AQL_IKA at start ('1...' = 1);
- * 0 in a build without the AQL backend. ika_set_for_test: tests/ only; -1 = the switch / env again. */
-int ika_mode_now();
-void ika_set_for_test(int on);
 
 /* ------------------------------------------------------------------ lever IKA: which kernels a module names
  *
