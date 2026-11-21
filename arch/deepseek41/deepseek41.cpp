@@ -339,6 +339,10 @@ struct Layer {
     /* Lever 1U-E2 (RADIANCE_DS41_E2 declared): this rank's column part of the kv GEMV (gemm_nt_ggml, N / world, over a row
      * view of e_kv) into Model::ekv_p and the row-interleaved all_gather into Model::ekv; 0 where not declared. */
     rad_op e_gemm_p = 0, e_gath = 0;
+    /* Lever EGL (RADIANCE_DS41_EGL=1 declared, with 1U-E2's part form): this layer's own rows for its lookup + copy + part GEMM
+     * issued on lane 1 at a decode pass's head (egl_head): the gathered rows (host domain, as Model::emb), their copy on the
+     * card and the column part, PERSIST (no transient shares their bytes: Ctx::lane1_ rule 3); 0 where not declared. */
+    rad_buf egl_emb = 0, egl_embd = 0, egl_kvp = 0;
     /* Lever 1U-GQ (RADIANCE_DS41_GQ declared): q_a + kv_g as one gemm_nt_ggml_pair (qkv_pair), and the two
      * attention_output_a groups as one (oa_pair); 0 where not declared. */
     rad_op qkv_pair = 0, oa_pair = 0;
@@ -2834,6 +2838,20 @@ static bool fcs_declared() {
     return g_fcs_env.load(std::memory_order_relaxed) == 1;
 }
 static bool fcs_now() { return g_fcs_ok.load(std::memory_order_relaxed) && (g_sw_e2.load(std::memory_order_relaxed) & 2); }
+/* Lever EGL (DRAFTER track 22.11.2026 round 82): an Engram layer's lookup + copy + 1U-E2 part GEMM on lane 1 from a decode
+ * pass's head (egl_head; why and the form there). Declared by RADIANCE_DS41_EGL=1 (start value on; with RADIANCE_DS41_E2=1:
+ * it needs E2's part form), switched in process by fn4 ds41_e2 BIT 2 (values 4..7; bit 0 stays E2's split, bit 1 FCS). */
+static std::atomic<int> g_egl_env{-2}, g_egl_ok{0}, g_egl_noted{0};
+static std::atomic<long long> g_egl_passes{0}, g_egl_layers{0}, g_egl_rows{0};
+static bool egl_declared() {
+    if (g_egl_env.load(std::memory_order_relaxed) == -2) {
+        const char* e = std::getenv("RADIANCE_DS41_EGL");
+        int unread = -2;
+        g_egl_env.compare_exchange_strong(unread, e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : -1);
+    }
+    return g_egl_env.load(std::memory_order_relaxed) == 1;
+}
+static bool egl_now() { return g_egl_ok.load(std::memory_order_relaxed) && (g_sw_e2.load(std::memory_order_relaxed) & 4); }
 /* Lever FUSE-R (ds41-fuse, 13.11.2026; zzzaql's AQL-stamped c8 on int14: gemm_nt_f32_tile -> router_scored 173 us and
  * router_scored -> scatter_small 172 us of dependent-launch gaps a decode step, both on the critical path): the trunk MoE
  * layers' router chain in fewer launches, each form the stock code with only the launch boundaries removed (libr4d
@@ -3194,9 +3212,10 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;   /* lever IX-NI: counted here, libr4d's */
     if (!std::strcmp(name, "ds41_gq"))   /* lever 1U-GQ */
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 (bit 0) + lever FCS (bit 1): each bit needs its ops declared */
-        return value >= 0 && value <= 3 && (!(value & 1) || g_sw_e2_ok.load(std::memory_order_relaxed)) &&
-                       (!(value & 2) || g_fcs_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 (bit 0) + lever FCS (bit 1) + lever EGL (bit 2): each bit needs its declare */
+        return value >= 0 && value <= 7 && (!(value & 1) || g_sw_e2_ok.load(std::memory_order_relaxed)) &&
+                       (!(value & 2) || g_fcs_ok.load(std::memory_order_relaxed)) &&
+                       (!(value & 4) || egl_declared()) ? 1 : -1;   /* EGL: a node with no Engram layer takes it, issues as before */
     if (!std::strcmp(name, "ds41_prefetch"))   /* tp8 loop D24: >= 1 needs the reads declared */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_pf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_moe1"))   /* lever P: 1 needs the dk ops declared at some trunk layer */
@@ -3315,8 +3334,8 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         *applied = gq_now();
         return 1;
     }
-    if (!std::strcmp(name, "ds41_e2")) {   /* bit 0 E2, bit 1 FCS: what the issue reads */
-        *applied = (e2_now() ? 1 : 0) | (fcs_now() ? 2 : 0);
+    if (!std::strcmp(name, "ds41_e2")) {   /* bit 0 E2, bit 1 FCS, bit 2 EGL: what the issue reads */
+        *applied = (e2_now() ? 1 : 0) | (fcs_now() ? 2 : 0) | (egl_now() ? 4 : 0);
         return 1;
     }
     if (!std::strcmp(name, "ds41_moe1")) {   /* what the issue reads: 0 where nothing was declared */
@@ -4386,6 +4405,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv);
         /* Lever 1U-E2: the decode band's split by output columns (e2_issue), beside the whole GEMV */
         if (e2_declared() && g.world > 1) DS_TRY(e2_layer(b, m, L, T, (c.hc + 1) * D, H * c.ple_dim));
+        /* Lever EGL: this layer's own rows for its lane-1 chain (egl_head), at E2's decode-band rows */
+        if (egl_declared() && L.e_gemm_p && L.e_gath && m.e2_rows > 0 && m.e2_part > 0) {
+            const int64_t R = m.e2_rows;
+            L.egl_emb = decl_b(b, nm.f("blk.%d.egl_rows", l), RAD_BF16, { R, H * c.ple_dim }, RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
+            L.egl_embd = decl_b(b, nm.f("blk.%d.egl_rows_dev", l), RAD_BF16, { R, H * c.ple_dim }, RAD_BUF_PERSIST);
+            L.egl_kvp = decl_b(b, nm.f("blk.%d.egl_kv_part", l), RAD_BF16, { R, m.e2_part }, RAD_BUF_PERSIST);
+            if (!L.egl_emb || !L.egl_embd || !L.egl_kvp) L.egl_emb = L.egl_embd = L.egl_kvp = 0;
+        }
         /* Lever E1: the GEMM over the unique rows into engram_kv_u, then every pooled row's kv row gathered from it
          * (gather_rows, a byte copy) through this layer's map */
         if (edd) {
@@ -8410,8 +8437,9 @@ static void rf_declare(Model& m, const RadBuildCtx* ctx) {
  * serves the pair op / the gather, or the shapes do not split) -> not available (>= 1 refused, the switch reads 0). */
 static void i11_declare(Model& m, const RadBuildCtx* ctx) {
     if (ctx->shape_probe || (!gq_declared() && !e2_declared())) return;
-    int gq = 0, qkv = 0, oa = 0, e2 = 0, eng = 0, dqkv = 0, doa = 0;
+    int gq = 0, qkv = 0, oa = 0, e2 = 0, eng = 0, dqkv = 0, doa = 0, egl = 0;
     for (const Layer& L : m.layers) {
+        egl += L.egl_kvp ? 1 : 0;   /* lever EGL */
         qkv += L.qkv_pair ? 1 : 0;
         oa += L.oa_pair ? 1 : 0;
         gq += L.qkv_pair || L.oa_pair ? 1 : 0;
@@ -8431,6 +8459,13 @@ static void i11_declare(Model& m, const RadBuildCtx* ctx) {
         g_sw_e2_ok.store(e2 > 0 ? 1 : 0, std::memory_order_relaxed);
         if (e2 == 0) g_sw_e2.fetch_and(~1, std::memory_order_relaxed);   /* bit 1 is lever FCS's (dsp_declare) */
     }
+    /* lever EGL: on (bit 2, the start value) once a layer declared its rows; it needs E2's part form */
+    if (egl_declared() && egl > 0 && e2 > 0 && !g_egl_ok.exchange(1, std::memory_order_relaxed))
+        g_sw_e2.fetch_or(4, std::memory_order_relaxed);
+    if (ctx->rank == 0 && egl_declared() && !g_egl_noted.exchange(1, std::memory_order_relaxed))
+        fprintf(stderr, "radiance: deepseek41: lever EGL (ds41_e2 bit 2, RADIANCE_DS41_EGL) %s: %d Engram layer(s) of this node "
+                        "issue their lookup + copy + part GEMM on the second lane at a decode pass's head (E2 at %d layers)\n",
+                egl > 0 && e2 > 0 ? "declared" : "not declared (needs RADIANCE_DS41_E2=1's part form at an Engram layer)", egl, e2);
     if (ctx->rank != 0) return;
     g_gq_layers.store(gq_declared() ? gq : 0, std::memory_order_relaxed);
     g_e2_layers.store(e2_declared() ? e2 : 0, std::memory_order_relaxed);
@@ -10079,6 +10114,80 @@ struct PflScope {
     }
 };
 
+/* Lever EGL (DRAFTER track 22.11.2026 round 82; RADIANCE_DS41_EGL=1 declares it, fn4 ds41_e2 bit 2 picks it per pass): an
+ * Engram layer's lookup (embed_lookup_planes over the layer's ids), the copy of its rows onto the card and lever 1U-E2's
+ * column-part GEMM read the token ids alone -- written by the step's ngram_ids before the first block; only stream_gate_add
+ * reads an activation -- yet each was issued ORDERED at its layer (lq208 pair leader c16: lookup 25.3 + copy 8.6 + GEMM
+ * 60.5 us, 108.4 us stamped from the lookup to the gather; lq231 one machine c16: 202 / 210 us a layer at layers 1 / 14).
+ * Here a decode pass issues them for every Engram layer this part holds on LANE 1 right behind the ids, into the layer's
+ * own PERSIST rows (Layer::egl_*: nothing else writes them), and the layer joins lane 1 into lane 0 in front of its
+ * all_gather (every collective stays on lane 0: Ctx::lane1_ rule 1), then the gate as before. Exact by construction (rule
+ * A): the same ops (kernels, n, operand values) as e2_gemm issues at the layer -- one launch of the pass's T rows, the part
+ * form (T <= e2_rows) -- only their queue and the rows' addresses differ. Where: a decode-only trunk pass (no prefill row,
+ * no drafter / encoder / generator pass, no media row) of 1 .. e2_rows rows with E2's part form on and no twin (decode rows
+ * never take one). Priced on one card (drafter/kit/mes/mxw.cpp MXW_EGL, xeon r82a-d: a 3-stage drafter MoE play with an
+ * Engram-like chain inline vs on a second queue with these two joins, played from the core's tape): 1,134.4 -> 1,088.7 us
+ * (-45.7 us; 46 % of the inline chain hidden), the same with the second queue as the fifth on the card; with
+ * RADIANCE_AQL_WAITK=1 -33.3 us. Outputs identical. */
+static thread_local uint64_t t_egl = 0;   /* bit l: layer l's chain went out on lane 1 this pass; its gather is owed */
+static bool egl_pass(const Model& m, const RadBatch* b, int64_t T) {
+    if (!egl_now() || !e2_now() || T < 1 || T > m.e2_rows || T > kBiBand || m.e2_part <= 0) return false;
+    int64_t Dn = 0, DT = 0;
+    batch_split(b, &Dn, &DT);
+    return b->draft_pass == 0 && !b->enc && !b->gen && Dn == b->n_seq && DT == T &&
+           !(b->n_mm_rows > 0 && b->mm_rows) && !m.bt.on;
+}
+/* after the ids of this part's Engram layers are issued (tok_ops): layers > after_l only (the late ids of a follower's
+ * crossing at layer after_l: that layer would join at once) */
+static void egl_head(RadCtx* x, Model& m, const RadBatch* b, int part, int64_t T, int after_l) {
+    t_egl = 0;
+    if (!egl_pass(m, b, T)) return;
+    const int64_t H = m.c.ple_heads;
+    int n = 0;
+    for (auto& L : m.layers) {
+        if (!L.e_ids || !L.egl_kvp || !L.e_gemm_p || !L.e_gath || L.l <= after_l || L.l >= 64 || !m.lr.held(L.l) ||
+            !pp_part_layer(m, part, L.l))
+            continue;
+        if (n++ == 0) {
+            rad_lane_join(x, 0, 1);   /* lane 1 behind everything lane 0 issued: the ids */
+            rad_lane(x, 1);
+        }
+        if (m.ple_group > 0)
+            RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                        m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(L.egl_emb, T));
+        else
+            RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(L.egl_emb, T));
+        RAD_ISSUE_N(x, L.e_copy, T, brows(L.egl_emb, T), brows(L.egl_embd, T));
+        RadOperand w = RAD_W(L.e_kv);   /* e2_gemm's row view: this rank's part */
+        w.offset = (int64_t)m.g.rank * m.e2_part * m.e2_rb;
+        w.rows = m.e2_part;
+        RAD_ISSUE_N(x, L.e_gemm_p, T, brows(L.egl_embd, T), w, brows(L.egl_kvp, T));
+        t_egl |= 1ull << L.l;
+    }
+    if (n == 0) return;
+    rad_lane(x, 0);
+    if (rad_rank(x) != 0) return;
+    g_egl_layers.fetch_add(n, std::memory_order_relaxed);
+    g_egl_rows.fetch_add(T, std::memory_order_relaxed);
+    const long long k = g_egl_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (k == 1 || k % 65536 == 0)
+        fprintf(stderr, "radiance: deepseek41: lever EGL: %lld decode passes issued %lld Engram chains on the second lane at "
+                        "their head (this pass: %d layer(s), %lld rows)\n",
+                k, g_egl_layers.load(std::memory_order_relaxed), n, (long long)T);
+}
+/* at layer L: the chain egl_head put on lane 1 -> lane 0 joins it and gathers the parts into y; false = not this pass's */
+static bool egl_gather(RadCtx* x, Model& m, const Layer& L, int64_t T, RadOperand y) {
+    if (L.l < 0 || L.l >= 64 || !(t_egl >> L.l & 1)) return false;
+    t_egl &= ~(1ull << L.l);
+    rad_lane_join(x, 1, 0);
+    RAD_ISSUE_N(x, L.e_gath, T * m.e2_part, brows(L.egl_kvp, T), y);
+    if (m.g.rank == 0) {   /* as e2_gemm counts its split */
+        g_e2_splits.fetch_add(1, std::memory_order_relaxed);
+        g_e2_rows.fetch_add(T, std::memory_order_relaxed);
+    }
+    return true;
+}
+
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     PflScope pfl(x, m, batch, sg);   /* tp8 loop P42: RADIANCE_DS41_PF_LAYERS (rank 0, a lone planned prefill pass) */
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start (each part of a lane step's pass too) */
@@ -10423,7 +10532,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     }
     engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
     };
-    if (!pp_ids_late(m)) tok_ops();
+    t_egl = 0;   /* lever EGL: no chain owed from another pass */
+    if (!pp_ids_late(m)) {
+        tok_ops();
+        egl_head(x, m, batch, part, T, -1);   /* lever EGL: this part's Engram chains on lane 1, right behind the ids */
+    }
 
     /* lever PSK-L20: the split layer's all-row part (its collapse + norm) over the STEP's segments / runs, as rows() /
      * whole() issue it in an uncut pass */
@@ -10777,7 +10890,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             pp_te(m), batch->step, (long long)T);
             }
             if (ring == RAD_PP_X1 && !band_store_issue(x, m, batch)) return;   /* tp8 loop P28 round 2c */
-            if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
+            if (ring == RAD_PP_X1 && pp_ids_late(m)) {   /* tp8 dev D10 round 2: X1's ids are in the batch now */
+                tok_ops();
+                egl_head(x, m, batch, part, T, l);   /* lever EGL: the Engram layers after this one */
+            }
             const bool sp_rx = held && (spv[(size_t)li] != 0 || seg_hsh);
             if (sp_rx && L.pcn_a) {   /* tp8 loop P20: the crossing's rows whole on every rank, this rank's quarter collapsed */
                 with_rows(sp0, spn, [&] { pcn_next(L, true); });
@@ -10994,7 +11110,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const bool e_gg = gguf_dense(m, L.e_kv);   /* lever WMK: a mixed run's Engram rows in one launch (dense()) */
             /* tp8 loop P48b: each launch's twin classes as the by-launch issue below would see them (dense()'s TwinScope) */
             dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); m.edd_tw.push_back(t_twin); });
-            if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
+            if (!egl_gather(x, m, L, T, brows(m.ekv, T)) && !engdd_issue(x, m, L, batch, T, m.edd_ls)) {   /* lever EGL first */
                 if (m.ple_group > 0)
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
                                 m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
@@ -12296,7 +12412,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
     }
     engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
     };
-    if (!pp_ids_late(m)) tok_ops();
+    t_egl = 0;   /* lever EGL: no chain owed from another pass */
+    if (!pp_ids_late(m)) {
+        tok_ops();
+        egl_head(x, m, batch, part, T, -1);   /* lever EGL: this part's Engram chains on lane 1, right behind the ids */
+    }
     t_mhc_a.clear();           /* lever M1: nothing fused yet this step */
     t_mhc_a_l = -1;
 
@@ -12312,7 +12432,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (const int ring = pp_recv_at(m, l); ring >= 0) {
             if (!pp_cross(x, m, batch, ring, 0, T)) return;
             if (!pp_copy_issue(x, m, batch, ring, true)) return;
-            if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
+            if (ring == RAD_PP_X1 && pp_ids_late(m)) {   /* tp8 dev D10 round 2: X1's ids are in the batch now */
+                tok_ops();
+                egl_head(x, m, batch, part, T, l);   /* lever EGL: the Engram layers after this one */
+            }
             if (L.pcn_a) {
                 const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
                 t_mhc_a.clear();
@@ -12340,7 +12463,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             /* lever E1: the step's rows are one kv GEMM launch below; deduplicated when its plan says so */
             m.edd_ls.assign(1, ds41_engdd::Launch{ 0, T });
             m.edd_tw.clear();   /* step(): no twin (twin_bi_now) */
-            if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
+            if (!egl_gather(x, m, L, T, brows(m.ekv, T)) && !engdd_issue(x, m, L, batch, T, m.edd_ls)) {   /* lever EGL first */
                 /* T rows of operands; the gather's band is T * H, one table row per head per token,
                  * read through the ids and rows as flat (rad_block_ple.h does the same). */
                 if (m.ple_group > 0)
