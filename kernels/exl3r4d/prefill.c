@@ -47,15 +47,21 @@ int exl3r4d_fn4_bi(void) { return g_fn4_bi; }
  * row (0xffff: NaN as f16 and as bf16) instead of zeros: 4 in gate_up's h and down's y, 5 in h only, 6 in y only; 7 = both
  * with the largest finite value (h f16 65504, y bf16 3.39e38: a reader that takes a max -- fmaxf drops a NaN -- shows there). If no
  * reader exists, every answer is today's (exl3_drz 0's); a reader turns its rows to NaN / overflow. The decode band (fill()'s dz bit 2)
- * and the run form keep their zeros at 4..6. */
+ * and the run form keep their zeros at 4..6.
+ * Qwen loop round 15 (R36's cell fas1: exl3_drz 1 still moves short prompts alone with the fence at every size, and the 4..7
+ * readings never touched the run form or the decode band, where c768f87's exl3_drz 1 also skips the zeros): READING value 8 =
+ * NaN rows (0xffff) in EVERY dead-row write -- the map form's ZERO entries (as 4) AND zero_dead_rows (the prefill run form, every
+ * decode-band kernel: fill()'s dz bit 3). 8 = 0's texts -> no reader of any dead row anywhere (then a timing / order cause);
+ * NaN or changed texts -> a reader in the run form / decode band (4 was clean in the map form). */
 static volatile int g_fn4_drz = 0;
 int exl3r4d_fn4_drz(void) { return g_fn4_drz == 1; }
+int exl3r4d_fn4_drz_nan(void) { return g_fn4_drz == 8; }
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;
     if (!strcmp(name, "exl3_dz")) return EXL3R4D_DZ == 2 ? (value == 0 || value == 1 ? 1 : -1) : value == (EXL3R4D_DZ == 1) ? 1 : -1;
     if (!strcmp(name, "exl3_bi")) return value == 0 || value == 1 ? 1 : -1;
-    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 || (value >= 4 && value <= 7) ? 1 : -1;
+    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 || (value >= 4 && value <= 8) ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {

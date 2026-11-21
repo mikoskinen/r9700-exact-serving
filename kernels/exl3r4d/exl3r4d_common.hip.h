@@ -735,8 +735,10 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 #endif
 // qfn-on-ds lever DRZ (p.dz bit 2, the fn4 switch exl3_drz; Qwen loop round 13): the dead rows are read by nobody (down
 // reads h only in its runs; the gather skips a dropped slot, its inverse -1), so they are left as they are.
+// dz bit 3 (exl3_drz 8, a READING value, Qwen loop round 15): NaN (0xffff in f16 and bf16) instead of zeros.
 static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspare, int cb) {
   if (p.dz & 4) return;
+  const unsigned zv = (p.dz & 8) ? ~0u : 0u;
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
 #if EXL3R4D_DZ
@@ -746,7 +748,7 @@ static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspar
     for (int u = threadIdx.x; u < mine * 16; u += EXL3R4D_BDIM) {
       const int d = spare + (int)(u / 16) * nspare;
       const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
-      *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
+      *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){zv, zv, zv, zv};
     }
     return;
   }
@@ -755,7 +757,7 @@ static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspar
     const int d = u / 16;
     if (d % nspare != spare) continue;
     const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
-    *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
+    *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){zv, zv, zv, zv};
   }
 }
 
