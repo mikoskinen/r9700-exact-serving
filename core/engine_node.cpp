@@ -1576,6 +1576,12 @@ int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
         ni.devs.push_back(r->device);
         ni.totals.push_back(rad_dev_props(r->device, &pr) >= 0 && pr.vram_bytes > 0 ? pr.vram_bytes : -1);
     }
+    /* tp8 loop D68: + the parts' card time by kind and sequences (core/pp_nodeidle.h); unset: not kept, no line */
+    if (const char* pv = std::getenv("RADIANCE_PP_NODE_IDLE_PARTS"); pv && *pv) {
+        if (!std::strcmp(pv, "1")) ni.parts_on = true;
+        else if (std::strcmp(pv, "0"))
+            RAD_WARN("RADIANCE_PP_NODE_IDLE_PARTS=%s is not 1 or 0: the parts by kind are not kept", pv);
+    }
     ni.arm();
     pp_ni_ = own->get();
     RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE=1 -- rank 0's card time in parts, between parts and waiting on the "
@@ -1588,6 +1594,12 @@ int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
                                   : "+ the same time by stretch, with a BG lane's frame in pass on this node or without; ")
                           : "",
                  ni.period_s);
+    if (ni.parts_on)
+        RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE_PARTS=1 -- + the parts' card time by kind (%s), phase and sequences, "
+                 "by stretch, p50 / p25 / p75 a key, in a line beside each node-idle line (tp8 loop D68)",
+                 lead ? "head, head segment, tail model part, tail segment, tail with its logits + sampler, sampler, drafter + step end "
+                        "(a tail is two parts with this on)"
+                      : "pass, segment");
     return 1;
 }
 
@@ -2285,7 +2297,10 @@ int Engine::follower_loop() {
             else pp_set_pass(lane, RAD_PP_PART_WHOLE, 0, 0, band, 0, tband, rband, rkeys);
             issue_what_.store(kIssueFollower, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
-            if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the ranks are parked, rank 0's stream is this thread's */
+            if (pp_ni_) {
+                pp_ni_->tag(split ? PpNodeIdle::kPartSeg : PpNodeIdle::kPartPass, b->phase, b->n_seq, b->n_tok);   /* tp8 loop D68 */
+                pp_ni_->begin();              /* tp8 dev D8: the ranks are parked, rank 0's stream is this thread's */
+            }
             if (pfs) pff->seg_a();            /* tp8 loop P22b */
             barrier_->arrive_and_wait();      /* release the ranks */
             barrier_->arrive_and_wait();      /* and wait for them */

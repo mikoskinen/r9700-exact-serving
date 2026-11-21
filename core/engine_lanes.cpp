@@ -768,7 +768,10 @@ int Engine::lane_head(int lane, const RadBatch* b) {
         pfp->rel += (double)(pf1 - pf0) / 1e6;
         pf_tl_->mark(PfTimeline::kA, pfe->seq, pf_ci);
     }
-    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    if (pp_ni_) {
+        pp_ni_->tag(PpNodeIdle::kPartHead, b->phase, b->n_seq, b->n_tok);   /* tp8 loop D68 */
+        pp_ni_->begin();              /* tp8 dev D8 */
+    }
     hiss_want_ = pp_stamps_ != nullptr;   /* tp8 loop D37: rank 0 times its run_step of this head */
     hiss_t0_ = hiss_t1_ = 0;
     barrier_->arrive_and_wait();      /* release the ranks */
@@ -2364,7 +2367,10 @@ int Engine::lane_tail_model(int lane, const RadBatch* b) {
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
-    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    if (pp_ni_) {
+        pp_ni_->tag(PpNodeIdle::kPartTailModel, b->phase, b->n_seq, b->n_tok);   /* tp8 loop D68 */
+        pp_ni_->begin();              /* tp8 dev D8 */
+    }
     barrier_->arrive_and_wait();      /* release the ranks */
     barrier_->arrive_and_wait();      /* and wait for them */
     if (pp_ni_) pp_ni_->end();
@@ -2430,7 +2436,10 @@ int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool firs
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
-    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    if (pp_ni_) {
+        pp_ni_->tag(PpNodeIdle::kPartHeadSeg, b->phase, b->n_seq, b->n_tok);   /* tp8 loop D68 */
+        pp_ni_->begin();              /* tp8 dev D8 */
+    }
     barrier_->arrive_and_wait();      /* release the ranks */
     barrier_->arrive_and_wait();      /* and wait for them */
     if (pp_ni_) pp_ni_->end();
@@ -2453,7 +2462,10 @@ int Engine::lane_tail_seg(int lane, const RadBatch* b, int s0, int s1) {
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
-    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
+    if (pp_ni_) {
+        pp_ni_->tag(PpNodeIdle::kPartTailSeg, b->phase, b->n_seq, b->n_tok);   /* tp8 loop D68 */
+        pp_ni_->begin();              /* tp8 dev D8 */
+    }
     barrier_->arrive_and_wait();      /* release the ranks */
     barrier_->arrive_and_wait();      /* and wait for them */
     if (pp_ni_) pp_ni_->end();
@@ -2572,7 +2584,10 @@ int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vecto
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
     if (pfp) pf_tl_->mark(PfTimeline::kC, pf_seq, pf_ci);
-    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the tail, its drafter and its step end */
+    if (pp_ni_) {   /* tp8 loop D68: the tail with its logits + sampler (the sampler alone when its model part went ahead) */
+        pp_ni_->tag(model_done ? PpNodeIdle::kPartSampler : PpNodeIdle::kPartTail, b->phase, b->n_seq, b->n_tok);
+        pp_ni_->begin();              /* tp8 dev D8: the tail, its drafter and its step end */
+    }
     barrier_->arrive_and_wait();      /* release the ranks */
     int bst = RAD_OK;
     {
@@ -2610,6 +2625,11 @@ int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vecto
     }
     if (!(block_drafting() && drafter_snap_)) RAD_TRY(save_checkpoints());
     if (t_on) phase_mark(PH_SAVE);
+    if (pp_ni_ && pp_ni_->parts_on) {   /* tp8 loop D68: the drafter + step end as a part of its own (ranks parked: after the join) */
+        pp_ni_->end();
+        pp_ni_->tag(PpNodeIdle::kPartDrafter, b->phase, b->n_seq, b->n_tok);
+        pp_ni_->begin();
+    }
     st = block_drafting() ? issue_block_drafter(b->step, so) : issue_serial_drafter(b->step, so);
     if (st < 0) return st;
     if (pfp) {
