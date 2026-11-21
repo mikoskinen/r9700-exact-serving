@@ -5765,6 +5765,123 @@ TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         }
     }
 }
+/* tp8 loop D68 (RADIANCE_PP_NODE_IDLE_PARTS=1 beside NODE_IDLE, either node; log only): the DSpark-drafted pipeline with the parts'
+ * card time kept by kind, phase and sequences -- the leader's heads and its tails with their sampler + drafter, the follower's
+ * passes -- serves one process's tokens at 2 lanes W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes BG 2, READY_FIRST, the stretch
+ * split); each node prints its line (window lines a second apart and the run's), the run's keys hold parts with p25 <= p50 <= p75;
+ * unset, 0, a bad value or no NODE_IDLE: no such line (a bad value said). */
+TEST(d68_parts_by_kind_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
+    REQUIRE(worldds().ok);
+    const std::vector<std::string> spec = { "--num-speculative-tokens", "3" };
+    std::vector<Drafted> ref;
+    {
+        Serving one;
+        one.model = worldds().llama_rad;
+        REQUIRE(one.start("", cat(spec, { "--max-num-seqs", "6" })));
+        ref = drafted_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int bg; const char* cut; const char* idle; const char* parts; };
+    for (const Arm a : { Arm{ 2, -1, "1,3", "1", "1" }, Arm{ 3, -1, "0,3", "2", "1" }, Arm{ 4, 2, "1,3", "2", "1" },
+                         Arm{ 2, -1, "1,3", "2", nullptr }, Arm{ 2, -1, "1,3", "2", "0" }, Arm{ 2, -1, "1,3", "2", "2" },
+                         Arm{ 2, -1, "1,3", nullptr, "1" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        if (a.idle) {
+            env.push_back(std::string("RADIANCE_PP_NODE_IDLE=") + a.idle);
+            env.push_back("RADIANCE_PP_NODE_IDLE_S=1");
+        }
+        if (a.parts) env.push_back(std::string("RADIANCE_PP_NODE_IDLE_PARTS=") + a.parts);
+        if (a.bg >= 0) {
+            env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
+            env.push_back("RADIANCE_PP_READY_FIRST=1");
+        }
+        Serving pp;
+        pp.model = worldds().llama_rad;
+        REQUIRE(pp.start(a.cut, cat(spec, lane_shape(a.lanes)), env));
+        const std::vector<Drafted> got = drafted_set(pp.port);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));   /* one window line past the last request */
+        (void)drafted_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        long long accepted = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ref[i].tok != got[i].tok) ++differ;
+            accepted += got[i].accepted;
+        }
+        const char* key = "node parts by kind and sequences (RADIANCE_PP_NODE_IDLE_PARTS=1, tp8 loop D68)";
+        auto count = [&](const std::string& lg, const char* k) {
+            long long n = 0;
+            for (size_t at = lg.find(k); at != std::string::npos; at = lg.find(k, at + 1)) ++n;
+            return n;
+        };
+        /* the run's line (the clean stretch: every arm has decode parts there): its keys' p50 / p25 / p75 and counts */
+        auto run_keys = [&](const std::string& lg, const char* kind, long long* parts, int* bad) {
+            *parts = 0;
+            *bad = 0;
+            const std::string rk = std::string(key) + ": rank 0's card over the run, without a BG step in flight";
+            const size_t at = lg.rfind(rk);
+            if (at == std::string::npos) return 0;
+            const size_t nl = lg.find('\n', at);
+            const std::string ln = lg.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+            int keys = 0;
+            for (size_t k = ln.find(std::string(kind) + " "); k != std::string::npos; k = ln.find(std::string(kind) + " ", k + 1)) {
+                const size_t pk = ln.find(": p50 ", k);
+                if (pk == std::string::npos) break;
+                double p50 = -1, p25 = -1, p75 = -1, rows = -1;
+                long long n = -1;
+                if (std::sscanf(ln.c_str() + pk, ": p50 %lf ms (p25 %lf, p75 %lf; %lld parts, %lf rows)", &p50, &p25, &p75, &n, &rows) != 5) {
+                    ++*bad;
+                    continue;
+                }
+                ++keys;
+                *parts += n;
+                if (!(p25 >= 0 && p25 <= p50 && p50 <= p75 && n >= 3 && rows > 0)) ++*bad;
+            }
+            return keys;
+        };
+        long long hp = 0, tp = 0, fp = 0;
+        int hb = 0, tb = 0, fb = 0;
+        const int hk = run_keys(llog, "head D", &hp, &hb);
+        const int tk = run_keys(llog, "tail (+ sampler, drafter, step end) D", &tp, &tb);
+        const int fk = run_keys(flog, "pass D", &fp, &fb);
+        const long long lw = count(llog, key), fw = count(flog, key);
+        fprintf(stderr, "    D68 %d lanes%s W(%s) NODE_IDLE=%s PARTS=%s: %d of %zu prompts differ (%lld accepted); lines leader %lld / follower "
+                        "%lld; the run's clean keys: leader head D %d (%lld parts), tail D %d (%lld parts), follower pass D %d (%lld parts); "
+                        "malformed %d\n",
+                a.lanes, a.bg >= 0 ? " BG 2" : "", a.cut, a.idle ? a.idle : "unset", a.parts ? a.parts : "unset", differ, ref.size(), accepted,
+                lw, fw, hk, hp, tk, tp, fk, fp, hb + tb + fb);
+        CHECK_EQ(differ, 0);
+        CHECK(accepted > 0);
+        if (a.idle && a.parts && !std::strcmp(a.parts, "1")) {
+            CHECK(lw >= 2);   /* window lines + the run's */
+            CHECK(fw >= 2);
+            CHECK(hk > 0);
+            CHECK(tk > 0);
+            CHECK(fk > 0);
+            CHECK_EQ(hb + tb + fb, 0);
+            CHECK(llog.find("RADIANCE_PP_NODE_IDLE_PARTS=1 -- + the parts' card time by kind") != std::string::npos);
+            if (a.lanes == 4)   /* the lines as a start prints them */
+                for (const std::string* lg : { &llog, &flog })
+                    if (const size_t at = lg->rfind(key); at != std::string::npos) {
+                        const size_t b0 = lg->rfind('\n', at), e0 = lg->find('\n', at);
+                        fprintf(stderr, "      %s\n", lg->substr(b0 == std::string::npos ? 0 : b0 + 1, e0 == std::string::npos ? std::string::npos : e0 - b0 - 1).c_str());
+                    }
+            if (lw < 2 || fw < 2 || hk == 0 || tk == 0 || fk == 0)
+                fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 12).c_str(), tail(flog, 12).c_str());
+        } else {
+            CHECK_EQ(lw, 0LL);
+            CHECK_EQ(fw, 0LL);
+            if (a.parts && !std::strcmp(a.parts, "2") && a.idle)
+                CHECK(llog.find("RADIANCE_PP_NODE_IDLE_PARTS=2 is not 1 or 0") != std::string::npos);
+        }
+        if (a.idle) CHECK(llog.find("node idle (RADIANCE_PP_NODE_IDLE=") != std::string::npos);   /* the D8 lines as before */
+    }
+}
 /* tp8 loop D61 (fn4 host_spin, both nodes; timing only): the DSpark-drafted pipeline with every critical-path wait spinning before it
  * blocks -- the rank barrier, the leader's drafter-end wait, the follower's frame receive, the loops' naps -- serves one process's
  * tokens at 1 lane and 2 lanes at the wrap-around cut W(1,3), 3 lanes W(0,3) and BEST's shape (4 lanes, BG 2, READY_FIRST) from the
