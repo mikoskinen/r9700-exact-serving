@@ -255,6 +255,22 @@ __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) 
     }
     return lo;
   };
+  if (a.drz) {
+    // lever DRZ (prefill.c g_fn4_drz): the ZERO entries write nothing, so the chunks cover only the rows a run owns,
+    // [off[0], off[n_expert]) -- the fewest chunks of at most R rows, balanced; the chunks past them are empty (their
+    // launches exit at the head). Each live entry is today's (its rows, its prep rows from its chunk's rbase): the same
+    // bytes. A chunk's entries stay within chunk_gy: its rows are at most R (+ one partial entry a run).
+    const int Tt = (int)a.g.T;
+    const long long L0 = clamp_row(a.g.off[0], Tt), L1 = clamp_row(a.g.off[a.g.n_expert], Tt), live = L1 - L0;
+    long long nl = live > 0 ? (live + R - 1) / R : 0;
+    if (nl > a.chunk_n) nl = a.chunk_n;
+    const long long Rb = nl > 0 ? (live + nl - 1) / nl : 0;
+    for (int c = threadIdx.x; c < a.chunk_n; c += blockDim.x) {
+      const int lo = c < nl ? first_at(L0 + c * Rb) : E;
+      const int hi = c < nl ? (c == nl - 1 ? first_at(L1) : first_at(L0 + (c + 1) * Rb)) : E;
+      ((uint4*)a.ctab)[c] = make_uint4((unsigned)lo, (unsigned)hi, lo < E ? ent[lo].y : 0u, 0u);
+    }
+  } else
   for (int c = threadIdx.x; c < a.chunk_n; c += blockDim.x) {
     const int lo = first_at((long long)c * R), hi = c == a.chunk_n - 1 ? E : first_at((long long)(c + 1) * R);
     ((uint4*)a.ctab)[c] = make_uint4((unsigned)lo, (unsigned)hi, lo < E ? ent[lo].y : 0u, 0u);
@@ -1059,6 +1075,7 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
     PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, ent.x == EXL3R4D_PF_ZERO ? 3u : ent.x % (unsigned)EXL3R4D_NCLS);
     constexpr int GD = MATS == 1 && AM == 0 ? EXL3R4D_PF_DN_G : 1;
     if (ent.x == EXL3R4D_PF_ZERO) {
+      if (a.drz) return;   // lever DRZ (prefill.c g_fn4_drz): rows nobody reads stay as they are
       if constexpr (GD == 1)
         zero_rows(p, r0, r1, blockIdx.x);
       else

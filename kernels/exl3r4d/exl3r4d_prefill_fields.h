@@ -13,3 +13,4 @@
     uint32_t*   order;              /* scratch, after the chunk table: gate_up's entries longest first a chunk, or null
                                      * (EXL3R4D_PF_LPT; written by the map kernel) */
     int32_t     ystream;            /* down's map form: 1 = the streamed y (EXL3R4D_PF_YNT_MB, prefill.c) */
+    int32_t     drz;                /* qfn-on-ds lever DRZ (fn4 exl3_drz): 1 = a ZERO entry writes nothing (map form) */

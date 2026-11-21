@@ -37,11 +37,18 @@ int exl3r4d_fn4_dz(void) { return EXL3R4D_DZ == 2 ? g_fn4_dz : EXL3R4D_DZ == 1; 
  * differed (EPIC) and Flash-Next's M 1 (split-K 2). 0 at start = today's forms. */
 static volatile int g_fn4_bi = 0;
 int exl3r4d_fn4_bi(void) { return g_fn4_bi; }
+/* qfn-on-ds lever DRZ (Qwen loop round 13, 21.11.2026), "exl3_drz" 0 / 1: the map form's ZERO entries (the rows no run
+ * owns: [0, off[0]) and [off[n_expert], T) -- under expert parallelism the other ranks' dropped slots, ~3/4 of T at EP 4)
+ * write nothing instead of zeros. Nobody reads those rows: down's ZERO entries do not read h, and the gather skips a
+ * dropped slot (libr4d moe_gather / moe_gather_inv: its inverse stays -1), so every row any reader sees is today's bytes.
+ * A protected expert's rows (served by the protected GEMM pair) are written by that pair. 0 at start = today. */
+static volatile int g_fn4_drz = 0;
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;
     if (!strcmp(name, "exl3_dz")) return EXL3R4D_DZ == 2 ? (value == 0 || value == 1 ? 1 : -1) : value == (EXL3R4D_DZ == 1) ? 1 : -1;
     if (!strcmp(name, "exl3_bi")) return value == 0 || value == 1 ? 1 : -1;
+    if (!strcmp(name, "exl3_drz")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
@@ -49,6 +56,7 @@ __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int 
     if (ok <= 0) return ok;
     if (!strcmp(name, "exl3_pfprep")) g_fn4_pf_prep_gu = value;
     else if (!strcmp(name, "exl3_bi")) g_fn4_bi = value;
+    else if (!strcmp(name, "exl3_drz")) g_fn4_drz = value;
     else if (EXL3R4D_DZ == 2) g_fn4_dz = value;
     return 1;
 }
@@ -57,6 +65,7 @@ __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* 
     if (!strcmp(name, "exl3_pfprep")) { *applied = g_fn4_pf_prep_gu; return 1; }
     if (!strcmp(name, "exl3_dz")) { *applied = exl3r4d_fn4_dz(); return 1; }
     if (!strcmp(name, "exl3_bi")) { *applied = g_fn4_bi; return 1; }
+    if (!strcmp(name, "exl3_drz")) { *applied = g_fn4_drz; return 1; }
     return 0;
 }
 #if EXL3R4D_ROUTEDUMP
@@ -241,6 +250,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
     d.chunk_n = 1;
     d.ystream = ystream(&g, T, d.g.y_cols, run, am);
+    d.drz = g_fn4_drz;   /* lever DRZ */
     d.order = lpt(&g, run) && !rot_am(am) && am == 0
                   ? (uint32_t*)(mbase + map_only_bytes(&g, T) + ctab_bytes(&g, T, run)) : 0;
     {
