@@ -4519,8 +4519,10 @@ static int hc_readv() {
     return v;
 }
 /* qfn-on-ds lever HWC (hc_readv bit 13, Qwen loop round 19): hc_write in its chained forms where its row chains, up to
- * kHcWriteChainRows rows (the decode steps past arw_rows: the hc reads behind it chain at these heights too). */
-constexpr long kHcWriteChainRows = 128;
+ * kHcWriteChainRows rows. The engine read (test ms15, in process A B B A 363 / 8555): full-row step 32 rows 24.20 / 24.24 ->
+ * 23.93 / 23.92 ms, 64 rows 34.94 / 34.96 -> 35.21 / 35.24 ms, 128 rows 52.46 / 52.36 -> 52.36 / 52.25 ms, 5 / 25 rows
+ * unchanged: a gain at 32 rows, a loss at 64 -- so the chain rule's own bound (r4d_chain_rows_ok, 32 rows) now. */
+constexpr long kHcWriteChainRows = kR4dChainMaxRows;
 static bool hc_write_chain() { return (hc_readv() & 8192) != 0; }
 /* qfn-on-ds lever B3R: 16-row groups a block of kernel B3 under bi_dec at `rows` decode rows (hc_readv bits 11-12) */
 static int b3r_gpb(long rows) {
