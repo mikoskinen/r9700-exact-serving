@@ -2175,6 +2175,8 @@ int Engine::step_loop_lanes() {
                 dch_line_ns = now;
                 if (const std::string sl = fn4::spin_line(); !sl.empty())   /* tp8 loop D61 */
                     RAD_INFO("two-node pipeline: %s, since its last change (tp8 loop D61)", sl.c_str());
+                if (const std::string sl = fn4::slack_line(); !sl.empty())   /* tp8 loop D63 */
+                    RAD_INFO("two-node pipeline: %s, since its last change (tp8 loop D63)", sl.c_str());
                 if (pph_) {   /* tp8 loop D60: the window since the last line */
                     const double ws = (double)(now - pph_->win_t0) / 1e9;
                     RAD_INFO("%s", pph_text(pph_->win, pph_->win_drop, fmt(" over the last %.1f s", ws).c_str(), ws).c_str());

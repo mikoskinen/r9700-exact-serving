@@ -26,6 +26,7 @@
  * (~/gpu/bench-rdma/src/ppx.cpp rdma_setup), which ran on gpu02 / gpu03 on 14.11.
  */
 #include "net/node_link.h"
+#include "runtime/fn4_switch.h"   /* tp8 loop D63: host_slack */
 
 #if defined(RAD_HAVE_VERBS)
 #pragma GCC diagnostic push
@@ -426,7 +427,7 @@ private:
             if (n < 0) { link_.fail("verbs: polling the receive completions failed"); return; }
             if (n == 0) {
                 if (++idle > 1024 && link_.opts().poll_us > 0)
-                    std::this_thread::sleep_for(std::chrono::microseconds(link_.opts().poll_us));
+                    fn4::slack_sleep_us(link_.opts().poll_us, fn4::kSlackLinkRecv);   /* tp8 loop D63: under host_slack's timer slack */
                 else
                     __builtin_ia32_pause();
                 continue;

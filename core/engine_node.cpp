@@ -2419,6 +2419,8 @@ int Engine::follower_loop() {
             RAD_INFO("follower: %lld steps run, %lld builds replayed", (long long)steps, (long long)builds);
             if (const std::string sl = fn4::spin_line(); !sl.empty())   /* tp8 loop D61 */
                 RAD_INFO("follower: %s, since its last change (tp8 loop D61)", sl.c_str());
+            if (const std::string sl = fn4::slack_line(); !sl.empty())   /* tp8 loop D63 */
+                RAD_INFO("follower: %s, since its last change (tp8 loop D63)", sl.c_str());
         }
         if (pp_ni_) pp_ni_->minute();
         if (pp_load_ms_ > 0 && pp_ni_) pp_link_->set_load(pp_ni_->recent_pm((uint64_t)pp_bound_ms_ * 1000000ull));   /* tp8 loop D51 */

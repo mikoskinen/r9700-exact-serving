@@ -4,6 +4,9 @@
 
 #include <dlfcn.h>
 #include <link.h>
+#if defined(__linux__)
+#include <sys/prctl.h>   /* tp8 loop D63: PR_SET_TIMERSLACK */
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -47,7 +50,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
                                         "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room", "pp_send_ash",
                                         "aql_waitk", "aql_ika", "ds41_rr1", "dspark_mhr", "dspark_hs",
-                                        "host_spin", "pp_bg_split", "aql_cik" };
+                                        "host_spin", "pp_bg_split", "aql_cik", "host_slack" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -403,6 +406,23 @@ int env_aql_cik() {
     return env;
 }
 
+/* tp8 loop D63: RADIANCE_HOST_SLACK=v at start, v = 0 .. 1000 (a thread's timer slack in us; 0 = its default); unset / empty = 0;
+ * anything else is said once and means 0 (every thread keeps its default slack, as before). */
+int env_host_slack() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_HOST_SLACK");
+        if (!e || !*e) return 0;
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (!std::isdigit((unsigned char)e[0]) || (end && *end) || v < 0 || v > 1000) {
+            std::fprintf(stderr, "radiance: RADIANCE_HOST_SLACK=%s is not 0 .. 1000 (us): every thread keeps its default timer slack (tp8 loop D63)\n", e);
+            return 0;
+        }
+        return (int)v;
+    }();
+    return env;
+}
+
 /* tp8 loop D61: RADIANCE_HOST_SPIN=v at start, v = N + 256 x M as the switch takes (0 .. 4095); unset / empty = 0; anything else is
  * said once and means 0 (every wait blocks at once, as before). */
 int env_host_spin() {
@@ -480,6 +500,10 @@ int reported(State& s, int i) {
     if (i == kAqlCik) {            /* tp8 loop W9: set, else RADIANCE_AQL_CIK (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_aql_cik();
+    }
+    if (i == kHostSlack) {         /* tp8 loop D63: set, else RADIANCE_HOST_SLACK (0 = every thread's default slack) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_host_slack();
     }
     if (i == kSchedLaneRoom) {     /* tp8 loop D56: set, else RADIANCE_SCHED_LANE_ROOM (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -653,6 +677,68 @@ int64_t host_spin_ns(int site) {
     if (n == 0 || (m != 0 && !(m & site))) return 0;
     return (int64_t)n * 100000;
 }
+int host_slack() {
+    const int v = st().val[kHostSlack].load(std::memory_order_relaxed);
+    return v >= 0 ? v : env_host_slack();
+}
+namespace {
+/* tp8 loop D63: whether host_slack was ever above 0 in this process (counting and prctl calls only from then on), the value this
+ * thread applied last (0 = its default, which it has at creation), and per site the sleeps, the time asked and the time slept */
+std::atomic<bool> g_slack_seen{ false };
+thread_local int t_slack = 0;
+struct SlackCounts {
+    std::atomic<uint64_t> n[kSlackSites] = {}, asked_ns[kSlackSites] = {}, slept_ns[kSlackSites] = {};
+};
+SlackCounts& slack_counts() { static SlackCounts c; return c; }
+}  // namespace
+void slack_apply() {
+    const int v = host_slack();
+    if (v == t_slack) return;   /* also: never above 0 -> nothing to set */
+    if (v > 0) g_slack_seen.store(true, std::memory_order_relaxed);
+#if defined(__linux__)
+    (void)prctl(PR_SET_TIMERSLACK, v > 0 ? (unsigned long)v * 1000ul : 0ul, 0ul, 0ul, 0ul);   /* 0: the thread's default slack */
+#endif
+    t_slack = v;
+}
+void slack_sleep_us(int us, int site) {
+    slack_apply();
+    if (!g_slack_seen.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(us));   /* the switch never above 0: as before */
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
+    const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    SlackCounts& c = slack_counts();
+    const int k = site >= 0 && site < kSlackSites ? site : kSlackNap;
+    c.n[k].fetch_add(1, std::memory_order_relaxed);
+    c.asked_ns[k].fetch_add((uint64_t)us * 1000ull, std::memory_order_relaxed);
+    c.slept_ns[k].fetch_add(ns, std::memory_order_relaxed);
+}
+static std::string slack_text(int label, bool reset) {
+    SlackCounts& c = slack_counts();
+    static const char* const nm[kSlackSites] = { "lane naps", "link send proxy", "link receive completions", "ring waits" };
+    std::string out;
+    for (int k = 0; k < kSlackSites; ++k) {
+        const uint64_t n = c.n[k].load(std::memory_order_relaxed);
+        if (n == 0) continue;
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "%s%s %llu (asked %.1f us, slept %.1f us mean)", out.empty() ? "" : ", ", nm[k],
+                      (unsigned long long)n, (double)c.asked_ns[k].load(std::memory_order_relaxed) / 1e3 / (double)n,
+                      (double)c.slept_ns[k].load(std::memory_order_relaxed) / 1e3 / (double)n);
+        out += buf;
+    }
+    if (reset)
+        for (int k = 0; k < kSlackSites; ++k) {
+            c.n[k].store(0, std::memory_order_relaxed);
+            c.asked_ns[k].store(0, std::memory_order_relaxed);
+            c.slept_ns[k].store(0, std::memory_order_relaxed);
+        }
+    if (out.empty()) return out;
+    return "host_slack " + std::to_string(label) + "'s sleeps: " + out;
+}
+std::string slack_line() { return slack_text(host_slack(), false); }
+std::string slack_take(int label) { return slack_text(label, true); }
 namespace {
 /* tp8 loop D61: per site (barrier, drafter end, frame, nap) the waits the spin caught / that blocked after it, and the time spun */
 struct SpinCounts {
@@ -694,7 +780,7 @@ std::string spin_line() { return spin_text(host_spin(), false); }
 std::string spin_take(int label) { return spin_text(label, true); }
 void nap_us(int us) {
     if (host_spin_ns(kSpinNap) <= 0) {
-        std::this_thread::sleep_for(std::chrono::microseconds(us));
+        slack_sleep_us(us, kSlackNap);   /* tp8 loop D63: under host_slack's timer slack (as before while it was never above 0) */
         return;
     }
     const auto t0 = std::chrono::steady_clock::now(), t1 = t0 + std::chrono::microseconds(us);
@@ -1122,7 +1208,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, aql_cik, host_slack, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1753,6 +1839,15 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kHostSlack) {         /* tp8 loop D63: read at every sleep it covers, on each node */
+        if (v < 0 || v > 1000) {
+            if (err) *err = "host_slack takes 0 (every covered thread back to its default timer slack, as before) or 1 .. 1000 (the "
+                            "timer slack in us of the threads that poll the pipeline's critical path with short sleeps: the lane loops' "
+                            "naps, the link's send proxy, its receive-completion thread, the ring waits; tp8 loop D63)";
+            return false;
+        }
+        return true;
+    }
     if (i == kPpSendAsh) {         /* tp8 loop P46: the engine's, written into this node's send rings between steps */
         if (v != 0 && v != 1) {
             if (err) *err = "pp_send_ash takes 0 (a row-sharded payload's share crosses PCIe on the pass's stream, as before) or 1 (each "
@@ -1908,6 +2003,7 @@ bool follower_switch(int i) {
            i == kAqlIka ||         /* tp8 loop W3s: each node's own played packets */
            i == kAqlCik ||         /* tp8 loop W9: each node's own issued / played packets */
            i == kHostSpin ||       /* tp8 loop D61: each node's own waits */
+           i == kHostSlack ||      /* tp8 loop D63: each node's own threads' sleeps */
            i == kPpSegSet;         /* tp8 loop D33: likewise */
 }
 
@@ -2015,7 +2111,7 @@ bool apply_pending(int step, int* sched) {
     if (!s.any_pending) return false;
     s.any_pending = false;
     bool changed = false;
-    std::string what, spin_before;
+    std::string what, spin_before, slack_before;
     for (int i = 0; i < kSwitches; ++i) {
         if (!s.pend[i]) continue;
         s.pend[i] = false;
@@ -2049,7 +2145,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kAqlCik || i == kHostSpin || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kAqlHdp || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedSrf || i == kSchedLaneRoom || i == kPpSendAsh || i == kAqlWaitk || i == kAqlIka || i == kAqlCik || i == kHostSpin || i == kHostSlack || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
                 i == kStageLone || i == kDraftShortBlk)
@@ -2077,6 +2173,7 @@ bool apply_pending(int step, int* sched) {
         }
         if (sched_switch(i) && sched) sched[i] = v;
         if (i == kHostSpin) spin_before = spin_take(reported(s, i));   /* tp8 loop D61: the waits under the old value */
+        if (i == kHostSlack) slack_before = slack_take(reported(s, i));   /* tp8 loop D63: the sleeps under the old value */
         s.val[i].store(v, std::memory_order_release);
         changed = true;
         what += std::string(what.empty() ? "" : ", ") + kNames[i] + "=" + std::to_string(v);
@@ -2093,6 +2190,7 @@ bool apply_pending(int step, int* sched) {
         RAD_INFO("fn4: switches %s applied at step %d (epoch %llu)", what.c_str(), step,
                  (unsigned long long)s.epoch.load(std::memory_order_relaxed));
         if (!spin_before.empty()) RAD_INFO("fn4: before that change, %s (tp8 loop D61)", spin_before.c_str());
+        if (!slack_before.empty()) RAD_INFO("fn4: before that change, %s (tp8 loop D63)", slack_before.c_str());
     }
     return changed;
 }

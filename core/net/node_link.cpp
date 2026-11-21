@@ -707,7 +707,7 @@ void NodeLink::rx_loop() {
                              (unsigned long long)landed));
                     return;
                 }
-                std::this_thread::sleep_for(std::chrono::microseconds(20));
+                fn4::slack_sleep_us(20, fn4::kSlackRing);   /* tp8 loop D63 */
             }
             char* dst = (char*)r + RAD_PP_RING_HDR;
             st = read_exact(dst, (int64_t)h.bytes, o_.dead_ms);
@@ -852,7 +852,7 @@ void NodeLink::proxy_loop() {
 #endif
             continue;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(o_.poll_us));
+        fn4::slack_sleep_us(o_.poll_us, fn4::kSlackLinkSend);   /* tp8 loop D63: under host_slack's timer slack */
     }
 }
 
@@ -961,7 +961,7 @@ int ring_put(RadPpRing* r, const void* p, uint64_t bytes, uint64_t rows) {
     while (__atomic_load_n(&r->sent, __ATOMIC_ACQUIRE) < r->ready) {
         if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
         if (r->deadline_ms && now_ns() - t0 > r->deadline_ms * 1000000ull) return RAD_E_NOTFOUND;
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
+        fn4::slack_sleep_us(20, fn4::kSlackRing);   /* tp8 loop D63 */
     }
     if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
     char* const dst = (char*)r + RAD_PP_RING_HDR;
@@ -987,7 +987,7 @@ int ring_take(RadPpRing* r, int rank, void* p, uint64_t bytes, uint64_t rows) {
     while (__atomic_load_n(&r->landed, __ATOMIC_ACQUIRE) < want) {
         if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
         if (now_ns() - t0 > dl) return RAD_E_NOTFOUND;
-        if (++spins > 256) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        if (++spins > 256) fn4::slack_sleep_us(20, fn4::kSlackRing);   /* tp8 loop D63 */
     }
     const uint64_t at = rad_pp_align(bytes);
     if (r->rows != rows || r->bytes != at + RAD_PP_TRAILER) return RAD_E_SHAPE;
