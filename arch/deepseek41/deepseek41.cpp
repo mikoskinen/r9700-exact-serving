@@ -390,6 +390,10 @@ struct Layer {
      * col_f + norm_f, issued for post_a; pcn_a = the previous layer's post_f + this layer's col_a +
      * norm_a, issued for that post_f (so before this layer's Engram-free tap and mix_a). */
     rad_op pcn_f = 0, pcn_a = 0;
+    /* lever BIW (DRAFTER track round 75, RADIANCE_DS41_BIW=1): pcn_a / pcn_f / cn_a / cn_f / kv_fs at libr4d's _w1k form (the
+     * 1024-thread workgroup a row at every M: each row the bytes of its <= 32-row piece), issued in place of a decode segment's
+     * kBiNorm pieces as ONE launch of up to kBiNormW rows; 0 = the pieces (unset, or no library declares the form) */
+    rad_op pcn_f_w = 0, pcn_a_w = 0, cn_a_w = 0, cn_f_w = 0, kv_fs_w = 0;
     /* Lever M1 (RADIANCE_DS41_MHC_FUSE declared): pcn_a + this layer's mix_a as one op (mhc_post_collapse_rmsnorm_mix),
      * declared beside pcn_a, issued in its place for a launch the mhc_fuse switch takes (mhc_fuse_min). 0 elsewhere. */
     rad_op pcn_mix = 0;
@@ -786,6 +790,7 @@ struct Model {
     rad_op sone = 0;
     rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
     rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
+    rad_op cn_fin_w = 0, pcn_fin_w = 0;   /* lever BIW: their _w1k twins (Layer::pcn_a_w), or 0 */
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
     rad_op ar_pcn_fin = 0;
     BiTr bt{};
@@ -1772,8 +1777,8 @@ static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads
 }
 /* mhc_collapse (h, pre -> x) then rmsnorm (x, w -> y), as one op. */
 static rad_op collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, rad_buf h,
-                            rad_buf pre, rad_buf x, rad_buf y) {
-    return fused(b, "mhc_collapse_rmsnorm",
+                            rad_buf pre, rad_buf x, rad_buf y, const char* nm = "mhc_collapse_rmsnorm") {
+    return fused(b, nm,
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
                    RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
                  { w }, { h, pre }, { x, y });
@@ -1782,8 +1787,8 @@ static rad_op collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_wei
  * op. */
 static rad_op post_collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w,
                                  rad_buf in, rad_buf h, rad_buf out, rad_buf pre, rad_buf x,
-                                 rad_buf y) {
-    return fused(b, "mhc_post_collapse_rmsnorm",
+                                 rad_buf y, const char* nm = "mhc_post_collapse_rmsnorm") {
+    return fused(b, nm,
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
                    RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
                  { w }, { in, h, m.post, m.comb, pre }, { out, x, y });
@@ -2353,15 +2358,19 @@ static void walk_read_env() {
  * fused norms' r4d_act_threads widths 1024 <= 32 rows, 512, 256) sees the rows its sequence gives it alone; the MoE one
  * pass a segment. 0 = one launch over the step (today). RADIANCE_DS41_BI=0 / off declares it and starts at 0, 1 / on
  * at 1; unset declares nothing (the switch takes only 0, step() is today's). `_ok`: a declare had it on. */
+static int biw_env();   /* lever BIW (below kBiNorm) */
 static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2 unread, -1 unset */
-static int twin_bi_now() { return g_sw_bi.load(std::memory_order_relaxed); }   /* tp8 loop P30t */
+static int twin_bi_now() { return g_sw_bi.load(std::memory_order_relaxed) & 7; }   /* tp8 loop P30t */
+/* lever BI's value 0 .. 7 (ds41_bi without lever BIW's bit 8) and lever BIW's bit (the twins in place of the norm pieces) */
+static int bi_now() { return g_sw_bi.load(std::memory_order_relaxed) & 7; }
+static bool biw_live() { return (g_sw_bi.load(std::memory_order_relaxed) & 8) != 0; }
 static void bi_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_BI");
     const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : (e[0] >= '2' && e[0] <= '6' && !e[1]) ? e[0] - '0'
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
     if (g_sw_bi_env.compare_exchange_strong(unread, v)) {
-        if (v >= 0) g_sw_bi.store(v, std::memory_order_relaxed);
+        if (v >= 0) g_sw_bi.store(v | (v >= 1 && biw_env() == 1 ? 8 : 0), std::memory_order_relaxed);   /* + lever BIW's bit */
         if (e && v < 0)
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI=%s is not 0 / off, 1 / on or 2: lever BI is not declared\n", e);
     }
@@ -2404,6 +2413,22 @@ static bool bi_pmm(int v) { return v == 7; }
 static std::atomic<long long> g_pmm_steps{0}, g_pmm_merged{0};   /* lever PMM: steps with a merged pass; passes saved (layer 0) */
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
+/* lever BIW (DRAFTER track round 75): RADIANCE_DS41_BIW=0 / 1 at the first declare declares the fused norms' _w1k twins (libr4d:
+ * the 1024-thread workgroup a row at EVERY M, so each row keeps the bytes of its kBiNorm piece) beside pcn_a / pcn_f / cn_a /
+ * cn_f / the final pcn / cn and the window key's kv_fs. Switch: fn4 ds41_bi + 8 (bit 3 beside lever BI's value 1 .. 7, taken
+ * only with BI on and where a twin was declared) = a decode segment of more than kBiNorm rows runs each of them as ONE launch
+ * of up to kBiNormW rows instead of 32-row pieces (exact, rule A: every row's bytes are the piece's); RADIANCE_DS41_BIW=1
+ * starts with the bit on, 0 off. Unset (or another value): nothing declared, the bit refused, the pieces as today. */
+static constexpr int64_t kBiNormW = 64;
+static int biw_env() {   /* -1 unset, 0, 1 */
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_BIW");
+        return !e ? -1 : !std::strcmp(e, "1") ? 1 : !std::strcmp(e, "0") ? 0 : -1;
+    }();
+    return v;
+}
+static std::atomic<int> g_sw_biw_ok{0};   /* a declare declared a _w1k twin */
+static std::atomic<long long> g_biw_launch{0}, g_biw_rows{0};   /* rank 0: _w1k launches issued and the rows they carried */
 /* tp8 loop F58 (19.11.2026): RADIANCE_DS41_BI_DBAND=1 (read with RADIANCE_DS41_BI at the first declare; both nodes) -- a
  * decode segment of more than kBiBand rows (depth-3 drafting at lanes of 16: 16 x 4 = 64 rows under fn4 sched_row_cap
  * 64) runs its attention in pieces of whole decode sequences of at most kBiBand rows (ds41_dec_band.h: as few as greedy
@@ -3150,7 +3175,9 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
         return value == 0 || (value == 1 && !g_sw_hs_bad.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
-        return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ||
+               (value >= 9 && value <= 15 && g_sw_bi_ok.load(std::memory_order_relaxed) &&
+                g_sw_biw_ok.load(std::memory_order_relaxed)) ? 1 : -1;   /* + 8: lever BIW (with BI on, a twin declared) */
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
         return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
                ((value == 2 || value == 3 || value == 4) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
@@ -4428,6 +4455,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                               { L.attn_norm, L.hc_a_fn, L.hc_a_scale, L.hc_a_base },
                               { m.act.x, m.h1, m.post, m.comb, m.pre_f }, { m.h0, m.xcol, m.xn, m.pre_a, m.post, m.comb });
         if (!L.pcn_a) L.cn_a = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn);
+        if (biw_env() >= 0) {   /* lever BIW: the _w1k twins (0 where no library declares them) */
+            if (L.pcn_a)
+                L.pcn_a_w = post_collapse_norm(b, m, T, L.attn_norm, m.act.x, m.h1, m.h0, m.pre_f, m.xcol, m.xn,
+                                               "mhc_post_collapse_rmsnorm_w1k");
+            if (L.cn_a) L.cn_a_w = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn, "mhc_collapse_rmsnorm_w1k");
+        }
     }
     if (!L.cn_a && !L.pcn_a) L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
     if (L.pcn_a && l > 0) DS_TRY(ar_pcn_moe_declare(b, m, m.layers[(size_t)l - 1], T, L.attn_norm, m.xn, &L.ar_pcn_a));
@@ -4516,6 +4549,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                               RAD_INT("block_size", m.win_bs), RAD_STR("kv_dtype", m.w8 ? "fp8_e4m3" : "bf16") },
                             { L.kv_norm }, { m.kv, cs }, { m.kvn });
             if (L.kv_fs) g_sw_kvf_ok.store(1, std::memory_order_relaxed);
+            if (L.kv_fs && biw_env() >= 0)   /* lever BIW: the window key's fold at the _w1k form */
+                L.kv_fs_w = fused(b, "rmsnorm_rope_roundtrip_kv_store_w1k",
+                                  { RAD_RANGE("M", 1, T), RAD_INT("n", hd), RAD_F64("eps", m.c.eps), RAD_INT("n_head", 1),
+                                    RAD_INT("head_dim", hd), RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope),
+                                    RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
+                                    RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
+                                    RAD_INT("block_size", m.win_bs), RAD_STR("kv_dtype", m.w8 ? "fp8_e4m3" : "bf16") },
+                                  { L.kv_norm }, { m.kv, cs }, { m.kvn });
         }
 
         /* ---- the compressor and the index keys, at a kv source */
@@ -4869,6 +4910,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                             { L.ffn_norm, L.hc_f_fn, L.hc_f_scale, L.hc_f_base },
                             { m.attn_out, m.h0, m.post, m.comb, m.pre_a }, { m.h1, m.xcol, m.act.x, m.pre_f, m.post, m.comb });
     if (!L.pcn_f) L.cn_f = collapse_norm(b, m, T, L.ffn_norm, m.h1, m.pre_a, m.xcol, m.act.x);
+    if (biw_env() >= 0) {   /* lever BIW */
+        if (L.pcn_f)
+            L.pcn_f_w = post_collapse_norm(b, m, T, L.ffn_norm, m.attn_out, m.h0, m.h1, m.pre_a, m.xcol, m.act.x,
+                                           "mhc_post_collapse_rmsnorm_w1k");
+        if (L.cn_f) L.cn_f_w = collapse_norm(b, m, T, L.ffn_norm, m.h1, m.pre_a, m.xcol, m.act.x, "mhc_collapse_rmsnorm_w1k");
+    }
     if (!L.pcn_f && !L.cn_f) {
         L.col_f = op(b, "mhc_collapse", hcp, {}, { m.h1, m.pre_a }, { m.xcol });
         L.norm_f = rmsnorm(b, m, T, L.ffn_norm, D, m.xcol, m.act.x);
@@ -7807,6 +7854,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                       m.final_hidden, &m.ar_pcn_fin));
         if (!m.pcn_fin)
             m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
+        if (biw_env() >= 0) {   /* lever BIW */
+            if (m.pcn_fin)
+                m.pcn_fin_w = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol, m.final_hidden,
+                                                 "mhc_post_collapse_rmsnorm_w1k");
+            if (m.cn_fin)
+                m.cn_fin_w = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden, "mhc_collapse_rmsnorm_w1k");
+        }
         if (!m.pcn_fin && !m.cn_fin) {
             m.contract = op(b, "mhc_collapse",
                             { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
@@ -8088,6 +8142,23 @@ static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                         "indexer launch, <= %lld a fused norm; each prefill sequence at its own rows; the MoE a pass a "
                         "segment); a pass with two or more prefill sequences is not recorded\n",
                 g_sw_bi.load(std::memory_order_relaxed), (long long)kBiBand, (long long)kBiNorm);
+    if (biw_env() >= 0) {   /* lever BIW: what the declare took */
+        int pa = 0, pf = 0, ca = 0, cf = 0, kv = 0, na = 0, nf = 0, nk = 0;
+        for (const Layer& L : m.layers) {
+            pa += L.pcn_a_w != 0; pf += L.pcn_f_w != 0; ca += L.cn_a_w != 0; cf += L.cn_f_w != 0; kv += L.kv_fs_w != 0;
+            na += (L.pcn_a || L.cn_a) != 0; nf += (L.pcn_f || L.cn_f) != 0; nk += L.kv_fs != 0;
+        }
+        const bool any = pa + pf + ca + cf + kv + (m.pcn_fin_w != 0) + (m.cn_fin_w != 0) > 0;
+        if (any && !ctx->shape_probe) g_sw_biw_ok.store(1, std::memory_order_relaxed);
+        if (!any && !ctx->shape_probe) g_sw_bi.fetch_and(7, std::memory_order_relaxed);   /* nothing to issue: the bit off */
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever BIW (RADIANCE_DS41_BIW=%d) declared: _w1k twins pcn_a %d + cn_a %d of %d, "
+                        "pcn_f %d + cn_f %d of %d, kv_fs %d of %d, final pcn %d / cn %d; fn4 ds41_bi + 8 (now %s, ds41_bi %d) = a "
+                        "decode segment above %lld rows runs each of them as ONE launch of <= %lld rows (each row the bytes of "
+                        "its %lld-row piece)\n",
+                biw_env(), pa, ca, na, pf, cf, nf, kv, nk, m.pcn_fin_w != 0, m.cn_fin_w != 0, biw_live() ? "on" : "off",
+                g_sw_bi.load(std::memory_order_relaxed), (long long)kBiNorm, (long long)kBiNormW, (long long)kBiNorm);
+    }
     return RAD_OK;
 }
 
@@ -9279,7 +9350,7 @@ static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vecto
         if (!s.dec) s.k = s.s0 == 0 ? -1 : k++;
     if (DT > kBiBand) g_bi_wide.fetch_add(1, std::memory_order_relaxed);   /* > 48 decode rows: one segment past the band */
     (void)m;
-    const int bi = g_sw_bi.load(std::memory_order_relaxed);
+    const int bi = bi_now();
     return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && (sg[0].n > kBiNorm || (bi_pieces(bi) && sg[0].n > kBiMoe)));
 }
 
@@ -10071,6 +10142,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             fprintf(stderr, "radiance: deepseek41: tp8 loop D22 (RADIANCE_DS41_DENSE_BAND=%lld, or 64 under ds41_wmk 5): %lld decode-only "
                             "dense GGUF runs above %lld rows issued as one launch (layer-ops summed)\n", (long long)dense_band_env(),
                     g_dband64_runs.load(std::memory_order_relaxed), (long long)kBiBand);
+        /* lever BIW: its own line beside, once a recorded or live issue took a _w1k launch */
+        if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_biw_launch.load(std::memory_order_relaxed) > 0)
+            fprintf(stderr, "radiance: deepseek41: lever BIW stats: %lld _w1k launches issued (recorded or live) carrying %lld "
+                            "decode rows in place of their %lld-row pieces\n", g_biw_launch.load(std::memory_order_relaxed),
+                    g_biw_rows.load(std::memory_order_relaxed), (long long)kBiNorm);
         /* lever A9 (ds41_bi 5 / 6): its own line beside, once a step took it (the line above stays int12's) */
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_bi_onear.load(std::memory_order_relaxed) > 0)
             fprintf(stderr, "radiance: deepseek41: lever A9 stats: %lld of %lld segmented steps with one MoE all-reduce; "
@@ -10127,6 +10203,25 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         for (const BiSeg& s : *cur) {
             if (!s.dec || s.n <= cap) { fn(s.r0, s.n); continue; }
             for (int64_t a = 0; a < s.n; a += cap) fn(s.r0 + a, std::min(cap, s.n - a));
+        }
+    };
+    /* lever BIW: rows(kBiNorm, ..) for a fused norm whose _w1k twin is `twin` -- fn(r0, n, w): a decode segment of more than
+     * kBiNorm rows goes in launches of up to kBiNormW rows where the twin is declared, w = true for a launch of more than
+     * kBiNorm rows (issue the twin: each row the bytes of its piece), false for every other launch (the op itself, as today) */
+    auto nrows = [&](rad_op twin, const auto& fn) {
+        for (const BiSeg& s : *cur) {
+            if (!s.dec || s.n <= kBiNorm) { fn(s.r0, s.n, false); continue; }
+            const bool on = twin && biw_live();
+            const int64_t cap = on ? kBiNormW : kBiNorm;
+            for (int64_t a = 0; a < s.n; a += cap) {
+                const int64_t k = std::min(cap, s.n - a);
+                const bool w = on && k > kBiNorm;
+                if (w && rad_rank(x) == 0) {
+                    g_biw_launch.fetch_add(1, std::memory_order_relaxed);
+                    g_biw_rows.fetch_add(k, std::memory_order_relaxed);
+                }
+                fn(s.r0 + a, k, w);
+            }
         }
     };
     /* lever WMK (ds41_wmk 1, wmk_whole_on): a dense GGUF GEMM over each run of consecutive rows that holds a prefill segment in
@@ -10391,8 +10486,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             t_mhc_a.clear();
             t_mhc_a_l = N.l;
         }
-        rows(kBiNorm, [&](int64_t r0, int64_t n) {
-            if (fmin > 0 && n >= fmin) {
+        nrows(N.pcn_a_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+            if (!w && fmin > 0 && n >= fmin) {
                 RAD_ISSUE_N(x, N.pcn_mix, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(N.attn_norm), R(m.xn, r0, n),
                             RAD_W(N.hc_a_fn), RAD_W(N.hc_a_scale), RAD_W(N.hc_a_base), R(m.pre_a, r0, n));
@@ -10401,7 +10496,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 return;
             }
             if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
-            RAD_ISSUE_N(x, N.pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+            RAD_ISSUE_N(x, w ? N.pcn_a_w : N.pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                         R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(N.attn_norm), R(m.xn, r0, n));
         });
     };
@@ -10616,7 +10711,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         t_tw_psk_l = tw_psk && (psk_l || cr_any);
         t_tw_off = !m.twin_mask ? 0
                  : (m.pipe2 > 0 ? kTwAll : 0) | (m.sphc_eng && !tw_sub ? kTwEng : 0) |
-                   (bi_pmm(g_sw_bi.load(std::memory_order_relaxed)) ? kTwShx : 0) |
+                   (bi_pmm(bi_now()) ? kTwShx : 0) |
                    (m.sp_ag_qr && m.sp_ag_kv && sp_attn >= 1 && !L.norm_a && !tw_sub &&
                             ((!L.src && !L.i_score) ||
                              /* tp8 loop P26c: a kv / index source of ratio > 1 where level 3 runs q_a / kv over the quarter */
@@ -10699,8 +10794,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
                 t_mhc_a.clear();
                 t_mhc_a_l = L.l;
-                rows(kBiNorm, [&](int64_t r0, int64_t n) {
-                    if (fmin > 0 && n >= fmin) {
+                nrows(L.pcn_a_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+                    if (!w && fmin > 0 && n >= fmin) {
                         RAD_ISSUE_N(x, L.pcn_mix, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                                     R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n),
                                     RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base), R(m.pre_a, r0, n));
@@ -10709,7 +10804,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         return;
                     }
                     if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
-                    RAD_ISSUE_N(x, L.pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                    RAD_ISSUE_N(x, w ? L.pcn_a_w : L.pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                                 R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
                 });
             } else {
@@ -10941,6 +11036,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             h_sh = xn_sh = true;
         } else if (L.cn_a) {
             if (l20) rows_step(kBiNorm, cn_a);
+            else if (L.cn_a_w)   /* lever BIW: a decode segment above kBiNorm rows as one _w1k launch */
+                nrows(L.cn_a_w, [&](int64_t r0, int64_t n, bool w) {
+                    if (!w) return cn_a(r0, n);
+                    RAD_ISSUE_N(x, L.cn_a_w, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm),
+                                R(m.xn, r0, n));
+                });
             else rows(kBiNorm, cn_a);
         } else if (L.col_a) {
             if (l20) whole_step(col_a);
@@ -10963,7 +11064,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* tp8 loop P26 (RADIANCE_DS41_SPHC_ATTN=1, m.sp_ag_qr): an SP layer whose xn only q_a and kv read (no compressor
              * chain: L.src; no indexer projection: L.i_score) runs both over this rank's quarter and gathers their outputs
              * instead of xn; everything below reads qr / kv over every row as today (a1_cheap skips the two GEMMs) */
-            const bool cheap0 = bi_cheap(g_sw_bi.load(std::memory_order_relaxed));
+            const bool cheap0 = bi_cheap(bi_now());
             /* tp8 loop P26c (level 3, m.sp_ag_iw): a kv / index source layer of ratio > 1 too -- its compressor's GEMM reads
              * the quarter (P26b, or no chain in an all-replay pass) and its indexer's projection runs over the quarter below,
              * so nothing there reads xn past this rank's quarter either */
@@ -11048,7 +11149,22 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         RAD_ISSUE_N(x, L.kv_f, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an),
                                     brows(cs, g.max_ctx), P(batch->positions, a0, an));
                 };
-                if (s.dec && s.n > kBiNorm)
+                /* lever BIW: the window key's fold over more than kBiNorm decode rows as ONE _w1k launch (the pieces' bytes) */
+                const auto kvw = [&](int64_t a0, int64_t an) {
+                    if (rad_rank(x) == 0) {
+                        g_biw_launch.fetch_add(1, std::memory_order_relaxed);
+                        g_biw_rows.fetch_add(an, std::memory_order_relaxed);
+                    }
+                    RAD_ISSUE_N(x, L.kv_fs_w, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an), brows(cs, g.max_ctx),
+                                P(batch->positions, a0, an), P(wb->slot_mapping, a0, an), kv_cache(m.win, l));
+                };
+                if (s.dec && s.n > kBiNorm && kvfold && L.kv_fs_w && biw_live())
+                    for (int64_t a = 0; a < s.n; a += kBiNormW) {
+                        const int64_t k = std::min(kBiNormW, s.n - a);
+                        if (k > kBiNorm) kvw(s.r0 + a, k);
+                        else kvn(s.r0 + a, k);
+                    }
+                else if (s.dec && s.n > kBiNorm)
                     for (int64_t a = 0; a < s.n; a += kBiNorm) kvn(s.r0 + a, std::min(kBiNorm, s.n - a));
                 else
                     kvn(s.r0, s.n);
@@ -11171,7 +11287,22 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     else
                         RAD_ISSUE_N(x, L.kv_n, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an));
                 };
-                if (s.dec && n > kBiNorm)
+                /* lever BIW: the window key's fold over more than kBiNorm decode rows as ONE _w1k launch (the pieces' bytes) */
+                const auto kvw = [&](int64_t a0, int64_t an) {
+                    if (rad_rank(x) == 0) {
+                        g_biw_launch.fetch_add(1, std::memory_order_relaxed);
+                        g_biw_rows.fetch_add(an, std::memory_order_relaxed);
+                    }
+                    RAD_ISSUE_N(x, L.kv_fs_w, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an), brows(cs, g.max_ctx),
+                                P(batch->positions, a0, an), P(wb->slot_mapping, a0, an), kv_cache(m.win, l));
+                };
+                if (s.dec && n > kBiNorm && kvfold && L.kv_fs_w && biw_live())
+                    for (int64_t a = 0; a < n; a += kBiNormW) {
+                        const int64_t k = std::min(kBiNormW, n - a);
+                        if (k > kBiNorm) kvw(r0 + a, k);
+                        else kvn(r0 + a, k);
+                    }
+                else if (s.dec && n > kBiNorm)
                     for (int64_t a = 0; a < n; a += kBiNorm) kvn(r0 + a, std::min(kBiNorm, n - a));
                 else
                     kvn(r0, n);
@@ -11512,8 +11643,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (L.pcn_f) {
             /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_f + mix_f in one op (its rows' mix_f then not issued) */
             const int64_t fmin = L.pcn_mix_f ? mhc_fuse_min() : 0;
-            rows(kBiNorm, [&](int64_t r0, int64_t n) {
-                if (fmin > 0 && n >= fmin) {
+            nrows(L.pcn_f_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+                if (!w && fmin > 0 && n >= fmin) {
                     RAD_ISSUE_N(x, L.pcn_mix_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n),
                                 R(m.comb, r0, n), R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm),
                                 R(m.act.x, r0, n), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
@@ -11523,7 +11654,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     return;
                 }
                 if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
-                RAD_ISSUE_N(x, L.pcn_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                RAD_ISSUE_N(x, w ? L.pcn_f_w : L.pcn_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm), R(m.act.x, r0, n));
             });
         } else
@@ -11533,8 +11664,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             });
         if (L.pcn_f) {
         } else if (L.cn_f) {
-            rows(kBiNorm, [&](int64_t r0, int64_t n) {
-                RAD_ISSUE_N(x, L.cn_f, n, R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm),
+            nrows(L.cn_f_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+                RAD_ISSUE_N(x, w ? L.cn_f_w : L.cn_f, n, R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm),
                             R(m.act.x, r0, n));
             });
         } else {
@@ -11662,7 +11793,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const Layer* tnx = next_layer(m, L.l);
             const bool nx_cut = psk && (L.l + 1 >= m.psk_first || (l20_on && L.l + 1 == m.psk_l20 && !cr_all) || cr_any);
             const bool tbo_x = (m.pipe2_tbo & 2) && !cut && !m.bt.on && p0 == 0 && pn == T &&
-                               bi_cheap(g_sw_bi.load(std::memory_order_relaxed)) && pp_send_after(m, L.l) < 0 && tnx &&
+                               bi_cheap(bi_now()) && pp_send_after(m, L.l) < 0 && tnx &&
                                tnx->l == L.l + 1 && pp_part_layer(m, part, tnx->l) && pp_recv_at(m, tnx->l) < 0 &&
                                tnx->pcn_a && tnx->pcn_mix && !tnx->e_ids && !tnx->tap && !nx_cut && !m.media;
             if (tbo_x) {
@@ -11709,7 +11840,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
         } else
         {   /* ds41_bi 2 / 4 / 6: the decode segment in pieces within the EXL3 decode band; 5 / 6 (lever A9): one all-reduce */
-            const int biv = g_sw_bi.load(std::memory_order_relaxed);
+            const int biv = bi_now();
             const int64_t piece = bi_pieces(biv) ? kBiMoe : ((int64_t)1 << 40);
             /* lever P (ds41_moe1 1): the step is ONE decode segment above a piece and within the dk ops' rows -- its MoE
              * as one pass, the routed experts through the decode-band-bytes ops (the pieces' bytes per row); the pass
@@ -11890,8 +12021,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const int64_t fmin = nx->pcn_mix ? mhc_fuse_min() : 0;
             t_mhc_a.clear();
             t_mhc_a_l = nx->l;
-            rows(kBiNorm, [&](int64_t r0, int64_t n) {
-                if (fmin > 0 && n >= fmin) {
+            nrows(nx->pcn_a_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+                if (!w && fmin > 0 && n >= fmin) {
                     RAD_ISSUE_N(x, nx->pcn_mix, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                                 R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(nx->attn_norm), R(m.xn, r0, n),
                                 RAD_W(nx->hc_a_fn), RAD_W(nx->hc_a_scale), RAD_W(nx->hc_a_base), R(m.pre_a, r0, n));
@@ -11900,12 +12031,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     return;
                 }
                 if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
-                RAD_ISSUE_N(x, nx->pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                RAD_ISSUE_N(x, w ? nx->pcn_a_w : nx->pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(nx->attn_norm), R(m.xn, r0, n));
             });
         } else if (!nx && m.pcn_fin)
-            rows(kBiNorm, [&](int64_t r0, int64_t n) {
-                RAD_ISSUE_N(x, m.pcn_fin, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+            nrows(m.pcn_fin_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+                RAD_ISSUE_N(x, w ? m.pcn_fin_w : m.pcn_fin, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(m.final_gain),
                             R(m.final_hidden, r0, n));
             });
@@ -11941,8 +12072,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     }
     if (m.pcn_fin) {
     } else if (m.cn_fin) {
-        rows(kBiNorm, [&](int64_t r0, int64_t n) {
-            RAD_ISSUE_N(x, m.cn_fin, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(m.final_gain),
+        nrows(m.cn_fin_w, [&](int64_t r0, int64_t n, bool w) {   /* lever BIW */
+            RAD_ISSUE_N(x, w ? m.cn_fin_w : m.cn_fin, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(m.final_gain),
                         R(m.final_hidden, r0, n));
         });
     } else {
@@ -12000,7 +12131,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const bool psk_plan = m.psk_first > 0 && psk_hint(batch) != nullptr;
     /* tp8 S6: a pipeline node runs BI's segments and PSK's cut passes too (step_bi crosses at the cut, per node) */
     /* lever BI (ds41_bi 1): a step of more than one shape class runs in segments (step_bi) */
-    if (m.bi_sub && (g_sw_bi.load(std::memory_order_relaxed) > 0 || psk_plan)) {
+    if (m.bi_sub && (bi_now() > 0 || psk_plan)) {
         static thread_local std::vector<BiSeg> sg;
         if (bi_segments(x, m, batch, sg)) {
             step_bi(x, m, batch, sg);
@@ -12763,7 +12894,7 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
     }
     /* Lever E1: a pass it may deduplicate issues row counts read from the step's ids at issue: not recorded */
     if (deepseek41::engdd_may_act(b)) return 0;
-    if (b && b->draft_pass == 0 && deepseek41::g_sw_bi.load(std::memory_order_relaxed) > 0) {
+    if (b && b->draft_pass == 0 && deepseek41::bi_now() > 0) {
         int64_t Dn = 0, DT = 0;
         rad::arch::batch_split(b, &Dn, &DT);
         if (b->n_seq - Dn >= 2) return 0;
