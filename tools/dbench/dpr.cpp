@@ -115,6 +115,8 @@ int main(int argc, char** argv) {
     auto collapse = (Entry)dlsym(h, "r4d_rad_mhc_collapse");
     auto fill = (Entry)dlsym(h, "r4d_rad_fill");
     auto conf = (Entry)dlsym(h, "r4d_rad_dspark_conf");
+    auto cnfhook = (void (*)(int))dlsym(h, "r4d_conf_cnf");   /* lever CNF's hook: libr4d of round 67 on */
+    std::printf("dpr: %s; lever CNF hook %s\n", argv[1], cnfhook ? "present (part D runs)" : "absent");
     if (!collapse || !fill || !conf) { std::fprintf(stderr, "symbols missing (%p %p %p)\n", (void*)collapse, (void*)fill, (void*)conf); return 2; }
     const int D = 5120, HC = 4;
     hipStream_t st; hc(hipStreamCreate(&st), "stream");
@@ -271,6 +273,23 @@ int main(int argc, char** argv) {
                             "CNF %.2f (%+.1f %%)\n", R, M, steps, rc, nd, M * steps, nd == 0 && rc == 0 ? "IDENTICAL" : "DIFFER", t1, t2,
                             100.0 * (t2 - t1) / t1);
                 fails += !(nd == 0 && rc == 0);
+                if (cnfhook) {   /* D: the library's own lever CNF entry (r4d_conf_cnf(1)) vs its conf_kernel */
+                    c.t[5].data = do2; c.fix();
+                    hc(hipMemset(do2, 0x7d, (size_t)M * steps * 4), "ms");
+                    cnfhook(1);
+                    const int rc2 = conf(&c.a, (RadStream)st);
+                    hc(hipStreamSynchronize(st), "sync");
+                    hc(hipMemcpy(o2.data(), do2, o2.size() * 4, hipMemcpyDeviceToHost), "cp");
+                    int nd2 = 0;
+                    for (size_t i = 0; i < o1.size(); ++i) nd2 += o1[i] != o2[i];
+                    const double t3 = timed([&] { conf(&c.a, (RadStream)st); });
+                    cnfhook(0);
+                    c.t[5].data = do1; c.fix();
+                    std::printf("D  R %d M %2d steps %d: libr4d CNF entry rc %d, %d of %d outputs differ from its conf_kernel -> %s; us a launch "
+                                "back to back %.2f vs %.2f (%+.1f %%)\n", R, M, steps, rc2, nd2, M * steps, nd2 == 0 && rc2 == 0 ? "IDENTICAL" : "DIFFER",
+                                t3, t1, 100.0 * (t3 - t1) / t1);
+                    fails += !(nd2 == 0 && rc2 == 0);
+                }
             }
         hipFree(dx); hipFree(dpr); hipFree(da); hipFree(dt); hipFree(dw); hipFree(do1); hipFree(do2);
     }
