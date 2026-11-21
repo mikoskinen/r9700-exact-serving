@@ -1705,7 +1705,9 @@ int Ctx::play_pass(PassTape& t) {
     }
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
-        /* Lever TRB: the shared patch goes out before anything but another table step (a played stretch reads it). */
+        /* Lever TRB: the shared patch goes out before anything but another table step (a played stretch reads it). A host
+         * step that may record events of its own (an expert prefetch, a KV stage, a host op) ends the waited-event memo: an
+         * event recorded again after its wait is a new recording, which a skipped wait would not order. */
         if (trb_play_ && st.kind != kTapeTable) {
             rc = trb_flush();
             if (rc < 0) {
@@ -1713,6 +1715,10 @@ int Ctx::play_pass(PassTape& t) {
                 if (step_status_ >= 0) step_status_ = rc;
                 step_fail_ = fmt("lever TRB: a weight-table patch failed: %s", rad_strerror(rc));
                 return rc;
+            }
+            if (st.kind != kTapePlay && st.kind != kTapeRoute) {
+                trb_ev_[0].clear();
+                trb_ev_[1].clear();
             }
         }
         /* tp8 loop D41b: a host step before the first recorded stretch of a timed head, timed by kind */

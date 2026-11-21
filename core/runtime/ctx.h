@@ -851,8 +851,9 @@ private:
     std::vector<uint32_t>  waited_gen_[2];
     /* Lever TRB (DRAFTER track round 76; start env RADIANCE_TABLE_BATCH, read at init): a played pass's weight-table refreshes
      * (kTapeTable steps: today each table's moved weights each get a stream wait and each table its own patch kernel, at its
-     * layer's play boundary). 1: inside play_pass, a stream wait on an event this play already waited on (on the same lane)
-     * is not put again (every weight of a moved unit names the unit's one event), and the patches of consecutive table steps
+     * layer's play boundary). 1: inside play_pass, a stream wait on an event this play already waited on (on the same lane,
+     * with no host step that may record events -- expert prefetch, KV stage, host op -- in between) is not put again (every
+     * weight of a moved unit names the unit's one event), and the patches of consecutive table steps
      * go out as shared 24-entry patch kernels, flushed before the next played stretch; 2: 1 + every table of the pass whose
      * moved weights' events have all completed is refreshed once at the pass start (its later steps find nothing pending),
      * the rest at their steps as under 1. 0 / unset: as before. Play-time only (no recording changes). */
