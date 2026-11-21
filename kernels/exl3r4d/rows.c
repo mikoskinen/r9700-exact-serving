@@ -288,9 +288,17 @@ static const RadConstraint c_decode_gu[] = {
 };
 #define N_DECODE_GU (int)(sizeof c_decode_gu / sizeof c_decode_gu[0])
 
-/* v5 moe_exl3_gate_up_down, the decode band's: no h_rot / a_rot keys (the op is defined at a_rot 0, h_rot 1). */
+/* v5 moe_exl3_gate_up_down, the decode band's: no h_rot / a_rot keys (the op is defined at a_rot 0, h_rot 1).
+ * qfn-on-ds lever X3GD (Qwen loop round 5, 21.11.2026; QUEUE Q24): the fused chain's rows may reach past the band's top
+ * (EXL3R4D_GD_M_MAX, 32 here; the decode kernels are correct at any M, a run longer than a pass taking several) while the
+ * split gate_up / down keep EXL3R4D_M_MAX, so a step the architecture sends through the split ops (a prefill piece
+ * among its rows) keeps today's bands. The architecture declares the chain past 16 rows only under its start variable
+ * (RADIANCE_FN4_X3GD_HI); unset, it declares M <= 16 as before and this wider row answers the same declares. */
+#ifndef EXL3R4D_GD_M_MAX
+#define EXL3R4D_GD_M_MAX 32
+#endif
 static const RadConstraint c_decode_gd[] = {
-    RAD_CLE("M", EXL3R4D_M_MAX),
+    RAD_CLE("M", EXL3R4D_GD_M_MAX),
     RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),
@@ -424,7 +432,7 @@ static const RadKernelInfo k_rows[] = {
                     "(h_rot 1); at K = 4 ONE persistent launch (input rotation in its prologue, gate_up's and down's "
                     "units ordered by counters, down of an expert after its gate_up), else the separate kernels; the "
                     "separate ops' bits either way (decode band)",
-        .shape = "M <= 16; K % 128, N % 256 (each class); two parity classes in one grid",
+        .shape = "M <= EXL3R4D_GD_M_MAX (32; the split rows stop at 16); K % 128, N % 256 (each class); two parity classes in one grid",
         .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode_gd, .n_constraints = N_DECODE_GD,
@@ -503,7 +511,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, the decode chain as one op, four classes by number mod 4 (v7): "
                     "gate_up_mod4 (a_rot 0, h_rot 1) then down_mod4 (h_rot 1); at K = 4 ONE persistent launch, else "
                     "the separate kernels; the separate ops' bits either way (decode band)",
-        .shape = "M <= 16; K % 128, N % 256 (each class); four classes in one grid",
+        .shape = "M <= EXL3R4D_GD_M_MAX (32; the split rows stop at 16); K % 128, N % 256 (each class); four classes in one grid",
         .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode_gd, .n_constraints = N_DECODE_GD,
