@@ -34,7 +34,7 @@ __device__ __forceinline__ uint32_t u4get(r4d_u32x4 v, int q) { return v[q]; }
 template<int R, int M>
 __global__ __launch_bounds__((R + r4dwalk::NLW) * 32)
 void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const int* __restrict__ uoff,
-                          const int* __restrict__ upos, int* __restrict__ wstat)
+                          const int* __restrict__ upos, int* __restrict__ wstat, int wflags)
 {
     using namespace r4dwalk;
     constexpr int NS = 2 * M;
@@ -105,11 +105,13 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
                 }
             }
         };
-        if (nr > 0) issue(0);
+        // bench oracle (wflags bit 1): no loads and no stores, the rounds' barriers only -- the compute + sync floor (bytes wrong)
+        const bool noload = (wflags & 1) != 0;
+        if (nr > 0 && !noload) issue(0);
         for (int j = 0; j < nr; ++j) {
-            store(j);
+            if (!noload) store(j);
             lds_barrier();                       // B_j: round j's pages visible
-            if (j + 1 < nr) issue(j + 1);        // in flight during round j's compute
+            if (j + 1 < nr && !noload) issue(j + 1);   // in flight during round j's compute
             lds_barrier();                       // A_j: round j computed; round j + 1 may overwrite round j - 1's slots
         }
         return;
@@ -294,7 +296,7 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
             #pragma unroll
             for (int i = 0; i < 4; ++i) e[i] = bt[min(t0 + i, lastb)];
         }
-        tile(res, ti, e, sl);
+        if (!(wflags & 2)) tile(res, ti, e, sl);   // bench oracle (wflags bit 2): no tile math -- the load rounds' floor (bytes wrong)
         if (res) ++n_lds; else ++n_glb;
     }
     while (nb < 2 * nr) { lds_barrier(); ++nb; }
@@ -324,10 +326,10 @@ void r4d_attn_walk_kernel(const R4DArgs a, const int* __restrict__ ulist, const 
 /* The bench entry (r4d_selftest --perfatwalk): attn_decode_gq_h256_gqa6_bs4_fp8kv's RadArgs, plus the union lists
  * (`ulist` page ids of group g at [uoff[g], uoff[g + 1]), groups of R consecutive rows; `upos` [rows][max_blocks] each
  * entry's place in its group's union), R in {4, 8, 16}, M in {7, 15}; `wstat` (2 ints, may be null) counts tiles from
- * the ring / from the cache. The walk writes today's f16 partials at splits 1; the merge is today's gated one.
+ * the ring / from the cache; `wflags` 0 = the walk, bench oracles (wrong bytes, timing only): bit 1 no loads, bit 2 no tile math. The walk writes today's f16 partials at splits 1; the merge is today's gated one.
  * Returns RAD_OK, a refusal (splits != 1, a geometry it does not serve) or -100 - hipError_t. */
 extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const int* ulist, const int* uoff,
-                                       const int* upos, int R, int M, int* wstat) {
+                                       const int* upos, int R, int M, int* wstat, int wflags) {
     R4DArgs r;
     const int rc = g8_decode_common(a, &r, 256);
     if (rc != RAD_OK) return rc;
@@ -342,7 +344,7 @@ extern "C" int r4d_attn_walk_gq6_bench(const RadArgs* a, RadStream stream, const
     const int groups = (r.num_seqs + R - 1) / R;
     int emit_rc = RAD_OK;
 #define WALK_LAUNCH(RR, MM) emit_rc = R4D_EMIT(stream, (r4d_attn_walk_kernel<RR, MM>), dim3(groups, r.kv_heads, 1), \
-                                               dim3((RR + r4dwalk::NLW) * 32), 0, r, ulist, uoff, upos, wstat)
+                                               dim3((RR + r4dwalk::NLW) * 32), 0, r, ulist, uoff, upos, wstat, wflags)
     if      (R == 4  && M == 15) WALK_LAUNCH(4, 15);
     else if (R == 8  && M == 15) WALK_LAUNCH(8, 15);
     else if (R == 16 && M == 15) WALK_LAUNCH(16, 15);

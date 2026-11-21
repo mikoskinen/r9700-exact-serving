@@ -5774,7 +5774,7 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
     if (iters <= 0) iters = 20;
     const char* rowname = "attn_decode_gq_h256_gqa6_bs4_fp8kv";
     const RadKernelInfo* rk = find(pl, rowname);
-    typedef int (*WalkFn)(const RadArgs*, RadStream, const int*, const int*, const int*, int, int, int*);
+    typedef int (*WalkFn)(const RadArgs*, RadStream, const int*, const int*, const int*, int, int, int*, int);
     const WalkFn wf = (WalkFn)dlsym(pl.h, "r4d_attn_walk_gq6_bench");
     if (!rk || !wf) { std::printf("--perfatwalk: %s or r4d_attn_walk_gq6_bench absent\n", rowname); return; }
     FILE* f = std::fopen(path, "rb");
@@ -5910,7 +5910,7 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
         st_memcpy(d_up, upos.data(), upos.size() * 4, hipMemcpyHostToDevice);
         st_memset(d_ws, 0, 16);
         poison();
-        rc = wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, (int*)d_ws);
+        rc = wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, (int*)d_ws, 0);
         if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  walk R%-2d M%-2d%s rc=%d (not served)\n", R, M, rl ? " re-load" : "", rc); continue; }
         fetch(got_o, got_q8, got_s);
         int32_t ws[4] = { 0, 0, 0, 0 };
@@ -5919,12 +5919,18 @@ static void attn_walk_perf(const Plugin& pl, const char* path, int64_t rows_want
         for (size_t i = 0; i < ob; ++i) bo += got_o[i] != ref_o[i];
         for (size_t i = 0; i < q8b; ++i) bq += got_q8[i] != ref_q8[i];
         for (size_t i = 0; i < sb; ++i) bsd += got_s[i] != ref_s[i];
-        const double us = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr); });
+        const double us = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr, 0); });
         const double ub = (double)ulist.size() * bs * rowb;
         std::printf("  walk R%-2d M%-2d%s %9.1f us a call (%+.1f %% vs today)   bytes vs today: o %lld / q8 %lld / s %lld differ -> %s   "
                     "tiles ring %d / cache %d   list %.1f MB a call (per-row reads / list %.2f)\n",
                     R, M, rl ? " re-load" : "", us, 100.0 * (us - us0) / us0, (long long)bo, (long long)bq, (long long)bsd,
                     (bo || bq || bsd) ? "DIFFERENT" : "IDENTICAL", ws[0], ws[1], ub / 1e6, ub > 0 ? kv / ub : 0.0);
+        if (rl) {   /* the walk's floors (Qwen loop F34): wrong bytes, timing only */
+            const double un = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr, 1); });
+            const double uc = timed([&] { wf(&a, nullptr, (const int*)d_ul, (const int*)d_uo, (const int*)d_up, R, M, nullptr, 2); });
+            std::printf("  walk R%-2d M%-2d re-load ORACLES (bytes not compared): no loads %9.1f us a call (compute + sync floor), "
+                        "no tile math %9.1f us a call (load rounds floor)\n", R, M, un, uc);
+        }
     }
     const double us1 = timed([&] { rk->launch(&a, nullptr); });
     std::printf("  today     %9.1f us a call (again: drift)\n", us1);

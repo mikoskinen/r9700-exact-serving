@@ -146,7 +146,7 @@ std::vector<uint8_t> today(const Sel& s, const Ops& o) {
 
 void launch_walk(int R, int M, const R4DArgs& a, int groups, const int* ul, const int* uo, const int* up, int* ws) {
 #define WL(RR, MM) if (R == RR && M == MM) { hipLaunchKernelGGL((r4d_attn_walk_kernel<RR, MM>), dim3(groups, 1, 1), \
-                                                               dim3((RR + r4dwalk::NLW) * 32), 0, nullptr, a, ul, uo, up, ws); return; }
+                                                               dim3((RR + r4dwalk::NLW) * 32), 0, nullptr, a, ul, uo, up, ws, 0); return; }
     WL(4, 15) WL(8, 15) WL(16, 15) WL(8, 7) WL(16, 7)
 #undef WL
     std::printf("  no instance R %d M %d\n", R, M);
