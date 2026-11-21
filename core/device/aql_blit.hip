@@ -95,6 +95,12 @@ struct AqlCik {
                 }
             }
             __syncthreads();
+            /* tp8 loop R48: upstream 8f2e511f part 2 (libr4d r4d_chain.h r4d_chain_acquire) -- behind a real wait the scalar data
+             * cache is emptied by hand too; the copies' data are vector loads, their sizes / pointers kernel arguments, so this is
+             * the same insurance as the libr4d entry, not a known stale read here. */
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            asm volatile("s_dcache_inv" ::: "memory");
+            return;
         }
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
