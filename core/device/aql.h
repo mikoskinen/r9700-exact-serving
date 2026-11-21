@@ -111,6 +111,61 @@ void waitk_set_for_test(int mode);
  * (0 in a build without the AQL backend). */
 int waitk_mode_now();
 
+/* ------------------------------------------------------------------ lever IKA: which kernels a module names
+ *
+ * RADIANCE_AQL_IKA=1 (DRAFTER track round 50; core reviewed in tp8 loop W3): a kernel is self-acquiring when the shared
+ * object holding its code lists its identifier in `r4d_ika_kernels` (aql.cpp ika_kernel). The list holds bare
+ * identifiers; the symbol is the Itanium-mangled name, so the match is on the kernel's OWN identifier: the source name
+ * right after `_Z` (`_Z19exl3r4d_gemm_kernelILi..`), or the last source name of a nested name before its template
+ * arguments or its end (`_ZN12_GLOBAL__N_113binary_kernelEPKt..` -> binary_kernel: libr4d's kernels sit in anonymous
+ * namespaces). Namespace components and template arguments never match (`_Z6kernelI13binary_kernelEvv` is `kernel`).
+ * A name that does not start with `_Z` is an extern "C" kernel: its symbol is its identifier. Anything this does not
+ * parse gives "" -- such a kernel is never treated as self-acquiring (both packet fences stay). */
+inline std::string ika_identifier(const std::string& sym) {
+    if (sym.compare(0, 2, "_Z") != 0) return sym;
+    size_t p = 2;
+    auto source_name = [&](std::string* out) {   /* <number><identifier> at p */
+        size_t q = p, n = 0;
+        while (q < sym.size() && sym[q] >= '0' && sym[q] <= '9') n = n * 10 + (size_t)(sym[q++] - '0');
+        if (q == p || n == 0 || q + n > sym.size()) return false;
+        *out = sym.substr(q, n);
+        p = q + n;
+        return true;
+    };
+    auto abi_tags = [&] {                         /* B<source-name>... after a name */
+        std::string tag;
+        while (p < sym.size() && sym[p] == 'B') { ++p; if (!source_name(&tag)) return false; }
+        return true;
+    };
+    if (p < sym.size() && sym[p] == 'L') ++p;     /* internal linkage (a static kernel) */
+    std::string id;
+    if (p < sym.size() && sym[p] == 'N') {        /* N [CV] [ref] <prefix>* <unqualified-name> E */
+        ++p;
+        while (p < sym.size() && (sym[p] == 'r' || sym[p] == 'V' || sym[p] == 'K')) ++p;
+        if (p < sym.size() && (sym[p] == 'R' || sym[p] == 'O')) ++p;
+        if (sym.compare(p, 2, "St") == 0) p += 2; /* std:: */
+        bool any = false;
+        while (p < sym.size()) {
+            if (sym[p] == 'E' || sym[p] == 'I') return any ? id : std::string();
+            if (sym[p] == 'L') { ++p; continue; } /* internal linkage inside a nested name */
+            if (!source_name(&id) || !abi_tags()) return std::string();
+            any = true;
+        }
+        return std::string();
+    }
+    if (sym.compare(p, 2, "St") == 0) p += 2;
+    if (!source_name(&id) || !abi_tags()) return std::string();
+    return id;
+}
+/* Whether `sym`'s own identifier is one of the `n` names of `list` (null / empty entries skipped). */
+inline bool ika_listed(const std::string& sym, const char* const* list, int n) {
+    const std::string id = ika_identifier(sym);
+    if (id.empty() || !list) return false;
+    for (int i = 0; i < n; ++i)
+        if (list[i] && *list[i] && id == list[i]) return true;
+    return false;
+}
+
 }  // namespace aql
 }  // namespace rad
 

@@ -540,7 +540,10 @@ struct ResolveClock {
  * since the last one (the plain rule's set; Ctx::haz_mark). cohbench3 (drafter/kit/mes): 0 stale elements in 300 trials
  * x 3 sizes with the kernel's own acquire and the packets' acquire + release none, vs 1.2 M - 1.9 G with none and no
  * kernel acquire. RADIANCE_AQL_IKA=1 at start: a kernel is IKA when the shared object holding its code exports
- * `const char* const* r4d_ika_kernels(int* n)` naming it (an identifier, matched as the mangled name's <length><name>). */
+ * `const char* const* r4d_ika_kernels(int* n)` naming it (an identifier, matched against the kernel's OWN identifier in
+ * its mangled name: aql.h ika_identifier; tp8 loop W3: the first form matched `<length><name>` behind a non-digit only,
+ * so libr4d's anonymous-namespace kernels, `_ZN12_GLOBAL__N_1<length><name>..`, never matched -- 32 of the 1,634
+ * kernels ds41-drafter-ika-f1349e59's libr4d names). */
 bool ika_on() {
     static const bool on = [] {
         const char* e = std::getenv("RADIANCE_AQL_IKA");
@@ -566,15 +569,7 @@ bool ika_kernel(const Module* m, const std::string& name) {
     if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return false;
     int n = 0;
     const char* const* v = fn(&n);
-    for (int i = 0; v && i < n; ++i) {
-        if (!v[i] || !*v[i]) continue;
-        const std::string key = std::to_string(std::strlen(v[i])) + v[i];
-        const size_t at = name.find(key);
-        /* <length><name> starts the identifier: the character before it is not a digit */
-        if (at != std::string::npos && (at == 0 || !std::isdigit((unsigned char)name[at - 1]))) return true;
-        if (name == v[i]) return true;   /* an extern "C" kernel: its symbol is its name */
-    }
-    return false;
+    return ika_listed(name, v, n);
 }
 
 KernelRec* resolve(Func* fn, int ord) {
