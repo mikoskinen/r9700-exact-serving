@@ -47,7 +47,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d_pf", "pp_tband", "pp_merge", "pp_merge_ms", "pp_rband",
                                         "sched_srf", "aql_hdp", "ds41_csplit", "sched_lane_room", "pp_send_ash",
                                         "aql_waitk", "aql_ika", "ds41_rr1", "dspark_mhr", "dspark_hs",
-                                        "host_spin" };
+                                        "host_spin", "pp_bg_split" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -527,7 +527,8 @@ bool sched_switch(int i) {
            i == kDraftShortBlk ||                   /* tp8 loop D23: the engine's (block_shape) */
            i == kStageLone ||                       /* SAL (ds41-pf2): the engine's, as stage_short */
            i == kPpBgRoom || i == kPpBgJoinMs ||    /* tp8 loop P23s: the leader's lanes, as stage_short */
-           i == kPpMerge || i == kPpMergeMs;        /* tp8 MERGE: the leader's lanes, as stage_short */
+           i == kPpMerge || i == kPpMergeMs ||      /* tp8 MERGE: the leader's lanes, as stage_short */
+           i == kPpBgSplit;                         /* tp8 loop D62: the leader's lanes, as pp_bg_room */
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -1104,7 +1105,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, ds41_csplit, sched_lane_room, pp_send_ash, aql_waitk, aql_ika, ds41_rr1, dspark_mhr, dspark_hs, host_spin, pp_bg_split, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1161,6 +1162,14 @@ static bool check_here(const std::string& name, int v, std::string* err) {
     if (i == kPpBgRoom) {   /* tp8 loop P23s */
         if (v != 0 && (v < 256 || v > 65536)) {
             if (err) *err = "pp_bg_room takes 0 (the shared budget) or 256 .. 65536 (rows of lent newcomers a BG lane's inbox holds)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kPpBgSplit) {   /* tp8 loop D62 */
+        if (v < 0 || v > 2) {
+            if (err) *err = "pp_bg_split takes 0 (a BG newcomer whole to one BG lane), 1 (cut on the 512 grid near its middle, the two "
+                            "pieces to two BG lanes: RADIANCE_PP_BG_SPLIT=1) or 2 (as 1 only where both BG lanes are idle)";
             return false;
         }
         return true;

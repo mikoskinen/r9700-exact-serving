@@ -273,10 +273,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
         RAD_INFO("two-node pipeline: a lent piece's commit opens its home request's drafter range as the home's own chunk would, so "
                  "a newcomer the BG lane ran whole drafts from its second token on (tp8 loop F22)");
     if (lanes_.bg_lane() >= 0 && lanes_.bg_split())
-        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_SPLIT=1 -- %s", lanes_.bg_n() >= 2
+        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_SPLIT=%d -- %s%s", lanes_.bg_split(), lanes_.bg_n() >= 2
                      ? "a BG newcomer is cut at the 512-grid point nearest its middle (>= 128 rows a side) and its two pieces go to two "
                        "BG lanes in the planning order (tp8 dev M8)"
-                     : "not taken: it needs RADIANCE_PP_BG_LANE=2 or more");
+                     : "not taken: it needs RADIANCE_PP_BG_LANE=2 or more",
+                 lanes_.bg_split() == 2 && lanes_.bg_n() >= 2
+                     ? ", only where both lanes are idle: an empty inbox and no BG step in flight, else whole (tp8 loop D62)" : "");
     if (lanes_.bg_hold_ms() > 0)
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%lld -- a newcomer the BG lanes have no room for is left out of its "
                  "home's step (the step goes out with its decode rows alone) and planned again at the home's next step, for a BG "
@@ -287,6 +289,8 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     /* tp8 loop P23s: the in-process switches pp_bg_room / pp_bg_join_ms start at the env's values (0 without a BG lane) */
     fn4::note_sched(fn4::kPpBgRoom, (int)lanes_.bg_room());
     fn4::note_sched(fn4::kPpBgJoinMs, (int)lanes_.bg_join_ms());
+    /* tp8 loop D62: fn4 pp_bg_split starts at RADIANCE_PP_BG_SPLIT (0 unset; 0 without a BG lane) */
+    fn4::note_sched(fn4::kPpBgSplit, lanes_.bg_lane() >= 0 ? lanes_.bg_split() : 0);
     /* tp8 MERGE: fn4 pp_merge starts at RADIANCE_PP_MERGE (0 unset), taken with two decode lanes or more */
     {
         int v = 0;
@@ -818,10 +822,11 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
                  (long long)lanes_.lane_rows_m(), (long long)lanes_.lane_rows_kept());
     if (lanes_.bg_lane() >= 0)
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
-                 "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "
-                 "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld; drafter ranges opened "
-                 "by a lent piece's commit %lld (on, tp8 loop F22)%s%s", lanes_.bg_lane(),
+                 "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT / pp_bg_split; %lld whole for want "
+                 "of two lanes' room, %lld for a busy BG lane under pp_bg_split 2); kept home: a prefix restore %lld, the BG lanes' room "
+                 "%lld, not a planner %lld; drafter ranges opened by a lent piece's commit %lld (on, tp8 loop F22)%s%s", lanes_.bg_lane(),
                  (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
+                 (long long)c.bg_skip[LaneSet::kBgSplitBusy],
                  (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
                  (long long)c.bg_skip[LaneSet::kBgOrder], (long long)c.bg_floor,
                  lanes_.bg_hold_ms() > 0

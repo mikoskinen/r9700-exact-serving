@@ -58,7 +58,7 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     bg_rows_n_ = bg_rows_env();   /* tp8 loop D47 */
     lane_rows_m_ = lane_rows_env();   /* tp8 loop D47b */
     const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
-    bg_split_ = bs && !std::strcmp(bs, "1");
+    bg_split_ = bs && !std::strcmp(bs, "1") ? 1 : bs && !std::strcmp(bs, "2") ? 2 : 0;   /* 2: tp8 loop D62 */
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh) {
         char* end = nullptr;
         const long long v = std::strtoll(bh, &end, 10);
@@ -869,12 +869,23 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
         /* a snapshot inside the first piece keeps the entry whole (its next piece would wait for its commit at h > 0) */
         if (x && e.ckpt_slot >= 0 && c0 + e.ckpt_tok + 1 <= x) x = 0;
         if (x) {
+            /* tp8 loop D62 (pp_bg_split 2): both pieces' lanes idle -- an empty inbox and no BG step in flight -- else whole */
+            const bool idle_only = lanes_->bg_split() == 2;
+            bool busy = false;
             size_t k = 0;
-            for (; k < bgo.size() && to < 0; ++k)
+            for (; k < bgo.size() && to < 0; ++k) {
+                if (idle_only && !lanes_->bg_idle_locked(bgo[k])) { busy = true; continue; }
                 if (room(bgo[k], x - c0)) to = bgo[k];
-            for (; k < bgo.size() && to2 < 0; ++k)
+            }
+            for (; k < bgo.size() && to2 < 0; ++k) {
+                if (idle_only && !lanes_->bg_idle_locked(bgo[k])) { busy = true; continue; }
                 if (room(bgo[k], end - x)) to2 = bgo[k];
-            if (to < 0 || to2 < 0) { x = 0; to = to2 = -1; lanes_->note_bg_skip_locked(LaneSet::kBgSplitRoom); }
+            }
+            if (to < 0 || to2 < 0) {
+                x = 0;
+                to = to2 = -1;
+                lanes_->note_bg_skip_locked(busy ? LaneSet::kBgSplitBusy : LaneSet::kBgSplitRoom);
+            }
         }
     }
     if (!x)

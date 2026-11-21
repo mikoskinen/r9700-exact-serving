@@ -600,6 +600,14 @@
  *                   order, step, byte or plan rule reads it (rule A). Read at every wait. Unset: the start's RADIANCE_HOST_SPIN
  *                   (the same values; anything else = 0). A follower switch (each node's own threads); one machine takes it too
  *                   (its rank barrier).
+ *   pp_bg_split     engine, the two-node LEADER's lanes (tp8 loop D62, DECODE round 49; 112 here, after host_spin): how a BG newcomer
+ *                   is lent (Scheduler::lane_split_bg) with two BG lanes or more (RADIANCE_PP_BG_LANE >= 2): 0 -- whole, to one BG
+ *                   lane (today's program); 1 -- tp8 dev M8's RADIANCE_PP_BG_SPLIT=1: cut at the 512-grid point nearest its middle
+ *                   (>= 128 rows a side; answer-neutral: only which rows share a pass), the first piece to the first BG lane with
+ *                   room, the rest to a later one; 2 -- as 1, but only where both lanes are IDLE (an empty inbox and no BG step in
+ *                   flight), else whole (the low-load form: the follower starts on the first piece's body while the leader runs
+ *                   the second piece's head). Read at each lend. Unset: the start's RADIANCE_PP_BG_SPLIT (0 / 1 / 2). The
+ *                   leader's own (the follower skips it by name).
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -836,7 +844,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

@@ -180,13 +180,20 @@ public:
     void set_bg(int k) { bg_ = k > 0 ? k : 0; }
     /* M8's counts: newcomers lent whole to the BG lane, their rows, and why one stayed home (a prefix restore, the BG lane's
      * room, the BG lane not among this plan's planners) */
-    enum { kBgRestore, kBgRoom, kBgOrder, kBgSplitRoom, kBgWhyN };
+    enum { kBgRestore, kBgRoom, kBgOrder, kBgSplitRoom, kBgSplitBusy, kBgWhyN };   /* kBgSplitBusy: tp8 loop D62, pp_bg_split 2 */
     void note_bg_locked(int64_t rows) { ++bg_lent_; bg_rows_ += rows; }
     /* RADIANCE_PP_BG_SPLIT=1 (with two BG lanes or more): a newcomer cut on the 512 grid near its middle, its two pieces to two
-     * BG lanes in the planning order (Scheduler::lane_split_bg) */
-    bool bg_split() const { return bg_split_; }
-    void set_bg_split(bool on) { bg_split_ = on; }
+     * BG lanes in the planning order (Scheduler::lane_split_bg). tp8 loop D62 (fn4 pp_bg_split, the env its start value): 2 = the
+     * same cut only where both lanes are idle (bg_idle_locked), else the newcomer goes whole; 0 = whole always (today). */
+    int  bg_split() const { return bg_split_; }
+    void set_bg_split(int mode) { bg_split_ = mode >= 0 && mode <= 2 ? mode : 0; }
     void note_bg_split_locked() { ++bg_split_n_; }
+    /* tp8 loop D62: a BG lane with nothing to run -- an empty inbox and no step of its own in flight (its plan noted by
+     * note_bg_take_locked, not yet committed) */
+    bool bg_idle_locked(int lane) const {
+        if (lane < 0 || (size_t)lane >= inbox_.size() || !inbox_[(size_t)lane].empty()) return false;
+        return (size_t)lane >= bgt0_.size() || bgt0_[(size_t)lane] <= 0;
+    }
     /* tp8 loop F22 (with BG lanes): a lent piece's commit records the block
      * drafter's range in its home's request as the home's own Scheduler::block_end would have (the lane that ran the piece
      * ran the drafter's context pass over its rows: block_begin mirrors every entry, the drafter's KV is the sequence's in
@@ -417,7 +424,7 @@ private:
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
     int     bg_ = 0;                        /* RADIANCE_PP_BG_LANE=k (bg_lane, tp8 dev M8) */
     int64_t bg_lent_ = 0, bg_rows_ = 0, bg_skip_[kBgWhyN] = {}, bg_split_n_ = 0;
-    bool    bg_split_ = false;              /* RADIANCE_PP_BG_SPLIT=1 (bg_split, tp8 dev M8) */
+    int     bg_split_ = 0;                  /* RADIANCE_PP_BG_SPLIT=1 / 2 (bg_split, tp8 dev M8; 2 and fn4 pp_bg_split: tp8 loop D62) */
     int64_t bg_floor_n_ = 0;
     int64_t bg_hold_ms_ = 0;                /* RADIANCE_PP_BG_HOLD_MS (bg_hold_ms, tp8 dev D11) */
     int64_t bg_room_ = 0;                   /* RADIANCE_PP_BG_ROOM (bg_room, tp8 loop P23) */

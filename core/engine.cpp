@@ -1067,6 +1067,20 @@ void Engine::fn4_apply_changes(const int* sw) {
                 if (lanes_.bg_lane() >= 0) lanes_.set_bg_join_ms(sw[fn4::kPpBgJoinMs]);
                 fn4::note_sched(fn4::kPpBgJoinMs, lanes_.bg_lane() >= 0 ? (int)lanes_.bg_join_ms() : 0);
             }
+            /* tp8 loop D62: pp_bg_split -- how the next BG newcomers are lent (the pieces in flight keep their lanes); the counts so
+             * far, so an in-process arm reads its own by difference */
+            if (sw[fn4::kPpBgSplit] != fn4::kNoChange) {
+                const int was = lanes_.bg_split();
+                if (lanes_.bg_lane() >= 0) lanes_.set_bg_split(sw[fn4::kPpBgSplit]);
+                fn4::note_sched(fn4::kPpBgSplit, lanes_.bg_lane() >= 0 ? lanes_.bg_split() : 0);
+                if (lanes_.bg_lane() >= 0) {
+                    const LaneSet::Counts c = lanes_.counts();
+                    RAD_INFO("two-node pipeline: pp_bg_split %d -> %d (tp8 loop D62): so far %lld newcomers lent to the BG lanes, %lld "
+                             "of them in two pieces, %lld whole for want of two lanes' room, %lld whole for a busy BG lane", was,
+                             lanes_.bg_split(), (long long)c.bg, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
+                             (long long)c.bg_skip[LaneSet::kBgSplitBusy]);
+                }
+            }
             /* tp8 MERGE: the decode lanes' merge (core/sched/lanes.h), read by step_loop_lanes at its next round on this thread;
              * only with two decode lanes or more (else 0). The follower plans nothing: it notes the value and does nothing. */
             if (sw[fn4::kPpMerge] != fn4::kNoChange) {
