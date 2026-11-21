@@ -773,6 +773,9 @@ public:
      * step can be saved whole (Engine::save_checkpoints: no CONV group, or a plugin serving its window,
      * fn4::ckpt_conv_src); without it the switch acts as 0. */
     void    set_tail_inner_capable(bool ok);
+    /* qfn-on-ds lever TIP (Qwen loop round 21): the engine saves a snapshot inside a step only at the start of one of the
+     * chunk's pieces (the plugin stages its rows there); elsewhere lever TI cuts the chunk as lever G does. */
+    void    set_tail_inner_pieces(bool on) { tail_inner_pieces_ = on; }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
@@ -909,6 +912,7 @@ private:
      * plan_chunk's own budget is the room). */
     int           tail_inner_sw_ = 0;
     bool          tail_inner_ok_ = false;
+    bool          tail_inner_pieces_ = false;   /* lever TIP: inside snapshots only at a piece start */
     int64_t       ti_limit_ = INT64_MAX;
     /* A request has latched the lever in this process: snapshots off the resume grid may exist (admit_one's short-resume
      * rule and plan_chunk's off-grid start act only then, so the switch at 0 from start is today's scheduler). */

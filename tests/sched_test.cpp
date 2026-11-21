@@ -927,9 +927,9 @@ TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold
     std::string err;
     int da[rad::fn4::kSwitches];
     struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
-    auto go = [&](int ti, int64_t lin) {
+    auto go = [&](int ti, int64_t lin, int grid = 256, int n = 1700, bool pieces = true) {
         CHECK(rad::fn4::request("resume_cold", 1, &err));
-        CHECK(rad::fn4::request("sched_tail_grid", 256, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", grid, &err));
         CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
         rad::fn4::apply_pending(0, da);
         Fixture f;
@@ -938,12 +938,13 @@ TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold
         f.cfg.prefix_exact = true;
         CHECK_OK(f.start());
         f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(pieces);
         if (lin > 0) {
-            f.pc.seed(1700);
+            f.pc.seed(n);
             f.pc.lin = lin;
             f.pc.src = 3;
         }
-        const uint64_t a = f.submit(1700, 2);
+        const uint64_t a = f.submit(n, 2);
         Run o;
         for (int k = 0; k < 40 && f.sch.step(); ++k) {
             for (const StepEntry& e : f.sch.plan().e)
@@ -974,6 +975,14 @@ TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold
     CHECK_EQ(hit_g.resumed, (int64_t)1536);
     const Run off_grid = go(1, 1408);                          /* an inside snapshot off the piece grid: not a resume point */
     CHECK_EQ(off_grid.resumed, (int64_t)1280);
+    /* the TIP mode keeps lever TI to piece starts: a 1650-token prompt's 128-grid tail at 1408 (off the piece grid) is cut as
+     * lever G cuts it; lever TI alone (the DS line's, pieces off) takes it inside */
+    const Run g128_tip = go(1, 0, 128, 1650, true);
+    CHECK_EQ(g128_tip.inner, (int64_t)-1);
+    REQUIRE(!g128_tip.pc.empty());
+    CHECK_EQ(g128_tip.pc.back().first, (int64_t)1408);
+    const Run g128_ti = go(1, 0, 128, 1650, false);
+    CHECK_EQ(g128_ti.inner, (int64_t)1408);
     CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
     CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
     CHECK(rad::fn4::request("resume_cold", 0, &err));

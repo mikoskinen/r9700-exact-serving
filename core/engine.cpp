@@ -3146,7 +3146,12 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                      : "NOT served (no plugin serves rad_tip_set on every rank, no prefix cache, or the model snapshots a "
                        "window): lever TI acts as without it");
         }
+        /* lever TIP alone (no plugin serving a CONV window's ids): lever TI takes a snapshot inside a step only where TIP
+         * stages it, at a piece start; elsewhere it cuts as lever G (a row the plugin refuses would fail the step) */
+        const bool tip_pieces = tip_on_ && !ti_capable_;
         ti_capable_ = ti_capable_ || tip_on_;
+        sched_.set_tail_inner_pieces(tip_pieces);
+        for (auto& ls : lane_sched_) ls->set_tail_inner_pieces(tip_pieces);
         sched_.set_tail_inner_capable(ti_capable_);
         for (auto& ls : lane_sched_) ls->set_tail_inner_capable(ti_capable_);   /* tp8 S5 */
     }

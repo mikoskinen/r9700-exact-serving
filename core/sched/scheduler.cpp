@@ -2061,7 +2061,9 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
          * chunk never takes the full plan -- an arena recall -- that its two pieces would not) */
         const bool ti = fine > 0 && tail_inner_sw_ > 0 && tail > n_computed && tail < n_target &&
                         n_computed + want == n_target && n_target - n_computed <= ti_limit_ && !geo_.on_grid(tail) &&
-                        (span_now_ || geo_.shared_tok <= 0 || n_target - n_computed <= geo_.shared_tok);
+                        (span_now_ || geo_.shared_tok <= 0 || n_target - n_computed <= geo_.shared_tok) &&
+                        /* lever TIP: only at the start of one of the chunk's pieces, where the plugin stages its rows */
+                        (!tail_inner_pieces_ || (I > 0 && (tail - n_computed) % I == 0));
         if (ti) {
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (tail > n_computed && n_computed + want >= tail) {
