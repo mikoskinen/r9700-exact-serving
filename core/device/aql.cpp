@@ -555,6 +555,24 @@ bool ika_on() {
     return on;
 }
 
+/* Lever CHI (DRAFTER track round 52, 21.11.2026; start env RADIANCE_AQL_CHI=1, read only while lever IKA is on): a CHAINED kernel's
+ * form (RadKernelChainFn, r4d_chain.h) fences itself whenever its record is on -- an agent acquire after its wait, an agent release
+ * before its add -- so a chained record is captured as self-acquiring and plays as lever IKA's records do: release none, and acquire
+ * none where Ctx::haz_mark allows (the scalar-cache rule). Today a chained record keeps the packet's agent acquire, and the packet
+ * processor runs that acquire before it launches the next dispatch, so a chained kernel behind a chained one gains ~nothing over an
+ * ordered one (drafter/kit/mes/mesc.cpp r52c / r52d, xeon card 1, 200 dependent packets: tiny 3.08 vs 3.01 us a dispatch ordered
+ * with IKA, 64 x 256 8.62 vs 7.34) while the same chain with the packet's acquire none costs 1.85 / 5.27. One more condition, for the
+ * argument slot (rewritten every play): the slot's previous use must lie before the queue's last ORDERED packet with an acquire. */
+bool chi_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_AQL_CHI");
+        const bool v = e && e[0] == '1';
+        if (v) RAD_INFO("aql: lever CHI on (RADIANCE_AQL_CHI=1): a chained record plays as a self-acquiring one while lever IKA is on");
+        return v;
+    }();
+    return on;
+}
+
 bool ika_kernel(const Module* m, const std::string& name) {
     if (!ika_on() || !m || !m->bundle) return false;
     Dl_info di{};
@@ -699,6 +717,10 @@ struct Stream {
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
     int64_t         last_sys_acq = -(int64_t)kQueuePackets;
+    /* Lever CHI (DRAFTER track round 52): the latest packet that went out ORDERED (barrier bit) with an acquire of agent scope or
+     * wider -- the packet processor ran its acquire after everything before it had completed, so no scalar cache line of an
+     * argument slot written before it can survive it. */
+    int64_t         last_oacq = -2 * (int64_t)kQueuePackets;
     uint64_t        epoch = 0;                /* host epoch at the last system acquire */
     hsa_signal_t    ride{};                   /* rad_ride: the next dispatch's completion signal */
     bool            agent_only = false;       /* rad_xp_stream_create: never a system-scope acquire */
@@ -1113,6 +1135,9 @@ inline void host_writes_out(Stream* s) {
 }
 
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
+    if (((header >> HSA_PACKET_HEADER_BARRIER) & 1u) &&
+        ((header >> HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) & 3u) >= HSA_FENCE_SCOPE_AGENT)
+        s->last_oacq = (int64_t)idx;   /* lever CHI */
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
     host_writes_out(s);                 /* the argument slot, written before the header */
@@ -1327,7 +1352,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika);
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, k->ika || (chain && ika_on() && chi_on()));
     /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
      * bookkeeping to the next real packet; everything else as for any dispatch. */
     const bool aside = (fence & kFenceAside) != 0;
@@ -1469,8 +1494,13 @@ struct PlayRun {
          * lever); with RADIANCE_AQL_IKA unset no record is self-acquiring and the switch reads 0. */
         const bool ika_live = ika_on() && rad::fn4::aql_ika() >= 1;   /* 2 = 1 + lever IKB (launch-time only) */
         const bool mark = ika_play_mark(ika_live, r.noacq != 0, r.noacq_ika != 0, r.ika != 0, r.ikaok != 0);
+        /* Lever CHI (DRAFTER round 52, re-based on W3s in round 53): a chained record (its record on at this play) takes lever IKA's
+         * own drop while IKA plays, when the slot's previous use is older than the queue's last ordered packet with an acquire (its
+         * scalar-cache lines of the slot cannot be stale); the rule's marks never drop a chained record's acquire, as before. */
+        const bool chi_ok = ika_live && r.chain && chain && chi_on() && r.ika && r.ikaok &&
+                            (int64_t)idx - (int64_t)(s->mask + 1) < s->last_oacq;
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_none_() || (mark && !r.chain && !foreign && aql_acq_mode() == 1)))
+            (aql_acq_none_() || (((mark && !r.chain) || chi_ok) && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent
@@ -1493,6 +1523,7 @@ struct PlayRun {
             stamp->chained = chain;
         }
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
+        if (ordered && acq >= HSA_FENCE_SCOPE_AGENT) s->last_oacq = (int64_t)idx;   /* lever CHI */
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
