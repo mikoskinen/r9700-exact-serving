@@ -53,6 +53,19 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 #ifndef R4D_CHAIN_SLOW
 #define R4D_CHAIN_SLOW 16
 #endif
+// The acquire behind a chained WAIT (upstream 8f2e511f part 2, ported in tp8 loop R48): the vector caches by the fence, the scalar
+// data cache by hand, which the fence leaves. A load whose address every lane shares is a scalar load served from the scalar data
+// cache (a GEMM's row scales, a routed kernel's counts and offsets); the packet processor's acquire empties that cache when it
+// LAUNCHES the kernel, which for a chained kernel waiting in its prologue is before the kernels in front have written. Upstream,
+// R9700, packet acquire on: one launch in 1,800 read a stale shared value without it, none with it. Every wave, for the compute
+// unit it runs on. A record with target 0 (lever CIK: launched WITH its barrier bit, behind everything before it) waits for
+// nothing and keeps the fence alone: its packet's acquire, where kept, ran after the kernels in front completed; where lever
+// CHI / CTA dropped it, lever IKA's scalar-cache rule (Ctx::haz_mark) decided, as for an IKA record.
+__device__ __forceinline__ void r4d_chain_acquire() {
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    asm volatile("s_dcache_inv" ::: "memory");
+}
+
 __device__ __forceinline__ void r4d_chain_wait() {
     const R4dChainRec* r = r4d_chain_rec();
     if (!r) return;
@@ -73,6 +86,8 @@ __device__ __forceinline__ void r4d_chain_wait() {
             }
         }
         __syncthreads();
+        r4d_chain_acquire();   /* tp8 loop R48: upstream 8f2e511f part 2 */
+        return;
     }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 }
