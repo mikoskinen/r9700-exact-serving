@@ -600,7 +600,10 @@ private:
      * layer segments with other lanes' parts between them -- its head [0, h) as segments [s0, s1) (the first takes the
      * release, the restores and holds the frame; the last ships it, then X1), its tail [t, n) as model-part segments, the
      * last one with the sampler, drafter and step end (lane_tail_issue from `tail_seg0_`, RAD_PP_SEG_END). */
-    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0, int lflags = 0);
+    /* tp8 loop D64 (fn4 pp_lead_seg + 131072): `tband` = the step's tail band j decided by the lane loop (0 none): its frame
+     * carries the tail band flag and its tail (whole) runs from t - j, as a whole head's step (lane_head) would. */
+    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0, int lflags = 0,
+                       int tband = 0);
     int  lane_tail_seg(int lane, const RadBatch* b, int s0, int s1);
     int  tail_seg0_ = 0;
     /* ... the held frame of the lane's step (pp_ship's bytes, built at its first head segment so it carries that release's

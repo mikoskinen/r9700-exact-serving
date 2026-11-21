@@ -1062,10 +1062,10 @@ int Engine::step_loop_lanes() {
             const int x = std::atoi(v);
             /* tp8 loop D36: + 256 = no band passes; D40: + 8 = the tail whole, + 512 = SP in the head's segments */
             /* tp8 loop D49b: + 1024 x N = segments only while the decode lanes' last steps decoded <= N sequences */
-            /* tp8 loop F81: + 65536 = no position-order guard */
-            if (x >= 0 && x <= 131071 && (x & 7) <= 2) lsp_start = x;
+            /* tp8 loop F81: + 65536 = no position-order guard; D64: + 131072 = a tail band BG step's head in segments */
+            if (x >= 0 && x <= 262143 && (x & 7) <= 2) lsp_start = x;
             else RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG_FORM=%s is not taken: form + 8 x tail-whole + 16 x stride (+ 256, "
-                          "+ 512, + 1024 x N, + 65536), form 0 / 1 / 2 (tp8 loop D32 / D40 / D49b / F81); 1 (M9 as built)", v);
+                          "+ 512, + 1024 x N, + 65536, + 131072), form 0 / 1 / 2 (tp8 loop D32 / D40 / D49b / F81 / D64); 1 (M9 as built)", v);
         }
         RAD_INFO("two-node pipeline: fn4 pp_lead_seg starts at %d (form %d%s, stride %d%s%s; RADIANCE_PP_LEAD_SEG_FORM, tp8 loop D32): 0 "
                  "= a BG step's leader parts whole, 1 = M9 as built, 2 = decode first (a decode tail whose X2 landed and its lane's "
@@ -1073,10 +1073,12 @@ int Engine::step_loop_lanes() {
                  "busy); + 8 = the tail whole (D40); + 16 x s = every s-th declared boundary; + 256 = no band passes (D36); + 512 = "
                  "the head's segments may run the plugin's SP plan (D40, RADIANCE_DS41_SPHC_LSEG=1); + 1024 x N = segments only while "
                  "the decode lanes' last steps decoded <= N sequences, the parts whole above (D49b); a step carrying a prompt entry "
-                 "that is not a whole fresh prompt runs its parts whole (the position-order guard, F81; + 65536 = none)%s", lsp_start, lsp_start & 7,
-                 (lsp_start & 7) == 0 ? ": whole" : (lsp_start & 7) == 1 ? ": M9" : ": decode first",
+                 "that is not a whole fresh prompt runs its parts whole (the position-order guard, F81; + 65536 = none); + 131072 = "
+                 "a tail band BG step's head in these segments, its tail whole (D64; else such a step runs whole)%s%s", lsp_start,
+                 lsp_start & 7, (lsp_start & 7) == 0 ? ": whole" : (lsp_start & 7) == 1 ? ": M9" : ": decode first",
                  std::max(1, (lsp_start >> 4) & 15), (lsp_start & 8) ? ", tail whole" : "", (lsp_start & 512) ? ", SP word" : "",
-                 (lsp_start >> 10) ? fmt("; starts with N = %d", (lsp_start >> 10) & 63).c_str() : "");
+                 ((lsp_start >> 10) & 63) ? fmt("; starts with N = %d", (lsp_start >> 10) & 63).c_str() : "",
+                 (lsp_start & 131072) ? "; starts with tail band heads in segments (D64)" : "");
     }
     fn4::lead_seg_register(lseg);
     auto lsp_now = [&]() {
@@ -1096,6 +1098,7 @@ int Engine::step_loop_lanes() {
     int64_t lsp_spseg = 0, lsp_tw8 = 0;   /* tp8 loop D40: head segments issued with the SP word; steps whose tail + 8 kept whole */
     int64_t lsp_load = 0;                 /* tp8 loop D49b: BG steps whose parts ran whole by + 1024 x N (decode load above N) */
     int64_t lsp_pos = 0;                  /* tp8 loop F81: steps whose parts ran whole by the position-order guard */
+    int64_t lsp_tbh = 0;                  /* tp8 loop D64: tail band BG steps whose head ran in segments (+ 131072) */
     /* tp8 loop D32 (RADIANCE_PP_LEAD_SEG_RINGS=2, the leader; its plugin reads the same env and declares a second ring): a BG
      * step's segments use ring lane % rings, so the two BG lanes of B2L (lanes 2 / 3) each segment while the other does */
     int lseg_rings = 1;
@@ -1275,13 +1278,14 @@ int Engine::step_loop_lanes() {
                  "boundary ring(s), %lld BG parts began their segments beside another BG step's; %lld head segments carried "
                  "the SP word (+ 512), %lld BG steps kept their tail whole by + 8 (tp8 loop D40), %lld BG steps ran their parts "
                  "whole by the decode load rule (+ 1024 x N, tp8 loop D49b), %lld steps ran their parts whole by the position-order "
-                 "guard (a prompt entry that is not a whole fresh prompt; + 65536 = no guard, tp8 loop F81)",
+                 "guard (a prompt entry that is not a whole fresh prompt; + 65536 = no guard, tp8 loop F81), %lld tail band BG steps "
+                 "ran their head in segments, their tail whole (+ 131072, tp8 loop D64)",
                  (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
                  (long long)lseg_inside, (long long)lseg_polls,
                  lseg_mixed ? fmt("; %lld MIXED newcomer steps of decode lanes among them (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)",
                                   (long long)lseg_msteps).c_str() : "", when, lsp_now(), (long long)lsp_first,
                  (long long)lsp_whole, (long long)lsp_wtail, lseg_rings, (long long)lsp_both, (long long)lsp_spseg,
-                 (long long)lsp_tw8, (long long)lsp_load, (long long)lsp_pos);
+                 (long long)lsp_tw8, (long long)lsp_load, (long long)lsp_pos, (long long)lsp_tbh);
         if (lseg_ship_)
             RAD_INFO("two-node pipeline: %lld segmented heads' frames shipped after their last segment ran (RADIANCE_PP_LEAD_SEG_SHIP=1, "
                      "tp8 loop P27)%s: held past the last segment's issue %.2f ms on average, the longest %.2f; %lld other frames went "
@@ -1817,7 +1821,15 @@ int Engine::step_loop_lanes() {
                             (!(pm & 4) || (pm & 3) != 0);
             const int sband = seg_step ? pp_band_step(l, b) : -1;
             if (sband > 0 && !lseg_band) seg_step = false;
-            if (seg_step && sband <= 0 && pp_tband_step(l, b) > 0) seg_step = false;   /* tp8 loop D39: a tail band step runs whole */
+            /* tp8 loop D39: a tail band step runs whole -- tp8 loop D64: + 131072 = its HEAD in these segments, its tail whole (the
+             * frame keeps the tail band flag, the follower's parts and the leader's tail are the band pass's; at --pp-cut 10,33
+             * with D51 every fresh BG step is one, so without it LSP never segments a BG step there) */
+            int stband = 0;
+            if (seg_step && sband <= 0) {
+                const int tj = pp_tband_step(l, b);
+                if (tj > 0 && (lsv & 131072)) stband = tj;
+                else if (tj > 0) seg_step = false;
+            }
             if (seg_step && lform == 2 && !decode_live()) {   /* D32: no decode lane busy -> whole, as BEST */
                 seg_step = false;
                 ++lsp_whole;
@@ -1859,7 +1871,7 @@ int Engine::step_loop_lanes() {
                 s.mixed = !lanes_.is_bg(l) && !relay_step;
                 s.form = lform;
                 s.stride = lstride;
-                s.whole_tail = ltail_whole || lsp_kept(lseg_tb, lstride).empty();
+                s.whole_tail = stband > 0 || ltail_whole || lsp_kept(lseg_tb, lstride).empty();   /* tp8 loop D64: a band tail whole */
                 if (ltail_whole && !lsp_kept(lseg_tb, lstride).empty()) ++lsp_tw8;   /* tp8 loop D40 */
                 s.lflags = llflags;
                 s.ring = l % lseg_rings;
@@ -1870,9 +1882,11 @@ int Engine::step_loop_lanes() {
                     int a = 0;
                     for (int32_t x : hb) { s.parts.emplace_back(a, (int)x); a = x; }
                     s.parts.emplace_back(a, cfg_.pp_cut_h + s.band);   /* tp8 loop D36: a band step's head ends at h + k */
-                    if (const int hs = lane_head_seg(l, b, s.parts[0].first, s.parts[0].second, true, false, s.band, s.lflags); hs < 0)
+                    if (const int hs = lane_head_seg(l, b, s.parts[0].first, s.parts[0].second, true, false, s.band, s.lflags, stband);
+                        hs < 0)
                         return fail_loop(hs);
                     if (s.lflags) ++lsp_spseg;   /* tp8 loop D40 */
+                    if (stband > 0) ++lsp_tbh;   /* tp8 loop D64 */
                     if (rad_event_record(lev(l, 0), ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                     s.ship_s0 = pp_steps_shipped_;   /* tp8 loop P27 */
                     s.k = 1;
@@ -2356,7 +2370,7 @@ int Engine::lane_tail_model(int lane, const RadBatch* b) {
 /* tp8 dev M9: one segment [s0, s1) of a BG lane step's head part. The first takes what lane_head takes before its release
  * (the fresh states, the release with its switches, the prefix restores) and holds the step's frame; the last ships it
  * (the follower then issues its pass, which waits on its card for X1 as always) and ends with X1's send. */
-int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band, int lflags) {
+int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band, int lflags, int tband) {
     lane_select(lane);
     if (first) {
         clear_fresh_states();
@@ -2366,15 +2380,28 @@ int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool firs
             return RAD_E_STATE;
         }
         pp_trunk_pending_[lane] = false;
-        if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = 0;   /* tp8 loop D39: a segmented step is no tail band step */
-        pp_tband_note(lane, 0);   /* tp8 loop D39b: its prompts' later chunks run W(h, t)'s */
+        /* tp8 loop D39: a segmented step is no tail band step -- tp8 loop D64 (pp_lead_seg + 131072): unless the lane loop
+         * decided its tail band j (never beside a head band): then as lane_head's, the lane keeps j for its (whole) tail */
+        if (band > 0) tband = 0;
+        if (!tband) {   /* the published order of these notes for a segmented step */
+            if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = 0;
+            pp_tband_note(lane, 0);   /* tp8 loop D39b: its prompts' later chunks run W(h, t)'s */
+        }
         pp_rband_note(lane, 0, 0);   /* tp8 loop P41: a segmented step is no reverse pass and crosses no keys: its prompts drop */
         RAD_TRY(restore_checkpoints());
-        /* tp8 loop D36: a band step's held frame says so (flags bit 2: the follower's parts start at h + k) */
+        /* tp8 loop D36: a band step's held frame says so (flags bit 2: the follower's parts start at h + k); D64: a tail band
+         * step's (flags bit 3: the follower's parts end at t - j) */
         pp_ship_band_ = band;
+        pp_ship_tband_ = tband;
         const int hs = pp_ship_hold(b, lane);
         pp_ship_band_ = 0;
+        pp_ship_tband_ = 0;
         if (hs < 0) return hs;
+        if (tband) {   /* tp8 loop D64: lane_head's order -- the frame made, then the lane's j and the notes */
+            if ((size_t)lane < pp_tband_lane_.size()) pp_tband_lane_[(size_t)lane] = tband;
+            ++pp_tband_n_;
+            pp_tband_note(lane, tband);
+        }
         if (band) {
             ++pp_band_n_;
             ++pp_band_seg_n_;

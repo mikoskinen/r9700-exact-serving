@@ -495,6 +495,10 @@
  *                   prompts (context 0, the prompt's last row, no snapshot / replay) runs its parts whole -- a piece of a longer
  *                   prompt in segments let a later piece's head / tail run before its remaining segments (lq225 'all': layer 8's
  *                   compressed-KV copy differed). + 65536 = no guard (the F75 / F81 form, a negative control only).
+ *                   + 131072 (tp8 loop D64): a TAIL BAND BG step (fn4 pp_tband 1 / 3 / 4 / 5: every fresh BG step at --pp-cut
+ *                   10,33 with D50 / D51) runs its HEAD in these segments, its tail whole -- the held frame keeps the tail band
+ *                   flag, the follower's parts end at t - j and the leader's tail starts there, as lane_head's band step; without
+ *                   it such a step runs its parts whole (D39), so LSP never segmented a BG step beside D51. Order only (rule A).
  *   pp_seg_set      engine, the two-node FOLLOWER (tp8 loop D33; 95 here, after pp_lead_seg): which of the follower's declared
  *                   segment boundaries (RADIANCE_PP_SEG_LAYERS, at most RADIANCE_PP_SEG_MAX - 1 of them) split a pass: n + 64 x s,
  *                   n 0 .. 31, s 0 .. 7 -- every s-th boundary inside W(h, t) (0 = 1: all), then the first n of those (0: all
