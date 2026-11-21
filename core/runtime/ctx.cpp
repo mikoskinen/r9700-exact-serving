@@ -707,7 +707,20 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
 
     /* A handoff only: records the plugin's device buffers for the mover; nothing here reads
      * them. */
+    /* tp8 loop W5 (lever RR1, fn4 ds41_rr1): a report that names this layer's own card-side row (rad_route_counts) after
+     * the layer already reported in this step is a block's end-of-step report whose pass report just copied its counts
+     * into that row. Only the copy goes (below: the pointers are equal); the handoff keeps the counts buffer the step's
+     * earlier report named -- the block's own, which its router rewrites every pass -- so the file stager's trigger never
+     * reads the row, which no router writes (rad_block_moe_fp8.h route_report_at's note on the NaN logits that gave). So
+     * every handoff, heat count and bank is what the copying report left, and the plugin's choice depends only on the
+     * pass it issues (a recording and its audit agree). */
+    const int32_t* const own_row = route_dev_ ? route_dev_ + (int64_t)layer * route_n_expert_ : nullptr;
+    const int32_t* const kept = r->expert_count && r->expert_count == own_row && s.reported == step &&
+                                        s.routing.expert_count && s.routing.expert_count != own_row
+                                    ? s.routing.expert_count
+                                    : nullptr;
     s.routing  = *r;
+    if (kept) s.routing.expert_count = kept;
     s.reported = step;
 
     if (r->expert_count) {
