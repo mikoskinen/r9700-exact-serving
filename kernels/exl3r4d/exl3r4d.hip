@@ -160,6 +160,9 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #ifndef EXL3R4D_X6_SGB  // X6 S1 probes (tp8 DECODE, QUEUE X6): the X3D K loop's per-k-step schedule pinned three ways; 0 = the compiler's
 #define EXL3R4D_X6_SGB 0
 #endif
+#ifndef EXL3R4D_X6_PRE  // X6 next step (tp8 DECODE round 60, QUEUE X6u): the X5_SUM 3 pre-pass; 0 = as served (one row at a time,
+#define EXL3R4D_X6_PRE 0  // one load a k-step); 1 = no pre-pass (TIMING ONLY, wrong output: its upper bound); 2 = two rows at a time with
+#endif                    // four loads a row issued before their dots (each row's dot order and butterfly unchanged: the same bits)
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -990,7 +993,42 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // a + b = b + a); lane nl keeps its row's. A dropped row's xr is zeros (the prep's), a lane past the rows keeps 0 (never
   // stored). Per row and per the launch's split only, as the in-loop forms.
   [[maybe_unused]] float xsum = 0.f;
-  if constexpr (FOLD && EXL3R4D_X5_SUM == 3) {
+  if constexpr (FOLD && EXL3R4D_X5_SUM == 3 && EXL3R4D_X6_PRE == 2) {   // X6u: the same sums, the loads issued ahead
+    const int nrows = min(chunk, r1 - rc), nk = kps * 16;
+    const v2h one = (v2h){(_Float16)1.0f, (_Float16)1.0f};
+    for (int i = 0; i < nrows; i += 2) {   // wave-uniform; an odd last row is summed twice, its copy dropped
+      const int i1 = i + 1 < nrows ? i + 1 : i;
+      const _Float16* xa = (const _Float16*)p.xr + (size_t)(rc + i) * p.xr_pitch + (size_t)mat * w.cols + (size_t)ks0 * 16;
+      const _Float16* xb = (const _Float16*)p.xr + (size_t)(rc + i1) * p.xr_pitch + (size_t)mat * w.cols + (size_t)ks0 * 16;
+      float sa = 0.f, sb = 0.f;
+      int k = 4 * lane;
+      for (; k + 3 * 4 * WAVE32 < nk; k += 4 * 4 * WAVE32) {
+        union { v2u u; v2h h[2]; } qa[4], qb[4];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) { qa[t].u = *(const v2u*)(xa + k + t * 4 * WAVE32); qb[t].u = *(const v2u*)(xb + k + t * 4 * WAVE32); }
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          sa = __builtin_amdgcn_fdot2(qa[t].h[0], one, sa, false);
+          sa = __builtin_amdgcn_fdot2(qa[t].h[1], one, sa, false);
+          sb = __builtin_amdgcn_fdot2(qb[t].h[0], one, sb, false);
+          sb = __builtin_amdgcn_fdot2(qb[t].h[1], one, sb, false);
+        }
+      }
+      for (; k < nk; k += 4 * WAVE32) {
+        union { v2u u; v2h h[2]; } qa, qb;
+        qa.u = *(const v2u*)(xa + k);
+        qb.u = *(const v2u*)(xb + k);
+        sa = __builtin_amdgcn_fdot2(qa.h[0], one, sa, false);
+        sa = __builtin_amdgcn_fdot2(qa.h[1], one, sa, false);
+        sb = __builtin_amdgcn_fdot2(qb.h[0], one, sb, false);
+        sb = __builtin_amdgcn_fdot2(qb.h[1], one, sb, false);
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) { sa += __shfl_xor(sa, o, 32); sb += __shfl_xor(sb, o, 32); }
+      if (nl == i) xsum = sa;
+      if (i1 != i && nl == i1) xsum = sb;
+    }
+  } else if constexpr (FOLD && EXL3R4D_X5_SUM == 3 && EXL3R4D_X6_PRE == 0) {
     const int nrows = min(chunk, r1 - rc), nk = kps * 16;
     const v2h one = (v2h){(_Float16)1.0f, (_Float16)1.0f};
     for (int i = 0; i < nrows; ++i) {   // wave-uniform
