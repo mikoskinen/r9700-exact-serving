@@ -446,8 +446,14 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
          * card inside the GEMM launch, while the resident experts compute, and read the copies (the same bytes);
          * absent or 0 is no ring. A placement of the same bytes, not a different product. */
         { "xring",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* qfn-on-ds lever DRZ-K (the Qwen line's exl3r4d, Qwen loop round 18): 1 = this op keeps its dead-row stores under
+         * exl3_drz 1 (the architecture declares a layer so under RADIANCE_FN4_DRZ_KEEP); absent or 0 is the switch's word */
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
-    static const RadParamSpec p_dn[] = { EXL3_GEMM_PARAMS };
+    static const RadParamSpec p_dn[] = {
+        EXL3_GEMM_PARAMS,
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* qfn-on-ds lever DRZ-K, as gate_up's */
+    };
 #undef EXL3_GEMM_PARAMS
     static const RadParamSpec p_pg[] = {
         { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
@@ -498,6 +504,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
         { "N_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
         { "K_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* qfn-on-ds lever DRZ-K, as gate_up's */
     };
     static const RadOperandSpec gate_up_down[18] = {
         { "a",             RAD_OPD_IN,   0 },

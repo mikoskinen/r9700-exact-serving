@@ -177,6 +177,29 @@ inline int64_t fn4_x3gd_hi_env() {
     }();
     return v;
 }
+/* qfn-on-ds lever DRZ-K (Qwen loop round 18, FINDINGS F49 / F51): DRZ (exl3_drz 1) moves answers only through the layers that
+ * keep protected bf16 experts (BITRACE: h_ffn of L34 / L44 / L46 / L47 first, never L00-L33; `rad-info --recipe`: exactly
+ * those keep bf16 experts), with the fused chain and with the split decode band alike. RADIANCE_FN4_DRZ_KEEP, read at
+ * declare: "prot" = every layer with a protected expert on ANY rank, or a comma list of layer numbers ("44", "34,44,46,47")
+ * -- those layers' EXL3 ops are declared with drz_keep 1 and keep their dead-row stores under exl3_drz 1 (exl3r4d: fill()
+ * clears dz bit 2, the prefill band runs drz 0); every other layer takes the switch. Unset = no parameter: today's
+ * declares. */
+inline const char* fn4_drz_keep_env() {   /* read at every declare (once a layer), so a host test can set it */
+    const char* e = std::getenv("RADIANCE_FN4_DRZ_KEEP");
+    return e && *e ? e : nullptr;
+}
+inline bool fn4_drz_keep_listed(int l) {
+    const char* e = fn4_drz_keep_env();
+    if (!e || std::strcmp(e, "prot") == 0) return false;
+    for (const char* s = e; *s;) {
+        char* end = nullptr;
+        const long v = std::strtol(s, &end, 10);
+        if (end == s) { ++s; continue; }
+        if (v == l) return true;
+        s = end;
+    }
+    return false;
+}
 inline std::atomic<int>& fn4_exl3_map_flag() {
     static std::atomic<int> f{[] {
         const char* e = std::getenv("RADIANCE_FN4_X3MAP");
@@ -2689,6 +2712,25 @@ inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::ve
                 }
         }
     }
+    /* qfn-on-ds lever DRZ-K: this layer keeps its dead-row stores under exl3_drz 1 (RADIANCE_FN4_DRZ_KEEP) */
+    bool drz_keep = false;
+    if (const char* ke = fn4_drz_keep_env()) {
+        if (std::strcmp(ke, "prot") == 0) {
+            drz_keep = !prot.empty();   /* this rank's; then every expert of the layer, any rank's */
+            const int64_t nall = c.n_expert_all > 0 ? c.n_expert_all : c.n_expert;
+            for (int64_t ge = 0; !drz_keep && ge < nall; ++ge) {
+                RadEncoding e0{}, e1{};
+                drz_keep = weight_enc(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)ge), &e0) &&
+                           weight_enc(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)ge), &e1) &&
+                           format_of(e0) == 3 && format_of(e1) == 3;
+            }
+        } else {
+            drz_keep = fn4_drz_keep_listed(l);
+        }
+        if (drz_keep)
+            rad_note(b, "layer %d: lever DRZ-K: its EXL3 ops keep their dead-row stores under exl3_drz 1 "
+                        "(RADIANCE_FN4_DRZ_KEEP=%s)", l, ke);
+    }
     b_x3h = decl_b(b, nm.f("blk.%d.moe_exl3_h", l), RAD_F16, {c.rows * c.top_k, F});
     /* fn4 v10: declared whatever the switch says, so it can flip between steps; gate_up writes it, down reads it, and
      * nothing between them does (the shared expert's ops have their own buffers). */
@@ -2711,6 +2753,7 @@ inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::ve
                                  RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
                                  RAD_INT("a_rot", 0) };
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
+    if (drz_keep) gp.push_back(RAD_INT("drz_keep", 1));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h, b_x3map});
     tables(false);
@@ -2718,6 +2761,7 @@ inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::ve
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
                                  RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
+    if (drz_keep) dp.push_back(RAD_INT("drz_keep", 1));
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff, b_x3map}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
@@ -2738,6 +2782,7 @@ inline int MoeFP8::declare_exl3_q(RadBuilder* b, Names& nm, int l, const std::ve
                                       RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                       RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
                                       RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D) };
+        if (drz_keep) gdp.push_back(RAD_INT("drz_keep", 1));
         op_x3gd = rw(b, rad_decl_op(b, EXL3_OP_GU_DN, gdp.data(), (int)gdp.size(), tab.data(), (int)tab.size()),
                      {w.h.x, w.sorted, w.eoff}, {w.edn});
     }
