@@ -3616,13 +3616,20 @@ TEST(pp_lead_seg_is_the_leaders_switch_form_and_stride) {
     CHECK(fn4::check("pp_lead_seg", 65535 - 5, &err));   /* 65530 = 1018 + 1024 x 63 */
     CHECK(!fn4::check("pp_lead_seg", 1027, &err));
     CHECK(err.find("+ 1024 x N (N 1 .. 63) = segments only while the decode lanes' last steps decoded <= N") != std::string::npos);
-    /* tp8 loop F81: + 65536 = no position-order guard (the negative control); 131072 and a bad form with it refused */
+    /* tp8 loop F81: + 65536 = no position-order guard (the negative control); a bad form with it refused */
     CHECK(fn4::check("pp_lead_seg", 65536, &err));
     CHECK(fn4::check("pp_lead_seg", 34 + 65536, &err));
     CHECK(fn4::check("pp_lead_seg", 65530 + 65536, &err));
-    CHECK(!fn4::check("pp_lead_seg", 131072, &err));
     CHECK(!fn4::check("pp_lead_seg", 3 + 65536, &err));
     CHECK(err.find("+ 65536 = no position-order guard") != std::string::npos);
+    /* tp8 loop D64: + 131072 = a tail band BG step's head in segments, its tail whole; 262144 and a bad form with it refused */
+    CHECK(fn4::check("pp_lead_seg", 131072, &err));
+    CHECK(fn4::check("pp_lead_seg", 2 + 131072, &err));
+    CHECK(fn4::check("pp_lead_seg", 2 + 8 + 80 + 512 + 1024 * 10 + 131072, &err));   /* START DC8's c8 arm: stride 5, SP, N 10 */
+    CHECK(fn4::check("pp_lead_seg", 262143 - 5, &err));   /* every bit, form 2 */
+    CHECK(!fn4::check("pp_lead_seg", 262144, &err));
+    CHECK(!fn4::check("pp_lead_seg", 3 + 131072, &err));
+    CHECK(err.find("+ 131072 = a tail band BG step's head in these segments, its tail whole (tp8 loop D64)") != std::string::npos);
     CHECK(!fn4::check("pp_lead_seg", -1, &err));
     fn4::lead_seg_register(false);
     CHECK(fn4::check("pp_lead_seg", 0, &err));
