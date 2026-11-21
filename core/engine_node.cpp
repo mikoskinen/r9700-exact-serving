@@ -1598,7 +1598,7 @@ int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
         RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE_PARTS=1 -- + the parts' card time by kind (%s), phase and sequences, "
                  "by stretch, p50 / p25 / p75 a key, in a line beside each node-idle line (tp8 loop D68)",
                  lead ? "head, head segment, tail model part, tail segment, tail with its logits + sampler, sampler, drafter + step end "
-                        "(a tail is two parts with this on)"
+                        "(the last two one D8 part)"
                       : "pass, segment");
     return 1;
 }

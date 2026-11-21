@@ -28,9 +28,9 @@
  * tp8 loop D68 (RADIANCE_PP_NODE_IDLE_PARTS=1 beside NODE_IDLE=1 / 2, either node; unset: nothing below is kept or printed): the
  * same parts' card time BY KIND AND SEQUENCES -- the engine tags each part before its begin with what it is (the leader's head,
  * head segment, tail model part, tail segment, tail = the tail's model part + the head's logits + its sampler (or the sampler
- * alone when the model part went ahead), then the drafter + step end as a part of its own -- the one place the setting changes
- * the parts: with it on, a tail is two parts, so the D8 / D45 lines count one part more a tail and the card's time between the
- * sampler and the drafter's first kernel as a gap; the follower's pass or segment), its batch's phase (D decode only / P prefill / M mixed) and sequences / rows; a part's ms goes to (stretch,
+ * alone when the model part went ahead), then the drafter + step end as a part of its own for this line (a continuation mark:
+ * the D8 / D45 lines and D51's load samples count the tail as one part, as without the setting); the follower's pass or
+ * segment), its batch's phase (D decode only / P prefill / M mixed) and sequences / rows; a part's ms goes to (stretch,
  * kind, phase, sequences) and one more line a period prints each key's p50 / p25 / p75 ms, count and mean rows (keys with >= 3
  * parts), clean stretch first. Why: DECODE round 54 (lq229's step log) found the bound node's lane part growing with SEQUENCES
  * more than with rows (c4 -> c8: ~+2.3 ms a lane part a sequence beyond rows and context) and could name it only with a stamped
@@ -58,7 +58,7 @@ namespace rad {
 struct PpNodeIdle {
     static constexpr size_t kCap = 4096;
     static constexpr float kIdleMs = 5000.0f;   /* a gap this long is no work at all (between the test's cells) */
-    struct Rec { RadEvent ev; bool begin; bool bg; uint32_t tag = 0; int32_t rows = 0; };
+    struct Rec { RadEvent ev; bool begin; bool bg; uint32_t tag = 0; int32_t rows = 0; bool cont = false; };
     /* tp8 loop D68: a part's kind (the tag's low byte), set by the engine before the part's begin */
     enum : uint32_t { kPartOther = 0, kPartHead = 1, kPartHeadSeg = 2, kPartTailModel = 3, kPartTailSeg = 4, kPartTail = 5,
                       kPartPass = 6, kPartSeg = 7, kPartSampler = 8, kPartDrafter = 9 };
@@ -209,11 +209,15 @@ struct PpNodeIdle {
         return e;
     }
     /* on rank 0's stream, with its rank thread parked (before a release / after the join) */
-    void mark(bool begin) {
+    /* tp8 loop D68b: a CONTINUATION mark (cont) splits the open part in two for the parts line only: no new part in the D8 / D45
+     * counts, the open part's stretch kept, no D45 wait attribution, no D51 sample -- so every other line and the t5 judge read
+     * what they read without it */
+    bool open_bg = false;
+    void mark(bool begin, bool cont = false) {
         drain();
-        vram_sample();
-        const bool now_bg = bg_now();
-        if (split) {   /* tp8 loop D45: the receive waits since the last mark, to the stretch in effect since then */
+        const bool now_bg = cont ? open_bg : bg_now();
+        if (!cont) vram_sample();
+        if (split && !cont) {   /* tp8 loop D45: the receive waits since the last mark, to the stretch in effect since then */
             uint64_t wt = 0, n = 0, tp = 0;
             waits(&wt, &n, &tp);
             const uint64_t d = wt >= sp_wt_last ? wt - sp_wt_last : 0;
@@ -222,7 +226,7 @@ struct PpNodeIdle {
             run.sp_wait[sp_prev] += d;
             sp_prev = now_bg;
         }
-        if (recent_keep_ns) {   /* tp8 loop D51: a sample of the cumulative counts (the drain above brought them up to date) */
+        if (recent_keep_ns && !cont) {   /* tp8 loop D51: a sample of the cumulative counts (the drain above brought them up to date) */
             uint64_t wt = 0, n = 0, tp = 0;
             waits(&wt, &n, &tp);
             const uint64_t now = rad_mono_ns();
@@ -232,10 +236,20 @@ struct PpNodeIdle {
         RadEvent e = take();
         if (!e) { ++dropped; return; }
         if (rad_event_record(e, s) < 0) { pool.push_back(e); ++dropped; return; }
-        recs.push_back({ e, begin, now_bg, begin ? next_tag : 0u, begin ? next_rows : 0 });
-        if (begin) next_tag = 0, next_rows = 0;   /* tp8 loop D68: an untagged part is 'other' */
+        recs.push_back({ e, begin, now_bg, begin ? next_tag : 0u, begin ? next_rows : 0, cont });
+        if (begin) {   /* tp8 loop D68: an untagged part is 'other' */
+            next_tag = 0;
+            next_rows = 0;
+            if (!cont) open_bg = now_bg;
+        }
     }
     void begin() { mark(true); }
+    /* tp8 loop D68b: the open part goes on as `kind` from here (parts line only; see mark) */
+    void begin_more(uint32_t kind, int phase, int64_t n_seq, int64_t n_tok) {
+        if (!parts_on) return;
+        tag(kind, phase, n_seq, n_tok);
+        mark(true, true);
+    }
     void end() { mark(false); }
     /* the records whose events completed, in stream order: the time since the one before */
     void drain() {
@@ -249,9 +263,11 @@ struct PpNodeIdle {
                     cum_part += ms;   /* tp8 loop D51 */
                     for (Win* w : { &win, &run }) {
                         w->part_ms += ms;
-                        ++w->parts;
                         w->sp_part[last.bg] += ms;   /* tp8 loop D45: the stretch at the part's begin */
-                        ++w->sp_parts[last.bg];
+                        if (!last.cont) {   /* tp8 loop D68b: a continuation is the same part */
+                            ++w->parts;
+                            ++w->sp_parts[last.bg];
+                        }
                         if (parts_on) {   /* tp8 loop D68 */
                             PAcc& a = w->pt[(last.bg ? 1u << 31 : 0u) | last.tag];
                             if (a.ms.size() < kPartKeep) a.ms.push_back(ms);
