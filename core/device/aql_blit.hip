@@ -15,6 +15,7 @@
 
 #include "aql.h"
 #include "device.h"
+#include "rad_abi.h"
 
 namespace {
 
@@ -52,6 +53,61 @@ struct AqlIka {
 __global__ __launch_bounds__(kThreads) void aql_copy16_ika(const u32x4* __restrict__ src,
                                                            u32x4* __restrict__ dst, uint64_t n) {
     const AqlIka ika;
+    copy16_body(src, dst, n);
+}
+
+/* Lever CBL (DRAFTER track round 64): the same device-local copies and fills in a CHAIN-CAPABLE self-acquiring form -- lever CIK's
+ * entry (libr4d r4d_ika.h R4D_IKA_CHAIN_ENTRY + r4d_chain.h): when the engine wrote a chain record at RAD_CHAIN_KARG_OFF of the
+ * argument place, one lane of each block waits at entry until the queue's chain counter reaches the record's target (no wait at
+ * target 0), and every lane adds 1 to the counter at its exit after the agent release (the core counts these kernels in lanes:
+ * aql.cpp lanes_of); no record accepted = AqlIka's two fences exactly. Launched only while lever CBL is live (fn4 aql_ika 3 with
+ * lever CIK on: rad::aql::cbl_live_now), where IKB launches its forms (never across the link). Engine-only by
+ * construction: these are the AQL backend's own kernels, and every place it plays them from holds the record's bytes (a 1-KB queue
+ * slot, a tape copy padded by a slot, a CTA block). Same loads and stores as the plain form. */
+struct AqlChainRec {
+    unsigned long long  magic, target;
+    unsigned long long* ctr;
+    unsigned long long  check;
+};
+__device__ __forceinline__ const AqlChainRec* aql_chain_rec() {
+    const AqlChainRec* r = (const AqlChainRec*)((const char*)__builtin_amdgcn_kernarg_segment_ptr() + RAD_CHAIN_KARG_OFF);
+    const unsigned long long magic = r->magic, target = r->target, check = r->check;
+    const unsigned long long* ctr = r->ctr;
+    if (magic != RAD_CHAIN_MAGIC || check != (magic ^ target ^ (unsigned long long)(uintptr_t)ctr ^ RAD_CHAIN_CHECK))
+        return nullptr;
+    return r;
+}
+struct AqlCik {
+    __device__ __forceinline__ AqlCik() {
+        const AqlChainRec* r = aql_chain_rec();
+        if (r && r->target != 0) {
+            if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+                const unsigned long long target = r->target;
+                unsigned long long* ctr = r->ctr;
+                int k = 0;
+                while (__hip_atomic_load(ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < target) {
+                    if (k < 8) {
+                        __builtin_amdgcn_s_sleep(1);
+                        ++k;
+                    } else {
+                        __builtin_amdgcn_s_sleep(16);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    __device__ __forceinline__ ~AqlCik() {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        const AqlChainRec* r = aql_chain_rec();
+        if (r) __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+};
+
+__global__ __launch_bounds__(kThreads) void aql_copy16_cik(const u32x4* __restrict__ src,
+                                                           u32x4* __restrict__ dst, uint64_t n) {
+    const AqlCik cik;
     copy16_body(src, dst, n);
 }
 
@@ -117,6 +173,12 @@ __global__ __launch_bounds__(kThreads) void aql_copy1_ika(const unsigned char* _
     copy1_body(src, dst, n);
 }
 
+__global__ __launch_bounds__(kThreads) void aql_copy1_cik(const unsigned char* __restrict__ src,
+                                                          unsigned char* __restrict__ dst, uint64_t n) {
+    const AqlCik cik;
+    copy1_body(src, dst, n);
+}
+
 __device__ __forceinline__ void copy2d16_body(const u32x4* __restrict__ src, u32x4* __restrict__ dst, uint64_t spitch16,
                                               uint64_t dpitch16, uint64_t w16, uint64_t height) {
     const uint64_t cstride = (uint64_t)gridDim.x * kThreads;
@@ -143,6 +205,14 @@ __global__ __launch_bounds__(kThreads) void aql_copy2d16_ika(const u32x4* __rest
     copy2d16_body(src, dst, spitch16, dpitch16, w16, height);
 }
 
+__global__ __launch_bounds__(kThreads) void aql_copy2d16_cik(const u32x4* __restrict__ src,
+                                                             u32x4* __restrict__ dst, uint64_t spitch16,
+                                                             uint64_t dpitch16, uint64_t w16,
+                                                             uint64_t height) {
+    const AqlCik cik;
+    copy2d16_body(src, dst, spitch16, dpitch16, w16, height);
+}
+
 __device__ __forceinline__ void copy2d1_body(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst,
                                              uint64_t spitch, uint64_t dpitch, uint64_t width, uint64_t height) {
     const uint64_t cstride = (uint64_t)gridDim.x * kThreads;
@@ -166,6 +236,14 @@ __global__ __launch_bounds__(kThreads) void aql_copy2d1_ika(const unsigned char*
                                                             uint64_t spitch, uint64_t dpitch,
                                                             uint64_t width, uint64_t height) {
     const AqlIka ika;
+    copy2d1_body(src, dst, spitch, dpitch, width, height);
+}
+
+__global__ __launch_bounds__(kThreads) void aql_copy2d1_cik(const unsigned char* __restrict__ src,
+                                                            unsigned char* __restrict__ dst,
+                                                            uint64_t spitch, uint64_t dpitch,
+                                                            uint64_t width, uint64_t height) {
+    const AqlCik cik;
     copy2d1_body(src, dst, spitch, dpitch, width, height);
 }
 
@@ -227,6 +305,12 @@ __global__ __launch_bounds__(kThreads) void aql_fill16_ika(u32x4* __restrict__ d
     fill16_body(dst, v, n);
 }
 
+__global__ __launch_bounds__(kThreads) void aql_fill16_cik(u32x4* __restrict__ dst, unsigned v,
+                                                           uint64_t n) {
+    const AqlCik cik;
+    fill16_body(dst, v, n);
+}
+
 __device__ __forceinline__ void fill1_body(unsigned char* __restrict__ dst, unsigned char v, uint64_t n) {
     const uint64_t stride = (uint64_t)gridDim.x * kThreads;
     for (uint64_t i = (uint64_t)blockIdx.x * kThreads + threadIdx.x; i < n; i += stride) dst[i] = v;
@@ -243,6 +327,12 @@ __global__ __launch_bounds__(kThreads) void aql_fill1_ika(unsigned char* __restr
     fill1_body(dst, v, n);
 }
 
+__global__ __launch_bounds__(kThreads) void aql_fill1_cik(unsigned char* __restrict__ dst,
+                                                          unsigned char v, uint64_t n) {
+    const AqlCik cik;
+    fill1_body(dst, v, n);
+}
+
 inline unsigned blocks_for(uint64_t n, uint64_t per_block, uint64_t cap = kMaxBlocks) {
     uint64_t b = (n + per_block - 1) / per_block;
     if (b < 1) b = 1;
@@ -253,6 +343,10 @@ inline unsigned blocks_for(uint64_t n, uint64_t per_block, uint64_t cap = kMaxBl
 inline bool aligned16(uint64_t v) { return (v & 15u) == 0; }
 
 inline int launched() { return hipGetLastError() == hipSuccess ? 0 : -1; }
+
+/* Lever IKB / CBL: the form a device-local copy or fill launches -- CBL's chain-capable one while it is live, else IKB's self-acquiring
+ * one while that is live, else the plain kernel. */
+#define AQL_PICK(base) (rad::aql::cbl_live_now() ? base##_cik : rad::aql::ikb_live_now() ? base##_ika : base)
 
 /* Lever WAITK (DRAFTER track 21.11.2026 round 49): a cross-queue wait polled by one wave, issued AHEAD of the unchanged barrier-AND on
  * the same signal, so that barrier is never pending when the packet processor reaches it. A pending barrier-AND costs ~+40 us a packet
@@ -280,13 +374,13 @@ extern "C" int rad_aql_blit_copy(void* dst, const void* src, uint64_t bytes, voi
             hipLaunchKernelGGL(aql_copy_link, dim3(1), dim3(kLinkThreads), 0, s,
                                (const u32x4*)src, (u32x4*)dst, n);
         else
-            hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_copy16_ika : aql_copy16, dim3(blocks_for(n, 4 * kThreads)),
+            hipLaunchKernelGGL(AQL_PICK(aql_copy16), dim3(blocks_for(n, 4 * kThreads)),
                                dim3(kThreads), 0, s, (const u32x4*)src, (u32x4*)dst, n);
     } else {
         /* Unaligned: byte copies have one byte per thread in flight, so across the link they
          * use 16 workgroups instead of the aligned path's one. */
         const uint64_t cap = link ? kLinkByteBlocks : kMaxBlocks;
-        hipLaunchKernelGGL(!link && rad::aql::ikb_live_now() ? aql_copy1_ika : aql_copy1, dim3(blocks_for(bytes, 4 * kThreads, cap)), dim3(kThreads),
+        hipLaunchKernelGGL((link ? aql_copy1 : AQL_PICK(aql_copy1)), dim3(blocks_for(bytes, 4 * kThreads, cap)), dim3(kThreads),
                            0, s, (const unsigned char*)src, (unsigned char*)dst, bytes);
     }
     return launched();
@@ -299,10 +393,10 @@ extern "C" int rad_aql_blit_copy2d(void* dst, uint64_t dpitch, const void* src, 
     const unsigned by = (unsigned)(height < 65535 ? height : 65535);
     if (aligned16((uint64_t)(uintptr_t)dst | (uint64_t)(uintptr_t)src | dpitch | spitch | width)) {
         const uint64_t w16 = width / 16;
-        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_copy2d16_ika : aql_copy2d16, dim3(blocks_for(w16, kThreads), by), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(AQL_PICK(aql_copy2d16), dim3(blocks_for(w16, kThreads), by), dim3(kThreads), 0, s,
                            (const u32x4*)src, (u32x4*)dst, spitch / 16, dpitch / 16, w16, height);
     } else {
-        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_copy2d1_ika : aql_copy2d1, dim3(blocks_for(width, kThreads), by), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(AQL_PICK(aql_copy2d1), dim3(blocks_for(width, kThreads), by), dim3(kThreads), 0, s,
                            (const unsigned char*)src, (unsigned char*)dst, spitch, dpitch, width,
                            height);
     }
@@ -326,10 +420,10 @@ extern "C" int rad_aql_blit_fill(void* dst, int value, uint64_t bytes, void* str
     if (aligned16((uint64_t)(uintptr_t)dst | bytes)) {
         const unsigned v = 0x01010101u * b;
         const uint64_t n = bytes / 16;
-        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_fill16_ika : aql_fill16, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(AQL_PICK(aql_fill16), dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0, s,
                            (u32x4*)dst, v, n);
     } else {
-        hipLaunchKernelGGL(rad::aql::ikb_live_now() ? aql_fill1_ika : aql_fill1, dim3(blocks_for(bytes, 4 * kThreads)), dim3(kThreads), 0, s,
+        hipLaunchKernelGGL(AQL_PICK(aql_fill1), dim3(blocks_for(bytes, 4 * kThreads)), dim3(kThreads), 0, s,
                            (unsigned char*)dst, b, bytes);
     }
     return launched();
@@ -339,7 +433,17 @@ extern "C" int rad_aql_blit_fill(void* dst, int value, uint64_t bytes, void* str
  * binary is IKA when named here: aql.h ika_listed). */
 extern "C" const char* const* rad_aql_blit_ika_kernels(int* n) {
     static const char* const k[] = { "aql_copy16_ika", "aql_copy1_ika", "aql_copy2d16_ika", "aql_copy2d1_ika", "aql_fill16_ika",
-                                     "aql_fill1_ika", nullptr };
+                                     "aql_fill1_ika", "aql_copy16_cik", "aql_copy1_cik", "aql_copy2d16_cik", "aql_copy2d1_cik",
+                                     "aql_fill16_cik", "aql_fill1_cik", nullptr };
+    if (n) *n = 12;
+    return k;
+}
+
+/* Lever CBL (round 64): core's own chain-capable kernels (each also self-acquiring, above), for core/device/aql.cpp resolve(): a
+ * kernel named here reads the chain record whatever the env, so every launch of it writes one (KernelRec::cikcap). */
+extern "C" const char* const* rad_aql_blit_cik_kernels(int* n) {
+    static const char* const k[] = { "aql_copy16_cik", "aql_copy1_cik", "aql_copy2d16_cik", "aql_copy2d1_cik", "aql_fill16_cik",
+                                     "aql_fill1_cik", nullptr };
     if (n) *n = 6;
     return k;
 }

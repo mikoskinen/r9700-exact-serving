@@ -677,6 +677,49 @@ void cik_line() {
                  b == UINT64_MAX ? "none" : std::to_string(b).c_str(), (long long)played, (long long)played_lanes);
 }
 
+/* Lever CBL (DRAFTER track round 64): fn4 aql_ika 3 with lever CIK on -- core's device-local copies and fills (aql_blit.hip) launch their
+ * chain-capable forms (cbl_live_now): in a DeepSeek decode pass the core's ~91 copies / fills a pass (scaling-1113 S1 stamps, tp4) sit
+ * between chained kernels and end their runs. */
+
+/* Lever CRD (DRAFTER track round 64): start env RADIANCE_AQL_CRD=D (1..1023; unset / 0 = no cap): a queue plays at most D chained
+ * packets in a row without the barrier bit (PlayRun::put, dispatch). */
+std::atomic<int> g_crd_test{-1};
+int crd_cap() {
+    static const int cap = [] {
+        const char* e = std::getenv("RADIANCE_AQL_CRD");
+        const int v = e ? std::atoi(e) : 0;
+        const int c = v > 0 && v < 1024 ? v : 0;
+        if (c) RAD_INFO("aql: lever CRD on (RADIANCE_AQL_CRD=%d): at most %d chained packets in a row play without the barrier bit", c, c);
+        return c;
+    }();
+    const int t = g_crd_test.load(std::memory_order_relaxed);
+    return t >= 0 ? t : cap;
+}
+
+/* Lever CRB (DRAFTER track round 64): start env RADIANCE_AQL_CRB=B (blocks, 1..1048575; unset / 0 = no cap): lever CRD's cap counted in
+ * the run's blocks. */
+uint64_t crb_cap() {
+    static const uint64_t cap = [] {
+        const char* e = std::getenv("RADIANCE_AQL_CRB");
+        const long v = e ? std::atol(e) : 0;
+        const uint64_t c = v > 0 && v < (1L << 20) ? (uint64_t)v : 0;
+        if (c) RAD_INFO("aql: lever CRB on (RADIANCE_AQL_CRB=%llu): a chained run ends before its blocks pass %llu", (unsigned long long)c, (unsigned long long)c);
+        return c;
+    }();
+    return cap;
+}
+
+/* Lever CBL: whether `m` is core's own object and lists `name` as chain-capable (rad_aql_blit_cik_kernels). */
+bool core_cik_listed(const Module* m, const std::string& name) {
+    if (!m || !m->bundle) return false;
+    Dl_info di{}, self{};
+    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
+    if (!dladdr(reinterpret_cast<void*>(&rad_aql_blit_cik_kernels), &self) || self.dli_fbase != di.dli_fbase) return false;
+    int n = 0;
+    const char* const* v = rad_aql_blit_cik_kernels(&n);
+    return ika_listed(name, v, n);
+}
+
 /* Whether the module holding `m`'s code was built with the chain-capable IKA entry: its OWN object exports
  * `int r4d_ika_chain(void)` returning 1 (libr4d / exl3r4d built with R4D_IKA_CHAIN). Core's own blit kernels never are. */
 bool cik_module(const Module* m) {
@@ -758,7 +801,7 @@ KernelRec* resolve(Func* fn, int ord) {
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
     k->ika = ika_kernel(m, k->name);
-    k->cikcap = !k->chained && cik_module(m) && ika_kernel_listed(m, k->name);
+    k->cikcap = !k->chained && ((cik_module(m) && ika_kernel_listed(m, k->name)) || core_cik_listed(m, k->name));
     k->cik = k->cikcap && k->ika && cik_on();   /* lever CIK (a named chained form keeps its own block-count done) */
     if (k->cik) k->chained = true;
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
@@ -863,6 +906,9 @@ struct Stream {
      * launched since the last packet whose barrier bit held it behind everything before. A chained
      * kernel's wait covers only chained blocks, so while this is set the next one keeps its bit. */
     bool            plain_inflight = false;
+    /* Lever CRD (DRAFTER round 64): unordered chained packets since this queue's last ordered one. */
+    int             chain_run = 0;
+    uint64_t        chain_run_blocks = 0;   /* lever CRB: blocks of those packets */
 
     void lock() {
         while (busy.exchange(true, std::memory_order_acquire))
@@ -1424,6 +1470,8 @@ int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
     if (rc < 0) { s->unlock(); return rc; }
     s->prev_chained = false;
     s->plain_inflight = false;
+    s->chain_run = 0;
+    s->chain_run_blocks = 0;
     if (out_idx) *out_idx = idx;
     auto* p = reinterpret_cast<hsa_barrier_and_packet_t*>(
         static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask));
@@ -1523,7 +1571,12 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
      * the bit, since its completion must cover everything before it. */
-    const bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
+    bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
+    /* Lever CRD: a chained run longer than the cap starts a new one (the packet keeps its barrier bit). */
+    if (!keep && crd_cap() && s->chain_run >= crd_cap()) keep = true;
+    if (!keep && crb_cap() && s->chain_run_blocks + blocks_of(p) > crb_cap()) keep = true;
+    s->chain_run = keep ? 0 : s->chain_run + 1;
+    s->chain_run_blocks = keep ? 0 : s->chain_run_blocks + blocks_of(p);
     if (k->chained || k->cikcap) chain_record(s, slot, chain, keep);
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
     if (chain) s->chain_issued += k->cik ? lanes_of(p) : blocks_of(p);
@@ -1647,6 +1700,15 @@ struct PlayRun {
          * kernel that reads its output and sits behind a chained one (a cache read beside a
          * collective, say) would wait for the chained blocks only. */
         if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
+        /* Lever CRD (DRAFTER round 64, RADIANCE_AQL_CRD=D): at most D unordered chained packets in a row -- the next keeps its barrier
+         * bit (and so, under CIK, plays as an ordered target-0 record). Unbounded, a queue of chained kernels runs ahead until the card's
+         * wave slots are full of blocks waiting on the counter, and the next wide kernel's blocks land where slots free up, unevenly:
+         * drafter/kit/mes/ikh11.cpp (xeon GPU2, r64c, 64 x 256 kernels with a tiny chained kernel every third): up to 5 blocks of one
+         * kernel on one WGP (2 when ordered or uniform), its body tail 3.5-4.2 us vs 2.3-2.6. */
+        if (!ordered && crd_cap() && s->chain_run >= crd_cap()) ordered = true;
+        /* Lever CRB (RADIANCE_AQL_CRB=B): the same with the run's blocks as the measure -- the next chained packet keeps its bit when the
+         * unordered run's blocks with its own would exceed B. */
+        if (!ordered && crb_cap() && s->chain_run_blocks + blocks_of(&r.pkt) > crb_cap()) ordered = true;
         /* Lever CTA: an ordered chained record (target 0) plays from its block in the tape's copy (constant record), else from
          * the queue's slot with the record written now. */
         const bool cta = chain && ordered && r.karg_t0 && cta_on();
@@ -1710,6 +1772,8 @@ struct PlayRun {
         }
         s->prev_chained = chain;
         s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
+        s->chain_run = ordered ? 0 : s->chain_run + 1;
+        s->chain_run_blocks = ordered ? 0 : s->chain_run_blocks + (crb_cap() ? blocks_of(&r.pkt) : 0);
         s->wr = idx + 1;
         next = idx + 1;
         *out_idx = idx;
@@ -4628,7 +4692,9 @@ WaitkCounts waitk_counts() {
 void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
 int waitk_mode_now() { return waitk_mode(); }
 bool ika_live_now() { return ika_on() && rad::fn4::aql_ika() >= 1; }
-bool ikb_live_now() { return ika_on() && rad::fn4::aql_ika() == 2; }
+bool ikb_live_now() { return ika_on() && rad::fn4::aql_ika() >= 2; }
+bool cbl_live_now() { return cik_on() && ika_on() && rad::fn4::aql_ika() == 3; }
+void crd_set_for_test(int cap) { g_crd_test.store(cap < 0 ? -1 : cap > 1023 ? 1023 : cap, std::memory_order_relaxed); }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -5052,6 +5118,8 @@ void waitk_set_for_test(int) {}
 int waitk_mode_now() { return 0; }
 bool ika_live_now() { return false; }
 bool ikb_live_now() { return false; }
+bool cbl_live_now() { return false; }
+void crd_set_for_test(int) {}
 }  // namespace aql
 }  // namespace rad
 

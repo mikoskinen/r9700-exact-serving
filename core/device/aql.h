@@ -117,6 +117,12 @@ bool ika_live_now();
  * forms only then, so aql_ika 0 and 1 launch the plain kernels (0 = the packets without either lever, 1 = lever IKA alone; a change
  * of the switch re-records). false in a build without the AQL backend. */
 bool ikb_live_now();
+/* Lever CBL (DRAFTER round 64): fn4 aql_ika 3 with lever CIK on (RADIANCE_AQL_CIK=1 at start) -- core's copy / fill launchers pick their
+ * chain-capable forms (aql_blit.hip *_cik), which the backend chains as it chains CIK kernels. false in a build without the AQL backend. */
+bool cbl_live_now();
+/* Lever CRD (DRAFTER round 64): replaces RADIANCE_AQL_CRD's start value (the chained run cap, 0 = none) for this process; -1 = the start
+ * value again. A bench / test hook. */
+void crd_set_for_test(int cap);
 
 /* ------------------------------------------------------------------ lever IKA: which kernels a module names
  *
@@ -247,4 +253,6 @@ int rad_aql_blit_ranges(void* dst, const void* src, uint64_t prefix, const RadCo
 /* Lever IKA (DRAFTER round 51): the self-acquiring copy / fill forms of aql_blit.hip by identifier, the list core/device/aql.cpp
  * ika_kernel reads for a fat binary of core's own object (libr4d's is r4d_ika_kernels). */
 const char* const* rad_aql_blit_ika_kernels(int* n);
+/* Lever CBL (DRAFTER round 64): the chain-capable copy / fill forms of aql_blit.hip by identifier (each also in the list above). */
+const char* const* rad_aql_blit_cik_kernels(int* n);
 }

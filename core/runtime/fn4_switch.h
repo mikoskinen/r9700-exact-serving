@@ -564,6 +564,9 @@
  *                   IKA walk on its exact ranges; the kernel is picked at launch, so a pass re-records (the epoch) as at every change.
  *                   Needs RADIANCE_AQL_IKA=1 at start (which kernels are self-acquiring is read at their first launch), which starts
  *                   it at 1; without the env 1 / 2 are refused and it reads 0. A follower switch (each node's own played packets).
+                   3 (DRAFTER round 64, lever CBL) -- 2, and where lever CIK is on (RADIANCE_AQL_CIK=1 at start) those copies / fills
+                   launch in their CHAIN-CAPABLE forms (aql_blit.hip *_cik: CIK's entry and exit), which the backend chains as it chains
+                   CIK kernels; the same loads / stores (rule A); without CIK 3 launches as 2. Re-records as 2 does.
  *   sched_lane_room scheduler (tp8 loop D56; 104 here, after ds41_csplit): 0 -- a lane's admission room gates (a fresh prompt's whole
  *                   rest, a preempted request's whole recompute, beside every runner's rest of prompt + a block each) count the asking
  *                   lane's running requests, as before; 1 -- they count every lane's (each lane's running set and the ones its plan left
