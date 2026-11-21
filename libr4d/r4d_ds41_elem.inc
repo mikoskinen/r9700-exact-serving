@@ -357,6 +357,15 @@ static const RadConstraint cDs41PcnMix[] = {
            "mhc_post (x, h, post, comb -> out), then mhc_collapse (out, pre -> xc), then rmsnorm (xc, "
            "w -> y): out, xc and y as the three ops leave them, each rounded to dtype before the next "
            "step reads it. out must not alias h."),
+    SCHEMA("mhc_post_collapse_rmsnorm_w1k", pDs41CollapseNorm, oDs41PostCollapseNorm,
+           "mhc_post_collapse_rmsnorm at its <= 32-row workgroup width (1024 threads a row) at every M: each row's out, xc "
+           "and y are the bytes that row gets in any mhc_post_collapse_rmsnorm launch of <= 32 rows. out must not alias h."),
+    SCHEMA("mhc_collapse_rmsnorm_w1k", pDs41CollapseNorm, oDs41CollapseNorm,
+           "mhc_collapse_rmsnorm at its <= 32-row workgroup width (1024 threads a row) at every M: each row's x and y are "
+           "the bytes that row gets in any mhc_collapse_rmsnorm launch of <= 32 rows."),
+    SCHEMA("rmsnorm_rope_roundtrip_kv_store_w1k", pDs41NormRopeRtKv, oDs41NormRopeRtKv,
+           "rmsnorm_rope_roundtrip_kv_store at its <= 32-row workgroup width (1024 threads a row) at every M: each row's y "
+           "and cache entry are the bytes that row gets in any rmsnorm_rope_roundtrip_kv_store launch of <= 32 rows."),
     SCHEMA("mhc_post_collapse_rmsnorm_l256", pDs41CollapseNorm, oDs41PostCollapseNorm,
            "mhc_post_collapse_rmsnorm with the norm's sum of squares in rmsnorm's own 256-lane partition: out, xc "
            "and y are the three ops' bytes at every M (mhc_post_collapse_rmsnorm folds the norm over its workgroup, "
@@ -523,6 +532,28 @@ static const RadConstraint cDs41PcnMix[] = {
   R4D_PRIO_ONLY, ROW(cDs41PostCollapseNorm), NOTUNE, nullptr, nullptr,
   r4d_rad_mhc_post_collapse_rmsnorm_l256, nullptr, nullptr, nullptr,
   r4d_shape_mhc_post_collapse_rmsnorm, nullptr, r4d_fuse_mhc_post_collapse_rmsnorm },
+/* lever BIW (DRAFTER track 21.11.2026 round 75). No `replaces`: deepseek41 issues them in place of the <= 32-row pieces of a
+ * decode segment (kBiNorm; RADIANCE_DS41_BIW). tools/dbench/biw holds each to the pieces byte for byte at M 1..96. */
+{ "mhc_post_collapse_rmsnorm_w1k_bf16", "mhc_post_collapse_rmsnorm_w1k", "norm",
+  "mhc_post_collapse_rmsnorm at 1024 threads a row at every M",
+  "M 1..65535, n 1..16384, hc 2..8; a 1024-thread workgroup a row (r4d_act_threads at M <= 32)",
+  "bf16 x, h, out, xc and y, f32 post, comb and pre, f32 or bf16 w", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41PostCollapseNorm), NOTUNE, nullptr, nullptr,
+  r4d_rad_mhc_post_collapse_rmsnorm_w1k, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_post_collapse_rmsnorm, nullptr, r4d_fuse_mhc_post_collapse_rmsnorm },
+{ "mhc_collapse_rmsnorm_w1k_bf16", "mhc_collapse_rmsnorm_w1k", "norm",
+  "mhc_collapse_rmsnorm at 1024 threads a row at every M",
+  "any M and n, hc 2..8; a 1024-thread workgroup a row (r4d_act_threads at M <= 32)",
+  "bf16 h, x and y, f32 pre, f32 or bf16 w", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDs41CollapseNorm), NOTUNE, nullptr, nullptr, r4d_rad_mhc_collapse_rmsnorm_w1k, nullptr,
+  nullptr, nullptr, r4d_shape_mhc_collapse_rmsnorm, nullptr, r4d_fuse_mhc_collapse_rmsnorm },
+{ "rmsnorm_rope_roundtrip_kv_store_w1k_fp8_bf16", "rmsnorm_rope_roundtrip_kv_store_w1k", "norm",
+  "rmsnorm_rope_roundtrip_kv_store at 1024 threads a row at every M",
+  "any M, n <= 16384 even; a 1024-thread workgroup a row (r4d_act_threads at M <= 32)",
+  "bf16 x, y and cache, f32 or bf16 w, f32 cos_sin, i32 positions and slot mapping", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41NormRopeRtKvFp8), NOTUNE, nullptr, nullptr,
+  r4d_rad_rmsnorm_rope_roundtrip_kv_store_w1k, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_rope_roundtrip_kv_store },
 /* lever M1 (ds41-int9b). No `replaces`: the arch issues it in place of the pair (deepseek41, RADIANCE_DS41_MHC_FUSE /
  * fn4 mhc_fuse). r4d_selftest --case mhc_pcn_mix and tests/r4d_emu ds41i9b hold it to the two rows byte for byte. */
 { "mhc_post_collapse_rmsnorm_mix_bf16", "mhc_post_collapse_rmsnorm_mix", "norm",

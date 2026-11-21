@@ -3103,7 +3103,7 @@ constexpr long kFzMaxN = 16384;
  * (rmsnorm_rope_roundtrip_kv_store) then kv_store_bf16's slot_mapping [M] and kv_cache [n_blocks, 1,
  * block_size, n] (block_size and kv_dtype bf16 as kv_store declares them). */
 template <bool KV>
-int norm_rope_rt_launch(const RadArgs* a, RadStream stream) {
+int norm_rope_rt_launch(const RadArgs* a, RadStream stream, bool w1k = false) {
     if (!a || a->n_t < (KV ? 7 : 5)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2], &cs = a->t[3], &pos = a->t[4];
     if (!x.data || !w.data || !y.data || !cs.data || !pos.data) return R4D_NO(RAD_E_INVAL);
@@ -3150,7 +3150,9 @@ int norm_rope_rt_launch(const RadArgs* a, RadStream stream) {
         kv.n_blocks = (uint32_t)kc.shape[0];
         kv.slotb = (uint32_t)ds_w8_bytes((int)n);
     }
-    const int thr = r4d_act_threads((int)M, (int)n);
+    /* lever BIW (DRAFTER track round 75): w1k = the 1024-thread form at every M (r4d_act_threads' width up to 32 rows), so
+     * one launch over 33..64 decode rows holds each row to the bytes of the <= 32-row pieces deepseek41's BI issue cuts today */
+    const int thr = w1k ? 1024 : r4d_act_threads((int)M, (int)n);
     const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
 #define FZ_NRQ(WF, T, W)                                                                          \
     R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T, KV, W>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
@@ -3172,6 +3174,8 @@ int norm_rope_rt_launch(const RadArgs* a, RadStream stream) {
 }
 int norm_rope_rt_body(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<false>(a, stream); }
 int norm_rope_rt_kv_body(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<true>(a, stream); }
+int norm_rope_rt_body_w1k(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<false>(a, stream, true); }
+int norm_rope_rt_kv_body_w1k(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<true>(a, stream, true); }
 
 /* x [M, n_head*head_dim] in place, cos_sin, positions. The lane-group form needs a gptj pair on
  * one wave's even/odd lanes (head_dim and off even, the row's constraints) and a power-of-two block
@@ -3238,7 +3242,7 @@ int rope_rt_body(const RadArgs* a, RadStream stream) {
 }
 
 /* h [M, hc*n], pre [M, hc] f32, x [M, n] (the collapsed row, stored), w, y (rows as rmsnorm). */
-int collapse_norm_body(const RadArgs* a, RadStream stream) {
+int collapse_norm_body(const RadArgs* a, RadStream stream, bool w1k = false) {
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
     if (n <= 0 || hc < 2 || hc > 8 || hc * n > INT_MAX) return R4D_NO(RAD_E_SHAPE);
@@ -3260,7 +3264,7 @@ int collapse_norm_body(const RadArgs* a, RadStream stream) {
     if (My < rows || rows > INT_MAX) return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
-    const int thr = r4d_act_threads((int)rows, (int)n);
+    const int thr = w1k ? 1024 : r4d_act_threads((int)rows, (int)n);   /* lever BIW: see norm_rope_rt_launch */
 #define FZ_CN(WF, T, HM)                                                                           \
     R4D_EMIT(stream, (collapse_norm_kernel<WF, T, HM>),                                            \
              dim3(r4d_cliff_rows((uint32_t)rows, 1, T / kFzWave)), dim3(T), 0,                     \
@@ -3339,7 +3343,7 @@ int pcn_words_body(const RadArgs* a, RadStream stream, int nb, unsigned* ctr) {
                     (long)xi.stride[0], A);
 }
 
-int post_collapse_norm_body(const RadArgs* a, RadStream stream, bool l256) {
+int post_collapse_norm_body(const RadArgs* a, RadStream stream, bool l256, bool w1k = false) {
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
     if (n <= 0 || n > 16384 || hc < 2 || hc > 8) return R4D_NO(RAD_E_SHAPE);
@@ -3365,7 +3369,7 @@ int post_collapse_norm_body(const RadArgs* a, RadStream stream, bool l256) {
     if (My < rows) return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
-    const int thr = r4d_act_threads((int)rows, (int)n);
+    const int thr = w1k ? 1024 : r4d_act_threads((int)rows, (int)n);   /* lever BIW: see norm_rope_rt_launch */
     /* lever DPH (DRAFTER track round 68): l256 (the op mhc_post_collapse_rmsnorm_l256) = the norm in rmsnorm_bf16's
      * 256-lane partition (the three ops' bytes at every M); else the fold over thr threads, as before */
     if (l256) {
@@ -3799,6 +3803,19 @@ extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) 
  * 256-lane partition -- out, xc and y the chain's bytes at every M (tools/dbench/dph) */
 extern "C" int r4d_rad_mhc_post_collapse_rmsnorm_l256(const RadArgs* a, RadStream s) {
     return post_collapse_norm_body(a, s, true);
+}
+/* lever BIW (DRAFTER track round 75): the three fused norms deepseek41's BI issue cuts into <= 32-row pieces (kBiNorm) at a
+ * decode segment of more rows, at the 1024-thread form at EVERY M: each row's out / xc / y (/ the cache entry) are the bytes
+ * the same row gets in any launch of <= 32 rows (the kernels read M only as the grid's bound), so ONE launch replaces the
+ * pieces exactly (tools/dbench/biw) */
+extern "C" int r4d_rad_mhc_post_collapse_rmsnorm_w1k(const RadArgs* a, RadStream s) {
+    return post_collapse_norm_body(a, s, false, true);
+}
+extern "C" int r4d_rad_mhc_collapse_rmsnorm_w1k(const RadArgs* a, RadStream s) {
+    return collapse_norm_body(a, s, true);
+}
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kv_store_w1k(const RadArgs* a, RadStream s) {
+    return norm_rope_rt_kv_body_w1k(a, s);
 }
 /* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm + mhc_mix over its out, one op (pcn_mix_body); its scratch is mhc_mix's
  * partials for M rows */
