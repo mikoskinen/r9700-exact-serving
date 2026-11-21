@@ -595,7 +595,21 @@ int NodeLink::read_exact(void* p, int64_t n, int idle_ms) {
     while (n > 0) {
         if (stopping_.load(std::memory_order_acquire)) return RAD_E_CANCELLED;
         pollfd pf{ fd_, POLLIN, 0 };
-        const int pr = poll(&pf, 1, 50);
+        /* tp8 loop D61 (fn4 host_spin site 4: the frame's way in): a socket with nothing to read is polled without blocking for up
+         * to the switch's bound before the blocking poll below (the receive thread then wakes on no interrupt); 0: the blocking
+         * poll at once, as before. Counted as 'socket read' on this node. */
+        int pr = 0;
+        if (const int64_t spin = fn4::host_spin_ns(fn4::kSpinFrame); spin > 0 && started_.load(std::memory_order_acquire)) {
+            const uint64_t s0 = now_ns();
+            uint64_t s1 = s0;
+            while ((pr = poll(&pf, 1, 0)) == 0 && !stopping_.load(std::memory_order_acquire) && (int64_t)((s1 = now_ns()) - s0) < spin) {
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+            }
+            fn4::note_spin(fn4::kSpinSock, pr > 0, (pr > 0 ? now_ns() : s1) - s0);
+        }
+        if (pr == 0) pr = poll(&pf, 1, 50);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return RAD_E_IO;

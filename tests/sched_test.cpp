@@ -17027,6 +17027,9 @@ TEST(host_spin_the_switch_takes_n_and_sites_and_starts_off) {
     CHECK(sl.find("rank barrier 0 caught / 1 blocked (spun 1.0 ms)") != std::string::npos);
     CHECK(sl.find("frame receive 1 caught / 0 blocked") != std::string::npos);
     CHECK(sl.find("drafter end") == std::string::npos);
+    fn4::note_spin(fn4::kSpinSock, true, 2000000);   /* the link's receive thread: site 4's bound, its own count */
+    CHECK(fn4::spin_line().find("socket read 1 caught / 0 blocked (spun 2.0 ms)") != std::string::npos);
+    CHECK(fn4::spin_line().find("frame receive 1 caught / 0 blocked") != std::string::npos);
     /* a change prints the old value's counts and zeroes them */
     CHECK(DstSwitches::set("host_spin", 0));
     CHECK(fn4::spin_line().empty());

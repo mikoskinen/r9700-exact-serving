@@ -638,10 +638,12 @@ int64_t host_spin_ns(int site) {
 namespace {
 /* tp8 loop D61: per site (barrier, drafter end, frame, nap) the waits the spin caught / that blocked after it, and the time spun */
 struct SpinCounts {
-    std::atomic<uint64_t> caught[4] = {}, blocked[4] = {}, ns[4] = {};
+    std::atomic<uint64_t> caught[5] = {}, blocked[5] = {}, ns[5] = {};
 };
 SpinCounts& spin_counts() { static SpinCounts c; return c; }
-int spin_site_index(int site) { return site == kSpinBarrier ? 0 : site == kSpinDrafterEnd ? 1 : site == kSpinFrame ? 2 : 3; }
+int spin_site_index(int site) {
+    return site == kSpinBarrier ? 0 : site == kSpinDrafterEnd ? 1 : site == kSpinFrame ? 2 : site == kSpinSock ? 4 : 3;
+}
 }  // namespace
 void note_spin(int site, bool caught, uint64_t ns) {
     SpinCounts& c = spin_counts();
@@ -651,9 +653,9 @@ void note_spin(int site, bool caught, uint64_t ns) {
 }
 static std::string spin_text(int label, bool reset) {
     SpinCounts& c = spin_counts();
-    static const char* const nm[4] = { "rank barrier", "drafter end", "frame receive", "poll naps" };
+    static const char* const nm[5] = { "rank barrier", "drafter end", "frame receive", "poll naps", "socket read" };
     std::string out;
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < 5; ++k) {
         const uint64_t a = c.caught[k].load(std::memory_order_relaxed), b = c.blocked[k].load(std::memory_order_relaxed);
         if (a + b == 0) continue;
         char buf[160];
@@ -662,7 +664,7 @@ static std::string spin_text(int label, bool reset) {
         out += buf;
     }
     if (reset)
-        for (int k = 0; k < 4; ++k) {
+        for (int k = 0; k < 5; ++k) {
             c.caught[k].store(0, std::memory_order_relaxed);
             c.blocked[k].store(0, std::memory_order_relaxed);
             c.ns[k].store(0, std::memory_order_relaxed);

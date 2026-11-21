@@ -594,8 +594,8 @@
  *                   pipeline's critical path. v = N + 256 x M: N 0..255 = spin up to N x 100 us (a pause loop on the condition)
  *                   before blocking as before; 0 -- every wait blocks at once, as before (today's program); M 0..15 = the sites
  *                   (0 = every site): 1 the rank barrier (a release and a join: core/runtime/rank_barrier.cpp), 2 the leader's
- *                   wait for a lane's drafter passes (Engine::lane_tail_finish's step_end_), 4 the follower's frame receive
- *                   (net::NodeLink::recv), 8 the lane loops' poll naps (sleep_for 20 / 50 / 100 us: a spin of that length, so a
+ *                   wait for a lane's drafter passes (Engine::lane_tail_finish's step_end_), 4 a frame's way in (net::NodeLink:
+ *                   the receive thread's socket read, polled without blocking, and recv's queue wait), 8 the lane loops' poll naps (sleep_for 20 / 50 / 100 us: a spin of that length, so a
  *                   poll lands every ~20 us instead of every ~80 with the default 50-us timer slack). Timing only: no issue
  *                   order, step, byte or plan rule reads it (rule A). Read at every wait. Unset: the start's RADIANCE_HOST_SPIN
  *                   (the same values; anything else = 0). A follower switch (each node's own threads); one machine takes it too
@@ -978,6 +978,8 @@ int  aql_ika();
 int  host_spin();
 /* The sites host_spin's M names (bits); kSpinAll = every site. */
 static constexpr int kSpinBarrier = 1, kSpinDrafterEnd = 2, kSpinFrame = 4, kSpinNap = 8, kSpinAll = 15;
+/* Not a site of its own: the link's receive thread reading the socket (site 4's bound), counted apart ('socket read'). */
+static constexpr int kSpinSock = 16 | kSpinFrame;
 /* How long a wait at `site` spins before it blocks, ns (0 = it blocks at once: host_spin's N is 0 or M leaves the site out). */
 int64_t host_spin_ns(int site);
 /* One wait at `site` ended: `caught` when the spin saw the condition (no block), `ns` the time it spun. Counted per site. */

@@ -5409,6 +5409,7 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
         const long long ld = count(llog, "drafter end", true), ldb = count(llog, "drafter end", false);
         const long long fb = count(flog, "rank barrier", true), ff = count(flog, "frame receive", true);
         const long long ffb = count(flog, "frame receive", false), naps = count(llog, "poll naps", true) + count(flog, "poll naps", true);
+        const long long fs = count(flog, "socket read", true), fsb = count(flog, "socket read", false);
         double m[10] = {};
         const char* rkey = "by phase over the run (tp8 loop D60): ";
         if (const size_t at = llog.rfind(rkey); at != std::string::npos) {
@@ -5423,10 +5424,10 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
                               &p[6], &m[6], &p[7], &m[7], &p[8], &m[8], &p[9], &m[9]);
         }
         fprintf(stderr, "    %d lanes%s W(%s) %s: %d of %zu prompts differ (%lld accepted); leader barrier %lld caught / %lld blocked, "
-                        "drafter end %lld / %lld; follower barrier %lld caught, frames %lld / %lld; naps %lld; D60 mean ms drafter end "
+                        "drafter end %lld / %lld; follower barrier %lld caught, frames %lld / %lld, socket reads %lld / %lld; naps %lld; D60 mean ms drafter end "
                         "%.3f, release + ship %.3f, issue %.3f, drafter end -> head %.3f\n",
                 a.lanes, a.bg >= 0 ? " BG 2" : "", a.cut, a.post ? "POST 20 -> 0" : a.env ? (std::string("RADIANCE_HOST_SPIN=") + a.env).c_str() : "unset",
-                differ, ref.size(), accepted, lb, lbb, ld, ldb, fb, ff, ffb, naps, m[1], m[6], m[7], m[8]);
+                differ, ref.size(), accepted, lb, lbb, ld, ldb, fb, ff, ffb, fs, fsb, naps, m[1], m[6], m[7], m[8]);
         CHECK_EQ(differ, 0);
         CHECK(accepted > 0);
         const bool on = (a.env && !std::strcmp(a.env, "20")) || a.post;
@@ -5434,9 +5435,10 @@ TEST(d61_host_spin_on_the_drafted_pipeline_keeps_one_process_tokens) {
             CHECK(lb > 0);   /* the leader's rank barrier spun and caught releases / joins */
             CHECK(fb > 0);   /* the follower's too */
             CHECK(ff + ffb > 0);   /* the follower's frame receive took the spin */
+            CHECK(fs > 0);         /* its receive thread caught frames on the socket without blocking */
             CHECK(ld + ldb > 0);   /* the drafter-end wait took the spin (the fixture drafts: so.early) */
         } else {
-            CHECK_EQ(lb + lbb + ld + ldb + fb + ff + ffb + naps, 0);   /* host_spin 0: no wait spun */
+            CHECK_EQ(lb + lbb + ld + ldb + fb + ff + ffb + fs + fsb + naps, 0);   /* host_spin 0: no wait spun */
         }
         if ((a.post || (a.env && !std::strcmp(a.env, "20"))) && (fb == 0 || lb == 0)) {
             for (const std::string* lg : { &llog, &flog })
