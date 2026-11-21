@@ -488,6 +488,9 @@ struct Dsp {
      * plane k's compaction (ia[0] = 1, ia[1 + s] = s x blk) and expansion (ie[r] = r % blk ? 0 : 1 + r / blk) indices,
      * uploaded at this rank's first EMA pass (ema_up). */
     rad_op ema_g = 0, ema_ar = 0, ema_e = 0;
+    /* lever DPR-E (round 71; g_sw_dmr's comment, + 8 on an EMA pass): ema_e's gather of xa by the same plane into d.x itself
+     * (contiguous), declared beside EMA where the start env names lever DPR (0 / 1) and the wire is exact */
+    rad_op ema_x = 0;
     rad_buf xa = 0, ema_ia = 0, ema_ie = 0;
     std::vector<int64_t> ema_blk;
     std::vector<int32_t> ema_host;   /* the two planes, ia then ie, as uploaded */
@@ -2191,12 +2194,16 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * + 8 (DRAFTER track 21.11.2026 round 67, lever DPR; a bit beside the level: 8..15 = level v & 7 + DPR, start env
  * RADIANCE_DS41_DSPARK_DPR=1 adds it to the start value) = the query pass's prologue without pre0 / pre1 / stage 0's col_a
  * where the stage's collapse is the identity: after the embedding's EXACT all-reduce (world > 1, no fp8 wire: dspark_arf()
- * < 2; not an EMA pass) h0's hc strips are hc casts of d.x and pre_f is one-hot on stream 0, so col_a writes
+ * < 2; on an EMA pass see DPR-E below) h0's hc strips are hc casts of d.x and pre_f is one-hot on stream 0, so col_a writes
  * bf16(0 + 1 x + 0 x + 0 x + 0 x) = x for every x but -0.0 (-> +0.0) and NaN payloads; the exact all-reduce folds every
  * element from +0.0f (r4d_ar_{one,two}shot_Nrank_exact.hip: acc = 0.0f, acc += each rank's), so d.x holds no -0.0, and the
  * embedding holds no NaN: col_a's output is d.x byte for byte and pre_f (read by nothing else before stage 0's mix_f writes
  * it) is dead. Three launches and two cross-queue hops off the pass's head (lq208 c32: rmsnorm at 104.8 us after the
  * lookup, ~86.8 without them). The same ops on the other passes; the walk, head and every stage past 0 as before.
+ * DPR-E (round 71): on an EMA pass (level 7) d.x holds this rank's lookup, not the reduced rows, so DPR there issues one
+ * more gather, ema_x = ema_e's (xa by the same plane) into d.x itself: every h0 strip is that gather's bytes, so d.x is
+ * byte for byte what col_a would write from them (xa comes from the exact all-reduce: no -0.0). Declared beside EMA where
+ * the start env names RADIANCE_DS41_DSPARK_DPR (0 / 1) and the wire is exact; without it an EMA pass keeps col_a.
  * + 16 (DRAFTER track 21.11.2026 round 68, lever DPH; 16..31 = the bits below + DPH, start env RADIANCE_DS41_DSPARK_DPH=1 adds
  * it to the start value, =0 declares its ops with the bit off) = the pass's tail before the head as ONE op: the last stage's
  * post_f, d.contract and d.fnorm as ONE mhc_post_collapse_rmsnorm_l256 (libr4d round 68: mhc_post_collapse_rmsnorm with the
@@ -5601,7 +5608,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (!d.embed || !d.expand || !d.pre0 || !d.pre1 || !d.q_tab || !d.poff_op || !d.apos_op) return RAD_E_INVAL;
     /* lever EMA (DRAFTER track round 59; g_sw_dmr's comment, level 7): declared at RADIANCE_DS41_DSPARK_MHR=7 where an
      * all-reduce runs (world > 1) on every block length >= 2 rows (the drafter's own + the short ones the env names) */
-    d.ema_g = d.ema_ar = d.ema_e = 0;
+    d.ema_g = d.ema_ar = d.ema_e = d.ema_x = 0;
     d.ema_blk.clear();
     d.ema_host.clear();
     d.ema_up = false;
@@ -5631,6 +5638,11 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             d.ema_e = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
                          { d.xa, d.ema_ie }, { d.h0 });
             ok = d.ema_g && d.ema_ar && d.ema_e;
+            /* lever DPR-E (round 71): the gather into d.x, where the start env names lever DPR and the wire is exact */
+            const char* pe = std::getenv("RADIANCE_DS41_DSPARK_DPR");
+            if (ok && pe && (!std::strcmp(pe, "0") || !std::strcmp(pe, "1")) && dspark_arf() < 2)
+                d.ema_x = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
+                             { d.xa, d.ema_ie }, { d.x });
         }
         if (ok) {
             /* the planes: ia[k][0] = 1 (sequence 0's first mask row), ia[k][1 + s] = s x blk; ie[k][r] = 1 + r / blk at an
@@ -5645,7 +5657,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 for (int64_t r = 0; r < Q; ++r) ie[r] = (int32_t)(r % bl ? 0 : 1 + r / bl);
             }
         } else {
-            d.ema_g = d.ema_ar = d.ema_e = 0;
+            d.ema_g = d.ema_ar = d.ema_e = d.ema_x = 0;
             d.ema_blk.clear();
             g_ema_bad.store(1, std::memory_order_relaxed);
             if (g.rank == 0)
@@ -8611,6 +8623,11 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         d.ema_up = true;
     }
 
+    /* lever DPR (round 67; g_sw_dmr's comment, + 8): stage 0's collapse is the identity after the exact all-reduce -> no
+     * pre0 / pre1 and no stage-0 col_a (a function of the pass key and the switches: the same on every pass of a key);
+     * DPR-E (round 71): on an EMA pass where ema_x is declared, d.x = ema_x's gather of the reduced rows */
+    const bool dpr = dpr_now() && !m.zero && g.world > 1 && d.embed_ar && (ek < 0 || d.ema_x) && dspark_arf() < 2 &&
+                     !d.st.empty() && !(dmr_now() >= 3 && d.st[0].pcn_a);
     RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
     if (ek >= 0) {
         const int64_t o = ek * d.Q;
@@ -8618,6 +8635,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         RAD_ISSUE_N(x, d.ema_ar, (S + 1) * D, brows(d.xa, S + 1), RAD_NONE);
         for (int64_t i = 0; i < c.hc; ++i)
             RAD_ISSUE_N(x, d.ema_e, T, brows(d.xa, S + 1), brow_slice(d.ema_ie, o, T, 1), bcol(d.h0, i * D, D, T));
+        if (dpr) RAD_ISSUE_N(x, d.ema_x, T, brows(d.xa, S + 1), brow_slice(d.ema_ie, o, T, 1), brows(d.x, T));
         if (g.rank == 0 && g_ema_passes.fetch_add(1, std::memory_order_relaxed) == 0)
             fprintf(stderr, "radiance: deepseek41: lever EMA: first query pass issued with the embedding's all-reduce at %lld "
                             "of %lld rows (%lld sequences x %lld + the mask row; counted at issue: a recorded pass once)\n",
@@ -8626,13 +8644,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
         for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
     }
-    /* lever DPR (round 67; g_sw_dmr's comment, + 8): stage 0's collapse is the identity after the exact all-reduce -> no
-     * pre0 / pre1 and no stage-0 col_a (a function of the pass key and the switches: the same on every pass of a key) */
-    const bool dpr = dpr_now() && !m.zero && g.world > 1 && d.embed_ar && ek < 0 && dspark_arf() < 2 && !d.st.empty() &&
-                     !(dmr_now() >= 3 && d.st[0].pcn_a);
     if (dpr && g.rank == 0 && g_dpr_passes.fetch_add(1, std::memory_order_relaxed) == 0)
         fprintf(stderr, "radiance: deepseek41: lever DPR: first query pass issued without pre0 / pre1 / stage 0's collapse at %lld "
-                        "rows (counted at issue: a recorded pass once)\n", (long long)T);
+                        "rows%s (counted at issue: a recorded pass once)\n", (long long)T,
+                ek >= 0 ? " (DPR-E: an EMA pass, x gathered from the reduced rows)" : "");
     if (!dpr) {
         RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
         RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
