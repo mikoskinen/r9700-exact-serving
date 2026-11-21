@@ -162,6 +162,36 @@ static void arf_case(const Plugin& pl, const std::vector<int>& devs) {
     }
     ok(fmt("ar_fp8 counter: wire 0 no fp8 launch, wire 1 one a rank a size (%d)", (int)(4 * rows.size())).c_str(),
        c1 - c0 == 0 && c2 - c1 == (long)(4 * rows.size()), fmt("wire 0 %ld, wire 1 %ld", c1 - c0, c2 - c1));
+    /* round 59 (DAR b DEFECT fix): the row a small message selects in serving, ar_oneshot_4rank_exact, takes the fp8 form at
+     * EVERY size under `wire` 1 (round 58's entry took it only from ts_min = 32,768 elements: T 1 / 2 here reduced exact,
+     * so a drafter row's bits depended on its pass's row count) */
+    if (const RadKernelInfo* r1 = find(pl, "ar_oneshot_4rank_exact")) {
+        std::vector<Job> f1;
+        std::string w1;
+        const long d0 = calls();
+        const bool ro = run(r1, devs, 1, 16, 256, rows, {}, &f1, &w1);
+        const long d1 = calls();
+        ok("ar_fp8: the one-shot row (ar_oneshot_4rank_exact) at wire 1: init and launches", ro, w1);
+        if (ro) {
+            for (size_t k = 0; k < rows.size(); ++k) {
+                int64_t bf = 0;
+                int hf = 0, same = 0;
+                for (int r = 0; r < 4; ++r) {
+                    bf += f1[(size_t)r].bad[k];
+                    hf += f1[(size_t)r].hash[k] != f1[0].hash[k];
+                    same += f1[(size_t)r].hash[k] == f[(size_t)r].hash[k];
+                }
+                ok(fmt("ar_fp8 one-shot row T %lld x 5120, wire 1: == the fp8 wire's host fold on every rank, = the two-shot row's "
+                       "bytes (one form at every size: batch-invariant)", (long long)rows[k]).c_str(),
+                   bf == 0 && hf == 0 && same == 4,
+                   fmt("%lld wrong, rank hashes differing %d, ranks equal to the two-shot row %d of 4", (long long)bf, hf, same));
+            }
+            ok(fmt("ar_fp8 one-shot row counter: one fp8 launch a rank a size (%d)", (int)(4 * rows.size())).c_str(),
+               d1 - d0 == (long)(4 * rows.size()), fmt("%ld", d1 - d0));
+        }
+    } else {
+        ok(name, false, "row ar_oneshot_4rank_exact absent");
+    }
     {
         double se = 0, sx = 0, mx = 0;
         const std::vector<uint16_t>&a = x[0].last, &b = f[0].last;
