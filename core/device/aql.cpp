@@ -4379,6 +4379,7 @@ WaitkCounts waitk_counts() {
 }
 void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
 int waitk_mode_now() { return waitk_mode(); }
+bool ika_live_now() { return ika_on() && rad::fn4::aql_ika() == 1; }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4800,6 +4801,7 @@ bool ride_reusable(void*) { return false; }
 WaitkCounts waitk_counts() { return WaitkCounts{}; }
 void waitk_set_for_test(int) {}
 int waitk_mode_now() { return 0; }
+bool ika_live_now() { return false; }
 }  // namespace aql
 }  // namespace rad
 

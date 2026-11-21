@@ -110,6 +110,10 @@ void waitk_set_for_test(int mode);
 /* The mode the next wait runs at: the test value, else fn4 aql_waitk once set (tp8 loop W1s), else RADIANCE_AQL_WAITK's start value
  * (0 in a build without the AQL backend). */
 int waitk_mode_now();
+/* Lever IKB (DRAFTER round 53): whether lever IKA plays its marks now = PlayRun's `ika_live` (RADIANCE_AQL_IKA=1 at start and fn4
+ * aql_ika 1); core's copy / fill launchers (aql_blit.hip) pick their self-acquiring forms only then, so aql_ika 0 launches the plain
+ * kernels (a change of the switch re-records). false in a build without the AQL backend. */
+bool ika_live_now();
 
 /* ------------------------------------------------------------------ lever IKA: which kernels a module names
  *

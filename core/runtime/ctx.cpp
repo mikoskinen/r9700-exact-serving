@@ -1424,11 +1424,13 @@ int Ctx::haz_mark(PassTape& t) {
         }
         if (aw) {
             const int32_t own = part_of[(size_t)i];
-            /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it -- unless its kernel is a
-             * self-acquiring copy (lever IKA, DRAFTER round 51: aql_copy16_ika while the lever is on); then its exact ranges
-             * go through the rule as any op's, and the window stays known for the dispatch after it. */
-            if (own < 0 || haz_ops_[(size_t)own].opaque ||
-                (haz_ops_[(size_t)own].route_copy && tape_rec_ika(t.dev, i) <= 0)) {
+            /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it -- except in IKA's walk when its
+             * kernel is a self-acquiring copy (lever IKB, DRAFTER rounds 51 / 53: aql_copy16_ika, launched only while fn4 aql_ika
+             * is 1): there its exact ranges go through the rule as any op's and IKA's window stays known for the dispatch after
+             * it. The rule's own walk (`aws`, what aql_ika 0 plays) treats it as before. */
+            const bool rcopy = own >= 0 && !haz_ops_[(size_t)own].opaque && haz_ops_[(size_t)own].route_copy;
+            const bool rcopy_ika = rcopy && awi && tape_rec_ika(t.dev, i) > 0;
+            if (own < 0 || haz_ops_[(size_t)own].opaque || (rcopy && !rcopy_ika)) {
                 aw->unknown = true;
                 if (awi) awi->unknown = true;
             } else {
@@ -1466,7 +1468,9 @@ int Ctx::haz_mark(PassTape& t) {
                     w->w = ls_unite(w->w, wr);
                     return ika_drop ? 2 : 1;
                 };
-                const int a = walk(aw, false);
+                int a = 0;
+                if (rcopy) aw->unknown = true;   /* IKB: the rule's own walk never looks into a routing copy */
+                else a = walk(aw, false);
                 const int b = awi ? walk(awi, true) : a;
                 const int bits = (a == 1 ? 1 : 0) | (b == 2 ? 2 : 0) | (b == 1 ? 4 : 0);
                 if (bits) {
