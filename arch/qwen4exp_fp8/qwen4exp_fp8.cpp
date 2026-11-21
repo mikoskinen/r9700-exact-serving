@@ -253,7 +253,7 @@ struct Model {
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
     bool      pipe_noted = false;
     bool      nowait_noted = false;   /* PF probe NOWAIT (sp_route bit 256) said once */
-    int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted */
+    int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted; P2S: 1000 (mode + 1) + layers paired */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
      * time and the indexer scores it in windows. `pipe_on` adds ranks whose blocks issue their own
@@ -2401,6 +2401,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             bt_rd(c, m, r0(p), rn(p), "rd_mix", 0, false);
         }
     }
+    /* qfn-on-ds P2S note (F50): the layers that take the pairs in this step, and the first that does not with its reason */
+    int p2s_n = 0;
+    int64_t p2s_no = -1;
+    const char* p2s_why = nullptr;
     for (int64_t li = 0; li < n; ++li) {
         const Layer& l = m.layers[(size_t)li];
         spL = lsp(li);
@@ -2418,18 +2422,19 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                                  !(m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) &&
                                  [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }() &&
                                  (pmode == 3 || l.mlp.pair_ok(2 * R, R));
-        if (pair_sp && li == 0 && g.rank == 0 && m.pair_noted != (pair_sp_now ? 10 + pmode : -10 - pmode)) {
-            m.pair_noted = pair_sp_now ? 10 + pmode : -10 - pmode;
-            fprintf(stderr, pair_sp_now ? "radiance: qwen4exp: P2S: moe_pair %d under hc_sp 2: a %lld-row step's %lld pieces' routed "
-                                          "experts in pairs (%s)\n"
-                                        : "radiance: qwen4exp: P2S: moe_pair %d asked under hc_sp 2, but this %lld-row step (%lld "
-                                          "pieces) or the MoE block's forms do not allow it (%s; %s): today's order\n",
-                    pmode, (long long)T, (long long)K,
-                    pmode == 3 ? "the pair order, each piece's own pass" : pmode == 4 ? "one joint pass, the last two pieces single"
-                                                                         : "one joint pass a pair",
-                    pair_sp_now ? "" : !spo ? "not the hc_sp 2 order" : (m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1))
-                                             ? "SP-route" : [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }()
-                                             ? (l.mlp.pair_why(2 * R, R) ? l.mlp.pair_why(2 * R, R) : "?") : "a piece not SP");
+        /* F50: counted over the step's layers and noted after the loop (layer 0 runs without SP under sp_ple 1, so a note
+         * read at layer 0 alone said "today's order" while layers 1-47 paired) */
+        if (pair_sp && g.rank == 0) {
+            if (pair_sp_now) {
+                ++p2s_n;
+            } else if (p2s_no < 0) {
+                p2s_no = li;
+                p2s_why = !spo ? "not the hc_sp 2 order"
+                          : (m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) ? "SP-route"
+                          : [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }()
+                              ? (l.mlp.pair_why(2 * R, R) ? l.mlp.pair_why(2 * R, R) : "?")
+                              : "a piece not SP";
+            }
         }
         const bool pmk_l = pmk && spo && !pair_on && !pair_sp_now && K >= 2 && K <= 8 &&
                            [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }();
@@ -2728,6 +2733,16 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             for (int64_t p = 0; p < K; ++p)
                 if (sp_pm(p, spN)) nx->hc_mix.codes(c, r0(p), rn(p));
         }
+    }
+    /* qfn-on-ds P2S note (F50): once a change of (mode, layers paired) */
+    if (pair_sp && g.rank == 0 && m.pair_noted != 1000 * (pmode + 1) + p2s_n) {
+        m.pair_noted = 1000 * (pmode + 1) + p2s_n;
+        fprintf(stderr, "radiance: qwen4exp: P2S: moe_pair %d under hc_sp 2 (%s): a %lld-row step's %lld pieces -- %d of %lld layers "
+                        "in pairs%s%s%s%s\n",
+                pmode, pmode == 3 ? "the pair order, each piece's own pass" : pmode == 4 ? "one joint pass, the last two pieces single"
+                                                                         : "one joint pass a pair",
+                (long long)T, (long long)K, p2s_n, (long long)n, p2s_no >= 0 ? "; the first in today's order: layer " : "",
+                p2s_no >= 0 ? std::to_string(p2s_no).c_str() : "", p2s_no >= 0 ? " -- " : "", p2s_no >= 0 && p2s_why ? p2s_why : "");
     }
     /* fn4 SP-hc: after the last layer every rank holds only its quarters of the wide stream; the output mixer and the
      * MTP head read every row of it, so it is gathered raw (exact) here. */
