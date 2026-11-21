@@ -1275,8 +1275,11 @@ int Engine::step_loop() {
     /* A step that runs for 20 s reports where the step loop waits: its syscall and its stack.
      * Every iteration, idle or not, marks progress, so only a stuck step is reported. */
     rad::StallWatch step_watch("step", 20000);
+    int64_t n_steps = 0;   /* tp8 loop item 7: steps run (RADIANCE_DEBUG_HANG_STEP's count) */
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
+        stuck_beat();
+        if (debug_hang_k_ > 0) debug_hang_at(n_steps, "step");
         if (pp_link_ && !pp_link_->alive()) {
             RAD_ERR("two-node pipeline: the link to the follower is down (%s): failing every request",
                     pp_link_->why().c_str());
@@ -1319,6 +1322,7 @@ int Engine::step_loop() {
             continue;
         }
         idle = 0;
+        ++n_steps;
         if (t_on) phase_mark(PH_PLAN);
 
         clear_fresh_states();
@@ -3034,7 +3038,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     /* tp8 S4 (robustness 5): a pipeline's follower serves no HTTP, so run_server's handler is not
      * installed there; a stop signal ends its loop and tells the leader (kBye). */
     if (pp_follower()) install_follower_stop_signals();
+    stuck_open();   /* tp8 loop item 7: RADIANCE_STUCK_EXIT_S / RADIANCE_DEBUG_HANG_STEP (nothing when unset) */
     std::thread stepper([this] {
+        if (stuck_) stuck_->hold();
         if (gen_) gen_loop();
         else if (pp_follower()) (void)follower_loop();
         else step_loop();
@@ -3055,6 +3061,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     stopping_.store(true, std::memory_order_release);
     barrier_->abort();
     if (stepper.joinable()) stepper.join();
+    /* tp8 loop item 7: a loop that ended cleanly disarms its watchdog (a long teardown is not a stuck loop); after a failed
+     * one it stays, so a teardown that waits on a wedged queue still ends N s after the loop's last iteration. */
+    if (stuck_ && loop_status_.load(std::memory_order_acquire) >= 0) stuck_->disarm();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     pp_close(pp_follower() ? "the follower is stopping" : "the leader is stopping");
@@ -3063,6 +3072,55 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
+}
+
+/* ---- tp8 loop item 7: the step / follower loop's watchdog (engine.h stuck_) and its test hook */
+void Engine::stuck_beat_on() { stuck_->beat(); }
+
+void Engine::stuck_open() {
+    stuck_.reset();
+    stuck_exit_s_ = 0;
+    debug_hang_k_ = 0;
+    if (const char* v = std::getenv("RADIANCE_DEBUG_HANG_STEP"); v && *v) {
+        const long long k = std::atoll(v);
+        if (k > 0) {
+            debug_hang_k_ = k;
+            RAD_WARN("RADIANCE_DEBUG_HANG_STEP=%lld: a TEST HOOK -- this node's %s loop stops for good once %lld steps have run "
+                     "(a stand-in for a card wait that never returns; tp8 loop item 7)", k,
+                     pp_follower() ? "follower" : "step", k);
+        }
+    }
+    const char* v = std::getenv("RADIANCE_STUCK_EXIT_S");
+    if (!v || !*v) return;
+    const int n = std::atoi(v);
+    if (n == 0) return;
+    if (n < 1 || n > 86400) {
+        RAD_WARN("RADIANCE_STUCK_EXIT_S=%s ignored: 1 .. 86400 seconds (0 = off)", v);
+        return;
+    }
+    if (gen_) {
+        RAD_WARN("RADIANCE_STUCK_EXIT_S=%d ignored: a generator's loop marks no step progress", n);
+        return;
+    }
+    stuck_exit_s_ = n;
+    const char* role = pp_follower() ? "follower" : pp_leader() ? "leader" : "step";
+    const std::string what = fmt("RADIANCE_STUCK_EXIT_S=%d: the %s loop", n, role);
+    stuck_ = std::make_unique<StuckExit>(what, (uint64_t)n * 1000ull, [this, n](double silent) {
+        /* the other node goes down with this one (kAbort on the link; NodeLink::fail bounds its own write) */
+        if (pp_link_ && pp_link_->alive())
+            pp_link_->fail(fmt("the %s made no progress for %.0f s (RADIANCE_STUCK_EXIT_S=%d) and ends with exit 70",
+                               pp_follower() ? "follower" : "leader", silent, n));
+    });
+    RAD_INFO("RADIANCE_STUCK_EXIT_S=%d: the %s loop's watchdog -- no iteration for %d s ends this process with exit 70%s "
+             "(tp8 loop item 7; set it on both nodes)", n, role, n,
+             pp_link_ ? " after failing the link (the other node goes down with it)" : "");
+}
+
+void Engine::debug_hang_at(int64_t n, const char* loop) {
+    if (debug_hang_k_ <= 0 || n < debug_hang_k_) return;
+    RAD_WARN("RADIANCE_DEBUG_HANG_STEP=%lld: the %s loop stops here after %lld steps and waits for good (TEST HOOK, tp8 "
+             "loop item 7)", (long long)debug_hang_k_, loop, (long long)n);
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
 /* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from

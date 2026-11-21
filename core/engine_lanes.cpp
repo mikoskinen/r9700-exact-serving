@@ -1599,6 +1599,8 @@ int Engine::step_loop_lanes() {
     };
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
+        stuck_beat();   /* tp8 loop item 7 */
+        if (debug_hang_k_ > 0) debug_hang_at(pp_steps_shipped_, "leader's lane");
         if (pp_link_ && !pp_link_->alive()) {
             RAD_ERR("two-node pipeline: the link to the follower is down (%s): failing every request",
                     pp_link_->why().c_str());

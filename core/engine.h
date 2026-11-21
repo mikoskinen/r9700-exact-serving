@@ -53,6 +53,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
+class StuckExit;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
 namespace server { class Sink; }
 namespace net { class NodeLink; }
@@ -1178,6 +1179,22 @@ private:
     void missl_credit(Rank& r, MissRank& ml, int layer, int bank, const int32_t* h, int now_step);
     void missl_issued(Rank& r, MissRank& ml, const RadBatch& b);
     void rank_loop(int rank);
+
+    /* ---- tp8 loop item 7 (RADIANCE_STUCK_EXIT_S=N, 1 .. 86400 s; unset / 0 = today: no watchdog): the step / follower
+     * loop's watchdog (util/stallwatch.h StuckExit). No loop iteration for N s ends the process with exit 70 after failing
+     * a pipeline's link, so the other node goes down with it and a supervisor restarts both: a loop that waits forever on
+     * its card keeps the HTTP server and the link's heartbeat alive, so nothing else would ever see it down (FINDINGS F66,
+     * lq176). Made by serve() before the loop starts (not for a generator); disarmed after a clean loop end, kept after a
+     * failed one (that teardown is bounded too). Declared last: destroyed before pp_link_ and the ranks. */
+    std::unique_ptr<StuckExit> stuck_;
+    int  stuck_exit_s_ = 0;
+    void stuck_beat() { if (stuck_) stuck_beat_on(); }
+    void stuck_beat_on();
+    void stuck_open();
+    /* Its test hook (RADIANCE_DEBUG_HANG_STEP=K, 0 = off): a loop that has run K steps stops for good at the top of its
+     * next iteration -- the stand-in for a card wait that never returns (pp_e2e stuck_exit cases). Read by serve(). */
+    int64_t debug_hang_k_ = 0;
+    void debug_hang_at(int64_t n, const char* loop);
 };
 
 }  /* namespace rad */

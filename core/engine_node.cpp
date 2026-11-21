@@ -244,7 +244,9 @@ bool node_own_env(const std::string& k) {
         if (k.rfind(o, 0) == 0) return true;
     /* tp8 loop D20 (loop FINDINGS F57): the leader's drafter knobs, whole keys (the follower declares no drafter: deepseek41
      * lr_settle; its engine runs no query pass) -- D18's short block, D19's tiers */
-    static const char* own_key[] = { "RADIANCE_DS41_DSPARK_SHORT", "RADIANCE_DRAFT_SHORT_TIERS" };
+    /* tp8 loop item 7: the stuck-loop watchdog and its test hook are each process's own (they change no byte it computes) */
+    static const char* own_key[] = { "RADIANCE_DS41_DSPARK_SHORT", "RADIANCE_DRAFT_SHORT_TIERS", "RADIANCE_STUCK_EXIT_S",
+                                     "RADIANCE_DEBUG_HANG_STEP" };
     for (const char* o : own_key)
         if (k == o) return true;
     return false;
@@ -2359,6 +2361,8 @@ int Engine::follower_loop() {
     };
     while (!stopping_.load(std::memory_order_acquire)) {
         watch.progress();
+        stuck_beat();   /* tp8 loop item 7 */
+        if (debug_hang_k_ > 0) debug_hang_at(steps, "follower");
         if (pp_stop_requested()) {
             RAD_INFO("follower: stopping on a signal after %lld steps: the leader is told (kBye) and goes down "
                      "with it", (long long)steps);

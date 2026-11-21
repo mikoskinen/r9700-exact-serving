@@ -23,10 +23,14 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sys/types.h>
+#include <thread>
 
 namespace rad {
 
@@ -46,6 +50,47 @@ public:
 private:
     std::unique_ptr<Impl> p_;
     std::atomic<uint64_t> beat_{0};   /* rad_mono_ns of the last progress() */
+};
+
+/* tp8 loop item 7 (RADIANCE_STUCK_EXIT_S): a watchdog that ENDS the process when a loop stops marking
+ * progress. A StallWatch only reports; a step loop that waits forever on its card (a queue stuck on a
+ * barrier nothing will release) keeps every other thread -- the HTTP server, a pipeline's link
+ * heartbeat -- alive, so neither a client nor the other node nor a supervisor ever sees it down.
+ *
+ * Only beat() counts as progress (log lines from other threads do not). When `limit_ms` passes
+ * without one, `on_fire(silent_s)` runs once on the watchdog's own thread (it should tell whoever
+ * must go down with the process; it is given at most `fire_ms`), then the process ends with
+ * _exit(`code`) -- no destructors: a wedged queue cannot be torn down. disarm() (or destruction)
+ * stops the thread; a disarmed watch never fires. */
+class StuckExit {
+public:
+    StuckExit(std::string what, uint64_t limit_ms, std::function<void(double)> on_fire, int code = 70,
+              uint64_t fire_ms = 1500);
+    ~StuckExit();
+    StuckExit(const StuckExit&) = delete;
+    StuckExit& operator=(const StuckExit&) = delete;
+
+    void beat() { beat_.store(now_ns(), std::memory_order_relaxed); }
+    /* The thread the exit line describes (the loop's own): the calling thread. */
+    void hold();
+    void disarm();
+    pid_t holder() const { return holder_.load(std::memory_order_relaxed); }
+
+    static uint64_t now_ns();
+
+private:
+    void run();
+    std::string                 what_;
+    uint64_t                    limit_ns_ = 0;
+    std::function<void(double)> on_fire_;
+    int                         code_ = 70;
+    uint64_t                    fire_ms_ = 1500;
+    std::atomic<uint64_t>       beat_{0};
+    std::atomic<pid_t>          holder_{0};
+    std::mutex                  mu_;
+    std::condition_variable     cv_;
+    bool                        stop_ = false;
+    std::thread                 th_;
 };
 
 /* What thread `tid` of this process is doing, as the report words it: state, wait channel, system

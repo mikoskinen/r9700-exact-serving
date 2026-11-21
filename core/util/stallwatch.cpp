@@ -287,4 +287,58 @@ StallWatch::~StallWatch() {
     if (p_->th.joinable()) p_->th.join();
 }
 
+/* ---- tp8 loop item 7: StuckExit ---- */
+uint64_t StuckExit::now_ns() { return rad_mono_ns(); }
+
+StuckExit::StuckExit(std::string what, uint64_t limit_ms, std::function<void(double)> on_fire, int code,
+                     uint64_t fire_ms)
+    : what_(std::move(what)), limit_ns_(limit_ms * 1000000ull), on_fire_(std::move(on_fire)), code_(code),
+      fire_ms_(fire_ms) {
+    beat();
+    holder_.store((pid_t)syscall(SYS_gettid), std::memory_order_relaxed);
+    th_ = std::thread([this] { run(); });
+}
+
+void StuckExit::hold() { holder_.store((pid_t)syscall(SYS_gettid), std::memory_order_relaxed); }
+
+void StuckExit::disarm() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (th_.joinable() && th_.get_id() != std::this_thread::get_id()) th_.join();
+}
+
+StuckExit::~StuckExit() { disarm(); }
+
+void StuckExit::run() {
+    /* A poll of an eighth of the limit, at least 50 ms and at most 1 s: the exit is at most that late. */
+    const uint64_t poll = std::max<uint64_t>(50000000ull, std::min<uint64_t>(1000000000ull, limit_ns_ / 8));
+    std::unique_lock<std::mutex> lk(mu_);
+    while (!cv_.wait_for(lk, std::chrono::nanoseconds(poll), [&] { return stop_; })) {
+        const uint64_t last = beat_.load(std::memory_order_relaxed), now = now_ns();
+        if (now < last || now - last < limit_ns_) continue;
+        lk.unlock();
+        const double silent = (double)(now - last) / 1e9;
+        const pid_t h = holder_.load(std::memory_order_relaxed);
+        RAD_ERR("%s: no progress for %.1f s -- ending the process with exit %d (RADIANCE_STUCK_EXIT_S: a loop that "
+                "waits this long waits on something that will not come; a supervisor restarts the process). The %s "
+                "loop's thread is %s", what_.c_str(), silent, code_, what_.c_str(),
+                h > 0 ? stall_describe_thread(h, true).c_str() : "not known");
+        /* The callback (a pipeline's link fail: the other node goes down with this one) on a thread of its own, at
+         * most fire_ms: it must not hold the exit behind a lock the stuck loop holds. */
+        if (on_fire_) {
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            std::thread([f = on_fire_, silent, done] { f(silent); done->store(true, std::memory_order_release); }).detach();
+            const uint64_t t0 = now_ns();
+            while (!done->load(std::memory_order_acquire) && now_ns() - t0 < fire_ms_ * 1000000ull)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::fflush(stdout);
+        std::fflush(stderr);
+        _exit(code_);
+    }
+}
+
 }  /* namespace rad */
