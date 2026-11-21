@@ -842,7 +842,38 @@ void Engine::rank_loop(int index) {
             if (ml_pass) missl_issued(r, *ml, *b);
             const bool hiss = index == 0 && hiss_want_ && what != kIssueSampler;   /* tp8 loop D37 */
             if (hiss) hiss_t0_ = rad_mono_ns();
+            /* qfn-on-ds lever TIP: the step's snapshot row inside it, named to the plugin for this issue only */
+            int64_t tip_row = 0;
+            if (tip_on_ && what != kIssueSampler && b->draft_pass == 0 && b->enc == 0 && (size_t)index < tip_.size()) {
+                TipRank& t = tip_[(size_t)index];
+                const StepEntry* te = nullptr;
+                tip_row = tip_row_of(issue_sched_.load(std::memory_order_acquire)->plan(), &te);
+                if (tip_row > 0 && te) {
+                    t.row = tip_row;
+                    t.seq = te->seq;
+                    t.ck = te->ckpt_slot;
+                    t.fail = 0;
+                    const KVManager& kv = r.kv;
+                    t.slots.assign((size_t)kv.n_groups(), -1);
+                    t.staged.assign((size_t)kv.n_groups(), {});
+                    for (int32_t g = 0; g < kv.n_groups(); ++g) {
+                        const KVGroupPlan* p = kv.plan(g);
+                        if (!p || !p->stateful()) continue;
+                        t.slots[(size_t)g] = kv.state_slot(te->seq, g);
+                        t.staged[(size_t)g].assign((size_t)std::max<int64_t>(p->n_layers, 0), 0);
+                    }
+                    if (fn4::tip_set(index, (long long)tip_row, &Engine::tip_stage, &t) <= 0) {
+                        RAD_ERR("rank %d step %d: lever TIP: the plugin refused the snapshot row %lld", index, b->step,
+                                (long long)tip_row);
+                        step_status_.store(RAD_E_STATE, std::memory_order_release);
+                        tip_row = 0;
+                    }
+                } else {
+                    tip_row = 0;
+                }
+            }
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if (tip_row > 0) (void)fn4::tip_set(index, 0, nullptr, nullptr);
             if (hiss) hiss_t1_ = rad_mono_ns();
             if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
@@ -1942,6 +1973,53 @@ int Engine::save_checkpoints() {
                  * stream orders behind these copies); a LINEAR state stays the chunk end's, which a resume at the tail
                  * grid never reads (the plugin's declaration: the export exists only where that holds). */
                 const bool inside = e.ckpt_tok < e.n_tokens - 1;
+                /* qfn-on-ds lever TIP: the plugin staged the rows it reads at a piece start into this slot from inside the
+                 * step (tip_stage); the groups it lists free are saved as the step leaves them; any other row unstaged is
+                 * refused, since the step end's state would be saved under the snapshot's position */
+                if (inside && tip_on_) {
+                    for (auto& rk : ranks_) {
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        TipRank& t = tip_[(size_t)rk->index];
+                        int st = RAD_OK;
+                        if (t.ck != e.ckpt_slot || t.seq != e.seq || t.fail) {
+                            RAD_ERR("rank %d: lever TIP: sequence %llu's snapshot (slot %d, row %d) was not staged by its step "
+                                    "(staged slot %d, sequence %llu, %d failed copies)", rk->index, (unsigned long long)e.seq,
+                                    (int)e.ckpt_slot, (int)e.ckpt_tok + 1, (int)t.ck, (unsigned long long)t.seq, t.fail);
+                            st = RAD_E_STATE;
+                        }
+                        const KVManager& kv = rk->kv;
+                        for (int32_t g = 0; st >= 0 && g < kv.n_groups(); ++g) {
+                            const KVGroupPlan* p = kv.plan(g);
+                            if (!p || !p->stateful()) continue;
+                            const bool fr = std::find(t.free_groups.begin(), t.free_groups.end(), (int)g) != t.free_groups.end();
+                            for (int64_t l = 0; st >= 0 && l < p->n_layers; ++l) {
+                                if ((size_t)g < t.staged.size() && (size_t)l < t.staged[(size_t)g].size() &&
+                                    t.staged[(size_t)g][(size_t)l]) continue;
+                                if (!fr) {
+                                    RAD_ERR("rank %d: lever TIP: group %d layer %lld of sequence %llu was not staged inside its "
+                                            "step (no plugin op staged it); the step end's state would be saved under the "
+                                            "snapshot's position", rk->index, (int)g, (long long)l, (unsigned long long)e.seq);
+                                    st = RAD_E_STATE;
+                                    break;
+                                }
+                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->ctx.stream());
+                            }
+                        }
+                        t.row = 0; t.ck = -1;
+                        if (st < 0) {
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return st;
+                        }
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    ++tip_saves_;
+                    ++ti_saves_;
+                    RAD_INFO("lever TIP: sequence %llu's snapshot at position %lld saved from inside its %d-row step (row %d; "
+                             "%llu state rows staged on rank 0 so far, %llu snapshots)", (unsigned long long)e.seq,
+                             (long long)(e.ctx_len + e.ckpt_tok + 1), (int)e.n_tokens, (int)e.ckpt_tok + 1,
+                             (unsigned long long)tip_[0].rows, (unsigned long long)tip_saves_);
+                    continue;
+                }
                 int64_t row0 = 0;
                 if (inside) {
                     if (!ti_capable_ && ranks_[0]->kv.has_conv_state()) {
@@ -1993,6 +2071,43 @@ int Engine::save_checkpoints() {
         if (ss < 0) return ss;
     }
     return RAD_OK;
+}
+
+/* qfn-on-ds lever TIP: the plugin's staging callback (rad_arch.h TipStage::put), on the rank's thread inside its issue: copy
+ * the sequence's (group, model layer) state row into the snapshot's checkpoint slot on the stream the plugin issues on. */
+int Engine::tip_stage(void* u, int group, int layer, void* stream) {
+    TipRank* t = static_cast<TipRank*>(u);
+    if (!t || !t->e || t->row <= 0 || t->ck < 0) return RAD_E_STATE;
+    Rank& rk = *t->e->ranks_[(size_t)t->rank];
+    const int64_t li = rk.ctx.kv_layer_index((rad_kvgroup)group, layer);
+    if (group < 0 || (size_t)group >= t->slots.size() || t->slots[(size_t)group] < 0 || li < 0 ||
+        (size_t)li >= t->staged[(size_t)group].size()) {
+        ++t->fail;
+        RAD_ERR("rank %d: lever TIP: no state row for group %d layer %d (layer row %lld)", t->rank, group, layer, (long long)li);
+        return RAD_E_STATE;
+    }
+    const int s = rk.kv.stage_state_row((int32_t)group, (int32_t)li, t->slots[(size_t)group], t->ck, (RadStream)stream);
+    if (s < 0) { ++t->fail; return s; }
+    t->staged[(size_t)group][(size_t)li] = 1;
+    ++t->rows;
+    return RAD_OK;
+}
+
+int64_t Engine::tip_row_of(const StepPlan& plan, const StepEntry** out) const {
+    *out = nullptr;
+    const StepEntry* hit = nullptr;
+    int64_t row0 = 0, at = 0;
+    for (const StepEntry& e : plan.e) {
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) {
+            if (hit) return 0;   /* two inside snapshots in one step: never planned (one prefill a TI step) */
+            hit = &e;
+            at = row0 + e.ckpt_tok + 1;
+        }
+        row0 += e.n_tokens;
+    }
+    if (!hit || plan.e.size() != 1) return 0;
+    *out = hit;
+    return at;
 }
 
 /* Scored rows (Request::token_scores): the logits row at a scored prompt's last position, copied
@@ -3010,6 +3125,28 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         const void* ids = nullptr;
         int ctx = 0;
         ti_capable_ = fn4::ckpt_conv_src(-1, &ids, &ctx) > 0;
+        /* qfn-on-ds lever TIP (RADIANCE_FN4_TIP=1): a plugin serving rad_tip_set stages every state row it reads at a piece
+         * start from inside the step (straight into the checkpoint slot), the rest (rad_tip_free) as the step leaves them */
+        if (const char* tv = std::getenv("RADIANCE_FN4_TIP"); tv && *tv && *tv != '0') {
+            std::vector<TipRank> t(ranks_.size());
+            bool ok = cfg_.prefix_cache && !ranks_[0]->kv.has_window_snapshot();
+            for (size_t i = 0; ok && i < ranks_.size(); ++i) {
+                int fg[16];
+                const int nf = fn4::tip_free((int)i, fg, 16);
+                if (nf < 0) { ok = false; break; }
+                t[i].e = this;
+                t[i].rank = (int)i;
+                t[i].free_groups.assign(fg, fg + nf);
+            }
+            tip_on_ = ok;
+            if (ok) tip_ = std::move(t);
+            RAD_INFO("lever TIP (RADIANCE_FN4_TIP): %s", ok
+                     ? "on -- lever G's tail snapshot inside the prompt's last step at the start of its last piece, the plugin "
+                       "staging each state row between its op's two launches (with sched_tail_grid 2048 + sched_tail_inner 1)"
+                     : "NOT served (no plugin serves rad_tip_set on every rank, no prefix cache, or the model snapshots a "
+                       "window): lever TI acts as without it");
+        }
+        ti_capable_ = ti_capable_ || tip_on_;
         sched_.set_tail_inner_capable(ti_capable_);
         for (auto& ls : lane_sched_) ls->set_tail_inner_capable(ti_capable_);   /* tp8 S5 */
     }

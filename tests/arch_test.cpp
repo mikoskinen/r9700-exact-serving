@@ -13090,6 +13090,114 @@ TEST(flashnext_psp_pairs_the_full_pieces_of_an_odd_step_and_keeps_the_last_singl
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds lever TIP (Qwen loop round 21): a prompt's tail snapshot at the start of the step's LAST PIECE, taken inside the
+ * step (rad_tip_set names the row). Every state op of the step -- each delta-net layer's convolution, solve and scan, the
+ * PLE's ids and convolution -- runs [0, row) and [row, T) in two launches, and each of its state rows is staged exactly once
+ * BETWEEN them (the issue before the stage call is the first launch's last op at `row` rows; the next of that op kind runs
+ * T - row rows); every other issue is the control's (row 0). At 2,560 rows (two pieces) the delta net takes its piece path
+ * (staged after piece 0's scan), at 5,120 (three pieces) the split. Negative control: a row that is not a piece start fails
+ * the step; the hooks refuse without RADIANCE_FN4_TIP's declare (tip_free -1 on a model with no pipelined step: not here). */
+namespace tipt {
+struct St { int group, layer; size_t at; };
+std::vector<St> st;
+int cb(void*, int g, int l, void* s) { st.push_back({ g, l, ((RadCtx*)s)->issues.size() }); return 0; }
+}  // namespace tipt
+TEST(flashnext_tip_stages_every_state_row_between_its_ops_two_launches) {
+    setenv("RADIANCE_FN4_TIP", "1", 1);
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int64_t T : { 2560, 5120 }) {
+        const int64_t row = (T - 1) / 2048 * 2048;
+        std::map<std::pair<std::string, int64_t>, int64_t> ctl;
+        for (int arm : { 0, 1, 2 }) {   /* 0: no row; 1: the last piece's start; 2: a row inside a piece (refused) */
+            const int rank = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.pipe_on);
+            int fg[8];
+            const int nf = qwen4exp_fp8::tip_free(rank, fg, 8);
+            CHECK(nf >= 0);
+            if (m.qsacfg.kv_tail) { CHECK_EQ(nf, 1); CHECK_EQ(fg[0], (int)m.qsacfg.kv_tail); }
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(512);
+            tipt::st.clear();
+            if (arm) CHECK_EQ(qwen4exp_fp8::tip_set(rank, arm == 1 ? row : row + 1000, &tipt::cb, nullptr), 1);
+            const auto pf = kit(b, {}, { (int)T }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            CHECK_EQ(qwen4exp_fp8::tip_set(rank, 0, nullptr, nullptr), 1);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            const RadCtx& c = *v[0];
+            if (arm == 2) {                                   /* the negative control */
+                CHECK(!c.step_fail.empty());
+                CHECK(c.step_fail.find("lever TIP") != std::string::npos);
+                CHECK(tipt::st.empty());
+                continue;
+            }
+            CHECK_PASSES(b, v);
+            CHECK(c.step_fail.empty());
+            int64_t n_gdn = 0;
+            for (const auto& l : m.layers) n_gdn += l.full ? 0 : 1;
+            REQUIRE(n_gdn > 0);
+            auto opname = [&](size_t i) { const RecOp* o = b.op_of(c.issues[i].op); return o ? o->op : std::string("?"); };
+            static const char* kState[] = { "gdn_conv_prep", "gdn_kkt_solve", "gdn_chunk_scan", "ngram_ids", "ple_conv" };
+            auto state_op = [&](const std::string& o) { for (const char* k : kState) if (o == k) return true; return false; };
+            std::map<std::pair<std::string, int64_t>, int64_t> other;
+            int64_t at_row = 0, at_rest = 0;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const std::string o = opname(i);
+                if (state_op(o)) { at_row += c.issues[i].n == row; at_rest += c.issues[i].n == T - row; continue; }
+                ++other[{ o, c.issues[i].n }];
+            }
+            if (arm == 0) {
+                CHECK(tipt::st.empty());
+                ctl = other;
+                continue;
+            }
+            CHECK(other == ctl);                               /* nothing but the state ops changed */
+            /* every delta-net layer's state and window, the PLE's two windows: once each */
+            const int64_t want = 2 * n_gdn + (m.ple_layer >= 0 ? 2 : 0);
+            CHECK_EQ((int64_t)tipt::st.size(), want);
+            std::map<std::pair<int, int>, int> seen;
+            for (const tipt::St& s : tipt::st) {
+                ++seen[{ s.group, s.layer }];
+                REQUIRE(s.at > 0 && s.at < c.issues.size());
+                const std::string before = opname(s.at - 1);
+                const bool gdn = s.group == (int)m.kv_state || s.group == (int)m.kv_conv;
+                if (gdn) CHECK_EQ(before, std::string("gdn_chunk_scan"));
+                else CHECK(before == "ngram_ids" || before == "ple_conv");
+                CHECK_EQ(c.issues[s.at - 1].n, row);           /* the first launch, [0, row) */
+                size_t j = s.at;
+                while (j < c.issues.size() && opname(j) != (gdn ? std::string("gdn_conv_prep") : before)) ++j;
+                REQUIRE(j < c.issues.size());
+                CHECK_EQ(c.issues[j].n, T - row);              /* the next of its kind: the second launch, [row, T) */
+            }
+            for (const auto& kv : seen) CHECK_EQ(kv.second, 1);
+            CHECK(at_row >= 3 * n_gdn);
+            CHECK(at_rest >= 3 * n_gdn);
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+    unsetenv("RADIANCE_FN4_TIP");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's

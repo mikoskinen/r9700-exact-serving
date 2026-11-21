@@ -328,6 +328,78 @@ struct Model {
 
 static Model g_model[MAX_RANKS];
 
+/* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1 at start, the engine's too): a prompt's tail snapshot at the
+ * START OF THE LAST PIECE of its last pipelined prefill step, taken inside the step instead of cutting the step there (lever
+ * G at sched_tail_grid 2048 cuts it: the tail then runs as a lone step and pays its fixed cost, +40..+60 ms a cold prompt).
+ * The engine names the row (rad_tip_set, on the rank's thread around its issue); the delta net's convolution, solve and scan
+ * and the PLE's two windowed ops run [0, row) and [row, T) in two launches and stage each state row between them
+ * (rad_arch.h TipStage) -- the same arithmetic: the scan's state is fp32 in the cache and across its chunks, every window is
+ * what its launch's last rows leave, and the row is a multiple of every chunk / block / ratio. The QSA tail ring is not read
+ * by a resume at a multiple of its ratio (4), so it is the one group left as the step leaves it (rad_tip_free). Kept out of
+ * Model (declare resets that): the pinned ring the bounds are uploaded from and their device copy live for the process. */
+struct TipRank {
+    int64_t   row = 0;
+    int     (*stage)(void*, int, int, void*) = nullptr;
+    void*     u = nullptr;
+    int32_t*  ring_h = nullptr;   /* 64 x {0, row}: a slot is rewritten 64 TIP steps after its copy was issued */
+    int32_t*  cu_d = nullptr;     /* {0, row, T} on the card */
+    int64_t   k = 0;
+    bool      tried = false;
+    bool      noted = false;
+};
+static TipRank g_tipr[MAX_RANKS];
+static bool fn4_tip_env() {
+    static const bool on = fn4_env_on("RADIANCE_FN4_TIP");
+    return on;
+}
+/* The step's TipStage, its bounds uploaded on the step's stream; false (and the step failed) where the row is not the start
+ * of a piece of this pipelined step of one prefill sequence. */
+static bool tip_stage_for(RadCtx* c, const RadBatch* batch, const Model& m, TipStage* out) {
+    *out = TipStage{};
+    const int rk = rad_rank(c);
+    TipRank& t = g_tipr[rk];
+    if (t.row <= 0) return true;
+    const int64_t T = batch->n_tok, R = m.pass_rows;
+    if (batch->n_seq != 1 || batch->phase != RAD_PHASE_PREFILL || batch->draft_pass != 0 || R <= 0 || t.row % R != 0 ||
+        t.row >= T || !t.stage) {
+        char why[256];
+        snprintf(why, sizeof why, "qwen4exp: lever TIP: a snapshot at row %lld of a %lld-row step (%lld sequences, phase %d) "
+                                  "is not the start of a piece of a pipelined prefill step of one sequence (pieces of %lld)",
+                 (long long)t.row, (long long)T, (long long)batch->n_seq, batch->phase, (long long)R);
+        rad_step_fail(c, why);
+        return false;
+    }
+    if (!t.tried) {
+        t.tried = true;
+        t.ring_h = (int32_t*)rad_dev_alloc(64 * 2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        t.cu_d = (int32_t*)rad_dev_alloc(4 * sizeof(int32_t), RAD_MEM_DEVICE);
+    }
+    if (!t.ring_h || !t.cu_d) {
+        rad_step_fail(c, "qwen4exp: lever TIP: no pinned / device memory for the snapshot row's bounds");
+        return false;
+    }
+    int32_t* h = t.ring_h + 2 * (t.k++ % 64);
+    h[0] = 0;
+    h[1] = (int32_t)t.row;
+    const RadStream s = rad_stream(c);
+    if (rad_memcpy_async(t.cu_d, h, 2 * sizeof(int32_t), s) != RAD_OK ||
+        rad_memcpy_async(t.cu_d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK) {
+        rad_step_fail(c, "qwen4exp: lever TIP: the snapshot row's bounds could not be uploaded");
+        return false;
+    }
+    out->row = t.row;
+    out->cu = t.cu_d;
+    out->stage = t.stage;
+    out->u = t.u;
+    if (!t.noted && rk == 0) {
+        t.noted = true;
+        fprintf(stderr, "radiance: qwen4exp: lever TIP: a %lld-row prefill step takes its tail snapshot at its row %lld (the "
+                        "start of its last piece) inside the step: the delta net and the PLE run their state ops in two "
+                        "launches and stage the rows between them\n", (long long)T, (long long)t.row);
+    }
+    return true;
+}
+
 /* fn4 BI-dual: switch exl3_dual's value (RADIANCE_FN4_X3DUAL starts it at 1; declared ranks only issue it). */
 static std::atomic<int>& fn4_dual_flag() {
     static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_X3DUAL") ? 1 : 0};
@@ -2422,13 +2494,18 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     (long long)T, (long long)K, (long long)R);
     }
 
+    /* qfn-on-ds lever TIP: the tail snapshot inside this step, at the start of its last piece (g_tipr) */
+    TipStage tip{};
+    if (!tip_stage_for(c, batch, m, &tip)) return;
+    const TipStage* tipp = tip.on() ? &tip : nullptr;
+
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
     on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE); });
     wait1();
     bt_pt(c, m, m.a_x.x, 0, T, "emb", -1);
-    if (m.ple_layer >= 0) m.ple.ids(c, batch);
+    if (m.ple_layer >= 0) m.ple.ids(c, batch, tipp);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
@@ -2441,7 +2518,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 
     const int64_t n = (int64_t)m.layers.size();
     if (n > 0) {
-        if (m.ple_layer == 0) { m.ple.step(c, batch); bt_pt(c, m, m.b_h, 0, T, "ple", 0); }
+        if (m.ple_layer == 0) { m.ple.step(c, batch, tipp); bt_pt(c, m, m.b_h, 0, T, "ple", 0); }
         for (int64_t p = 0; p < K; ++p) {
             bi_read(c, m, m.layers[0].hc_mix, T, r0(p), rn(p));
             bt_rd(c, m, r0(p), rn(p), "rd_mix", 0, false);
@@ -2493,7 +2570,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
          * piece 1's and 2's mixer reductions instead of after them (the delta net hands every piece at its very end) */
         if (pmk_l && pford && !l.full) pc.max_hand = 1;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
-        else        l.gdn.step(c, batch, false, &pc);
+        else        l.gdn.step(c, batch, false, &pc, tipp);
         bt_blk(c, m, l, T, (int)li);   /* lane 0's buffers; lane 1 reduces only `x` */
         auto ar_mix = [&](int64_t p) {
             if (sp_p(p))     rs_p(p);
@@ -2762,7 +2839,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
         }
         if (ple_next) {
-            m.ple.step(c, batch);
+            m.ple.step(c, batch, tipp);
             bt_pt(c, m, m.b_h, 0, T, "ple", (int)li + 1);
             for (int64_t p = 0; p < K; ++p) {
                 if (sp_pm(p, spN)) hrm(nx->hc_mix, p, false, spN); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
@@ -3210,6 +3287,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     for (const Layer& l : m.layers) l.mlp.set_qmax(batch->max_q_len);
     const int32_t* pcu = pipe_bounds(c, batch, m);
     SpSer sp;
+    if (g_tipr[rad_rank(c)].row > 0 && !pipelined(m, T)) {   /* lever TIP: only a pipelined step stages its rows */
+        rad_step_fail(c, "qwen4exp: lever TIP: a snapshot inside a step that is not pipelined (one pass or less, or the "
+                         "pipelined form refused): its state rows would be the step end's");
+        return;
+    }
     if (pipelined(m, T))               step_pipelined(c, batch, m, pcu);
     else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
     else                               step_serial(c, batch, m, pcu);
@@ -3242,6 +3324,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * mapped table). */
 uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
+    /* lever TIP: a step with a snapshot inside issues per its row (two launches a state op and staging calls), which no key
+     * carries: never recorded, never a replay */
+    if (g_tipr[rad_rank(c)].row > 0) return 0;
     if (batch->enc) return 1;
     /* Mixed batches split the query rows into decode and prefill subsets before attention; the
      * whole-batch host summary cannot key those subset geometries exactly. */
@@ -3366,6 +3451,26 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     return RAD_OK;
 }
 
+/* lever TIP (the engine's hooks, core/runtime/fn4_switch.cpp): rad_tip_set names the snapshot row of the step this rank
+ * issues next (0 after it); -1 where the start did not declare the lever (RADIANCE_FN4_TIP) or the rank has no pipelined
+ * prefill. rad_tip_free lists the stateful groups a resume at a piece start does not read (the QSA tail ring), which the
+ * engine saves as the step leaves them. */
+int tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    if (rank < 0 || rank >= MAX_RANKS || !fn4_tip_env()) return -1;
+    if (!g_model[rank].pipe_on && row != 0) return -1;
+    TipRank& t = g_tipr[rank];
+    t.row = row > 0 ? (int64_t)row : 0;
+    t.stage = row > 0 ? stage : nullptr;
+    t.u = row > 0 ? u : nullptr;
+    return 1;
+}
+int tip_free(int rank, int* groups, int max) {
+    if (rank < 0 || rank >= MAX_RANKS || !fn4_tip_env() || !g_model[rank].pipe_on) return -1;
+    int n = 0;
+    if (g_model[rank].qsacfg.kv_tail && groups && n < max) groups[n++] = (int)g_model[rank].qsacfg.kv_tail;
+    return n;
+}
+
 }  /* namespace qwen4exp_fp8 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
@@ -3476,4 +3581,8 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch,
                                       const int32_t* used_max_h) {
     return qwen4exp_fp8::pass_key(c, batch, used_max_h);
 }
+extern "C" int rad_tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    return qwen4exp_fp8::tip_set(rank, row, stage, u);
+}
+extern "C" int rad_tip_free(int rank, int* groups, int max) { return qwen4exp_fp8::tip_free(rank, groups, max); }
 #endif

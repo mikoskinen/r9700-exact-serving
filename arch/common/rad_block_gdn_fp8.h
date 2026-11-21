@@ -150,8 +150,12 @@ struct GdnFP8 {
     /* `own_ar` false: the caller issues this step's all-reduce itself, a row slice at a time
      * (issue_ar), to overlap it with other work (a pipelined prefill). Only on a block without a
      * trailing add, which would read the delta before the reduction. */
+    /* `tip` (lever TIP, rad_arch.h TipStage): a snapshot at a row inside this pure prefill step of one sequence -- the
+     * convolution, solve and scan run [0, row) and [row, T) in two launches (the piece path: after piece 0, where row is
+     * its end) and the state and convolution rows of this layer are staged between them. The scan keeps its state fp32
+     * across chunks and the cache is fp32 (r4d_gdn_chunk_scan), so a 64-aligned split hands on the same bits. */
     void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
-              ArPieces* pieces = nullptr) const;
+              ArPieces* pieces = nullptr, const TipStage* tip = nullptr) const;
     /* The prefill rows [r0, r0 + n) of T: the gated norm (in place on o.x, the gate from in.x's z part) and q_o's codes of
      * its output -- one op under lever GNQ8 (op_gnq8 declared and switch gnq8 on), else the pair. */
     void gnorm_q(RadCtx* c, int64_t T, int64_t r0, int64_t n) const {
@@ -422,7 +426,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
 }
 
 inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
-                         ArPieces* pieces) const {
+                         ArPieces* pieces, const TipStage* tip) const {
     const RadKVGroupBatch* st = kv_batch(batch, kv_state);
     const RadKVGroupBatch* cv = kv_batch(batch, kv_conv);
     const int32_t* st_idx = st ? st->state_index : nullptr;
@@ -469,6 +473,11 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         kv_cache(kv_state, layer), praw(cu, RAD_I32, 2),
                         brows(w.o.x, T), kv_cache(kv_state, layer),
                         praw2(st_idx, RAD_I32, 1, st_w));
+            /* lever TIP: the state and window as piece 0 leaves them, before piece 1's convolution rewrites the window */
+            if (p == 0 && tip && tip->on() && tip->row == pieces->rows) {
+                tip->put(c, kv_state, layer);
+                tip->put(c, kv_conv, layer);
+            }
             gnorm_q(c, T, r0, n);
             out.step(c, w.o, w.h.x, T, r0, n);
             if (p == 0) pieces->hand(r0, n);
@@ -554,6 +563,52 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * gated norm, quantiser and out projection are per row, so a pure prefill step can finish them
      * a piece at a time and hand off each piece's reduction behind it. */
     const bool cut = !own_ar && pieces && pieces->cuts(T) && D == 0 && P > 0 && !op_add;
+    /* lever TIP: one prefill sequence, the snapshot row inside it -- two launches of the convolution, solve and scan over
+     * [0, row) and [row, T) (cu = tip->cu / tip->cu + 1; the second takes its first row's position as its context, as the
+     * piece path above), this layer's state and window staged between them */
+    if (P == 1 && D == 0 && tip && tip->on() && tip->row < T) {
+        const int64_t rr = tip->row;
+        for (int part = 0; part < 2; ++part) {
+            const int32_t* pcu = tip->cu + part;
+            const int64_t  n   = part == 0 ? rr : T - rr;
+            RAD_ISSUE_N(c, op_conv_prep, n,
+                        bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log), RAD_W(w_dt_bias),
+                        kv_cache(kv_conv, layer), praw(pcu, RAD_I32, 2),
+                        bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
+                        praw(cv_idx, RAD_I32, 1),
+                        part == 0 ? praw(batch->ctx_lens, RAD_I32, 1) : praw(batch->positions + rr, RAD_I32, 1),
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                        brows(w.gdec, T), brows(w.beta, T));
+            RAD_ISSUE_N(c, op_kkt, n,
+                        brows(w.k, T), brows(w.beta, T), brows(w.gdec, T),
+                        praw(pcu, RAD_I32, 2), brows(w.kkt, T));
+            RAD_ISSUE_N(c, op_scan, n,
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T), brows(w.kkt, T),
+                        brows(w.gdec, T), brows(w.beta, T),
+                        kv_cache(kv_state, layer), praw(pcu, RAD_I32, 2),
+                        brows(w.o.x, T), kv_cache(kv_state, layer),
+                        praw2(st_idx, RAD_I32, 1, st_w));
+            if (part == 0) {
+                tip->put(c, kv_state, layer);
+                tip->put(c, kv_conv, layer);
+            }
+        }
+        if (cut) {
+            for (int64_t r0 = 0; r0 < T; r0 += pieces->rows) {
+                const int64_t n = T - r0 < pieces->rows ? T - r0 : pieces->rows;
+                gnorm_q(c, T, r0, n);
+                out.step(c, w.o, w.h.x, T, r0, n);
+                if (r0 + n < T) pieces->hand(r0, n);
+            }
+            return;
+        }
+        gnorm_q(c, T, DT, PT);
+        out.step(c, w.o, w.h.x, T);
+        if (own_ar && op_ar && !ar_taken(g, T, ar_out, ar_out_take))
+            RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
+        if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+        return;
+    }
     if (P > 0) {
         RAD_ISSUE(c, op_conv_prep,
                   bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log), RAD_W(w_dt_bias),

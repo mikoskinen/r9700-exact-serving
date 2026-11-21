@@ -136,6 +136,9 @@ struct Hooks {
     /* lever XR (exl3r4d's rad_host_pool_ranges, ds41-etp-xr): a rank's pinned host pools */
     int (*host_pools)(int, int, const unsigned long long*, const unsigned long long*) = nullptr;
     int (*ckpt_conv)(int, const void**, int*) = nullptr;   /* lever TI (ds41-pf2): rad_ckpt_conv_src */
+    /* qfn-on-ds lever TIP: rad_tip_set / rad_tip_free (qwen4exp_fp8 / _x3) */
+    int (*tip_set)(int, long long, int (*)(void*, int, int, void*), void*) = nullptr;
+    int (*tip_free)(int, int*, int) = nullptr;
 };
 
 struct State {
@@ -286,6 +289,8 @@ void find_hooks(State& s) {
             k.wmk_stats = sym<int (*)(long long*, int)>(h, "rad_wmk_stats");
             k.host_pools = sym<int (*)(int, int, const unsigned long long*, const unsigned long long*)>(h, "rad_host_pool_ranges");
             k.ckpt_conv = sym<int (*)(int, const void**, int*)>(h, "rad_ckpt_conv_src");
+            k.tip_set = sym<int (*)(int, long long, int (*)(void*, int, int, void*), void*)>(h, "rad_tip_set");
+            k.tip_free = sym<int (*)(int, int*, int)>(h, "rad_tip_free");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -581,6 +586,26 @@ int ckpt_conv_src(int rank, const void** ids, int* ctx) {
     for (const Hooks& k : s.hooks)
         if (k.ckpt_conv) return k.ckpt_conv(rank, ids, ctx) > 0 ? 1 : 0;
     return 0;
+}
+int tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    int r = -1;
+    for (const Hooks& k : s.hooks)
+        if (k.tip_set) r = std::max(r, k.tip_set(rank, row, stage, u));
+    return r;
+}
+int tip_free(int rank, int* groups, int max) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    for (const Hooks& k : s.hooks)
+        if (k.tip_free) {
+            const int n = k.tip_free(rank, groups, max);
+            if (n >= 0) return n;
+        }
+    return -1;
 }
 void note_sched_tail_grid(const int64_t* v) {
     State& s = st();

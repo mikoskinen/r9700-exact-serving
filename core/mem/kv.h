@@ -622,6 +622,14 @@ public:
      * than `ctx` ids or are not 4-byte ids; RAD_OK with no CONV group. */
     int checkpoint_patch_conv(int32_t ck_slot, const void* ids, int64_t ctx, RadStream s);
     bool has_conv_state() const;
+    /* qfn-on-ds lever TIP (Qwen loop round 21): a snapshot written row by row from inside the step that writes the state.
+     * A checkpoint slot's state section is every stateful group in plans_ order, n_layers rows of layer_bytes_per_state
+     * (checkpoint_copy's walk); state_rows_off is a group's offset in it (-1: not stateful). stage_state_row copies layer
+     * `layer` (the group's own layer index) of state slot `slot` into that row of checkpoint slot `ck` on `s` (the store
+     * is pinned host memory) -- RAD_E_INVAL on a slot the store does not hold or a model whose snapshots carry a window
+     * section (none is staged). */
+    int64_t state_rows_off(int32_t g) const;
+    int stage_state_row(int32_t g, int32_t layer, int32_t slot, int32_t ck, RadStream s) const;
 
     /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
      * A WINDOW group keeps only the blocks its window can still read, so the prefix cache's block

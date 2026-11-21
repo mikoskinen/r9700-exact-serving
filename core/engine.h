@@ -1019,6 +1019,30 @@ private:
      * saved inside a step so far (save_checkpoints). */
     bool     ti_capable_ = false;
     uint64_t ti_saves_ = 0;
+    /* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1, a plugin serving rad_tip_set): lever TI's snapshot at the
+     * start of the step's last piece, its state rows staged by the plugin straight into the checkpoint slot from between a
+     * state op's two launches (tip_stage). One per rank, set on the rank's thread around its issue (rank_loop) and read
+     * by save_checkpoints: the step's row, sequence, slot, the rows staged and the groups the plugin leaves as the step
+     * leaves them (rad_tip_free: not read by a resume at a piece start). */
+    struct TipRank {
+        Engine*  e = nullptr;
+        int      rank = 0;
+        int64_t  row = 0;
+        uint64_t seq = 0;
+        int32_t  ck = -1;
+        std::vector<int32_t> slots;                /* the sequence's state slot a group (state_slots_of) */
+        std::vector<std::vector<uint8_t>> staged;  /* [group][layer] */
+        std::vector<int32_t> free_groups;
+        int      fail = 0;
+        uint64_t rows = 0;                         /* rows staged, this rank's (read for the engine's line) */
+    };
+    bool     tip_on_ = false;
+    std::vector<TipRank> tip_;
+    uint64_t tip_saves_ = 0;
+    static int tip_stage(void* u, int group, int layer, void* stream);
+    /* The step's TIP snapshot (an entry whose snapshot lies inside it, on the only prefill sequence): its row in the step,
+     * or 0 (none); `e` the entry. */
+    int64_t tip_row_of(const StepPlan& plan, const StepEntry** e) const;
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;

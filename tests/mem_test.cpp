@@ -8705,6 +8705,80 @@ static std::vector<KVGroupInfo> engram_conv_groups() {
     return g;
 }
 
+/* qfn-on-ds lever TIP (Qwen loop round 21): the rows the plugin stages from inside the step (stage_state_row, one (group,
+ * layer) row of a state slot into that row of a checkpoint slot) land where checkpoint_save puts them: staging every row of a
+ * hybrid model's LINEAR + CONV groups gives checkpoint_save's blob byte for byte; a row staged from the step's middle (pattern
+ * 0) and the rest after the step (pattern 1) gives each row its own pattern. Refusals (a layer past the group's, an unheld
+ * slot, a group with no state) write nothing. */
+TEST(lever_tip_staged_rows_land_where_checkpoint_save_puts_them) {
+    if (!host_backend_or_skip("the staged rows")) return;
+    Fixture f;
+    f.cfg.n_spec = 2;
+    f.cfg.checkpoint_slots = 4;
+    REQUIRE_EQ(f.build_groups(hybrid_conv_groups()), RAD_OK);
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16));
+    const std::vector<int32_t> a = slots_of(f.kv, 1);
+    fill_states(f.kv, 0);
+    int32_t ck0 = -1, ck1 = -1;
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&ck0), RAD_OK);
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&ck1), RAD_OK);
+    const int64_t nb = f.kv.checkpoint_bytes();
+    unsigned char* b0 = (unsigned char*)f.kv.checkpoint_ptr(ck0);
+    unsigned char* b1 = (unsigned char*)f.kv.checkpoint_ptr(ck1);
+    std::memset(b0, 0x11, (size_t)nb);
+    std::memset(b1, 0x22, (size_t)nb);
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_OK(f.kv.checkpoint_save(a.data(), (int)a.size(), ck0, st));
+    int64_t rows = 0;
+    for (const KVGroupPlan& p : f.kv.plans()) {
+        if (!p.stateful()) continue;
+        for (int64_t l = 0; l < p.n_layers; ++l, ++rows)
+            CHECK_OK(f.kv.stage_state_row(p.index, (int32_t)l, a[(size_t)p.index], ck1, st));
+    }
+    CHECK_OK(rad_stream_sync(st));
+    CHECK(rows >= 2);
+    CHECK(std::memcmp(b0, b1, (size_t)nb) == 0);
+    /* the first stateful group's rows from "inside the step" (pattern 0), the rest after it (pattern 1) */
+    int32_t g0 = -1;
+    for (const KVGroupPlan& p : f.kv.plans()) if (p.stateful()) { g0 = p.index; break; }
+    REQUIRE(g0 >= 0);
+    std::memset(b1, 0x33, (size_t)nb);
+    for (int64_t l = 0; l < f.kv.plan(g0)->n_layers; ++l) CHECK_OK(f.kv.stage_state_row(g0, (int32_t)l, a[(size_t)g0], ck1, st));
+    CHECK_OK(rad_stream_sync(st));
+    fill_states(f.kv, 1);
+    for (const KVGroupPlan& p : f.kv.plans()) {
+        if (!p.stateful() || p.index == g0) continue;
+        for (int64_t l = 0; l < p.n_layers; ++l) CHECK_OK(f.kv.stage_state_row(p.index, (int32_t)l, a[(size_t)p.index], ck1, st));
+    }
+    CHECK_OK(rad_stream_sync(st));
+    int64_t off = 0, wrong = 0;
+    for (const KVGroupPlan& p : f.kv.plans()) {
+        if (!p.stateful()) continue;
+        CHECK_EQ(f.kv.state_rows_off(p.index), off);
+        const int64_t lb = p.bytes_per_state / p.n_layers;
+        for (int64_t l = 0; l < p.n_layers; ++l, off += lb)
+            for (int64_t i = 0; i < lb; ++i)
+                wrong += b1[off + i] != pat(p.index == g0 ? 0 : 1, p.index * 16 + l, a[(size_t)p.index], i);
+    }
+    CHECK_EQ(off, nb);
+    CHECK_EQ(wrong, 0ll);
+    /* refusals write nothing */
+    std::vector<unsigned char> keep(b1, b1 + nb);
+    CHECK(f.kv.stage_state_row(g0, (int32_t)f.kv.plan(g0)->n_layers, a[(size_t)g0], ck1, st) < 0);
+    CHECK(f.kv.stage_state_row(g0, -1, a[(size_t)g0], ck1, st) < 0);
+    int32_t gone = -1;
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&gone), RAD_OK);
+    f.kv.free_checkpoint(gone);
+    CHECK(f.kv.stage_state_row(g0, 0, a[(size_t)g0], gone, st) < 0);
+    CHECK_EQ(f.kv.state_rows_off(0), (int64_t)-1);                      /* the null sentinel: no state */
+    CHECK(f.kv.stage_state_row(0, 0, a[(size_t)g0], ck1, st) < 0);
+    CHECK_OK(rad_stream_sync(st));
+    CHECK(std::memcmp(keep.data(), b1, keep.size()) == 0);
+    rad_stream_destroy(st);
+}
+
 TEST(lever_ti_a_patch_writes_the_conv_window_of_a_row_inside_the_step) {
     if (!host_backend_or_skip("the conv patch")) return;
     Fixture f;

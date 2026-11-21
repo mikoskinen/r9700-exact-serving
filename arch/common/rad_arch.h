@@ -1126,6 +1126,22 @@ inline int64_t vocab_head_rows(const Geom& g) {
  * the batch, so the operand names the group and layer and the core resolves it like a weight
  * handle. */
 inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, layer); }
+/* qfn-on-ds lever TIP (Qwen loop round 21): a prompt's tail snapshot taken at a row INSIDE its last prefill step -- the start of
+ * the step's last piece, so no piece boundary moves -- instead of cutting the step there. The engine sets it around the step
+ * (the plugin's rad_tip_set); a block whose per-sequence state op runs over the step's rows runs it in two launches, [0, row)
+ * and [row, T) (cu = {0, row, T} on the card: the second launch's cu is cu + 1, its context row's position), and between
+ * them calls put() for every state row that launch pair writes: the engine copies the sequence's (group, layer) row into its
+ * staging blob on the stream the block issues on, and saves the blob as the snapshot. Null / row 0: no snapshot inside. */
+struct TipStage {
+    int64_t        row = 0;
+    const int32_t* cu = nullptr;
+    int  (*stage)(void* u, int group, int layer, void* stream) = nullptr;
+    void* u = nullptr;
+    bool on() const { return row > 0 && cu && stage; }
+    void put(RadCtx* c, rad_kvgroup g, int layer) const {
+        if (stage && stage(u, (int)g, layer, rad_stream(c)) < 0) rad_step_fail(c, "lever TIP: the engine refused a state row's staging copy");
+    }
+};
 /* fn4 kvs_apart (qwen/KV-STREAM-EXACT.md): a streamed group's RING whatever view the pass is on -- `cols` -1 on a KV operand
  * (core/runtime/issue.cpp); meaningful only in a pass staged on a stage funded beside the ring (kv_stage_apart_wait 2),
  * where a store keeps the ring current; elsewhere it resolves as kv_cache. */

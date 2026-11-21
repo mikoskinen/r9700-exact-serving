@@ -1987,6 +1987,11 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
         int64_t ck = -1;
         const int64_t w = plan_chunk(n, end, cfg_.max_tok, &ck, 0, &r);
         if (w <= 0) break;
+        /* qfn-on-ds lever TIP (Qwen loop round 21): lever TI's snapshot inside the chunk (taken there, not cut) at the start
+         * of one of the chunk's pieces -- a resume there computes the rest in the cold run's own pieces, as at a chunk start
+         * (a piece computes the bytes its own chunk would: step_pipelined); an inside snapshot off the piece grid is not */
+        if (ck > n && ck < n + w && geo_.checkpoint_interval > 0 && (ck - n) % geo_.checkpoint_interval == 0)
+            out->push_back(ck);
         n += w;
         if (n < end) out->push_back(n);
     }

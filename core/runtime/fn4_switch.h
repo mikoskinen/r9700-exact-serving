@@ -1099,6 +1099,13 @@ int  aql_hdp();
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
 int  ckpt_conv_src(int rank, const void** ids, int* ctx);
+/* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1): lever TI's snapshot at the start of the step's last piece,
+ * staged by the plugin. tip_set names the row inside the step rank `rank` issues next (0: none) and the engine's staging
+ * callback stage(u, group, layer, stream) the plugin calls between a state op's two launches (every plugin that serves
+ * rad_tip_set is told; 1 when one accepted, -1 when none serves it). tip_free lists the stateful groups a resume at a piece
+ * start does not read (saved as the step leaves them): their count, or -1 when no plugin serves the lever. */
+int  tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u);
+int  tip_free(int rank, int* groups, int max);
 /* Lever SAL (ds41-pf2, stage_lone; 80 here, after sched_tail_inner): 1 = lever SA's stage_short arms the prefill stager only on a
  * step with no decode rows (a lone prefill's chunk at the span's shared level: a prompt shorter than the span's minimum, a long
  * prompt's first interval, a turn's tail), never beside decoding sequences; 0 = stage_short as built (any step it admits). The

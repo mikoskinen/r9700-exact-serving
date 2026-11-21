@@ -135,3 +135,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     return qwen4exp_fp8::pass_key(c, batch, used_max_h);
 }
+/* qfn-on-ds lever TIP (Qwen loop round 21): qwen4exp_fp8's hooks under this key too (RADIANCE_FN4_TIP=1 declares) */
+extern "C" int rad_tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    return qwen4exp_fp8::tip_set(rank, row, stage, u);
+}
+extern "C" int rad_tip_free(int rank, int* groups, int max) { return qwen4exp_fp8::tip_free(rank, groups, max); }

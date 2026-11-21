@@ -579,9 +579,10 @@ static rad_buf fake_buf_of(const void* p, size_t n_bufs) {
 /* Pinned host memory a plugin fills itself (qwen4exp_fp8's piece bounds, the calibration tap's
  * staging), as host memory; nothing else is handed out. */
 extern "C" void* rad_dev_alloc(int64_t bytes, int kind) {
-    return kind == RAD_MEM_HOST_PINNED && bytes > 0 ? std::calloc(1, (size_t)bytes) : nullptr;
+    /* qfn-on-ds lever TIP: qwen4exp_fp8's device copy of a snapshot row's bounds (16 bytes), as host memory too */
+    return (kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_DEVICE) && bytes > 0 ? std::calloc(1, (size_t)bytes) : nullptr;
 }
-extern "C" void  rad_dev_free(void* p, int kind) { if (kind == RAD_MEM_HOST_PINNED) std::free(p); }
+extern "C" void  rad_dev_free(void* p, int kind) { if (kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_DEVICE) std::free(p); }
 /* The device copies: nothing is copied. One into a buffer on a step's stream is recorded as a
  * write of that buffer before the next issue (RadCtx::copies). */
 extern "C" int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {

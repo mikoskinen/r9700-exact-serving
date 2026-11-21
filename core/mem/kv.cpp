@@ -1846,6 +1846,34 @@ int KVManager::checkpoint_patch_conv(int32_t ck_slot, const void* ids, int64_t c
     return RAD_OK;
 }
 
+int64_t KVManager::state_rows_off(int32_t g) const {
+    int64_t off = 0;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const KVGroupPlan& p = plans_[i];
+        if (!p.stateful()) continue;
+        if ((int32_t)i == g) return off;
+        off += p.layer_bytes_per_state() * p.n_layers;
+    }
+    return -1;
+}
+
+int KVManager::stage_state_row(int32_t g, int32_t layer, int32_t slot, int32_t ck_slot, RadStream s) const {
+    if (!ck_store_ || !ck_store_->in_use(ck_slot) || window_ck_bytes_ > 0) {
+        RAD_ERR("lever TIP: checkpoint slot %d is not held in this rank's store, or the model's snapshots carry a window "
+                "section", (int)ck_slot);
+        return RAD_E_INVAL;
+    }
+    const KVGroupPlan* p = plan(g);
+    const int64_t off = state_rows_off(g);
+    char* ck = (char*)checkpoint_ptr(ck_slot);
+    if (!p || off < 0 || !ck || layer < 0 || layer >= p->n_layers) return RAD_E_INVAL;
+    const int64_t nbytes = p->layer_bytes_per_state();
+    if (off + (int64_t)(layer + 1) * nbytes > checkpoint_bytes_) return RAD_E_STATE;
+    const void* st = state_ptr(g, layer, slot);
+    if (!st) return RAD_E_STATE;
+    return rad_memcpy_async(ck + off + (int64_t)layer * nbytes, st, nbytes, s);
+}
+
 int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStream s,
                                const std::vector<int32_t>* win) {
     return checkpoint_copy(slots, n, ck, /*save=*/true, s, win);

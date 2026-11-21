@@ -917,6 +917,69 @@ TEST(fn4_resume_cold_resumes_on_the_cold_plan_and_cuts_no_shared_head) {
     rad::fn4::apply_pending(1, da);
 }
 
+/* qfn-on-ds lever TIP (Qwen loop round 21): lever TI's snapshot inside a prompt's last chunk at the START OF ONE OF ITS PIECES
+ * (the tail grid = the interval: interval 256, span 2 -- a 1700-token prompt's last chunk [1280, 1700) runs whole with its
+ * snapshot at 1536, the start of its second piece) is a resume point under resume_cold: a hit there runs the rest in the cold
+ * run's own piece [1536, 1700). Controls: TI off cuts the chunk at 1536 (the tail a chunk start, resumed the same); an inside
+ * snapshot OFF the piece grid (1408, another prompt's 128-grid tail) is not a resume point (resumes at the chunk start 1280);
+ * the mutation (cold_starts without the inside piece start) resumes the 1536 hit at 1280. */
+TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
+    auto go = [&](int ti, int64_t lin) {
+        CHECK(rad::fn4::request("resume_cold", 1, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", 256, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+        Fixture f;
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        if (lin > 0) {
+            f.pc.seed(1700);
+            f.pc.lin = lin;
+            f.pc.src = 3;
+        }
+        const uint64_t a = f.submit(1700, 2);
+        Run o;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {
+                    if (o.resumed < 0) o.resumed = e.ctx_len;
+                    o.pc.push_back({ (int64_t)e.ctx_len, e.n_tokens });
+                    if (e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) o.inner = e.ctx_len + e.ckpt_tok + 1;
+                }
+            f.commit_plain();
+        }
+        return o;
+    };
+    const Run cold_ti = go(1, 0);
+    CHECK_EQ(cold_ti.resumed, (int64_t)0);
+    REQUIRE(!cold_ti.pc.empty());
+    CHECK_EQ(cold_ti.pc.back().first, (int64_t)1280);         /* the last chunk whole */
+    CHECK_EQ(cold_ti.pc.back().second, (int32_t)420);
+    CHECK_EQ(cold_ti.inner, (int64_t)1536);                    /* its snapshot inside, at its second piece's start */
+    const Run cold_g = go(0, 0);
+    REQUIRE(cold_g.pc.size() >= 2);
+    CHECK_EQ(cold_g.pc.back().first, (int64_t)1536);           /* the control: lever G cuts the chunk there */
+    CHECK_EQ(cold_g.inner, (int64_t)-1);
+    const Run hit_ti = go(1, 1536);
+    CHECK_EQ(hit_ti.resumed, (int64_t)1536);                   /* TIP: resumed at the inner snapshot */
+    REQUIRE(!hit_ti.pc.empty());
+    CHECK_EQ(hit_ti.pc.front().second, (int32_t)164);          /* the cold run's own last piece [1536, 1700) */
+    const Run hit_g = go(0, 1536);
+    CHECK_EQ(hit_g.resumed, (int64_t)1536);
+    const Run off_grid = go(1, 1408);                          /* an inside snapshot off the piece grid: not a resume point */
+    CHECK_EQ(off_grid.resumed, (int64_t)1280);
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
 /* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes
  * one interval a step, and a longer one spans through to its last intervals. */
 TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
