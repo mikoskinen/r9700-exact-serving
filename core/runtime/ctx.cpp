@@ -1424,8 +1424,11 @@ int Ctx::haz_mark(PassTape& t) {
         }
         if (aw) {
             const int32_t own = part_of[(size_t)i];
-            /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it. */
-            if (own < 0 || haz_ops_[(size_t)own].opaque || haz_ops_[(size_t)own].route_copy) {
+            /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it -- unless its kernel is a
+             * self-acquiring copy (lever IKA, DRAFTER round 51: aql_copy16_ika while the lever is on); then its exact ranges
+             * go through the rule as any op's, and the window stays known for the dispatch after it. */
+            if (own < 0 || haz_ops_[(size_t)own].opaque ||
+                (haz_ops_[(size_t)own].route_copy && tape_rec_ika(t.dev, i) <= 0)) {
                 aw->unknown = true;
                 if (awi) awi->unknown = true;
             } else {

@@ -199,4 +199,7 @@ int rad_aql_blit_wait(const void* value, void* stream);
 /* rad_memcpy_ranges_async's kernel: `prefix` a multiple of 16, both bases 16-byte aligned. */
 int rad_aql_blit_ranges(void* dst, const void* src, uint64_t prefix, const RadCopyRange* ranges,
                         int n, void* stream);
+/* Lever IKA (DRAFTER round 51): the self-acquiring copy / fill forms of aql_blit.hip by identifier, the list core/device/aql.cpp
+ * ika_kernel reads for a fat binary of core's own object (libr4d's is r4d_ika_kernels). */
+const char* const* rad_aql_blit_ika_kernels(int* n);
 }

@@ -559,6 +559,13 @@ bool ika_kernel(const Module* m, const std::string& name) {
     if (!ika_on() || !m || !m->bundle) return false;
     Dl_info di{};
     if (!dladdr(m->bundle, &di) || !di.dli_fbase) return false;
+    /* DRAFTER round 51: a fat binary of core's own object (aql_blit.hip's copies / fills) is named by core's list */
+    Dl_info self{};
+    if (dladdr(reinterpret_cast<void*>(&rad_aql_blit_ika_kernels), &self) && self.dli_fbase == di.dli_fbase) {
+        int nc = 0;
+        const char* const* vc = rad_aql_blit_ika_kernels(&nc);
+        return ika_listed(name, vc, nc);
+    }
     void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
     if (!h) h = dlopen(nullptr, RTLD_LAZY);
     if (!h) return false;
