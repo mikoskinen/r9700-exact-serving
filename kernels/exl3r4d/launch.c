@@ -243,6 +243,10 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
         }
     }
     d->dz = (int32_t)(exl3r4d_fn4_dz() | (exl3r4d_fn4_bi() ? 2 : 0) | (exl3r4d_fn4_drz() ? 4 : 0) | (exl3r4d_fn4_drz_nan() ? 8 : 0) | (exl3r4d_fn4_drz_max() ? 16 : 0));   /* bit 0 DZ, bit 1 BI (fn4), bit 2 DRZ, bit 3 DRZ reading 8 (NaN), bit 4 DRZ reading 9 (largest finite) */   /* ds41 eport: fn4 DZ's form at run time (prefill.c; 0 unless EXL3R4D_DZ 1 / 2) */
+    /* qfn-on-ds lever DRZ-K (Qwen loop round 18, FINDINGS F49 / F51): an op the architecture declared with drz_keep 1 (a
+     * layer named by RADIANCE_FN4_DRZ_KEEP) keeps its dead-row stores under exl3_drz 1; the reading values (bits 3 / 4) and
+     * every other op are unchanged */
+    if (rad_param_geti(a->p, a->n_p, "drz_keep", 0)) d->dz &= ~4;
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
@@ -714,6 +718,11 @@ static int launch_gd(const RadArgs* a, RadStream s, int op) {
     RadParam pg[15], pd[14];
     int ng = 0, nd = 0, rc;
     gd_params(op, a->p, a->n_p, pg, &ng, pd, &nd);
+    {   /* qfn-on-ds lever DRZ-K: the op's drz_keep to both halves' views (gd_params copies a fixed parameter set) */
+        const RadParam* kp = rad_param_find(a->p, a->n_p, "drz_keep");
+        if (kp && !rad_param_find(pg, ng, "drz_keep") && ng < (int)(sizeof pg / sizeof pg[0])) pg[ng++] = *kp;
+        if (kp && !rad_param_find(pd, nd, "drz_keep") && nd < (int)(sizeof pd / sizeof pd[0])) pd[nd++] = *kp;
+    }
     const int64_t T = rad_tensor_rows(rad_arg_in(a, gd->y));
     int64_t w = 0, xc = 0;
     if (mod4) {

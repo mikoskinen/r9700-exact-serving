@@ -269,7 +269,9 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
     d.chunk_n = 1;
     d.ystream = ystream(&g, T, d.g.y_cols, run, am);
-    d.drz = g_fn4_drz;   /* lever DRZ */
+    /* lever DRZ; DRZ-K (Qwen loop round 18): an op declared with drz_keep 1 runs exl3_drz 1 as 0 (its ZERO entries and the
+     * chunk table as today); the reading values 4..9 are not affected */
+    d.drz = g_fn4_drz == 1 && rad_param_geti(a->p, a->n_p, "drz_keep", 0) ? 0 : g_fn4_drz;
     d.order = lpt(&g, run) && !rot_am(am) && am == 0
                   ? (uint32_t*)(mbase + map_only_bytes(&g, T) + ctab_bytes(&g, T, run)) : 0;
     {

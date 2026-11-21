@@ -418,8 +418,14 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         /* v8: the SwiGLU clamp (DeepSeek's swiglu_limit): gate = min(gate, limit), up = clamp(up, -limit, limit)
          * before silu(gate) * up; absent or 0 is none */
         { "limit",    RAD_P_F64, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* qfn-on-ds lever DRZ-K (Qwen loop round 18): 1 = this op keeps its dead-row stores under exl3_drz 1 (the
+         * layer is declared so by the architecture: RADIANCE_FN4_DRZ_KEEP); absent or 0 is the switch's word */
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
-    static const RadParamSpec p_dn[] = { EXL3_GEMM_PARAMS };
+    static const RadParamSpec p_dn[] = {
+        EXL3_GEMM_PARAMS,
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* qfn-on-ds lever DRZ-K, as gate_up's */
+    };
 #undef EXL3_GEMM_PARAMS
     static const RadParamSpec p_pg[] = {
         { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
@@ -470,6 +476,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
         { "N_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
         { "K_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* qfn-on-ds lever DRZ-K, as gate_up's */
     };
     static const RadOperandSpec gate_up_down[18] = {
         { "a",             RAD_OPD_IN,   0 },
