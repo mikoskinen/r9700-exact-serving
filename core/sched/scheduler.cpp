@@ -306,6 +306,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             RAD_WARN("scheduler: RADIANCE_PP_PLAN_RESERVED=0 -- the rule before tp8 loop F71 / F83: under lanes a plan may take the step's "
                      "max_tok room beside the rows lent to its lane, and such a step is refused and re-planned (a burst livelocks a lane)");
     }
+    {   /* tp8 loop F83: lent pieces that do not fit beside the lane's own plan wait a step (lanes.cpp lane_take_inbox) */
+        const char* e = std::getenv("RADIANCE_PP_INBOX_DEFER");
+        inbox_defer_ = !(e && !std::strcmp(e, "0"));
+    }
     {   /* lever BI's chunking: RADIANCE_SCHED_BI_CHUNK's start line once a process; the value is the fn4 switch
          * sched_bi_chunk's, read at every step planned (step()) */
         static const int bi = bi_chunk_env();

@@ -5186,13 +5186,15 @@ TEST(plan_reserved_serves_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    /* tp8 loop F83: the rule is the default since; the 4-lane arm runs with the env unset (the default), the 3-lane one with it at 1 */
-    struct Arm { int lanes; int bg; const char* cut; bool env1; };
+    /* tp8 loop F83: the rule is the default since; the 4-lane arm runs with the env unset (the default), the 3-lane one with it at 1,
+     * and a third arm with the rule before (env 0) under F83's inbox guard (RADIANCE_PP_INBOX_DEFER, default on): one process's tokens
+     * whether or not a lent piece had to wait a step (its named lines are printed, not required) */
+    struct Arm { int lanes; int bg; const char* cut; const char* env; };
     long long lent_all = 0;
-    for (const Arm a : { Arm{ 4, 2, "1,3", false }, Arm{ 3, 1, "0,2", true } }) {
+    for (const Arm a : { Arm{ 4, 2, "1,3", nullptr }, Arm{ 3, 1, "0,2", "1" }, Arm{ 4, 2, "1,3", "0" } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
-        if (a.env1) env.push_back("RADIANCE_PP_PLAN_RESERVED=1");
+        if (a.env) env.push_back(std::string("RADIANCE_PP_PLAN_RESERVED=") + a.env);
         for (const char* v : { "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1",
                                "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -5220,11 +5222,12 @@ TEST(plan_reserved_serves_one_process_tokens) {
         const long long lent = occ(llog, " lent to other lanes") - occ(llog, " 0 lent to other lanes");
         const long long named = occ(llog, "rows of other lanes' pieces");
         fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld prompts with lent chunks; "
-                        "%lld 'rows of other lanes' pieces' lines\n", a.env1 ? "1" : "unset (default)", a.bg, a.lanes, a.cut, differ,
-                ref.size() + ref_b.size(), lent, named);
+                        "%lld 'rows of other lanes' pieces' lines, %lld F83 guard lines\n", a.env ? a.env : "unset (default)", a.bg, a.lanes, a.cut, differ,
+                ref.size() + ref_b.size(), lent, named, occ(llog, "tp8 loop F83; the first such step"));
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
-        CHECK_EQ(named, 0LL);
+        if (!a.env || a.env[0] != '0') CHECK_EQ(named, 0LL);
+        else CHECK_EQ(occ(llog, "exceeds the pools sized at"), 0LL);   /* the guard: an overrun waits a step, never a refused build */
         lent_all += lent;
         /* tp8 loop D35: the leader's decode-chain host line at the run's end */
         long long dch = -1;

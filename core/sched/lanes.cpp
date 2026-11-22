@@ -574,6 +574,29 @@ void Scheduler::lane_take_inbox() {
         }
         got.swap(keep);
     }
+    /* tp8 loop F83: never a plan past max_tok -- the build refuses one, the lane re-plans the same plan, and with no other lane to
+     * take its newcomers (a burst of long prompts) it never steps again (lq247b-d53: 9 min, 95,000 E lines a minute). The pieces
+     * that do not fit beside this lane's own plan wait in its inbox for its next step, in their order (as the waits above; one
+     * piece of a sequence a step, so no sequence's later piece runs before a deferred one: lent_next waits for it). Acts only where
+     * the plan would otherwise be refused: F71's rule (on by default) leaves the room, so this is the guard for any other rule
+     * that takes the step's room without counting the lent rows. RADIANCE_PP_INBOX_DEFER=0 = as before. */
+    if (inbox_defer_ && !got.empty()) {
+        const int64_t room = cfg_.max_tok - plan_.n_tok;
+        int64_t used = 0, total = 0;
+        for (const LaneSet::Piece& p : got) total += p.e.n_tokens;
+        size_t fit = 0;
+        while (fit < got.size() && used + got[fit].e.n_tokens <= room) used += got[fit++].e.n_tokens;
+        if (fit < got.size()) {
+            if (inbox_defer_n_++ == 0)
+                RAD_WARN("two-node pipeline: lane %d's own plan (%lld rows) left %lld of max_tok %lld for %zu lent piece(s) of %lld rows: "
+                         "%zu wait in its inbox for its next step (tp8 loop F83; the first such step of the run)", lane_,
+                         (long long)plan_.n_tok, (long long)std::max<int64_t>(room, 0), (long long)cfg_.max_tok, got.size(),
+                         (long long)total,
+                         got.size() - fit);
+            for (size_t k = fit; k < got.size(); ++k) lanes_->lend_locked(lane_, got[k], /*count=*/false);
+            got.resize(fit);
+        }
+    }
     /* tp8 loop P23: a BG lane's step -- how many newcomers (pieces with their first token) it carries, and its rows */
     if (!got.empty() && (lanes_->is_bg(lane_) || lanes_->relay_bg(lane_))) {
         int64_t newc = 0, rows = 0;
