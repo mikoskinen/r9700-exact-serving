@@ -1792,6 +1792,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                      {}, {m.b_rope_cs = decl_b(b, nm.f("rope_cs"), RAD_F32,
                                                {rope_table_rows(g), m.n_rot})});
+    /* Qwen tp8 S3a: on the follower no MTP head reads the table after the trunk, so its planned life ends at the last
+     * attention block -- declared BEFORE that layer's indexer, which is issued first: an indexer buffer first written there
+     * (a node with one QSA layer: arch_test's W(2, 6) follower) could share the table's bytes. Kept out of the pool there
+     * (<= 67 MB at 262k context; the follower holds no embedding or lm_head). */
+    if (m.pp && m.pp_rank == 1 && m.b_rope_cs) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_rope_cs));
 
     AttnGatedFP8::Wire aw{};
     aw.x = m.b_h; aw.h = m.a_x; aw.qg = m.b_qg; aw.k = m.b_k; aw.v = m.b_v;
@@ -1828,8 +1833,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * its collective a second time at `overlap` 1, for the rows that leave the CUs to that work
      * (the lane rows of libr4d/r4d_rows.cpp). */
     const int pipe_overlap = m.pipe_on ? 1 : 0;
+    /* Qwen tp8 S2 / S3a: a pipeline node's stage ops over the wide stream, declared in issue order -- the follower's X1
+     * receive before its first layer (its first definition of the stream), the leader's X1 send + X2 receive before layer t,
+     * the follower's X2 send after its last layer -- since declaration order is the planner's liveness. The hc_ss handoff
+     * does not cross (S3a): the receiving read computes the scales itself, the same bits as a read handed them (docs/OPS.md
+     * `ss`: 'same bits as the read's pass'), so the crossing is the stream alone, 20,480 B a row. */
+    std::vector<rad_buf> pp_bufs = { m.b_h };
+    if (m.pp) {
+        m.pp_parts = (int)pp_bufs.size();
+        m.pp_row = rad::arch::qfnlayers::crossing_row_bytes(m.hccfg.hc, g.n_embd, false);
+    }
+    auto pp_stage = [&](bool send, int ring) {
+        rad_op h = RAD_OP(b, send ? "stage_send" : "stage_recv",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", m.pp_parts)),
+                          RAD_NOWEIGHTS);
+        if (h == RAD_NULL_HANDLE) return h;
+        if (send) rad_op_reads(b, h, pp_bufs.data(), (int)pp_bufs.size());
+        else      rad_op_writes(b, h, pp_bufs.data(), (int)pp_bufs.size());
+        return h;
+    };
     for (int64_t l = 0; l < g.n_layer; ++l) {
         Layer& lay = m.layers[(size_t)l];
+        if (m.pp && m.pp_rank == 1 && l == m.lr_first) m.op_x1 = pp_stage(false, RAD_PP_X1);   /* the follower takes X1 */
+        if (m.pp && m.pp_rank == 0 && l == m.pp_t) {                                           /* the leader's cut */
+            m.op_x1 = pp_stage(true, RAD_PP_X1);
+            m.op_x2 = pp_stage(false, RAD_PP_X2);
+        }
         lay.full = is_full_attention(l, interval) ? 1 : 0;
         lay.attn.ar_overlap = lay.gdn.ar_overlap = lay.mlp.ar_overlap = pipe_overlap;
         /* Qwen tp8 S1: another node's layer -- no weights, experts, KV binds or ops here (its PLE: m.ple_layer is -1) */
@@ -2027,6 +2056,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
+    if (m.pp && m.pp_rank == 1) m.op_x2 = pp_stage(true, RAD_PP_X2);   /* the follower's result back (Qwen tp8 S3a) */
     /* (Qwen tp8 S1: the next layer this node runs) */
     for (int64_t l = 0; l + 1 < (int64_t)m.layers.size(); ++l)
         if (lr_held(m, l) && lr_after(m, l) >= 0) m.layers[(size_t)l].mlp.xp_next = &m.layers[(size_t)lr_after(m, l)].mlp;
@@ -2186,25 +2216,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * in one process, so no arithmetic moves across the cut. X1 after layer h - 1 (leader -> follower), X2 after layer
      * t - 1 (follower -> leader); declared alike on both nodes so the rendezvous compares them. Every Flash-Next state is
      * its own layer's and the PLE layer sits below h (its token ids stay on the leader), so nothing else crosses. */
-    if (m.pp) {
-        std::vector<rad_buf> pb = { m.b_h };
-        if (m.b_hss) pb.push_back(m.b_hss);
-        m.pp_parts = (int)pb.size();
-        m.pp_row = rad::arch::qfnlayers::crossing_row_bytes(m.hccfg.hc, g.n_embd, m.b_hss != 0);
+    if (m.pp) {   /* (the stage ops are declared where they are issued: in the layer loop above, Qwen tp8 S3a) */
         rad_pp_declare_crossing(RAD_PP_X1, m.pp_row, m.pp_parts);
         rad_pp_declare_crossing(RAD_PP_X2, m.pp_row, m.pp_parts);
-        auto stage = [&](bool send, int ring) {
-            rad_op h = RAD_OP(b, send ? "stage_send" : "stage_recv",
-                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", m.pp_parts)),
-                              RAD_NOWEIGHTS);
-            if (h == RAD_NULL_HANDLE) return h;
-            if (send) rad_op_reads(b, h, pb.data(), (int)pb.size());
-            else      rad_op_writes(b, h, pb.data(), (int)pb.size());
-            return h;
-        };
-        const bool lead = m.pp_rank == 0;
-        m.op_x1 = stage(lead, RAD_PP_X1);    /* the leader sends X1, the follower receives it */
-        m.op_x2 = stage(!lead, RAD_PP_X2);   /* the follower sends X2, the leader receives it */
         if (!m.op_x1 || !m.op_x2) {
             fprintf(stderr, "radiance: qwen4exp: --pp-nodes 2: stage_send / stage_recv did not resolve (a kernel library with "
                             "the stage ops: libr4d r4d_stage.hip, libref ref_stage.cpp)\n");
@@ -2253,7 +2267,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  m.pp_rank, m.pp_h, m.pp_t, m.lr.text.c_str(), m.lr.n_own, (long long)g.n_layer,
                  m.pp_rank == 0 ? "the leader: the embedding, the PLE layer, the final mixer, lm_head and the MTP head"
                                 : "the follower: no embedding, mixer, head or drafter",
-                 m.pp_parts, (long long)m.pp_row, m.b_hss ? " + the hc_ss row" : "");
+                 m.pp_parts, (long long)m.pp_row, "");
         rad_note(b, "%s", line);
         if (g.rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: qwen4exp: %s\n", line);
     } else if (m.lr.on) {
@@ -2268,7 +2282,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  "stream, a gap passes the wide stream on; the crossing a row %lld B",
                  m.lr.text.c_str(), m.lr.n_own, (long long)g.n_layer, full, m.lr.n_own - full, m.lr.first, m.lr.last,
                  m.lr.leader ? " (holds the last layer)" : "", m.ple_layer >= 0 ? "held" : "not on this node",
-                 (long long)rad::arch::qfnlayers::crossing_row_bytes(m.hccfg.hc, g.n_embd, m.b_hss != 0));
+                 (long long)rad::arch::qfnlayers::crossing_row_bytes(m.hccfg.hc, g.n_embd, false));
         rad_note(b, "%s", line);
         if (g.rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: qwen4exp: %s\n", line);
     }
@@ -3216,9 +3230,41 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
  * other where step_pipelined's conditions do not hold. */
-static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+/* Qwen tp8 S3a (Qwen loop round 30, WIP): this pass's part of the two-node pipeline (abi/rad_pp.h, read at issue as
+ * llama_fp8 :1007-1013): the leader issues its HEAD ([0, h) up to and including X1's send), its TAIL (from X2's receive:
+ * [t, n) + the mixer and the head) or both (one lane: the whole pass); the follower always its whole pass (X1's receive,
+ * [h, t), X2's send). Off (one machine, a proxy): head and tail. */
+struct PpPass {
+    bool on = false;
+    bool head = true, tail = true;
+    RadPpInfo info{};
+};
+static PpPass pp_pass(const Model& m) {
+    PpPass p;
+    if (!m.pp) return p;
+    p.on = true;
+    p.info = rad_pp_query();
+    const int part = m.pp_rank == 0 ? p.info.part : RAD_PP_PART_WHOLE;
+    p.head = part != RAD_PP_PART_TAIL;
+    p.tail = part != RAD_PP_PART_HEAD;
+    return p;
+}
+/* One crossing's stage op over the wide stream's T rows (the receiver's read recomputes the hc_ss scales: same bits) */
+static bool pp_cross(RadCtx* c, const Model& m, const PpPass& pp, rad_op op, int ring, int64_t T) {
+    RadPpRing* rg = ring >= 0 && ring < RAD_PP_N_RINGS ? pp.info.ring[ring] : nullptr;
+    if (!rg || !op) {
+        rad_step_fail(c, "qwen4exp: two-node pipeline: the core set up no ring for this crossing (or the stage op is not declared)");
+        return false;
+    }
+    RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_h, T));
+    return true;
+}
+
+static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const PpPass& pp = PpPass{}) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
+    /* Qwen tp8 S3a: the embedding, the PLE's ids and the stream's entry are the leader's head; the follower's stream is X1 */
+    if (!pp.on || (m.pp_rank == 0 && pp.head)) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
@@ -3232,6 +3278,9 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
+    } else if (m.pp_rank == 1 && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) {
+        return;
+    }
 
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
@@ -3242,6 +3291,15 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         /* Qwen tp8 S1: another node's layer -- the stream passes on (the write's norm scales stay its rows', as a crossing
          * that carries them) */
         if (!lr_held(m, li)) continue;
+        if (pp.on && m.pp_rank == 0) {   /* Qwen tp8 S3a: the leader's parts */
+            if (li < m.pp_h && !pp.head) continue;
+            if (li == m.pp_t) {   /* the cut: X1 out after layer h - 1's write, X2 in before layer t's read */
+                if (pp.head && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) return;
+                if (!pp.tail) return;
+                if (!pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T)) return;
+                ss_ok = false;   /* the read computes the norm scales itself: the same bits as the write's (docs/OPS.md `ss`) */
+            }
+        }
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) { m.ple.step(c, batch); ss_ok = false; bt_pt(c, m, m.b_h, 0, T, "ple", (int)li); }
@@ -3283,6 +3341,8 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         bt_pt(c, m, m.b_h, 0, T, "h_ffn", (int)li);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
+    /* Qwen tp8 S3a: the follower's result back to the leader after its last layer's write */
+    if (pp.on && m.pp_rank == 1) pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T);
 }
 
 /* ============================== fn4 SP-serial (14.11.2026) ==============================
@@ -3589,10 +3649,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
 
-    /* Qwen tp8 S2: a pipeline node is declared (its layers, the crossings, the stage ops); its passes by part are S3 */
-    if (m.pp) {
-        rad_step_fail(c, "qwen4exp: --pp-nodes 2 declares this node's part of W(h, t) only; its step loops by part are Qwen tp8 "
-                         "step S3, not in this build -- time a stage alone with RADIANCE_FN4_LAYERS (proxy)");
+    /* Qwen tp8 S3a (WIP): a pipeline node runs its part through step_serial only (the pipelined / SP forms by part are S3b);
+     * no encoder pass, no drafter pass on the follower, no snapshot inside a step */
+    const PpPass pp = pp_pass(m);
+    if (pp.on && (batch->enc || (m.pp_rank == 1 && batch->draft_pass != 0) || g_tipr[rad_rank(c)].row > 0)) {
+        rad_step_fail(c, "qwen4exp: two-node pipeline (Qwen tp8 S3a): an encoder pass, a drafter pass on the follower or a "
+                         "snapshot inside a step is not built");
         return;
     }
 
@@ -3646,11 +3708,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
                          "pipelined form refused): its state rows would be the step end's");
         return;
     }
-    if (pipelined(m, T))               step_pipelined(c, batch, m, pcu);
+    if (pp.on) {   /* Qwen tp8 S3a: a pipeline node's part, serial; the mixer and the head after the leader's tail only */
+        step_serial(c, batch, m, pcu, pp);
+        if (!(m.pp_rank == 0 && pp.tail)) {   /* the follower, or a head part: nothing after its send */
+            bt_flush(c, m, batch);
+            bi_cuts() = BiCuts{};
+            bi_wide_rows() = 0;
+            return;
+        }
+    }
+    else if (pipelined(m, T))          step_pipelined(c, batch, m, pcu);
     else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
     else                               step_serial(c, batch, m, pcu);
 
-    if (!pipelined(m, T) && !sp.nrun) bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* step_serial's wide stream (step_serial_sp: its own) */
+    if ((pp.on || !pipelined(m, T)) && !sp.nrun) bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* step_serial's wide stream (step_serial_sp: its own) */
     bi_read_pieces(c, m, m.mixer, T);
     bt_pt(c, m, m.a_x.x, 0, T, "final", -1);
 
@@ -3699,6 +3770,8 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (batch->phase == RAD_PHASE_MIXED) return 0;
 
     Model& m = g_model[rad_rank(c)];
+    /* Qwen tp8 S3a (WIP): a pipeline node's passes are not recorded until S3b keys them by part */
+    if (m.pp) return 0;
     /* Decode, verify and draft passes (the MTP head attends over the same KV group): every
      * attention launch covers all the pass's sequences, and the shape fields the core keys (n_tok,
      * n_seq, max_q_len, n_spec, draft_pass) fix each launch's q_len band and units. The live KV
