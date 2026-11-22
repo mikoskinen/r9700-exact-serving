@@ -138,7 +138,7 @@ set(R4D_UNITS
   # fn4 SDMA-AR: the exact two-shot with the peer bytes on the copy engines (selftest entry points).
   "r4d_ar_sdma|"
   "r4d_ar_twoshot_Nrank_ti8|"
-  # fn4 SP-hc: the two-shot's halves over whole-row shards (reduce_scatter_rows / all_gather_rows)
+  # tp8 loop P20 (from fn4 SP-hc): the two-shot's halves over whole-row shards (reduce_scatter_rows / all_gather_rows)
   "r4d_ar_sp_rows|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
@@ -219,6 +219,43 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  "r4d_moe_iqr|"
+  "r4d_iqr_relayout|"
+  # DeepSeek-V4.1-Flash: the elementwise and small ops, the sparse attention and its indexer, and
+  # the GEMMs over llama.cpp's native blocks (GGUF imports), MXFP4's in a unit of their own.
+  "r4d_ds41_elem|"
+  "r4d_ds41_sparse|"
+  "r4d_ds41_ggml|"
+  # Lever D2: gemm_nt_ggml / logits_gemm_ggml's decode band in the multi-row form (every weight block dequantised
+  # once for all the call's rows, the stock kernel's bits), off unless switched on; the wave64 unit is the same
+  # source compiled -mwavefrontsize64, reached only through its bench pin.
+  "r4d_ds41_ggml_mr|"
+  "r4d_ds41_ggml_mr64|-mwavefrontsize64"
+  # Lever A4 (ds41-a4): the same kernels in their XP forms (the slab's activation loads one slab ahead), the plain, pair
+  # and fold kernels at the 5-16-row heights; reached only through the gg_gemv_m16 switch's table or the bench's pin.
+  "r4d_ds41_ggml_mr2|"
+  # Lever GPF: gemm_nt_ggml / logits_gemm_ggml's prefill WMMA rows in other tile geometries (the stock kernel's
+  # arithmetic, the same bits), off unless switched on (gg_pf) or pinned by the bench.
+  "r4d_ds41_ggml_pf|"
+  # Lever WMK (ds41-wmk2): the part-order WMMA form (gg_wk_kernel) of the dense GGUF GEMMs, its own code object, reached
+  # only under fn4 ds41_wmk 1 (<= 48 rows) or the bench pin r4d_gg_wk_pin.
+  "r4d_ds41_wmk|"
+  # Lever GPF-b: gemm_nt_f32's prefill rows (router, compressor kv | gate) in a tiled form, the stock bits; off unless switched.
+  "r4d_ds41_f32pf|"
+  # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
+  "r4d_ds41_mxfp4|"
+  # DSpark beside its walk: the confidence head (dspark_conf) and the walk's next-best first proposals (dspark_alt).
+  "r4d_dspark_extra|"
+  # ds41-drk: the drafter's kernels -- the MXFP4 grouped GEMM's multi-row forms (drafter_mx) and the skinny bf16
+  # GEMM's prefetching decode form (drafter_bf); both off unless switched on, both the stock kernels' bits.
+  "r4d_ds41_mxfp4_mr|"
+  "r4d_gemm_bf16_nt_pf|"
+  # Lever W1: the DSpark Markov walk over the whole vocabulary, a step on a vocabulary shard (dspark_walk_step).
+  "r4d_ds41_walk|"
+  # Lever SD: sampled drafting on that walk (dspark_walk_sample_step: x ~ Q over the eight best keys, the coupled state).
+  "r4d_ds41_wsamp|"
+  # tp8 S4: the two-node pipeline's crossings (stage_send / stage_recv through the core's host rings).
+  "r4d_stage|"
 )
 
 set(R4D_SRC "")
@@ -244,13 +281,41 @@ endforeach()
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
 set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
-                    r4d_fuse.cpp)
+                    r4d_fuse.cpp r4d_ika.cpp)
+
+# The native-block GEMMs' layout (planes -> llama.cpp's blocks) uses libquant's one definition of the
+# blocks, compiled in when libquant's sources are beside libr4d (in radiance's tree).
+set(R4D_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+if(EXISTS ${R4D_GGML_DIR}/lq_ggml_planes.cpp)
+  list(APPEND R4D_DECLARATION r4d_ds41_ggml_layout.cpp ${R4D_GGML_DIR}/lq_ggml_planes.cpp
+       ${R4D_GGML_DIR}/lq_ggml_dequant.cpp ${R4D_GGML_DIR}/lq_ggml_tables.cpp)
+  set(R4D_HAVE_GGML 1)
+endif()
 
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}
   HIP_SOURCES ${R4D_SRC}
   GPU_TARGETS ${R4D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
+# Lever IKA (r4d_ika.h, DRAFTER track round 50): the converted kernels acquire / release at agent scope themselves and list
+# themselves in r4d_ika_kernels, so the engine (RADIANCE_AQL_IKA=1) may drop their packets' fences. OFF = the kernels as before.
+option(R4D_IKA "libr4d: kernels acquire and release in-kernel (lever IKA)" OFF)
+if(R4D_IKA)
+  target_compile_definitions(libr4d PRIVATE R4D_IKA=1)
+endif()
+# Lever CW7 (r4d_chain.h, qfn-on-ds Qwen loop round 14 / DS DRAFTER round 66): the chained wait empties the scalar data cache and
+# leaves the body's code as the unchained build's. OFF = the wait as before (r4d_chain.h's R4D_CHAIN_WAIT 1).
+# Default ON since Qwen loop round 15 (COORD 21.11. 16:16: CW7 joins BEST as an exactness fix -- cw7b = ms11's bytes on every
+# cell, cw7c +0.01..+0.14 ms a step, prefill +0.07..+0.10 %; one base image, not a layered libr4d). A build dir configured before
+# this keeps its cached OFF: configure it with -DR4D_CHAIN_WAIT7=ON.
+option(R4D_CHAIN_WAIT7 "libr4d: the chained wait in lever CW7's form (scalar cache emptied, codegen-neutral)" ON)
+if(R4D_CHAIN_WAIT7)
+  target_compile_definitions(libr4d PRIVATE R4D_CHAIN_WAIT=7)
+endif()
+if(R4D_HAVE_GGML)
+  target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
+  target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})
+endif()
 
 # Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
 # catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol
@@ -264,6 +329,14 @@ set_target_properties(r4d_selftest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_B
 #   r4d_selftest /opt/radiance/share/radiance/kernels/libr4d.so [--case <row>]
 # The collective cases need every card of the box in the container.
 install(TARGETS r4d_selftest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# iqr_permute: rewrite a sealed IQR container in the GEMM's lane order, so a file read is a copy
+# and the host pool can hold it. Links libr4d for the CPU walk; the new container carries the
+# stored form as a "stored" encoding the loader reads directly.
+add_executable(iqr_permute ${CMAKE_CURRENT_SOURCE_DIR}/iqr_permute.cpp ${CMAKE_SOURCE_DIR}/core/format/radfile.cpp ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
+target_link_libraries(iqr_permute PRIVATE radiance::abi ${CMAKE_DL_LIBS})
+target_include_directories(iqr_permute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/core/format)
+set_target_properties(iqr_permute PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # C++17: at C++20 clang tightens the address-space check on
 # __builtin_amdgcn_global_load_tr_b128_v8i16 in r4d_common.h. Kernel cost figures are for C++17.

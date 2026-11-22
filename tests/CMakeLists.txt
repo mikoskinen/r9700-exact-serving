@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test nemotronh_test ds41_vision_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -47,7 +47,9 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
+# sd_exact_test (lever SD) checks the sampled walk's law and the coupled verify's emitted law from libr4d's header-only
+# r4d_ds41_wsamp_math.h, so it needs only the include path too.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test sd_exact_test)
 
 # ref2va_pack_test checks the Ref2VA sequence packing (arch/minimaxh3/rad_ref2va_pack.cpp, a
 # device-free TU of the plugin) against golden vectors generated from the reference implementation
@@ -168,6 +170,18 @@ foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
+    if(n STREQUAL "ds41_vision_test")
+      # DeepSeek-V4.1's picture processor and vision tower against the release's own code (the reference dumps
+      # DS41_VIS_REF, the release DS41_VIS_RELEASE); the tower runs op by op on libref, opened with dlopen.
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/item.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/media.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/resample.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/imaging.cpp)
+      target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+      target_link_libraries(${n} PRIVATE ${CMAKE_DL_LIBS})
+      add_dependencies(${n} libref)
+    endif()
     if(n STREQUAL "nemotron35_test")
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
                                  ${CMAKE_SOURCE_DIR}/core/mm/item.cpp
@@ -339,15 +353,16 @@ endif()
 # the host backend; convert_test runs rad-convert on the same checkpoints. Both start the built
 # binaries as children, so they depend on them and on every plugin the checkpoints select
 # (llama_fp8 for convert_test's --set of an fp8 quantization_config).
-set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
+set(RAD_E2E_DEPS radiance rad-convert rad-sidecar libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
                  llama_dense_fp8 llama_fp8 qwenimage21)
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
+foreach(t engine_e2e_test pp_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
+      RAD_E2E_SIDECAR="$<TARGET_FILE:rad-sidecar>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
     if(t STREQUAL "spark25_convert_test")
       add_dependencies(${t} rad-convert libref spark25_bf16)
@@ -370,6 +385,10 @@ endforeach()
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+# tp8 S4: the two-node pipeline as two processes over localhost TCP (tests/pp_e2e_test.cpp).
+if(TARGET pp_e2e_test)
+  set_tests_properties(pp_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 600)
 endif()
 if(TARGET clef_decision_test)
   set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
@@ -540,11 +559,20 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
-                ${R4D_DIR}/r4d_lili.hip ${R4D_DIR}/r4d_gemm_fp8a8.hip)
+                ${R4D_DIR}/r4d_lili.hip ${R4D_DIR}/r4d_ds41_sparse.hip ${R4D_DIR}/r4d_ds41_elem.hip
+                ${R4D_DIR}/r4d_ds41_ggml_mr.hip ${R4D_DIR}/r4d_ds41_ggml_mr2.hip
+                ${R4D_DIR}/r4d_dspark_extra.hip ${R4D_DIR}/r4d_ds41_mxfp4_mr.hip
+                ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16_nt_pf.hip
+                ${R4D_DIR}/r4d_ds41_ggml_pf.hip ${R4D_DIR}/r4d_ds41_f32pf.hip ${R4D_DIR}/r4d_ds41_walk.hip
+                ${R4D_DIR}/r4d_ds41_wsamp.hip ${R4D_DIR}/r4d_gemm_fp8a8.hip
+                ${R4D_DIR}/r4d_moe.hip   # qfn-on-ds lever RGT (r4d_emu_qrgt): the fused decode router
+                ${R4D_DIR}/r4d_gdn_gated_rmsnorm_h128_bf16.hip)   # qfn-on-ds lever GNQ8 (r4d_emu_gnq8)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 lili i8wide)
+                  dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
+                  ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f
+                  ds41tw i8wide qrgt gnq8 qwalk)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -586,7 +614,18 @@ else()
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_lili.cpp
-                ${R4D_EMU}/test_i8wide.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_ds41idx.cpp ${R4D_EMU}/test_ds41attn.cpp ${R4D_EMU}/test_ds41mr.cpp
+                ${R4D_EMU}/test_argts.cpp ${R4D_EMU}/test_ds41fold.cpp ${R4D_EMU}/test_ds41vram.cpp
+                ${R4D_EMU}/test_dspark.cpp ${R4D_EMU}/test_ds41fold2.cpp ${R4D_EMU}/test_ds41drk.cpp
+                ${R4D_EMU}/test_ds41kvwin.cpp ${R4D_EMU}/test_ds41pf.cpp ${R4D_EMU}/test_ds41walk.cpp
+                ${R4D_EMU}/test_ds41wsamp.cpp ${R4D_EMU}/test_ds41i9b.cpp ${R4D_EMU}/test_ds41arc.cpp
+                ${R4D_EMU}/test_ds41i11.cpp ${R4D_EMU}/test_ds41gq.cpp ${R4D_EMU}/test_ds41xpush.cpp
+                ${R4D_EMU}/test_ds41a4.cpp ${R4D_EMU}/test_ds41fuse.cpp ${R4D_EMU}/test_ds41p1.cpp
+                ${R4D_EMU}/test_ds41dkv.cpp
+                ${R4D_EMU}/test_ds41spd.cpp ${R4D_EMU}/test_ds41p30f.cpp ${R4D_EMU}/test_ds41tw.cpp
+                ${R4D_EMU}/test_i8wide.cpp ${R4D_EMU}/test_qrgt.cpp ${R4D_EMU}/test_gnq8.cpp
+                ${R4D_EMU}/test_qwalk.cpp
+                ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -623,9 +662,66 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili)
+  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
+            ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw qrgt gnq8 qwalk)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
+  # qfn-on-ds lever P-2 (Qwen loop round 11): the union walk's partials against today's sparse prefill attention row.
+  set_tests_properties(r4d_emu_qwalk PROPERTIES LABELS "r4d_emu" TIMEOUT 600)
+  # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
+  # ~2 min alone on the emulator (the 300k decode-form case), longer beside a parallel suite.
+  set_tests_properties(r4d_emu_ds41idx PROPERTIES LABELS "r4d_emu" TIMEOUT 900
+                       ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+  # DeepSeek-V4.1's packed compressed latent (nvfp4) through every attn_sparse_sink form, held to libref.
+  set_tests_properties(r4d_emu_ds41attn PROPERTIES LABELS "r4d_emu" TIMEOUT 1200
+                       ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+  # Lever DKV: the packed latent's plan rows (latent_unpack) and gathered rows (latent_gather) through their attentions.
+  set_tests_properties(r4d_emu_ds41dkv PROPERTIES LABELS "r4d_emu" TIMEOUT 1500)
+  # Lever K1's folds (rmsnorm_rope_roundtrip_kv_store, attn_sparse_sink_rope_roundtrip) against the rows they fold.
+  set_tests_properties(r4d_emu_ds41fold PROPERTIES LABELS "r4d_emu" TIMEOUT 1500)
+  # Lever K1 folds a / e (rmsnorm / swiglu_clamped in the multi-row form's staging) against the two launches they fold.
+  set_tests_properties(r4d_emu_ds41fold2 PROPERTIES LABELS "r4d_emu" TIMEOUT 1500)
+  # Lever VA "bf16": gemm_nt_f32 over bf16 weights against the same values as f32, DeepSeek-V4.1's shapes.
+  set_tests_properties(r4d_emu_ds41vram PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
+  # Lever KVWIN: the fp8 window slot's packer, fold c's packed store and every attn_sparse_sink form over it, held to
+  # the bf16 window and to libref.
+  set_tests_properties(r4d_emu_ds41kvwin PROPERTIES LABELS "r4d_emu" TIMEOUT 2400
+                       ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+  # Lever GPF: the prefill WMMA forms against the stock WMMA kernel, byte for byte.
+  set_tests_properties(r4d_emu_ds41pf PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
+  # Lever W1: dspark_walk_step over 1-4 vocabulary shards against a plain host walk, bit for bit, ties included
+  # (RADIANCE_DS41_WALK_TABLES=<dir> adds the checkpoint's Markov tables at the real vocabulary, by hand).
+  set_tests_properties(r4d_emu_ds41walk PROPERTIES LABELS "r4d_emu" TIMEOUT 900)
+  # Lever SD: dspark_walk_sample_step over 1-4 vocabulary shards against a plain host sampled walk, tokens and coupled
+  # states bit for bit, greedy rows = lever W1's walk, and x ~ Q by a chi-square over seeds.
+  set_tests_properties(r4d_emu_ds41wsamp PROPERTIES LABELS "r4d_emu" TIMEOUT 1200)
+  # ds41-int9b: levers M1 (mhc_post_collapse_rmsnorm_mix), IX-LDSR2 (index_score's LDS form) and IX-NI (no -inf past reach,
+  # candidates below reach) against the stock forms byte for byte, with mutation controls.
+  set_tests_properties(r4d_emu_ds41i9b PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
+  # ds41-int10: lever ARC -- r4d_ar_arc.h's pick (threshold, grid by the ARW table, capacity) and the coded wire's codec
+  # (r4d_ar_coded.h) through put / get and the two-shot's reduce against the plain fold, byte for byte, with mutation controls.
+  set_tests_properties(r4d_emu_ds41arc PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # ds41-int11: lever 1U-MX (mhc_mix's wide-wave decode form) and lever 1U-GQ (gemm_nt_ggml_pair) against the stock forms,
+  # byte for byte.
+  set_tests_properties(r4d_emu_ds41i11 PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
+  set_tests_properties(r4d_emu_ds41gq PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
+  # ds41-int13: XPUSH -- the exact two-shot's interleaved first hop (r4d_ar_xpush.h) against the lockstep loop's stores,
+  # byte for byte, at 3 / 4 / 8 ranks, even and weighted shards, 1 .. 24 blocks and 1 .. 4 pieces, with a control.
+  set_tests_properties(r4d_emu_ds41xpush PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # ds41-a4: lever A4, the gg_gemv_m16 forms (XP slabs, grid fit, H1R2) and the switch's table against the stock band,
+  # plain / pair / folds, M 1..16 (+ 17 / 24 / 48), byte for byte.
+  set_tests_properties(r4d_emu_ds41a4 PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # ds41-fuse: levers FUSE-R (the router's projection + selection + sort in one launch, the GEMM's last workgroup ranking;
+  # the selection + sort without a gate) and FUSE-M (mhc_mix's FIN form under ds41_mix_fin) against the stock chains, byte
+  # for byte.
+  set_tests_properties(r4d_emu_ds41fuse PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # ds41-p1pass: lever P -- the MoE gather of a 17 .. 48-row decode step as ONE pass (the two-shot list words, moe_gather)
+  # against today's pieces of <= 16 rows, byte for byte per token and rank.
+  set_tests_properties(r4d_emu_ds41p1 PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # ds41-etp-spd: lever SPD-F -- the decode band's f32 projection forms (the router's fused launch, gemm_nt_f32) pinned by
+  # r4d_f32dec_pin against the stock forms, byte for byte.
+  set_tests_properties(r4d_emu_ds41spd PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
   # fn4 BI wide: gemm_nt_q_dec's rows against the narrow row at alone heights, 1..132 rows and the Flash-Next TP4
   # shapes (about 80 s): `slow`.
   add_test(NAME r4d_emu_i8wide COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_i8wide)
@@ -638,7 +734,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_lili
+                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_lili r4d_emu_ds41mr r4d_emu_argts r4d_emu_dspark r4d_emu_ds41drk
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

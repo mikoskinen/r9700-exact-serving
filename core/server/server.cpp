@@ -244,7 +244,8 @@ void Server::register_routes() {
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
     router_.post("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
-    /* fn4 (test builds): the runtime switches, applied at the next step release. */
+    /* Runtime switches (test builds; dashboard.cpp, runtime/fn4_switch.h), applied at the next step
+     * release. */
     router_.get ("/admin/fn4", [this](const HttpRequest& q) { return handle_fn4(q); });
     router_.post("/admin/fn4", [this](const HttpRequest& q) { return handle_fn4(q); });
     /* Forget one stored conversation: by its client label in the path (or `?label=`, for a

@@ -20,6 +20,7 @@
 #pragma once
 #include "rad_core.h"
 #include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
+#include "rad_pp.h"       /* tp8 S4: the two-node pipeline */
 #include "cvec.h"
 #include <map>
 #include <set>
@@ -29,6 +30,7 @@
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
+#include "sched/lanes.h"   /* tp8 S5 */
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -45,6 +47,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace rad {
 
@@ -52,11 +55,14 @@ class Kld;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
 namespace server { class Sink; }
+namespace net { class NodeLink; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
 class ExpertStats;   /* place/xstats.h */
 class XsTally;
+class MissLog;       /* place/misslog.h */
+class MissRank;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
@@ -154,11 +160,24 @@ private:
     std::unique_ptr<RadFile> file_;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
-    /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
+    /* Lever DLW (ds41-dlw, 11.11.2026): RADIANCE_WEIGHT_SIDECAR=FILE -- a second, small container
+     * (written by rad-sidecar) whose entries replace the container's entries of the same name and
+     * logical shape in another encoding: declare sees the sidecar's encoding, the load reads its
+     * planes. Null unset (open_weight_sidecar). */
+    std::unique_ptr<RadFile> side_;
+    int open_weight_sidecar();
+    /* The source rad_weight_encoding answers from: container entries (or a sidecar's in their
+     * place) or checkpoint tensors. */
     WeightSourceFn sources() const;
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+    /* RADIANCE_DEBUG_MISS_LOG=FILE (place/misslog.h); null without it. */
+    std::unique_ptr<MissLog> missl_;
+    /* HeatParams::prefill_share as bring-up read it (RADIANCE_HEAT_PREFILL); 1 records nothing. */
+    float heat_prefill_share_ = 1.0f;
+    /* HeatParams::prefill_decay in (0, 1): dual heat, which also records each step's rows. */
+    bool heat_dual_ = false;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -307,6 +326,20 @@ private:
 
     /* One scheduler for every rank: one decision per step, one batch, shared by pointer. */
     Scheduler                     sched_;
+    /* tp8 S5: a two-node pipeline's lanes (core/sched/lanes.h, engine_lanes.cpp): lane 0 is sched_,
+     * lanes 1.. these, each with its own builder and slab; empty on one lane. `lsched()` is the lane
+     * the step loop is working on (the trunk step, its drafter passes, its commit), `issue_sched_`
+     * the lane whose batch the ranks issue (rank_loop's batch_for). Both are sched_ on one lane. */
+    std::vector<std::unique_ptr<Scheduler>> lane_sched_;
+    LaneSet                       lanes_;
+    int                           n_lanes_ = 1;
+    Scheduler*                    cur_sched_ = &sched_;
+    std::atomic<Scheduler*>       issue_sched_{ &sched_ };
+    Scheduler& lsched() { return *cur_sched_; }
+    const Scheduler& lsched() const { return *cur_sched_; }
+    Scheduler& sched_of(int lane) { return lane <= 0 ? sched_ : *lane_sched_[(size_t)(lane - 1)]; }
+    /* The step loop works on lane `l` (lsched, the plugin's view of the pass: rad_pp_info). */
+    void lane_select(int l);
     std::unique_ptr<IKVManager>   kv_iface_;
     std::unique_ptr<IPrefixCache> pc_iface_;
 
@@ -317,7 +350,9 @@ private:
      * forward pass alone (kIssueModel: the next step's, issued before this one is read back), or
      * that pass's sampler alone (kIssueSampler, once the host has committed its inputs). Every
      * release must set it; a stale value would make a draft pass issue only its sampler. */
-    enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2 };
+    enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2,
+           /* tp8 S4: a pipeline follower's pass: the model and the tiering behind it, no sampler */
+           kIssueFollower = 3 };
     std::atomic<int>              issue_what_{kIssueAll};
     std::atomic<int>              step_status_{RAD_OK};
     std::atomic<bool>             stopping_{false};
@@ -364,6 +399,255 @@ private:
     RadBuildCtx build_ctx(int rank, int64_t max_tok) const;
     void probe_arena_levels();
     int  step_loop();
+
+    /* ---- tp8 S4: the two-node pipeline (engine_node.cpp, abi/rad_pp.h). Unused on one machine
+     * (Config::pp_nodes 1): every member is null or zero and no line below runs. */
+    std::unique_ptr<net::NodeLink> pp_link_;
+    /* this node's rings, by ring index (lane * RAD_PP_N_RINGS + crossing; tp8 S5) and role */
+    RadPpRing* pp_send_[RAD_PP_MAX_RING_IX] = {};
+    RadPpRing* pp_recv_[RAD_PP_MAX_RING_IX] = {};
+    int64_t    pp_ring_cap_[RAD_PP_MAX_RING_IX] = {};
+    /* The leader: a trunk build made and not yet shipped (it crosses at its release, with the
+     * switches and the PSK plan prepare_release applied). One a lane (tp8 S5); [0] on one lane. */
+    bool       pp_trunk_pending_[RAD_PP_MAX_LANES] = {};
+    int64_t    pp_steps_shipped_ = 0, pp_builds_shipped_ = 0;
+    /* tp8 loop D35 (DECODE round 26; counters only): the leader host's part of a decode lane's chain -- a decode step's collect
+     * returned -> the lane's next decode step shipped (commit, drafter finish, plan, release, head issue: the time no part of
+     * this lane's chain is on either card), and the collect's own wait for the card; a 0.1-ms histogram for the p50 */
+    uint64_t   dch_collect_ns_[RAD_PP_MAX_LANES] = {};
+    int64_t    dch_n_ = 0, dch_wait_n_ = 0;
+    double     dch_ms_ = 0, dch_max_ms_ = 0, dch_wait_ms_ = 0;
+    uint32_t   dch_hist_[512] = {};
+    void       dch_note_head(int lane, const RadBatch* b);
+    std::string dch_text() const;
+    bool       pp_closed_ = false;
+    /* tp8 dev D10 round 2: the step being shipped was issued ahead of its lane's collect (its frame's flags bit 1): its X1
+     * lands only after the leader's tail of the step before it, so the follower issues its pass once X1 has landed */
+    bool       pp_ship_ahead_ = false;
+    /* The PSK plan psk_release handed the plugin for the step being released, for the follower. */
+    bool       psk_last_valid_ = false;
+    int64_t    psk_last_dec_ = 0;
+    /* Review F2 / F3: the follower's count of the leader's switch requests it took (fn4::follow);
+     * the leader's ask of the follower (fn4::set_peer_check), one at a time. */
+    uint32_t   pp_fn4_taken_[256] = {};
+    std::mutex pp_ask_mu_, pp_ans_mu_;
+    std::condition_variable pp_ans_cv_;
+    uint64_t   pp_ask_seq_ = 0, pp_ans_seq_ = 0;
+    int        pp_ans_verdict_ = 0;
+    std::string pp_ans_why_;
+    int  pp_peer_check(const std::string& name, int v, std::string* why);
+    void pp_send_fn4_state();
+    /* Review F4: the state slots the leader zeroed since its last trunk ship (group, slot); the
+     * follower zeroes the same before the pass. */
+    std::vector<std::pair<int32_t, int32_t>> pp_clears_;
+    /* Review robustness 1(e): the drafter builds made since the last trunk ship, as their frames,
+     * sent from the step loop before the next trunk (outside the scheduler's lock). */
+    std::vector<std::tuple<int32_t, int32_t, std::vector<uint8_t>>> pp_draft_q_;   /* (step, lane, frame) */
+    /* The step frame of build `b`: header + PSK plan + clears + wire in `out`, the span (the
+     * builder's until its next build) in `span` / `span_n`. */
+    int  pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n,
+                  int lane = 0);
+    /* tp8 S6: the step's checkpoint restores (before the pass) and saves (after it) for the follower's
+     * own state groups (the prefix cache's snapshots), and the KV-copy check (RADIANCE_PP_KV_CHECK). */
+    int  pp_ck_list(std::vector<int32_t>* out, int lane = 0);
+    int  pp_ck_apply(const int32_t* q, int32_t n, bool save);
+    void pp_kv_check_send();
+    int  pp_kv_check_recv(const std::vector<uint8_t>& body, uint64_t step);
+    int  pp_kv_crc(int32_t group, int32_t slot, int64_t top, uint32_t* crc, int64_t* bytes);
+    int  pp_kv_check_every_ = 0;
+    int64_t pp_kv_checks_ = 0, pp_kv_bad_ = 0;
+    /* tp8 loop P37 (RADIANCE_PP_KV_CHECK_DEFER=1, with RADIANCE_PP_KV_CHECK=N): under lanes a due check waits for a round
+     * with no prompt rows in flight or waiting, up to N more trunk steps (engine_lanes.cpp), instead of draining the
+     * pipeline inside a prompt. Off (0) = today's drain at once. */
+    bool pp_kv_check_defer_ = false;
+    /* Robustness 5: SIGTERM / SIGINT reached a follower (serve() installs the handler there). */
+    bool pp_stop_requested() const;
+    bool pp_on() const { return cfg_.pp_nodes == 2; }
+    bool pp_leader() const { return cfg_.pp_nodes == 2 && cfg_.pp_rank == 0; }
+    bool pp_follower() const { return cfg_.pp_nodes == 2 && cfg_.pp_rank == 1; }
+    /* The options a two-node node refuses or changes, before the devices are opened. */
+    int  pp_check();
+    /* The link and the first rendezvous, after the plugins load and before declare. */
+    int  pp_connect();
+    /* configure_kv, before any rank carves (review F1): both nodes send the tokens their ranks can
+     * page and cap at the least, so every KV group holds the same block count on both. */
+    int  pp_kv_agree(int64_t* least);
+    /* After the scheduler's init in serve(): the rings, the second rendezvous (KV, the step
+     * batch's layout, the crossings), the verbs path, the link's threads, the leader's build hook. */
+    int  pp_serve_setup();
+    /* The leader: every build crosses (BatchBuilder::Wire); a trunk step with `run`, at its
+     * release. */
+    int  pp_ship(const RadBatch* b, bool run, int lane = 0);
+    void pp_on_build(const RadBatch* b, int lane);
+    /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0, int rband = 0,
+                     int rkeys = 0);
+    /* tp8 loop P28 (RADIANCE_PP_BAND=1 on the leader, with the plugin's rad_pp_band k): whether a lane step's head runs as a
+     * band pass -- a BG lane's step whose prompts are all fresh (ctx 0, no snapshot restore), run whole; its frame says so
+     * (StepHdr flags bit 2), the follower's parts start at h + k */
+    bool pp_band_on_ = false;
+    int  pp_ship_band_ = 0;      /* the frame pp_frame makes now is a band pass's (flags bit 2) */
+    int64_t pp_band_n_ = 0;
+    int64_t pp_band_max_rows_ = 2047;   /* RADIANCE_PP_BAND_MAX_ROWS: a band step's rows at most */
+    int  pp_band_step(int lane, const RadBatch* b);
+    /* tp8 loop D36: the band the lane loop already chose for the step lane_head releases next (-1: lane_head asks
+     * pp_band_step itself), so a step's band is decided once -- RADIANCE_PP_BAND_MIN_SEQS's count stays one a step */
+    int  pp_band_pre_ = -1;
+    int64_t pp_band_seg_n_ = 0;   /* tp8 loop D36: band steps whose head ran in segments (RADIANCE_PP_LEAD_SEG_BAND=1) */
+    bool pp_band_off_ = false;    /* tp8 loop D36: fn4 pp_lead_seg + 256 at the step being planned -- no band pass */
+    /* tp8 loop D39 (RADIANCE_PP_TAIL_BAND=1 on the leader, with the plugin's rad_pp_tail_band j; unset: nothing): the TAIL
+     * band -- a BG lane's step of fresh prompts runs the follower over [h, t - j) (then only the band layers' window / KV
+     * stores from its own last rows) and the leader's tail from t - j; its frame says so (StepHdr flags bit 3). The step's
+     * j is kept by lane for its tail part (pp_tband_lane_). */
+    bool pp_tband_on_ = false;
+    int  pp_ship_tband_ = 0;     /* the frame pp_frame makes now is a tail band pass's (flags bit 3) */
+    int64_t pp_tband_n_ = 0;
+    int64_t pp_tband_off_n_ = 0;   /* step 2c: fresh BG steps fn4 pp_tband 0 kept W(h, t)'s */
+    std::vector<int> pp_tband_lane_;
+    int  pp_tband_step(int lane, const RadBatch* b, bool count = false);
+    /* tp8 loop D39b (fn4 pp_tband 2 / RADIANCE_PP_TAIL_BAND=2): a prompt's LATER chunks run as tail band passes too while every
+     * chunk of it so far did -- the leader then holds the band layers' keys of all its rows (its own band layer wrote them), the
+     * follower its own (its key chain): pp_tband_seq_ = the sequences (KV keys) whose every chunk so far ran as one; pp_tband_note
+     * keeps it at each step's head (any prefill entry of a step that is not a tail band pass, and every decode entry, drops its
+     * sequence: safe both ways -- a dropped sequence only runs W(h, t)'s) */
+    int  pp_tband_start_ = 1;
+    int64_t pp_tband_cont_n_ = 0;   /* tail band passes with a later chunk (ctx > 0) in them */
+    std::unordered_map<uint64_t, uint8_t> pp_tband_seq_;
+    void pp_tband_note(int lane, int tband);
+    /* tp8 loop P41 (fn4 pp_rband / RADIANCE_PP_RBAND_EVERY on the leader, with the plugin's reverse band, rad_pp_rband l = h - 1;
+     * unset: nothing): a lone prompt chunk's head may run as a REVERSE pass -- the leader's head over [0, l) (+ layer l's key chain),
+     * the follower from l (its frame says so: StepHdr flags bit 5). Only a chunk whose every earlier row of its sequence crossed X1
+     * in a prompt pass (the plugin's keys form) or ran a reverse pass, so the follower's copy of layer l's window is whole:
+     * pp_rband_seq_ = such sequences (KV keys) and their chunk count; a decode entry or a prefix restore drops one. */
+    int  pp_ship_rband_ = 0;      /* the frame pp_frame makes now is a reverse pass's (flags bit 5) */
+    int  pp_ship_rkeys_ = 0;      /* step 5: ... crosses X1 in the keys form (flags bit 6) */
+    int64_t pp_rkeys_n_ = 0;      /* step 5: lane steps that crossed X1 in the keys form */
+    int  pp_rband_start_ = 0;     /* RADIANCE_PP_RBAND_EVERY's value (fn4 pp_rband -1 reads it) */
+    int64_t pp_rband_n_ = 0, pp_rband_rows_ = 0, pp_rband_unclean_ = 0, pp_rband_end_ = 0;
+    std::unordered_map<uint64_t, int32_t> pp_rband_seq_;
+    int  pp_rband_step(int lane, const RadBatch* b, int* keys = nullptr);
+    void pp_rband_note(int lane, int rband, int rkeys);
+    int  pp_tband_of(int lane) const { return lane >= 0 && (size_t)lane < pp_tband_lane_.size() ? pp_tband_lane_[(size_t)lane] : 0; }
+    int64_t pp_band_off_n_ = 0;   /* ... and the fresh BG steps it kept W(h, t)'s */
+    /* tp8 loop D46 (fn4 pp_tband 3 / RADIANCE_PP_TAIL_BAND=3, with the plugin's tail COPY, rad_pp_tail_copy): the leader holds the
+     * tail band layers' per-sequence state of EVERY sequence (each pass that is no tail band pass carries the band layers' KV rows
+     * in X2 and the leader stores them), so a DECODE lane's step runs as a tail band pass too while a BG step is in flight
+     * (pp_tband_bg_, set by the lane loop before each plan's head: a BG lane busy or holding a newcomer, D32 / D45's stretch) --
+     * the follower's decode passes one band lighter in the follower-bound stretches, W(h, t)'s in the leader-bound clean ones.
+     * pp_tcopy_seq_ = per sequence (KV key) its last row NOT written on the leader (core/sched/tcopy.h: -1 none; a snapshot
+     * restore / cone replay is one); a decode lane's step runs as such a band pass only when every sequence of it is held. */
+    int  pp_tband_copy_ = 0;         /* the plugin's copy form (rad_pp_tail_copy): 0 none, 1 every pass, R >= 2 a window */
+    bool pp_tband_bg_ = false;
+    int64_t pp_tband_dec_n_ = 0;     /* decode lanes' steps that ran as tail band passes (pp_tband 3) */
+    int64_t pp_tband_dec_skip_ = 0;  /* ... and those a BG step was in flight for that a sequence of kept W(h, t)'s */
+    /* tp8 loop D50 (fn4 pp_tband 4 / 4 + 1024 x N): a held decode step bands in a CLEAN stretch too (4), or only above N decoded
+     * sequences there (4 + 1024 x N) -- at --pp-cut h,t+1 the band = W(h, t)'s decode, so where layer t runs follows the stretch
+     * and the load */
+    int64_t pp_tband_dec_clean_ = 0; /* decode lanes' band passes with no BG step in flight (pp_tband 4) */
+    int64_t pp_tband_dec_low_ = 0;   /* clean-stretch decode steps 4 + 1024 x N kept W(h, t)'s at a load <= N */
+    int64_t pp_tband_dec_seen_ = 0;  /* decode lanes' steps pp_tband_step judged (the cell's denominator) */
+    std::string tband_text(const char* when) const;   /* the periodic / run-end counters line */
+    /* tp8 loop D51 (fn4 pp_tband 5): the decode band follows the MEASURED bound -- the follower's recent card working share (its
+     * heartbeat load report, RADIANCE_PP_LOAD_REPORT_MS on the follower) against the leader's own (RADIANCE_PP_NODE_IDLE on both):
+     * band once the follower works more by > pp_bound_h_ permille over the last pp_bound_ms_, keep the layer on the follower once
+     * the leader does, else the last decision; no fresh report -> 3's rule */
+    int  pp_bound_ms_ = 200, pp_bound_h_ = 20;   /* RADIANCE_PP_TBAND_BOUND_MS / _H */
+    int  pp_load_ms_ = 0;                        /* the follower: RADIANCE_PP_LOAD_REPORT_MS (0 = no report) */
+    bool pp_t5_on_ = false;
+    int64_t pp_t5_band_ = 0, pp_t5_keep_ = 0, pp_t5_fb_ = 0;
+    double  pp_t5_lsum_ = 0, pp_t5_fsum_ = 0;
+    bool pp_tband_by_bound(bool count);
+    std::string t5_text(const char* when) const;
+    std::unordered_map<uint64_t, int64_t> pp_tcopy_seq_;   /* core/sched/tcopy.h Gap: -1 all written, p the last gap */
+    /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
+    int  step_loop_lanes();
+    int  lane_head(int lane, const RadBatch* b);
+    int  lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on);
+    /* tp8 dev 1b (RADIANCE_PP_TAIL_AHEAD=1 with RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t)): a lane step's tail in three
+     * releases -- its model part (X2's receive .. the head's logits, kIssueModel), issued while the lane before it is
+     * still being collected; its sampler + drafter + step end (kIssueSampler once the model went ahead); its collect,
+     * commit and drafter finish. lane_tail is the issue and the finish back to back, as before. */
+    int  lane_tail_model(int lane, const RadBatch* b);
+    int  lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on,
+                         bool model_done);
+    int  lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on);
+    /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k, the leader; the plugin declares the boundaries): a BG lane's step's leader parts in
+     * layer segments with other lanes' parts between them -- its head [0, h) as segments [s0, s1) (the first takes the
+     * release, the restores and holds the frame; the last ships it, then X1), its tail [t, n) as model-part segments, the
+     * last one with the sampler, drafter and step end (lane_tail_issue from `tail_seg0_`, RAD_PP_SEG_END). */
+    int  lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool first, bool last, int band = 0, int lflags = 0);
+    int  lane_tail_seg(int lane, const RadBatch* b, int s0, int s1);
+    int  tail_seg0_ = 0;
+    /* ... the held frame of the lane's step (pp_ship's bytes, built at its first head segment so it carries that release's
+     * PSK plan and clears), sent at its last head segment */
+    struct PpHeld { bool on = false; int32_t step = 0; std::vector<uint8_t> head, span; };
+    PpHeld pp_held_[RAD_PP_MAX_LANES];
+    /* tp8 loop P27 (RADIANCE_PP_LEAD_SEG_SHIP=1, with LEAD_SEG): the last head segment does not ship the held frame; the lane
+     * loop ships it once that segment has run on rank 0's card (its X1 sent), so the follower never issues the pass into an X1
+     * that is not sent yet and the decode frames issued between the head's segments reach it first */
+    bool lseg_ship_ = false;
+    int  pp_ship_hold(const RadBatch* b, int lane);
+    int  pp_ship_release(int lane);
+    bool tail_ahead_ = false;
+    int64_t tail_ahead_n_ = 0;   /* model parts issued ahead */
+    /* tp8 MERGE (fn4 pp_merge, the leader's; RADIANCE_PP_MERGE its start value; core/sched/lanes.h merge_into / split_from):
+     * bit 1 the decode lanes run as ONE lane (lane 0) while a BG lane has a step in flight or a newcomer in its inbox, split
+     * back when none; bit 2 merged always; bit 4 with RADIANCE_PP_LEAD_SEG, BG steps run their leader parts in segments only
+     * with the merge on; bit 8 no BG leader segments at all; bit 16 hold kept-home newcomers while merged. 0 = today. Read by step_loop_lanes at the top of every round. */
+    std::atomic<int> pp_merge_{0};
+    /* tp8 MERGE: fn4 pp_merge_ms (RADIANCE_PP_MERGE_MS) -- the lanes stay merged this many ms after the last BG work; bit 16 of
+     * pp_merge: while merged, D11's hold (RADIANCE_PP_MERGE_HOLD_MS, default 1500) for a newcomer the BG lanes have no room for */
+    std::atomic<int> pp_merge_ms_{0};
+    /* tp8 MERGE bit 32: the lanes whose steps run as relay (BG) steps now -- their frames carry StepHdr flags bit 8, and the
+     * follower runs such a pass in segments as a BG lane's */
+    uint32_t pp_relay_mask_ = 0;
+    int  lanes_init(const std::vector<BatchBuilder::RankIO>& rio);
+    void lanes_note(int64_t lane_steps, int64_t rounds_two);
+    /* Stage busy stamps (RADIANCE_PP_STAMPS=path): every pass's host issue-to-done interval on this
+     * node, for the throughput check (both stages busy at once). Host backend only: there a pass runs
+     * on its rank threads, so issue..join is its run. */
+    FILE* pp_stamps_ = nullptr;
+    uint64_t pp_stamp_n_ = 0;
+    /* tp8 loop D37 (with RADIANCE_PP_STAMPS, the leader): a whole head part's issue on rank 0's thread -- set by lane_head before
+     * the release, the times written by rank 0 (its run_step's entry and return), read after the join (the barrier orders
+     * both); lane_head stamps them as 'hiss LANE STEP entry return' beside the 'head' stamp (release .. X1) */
+    bool hiss_want_ = false;
+    uint64_t hiss_t0_ = 0, hiss_t1_ = 0;
+    void  pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1);
+    /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1, the leader): a lone prefill's chunks on rank 0's card -- card-local event
+     * times around every head and tail part, the host's time a chunk -- one line a prompt at its first token
+     * (engine_lanes.cpp). Owned by step_loop_lanes; null when off. */
+    struct PfTimeline* pf_tl_ = nullptr;
+    /* qfn-on-ds (Qwen loop round 18): the same timeline in the one-machine step loop (RADIANCE_PF_TIMELINE=1; off = nothing
+     * recorded): per lone-prefill chunk on rank 0's stream, before its model pass is released (A), after the ranks issued it
+     * (B) and after the step's own sampler / snapshots / drafter passes (C); one line a prompt at its first token
+     * (engine_lanes.cpp). Owned by step_loop. */
+    void pf1_open();
+    void pf1_close();
+    int  pf1_mark_a(const RadBatch* b);
+    void pf1_mark_b(const RadBatch* b, int ci, uint64_t t_release);
+    void pf1_mark_c(const RadBatch* b);
+    void pf1_finish(const RadBatch* b, uint64_t t_collect, bool tok);
+    /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1, either node): rank 0's card in parts / between parts / waiting for the other
+     * node's crossing, a line a minute (core/pp_nodeidle.h). Owned by the node's step loop; null when off. */
+    struct PpNodeIdle* pp_ni_ = nullptr;
+    int  pp_node_idle_open(std::unique_ptr<struct PpNodeIdle>* own);
+    /* The follower's step loop: replay the leader's builds, run the trunk steps, until the leader
+     * stops (0) or the link fails (negative). */
+    int  follower_loop();
+    void pp_close(const char* why);
+    /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT's mode (0 / 1 / 2) and, at close, mode 2's check of the shares */
+    static int pp_send_split();
+    /* tp8 loop P10 (RADIANCE_PP_SEND_ASYNC): the row floor of a payload that crosses from a side stream (0 = off), and
+     * the card staging buffer it needs on this node's sending rank (0 when off) */
+    static int64_t pp_send_async_rows();
+    int64_t pp_send_async_bytes() const;
+    void* pp_stage_dev_ = nullptr;
+    /* tp8 loop P10b (RADIANCE_PP_RECV_ASYNC): the row floor of a payload taken through a card staging buffer from a side
+     * stream (0 = off), and the staging buffer every rank of this node needs for it (0 when off) */
+    static int64_t pp_recv_async_rows();
+    int64_t pp_recv_async_bytes() const;
+    void pp_split_note();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
@@ -411,6 +695,27 @@ private:
     bool                 short_on_ = false;     /* the short block runs now (block_shape) */
     /* --draft-short-from resolved at bring-up (auto: 0 for a chain, 2 for a tree). */
     int64_t              short_from_ = 0;
+    /* tp8 loop D18: query passes (and their rows) at the short block and at the drafter's own, counted while a short block
+     * is served (drafter_short_ > 0); the two-node pipeline's minute and stop lines print them. */
+    int64_t              short_q_n_ = 0, short_q_rows_ = 0, long_q_n_ = 0, long_q_rows_ = 0;
+    void                 short_block_line(const char* when) const;
+    /* tp8 loop D19: the short block tiers (RADIANCE_DRAFT_SHORT_TIERS=N:S,..., leader env), from the highest load down: a
+     * step that decoded >= `from` sequences (short_block_on's hysteresis, a state a tier) runs `block`; empty without the
+     * env (then drafter_short_ / short_from_ / short_on_ serve as before). drafter_short_ is the first tier's block. */
+    struct ShortTier {
+        int64_t from = 0, block = 0, q_n = 0, q_rows = 0;
+        bool    on = false;
+    };
+    std::vector<ShortTier> short_tiers_;
+    /* tp8 loop D23 (fn4 draft_short_blk, leader): the short block of this many rows a sequence runs wherever the top choice
+     * (--draft-short-from's tier, or the highest-load tier) would run its own; 0 = the start's. Query passes at it counted. */
+    std::atomic<int>     short_blk_{0};
+    int64_t              forced_q_n_ = 0, forced_q_rows_ = 0;
+    /* DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT=1, leader env, + fn4 draft_head_cut 1): the query pass at the drafter's own block
+     * reads only the first D rows a block into its head (D = the head depth in force, below the block); the cut passes
+     * and the head rows they left out, for the minute / stop lines (short_block_line). */
+    bool                 head_cut_ = false;
+    int64_t              head_cut_n_ = 0, head_cut_rows_ = 0;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
@@ -458,7 +763,14 @@ private:
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
-    int  prepare_release(const RadBatch* b);
+    int  prepare_release(const RadBatch* b, bool switches = true);
+    /* The fn4 values apply_pending handed over, to their owners (prepare_release; a pipeline's
+     * follower after it applied the leader's requests). */
+    void fn4_apply_changes(const int* sw);
+    /* Lever PSK design 2 (ds41-psk2), at a step's release with every rank parked: the scheduler's plan for the step's
+     * trunk pass to the plugin (fn4::psk_plan), and the pass's layer end to every rank's stager (INT32_MAX: every
+     * layer, the default and every pass without a plan). */
+    void psk_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
@@ -477,7 +789,8 @@ private:
      * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
      * reads the states back once, then binds each to the verify row it will be coupled at. */
     bool     mtp_couple_ = false;
-    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;   /* rank 0's handles */
+    std::vector<rad_buf> couple_draws_rank_;           /* the draws plane, by rank */
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
@@ -486,6 +799,18 @@ private:
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
+    /* Lever SD (fn4 draft_sample; engine_draft.cpp). `couple_cycle_`: the drafter cycle in flight staged its draws
+     * (draft_sample >= 1 when it was issued), so its states are read back and bound; otherwise nothing is staged,
+     * read or bound, and a verify carries no coupled row (today's passes). The q_temp column a drafter may declare
+     * (`mtp_couple_qtemp`, [rows, 1] f32: the request's temperature x the switch's scale), by rank, and its pinned
+     * staging. The counters go to fn4::note_sample. */
+    bool couple_cycle_ = false;
+    bool couple_bind_note_ = false;        /* a readback that could not bind was reported (once) */
+    std::vector<rad_buf> couple_qt_rank_;
+    float* couple_qt_stage_ = nullptr;     /* pinned [max_seqs] */
+    int64_t couple_n_samp_ = 0, couple_n_greedy_ = 0, couple_n_bound_ = 0, couple_n_malf_ = 0,
+            couple_n_fallback_ = 0, couple_n_lookup_ = 0;
+    void couple_note();
     /* `rows` are serial_row_ or block_row_ (Scheduler::SerialRow / BlockRow). */
     template <class Row> int stage_couple_draws(const Row* rows, int n);
     int  bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card);
@@ -525,12 +850,31 @@ private:
      * the checkpoint save waits for its context pass (save_checkpoints). */
     bool drafter_snap_ = false;
     int  save_checkpoints();
+    int  restore_checkpoints();   /* a prefix hit's snapshot restores, before the release (lsched()'s plan) */
     /* A tree drafter (rad_drafter_tree), driven on the card only: ADV_BTAKE takes its parents,
      * ADV_COMPACT moves the accepted path's K and V after the acceptance, and ADV_CTXTREE stages
      * the context pass by that path. */
     bool    tree_ = false;
     rad_buf tree_parents_ = 0;
     int     tree_compact(int rows);
+    /* ds41-acc: a chain block drafter's confidence plane and alternative branches
+     * (rad_drafter_confidence / rad_drafter_alternatives, core/sched/draft_conf.h), rank 0's
+     * handles, copied to the pinned planes behind the query pass while the switches ask for them
+     * (dspark_conf / dspark_alt). A gate (dspark_conf 1, 5..95, 101..195) waits for conf_ev_ before
+     * the next verify is built, once a step (conf_gate), and leaves each block row's count in
+     * conf_cut_ (-1: none); dconf_commit holds the step's verifies to them (draft_conf.h Tracker). */
+    rad_buf  conf_buf_ = 0, alt_buf_ = 0;
+    int64_t  conf_pitch_ = 0, n_alt_ = 0, alt_pitch_ = 0;
+    float*   conf_host_ = nullptr;
+    int32_t* alt_host_ = nullptr;
+    RadEvent conf_ev_ = nullptr;
+    int      conf_val_ = 0;
+    bool     alt_on_ = false, conf_cut_done_ = false;
+    bool     conf_dbg_ = false;   /* RADIANCE_DEBUG_DRAFT_CONF: hashed logits on the host (tests) */
+    int      dconf_step_ = 0;
+    std::vector<int32_t> conf_cut_;
+    int  conf_gate();
+    void dconf_commit(const StepPlan& plan, const StepOut& so, int step);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
     /* The block and proposal count this step's query pass runs at: the drafter's own, or its short
@@ -544,6 +888,50 @@ private:
     /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
      * issue_ahead's expect_draft. */
     int  block_steps_ = 0;
+    /* The depth-0 context skip (fn4 draft_ctxskip; engine_draft.cpp, "the depth-0 context skip").
+     * RADIANCE_DRAFT_CTXSKIP=0 | 1 at start declares it for a windowed block drafter drafting: the
+     * budget reserves the ring (ctxskip_bytes), step_state_init allocates it on every rank that taps
+     * rows for the drafter (its buffer named "dspark_src"), and block_context_pass then keeps a plain
+     * step's tapped rows in it instead of passing them while the head does not run, and refills the
+     * drafter's window from them before it runs again. Unset: nothing declared, allocated or
+     * logged, and block_context_pass is today's context pass. */
+    struct CtxSkip {
+        bool    declared = false;
+        bool    ready = false;           /* the ring on every rank that taps */
+        int     start = 0;               /* RADIANCE_DRAFT_CTXSKIP's value */
+        int     on = 0;                  /* the switch */
+        int     slots = 0;               /* step slots kept between refills; slot `slots` is the stash */
+        int     used = 0;                /* slots holding kept rows */
+        int64_t pitch = 0;               /* bytes a tapped row */
+        int64_t ring_bytes = 0;          /* a rank */
+        std::vector<rad_buf> src;        /* a rank's tapped rows buffer; 0 where it taps none */
+        std::vector<char*>   ring;
+        int64_t skipped = 0, refills = 0, refill_rows = 0, dropped = 0, ring_full = 0;
+        std::vector<Scheduler::CtxRun> runs;
+        /* tp8 dev D4 (RADIANCE_PP_CTXSKIP_LANES=1 on a leader with lanes; else 1 / max_seqs / unused): the ring cut into
+         * one region a lane -- rows [lane x lane_rows, (lane + 1) x lane_rows) of every step slot -- and a slot count a
+         * lane (used_l), so each lane keeps and refills its own consecutive steps */
+        int     lanes = 1;
+        int64_t lane_rows = 0;           /* rows a lane's region holds (a lane's cards) */
+        int64_t ring_rows = 0;           /* rows a step slot holds: max_seqs, or lanes x lane_rows */
+        std::vector<int> used_l;
+    } ctxs_;
+    /* tp8 dev D4: the current lane's slot count, and its region's first ring row */
+    int&    ctx_used();
+    int64_t ctx_row0() const;
+    /* The ring's bytes a rank for `p` (0 when the skip is not declared or `p` taps nothing for a
+     * windowed block drafter); `src`, `pitch`, `slots` as found. */
+    int64_t ctxskip_bytes(const Program& p, rad_buf* src = nullptr, int64_t* pitch = nullptr,
+                          int* slots = nullptr) const;
+    int  ctxskip_setup();
+    void ctxskip_fini();
+    int  ctx_limit() const;      /* lever Z0-A */
+    bool ctx_refill_due();       /* lever Z0-A */
+    /* The context pass of issue_block_drafter: today's, or under the skip a kept step / a refill. */
+    int  block_context_pass(int step);
+    int  ctx_copy_rows(int slot, int64_t rows, bool to_ring);
+    int  ctx_refill_all(int step);
+    void ctx_note() const;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */
@@ -569,6 +957,14 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    /* Lever DL (place/mover.h, the drafter's lend): RADIANCE_DRAFT_LEND set at start declares it
+     * (every drafter unit keeps a host copy; Engine::load_weights); set up in start() once the
+     * loans are carved, where `dl_capable_` says whether any rank has a drafter slab to lend. The
+     * scheduler sees it through set_lend_view (serve); prepare_release hands its target to every
+     * rank's mover. */
+    bool     dl_declared_ = false;
+    bool     dl_capable_ = false;
+    int      draft_lend_state(uint64_t* changes) const;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a
@@ -577,10 +973,76 @@ private:
     void arena_tick(uint64_t now_ns);
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
+    /* Lever Z0-A (RADIANCE_DS41_ARENA_DECODE_ROWS as a list, fn4 arena_d0): the largest decode rung declared
+     * (the one today's decode and verify steps take), how many were accepted, and the switch. */
+    int64_t          arena_dec_max_ = 0;
+    /* Lever Z0-W (RADIANCE_DRAFT_LEND_WEIGHTS at start, fn4 draft_lend_w): set up on every rank, the switch,
+     * and whether the drafter's query-pass weights are lent now. */
+    bool             dw_capable_ = false;
+    std::atomic<int> dw_on_{0};
+    bool             dw_lent_ = false;
+    int  draft_w_step();
+    /* Lever LF (ds41-lf, fn4 place_lf; RADIANCE_PLACE_LF=1 at start): every rank places dynamically, and the switch
+     * (Mover::set_place_lf on every rank). */
+    bool             lf_capable_ = false;
+    std::atomic<int> lf_on_{0};
+    /* Levers SWL / L2 (ds41-swl; fn4 place_swap_lent, heat_min_gain_x100, heat_hyst_x100): every rank places dynamically
+     * (lf_capable_'s condition), and SWL as applied (Mover::set_swap_lent on every rank); L2 lives in each rank's
+     * heat engine (HeatEngine::set_min_gain / set_hysteresis). */
+    bool             swl_capable_ = false;
+    std::atomic<int> swl_on_{0};
+    /* Lever SA / HB (ds41-sahb; fn4 stage_short / stage_pick / place_hb): whether each can act (Engine::sahb_setup),
+     * the switches as applied, and the ranks place_hb acts on (RADIANCE_PLACE_HB_RANKS, a bit a rank; all unset). */
+    bool             sa_capable_ = false, hb_capable_ = false;
+    std::atomic<int> stage_short_{0}, stage_pick_{0}, place_hb_{0};
+    std::atomic<int> stage_lone_{0};   /* lever SAL (ds41-pf2, fn4 stage_lone) */
+    /* Lever SP (ds41-int9; fn4 stage_full_min / stage_full_pick): whether it can act (a prefill stager on every rank,
+     * Engine::sahb_setup), the switches as applied (read by arena_step). */
+    bool             sp_capable_ = false;
+    std::atomic<int> stage_full_min_{0}, stage_full_pick_{0};
+    uint64_t         hb_mask_ = ~(uint64_t)0;
+    void sahb_setup();
+    void sahb_note();
+    int64_t step_rows(const Rank& r, int step) const;
+    int              arena_dec_rungs_ = 0;
+    std::atomic<int> arena_d0_{0};
+    /* Lever PSK design 2: whether the plugin's ds41_psk has been read for the scheduler (first release, then after every
+     * fn4 change), the plan's buffers, the planned passes and the ones whose layers past an end were not staged. */
+    bool psk_mode_read_ = false;
+    std::vector<int32_t> psk_ahead_, psk_rows_, psk_flags_;   /* flags: lever PSK-CR's replay bit per entry */
+    int64_t psk_planned_ = 0, psk_cut_passes_ = 0;
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */
     int64_t  arena_span_rows_ = 0;
+    /* Lever TI (ds41-pf2): a plugin serves a CONV window at a row inside a step (fn4::ckpt_conv_src), and the snapshots
+     * saved inside a step so far (save_checkpoints). */
+    bool     ti_capable_ = false;
+    uint64_t ti_saves_ = 0;
+    /* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1, a plugin serving rad_tip_set): lever TI's snapshot at the
+     * start of the step's last piece, its state rows staged by the plugin straight into the checkpoint slot from between a
+     * state op's two launches (tip_stage). One per rank, set on the rank's thread around its issue (rank_loop) and read
+     * by save_checkpoints: the step's row, sequence, slot, the rows staged and the groups the plugin leaves as the step
+     * leaves them (rad_tip_free: not read by a resume at a piece start). */
+    struct TipRank {
+        Engine*  e = nullptr;
+        int      rank = 0;
+        int64_t  row = 0;
+        uint64_t seq = 0;
+        int32_t  ck = -1;
+        std::vector<int32_t> slots;                /* the sequence's state slot a group (state_slots_of) */
+        std::vector<std::vector<uint8_t>> staged;  /* [group][layer] */
+        std::vector<int32_t> free_groups;
+        int      fail = 0;
+        uint64_t rows = 0;                         /* rows staged, this rank's (read for the engine's line) */
+    };
+    bool     tip_on_ = false;
+    std::vector<TipRank> tip_;
+    uint64_t tip_saves_ = 0;
+    static int tip_stage(void* u, int group, int layer, void* stream);
+    /* The step's TIP snapshot (an entry whose snapshot lies inside it, on the only prefill sequence): its row in the step,
+     * or 0 (none); `e` the entry. */
+    int64_t tip_row_of(const StepPlan& plan, const StepEntry** e) const;
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;
@@ -590,6 +1052,19 @@ private:
      * checked against both. */
     int64_t  late_step_bytes_ = 0;
     int64_t  late_lazy_bytes_ = 0;
+    /* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED=1; core/mem/vram_budget.h kv_placed): each rank's card at
+     * the budget's reading -- its free VRAM, the engine's device bytes and live streams there
+     * (rad_dev_ledger_of), one hardware queue's bytes -- and the least free the split was sized on.
+     * configure_kv measures against it what the budget never saw (kvp_unseen_), and under the switch
+     * each KV pool gives it back before the agreement (kvp_trim_) and returns its pages past the agreed
+     * cap after it (kvp_back_). Unset: measured and printed on a pipeline node only, nothing moved. */
+    struct KvpRead { int64_t free = -1, dev_bytes = 0, streams = 0, queue_bytes = 0; };
+    std::vector<KvpRead> kvp_read_;
+    int64_t kvp_least_free_ = -1;
+    int64_t kvp_claimable_ = -1;   /* the budget's claimable: what the split left beside its pools is spare too */
+    std::vector<int64_t> kvp_unseen_, kvp_trim_, kvp_back_;
+    int kv_placed_measure();
+    int kv_placed_return(size_t ri, int64_t least);
     /* Linear-state snapshot store: pinned host memory, --checkpoint-slots slots, each holding every
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
@@ -604,6 +1079,8 @@ private:
                   const char* tag, int every_s,
                   const std::function<void(size_t, double)>& progress, int* bad);
     int  score_rows(const RadBatch* b, const StepOut& so);
+    int  score_rows_issue(const RadBatch* b, const StepOut& so);   /* tp8 dev 1b: score_rows' copies ... */
+    int  score_rows_take(const RadBatch* b, const StepOut& so);    /* ... and its wait + scoring */
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */
@@ -679,14 +1156,24 @@ private:
      * what the heat engine proposes. A member because Rank is private; a no-op on a static plan.
      * The definition explains why a step is the unit. */
     void tiering_dispatch(Rank& r, int step);
+    /* The share of a step a trunk histogram of `step` is credited at (HeatParams::prefill_share,
+     * RADIANCE_HEAT_PREFILL); 1 unless the share is below one and the step had prefill rows. */
+    float heat_share(const Rank& r, int layer, int step, float* pshare) const;
     /* The routing histograms landed since the last drain (tiering_dispatch), and the drain alone
      * for --expert-stats where the heat engine is off. */
     void find_histograms(Rank& r, int before_step);
-    void xstats_drain(Rank& r, XsTally* xs, int before_step);
+    void xstats_drain(Rank& r, XsTally* xs, MissRank* ml, int before_step);
     /* --expert-stats: the map and the file, opened before the rank threads start; closed after they
      * stop, crediting what the ring still holds once the streams are drained. */
     int  xstats_open();
     void xstats_close();
+    /* RADIANCE_DEBUG_MISS_LOG: the same life as --expert-stats; one found histogram into the rank's
+     * log, classed by the tier of each live expert (`now_step` the draining dispatch, -1 at
+     * shutdown); the snapshot of the tiers a pass reads, taken at its issue. */
+    int  missl_open();
+    void missl_close();
+    void missl_credit(Rank& r, MissRank& ml, int layer, int bank, const int32_t* h, int now_step);
+    void missl_issued(Rank& r, MissRank& ml, const RadBatch& b);
     void rank_loop(int rank);
 };
 

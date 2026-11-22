@@ -21,6 +21,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -68,8 +69,20 @@ public:
 
     /* Drop the blob from the page cache and this process's page tables, so a container larger
      * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables
-     * are small and read constantly. Advisory; the kernel may decline. */
-    void drop_blob_cache() const;
+     * are small and read constantly. `keep` (file offset, bytes) is left alone: the mapped tier,
+     * read through the mapping for the engine's life, whose cached pages a restart would otherwise
+     * throw away (every gather from it then starts cold). Advisory; the kernel may decline. */
+    void drop_blob_cache(const std::vector<std::pair<int64_t, int64_t>>& keep = {}) const;
+
+    /* What an earlier process left cached of the blob comes back: snapshot_resident(), called
+     * right after open() and before anything allocates, records the blob's pages resident in the
+     * page cache (mincore, as page runs), because the load's own pinned pools can push the kernel
+     * into direct reclaim that takes them; rewarm() asks the kernel (MADV_WILLNEED) for the
+     * recorded pages inside `ranges` -- the mapped tier, whose host gathers otherwise start cold
+     * after every restart -- up to `max_bytes`, and drops the record. Bytes asked for; 0 with no
+     * record. Advisory. The engine takes the snapshot unless --mapped-rewarm off. */
+    void    snapshot_resident();
+    int64_t rewarm(const std::vector<std::pair<int64_t, int64_t>>& ranges, int64_t max_bytes);
 
     /* Drop one range of the blob behind a single forward cursor. A buffered front-to-back read of
      * a container larger than RAM otherwise builds reclaim pressure that slows the read itself.
@@ -166,6 +179,7 @@ private:
     VocabSection                                  vocab_, aux_vocab_;
     std::vector<ExpertGroup>                      groups_;
     std::unordered_map<std::string_view, int64_t> by_name_;
+    std::vector<std::pair<int64_t, int64_t>>      resident_;   /* page runs cached at the snapshot */
 };
 
 /* ================================================================== writer */
@@ -190,8 +204,17 @@ public:
     RadWriter& operator=(const RadWriter&) = delete;
 
     int  begin(const char* path);
+    /* Resume a killed write: open the target and its spill without truncating, so planes the
+     * journal marked complete stay where they are. abort() keeps both files. */
+    int  begin_resume(const char* path);
+    /* After seal(): record that a weight's planes are already at their offsets, for finish()'s
+     * completeness check. A resumed large weight skipped by the journal is named this way. */
+    int  mark_weight_done(int64_t idx);
+    /* Keep the target and its spill: a deliberate checkpoint, for a resume test or a pause. */
+    void abort_keep();
     void abort();                       /* discard, unlink both the target and the spill -- or, in
-                                         * append mode, cut the file back to its old length */
+                                         * append mode, cut the file back to its old length, or in
+                                         * resume mode leave both for the next attempt */
 
     void set_arch(std::string_view s)       { arch_ = s; }
     void set_model_name(std::string_view s) { model_ = s; }
@@ -283,7 +306,8 @@ private:
      * rebase them. */
     int  finish_append();
     int  check_complete() const;
-    bool     append_ = false;
+    bool        append_ = false;
+    bool        resume_ = false;    /* begin_resume: abort keeps the file and its spill */
     int64_t  old_size_ = 0, append_base_ = 0;
     uint64_t old_data_off_ = 0;
     RadFileHeader old_hdr_{};

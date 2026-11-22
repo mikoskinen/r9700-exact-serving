@@ -8,6 +8,7 @@
 // [half 0's eight][half 1's eight], so the GEMM reads a fragment with one global_load_b64. Rows are
 // not permuted; splitting A into two planes is slower (see the note in the GEMM).
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
@@ -57,7 +58,7 @@ __device__ __forceinline__ void r4d_quant_act_i8_body(
 template <int THR>
 __global__ __launch_bounds__(THR) void r4d_quant_act_i8_kernel(
     const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
-    int K) {
+    int K) { R4D_IKA_ENTRY();
   r4d_quant_act_i8_body<THR, false>(A, Q, S, K);
 }
 template <int THR>
@@ -81,7 +82,7 @@ __global__ __launch_bounds__(THR) void r4dchain_quant_act_i8(
 template <int THR>
 __global__ __launch_bounds__(THR) void r4d_quant_act_i8_asum_kernel(
     const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
-    float* __restrict__ Asum, int K, int group, int Mpad) {
+    float* __restrict__ Asum, int K, int group, int Mpad) { R4D_IKA_ENTRY();
   const int row = blockIdx.x;
   const __hip_bfloat16* a = A + (size_t)row * K;
   signed char* q = Q + (size_t)row * K;

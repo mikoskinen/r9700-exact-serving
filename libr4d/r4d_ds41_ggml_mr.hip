@@ -1,0 +1,1306 @@
+/* r4d_ds41_ggml_mr.hip -- lever D2: gemm_nt_ggml / logits_gemm_ggml's decode band (M <= 48 activation rows)
+ * in a multi-row form: every weight block read and dequantised ONCE for all the call's activation rows, with
+ * each output's floating-point operations exactly those of today's kernel (gg_gemv_kernel), so the bytes are
+ * the same. Off unless switched on (r4d_ds41_ggml_mr.h); gg_gemm calls it ahead of the stock launch.
+ *
+ * ---- why the stock decode band's cost grows with M (r4d_ds41_ggml.hip, gg_gemm's M <= 48 band)
+ *
+ *  (a) A pass takes at most kGgXM = 8 activation rows. Each block walks its weight row group once a pass, so
+ *      above 8 rows the group is re-read (from L2) and re-dequantised ceil(M / 8) times: at M = 24 three times,
+ *      at 48 six.
+ *  (b) The activation rows are staged as f32 in a 36 KiB buffer (gg_xbuf, 9216 floats with a pad of 4 every
+ *      32). A whole row of K = 5120 takes 5760 floats: one row fits (K 4096: 2, 2048: 4, 1280: 6, 768: 10). A
+ *      pass with more rows than fit runs "chunked": K in chunks of 1024 values (2048 at 3-4 rows), restaged
+ *      for EVERY row group (8 or 16 weight rows), each chunk between two block barriers around ONE unit a lane
+ *      (a chunk is 32 units, lane = unit mod 32). The chunk's weight loads are issued only after its barrier,
+ *      so every chunk of every row group exposes a DRAM round trip, and mc x KC activations are re-read from
+ *      L2 and widened a row group. That is the jump from M = 1 to M = 2-4 at K >= 4096 and the slope to 8.
+ *  (c) Inside a pass the decode IS shared by the pass's rows (gg_unit dequantises a unit's group once, then
+ *      loops the rows), but each row costs a mul + an add a weight value (no FMA: -ffp-contract=off), two LDS
+ *      float4 reads per 8 values, and a 5-level butterfly an output. At K = 1280 (attn_q_b, 40 units a row)
+ *      lane = unit mod 32 gives lanes 0-7 two units and the other 24 one (62.5 % of the lanes busy), at K = 768
+ *      (shexp_down, 24 units) 75 %, at 512 50 %.
+ *  So the stock band neither keeps one weight read for all rows (a, b) nor keeps its lanes busy at short K (c).
+ *
+ * ---- the form (gg_mr_kernel<T, H, R, MT>)
+ *
+ *  - A wave holds H weight rows side by side, 32 / H lanes (LPR) a row, and each lane R rows of its own (R
+ *    consecutive rows dequantised from the same staged activations). A "stage" is LPR units of every row: lane
+ *    i of a row slot takes unit U = s * LPR + i. With H = 4 a stage is one 256-value block of a K-quant row, and
+ *    K = 1280 / 768 / 512 split evenly (5 / 3 / 2 units a lane).
+ *  - The block (WN waves, WN * H * R weight rows) stages MT activation rows (its slice of M; M > MT splits M
+ *    over grid.y) for SS stages at a time as f32 in LDS, in the lanes' read order ([stage][row][group][half]
+ *    [lane][4]: a lane's eight values of a group are two float4 at consecutive lanes' addresses, no bank
+ *    conflicts, and the H row slots read the same addresses). Two barriers a slab, not a chunk a row group.
+ *  - A lane dequantises its unit of each of its R rows ONCE a stage (all four groups into registers), issues
+ *    the loads of the stage PD ahead into the raw words it just freed (PD buffers, the stage loop unrolled PD
+ *    times: 1 to 4 stages in flight, more when MT x R makes a stage's arithmetic short), then applies the 32
+ *    values to all MT rows (2 LDS float4 a group a row, 8 R mul + 8 R add). Weight loads stay in flight across
+ *    the slabs' barriers.
+ *  - r4d_ds41_ggml_mr64.hip compiles the same kernels wave64 (bench pin only): the per-lane code is the same, the
+ *    question is whether the dual ALUs run a wave64 mul / add in one pass (wave32 gets about a quarter of its
+ *    VALU slots paired as VOPD).
+ *  - The weight words are the bytes Gg<T>::load reads, in fewer, wider loads (mr_load: 8-byte loads at 2-byte
+ *    alignment, as the stock IQ load_w forms do), so the dequantised values are the same.
+ *
+ * ---- exactness: each output (row n, activation row m) is the same sequence of operations as gg_gemv_kernel's
+ *
+ *  Stock: lane p (0..31) of the wave owning row n sums, from acc = 0.0f, its units U = p, p + 32, p + 64, ...
+ *  (gg_row: U = U0 + lane, step 32, the UF units in flight accumulated in ascending V; K chunks in ascending
+ *  order; the bits do not depend on M, XM, RPW, the grid or whether K was staged whole -- r4d_ds41_ggml.hip
+ *  says so and the selftest checks it), each unit as four groups G = 0..3 of eight values t = 0..7:
+ *  acc += x[k] * w[k], x the bf16 widened to f32 (exact), w = Gg<T>::dec<G> of the unit's words, the product
+ *  rounded on its own (no contraction in either unit: CMakeLists compiles every unit -ffp-contract=off). Then
+ *  r4d_wave_sum: v += xor16, then xor 8, 4, 2, 1 (DPP), and lane 0 rounds once (gg_put).
+ *  Here: partial p of row n lives in the lane of n's row slot with i = p mod LPR, as its partial j = p / LPR.
+ *  Stage s feeds unit U = s LPR + i, so p = U mod 32 = (s mod H) LPR + i: partial j = s mod H gets units
+ *  U = p, p + 32, ... in ascending order (stages ascend), each unit by the same dec<G> and the same G, t order,
+ *  from 0.0f, with the same x values. acc[r][m][0] is always the current stage's partial: after each stage the
+ *  H partials rotate one slot (register moves, no arithmetic), and the stage count is padded to a multiple of H
+ *  with rotations only, so slot j ends holding partial j. The butterfly: its first log2(H) levels (xor 16 down
+ *  to xor LPR) pair partials that sit in one lane (p and p + X are partials j and j + X / LPR of lane i), the
+ *  rest (xor LPR / 2 .. 1) are r4d_dpp_xor_add inside the row slot's LPR lanes (DPP row_xmask stays inside a
+ *  row of 16, so slots never mix). Each level adds the same two values as the stock level does, the lower
+ *  partial's value first, so the sum is the same IEEE operation (an IEEE add is commutative, every bit, for
+ *  any non-NaN operands; only two NaN payloads could depend on the order). H = 1 calls r4d_wave_sum itself.
+ *  Lane i = 0 of the slot rounds once with gg_put. Activation rows past M are staged as zeros and never
+ *  stored; weight rows past N read row N - 1 and are never stored; units past the row (a partial last stage)
+ *  are skipped by their lanes, as gg_row's V < U1 test skips them.
+ *
+ *  r4d_selftest --mrcheck byte-compares this form against the stock path at every DeepSeek-V4.1 dense TP4
+ *  shape, q5_K / q6_K / q8_0, M = 1..48; tests/r4d_emu's ds41mr runs both kernels on the host emulator.
+ */
+#define R4D_GG_BLOCKS_ONLY 1
+#include "r4d_ds41_ggml.hip"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+constexpr int kMrThreads = 256;          /* WN <= 8 waves a block */
+constexpr int kMrLdsMax = 49152;         /* one stage of MT rows at most */
+constexpr int kMrMaxM = 48;              /* = kGgDecodeRows */
+
+struct GgMrArgs {
+    const uint16_t* x;
+    long long x_ld;                      /* elements */
+    const uint8_t* w;
+    long long w_ld;                      /* bytes a weight row */
+    void* y;
+    long long y_ld;                      /* elements */
+    int M, N, K;
+    int UK;                              /* units a row */
+    int NS;                              /* stages a row (the last may be partial) */
+    int SS;                              /* stages a slab */
+    int x_al;
+    /* Lever K1 folds a / e (PRO > 0, r4d_gg_mr_fold): the activation's producer computed in the staging, from its own
+     * input in `x` (PRO 1: rmsnorm's x [M, K]; PRO 2: swiglu_clamped's gate_up [M, 2K], the up half at x + K), each
+     * value rounded to bf16 as the producer stores it and widened as gg_x8 widens a stored bf16; block column 0 also
+     * writes those bf16 to `h` (h_ld elements a row), the producer's own output. */
+    const float* g;                      /* PRO 1: rmsnorm's f32 gain [K] */
+    float eps, wadd, mult;               /* PRO 1: rmsnorm's scalars as its launch reads them */
+    int nw;                              /* PRO 1: the waves of rmsnorm's workgroup a row (r4d_act_threads(M, K) / 32) */
+    float limit;                         /* PRO 2: swiglu_clamped's limit */
+    uint16_t* h;
+    long long h_ld;
+    int h_al, u_al;                      /* 16-byte aligned rows of h / of gate_up's up half */
+};
+
+/* ------------------------------------------------------------------ weight words
+ * Gg<T>::load's dwords, the same bytes in the same order, by 8-byte loads at the blocks' 2-byte (q6_K, q8_0) or
+ * 4-byte (q5_K) alignment: the device runs with unaligned access enabled, as Gg<IQ2_XXS>::load_w relies on. */
+__device__ __forceinline__ void mr_b64(const uint8_t* p, uint32_t* r) {
+    const gg_u32x2 v = *(gg_gu64a2)(const void*)p;
+    r[0] = v.x;
+    r[1] = v.y;
+}
+template <int T>
+__device__ __forceinline__ void mr_load(const uint8_t* b, int u, uint32_t* r) {
+    if constexpr (T == GG_Q8_0) {
+        r[0] = gg_u16(b);
+        mr_b64(b + 2, r + 1);
+        mr_b64(b + 10, r + 3);
+        mr_b64(b + 18, r + 5);
+        mr_b64(b + 26, r + 7);
+    } else if constexpr (T == GG_Q6_K) {
+        const int h = u >> 2, l0 = 8 * (u & 3);
+        mr_b64(b + 64 * h + l0, r);
+        mr_b64(b + 64 * h + 32 + l0, r + 2);
+        mr_b64(b + 128 + 32 * h + l0, r + 4);
+        mr_b64(b + 192 + 8 * h, r + 6);
+        r[8] = gg_u16(b + 208);
+    } else if constexpr (T == GG_Q5_K) {
+        const int jp = u >> 2, l0 = 8 * (u & 3);
+        mr_b64(b, r);
+        mr_b64(b + 8, r + 2);
+        mr_b64(b + 16 + l0, r + 4);
+        mr_b64(b + 48 + 64 * jp + l0, r + 6);
+        mr_b64(b + 80 + 64 * jp + l0, r + 8);
+    } else {
+        Gg<T>::load(b, u, r);
+    }
+}
+
+/* The unit U and group G whose eight values start at K position k (a multiple of 8): Gg<T>::goff inverted. */
+template <int T>
+__device__ __forceinline__ void mr_piece(int k, int& U, int& G) {
+    if constexpr (Gg<T>::QK == 32) {                  /* q8_0, iq4_nl, the float form: goff = 8 g */
+        U = k >> 5;
+        G = (k >> 3) & 3;
+    } else if constexpr (T == GG_Q5_K || T == GG_Q6_K) {
+        /* goff = 128 (u >> 2) + 32 g + 8 (u & 3) (Q5_K's 64 (g >> 1) + 32 (g & 1) is 32 g) */
+        const int q = (k >> 3) & 31;
+        U = 8 * (k >> 8) + 4 * (q >> 4) + (q & 3);
+        G = (q >> 2) & 3;
+    } else {                                          /* the I-quants: goff = 32 u + 8 g */
+        const int q = (k >> 3) & 31;
+        U = 8 * (k >> 8) + (q >> 2);
+        G = q & 3;
+    }
+}
+
+/* The eight bf16 a fold's producer stores at columns k .. k + 7 of row `row`, and the same values widened (exact), as
+ * the GEMM would read them back from the producer's output. Each value is the producer's own expression:
+ *   PRO 1  rmsnorm_body (r4d_model_bf16.hip): f32_to_bf16(act_f32(x) * s * (g + wadd) * mult), s the row's
+ *          rsqrtf(sum / n + eps) (mr_norm_scales), g the f32 gain;
+ *   PRO 2  swiglu_clamped_kernel (r4d_glm.hip): g = fminf(gate, limit), u = fminf(fmaxf(up, -limit), limit),
+ *          f32_to_bf16((g / (1.0f + expf(-g))) * u).
+ * Every unit is compiled -ffp-contract=off, so each product and sum rounds on its own here as there. */
+template <int PRO>
+__device__ __forceinline__ void mr_produce(const GgMrArgs& A, int row, int k, float sc, uint16_t* hb, float* v) {
+    const uint16_t* xr = A.x + (long long)row * A.x_ld;
+    uint32_t q[4];
+    gg_x8raw(xr + k, A.x_al != 0, q);
+    if constexpr (PRO == 1) {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const float x = (t & 1) ? bf16w_hi(q[t >> 1]) : bf16w_lo(q[t >> 1]);
+            hb[t] = f32_to_bf16(x * sc * (A.g[k + t] + A.wadd) * A.mult);
+        }
+    } else {
+        uint32_t u[4];
+        gg_x8raw(xr + A.K + k, A.u_al != 0, u);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const float g = fminf((t & 1) ? bf16w_hi(q[t >> 1]) : bf16w_lo(q[t >> 1]), A.limit);
+            const float uu = fminf(fmaxf((t & 1) ? bf16w_hi(u[t >> 1]) : bf16w_lo(u[t >> 1]), -A.limit), A.limit);
+            hb[t] = f32_to_bf16((g / (1.0f + expf(-g))) * uu);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 8; ++t) v[t] = bf16_to_f32(hb[t]);
+}
+/* Block column 0's copy of a produced octet into the producer's output row. */
+__device__ __forceinline__ void mr_put_h(const GgMrArgs& A, int row, int k, const uint16_t* hb) {
+    uint16_t* d = A.h + (long long)row * A.h_ld + k;
+    if (A.h_al) {
+        r4d_u32x4 t;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) t[i] = (uint32_t)hb[2 * i] | ((uint32_t)hb[2 * i + 1] << 16);
+        *(r4d_u32x4*)(void*)d = t;
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) d[t] = hb[t];
+    }
+}
+
+/* Stages [s0, s1) of activation rows m0 .. m0 + MT - 1 (rows from mc on, and values past K, as zeros) into the
+ * slab: [stage][row][group][half][lane][4] f32, VPS floats a stage a row. PRO > 0: the producer's values
+ * (mr_produce, `sc` the rows' norm scales under PRO 1), and block column 0 writes them to h as well. */
+template <int T, int H, int MT, int PRO = 0>
+__device__ __forceinline__ void mr_stage(const GgMrArgs& A, float* xs, int m0, int mc, int s0, int s1,
+                                         const float* sc = nullptr) {
+    constexpr int LPR = 32 / H, VPS = 32 * LPR, PPS = VPS / 8;
+    const int np = (s1 - s0) * MT * PPS;
+    for (int idx = (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
+        const int q = idx % PPS, rest = idx / PPS;
+        const int m = rest % MT, ss = rest / MT;
+        const int s = s0 + ss, k = s * VPS + 8 * q;
+        float v[8];
+        if (m < mc && k < A.K) {
+            if constexpr (PRO == 0) {
+                gg_x8(A.x + (long long)(m0 + m) * A.x_ld + k, A.x_al != 0, v);
+            } else {
+                uint16_t hb[8];
+                mr_produce<PRO>(A, m0 + m, k, PRO == 1 ? sc[m] : 0.0f, hb, v);
+                if (blockIdx.x == 0) mr_put_h(A, m0 + m, k, hb);
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) v[t] = 0.0f;
+        }
+        int U = 0, G = 0;
+        mr_piece<T>(k, U, G);
+        const int i = U - s * LPR;
+        float* d = xs + (ss * MT + m) * VPS;
+        *(float4*)(d + ((2 * G) * LPR + i) * 4) = make_float4(v[0], v[1], v[2], v[3]);
+        *(float4*)(d + ((2 * G + 1) * LPR + i) * 4) = make_float4(v[4], v[5], v[6], v[7]);
+    }
+}
+
+/* ------------------------------------------------------------------ lever A4 (ds41-a4): XP, the slab one ahead
+ * An XP form (gg_mr_body's XP = true, compiled in r4d_ds41_ggml_mr2.hip) splits mr_stage in two: mr_fetch issues the
+ * next slab's activation loads into registers (the raw bf16 words, mr_xpn(H, MT) pieces of eight values a thread at most)
+ * before the current slab's stages run, and mr_put converts them into the slab after the stages, between the same two
+ * barriers mr_stage sits between. The slab's values, its layout and every staged value are mr_stage's (the same
+ * piece -> (stage, row, k) map, the same widening, the producer's same expression under PRO 1 / 2, zeros past mc and
+ * past K), so the arithmetic of every output is the plain form's: only when the activation's L2 round trip happens
+ * moves (behind the previous slab's arithmetic instead of between two barriers). mr_size2 sizes SS so that a slab
+ * has at most mr_xpn(H, MT) pieces a thread where one stage fits; past that (few waves a block) mr_put loads the rest of the slab
+ * itself, as mr_stage does. */
+/* Pieces a thread at most (the registers a form spends on the slab ahead): a stage of MT rows at WN 4 and one stage a
+ * slab, between 1 and 8 (= ceil(MT / H)); mr_size2 sizes SS (and declines WN below what a stage needs) by the same rule. */
+constexpr int mr_xpn(int H, int MT) { return (MT + H - 1) / H < 1 ? 1 : ((MT + H - 1) / H > 8 ? 8 : (MT + H - 1) / H); }
+
+template <int PRO, int XPN>
+struct MrXp {
+    uint32_t q[XPN][4];
+    uint32_t u[PRO == 2 ? XPN : 1][4];   /* PRO 2: the up half's words */
+};
+
+/* mr_produce's arithmetic on words already loaded (q: the producer's input at k, u: PRO 2's up half at k) */
+template <int PRO>
+__device__ __forceinline__ void mr_produce_q(const GgMrArgs& A, int k, float sc, const uint32_t* q, const uint32_t* u,
+                                             uint16_t* hb, float* v) {
+    if constexpr (PRO == 1) {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const float x = (t & 1) ? bf16w_hi(q[t >> 1]) : bf16w_lo(q[t >> 1]);
+            hb[t] = f32_to_bf16(x * sc * (A.g[k + t] + A.wadd) * A.mult);
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const float g = fminf((t & 1) ? bf16w_hi(q[t >> 1]) : bf16w_lo(q[t >> 1]), A.limit);
+            const float uu = fminf(fmaxf((t & 1) ? bf16w_hi(u[t >> 1]) : bf16w_lo(u[t >> 1]), -A.limit), A.limit);
+            hb[t] = f32_to_bf16((g / (1.0f + expf(-g))) * uu);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 8; ++t) v[t] = bf16_to_f32(hb[t]);
+}
+
+/* Slab [s0, s1)'s loads into P (mr_stage's piece idx = threadIdx.x + j blockDim.x, j < XPN) */
+template <int T, int H, int MT, int PRO, int XPN>
+__device__ __forceinline__ void mr_fetch(const GgMrArgs& A, MrXp<PRO, XPN>& P, int m0, int mc, int s0, int s1) {
+    constexpr int LPR = 32 / H, VPS = 32 * LPR, PPS = VPS / 8;
+    const int np = (s1 - s0) * MT * PPS;
+#pragma unroll
+    for (int j = 0; j < XPN; ++j) {
+        const int idx = (int)threadIdx.x + j * (int)blockDim.x;
+        if (idx < np) {
+            const int q = idx % PPS, rest = idx / PPS;
+            const int m = rest % MT, ss = rest / MT;
+            const int k = (s0 + ss) * VPS + 8 * q;
+            if (m < mc && k < A.K) {
+                const uint16_t* xr = A.x + (long long)(m0 + m) * A.x_ld;
+                gg_x8raw(xr + k, A.x_al != 0, P.q[j]);
+                if constexpr (PRO == 2) gg_x8raw(xr + A.K + k, A.u_al != 0, P.u[j]);
+            }
+        }
+    }
+}
+
+/* Slab [s0, s1) from P into xs: mr_stage's values at mr_stage's addresses */
+template <int T, int H, int MT, int PRO, int XPN>
+__device__ __forceinline__ void mr_put(const GgMrArgs& A, const MrXp<PRO, XPN>& P, float* xs, int m0, int mc, int s0, int s1,
+                                       const float* sc) {
+    constexpr int LPR = 32 / H, VPS = 32 * LPR, PPS = VPS / 8;
+    const int np = (s1 - s0) * MT * PPS;
+#pragma unroll
+    for (int j = 0; j < XPN; ++j) {
+        const int idx = (int)threadIdx.x + j * (int)blockDim.x;
+        if (idx < np) {
+            const int q = idx % PPS, rest = idx / PPS;
+            const int m = rest % MT, ss = rest / MT;
+            const int s = s0 + ss, k = s * VPS + 8 * q;
+            float v[8];
+            if (m < mc && k < A.K) {
+                if constexpr (PRO == 0) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { v[2 * i] = bf16w_lo(P.q[j][i]); v[2 * i + 1] = bf16w_hi(P.q[j][i]); }
+                } else {
+                    uint16_t hb[8];
+                    mr_produce_q<PRO>(A, k, PRO == 1 ? sc[m] : 0.0f, P.q[j], P.u[PRO == 2 ? j : 0], hb, v);
+                    if (blockIdx.x == 0) mr_put_h(A, m0 + m, k, hb);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < 8; ++t) v[t] = 0.0f;
+            }
+            int U = 0, G = 0;
+            mr_piece<T>(k, U, G);
+            const int i = U - s * LPR;
+            float* d = xs + (ss * MT + m) * VPS;
+            *(float4*)(d + ((2 * G) * LPR + i) * 4) = make_float4(v[0], v[1], v[2], v[3]);
+            *(float4*)(d + ((2 * G + 1) * LPR + i) * 4) = make_float4(v[4], v[5], v[6], v[7]);
+        }
+    }
+    /* a slab of more pieces than the registers hold (few waves a block): the rest loaded here, mr_stage's own way (the same values
+     * at the same addresses; only their loads are not ahead) */
+    for (int idx = XPN * (int)blockDim.x + (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
+        const int q = idx % PPS, rest = idx / PPS;
+        const int m = rest % MT, ss = rest / MT;
+        const int s = s0 + ss, k = s * VPS + 8 * q;
+        float v[8];
+        if (m < mc && k < A.K) {
+            if constexpr (PRO == 0) {
+                gg_x8(A.x + (long long)(m0 + m) * A.x_ld + k, A.x_al != 0, v);
+            } else {
+                uint16_t hb[8];
+                mr_produce<PRO>(A, m0 + m, k, PRO == 1 ? sc[m] : 0.0f, hb, v);
+                if (blockIdx.x == 0) mr_put_h(A, m0 + m, k, hb);
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) v[t] = 0.0f;
+        }
+        int U = 0, G = 0;
+        mr_piece<T>(k, U, G);
+        const int i = U - s * LPR;
+        float* d = xs + (ss * MT + m) * VPS;
+        *(float4*)(d + ((2 * G) * LPR + i) * 4) = make_float4(v[0], v[1], v[2], v[3]);
+        *(float4*)(d + ((2 * G + 1) * LPR + i) * 4) = make_float4(v[4], v[5], v[6], v[7]);
+    }
+}
+
+/* The butterfly of one output over its H partials in this lane (slot j = partial j, p = j LPR + i) and the row
+ * slot's LPR lanes: r4d_wave_sum's levels xor 16, 8, 4, 2, 1 with the same operands. */
+template <int H>
+__device__ __forceinline__ float mr_reduce(const float (&a)[H]) {
+    if constexpr (H == 1) {
+        return r4d_wave_sum(a[0]);
+    } else {
+        constexpr int LPR = 32 / H;
+        float v[H];
+#pragma unroll
+        for (int j = 0; j < H; ++j) v[j] = a[j];
+        /* in-lane levels: xor X pairs partial j with j + X / LPR (the lower p first, as the stock lane p keeps
+         * its own value first); after them v[0] is the stock's level-(xor LPR) value of lane p = i */
+#pragma unroll
+        for (int X = 16; X >= LPR; X >>= 1) {
+            const int D = X / LPR;
+#pragma unroll
+            for (int j = 0; j < D; ++j) v[j] = v[j] + v[j + D];
+        }
+        float r = v[0];
+        if constexpr (LPR >= 16) r = r4d_dpp_xor_add<0x168>(r);
+        if constexpr (LPR >= 8) r = r4d_dpp_xor_add<0x164>(r);
+        if constexpr (LPR >= 4) r = r4d_dpp_xor_add<0x162>(r);
+        if constexpr (LPR >= 2) r = r4d_dpp_xor_add<0x161>(r);
+        return r;
+    }
+}
+
+/* Stages of weight words in flight ahead of the one computed (the stage loop is unrolled this many times, a
+ * buffer a stage, so no word moves between registers while its load is pending): enough stages of arithmetic to
+ * cover a DRAM round trip (~2 us) at a few waves a SIMD, as MT x R shrinks the arithmetic a stage. */
+template <int MT, int R>
+constexpr int mr_pd() { return MT * R >= 24 ? 1 : (MT * R >= 8 ? 2 : 4); }
+
+/* PRO 1 (lever K1 fold a): the norm scale of each of the block's rows, rmsnorm_body's (r4d_model_bf16.hip) to the
+ * bit. There a row's workgroup sums squares over kR4dSumLanes' partition (r4d_lanes_sumsq: lane v < 256 adds
+ * columns v, v + 256, ... in order from 0), block_sum adds each wave's r4d_wave_sum in wave order from 0 (the waves
+ * past the eighth add their zero sums: `nw` waves in all at r4d_act_threads(M, n)), then s = rsqrtf(sum / n +
+ * eps). Here the eight waves of that partition are virtual: this block's waves take them (and the rows) in turn,
+ * each lane its partition lane's columns in the same order, the same butterfly on the same 32 values, and one
+ * thread a row adds the eight sums in order, then nw - 8 zeros, then takes rsqrtf. */
+template <int MT>
+__device__ __forceinline__ void mr_norm_scales(const GgMrArgs& A, int m0, int mc, float (&ws)[MT][8], float* sc) {
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5, nw = (int)blockDim.x >> 5;
+    for (int pv = wave; pv < mc * 8; pv += nw) {
+        const int m = pv >> 3, vw = pv & 7;
+        const uint16_t* xr = A.x + (long long)(m0 + m) * A.x_ld;
+        float ss = 0.0f;
+        for (int c = vw * 32 + lane; c < A.K; c += 256) {
+            const float v = bf16_to_f32(xr[c]);
+            ss += v * v;
+        }
+        ss = r4d_wave_sum(ss);
+        if (lane == 0) ws[m][vw] = ss;
+    }
+    lds_barrier();
+    for (int m = (int)threadIdx.x; m < mc; m += (int)blockDim.x) {
+        float t = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) t += ws[m][w];
+        for (int w = 8; w < A.nw; ++w) t += 0.0f;
+        sc[m] = rsqrtf(t / (float)A.K + A.eps);
+    }
+    lds_barrier();
+}
+
+/* The form's block body: block column `bx` of the call A (the plain kernel's blockIdx.x; lever 1U-GQ's pair kernel runs
+ * two calls' column ranges in one grid, each block the body of its own call at its own column). */
+template <int T, int H, int R, int MT, typename OT, int PRO = 0, bool XP = false>
+__device__ __forceinline__ void gg_mr_body(const GgMrArgs& A, int bx) {
+    using Q = Gg<T>;
+    static_assert(H == 1 || H == 2 || H == 4 || H == 8, "row slots a wave");
+    constexpr int LPR = 32 / H, VPS = 32 * LPR, PD = mr_pd<MT, R>();
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
+    float* const xs = (float*)emu_dyn_lds();
+#else
+    extern __shared__ __attribute__((aligned(16))) float mr_xs[];
+    float* const xs = mr_xs;
+#endif
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5, nw = (int)blockDim.x >> 5;
+    const int g = lane / LPR, i = lane - g * LPR;
+    const int nl = (bx * nw + wave) * (H * R) + g * R;   /* this lane's first weight row */
+    const int m0 = (int)blockIdx.y * MT, mc = min(MT, A.M - m0);
+    const uint8_t* wr[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wr[r] = A.w + (long long)min(nl + r, A.N - 1) * A.w_ld;
+
+    float acc[R][MT][H];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < MT; ++m)
+#pragma unroll
+            for (int j = 0; j < H; ++j) acc[r][m][j] = 0.0f;
+
+    /* stage s's words live in raw[s % PD], loaded PD stages ahead */
+    uint32_t raw[PD][R][Q::NR];
+    auto load = [&](int s, uint32_t (&rw)[R][Q::NR]) {
+        const int U = s * LPR + i;
+        if (s < A.NS && U < A.UK) {
+            const int b = U / Q::UPB;
+#pragma unroll
+            for (int r = 0; r < R; ++r) mr_load<T>(wr[r] + (long long)b * Q::BB, U - b * Q::UPB, rw[r]);
+        }
+    };
+#pragma unroll
+    for (int k = 0; k < PD; ++k) load(k, raw[k]);
+
+    auto rotate = [&]() {
+        if constexpr (H > 1) {
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    const float t0 = acc[r][m][0];
+#pragma unroll
+                    for (int j = 0; j + 1 < H; ++j) acc[r][m][j] = acc[r][m][j + 1];
+                    acc[r][m][H - 1] = t0;
+                }
+        }
+    };
+    /* one stage: dequantise this lane's unit of its R rows once (all four groups), put the stage PD ahead in
+     * flight in the words just freed, apply the 32 values to the MT staged rows, rotate the partials */
+    auto stage = [&](int s, const float* xb, uint32_t (&rw)[R][Q::NR]) {
+        const int U = s * LPR + i;
+        const bool act = U < A.UK;
+        const int u = U - (U / Q::UPB) * Q::UPB;
+        float w[R][32];
+        if (act) {
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                gg_for<4>([&](auto gi) {
+                    constexpr int G = decltype(gi)::value;
+                    Q::template dec<G>(rw[r], u, nullptr, &w[r][8 * G]);
+                });
+        }
+        load(s + PD, rw);
+        if (act) {
+#pragma unroll
+            for (int G = 0; G < 4; ++G) {
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    const float* xp = xb + m * VPS;
+                    const float4 a = *(const float4*)(xp + ((2 * G) * LPR + i) * 4);
+                    const float4 c = *(const float4*)(xp + ((2 * G + 1) * LPR + i) * 4);
+                    const float xv[8] = { a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w };
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) acc[r][m][0] += xv[t] * w[r][8 * G + t];
+                }
+            }
+        }
+        rotate();
+    };
+
+    /* fold a: the rows' norm scales before the first slab (the first stages' weight loads are in flight). Static LDS
+     * only in the fold's kernels (r4d_gg_mr_fold leaves room for it); the plain form keeps all 64 KiB for its slab. */
+    const float* sc = nullptr;
+    if constexpr (XP) {
+        /* lever A4: the first slab's activation loads go out with the first stages' weight loads */
+        constexpr int XPN = mr_xpn(H, MT);
+        MrXp<PRO, XPN> P;
+        mr_fetch<T, H, MT, PRO, XPN>(A, P, m0, mc, 0, min(A.SS, A.NS));
+        if constexpr (PRO == 1) {
+            __shared__ float mr_sc[MT];
+            __shared__ float mr_ws[MT][8];
+            mr_norm_scales<MT>(A, m0, mc, mr_ws, mr_sc);
+            sc = mr_sc;
+        }
+        for (int s0 = 0; s0 < A.NS; s0 += A.SS) {
+            const int s1 = min(s0 + A.SS, A.NS);
+            lds_barrier();
+            mr_put<T, H, MT, PRO, XPN>(A, P, xs, m0, mc, s0, s1, sc);
+            lds_barrier();
+            /* the next slab's loads in flight behind this slab's arithmetic */
+            if (s1 < A.NS) mr_fetch<T, H, MT, PRO, XPN>(A, P, m0, mc, s1, min(s1 + A.SS, A.NS));
+#pragma unroll 1
+            for (int sb = s0 - s0 % PD; sb < s1; sb += PD) {
+#pragma unroll
+                for (int k = 0; k < PD; ++k)
+                    if (sb + k >= s0 && sb + k < s1) stage(sb + k, xs + (sb + k - s0) * MT * VPS, raw[k]);
+            }
+        }
+    } else {
+    if constexpr (PRO == 1) {
+        __shared__ float mr_sc[MT];
+        __shared__ float mr_ws[MT][8];
+        mr_norm_scales<MT>(A, m0, mc, mr_ws, mr_sc);
+        sc = mr_sc;
+    }
+
+    for (int s0 = 0; s0 < A.NS; s0 += A.SS) {
+        const int s1 = min(s0 + A.SS, A.NS);
+        lds_barrier();
+        mr_stage<T, H, MT, PRO>(A, xs, m0, mc, s0, s1, sc);
+        lds_barrier();
+        /* groups of PD stages from a multiple of PD, so stage s is raw[s % PD] whatever the slab's start */
+#pragma unroll 1
+        for (int sb = s0 - s0 % PD; sb < s1; sb += PD) {
+#pragma unroll
+            for (int k = 0; k < PD; ++k)
+                if (sb + k >= s0 && sb + k < s1) stage(sb + k, xs + (sb + k - s0) * MT * VPS, raw[k]);
+        }
+    }
+    }
+    if constexpr (H > 1) {
+        /* the stage count padded to a multiple of H: rotations only, so slot j holds partial j */
+        const int pad = (H - A.NS % H) % H;
+#pragma unroll 1
+        for (int e = 0; e < pad; ++e) rotate();
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int n = nl + r;
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            const float v = mr_reduce<H>(acc[r][m]);
+            if (i == 0 && m < mc && n < A.N) gg_put((OT*)A.y + (long long)(m0 + m) * A.y_ld + n, v);
+        }
+    }
+}
+
+template <int T, int H, int R, int MT, typename OT, int PRO = 0, bool XP = false>
+__global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
+    gg_mr_body<T, H, R, MT, OT, PRO, XP>(A, (int)blockIdx.x);
+}
+
+/* Lever 1U-GQ (ds41-int11, gemm_nt_ggml_pair): two calls of one form (the same type, K, M, H, R, MT, WN, SS) in one
+ * grid -- blocks [0, gxa) are A's columns, [gxa, gridDim.x) B's. Each block runs gg_mr_body of its own call exactly as
+ * that call's own launch of the form would run it, so every output keeps the form's per-output operations: the
+ * pair's bytes are the two launches' (and, by the form's exactness argument above, the stock kernel's). */
+template <int T, int H, int R, int MT, typename OT, bool XP = false>
+__global__ __launch_bounds__(kMrThreads) void gg_mr_pair_kernel(GgMrArgs A, GgMrArgs B, int gxa) {
+    if ((int)blockIdx.x < gxa) gg_mr_body<T, H, R, MT, OT, 0, XP>(A, (int)blockIdx.x);
+    else gg_mr_body<T, H, R, MT, OT, 0, XP>(B, (int)blockIdx.x - gxa);
+}
+
+/* ------------------------------------------------------------------ forms
+ * (H, R, MT): H weight rows a wave side by side, R a lane, MT activation rows a block. MT is the accumulator
+ * count's third factor (R x MT x H floats a lane, <= 96) and one stage of MT rows must fit kMrLdsMax. */
+#ifdef R4D_GG_MR_FEW
+#define MR_FORMS(X) X(4, 2, 8) X(4, 1, 24) X(1, 1, 8) X(2, 2, 16)
+#else
+#define MR_FORMS(X)                                                                                        \
+    X(1, 1, 1) X(1, 1, 2) X(1, 1, 3) X(1, 1, 4) X(1, 1, 6) X(1, 1, 8) X(1, 1, 12)                           \
+    X(2, 1, 1) X(2, 1, 2) X(2, 1, 3) X(2, 1, 4) X(2, 1, 6) X(2, 1, 8) X(2, 1, 12) X(2, 1, 16) X(2, 1, 24)   \
+    X(2, 2, 1) X(2, 2, 2) X(2, 2, 3) X(2, 2, 4) X(2, 2, 6) X(2, 2, 8) X(2, 2, 12) X(2, 2, 16) X(2, 2, 24)   \
+    X(4, 1, 1) X(4, 1, 2) X(4, 1, 3) X(4, 1, 4) X(4, 1, 6) X(4, 1, 8) X(4, 1, 12) X(4, 1, 16) X(4, 1, 24)   \
+    X(4, 2, 1) X(4, 2, 2) X(4, 2, 3) X(4, 2, 4) X(4, 2, 6) X(4, 2, 8) X(4, 2, 12)
+#endif
+
+/* The MT values a (H, R) pair has, ascending; their count. */
+[[maybe_unused]] int mr_mts(int H, int R, int* out) {
+    int n = 0;
+#define MR_MT(h, r, mt) if (H == h && R == r) out[n++] = mt;
+    MR_FORMS(MR_MT)
+#undef MR_MT
+    return n;
+}
+
+/* Lever A4's XP forms (gg_mr_body XP = true; r4d_ds41_ggml_mr2.hip compiles them, the plain kernel, the pair kernel and
+ * both folds): the decode band's 5-16-row heights (the gg_gemv_m16 switch's table, the bench's pins). H1R2 (two weight
+ * rows a lane, all 32 lanes on a row's 32 partials) is new; the others are D2's (H, R) pairs at these MT. H1 stops at MT 12: a stage of
+ * 16 rows (64 KiB) does not fit kMrLdsMax, so mr_size2 caps MT by the LDS (16 rows: two tiles of 8). */
+#define MR2_FORMS(X)                                                                                       \
+    X(1, 1, 4) X(1, 1, 6) X(1, 1, 8) X(1, 1, 12)                                                            \
+    X(1, 2, 4) X(1, 2, 6) X(1, 2, 8) X(1, 2, 12)                                                            \
+    X(2, 1, 4) X(2, 1, 6) X(2, 1, 8) X(2, 1, 12) X(2, 1, 16)                                                \
+    X(2, 2, 4) X(2, 2, 6) X(2, 2, 8) X(2, 2, 12) X(2, 2, 16)                                                \
+    X(4, 1, 4) X(4, 1, 6) X(4, 1, 8) X(4, 1, 12) X(4, 1, 16)                                                \
+    X(4, 2, 4) X(4, 2, 6) X(4, 2, 8) X(4, 2, 12)
+
+[[maybe_unused]] int mr2_mts(int H, int R, int* out) {
+    int n = 0;
+#define MR_MT(h, r, mt) if (H == h && R == r) out[n++] = mt;
+    MR2_FORMS(MR_MT)
+#undef MR_MT
+    return n;
+}
+
+#ifdef R4D_GG_MR_XP
+/* ------------------------------------------------------------------ r4d_ds41_ggml_mr2.hip: the XP launches only */
+template <int T, typename OT>
+int mr2_plain_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt) return R4D_EMIT(s, (gg_mr_kernel<T, h, r, mt, OT, 0, true>), grid, dim3(thr), lds, A);
+    MR2_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+template <int T, typename OT>
+int mr2_pair_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, const GgMrArgs& B, int gxa, dim3 grid, unsigned thr,
+               unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt)                                                                      \
+        return R4D_EMIT(s, (gg_mr_pair_kernel<T, h, r, mt, OT, true>), grid, dim3(thr), lds, A, B, gxa);
+    MR2_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+template <int T, int PRO>
+int mr2_fold_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt) return R4D_EMIT(s, (gg_mr_kernel<T, h, r, mt, uint16_t, PRO, true>), grid, dim3(thr), lds, A);
+    MR2_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+#define MR2_TY(ty, CALL) \
+    switch (ty) { case GG_Q5_K: return CALL(GG_Q5_K); case GG_Q6_K: return CALL(GG_Q6_K); case GG_Q8_0: return CALL(GG_Q8_0); \
+                  default: return R4D_GG_MR_DECLINE; }
+}  // namespace
+
+/* kind 0 gemm_nt_ggml / logits_gemm_ggml (bf16 out; f32 out only for q6_K, the head's type, and at every type on the
+ * emulator), 1 the pair (b, gxa), 2 / 3 folds a / e (PRO 1 / 2); the arguments are r4d_ds41_ggml_mr.hip's GgMrArgs. */
+int r4d_gg_mr_launch_xp(RadStream s, int kind, int ty, bool f32out, int H, int R, int MT, const void* a, const void* b,
+                        int gxa, unsigned gx, unsigned gy, unsigned thr, unsigned lds) {
+    const GgMrArgs& A = *(const GgMrArgs*)a;
+    const dim3 grid(gx, gy);
+    if (kind == 0) {
+#ifndef R4D_EMU_HOST
+        if (f32out) return ty == GG_Q6_K ? mr2_plain_t<GG_Q6_K, float>(s, H, R, MT, A, grid, thr, lds) : R4D_GG_MR_DECLINE;
+#else
+        if (f32out) {
+#define C(T) mr2_plain_t<T, float>(s, H, R, MT, A, grid, thr, lds)
+            MR2_TY(ty, C)
+#undef C
+        }
+#endif
+#define C(T) mr2_plain_t<T, uint16_t>(s, H, R, MT, A, grid, thr, lds)
+        MR2_TY(ty, C)
+#undef C
+    }
+    if (kind == 1) {
+        const GgMrArgs& B = *(const GgMrArgs*)b;
+#ifdef R4D_EMU_HOST
+        if (f32out) {
+#define C(T) mr2_pair_t<T, float>(s, H, R, MT, A, B, gxa, grid, thr, lds)
+            MR2_TY(ty, C)
+#undef C
+        }
+#else
+        if (f32out) return R4D_GG_MR_DECLINE;
+#endif
+#define C(T) mr2_pair_t<T, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds)
+        MR2_TY(ty, C)
+#undef C
+    }
+    if (kind == 2) {
+#define C(T) mr2_fold_t<T, 1>(s, H, R, MT, A, grid, thr, lds)
+        MR2_TY(ty, C)
+#undef C
+    }
+    if (kind == 3) {
+#define C(T) mr2_fold_t<T, 2>(s, H, R, MT, A, grid, thr, lds)
+        MR2_TY(ty, C)
+#undef C
+    }
+    return R4D_GG_MR_DECLINE;
+}
+
+#else  /* !R4D_GG_MR_XP: D2's unit (and its wave64 copy) */
+template <int T, typename OT>
+int mr_launch_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt) return R4D_EMIT(s, (gg_mr_kernel<T, h, r, mt, OT>), grid, dim3(thr), lds, A);
+    MR_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+
+int mr_launch(RadStream s, int ty, bool f32out, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr,
+              unsigned lds) {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: f32 outputs at every type (a sharper order check than bf16's) */
+    if (f32out) {
+        switch (ty) {
+        case GG_Q5_K: return mr_launch_t<GG_Q5_K, float>(s, H, R, MT, A, grid, thr, lds);
+        case GG_Q6_K: return mr_launch_t<GG_Q6_K, float>(s, H, R, MT, A, grid, thr, lds);
+        case GG_Q8_0: return mr_launch_t<GG_Q8_0, float>(s, H, R, MT, A, grid, thr, lds);
+        default: return R4D_GG_MR_DECLINE;
+        }
+    }
+#endif
+    if (f32out) return ty == GG_Q6_K ? mr_launch_t<GG_Q6_K, float>(s, H, R, MT, A, grid, thr, lds) : R4D_GG_MR_DECLINE;
+    switch (ty) {
+    case GG_Q5_K: return mr_launch_t<GG_Q5_K, uint16_t>(s, H, R, MT, A, grid, thr, lds);
+    case GG_Q6_K: return mr_launch_t<GG_Q6_K, uint16_t>(s, H, R, MT, A, grid, thr, lds);
+    case GG_Q8_0: return mr_launch_t<GG_Q8_0, uint16_t>(s, H, R, MT, A, grid, thr, lds);
+    default: return R4D_GG_MR_DECLINE;
+    }
+}
+
+#ifndef R4D_GG_MR_W64
+template <int T, typename OT>
+int mr_pair_launch_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, const GgMrArgs& B, int gxa, dim3 grid,
+                     unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt)                                                                      \
+        return R4D_EMIT(s, (gg_mr_pair_kernel<T, h, r, mt, OT>), grid, dim3(thr), lds, A, B, gxa);
+    MR_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+
+[[maybe_unused]] int mr_pair_launch(RadStream s, int ty, bool f32out, int H, int R, int MT, const GgMrArgs& A,
+                                    const GgMrArgs& B, int gxa, dim3 grid, unsigned thr, unsigned lds) {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: f32 outputs at every type, as mr_launch */
+    if (f32out) {
+        switch (ty) {
+        case GG_Q5_K: return mr_pair_launch_t<GG_Q5_K, float>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+        case GG_Q6_K: return mr_pair_launch_t<GG_Q6_K, float>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+        case GG_Q8_0: return mr_pair_launch_t<GG_Q8_0, float>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+        default: return R4D_GG_MR_DECLINE;
+        }
+    }
+#endif
+    if (f32out) return R4D_GG_MR_DECLINE;
+    switch (ty) {
+    case GG_Q5_K: return mr_pair_launch_t<GG_Q5_K, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+    case GG_Q6_K: return mr_pair_launch_t<GG_Q6_K, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+    case GG_Q8_0: return mr_pair_launch_t<GG_Q8_0, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+    default: return R4D_GG_MR_DECLINE;
+    }
+}
+#endif
+
+[[maybe_unused]] int mr_cu_count() {
+#ifdef R4D_EMU_HOST
+    return 64;
+#else
+    static int cache[64];
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return 64;
+    if (cache[dev] <= 0) {
+        int v = 0;
+        if (hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || v <= 0) v = 64;
+        cache[dev] = v;
+    }
+    return cache[dev];
+#endif
+}
+
+#ifndef R4D_GG_MR_W64
+/* ------------------------------------------------------------------ the switch, the pin, the rule */
+int g_mr_on = 0;                          /* the runtime switch (r4d_gg_mr_set) */
+int g_mr_pin_h = 0, g_mr_pin_r = 0, g_mr_pin_mt = 0, g_mr_pin_wn = 0;   /* 0: no pin; h -1: the rule, forced */
+int g_mr_pin_w64 = 0;                     /* the wave64 unit's kernels (r4d_ds41_ggml_mr64.hip) */
+char g_mr_last[160];                      /* the last launch's form, for the bench's lines */
+
+struct MrForm {
+    int H, R, MT, WN, SS, gx, gy, w64;
+    unsigned lds;
+    int xp;                               /* lever A4: the XP unit's kernels (r4d_ds41_ggml_mr2.hip) */
+};
+
+/* The form for a call: the pin's (H, R, MT cap, WN, wave64), else the rule. MT is the smallest of the pair's
+ * values that holds ceil(M / tiles) rows, tiles = ceil(M / MT cap); WN halves from 8 while the grid has under two
+ * blocks a CU (wave64: at least 2, a whole wave); SS fills the slab budget (16 waves a CU's 64 KiB), whole groups
+ * of the kernel's prefetch depth where more than one fits, at least one stage. false: not taken. */
+/* The measured forms (r4d_ds41_gg_mr_forms.h, generated by tools/gg_mr_forms.py from r4d_selftest --perfmr's MRSUM
+ * lines): an entry names (type, N, K, an M band) and the wave32 form (H, R, MT cap, WN; 0 = the rule's) that beat the
+ * rule's own pick there with the stock rule's bytes. Empty until a bench has been read: the rule below throughout.
+ * Every form has the same per-output arithmetic (the exactness argument above), so an entry moves speed only. */
+struct MrTab {
+    int ty, N, K, m_lo, m_hi;
+    int H, R, MT, WN;
+};
+#include "r4d_ds41_gg_mr_forms.h"
+
+bool mr_tab(const R4dGgMrCall& c, int* H, int* R, int* cap, int* WN) {
+    for (const MrTab& t : kMrForms)
+        if (t.H > 0 && t.ty == c.ty && t.N == c.N && t.K == c.K && c.M >= t.m_lo && c.M <= t.m_hi) {
+            *H = t.H; *R = t.R > 0 ? t.R : 1; *cap = t.MT; *WN = t.WN;
+            return true;
+        }
+    return false;
+}
+
+/* n_all > 0 (lever 1U-GQ's pair): the grid holds that many weight rows in all, so WN is sized for them (the waves of
+ * both calls), not for c's alone; the form (H, R, MT) stays c's. */
+bool mr_pick(const R4dGgMrCall& c, MrForm* f, int n_all = 0) {
+    int H = 4, R = c.N >= 4096 ? 2 : 1, cap = 0, WN = 0, w64 = 0;
+    /* The table under the runtime switch only: a pin, and the bench's forced rule (h -1), keep their own form. */
+    if (g_mr_pin_h == 0 && !c.f32out) (void)mr_tab(c, &H, &R, &cap, &WN);
+    if (g_mr_pin_h > 0) {
+        H = g_mr_pin_h;
+        R = g_mr_pin_r > 0 ? g_mr_pin_r : 1;
+        cap = g_mr_pin_mt;
+        WN = g_mr_pin_wn;
+        w64 = g_mr_pin_w64;
+    }
+    int mts[16];
+    const int nmt = mr_mts(H, R, mts);
+    if (nmt == 0) return false;
+    if (cap <= 0 || cap > mts[nmt - 1]) cap = mts[nmt - 1];
+    const int tiles = (c.M + cap - 1) / cap, need = (c.M + tiles - 1) / tiles;
+    int MT = 0;
+    for (int k = 0; k < nmt; ++k)
+        if (mts[k] >= need && mts[k] <= cap) { MT = mts[k]; break; }
+    if (MT == 0) return false;
+    const int LPR = 32 / H, VPS = 32 * LPR, PD = MT * R >= 24 ? 1 : (MT * R >= 8 ? 2 : 4);   /* = mr_pd<MT, R>() */
+    const long long sb = (long long)MT * VPS * 4;
+    if (sb > kMrLdsMax) return false;
+    const int gy = (c.M + MT - 1) / MT;
+    const long long rw = (long long)H * R, nwv = ((n_all > 0 ? n_all : c.N) + rw - 1) / rw;
+    const int wmin = w64 ? 2 : 1;
+    if (WN <= 0) {
+        const long long want = 2LL * mr_cu_count();
+        WN = 8;
+        while (WN > wmin && ((nwv + WN - 1) / WN) * gy < want) WN >>= 1;
+    }
+    if (WN != 1 && WN != 2 && WN != 4 && WN != 8) return false;
+    if (WN < wmin) return false;
+    const long long gx = (nwv + WN - 1) / WN;
+    if (gx > 0x7fffffffLL || gy > 65535) return false;
+    const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+    const int UK = c.K / Q * UPB, NS = (UK + LPR - 1) / LPR;
+    const long long budget = 4096LL * WN;     /* 64 KiB a CU over 16 waves */
+    long long SS = budget / sb;
+    if (SS > PD) SS = SS / PD * PD;           /* whole groups of the kernel's unrolled stages */
+    if (SS < 1) SS = 1;
+    if (SS >= NS) SS = NS;                    /* one slab */
+    if (SS * sb > 65536) return false;
+    f->H = H; f->R = R; f->MT = MT; f->WN = WN; f->SS = (int)SS; f->gx = (int)gx; f->gy = gy; f->w64 = w64;
+    f->lds = (unsigned)(SS * sb);
+    return true;
+}
+
+/* Lever K1 folds (PRO 1 rmsnorm, 2 swiglu_clamped): the same forms, bf16 out, q5_K / q6_K / q8_0. */
+template <int T, int PRO>
+int mr_launch_fold_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt) return R4D_EMIT(s, (gg_mr_kernel<T, h, r, mt, uint16_t, PRO>), grid, dim3(thr), lds, A);
+    MR_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+template <int PRO>
+int mr_launch_fold(RadStream s, int ty, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+    switch (ty) {
+    case GG_Q5_K: return mr_launch_fold_t<GG_Q5_K, PRO>(s, H, R, MT, A, grid, thr, lds);
+    case GG_Q6_K: return mr_launch_fold_t<GG_Q6_K, PRO>(s, H, R, MT, A, grid, thr, lds);
+    case GG_Q8_0: return mr_launch_fold_t<GG_Q8_0, PRO>(s, H, R, MT, A, grid, thr, lds);
+    default: return R4D_GG_MR_DECLINE;
+    }
+}
+
+/* ------------------------------------------------------------------ lever A4 (ds41-a4): the fn4 switch gg_gemv_m16
+ * Under D2 (gg_gemv 2), gg_gemv_m16 = 1 takes the A4 table's form for a decode-band call of M <= 16 rows: an entry names
+ * (type, N, K, an M band, pair or not) and a form (H, R, MT cap, WN, XP). WN 0 is D2's rule, -1 the grid fit (the WN in
+ * 1 .. 8 whose busiest WGP holds the fewest waves, ties to the larger WN), 1 .. 8 that many waves a block (D2 took 1 / 2
+ * / 4 / 8 only); XP 1 runs the XP unit's kernels (the slab one ahead, mr_fetch / mr_put), XP 0 D2's. Keys without an
+ * entry, M > 16, and an entry whose form does not fit take D2's pick (mr_pick) unchanged. The table is the compiled
+ * r4d_ds41_gg_m16_forms.h (generated by r4d_selftest --perfm16's table) after the entries of RADIANCE_DS41_GG_M16_FORMS
+ * (a file of the same lines, read at load; the bench writes it). Every form has the per-output arithmetic of the
+ * exactness argument above (WN and XP move no operation of an output), so the switch moves speed only. */
+int g_mr_m16 = 0;
+int g_mr_pin_xp = 0;                      /* a pin through mr_size2: 1 the XP kernels, 2 D2's kernels (any WN 1..8) */
+
+struct Mr2Tab {
+    int ty, N, K, m_lo, m_hi, pair;
+    int H, R, MT, WN, XP;
+};
+#include "r4d_ds41_gg_m16_forms.h"
+
+std::vector<Mr2Tab>& mr2_rt() {
+    static std::vector<Mr2Tab> v;
+    return v;
+}
+int mr2_ty(const char* s) {
+    if (!std::strcmp(s, "q5_K")) return GG_Q5_K;
+    if (!std::strcmp(s, "q6_K")) return GG_Q6_K;
+    if (!std::strcmp(s, "q8_0")) return GG_Q8_0;
+    return -1;
+}
+/* A table file: lines "type N K m_lo m_hi pair H R MT WN XP" ('#' starts a comment); the entries go after the ones loaded
+ * before. Returns the entries added (-1: unreadable); *bad counts the malformed lines (skipped). */
+int mr2_load_file(const char* path, int* bad) {
+    *bad = 0;
+    FILE* fp = std::fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    int added = 0;
+    while (std::fgets(line, sizeof line, fp)) {
+        char* h = std::strchr(line, '#');
+        if (h) *h = 0;
+        char ty[16];
+        Mr2Tab t{};
+        const int n = std::sscanf(line, "%15s %d %d %d %d %d %d %d %d %d %d", ty, &t.N, &t.K, &t.m_lo, &t.m_hi, &t.pair, &t.H,
+                                  &t.R, &t.MT, &t.WN, &t.XP);
+        if (n <= 0) continue;
+        t.ty = n == 11 ? mr2_ty(ty) : -1;
+        if (t.ty < 0 || !(t.H == 1 || t.H == 2 || t.H == 4) || t.R < 1 || t.R > 2 || t.WN < -1 || t.WN > 8 || t.XP < 0 ||
+            t.XP > 1 || t.pair < 0 || t.pair > 1 || t.m_lo < 1 || t.m_hi > 16 || t.m_lo > t.m_hi || t.N < 1 || t.K < 1) {
+            ++*bad;
+            continue;
+        }
+        mr2_rt().push_back(t);
+        ++added;
+    }
+    std::fclose(fp);
+    return added;
+}
+/* RADIANCE_DS41_GG_M16_FORMS=FILE: its entries ahead of the compiled table; RADIANCE_DS41_GG_M16=1 starts the switch on.
+ * Silent when neither is set. */
+int mr2_load_env() {
+    const char* sw = std::getenv("RADIANCE_DS41_GG_M16");
+    const char* path = std::getenv("RADIANCE_DS41_GG_M16_FORMS");
+    if (path && *path) {
+        int bad = 0;
+        const int n = mr2_load_file(path, &bad);
+        if (n < 0)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GG_M16_FORMS=%s cannot be read: lever A4's compiled table "
+                                 "only (%d entries)\n", path, (int)R4D_GG_M16_FORMS_N);
+        else
+            std::fprintf(stderr, "radiance: libr4d: lever A4 (gg_gemv_m16): %d forms from %s (%d malformed lines skipped), "
+                                 "then the compiled table's %d\n", n, path, bad, (int)R4D_GG_M16_FORMS_N);
+    }
+    if (sw && *sw) {
+        g_mr_m16 = std::strcmp(sw, "1") == 0 ? 1 : 0;
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GG_M16=%s: gg_gemv_m16 %d at load (lever A4's forms at M <= 16 "
+                             "under gg_gemv 2)\n", sw, g_mr_m16);
+    }
+    return (int)mr2_rt().size();
+}
+[[maybe_unused]] const int g_mr2_loaded = mr2_load_env();
+
+bool mr2_tab(const R4dGgMrCall& c, int pair, int* H, int* R, int* cap, int* WN, int* XP) {
+    auto hit = [&](const Mr2Tab& t) {
+        if (t.H <= 0 || t.ty != c.ty || t.N != c.N || t.K != c.K || c.M < t.m_lo || c.M > t.m_hi || t.pair != pair) return false;
+        *H = t.H; *R = t.R > 0 ? t.R : 1; *cap = t.MT; *WN = t.WN; *XP = t.XP;
+        return true;
+    };
+    for (const Mr2Tab& t : mr2_rt())
+        if (hit(t)) return true;
+    for (const Mr2Tab& t : kMrM16Forms)
+        if (hit(t)) return true;
+    return false;
+}
+
+/* mr_pick's sizing for an explicit (H, R, MT cap, WN, XP): MT as mr_pick takes it from the unit's list (D2's MR_FORMS, or
+ * MR2_FORMS for XP); WN 0 D2's rule, -1 the grid fit, else 1..8; SS as mr_pick's, and under XP shrunk toward mr_xpn(H, MT) pieces
+ * a thread in a slab. false: not taken (the caller falls back to mr_pick). */
+bool mr_size2(const R4dGgMrCall& c, MrForm* f, int n_all, int H, int R, int cap, int WN, int xp) {
+#ifndef R4D_EMU_HOST   /* the XP unit's f32 out: q6_K (the head) on the card, every type on the emulator */
+    if (c.f32out && xp && c.ty != GG_Q6_K) return false;
+#endif
+    int mts[16];
+    const int nmt = xp ? mr2_mts(H, R, mts) : mr_mts(H, R, mts);
+    if (nmt == 0) return false;
+    if (cap <= 0 || cap > mts[nmt - 1]) cap = mts[nmt - 1];
+    {   /* a stage of MT rows must fit kMrLdsMax: the cap comes down to the largest MT that does (more tiles, the same outputs) */
+        const int lpr = 32 / H, mlds = kMrLdsMax / (32 * lpr * 4);
+        while (cap > mts[0] && cap > mlds) cap = cap - 1;
+    }
+    const int tiles = (c.M + cap - 1) / cap, need = (c.M + tiles - 1) / tiles;
+    int MT = 0;
+    for (int k = 0; k < nmt; ++k)
+        if (mts[k] >= need && mts[k] <= cap) { MT = mts[k]; break; }
+    if (MT == 0) return false;
+    const int LPR = 32 / H, VPS = 32 * LPR, PD = MT * R >= 24 ? 1 : (MT * R >= 8 ? 2 : 4);   /* = mr_pd<MT, R>() */
+    const long long sb = (long long)MT * VPS * 4;
+    if (sb > kMrLdsMax) return false;
+    const int gy = (c.M + MT - 1) / MT;
+    const long long rw = (long long)H * R, nwv = ((n_all > 0 ? n_all : c.N) + rw - 1) / rw;
+    if (WN == 0) {
+        const long long want = 2LL * mr_cu_count();
+        WN = 8;
+        while (WN > 1 && ((nwv + WN - 1) / WN) * gy < want) WN >>= 1;
+    } else if (WN < 0) {
+        const long long wgp = mr_cu_count() / 2 > 0 ? mr_cu_count() / 2 : 1;
+        long long best = -1;
+        for (int w = 8; w >= 1; --w) {
+            const long long blocks = ((nwv + w - 1) / w) * gy, load = ((blocks + wgp - 1) / wgp) * w;
+            if (best < 0 || load < best) { best = load; WN = w; }
+        }
+    }
+    if (WN < 1 || WN > 8) return false;
+    const long long gx = (nwv + WN - 1) / WN;
+    if (gx > 0x7fffffffLL || gy > 65535) return false;
+    const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+    const int UK = c.K / Q * UPB, NS = (UK + LPR - 1) / LPR;
+    const long long budget = 4096LL * WN;
+    long long SS = budget / sb;
+    if (SS > PD) SS = SS / PD * PD;
+    if (SS < 1) SS = 1;
+    if (SS >= NS) SS = NS;
+    if (xp) {   /* a slab within the registers where one stage fits (else mr_put loads the rest itself: no decline) */
+        const long long room = (long long)mr_xpn(H, MT) * 32 * WN, pps = (long long)MT * (VPS / 8);
+        while (SS > 1 && SS * pps > room) --SS;
+    }
+    if (SS * sb > 65536) return false;
+    f->H = H; f->R = R; f->MT = MT; f->WN = WN; f->SS = (int)SS; f->gx = (int)gx; f->gy = gy; f->w64 = 0;
+    f->lds = (unsigned)(SS * sb);
+    f->xp = xp ? 1 : 0;
+    return true;
+}
+
+/* The form a call takes: a pin (D2's mr_pick, or mr_size2 under r4d_gg_mr_pin_xp), else under gg_gemv_m16 the A4
+ * table's entry at M <= 16, else D2's mr_pick. pair: lever 1U-GQ's pair (its own table entries; n_all its rows). */
+bool mr_choose(const R4dGgMrCall& c, MrForm* f, int n_all, int pair) {
+    if (g_mr_pin_h != 0) {
+        if (g_mr_pin_xp && g_mr_pin_h > 0)
+            return mr_size2(c, f, n_all, g_mr_pin_h, g_mr_pin_r > 0 ? g_mr_pin_r : 1, g_mr_pin_mt, g_mr_pin_wn,
+                            g_mr_pin_xp == 1);
+        return mr_pick(c, f, n_all);
+    }
+    if (g_mr_m16 && c.M <= 16) {
+        int H = 0, R = 0, cap = 0, WN = 0, XP = 0;
+        if (mr2_tab(c, pair, &H, &R, &cap, &WN, &XP) && mr_size2(c, f, n_all, H, R, cap, WN, XP)) return true;
+    }
+    return mr_pick(c, f, n_all);
+}
+
+}  // namespace
+
+/* r4d_ds41_ggml_mr2.hip: lever A4's XP launches (kind 0 plain, 1 pair, 2 / 3 folds a / e) */
+int r4d_gg_mr_launch_xp(RadStream s, int kind, int ty, bool f32out, int H, int R, int MT, const void* a, const void* b,
+                        int gxa, unsigned gx, unsigned gy, unsigned thr, unsigned lds);
+
+#ifndef R4D_EMU_HOST
+/* r4d_ds41_ggml_mr64.hip: the same kernels compiled wave64 (two of this unit's 32-lane waves a hardware wave) */
+int r4d_gg_mr_launch_w64(RadStream s, int ty, bool f32out, int H, int R, int MT, const void* args, unsigned gx,
+                         unsigned gy, unsigned thr, unsigned lds);
+#endif
+
+int r4d_gg_mr_on() { return g_mr_pin_h != 0 ? 1 : g_mr_on; }
+
+void r4d_gg_mr_set(int on) { g_mr_on = on ? 1 : 0; }
+
+int r4d_gg_mr_gemm(RadStream s, const R4dGgMrCall& c) {
+    g_mr_last[0] = 0;   /* lever A4: a declined call leaves no form behind (the bench reads "" as the stock path) */
+    if (c.ty != GG_Q5_K && c.ty != GG_Q6_K && c.ty != GG_Q8_0) return R4D_GG_MR_DECLINE;
+    if (c.M < 1 || c.M > kMrMaxM || c.N < 1 || c.K < 1) return R4D_GG_MR_DECLINE;
+    if (c.ty == GG_Q5_K && ((uintptr_t)c.w & 3u)) return R4D_GG_MR_DECLINE;
+    MrForm f{};
+    if (!mr_choose(c, &f, 0, 0)) return R4D_GG_MR_DECLINE;
+    GgMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.w_ld = c.w_ld; A.y = c.y; A.y_ld = c.y_ld;
+    A.M = c.M; A.N = c.N; A.K = c.K;
+    const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+    A.UK = c.K / Q * UPB;
+    A.NS = (A.UK + 32 / f.H - 1) / (32 / f.H);
+    A.SS = f.SS;
+    A.x_al = c.x_al;
+    std::snprintf(g_mr_last, sizeof g_mr_last, "H%d R%d MT%d WN%d SS%d grid %dx%d lds %u%s%s", f.H, f.R, f.MT, f.WN,
+                  f.SS, f.gx, f.gy, f.lds, f.w64 ? " w64" : "", f.xp ? " xp" : "");
+    if (f.xp)
+        return r4d_gg_mr_launch_xp(s, 0, c.ty, c.f32out, f.H, f.R, f.MT, &A, nullptr, 0, (unsigned)f.gx, (unsigned)f.gy,
+                                   32u * f.WN, f.lds);
+#ifndef R4D_EMU_HOST
+    if (f.w64)
+        return r4d_gg_mr_launch_w64(s, c.ty, c.f32out, f.H, f.R, f.MT, &A, (unsigned)f.gx, (unsigned)f.gy, 32u * f.WN,
+                                    f.lds);
+#endif
+    return mr_launch(s, c.ty, c.f32out, f.H, f.R, f.MT, A, dim3((unsigned)f.gx, (unsigned)f.gy), 32u * f.WN, f.lds);
+}
+
+/* Lever K1 folds a / e: the form (mr_pick's, as r4d_gg_mr_gemm takes it) with the activation's producer in its
+ * staging (gg_mr_kernel's PRO, mr_produce): y = gemm_nt_ggml(producer(x)), and the producer's bf16 output in h,
+ * the bytes of the two separate launches. Declined (R4D_GG_MR_DECLINE: the caller issues the two launches) where
+ * r4d_gg_mr_gemm would decline, for f32 out, a wave64 pin, and where the fold's static LDS (fold a: 36 bytes a
+ * row) does not fit beside the slab after shrinking it (SS only groups stages between barriers: the arithmetic of
+ * an output is the same at any SS). The caller decides whether the form is on (r4d_gg_mr_on). */
+int r4d_gg_mr_fold(RadStream s, const R4dGgMrCall& c, const R4dGgMrFold& fo) {
+    g_mr_last[0] = 0;
+    if (fo.pro != 1 && fo.pro != 2) return R4D_GG_MR_DECLINE;
+    if (c.f32out || !fo.h || (fo.pro == 1 && !fo.g)) return R4D_GG_MR_DECLINE;
+    if (c.ty != GG_Q5_K && c.ty != GG_Q6_K && c.ty != GG_Q8_0) return R4D_GG_MR_DECLINE;
+    if (c.M < 1 || c.M > kMrMaxM || c.N < 1 || c.K < 1 || (c.K & 7)) return R4D_GG_MR_DECLINE;
+    if (c.ty == GG_Q5_K && ((uintptr_t)c.w & 3u)) return R4D_GG_MR_DECLINE;
+    MrForm f{};
+    if (!mr_choose(c, &f, 0, 0) || f.w64) return R4D_GG_MR_DECLINE;
+    const unsigned stat = fo.pro == 1 ? (unsigned)(f.MT * 4 * 9) : 0u;
+    if (f.lds + stat > 65536u) {
+        const unsigned sb = f.lds / (unsigned)f.SS;
+        const unsigned ss = (65536u - stat) / sb;
+        if (ss < 1) return R4D_GG_MR_DECLINE;
+        f.SS = (int)ss;
+        f.lds = ss * sb;
+    }
+    GgMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.w_ld = c.w_ld; A.y = c.y; A.y_ld = c.y_ld;
+    A.M = c.M; A.N = c.N; A.K = c.K;
+    const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+    A.UK = c.K / Q * UPB;
+    A.NS = (A.UK + 32 / f.H - 1) / (32 / f.H);
+    A.SS = f.SS;
+    A.x_al = c.x_al;
+    A.g = fo.g; A.eps = fo.eps; A.wadd = fo.wadd; A.mult = fo.mult; A.nw = fo.nw;
+    A.limit = fo.limit;
+    A.h = fo.h; A.h_ld = fo.h_ld; A.h_al = fo.h_al; A.u_al = fo.u_al;
+    std::snprintf(g_mr_last, sizeof g_mr_last, "fold%d H%d R%d MT%d WN%d SS%d grid %dx%d lds %u%s", fo.pro, f.H, f.R, f.MT,
+                  f.WN, f.SS, f.gx, f.gy, f.lds, f.xp ? " xp" : "");
+    if (f.xp)
+        return r4d_gg_mr_launch_xp(s, fo.pro == 1 ? 2 : 3, c.ty, false, f.H, f.R, f.MT, &A, nullptr, 0, (unsigned)f.gx,
+                                   (unsigned)f.gy, 32u * f.WN, f.lds);
+    const dim3 grid((unsigned)f.gx, (unsigned)f.gy);
+    return fo.pro == 1 ? mr_launch_fold<1>(s, c.ty, f.H, f.R, f.MT, A, grid, 32u * f.WN, f.lds)
+                       : mr_launch_fold<2>(s, c.ty, f.H, f.R, f.MT, A, grid, 32u * f.WN, f.lds);
+}
+
+/* Lever 1U-GQ (ds41-int11): two decode-band calls in one launch of the form. Both must have the same block type, K and
+ * M (and bf16 out); one form is picked for the pair -- mr_pick's for the call with more weight rows, a pin's when
+ * pinned -- and each call gets its own column range of the grid at that form's WN (gxa = A's columns). Declined
+ * (R4D_GG_MR_DECLINE: the caller issues the two launches) where either call would be declined alone, where the
+ * calls differ in type / K / M, for f32 out and for a wave64 pin. The caller decides whether the form is on. */
+static int mr_pair_go(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b, bool f32) {
+    g_mr_last[0] = 0;
+    if (a.ty != b.ty || a.K != b.K || a.M != b.M || a.f32out != f32 || b.f32out != f32) return R4D_GG_MR_DECLINE;
+    for (const R4dGgMrCall* c : { &a, &b }) {
+        if (c->ty != GG_Q5_K && c->ty != GG_Q6_K && c->ty != GG_Q8_0) return R4D_GG_MR_DECLINE;
+        if (c->M < 1 || c->M > kMrMaxM || c->N < 1 || c->K < 1) return R4D_GG_MR_DECLINE;
+        if (c->ty == GG_Q5_K && ((uintptr_t)c->w & 3u)) return R4D_GG_MR_DECLINE;
+    }
+    /* the larger call's form (its measured table entry, else the rule), WN sized for both calls' rows */
+    const R4dGgMrCall& big = b.N > a.N ? b : a;
+    MrForm f{};
+    if (a.N + (long long)b.N > 0x7fffffffLL || !mr_choose(big, &f, a.N + b.N, 1) || f.w64) return R4D_GG_MR_DECLINE;
+    const long long rw = (long long)f.H * f.R;
+    const long long gxa = ((a.N + rw - 1) / rw + f.WN - 1) / f.WN, gxb = ((b.N + rw - 1) / rw + f.WN - 1) / f.WN;
+    if (gxa + gxb > 0x7fffffffLL) return R4D_GG_MR_DECLINE;
+    auto args_of = [&](const R4dGgMrCall& c) {
+        GgMrArgs A{};
+        A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.w_ld = c.w_ld; A.y = c.y; A.y_ld = c.y_ld;
+        A.M = c.M; A.N = c.N; A.K = c.K;
+        const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+        A.UK = c.K / Q * UPB;
+        A.NS = (A.UK + 32 / f.H - 1) / (32 / f.H);
+        A.SS = f.SS;
+        A.x_al = c.x_al;
+        return A;
+    };
+    std::snprintf(g_mr_last, sizeof g_mr_last, "pair H%d R%d MT%d WN%d SS%d grid %lld+%lldx%d lds %u%s", f.H, f.R, f.MT,
+                  f.WN, f.SS, gxa, gxb, f.gy, f.lds, f.xp ? " xp" : "");
+    if (f.xp) {
+        const GgMrArgs A = args_of(a), B = args_of(b);
+        return r4d_gg_mr_launch_xp(s, 1, a.ty, f32, f.H, f.R, f.MT, &A, &B, (int)gxa, (unsigned)(gxa + gxb), (unsigned)f.gy,
+                                   32u * f.WN, f.lds);
+    }
+    return mr_pair_launch(s, a.ty, f32, f.H, f.R, f.MT, args_of(a), args_of(b), (int)gxa,
+                          dim3((unsigned)(gxa + gxb), (unsigned)f.gy), 32u * f.WN, f.lds);
+}
+int r4d_gg_mr_pair(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b) { return mr_pair_go(s, a, b, false); }
+#ifdef R4D_EMU_HOST
+/* tests/r4d_emu: the pair with f32 outputs (the emulator's unit instantiates them at every type, as mr_launch). */
+int r4d_gg_mr_pair_f32(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b) { return mr_pair_go(s, a, b, true); }
+#endif
+
+/* r4d_gg_mr_pin (bench / test hook, r4d_selftest --mrcheck / --perfmr): h 0 clears the pin (the runtime switch
+ * decides, off by default), -1 forces the rule, 1 / 2 / 4 pins H with R rows a lane (1 or 2), MT cap `mt` (0: the
+ * pair's largest) and WN waves a block (0: the rule's). r4d_gg_mr_pin_w64(1): a pinned form runs the wave64
+ * unit's kernels (the same source, so the same bits; on the emulator the wave32 ones). */
+extern "C" void r4d_gg_mr_pin(int h, int r, int mt, int wn) {
+    g_mr_pin_h = (h == -1 || h == 1 || h == 2 || h == 4 || h == 8) ? h : 0;
+    g_mr_pin_r = r;
+    g_mr_pin_mt = mt;
+    g_mr_pin_wn = wn;
+}
+extern "C" void r4d_gg_mr_pin_w64(int on) { g_mr_pin_w64 = on ? 1 : 0; }
+/* Lever A4: r4d_gg_mr_pin_xp(1) sends a pin (h > 0) through mr_size2 with the XP unit's kernels, (2) with D2's kernels
+ * (both: WN 1..8, -1 the grid fit); 0 D2's pin path as before. */
+extern "C" void r4d_gg_mr_pin_xp(int v) { g_mr_pin_xp = v == 1 || v == 2 ? v : 0; }
+/* The fn4 switch gg_gemv_m16 (r4d_ds41_ggml.hip's rad_fn4_*): 0 / 1. */
+void r4d_gg_mr_m16_set(int v) { g_mr_m16 = v ? 1 : 0; }
+int r4d_gg_mr_m16_get() { return g_mr_m16; }
+/* The A4 table's entries (the file's, then the compiled ones): for the start log and the bench. */
+extern "C" int r4d_gg_mr_m16_forms() { return (int)mr2_rt().size() + (int)R4D_GG_M16_FORMS_N; }
+/* Test hook: a table file's entries appended to the loaded ones (as RADIANCE_DS41_GG_M16_FORMS at load); -1 unreadable,
+ * -2 - n: n malformed lines. reset 1 drops the loaded entries first. */
+extern "C" int r4d_gg_mr_m16_load(const char* path, int reset) {
+    if (reset) mr2_rt().clear();
+    int bad = 0;
+    const int n = mr2_load_file(path, &bad);
+    return n < 0 ? -1 : bad ? -2 - bad : n;
+}
+
+/* The last launch's form ("H4 R2 MT8 WN8 SS4 grid 256x1 lds 32768"), for the bench's lines. */
+extern "C" const char* r4d_gg_mr_last() { return g_mr_last; }
+
+#else  /* R4D_GG_MR_W64: r4d_ds41_ggml_mr64.hip, compiled -mwavefrontsize64 */
+
+}  // namespace
+
+int r4d_gg_mr_launch_w64(RadStream s, int ty, bool f32out, int H, int R, int MT, const void* args, unsigned gx,
+                         unsigned gy, unsigned thr, unsigned lds) {
+    return mr_launch(s, ty, f32out, H, R, MT, *(const GgMrArgs*)args, dim3(gx, gy), thr, lds);
+}
+
+#endif  /* R4D_GG_MR_W64 */
+
+#if defined(R4D_EMU_HOST) && !defined(R4D_GG_MR_W64)
+/* tests/r4d_emu (ds41mr): the stock decode band's launch, as gg_gemm issues it (gg_xbuf's staging, rows a wave
+ * `rpw`, grid cap 256), from this unit's copy of gg_gemv_kernel -- the same source as the plugin's. */
+long long mr_emu_xbuf(int xm, long long K, int* xlm, int* xr, int* kc) {
+    *xr = (int)(K + K / 8);
+    const long long f = 9216 / (K + K / 8);
+    *xlm = (int)(f < xm ? f : xm);
+    long long cc = 9216 / ((long long)xm * 1152);
+    if (cc < 1) cc = 1;
+    const long long kr = (K + 1023) / 1024 * 1024;
+    *kc = (int)(1024LL * cc < kr ? 1024LL * cc : kr);
+    const long long whole = (long long)*xlm * *xr, chunk = (long long)xm * (*kc + *kc / 8);
+    return *xlm >= xm ? whole : (whole > chunk ? whole : chunk);
+}
+template <int T, int RPW, typename OT>
+int mr_emu_stock_t(const R4dGgMrCall& c, unsigned grid, unsigned lds, const GgGemvArgs& A) {
+    return R4D_EMIT(nullptr, (gg_gemv_kernel<T, RPW, false, OT>), dim3(grid), dim3(kGgThreads), lds, A);
+}
+int r4d_gg_mr_emu_stock(const R4dGgMrCall& c, int rpw) {
+    GgGemvArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld;
+    A.w = c.w; A.wtab = nullptr; A.w_ld = c.w_ld; A.w_es = 0;
+    A.y = c.y; A.y_ld = c.y_ld;
+    A.M = c.M; A.N = c.N; A.K = c.K;
+    A.XM = c.M < kGgXM ? c.M : kGgXM;
+    const long long xbuf = mr_emu_xbuf(A.XM, c.K, &A.XLM, &A.XR, &A.KC);
+    const long long nrg = (c.N + 8 * rpw - 1) / (8 * rpw);
+    A.rgpi = 1; A.ipe = (int)nrg;
+    A.x_al = c.x_al;
+    A.live_off = 0; A.x_off = 0;
+    const unsigned grid = (unsigned)(nrg < 256 ? nrg : 256), lds = (unsigned)(xbuf * 4);
+#define MR_EMU_ST(T) \
+    (rpw == 2 ? (c.f32out ? mr_emu_stock_t<T, 2, float>(c, grid, lds, A) : mr_emu_stock_t<T, 2, uint16_t>(c, grid, lds, A)) \
+              : (c.f32out ? mr_emu_stock_t<T, 1, float>(c, grid, lds, A) : mr_emu_stock_t<T, 1, uint16_t>(c, grid, lds, A)))
+    switch (c.ty) {
+    case GG_Q5_K: return MR_EMU_ST(GG_Q5_K);
+    case GG_Q6_K: return MR_EMU_ST(GG_Q6_K);
+    case GG_Q8_0: return MR_EMU_ST(GG_Q8_0);
+    default: return -1;
+    }
+#undef MR_EMU_ST
+}
+#endif
+
+#endif  /* R4D_GG_MR_XP */

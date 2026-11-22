@@ -393,6 +393,63 @@ extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, 
 }
 
 /* ==========================================================================================
+ * router_scored_topk_scatter -- DeepSeek-V4.1's selection (a named score), the sort over its ids and
+ * the shared gate's fill. (kernel: libr4d/r4d_ds41_elem.hip, router_scored_scatter_kernel)
+ *
+ * Operands: router_sigmoid_topk_scatter's: [0] logits  [1] bias  [2] ids  [3] weights
+ *           [4] sorted_tok  [5] expert_offset  [6] expert_count  [7] gate?  [8] inverse?
+ */
+extern "C" int r4d_fuse_router_scored_topk_scatter(const RadParam* p, int n_p, uint64_t present,
+                                                   int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (step == 0) {
+        const int64_t ne = pi(p, n_p, "n_expert"), nl = pi(p, n_p, "n_local", ne);
+        if (ne <= 0 || nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
+        Step s(out, "router_scored_topk");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n_expert").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "norm").mirror(p, n_p, "route_scale").mirror(p, n_p, "score")
+         .mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3 });              /* logits, bias, ids, weights */
+    }
+    /* the sort and the fill are router_sigmoid_topk_scatter's steps 1 and 2 */
+    return r4d_fuse_router_sigmoid_topk_scatter(p, n_p, present, step, out);
+}
+
+/* ==========================================================================================
+ * router_gemm_f32_scored_topk_scatter -- lever FUSE-R (ds41-fuse): the router's projection, then
+ * router_scored_topk_scatter's chain (no gate). (kernel: libr4d/r4d_ds41_elem.hip,
+ * router_gemm_scored_scatter_kernel)
+ *
+ * Operands: [0] a  [1] b  [2] bias  [3] logits  [4] ids  [5] weights  [6] sorted_tok
+ *           [7] expert_offset  [8] expert_count  [9] inverse?
+ */
+extern "C" int r4d_fuse_router_gemm_f32_scored_topk_scatter(const RadParam* p, int n_p, uint64_t present,
+                                                            int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (step == 0) {
+        Step s(out, "gemm_nt_f32");
+        s.mirror(p, n_p, "M").pint("N", pi(p, n_p, "n_expert")).mirror(p, n_p, "K").pstr("dtype", "bf16");
+        return s.wire({ 0, 1, 3 });                 /* x, w, y */
+    }
+    if (step == 1) {
+        Step s(out, "router_scored_topk");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n_expert").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "norm").mirror(p, n_p, "route_scale").mirror(p, n_p, "score")
+         .pstr("dtype", "f32");
+        return s.wire({ 3, 2, 4, 5 });              /* logits, bias, ids, weights */
+    }
+    if (step == 2) {
+        const bool inv = RAD_FUSE_HAS(present, 9);
+        Step s(out, inv ? "moe_scatter_inv" : "moe_scatter");
+        s.mirror(p, n_p, "M").pint("n_expert", pi(p, n_p, "n_local", pi(p, n_p, "n_expert")))
+         .mirror(p, n_p, "top_k").mirror_opt(p, n_p, "expert_base").mirror_opt(p, n_p, "protect");
+        if (inv) return s.wire({ 4, 6, 7, 8, 9 });
+        return s.wire({ 4, 6, 7, 8 });
+    }
+    return RAD_E_NOTFOUND;
+}
+
+/* ==========================================================================================
  * gate_quant_fp8 -- the same epilogue with the gate in its own operand.
  * (kernel: libr4d/r4d_fused_quant_fp8.hip, gate_quant_fp8_kernel)
  *
@@ -890,6 +947,44 @@ extern "C" int r4d_fuse_ar_gather_hc_write(const RadParam* p, int n_p, uint64_t 
 }
 
 /* ==========================================================================================
+ * moe_gather_all_reduce -- moe_gather, then the four-rank exact all-reduce of its output.
+ * (kernels: libr4d/r4d_ar_oneshot_Nrank_exact.hip, r4d_ar_gather_hc_write_wide_kernel at hc 0, below
+ *  ts_min; libr4d/r4d_ar_twoshot_Nrank_exact.hip, r4d_ar_gather_twoshot_kernel, from it;
+ *  shim: r4d_ar_entry.hip, r4d_rad_moe_gather_ar_4rank)
+ *
+ * Operands: [0] y_expert  [1] expert_w  [2] sorted_tok  [3] shared?  [4] shared_gate?  [5] y (inout)
+ *
+ * ar_gather_hc_write's chain without its third step: the gather writes `y`, which is reduced in
+ * place. `numel` is M * n and `exact` 1, selecting the exact all_reduce rows; at M * n under the
+ * four-rank one-shot's ts_min both the fused kernel and the chain take the one-shot transport, from
+ * it both take the two-shot (the fused one where its slot list fits LDS), and the two-shot's fold is
+ * the one-shot's element for element, so the bytes agree either way.
+ */
+extern "C" int r4d_fuse_moe_gather_ar(const RadParam* p, int n_p, uint64_t present, int step,
+                                      RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), k = pi(p, n_p, "top_k");
+    if (M <= 0 || n <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "moe_gather");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "act");
+        return s.wire({ 0, 1, 2, 3, 4, 5 });   /* y_expert, expert_w, sorted_tok, shared, gate, y */
+    }
+    case 1: {
+        Step s(out, "all_reduce");
+        s.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+         .mirror(p, n_p, "dtype").pint("exact", 1);
+        return s.wire({ 5, RAD_FUSE_NONE });   /* x = y (inout), y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * ar_rmsnorm_quant_fp8 -- the two-rank all-reduce with the norm and the quantiser folded on.
  * (kernel: libr4d/r4d_fused_quant_fp8.hip, ar_rmsnorm_quant_fp8_kernel; shim: r4d_ar_entry.hip)
  *
@@ -945,6 +1040,221 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
         s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps")
          .mirror(p, n_p, "group").mirror(p, n_p, "dtype").mirror_opt(p, n_p, "wadd");
         return s.wire({ 0, 1, 2, 3, 4, 5 });        /* x, residual, w, q, scale, out_bf16 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * DeepSeek-V4.1's chains (kernels: libr4d/r4d_ds41_elem.hip, "fused chains").
+ *
+ * rmsnorm_rope_roundtrip  [0] x  [1] w  [2] y  [3] cos_sin  [4] positions
+ *     rmsnorm_bf16 (x, w -> y), rope_rows_bf16 over y, quant_roundtrip over y. The kernel takes
+ *     the norm's width from r4d_act_threads(M, n) as rmsnorm_bf16 does, so `M` is mirrored.
+ * rope_rows_roundtrip     [0] x  [1] cos_sin  [2] positions
+ *     rope_rows_bf16 then quant_roundtrip over x's n_head * head_dim columns, in place.
+ * mhc_collapse_rmsnorm    [0] h  [1] pre  [2] x  [3] w  [4] y
+ *     mhc_collapse_bf16 (h, pre -> x), then rmsnorm_bf16 (x, w -> y).
+ * mhc_post_collapse_rmsnorm  [0] x  [1] h  [2] post  [3] comb  [4] out  [5] pre  [6] xc  [7] w  [8] y
+ *     mhc_post_bf16 (x, h, post, comb -> out), mhc_collapse_bf16 (out, pre -> xc), rmsnorm_bf16
+ *     (xc, w -> y).
+ * Each step's output is the bf16 its own row stores; the fused kernels keep exactly those values
+ * between steps (in LDS, a register, or the stored x).
+ */
+namespace {
+void mirror_rope(Step& s, const RadParam* p, int n_p) {
+    s.mirror(p, n_p, "M").mirror(p, n_p, "n_head").mirror(p, n_p, "head_dim")
+     .mirror(p, n_p, "rot").mirror(p, n_p, "off").mirror(p, n_p, "mode")
+     .mirror(p, n_p, "inverse").mirror(p, n_p, "dtype");
+}
+void mirror_quant(Step& s, const RadParam* p, int n_p, int64_t n) {
+    s.mirror(p, n_p, "M").pint("n", (long long)n).mirror(p, n_p, "block")
+     .mirror(p, n_p, "format").mirror(p, n_p, "scale").mirror(p, n_p, "dtype");
+}
+void mirror_norm(Step& s, const RadParam* p, int n_p) {
+    s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+     .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+}
+}  /* namespace */
+
+extern "C" int r4d_fuse_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, uint64_t present,
+                                               int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0 || n != pi(p, n_p, "n_head") * pi(p, n_p, "head_dim"))
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 1: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    case 2: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 2 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_rope_rows_roundtrip(const RadParam* p, int n_p, uint64_t present, int step,
+                                            RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n_head") * pi(p, n_p, "head_dim");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 1: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 0 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                             int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2 });                 /* h, pre, x */
+    }
+    case 1: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                                  int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_post");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3, 4 });           /* x, h, post, comb, out */
+    }
+    case 1: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6 });                 /* out, pre, xc */
+    }
+    case 2: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 6, 7, 8 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * attn_sparse_sink_rope_roundtrip -- DeepSeek-V4.1's attention with its output's inverse rope and round
+ * trip (lever K1 fold d). (row: ds41_attn_sparse_sink_rope_rt_d512_bf16; kernels: r4d_ds41_sparse.hip,
+ * ds41_attn_dec_kernel under ORT, else attn_sparse_sink's launch then rope_rows_roundtrip's)
+ *
+ * Operands: [0] q  [1] window_cache  [2] window_bt  [3] window_used  [4] comp_cache?  [5] comp_bt?
+ *           [6] sel?  [7] positions  [8] cu_seqlens  [9] sinks  [10] out  [11] cos_sin
+ *
+ * attn_sparse_sink writes out; ds41_rope_rows (n_head = heads, head_dim = dim) rotates it in place at the
+ * attention's positions; quant_roundtrip (n = heads * dim, scale = block_scale) rounds it in place. The
+ * fused epilogue keeps exactly the bf16 each step stores (ds_ort_pair). */
+extern "C" int r4d_fuse_attn_sparse_sink_rope_roundtrip(const RadParam* p, int n_p, uint64_t present,
+                                                        int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    auto opt = [present](int i) { return opt_opd(present, i); };
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
+    if (M <= 0 || H < 1 || Dm < 1) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "attn_sparse_sink");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "dim").mirror(p, n_p, "window")
+         .mirror(p, n_p, "ratio").mirror(p, n_p, "topk").mirror(p, n_p, "scale").mirror(p, n_p, "dtype")
+         .mirror_opt(p, n_p, "latent_format");
+        return s.wire({ 0, 1, 2, 3, opt(4), opt(5), opt(6), 7, 8, 9, 10 });
+    }
+    case 1: {
+        Step s(out, "ds41_rope_rows");
+        s.mirror(p, n_p, "M").pint("n_head", (long long)H).pint("head_dim", (long long)Dm)
+         .mirror(p, n_p, "rot").mirror(p, n_p, "off").mirror(p, n_p, "mode").mirror(p, n_p, "inverse")
+         .mirror(p, n_p, "dtype");
+        return s.wire({ 10, 11, 7 });               /* x = out, cos_sin, positions */
+    }
+    case 2: {
+        Step s(out, "quant_roundtrip");
+        s.mirror(p, n_p, "M").pint("n", (long long)(H * Dm)).mirror(p, n_p, "block")
+         .mirror(p, n_p, "format").pstr("scale", r4d_pgets(p, n_p, "block_scale")).mirror(p, n_p, "dtype");
+        return s.wire({ 10 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * rmsnorm_gemm_nt_ggml / swiglu_clamped_gemm_nt_ggml -- an activation's producer and the GGUF GEMM over its output
+ * (lever K1 folds a and e). (rows: rmsnorm_gemm_nt_ggml_qk256 / _qk32, swiglu_clamped_gemm_nt_ggml_qk256 / _qk32;
+ * kernels: r4d_ds41_ggml_mr.hip's form with the producer in its staging under lever D2, else the producer's launch
+ * and gemm_nt_ggml's, r4d_ds41_ggml.hip)
+ *
+ * Operands: rmsnorm_gemm_nt_ggml          [0] x  [1] w  [2] g  [3] h  [4] y
+ *           swiglu_clamped_gemm_nt_ggml   [0] gate_up  [1] w  [2] h  [3] y
+ *
+ * The producer writes h (rounded to bf16 where it stores), the GEMM reads h; the fused staging rounds the same
+ * values the same way before the GEMM's widening, and block column 0 stores them to h. */
+extern "C" int r4d_fuse_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step,
+                                             RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").pint("n", (long long)pi(p, n_p, "K")).mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+         .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+        return s.wire({ 0, 2, 3 });                 /* x, w = g, y = h */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 3, 1, 4 });                 /* a = h, w, y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step,
+                                                    RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "swiglu_clamped");
+        s.mirror(p, n_p, "M").pint("n", (long long)pi(p, n_p, "K")).mirror(p, n_p, "limit").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 2 });                    /* gate_up, y = h */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 2, 1, 3 });                 /* a = h, w, y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* gemm_nt_ggml_pair (lever 1U-GQ, ds41-int11): two gemm_nt_ggml over the same rows, one launch in the decode band under
+ * lever D2's form (r4d_ds41_ggml_mr.hip r4d_gg_mr_pair), else the two launches.
+ * Operands: [0] a  [1] w  [2] a2 (absent: a)  [3] w2  [4] y  [5] y2 */
+extern "C" int r4d_fuse_gemm_nt_ggml_pair(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0 || pi(p, n_p, "N2") <= 0)
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 4 });                 /* a, w, y */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").pint("N", (long long)pi(p, n_p, "N2")).mirror(p, n_p, "K").mirror(p, n_p, "type")
+         .mirror(p, n_p, "dtype");
+        const int16_t a2 = (present & (1ull << 2)) ? 2 : 0;
+        return s.wire({ a2, 3, 5 });                /* a2 (or a), w2, y2 */
     }
     default:
         return RAD_E_NOTFOUND;

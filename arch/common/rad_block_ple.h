@@ -121,8 +121,11 @@ struct PleLayer {
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& cfg, int layer,
                  const Wire& wire, const Src& src);
     /* The hash, issued at the top of the step; the rest at the layer (see ids()). */
-    void ids(RadCtx* c_, const RadBatch* batch) const;
-    void step(RadCtx* c_, const RadBatch* batch) const;
+    /* `tip` (lever TIP, rad_arch.h TipStage): one prefill sequence with a snapshot row inside the step -- each windowed op
+     * runs [0, row) and [row, T) in two launches and stages its window row between them (a window is what its launch's
+     * last rows leave, so the second launch reads exactly what the in-launch rows would). */
+    void ids(RadCtx* c_, const RadBatch* batch, const TipStage* tip = nullptr) const;
+    void step(RadCtx* c_, const RadBatch* batch, const TipStage* tip = nullptr) const;
 };
 
 inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& cfg,
@@ -397,7 +400,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
  * ids() runs first in the step, before every layer: it reads only the token ids and its own
  * window. The host gather that consumes it then waits for one small kernel, and the layers issued
  * in between keep the device busy during the gather. */
-inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
+inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch, const TipStage* tip) const {
     const int64_t T = batch->n_tok;
     const int64_t S = batch->n_seq;
 
@@ -421,6 +424,28 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
      * after the step's (`tok` reaches A tokens past the step); the window left behind is the
      * step's alone. */
     const int64_t A = P > 0 ? ahead_rows(batch) : 0;
+    if (P == 1 && D == 0 && tip && tip->on() && tip->row < T) {   /* lever TIP: [0, row), the window staged, [row, T) */
+        const int64_t rr = tip->row;
+        RAD_ISSUE_N(c_, op_ids, rr,
+                    praw(batch->token_ids, RAD_I32, T), kv_cache(kv_tok, layer_),
+                    praw(tip->cu, RAD_I32, 2),
+                    RAD_W(w_mult), RAD_W(w_vsz), RAD_W(w_off),
+                    praw(tk_idx, RAD_I32, 1),
+                    praw(batch->ctx_lens, RAD_I32, 1),
+                    RAD_NONE,
+                    brows(b_ids, T), RAD_NONE);
+        tip->put(c_, kv_tok, layer_);
+        RAD_ISSUE_N(c_, op_ids, T - rr,
+                    praw(batch->token_ids, RAD_I32, T + A), kv_cache(kv_tok, layer_),
+                    praw(tip->cu + 1, RAD_I32, 2),
+                    RAD_W(w_mult), RAD_W(w_vsz), RAD_W(w_off),
+                    praw(tk_idx, RAD_I32, 1),
+                    praw(batch->positions + rr, RAD_I32, 1),
+                    RAD_NONE,
+                    brows(b_ids, T),
+                    A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
+        return;
+    }
     if (P > 0)
         RAD_ISSUE_N(c_, op_ids, T,
                     praw(batch->token_ids, RAD_I32, T + A), kv_cache(kv_tok, layer_),
@@ -433,7 +458,7 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
                     A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
 }
 
-inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
+inline void PleLayer::step(RadCtx* c_, const RadBatch* batch, const TipStage* tip) const {
     const int64_t T = batch->n_tok;
     const int64_t S = batch->n_seq;
 
@@ -470,7 +495,24 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                     praw(batch->ctx_lens, RAD_I32, D),
                     praw(batch->num_accepted, RAD_I32, D),
                     brows(b_out, DT));
-    if (P > 0)
+    if (P == 1 && D == 0 && tip && tip->on() && tip->row < T) {   /* lever TIP: [0, row), the window staged, [row, T) */
+        const int64_t rr = tip->row;
+        RAD_ISSUE_N(c_, op_conv, rr,
+                    brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
+                    praw(tip->cu, RAD_I32, 2), brows(b_gv, T),
+                    praw(cv_idx, RAD_I32, 1),
+                    praw(batch->ctx_lens, RAD_I32, 1),
+                    RAD_NONE,
+                    brows(b_out, T));
+        tip->put(c_, kv_conv, layer_);
+        RAD_ISSUE_N(c_, op_conv, T - rr,
+                    brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
+                    praw(tip->cu + 1, RAD_I32, 2), brows(b_gv, T),
+                    praw(cv_idx, RAD_I32, 1),
+                    praw(batch->positions + rr, RAD_I32, 1),
+                    RAD_NONE,
+                    brows(b_out, T));
+    } else if (P > 0)
         RAD_ISSUE_N(c_, op_conv, T,
                     brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
                     praw(batch->cu_seqlens + D, RAD_I32, P + 1), brows(b_gv, T),

@@ -15,6 +15,7 @@
 #include "sched/advance.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <dirent.h>
 #include <unistd.h>
 
 using rad::DirectFile;
@@ -725,6 +727,165 @@ TEST(waiting_on_an_unrecorded_event_is_a_no_op) {
     CHECK_OK(rad_stream_sync(st.s));
 }
 
+/* ------------------------------------------------------------------ lever WAITK (tp8 loop W1)
+ *
+ * RADIANCE_AQL_WAITK puts a one-wave wait kernel ahead of a pending wait's unchanged barrier-AND (core/device/aql.h).
+ * The start value and the per-wait choice are pure and run on any backend; the card cases switch the lever on for
+ * this process (rad::aql::waitk_set_for_test) and check that the waiting stream is still held behind the producer,
+ * that the kernel goes out only for a wait pending at enqueue, and that it never takes a ride pending on the waiting
+ * stream (a ride is completed by the next REAL dispatch). On a card: RAD_TEST_FILTER=waitk tests/device_test. */
+struct WaitkScope {
+    explicit WaitkScope(int mode) { rad::aql::waitk_set_for_test(mode); }
+    ~WaitkScope() { rad::aql::waitk_set_for_test(-1); }
+};
+
+TEST(waitk_reads_its_start_value_and_plans_a_kernel_only_for_a_pending_wait) {
+    using namespace rad::aql;
+    CHECK_EQ(waitk_mode_of(nullptr), 0);
+    CHECK_EQ(waitk_mode_of(""), 0);
+    CHECK_EQ(waitk_mode_of("0"), 0);
+    CHECK_EQ(waitk_mode_of("-1"), 0);
+    CHECK_EQ(waitk_mode_of("on"), 0);
+    CHECK_EQ(waitk_mode_of("1"), 1);
+    CHECK_EQ(waitk_mode_of("2"), 2);
+    CHECK_EQ(waitk_mode_of("7"), 2);
+    /* need 1 = an event wait, 2 = a ride wait; value = the awaited signal's value at enqueue */
+    for (int mode = 0; mode <= 2; ++mode)
+        for (int need = 1; need <= 2; ++need)
+            for (int cap = 0; cap <= 1; ++cap)
+                for (int64_t value : {int64_t(0), int64_t(1)}) {
+                    const int p = waitk_plan(mode, need, cap != 0, value);
+                    const int want = (mode < need || cap) ? kWaitkOff : value == 0 ? kWaitkMet : kWaitkKernel;
+                    CHECK_EQ(p, want);
+                }
+    /* the off state is every start without the env: no wait kernel for any wait */
+    CHECK_EQ(waitk_plan(0, 1, false, 1), kWaitkOff);
+    CHECK_EQ(waitk_plan(1, 2, false, 1), kWaitkOff);
+    CHECK_EQ(waitk_plan(2, 2, false, 1), kWaitkKernel);
+}
+
+TEST(a_waitk_wait_on_a_pending_event_or_ride_holds_the_waiting_stream_behind_the_producer) {
+    if (rad::device_is_host()) SKIP("a card only");
+    const int64_t n = 1 << 20;
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> mid(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> dst(n, RAD_MEM_HOST_PINNED);
+    REQUIRE(src && mid && dst);
+    for (int mode = 0; mode <= 2; ++mode) {
+        WaitkScope on(mode);
+        for (int ride = 0; ride <= 1; ++ride) {
+            Stream a, b;
+            Event ea;
+            REQUIRE(a.s && b.s && ea.e);
+            fill(src, n, 0x3A170000u + (uint32_t)(mode * 2 + ride));
+            CHECK_OK(rad_memset_async(dst, 0xEE, n, b.s));
+            CHECK_OK(rad_stream_sync(b.s));
+            /* the producer is held behind a closed gate, so the wait is pending when it is enqueued */
+            void* gate = nullptr;
+            REQUIRE_EQ(rad_stream_gate(a.s, &gate), RAD_OK);
+            const rad::aql::WaitkCounts c0 = rad::aql::waitk_counts();
+            if (ride) {
+                void* mark = nullptr;
+                REQUIRE_EQ(rad_ride(a.s, &mark), RAD_OK);
+                CHECK_OK(rad_memcpy_async(mid, src, n, a.s));     /* completes the ride */
+                CHECK_OK(rad_ride_wait(b.s, mark));
+            } else {
+                CHECK_OK(rad_memcpy_async(mid, src, n, a.s));
+                CHECK_OK(rad_event_record(ea.e, a.s));
+                CHECK_OK(rad_event_wait(b.s, ea.e));
+            }
+            CHECK_OK(rad_memcpy_async(dst, mid, n, b.s));
+            const rad::aql::WaitkCounts c1 = rad::aql::waitk_counts();
+            const bool covered = mode >= (ride ? 2 : 1);
+            CHECK_EQ(c1.kernels - c0.kernels, covered ? 1 : 0);
+            CHECK_EQ(c1.met - c0.met, 0);
+            /* b runs nothing of the copy before the gate opens */
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            CHECK_EQ(dst.p[0], 0xEE);
+            CHECK_EQ(dst.p[n - 1], 0xEE);
+            CHECK_OK(rad_gate_open(gate));
+            CHECK_OK(rad_stream_sync(b.s));
+            CHECK_OK(rad_stream_sync(a.s));
+            CHECK_EQ(std::memcmp(dst, src, (size_t)n), 0);
+        }
+        /* a wait met at enqueue is only the barrier */
+        Stream a, b;
+        Event ea;
+        CHECK_OK(rad_event_record(ea.e, a.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        const rad::aql::WaitkCounts c0 = rad::aql::waitk_counts();
+        CHECK_OK(rad_event_wait(b.s, ea.e));
+        CHECK_OK(rad_stream_sync(b.s));
+        const rad::aql::WaitkCounts c1 = rad::aql::waitk_counts();
+        CHECK_EQ(c1.kernels - c0.kernels, 0);
+        CHECK_EQ(c1.met - c0.met, mode >= 1 ? 1 : 0);
+    }
+}
+
+TEST(a_waitk_wait_kernel_leaves_a_ride_pending_on_the_waiting_stream_to_its_next_dispatch) {
+    if (rad::device_is_host()) SKIP("a card only");
+    WaitkScope on(1);
+    Stream a, b, c;
+    Event ea;
+    DevBuf<uint8_t> x(4096, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> flag(64, RAD_MEM_HOST_PINNED);
+    REQUIRE(a.s && b.s && c.s && ea.e && x && flag);
+    std::memset(flag.p, 0, 64);
+    void* g1 = nullptr;
+    REQUIRE_EQ(rad_stream_gate(a.s, &g1), RAD_OK);
+    CHECK_OK(rad_event_record(ea.e, a.s));                       /* pending behind g1 */
+    void* mark = nullptr;
+    REQUIRE_EQ(rad_ride(b.s, &mark), RAD_OK);                   /* b's next real dispatch completes it */
+    const int64_t k0 = rad::aql::waitk_counts().kernels;
+    CHECK_OK(rad_event_wait(b.s, ea.e));                         /* pending: a wait kernel, which must not take the ride */
+    CHECK_EQ(rad::aql::waitk_counts().kernels - k0, 1);
+    void* g2 = nullptr;
+    REQUIRE_EQ(rad_stream_gate(b.s, &g2), RAD_OK);              /* holds b's next real dispatch */
+    CHECK_OK(rad_memset_async(x, 3, 4096, b.s));                /* takes the ride */
+    CHECK_OK(rad_ride_wait(c.s, mark));
+    CHECK_OK(rad_memset_async(flag, 1, 64, c.s));
+    CHECK_OK(rad_gate_open(g1));
+    CHECK_OK(rad_stream_sync(a.s));
+    /* the event is met and b's wait kernel is done; the ride must still wait for the memset behind g2 */
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_EQ(((volatile uint8_t*)flag.p)[0], 0);
+    CHECK_OK(rad_gate_open(g2));
+    CHECK_OK(rad_stream_sync(b.s));
+    CHECK_OK(rad_stream_sync(c.s));
+    CHECK_EQ(((volatile uint8_t*)flag.p)[0], 1);
+}
+
+TEST(two_streams_joining_hundreds_of_times_under_waitk_neither_deadlock_nor_reorder) {
+    if (rad::device_is_host()) SKIP("a card only");
+    const int64_t big = 1 << 20, small = 4096;
+    const int     joins = 400;
+    WaitkScope on(2);
+    Stream a, b;
+    Event ea, eb;
+    DevBuf<uint8_t> d0(big, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> d1(big, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> h(big, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> r(small, RAD_MEM_HOST_PINNED);
+    REQUIRE(d0 && d1 && h && r);
+    fill(h, big, 0x5EEE);
+    const int64_t k0 = rad::aql::waitk_counts().kernels;
+    CHECK_OK(rad_memcpy_async(d0, h, big, a.s));
+    for (int i = 0; i < joins; ++i) {
+        CHECK_OK(rad_event_record(ea.e, a.s));
+        CHECK_OK(rad_event_wait(b.s, ea.e));
+        CHECK_OK(rad_memcpy_async(d1, d0, big, b.s));
+        CHECK_OK(rad_event_record(eb.e, b.s));
+        CHECK_OK(rad_event_wait(a.s, eb.e));
+        CHECK_OK(rad_memcpy_async(d0, d1, small, a.s));
+    }
+    CHECK_OK(rad_memcpy_async(r, d0, small, a.s));
+    CHECK_OK(rad_stream_sync(a.s));
+    CHECK_OK(rad_stream_sync(b.s));
+    CHECK_EQ(std::memcmp(r, h, (size_t)small), 0);
+    /* the host runs far ahead, so most of the 800 waits are pending at enqueue */
+    CHECK(rad::aql::waitk_counts().kernels - k0 > 0);
+}
+
 /* An advance runs at its place in stream order. The sampled token it accepts is the last thing a
  * step copies into place, and the advance is issued behind that copy without a host wait. On the
  * host backend each stream is a queue with a worker thread, so an advance run on the issuing
@@ -843,6 +1004,23 @@ TEST(directfile_write_then_read_roundtrip) {
      * or fails, so callers on the step path need not check a byte count. */
     CHECK(f.read_at(t2, body, tail + 1) < 0);
     CHECK(f.read_at(r, body + tail + A, A) < 0);
+
+    /* An extent rounded out to the alignment past end of file (the container's last weight):
+     * succeeds when what was needed arrived, fails when the needed bytes run past the end. */
+    {
+        DevBuf<uint8_t> big(body + A, RAD_MEM_HOST_PINNED);
+        CHECK(big);
+        if (big) {
+            std::memset(big, 0, (size_t)(body + A));
+            CHECK_OK(f.read_covering(big, 0, body + A, body + tail));
+            CHECK_EQ(std::memcmp(big, w, (size_t)body), 0);
+            CHECK_EQ(std::memcmp(big + body, t, (size_t)tail), 0);
+            CHECK(f.read_covering(big, 0, body + A, body + tail + 1) < 0);
+            CHECK(f.read_covering(big, A, body, body) < 0);          /* needed past the end */
+            CHECK_OK(f.read_covering(big, A, body, body - A + tail));
+            CHECK(f.read_covering(big, 0, A, A + 1) < 0);            /* need > bytes: refused */
+        }
+    }
 
     /* Reopen without O_TRUNC: the bytes are on disk, not in this handle. */
     f.close();
@@ -1609,6 +1787,195 @@ TEST(a_damaged_code_object_is_refused_not_misread) {
     auto nolist = elf_with_note(m.b);
     CHECK(!rad::aql::code_object_kernels(nolist.data(), nolist.size(), &ks, &why));
     CHECK(has(why, "amdhsa.kernels"));
+}
+
+/* ------------------------------------------------------------------ lever IKA (tp8 loop W3)
+ *
+ * RADIANCE_AQL_IKA=1 plays the packets of kernels their own module names in r4d_ika_kernels without the packet's
+ * release, and without its acquire where Ctx::haz_mark allows (DRAFTER track round 50). Which kernel is named is a pure
+ * function of its mangled symbol (core/device/aql.h ika_identifier / ika_listed), so it runs on any backend. The
+ * symbols below are the IKA libr4d's own (ds41-drafter-ika-f1349e59, kernels/libr4d.so) and exl3r4d's: the first
+ * matcher took `<length><name>` behind a non-digit only, so every anonymous-namespace kernel (`_ZN12_GLOBAL__N_1..`,
+ * 140 of the 147 listed libr4d names) was missed; and a listed identifier must never match a namespace component or a
+ * template argument (that kernel holds no in-kernel fence). */
+TEST(ika_names_a_kernel_by_its_own_identifier_in_the_mangled_symbol) {
+    using rad::aql::ika_identifier;
+    struct C { const char* sym; const char* id; };
+    const C cases[] = {
+        { "_ZN12_GLOBAL__N_113binary_kernelEPKtS1_Ptjjjjijf", "binary_kernel" },
+        { "_ZN12_GLOBAL__N_120ds41_attn_dec_kernelILi1ELi1024ELi2ELi4ELb1ELb0ELb0ELb0EEEvNSt11conditionalIXT5_ENS_"
+          "13DsAttnArgsOrtENS_10DsAttnArgsEE4typeE", "ds41_attn_dec_kernel" },
+        { "_Z28r4d_qk_norm_rope_gate_kernelILi128ELi0EEvPK14__hip_bfloat16S2_PS0_S3_S3_PKvS5_S5_S5_liiiffiiiii9QkKvStore",
+          "r4d_qk_norm_rope_gate_kernel" },
+        { "_Z20rmsnorm_short_kernelILb0EEvPKtPKvPtjfffjjj", "rmsnorm_short_kernel" },
+        { "_Z11fill_kernelIjEvPT_jjS0_", "fill_kernel" },
+        { "_Z19exl3r4d_gemm_kernelILi1EEvv", "exl3r4d_gemm_kernel" },
+        { "_ZL11fill_kernelPfi", "fill_kernel" },                 /* a static kernel */
+        { "_ZN3r4d4gemmIfEEvv", "gemm" },                          /* a named namespace */
+        { "_ZN3r4d12_GLOBAL__N_14gemmEv", "gemm" },                /* nested namespaces */
+        { "_ZNK3r4d4gemmEv", "gemm" },                             /* qualifiers before the prefix */
+        { "_ZNSt4gemmEv", "gemm" },                                /* std:: */
+        { "_Z3fooB5cxx11v", "foo" },                               /* an ABI tag after the name */
+        { "_Z6kernelI13binary_kernelEvv", "kernel" },              /* a template argument is not the name */
+        { "_ZN13binary_kernel6helperEv", "helper" },               /* a namespace component is not the name */
+        { "_Z14gemm_kernel_xxv", "gemm_kernel_xx" },
+        { "aql_copy16", "aql_copy16" },                            /* extern "C": the symbol is the name */
+        { "_Z", "" }, { "_ZN", "" }, { "_ZNE", "" }, { "_Z99abc", "" }, { "_Z0v", "" }, { "_ZZ3fooE3bar", "" },
+    };
+    for (const C& c : cases) {
+        const std::string got = ika_identifier(c.sym);
+        if (got != c.id) fprintf(stderr, "    %s -> '%s' (want '%s')\n", c.sym, got.c_str(), c.id);
+        CHECK(got == c.id);
+    }
+    const char* const list[] = { "binary_kernel", nullptr, "", "gemm", "exl3r4d_gemm_kernel", "ds41_attn_dec_kernel" };
+    const int n = (int)(sizeof list / sizeof list[0]);
+    using rad::aql::ika_listed;
+    CHECK(ika_listed("_ZN12_GLOBAL__N_113binary_kernelEPKtS1_Ptjjjjijf", list, n));
+    CHECK(ika_listed(cases[1].sym, list, n));
+    CHECK(ika_listed("_Z19exl3r4d_gemm_kernelILi1EEvv", list, n));
+    CHECK(ika_listed("_ZN3r4d4gemmIfEEvv", list, n));
+    CHECK(ika_listed("_Z4gemmv", list, n));
+    CHECK(!ika_listed("_Z6kernelI13binary_kernelEvv", list, n));
+    CHECK(!ika_listed("_ZN13binary_kernel6helperEv", list, n));
+    CHECK(!ika_listed("_Z14gemm_kernel_xxv", list, n));
+    CHECK(!ika_listed("_Z5xgemmv", list, n));
+    CHECK(!ika_listed("_Z20rmsnorm_short_kernelILb0EEvPKtPKvPtjfffjjj", list, n));
+    CHECK(!ika_listed("_Z", list, n));
+    CHECK(!ika_listed("", list, n));
+    CHECK(!ika_listed("_Z4gemmv", nullptr, 0));
+    CHECK(!ika_listed("_Z4gemmv", list, 0));
+}
+
+/* The source side of the same rule (libr4d/r4d_ika_list.inc is what libr4d built with R4D_IKA exports): every kernel
+ * definition in libr4d whose identifier the list names starts with R4D_IKA_ENTRY(), and every definition that starts
+ * with it is listed. A same-named kernel without the entry (another unit's anonymous namespace, say) would be treated as
+ * self-acquiring and play without both packet fences: stale reads. Reads the source tree beside this test's fixtures;
+ * skips where it is not there (inside an image). */
+namespace {
+std::string ika_strip_comments(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (s.compare(i, 2, "//") == 0) { while (i < s.size() && s[i] != '\n') ++i; continue; }
+        if (s.compare(i, 2, "/*") == 0) {
+            const size_t e = s.find("*/", i + 2);
+            for (size_t k = i; k < (e == std::string::npos ? s.size() : e + 2); ++k) if (s[k] == '\n') o += '\n';
+            i = e == std::string::npos ? s.size() : e + 2;
+            continue;
+        }
+        if (s[i] == '\'' && (i == 0 || !std::isalnum((unsigned char)s[i - 1]))) {   /* a character literal, kept whole */
+            o += s[i++];
+            while (i < s.size() && s[i] != '\'' && s[i] != '\n') { if (s[i] == '\\' && i + 1 < s.size()) o += s[i++]; o += s[i++]; }
+            if (i < s.size()) o += s[i++];
+            continue;
+        }
+        if (s[i] == '"') {   /* a string literal, kept whole */
+            o += s[i++];
+            while (i < s.size() && s[i] != '"') { if (s[i] == '\\' && i + 1 < s.size()) o += s[i++]; o += s[i++]; }
+            if (i < s.size()) o += s[i++];
+            continue;
+        }
+        o += s[i++];
+    }
+    return o;
+}
+bool ika_ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
+/* The __global__ definitions of a source text: (identifier, whether the body's first statement is R4D_IKA_ENTRY). */
+std::vector<std::pair<std::string, bool>> ika_kernel_defs(const std::string& t) {
+    std::vector<std::pair<std::string, bool>> out;
+    for (size_t at = t.find("__global__"); at != std::string::npos; at = t.find("__global__", at + 10)) {
+        if ((at > 0 && ika_ident_char(t[at - 1])) || (at + 10 < t.size() && ika_ident_char(t[at + 10]))) continue;
+        size_t p = at + 10;
+        std::string name;
+        auto skip_parens = [&](size_t q) {   /* q at '(' -> past its ')' */
+            int d = 0;
+            for (; q < t.size(); ++q) {
+                if (t[q] == '(') ++d;
+                else if (t[q] == ')' && --d == 0) return q + 1;
+            }
+            return q;
+        };
+        while (p < t.size()) {
+            while (p < t.size() && std::isspace((unsigned char)t[p])) ++p;
+            if (p >= t.size()) break;
+            if (!ika_ident_char(t[p])) { if (t[p] == '*' || t[p] == '&' || t[p] == ':') { ++p; continue; } break; }
+            size_t e = p;
+            while (e < t.size() && ika_ident_char(t[e])) ++e;
+            const std::string w = t.substr(p, e - p);
+            size_t q = e;
+            while (q < t.size() && std::isspace((unsigned char)t[q])) ++q;
+            if (q < t.size() && t[q] == '(') {
+                if (w == "__launch_bounds__" || w == "__attribute__" || w == "R4D_WAVES" || w == "alignas" ||
+                    w == "__declspec") { p = skip_parens(q); continue; }
+                name = w;
+                p = skip_parens(q);
+                break;
+            }
+            p = e;
+        }
+        if (name.empty()) continue;
+        while (p < t.size() && t[p] != '{' && t[p] != ';') ++p;
+        if (p >= t.size() || t[p] == ';') continue;   /* a declaration */
+        size_t b = p + 1;
+        while (b < t.size() && std::isspace((unsigned char)t[b])) ++b;
+        out.emplace_back(name, t.compare(b, 13, "R4D_IKA_ENTRY") == 0);
+    }
+    return out;
+}
+}  // namespace
+
+TEST(ika_libr4d_lists_exactly_the_kernels_that_hold_the_in_kernel_fences) {
+    const std::string root = std::string(RAD_CHAT_FIXTURES) + "/../../../libr4d";
+    std::FILE* lf = std::fopen((root + "/r4d_ika_list.inc").c_str(), "rb");
+    if (!lf) SKIP("no libr4d source tree at %s", root.c_str());
+    std::string lt;
+    for (int c; (c = std::fgetc(lf)) != EOF;) lt += (char)c;
+    std::fclose(lf);
+    std::vector<std::string> names;
+    for (size_t q = lt.find('"'); q != std::string::npos; q = lt.find('"', q + 1)) {
+        const size_t e = lt.find('"', q + 1);
+        if (e == std::string::npos) break;
+        names.push_back(lt.substr(q + 1, e - q - 1));
+        q = e;
+    }
+    CHECK(names.size() >= 100);
+    std::vector<std::pair<std::string, bool>> defs;
+    if (DIR* d = opendir(root.c_str())) {
+        while (dirent* de = readdir(d)) {
+            const std::string f = de->d_name;
+            const bool src = (f.size() > 4 && f.compare(f.size() - 4, 4, ".hip") == 0) ||
+                             (f.size() > 2 && f.compare(f.size() - 2, 2, ".h") == 0) ||
+                             (f.size() > 4 && f.compare(f.size() - 4, 4, ".cuh") == 0);
+            if (!src) continue;
+            std::FILE* sf = std::fopen((root + "/" + f).c_str(), "rb");
+            if (!sf) continue;
+            std::string st;
+            for (int c; (c = std::fgetc(sf)) != EOF;) st += (char)c;
+            std::fclose(sf);
+            for (auto& x : ika_kernel_defs(ika_strip_comments(st))) defs.push_back(x);
+        }
+        closedir(d);
+    }
+    CHECK(defs.size() >= names.size());
+    int listed_defs = 0, entry_defs = 0;
+    for (const std::string& n : names) {
+        int found = 0, with = 0;
+        for (const auto& x : defs) if (x.first == n) { ++found; with += x.second ? 1 : 0; }
+        if (found == 0 || with != found) fprintf(stderr, "    listed %s: %d definition(s), %d with the entry\n", n.c_str(), found, with);
+        CHECK(found > 0);
+        CHECK_EQ(with, found);
+        listed_defs += found;
+    }
+    for (const auto& x : defs) {
+        if (!x.second) continue;
+        ++entry_defs;
+        bool in = false;
+        for (const std::string& n : names) in = in || n == x.first;
+        if (!in) fprintf(stderr, "    %s holds R4D_IKA_ENTRY() but is not listed\n", x.first.c_str());
+        CHECK(in);
+    }
+    fprintf(stderr, "    %zu listed names, %d definitions of them, %d definitions with the entry, %zu kernel definitions scanned\n",
+            names.size(), listed_defs, entry_defs, defs.size());
 }
 
 RAD_TEST_MAIN_HOST_KARGS()

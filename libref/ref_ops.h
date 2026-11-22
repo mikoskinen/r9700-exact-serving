@@ -64,6 +64,8 @@ int ref_mhc_pre_partial    (const RadArgs*, RadStream);
 int ref_mhc_pre_finish     (const RadArgs*, RadStream);
 int ref_mhc_post           (const RadArgs*, RadStream);
 int ref_mhc_contract       (const RadArgs*, RadStream);
+int ref_mhc_mix            (const RadArgs*, RadStream);
+int ref_mhc_collapse       (const RadArgs*, RadStream);
 int ref_kda_update         (const RadArgs*, RadStream);
 int ref_ssd_update         (const RadArgs*, RadStream);
 int ref_hc_read            (const RadArgs*, RadStream);
@@ -83,6 +85,7 @@ int ref_mul                (const RadArgs*, RadStream);
 int ref_silu_mul           (const RadArgs*, RadStream);
 int ref_swiglu_clamped     (const RadArgs*, RadStream);
 int ref_router_sigmoid_topk(const RadArgs*, RadStream);
+int ref_router_scored_topk(const RadArgs*, RadStream);
 int ref_router_sigmoid_group_topk(const RadArgs*, RadStream);
 int ref_swiglu_step        (const RadArgs*, RadStream);
 int ref_dsa_pool(const RadArgs*, RadStream);
@@ -116,6 +119,9 @@ int ref_logit_softcap      (const RadArgs*, RadStream);
 int ref_scale              (const RadArgs*, RadStream);
 int ref_fill               (const RadArgs*, RadStream);
 int ref_gather_rows        (const RadArgs*, RadStream);
+/* The two-node pipeline's crossings (ref_stage.cpp, abi/rad_pp.h). */
+int ref_stage_send         (const RadArgs*, RadStream);
+int ref_stage_recv         (const RadArgs*, RadStream);
 int ref_scatter_rows       (const RadArgs*, RadStream);
 int ref_ngram_ids          (const RadArgs*, RadStream);
 int ref_ple_gate           (const RadArgs*, RadStream);
@@ -130,6 +136,7 @@ int ref_quant_act_i8       (const RadArgs*, RadStream);
 int ref_quant_act_i8g      (const RadArgs*, RadStream);
 int ref_had_quant_act_i8   (const RadArgs*, RadStream);
 int ref_quant_act_fp8      (const RadArgs*, RadStream);
+int ref_quant_act_fp8_ue8m0(const RadArgs*, RadStream);   /* tp8 loop P30o */
 int ref_quant_cols_fp8     (const RadArgs*, RadStream);
 int ref_had_quant_act_fp8  (const RadArgs*, RadStream);
 int ref_had_quant_act_i8g  (const RadArgs*, RadStream);
@@ -142,6 +149,8 @@ int ref_dflash_select      (const RadArgs*, RadStream);
 int ref_dflash_markov_greedy(const RadArgs*, RadStream);
 int ref_dflash_markov_greedy_f32(const RadArgs*, RadStream);
 int ref_dflash_tree        (const RadArgs*, RadStream);
+int ref_dspark_conf       (const RadArgs*, RadStream);
+int ref_dspark_alt        (const RadArgs*, RadStream);
 int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
 int ref_gated_had_quant_i8 (const RadArgs*, RadStream);
@@ -183,6 +192,29 @@ int ref_ministral_rope     (const RadArgs*, RadStream);
 int ref_pixtral_rope       (const RadArgs*, RadStream);
 int ref_pixtral_merge      (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
+int ref_rope_rows          (const RadArgs*, RadStream);
+int ref_quant_roundtrip    (const RadArgs*, RadStream);
+int ref_softmax_pool       (const RadArgs*, RadStream);
+int ref_attn_sparse_sink   (const RadArgs*, RadStream);
+int ref_index_score        (const RadArgs*, RadStream);
+int ref_index_candidates   (const RadArgs*, RadStream);
+int ref_index_topk         (const RadArgs*, RadStream);
+/* index_candidates' keep: one bit a block of `block` positions over `width`, 32 to an i32 word. */
+static inline int64_t ref_keep_words(int64_t width, int64_t block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
+int ref_entry_store        (const RadArgs*, RadStream);
+int ref_window_store       (const RadArgs*, RadStream);
+#ifdef REF_HAVE_GGML
+int ref_gemm_nt_ggml       (const RadArgs*, RadStream);
+int ref_moe_gemm_ggml      (const RadArgs*, RadStream);
+int ref_moe_gemm_mxil      (const RadArgs*, RadStream);   /* libr4d lever WIL's op over its tile-interleaved form */
+int ref_logits_gemm_ggml   (const RadArgs*, RadStream);
+int ref_embed_lookup_ggml  (const RadArgs*, RadStream);
+#endif
+int ref_token_map          (const RadArgs*, RadStream);
+int ref_embed_lookup_planes(const RadArgs*, RadStream);
+int ref_stream_gate_add    (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
 int ref_ln_mod(const RadArgs*, RadStream);
@@ -317,6 +349,9 @@ int ref_gdn_gated_rmsnorm  (const RadArgs*, RadStream);
 int     ref_all_reduce     (const RadArgs*, RadStream);
 int     ref_all_gather     (const RadArgs*, RadStream);
 int64_t ref_all_reduce_scratch(const RadArgs*);
+int     ref_reduce_scatter_rows(const RadArgs*, RadStream);   /* tp8 loop P20 */
+int     ref_all_gather_rows    (const RadArgs*, RadStream);   /* tp8 loop P20 */
+int64_t ref_reduce_scatter_rows_scratch(const RadArgs*);
 int     ref_collective_init(const RadParam*, int, int, int, void**);
 void    ref_collective_fini(void*);
 
@@ -351,6 +386,8 @@ int ref_sample_logprobs    (const RadArgs*, RadStream);
     int fn##_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 
 REF_SHAPE_FN(ref_rmsnorm);
+REF_SHAPE_FN(ref_stage_send);
+REF_SHAPE_FN(ref_stage_recv);
 REF_SHAPE_FN(ref_rmsnorm_p);
 REF_SHAPE_FN(ref_rmsnorm_add);
 REF_SHAPE_FN(ref_hc_enter);
@@ -359,6 +396,8 @@ REF_SHAPE_FN(ref_mhc_pre_partial);
 REF_SHAPE_FN(ref_mhc_pre_finish);
 REF_SHAPE_FN(ref_mhc_post);
 REF_SHAPE_FN(ref_mhc_contract);
+REF_SHAPE_FN(ref_mhc_mix);
+REF_SHAPE_FN(ref_mhc_collapse);
 REF_SHAPE_FN(ref_kda_update);
 REF_SHAPE_FN(ref_ssd_update);
 REF_SHAPE_FN(ref_hc_read);
@@ -378,6 +417,7 @@ REF_SHAPE_FN(ref_mul);
 REF_SHAPE_FN(ref_silu_mul);
 REF_SHAPE_FN(ref_swiglu_clamped);
 REF_SHAPE_FN(ref_router_sigmoid_topk);
+REF_SHAPE_FN(ref_router_scored_topk);
 REF_SHAPE_FN(ref_router_sigmoid_group_topk);
 REF_SHAPE_FN(ref_swiglu_step);
 REF_SHAPE_FN(ref_dsa_pool);
@@ -424,6 +464,7 @@ REF_SHAPE_FN(ref_quant_act_i8);
 REF_SHAPE_FN(ref_quant_act_i8g);
 REF_SHAPE_FN(ref_had_quant_act_i8);
 REF_SHAPE_FN(ref_quant_act_fp8);
+REF_SHAPE_FN(ref_quant_act_fp8_ue8m0);
 REF_SHAPE_FN(ref_quant_cols_fp8);
 REF_SHAPE_FN(ref_had_quant_act_fp8);
 REF_SHAPE_FN(ref_had_quant_act_i8g);
@@ -436,6 +477,8 @@ REF_SHAPE_FN(ref_dflash_select);
 REF_SHAPE_FN(ref_dflash_markov_greedy);
 REF_SHAPE_FN(ref_dflash_markov_greedy_f32);
 REF_SHAPE_FN(ref_dflash_tree);
+REF_SHAPE_FN(ref_dspark_conf);
+REF_SHAPE_FN(ref_dspark_alt);
 REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
 REF_SHAPE_FN(ref_gated_had_quant_i8);
@@ -472,6 +515,25 @@ REF_SHAPE_FN(ref_ministral_rope);
 REF_SHAPE_FN(ref_pixtral_rope);
 REF_SHAPE_FN(ref_pixtral_merge);
 REF_SHAPE_FN(ref_rope_table);
+REF_SHAPE_FN(ref_rope_rows);
+REF_SHAPE_FN(ref_quant_roundtrip);
+REF_SHAPE_FN(ref_softmax_pool);
+REF_SHAPE_FN(ref_attn_sparse_sink);
+REF_SHAPE_FN(ref_index_score);
+REF_SHAPE_FN(ref_index_candidates);
+REF_SHAPE_FN(ref_index_topk);
+REF_SHAPE_FN(ref_entry_store);
+REF_SHAPE_FN(ref_window_store);
+#ifdef REF_HAVE_GGML
+REF_SHAPE_FN(ref_gemm_nt_ggml);
+REF_SHAPE_FN(ref_moe_gemm_ggml);
+REF_SHAPE_FN(ref_moe_gemm_mxil);
+REF_SHAPE_FN(ref_logits_gemm_ggml);
+REF_SHAPE_FN(ref_embed_lookup_ggml);
+#endif
+REF_SHAPE_FN(ref_token_map);
+REF_SHAPE_FN(ref_embed_lookup_planes);
+REF_SHAPE_FN(ref_stream_gate_add);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);
 REF_SHAPE_FN(ref_ln_mod_quant_fp8);
@@ -585,6 +647,8 @@ REF_SHAPE_FN(ref_gdn_gated_rmsnorm);
 
 REF_SHAPE_FN(ref_all_reduce);
 REF_SHAPE_FN(ref_all_gather);
+REF_SHAPE_FN(ref_reduce_scatter_rows);
+REF_SHAPE_FN(ref_all_gather_rows);
 
 REF_SHAPE_FN(ref_sample_penalties);
 REF_SHAPE_FN(ref_sample_dry);

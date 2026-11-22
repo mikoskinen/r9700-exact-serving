@@ -91,6 +91,33 @@ struct ExpertPlane {
      * nothing. */
     int64_t flex_bytes = 0, flex_capacity = 0;
     bool    heat_enabled = false;  /* false = the plan is static and none of the above will move */
+    /* Every rank's own expert residency and traffic (everything above is rank 0's): units by tier, the trunk's
+     * (layers below the trunk's count) and a draft head's in VRAM apart, the heat engine's routed / resident
+     * selections and streamed bytes, and the trunk units in the drafter's lent slab (lever DL). Cumulative counters;
+     * readers take rates by subtracting two polls. */
+    struct Rank {
+        int     rank = 0;
+        int64_t vram_units = 0, pinned_units = 0, other_units = 0;
+        int64_t trunk_vram_units = 0, draft_vram_units = 0;
+        int64_t routed = 0, routed_resident = 0, stream_bytes = 0;
+        int64_t draft_lent_units = 0, flex_bytes = 0;
+        /* ds41-lf: routed experts by slot class (heat.h SlotClass: cold, trunk, kv, arena, dslab, dw, draft), hits
+         * by the slot they sat in and misses by the slot they last sat in; each lender's slots (KV, arena, drafter's
+         * slab, drafter's weights): covered / held now, fills (of them lever LF's and just-missed units') and drops
+         * by cause; whether lever LF is on. Cumulative counters except covered / held. */
+        static constexpr int kClasses = 7, kLenders = 4;
+        bool    slots = false;
+        int64_t slot_hit[kClasses] = {}, slot_miss[kClasses] = {};
+        int64_t lent_covered[kLenders] = {}, lent_held[kLenders] = {};
+        int64_t lent_fills[kLenders] = {}, lent_fills_lf[kLenders] = {}, lent_fills_hot[kLenders] = {};
+        int64_t lent_drop_victim[kLenders] = {}, lent_drop_reserve[kLenders] = {}, lent_drop_recall[kLenders] = {};
+        int     place_lf = 0;
+        /* ds41-swl: lever SWL on this rank's mover, its heat promotions into each lender's slots (cumulative), and
+         * lever L2's guard on its heat engine (x 100). */
+        int     place_swl = 0, heat_min_gain_x100 = 0, heat_hyst_x100 = 0;
+        int64_t lent_swaps[kLenders] = {};
+    };
+    std::vector<Rank> ranks;
 };
 
 /* Interconnect traffic by consumer.

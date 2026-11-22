@@ -71,6 +71,25 @@ static const Flag g_flags[] = {
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"
                                         "it, off exchanges through pinned host memory" },
+    { "--pp-nodes",           "N",      "1 (default): one machine. 2: one engine on two machines, a\n"
+                                        "pipeline of two --tp groups (tp8 S4): the leader keeps the\n"
+                                        "scheduler, embedding, head and the layers outside --pp-cut,\n"
+                                        "the follower the layers inside it" },
+    { "--pp-rank",            "K",      "this node in a two-node pipeline: 0 the leader (serves\n"
+                                        "HTTP), 1 the follower (serves only the leader)" },
+    { "--pp-peer",            "ADDR",   "HOST[:PORT], the other node of a two-node pipeline; the\n"
+                                        "follower listens on PORT (29517 unless given), the leader\n"
+                                        "connects to it" },
+    { "--pp-cut",             "CUT",    "H,T: the follower's layers [H, T) of a two-node pipeline\n"
+                                        "(T alone is 0,T); both nodes give the same cut" },
+    { "--pp-lanes",           "N",      "1-4: the step streams of a two-node pipeline (tp8 S5;\n"
+                                        "default 2). A sequence stays in one lane; each lane has one\n"
+                                        "step in flight, so both nodes work at once on different\n"
+                                        "lanes. 1 runs one step at a time (tp8 S4); both nodes give\n"
+                                        "the same value" },
+    { "--node-link",          "MODE",   "tcp (default) | verbs: how a two-node pipeline's crossings\n"
+                                        "travel; verbs is RDMA between pinned host rings\n"
+                                        "(RADIANCE_PP_DEV, RADIANCE_PP_GID pick the device and GID)" },
     { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
     { "--busy-prefill-chunk", "MODE",   "a prefill chunk's share of a step that has other work: auto\n"
                                         "(default) leaves decode rows and new requests their room,\n"
@@ -80,6 +99,9 @@ static const Flag g_flags[] = {
                                         "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
                                         "0 lets every step carry a chunk; served default auto:1\n"
                                         "(0 under --deterministic, KL mode, generators)" },
+    { "--long-prefill-token-threshold", "N", "cap a long prefill's chunk at N tokens when other\n"
+                                        "requests exist; adaptive floor budget/eligible; 0 (default) off" },
+    { "--prefill-room-gate",  "MODE",   "a fresh prefill starts only when its whole prompt plus one\n                                        decode position fits beside every runner (on, the default);\n                                        off admits the first chunk alone, as before the gate" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -199,9 +221,12 @@ static const Flag g_flags[] = {
     { "--spec-ngram",         "K",      "speculate by prompt lookup alone: up to K drafts a step\n"
     "                                    copied from what followed the latest earlier occurrence of\n"
     "                                    the sequence's last n tokens (no weights, no draft pass).\n"
-    "                                    Sets the window to K; a draft head the container carries is\n"
-    "                                    not loaded. A proposal is verified only when its record\n"
-    "                                    says it pays at the measured step cost. 0 (default) off" },
+    "                                    Sets the window to K (leave --num-speculative-tokens unset,\n"
+    "                                    or give K); a draft head the container carries is not\n"
+    "                                    declared, loaded or placed. A proposal is verified only when\n"
+    "                                    its record says it pays at the measured step cost (with\n"
+    "                                    --draft-window adaptive, each sequence's window follows its\n"
+    "                                    acceptance). 0 (default) off" },
     { "--spec-ngram-min",     "N",      "shortest pattern prompt lookup matches (default 2)" },
     { "--spec-ngram-max",     "N",      "longest pattern prompt lookup matches, tried first\n"
                                         "(default 4, at most 15)" },
@@ -348,7 +373,10 @@ static const Flag g_flags[] = {
     { "--debug-draft-oracle", "FILE",   "a verify-path test, not a drafter: with --spec-ngram, prompt\n"
     "                                    lookup proposes from the token ids in FILE (a plain greedy\n"
     "                                    run's continuation of the one prompt the test sends), 30% of\n"
-    "                                    the drafts corrupted; the text must stay the plain run's" },
+    "                                    the drafts corrupted; the text must stay the plain run's.\n"
+    "                                    Also beside a draft head (--num-speculative-tokens N): the\n"
+    "                                    ids replace each head proposal at the head's own count, and\n"
+    "                                    no step is issued ahead of its commit (not a speed)" },
     { "--debug-accept-reference-kernels", nullptr,
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
@@ -566,6 +594,48 @@ int config_parse(int argc, char** argv, Config* c) {
             else { RAD_ERR("--p2p takes auto, on or off, not '%s'", v); return RAD_E_INVAL; }
         }
         else if (S("--tp-wire-min-kb"))        { if (!num(0, INT64_MAX, &c->tp_wire_min_kb)) return RAD_E_INVAL; }
+        else if (S("--pp-nodes"))              { if (!num(1, 2, &c->pp_nodes)) return RAD_E_INVAL; }
+        else if (S("--pp-rank"))               { if (!num(0, 1, &c->pp_rank)) return RAD_E_INVAL; }
+        else if (S("--pp-peer")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            std::string h = v;
+            int port = c->pp_port;
+            /* HOST:PORT, [V6]:PORT, or a bare host (an IPv6 literal without brackets has no port). */
+            const size_t rb = h.rfind(']');
+            const size_t col = h.rfind(':');
+            const bool has_port = col != std::string::npos &&
+                                  (rb != std::string::npos ? col > rb : h.find(':') == col);
+            if (has_port) {
+                int64_t pn = 0;
+                if (!parse_int(a.c_str(), h.c_str() + col + 1, 1, 65535, &pn)) return RAD_E_INVAL;
+                port = (int)pn;
+                h = h.substr(0, col);
+            }
+            if (h.size() > 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
+            if (h.empty()) { RAD_ERR("--pp-peer takes HOST[:PORT], not '%s'", v); return RAD_E_INVAL; }
+            c->pp_peer = h;
+            c->pp_port = port;
+        }
+        else if (S("--pp-cut")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int h = 0, t = 0, used = 0;
+            if (std::sscanf(v, "%d,%d%n", &h, &t, &used) == 2 && v[used] == '\0') {
+            } else if (h = 0, used = 0, std::sscanf(v, "%d%n", &t, &used) == 1 && v[used] == '\0') {
+            } else {
+                RAD_ERR("--pp-cut takes H,T or T (0 <= H < T), not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            if (h < 0 || t <= h) { RAD_ERR("--pp-cut takes H,T with 0 <= H < T, not '%s'", v); return RAD_E_INVAL; }
+            c->pp_cut_h = h;
+            c->pp_cut_t = t;
+        }
+        else if (S("--pp-lanes"))              { if (!num(1, 4 /* RAD_PP_MAX_LANES */, &c->pp_lanes)) return RAD_E_INVAL; }
+        else if (S("--node-link")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "tcp"))   c->node_link = 0;
+            else if (!std::strcmp(v, "verbs")) c->node_link = 1;
+            else { RAD_ERR("--node-link takes tcp or verbs, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--max-num-batched-tokens")){ if (!num(1, INT64_MAX, &c->max_tok)) return RAD_E_INVAL; }
         else if (S("--busy-prefill-chunk")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -573,6 +643,7 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "off"))  c->busy_prefill_chunk = 0;
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
+        else if (S("--long-prefill-token-threshold")) { if (!num(0, INT64_MAX, &c->long_prefill_token_threshold)) return RAD_E_INVAL; }
         else if (S("--prefill-interleave"))    {
             if (!(v = need(i))) return RAD_E_INVAL;
             c->prefill_interleave_set = true;
@@ -588,6 +659,12 @@ int config_parse(int argc, char** argv, Config* c) {
                 c->prefill_interleave = -1; c->prefill_interleave_share = sh;
             }
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
+        }
+        else if (S("--prefill-room-gate")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
+            else if (!std::strcmp(v, "off"))  c->prefill_room_gate = false;
+            else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
         }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
@@ -1358,6 +1435,21 @@ const ShowRow kShow[] = {
     { "--tp-wire-min-kb",     [](const Config& c) { return num(c.tp_wire_min_kb); } },
     { "--p2p",                [](const Config& c) {
           return std::string(c.p2p == RAD_P2P_ON ? "on" : c.p2p == RAD_P2P_OFF ? "off" : "auto"); } },
+    { "--pp-nodes",           [](const Config& c) {
+          return c.pp_nodes == 2 ? std::string("2 (a two-node pipeline)") : std::string("1 (one machine)"); } },
+    { "--pp-rank",            [](const Config& c) {
+          return c.pp_nodes == 2 ? std::string(c.pp_rank == 0 ? "0 (the leader)" : "1 (the follower)")
+                                 : std::string("n/a"); } },
+    { "--pp-peer",            [](const Config& c) {
+          return c.pp_peer.empty() ? std::string("none") : c.pp_peer + ":" + std::to_string(c.pp_port); } },
+    { "--pp-cut",             [](const Config& c) {
+          return c.pp_cut_t > 0 ? fmt("%d,%d (the follower's layers [%d, %d))", c.pp_cut_h, c.pp_cut_t,
+                                      c.pp_cut_h, c.pp_cut_t)
+                                : std::string("none"); } },
+    { "--pp-lanes",           [](const Config& c) {
+          /* the lanes in force, not how they were given: the rendezvous compares this row */
+          return c.pp_nodes == 2 ? fmt("%d", c.pp_lanes_now()) : std::string("n/a"); } },
+    { "--node-link",          [](const Config& c) { return std::string(c.node_link ? "verbs" : "tcp"); } },
     { "--max-num-batched-tokens", [](const Config& c) { return num(c.max_tok); } },
     { "--busy-prefill-chunk", [](const Config& c) {
           return c.busy_prefill_chunk < 0 ? std::string("auto")
@@ -1367,6 +1459,11 @@ const ShowRow kShow[] = {
                : c.prefill_interleave < 0 ? "auto:" + std::to_string(c.prefill_interleave_share)
                                           : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
+    { "--long-prefill-token-threshold", [](const Config& c) {
+          return c.long_prefill_token_threshold > 0 ? num(c.long_prefill_token_threshold)
+                                                    : std::string("0 (off)"); } },
+    { "--prefill-room-gate", [](const Config& c) {
+          return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },

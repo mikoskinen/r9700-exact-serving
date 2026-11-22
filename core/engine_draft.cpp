@@ -10,6 +10,8 @@
 #include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
+#include "sched/draft_conf.h"
+#include "runtime/fn4_switch.h"
 #include "device/device.h"
 
 #include <algorithm>
@@ -31,7 +33,7 @@ int Engine::step_state_init() {
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
     /* Scheduler::ends_every_request reads the same ids. */
-    sched_.set_eog(eog);
+    lsched().set_eog(eog);
     const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
     const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
     for (auto& rk : ranks_) {
@@ -59,6 +61,14 @@ int Engine::step_state_init() {
      * pinned staging beside them. A program without them is refused rather than served
      * uncoupled. */
     mtp_couple_ = cfg_.draft_coupling;
+    /* tp8 S4: a two-node pipeline's follower drafts nothing -- the drafter, its walk and the
+     * coupled verify are the leader's, which serves with the same --draft-coupling (the rendezvous
+     * compares it). Without this the follower, which declares no head, refused its start here (the
+     * S3 hardware run's arm B hit the same line, 17.11.). */
+    if (mtp_couple_ && pp_follower()) {
+        RAD_INFO("--draft-coupling on: a pipeline follower declares no drafter; the coupling is the leader's");
+        mtp_couple_ = false;
+    }
     if (mtp_couple_) {
         /* Coupling is defined on a linear chain of drafts: a serial head's rounds, or a block
          * drafter whose walk samples each position in turn (DFlash2, dflash_couple_propose), its
@@ -73,16 +83,25 @@ int Engine::step_state_init() {
             return RAD_E_UNSUPPORTED;
         }
         const Program& prog = ranks_[0]->program;
-        for (size_t i = 0; i < prog.buffers.size(); ++i) {
-            const std::string& name = prog.buffers[i].name;
-            auto ends = [&](const char* suffix) {
-                const size_t n = std::strlen(suffix);
-                return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
-            };
-            if (ends("mtp_couple_draws")) couple_draws_buf_ = (rad_buf)i;
-            if (ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+        /* By name in each rank's own program: handles index the program that declared them
+         * (advance_all), and the draws are staged on every rank. */
+        couple_draws_rank_.assign(ranks_.size(), 0);
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            const Program& pr = ranks_[r]->program;
+            for (size_t i = 0; i < pr.buffers.size(); ++i) {
+                const std::string& name = pr.buffers[i].name;
+                auto ends = [&](const char* suffix) {
+                    const size_t n = std::strlen(suffix);
+                    return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+                };
+                if (ends("mtp_couple_draws")) couple_draws_rank_[r] = (rad_buf)i;
+                if (r == 0 && ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+            }
         }
-        if (!couple_draws_buf_ || !couple_state_buf_) {
+        couple_draws_buf_ = couple_draws_rank_[0];
+        bool all_draws = true;
+        for (rad_buf h : couple_draws_rank_) all_draws = all_draws && h;
+        if (!all_draws || !couple_state_buf_) {
             RAD_ERR("--draft-coupling on, but the architecture declared no coupled MTP planes; "
                     "this model's drafter cannot couple");
             return RAD_E_STATE;
@@ -103,6 +122,27 @@ int Engine::step_state_init() {
             (int64_t)drafter_.depth * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
             RAD_MEM_HOST_PINNED));
         if (!couple_draw_stage_ || !couple_readback_) return RAD_E_NOMEM;
+        /* Lever SD: the q_temp column, where the drafter declares one (every rank or none). */
+        couple_qt_rank_.assign(ranks_.size(), 0);
+        bool any_qt = false, all_qt = true;
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            const Program& pr = ranks_[r]->program;
+            for (size_t i = 0; i < pr.buffers.size(); ++i) {
+                const std::string& name = pr.buffers[i].name;
+                static const char kQt[] = "mtp_couple_qtemp";
+                const size_t nq = sizeof kQt - 1;
+                if (name.size() >= nq && name.compare(name.size() - nq, nq, kQt) == 0) couple_qt_rank_[r] = (rad_buf)i;
+            }
+            any_qt = any_qt || couple_qt_rank_[r];
+            all_qt = all_qt && couple_qt_rank_[r];
+        }
+        if (any_qt && !all_qt) {
+            RAD_ERR("--draft-coupling: 'mtp_couple_qtemp' is declared on some ranks only");
+            return RAD_E_STATE;
+        }
+        if (!any_qt) couple_qt_rank_.clear();
+        couple_qt_stage_ = static_cast<float*>(rad_dev_alloc(n_slot * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+        if (!couple_qt_stage_) return RAD_E_NOMEM;
         if (drafter_.kind == RAD_DRAFT_BLOCK)
             RAD_INFO("DFlash coupled LIVE: %d position(s), x~Q along the candidate walk, maximal "
                      "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
@@ -110,6 +150,43 @@ int Engine::step_state_init() {
             RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, "
                      "maximal coupling at the verify; fixed-seed tokens are NOT preserved",
                      drafter_.depth);
+    }
+
+    /* Lever SD: fn4 draft_sample, whose 1 .. 200 need the coupling above; RADIANCE_DRAFT_SAMPLE at start (unset: 0,
+     * today's rule -- nothing is staged, read back or bound, and no verify carries a coupled row). */
+    {
+        const char* e = std::getenv("RADIANCE_DRAFT_SAMPLE");
+        const int v0 = e && *e ? std::atoi(e) : 0;
+        fn4::sample_register(mtp_couple_, v0);
+        if (mtp_couple_)
+            RAD_INFO("lever SD: fn4 draft_sample %d at start (0 greedy drafts + the agreement rule, 1 sampled drafts + "
+                     "the maximal coupling at the request's temperature, 2..200 at temperature x v/100; POST /admin/fn4)%s",
+                     fn4::get(fn4::kDraftSample), couple_qt_rank_.empty() ? "; this drafter declares no q_temp column"
+                                                                          : "");
+        else if (v0 != 0)
+            RAD_WARN("RADIANCE_DRAFT_SAMPLE=%s ignored: --draft-coupling is off (draft_sample stays 0)", e);
+    }
+
+    /* ds41-acc: the confidence plane and the alternative branches, pinned beside the slots. Both
+     * switches start off unless RADIANCE_FN4_DSPARK_CONF / RADIANCE_FN4_DSPARK_ALT say otherwise. */
+    if (conf_buf_ || alt_buf_ || conf_dbg_) {
+        if (conf_buf_ || conf_dbg_)
+            conf_host_ = static_cast<float*>(rad_dev_alloc(n_slot * conf_pitch_ * 4, RAD_MEM_HOST_PINNED));
+        if (alt_buf_)
+            alt_host_ = static_cast<int32_t*>(rad_dev_alloc(n_slot * n_alt_ * alt_pitch_ * 4, RAD_MEM_HOST_PINNED));
+        if (((conf_buf_ || conf_dbg_) && !conf_host_) || (alt_buf_ && !alt_host_)) return RAD_E_NOMEM;
+        RAD_TRY(rad_event_create_as(&conf_ev_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+        auto env = [](const char* k) { const char* v = std::getenv(k); return v && *v ? std::atoi(v) : 0; };
+        const int c0 = env("RADIANCE_FN4_DSPARK_CONF"), a0 = env("RADIANCE_FN4_DSPARK_ALT");
+        fn4::dspark_register(conf_buf_ != 0 || conf_dbg_, alt_buf_ != 0, c0, a0);
+        RAD_INFO("drafter '%s': %s%s%s; switches dspark_conf %d, dspark_alt %d (POST /admin/fn4)", drafter_.name,
+                 conf_buf_ || conf_dbg_ ? "a confidence plane (the dspark_conf gate verifies the longest confident prefix)" : "",
+                 (conf_buf_ || conf_dbg_) && alt_buf_ ? ", " : "",
+                 alt_buf_ ? fmt("%lld alternative branch(es) of %lld (the dspark_alt shadow tree, measured only)",
+                                (long long)n_alt_, (long long)alt_pitch_).c_str() : "",
+                 fn4::get(fn4::kDsparkConf), fn4::get(fn4::kDsparkAlt));
+    } else {
+        fn4::dspark_register(false, false, 0, 0);
     }
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
@@ -135,6 +212,353 @@ void Engine::step_state_fini() {
     step_end_ = nullptr;
     if (tok_end_) rad_event_destroy(tok_end_);
     tok_end_ = nullptr;
+    if (conf_host_) rad_dev_free(conf_host_, RAD_MEM_HOST_PINNED);
+    if (alt_host_) rad_dev_free(alt_host_, RAD_MEM_HOST_PINNED);
+    conf_host_ = nullptr;
+    alt_host_ = nullptr;
+    if (conf_ev_) rad_event_destroy(conf_ev_);
+    conf_ev_ = nullptr;
+    ctxskip_fini();
+}
+
+/* ------------------------------------------------------------------ the depth-0 context skip
+ *
+ * Under depth 0 (sched/draft.h) a block drafter's head runs only at probes, yet its context pass ran
+ * on every step: it stores each trunk row's key in the drafter's window cache, which a hole would
+ * leave unusable for the next window. With fn4 draft_ctxskip (RADIANCE_DRAFT_CTXSKIP=0 | 1 at start
+ * sets it up) a plain decode step -- every row one decode token -- whose head does not run keeps the
+ * trunk's tapped rows instead: one copy of the step's rows a rank into a ring of kCtxSlots step
+ * slots on the card (Scheduler::ctx_keep records which slot and row each sequence's position is in).
+ * The keys are then computed by refill passes: context passes (draft_pass -1, the same ops) over
+ * the kept rows of each sequence's last `window` positions, staged back into the tapped rows buffer
+ * from the ring, one entry a sequence at its first kept position, as a prompt's context pass runs
+ * (Scheduler::ctx_refill). A refill runs before the head next runs, on any step that cannot skip
+ * (rows of more than one token, a prefill, a verify), when the ring is full, before a checkpoint
+ * carrying the drafter's window (drafter_snap_), and once the switch is back at 0. Kept rows of a
+ * sequence that ends or is preempted are dropped with its drafter state.
+ *
+ * Where the head runs, the step's own rows still get today's context pass, last: they are stashed
+ * (slot kCtxSlots), the refill stages over them, they come back, and the context pass runs over them
+ * in the trunk's row order, which a drafter reading its context pass's rows at the anchors
+ * (RadBatch::anchor_rows, LiLiCorr) needs. On a step that cannot skip, the context pass runs first
+ * and the refill after it.
+ *
+ * Exact for the target: the drafter only proposes, and every emitted token is the target's (the
+ * verify, core/sample/accept.h). The drafter's keys are the same function of the same rows; their
+ * bytes equal a per-step pass's where the context pass's kernels give each row the same bytes at
+ * any row count (a GEMM's decode band, r4d_ds41_ggml.hip; above it a tiled form may round
+ * differently, which moves proposals only). The context pass and the refill read no routed expert,
+ * so the drafter's lend (lever DL), which lends only its expert slab, leaves them as they are.
+ *
+ * The tapped rows buffer is the plugin's "dspark_src" (deepseek41's DSpark) or "dflash_src" (the DFlash
+ * drafters): [max_tok, taps x n_embd], row i the trunk step's row i, written by taps inside the trunk
+ * step and read only by the context pass. A program without one, or a drafter without a window, sets
+ * nothing up. */
+namespace {
+constexpr int kCtxSlots = 32;   /* step slots between refills; slot kCtxSlots is the stash */
+/* Lever Z0-A: RADIANCE_DRAFT_CTXSKIP_SLOTS (2 .. 1024; unset kCtxSlots) sizes the ring (at most the drafter's window);
+ * the rows kept before a refill stay kCtxSlots unless fn4 arena_d0 is 1 (Engine::ctx_limit). */
+int ctx_slots_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DRAFT_CTXSKIP_SLOTS");
+        if (!e || !*e) return kCtxSlots;
+        const int n = std::atoi(e);
+        if (n < 2 || n > 1024) {
+            RAD_WARN("RADIANCE_DRAFT_CTXSKIP_SLOTS=%s is not 2 .. 1024; %d", e, kCtxSlots);
+            return kCtxSlots;
+        }
+        return n;
+    }();
+    return v;
+}
+/* RADIANCE_DRAFT_CTXSKIP: -1 unset (or not 0 / 1, warned), else the start value. */
+int ctxskip_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DRAFT_CTXSKIP");
+        if (!e || !*e) return -1;
+        if (!std::strcmp(e, "0")) return 0;
+        if (!std::strcmp(e, "1")) return 1;
+        RAD_WARN("RADIANCE_DRAFT_CTXSKIP=%s is not 0 or 1; ignored (the context skip is not set up)", e);
+        return -1;
+    }();
+    return v;
+}
+/* tp8 dev D4: RADIANCE_PP_CTXSKIP_LANES=1 -- the skip under lanes, the ring one region a lane (a leader with lanes only) */
+bool ctxskip_lanes_env() {
+    static const bool v = [] {
+        const char* e = std::getenv("RADIANCE_PP_CTXSKIP_LANES");
+        return e && !std::strcmp(e, "1");
+    }();
+    return v;
+}
+int ctxskip_lanes(const Config& c) {
+    return ctxskip_lanes_env() && c.pp_nodes == 2 && c.pp_rank == 0 && c.pp_lanes_now() > 1 ? c.pp_lanes_now() : 1;
+}
+int64_t ctxskip_lane_rows(const Config& c) {
+    const int64_t seqs = c.max_seqs > 0 ? c.max_seqs : 1;
+    const int n = ctxskip_lanes(c);
+    /* tp8 dev M8: with BG lanes (RADIANCE_PP_BG_LANE=k) the other lanes hold the cards, so a region is their share */
+    const int nd = n > 1 && LaneSet::bg_env() > 0 && LaneSet::bg_env() < n ? n - LaneSet::bg_env() : n;
+    return n > 1 ? (seqs + nd - 1) / nd : seqs;
+}
+int64_t ctxskip_ring_rows(const Config& c) { return ctxskip_lanes(c) * ctxskip_lane_rows(c); }
+int64_t dtype_bytes(int32_t dt) {
+    switch (dt) {
+        case RAD_BF16: case RAD_F16: return 2;
+        case RAD_F32: case RAD_I32: return 4;
+        default: return 0;
+    }
+}
+}  /* namespace */
+
+int64_t Engine::ctxskip_bytes(const Program& p, rad_buf* src, int64_t* pitch, int* slots) const {
+    if (src) *src = 0;
+    if (ctxskip_env() < 0 || cfg_.n_spec <= 0 || p.drafter.kind != RAD_DRAFT_BLOCK || p.drafter.depth <= 0 ||
+        p.drafter.window <= 0)
+        return 0;
+    const auto ends = [](const std::string& name, const char* suffix) {
+        const size_t n = std::strlen(suffix);
+        return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    for (size_t i = 1; i < p.buffers.size(); ++i) {
+        const BufferInfo& b = p.buffers[i];
+        if (!ends(b.name, "dspark_src") && !ends(b.name, "dflash_src")) continue;
+        const int64_t eb = dtype_bytes(b.decl.dtype);
+        if (b.decl.rank != 2 || eb <= 0 || b.decl.shape[1] <= 0) return 0;
+        const int64_t pb = b.decl.shape[1] * eb;
+        const int sl = std::min<int>(ctx_slots_env(), (int)p.drafter.window);
+        if (src) *src = (rad_buf)i;
+        if (pitch) *pitch = pb;
+        if (slots) *slots = sl;
+        return (int64_t)(sl + 1) * ctxskip_ring_rows(cfg_) * pb;
+    }
+    return 0;
+}
+
+int Engine::ctxskip_setup() {
+    ctxskip_fini();
+    const int ev = ctxskip_env();
+    if (ev < 0) return RAD_OK;
+    ctxs_.declared = true;
+    ctxs_.start = ev;
+    ctxs_.src.assign(ranks_.size(), 0);
+    ctxs_.ring.assign(ranks_.size(), nullptr);
+    int taps = 0;
+    bool same = true;
+    if (block_drafting() && drafter_.window > 0)
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            rad_buf b = 0;
+            int64_t pb = 0;
+            int sl = 0;
+            if (ctxskip_bytes(ranks_[r]->program, &b, &pb, &sl) <= 0 || !b) continue;
+            if (taps && (pb != ctxs_.pitch || sl != ctxs_.slots)) same = false;
+            ctxs_.src[r] = b;
+            ctxs_.pitch = pb;
+            ctxs_.slots = sl;
+            ++taps;
+        }
+    if (!taps || !same) {
+        RAD_INFO("RADIANCE_DRAFT_CTXSKIP=%d: %s; the context skip is not set up", ev,
+                 !block_drafting() || drafter_.window <= 0
+                     ? "no windowed block drafter drafting here (--num-speculative-tokens N with a DSpark-style head)"
+                     : !taps ? "no rank taps rows for the drafter in a buffer the engine knows ('dspark_src', "
+                                       "'dflash_src')"
+                             : "the ranks' tapped rows differ in shape");
+        ctxs_ = CtxSkip{};
+        fn4::ctxskip_register(false);
+        return RAD_OK;
+    }
+    const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+    ctxs_.lanes = ctxskip_lanes(cfg_);
+    ctxs_.lane_rows = ctxskip_lane_rows(cfg_);
+    ctxs_.ring_rows = ctxskip_ring_rows(cfg_);
+    ctxs_.used_l.assign((size_t)ctxs_.lanes, 0);
+    ctxs_.ring_bytes = (int64_t)(ctxs_.slots + 1) * ctxs_.ring_rows * ctxs_.pitch;
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        if (!ctxs_.src[r]) continue;
+        RAD_TRY(rad_dev_set(ranks_[r]->device));
+        ctxs_.ring[r] = static_cast<char*>(rad_dev_alloc(ctxs_.ring_bytes, RAD_MEM_DEVICE));
+        if (!ctxs_.ring[r]) {
+            RAD_ERR("draft context skip: no device memory for the %s ring on card %d",
+                    humanb(ctxs_.ring_bytes).c_str(), ranks_[r]->device);
+            (void)rad_dev_set(ranks_[0]->device);
+            return RAD_E_NOMEM;
+        }
+    }
+    (void)rad_dev_set(ranks_[0]->device);
+    ctxs_.ready = true;
+    ctxs_.on = ev;
+    fn4::ctxskip_register(true);
+    fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.on);
+    RAD_INFO("draft context skip (RADIANCE_DRAFT_CTXSKIP=%d, fn4 draft_ctxskip): while the head does not run, a "
+             "plain decode step keeps its tapped rows instead of the drafter's context pass, in a ring of %d steps "
+             "(+1 stash) x %lld rows x %s = %s a rank on %d of %zu ranks; the drafter's window (%d positions) is "
+             "refilled from them before the head runs", ev, ctxs_.slots, (long long)seqs,
+             humanb(ctxs_.pitch).c_str(), humanb(ctxs_.ring_bytes).c_str(), taps, ranks_.size(),
+             (int)drafter_.window);
+    if (ctxs_.lanes > 1)
+        RAD_INFO("draft context skip under %d lanes (RADIANCE_PP_CTXSKIP_LANES=1, tp8 dev D4): the ring is one region of %lld "
+                 "rows a lane in every step slot, each lane keeping and refilling its own steps", ctxs_.lanes,
+                 (long long)ctxs_.lane_rows);
+    ctx_note();
+    return RAD_OK;
+}
+
+/* tp8 dev D4: the current lane's slot count and region (lane 0's = the whole ring without the lanes' regions) */
+int& Engine::ctx_used() {
+    if (ctxs_.lanes <= 1) return ctxs_.used;
+    const int l = lsched().lane();
+    return ctxs_.used_l[(size_t)(l >= 0 && l < ctxs_.lanes ? l : 0)];
+}
+int64_t Engine::ctx_row0() const {
+    if (ctxs_.lanes <= 1) return 0;
+    const int l = lsched().lane();
+    return (int64_t)(l >= 0 && l < ctxs_.lanes ? l : 0) * ctxs_.lane_rows;
+}
+
+void Engine::ctxskip_fini() {
+    for (size_t r = 0; r < ctxs_.ring.size(); ++r)
+        if (ctxs_.ring[r]) {
+            if (r < ranks_.size()) (void)rad_dev_set(ranks_[r]->device);
+            rad_dev_free(ctxs_.ring[r], RAD_MEM_DEVICE);
+        }
+    if (!ranks_.empty() && !ctxs_.ring.empty()) (void)rad_dev_set(ranks_[0]->device);
+    ctxs_ = CtxSkip{};
+}
+
+void Engine::ctx_note() const {
+    if (!ctxs_.ready) return;
+    fn4::note_ctxskip(ctxs_.skipped, ctxs_.refills, ctxs_.refill_rows, ctxs_.dropped, ctxs_.ring_full,
+                      lsched().ctx_pending(), ctxs_.slots, ctxs_.ring_bytes >> 20);
+}
+
+/* Lever Z0-A: the step slots kept before a refill -- today's kCtxSlots (or fewer: the ring), the whole ring under fn4
+ * arena_d0 1, so a depth-0 step refills only at a probe, a prefill or the ring's end and keeps the small arena rung. */
+int Engine::ctx_limit() const {
+    return arena_d0_.load(std::memory_order_relaxed) == 1 ? ctxs_.slots : std::min(ctxs_.slots, kCtxSlots);
+}
+
+/* Lever Z0-A: whether block_context_pass will refill in the step about to be released (the ring at its limit, or a
+ * checkpoint carrying the drafter's window); such a step needs the rung the refill passes are cut to. */
+bool Engine::ctx_refill_due() {
+    if (!ctxs_.ready || !ctxs_.on || lsched().ctx_pending() == 0) return false;
+    if (ctx_used() >= ctx_limit()) return true;
+    if (drafter_snap_)
+        for (const StepEntry& e : lsched().plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) return true;
+    return false;
+}
+
+/* The step's first `rows` tapped rows into ring slot `slot` (to_ring), or back. Every rank that taps,
+ * on its stream: behind the trunk step that wrote them, ahead of the next pass that reads them. */
+int Engine::ctx_copy_rows(int slot, int64_t rows, bool to_ring) {
+    if (rows <= 0) return RAD_OK;
+    /* tp8 dev D4: a lane's rows go to its region (ring_rows = max_seqs and row 0 without the lanes' regions) */
+    const int64_t seqs = ctxs_.ring_rows, row0 = ctx_row0(), cap = ctxs_.lanes > 1 ? ctxs_.lane_rows : seqs;
+    if (slot < 0 || slot > ctxs_.slots || rows > cap) return RAD_E_STATE;
+    const int64_t bytes = rows * ctxs_.pitch;
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        if (!ctxs_.src[r]) continue;
+        Rank& rk = *ranks_[r];
+        char* sp = static_cast<char*>(rk.ctx.buf_ptr(ctxs_.src[r]));
+        char* rp = ctxs_.ring[r] + ((int64_t)slot * seqs + row0) * ctxs_.pitch;
+        if (!sp || !rp) return RAD_E_STATE;
+        RAD_TRY(to_ring ? rad_memcpy_async(rp, sp, bytes, rk.ctx.stream())
+                        : rad_memcpy_async(sp, rp, bytes, rk.ctx.stream()));
+    }
+    return RAD_OK;
+}
+
+/* Refill passes until no kept row is left, each at most the active arena level's rows. */
+int Engine::ctx_refill_all(int step) {
+    /* tp8 dev D4: a lane refills from its region */
+    const int64_t seqs = ctxs_.ring_rows, row0 = ctx_row0(), rcap = ctxs_.lanes > 1 ? ctxs_.lane_rows : seqs;
+    int64_t cap = cfg_.max_tok;
+    if (!ranks_.empty()) {
+        const int lvl = ranks_[0]->ctx.level();
+        if (lvl >= 0 && (size_t)lvl < arena_rows_.size() && arena_rows_[(size_t)lvl] > 0)
+            cap = std::min<int64_t>(cap, arena_rows_[(size_t)lvl]);
+    }
+    if (cap <= 0) return RAD_E_STATE;
+    for (;;) {
+        int64_t nr = 0, nd = 0;
+        const RadBatch* rb = lsched().ctx_refill(step, cap, (int64_t)drafter_.window, &ctxs_.runs, &nr, &nd);
+        ctxs_.dropped += nd;
+        if (!rb) break;
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            if (!ctxs_.src[r]) continue;
+            Rank& rk = *ranks_[r];
+            char* sp = static_cast<char*>(rk.ctx.buf_ptr(ctxs_.src[r]));
+            if (!sp) return RAD_E_STATE;
+            for (const Scheduler::CtxRun& u : ctxs_.runs) {
+                if (u.slot < 0 || u.slot + u.n > ctxs_.slots || u.row < 0 || u.row >= rcap || u.dst < 0 ||
+                    u.dst + u.n > nr)
+                    return RAD_E_STATE;
+                const char* from = ctxs_.ring[r] + ((int64_t)u.slot * seqs + row0 + u.row) * ctxs_.pitch;
+                RAD_TRY(rad_memcpy_2d_async(sp + (int64_t)u.dst * ctxs_.pitch, ctxs_.pitch, from,
+                                            seqs * ctxs_.pitch, ctxs_.pitch, u.n, rk.ctx.stream()));
+            }
+        }
+        RAD_TRY(block_pass(rb, "refill", step));
+        ++ctxs_.refills;
+        ctxs_.refill_rows += nr;
+    }
+    ctx_used() = 0;
+    return RAD_OK;
+}
+
+/* issue_block_drafter's context pass: today's where the skip is not set up; under it a kept step, or
+ * a refill around the context pass (the top of this section). */
+int Engine::block_context_pass(int step) {
+    const auto ctx_pass = [&]() -> int {
+        if (const RadBatch* cb = lsched().block_context(step)) {
+            if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
+            RAD_TRY(block_pass(cb, "context", step));
+        }
+        return RAD_OK;
+    };
+    if (!ctxs_.ready) return ctx_pass();
+    const bool head = lsched().block_head_runs();
+    bool snap = false;
+    if (drafter_snap_)
+        for (const StepEntry& e : lsched().plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { snap = true; break; }
+    int64_t rows = 0, live = 0;
+    /* tp8 dev D4: a lane's step keeps at most its region's rows */
+    const int64_t kcap = ctxs_.lanes > 1 ? ctxs_.lane_rows : (cfg_.max_seqs > 0 ? cfg_.max_seqs : 1);
+    const bool keepable = lsched().ctx_keepable(&rows, &live) && rows <= kcap;
+    int& used = ctx_used();
+    if (ctxs_.on && !head && !snap && keepable) {
+        if (live == 0) {   /* every row a finished sequence's placeholder: the pass would store nothing */
+            ++ctxs_.skipped;
+            ctx_note();
+            return RAD_OK;
+        }
+        if (used < ctx_limit()) {
+            RAD_TRY(ctx_copy_rows(used, rows, true));
+            (void)lsched().ctx_keep(used);
+            ++used;
+            ++ctxs_.skipped;
+            ctx_note();
+            return RAD_OK;
+        }
+        ++ctxs_.ring_full;   /* refilled below; this step's rows get their context pass */
+    }
+    if (lsched().ctx_pending() == 0) {
+        used = 0;
+        return ctx_pass();
+    }
+    if (head && keepable) {
+        RAD_TRY(ctx_copy_rows(ctxs_.slots, rows, true));    /* the stash */
+        RAD_TRY(ctx_refill_all(step));
+        RAD_TRY(ctx_copy_rows(ctxs_.slots, rows, false));
+        RAD_TRY(ctx_pass());
+    } else {
+        RAD_TRY(ctx_pass());
+        RAD_TRY(ctx_refill_all(step));
+    }
+    ctx_note();
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ the serial driver
@@ -163,7 +587,7 @@ bool Engine::serial_drafting() const {
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
-        AdvanceArgs a = sched_.advance_args((int)i);
+        AdvanceArgs a = lsched().advance_args((int)i);
         if (rows >= 0 && rows < a.n_seq) a.n_seq = rows;
         a.mode  = mode;
         a.round = round;
@@ -171,10 +595,15 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
         if (from_proposal) {
-            a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
-                                                                  : rk.ctx.buf_ptr(rk.tok_buf));
-            a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
-                              ? drafter_.proposal_pitch : 1;
+            /* This rank's own handle: a buffer handle indexes the program that declared it, and a
+             * plugin may declare a different buffer list on each rank (DeepSeek-V4.1's drafter
+             * source rows exist on its attention ranks only), so rank 0's handle can name another
+             * buffer here -- an attention-zero rank then verified garbage proposals at positions
+             * of its own while the other ranks verified the head's. */
+            const RadDrafterDecl& dd = rk.program.drafter;
+            a.src = static_cast<const int32_t*>(dd.proposal ? rk.ctx.buf_ptr(dd.proposal)
+                                                            : rk.ctx.buf_ptr(rk.tok_buf));
+            a.src_pitch = (dd.proposal && dd.proposal_pitch > 0) ? dd.proposal_pitch : 1;
             /* A tree drafter's parents, at the proposal's pitch (rad_drafter_tree). */
             if (tree_ && mode == ADV_BTAKE) {
                 a.par = static_cast<const int32_t*>(rk.ctx.buf_ptr(tree_parents_));
@@ -201,7 +630,7 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 int Engine::tree_compact(int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
-        AdvanceArgs a = sched_.advance_args((int)i);
+        AdvanceArgs a = lsched().advance_args((int)i);
         if (rows >= 0 && rows < a.n_seq) a.n_seq = rows;
         a.mode = 0;
         a.st   = rk.step_slots;
@@ -261,7 +690,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_row_.resize((size_t)cfg_.max_seqs);
     /* `n` counts rows that can draft. It can be zero while the history pass still has work (a
      * mid-prompt sequence has hidden states the head needs but no token to propose from). */
-    const int n = sched_.serial_begin(&rounds, serial_row_.data(), (int)serial_row_.size());
+    const int n = lsched().serial_begin(&rounds, serial_row_.data(), (int)serial_row_.size());
     if (rounds <= 0) return RAD_OK;
     serial_rounds_ = rounds;
     serial_rows_   = n;
@@ -279,7 +708,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     for (int rd = 0; rd <= rounds; rd += rd == 0 ? 2 : 1) {
         if (rd > 0 && n <= 0) break;
         const auto tA = std::chrono::steady_clock::now();
-        const RadBatch* db = sched_.serial_batch(rd, step);
+        const RadBatch* db = lsched().serial_batch(rd, step);
         if (!db) { if (rd == 0) continue; break; }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
@@ -357,7 +786,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
  * so a disagreement is a defect and the step is refused. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
             const StepEntry& e = plan.e[i];
@@ -372,7 +801,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
-    sched_.serial_end(serial_done_);
+    lsched().serial_end(serial_done_);
     if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
 
     Rank& r0 = *ranks_[0];
@@ -388,10 +817,11 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        const int rc = lsched().set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
+    couple_note();
     return RAD_OK;
 }
 
@@ -407,7 +837,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  * reap() may already have freed (sched/mtp_couple_bind.h). */
 int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card) {
     MtpCoupleBindPoint bp;
-    bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
+    bp.found = lsched().committed_seq(seq, &bp.n_out, &bp.live);
     if (!bp.found)
         RAD_WARN("coupled draft: row for sequence %llu is not in the committed step; clearing its "
                  "coupling", (unsigned long long)seq);
@@ -417,7 +847,25 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
                                           &couple_readback_[(size_t)i], (int)couple_rows_, done,
                                           slots_host_[card], meta_.n_vocab, couple_bound_,
                                           &n_bound, &why, &n_malformed);
-    if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
+    if (bs < 0) {
+        /* Lever SD: a readback that is not this draw's binds nothing -- the verify applies the agreement rule to the
+         * row's drafts, which is exact for any proposal -- instead of stopping the engine. Counted and logged once. */
+        ++couple_n_fallback_;
+        if (!couple_bind_note_) {
+            couple_bind_note_ = true;
+            RAD_WARN("coupled draft: %s -- not bound; the ordinary verify applies to this proposal (logged once, "
+                     "counted under fn4 sample.bind_fallback)", why.c_str());
+        }
+        for (auto& rk : ranks_) {
+            const int st = rk->sampler.set_mtp_couple(seq, nullptr, 0);
+            if (st < 0 && st != RAD_E_NOTFOUND) return st;
+        }
+        return RAD_OK;
+    }
+    if (drafted) {
+        couple_n_bound_ += n_bound;
+        couple_n_malf_ += n_malformed;
+    }
     if (n_malformed > 0 && !couple_malformed_note_) {
         couple_malformed_note_ = true;
         RAD_WARN("coupled draft: sequence %llu: %d draft position(s) had a shortlist with no valid "
@@ -443,7 +891,7 @@ void Engine::couple_verify_evidence(int step) {
     const rad_op op = smp.staged_couple_op();
     const MtpCoupleEvidence ev = mtp_couple_evidence(
         smp.couple_build(), step, ranks_[0]->ctx.op_domain(op),
-        [this](uint64_t seq) { return sched_.running(seq); });
+        [this](uint64_t seq) { return lsched().running(seq); });
     if (ev.rows <= 0 || smp.staged_couple_issued_step() != step) return;
     const char* kernel = ranks_[0]->ctx.ip_kernel_name(op);
     if (ev.device) {
@@ -467,20 +915,51 @@ void Engine::couple_verify_evidence(int step) {
 template <class Row>
 int Engine::stage_couple_draws(const Row* rows, int n) {
     std::string why;
-    const int stg = mtp_couple_plan_stage(sched_.plan(),
+    const int stg = mtp_couple_plan_stage(lsched().plan(),
                                           (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
                                           rows, n, &couple_by_card_, couple_draw_stage_, &why);
     if (stg < 0) {
         RAD_ERR("MTP coupled: %s", why.c_str());
         return stg;
     }
+    /* Lever SD: draft_sample 0 drafts greedily (mode 0: the proposer keeps its greedy token, status 0, and the
+     * sampler couples nothing) -- the serial drafter stages draws every cycle; the block drafter stages none at 0. */
+    if (fn4::get(fn4::kDraftSample) < 1)
+        for (int i = 0; i < n; ++i) couple_draw_stage_[i].mode = 0;
+    for (int i = 0; i < n; ++i) ++(couple_draw_stage_[i].mode == 1 ? couple_n_samp_ : couple_n_greedy_);
     for (auto& rk : ranks_) {
-        void* dst = rk->ctx.buf_ptr(couple_draws_buf_);
+        void* dst = rk->ctx.buf_ptr(couple_draws_rank_[(size_t)rk->index]);
         if (!dst) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
                                  n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));
     }
+    /* Lever SD: the q_temp column, row i the temperature of drafting row i's request x the switch's scale (1: 1.0,
+     * 2 .. 200: v / 100). A greedy row's value is never read (its draw is mode 0). */
+    if (!couple_qt_rank_.empty()) {
+        const int v = fn4::get(fn4::kDraftSample);
+        const double scale = v >= 2 && v <= 200 ? v / 100.0 : 1.0;
+        const StepPlan& plan = lsched().plan();
+        for (int i = 0; i < n; ++i) {
+            float t = 1.0f;
+            for (const StepEntry& e : plan.e)
+                if (e.req && e.card == rows[i].card && e.seq == rows[i].seq) { t = (float)(e.req->sp.temp * scale); break; }
+            couple_qt_stage_[i] = t;
+        }
+        for (auto& rk : ranks_) {
+            void* dst = rk->ctx.buf_ptr(couple_qt_rank_[(size_t)rk->index]);
+            if (!dst) return RAD_E_STATE;
+            RAD_TRY(rad_memcpy_async(dst, couple_qt_stage_, n * (int64_t)sizeof(float), rk->ctx.stream()));
+        }
+    }
     return RAD_OK;
+}
+
+void Engine::couple_note() {
+    if (!mtp_couple_) return;
+    if (couple_n_samp_ | couple_n_greedy_ | couple_n_bound_ | couple_n_malf_ | couple_n_fallback_ | couple_n_lookup_)
+        fn4::note_sample(couple_n_samp_, couple_n_greedy_, couple_n_bound_, couple_n_malf_, couple_n_fallback_,
+                         couple_n_lookup_);
+    couple_n_samp_ = couple_n_greedy_ = couple_n_bound_ = couple_n_malf_ = couple_n_fallback_ = couple_n_lookup_ = 0;
 }
 
 /* ------------------------------------------------------------------ the block driver
@@ -547,20 +1026,73 @@ void Engine::block_shape(int* block, int* steps) {
      * fewer proposals as rows. The load is the step just run's, which the next step, the one these
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
     if (drafter_short_ <= 0) return;
-    short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
-    if (short_on_) {
+    int64_t sb = 0;
+    bool top = false;   /* tp8 loop D23: the choice for the highest load (--draft-short-from's one tier, or tier 0) */
+    if (!short_tiers_.empty()) {
+        /* tp8 loop D19: the tier of the highest load this step reaches */
+        bool on[4] = {};
+        int64_t from[4] = {};
+        const int n = (int)std::min<size_t>(short_tiers_.size(), 4);
+        for (int i = 0; i < n; ++i) { on[i] = short_tiers_[(size_t)i].on; from[i] = short_tiers_[(size_t)i].from; }
+        const int k = Scheduler::short_tier_pick(on, from, n, lsched().decoded_seqs());
+        for (int i = 0; i < n; ++i) short_tiers_[(size_t)i].on = on[i];
+        if (k >= 0) { sb = short_tiers_[(size_t)k].block; top = k == 0; }
+    } else {
+        short_on_ = Scheduler::short_block_on(short_on_, lsched().decoded_seqs(), short_from_);
+        if (short_on_) { sb = drafter_short_; top = true; }
+    }
+    /* tp8 loop D23 (fn4 draft_short_blk): in process, the top choice runs the switch's declared block instead */
+    sb = Scheduler::short_block_forced(sb, top, short_blk_.load(std::memory_order_relaxed));
+    if (sb > 0) {
         /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
          * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
          * full pass's prefix); the verify takes that many. */
-        if (tree_) *steps = std::min(*steps, (int)drafter_short_ - 1);
-        else       *steps -= *block - (int)drafter_short_;
-        *block  = (int)drafter_short_;
+        if (tree_) *steps = std::min(*steps, (int)sb - 1);
+        else       *steps -= *block - (int)sb;
+        *block  = (int)sb;
     }
+}
+
+/* tp8 loop D18: the short block's share of the query passes so far (only while one is served). */
+void Engine::short_block_line(const char* when) const {
+    if (head_cut_)   /* DRAFTER track round 11, lever DHD */
+        RAD_INFO("speculation%s: lever DHD: %lld query passes at '%s''s own block ran its head on the first D rows of each "
+                 "block (%lld head rows left out in all) -- RADIANCE_DRAFT_HEAD_CUT", when, (long long)head_cut_n_,
+                 drafter_name_.c_str(), (long long)head_cut_rows_);
+    if (drafter_short_ <= 0) return;
+    if (forced_q_n_ > 0 || short_blk_.load(std::memory_order_relaxed) > 0)   /* tp8 loop D23 */
+        RAD_INFO("speculation%s: %lld query passes ran fn4 draft_short_blk's block (now %d; %lld rows, %.2f a pass) -- the "
+                 "line below counts them under their block too (tp8 loop D23)", when, (long long)forced_q_n_,
+                 short_blk_.load(std::memory_order_relaxed), (long long)forced_q_rows_,
+                 forced_q_n_ ? (double)forced_q_rows_ / (double)forced_q_n_ : 0.0);
+    if (!short_tiers_.empty()) {   /* tp8 loop D19: one part a tier */
+        std::string t;
+        for (const ShortTier& z : short_tiers_)
+            t += fmt("%lld at its short block of %lld row(s) a sequence from %lld decoding sequences (%lld rows, %.2f a pass), ",
+                     (long long)z.q_n, (long long)z.block, (long long)z.from, (long long)z.q_rows,
+                     z.q_n ? (double)z.q_rows / (double)z.q_n : 0.0);
+        RAD_INFO("speculation%s: '%s''s query passes by tier: %s%lld at its own block of %lld (%lld rows) -- "
+                 "RADIANCE_DRAFT_SHORT_TIERS (tp8 loop D19)", when, drafter_name_.c_str(), t.c_str(), (long long)long_q_n_,
+                 (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1), (long long)long_q_rows_);
+        return;
+    }
+    RAD_INFO("speculation%s: %lld query passes ran '%s''s short block of %lld row(s) a sequence (%lld rows, %.2f a pass), "
+             "%lld its own block of %lld (%lld rows) -- --draft-short-from %lld (tp8 loop D18)", when, (long long)short_q_n_,
+             drafter_name_.c_str(), (long long)drafter_short_, (long long)short_q_rows_,
+             short_q_n_ ? (double)short_q_rows_ / (double)short_q_n_ : 0.0, (long long)long_q_n_,
+             (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1), (long long)long_q_rows_,
+             (long long)short_from_);
 }
 
 int Engine::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
+    conf_val_ = 0;
+    alt_on_ = false;
+    conf_cut_done_ = false;
+    dconf_step_ = step;
     if (!block_drafting()) return RAD_OK;
+    /* The gate's counts belong to the proposal they cut: a new drafter cycle forgets them. */
+    if (conf_buf_ || conf_dbg_) lsched().draft_conf_begin();
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* A tree's accepted path into place in the trunk's cache, against the same build (the step
@@ -574,35 +1106,67 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
      * the step issued ahead verifies that many (issue_ahead). */
     int block = 0, steps = 0;
     block_shape(&block, &steps);
+    /* DRAFTER track round 11, lever DHD (RADIANCE_DRAFT_HEAD_CUT=1 at start + fn4 draft_head_cut 1): at the drafter's own block, a drafter whose every
+     * row proposes runs its head on the first D rows of each block, D = the head depth in force (draft_cycle's choice,
+     * which every sequence's window is capped by: Scheduler::draft_cap). Rows past D propose tokens no verify of the
+     * step issued ahead reads, so the first D proposals are the same tokens (each a row's own head row and the walk's
+     * first D steps) and the verify is unchanged. Not at a short block (its own op set), not while the sampled walk
+     * may run (draft_sample: that walk is declared at the whole block only), not before a depth is chosen. */
+    if (head_cut_ && fn4::get(fn4::kDraftHeadCut) == 1 && !tree_ && block == (int)drafter_.block &&
+        fn4::get(fn4::kDraftSample) < 1) {
+        const int d = lsched().block_head_cap();
+        if (d > 0 && d < steps) {
+            ++head_cut_n_;
+            head_cut_rows_ += steps - d;
+            steps = d;
+        }
+    }
     block_steps_ = steps;
     block_row_.resize((size_t)cfg_.max_seqs);
     /* The head reads the block's draft rows. A tree (rad_drafter_tree; DFlash2's convention, the
      * anchor predicts nothing) reads all block - 1 of them whatever its node count. */
     const int head = tree_ ? block - 1 : steps;
-    const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
-                                     block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
+    const int n = lsched().block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
+                                     block_row_.data(), (int)block_row_.size(), /*on_card=*/true,
+                                     /*front=*/head_cut_ && head < block);
 
-    /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). */
-    if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
+    /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). Lever SD: only while
+     * draft_sample is >= 1 -- the switch moves only at a step release, so the plugin issuing this cycle's query pass
+     * reads the same value and runs the sampled walk exactly when the draws are staged. */
+    couple_cycle_ = mtp_couple_ && fn4::get(fn4::kDraftSample) >= 1;
+    if (couple_cycle_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
      * drafter will need, and skipping would leave a permanent hole in its cache. A tree verify's
-     * context rows store only the accepted path, at its committed positions (ADV_CTXTREE). */
-    if (const RadBatch* cb = sched_.block_context(step)) {
-        if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
-        RAD_TRY(block_pass(cb, "context", step));
-    }
+     * context rows store only the accepted path, at its committed positions (ADV_CTXTREE). Under
+     * the depth-0 context skip a plain step's rows may be kept for a later refill instead
+     * (block_context_pass), which fills the hole before any query pass reads the window. */
+    RAD_TRY(block_context_pass(step));
     /* A snapshot carrying the drafter's window is saved now, with the step's context rows stored
      * and before the query pass and the step issued ahead (save_checkpoints). */
     if (drafter_snap_) RAD_TRY(save_checkpoints());
     if (n <= 0) return RAD_OK;
-    const RadBatch* qb = sched_.block_query(step);
+    const RadBatch* qb = lsched().block_query(step);
     if (!qb) return RAD_OK;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
+    if (drafter_short_ > 0) {   /* tp8 loop D18: which block this query pass ran (D19: which tier's) */
+        /* tp8 loop D23: a pass at draft_short_blk's block is counted there too (GET "short_blk", the minute line) */
+        if (const int fb = short_blk_.load(std::memory_order_relaxed); fb > 0 && block == fb) {
+            ++forced_q_n_;
+            forced_q_rows_ += qb->n_tok;
+            fn4::note_short_blk(qb->n_tok);
+        }
+        bool tier = false;
+        for (ShortTier& t : short_tiers_)
+            if (block == (int)t.block) { ++t.q_n; t.q_rows += qb->n_tok; tier = true; break; }
+        if (tier) {
+        } else if (short_tiers_.empty() && block == (int)drafter_short_) { ++short_q_n_; short_q_rows_ += qb->n_tok; }
+        else                                                             { ++long_q_n_;  long_q_rows_  += qb->n_tok; }
+    }
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     Rank& r0 = *ranks_[0];
-    if (mtp_couple_) {
+    if (couple_cycle_) {
         /* Positions 1..steps of the drafting rows, on the stream of the slots below. */
         const void* state = r0.ctx.buf_ptr(couple_state_buf_);
         if (!state || steps > (int)drafter_.depth) return RAD_E_STATE;
@@ -613,8 +1177,78 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
                              (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
+    /* ds41-acc: the pass's confidence logits and branches, rows in block_row_'s order, read as the
+     * plugin issued them (the switches move only at a step release, after this). A gate records
+     * the event the next verify's build waits on (conf_gate). */
+    conf_val_ = conf_buf_ || conf_dbg_ ? std::max(0, fn4::get(fn4::kDsparkConf)) : 0;
+    /* ds41-small: dspark_conf_rows, the gate's load bound -- above it this cycle reads no plane and
+     * waits for nothing, as dspark_conf 0 (the head the plugin issued is left unread). */
+    if (conf_val_) {
+        const int cap = fn4::get(fn4::kDsparkConfRows);
+        const bool gated = cap > 0 && lsched().decoded_seqs() > cap;
+        dconf::tracker().load_gate(cap > 0, gated);
+        if (gated) conf_val_ = 0;
+    }
+    alt_on_   = alt_buf_ && fn4::get(fn4::kDsparkAlt) == 1;
+    if (conf_val_ && conf_buf_) {
+        const void* src = r0.ctx.buf_ptr(conf_buf_);
+        if (!src) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(conf_host_, src, (int64_t)n * conf_pitch_ * 4, r0.ctx.stream()));
+    }
+    if (alt_on_) {
+        const void* src = r0.ctx.buf_ptr(alt_buf_);
+        if (!src) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(alt_host_, src, (int64_t)n * n_alt_ * alt_pitch_ * 4, r0.ctx.stream()));
+    }
+    if (conf_val_ && dconf::policy_of(conf_val_).mode == 1) RAD_TRY(rad_event_record(conf_ev_, r0.ctx.stream()));
     block_rows_ = n;
     return RAD_OK;
+}
+
+/* ds41-acc: the confidence gate, once a step, before the next verify is built (issue_ahead, or
+ * finish_block_drafter when no step is issued ahead): each drafting row verifies the longest prefix
+ * of its proposal whose logits clear the threshold (core/sched/draft_conf.h), handed to the scheduler
+ * so every site that caps a proposal applies it (Scheduler::draft_cap). */
+int Engine::conf_gate() {
+    if (conf_cut_done_) return RAD_OK;
+    conf_cut_done_ = true;
+    conf_cut_.assign((size_t)std::max(0, block_rows_), -1);
+    if (!conf_val_ || block_rows_ <= 0) return RAD_OK;
+    const dconf::Policy p = dconf::policy_of(conf_val_);
+    if (p.mode == 1) RAD_TRY(rad_event_sync(conf_ev_));
+    if (conf_dbg_)   /* the test source: a logit in [-3, 3] from (sequence, step, position) */
+        for (int i = 0; i < block_rows_; ++i)
+            for (int64_t j = 0; j < conf_pitch_; ++j) {
+                uint64_t h = block_row_[(size_t)i].seq * 0x9E3779B97F4A7C15ull + (uint64_t)dconf_step_ * 0xBF58476D1CE4E5B9ull +
+                             (uint64_t)j * 0x94D049BB133111EBull;
+                h ^= h >> 31; h *= 0xD6E8FEB86659FD93ull; h ^= h >> 32;
+                conf_host_[(int64_t)i * conf_pitch_ + j] = (float)((int)(h % 601) - 300) / 100.0f;
+            }
+    if (p.mode != 1) return RAD_OK;
+    for (int i = 0; i < block_rows_; ++i) {
+        const int k = dconf::prefix_len(conf_host_ + (int64_t)i * conf_pitch_, block_steps_, p);
+        conf_cut_[(size_t)i] = k;
+        lsched().set_draft_conf(block_row_[(size_t)i].seq, k, p.replace);
+    }
+    return RAD_OK;
+}
+
+/* ds41-acc: the step's verifies against the proposals the tracker holds (calibration, the shadow
+ * tree). A verify emits its accepted drafts, then the target's own token. */
+void Engine::dconf_commit(const StepPlan& plan, const StepOut& so, int step) {
+    if (!conf_buf_ && !alt_buf_ && !conf_dbg_) return;
+    dconf::Tracker& t = dconf::tracker();
+    int32_t em[RAD_SCHED_MAX_SPEC + 1];
+    for (size_t i = 0; i < plan.e.size() && i < so.accepted.size(); ++i) {
+        const StepEntry& e = plan.e[i];
+        if (e.is_prefill || !e.produces_token || so.first_row[i] < 0) continue;
+        const int drafted = e.draft ? std::max(0, std::min<int>(e.n_spec, e.n_draft)) : 0;
+        const int acc = std::max(0, std::min(so.accepted[i], drafted));
+        for (int k = 0; k < acc; ++k) em[k] = e.draft[k];
+        em[acc] = so.token[i];
+        t.verified(e.seq, step, drafted, acc, em, acc + 1);
+    }
+    if ((step & 63) == 0) t.purge(step);
 }
 
 /* After commit: check the host's acceptance against the card's, which positioned the query pass
@@ -623,7 +1257,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
 int Engine::finish_block_drafter(const StepOut& so) {
     if (!block_drafting()) return RAD_OK;
     if (block_rows_ > 0) {
-        const StepPlan& plan = sched_.plan();
+        const StepPlan& plan = lsched().plan();
         for (size_t i = 0; i < plan.e.size(); ++i) {
             const StepEntry& e = plan.e[i];
             if (so.first_row[i] < 0) continue;
@@ -633,13 +1267,15 @@ int Engine::finish_block_drafter(const StepOut& so) {
                         "sequence %llu and the host %d ending in %d; the query pass ran from the "
                         "card's", drafter_.name, S.acc, S.tok[0], (unsigned long long)e.seq,
                         so.accepted[i], so.token[i]);
-                sched_.block_end();
+                lsched().block_end();
                 return RAD_E_STATE;
             }
         }
     }
-    sched_.block_end();
+    lsched().block_end();
     if (block_rows_ <= 0) return RAD_OK;
+    /* The gate, where no step was issued ahead to apply it (the planes landed with the slots). */
+    RAD_TRY(conf_gate());
 
     Rank& r0 = *ranks_[0];
     const int steps = block_steps_;
@@ -667,10 +1303,26 @@ int Engine::finish_block_drafter(const StepOut& so) {
         if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
         const uint64_t seq = block_row_[(size_t)i].seq;
         const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
-        const int rc = sched_.set_draft(seq, d, steps, tree_ ? S.par : nullptr);
-        if (mtp_couple_)
+        /* ds41-acc: the confidence gate's count, as the step issued ahead was built with it. */
+        const int cut = i < (int)conf_cut_.size() ? conf_cut_[(size_t)i] : -1;
+        const int n_pub = cut >= 0 ? std::min(steps, cut) : steps;
+        const int rc = lsched().set_draft(seq, d, n_pub, tree_ ? S.par : nullptr);
+        if (conf_val_ || alt_on_)
+            dconf::tracker().proposed(seq, dconf_step_,
+                                      conf_val_ ? conf_host_ + (int64_t)i * conf_pitch_ : nullptr, steps,
+                                      alt_on_ ? alt_host_ + (int64_t)i * n_alt_ * alt_pitch_ : nullptr,
+                                      (int)n_alt_, (int)alt_pitch_, cut);
+        if (couple_cycle_) {
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
+        } else if (mtp_couple_) {
+            /* Lever SD at draft_sample 0: no state of an earlier cycle stays bound to this proposal. */
+            for (auto& rk : ranks_) {
+                const int st = rk->sampler.set_mtp_couple(seq, nullptr, 0);
+                if (st < 0 && st != RAD_E_NOTFOUND) return st;
+            }
+        }
     }
+    couple_note();
     return RAD_OK;
 }
 

@@ -1,0 +1,289 @@
+/* r4d_ds41_elem_shapes.inc -- operand descriptions of DeepSeek-V4.1's elem ops; included at the end
+ * of r4d_shapes.cpp for its helpers (opd, opd_idx, opd_none, pick, R4D_PICK, pi, dt_act).
+ *
+ * Each is libref's ref_<op>_shape (libref/ref_shapes.cpp) operand for operand, extents, dtypes and
+ * index ranges, with the same declines, since rad-kbench fills both kernels from one description. */
+
+extern "C" int r4d_shape_token_map(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), nv = pi(p, n_p, "n_vocab");
+    if (M <= 0 || nv < 1) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_idx(M, 0, nv),                 /* ids */
+        opd_idx(nv, 0, nv),                /* table */
+        opd((uint32_t)RAD_I32, M),         /* mapped */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_stream_gate_add(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n < 1 || hc < 1 || hc > 16) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),                 /* h */
+        opd(D, M, hc * n),                 /* k */
+        opd(D, M, n),                      /* v */
+        opd((uint32_t)RAD_F32, hc * n),    /* w */
+        opd(D, M, hc * n),                 /* out */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_rope_rows(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");
+    const int64_t rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1);
+    if (M <= 0 || nh < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, nh * hd),                /* x, rotated in place */
+        opd((uint32_t)RAD_F32, M, rot),    /* cos_sin: a rope_table plane of M rows */
+        opd_idx(M, 0, M),                  /* positions */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_quant_roundtrip(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), block = pi(p, n_p, "block");
+    if (M <= 0 || n < 1 || block < 1 || n % block) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = { opd(dt_act(p, n_p, "dtype"), M, n) };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_mhc_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),                              /* h */
+        opd((uint32_t)RAD_F32, hc * (hc + 2), hc * n),  /* fn */
+        opd((uint32_t)RAD_F32, 3),                      /* scale */
+        opd((uint32_t)RAD_F32, hc * (hc + 2)),          /* base */
+        opd((uint32_t)RAD_F32, M, hc),                  /* pre */
+        opd((uint32_t)RAD_F32, M, hc),                  /* post */
+        opd((uint32_t)RAD_F32, M, hc * hc),             /* comb */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_mhc_collapse(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, hc * n), opd((uint32_t)RAD_F32, M, hc), opd(D, M, n) };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_softmax_pool(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), ratio = pi(p, n_p, "ratio");
+    if (M <= 0 || n < 1 || ratio < 1 || ratio > 64) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, M * ratio, 2 * n),  /* stage: values then scores */
+        opd(dt_act(p, n_p, "dtype"), M, n),        /* out */
+        opd_idx(M, 0, M),                          /* page, optional: negative skips the entry */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_entry_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
+    /* format mxfp4: a block holds (n/2 + n/32) bytes rounded up to 16, in bf16 slots */
+    const char* f = r4d_pgets(p, n_p, "format");
+    const bool mx = f && !std::strcmp(f, "mxfp4"), nv = f && !std::strcmp(f, "nvfp4");
+    if (f && !mx && !nv && std::strcmp(f, "bf16")) return RAD_E_UNSUPPORTED;
+    /* nvfp4: (n/2 + n/16) bytes rounded up to 16 (the packed latent) */
+    const int64_t slots = mx ? (n / 2 + n / 32 + 15) / 16 * 16 / 2 : nv ? (n / 2 + n / 16 + 15) / 16 * 16 / 2 : n;
+    if (M <= 0 || n < 1 || bs < 1 || slots % bs || ((mx || nv) && (n % 32 || n > 1024))) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                                       /* x */
+        opd_idx(M, 0, M, -1, RAD_OPD_F_IDX_UNIQUE),         /* page: distinct blocks */
+        opd(D, M, 1, bs, slots / bs),                       /* cache */
+    };
+    R4D_PICK(l);
+}
+
+/* window_store (lever KVWIN): kv_store's slot mapping (two blocks of slack, no slot repeated), the cache in
+ * the fp8 window slot's bf16 slots ((n + n/32) bytes rounded up to 16). */
+extern "C" int r4d_shape_window_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
+    const char* f = r4d_pgets(p, n_p, "format");
+    if (M <= 0 || n < 32 || n % 32 || bs <= 0 || !f || std::strcmp(f, "fp8_e4m3")) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2, slot = (n + n / 32 + 15) / 16 * 16 / 2;
+    const RadOpdDesc l[] = {
+        opd(dt_act(p, n_p, "dtype"), M, n),                  /* x */
+        opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping */
+        opd((uint32_t)RAD_BF16, nb, 1, bs, slot),           /* kv_cache */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
+    if (M < 1 || ne < 1 || ne > 512 || k < 1 || k > ne) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, ne), opd((uint32_t)RAD_F32, ne), opd_idx(M, k, ne),
+                             opd(D, M, k) };
+    R4D_PICK(l);
+}
+
+/* router_sigmoid_topk_scatter's operands (r4d_shapes.cpp), the score aside. */
+extern "C" int r4d_shape_router_scored_topk_scatter(const RadParam* p, int n_p, int operand,
+                                                    RadOpdDesc* out) {
+    return r4d_shape_router_sigmoid_topk_scatter(p, n_p, operand, out);
+}
+
+/* lever FUSE-R (ds41-fuse): gemm_nt_f32's operands (a bf16, b f32 -- or bf16 under RADIANCE_DS41_ROUTER_BF16 -- , logits
+ * f32) around router_scored_topk_scatter's, `logits` named once: a, b, bias -> logits, ids, weights, sorted_tok,
+ * expert_offset, expert_count, inverse?. The decode band (M <= 48), <= 384 experts. */
+extern "C" int r4d_shape_router_gemm_f32_scored_topk_scatter(const RadParam* p, int n_p, int operand,
+                                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), K = pi(p, n_p, "K"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
+    const int64_t nl = pi(p, n_p, "n_local", ne);
+    /* loop FINDINGS F72 (DECODE round 25): 64 = the kernel's own bound since lever RGP (kRgsMaxRows, r4d_ds41_elem.hip), which
+     * the core declares under RADIANCE_RGS_ROWS=64; 48 here refused the device bands of that declare at start */
+    if (M < 1 || M > 64 || K < 1 || ne < 1 || ne > 384 || k < 1 || k > ne || k > 32 || M * k > 1024 || nl < 1 ||
+        nl > ne)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, K),          /* a */
+        opd((uint32_t)RAD_F32, ne, K),          /* b, the projection */
+        opd((uint32_t)RAD_F32, ne),             /* bias */
+        opd((uint32_t)RAD_F32, M, ne),          /* logits */
+        opd_idx(M, k, ne),                      /* ids */
+        opd((uint32_t)RAD_F32, M, k),           /* weights */
+        opd((uint32_t)RAD_I32, M * k),          /* sorted_tok */
+        opd((uint32_t)RAD_I32, nl + 1),         /* expert_offset */
+        opd((uint32_t)RAD_I32, nl),             /* expert_count */
+        opd_none(),                             /* inverse: optional */
+    };
+    R4D_PICK(l);
+}
+
+/* The planes as a host tool draws them: i8 codes (no table), a scale per `group` of a row. */
+extern "C" int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t ne = pi(p, n_p, "n_embd"), nv = pi(p, n_p, "n_vocab");
+    const int64_t G = pi(p, n_p, "group"), vo = pi(p, n_p, "vocab_offset", 0);
+    if (M <= 0 || ne <= 0 || nv <= 0 || G <= 0 || ne % G || vo < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd_idx(M, 0, vo + nv),            /* tokens */
+        opd((uint32_t)RAD_I8, nv, ne),     /* codes */
+        opd(D, nv, ne / G),                /* scale */
+        opd_none(),                        /* table: optional */
+        opd(D, M, ne),                     /* x */
+    };
+    R4D_PICK(l);
+}
+
+/* The fused chains: the operands of their steps' rows, as those rows describe them. */
+extern "C" int r4d_shape_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, int operand,
+                                                RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), nh = pi(p, n_p, "n_head");
+    const int64_t hd = pi(p, n_p, "head_dim"), rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1);
+    const int64_t block = pi(p, n_p, "block");
+    if (M <= 0 || nh < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd || n != nh * hd ||
+        block < 1 || n % block)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                      /* x */
+        opd((uint32_t)RAD_F32, n),         /* w, the gain */
+        opd(D, M, n),                      /* y */
+        opd((uint32_t)RAD_F32, M, rot),    /* cos_sin: a rope_table plane of M rows */
+        opd_idx(M, 0, M),                  /* positions */
+    };
+    R4D_PICK(l);
+}
+
+/* rmsnorm_rope_roundtrip's operands, then kv_store's slot mapping and cache at kv_store's own shapes
+ * (r4d_shape_kv_store: two blocks of slack, no slot repeated) at n_head_kv 1, head_dim n / 2. */
+extern "C" int r4d_shape_rmsnorm_rope_roundtrip_kv_store(const RadParam* p, int n_p, int operand,
+                                                         RadOpdDesc* out) {
+    if (operand < 5) return r4d_shape_rmsnorm_rope_roundtrip(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
+    if (M <= 0 || n < 2 || (n & 1) || bs <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2;
+    /* kv_dtype fp8_e4m3: window_store's fp8 window slot in bf16 slots */
+    const char* kd = r4d_pgets(p, n_p, "kv_dtype");
+    const bool w8 = kd && !std::strcmp(kd, "fp8_e4m3");
+    if (w8 && n % 32) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping */
+        w8 ? opd((uint32_t)RAD_BF16, nb, 1, bs, (n + n / 32 + 15) / 16 * 16 / 2)
+           : opd(dt_act(p, n_p, "kv_dtype"), nb, 1, bs, n),  /* kv_cache */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");
+    const int64_t rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1), block = pi(p, n_p, "block");
+    if (M <= 0 || nh < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd || block < 1 ||
+        (nh * hd) % block)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, nh * hd),                /* x, in place */
+        opd((uint32_t)RAD_F32, M, rot),    /* cos_sin */
+        opd_idx(M, 0, M),                  /* positions */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand,
+                                              RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),                 /* h */
+        opd((uint32_t)RAD_F32, M, hc),     /* pre */
+        opd(D, M, n),                      /* x */
+        opd((uint32_t)RAD_F32, n),         /* w */
+        opd(D, M, n),                      /* y */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand,
+                                                   RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                      /* x */
+        opd(D, M, hc * n),                 /* h */
+        opd((uint32_t)RAD_F32, M, hc),     /* post */
+        opd((uint32_t)RAD_F32, M, hc * hc), /* comb */
+        opd(D, M, hc * n),                 /* out */
+        opd((uint32_t)RAD_F32, M, hc),     /* pre */
+        opd(D, M, n),                      /* xc */
+        opd((uint32_t)RAD_F32, n),         /* w */
+        opd(D, M, n),                      /* y */
+    };
+    R4D_PICK(l);
+}
+
+/* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm's operands, then mhc_mix's fn, scale, base and pre (post and comb
+ * are the first's, inout); hc 4, n a multiple of 1024. */
+extern "C" int r4d_shape_mhc_post_collapse_rmsnorm_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || hc != 4 || n < 1024 || n % 1024 || n > 16384) return RAD_E_UNSUPPORTED;
+    if (operand < 9) return r4d_shape_mhc_post_collapse_rmsnorm(p, n_p, operand, out);
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_F32, hc * (hc + 2), hc * n),  /* fn */
+        opd((uint32_t)RAD_F32, 3),                      /* scale */
+        opd((uint32_t)RAD_F32, hc * (hc + 2)),          /* base */
+        opd((uint32_t)RAD_F32, M, hc),                  /* pre_o */
+    };
+    R4D_PICK(l);
+}

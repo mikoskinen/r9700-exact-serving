@@ -252,7 +252,10 @@ struct Model {
     HyperConn mixer;            /* the 97th connection: no write half */
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
     bool      pipe_noted = false;
-    int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted */
+    bool      nowait_noted = false;   /* PF probe NOWAIT (sp_route bit 256) said once */
+    bool      psp_noted = false;      /* lever PSP (sp_route bit 512) said once */
+    bool      gpf_noted = false;      /* lever GPF (sp_route bit 4096) said once */
+    int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted; P2S: 1000 (mode + 1) + layers paired */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
      * time and the indexer scores it in windows. `pipe_on` adds ranks whose blocks issue their own
@@ -271,6 +274,9 @@ struct Model {
      * read on this rank's quarter of each piece between them, the codes redone on every row (HyperConn::codes), and the
      * wide stream gathered raw after the last layer (sp_agh). */
     rad_op    sp_rs = 0, sp_ag = 0, sp_agh = 0;
+    /* fn4 SP-route (16.11.2026, qwen/prefill; RADIANCE_FN4_SP_ROUTE declares, switch sp_route): the router logits' all-gather
+     * of an SP-hc piece (raw rows of n_expert_all), declared beside SP-hc */
+    rad_op    sp_agl = 0;
     bool      sp_on = false;
     /* fn4 KVCAP C1 (15.11.2026, qwen/KV-BOUNDS.md): the most rows one sp_agh launch carries, its declared bound. Both issue
      * sites carry at most a pass or an SP-serial segment (a pipelined piece <= pass_rows; an SP-serial run's T <=
@@ -319,9 +325,100 @@ struct Model {
     int64_t     bi_td = 0;       /* this step's decode rows */
     int64_t     bi_qd = 1;       /* rows a decode sequence (1 + n_spec) */
     std::vector<int64_t> bi_cut;
+    /* qfn-on-ds lever HCP (Qwen loop round 23, sp_route bit 8192; bi_segments sets it a step): a prefill segment's
+     * connection reads past the prompt's first interval at the K split of a FULL piece (HyperConn::op_read_sp), whatever
+     * the segment's rows -- hcp_pos0[i] the first position of segment [bi_cut[i], bi_cut[i + 1]) (-1: a decode segment or
+     * no host positions); hcp_pos_step a pure prefill step's first position (bi_cut empty: one read). hcp_n: reads pinned
+     * (rank 0's engine line). */
+    bool        hcp = false;
+    std::vector<int64_t> hcp_pos0;
+    int64_t     hcp_pos_step = -1;
+    mutable uint64_t hcp_n = 0;
+    bool        hcp_noted = false;
 };
 
 static Model g_model[MAX_RANKS];
+
+/* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1 at start, the engine's too): a prompt's tail snapshot at the
+ * START OF THE LAST PIECE of its last pipelined prefill step, taken inside the step instead of cutting the step there (lever
+ * G at sched_tail_grid 2048 cuts it: the tail then runs as a lone step and pays its fixed cost, +40..+60 ms a cold prompt).
+ * The engine names the row (rad_tip_set, on the rank's thread around its issue); the delta net's convolution, solve and scan
+ * and the PLE's two windowed ops run [0, row) and [row, T) in two launches and stage each state row between them
+ * (rad_arch.h TipStage) -- the same arithmetic: the scan's state is fp32 in the cache and across its chunks, every window is
+ * what its launch's last rows leave, and the row is a multiple of every chunk / block / ratio. The QSA tail ring is not read
+ * by a resume at a multiple of its ratio (4), so it is the one group left as the step leaves it (rad_tip_free). Kept out of
+ * Model (declare resets that): the pinned ring the bounds are uploaded from and their device copy live for the process. */
+struct TipRank {
+    int64_t   row = 0;
+    int     (*stage)(void*, int, int, void*) = nullptr;
+    void*     u = nullptr;
+    int32_t*  ring_h = nullptr;   /* 64 x {0, row, R, row}: a slot is rewritten 64 TIP steps after its copy was issued */
+    int32_t*  cu_d = nullptr;     /* {0, row, T, R, row} on the card (lever TIF: cu_d + 3 = piece 1 up to the row) */
+    int64_t   k = 0;
+    bool      tried = false;
+    bool      noted = false;
+};
+static TipRank g_tipr[MAX_RANKS];
+static bool fn4_tip_env() {
+    static const bool on = fn4_env_on("RADIANCE_FN4_TIP");
+    return on;
+}
+/* The step's TipStage, its bounds uploaded on the step's stream; false (and the step failed) where the row is not the start
+ * of a piece of this pipelined step of one prefill sequence. */
+static bool tip_stage_for(RadCtx* c, const RadBatch* batch, const Model& m, TipStage* out) {
+    *out = TipStage{};
+    const int rk = rad_rank(c);
+    TipRank& t = g_tipr[rk];
+    if (t.row <= 0) return true;
+    const int64_t T = batch->n_tok, R = m.pass_rows;
+    /* lever TIF (Qwen loop round 23): also a 64-aligned row inside the step's LAST piece (the delta net's scan chunks and the
+     * PLE's windows hand on there as at a piece start; the scheduler plans it under sched_tail_inner 3) */
+    const bool tif_row = R > 0 && t.row % 64 == 0 && t.row > (T - 1) / R * R && T > R;
+    if (batch->n_seq != 1 || batch->phase != RAD_PHASE_PREFILL || batch->draft_pass != 0 || R <= 0 ||
+        (t.row % R != 0 && !tif_row) || t.row >= T || !t.stage) {
+        char why[256];
+        snprintf(why, sizeof why, "qwen4exp: lever TIP: a snapshot at row %lld of a %lld-row step (%lld sequences, phase %d) "
+                                  "is neither the start of a piece nor a 64-aligned row of the last piece of a pipelined "
+                                  "prefill step of one sequence (pieces of %lld)",
+                 (long long)t.row, (long long)T, (long long)batch->n_seq, batch->phase, (long long)R);
+        rad_step_fail(c, why);
+        return false;
+    }
+    if (!t.tried) {
+        t.tried = true;
+        t.ring_h = (int32_t*)rad_dev_alloc(64 * 4 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        t.cu_d = (int32_t*)rad_dev_alloc(8 * sizeof(int32_t), RAD_MEM_DEVICE);
+    }
+    if (!t.ring_h || !t.cu_d) {
+        rad_step_fail(c, "qwen4exp: lever TIP: no pinned / device memory for the snapshot row's bounds");
+        return false;
+    }
+    /* {0, row} -> cu_d[0..1], the step's T -> cu_d[2], and (lever TIF) {R, row} -> cu_d[3..4] */
+    int32_t* h = t.ring_h + 4 * (t.k++ % 64);
+    h[0] = 0;
+    h[1] = (int32_t)t.row;
+    h[2] = (int32_t)R;
+    h[3] = (int32_t)t.row;
+    const RadStream s = rad_stream(c);
+    if (rad_memcpy_async(t.cu_d, h, 2 * sizeof(int32_t), s) != RAD_OK ||
+        rad_memcpy_async(t.cu_d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK ||
+        rad_memcpy_async(t.cu_d + 3, h + 2, 2 * sizeof(int32_t), s) != RAD_OK) {
+        rad_step_fail(c, "qwen4exp: lever TIP: the snapshot row's bounds could not be uploaded");
+        return false;
+    }
+    out->row = t.row;
+    out->cu = t.cu_d;
+    out->cu_in = t.cu_d + 3;
+    out->stage = t.stage;
+    out->u = t.u;
+    if (!t.noted && rk == 0) {
+        t.noted = true;
+        fprintf(stderr, "radiance: qwen4exp: lever TIP: a %lld-row prefill step takes its tail snapshot at its row %lld (the "
+                        "start of its last piece) inside the step: the delta net and the PLE run their state ops in two "
+                        "launches and stage the rows between them\n", (long long)T, (long long)t.row);
+    }
+    return true;
+}
 
 /* fn4 BI-dual: switch exl3_dual's value (RADIANCE_FN4_X3DUAL starts it at 1; declared ranks only issue it). */
 static std::atomic<int>& fn4_dual_flag() {
@@ -338,11 +435,12 @@ static std::atomic<int>& fn4_hcbi_flag() {
 /* fn4 BI: switch bi_seg's value (RADIANCE_FN4_BI_SEG starts it): the trunk's linears cut at the step's segments. */
 static std::atomic<int>& fn4_biseg_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_BI_SEG");
-                                   const int v = e && *e ? std::atoi(e) : 0; return v == 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   const int v = e && *e ? std::atoi(e) : 0; return v == 3 ? 3 : v == 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 BI: the step's segments (Model::bi_cut) when hc_bi or bi_seg is on; the reads take them under hc_bi
  * (bi_read), every LinearFP8 under bi_seg (rad::arch::bi_cuts, this rank thread's, cleared at a step without). */
+static std::atomic<int>& fn4_sproute_flag();
 static void bi_segments(Model& m, const RadBatch* batch) {
     m.bi_mode = fn4_hcbi_flag().load(std::memory_order_relaxed);
     m.bi_on = m.bi_mode > 0;
@@ -351,10 +449,16 @@ static void bi_segments(Model& m, const RadBatch* batch) {
     m.bi_cut.clear();
     bi_cuts() = BiCuts{};
     bi_wide_rows() = 0;
-    if (!m.bi_on && !seg) return;
+    /* lever HCP (sp_route bit 8192): on for a trunk step with host positions (the core always hands them) */
+    m.hcp = (fn4_sproute_flag().load(std::memory_order_relaxed) & 8192) != 0 && batch->positions_h &&
+            batch->draft_pass == 0 && !batch->enc;
+    m.hcp_pos0.clear();
+    m.hcp_pos_step = -1;
     const int64_t T = batch->n_tok;
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
+    if (m.hcp && td == 0 && T > 0) m.hcp_pos_step = batch->positions_h[0];   /* a pure prefill step (the fallback reads) */
+    if (!m.bi_on && !seg) return;
     m.bi_td = td;
     m.bi_qd = sd > 0 && td % sd == 0 ? td / sd : 1;   /* a decode sequence's rows (1 + n_spec) */
     /* fn4 BI wide (bi_wide bit 1): the decode rows above the narrow band through the linears' gemm_nt_q_dec */
@@ -366,6 +470,35 @@ static void bi_segments(Model& m, const RadBatch* batch) {
             if (batch->positions_h[r] != batch->positions_h[r - 1] + 1) m.bi_cut.push_back(r);
     m.bi_cut.push_back(T);
     if (seg && m.bi_cut.size() > 2) bi_cuts() = BiCuts{m.bi_cut.data(), (int)m.bi_cut.size()};
+    if (m.hcp)
+        for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
+            m.hcp_pos0.push_back(m.bi_cut[i] >= td ? (int64_t)batch->positions_h[m.bi_cut[i]] : -1);
+}
+/* lever HCP (Qwen loop round 23, sp_route bit 8192; QUEUE Q44 lever TIF's premise): libr4d's hc_read splits the down product's
+ * K by the launch's row tiles (r4d_hc_bf16.hip hc_down_kchunk; at lowrank 320 / HN 10,240: 2 ways from 1,537 rows, 3 at
+ * 1,025-1,536, 4 at 769-1,024, 9 at 257-384, 13 at 129-256), so a prompt's rows read inside a 1,200-row last piece, a full
+ * piece or a 267-row tail step sum K in three orders, and every row after differs -- the reason a prefix hit is exact only where the cold run cut its chunk (resume_cold), and lever
+ * G's 256 cut moves the cold's bytes (g2k1 / tip0: lA 9 / 12). HCP reads every prefill segment that starts past the prompt's
+ * first interval (its first position >= a pass's rows) and has more than 64 rows (the 128-row tile, kTileMinRows) through
+ * op_read_sp: kc_rows = the full piece's rows (16 tiles), the split a full piece reads with today, whatever the segment's,
+ * whole or a rank's part (libr4d nrt_k: a part of > 64 rows at the 128-row tile). Full pieces keep their bytes; a shorter
+ * piece, a tail step and a hit's rows take the full piece's order, so where a row lies in which piece no longer moves it. A
+ * prompt's first interval (every newcomer shorter than a pass) is never pinned: no resume point lies inside it. Off = today. */
+static bool hcp_seg_ok(const Model& m, int64_t a) {
+    if (!m.hcp) return false;
+    const int64_t R = m.pass_rows > 0 ? m.pass_rows : 2048;
+    if (m.bi_cut.size() < 2 || m.hcp_pos0.size() + 1 != m.bi_cut.size()) return m.hcp_pos_step >= R;
+    for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
+        if (a >= m.bi_cut[i] && a < m.bi_cut[i + 1]) return m.hcp_pos0[i] >= R;
+    return false;
+}
+/* a prefill read of rows [a, a + n) of segment row `a0`'s: through op_read_sp where HCP pins it */
+static bool hcp_pins(const Model& m, const HyperConn& h, int64_t a0, int64_t n) {
+    return n > 64 && h.op_read_sp && n <= h.c.read_rows && hcp_seg_ok(m, a0);
+}
+static void hcp_read(RadCtx* c, const Model& m, const HyperConn& h, int64_t T, int64_t a, int64_t n, bool ss) {
+    if (hcp_pins(m, h, a, n)) { h.read_sp(c, T, a, n, ss); ++m.hcp_n; return; }
+    h.read(c, T, a, n, ss);
 }
 /* fn4 BI (switch bi_seg 2): the lm_head at each output row's ALONE height class. logits_gemm (fp8 / i8 head) runs a
  * matvec at M <= 2 and WMMA from M = 3; within WMMA a row's bytes do not depend on M (lm_wmma_body: each 128-column scale
@@ -375,9 +508,16 @@ static void bi_segments(Model& m, const RadBatch* batch) {
  * that finishes this step: the decode rows go in one launch when 1 + n_spec >= 3 (else a launch a sequence, at its own
  * M), each prompt's row in a launch of its own. Returns false (the caller issues one launch) when off, or when the step's
  * outputs do not have that form (uneven verify blocks, scoring rows). 12.11.2026, fn4 180: the logits were the first
- * differing op in 19 of 40 probes, every one a prompt's last row in a mixed step. */
+ * differing op in 19 of 40 probes, every one a prompt's last row in a mixed step.
+ * bi_seg 3 (20.11.2026, qwen-port round 3, s5-bt: logits first-differing in 2 of 20 probes, a row verified at q 3 beside
+ * load vs q 2 alone): the decode rows in ONE launch whenever they are 3 or more, at any verify depth. A decode row's alone
+ * class is that of its alone step at the published depth (MTP 3, draft_adaptive 0: q 4, WMMA); a step whose depth a
+ * row cap lowered (CAP48 / RADIANCE_DECODE_ROW_CAP_UNIFORM: q 2 or 3) then keeps the WMMA class instead of a matvec a
+ * sequence. Only steps below q 3 with two or more decode sequences change; a lone sequence below q 3 (cap <= 3) keeps
+ * its M = qd launch. */
 static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
-    if (fn4_biseg_flag().load(std::memory_order_relaxed) < 2) return false;
+    const int bsm = fn4_biseg_flag().load(std::memory_order_relaxed);
+    if (bsm < 2) return false;
     const int64_t n = batch->n_out;
     if (n <= 1) return false;                      /* one row: already its alone class */
     int64_t sd = 0, td = 0;
@@ -391,7 +531,7 @@ static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
                     brow_slice(m.b_logits, r0, k, V));
     };
     if (td > 0) {
-        if (qd >= 3) one(0, td);
+        if (qd >= 3 || (bsm >= 3 && td >= 3)) one(0, td);
         else for (int64_t s = 0; s < sd; ++s) one(s * qd, qd);
     }
     for (int64_t r = td; r < n; ++r) one(r, 1);
@@ -406,7 +546,7 @@ static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
 constexpr int64_t kBiDecRows = 8;
 static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t a, int64_t b, bool ss) {
     const bool dec = m.bi_mode >= 3 && a < m.bi_td;
-    if (!dec) { hcx.read(c, T, a, b - a, ss); return; }
+    if (!dec) { hcp_read(c, m, hcx, T, a, b - a, ss); return; }   /* lever HCP: past the first interval, a full piece's K split */
     /* hc_bi 5 (12.11.2026, 199: hc_bi 3's 8-row reads cost 15.7 % at c16): the decode rows in one launch through the
      * twin (libr4d bi_dec: form G in 8-row groups, B3 in 16-row groups; each row's bytes as at 3). */
     if (m.bi_mode == 5 && hcx.op_read_bd) {
@@ -422,7 +562,7 @@ static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t
     for (int64_t p = a; p < b; p += pc) hcx.read(c, T, p, std::min(pc, b - p), ss);
 }
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
-    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) { hcx.read(c, T, r0, n, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) { hcp_read(c, m, hcx, T, r0, n, ss); return; }
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
         const int64_t a = std::max(m.bi_cut[i], r0), b = std::min(m.bi_cut[i + 1], r0 + n);
         if (b > a) bi_read_seg(c, m, hcx, T, a, b, ss);
@@ -430,7 +570,13 @@ static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, 
 }
 /* read_pieces under hc_bi: each segment in pieces of the read's band. */
 static void bi_read_pieces(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, bool ss = false) {
-    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) { hcx.read_pieces(c, T, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) {
+        if (!m.hcp) { hcx.read_pieces(c, T, ss); return; }
+        const int64_t pr = hcx.c.read_rows;   /* lever HCP: read_pieces' pieces, each through hcp_read */
+        if (pr <= 0 || T <= pr) { hcp_read(c, m, hcx, T, 0, T, ss); return; }
+        for (int64_t r0 = 0; r0 < T; r0 += pr) hcp_read(c, m, hcx, T, r0, T - r0 < pr ? T - r0 : pr, ss);
+        return;
+    }
     const int64_t piece = hcx.c.read_rows > 0 ? hcx.c.read_rows : T;
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
         for (int64_t a = m.bi_cut[i]; a < m.bi_cut[i + 1]; a += piece)
@@ -498,8 +644,8 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: qwen4exp: fn4 BI's tracer ON (RADIANCE_FN4_BITRACE=%s): %zu traced buffers, %lld points a "
-                        "step at most, rows at positions %lld .. %lld of sequences first seen at 0 with at most %lld query "
-                        "rows; passes not recorded\n",
+                        "step at most, rows at positions %lld .. %lld of sequences first seen at 0 (or, with PMIN, at a prefix "
+                        "hit at or below PMIN) with at most %lld query rows; passes not recorded\n",
                 t.dir.c_str(), t.tb.size(), (long long)t.cap, (long long)t.pmin, (long long)t.pmax, (long long)t.plen);
     return RAD_OK;
 }
@@ -599,7 +745,12 @@ static void bt_flush(RadCtx* c, Model& m, const RadBatch* batch) {
         if (it == t.card.end() || cx < k.ctx || (prefill && (cx == 0 || cx != k.end))) {
             const int32_t r = cu[(size_t)s];
             k.serial = ++t.serials;
-            k.follow = cx == 0 && r >= 0 && r < T && pos[(size_t)r] == 0 && ql[(size_t)s] <= t.plen;
+            /* Qwen loop F25 (21.11.2026): with RADIANCE_FN4_BITRACE_PMIN set, a request whose first step starts at a prefix hit
+             * (0 < context <= PMIN, its first row at that context) is followed too, so a hit sibling's rows at PMIN.. are traced
+             * beside its cold twin's; PMIN unset (0) = the cold-only rule as before */
+            const bool cold0 = cx == 0 && r >= 0 && r < T && pos[(size_t)r] == 0;
+            const bool hit = t.pmin > 0 && cx > 0 && cx <= t.pmin && r >= 0 && r < T && pos[(size_t)r] == cx;
+            k.follow = (cold0 || hit) && ql[(size_t)s] <= t.plen;
         }
         k.ctx = cx;
         k.end = cx + ql[(size_t)s];
@@ -954,6 +1105,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                             "model.language_model.layers.0.mlp.experts", &ps));
             RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ps, &mc));
         }
+        /* qfn-on-ds: EXL3 experts take the Qwen line's declare (MoeFP8::Config::exl3_v12: protected experts by place,
+         * the shared routing map, the fused decode chain, the v12 band); the DeepSeek line's form is deepseek41's. */
+        mc.exl3_v12 = mc.expert_exl3 ? 1 : 0;
         /* Plain experts mean a container converted without a quantising recipe, so every linear
          * is plain too: the blocks issue bf16 GEMMs over bf16 activations and nothing quantises
          * (Geom::w_bf16). Each linear refuses a quantised encoding then. The converse is allowed:
@@ -1723,6 +1877,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
     for (size_t l = 0; l + 1 < m.layers.size(); ++l) m.layers[l].mlp.xp_next = &m.layers[l + 1].mlp;
+    /* qfn-on-ds P2S: with the two-piece buffers declared, say at start whether a layer's MoE takes a joint pass of two
+     * pieces (MoeFP8::pair_ok) and, if not, the first condition that refuses it */
+    if (fn4_env_on("RADIANCE_FN4_P2X") && g.rank == 0 && !m.layers.empty() && m.pass_rows > 0) {
+        const char* why = m.layers[0].mlp.pair_why(2 * m.pass_rows, m.pass_rows);
+        fprintf(stderr, "radiance: qwen4exp: P2S: a joint routed pass of two %lld-row pieces (MoE rows %lld): %s\n",
+                (long long)m.pass_rows, (long long)m.moecfg.rows, why ? why : "allowed");
+    }
 
     /* fn4 SP-hc (test builds): declared only on request, at four ranks under the pipelined prefill. */
     /* fn4 KVCAP C1: the wide stream's all-gather bounded by the rows one launch carries (Model::sp_agh_rows) */
@@ -1749,6 +1910,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           RAD_NOWEIGHTS),
                       {m.b_h}, {m.b_h});
         m.sp_agh_rows = agh_rows;
+        if (fn4_env_on("RADIANCE_FN4_SP_ROUTE") && g.wire_exact && m.b_rlogits) {   /* fn4 SP-route */
+            const int64_t NE = m.moecfg.n_expert_all;
+            if (NE % 32 == 0) {
+                m.sp_agl = rw(b, RAD_OP(b, "all_gather_rows",
+                                  RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * NE, T * NE),
+                                             RAD_STR("dtype", g.dtype), RAD_INT("row", NE), RAD_INT("raw", 1),
+                                             RAD_INT("overlap", 1)),
+                                  RAD_NOWEIGHTS),
+                              {m.b_rlogits}, {m.b_rlogits});
+                if (m.sp_agl) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_rlogits));
+            }
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: qwen4exp: fn4 SP-route %s (RADIANCE_FN4_SP_ROUTE; switch sp_route: the router GEMM on "
+                                "each rank's quarter of an SP-hc piece, the logits gathered raw)\n",
+                        m.sp_agl ? "declared" : "NOT served -- all_gather_rows over the logits did not resolve");
+        }
         bool ok = m.sp_rs && m.sp_ag && m.sp_agh;
         const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
         for (Layer& lay : m.layers) {
@@ -1863,7 +2040,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * rad-convert declares at a non-zero max_spec). */
     const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
                                     "mtp_num_hidden_layers", 0);
-    if (nextn > 0 && g.max_spec > 0) {
+    if (nextn > 0 && rad_ctx_draft_head(ctx)) {
         const char* mpre = "mtp";
         /* Sized at max_tok, not max_logit_rows: the history pass that fills the head's own K and V
          * has one row per token over a whole prefill chunk. */
@@ -2000,8 +2177,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
 
         m.mtp.media = m.media;
+        /* qfn-on-ds lever MSP (Qwen loop round 20; RADIANCE_FN4_MSP=1 declares, sp_route bit 1024 picks it): a prompt's
+         * mid-chunk history pass of four read pieces runs the head's per-row work on this rank's piece, then gathers the
+         * block input raw (SP-hc's all_gather_rows over a_x.x, the head's w.x) and redoes its codes (MtpHcBlock::step_msp) */
+        if (fn4_env_on("RADIANCE_FN4_MSP") && g.world == 4 && m.sp_ag && (m.sp_on || m.spser_ok) && g.wire_exact &&
+            m.hccfg.read_rows > 0 && (int64_t)g.world * m.hccfg.read_rows <= T) {
+            m.mtp.msp_ag   = m.sp_ag;
+            m.mtp.msp_rows = m.hccfg.read_rows;
+        }
         RAD_ARCH_TRY(m.mtp.declare(b, nm, g, (int)g.n_layer, m.kv_full, &m.kv_qsa_bkey, m.n_rot,
                                    m.w_tok, m.w_lm_head, m.hccfg, g.max_spec, tw, ts));
+        if (fn4_env_on("RADIANCE_FN4_MSP") && g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: qwen4exp: lever MSP (RADIANCE_FN4_MSP; sp_route bit 1024): %s\n",
+                    !m.mtp.msp_ag ? "NOT served -- needs four ranks, SP-hc / SP-serial served (RADIANCE_FN4_SPHC or _SPSERIAL), "
+                                    "the exact wire, a read piece (--prefill-span) and the connection's codes op"
+                    : m.mtp.msp_rs ? "a prompt's mid-chunk MTP history pass of four read pieces runs its gather, mtp_enter and "
+                                     "connection read on this rank's piece, then gathers the block input raw and redoes its codes "
+                                     "(bit 2048: its embedding by a raw reduce-scatter onto the piece)"
+                                   : "a prompt's mid-chunk MTP history pass of four read pieces runs its gather, mtp_enter and "
+                                     "connection read on this rank's piece, then gathers the block input raw and redoes its codes "
+                                     "(bit 2048 not served: the embedding's reduce-scatter did not resolve)");
         /* A head pass refills the rope table ahead of the head's ops (step), while the carry
          * `mtp_hin` still holds the rows the previous pass left. The refill is the trunk's
          * `rope_table` op, so the table's planned life would end at its last declared reader,
@@ -2112,6 +2307,10 @@ struct MixAr {
     rad_op       rs = 0;
     rad_buf      x = 0;
     int64_t      n_embd = 0, sp_min = 0;
+    /* fn4 PF marks (qwen/prefill; sp_route bit 8): record lane-1 mark (r0 / rows) behind each handed piece's reduction,
+     * and the bit in *mk, so the step waits for that piece alone (Ctx::lane_join 0x100 / 0x200) */
+    uint32_t*    mk = nullptr;
+    int64_t      rows = 0;
 };
 static void mix_ar_piece(void* u, int64_t r0, int64_t n) {
     const MixAr& s = *(const MixAr*)u;
@@ -2120,6 +2319,10 @@ static void mix_ar_piece(void* u, int64_t r0, int64_t n) {
     if (s.rs && n >= s.sp_min) RAD_ISSUE_N(s.c, s.rs, n * s.n_embd, brow_slice(s.x, r0, n, s.n_embd), RAD_NONE);
     else if (s.l->full) s.l->attn.issue_ar(s.c, r0, n);
     else           s.l->gdn.issue_ar(s.c, r0, n);
+    if (s.mk && s.rows > 0 && r0 / s.rows < 8) {
+        const int k = (int)(r0 / s.rows);
+        if (rad_lane_join(s.c, 1, 0x100 + k) == RAD_OK) *s.mk |= 1u << k;
+    }
     rad_lane(s.c, 0);
 }
 
@@ -2156,12 +2359,16 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
 /* fn4 P2x (declared with RADIANCE_FN4_P2X=1: the expert buffers two pieces tall): switch "moe_pair" 0 / 1 / 2 puts a
  * pipelined prefill step's two pieces through ONE routed-expert pass (MoeFP8::pair_routed) -- 1 with each piece's
  * shared arm after it (beside piece 0's MoE all-reduce), 2 with the shared arms inside it (pass()'s interleave);
- * RADIANCE_FN4_MOE_PAIR=<n> starts it at n. */
+ * RADIANCE_FN4_MOE_PAIR=<n> starts it at n.
+ * qfn-on-ds lever P2S (Qwen loop round 17, QUEUE Q38): under hc_sp 2 (every piece SP) a step of an EVEN number of full pieces
+ * runs its pieces' routed experts in PAIRS ((0, 1), (2, 3)): 1 / 2 the joint pass (as above; RADIANCE_FN4_P2X=1 declares the
+ * MoE two pieces tall), 3 = the pair ORDER with each piece's own pass (exact by construction, no P2X needed: the order's own
+ * cost, the arm that splits the joint form's net into its order and its kernel saving). See step_pipelined's P2S branch. */
 static std::atomic<int>& fn4_pair_flag() {
     static std::atomic<int> f{[] {
         const char* v = std::getenv("RADIANCE_FN4_MOE_PAIR");
         const int n = v && *v ? std::atoi(v) : 0;
-        return n >= 0 && n <= 2 ? n : 0;
+        return n >= 0 && n <= 4 ? n : 0;
     }()};
     return f;
 }
@@ -2195,6 +2402,17 @@ static std::atomic<int>& fn4_spple_flag() {
     static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SP_PLE") ? 1 : 0};
     return f;
 }
+/* fn4 SP-route (16.11.2026, qwen/prefill; switch "sp_route", RADIANCE_FN4_SP_ROUTE at start declares it and gives its value;
+ * 0 = today): in a pipelined hc_sp 2 step whose pieces all take SP, each rank runs the router GEMM on its own quarter of a
+ * piece right after the quarter's connection read (MoeFP8::route_rows), the logits rows go to every rank with a raw
+ * all-gather on the second lane beside it (sp_agl, after the piece's block-input gather), and the piece's MoE pass skips its
+ * GEMM (pass(..., routed)): the router's 2048-row GEMM, replicated on all four ranks today, becomes one 512-row GEMM a rank.
+ * The logits bytes are the same (a row's logits do not depend on the launch's other rows), so the top-k, the scatter and
+ * everything after them are today's. */
+static std::atomic<int>& fn4_sproute_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SP_ROUTE") ? 1 : 0};
+    return f;
+}
 constexpr int64_t kSpMinRows = 64;
 /* fn4 KVCAP C1: an sp_agh launch of `rows` rows fits the bound its peer scratch was declared for (Model::sp_agh_rows);
  * past it the step fails with the reason, before the launch (the core would refuse the count as outside the op's bucket
@@ -2219,7 +2437,14 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };
     /* fn4 P2x: the two pieces' routed experts in one pass (moe_pair 1 / 2), where the MoE was declared for it */
     const int pmode = fn4_pair_flag().load(std::memory_order_relaxed);
-    const bool pair_on = pmode > 0 && K == 2 && m.moecfg.rows >= T;
+    /* qfn-on-ds P2S: under hc_sp 2 the pairs ride the SP order (pair_sp, the branch below); the K = 2 form above keeps the
+     * stock order (SP off) and takes only modes 1 / 2 when hc_sp is not 2 */
+    /* qfn-on-ds lever PSP (sp_route bit 512, below): also an odd piece count -- pairs (0, 1), (2, 3), .. and the last piece
+     * single (the loop's paired(); moe_pair 4's tail runs the same mix of joint and single passes) */
+    const bool psp_k = (fn4_sproute_flag().load(std::memory_order_relaxed) & 512) != 0;
+    const bool pair_sp = pmode > 0 && m.sp_on && g.world == 4 && fn4_sp_flag().load(std::memory_order_relaxed) == 2 &&
+                         K >= 2 && (K % 2 == 0 || psp_k) && (pmode == 3 || m.moecfg.rows >= 2 * R);
+    const bool pair_on = pmode > 0 && pmode < 3 && !pair_sp && K == 2 && m.moecfg.rows >= T;
     /* fn4 SP-hc: sp, the real sequence-parallel residual (reduce-scatter, the connections on this rank's quarter, the
      * all-gather and the codes redone); spp, the speed probe (the quarter only, all-reduces kept, wrong output). A
      * piece takes SP when it has kSpMinRows rows; its quarter is the reduce-scatter's shard: q = ceil(rn / world),
@@ -2231,6 +2456,29 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * of four a layer on lane 0's path at two pieces). The same ops on the same rows: only the order of issue moves. */
     const bool spo = sp && spv == 2;
     const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
+    /* fn4 PF marks (16.11.2026, qwen/prefill; sp_route bit 8): in the hc_sp 2 order, lane 0 waits for the one collective
+     * an op reads (piece p's mixer reduction before its connection write; piece p's gathers before its codes) instead of
+     * everything the second lane holds. The same ops on the same rows; only where lane 0 waits moves. */
+    const bool pmk = (fn4_sproute_flag().load(std::memory_order_relaxed) & 8) != 0;
+    /* fn4 SPO-tail (sp_route bit 16): the hc_sp 2 order also where only the last piece is partial */
+    const bool spo_tail = spo && (fn4_sproute_flag().load(std::memory_order_relaxed) & 16) != 0;
+    /* fn4 PF-ORDER (sp_route bit 32): see the layer loop */
+    const bool pford = (fn4_sproute_flag().load(std::memory_order_relaxed) & 32) != 0;
+    /* PF probe NOWAIT (qfn-on-ds, Qwen loop round 13, QUEUE Q9's upper-bound read; sp_route bit 256; WRONG BYTES, timed
+     * only): inside this step lane 0 never waits for lane 1 (wait1 / waitm issue no join); lane 1 still orders every
+     * collective behind the lane-0 mark it reads (on1's join 0 -> 1, the handed pieces' mix_ar_piece), and the step ends
+     * with one join 1 -> 0. So a step takes max(lane 0's own chain, lane 1's chain behind it): what lane 0 costs if its
+     * waits on the collectives were filled -- the ceiling of a second prompt's pieces in the step (Q9) and of every form
+     * that hides the comm lane's waits. Lane 0 reads x before its reduction lands (garbage rows, finite); a start that
+     * takes it reads timing only (no identity cell, nonce prompts). */
+    const bool nowait = (fn4_sproute_flag().load(std::memory_order_relaxed) & 256) != 0;
+    /* qfn-on-ds lever PSP (Qwen loop round 19, sp_route bit 512; QUEUE Q39): the step's PARTIAL last piece takes SP too, so the
+     * hc_sp 2 order (and P2S's pairs: a full piece with the partial one in one routed pass) covers every prompt's last cold
+     * chunk (the prefill timeline, R42: a chunk with a partial piece 109-121 ms a 1k rows against 95-96 for span chunks). Its
+     * quarter's reads go through the SP-serial twins (HyperConn::read_kt, the K split pinned to the PIECE's own row tiles), which
+     * is what reading the partial piece whole gives (spser_run's rule: every rank's part more than 64 rows, a twin for the
+     * piece's tiles); the other ops are per row. So the same bytes as today; off = today. */
+    const bool psp = psp_k;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2238,7 +2486,14 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const int64_t spl0 = sp && fn4_spple_flag().load(std::memory_order_relaxed) > 0 && m.ple_layer > 0 ? m.ple_layer : 0;
     auto lsp = [&](int64_t li) { return sp && li >= spl0; };
     bool spL = sp;
-    auto sp_pm = [&](int64_t p, bool on) { return on && rn(p) == R && rn(p) >= kSpMinRows; };
+    auto psp_ok = [&](int64_t p) {   /* lever PSP: the partial last piece's SP, where its parts read as the piece whole */
+        if (!psp || p != K - 1 || p == 0 || rn(p) >= R || rn(p) % g.world != 0 || rn(p) / g.world <= 64) return false;
+        if (m.layers.empty()) return false;
+        for (const Layer* l : { &m.layers.front(), &m.layers.back() })   /* every connection declares the same twins */
+            if (!l->hc_mix.read_kt_op(rn(p)) || !l->hc_ffn.read_kt_op(rn(p))) return false;
+        return true;
+    };
+    auto sp_pm = [&](int64_t p, bool on) { return on && rn(p) >= kSpMinRows && (rn(p) == R || psp_ok(p)); };
     auto sp_p = [&](int64_t p) { return sp_pm(p, spL); };
     auto hq0m = [&](int64_t p, bool on) {
         if (!(spp || sp_pm(p, on))) return r0(p);
@@ -2257,8 +2512,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
     auto hrm = [&](const HyperConn& h, int64_t p, bool ss, bool on) {
         if (hqnm(p, on) <= 0) return;
-        if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
-        else h.read(c, T, hq0m(p, on), hqnm(p, on), ss);
+        /* lever HCP: a partial piece's rows (a rank's part under PSP, or the piece whole) at the full piece's split */
+        if (sp_pm(p, on) && rn(p) != R) {
+            if (hcp_pins(m, h, r0(p), hqnm(p, on))) { h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss); ++m.hcp_n; }
+            else h.read_kt(c, hq0m(p, on), hqnm(p, on), rn(p), ss);   /* lever PSP: the piece's own split */
+        }
+        else if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
+        else hcp_read(c, m, h, T, hq0m(p, on), hqnm(p, on), ss);
     };
     auto hr = [&](const HyperConn& h, int64_t p, bool ss) { hrm(h, p, ss, spL); };
     /* SP's collectives on piece p of a_x (the block output; the next block input) and of the wide stream */
@@ -2277,7 +2537,21 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         issue();
         rad_lane(c, 0);
     };
-    auto wait1 = [&] { rad_lane_join(c, 1, 0); };
+    auto wait1 = [&] { if (!nowait) rad_lane_join(c, 1, 0); };
+    if (psp && !m.psp_noted && g.rank == 0 && K >= 2 && rn(K - 1) < R) {
+        m.psp_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: lever PSP (sp_route bit 512): a %lld-row step's partial last piece of %lld rows %s\n",
+                (long long)T, (long long)rn(K - 1),
+                psp_ok(K - 1) ? "takes SP (its quarter's reads pinned to the piece's own K split, the SP-serial twins), so the "
+                                "hc_sp 2 order and P2S's pairs cover it"
+                              : "stays whole (a part of 64 rows or fewer, a row count the four ranks do not share evenly, or no "
+                                "SP-serial twin for its tiles: RADIANCE_FN4_SPSERIAL=1 at start declares them)");
+    }
+    if (nowait && !m.nowait_noted && g.rank == 0) {
+        m.nowait_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: PF probe NOWAIT (sp_route bit 256): a pipelined prefill step's lane 0 does not wait "
+                        "for lane 1 (one join at the step's end); WRONG BYTES, timing only\n");
+    }
     if (!m.pipe_noted) {
         m.pipe_noted = true;
         if (g.rank == 0)
@@ -2286,13 +2560,18 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     (long long)T, (long long)K, (long long)R);
     }
 
+    /* qfn-on-ds lever TIP: the tail snapshot inside this step, at the start of its last piece (g_tipr) */
+    TipStage tip{};
+    if (!tip_stage_for(c, batch, m, &tip)) return;
+    const TipStage* tipp = tip.on() ? &tip : nullptr;
+
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
     on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE); });
     wait1();
     bt_pt(c, m, m.a_x.x, 0, T, "emb", -1);
-    if (m.ple_layer >= 0) m.ple.ids(c, batch);
+    if (m.ple_layer >= 0) m.ple.ids(c, batch, tipp);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
@@ -2302,15 +2581,33 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * prefill sequence in two pieces. */
     const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL
                        ? pcu : nullptr;
+    /* qfn-on-ds lever GPF (Qwen loop round 22, sp_route bit 4096; test tip5's sibling hits): that two-piece path projects
+     * each piece alone, so a second piece of <= 64 rows (libr4d's narrow band) takes gemm_nt_q m16's split-K arithmetic for
+     * the delta net's in-projection and gemm_nt m16 for its a|b, where a step of three or more pieces (the cold run of the
+     * same rows) projects them inside its T-row tiled launch: a hit resuming one piece before a short last piece answered
+     * otherwise than its cold. On: the piece path only where the second piece is wider than the band (ArPieces::min_last);
+     * a (R, <= 64) step runs the delta net whole, as K >= 3 does. Changes the bytes of such steps only (T in (R, R + 64]). */
+    const bool gpf = (fn4_sproute_flag().load(std::memory_order_relaxed) & 4096) != 0;
+    if (gpf && gcu && T - R <= kBiNarrowRows && !m.gpf_noted && g.rank == 0) {
+        m.gpf_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: lever GPF (sp_route bit 4096): a %lld-row step's last piece of %lld rows is in the "
+                        "narrow band, so its delta net runs whole (the projections over all %lld rows, as a step of three "
+                        "pieces), not a piece at a time\n",
+                (long long)T, (long long)(T - R), (long long)T);
+    }
 
     const int64_t n = (int64_t)m.layers.size();
     if (n > 0) {
-        if (m.ple_layer == 0) { m.ple.step(c, batch); bt_pt(c, m, m.b_h, 0, T, "ple", 0); }
+        if (m.ple_layer == 0) { m.ple.step(c, batch, tipp); bt_pt(c, m, m.b_h, 0, T, "ple", 0); }
         for (int64_t p = 0; p < K; ++p) {
             bi_read(c, m, m.layers[0].hc_mix, T, r0(p), rn(p));
             bt_rd(c, m, r0(p), rn(p), "rd_mix", 0, false);
         }
     }
+    /* qfn-on-ds P2S note (F50): the layers that take the pairs in this step, and the first that does not with its reason */
+    int p2s_n = 0;
+    int64_t p2s_no = -1;
+    const char* p2s_why = nullptr;
     for (int64_t li = 0; li < n; ++li) {
         const Layer& l = m.layers[(size_t)li];
         spL = lsp(li);
@@ -2320,10 +2617,41 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
          * first piece's all-reduce runs beside the next piece's attention or out projection. */
         MixAr ms{c, &l};
         if (spL) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
+        /* fn4 PF marks: this layer runs the hc_sp 2 order (every piece SP) and the switch asks for the precise waits */
+        uint32_t mk = 0;
+        /* qfn-on-ds P2S (QUEUE Q38): this layer runs the hc_sp 2 order with paired routed passes -- every piece SP and full,
+         * not under SP-route (sp_route bit 1), and the MoE block's forms allow a joint pass (modes 1 / 2) */
+        const bool pair_sp_now = pair_sp && spo &&
+                                 !(m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) &&
+                                 [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }() &&
+                                 (pmode == 3 || (l.mlp.pair_ok(2 * R, R) &&
+                                                 (rn(K - 1) == R || K % 2 != 0 || l.mlp.pair_ok(R + rn(K - 1), R))));   /* PSP's partial pair */
+        /* F50: counted over the step's layers and noted after the loop (layer 0 runs without SP under sp_ple 1, so a note
+         * read at layer 0 alone said "today's order" while layers 1-47 paired) */
+        if (pair_sp && g.rank == 0) {
+            if (pair_sp_now) {
+                ++p2s_n;
+            } else if (p2s_no < 0) {
+                p2s_no = li;
+                p2s_why = !spo ? "not the hc_sp 2 order"
+                          : (m.sp_agl && (fn4_sproute_flag().load(std::memory_order_relaxed) & 1)) ? "SP-route"
+                          : [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }()
+                              ? (l.mlp.pair_why(2 * R, R) ? l.mlp.pair_why(2 * R, R) : "?")
+                              : "a piece not SP";
+            }
+        }
+        const bool pmk_l = pmk && spo && !pair_on && !pair_sp_now && K >= 2 && K <= 8 &&
+                           [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }();
+        if (pmk_l) { ms.mk = &mk; ms.rows = R; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
+        if (gpf) pc.min_last = kBiNarrowRows;   /* lever GPF: a (R, <= 64)-row step's mixer runs whole, as at K >= 3 */
+        /* fn4 PF-ORDER (sp_route bit 32, with the marks): a delta-net layer hands only piece 0's reduction; the step issues
+         * the others beside the pieces' connections (ar_mix below), so the second lane takes piece 0's gather before
+         * piece 1's and 2's mixer reductions instead of after them (the delta net hands every piece at its very end) */
+        if (pmk_l && pford && !l.full) pc.max_hand = 1;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
-        else        l.gdn.step(c, batch, false, &pc);
+        else        l.gdn.step(c, batch, false, &pc, tipp);
         bt_blk(c, m, l, T, (int)li);   /* lane 0's buffers; lane 1 reduces only `x` */
         auto ar_mix = [&](int64_t p) {
             if (sp_p(p))     rs_p(p);
@@ -2332,9 +2660,16 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         };
         /* A block that handed nothing leaves the first piece's all-reduce to be issued here. */
         if (pc.handed == 0) on1(true, [&] { ar_mix(0); });
-        wait1();
+        auto mark1 = [&](int k) { if (k < 16 && rad_lane_join(c, 1, 0x100 + k) == RAD_OK) mk |= 1u << k; };
+        auto waitm = [&](int k) {
+            if (k < 16 && (mk & (1u << k))) { if (!nowait) rad_lane_join(c, 0x200 + k, 0); mk &= ~(1u << k); } else wait1();
+        };
+        if (pmk_l && pc.handed == 0) mark1(0);
+        if (!pmk_l) wait1();   /* fn4 PF marks: the spo branch below waits piece by piece */
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
         int64_t sp_pend = -1;   /* fn4 SP-hc: a piece whose MoE reduce-scatter is still to be issued */
+        int64_t pp_lo = 0, pp_n = 0;   /* qfn-on-ds P2S: the last pass's pieces [pp_lo, pp_lo + pp_n) still to be reduce-scattered */
+        bool pp_mark = false;          /* P2S: the writes wait for piece K - 2's reduce-scatter by mark 15 */
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
         const bool pair_now = pair_on && l.mlp.pair_ok(T, R);
         if (pair_on && li == 0 && g.rank == 0 && m.pair_noted != (pair_now ? pmode : -1)) {
@@ -2369,11 +2704,127 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             l.mlp.pair_finish(c, T, r0(1), rn(1), pmode != 2);
             wait1();
             on1(true, [&] { l.mlp.issue_ar(c, r0(1), rn(1)); });
+        } else if (pair_sp_now) {
+            /* qfn-on-ds lever P2S (QUEUE Q38): the hc_sp 2 order (the branch below) with the pieces' routed experts in pairs. Per
+             * piece p: piece p + 1's connections beside piece p's gather, the wait, piece p + 1's gather, piece p's codes; a
+             * pair's first piece then waits, and at its second the pending MoE reduce-scatters (the previous pass's pieces) go
+             * out beside this pass -- one routed pass over both pieces (moe_pair 1 / 2: every touched expert read and decoded
+             * once for 2 R rows), or each piece's own pass in the same order (3: exact by construction, the order's own cost).
+             * 4: the joint pair only where two more pieces follow it (K = 4: (0, 1), then 2 and 3 single), so the last
+             * pieces keep today's tail. The last pass's reduce-scatters go out after the loop; with two, the writes wait for
+             * the first by a mark. The same ops on the same rows as the branch below; a joint pass's slot outputs are the
+             * per-piece pass's bytes (perfmoe --split-seed, LEVERS P2x row 134 (162)). */
+            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
+            {
+                const bool ss0 = hw(l.hc_mix, 0);
+                bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
+                hr(l.hc_ffn, 0, ss0);
+                bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
+            }
+            wait1();
+            on1(true, [&] { ag_p(0); });
+            auto paired = [&](int64_t q) {   /* pieces q (even) and q + 1 share a pass */
+                return q % 2 == 0 && q + 1 < K && (pmode != 4 || q + 3 < K);
+            };
+            for (int64_t p = 0; p < K; ++p) {
+                if (p + 1 < K) {
+                    if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
+                    const bool ss = hw(l.hc_mix, p + 1);
+                    bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
+                    hr(l.hc_ffn, p + 1, ss);
+                    bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
+                }
+                wait1();
+                if (p + 1 < K) on1(true, [&] { ag_p(p + 1); });
+                const bool first = paired(p), second = p >= 1 && paired(p - 1);
+                if (!first && pp_n > 0) {   /* the previous pass's reduce-scatters beside this pass */
+                    const int64_t q = pp_lo, nq = pp_n;
+                    on1(true, [&] { for (int64_t j = 0; j < nq; ++j) rs_p(q + j); });
+                    pp_n = 0;
+                }
+                l.hc_ffn.codes(c, r0(p), rn(p));
+                if (first) continue;
+                if (second && pmode != 3) {
+                    /* PN: the pair's rows -- 2 R, or R + the partial last piece under lever PSP (pair_routed_at's second piece
+                     * is N - R rows) */
+                    const int64_t P0 = r0(p - 1), PN = rn(p - 1) + rn(p);
+                    l.mlp.pair_routed_at(c, T, P0, PN, R, pmode == 2);
+                    l.mlp.pair_finish(c, T, P0, rn(p - 1), pmode != 2, P0, PN);
+                    l.mlp.pair_finish(c, T, r0(p), rn(p), pmode != 2, P0, PN);
+                } else {
+                    if (second) l.mlp.pass(c, T, r0(p - 1), rn(p - 1), false);
+                    l.mlp.pass(c, T, r0(p), rn(p), false);
+                }
+                pp_lo = second ? p - 1 : p;
+                pp_n = second ? 2 : 1;
+            }
         } else if (spo && [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return K >= 2; }()) {
             /* fn4 hc_sp 2: every piece SP. Piece 0's connections (piece 1's mixer reduce-scatter beside them), one wait for
              * both reduce-scatters (hw of piece 1 reads piece 1's), then per piece p: piece p + 1's connections beside piece
              * p's gather, the wait, piece p + 1's gather and piece p - 1's MoE reduce-scatter beside piece p's codes + MoE.
              * Piece p + 2's mixer reduce-scatter goes out before piece p + 1's write, so the wait at p covers it. */
+            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; if (pmk_l) mark1(1); }
+            /* fn4 SP-route: the router on this rank's quarter right after its read (lane 0), its logits gathered behind the
+             * piece's block-input gather (lane 1), the pass without its GEMM */
+            /* fn4 PF probe (qwen/prefill, measurement of where the pipelined step's time goes; exact: the repeats rewrite the
+             * same bytes): sp_route bit 2 = every block-input gather issued twice on lane 1 (+1 AG a piece and layer), bit 4 =
+             * every quarter connection read issued twice on lane 0 (+1 hc read a piece and layer). */
+            const int sprv = fn4_sproute_flag().load(std::memory_order_relaxed);
+            const bool rsp = m.sp_agl && (sprv & 1);
+            const bool prb_ag = (sprv & 2) != 0, prb_hr = (sprv & 4) != 0;
+            const int64_t NE = m.moecfg.n_expert_all;
+            bool routed[8] = { false, false, false, false, false, false, false, false };
+            auto rq = [&](int64_t p) { if (rsp && p < 8) routed[p] = l.mlp.route_rows(c, rn(p), hq0(p), hqn(p)); };
+            auto agl = [&](int64_t p) {
+                if (p < 8 && routed[p])
+                    on1(true, [&] { RAD_ISSUE_N(c, m.sp_agl, rn(p) * NE, brow_slice(m.b_rlogits, r0(p), rn(p), NE), RAD_NONE); });
+            };
+            {
+                if (pmk_l) waitm(0);   /* fn4 PF marks: piece 0's mixer reduction only */
+                const bool ss0 = hw(l.hc_mix, 0);
+                bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
+                hr(l.hc_ffn, 0, ss0);
+                if (prb_hr) hr(l.hc_ffn, 0, ss0);
+                bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
+                rq(0);
+            }
+            if (!pmk_l) wait1();
+            on1(true, [&] { ag_p(0); });
+            if (prb_ag) on1(true, [&] { ag_p(0); });
+            agl(0);
+            if (pmk_l) mark1(8);
+            for (int64_t p = 0; p < K; ++p) {
+                if (p + 1 < K) {
+                    if (p + 2 < K && p + 2 >= issued) {
+                        on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3;
+                        if (pmk_l) mark1((int)p + 2);
+                    }
+                    if (pmk_l) waitm((int)p + 1);   /* fn4 PF marks: piece p + 1's mixer reduction */
+                    const bool ss = hw(l.hc_mix, p + 1);
+                    bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
+                    hr(l.hc_ffn, p + 1, ss);
+                    if (prb_hr) hr(l.hc_ffn, p + 1, ss);
+                    bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
+                    rq(p + 1);
+                }
+                if (pmk_l) waitm(8 + (int)p); else wait1();   /* fn4 PF marks: piece p's gathers only */
+                if (p + 1 < K) {
+                    on1(true, [&] { ag_p(p + 1); });
+                    if (prb_ag) on1(true, [&] { ag_p(p + 1); });
+                    agl(p + 1);
+                    if (pmk_l) mark1(8 + (int)p + 1);
+                }
+                if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
+                l.hc_ffn.codes(c, r0(p), rn(p));
+                l.mlp.pass(c, T, r0(p), rn(p), false, p < 8 && routed[p]);
+                sp_pend = p;
+            }
+        } else if (spo_tail && K >= 2 && !sp_p(K - 1) && [&] { for (int64_t q = 0; q + 1 < K; ++q) if (!sp_p(q)) return false; return true; }()) {
+            /* fn4 SPO-tail (16.11.2026, qwen/prefill; sp_route bit 16): the hc_sp 2 order for a step whose last piece is
+             * shorter than a pass (every prompt's last step; a Claude Code follow-up's 2-8k chunk): the full pieces as the
+             * branch above runs them, the partial piece's connections (whole-piece forms, no SP) beside the last full
+             * piece's gather, its pass and MoE all-reduce after the full pieces' passes. The same ops on the same rows as
+             * the loop below; only the issue order of the full pieces' gathers and the partial piece's reads moves. */
             if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
             {
                 const bool ss0 = hw(l.hc_mix, 0);
@@ -2388,15 +2839,22 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
                     const bool ss = hw(l.hc_mix, p + 1);
                     bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
-                    hr(l.hc_ffn, p + 1, ss);
+                    if (sp_p(p + 1)) hr(l.hc_ffn, p + 1, ss);
+                    else bi_read(c, m, l.hc_ffn, T, hq0(p + 1), hqn(p + 1), ss);
                     bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
                 }
                 wait1();
-                if (p + 1 < K) on1(true, [&] { ag_p(p + 1); });
+                if (p + 1 < K && sp_p(p + 1)) on1(true, [&] { ag_p(p + 1); });
                 if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
-                l.hc_ffn.codes(c, r0(p), rn(p));
-                l.mlp.pass(c, T, r0(p), rn(p), false);
-                sp_pend = p;
+                if (sp_p(p)) {
+                    l.hc_ffn.codes(c, r0(p), rn(p));
+                    l.mlp.pass(c, T, r0(p), rn(p), false);
+                    sp_pend = p;
+                } else {
+                    l.mlp.pass(c, T, r0(p), rn(p), false);
+                    wait1();
+                    on1(true, [&] { l.mlp.issue_ar(c, r0(p), rn(p)); });
+                }
             }
         } else
         for (int64_t p = 0; p < K; ++p) {
@@ -2430,6 +2888,17 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             on1(true, [&] { l.mlp.issue_ar(c, r0(p), rn(p)); });
         }
         if (sp_pend >= 0) { wait1(); const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
+        if (pp_n > 0) {   /* P2S: the last pass's reduce-scatters; with two, mark the first for the writes below */
+            wait1();
+            const int64_t q = pp_lo;
+            on1(true, [&] { rs_p(q); });
+            if (pp_n == 2) {
+                mark1(15);   /* waitm(15) below falls back to the whole-lane wait if the mark was not taken */
+                pp_mark = true;
+                on1(true, [&] { rs_p(q + 1); });
+            }
+            pp_n = 0;
+        }
         l.mlp.route_report(c);
         bt_moe(c, m, T, (int)li);   /* lane 1 reduces only `x` */
         /* The writes, and the next layer's reads beside the last piece's all-reduce. PLE adds into
@@ -2437,6 +2906,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const Layer* nx = li + 1 < n ? &m.layers[(size_t)li + 1] : nullptr;
         const bool ple_next = nx && li + 1 == m.ple_layer;
         for (int64_t p = 0; p < K; ++p) {
+            if (pp_mark && p == K - 2) { waitm(15); pp_mark = false; }   /* P2S: piece K - 2's reduce-scatter */
             if (p == K - 1) wait1();
             const bool ss_ffn = hw(l.hc_ffn, p);
             /* The projection of this piece, before the next layer reads it. */
@@ -2450,7 +2920,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
         }
         if (ple_next) {
-            m.ple.step(c, batch);
+            m.ple.step(c, batch, tipp);
             bt_pt(c, m, m.b_h, 0, T, "ple", (int)li + 1);
             for (int64_t p = 0; p < K; ++p) {
                 if (sp_pm(p, spN)) hrm(nx->hc_mix, p, false, spN); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
@@ -2471,6 +2941,16 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 if (sp_pm(p, spN)) nx->hc_mix.codes(c, r0(p), rn(p));
         }
     }
+    /* qfn-on-ds P2S note (F50): once a change of (mode, layers paired) */
+    if (pair_sp && g.rank == 0 && m.pair_noted != 1000 * (pmode + 1) + p2s_n) {
+        m.pair_noted = 1000 * (pmode + 1) + p2s_n;
+        fprintf(stderr, "radiance: qwen4exp: P2S: moe_pair %d under hc_sp 2 (%s): a %lld-row step's %lld pieces -- %d of %lld layers "
+                        "in pairs%s%s%s%s\n",
+                pmode, pmode == 3 ? "the pair order, each piece's own pass" : pmode == 4 ? "one joint pass, the last two pieces single"
+                                                                         : "one joint pass a pair",
+                (long long)T, (long long)K, p2s_n, (long long)n, p2s_no >= 0 ? "; the first in today's order: layer " : "",
+                p2s_no >= 0 ? std::to_string(p2s_no).c_str() : "", p2s_no >= 0 ? " -- " : "", p2s_no >= 0 && p2s_why ? p2s_why : "");
+    }
     /* fn4 SP-hc: after the last layer every rank holds only its quarters of the wide stream; the output mixer and the
      * MTP head read every row of it, so it is gathered raw (exact) here. */
     if (sp) {
@@ -2478,6 +2958,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             if (sp_p(p)) on1(true, [&] { agh_p(p); });
         wait1();
     }
+    if (nowait) rad_lane_join(c, 1, 0);   /* PF probe NOWAIT: the step's one wait for lane 1 */
 }
 
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
@@ -2700,7 +3181,8 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto rd = [&](const HyperConn& h, const SpSer::Run& r, bool ss) {
         for (const SpSer::Part& p : r.mine) {
             if (p.dec)             bi_read_seg(c, m, h, T, p.a, p.a + p.n, ss);
-            else if (p.n == p.seg) h.read(c, T, p.a, p.n, ss);
+            else if (p.n == p.seg) hcp_read(c, m, h, T, p.a, p.n, ss);   /* lever HCP: the full piece's split */
+            else if (hcp_pins(m, h, p.a, p.n)) { h.read_sp(c, T, p.a, p.n, ss); ++m.hcp_n; }
             else                   h.read_kt(c, p.a, p.n, p.seg, ss);
         }
     };
@@ -2868,6 +3350,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
             RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
         m.mtp.qsa_win_cu = pipe_bounds(c, batch, m);
+        m.mtp.msp_now    = (fn4_sproute_flag().load(std::memory_order_relaxed) & 1024) != 0;   /* lever MSP */
+        m.mtp.msp_rs_now = (fn4_sproute_flag().load(std::memory_order_relaxed) & 2048) != 0;   /* MSP's embedding reduce-scatter */
         m.mtp.step(c, batch);
         return;
     }
@@ -2881,8 +3365,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (m.op_band)
             for (const Layer& l : m.layers) l.mlp.set_band(dual ? m.b_band : 0);
     }
+    /* qfn-on-ds lever X3GD: the step's longest sequence, for the fused EXL3 chain past 16 rows (rad_block_moe_fp8.h) */
+    for (const Layer& l : m.layers) l.mlp.set_qmax(batch->max_q_len);
     const int32_t* pcu = pipe_bounds(c, batch, m);
     SpSer sp;
+    if (g_tipr[rad_rank(c)].row > 0 && !pipelined(m, T)) {   /* lever TIP: only a pipelined step stages its rows */
+        rad_step_fail(c, "qwen4exp: lever TIP: a snapshot inside a step that is not pipelined (one pass or less, or the "
+                         "pipelined form refused): its state rows would be the step end's");
+        return;
+    }
     if (pipelined(m, T))               step_pipelined(c, batch, m, pcu);
     else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
     else                               step_serial(c, batch, m, pcu);
@@ -2901,6 +3392,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
                         brows(m.b_logits, batch->n_out));
         bt_pt(c, m, m.b_logits, 0, batch->n_out, "logits", -1, 1);
     }
+    if (m.hcp && !m.hcp_noted && m.g.rank == 0 && (m.hcp_n > 0 || !m.mixer.op_read_sp)) {   /* lever HCP: said once */
+        m.hcp_noted = true;
+        if (m.mixer.op_read_sp)
+            fprintf(stderr, "radiance: qwen4exp: lever HCP (sp_route bit 8192): a prefill segment past the prompt's first interval "
+                            "reads its connections at a full piece's K split (op_read_sp, kc_rows %lld) whatever its rows -- first "
+                            "in a %lld-row step at position %lld, %llu reads pinned so far\n",
+                    (long long)m.mixer.c.read_rows, (long long)batch->n_tok, (long long)m.hcp_pos_step,
+                    (unsigned long long)m.hcp_n);
+        else
+            fprintf(stderr, "radiance: qwen4exp: lever HCP (sp_route bit 8192) is INERT: the connections have no op_read_sp "
+                            "(RADIANCE_FN4_SPHC=1 at start with a span declares it)\n");
+    }
     bt_flush(c, m, batch);
     bi_cuts() = BiCuts{};   /* fn4 BI: the cuts are this trunk step's only */
     bi_wide_rows() = 0;
@@ -2915,6 +3418,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * mapped table). */
 uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
+    /* lever TIP: a step with a snapshot inside issues per its row (two launches a state op and staging calls), which no key
+     * carries: never recorded, never a replay */
+    if (g_tipr[rad_rank(c)].row > 0) return 0;
     if (batch->enc) return 1;
     /* Mixed batches split the query rows into decode and prefill subsets before attention; the
      * whole-batch host summary cannot key those subset geometries exactly. */
@@ -3039,6 +3545,26 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     return RAD_OK;
 }
 
+/* lever TIP (the engine's hooks, core/runtime/fn4_switch.cpp): rad_tip_set names the snapshot row of the step this rank
+ * issues next (0 after it); -1 where the start did not declare the lever (RADIANCE_FN4_TIP) or the rank has no pipelined
+ * prefill. rad_tip_free lists the stateful groups a resume at a piece start does not read (the QSA tail ring), which the
+ * engine saves as the step leaves them. */
+int tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    if (rank < 0 || rank >= MAX_RANKS || !fn4_tip_env()) return -1;
+    if (!g_model[rank].pipe_on && row != 0) return -1;
+    TipRank& t = g_tipr[rank];
+    t.row = row > 0 ? (int64_t)row : 0;
+    t.stage = row > 0 ? stage : nullptr;
+    t.u = row > 0 ? u : nullptr;
+    return 1;
+}
+int tip_free(int rank, int* groups, int max) {
+    if (rank < 0 || rank >= MAX_RANKS || !fn4_tip_env() || !g_model[rank].pipe_on) return -1;
+    int n = 0;
+    if (g_model[rank].qsacfg.kv_tail && groups && n < max) groups[n++] = (int)g_model[rank].qsacfg.kv_tail;
+    return n;
+}
+
 }  /* namespace qwen4exp_fp8 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
@@ -3050,11 +3576,21 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
 /* fn4 runtime switch (the core's runtime/fn4_switch.h, between steps, every rank parked): "gather_inv"
  * picks MoeFP8's inverse twins when the blocks were declared switchable (RADIANCE_FN4_SWITCHABLE=1 at
  * start); refused (-1) otherwise. */
+/* qfn-on-ds: this plugin's switches are the Qwen line's, which the core checks by its own ranges and never asks a plugin
+ * about; for every other name (the ds41 line's plugin switches, checked through rad_fn4_accepts) it is not the owner. */
+extern "C" int rad_fn4_accepts(const char*, int) { return 0; }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (step_pipelined; RADIANCE_FN4_P2X=1 declares) */
-        if (value < 0 || value > 2) return -1;
-        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
+        if (value < 0 || value > 4) return -1;
+        /* qfn-on-ds P2S: 3 (the pair order, each piece's own pass) needs no two-piece buffers; 1 / 2 / 4 run a joint pass */
+        if (value && value != 3 && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "gnq8") == 0) {   /* qfn-on-ds lever GNQ8: the GDN prefill gated norm writes the codes (RADIANCE_FN4_GNQ8 declares) */
+        if (value < 0 || value > 1) return -1;
+        if (value && !rad::arch::fn4_gnq8_declared()) return -1;
+        rad::arch::fn4_gnq8_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "arw_rows") == 0) {   /* fn4 ARW: the fused exact write's row cap (0 = none) */
@@ -3074,7 +3610,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
+        if (value < 0 || value > 6) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path; 5: + dense steps; 6: + the depth-3 sparse law at every depth */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -3084,8 +3620,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
-        if (value < 0 || value > 2) return -1;
+    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head; 3: + its decode rows in one launch at any depth) */
+        if (value < 0 || value > 3) return -1;
         qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -3116,6 +3652,14 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
+        if (value < 0 || value > 16383) return -1;   /* 8192: lever HCP (a prefill segment past the first interval reads its connections at a full piece's K split, op_read_sp; other bytes for partial pieces / tail and hit steps); bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes), 4096: lever GPF (a two-piece step's mixer a piece at a time only where its last piece is wider than 64 rows; other bytes for (R, <= 64)-row steps) */
+        if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
+        qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
+        rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);
+        rad::arch::fn4_x3probe_flag().store((value & 128) ? 1 : 0, std::memory_order_relaxed);
+        return 1;
+    }
     if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */
         if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SPHC")) return -1;
@@ -3131,4 +3675,8 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch,
                                       const int32_t* used_max_h) {
     return qwen4exp_fp8::pass_key(c, batch, used_max_h);
 }
+extern "C" int rad_tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    return qwen4exp_fp8::tip_set(rank, row, stage, u);
+}
+extern "C" int rad_tip_free(int rank, int* groups, int max) { return qwen4exp_fp8::tip_free(rank, groups, max); }
 #endif

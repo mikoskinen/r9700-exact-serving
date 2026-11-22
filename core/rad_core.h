@@ -64,12 +64,18 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
+    /* rad_kernel_fetches_rows: a row-gathering kernel reads the container's rows itself (its own
+     * row cache), so the page cache is not asked to prefetch them. False when unsaid. */
+    bool                 fetches_rows = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
 struct Resolved {
     const KernelRow* row = nullptr;
     void*            instance = nullptr;
+    /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance (its own scratch, flags and sequence
+     * counters: `ar_set` 1), taken by a pass issued on the rank's second stream; null otherwise. */
+    void*            instance1 = nullptr;
     /* The frozen geometry, including the tuned axes, so RadArgs.p carries them and the kernel
      * reads `sk` with rad_args_geti() like `M`. There is no variant index. */
     Geometry         geom;
@@ -219,6 +225,9 @@ struct WeightInfo {
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
+    /* Each selected plane's offset in the container (file_offset is plane_offset[0]), for a
+     * file-tier weight the loader relayouts on every read (weight_file_relaid). */
+    uint64_t       file_plane_offset[RAD_ENC_MAX_PLANES] = {0};
 
     /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
      * scheduling rather than prediction (spec §5). */
@@ -241,13 +250,29 @@ inline void weight_planes(const WeightInfo& w, RadTensor* t) {
     }
 }
 
+/* The selected plane's on-disk bytes are already the kernel buffer (a stored lane or
+ * scale table). The layout hook still names a dtype tag, so identity is false, but a
+ * file read of that one plane is the relayout. */
+inline bool weight_plane_is_stored(const WeightInfo& w) {
+    if (w.widen || w.narrow || w.n_sel < 1 || w.stored_bytes <= 0 || !w.enc_known) return false;
+    if (w.decl.shard != RAD_SHARD_NONE) return false;
+    const RadEncPlane& p = w.enc.plane[w.sel[0]];
+    int64_t rows = 1, cols = 1;
+    if (w.decl.rank >= 1) rows = w.decl.shape[0] > 0 ? w.decl.shape[0] : 1;
+    if (w.decl.rank >= 2) cols = w.decl.shape[1] > 0 ? w.decl.shape[1] : 1;
+    return rad_enc_plane_bytes(&p, rows, cols) == w.stored_bytes;
+}
+
 /* Whether the bytes can be read where they lie in the container (the file tier's O_DIRECT stage,
  * the mapped tier's pointer): only when they are the selected plane unchanged and this rank holds
- * all of it. A relayout is not in the file, and a column shard is not one contiguous range. */
+ * all of it. A relayout is not in the file, and a column shard is not one contiguous range.
+ * A stored plane whose byte count is the kernel buffer is that unchanged plane. */
 inline bool weight_file_direct(const WeightInfo& w, int world_size) {
-    return w.identity && !w.widen && !w.narrow &&
-           (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
+    if (w.widen || w.narrow) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    return w.identity || weight_plane_is_stored(w);
 }
+
 
 struct BufferInfo {
     std::string name;
@@ -412,10 +437,21 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+    /* tp8 loop D19: every short block it declared, in order (a plugin may call rad_drafter_short_block once a length); the
+     * first is drafter_short_block. Empty when it serves only its own. */
+    std::vector<int64_t> drafter_short_blocks;
     /* A block drafter that proposes a tree (rad_drafter_tree): `drafter_parents` holds each
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;
     rad_buf        drafter_parents = 0;
+    /* A chain block drafter's confidence plane (rad_drafter_confidence), f32 at `drafter_conf_pitch`
+     * a sequence, and its alternative branches (rad_drafter_alternatives), i32, `drafter_n_alt`
+     * branches of `drafter_alt_pitch` a sequence. 0 for a drafter that declared none. */
+    rad_buf        drafter_conf = 0;
+    int64_t        drafter_conf_pitch = 0;
+    rad_buf        drafter_alt = 0;
+    int64_t        drafter_n_alt = 0;
+    int64_t        drafter_alt_pitch = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -545,6 +581,28 @@ public:
     OpInfo*     op(rad_op h)         { return h && h < ops.size()     ? &ops[h] : nullptr; }
 
 };
+
+/* The kernel whose layout hook settled `w`'s stored form, or null when it is stored as is or
+ * widened. */
+inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const WeightInfo& w) {
+    if (w.identity || w.widen || w.lay_op < 0 || (size_t)w.lay_op >= prog.ops.size()) return nullptr;
+    const OpInfo& op = prog.ops[(size_t)w.lay_op];
+    if (w.lay_band < 0 || (size_t)w.lay_band >= op.bands.size() || w.lay_dom < 0 ||
+        w.lay_dom >= RAD_N_DOMAINS)
+        return nullptr;
+    const KernelRow* row = op.bands[(size_t)w.lay_band].dom[w.lay_dom].row;
+    return row ? row->info : nullptr;
+}
+
+/* Whether the file tier can serve `w` by relayouting it on every read, as the loader does once
+ * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
+ * of the container), not widened, and a kernel that relayouts. */
+inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
+    if (w.identity || w.widen || weight_plane_is_stored(w)) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    const RadKernelInfo* ki = weight_layout_kernel(prog, w);
+    return ki && ki->relayout;
+}
 
 /* ================================================================== requests */
 
@@ -768,6 +826,14 @@ struct Request {
      * quantum) and writes a checkpoint (Scheduler::plan_chunk), so following requests reuse the
      * whole head. /v1/systemone sets it on the first of several questions over one state. */
     int64_t              checkpoint_at = 0;
+    /* Lever PSK-CR (ds41-pskcr, the scheduler's): while n_computed < cr_end the prompt's chunks are a cone replay that
+     * rebuilds the windowed state at cr_end over global KV adopted from the prefix cache (no chunk crosses it, none
+     * takes a snapshot); 0 none. */
+    int32_t              cr_end = 0;
+    /* Lever G (ds41-tailgrid, fn4 sched_tail_grid; the scheduler's): the tail grid F this request latched at its admission,
+     * 0 none -- its tail snapshot is at the deepest multiple of F that leaves its last piece >= 128 rows
+     * (Scheduler::tail_checkpoint), fixed while it is prefilled so every chunk plans the same targets. */
+    int32_t              tail_grid = 0;
 
     /* Non-null: read the raw logits at these ids at the prompt's last position (TokenScores).
      * The request still samples the one token max_tokens allows; the caller discards it. */
@@ -820,6 +886,15 @@ struct Config {
      * collectives (RadBuildCtx::weight_prefetch_off), for an engine that shares its cards with
      * another server, where the second lane's read costs a queue switch every decode step. */
     bool  weight_prefetch = true;
+    /* --mapped-rewarm: re-touch the container's pages an earlier run left resident after the
+     * mapped load, through the page cache (RadFile::rewarm); a no-op on the file tier. */
+    bool  mapped_rewarm = false;
+    /* --row-prefetch: read a host gather's table rows on the mapped tier ahead of or beside its
+     * kernel (runtime/rowprefetch.h); CtxDesc::row_prefetch. */
+    bool  row_prefetch = true;
+    /* --debug-tape-dump: list each draft pass kind's first recording's dispatches on stderr
+     * (TAPEDUMP lines); CtxDesc::tape_dump. */
+    bool  debug_tape_dump = false;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -832,6 +907,26 @@ struct Config {
      * slower. `on` forces P2P and stops startup naming the refused pairs instead of falling
      * back. */
     int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
+    /* tp8 S4: the two-node pipeline (abi/rad_pp.h, core/net/node_link.h). One engine on two
+     * machines, each a --tp group of its own: the leader (rank 0) holds the scheduler, sampler,
+     * embedding and head and layers [0, h) and [t, n); the follower (rank 1) layers [h, t). The
+     * defaults are one machine, the published engine: nothing below is read unless pp_nodes == 2. */
+    int   pp_nodes = 1;               /* --pp-nodes 1|2 */
+    int   pp_rank = 0;                /* --pp-rank 0 (leader) | 1 (follower) */
+    std::string pp_peer;              /* --pp-peer HOST[:PORT]: the other node's address */
+    int   pp_port = 29517;            /* the PORT of --pp-peer; the follower listens on it */
+    int   pp_cut_h = 0;               /* --pp-cut H,T or T (= 0,T): the follower's layers [H, T) */
+    int   pp_cut_t = 0;
+    int   node_link = 0;              /* --node-link tcp (0) | verbs (1) */
+    /* A pipeline node turns its prefix cache off (engine_node.cpp pp_check) but plans its prefill chunks as the
+     * cache it was started with would (chunk_geometry_resolve: the --prefix-resume exact grid, lever G's tail):
+     * a chunk plan moves a near-tie's bits (the prompt's last row alone in a decode-shaped step is not the
+     * same arithmetic as inside its chunk), so the pipeline's answers are the one-machine start's. tp8 S4 hw. */
+    bool  pp_plan_prefix = false;
+    /* tp8 S5: --pp-lanes N (1..4 = RAD_PP_MAX_LANES; 0 = the default, 2 on a two-node pipeline): the
+     * leader's independent step streams. 1 is tp8 S4's one step in flight. Read only when pp_nodes == 2. */
+    int   pp_lanes = 0;
+    int   pp_lanes_now() const { return pp_nodes == 2 ? (pp_lanes > 0 ? pp_lanes : 2) : 1; }
     int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:
@@ -839,6 +934,11 @@ struct Config {
      * prefill stager arms for. 0 = off: the chunk takes every token the step has left. N > 0: cap
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
+    /* --long-prefill-token-threshold: cap a long prefill's chunk at N tokens while other
+     * requests exist. The effective cap is max(N, token budget / eligible requests), so a lone
+     * prefill still gets the whole budget. 0 (default) is off; this is the vLLM-style throttle
+     * that stops one long prompt from taking every token in a mixed step. */
+    int64_t long_prefill_token_threshold = 0;
     double  prefill_interleave_share = 0.25;   /* --prefill-interleave auto[:SHARE] */
     /* Whether --prefill-interleave was given. Not given, engine bring-up serves auto:1 (decode-only
      * steps for as long as a chunk step took) except under --deterministic, in KL mode and for a
@@ -849,6 +949,10 @@ struct Config {
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
+    /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
+     * position, beside every runner's remaining prompt and next-token headroom, fits the pool.
+     * Off admits the first chunk alone (the old behaviour); on is the default. */
+    bool  prefill_room_gate = true;
     int64_t preempt_wait_ms = 5000;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */

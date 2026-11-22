@@ -859,11 +859,11 @@ void PrefixCache::clear() {
     map_.clear();
     lru_.clear();
     drop_wait_.clear();
-    /* STALESNAP (15.11.2026, ported from the DeepSeek line's 23ee31a; hero2/QWEN-LP-IDENTITY.md item 4): the snapshots
-     * go with the entries they rest on. A snapshot kept through a reset is still found by its chain key, and a later
-     * prompt over the same tokens resumes there (C4b-d: a publisher's re-sent head hit the 15488 cut an earlier cell's
-     * request had left). As release_session: a snapshot handed out or reserved this step stays (its request restores
-     * from / saves into the slot). */
+    /* STALESNAP (14.11.2026): the snapshots go with the entries they rest on. A snapshot kept
+     * through a reset is still found by its chain key, and a later chain over the same tokens
+     * resumes there on whatever rows it now holds: an earlier reply's decode rows, which round
+     * differently from the prefill the snapshot was taken after. As release_session: a snapshot
+     * handed out or reserved this step stays (its request restores from / saves into the slot). */
     std::vector<BlockHash> keys;
     keys.reserve(ck_by_prefix_.size());
     for (const auto& kvp : ck_by_prefix_)

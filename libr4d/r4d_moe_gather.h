@@ -2,6 +2,7 @@
 // r4d_moe.hip; tests/r4d_emu runs it from here against the inverse the sort writes.
 #pragma once
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <cstdint>
 
 #include "r4d_common.h"
@@ -38,7 +39,7 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const int32_t* __restrict__ sorted, uint32_t T,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
-    uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    uint32_t sh_ld, uint32_t sg_ld, int sig) { R4D_IKA_ENTRY();
     __shared__ int32_t s_i[kGatherSlots];
     __shared__ float   s_w[kGatherSlots];
     const uint32_t t = blockIdx.x;

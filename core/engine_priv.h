@@ -12,6 +12,7 @@
 #include "engine.h"
 
 #include "mem/pools.h"
+#include "net/node_link.h"
 #include "mem/kv.h"
 #include "mem/prefix.h"
 #include "mem/kvtier.h"
@@ -23,6 +24,7 @@
 #include "place/mover.h"
 #include "place/stager.h"
 #include "place/xstats.h"
+#include "place/misslog.h"
 #include "runtime/ctx.h"
 #include "sample/sampler.h"
 #include "sched/advance.h"
@@ -55,6 +57,13 @@ struct Engine::Rank {
      * because its bank holds an already-credited step (the layer did not route). Counting these
      * apart keeps a placement engine starved of evidence from looking like idle layers. */
     uint64_t heat_credited = 0, heat_idle = 0;
+    /* The rows of each trunk step this rank issued, by step number modulo the ring, for the share
+     * a histogram of that step is credited at (HeatParams::prefill_share). Written at issue and
+     * read by the drain a step or more later, both on this rank's thread. Larger than the route
+     * ring's banks, so a landed histogram's step is still here. */
+    struct HeatStepRows { int step = -1; int64_t n_tok = 0, n_tok_decode = 0; };
+    static constexpr int kHeatStepRing = 256;
+    std::vector<HeatStepRows> heat_steps;
     /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
     int unstaged_steps = 0;
     KVManager kv;
@@ -72,6 +81,13 @@ struct Engine::Rank {
     /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
      * without that level. */
     int64_t                 arena_low_off = -1;
+    /* Lever SA (ds41-sahb, fn4 stage_short): the ring's place at the span's shared level whether or not that level
+     * keeps it (RADIANCE_STAGE_SPAN=0 lends it), -1 without the level; per Ctx level, the loan a stage_short step
+     * keeps (below the place at the span's shared level, arena_lent elsewhere); the loan bytes stage_short steps took
+     * back beyond their level's (cumulative). */
+    int64_t                 arena_sa_off = -1;
+    std::vector<int64_t>    arena_lent_sa;
+    int64_t                 sa_recall_bytes = 0;
     /* Prefill stager (core/place/stager.h): copies the next routed layer's pooled experts into the
      * top of this rank's arena while a full-plan step runs the layer before. */
     PrefillStager stager;

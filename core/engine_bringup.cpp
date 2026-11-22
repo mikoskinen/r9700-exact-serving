@@ -6,6 +6,12 @@
  */
 #include "engine_priv.h"
 #include "rad_internal.h"
+#include "rad_plugin.h"
+/* The IQR stored form written on the card (r4d_iqr_relayout.hip), resolved from the loaded
+ * kernel plugin. A missing symbol falls back to the host walk. */
+using IqrGpuRelayout = int (*)(const void*, void*, int64_t, int64_t, uint32_t, uint32_t, uint32_t,
+                               const void*, const void*, int64_t, void*);
+#include <dlfcn.h>
 #include "engine_hostmem.h"
 #include "kld.h"
 #include "gen/driver.h"
@@ -27,6 +33,7 @@
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
+#include "runtime/fn4_switch.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
 #include "sample/gbnf.h"
@@ -807,9 +814,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
  * is the architecture plugin's answer at declare, not the container's. */
 namespace {
 
+/* tp8 loop P30t: a sidecar entry named '<base>' + this stands beside the container's <base> (open_weight_sidecar) */
+constexpr const char kTwinSuffix[] = "#pf";
+constexpr size_t kTwinSuffixLen = sizeof kTwinSuffix - 1;
+
 /* A container is a file starting with the magic; anything else (a checkpoint directory, a
  * .safetensors, an index, a .gguf) is a checkpoint. A .rad path is always opened as a container,
  * so its reader reports what is wrong with it. */
+
 bool is_container(const std::string& path) {
     if (path.size() > 4 && path.compare(path.size() - 4, 4, ".rad") == 0) return true;
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -823,12 +835,124 @@ bool is_container(const std::string& path) {
 }  /* namespace */
 
 WeightSourceFn Engine::sources() const {
+    /* Lever DLW: a sidecar's entry answers before the container's of the same name. */
+    if (file_ && side_) {
+        const WeightSourceFn side = rad_container_sources(*side_), main = rad_container_sources(*file_);
+        return [side, main](const std::string& name, const Program& prog, WeightSource* out) {
+            const int st = side(name, prog, out);
+            return st == RAD_E_NOTFOUND ? main(name, prog, out) : st;
+        };
+    }
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
 
+/* Lever DLW (ds41-dlw, 11.11.2026): RADIANCE_WEIGHT_SIDECAR=FILE, a container rad-sidecar wrote from
+ * this one: each of its entries stands in for the container's entry of the same name -- the same
+ * logical rank and shape, any encoding (a bf16 linear as llama.cpp's q8_0, say) -- so declare sees
+ * the sidecar's encoding (rad_weight_encoding) and the load reads the sidecar's planes. Numbers are
+ * chosen offline, by the quantiser rad-sidecar runs (abi/rad_abi.h: a lossy step is the quantiser's
+ * job), and served as stored. Refused at open: a file that is not a container, a sidecar written
+ * from a container of another size or architecture, an entry the container does not hold or holds
+ * at another rank or shape, a routed expert's entry (experts sit at a fixed stride the container's
+ * own expert directory addresses). Unset: no second file, the container answers alone. */
+int Engine::open_weight_sidecar() {
+    side_.reset();
+    const char* path = std::getenv("RADIANCE_WEIGHT_SIDECAR");
+    if (!path || !*path) return RAD_OK;
+    if (!file_) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: a sidecar replaces entries of a .rad container, and %s is a "
+                "checkpoint", path, cfg_.model.c_str());
+        return RAD_E_INVAL;
+    }
+    auto side = std::make_unique<RadFile>();
+    RAD_TRY(side->open(path));
+    int64_t of_bytes = -1;
+    if (!side->get_i("sidecar.container_bytes", &of_bytes) || of_bytes != file_->size()) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: it was written from a container of %lld bytes, and %s holds %lld; "
+                "a sidecar serves only the container rad-sidecar read", path, (long long)of_bytes,
+                cfg_.model.c_str(), (long long)file_->size());
+        return RAD_E_FORMAT;
+    }
+    const std::string a_side = side->str(side->header().arch_id), a_main = file_->str(file_->header().arch_id);
+    if (a_side != a_main) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: its architecture is '%s', the container's '%s'", path,
+                a_side.c_str(), a_main.c_str());
+        return RAD_E_FORMAT;
+    }
+    if (side->entry_count() <= 0) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds no entries", path);
+        return RAD_E_FORMAT;
+    }
+    int64_t bytes = 0, replaced = 0, twins = 0, twin_bytes = 0;
+    std::map<std::string, int> forms;
+    for (int64_t i = 0; i < side->entry_count(); ++i) {
+        const RadFileEntry& s = side->entry(i);
+        const std::string name = side->str(s.name);
+        /* tp8 loop P30t: '<base>#pf' (rad-sidecar --twin) stands BESIDE the container's entry <base> instead of in its place: a
+         * second encoding of the same logical weight, served as its own weight under that name (sources() answers it from here;
+         * nothing else holds the name), checked against <base>'s rank and shape. The container's <base> stays as it is. */
+        const bool twin = name.size() > kTwinSuffixLen &&
+                          name.compare(name.size() - kTwinSuffixLen, kTwinSuffixLen, kTwinSuffix) == 0;
+        const std::string base = twin ? name.substr(0, name.size() - kTwinSuffixLen) : name;
+        const RadFileEntry* m = file_->find(base);
+        if (!m) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is not an entry of %s%s", path, base.c_str(), cfg_.model.c_str(),
+                    twin ? " (a twin '<name>#pf' stands beside a container entry of that name)" : "");
+            return RAD_E_NOTFOUND;
+        }
+        if (twin && side->find(base)) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds both '%s' and its twin '%s': a weight is replaced or twinned, not both",
+                    path, base.c_str(), name.c_str());
+            return RAD_E_INVAL;
+        }
+        bool same = s.rank == m->rank;
+        for (uint32_t k = 0; same && k < s.rank && k < RAD_MAX_RANK; ++k) same = s.shape[k] == m->shape[k];
+        if (!same) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is a rank-%u weight there and a rank-%u one of another "
+                    "shape in the container; a sidecar re-encodes a weight, it does not reshape it", path,
+                    name.c_str(), (unsigned)s.rank, (unsigned)m->rank);
+            return RAD_E_SHAPE;
+        }
+        if (s.expert >= 0 || m->expert >= 0) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is a routed expert's weight, which the container's expert "
+                    "directory addresses at a fixed stride; a sidecar replaces only other weights", path,
+                    name.c_str());
+            return RAD_E_INVAL;
+        }
+        if (!rad_enc_valid(&side->encoding(s))) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' carries a malformed encoding", path, name.c_str());
+            return RAD_E_FORMAT;
+        }
+        char e[160];
+        rad_enc_format(&side->encoding(s), e, sizeof e);
+        ++forms[e];
+        if (twin) {
+            ++twins;
+            twin_bytes += (int64_t)s.bytes;
+            continue;
+        }
+        bytes += (int64_t)s.bytes;
+        replaced += (int64_t)m->bytes;
+    }
+    std::string fl;
+    for (const auto& [f, n] : forms) fl += fmt("%s%d x %s", fl.empty() ? "" : ", ", n, f.c_str());
+    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s%s, read from %s "
+             "(RADIANCE_WEIGHT_SIDECAR): %s", (long long)side->entry_count(), humanb(bytes).c_str(),
+             humanb(replaced).c_str(),
+             twins ? fmt("; %lld twin(s) '<name>#pf', %s BESIDE the container's entries (tp8 loop P30t)", (long long)twins,
+                         humanb(twin_bytes).c_str()).c_str()
+                   : "",
+             path, fl.c_str());
+    side_ = std::move(side);
+    return RAD_OK;
+}
+
 int Engine::read_metadata() {
-    if (!is_container(cfg_.model)) return read_checkpoint_metadata();
+    if (!is_container(cfg_.model)) {
+        RAD_TRY(read_checkpoint_metadata());
+        return open_weight_sidecar();   /* lever DLW: refused for a checkpoint when set; nothing unset */
+    }
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
 
@@ -895,7 +1019,7 @@ int Engine::read_metadata() {
              meta_.name && *meta_.name ? meta_.name : "(unnamed)",
              meta_.arch_id, meta_.quant && *meta_.quant ? meta_.quant : "bf16",
              (long long)meta_.n_layers, (long long)meta_.n_ctx_train);
-    return RAD_OK;
+    return open_weight_sidecar();   /* lever DLW: RADIANCE_WEIGHT_SIDECAR; unset = RAD_OK, nothing opened */
 }
 
 /* A checkpoint served directly (spec §4.3): config.json or the GGUF header is the metadata, read
@@ -980,6 +1104,22 @@ int Engine::apply_rope_scaling() {
     return RAD_OK;
 }
 
+/* RADIANCE_XPREFETCH=0 (or off; lever VA "xpoff", read once): no next-layer expert prefetch -- its
+ * DMA queue is never opened, its stream, ring and buffers (xp_device_bytes) leave the VRAM budget, and
+ * that VRAM goes to the split like any other. Exact: the prefetch only copies expert bytes early into
+ * a ring the step may read them from instead of the pool. On DeepSeek-V4.1 it predicts nothing anyway
+ * (Ctx::xp_predict_run takes a router input of at most 4096 columns; the model's is 5120). Unset: as
+ * before. */
+static bool xprefetch_env_off() {
+    static const bool off = [] {
+        const char* e = getenv("RADIANCE_XPREFETCH");
+        const bool o = e && (!std::strcmp(e, "0") || !std::strcmp(e, "off"));
+        if (o) RAD_INFO("expert prefetch: off (RADIANCE_XPREFETCH=%s): no DMA queue, ring or stream for it", e);
+        return o;
+    }();
+    return off;
+}
+
 /* ================================================================== 3 + 4. plugins, declare */
 int Engine::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
@@ -1027,6 +1167,10 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.gen_max_refs   = cfg_.image_gen_max_refs;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
+    /* --spec-ngram K: prompt lookup alone drafts; the plugin declares no draft head (so a head the
+     * container carries is neither loaded nor placed) and sizes every verify buffer, state ring and
+     * kernel band for max_spec = K as at any speculative serve (RadBuildCtx::draft_head_off). */
+    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.expert_file_tier = cfg_.weights_disk_tier ? 1 : 0;
     bc.scope      = "";
@@ -1055,6 +1199,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
         bc.cvec = &cvec_views_[(size_t) rank];
     return bc;
 }
+
+static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels,
+                              const Config& cfg);   /* lever VA's RADIANCE_DEBUG_VRAM, below */
 
 int Engine::declare() {
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
@@ -1285,7 +1432,8 @@ int Engine::declare() {
     {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
-        const bool pays = cfg_.n_spec > 0 && pb.chain_pays;
+        /* A head drafts: speculation on, and not prompt lookup alone (--spec-ngram leaves the head out). */
+        const bool pays = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.chain_pays;
         rad_dev_chain_infer(pays);
         const bool on = rad_dev_chain_enabled() != 0;
         const char* why = on     ? "the model's plugin measured a gain with its speculative drafter"
@@ -1304,7 +1452,23 @@ int Engine::declare() {
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
-        draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        draft_tree_ = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.tree_pays != 0;
+        if (draft_tree_ && std::getenv("RADIANCE_DEBUG_DRAFT_CONF")) {
+            /* ds41-acc's test source of confidence logits (Engine::conf_gate) cuts a chain. */
+            draft_tree_ = false;
+            const char* why = "RADIANCE_DEBUG_DRAFT_CONF cuts a chain's proposals";
+            RAD_INFO("draft trees: not asked -- %s", why);
+            decide("draft trees", "not asked", why);
+        }
+        if (draft_tree_ && !cfg_.debug_draft_oracle.empty()) {
+            /* --debug-draft-oracle replaces a head's proposal with a chain of fixed ids
+             * (Scheduler::set_draft) and issues no step ahead (Engine::step_loop), which a tree
+             * needs: the head proposes a chain under the harness. */
+            draft_tree_ = false;
+            const char* why = "--debug-draft-oracle replaces the head's proposals with a chain";
+            RAD_INFO("draft trees: not asked -- %s", why);
+            decide("draft trees", "not asked", why);
+        }
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
@@ -1563,6 +1727,22 @@ int Engine::declare() {
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",
              ranks_[0]->program.ops.size() - 1, ranks_[0]->program.weights.size() - 1,
              ranks_[0]->program.buffers.size() - 1, ranks_[0]->program.kv_groups.size());
+    /* Lever VA "emb" (RADIANCE_DS41_EMB_RAM): name the table it makes placeable, at declare, so a
+     * host start (--debug-graph) shows it before any placement runs. */
+    if (embed_ggml_table()) {
+        const Program& p0 = ranks_[0]->program;
+        int n = 0;
+        for (size_t w = 1; w < p0.weights.size(); ++w)
+            if (read_only_by(p0, (rad_weight)w, "embed_lookup_ggml")) {
+                ++n;
+                RAD_INFO("embedding: '%s' (%s a rank) is read only by embed_lookup_ggml: a token "
+                         "embedding table --embedding-placement places (RADIANCE_DS41_EMB_RAM)",
+                         p0.weights[w].name.c_str(), humanb(p0.weights[w].stored_bytes).c_str());
+            }
+        if (!n)
+            RAD_INFO("embedding: RADIANCE_DS41_EMB_RAM is set, and no weight is read only by "
+                     "embed_lookup_ggml");
+    }
 
     /* The draft head is exactly what the plugin declared (rad_declare_drafter). The core never
      * infers one from weight names or metadata, so third-party drafters need no core changes. */
@@ -1574,6 +1754,25 @@ int Engine::declare() {
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    /* ds41-acc: a chain block drafter's confidence plane and alternative branches
+     * (rad_drafter_confidence / rad_drafter_alternatives), read on rank 0 (step_state_init). */
+    {
+        const bool chain = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && !tree_;
+        conf_buf_   = chain ? p0.drafter_conf : 0;
+        conf_pitch_ = conf_buf_ ? p0.drafter_conf_pitch : 0;
+        alt_buf_    = chain ? p0.drafter_alt : 0;
+        n_alt_      = alt_buf_ ? p0.drafter_n_alt : 0;
+        alt_pitch_  = alt_buf_ ? p0.drafter_alt_pitch : 0;
+        /* A test source of logits for a drafter that declares no plane: RADIANCE_DEBUG_DRAFT_CONF
+         * (any value) gives every proposal a hashed logit on the host, so the gate's path -- the wait
+         * before the step issued ahead, the cut, the publish -- runs on any chain block drafter. */
+        conf_dbg_ = chain && !conf_buf_ && std::getenv("RADIANCE_DEBUG_DRAFT_CONF") != nullptr;
+        if (conf_dbg_) {
+            conf_pitch_ = drafter_.depth;
+            RAD_WARN("RADIANCE_DEBUG_DRAFT_CONF: drafter '%s' proposals get hashed confidence logits "
+                     "(a test of the dspark_conf gate's path, not a confidence head)", drafter_.name);
+        }
+    }
     /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
      * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
      * wide tree's extra nodes repay at one sequence and not at many. */
@@ -1601,15 +1800,96 @@ int Engine::declare() {
                  (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block
                                                                    : drafter_.depth + 1) -
                                                drafter_.depth)));
+    /* tp8 loop D19: RADIANCE_DRAFT_SHORT_TIERS=N:S[,N:S...] -- several short blocks, picked by load (Engine::block_shape):
+     * each S one the drafter declared (rad_drafter_short_block, once a length); a chain block drafter only. It replaces
+     * --draft-short-from's one tier; unset, nothing here changes. */
+    short_tiers_.clear();
+    if (const char* v = std::getenv("RADIANCE_DRAFT_SHORT_TIERS"); v && *v) {
+        std::vector<std::pair<int64_t, int64_t>> tv;
+        std::string why;
+        if (drafter_.kind != RAD_DRAFT_BLOCK || tree_) {
+            RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS=%s: '%s' is not a chain block drafter; ignored (tp8 loop D19)", v,
+                     drafter_name_.c_str());
+        } else if (Scheduler::parse_short_tiers(v, &tv, &why) < 0) {
+            RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS=%s: %s; ignored (tp8 loop D19)", v, why.c_str());
+        } else {
+            std::string s;
+            for (const auto& t : tv) {
+                const auto& dl = p0.drafter_short_blocks;
+                if (std::find(dl.begin(), dl.end(), t.second) == dl.end()) {
+                    RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS: '%s' declares no short block of %lld row(s); the tier from %lld "
+                             "decoding sequences is dropped (tp8 loop D19)", drafter_name_.c_str(), (long long)t.second,
+                             (long long)t.first);
+                    continue;
+                }
+                ShortTier z;
+                z.from = t.first;
+                z.block = t.second;
+                short_tiers_.push_back(z);
+                s += fmt("%s%lld row(s) = %lld token(s) from %lld decoding sequences", s.empty() ? "" : ", ",
+                         (long long)z.block,
+                         (long long)(z.block - ((drafter_.block > 0 ? drafter_.block : drafter_.depth + 1) - drafter_.depth)),
+                         (long long)z.from);
+            }
+            if (!short_tiers_.empty()) {
+                drafter_short_ = short_tiers_.front().block;
+                RAD_INFO("speculation: short block tiers (RADIANCE_DRAFT_SHORT_TIERS, tp8 loop D19): '%s' runs %s; below "
+                         "them its own block of %lld (--draft-short-from is not read)", drafter_name_.c_str(), s.c_str(),
+                         (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1));
+            } else {
+                RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS=%s: no tier left; --draft-short-from serves as before (tp8 loop D19)", v);
+            }
+        }
+    }
+    /* tp8 loop D23 (fn4 draft_short_blk): the short block lengths the switch may pick -- the drafter's declared ones, only
+     * while a short block is served at all (a tier, or --draft-short-from); none otherwise, so every N > 0 is refused */
+    {
+        uint64_t m = 0;
+        if (drafter_short_ > 0) {
+            for (const int64_t sb : p0.drafter_short_blocks)
+                if (sb >= 1 && sb < 63) m |= 1ull << sb;
+            if (drafter_short_ < 63) m |= 1ull << drafter_short_;
+        }
+        fn4::short_register(m);
+        if (m) {
+            std::string l;
+            for (int k = 1; k < 63; ++k)
+                if ((m >> k) & 1) l += fmt("%s%d", l.empty() ? "" : ", ", k);
+            RAD_INFO("speculation: fn4 draft_short_blk may run '%s''s short block of %s row(s) a sequence in place of the "
+                     "start's %lld (tp8 loop D23; 0 = the start's)", drafter_name_.c_str(), l.c_str(),
+                     (long long)drafter_short_);
+        }
+    }
+    /* DRAFTER track round 11, lever DHD: RADIANCE_DRAFT_HEAD_CUT=1 -- a chain block drafter whose every row proposes
+     * (block = depth, DSpark's convention) runs its head on the first D rows of each block only, D = the head depth in
+     * force (Engine::issue_block_drafter); unset, nothing here changes. */
+    head_cut_ = false;
+    if (const char* v = std::getenv("RADIANCE_DRAFT_HEAD_CUT"); v && *v && std::strcmp(v, "0")) {
+        if (drafter_.kind != RAD_DRAFT_BLOCK || tree_ || drafter_.block != drafter_.depth)
+            RAD_WARN("RADIANCE_DRAFT_HEAD_CUT=%s: '%s' is not a chain block drafter whose every row proposes (block %lld, "
+                     "depth %lld); ignored (lever DHD)", v, drafter_name_.c_str(), (long long)drafter_.block,
+                     (long long)drafter_.depth);
+        else {
+            head_cut_ = true;
+            RAD_INFO("speculation: lever DHD (RADIANCE_DRAFT_HEAD_CUT): while fn4 draft_head_cut is 1, '%s''s query pass at "
+                     "its own block of %lld runs its head on the first D rows of each block, D = the head depth in force (no "
+                     "cut while draft_sample >= 1, at a short block, or before the first depth is chosen)",
+                     drafter_name_.c_str(), (long long)drafter_.block);
+        }
+    }
     if (tree_)
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",
                  drafter_.name, drafter_.depth);
+    /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
+     * declared it anyway would hold its weights and passes for nothing, so startup stops. */
     if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
-        RAD_ERR("--spec-ngram drafts by prompt lookup alone, and this container declares the draft "
-                "head '%s'; serve it with --num-speculative-tokens N, where prompt lookup fills in "
-                "for the sequences the head declines", drafter_.name);
-        return RAD_E_INVAL;
+        RAD_ERR("--spec-ngram %d: the '%s' plugin declared its draft head '%s' although the "
+                "deployment drafts by prompt lookup alone (it does not read "
+                "RadBuildCtx::draft_head_off). Use --num-speculative-tokens N instead: the head "
+                "drafts and prompt lookup fills in for any sequence it declines",
+                cfg_.spec_ngram, plugins_.arch_plugin.c_str(), drafter_.name);
+        return RAD_E_UNSUPPORTED;
     }
     if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
@@ -1623,11 +1903,146 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
+    } else if (cfg_.n_spec > 0 && cfg_.spec_ngram > 0) {
+        /* The probe still names the container's head (its stated depth) though nothing declared it. */
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- %s", cfg_.spec_ngram,
+                 pb.draft_depth > 0 ? "the container's draft head is left out: not declared, loaded or placed"
+                                    : "this container declares no draft head");
     } else if (cfg_.n_spec > 0) {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
     probe_arena_levels();
+    if (!ranks_.empty()) debug_vram_report(ranks_[0]->program, ranks_[0]->arena_levels, cfg_);
     return RAD_OK;
+}
+
+/* RADIANCE_DEBUG_VRAM=1: rank 0's VRAM terms the VA levers move, in bytes, at the end of declare -- so a
+ * host start (--debug-graph, no card) shows them: the activation arena's full plan and levels with
+ * their largest transients ("arena"), the router and compressor projections' stored bytes ("bf16"),
+ * the token table the embedding placement can move ("emb"), the expert floor's spare slab and the
+ * shadow count it was sized with ("shadow"), and the expert prefetch's ring and buffers ("xpoff").
+ * Nothing here is used by the engine. */
+static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels, const Config& cfg) {
+    /* RADIANCE_DEBUG_GRAPH_ALIAS=name[,name...] (a debug aid; unset: nothing here): at every arena level, each named
+     * transient's bytes and the transients of disjoint live range that share them (--debug-graph prints the full plan's;
+     * tp8 loop FINDINGS F43) */
+    if (const char* al = getenv("RADIANCE_DEBUG_GRAPH_ALIAS"); al && *al) {
+        const std::string want = std::string(",") + al + ",";
+        for (const ArenaLevel& lv : levels)
+            for (size_t i = 1; i < P.buffers.size() && i < lv.offset.size(); ++i) {
+                const BufferInfo& a = P.buffers[i];
+                if (want.find("," + a.name + ",") == std::string::npos || lv.offset[i] < 0) continue;
+                const int64_t ao = lv.offset[i], ab = buffer_bytes(lv.decl[i]);
+                std::string o;
+                int n = 0;
+                for (size_t j = 1; j < P.buffers.size() && j < lv.offset.size(); ++j) {
+                    const BufferInfo& b = P.buffers[j];
+                    if (j == i || lv.offset[j] < 0 || b.decl.domain != a.decl.domain) continue;
+                    const int64_t bo = lv.offset[j], bb = buffer_bytes(lv.decl[j]);
+                    if (bo + bb <= ao || ao + ab <= bo) continue;
+                    o += fmt(" %s [%d,%d]", b.name.c_str(), b.first_def, b.last_use);
+                    ++n;
+                }
+                RAD_INFO("alias (RADIANCE_DEBUG_GRAPH_ALIAS) level %lld rows: %s %lld B live [%d,%d] @ %lld shares its bytes "
+                         "with %d:%s", (long long)lv.rows, a.name.c_str(), (long long)ab, a.first_def, a.last_use,
+                         (long long)ao, n, o.c_str());
+            }
+    }
+    const char* d = getenv("RADIANCE_DEBUG_VRAM");
+    if (!(d && *d && std::strcmp(d, "0") != 0)) return;
+    auto top = [&](const ArenaLevel* lv) {
+        std::vector<std::pair<int64_t, size_t>> b;
+        for (size_t i = 1; i < P.buffers.size(); ++i) {
+            const BufferInfo& bi = P.buffers[i];
+            if (bi.decl.kind != RAD_BUF_TRANSIENT || bi.decl.domain == RAD_DOMAIN_HOST) continue;
+            b.emplace_back(lv ? buffer_bytes(lv->decl[i]) : bi.bytes, i);
+        }
+        std::sort(b.begin(), b.end(), [](const std::pair<int64_t, size_t>& x, const std::pair<int64_t, size_t>& y) {
+            return x.first != y.first ? x.first > y.first : x.second < y.second;
+        });
+        int64_t sum = 0;
+        for (const auto& e : b) sum += e.first;
+        std::string o = fmt("%zu transients, %lld B unshared; largest:", b.size(), (long long)sum);
+        for (size_t k = 0; k < b.size() && k < 8; ++k)
+            o += fmt(" %s %lld", P.buffers[b[k].second].name.c_str(), (long long)b[k].first);
+        return o;
+    };
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) arena: full plan %lld rows, end %lld B, fixed %lld B; %s",
+             (long long)cfg.max_tok, (long long)P.arena_bytes, (long long)P.arena_fixed_bytes, top(nullptr).c_str());
+    for (const ArenaLevel& lv : levels)
+        RAD_INFO("vram (RADIANCE_DEBUG_VRAM) arena: level %lld rows, end %lld B (%lld B below the full plan's end); %s",
+                 (long long)lv.rows, (long long)lv.end, (long long)(P.arena_bytes - lv.end), top(&lv).c_str());
+    int64_t router = 0, comp = 0, emb = 0;
+    int n_router = 0, n_comp = 0, n_emb = 0;
+    std::string emb_names;
+    for (size_t w = 1; w < P.weights.size(); ++w) {
+        const WeightInfo& wi = P.weights[w];
+        if (wi.name.find(".glm_router.weight") != std::string::npos) { router += wi.stored_bytes; ++n_router; }
+        if (wi.name.find("attn_compressor_kvg") != std::string::npos) { comp += wi.stored_bytes; ++n_comp; }
+        if (is_embedding_table(P, (rad_weight)w)) {
+            emb += wi.stored_bytes;
+            ++n_emb;
+            emb_names += (emb_names.empty() ? "" : ",") + wi.name;
+        }
+    }
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) bf16: %d router projections %lld B, %d compressor kv|gate projections %lld B",
+             n_router, (long long)router, n_comp, (long long)comp);
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) emb: %d token embedding table(s) the placement flag moves, %lld B (%s)",
+             n_emb, (long long)emb, emb_names.empty() ? "none" : emb_names.c_str());
+    /* The expert slab classes as weight_footprint forms them -- a unit a (layer, expert), its weights
+     * each aligned, the unit rounded to RAD_ALIGN_UNIT, a class a stride -- counted from the weights
+     * themselves: on the host backend no device kernel reads an expert, so weight_footprint maps them
+     * all and sees none. */
+    std::map<std::pair<int32_t, int32_t>, int64_t> unit;
+    int64_t nl = P.meta.n_layers;
+    for (size_t w = 1; w < P.weights.size(); ++w) {
+        const WeightInfo& wi = P.weights[w];
+        if (wi.decl.group.expert < 0 || wi.decl.group.layer < 0) continue;
+        nl = std::max(nl, (int64_t)wi.decl.group.layer + 1);
+        int64_t& b = unit[{ wi.decl.group.layer, wi.decl.group.expert }];
+        b = align_up(b, wi.align > 0 ? wi.align : (int64_t)RAD_ALIGN_UNIT) + weight_bytes(wi);
+    }
+    std::map<int64_t, int64_t> classes;   /* stride -> units */
+    int64_t unit_max = 0;
+    for (const auto& u : unit) {
+        const int64_t st = align_up(u.second, (int64_t)RAD_ALIGN_UNIT);
+        ++classes[st];
+        unit_max = std::max(unit_max, st);
+    }
+    const int sh = place_shadow_slots();
+    int64_t spare = 0, spare32 = 0;
+    std::string cls;
+    for (const auto& c : classes) {
+        spare += (int64_t)(sh + RAD_PLACE_STAGE_RING) * c.first + RAD_ALIGN_UNIT;
+        spare32 += (int64_t)(RAD_PLACE_SHADOW_SLOTS + RAD_PLACE_STAGE_RING) * c.first + RAD_ALIGN_UNIT;
+        cls += fmt("%s%lld x %lld B", cls.empty() ? "" : ", ", (long long)c.second, (long long)c.first);
+    }
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) shadow: %d shadow slots a class at most; %zu expert slab class(es) (%s); the expert "
+             "floor's spare slab %lld B (%lld B at the shipped %d)",
+             sh, classes.size(), cls.c_str(), (long long)spare, (long long)spare32, RAD_PLACE_SHADOW_SLOTS);
+    const int64_t xp = unit_max > 0 && !xprefetch_env_off() ? xp_device_bytes(unit_max, nl) : 0;
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) xpoff: the expert prefetch's ring and buffers %lld B over %lld routed layers "
+             "(the largest unit %lld B)%s",
+             (long long)xp, (long long)nl, (long long)unit_max,
+             xprefetch_env_off() ? " (RADIANCE_XPREFETCH off: none, and no DMA queue)" : "");
+    /* Lever KVWIN: each fixed-window group's page and its pool on a card -- KVManager::window_pool_cap's blocks,
+     * max_seqs x (window_blocks + 1) + ceil(max_tok / block), window_blocks = ceil(window / block) + 1 -- and the
+     * window a checkpoint slot carries (window_blocks pages), from the declared group. */
+    for (size_t g = 1; g < P.kv_groups.size(); ++g) {
+        const KVGroupInfo& gi = P.kv_groups[g];
+        if (gi.decl.kind != RAD_KV_WINDOW || gi.block_size <= 0 || gi.decl.window <= 0) continue;
+        const int64_t bs = gi.block_size, wbl = (gi.decl.window + bs - 1) / bs + 1;
+        const int64_t cap = (cfg.max_seqs > 0 ? cfg.max_seqs : 1) * (wbl + 1) +
+                            KVManager::window_steps(cfg) * (cfg.max_tok > 0 ? (cfg.max_tok + bs - 1) / bs : 0);
+        const int64_t slot = gi.layers.empty() ? 0 : gi.bytes_per_block / bs / (int64_t)gi.layers.size();
+        RAD_INFO("vram (RADIANCE_DEBUG_VRAM) kvwin: group '%s' %zu layer(s), %lld B a key and layer, %lld B a block of %lld; "
+                 "pool cap %lld blocks = %lld B a card%s; %lld B of window a checkpoint slot",
+                 gi.name.c_str(), gi.layers.size(), (long long)slot, (long long)gi.bytes_per_block, (long long)bs,
+                 (long long)cap, (long long)(cap * gi.bytes_per_block), gi.zero ? " (zero on this rank)" : "",
+                 (long long)(wbl * gi.bytes_per_block));
+    }
 }
 
 /* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
@@ -1666,7 +2081,52 @@ void Engine::probe_arena_levels() {
     while (lo < rows_min) lo <<= 1;
     lo = std::max<int64_t>(lo, 256);
     std::vector<int64_t> want;
-    for (int64_t R = lo; R < cfg_.max_tok; R *= 4) want.push_back(R);
+    /* RADIANCE_ARENA_LEVEL_MAX (rows; unset or 0: every rung): the ladder stops at that many rows,
+     * the span's shared level apart. A rung just under the chunk (4096 at --max-num-batched-tokens
+     * 4160) lends almost nothing more than the full plan, but its steps find the prefill stager's
+     * ring lent (stager.h: the stager arms only above every smaller level), so the commonest lone
+     * prefill chunk runs unstaged; without the rung such a step takes the full plan and is staged. */
+    int64_t lv_max = 0;
+    if (const char* e = getenv("RADIANCE_ARENA_LEVEL_MAX"); e && *e) lv_max = std::max<int64_t>(0, std::atoll(e));
+    for (int64_t R = lo; R < cfg_.max_tok; R *= 4)
+        if (lv_max <= 0 || R <= lv_max) want.push_back(R);
+    /* RADIANCE_DS41_ARENA_DECODE_ROWS=<rows> (lever VA "arena"; unset: no such rung): one rung below
+     * the 256-row floor, for decode and verify steps of at most <rows> rows (arena_step's need:
+     * sequences x (1 + speculative depth) at decode), so the arena above it is lent to the expert
+     * slab while steps stay that small. The floor guards against a kernel writing its last tile's
+     * padding rows past a level; below it the rows must be proven per model, so the rung is offered
+     * to deepseek41 only, at the rows its kernels were audited for (arena_decode_rows_ok: 8..64),
+     * and the plugin sizes its indexer plane by the level (deepseek41.cpp ds41_arena_decode_rows). */
+    /* Lever Z0-A (ds41-z0): the variable takes a list ("8,48"), one rung a value. The largest is the rung
+     * today's decode and verify steps take (arena_dec_max_); a smaller one is chosen only under fn4
+     * arena_d0 1, by a step that verifies nothing and runs no head (arena_step). One value = today. */
+    arena_dec_max_ = 0;
+    arena_dec_rungs_ = 0;
+    if (const char* e = getenv("RADIANCE_DS41_ARENA_DECODE_ROWS"); e && *e) {
+        std::string junk;
+        const std::vector<int64_t> rs = arena_decode_rows_list(e, &junk);
+        if (!junk.empty())
+            RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s: '%s' is not a row count; ignored", e,
+                     junk.c_str());
+        for (const int64_t R : rs) {
+            std::string bad;
+            if (plugins_.arch_plugin != "deepseek41")
+                bad = fmt("the '%s' plugin's kernels were not audited for it (deepseek41 only)",
+                          plugins_.arch_plugin.c_str());
+            else if (!arena_decode_rows_ok(R, lo, &bad)) {}
+            else {
+                if (std::find(want.begin(), want.end(), R) == want.end()) {
+                    want.push_back(R);
+                    std::sort(want.begin(), want.end());
+                }
+                arena_dec_max_ = std::max(arena_dec_max_, R);
+                ++arena_dec_rungs_;
+            }
+            if (!bad.empty())
+                RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s: %lld rows is not used -- %s", e,
+                         (long long)R, bad.c_str());
+        }
+    }
     arena_span_rows_ = 0;
     const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
     if (span_rows >= lo && span_rows < cfg_.max_tok &&
@@ -1761,6 +2221,41 @@ int Engine::plan() {
      *
      * All inputs exist by now: declare() has run (buffer plan, KV groups), and every kernel init
      * has run, so code objects are resident and free VRAM is the steady-state reading. */
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    /* tp8 loop F24 (RADIANCE_AQL_PRELOAD=1): the AQL backend loads a module's code object on a card at the first launch of one
+     * of its kernels, so the modules no init launched (prefill forms, a first >= 1k-row pass's) load while serving and
+     * outside this reading; on the two-node pipeline such a first use stalled both nodes ~46 s (FINDINGS F21 / F24 / F25).
+     * With the switch every module is loaded on every card here, before the budget reads the cards. Default off. */
+    /* tp8 loop P31: RADIANCE_AQL_MEMSET_OWNQ=1 (aql.cpp hipMemset) -- said once here */
+    if (const char* mo = std::getenv("RADIANCE_AQL_MEMSET_OWNQ"); mo && !std::strcmp(mo, "1"))
+        RAD_INFO("RADIANCE_AQL_MEMSET_OWNQ=1 (tp8 loop P31): a library's synchronous hipMemset fills on a queue made for the call and "
+                 "waits for that queue only, not for a rank's compute stream (the same bytes, complete on return)");
+    /* tp8 loop P31: RADIANCE_AQL_PRELOAD=2 = 1 + every registered kernel resolved on every card here (its first launch's
+     * symbol lookup and argument layout), so a first >= 1k-row pass resolves nothing while it issues. */
+    if (const char* pe = std::getenv("RADIANCE_AQL_PRELOAD"); pe && (!std::strcmp(pe, "1") || !std::strcmp(pe, "2"))) {
+        const bool all = !std::strcmp(pe, "2");
+        for (auto& r : ranks_) {
+            AqlPreload p;
+            const int st = aql_code_preload(r->device, &p);
+            if (st == RAD_E_UNSUPPORTED) {
+                RAD_INFO("RADIANCE_AQL_PRELOAD=%s: not the AQL backend here; nothing to load", pe);
+                break;
+            }
+            RAD_TRY(st);
+            RAD_INFO("RADIANCE_AQL_PRELOAD=%s (tp8 loop F24): card %d: %lld module(s) loaded now (%s of code objects, %.0f ms), "
+                     "%lld loaded before, %lld with no code for this card, %lld refused", pe, r->device, (long long)p.loaded,
+                     humanb(p.bytes).c_str(), p.ms, (long long)p.already, (long long)p.none, (long long)p.failed);
+            if (all) {
+                int64_t ok = 0, no = 0;
+                double ms = 0, ams = -1;
+                RAD_TRY(aql_code_resolve_all(r->device, &ok, &no, &ms, &ams));
+                RAD_INFO("RADIANCE_AQL_PRELOAD=2 (tp8 loop P31): card %d: %lld kernel(s) resolved now (%.0f ms), %lld without "
+                         "code for this card (their first launch reports it, as before); HIP's allocator's first use here %.1f ms",
+                         r->device, (long long)ok, ms, (long long)no, ams);
+            }
+        }
+    }
+#endif
     {
         std::vector<VramFacts> facts;
         facts.reserve(ranks_.size());
@@ -1800,7 +2295,7 @@ int Engine::plan() {
             /* The expert prefetch's stream, ring and buffers, when it can run: experts in a pinned
              * pool, not --deterministic, and a spare DMA engine (asked before the free reading
              * below, so its queue is already counted there). */
-            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic &&
+            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && !xprefetch_env_off() &&
                 (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
                 /* Routed layers counted as Ctx::bind_routing does, including a head past the trunk. */
                 int64_t nl = r->program.meta.n_layers;
@@ -1813,6 +2308,15 @@ int Engine::plan() {
             rad_dev_props(r->device, &props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* tp8 loop F66 (lever KVP): this card at the reading, for configure_kv's measurement */
+            {
+                if (kvp_read_.size() < ranks_.size()) kvp_read_.resize(ranks_.size());
+                KvpRead& kr = kvp_read_[(size_t)r->index];
+                kr.free = props.vram_free;
+                rad_dev_ledger_of(r->device, &kr.dev_bytes, &kr.streams);
+                kr.queue_bytes = f.queue_bytes;
+                kvp_least_free_ = kvp_least_free_ < 0 ? kr.free : std::min(kvp_least_free_, kr.free);
+            }
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
              * budget charges it against the one ledger. */
             f.unified     = props.unified != 0;
@@ -1884,9 +2388,41 @@ int Engine::plan() {
                       : r->program.is_shape_generator() ? gen::ShapeDriver::device_bytes(r->program)
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
+            /* tp8 S5: every lane of a two-node pipeline has a builder (a slab) of its own */
+            if (pp_on() && cfg_.pp_lanes_now() > 1 && !r->program.is_generator() && !r->program.is_audio_generator() &&
+                !r->program.is_video_generator() && !r->program.is_shape_generator()) {
+                /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N with RADIANCE_PP_BG_LANE=k): the k BG lanes' slabs carve N block-table
+                 * rows (Scheduler::init); the other lanes' as before. Unset: every lane's slab, today. */
+                const int nl = cfg_.pp_lanes_now(), kbg = LaneSet::bg_env() < nl ? LaneSet::bg_env() : 0;
+                const int64_t bgr = LaneSet::bg_rows_env(), lm = LaneSet::lane_rows_env(), one = f.staging;
+                int64_t sum = 0;
+                for (int l = 0; l < nl; ++l) {   /* each lane's slab at the rows Scheduler::init gives it */
+                    const bool bgl = kbg > 0 && l >= nl - kbg;
+                    const int64_t nd = nl - kbg, cards = bgl ? 0 : ((int64_t)l + 1) * cfg_.max_seqs / nd - (int64_t)l * cfg_.max_seqs / nd;
+                    /* lane 0 keeps --max-num-seqs rows (the MERGE target, Scheduler::init) */
+                    const int64_t rows = bgl ? (bgr > 0 && bgr < cfg_.max_seqs ? bgr : 0) : l == 0 ? 0 : LaneSet::lane_rows(cards, lm, cfg_.max_seqs);
+                    int64_t b = one;
+                    if (rows > 0 && rows < cfg_.max_seqs && (b = BatchBuilder::device_bytes(r->program, cfg_, kg, rows)) < 0)
+                        return RAD_E_INVAL;
+                    sum += b;
+                }
+                if (sum != one * nl && r->index == 0)
+                    RAD_INFO("VRAM budget: the lanes' step slabs at their block-table rows (RADIANCE_PP_BG_ROWS %lld / RADIANCE_PP_LANE_ROWS "
+                             "%lld, tp8 loop D47): %.1f MiB a card for %d lanes instead of %.1f MiB, %.1f MiB a card freed",
+                             (long long)bgr, (long long)lm, (double)sum / (1 << 20), nl, (double)(one * nl) / (1 << 20),
+                             (double)(one * nl - sum) / (1 << 20));
+                f.staging = sum;
+            }
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
+            /* tp8 loop P10: RADIANCE_PP_SEND_ASYNC's card staging buffer, on the sending rank only (pp_serve_setup
+             * allocates it after the carve, so the check below keeps it for later there). 0 when unset. */
+            if (r->index == 0) f.staging += pp_send_async_bytes();
+            f.staging += pp_recv_async_bytes();   /* tp8 loop P10b: every rank's (0 when unset) */
+            /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP): allocated at start beside the step
+             * state (ctxskip_setup), so in the budget and not kept for later. 0 when unset. */
+            f.staging += ctxskip_bytes(r->program);
             /* A second lane's queue is kept free for its build on first use; built at Ctx::init (ctx_lane_eager, fn4
-             * 15.11.2026) it is allocated before the settle check below and not kept again. */
+             * 15.11.2026, the Qwen line) it is allocated before the settle check below and not kept again. */
             int64_t lazy = r->program.scratch_regions > 1 && !ctx_lane_eager() ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
@@ -1980,6 +2516,7 @@ int Engine::plan() {
                 facts[i].statics -= tower_pin_bytes(wfs[i], cfg_.embedding_resolved);
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
+        kvp_claimable_ = vb.capacity > 0 ? vb.claimable : -1;   /* tp8 loop F66 (lever KVP) */
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
         decide("vram split",
                fmt("weights %s (experts %s of it), KV cache %s, a card", humanb(vb.weights).c_str(),
@@ -2143,6 +2680,7 @@ int Engine::plan() {
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
+        in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
@@ -2938,10 +3476,115 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+/* Lever DLW: this rank's share of a sidecar entry's selected planes, out of the sidecar's mapping, laid
+ * out as the sweep lays a container entry's (each rectangle's rows packed, the planes at `offs`). */
+static int fill_from_sidecar(const RadFile& side, const RadFileEntry& se, const std::vector<PlaneShare>& shares,
+                             const std::vector<int>& sel, const std::vector<int64_t>& offs, const std::string& name,
+                             uint8_t* in) {
+    for (size_t k = 0; k < shares.size(); ++k) {
+        const PlaneShare& sh = shares[k];
+        const RadFilePlane& pk = side.plane(se, sel[k]);
+        const uint8_t* base = side.data(pk);
+        uint8_t* at = in + offs[k];
+        for (const PlaneShare::Rect& q : sh.rects) {
+            if (q.rows <= 0) continue;
+            const int64_t a = q.row0 * sh.row_bytes + q.byte0, len = (q.rows - 1) * sh.row_bytes + q.bytes;
+            if (a < 0 || a + len > (int64_t)pk.bytes) {
+                RAD_ERR("load: '%s' would read [%lld, %lld) of a %llu-byte '%s' plane of the weight sidecar %s",
+                        name.c_str(), (long long)a, (long long)(a + len), (unsigned long long)pk.bytes,
+                        side.encoding(se).plane[sel[k]].role, side.path());
+                return RAD_E_FORMAT;
+            }
+            if (q.byte0 == 0 && q.bytes == sh.row_bytes) {
+                std::memcpy(at, base + a, (size_t)(q.rows * q.bytes));
+                at += q.rows * q.bytes;
+                continue;
+            }
+            for (int64_t y = 0; y < q.rows; ++y) {
+                std::memcpy(at, base + a + y * sh.row_bytes, (size_t)q.bytes);
+                at += q.bytes;
+            }
+        }
+    }
+    return RAD_OK;
+}
+
+/* The heat engine's parameters: the shipped HeatParams, with policy knobs from the environment
+ * for A/B runs (docs/GUIDE.md section 8). RADIANCE_HEAT_PREFILL is HeatParams::prefill_share,
+ * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0;
+ * RADIANCE_HEAT_MOVES is HeatParams::moves_per_step, 1..1024 (the mover's turnover slots follow
+ * it, mover_turnover_from_env); RADIANCE_HEAT_PREFILL_DECAY (0..1, exclusive) turns on the dual
+ * heat with that prefill decay, RADIANCE_HEAT_PREFILL_GAIN (> 0) scales its credit,
+ * RADIANCE_HEAT_DECODE_PIN (0..0.99) protects that fraction of the resident set by decode heat. Unset, empty or not a number: the default, the latter with a
+ * warning. Placement never changes an output, so none of them changes what a request returns,
+ * only where its experts are read from. */
+static HeatParams heat_params_from_env() {
+    HeatParams hp;
+    const auto num = [](const char* k, float* out) {
+        const char* e = getenv(k);
+        if (!e || !*e) return false;
+        char* end = nullptr;
+        const float v = std::strtof(e, &end);
+        if (end == e || *end || !(v == v) || v > 3.0e38f || v < -3.0e38f) {
+            RAD_WARN("%s=%s is not a number; the heat engine keeps its default", k, e);
+            return false;
+        }
+        *out = v;
+        return true;
+    };
+    float v = 0.0f;
+    if (num("RADIANCE_HEAT_PREFILL", &v)) hp.prefill_share = std::min(1.0f, std::max(0.0f, v));
+    if (num("RADIANCE_HEAT_CREDIT_CAP", &v) && v > 0.0f) hp.credit_cap = v;
+    if (num("RADIANCE_HEAT_MOVES", &v) && v >= 1.0f) hp.moves_per_step = (int)std::min(v, 1024.0f);
+    if (num("RADIANCE_HEAT_PREFILL_DECAY", &v) && v > 0.0f && v < 1.0f) hp.prefill_decay = v;
+    if (num("RADIANCE_HEAT_PREFILL_GAIN", &v) && v > 0.0f) hp.prefill_gain = v;
+    if (num("RADIANCE_HEAT_DECODE_PIN", &v) && v > 0.0f) hp.decode_pin = std::min(v, 0.99f);
+    /* Lever LF (ds41-lf): the long-memory decode heat's decay (HeatParams::long_decay), read only by the lent
+     * slots' fill under fn4 place_lf 1. */
+    if (num("RADIANCE_PLACE_LF_DECAY", &v) && v > 0.0f && v < 1.0f) hp.long_decay = v;
+    /* Lever HB (ds41-sahb): the long-memory prefill heat's decay (HeatParams::hb_decay), read only under fn4 place_hb. */
+    if (num("RADIANCE_PLACE_HB_DECAY", &v) && v > 0.0f && v < 1.0f) hp.hb_decay = v;
+    /* Lever L2 (ds41-swl): the swap guard's halves at start, in hundredths (heat_env_x100: "1.5", "0.75"); unset: the
+     * shipped 1.5 / 1.25, untouched. fn4 heat_min_gain_x100 / heat_hyst_x100 change them between steps. */
+    if (const char* e = getenv("RADIANCE_HEAT_MIN_GAIN"); e && *e) {
+        const int x = heat_env_x100(e, 0, kHeatMinGainX100Max);
+        if (x >= 0) hp.min_gain = heat_x100(x);
+        else RAD_WARN("RADIANCE_HEAT_MIN_GAIN=%s is not 0 .. 100 (hundredths); the heat engine keeps min_gain %.2f", e,
+                      (double)hp.min_gain);
+    }
+    if (const char* e = getenv("RADIANCE_HEAT_HYSTERESIS"); e && *e) {
+        const int x = heat_env_x100(e, kHeatHystX100Min, kHeatHystX100Max);
+        if (x >= 0) hp.hysteresis = heat_x100(x);
+        else RAD_WARN("RADIANCE_HEAT_HYSTERESIS=%s is not 1 .. 10 (hundredths); the heat engine keeps hysteresis %.2f", e,
+                      (double)hp.hysteresis);
+    }
+    return hp;
+}
+
+/* The lent slots a slab class keeps free for swaps (MoverConfig::turnover_slots), from the move
+ * budget as planner.h derives RAD_PLACE_TURNOVER_SLOTS: a swap holds a slot about three steps, so
+ * 3 x moves, less the shadow slots the planner already gives. RADIANCE_PLACE_TURNOVER (>= 0) sets
+ * it outright. The mover caps it at the shipped count scaled to the class's shadow slots, so it
+ * only ever shrinks: a smaller budget hands those slots back to the loan's experts. */
+static int mover_turnover_from_env(const HeatParams& hp) {
+    int t = hp.moves_per_step == RAD_PLACE_MOVES_PER_STEP
+                ? RAD_PLACE_TURNOVER_SLOTS
+                : std::max(0, 3 * hp.moves_per_step - RAD_PLACE_SHADOW_SLOTS);
+    if (const char* e = getenv("RADIANCE_PLACE_TURNOVER"); e && *e) {
+        char* end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (end != e && !*end && n >= 0 && n <= 1 << 20) t = (int)n;
+        else RAD_WARN("RADIANCE_PLACE_TURNOVER=%s is not a count; the mover keeps %d", e, t);
+    }
+    return t;
+}
+
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
+    /* Lever DLW: weights a sidecar's entry stands in for (also in n_loaded / total). */
+    int64_t n_side = 0, side_bytes = 0;
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -2960,8 +3603,82 @@ int Engine::load_weights() {
         /* The container is the file tier (--weights-disk-tier places units on Tier::SSD), so the
          * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
+        const HeatParams hp = heat_params_from_env();
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        mc.turnover_slots = mover_turnover_from_env(hp);
+        /* Lever DL: RADIANCE_DRAFT_LEND set at start (any value; it is the switch's start value)
+         * declares the drafter's lend. Only a block drafter: its experts run in its query pass alone
+         * (deepseek41.cpp dsp_declare), while a serial head's history pass runs every step. */
+        if (const char* e = std::getenv("RADIANCE_DRAFT_LEND"); e && *e) {
+            const RadDrafterDecl& dd = r->program.drafter;
+            if (dd.kind == RAD_DRAFT_BLOCK && dd.depth > 0 && cfg_.n_spec > 0 && r->program.meta.n_layers > 0) {
+                mc.draft_keep_from = (int32_t)r->program.meta.n_layers;
+                dl_declared_ = true;
+            } else if (r->index == 0) {
+                RAD_INFO("RADIANCE_DRAFT_LEND=%s: this deployment has no block drafter drafting "
+                         "(--num-speculative-tokens N with a DSpark-style head); nothing to lend", e);
+            }
+        }
+        /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
+         * relayout, as the relayout pool does once for a resident one. */
+        {
+            const Program* prog = &r->program;
+            Mover* mv = &r->mover;
+            r->mover.set_file_relayout([prog, mv](const WeightInfo& w, const RadTensor* planes,
+                                              void* dst, int64_t dst_bytes) {
+                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
+                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+                const Resolved& rs =
+                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
+                /* The trellis forms are the routed experts and the file-tier hot path: write the
+                 * stored form on the card, not on the host. The host walk stays for the rest. */
+                const RadEncPlane* tp = rad_enc_plane(&w.enc, "trellis");
+                if (tp && tp->kind == RAD_PLANE_TABLE) {
+                    uint32_t bits = 0;
+                    const uint8_t* codes = nullptr;
+                    const uint8_t* table = nullptr;
+                    const uint32_t* mad = nullptr;
+                    for (int i = 0; i < w.n_sel; ++i) {
+                        const RadEncPlane& pk = w.enc.plane[w.sel[i]];
+                        if (!std::strcmp(pk.role, "codes")) {
+                            codes = (const uint8_t*)planes[i].data;
+                            bits = pk.dtype == RAD_U2 ? 2u : pk.dtype == RAD_U3 ? 3u : 0u;
+                        } else if (!std::strcmp(pk.role, "trellis")) {
+                            table = (const uint8_t*)planes[i].data;
+                        } else if (!std::strcmp(pk.role, "trellis.mad")) {
+                            mad = (const uint32_t*)planes[i].data;
+                        }
+                    }
+                    uint32_t L = 0;
+                    for (int64_t e = tp->extent[0]; e > 1; e >>= 1) ++L;
+                    const int64_t N = w.stored_shape[0] ? w.stored_shape[0] : w.sel_rows[0];
+                    const int64_t K = w.stored_shape[1] ? w.stored_shape[1] : w.sel_cols[0];
+                    const int64_t entries = tp->extent[0];
+                    void* plug = nullptr;
+                    if (const char* home = std::getenv("RADIANCE_HOME")) {
+                        const std::string so = std::string(home) + "/kernels/libr4d.so";
+                        plug = dlopen(so.c_str(), RTLD_NOW | RTLD_NOLOAD);
+                        if (!plug) plug = dlopen(so.c_str(), RTLD_NOW);
+                    }
+                    auto* gpu = plug ? (IqrGpuRelayout)dlsym(plug, "r4d_iqr_relayout_gpu") : nullptr;
+                    static int once = 0;
+                    if (!once && !gpu) {
+                        once = 1;
+                        fprintf(stderr, "I iqr file relayout: gpu symbol missing (%s)\n",
+                                plug ? "dlsym" : "dlopen");
+                    }
+                    if (bits && codes && table && gpu && gpu(codes, dst, N, K, bits, L,
+                                                             (uint32_t)entries, table, mad, dst_bytes,
+                                                             (void*)mv->transfer_stream()) == RAD_OK) {
+                        if (!once) { once = 1; fprintf(stderr, "I iqr file relayout: gpu\n"); }
+                        return (int)RAD_OK;
+                    }
+                }
+                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
+                                    w.sel, planes, w.n_sel, dst, dst_bytes);
+            });
+        }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -2973,7 +3690,14 @@ int Engine::load_weights() {
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        heat_prefill_share_ = hp.prefill_share;
+        heat_dual_ = hp.prefill_decay > 0.0f && hp.prefill_decay < 1.0f;
+        {
+            /* ds41-lf: a draft head's units (layers past the trunk's) are counted apart by slot class. */
+            HeatParams hpr = hp;
+            hpr.trunk_layers = r->program.meta.n_layers > 0 ? (int32_t)r->program.meta.n_layers : -1;
+            RAD_TRY(r->heat.init(r->plan, hpr));
+        }
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -3001,10 +3725,13 @@ int Engine::load_weights() {
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
-             * giving the encoding and logical shape the share is cut in. */
-            const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
+             * giving the encoding and logical shape the share is cut in. Lever DLW: a weight
+             * sidecar's entry stands in for the container's of the same name (open_weight_sidecar);
+             * its planes are staged like a checkpoint's, read by the workers, not the sweep. */
+            const RadFileEntry* se = side_ ? side_->find(w.source) : nullptr;
+            const RadFileEntry* e = se ? nullptr : file_ ? file_->find(w.source) : nullptr;
             const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
-            if (!e && !cw) {
+            if (!e && !cw && !se) {
                 if (w.decl.optional) continue;
                 const std::string why = ckpt_src_ ? ckpt_src_->missing(w.source) : std::string();
                 if (!why.empty())
@@ -3016,9 +3743,9 @@ int Engine::load_weights() {
                 ++n_missing;
                 continue;
             }
-            const RadEncoding& src_enc = e ? file_->encoding(*e) : cw->enc;
-            const uint32_t src_rank = e ? e->rank : cw->rank;
-            const int64_t* src_shape = e ? e->shape : cw->shape;
+            const RadEncoding& src_enc = se ? side_->encoding(*se) : e ? file_->encoding(*e) : cw->enc;
+            const uint32_t src_rank = se ? se->rank : e ? e->rank : cw->rank;
+            const int64_t* src_shape = se ? se->shape : e ? e->shape : cw->shape;
 
             /* The source must hold the encoding declare saw (rad_weight_encoding) and every layout
              * hook answered for; otherwise refuse rather than relayout the wrong bytes. */
@@ -3027,8 +3754,8 @@ int Engine::load_weights() {
                 rad_enc_format(&w.enc, want, sizeof want);
                 rad_enc_format(&src_enc, have, sizeof have);
                 RAD_ERR("rank %d: '%s' was declared against '%s' as %s, and %s holds it as %s",
-                        r->index, w.name.c_str(), w.source.c_str(), want, cfg_.model.c_str(),
-                        have);
+                        r->index, w.name.c_str(), w.source.c_str(), want,
+                        se ? side_->path() : cfg_.model.c_str(), have);
                 return RAD_E_FORMAT;
             }
 
@@ -3042,8 +3769,34 @@ int Engine::load_weights() {
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            for (int k = 0; k < w.n_sel && e; ++k)
+                w.file_plane_offset[k] = file_->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
-            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
+            /* The file tier also serves a weight it relays on every read (weight_file_relaid):
+             * each selected plane whole in the container, as many bytes as the plane holds. */
+            const bool relaid = w.tier == Tier::SSD && e &&
+                                weight_file_relaid(r->program, w, cfg_.tp);
+            if (relaid)
+                for (int k = 0; k < w.n_sel; ++k) {
+                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                    const int64_t want = w.sel_rows[k] *
+                        rad_dtype_bytes(file_->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
+                    if ((int64_t)pk.bytes != want) {
+                        RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
+                                "holds %lld bytes where the whole plane is %lld", r->index,
+                                w.name.c_str(), file_->encoding(*e).plane[w.sel[k]].role,
+                                (long long)pk.bytes, (long long)want);
+                        return RAD_E_FORMAT;
+                    }
+                }
+            if (se && (w.tier == Tier::Mapped || w.tier == Tier::SSD)) {
+                RAD_ERR("rank %d: '%s' comes from the weight sidecar %s (RADIANCE_WEIGHT_SIDECAR) and was "
+                        "placed on the %s tier, which reads the container where it lies; a sidecar's "
+                        "weight is loaded into a pool", r->index, w.name.c_str(), side_->path(),
+                        tier_name(w.tier));
+                return RAD_E_STATE;
+            }
+            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),
@@ -3171,7 +3924,9 @@ int Engine::load_weights() {
             }
 
             /* From a checkpoint every weight is staged and read by its worker (no sweep); the pool
-             * stores it as is, widened, or relaid. */
+             * stores it as is, widened, or relaid. So is a weight a sidecar's entry stands in for
+             * (lever DLW): its worker copies this rank's share out of the sidecar's mapping, and
+             * the sweep, which reads only the container, delivers it afterwards. */
             if (!e) {
                 StagedWeight sw;
                 sw.prog = &r->program;
@@ -3198,9 +3953,18 @@ int Engine::load_weights() {
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
                 const std::string name = w.name;
-                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
-                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
-                };
+                if (se) {
+                    const RadFile* sf = side_.get();
+                    sw.fill = [sf, se, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_sidecar(*sf, *se, shares, sel, offs, name, in);
+                    };
+                    ++n_side;
+                    for (int k = 0; k < w.n_sel; ++k) side_bytes += sh[k].dense_bytes();
+                } else {
+                    sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+                    };
+                }
                 staged.push_back(std::move(sw));
                 ++n_loaded;
                 continue;
@@ -3287,6 +4051,14 @@ int Engine::load_weights() {
     int sw_st = RAD_OK;
     if (file_) {
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        /* Lever DLW: the sidecar's weights, which no sweep run delivers (they alone carry a fill
+         * in a container's load), to the workers once the container is read. */
+        for (size_t k = 0; k < staged.size() && sw_st == RAD_OK && !pool.failed(); ++k) {
+            if (!staged[k].fill) continue;
+            const int64_t n = staged[k].remaining;
+            pool.reserve((int)k);
+            pool.arrived((int)k, n);
+        }
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -3313,6 +4085,10 @@ int Engine::load_weights() {
     RAD_INFO("load: %lld weights, %s placed from %s of %s read", (long long)n_loaded,
              humanb(total).c_str(), humanb(read_bytes).c_str(),
              file_ ? "container" : "checkpoint");
+    if (side_)
+        RAD_INFO("load: %lld weight share(s), %s, read from the weight sidecar %s instead of the container "
+                 "(RADIANCE_WEIGHT_SIDECAR; summed over ranks)", (long long)n_side, humanb(side_bytes).c_str(),
+                 side_->path());
     if (n_mapped)
         /* Summed over ranks, which map the same file, so under TP the resident bytes are this
          * divided by --tp; the message says so. */
@@ -3432,6 +4208,175 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     return RAD_OK;
 }
 
+/* tp8 loop F66 (lever KVP): RADIANCE_KV_PLACED=1 sizes the KV pool after what the budget does not see is
+ * placed. Unset (or 0): today's pools; a pipeline node still prints the measurement. */
+static bool kv_placed_on() {
+    const char* e = std::getenv("RADIANCE_KV_PLACED");
+    return e && !std::strcmp(e, "1");
+}
+
+/* tp8 loop F73 (lq189: the follower's rank 0 could not back 5.86 GiB right after freeing its 6.06 GiB pool -- 'out of memory', the
+ * reason consumed by the pool's shortfall): a KV pool made again at `bytes` is tried for up to ~2 s (a freed backing the driver
+ * releases late), then at the size it had (`was`, the same tries): 0 = made at `bytes`, 1 = kept at `was` (nothing given back), < 0 =
+ * neither (the pool is empty; the caller stops, as at the carve). `why` gets the allocator's last reason. Test hook
+ * RADIANCE_KV_PLACED_TEST_FAIL=N fails the first N tries at `bytes` (the host suites). */
+static int kv_pool_remake(Pool& kp, int64_t bytes, int64_t was, std::string* why) {
+    static int test_fail = -1;
+    if (test_fail < 0) {
+        const char* t = std::getenv("RADIANCE_KV_PLACED_TEST_FAIL");
+        test_fail = t && *t ? std::max(0, std::atoi(t)) : 0;
+    }
+    auto reason = [&]() {
+        const std::vector<Shortfall>& sf = kp.shortfalls();
+        return sf.empty() ? std::string("the allocator gave no reason") : sf.back().str();
+    };
+    for (int t = 0; t < 40; ++t) {
+        if (test_fail > 0) {
+            --test_fail;
+            if (why) *why = "a refusal of the test hook RADIANCE_KV_PLACED_TEST_FAIL";
+        } else if (kp.resize(bytes) >= 0) {
+            return 0;
+        } else if (why) {
+            *why = reason();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    for (int t = 0; t < 40; ++t) {
+        if (kp.resize(was) >= 0) return 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (why) *why += "; at its old size too: " + reason();
+    return RAD_E_NOMEM;
+}
+
+/* The budget (plan) read every card before the pools, the weights, the embedding and the n-gram table
+ * were placed; it counts what the engine allocates, not what the driver backs beside it -- GPU page
+ * tables for the host memory the cards map (about 4 KiB a 2 MiB of it: ~206 MiB a card for a 103 GiB
+ * n-gram table), a plugin's own hipMalloc. Those came out of --gpu-headroom-mib (lq177: 196-208 MiB a
+ * card, 52-60 MiB left of 256 at settle; F64 / F66: a card thrashing or out of memory under load).
+ * Here, before the carve, each card's free-memory drop since the reading, less what the engine placed
+ * there (rad_dev_ledger_of: device bytes, streams x one queue), is that unseen part; under the switch
+ * a KV pool nothing was carved from gives it back (Pool::resize), so the agreed token count and the
+ * card's headroom are both what the budget meant. RADIANCE_KV_PLACED_TEST_MIB=N adds N MiB to every
+ * card's unseen part (the host suites). */
+int Engine::kv_placed_measure() {
+    kvp_unseen_.assign(ranks_.size(), 0);
+    kvp_trim_.assign(ranks_.size(), 0);
+    kvp_back_.assign(ranks_.size(), 0);
+    const bool on = kv_placed_on();
+    if (!on && !pp_on()) return RAD_OK;
+    if (kvp_read_.size() < ranks_.size() || kvp_least_free_ < 0) return RAD_OK;
+    const int64_t MiB = (int64_t)1 << 20;
+    int64_t test = 0;
+    if (const char* t = std::getenv("RADIANCE_KV_PLACED_TEST_MIB"); t && *t) test = std::max<int64_t>(std::atoll(t), 0) * MiB;
+    std::string line;
+    int64_t gave = 0;
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        Rank& r = *ranks_[i];
+        const KvpRead& a = kvp_read_[i];
+        RadDeviceProps p{};
+        if (a.free < 0 || rad_dev_props(r.device, &p) < 0) continue;
+        int64_t db = 0, ns = 0;
+        rad_dev_ledger_of(r.device, &db, &ns);
+        /* Spare before the headroom: what this card had free above the least the split was sized on, and
+         * what the split left beside its two pools (the budget's `unusable`, MiB rounding). */
+        const int64_t pools = (rank_cfg_.size() > i ? rank_cfg_[i].vram_weights_mib + rank_cfg_[i].vram_kv_mib
+                                                    : cfg_.vram_weights_mib + cfg_.vram_kv_mib) * MiB;
+        const int64_t spare = (a.free - kvp_least_free_) + (kvp_claimable_ > pools ? kvp_claimable_ - pools : 0);
+        const KvPlaced k = kv_placed(a.free, p.vram_free, db - a.dev_bytes, ns - a.streams, a.queue_bytes, spare, test);
+        kvp_unseen_[i] = k.unseen;
+        Pool& kp = r.pools.kv();
+        const bool movable = on && k.trim > 0 && kp.used() == 0 && kp.bytes() > k.trim;
+        line += fmt("%scard %d %s (free %s at the read, %s now; the engine placed %s and %+lld stream(s); spare %s)",
+                    line.empty() ? "" : ", ", r.device, humanb(k.unseen).c_str(), humanb(a.free).c_str(),
+                    humanb(p.vram_free).c_str(), humanb(db - a.dev_bytes).c_str(), (long long)(ns - a.streams),
+                    humanb(spare).c_str());
+        if (!movable) continue;
+        RAD_TRY(rad_dev_set(r.device));
+        const int64_t was = kp.bytes();
+        std::string why;
+        const int st = kv_pool_remake(kp, (was - k.trim) / MiB * MiB, was, &why);
+        if (st < 0) {
+            RAD_ERR("kv: rank %d's KV pool could not be made again at %s to give back the %s its card lost "
+                    "beside the budget (RADIANCE_KV_PLACED=1), nor at its old %s: %s", r.index, humanb(was - k.trim).c_str(),
+                    humanb(k.trim).c_str(), humanb(was).c_str(), why.c_str());
+            return st;
+        }
+        if (st == 1) {   /* tp8 loop F73: kept as it was -- this card's headroom stays short by the unseen part */
+            RAD_WARN("kv: rank %d's KV pool could not be made again at %s to give back the %s its card lost beside the "
+                     "budget (RADIANCE_KV_PLACED=1): %s -- kept at %s; this card's --gpu-headroom-mib stays short by that "
+                     "much (tp8 loop F73)", r.index, humanb(was - k.trim).c_str(), humanb(k.trim).c_str(), why.c_str(),
+                     humanb(was).c_str());
+            line += fmt("%scard %d: the pool kept at %s (F73)", line.empty() ? "" : ", ", r.device, humanb(was).c_str());
+            continue;
+        }
+        kvp_trim_[i] = was - kp.bytes();
+        gave += kvp_trim_[i];
+        /* The card should show the difference at once (the old backing freed before the new one): say if it
+         * did not, so a driver that keeps freed memory is named, not mistaken for a fix. */
+        RadDeviceProps q{};
+        if (rad_dev_props(r.device, &q) >= 0) {
+            line += fmt(" -> pool %s, card free %s", humanb(kp.bytes()).c_str(), humanb(q.vram_free).c_str());
+            if (q.vram_free < p.vram_free + kvp_trim_[i] / 2)
+                RAD_WARN("kv: card %d's free memory rose by %s when its KV pool gave back %s (RADIANCE_KV_PLACED=1): the "
+                         "driver kept the freed backing, so the headroom is not restored", r.device,
+                         humanb(q.vram_free - p.vram_free).c_str(), humanb(kvp_trim_[i]).c_str());
+        }
+    }
+    if (line.empty()) return RAD_OK;
+    RAD_INFO("VRAM placed since the budget read the cards that the budget did not count (tp8 loop F66: page tables "
+             "of mapped host memory, plugins' own allocations): %s%s", line.c_str(),
+             !on ? "; RADIANCE_KV_PLACED=1 would give it back from the KV pool before the carve"
+                 : gave > 0 ? fmt("; RADIANCE_KV_PLACED=1: the KV pool gave back %s over %zu card(s) before the carve, so "
+                                  "--gpu-headroom-mib stays whole", humanb(gave).c_str(), ranks_.size()).c_str()
+                            : "; RADIANCE_KV_PLACED=1: nothing to give back");
+    return RAD_OK;
+}
+
+/* Under RADIANCE_KV_PLACED=1, after the agreement: a rank whose fixed KV pool pages more than the
+ * agreed `least` tokens (a pipeline node capped by the other's count; a cheaper rank) is made again at
+ * the pool that pages exactly `least` (KVManager::pool_mib_for_tokens + 1 MiB), so the pages it could
+ * never hand out go back to the card. The carve's block counts are the cap's either way. */
+int Engine::kv_placed_return(size_t ri, int64_t least) {
+    if (!kv_placed_on() || least <= 0 || least == KVManager::kUnboundedTokens || ri >= ranks_.size()) return RAD_OK;
+    Rank& r = *ranks_[ri];
+    Pool& kp = r.pools.kv();
+    if (kp.used() != 0 || kp.elastic() || r.kv.stream_cost().groups > 0) return RAD_OK;
+    const int64_t MiB = (int64_t)1 << 20;
+    const int64_t have = kp.bytes() / MiB;
+    if (r.kv.paged_tokens(kp.avail()) <= least) return RAD_OK;
+    const int64_t need = r.kv.pool_mib_for_tokens(least, have);
+    if (need < 0 || need + 2 > have) return RAD_OK;
+    const int64_t was = kp.bytes();
+    RAD_TRY(rad_dev_set(r.device));
+    std::string why;
+    const int rs = kv_pool_remake(kp, (need + 1) * MiB, was, &why);   /* tp8 loop F73: retried, else back to `was` */
+    if (rs < 0) {
+        RAD_ERR("kv: rank %d's KV pool could not be made again at %s nor at its old %s: %s", r.index,
+                humanb((need + 1) * MiB).c_str(), humanb(was).c_str(), why.c_str());
+        return rs;
+    }
+    if (rs == 1) {
+        RAD_WARN("kv: rank %d's KV pool could not be made again at %s for the agreed %lld tokens (RADIANCE_KV_PLACED=1): %s -- "
+                 "kept at %s (tp8 loop F73)", r.index, humanb((need + 1) * MiB).c_str(), (long long)least, why.c_str(),
+                 humanb(was).c_str());
+        return RAD_OK;
+    }
+    if (r.kv.paged_tokens(kp.avail()) < least) {
+        /* Not expected (pool_mib_for_tokens is exact): back to the pool it had. */
+        if (kv_pool_remake(kp, was, was, &why) < 0) {
+            RAD_ERR("kv: rank %d's KV pool could not be made again at %s: %s", r.index, humanb(was).c_str(), why.c_str());
+            return RAD_E_NOMEM;
+        }
+        return RAD_OK;
+    }
+    kvp_back_[ri] = was - kp.bytes();
+    RAD_INFO("kv: rank %d's KV pool paged more than the agreed %lld tokens: made again at %s, %s back to card %d "
+             "(RADIANCE_KV_PLACED=1)", r.index, (long long)least, humanb(kp.bytes()).c_str(),
+             humanb(kvp_back_[ri]).c_str(), r.device);
+    return RAD_OK;
+}
+
 int Engine::configure_kv() {
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
@@ -3455,6 +4400,8 @@ int Engine::configure_kv() {
      * of paged blocks. Under an uneven split the pools differ (more delta-net heads, or zero
      * attention weights), so each rank is planned first and all are capped at the least before
      * any carves. */
+    /* tp8 loop F66 (lever KVP): what the cards lost beside the budget, given back before the count */
+    RAD_TRY(kv_placed_measure());
     int64_t least = -1;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         auto& r = ranks_[i];
@@ -3466,7 +4413,8 @@ int Engine::configure_kv() {
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
         /* A rank plan() re-sized for the common token count must page at least that count (same
          * plan, same bytes); anything less is a broken invariant. */
-        if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_) {
+        if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_ &&
+            !(i < kvp_trim_.size() && kvp_trim_[i] > 0)) {   /* lever KVP gave some back on purpose */
             RAD_ERR("kv: rank %d's KV pool was sized at %lld MiB to page the common %lld tokens "
                     "and pages %lld: the pool and the plan that sized it disagree", r->index,
                     (long long)rank_cfg_[i].vram_kv_mib, (long long)kv_planned_tokens_,
@@ -3476,6 +4424,11 @@ int Engine::configure_kv() {
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
         if (least < 0 || t < least) least = t;
     }
+    /* tp8 S4 (review F1): one block table serves both nodes of a two-node pipeline, so both cap
+     * at the smaller node's tokens before either carves -- every group, a zeroed one included,
+     * then holds the same block count on both (rendezvous 2 compares them). Nothing on one
+     * machine (no link). */
+    if (pp_link_) RAD_TRY(pp_kv_agree(&least));
     /* The mirrors are checked once, before any rank pins one, against the host tiers still to be
      * pinned after them: the prefix cache's, the activation arenas and, when sized already, the
      * checkpoint store. */
@@ -3495,12 +4448,14 @@ int Engine::configure_kv() {
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
-        if (ranks_.size() > 1) {
+        if (ranks_.size() > 1 || pp_link_) {
             const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
             if (own > least && own != KVManager::kUnboundedTokens)
                 RAD_INFO("kv: rank %d could page %lld tokens and carves %lld, the least rank's, so "
                          "that one block table serves every rank", r->index, (long long)own,
                          (long long)least);
+            /* tp8 loop F66 (lever KVP): the pages past the agreed count go back to the card */
+            RAD_TRY(kv_placed_return((size_t)r->index, least));
             r->kv.cap_paged_tokens(least);
         }
         /* Before the carve, which refuses a streamed plan with no mirror and maps. The maps come out
@@ -3786,6 +4741,8 @@ int Engine::configure_kv() {
 /* ================================================================== start */
 int Engine::start() {
     startup_begin_ns_ = rad_mono_ns();
+    /* tp8 S4: a node of a two-node pipeline; nothing on one machine (--pp-nodes 1). */
+    RAD_TRY(pp_check());
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
@@ -3832,6 +4789,9 @@ int Engine::start() {
                    : "the libraries named, in that order; architecture plugin " + plugins_.arch_plugin +
                          (plugins_.arch_version.empty() ? "" : "@" + plugins_.arch_version));
     }
+
+    /* tp8 S4: the other node, and the first rendezvous, before any weight is declared. */
+    RAD_TRY(pp_connect());
 
     ranks_.clear();
     for (int i = 0; i < cfg_.tp; ++i) {
@@ -3959,16 +4919,30 @@ int Engine::start() {
              * guard, wherever that is below the region at the top (stager.h). */
             int64_t top_level = 0;
             r->arena_low_off = -1;
+            r->arena_sa_off = -1;
+            /* RADIANCE_STAGE_SPAN=0: no place at the span's shared level, so that level lends the ring's
+             * room to the expert slab too and its steps (every mixed step at --prefill-span) are not
+             * staged; only full-plan steps are. 79 (7.11.): with mixed steps unstaged (RADIANCE_STAGE_MIXED
+             * =0) the reserved room alone left them 2.6-4.2 % slower than without levels. Unset: as before. */
+            const char* sse = getenv("RADIANCE_STAGE_SPAN");
+            const bool span_place = !(sse && (!std::strcmp(sse, "0") || !std::strcmp(sse, "off")));
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
                 const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                r->arena_low_off = std::min(off, r->program.arena_stage_off);
+                /* Lever SA: the place exists under RADIANCE_STAGE_SPAN=0 too; that level lends it unless a
+                 * stage_short step keeps it (Engine::arena_step). */
+                r->arena_sa_off = std::min(off, r->program.arena_stage_off);
+                if (!span_place) continue;
+                r->arena_low_off = r->arena_sa_off;
             }
             char* const base = (char*)r->ctx.arena_base();
+            /* The ring's second place: the span's shared level's own (RADIANCE_STAGE_SPAN unset), else lever SA's
+             * (the same offset; only a stage_short step uses it there). */
+            const int64_t low_off = r->arena_low_off >= 0 ? r->arena_low_off : r->arena_sa_off;
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
-                                   r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
+                                   low_off >= 0 ? base + low_off : nullptr,
                                    r->program.arena_stage_bytes, top_level + 1));
             if (r->stager.enabled() && r->index == 0)
                 RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
@@ -4016,7 +4990,8 @@ int Engine::start() {
      * plan that moves units borrows. A strip is one layer's stripe of one lendable group, lent
      * from the top, since a group's top blocks are the top of every layer's stripe. */
     for (auto& r : ranks_) {
-        if (!r->heat.enabled()) continue;
+        /* tp8 S4: a pipeline node lends no KV: its block ids are the leader's (engine_node.cpp). */
+        if (!r->heat.enabled() || pp_on()) continue;
         RAD_TRY(rad_dev_set(r->device));
         std::vector<LoanStrip> strips;
         for (const KVGroupPlan& p : r->kv.plans()) {
@@ -4037,13 +5012,31 @@ int Engine::start() {
     /* The next-layer expert prefetch, wherever experts sit in a pinned pool for routed GEMMs to
      * read over the link (core/runtime/xprefetch.h). Its stream and ring are in the VRAM budget
      * (xp_device_bytes, Engine::plan). Off under --deterministic. */
-    if (!cfg_.deterministic)
+    if (!cfg_.deterministic && !xprefetch_env_off())
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
         }
+    /* Lever XR (ds41-etp-xr): every rank's pinned host pools, to the kernel plugins that place by them (exl3r4d's
+     * gate_up map form reads them only under the fn4 switch exl3_xr; 0, the default, runs as before). The pools are
+     * fixed from here on (Mover: allocated at load). Placement information only: no op changes what it computes. */
+    {
+        int told = 0, pools = 0;
+        for (auto& r : ranks_) {
+            if (!r->heat.enabled()) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            uint64_t lo[16], hi[16], st[16];
+            const int n = r->mover.pool_ranges(lo, hi, st, 16);
+            if (n <= 0) continue;
+            pools = n;
+            told += fn4::host_pools(r->index, n, lo, hi) > 0 ? 1 : 0;
+        }
+        if (pools > 0)
+            RAD_INFO("host pools: %d a rank named to the kernel plugins on %d of %zu ranks (lever XR's residency test)",
+                     pools, told, ranks_.size());
+    }
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them
@@ -4099,6 +5092,7 @@ int Engine::start() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             r->arena_lent.assign(1, 0);
+            r->arena_lent_sa.assign(1, 0);
             const Program& P = r->program;
             const int64_t top = P.arena_bytes;
             for (const ArenaLevel& lv : r->arena_levels) {
@@ -4112,6 +5106,15 @@ int Engine::start() {
                           RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
                     : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_lent.push_back(top > edge ? top - edge : 0);
+                /* Lever SA: a stage_short step at that level keeps lever SA's place (below it, what the ring
+                 * would lend); every other level and value lends as above. */
+                int64_t sa = r->arena_lent.back();
+                if (lv.rows == arena_span_rows_ && !ring && r->arena_sa_off >= 0 && r->stager.enabled()) {
+                    const int64_t e2 = (r->arena_sa_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
+                                       RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                    sa = std::min(sa, top > e2 ? top - e2 : (int64_t)0);
+                }
+                r->arena_lent_sa.push_back(sa);
             }
             if (!ok) break;
             int64_t most = 0;
@@ -4139,6 +5142,127 @@ int Engine::start() {
             for (auto& r : ranks_) r->arena_lent.clear();
         }
     }
+    /* Lever Z0-A: arena_d0 can act only with a rung below the decode rung today's steps take. */
+    {
+        bool lower = false;
+        for (size_t k = 1; k < arena_rows_.size(); ++k)
+            if (arena_rows_[k] < arena_dec_max_) lower = true;
+        const bool cap = arena_dec_max_ > 0 && arena_dec_rungs_ >= 2 && lower;
+        fn4::arena_d0_register(cap);
+        arena_d0_.store(0, std::memory_order_relaxed);
+        fn4::note_sched(fn4::kArenaD0, 0);
+        if (cap)
+            RAD_INFO("activation arena: lever Z0-A set up (fn4 arena_d0, off): decode and verify steps take the "
+                     "%lld-token rung; under arena_d0 1 a step that verifies nothing and runs no head (depth 0) "
+                     "takes the smallest rung that holds its own rows", (long long)arena_dec_max_);
+    }
+    /* ---- lever DL: the drafter's expert slab, lent to the trunk while it does not draft --------
+     *
+     * Every rank's mover kept a host copy of each drafter unit (load_weights); here the copies are
+     * filled from the VRAM slots the load wrote and the slab is carved for the trunk's classes. It
+     * is lent only when the scheduler asks (Scheduler::draft_lend_wanted, at each step release). */
+    dl_capable_ = false;
+    if (dl_declared_) {
+        bool all = true;
+        for (auto& r : ranks_) {
+            if (!r->heat.enabled()) { all = false; continue; }
+            RAD_TRY(rad_dev_set(r->device));
+            LogRank lr(r->index);
+            RAD_TRY(r->mover.draft_lend_setup());
+            all = all && r->mover.draft_lend_ready();
+        }
+        (void)rad_dev_set(ranks_[0]->device);
+        dl_capable_ = all && !ranks_.empty();
+        if (!dl_capable_)
+            RAD_INFO("RADIANCE_DRAFT_LEND: the drafter's slab cannot be lent on every rank (a static plan, "
+                     "or no drafter class of its own); the lend stays off");
+    }
+    /* Lever Z0-W: RADIANCE_DRAFT_LEND_WEIGHTS (any value declares it; 1 starts it on) -- the drafter's static
+     * weights only its query pass reads, lent with the slab (Mover::draft_w_setup). The context pass (and so
+     * every refill) reads dspark.fc, dspark.enc.output_norm and each block's attn_kv / attn_kv_a_norm: those
+     * stay (hy-z0prof2's depth-0 profile: the drafter ops there read no other weight). */
+    dw_capable_ = false;
+    dw_lent_ = false;
+    dw_on_.store(0, std::memory_order_relaxed);
+    if (const char* e = getenv("RADIANCE_DRAFT_LEND_WEIGHTS"); e) {
+        if (!dl_capable_) {
+            RAD_INFO("RADIANCE_DRAFT_LEND_WEIGHTS=%s: the drafter's slab lend (lever DL) is not set up; the weight "
+                     "lend needs it and stays off", e);
+        } else {
+            bool all = true;
+            int64_t lent_bytes = 0, kept = 0;
+            for (auto& r : ranks_) {
+                RAD_TRY(rad_dev_set(r->device));
+                LogRank lr(r->index);
+                const int32_t first = r->mover.draft_first_layer();
+                RAD_TRY(r->mover.draft_w_setup([first](const std::string& n, int32_t layer) {
+                    const bool drafter = n.rfind("dspark.", 0) == 0 || (first >= 0 && layer >= first);
+                    if (!drafter) return false;
+                    if (n == "dspark.fc.weight" || n == "dspark.enc.output_norm.weight") return false;
+                    if (n.find(".attn_kv.") != std::string::npos || n.find(".attn_kv_a_norm.") != std::string::npos)
+                        return false;
+                    return true;
+                }));
+                all = all && r->mover.draft_w_ready();
+                lent_bytes = std::max(lent_bytes, r->mover.draft_w_bytes());
+                kept = std::max(kept, r->mover.draft_w_kept_bytes());
+            }
+            (void)rad_dev_set(ranks_[0]->device);
+            dw_capable_ = all && !ranks_.empty();
+            dw_on_.store(dw_capable_ && std::atoi(e) == 1 ? 1 : 0, std::memory_order_relaxed);
+            RAD_INFO("draft weight lend (lever Z0-W, RADIANCE_DRAFT_LEND_WEIGHTS=%s, fn4 draft_lend_w): %s; %s of the "
+                     "drafter's query-pass weights a rank lent with its slab while depth 0 holds, recalled and copied "
+                     "back before its head next runs; the context pass's %s stay",
+                     e, dw_capable_ ? (dw_on_.load() ? "on" : "set up, off") : "not set up on every rank",
+                     humanb(lent_bytes).c_str(), humanb(kept).c_str());
+        }
+    }
+    fn4::draft_w_register(dw_capable_);
+    fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
+
+    /* Lever LF (ds41-lf, fn4 place_lf): the lent slots' fill ranks by the long-memory decode heat. It can act
+     * wherever every rank places dynamically (a heat engine and a mover that move). RADIANCE_PLACE_LF=1 starts
+     * it on; unset or 0: off (today's fill). */
+    {
+        bool all = !ranks_.empty();
+        for (auto& r : ranks_) all = all && r->heat.enabled();
+        lf_capable_ = all;
+        const char* e = getenv("RADIANCE_PLACE_LF");
+        const int on = lf_capable_ && e && std::atoi(e) == 1 ? 1 : 0;
+        lf_on_.store(on, std::memory_order_relaxed);
+        for (auto& r : ranks_) r->mover.set_place_lf(on == 1);
+        if (e && *e)
+            RAD_INFO("lent-slot fill (lever LF, RADIANCE_PLACE_LF=%s, fn4 place_lf): %s; the long-memory decode heat "
+                     "decays %.4f a step", e, !lf_capable_ ? "not available (a static plan)" : on ? "on" : "off",
+                     lf_capable_ ? (double)heat_params_from_env().long_decay : 0.0);
+        fn4::place_lf_register(lf_capable_);
+        fn4::note_sched(fn4::kPlaceLf, on);
+    }
+    /* Levers SWL / L2 (ds41-swl, fn4 place_swap_lent / heat_min_gain_x100 / heat_hyst_x100): heat promotions into free
+     * lent slots, and the heat guard. They can act wherever every rank places dynamically (lever LF's condition).
+     * RADIANCE_PLACE_SWAP_LENT=1 starts SWL on; RADIANCE_HEAT_MIN_GAIN / _HYSTERESIS set the guard at start
+     * (heat_params_from_env; the heat engine's start line shows it). Unset: today's, and nothing is logged. */
+    {
+        swl_capable_ = lf_capable_;
+        const char* e = getenv("RADIANCE_PLACE_SWAP_LENT");
+        const int on = swl_capable_ && e && std::atoi(e) == 1 ? 1 : 0;
+        swl_on_.store(on, std::memory_order_relaxed);
+        for (auto& r : ranks_) r->mover.set_swap_lent(on == 1);
+        if (e && *e)
+            RAD_INFO("heat promotions into free lent slots (lever SWL, RADIANCE_PLACE_SWAP_LENT=%s, fn4 place_swap_lent): %s",
+                     e, !swl_capable_ ? "not available (a static plan)" : on ? "on" : "off");
+        fn4::swl_register(swl_capable_);
+        fn4::note_sched(fn4::kPlaceSwapLent, on);
+        const HeatParams hp0 = heat_params_from_env();
+        const bool h0 = !ranks_.empty() && ranks_[0]->heat.enabled();
+        fn4::note_sched(fn4::kHeatMinGainX100, h0 ? (int)ranks_[0]->heat.min_gain_x100()
+                                                  : (int)std::lround((double)hp0.min_gain * 100.0));
+        fn4::note_sched(fn4::kHeatHystX100, h0 ? (int)ranks_[0]->heat.hysteresis_x100()
+                                               : (int)std::lround((double)hp0.hysteresis * 100.0));
+    }
+    /* Lever SA / HB (ds41-sahb). */
+    sahb_setup();
+
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is
      * drained to the affordable loan before the blocks are handed out, and the followers' marks
@@ -4175,6 +5299,9 @@ int Engine::start() {
     }
 
     RAD_TRY(step_state_init());
+    /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP; engine_draft.cpp), reserved by the budget
+     * beside the step staging. Nothing when unset. */
+    RAD_TRY(ctxskip_setup());
 
     /* ---- the budget, checked against the card --------------------------------------------
      *
@@ -4201,9 +5328,9 @@ int Engine::start() {
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
 
         /* Both the headroom and the later allocations are still free here: serve() allocates
-         * the step staging; the KV tiers' staging and a second lane are built on first use (the lane at Ctx::init
-         * where ctx_lane_eager()). */
-        const int64_t late = late_step_bytes_ + late_lazy_bytes_;
+         * the step staging; the KV tiers' staging and a second lane are built on first use. */
+        const int64_t late = late_step_bytes_ + late_lazy_bytes_ + (r->index == 0 ? pp_send_async_bytes() : 0) +
+                             pp_recv_async_bytes();
         const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
         const int64_t room = got - late;
@@ -4260,6 +5387,13 @@ int Engine::start() {
         } else
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
+        /* tp8 loop F66 (lever KVP): what this card's KV pool gave back, beside the line above */
+        const int64_t kt = ri < kvp_trim_.size() ? kvp_trim_[ri] : 0, kb = ri < kvp_back_.size() ? kvp_back_[ri] : 0;
+        if (kt > 0 || kb > 0)
+            RAD_INFO("card %d: the KV pool gave back %s before the carve for the %s placed beside the budget, and %s "
+                     "past the agreed token count (RADIANCE_KV_PLACED=1); free above is after both",
+                     r->device, humanb(kt).c_str(), humanb(ri < kvp_unseen_.size() ? kvp_unseen_[ri] : 0).c_str(),
+                     humanb(kb).c_str());
     }
     return RAD_OK;
 }
@@ -4268,6 +5402,76 @@ const Program& Engine::program() const { return ranks_[0]->program; }
 
 /* ================================================================== dump */
 /* --debug-graph (spec §16); see Engine::dump in engine.h. */
+/* Lever SA / HB (ds41-sahb): what fn4 stage_short / stage_pick / place_hb can act on, said once.
+ *   SA: every rank has a prefill stager and lever SA's place at the span's shared level (arena_sa_off), so a
+ *       stage_short step can keep the ring there (Engine::arena_step).
+ *   HB: every rank runs the dual heat (RADIANCE_HEAT_PREFILL_DECAY). RADIANCE_PLACE_HB_RANKS (a comma list of rank
+ *       indices; unset or empty: every rank) names the ranks place_hb reserves on.
+ * Every switch starts at 0: nothing changes until a request sets one. */
+void Engine::sahb_setup() {
+    bool sa = !ranks_.empty() && arena_span_rows_ > 0;
+    for (auto& r : ranks_)
+        sa = sa && r->stager.enabled() && r->arena_sa_off >= 0 && !r->arena_lent.empty() &&
+             r->arena_lent_sa.size() == r->arena_lent.size();
+    bool hb = !ranks_.empty() && heat_dual_;
+    for (auto& r : ranks_) hb = hb && r->heat.enabled() && r->heat.dual();
+    sa_capable_ = sa;
+    hb_capable_ = hb;
+    hb_mask_ = ~(uint64_t)0;
+    std::string named = "every rank";
+    if (const char* e = getenv("RADIANCE_PLACE_HB_RANKS"); e && *e) {
+        hb_mask_ = 0;
+        named.clear();
+        for (const char* p = e; *p;) {
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) { ++p; continue; }
+            if (v >= 0 && v < 64) {
+                hb_mask_ |= (uint64_t)1 << v;
+                named += fmt("%s%ld", named.empty() ? "rank " : ", ", v);
+            }
+            p = end;
+        }
+        if (!hb_mask_) named = "none (RADIANCE_PLACE_HB_RANKS names no rank)";
+    }
+    stage_short_.store(0, std::memory_order_relaxed);
+    stage_pick_.store(0, std::memory_order_relaxed);
+    place_hb_.store(0, std::memory_order_relaxed);
+    for (auto& r : ranks_) {
+        r->stager.set_short(false, 0);
+        if (r->heat.enabled()) r->heat.set_hb_reserve(0);
+    }
+    fn4::sahb_register(sa, hb);
+    fn4::note_sched(fn4::kStageShort, 0);
+    fn4::note_sched(fn4::kStagePick, 0);
+    fn4::note_sched(fn4::kPlaceHb, 0);
+    /* Lever SP (ds41-int9, fn4 stage_full_min / stage_full_pick): a prefill stager on every rank; both start at 0
+     * (today's full-plan rule). Said nowhere at start: GET "sp" carries "capable"; fn4 logs every change it applies. */
+    bool sp = !ranks_.empty();
+    for (auto& r : ranks_) sp = sp && r->stager.enabled();
+    sp_capable_ = sp;
+    stage_full_min_.store(0, std::memory_order_relaxed);
+    stage_full_pick_.store(0, std::memory_order_relaxed);
+    for (auto& r : ranks_) r->stager.set_full(false, 0, false);
+    fn4::sp_register(sp);
+    fn4::note_sched(fn4::kStageFullMin, 0);
+    fn4::note_sched(fn4::kStageFullPick, 0);
+    const Rank& r0 = *ranks_[0];
+    int64_t span_lent = 0, span_lent_sa = 0;
+    for (size_t k = 1; k < arena_rows_.size() && k < r0.arena_lent.size() && k < r0.arena_lent_sa.size(); ++k)
+        if (arena_rows_[k] == arena_span_rows_) { span_lent = r0.arena_lent[k]; span_lent_sa = r0.arena_lent_sa[k]; }
+    RAD_INFO("lever SA / HB (ds41-sahb) set up, off: stage_short %s; place_hb %s",
+             sa ? fmt("can arm the prefill stager for a step of %lld .. %lld tokens at the span's shared level (its ring "
+                      "%s at %s of the arena; such a step's loan %s instead of %s)",
+                      (long long)r0.stager.min_rows(), (long long)arena_span_rows_,
+                      humanb(r0.stager.ring_bytes()).c_str(), humanb(r0.arena_sa_off).c_str(),
+                      humanb(span_lent_sa).c_str(), humanb(span_lent).c_str()).c_str()
+                : "not available (no prefill stager or no span's shared level on every rank)",
+             hb ? fmt("can reserve on %s (long prefill heat decay %.2f)", named.c_str(),
+                      (double)heat_params_from_env().hb_decay).c_str()
+                : "not available (no dual heat on every rank)");
+}
+
 int Engine::dump() {
     Program& p = ranks_[0]->program;
     fputs(dump_graph_str(p, nullptr).c_str(), stdout);

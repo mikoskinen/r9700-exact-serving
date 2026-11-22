@@ -14,6 +14,8 @@
 #include "mem_iface.h"
 #include "metrics.h"
 
+#include <functional>
+
 namespace rad {
 
 /* One sequence's participation in one step. The scheduler fills these; the builder turns them
@@ -57,6 +59,11 @@ struct StepEntry {
      * Set on a history-pass entry whose sequence drafts. */
     bool    draft_out = false;
     bool    is_prefill = false;
+    /* Lever PSK-CR (ds41-pskcr): a cone-replay chunk -- its rows rebuild the windowed state over global KV adopted from
+     * the prefix cache. The build maps its rows' slots in every RAD_KV_FULL group and its state slot in every
+     * RAD_KV_LINEAR group to -1, so nothing of those is written (a store skips a negative slot); its window and conv
+     * groups are written as any prefill's. */
+    bool    cr_replay = false;
     bool    produces_token = false;   /* this entry's last token is the sequence's last */
     /* The drafts came from prompt lookup, not the declared drafter. They count toward reported
      * acceptance but not the adaptive window's estimate of the draft head (DraftController,
@@ -71,6 +78,10 @@ struct StepEntry {
     int32_t dev_tok = 0;
     int32_t dev_out = -1;
     int32_t dev_aux = 0;
+    /* tp8 S5 (lanes.h): a piece of another lane's sequence riding in this lane's step: that lane's
+     * index (the scheduler that owns the request, and commits it); -1 for this scheduler's own entry,
+     * always on one lane. Its `slot` is -1: the request is in the home lane's table. */
+    int8_t  home = -1;
 };
 
 struct StepPlan {
@@ -126,7 +137,12 @@ public:
 
     /* Bytes init() allocates on each rank's card (the step slab and, with an encoder, the media
      * regions), computed without allocating, for the VRAM budget. -1 if init() would refuse. */
-    static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg);
+    static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg, int64_t bt_rows = 0);
+    /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N, a BG lane's builder): its block tables are carved for `rows` rows (each
+     * --max-model-len wide, as every lane's) instead of --max-num-seqs; build() / wire_replay() refuse a plan of more
+     * sequences by name. 0 (default) = --max-num-seqs, today's carve. Call before init(). */
+    void set_bt_rows(int64_t rows) { bt_rows_ = rows > 0 ? rows : 0; }
+    int64_t bt_rows() const { return bt_rows_ > 0 && bt_rows_ < max_seqs_ ? bt_rows_ : max_seqs_; }
 
     /* Build the batch for this step. The returned pointer stays valid for the next kOut - 1
      * calls and is shared by pointer across rank threads (spec §1). Null on a device failure,
@@ -139,6 +155,51 @@ public:
     /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
      * round, slot state and inputs (advance.h). */
     AdvanceArgs advance_args(int rank) const;
+
+    /* ---- tp8 S4: the two-node pipeline (abi/rad_pp.h). The leader ships every build's staging
+     * span with the scalars beside it (Wire); the follower uploads the same bytes to its own ranks'
+     * slabs and fills its batches from them, so both nodes' cards hold the same step arrays and
+     * block tables without the follower running a scheduler. Every build crosses, a drafter's too
+     * (`run` false on the follower: only its uploads are applied), because the block-table region
+     * of the slab is staged only where it changed (BtMirror) and so must see every build in order.
+     * Unused on one machine: build() only records where its span was. */
+    enum { kWireMaxDerived = 32 };
+    struct Wire {
+        uint32_t magic = 0x31525742u;   /* "BWR1" */
+        uint32_t version = 1;
+        uint64_t layout = 0;            /* layout_hash() of the leader's builder */
+        int32_t  phase = 0, step = 0;
+        int64_t  n_tok = 0, n_seq = 0, n_out = 0, n_draft_out = 0, n_seq_decode = 0, n_tok_decode = 0;
+        int64_t  n_ahead = 0, n_bidi = 0, n_pw = 0, n_mm = 0;
+        int32_t  max_q = 0, ctx_bound = 0, max_q_dec = 0, max_q_pf = 0;
+        int32_t  draft_pass = 0, n_spec = 0, n_ck = 0, rope_mixed = 0, cvec_rows = 0, score_only = 0;
+        int32_t  tree = 0, lora_rows = 0, n_groups = 0, n_derived = 0;
+        int64_t  bt_base = 0, used = 0, rng_at = 0, n_rng = 0;
+        int64_t  pitch[RAD_SCHED_MAX_KV_GROUPS] = {};
+        int32_t  used_max[RAD_SCHED_MAX_KV_GROUPS] = {};
+        int64_t  derived_n[kWireMaxDerived] = {};
+    };
+    /* The last build (not an encoder pass) as it crosses: its scalars and its span in the ring.
+     * False when there is none. */
+    bool wire_last(Wire* w, const char** span) const;
+    /* The follower's side: uploads `span` (w.used bytes) to every rank's slab and, with `run`,
+     * copies the derivations and fills every rank's batch; returns rank 0's batch (batch_for()
+     * serves the rest) or null with the reason logged. */
+    const RadBatch* wire_replay(const Wire& w, const char* span, int64_t bytes, bool run);
+    /* What a span means: every carve offset, group geometry and derivation slot. Two builders with
+     * one hash read each other's spans byte for byte (the rendezvous compares it). */
+    uint64_t layout_hash() const;
+    /* The follower's own carve, by group index (-1: no check): the block ids (a paged group's
+     * n_blocks, a state group's n_states) and slots (n_blocks x block_size, n_states) a replayed
+     * table or slot mapping may name. wire_replay refuses a span naming one past them -- a broken
+     * KV cap is then a loud refusal, not a write outside the pool. Unset (one machine): no check. */
+    void set_wire_limits(std::vector<int64_t> ids, std::vector<int64_t> slots) {
+        wire_id_lim_ = std::move(ids);
+        wire_slot_lim_ = std::move(slots);
+    }
+    /* Called at the end of every build() (not build_encoder) with its rank-0 batch: the leader
+     * ships it from here. Empty on one machine. */
+    std::function<void(const RadBatch*)> on_build;
 
     /* The sequences of `b`, a batch build() returned that is still valid (any rank's), in row
      * order; null for another batch (an encoder pass). What a streamed group's prefill stage
@@ -298,6 +359,7 @@ private:
     std::vector<RankIO> ranks_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
+    int64_t bt_rows_ = 0;   /* tp8 loop D47: the block tables' rows (0: max_seqs_); bt_rows() */
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
      * `conv_state_index` derivation, which no plugin calls at present; conv kernels read
      * RadKVGroupBatch::state_index instead. Kept per group so the derivation is correct with more
@@ -332,7 +394,21 @@ private:
         int64_t pitch = -1;
         std::vector<uint64_t> seq;
         std::vector<int64_t>  len;
+        /* tp8 prefill P0: a lane row's table base (win_row), -1 for a row staged from the table's start */
+        std::vector<int64_t>  base;
     };
+    /* tp8 prefill P0 (pipeline lanes): a fixed window group's row is staged from the block of its first query's
+     * window, not from the manager's table start. Under lanes the manager holds a sequence's window from its keep
+     * floor (its committed end) to the end of its chunks in flight in other lanes, which can pass the row's
+     * max_blocks: staged from the start, the row would be cut at the pitch and the kernel would miss the keys of
+     * its last queries. `skip` = the table entries no query of the row reads, `n` = the entries the row reaches. */
+    bool lanes_rebase_ = false;
+public:
+    /* Set by a lane scheduler (Scheduler::init with n_lanes > 1), before its first build. */
+    void set_lanes_rebase(bool on) { lanes_rebase_ = on; }
+private:
+    struct WinRow { int64_t skip = 0, n = 0; };
+    WinRow win_row(const KVGeom::G& L, const StepEntry& e, int64_t first, int64_t bt_len) const;
     std::vector<BtMirror> bt_mirror_;
     /* This build's upload ranges, host-side, until build() writes them behind the payload. */
     std::vector<RadCopyRange> ranges_;
@@ -340,6 +416,12 @@ private:
     void forget_tables();
     int64_t last_n_seq_ = 0;
     bool    last_tree_  = false;   /* the last build staged spec_parent (advance_args' parent_off) */
+    /* Where the last build's span sits in the ring, for wire_last (tp8 S4). */
+    int64_t last_off_ = -1, last_used_ = 0, last_rng_at_ = 0, last_n_rng_ = 0;
+    bool    last_enc_ = false;
+    std::vector<int64_t> wire_id_lim_, wire_slot_lim_;   /* set_wire_limits (the follower) */
+    /* wire_replay's check of a replayed span against them; false with the reason logged. */
+    bool wire_in_carve(const Wire& w, const char* span_base) const;
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;

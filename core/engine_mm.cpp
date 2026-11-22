@@ -222,7 +222,12 @@ int Engine::run_encodes() {
     }
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
-    RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms", items.size(), ms);
+    /* One line a call (pictures are a request's, not a step's): how long the passes took, so a
+     * picture's cost can be read off the log beside its request's TTFT. */
+    int64_t n_patch = 0, n_rows = 0;
+    for (const auto& ip : items) { n_patch += ip->n_patch; n_rows += ip->n_rows(); }
+    RAD_INFO("encoder: %zu item(s), %lld patches -> %lld rows, encoded in %.1f ms", items.size(),
+             (long long)n_patch, (long long)n_rows, ms);
     return RAD_OK;
 }
 

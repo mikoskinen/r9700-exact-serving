@@ -12,6 +12,8 @@
 #include "planner.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -257,7 +259,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     }
     /* build_classes: one expert slab class a stride. */
     for (int64_t s : expert_strides)
-        out->expert_spare += (int64_t)(RAD_PLACE_SHADOW_SLOTS + RAD_PLACE_STAGE_RING) * s +
+        out->expert_spare += (int64_t)(place_shadow_slots() + RAD_PLACE_STAGE_RING) * s +
                              RAD_ALIGN_UNIT;
     for (const auto& le : layer_experts)
         out->expert_layer_max = std::max(out->expert_layer_max, le.second);
@@ -398,7 +400,11 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.weights.push_back(w);
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
-        if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        if (!in_.container ||
+            !(weight_file_direct(wi, prog.ctx.world_size) ||
+              (in_.file_relayout && weight_file_relaid(prog, wi, prog.ctx.world_size) &&
+               weight_bytes(wi) <= RAD_PLACE_FILE_WINDOW_BYTES)))
+            mu.file_direct = false;
         /* The drafter's own weights (the "mtp." namespace) run on every draft pass of every
          * decode step; the expert fill pins them in the host pool ahead of everything ranked. */
         if (wi.name.rfind("mtp.", 0) == 0) mu.draft_head = true;
@@ -529,7 +535,8 @@ struct HostFall {
             }
             return true;
         }
-        /* The file tier, for a unit stored in the container as its kernel reads it. A Tier::SSD
+        /* The file tier, for a unit stored in the container as its kernel reads it or relaid on
+         * each read (MoveUnit::file_direct). A Tier::SSD
          * unit has no address until staged. A scheduled unit is staged by Plan::prefetch. A routed
          * one cannot be scheduled, since a grouped MoE GEMM needs every expert's pointer at issue,
          * so the file stager reads all of a routed layer's file-tier experts into a VRAM buffer
@@ -732,9 +739,10 @@ int Planner::assign_expert_tiered(Plan* p) {
                 mu.reason = "fits in no tier";
                 /* With the file tier on, only a non-file-direct unit gets here (HostFall::place). */
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room, and its "
-                                         "stored form is not the container's (a relayout, a "
-                                         "dtype conversion or a shard), so the file tier cannot "
-                                         "read it in place"
+                                         "stored form is not the container's in a way a file "
+                                         "read cannot make (a widening, a shard, or a relayout "
+                                         "whose kernel has no relayout function), so the file "
+                                         "tier cannot serve it"
                                        : "the host pool is full and no --weights-disk-tier was "
                                          "given");
                 rc = RAD_E_NOMEM;
@@ -758,21 +766,34 @@ int Planner::assign_expert_tiered(Plan* p) {
             if (mu.site == Site::DeviceStaged && mu.access != RAD_ACCESS_CONDITIONAL)
                 ++staged[(size_t)mu.slab_class];
         }
-        /* The hot VRAM cache's budget: with file-tier units in a class, the shadow slots
-         * may be filled with hot experts — read a routed expert into a shadow slab slot
-         * permanently, instead of the stager's per-pass buffer, when heat says the expert
-         * keeps routing. Eviction is bookkeeping (the container is ground truth). The
-         * budget is the full shadow cap rather than the swap formula's resident/4 share.
-         * Bounded by the class's residents so the two-pass fill converges — a later pass
-         * with fewer residents reserves fewer — and charged to the weights budget through
-         * k.spare like any shadow slot. */
+        /* The hot VRAM cache's budget. place_shadow_slots() (32 unless RADIANCE_PLACE_SHADOW_SLOTS) is the in-flight swap
+         * depth: enough to move host-pool experts onto the card, not enough to hold a
+         * file-tier decode's working set (each miss is a pread plus a relayout, and it
+         * repeats every token until the expert stays resident). On a real weights budget
+         * (>= 1 GiB of conditional room) half that room, split across classes that have
+         * file-tier units, becomes shadow slots the stager can admit into. The count is
+         * fixed from the budget, not from this pass's resident count, so the two-pass
+         * fill's spare is an upper bound and does not grow as residents step down. The
+         * other half stays the profile's static warm start. A fixture-sized budget keeps
+         * the 32-slot cap. */
+        int n_disk_cls = 0;
+        for (size_t c = 0; c < p->classes.size(); ++c)
+            if (on_disk[c] > 0) ++n_disk_cls;
+        const int64_t cond_room = (p->vram_budget > fixed) ? p->vram_budget - fixed : 0;
+        const bool wide = cond_room >= (int64_t)1024 * 1024 * 1024;
+        const int64_t hot_share = (wide && n_disk_cls > 0) ? (cond_room / 2) / n_disk_cls : 0;
         for (size_t c = 0; c < p->classes.size(); ++c) {
             const int64_t ring = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
             const int64_t shadow = (p->dynamic && resident[c] > 0)
-                ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, std::max<int64_t>(1, resident[c] / 4))
+                ? std::min<int64_t>(place_shadow_slots(), std::max<int64_t>(1, resident[c] / 4))
                 : 0;
-            const int64_t hot = (p->dynamic && on_disk[c] > 0 && resident[c] > 0)
-                ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, resident[c]) : 0;
+            const int64_t stride = p->classes[c].stride;
+            const int64_t by_bytes = (stride > 0 && hot_share > 0) ? hot_share / stride : 0;
+            const int64_t hot = (p->dynamic && on_disk[c] > 0)
+                ? std::min(on_disk[c], std::max(by_bytes,
+                      resident[c] > 0 ? std::min<int64_t>(place_shadow_slots(), resident[c])
+                                      : (int64_t)0))
+                : 0;
             p->classes[c].n_shadow = std::max(shadow, hot);
             if (p->classes[c].n_shadow + ring <= 0) continue;
             /* Plus the slab's tail pad: a kernel assembling a packed code window from a wide read
@@ -923,8 +944,15 @@ void Planner::finish(const Program& prog, Plan* p) {
         /* The staging ring, capped at the number of staged units in the class. */
         p->classes[c].n_stage = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
         /* n_shadow comes from the assignment pass, which reserved it out of the budget; do not
-         * recompute it here, or the mover and the budget would see different numbers. */
-        if (!p->classes[c].movable) p->classes[c].n_shadow = 0;
+         * recompute it here, or the mover and the budget would see different numbers. A class
+         * with no movable resident still keeps its shadow slots when file-tier units can be
+         * admitted into them (pin-top marks the warm start unmovable; the cache is the rest). */
+        if (!p->classes[c].movable && p->classes[c].n_shadow > 0) {
+            bool any_ssd = false;
+            for (const MoveUnit& mu : p->units)
+                if (mu.slab_class == (int32_t)c && mu.tier == Tier::SSD) { any_ssd = true; break; }
+            if (!any_ssd) p->classes[c].n_shadow = 0;
+        }
         const int64_t slots = p->classes[c].n_slots + p->classes[c].n_shadow +
                               p->classes[c].n_stage;
         p->slab_overhead += (p->classes[c].n_shadow + p->classes[c].n_stage) * p->classes[c].stride;
@@ -970,6 +998,24 @@ void Planner::finish(const Program& prog, Plan* p) {
     }
 }
 
+/* ------------------------------------------------------------------ the shadow slot count */
+int place_shadow_slots() {
+    /* Read at each call (a few per class at plan and mover init), so a test can set it; a bad value
+     * is said once. */
+    const char* e = std::getenv("RADIANCE_PLACE_SHADOW_SLOTS");
+    if (!e || !*e) return RAD_PLACE_SHADOW_SLOTS;
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end == e || *end || v < 8 || v > RAD_PLACE_SHADOW_SLOTS) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            RAD_WARN("RADIANCE_PLACE_SHADOW_SLOTS=%s is not a count from 8 to %d; the planner keeps %d", e,
+                     RAD_PLACE_SHADOW_SLOTS, RAD_PLACE_SHADOW_SLOTS);
+        return RAD_PLACE_SHADOW_SLOTS;
+    }
+    return (int)v;
+}
+
 /* ------------------------------------------------------------------ the lookup tables */
 bool read_only_by(const Program& prog, rad_weight w, const char* op) {
     bool read = false;
@@ -980,6 +1026,12 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op) {
                 read = true;
             }
     return read;
+}
+
+bool embed_ggml_table() {
+    /* Read at each call (a few per weight at declare and plan), so a test can set it. */
+    const char* e = std::getenv("RADIANCE_DS41_EMB_RAM");
+    return e && e[0] == '1' && !e[1];
 }
 
 /* --embedding-placement ram: the token embedding goes to the pinned host pool before any strategy

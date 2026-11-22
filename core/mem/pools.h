@@ -106,6 +106,15 @@ public:
 
     const std::vector<Shortfall>& shortfalls() const { return shortfalls_; }
 
+    /* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED): a pool nothing was reserved from yet, made again at
+     * `bytes`. A fixed pool's backing is freed first and allocated again at the new size, so a smaller
+     * size gives the card the difference; an elastic one only moves its budget, never past the address
+     * range it reserved. RAD_E_STATE once anything was reserved (offsets handed out stay valid only in
+     * the backing they were cut from), RAD_E_INVAL for a negative size; on a refused allocation the
+     * pool is empty (bytes() 0, the shortfall recorded) and the caller refuses to start, as
+     * Pools::configure does. */
+    int resize(int64_t bytes);
+
     std::string report() const;
 
 private:

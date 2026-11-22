@@ -153,4 +153,21 @@ struct RankSplit {
 RankSplit vram_budget_rank_split(int64_t common_weights_mib, int64_t common_kv_mib,
                                  int64_t need_kv_mib, int64_t weights_cap_bytes);
 
+/* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED=1): what a card lost between the budget's reading
+ * (Engine::plan) and the KV carve (Engine::configure_kv) that the engine did not place there itself
+ * -- GPU page tables for host memory the cards map (the n-gram table, the pinned pools), a plugin's
+ * own hipMalloc -- and what the KV pool gives back for it before the carve, so the card keeps the
+ * budget's --gpu-headroom-mib whole instead of losing it to allocations nothing counted.
+ *   unseen = (free at the read - free now) - device bytes the engine placed since
+ *            - streams it created since x one hardware queue's bytes (+ test_bytes, a test hook)
+ *   trim   = unseen less the card's own slack (what it had free above the least card the split was
+ *            sized on), never negative; whole MiB, rounded up.
+ * The driver's drift the budget keeps (16 MiB) is left for what comes after the carve. */
+struct KvPlaced {
+    int64_t unseen = 0;
+    int64_t trim   = 0;
+};
+KvPlaced kv_placed(int64_t free_read, int64_t free_now, int64_t placed_bytes, int64_t placed_streams,
+                   int64_t queue_bytes, int64_t slack, int64_t test_bytes);
+
 }  /* namespace rad */

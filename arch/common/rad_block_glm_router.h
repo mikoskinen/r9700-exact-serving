@@ -1,5 +1,6 @@
 /* GLM noaux_tc router. Correction bias changes selection only; mixture weights
- * come from the uncorrected sigmoid probabilities. All routing arithmetic is F32. With `groups`
+ * come from the uncorrected probabilities -- sigmoid, or the score Config::score names
+ * (DeepSeek-V4's sqrt(softplus)). All routing arithmetic is F32. With `groups`
  * above 1 the selection is group-limited (router_sigmoid_group_topk, Ling-3.0's 8 groups, 4 kept). */
 #ifndef RAD_BLOCK_GLM_ROUTER_H
 #define RAD_BLOCK_GLM_ROUTER_H
@@ -13,6 +14,14 @@ struct GlmRouter {
         int64_t experts = 288, top_k = 8, rows = 32, groups = 1, topk_groups = 1;
         int norm = 1;
         double route_scale = 2.5;
+        /* The score function by name (router_scored_topk: "sqrtsoftplus" for DeepSeek-V4); null is
+         * GLM's sigmoid (router_sigmoid_topk). */
+        const char* score = nullptr;
+        /* The projection stored as bf16 rather than f32, for a checkpoint whose router is BF16
+         * (DeepSeek-V4.1, RADIANCE_DS41_ROUTER_BF16): gemm_nt_f32 widens each weight to the same
+         * f32 value in its loop, so the logits are the f32 projection's bit for bit, at half the
+         * bytes. 0 keeps f32. */
+        int bf16 = 0;
     };
     struct Src {
         const char *weight = nullptr, *correction = nullptr;
@@ -41,8 +50,8 @@ struct GlmRouter {
         const char *pn = nm.f("%s.weight", name), *cn = nm.f("%s.correction", name);
         RAD_ARCH_TRY(map_copy(b, pn, src.weight));
         RAD_ARCH_TRY(map_copy(b, cn, src.correction));
-        projection = decl_w(b, pn, RAD_F32, { c.experts, g.n_embd }, RAD_ACCESS_PER_TOKEN,
-                            RAD_SHARD_NONE, grp_layer(layer));
+        projection = decl_w(b, pn, c.bf16 ? RAD_BF16 : RAD_F32, { c.experts, g.n_embd },
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(layer));
         correction = decl_w(b, cn, RAD_F32, { c.experts }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                             grp_layer(layer));
         if (!projection || !correction) return RAD_E_INVAL;
@@ -54,7 +63,17 @@ struct GlmRouter {
                         { w.input }, { w.logits });
         RAD_ARCH_TRY(split.declare(b, nm, g, name, c.rows, c.experts, g.n_embd, projection, w.input,
                                    w.logits));
-        if (c.groups > 1)
+        if (c.score)
+            op_select =
+                rw(b,
+                   RAD_OP(b, "router_scored_topk",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n_expert", c.experts),
+                                     RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm),
+                                     RAD_F64("route_scale", c.route_scale),
+                                     RAD_STR("score", c.score), RAD_STR("dtype", "f32")),
+                          RAD_WEIGHTS(correction)),
+                   { w.logits }, { w.ids, w.weights });
+        else if (c.groups > 1)
             op_select =
                 rw(b,
                    RAD_OP(b, "router_sigmoid_group_topk",
@@ -85,9 +104,21 @@ struct GlmRouter {
     }
     void step(RadCtx* ctx, int64_t first, int64_t rows, int64_t output_first = 0) const {
         project(ctx, first, rows, output_first);
+        select(ctx, rows, output_first);
+    }
+    /* The selection over logits a caller projected itself (project(), or the split's halves). */
+    void select(RadCtx* ctx, int64_t rows, int64_t output_first = 0) const {
         RAD_ISSUE_N(ctx, op_select, rows, brow_slice(w.logits, output_first, rows, c.experts),
                     RAD_W(correction), brow_slice(w.ids, output_first, rows, c.top_k),
                     brow_slice(w.weights, output_first, rows, c.top_k));
+    }
+    /* project()'s split form in its two halves (SplitF32Proj::step_part / step_gather), where
+     * split.takes(rows): this rank's columns, then the all_gather into the logits. */
+    void project_part(RadCtx* ctx, int64_t first, int64_t rows) const {
+        split.step_part(ctx, rows, brow_slice(w.input, first, rows, g.n_embd), projection);
+    }
+    void project_gather(RadCtx* ctx, int64_t rows, int64_t output_first = 0) const {
+        split.step_gather(ctx, rows, brow_slice(w.logits, output_first, rows, c.experts));
     }
 };
 }

@@ -99,8 +99,10 @@ struct MoveUnit {
      * report still attributes `bytes`, since padding is not weight. */
     int64_t slot_bytes = 0;
 
-    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), so
-     * the file tier can stage it with a read. A unit that is not never goes to the file tier. */
+    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), or
+     * the file tier relayouts it on each read (weight_file_relaid, PlannerInput::file_relayout), so
+     * the file tier can stage it with a read (and the relayout). A unit that is neither never
+     * goes to the file tier. */
     bool    file_direct = true;
 
     /* The drafter's own weights (the "mtp." namespace). They run on every draft pass of every
@@ -166,6 +168,14 @@ struct SlabClass {
  * gets them; the rest of the move budget is RAD_PLACE_TURNOVER_SLOTS. The quarter-of-the-slab cap
  * binds only on very small slabs. */
 #define RAD_PLACE_SHADOW_SLOTS 32
+/* The shadow slots a class gets, at most (lever VA "shadow"): RADIANCE_PLACE_SHADOW_SLOTS=<8..32>
+ * (set at start), unset (or out of range, with a warning) RAD_PLACE_SHADOW_SLOTS. Every use of
+ * the count reads this -- the expert floor's spare (weight_footprint), each class's shadow and hot
+ * budget (Planner), the mover's heat swap range -- so budget, plan and mover agree. Placement only:
+ * a unit's tier decides where its bytes are read from, not what a kernel computes with them. The
+ * lent turnover slots keep their shipped default (RAD_PLACE_TURNOVER_SLOTS, set outright by
+ * RADIANCE_PLACE_TURNOVER), so fewer shadow slots hand their VRAM to the cache and its loan. */
+int place_shadow_slots();
 
 /* Turnover slots: free slab slots the mover keeps out of a loan (Mover::lend_from) beyond the
  * shadow slots. A swap holds a slot for about three steps (copy behind the proposing step,
@@ -294,6 +304,10 @@ struct PlannerInput {
     /* No card is visible and the device backend is host memory (device_is_host()), so a host
      * kernel can read the weights pool as well as the mapping. See mapped_unit(). */
     bool                  host_backend = false;
+    /* The file tier relayouts a weight on every read when its kernel has a relayout
+     * (weight_file_relaid), so such a unit may go there too, not only one stored as it is read.
+     * The engine's mover does; a caller whose mover has no relayout leaves it false. */
+    bool                  file_relayout = false;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel
@@ -432,15 +446,23 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
 
 /* The tables the placement flags move, identified by their readers rather than by name: a
  * model-level weight read by at least one op, and only by `embed_lookup`, is a token embedding;
- * only by `embed_lookup_q`, an n-gram table. A lookup reads M rows a step, so a tier below the
- * card is usable; a weight a GEMM also reads (an output head tied to the embedding) would stream
- * whole every step and is neither. Shared by the budget resolver and the planner. */
+ * only by `embed_lookup_q`, or only by `embed_lookup_planes` (a table's planes read in place, each
+ * plane its own view), an n-gram table. A lookup reads M rows a step, so a tier below the card is
+ * usable; a weight a GEMM also reads (an output head tied to the embedding) would stream whole
+ * every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
+/* RADIANCE_DS41_EMB_RAM=1 (lever VA "emb"): a model-level table read only by
+ * `embed_lookup_ggml` (a token embedding in llama.cpp's blocks, DeepSeek-V4.1's q6_K table) is a
+ * token embedding too, so --embedding-placement (ram by default) places it like a bf16 one: pinned in
+ * host memory, its M rows a step read over the link in place. Exact: a lookup reads the same bytes
+ * wherever they sit. Unset or anything but "1": only `embed_lookup`'s table qualifies, as before. */
+bool embed_ggml_table();
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup");
+    return read_only_by(prog, w, "embed_lookup") ||
+           (embed_ggml_table() && read_only_by(prog, w, "embed_lookup_ggml"));
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup_q");
+    return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");
 }
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight": the report's per-class

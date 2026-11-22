@@ -19,12 +19,15 @@
 // Fragment rows are clamped as in the skinny kernel: rows past M or N re-read the last valid row
 // and their results are never stored.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_gemm_args.h"
 #include "r4d_bf16_gemm_rows.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #define BT_BK 64                // K per staged tile: four WMMA k steps
 // LDS row pitch in elements (144 bytes). A fragment read is sixteen lanes on sixteen rows, 8 bytes
@@ -38,7 +41,7 @@
 template <int TM, int TN, bool SPLIT>
 __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk, int LDA, int LDC) { R4D_IKA_ENTRY();
   constexpr int BM = BT_WM * TM * 16, BN = BT_WN * TN * 16;
   constexpr int CPR = BT_BK / 8;                  // 16-byte chunks a staged row
   constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
@@ -69,7 +72,7 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
   for (int i = 0; i < AL; ++i) {
     const int c = tid + 256 * i, r = c / CPR, e = (c % CPR) * 8;
     const int gr = m0 + r < M ? m0 + r : M - 1;
-    aoff[i] = (unsigned)gr * (unsigned)K + (unsigned)e;
+    aoff[i] = (unsigned)gr * (unsigned)LDA + (unsigned)e;
     adst[i] = sA + r * BT_PITCH + e;
   }
 #pragma unroll
@@ -162,7 +165,7 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
         if constexpr (SPLIT) v = tot[i][j][e];
         else v += acc[i][j][e];
         const int m = mb + e;
-        if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
+        if (n < N && m < M) C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
       }
     }
 }
@@ -179,11 +182,22 @@ int r4d_gemm_bf16_nt_tiled_arm(int M, int N) {
 }
 
 // `tile`: 1 = 128 x 128, 2 = 64 x 64 (M x N).
+static int gemm_bf16_tiled_p(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                             long stream, long long lda, long long ldc);
 int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, int tile,
                            long stream) {
+  return gemm_bf16_tiled_p(a, w, c, M, K, N, SK, tile, stream, K, N);
+}
+/* `lda` / `ldc`: the rows' pitches in elements. A is staged in 16-byte chunks, so its pitch is a
+ * multiple of 8. */
+static int gemm_bf16_tiled_p(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                             long stream, long long lda, long long ldc) {
   if (M < 1 || N < 1 || K < BT_BK || K % BT_BK) return -1;
+  if (lda < K || ldc < N || lda % 8 || ldc > INT32_MAX) return -1;
   if (SK < 1 || K % ((int64_t)SK * 16)) return -1;
   if (tile != 1 && tile != 2) return -1;
+  // 32-bit element offsets: the last row of either operand has to be addressable.
+  if ((long long)M * lda >= (1ll << 32) || (long long)N * K >= (1ll << 32)) return -1;
   const int spk = K / SK / 16;
   const int bt = tile == 1 ? 128 : 64;
   const int chunk = r4d_bf16_gemm_chunk_rows(M, N, K, bt, bt);
@@ -193,13 +207,13 @@ int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, 
   hipStream_t st = (hipStream_t)stream;
 #define LAUNCH(TM, TN, S)                                                                          \
   hipLaunchKernelGGL((r4d_gemm_bf16_nt_tiled_kernel<TM, TN, S>), grid, block, 0, st, Ap, Wp, Cp,   \
-                     mm, K, N, spk)
+                     mm, K, N, spk, (int)lda, (int)ldc)
   const bool split = SK > 1;
   for (int64_t m0 = 0; m0 < M; m0 += chunk) {
     const int mm = (int)std::min<int64_t>(chunk, M - m0);
     dim3 grid((N + bt - 1) / bt, (mm + bt - 1) / bt);
-    auto Ap = (const unsigned short*)a + m0 * K;
-    auto Cp = (__hip_bfloat16*)c + m0 * N;
+    auto Ap = (const unsigned short*)a + m0 * lda;
+    auto Cp = (__hip_bfloat16*)c + m0 * ldc;
     if (tile == 1) {
       if (split)
         LAUNCH(4, 2, true);
@@ -218,19 +232,162 @@ int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, 
   return 0;
 }
 
+// Qwen loop round 8 (QUEUE Q29): RADIANCE_FN4_BT_TILE=1 / 2 at start forces the 128 x 128 / 64 x 64 tile for every op that
+// names none (unset / 0 = the arm above). At prefill the router's GEMM (N 512, K 2560, 2,048 rows) is 64 blocks of 128 x 128,
+// one a CU, each walking K alone, and it runs 205 us a call beside the comm lane (prof2p) against ~40 us for a block's walk: 64 x 64
+// gives 256 shorter blocks. The same bytes at either tile (the contract above: the same WMMA sequence a 16 x 16 tile, the same SK).
+static int bt_tile_forced() {
+  static const int v = [] {
+    const char* e = std::getenv("RADIANCE_FN4_BT_TILE");
+    const int t = e ? std::atoi(e) : 0;
+    const int r = t == 1 || t == 2 ? t : 0;
+    if (r) std::fprintf(stderr, "radiance: libr4d: gemm_bf16_nt_tiled at the %s tile for every op that names none "
+                                "(RADIANCE_FN4_BT_TILE=%d, Qwen loop Q29)\n", r == 1 ? "128 x 128" : "64 x 64", r);
+    return r;
+  }();
+  return v;
+}
+
+// ============================================================== Qwen loop round 12, QUEUE Q29 (bench only)
+// The SK slices as separate BLOCKS (SLB): today a 128 x 128 block walks all K alone, its SK slices one after the other into
+// `tot` (tot = 0; tot += slice z's acc, z ascending), so at the router's prefill shape (N 512, K 2560, 2,048 rows) the grid is
+// 64 blocks, one a CU, each a dependent chain of K / 64 staged tiles. Here block (x, y, z) walks only slice z -- the same
+// staging, the same fragments, the same WMMA a 16 K step from acc = 0 -- and stores its f32 acc to a workspace; a fold kernel
+// then forms v = 0.f; v += P[0]; .. v += P[SK - 1] in ascending z and rounds to bf16 as today's store: the same f32 adds in the
+// same order, so the same bytes. SK x more blocks (4 a CU at SK 4), SK x M x N x 4 bytes of partials written and read once.
+template <int TM, int TN>
+__global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_slb_kernel(
+    const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
+    float* __restrict__ P, int M, int K, int N, int nks, int LDA) {   // bench only: not an IKA-listed kernel
+  constexpr int BM = BT_WM * TM * 16, BN = BT_WN * TN * 16;
+  constexpr int CPR = BT_BK / 8;
+  constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
+  __shared__ __attribute__((aligned(16))) unsigned short sA[BM * BT_PITCH];
+  __shared__ __attribute__((aligned(16))) unsigned short sW[BN * BT_PITCH];
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const int wm = wave / BT_WN, wn = wave % BT_WN;
+  constexpr unsigned kGroupM = 8;
+  const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+  const unsigned first = lin / per * kGroupM, r = lin % per;
+  const unsigned gm = min(gridDim.y - first, kGroupM);
+  const int m0 = (int)(first + r % gm) * BM, n0 = (int)(r / gm) * BN;
+  const int z = (int)blockIdx.z, kt0 = z * nks;
+  unsigned aoff[AL], woff[WL];
+  unsigned short* adst[AL];
+  unsigned short* wdst[WL];
+#pragma unroll
+  for (int i = 0; i < AL; ++i) {
+    const int c = tid + 256 * i, rr = c / CPR, e = (c % CPR) * 8;
+    const int gr = m0 + rr < M ? m0 + rr : M - 1;
+    aoff[i] = (unsigned)gr * (unsigned)LDA + (unsigned)e;
+    adst[i] = sA + rr * BT_PITCH + e;
+  }
+#pragma unroll
+  for (int i = 0; i < WL; ++i) {
+    const int c = tid + 256 * i, rr = c / CPR, e = (c % CPR) * 8;
+    const int gr = n0 + rr < N ? n0 + rr : N - 1;
+    woff[i] = (unsigned)gr * (unsigned)K + (unsigned)e;
+    wdst[i] = sW + rr * BT_PITCH + e;
+  }
+  const unsigned short* fa = sA + (wm * TM * 16 + (lane & 15)) * BT_PITCH + 4 * (lane >> 4);
+  const unsigned short* fw = sW + (wn * TN * 16 + (lane & 15)) * BT_PITCH + 4 * (lane >> 4);
+  v8f acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
+  r4d_u32x4 ra[AL], rw[WL];
+  const unsigned kb0 = (unsigned)kt0 * BT_BK;
+#pragma unroll
+  for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i] + kb0);
+#pragma unroll
+  for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(W + woff[i] + kb0);
+  for (int kt = kt0; kt < kt0 + nks; ++kt) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < AL; ++i) *(r4d_u32x4*)adst[i] = ra[i];
+#pragma unroll
+    for (int i = 0; i < WL; ++i) *(r4d_u32x4*)wdst[i] = rw[i];
+    __syncthreads();
+    if (kt + 1 < kt0 + nks) {
+      const unsigned k1 = (unsigned)(kt + 1) * BT_BK;
+#pragma unroll
+      for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i] + k1);
+#pragma unroll
+      for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(W + woff[i] + k1);
+    }
+#pragma unroll
+    for (int s = 0; s < BT_BK / 16; ++s) {
+      v8bf af[TM], bf[TN];
+#pragma unroll
+      for (int i = 0; i < TM; ++i) af[i] = fragP(fa + i * 16 * BT_PITCH + s * 16);
+#pragma unroll
+      for (int j = 0; j < TN; ++j) bf[j] = fragP(fw + j * 16 * BT_PITCH + s * 16);
+#pragma unroll
+      for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+      __builtin_amdgcn_sched_group_barrier(0x100, TM + TN, 0);
+      __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);
+    }
+  }
+  float* Pz = P + (size_t)z * (size_t)M * (size_t)N;
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+      const int mb = m0 + (wm * TM + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = mb + e;
+        if (n < N && m < M) Pz[(size_t)m * N + n] = acc[i][j][e];
+      }
+    }
+}
+__global__ __launch_bounds__(256) void r4d_gemm_bf16_slb_fold_kernel(const float* __restrict__ P, __hip_bfloat16* __restrict__ C,
+                                                                     int M, int N, int SK, int LDC) {
+  const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+  if (i >= (long long)M * N) return;
+  const int m = (int)(i / N), n = (int)(i % N);
+  float v = 0.f;
+  for (int z = 0; z < SK; ++z) v += P[(size_t)z * (size_t)M * (size_t)N + (size_t)i];
+  C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
+}
+/* r4d_selftest --perfbf16's Q29 arm: mode 0 = today's tiled launch at the 128 x 128 tile and this SK (the reference), mode 1 =
+ * the slices as blocks + the fold (ws: SK x M x N floats). Dense pitches (lda = K, ldc = N), one row chunk. */
+extern "C" int r4d_gemm_bf16_slb_bench(long a, long w, long c, long ws, int M, int K, int N, int SK, int mode, long stream) {
+  if (mode == 0) return gemm_bf16_tiled_p(a, w, c, M, K, N, SK, 1, stream, K, N);
+  if (SK < 2 || K % (SK * BT_BK) || M < 1 || N < 1 || !ws) return -1;
+  if (r4d_bf16_gemm_chunk_rows(M, N, K, 128, 128) < M) return -1;
+  hipStream_t st = (hipStream_t)stream;
+  dim3 grid((N + 127) / 128, (M + 127) / 128, SK);
+  hipLaunchKernelGGL((r4d_gemm_bf16_nt_slb_kernel<4, 2>), grid, dim3(256), 0, st, (const unsigned short*)a,
+                     (const unsigned short*)w, (float*)ws, M, K, N, K / SK / BT_BK, K);
+  hipError_t e = hipGetLastError();
+  if (e != hipSuccess) return (int)e;
+  const long long tot = (long long)M * N;
+  hipLaunchKernelGGL(r4d_gemm_bf16_slb_fold_kernel, dim3((unsigned)((tot + 255) / 256)), dim3(256), 0, st, (const float*)ws,
+                     (__hip_bfloat16*)c, M, N, SK, N);
+  e = hipGetLastError();
+  return e == hipSuccess ? 0 : (int)e;
+}
+
 // ============================================================== the plugin ABI entry point
 extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   GemmOps g;
-  int rc = gemm_ops(a, &g, 0);
+  int rc = gemm_ops(a, &g, 0, 0, /*pitched=*/1);
   if (rc != RAD_OK) return rc;
   if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 64, 64)) return R4D_NO(RAD_E_SHAPE);
+  if (g.lda % 8) return R4D_NO(RAD_E_STRIDE);
   // The skinny row's split rule with the same arguments keeps the two rows' outputs identical.
   Cfg c;
   rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);
   if (rc != RAD_OK) return rc;
   int tile = (int)r4d_geti_or(a, "tile", 0);
+  if (tile == 0) tile = bt_tile_forced();
   if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
-  const int e = r4d_gemm_bf16_nt_tiled(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
-                                       (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s);
+  const int e = gemm_bf16_tiled_p(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
+                                  (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s, g.lda, g.ldc);
   return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
 }

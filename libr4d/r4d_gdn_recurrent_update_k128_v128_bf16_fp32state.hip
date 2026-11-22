@@ -27,6 +27,7 @@
 // attention page size (e.g. 421888 elements per slot vs 393216 from the shape), so a shape-derived
 // stride would read every slot but the first at the wrong offset there.
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d.h"
 #include "r4d_gdn_args.h"
 #include "r4d_gdn_wmma.h"
@@ -755,7 +756,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                      long zg_pitch,
                                      const float* __restrict__ nw, float neps, int nact,
                                      int H, int Hg, float scale, float sp_thr,
-                                     const RuConv cv) {
+                                     const RuConv cv) { R4D_IKA_ENTRY();
     r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
 }
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,

@@ -185,6 +185,13 @@ public:
             if (held_[(size_t)s]) return s;
         return -1;
     }
+    /* How many of segment `k`'s existing slots something holds (ds41-lf's lent occupancy). */
+    int64_t held_in(int k) const {
+        const Seg& g = segs_[(size_t)k];
+        int64_t n = 0;
+        for (int64_t s = g.lo; s < g.live; ++s) n += held_[(size_t)s];
+        return n;
+    }
     /* How many existing slots at or past `from` something holds, over every segment. */
     int64_t held_from(int64_t from) const {
         int64_t k = 0;
@@ -313,6 +320,12 @@ struct MoverConfig {
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
+
+    /* Lever DL, the drafter's lend (RADIANCE_DRAFT_LEND set at start; Mover::draft_lend_setup): the
+     * routed units of plan layers at or above this one -- a draft head's experts, whose own slab
+     * classes hold nothing else -- keep a pinned host copy beside their VRAM slot, so their slab can
+     * be lent to the trunk while the drafter does not run. -1 (the default): none, today's mover. */
+    int32_t draft_keep_from = -1;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -425,6 +438,39 @@ struct MoverCounters {
     }
 };
 
+/* ds41-lf: each lender's slots (Mover::Lender order: KV cache, arena, drafter's slab, drafter's query-pass
+ * weights), counted on the rank thread. `covered` slots the loan offers now and `held` slots something holds
+ * (a unit, a copy in flight, a quarantine) -- the occupancy; `fills` promotions into them (Mover::fill, the only
+ * way a unit enters a lent slot), of which `fills_lf` ranked by lever LF and `fills_hot` of a unit with a short
+ * heat of at least 1 (routed off the device in the last steps: a just-missed expert); drops out of them by cause:
+ * `drop_victim` a swap's demotion (the heat engine chose it as the coldest), `drop_reserve` balance() rebuilding
+ * the working slots, `drop_recall` a shrinking loan (balance()'s sweep or reclaim()). ds41-swl: `swaps` heat promotions
+ * (Mover::issue) into a free lent slot under lever SWL (fn4 place_swap_lent 1); 0 while it is off, since only fill()
+ * puts a unit in a lent slot then. */
+struct LentStats {
+    static constexpr int kN = 4;
+    int64_t  covered[kN] = {}, held[kN] = {};
+    uint64_t fills[kN] = {}, fills_lf[kN] = {}, fills_hot[kN] = {};
+    uint64_t drop_victim[kN] = {}, drop_reserve[kN] = {}, drop_recall[kN] = {};
+    uint64_t swaps[kN] = {};
+};
+struct LentCounters {
+    static constexpr int kN = LentStats::kN;
+    Relaxed<int64_t>  covered[kN], held[kN];
+    Relaxed<uint64_t> fills[kN], fills_lf[kN], fills_hot[kN], drop_victim[kN], drop_reserve[kN], drop_recall[kN];
+    Relaxed<uint64_t> swaps[kN];
+    LentStats snapshot() const {
+        LentStats s;
+        for (int k = 0; k < kN; ++k) {
+            s.covered[k] = covered[k];          s.held[k] = held[k];
+            s.fills[k] = fills[k];              s.fills_lf[k] = fills_lf[k];      s.fills_hot[k] = fills_hot[k];
+            s.drop_victim[k] = drop_victim[k];  s.drop_reserve[k] = drop_reserve[k]; s.drop_recall[k] = drop_recall[k];
+            s.swaps[k] = swaps[k];
+        }
+        return s;
+    }
+};
+
 /* ------------------------------------------------------------------ the mover */
 class Mover {
 public:
@@ -501,7 +547,9 @@ public:
      * A unit in a lent slot keeps its host copy (weights never change), so giving the slot back
      * is a change of address: a recall waits only for kernels to stop naming the slot. */
 
-    enum Lender { kLendKV = 0, kLendArena = 1, kLenders = 2 };
+    /* kLendDraft: the drafter's own slab classes (lever DL, draft_lend_setup), lent to the trunk's
+     * classes while the drafter's experts sit at their host copies. */
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendDraft = 2, kLendDraftW = 3, kLenders = 4 };
 
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
@@ -568,6 +616,79 @@ public:
         return n;
     }
 
+    /* ---- lever DL: the drafter's slab, lent to the trunk while the drafter does not draft -------
+     *
+     * A block drafter (DSpark) runs its routed experts only in its query pass: the context pass that
+     * runs on every step reads the projection and the window keys, no expert (deepseek41.cpp
+     * dsp_declare). So while the scheduler holds the drafting depth at 0 the drafter's experts are
+     * read by nothing, and the slab classes that hold them (a stride no trunk unit has, so heat never
+     * puts a trunk unit there) are idle VRAM: on DeepSeek-V4.1 EXL3 2.25 TP4, 96 units of 17.93 MiB
+     * plus 24 shadow slots, 2.10 GiB a rank, about 230 trunk units.
+     *
+     * With MoverConfig::draft_keep_from set, every drafter unit keeps a pinned host copy (allocated
+     * here, outside --host-pool-mib, so the plan and the VRAM split are today's), and its promotions
+     * keep it, so leaving VRAM is a change of address (Kind::Drop), never a copy. The drafter's slab
+     * is registered as a third lender, kLendDraft, cut into the trunk classes' strides like any loan.
+     *
+     * set_draft_lend(true) parks the drafter: its slots stop being covered, each unit is dropped to
+     * its host copy, and once every slot has left quarantine the whole slab is lent (set_loan), which
+     * balance() fills with the hottest pooled trunk units. A query pass that runs meanwhile (a probe)
+     * reads the drafter's experts from host memory, as --draft-expert-placement host does: placement
+     * only, the same bytes. set_draft_lend(false) recalls it: the loan goes to 0 and balance() drops
+     * the trunk units (they kept their host copies), and once nothing of the trunk holds or
+     * quarantines a slot the drafter's slots are covered again and every unit is promoted back from
+     * its copy. Until a promotion lands its unit is read where it was published, so the drafter is
+     * correct at every point of either transition. The two never share a byte: the loan is raised
+     * only when no drafter slot is held, the drafter's slots covered only when the loan holds none.
+     *
+     * Everything advances in balance() (draft_advance), on the rank thread, a step at a time; the
+     * engine sets the target between steps. */
+    enum DraftLend { kDlResident = 0, kDlParking = 1, kDlLent = 2, kDlUnlending = 3, kDlLoading = 4 };
+    /* After the load and once the compute stream is bound: fills the host copies from the units'
+     * VRAM slots (a synchronous copy on the mover's stream) and carves the drafter's slab for the
+     * trunk. RAD_OK with draft_lend_ready() false when there is nothing to lend (no keep configured,
+     * a static plan, no drafter class, or no trunk class to lend to). */
+    int  draft_lend_setup();
+    bool draft_lend_ready() const { return dl_ready_; }
+    void set_draft_lend(bool lend) { dl_want_ = lend; }
+    bool draft_lend_target() const { return dl_want_; }
+    /* For the engine (any thread): the state, transitions so far, lends and recalls begun, the drafter's
+     * units in VRAM, trunk units in its memory, and the drafter's slab bytes. */
+    int      draft_lend_state() const { return dl_state_.load(std::memory_order_relaxed); }
+    uint64_t draft_lend_changes() const { return dl_changes_.load(std::memory_order_relaxed); }
+    uint64_t draft_lends() const { return dl_lends_.load(std::memory_order_relaxed); }
+    uint64_t draft_reclaims() const { return dl_reclaims_.load(std::memory_order_relaxed); }
+    int64_t  draft_units() const { return (int64_t)dl_units_.size(); }
+    int64_t  draft_resident() const { return dl_resident_.load(std::memory_order_relaxed); }
+    int64_t  draft_lent_units() const { return dl_lent_units_.load(std::memory_order_relaxed); }
+    int64_t  draft_slab_bytes() const { return dl_slab_bytes_; }
+    int64_t  draft_keep_bytes() const { return dl_keep_bytes_; }
+
+    /* Lever Z0-W (ds41-z0): the drafter's static weights that only its query pass reads, lent to the trunk's
+     * experts while the drafter does not draft. draft_w_setup() finds them in the static VRAM region
+     * (`lendable(name, layer)` per weight of every statically placed unit), merges adjacent lendable weights
+     * into stretches (a weight it must keep -- the context pass's -- ends one), keeps a pinned host copy of
+     * each stretch and registers them as a fourth lender, kLendDraftW, cut into the trunk classes' strides
+     * like any loan. draft_w_lend() raises the loan to its ceiling (balance() fills it with the hottest
+     * pooled units); draft_w_reclaim() recalls it synchronously (Mover::reclaim: every unit there back to
+     * its host copy, both streams drained) and copies every stretch back from its host copy, waiting for
+     * the copy, so the drafter reads its weights' own bytes at their own addresses again (recorded passes
+     * keep their pointers). The engine calls both between steps with every rank parked, the recall ahead
+     * of any step whose drafter head runs. Placement only: a unit lent here is read where it is published,
+     * a weight only after its bytes are back. RAD_OK with draft_w_ready() false when nothing is lendable. */
+    int      draft_w_setup(const std::function<bool(const std::string& name, int32_t layer)>& lendable);
+    bool     draft_w_ready() const { return dw_ready_; }
+    bool     draft_w_lent() const { return dw_lent_; }
+    int      draft_w_lend();
+    int      draft_w_reclaim(HeatEngine* heat);
+    int64_t  draft_w_bytes() const { return dw_bytes_; }          /* the stretches' bytes */
+    int64_t  draft_w_kept_bytes() const { return dw_kept_bytes_; } /* the drafter's static bytes it must keep */
+    uint64_t draft_w_lends() const { return dw_lends_; }
+    uint64_t draft_w_reclaims() const { return dw_reclaims_; }
+    int64_t  draft_w_lent_units() const;                           /* trunk units in a kLendDraftW slot */
+    /* The drafter's first layer (the lowest layer of its expert units, lever DL's), or -1 without one. */
+    int32_t  draft_first_layer() const;
+
     /* Where a unit's bytes are right now, as a device-visible address, or null for a file-tier
      * unit that has not been staged. */
     void* unit_base(int32_t unit) const;
@@ -597,6 +718,10 @@ public:
                      RadEvent after, RadEvent done, std::vector<int32_t>* staged);
     void unstage_units(const std::vector<int32_t>& staged);
     int64_t stage_need(const std::vector<int32_t>& units, int64_t* largest = nullptr) const;
+    /* Lever SA's counters: a unit's bytes (0 for an index out of range). */
+    int64_t unit_bytes_of(int32_t unit) const {
+        return unit >= 0 && (size_t)unit < unit_.size() ? unit_[(size_t)unit].bytes : 0;
+    }
 
     /* ---- routed layers read from the container: the file stager (core/place/stager.h) --------
      *
@@ -643,6 +768,15 @@ public:
                            RadEvent after, RadEvent done, FileRead* rd,
                            const int32_t* ecnt = nullptr, int32_t n_expert = 0,
                            const int32_t* protect = nullptr, int n_protect = 0);
+
+    /* A file-tier weight whose stored form is not the container's (weight_file_relaid) is
+     * converted on every read by the kernel's own relayout, as the loader does once for a
+     * resident weight. The function writes the stored form to `dst` from the container planes
+     * (`planes[k].data` points into the read). Set before init; a plan that places such a weight
+     * on the file tier with no function is refused there. */
+    using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
+                                           void* dst, int64_t dst_bytes)>;
+    void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
@@ -661,6 +795,24 @@ public:
     /* A snapshot by value: the counters are atomics read while the rank thread writes them. */
     MoverStats stats() const { return stats_.snapshot(); }
     std::string report() const;
+
+    /* ds41-lf: each lender's occupancy, fills and drops (LentStats), readable from the HTTP thread. */
+    LentStats lent_stats() const { return lent_.snapshot(); }
+    /* Lever LF (fn4 place_lf): true ranks fill()'s candidates -- the units that go into free lent slots, at a
+     * loan's growth and after drops -- by the heat engine's long-memory decode heat (HeatEngine::heat_long)
+     * instead of its placement heat; the tie-break, the slots, the copies and every drop and recall are today's.
+     * Set between steps (every rank thread parked). Placement only. */
+    void set_place_lf(bool on) { place_lf_ = on; }
+    bool place_lf() const { return place_lf_; }
+    /* Lever SWL (ds41-swl, fn4 place_swap_lent): true lets a heat promotion (issue()) take a free LENT slot when no
+     * budgeted swap slot (below ClassPools::n_hot_lo) is free; the lowest free slot either way, so a budgeted one
+     * still goes first. false (the default) is today's: budgeted swap slots only, else `starved_slab` (the filter
+     * came with upstream 7938081; before it, any free slot). A unit promoted into a lent slot is fill()'s case from
+     * there on: promote_to() keeps its host copy, so a demotion, balance()'s reserve and sweep, an arena / KV
+     * recall (reclaim()) and lever DL / Z0-W's recalls drop it by a change of address, behind the quarantine.
+     * Set between steps (every rank thread parked); an atomic only so /stats may read it. Placement only. */
+    void set_swap_lent(bool on) { swap_lent_.store(on, std::memory_order_relaxed); }
+    bool swap_lent() const { return swap_lent_.load(std::memory_order_relaxed); }
 
 private:
     /* One in-flight relocation: Free -> Copying -> Published -> Quarantine -> Free. Transfers
@@ -700,6 +852,7 @@ private:
         Site    site = Site::Device;
         int64_t slab_slot = -1;      /* index into class slab, or -1 */
         int64_t pool_slot = -1;      /* index into class host pool, or -1 */
+        int64_t park_slot = -1;      /* index into the class relaid-form park, or -1 */
         int64_t static_off = -1;     /* byte offset into the static VRAM region, or -1 */
         int32_t klass = -1;
         int64_t bytes = 0;
@@ -718,14 +871,23 @@ private:
         void*    slab_base = nullptr;
         void*    pool_base = nullptr;
         void*    pool_dev = nullptr;   /* the pinned pool as the device addresses it */
+        void*    park_base = nullptr;  /* pinned copy of the relaid form, not the placement pool */
+        SlotPool park;
         int64_t  stride = 0;
         int64_t  n_fixed = 0;          /* slots in the budgeted range; the flex ones start here */
         int64_t  n_work = 0;           /* shadow + staging: free slots the mover needs to move at all */
+        int64_t  n_hot_lo = 0;         /* slots at and above this, below n_fixed, are the file-tier
+                                        * hot cache. Heat promotions must not take them. */
         int64_t  n_turn = 0;           /* lent slots kept free past those: the fill stops short
                                         * of them and balance() drops lent units to rebuild them
                                         * (MoverConfig::turnover_slots) */
         int64_t  n_donated = 0;        /* units in lent slots that gave their host copy away
                                         * (Mover::donor_slot); at most n_turn of them */
+        /* Lever DL: a drafter class whose units keep their host copy wherever they sit (a promotion
+         * into a budgeted slot keeps the pool slot, as one into a lent slot does). Its pool is
+         * allocated by the mover itself (keep_base), outside the budget. */
+        bool     keep = false;
+        void*    keep_base = nullptr;
         std::vector<char*>   flex_ptr;
         /* One slab segment per lender that carved slots for this class. `need[i]` is the loan,
          * in the lender's measure, that covers the segment's i-th slot; ascending. */
@@ -747,6 +909,19 @@ private:
     MoverConfig    cfg_;
     Residency      res_;
     MoverCounters  stats_;
+    /* The file tier's on-read relayout (set_file_relayout): one host input per thread, which
+     * holds a weight's container planes for the relayout to read. */
+    struct RelayIn {
+        uint8_t* p = nullptr;
+        int64_t  cap = 0;
+        RelayIn() = default;
+        RelayIn(RelayIn&& o) noexcept : p(o.p), cap(o.cap) { o.p = nullptr; o.cap = 0; }
+        RelayIn(const RelayIn&) = delete;
+        ~RelayIn() { std::free(p); }
+    };
+    FileRelayout         relayout_;
+    std::vector<RelayIn> relay_in_;
+    int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
     /* The heat engine of the dispatch in flight, bound by begin_dispatch: the file stager's
      * admission test (which units read into the hot cache) runs between dispatches on this
      * same thread. Null when heat is off — no hot cache, no evictable victims. */
@@ -819,11 +994,16 @@ private:
         char*   dst = nullptr;
         bool    hot = false;
         bool    deposit = false;
+        const WeightInfo* relay = nullptr;   /* non-null: convert on the read, do not copy */
+        int32_t unit = -1;                    /* owner, so a relay can keep the stored form */
+        int64_t park_off = 0;                 /* byte offset of this weight in the unit */
     };
     std::vector<FileExt>    fext_;
     std::vector<int64_t>    fat_;          /* the staged units' buffer offsets */
     std::vector<char*>      fbase_;        /* the hot-cache units' slot bases */
     std::vector<int32_t>    frec_;         /* move records whose copies this read issues */
+    struct ParkCopy { char* dst = nullptr; const char* src = nullptr; int64_t bytes = 0; };
+    std::vector<ParkCopy>   park_cp_;      /* relaid-form copies this read issues, no pread */
     /* The file tier's cache cycle. `file_ok_`: by unit, the file stager reads it back when it is
      * on the file tier (cover_file_units). `layer_file_`: by plan layer, the bytes of its units
      * that are on the file tier or in the hot VRAM cache (which hands them back to the file tier
@@ -847,6 +1027,39 @@ private:
     int32_t               last_op_ = -1;
     int                   dispatch_ = 0;
 
+    /* Lever DL (draft_lend_setup, draft_advance). */
+    bool                  dl_ready_ = false;
+    bool                  dl_want_ = false;
+    std::vector<int32_t>  dl_units_;        /* the drafter's units */
+    std::vector<int32_t>  dl_classes_;      /* the classes they make up, keep set */
+    int64_t               dl_slab_bytes_ = 0, dl_keep_bytes_ = 0;
+    /* Lever Z0-W (draft_w_setup). */
+    struct DwStretch { char* dev = nullptr; int64_t bytes = 0; void* host = nullptr; };
+    std::vector<DwStretch> dw_;
+    bool                   dw_ready_ = false, dw_lent_ = false;
+    int64_t                dw_bytes_ = 0, dw_kept_bytes_ = 0;
+    uint64_t               dw_lends_ = 0, dw_reclaims_ = 0;
+    std::atomic<int>      dl_state_{kDlResident};
+    std::atomic<uint64_t> dl_changes_{0}, dl_lends_{0}, dl_reclaims_{0};
+    std::atomic<int64_t>  dl_resident_{0}, dl_lent_units_{0};
+    void dl_set(int st) {
+        dl_state_.store(st, std::memory_order_relaxed);
+        dl_changes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    int  draft_advance(HeatEngine* heat);
+    void dl_count();
+
+    /* ds41-lf: the lent-slot counters, lever LF's switch, and the slot-class helpers. lender_of: the lender
+     * whose segment holds `slot` of `cp`, -1 for a budgeted one; note_slot: tells the heat engine the class of
+     * the slot `unit` now sits in (SlotClass). */
+    LentCounters         lent_;
+    bool                 place_lf_ = false;
+    std::atomic<bool>    swap_lent_{false};   /* lever SWL (set_swap_lent) */
+    int  lender_of(const ClassPools& cp, int64_t slot) const;
+    void note_slot(int32_t unit, HeatEngine* heat) const;
+    enum DropCause { kDropOther = 0, kDropVictim = 1, kDropReserve = 2, kDropRecall = 3 };
+    void count_drop(const ClassPools& cp, int64_t slot, int cause);
+
     /* Each lender's loan in its own measure, and the totals the dashboard reads. */
     int64_t              loan_[kLenders] = {};
     std::atomic<int64_t> flex_used_{0};
@@ -865,11 +1078,19 @@ private:
     bool unit_in_flight(int32_t unit) const;
     /* Whether stage_units would copy `unit`: pooled, with no slab slot and no copy in flight. */
     bool stageable(int32_t unit) const;
-    /* A unit in a lent slot back to the host copy it kept. See Move::Kind::Drop. */
-    int  drop(int32_t unit, HeatEngine* heat);
+    /* A unit in a lent slot back to the host copy it kept. See Move::Kind::Drop. `cause` (DropCause) is only
+     * counted (LentStats). */
+    int  drop(int32_t unit, HeatEngine* heat, int cause = 0);
     /* The pool slot a demotion copies `unit` into: one its layer's units started out in, else a
      * same-layer donor's, else any free one, else any donor's; -1 when there is none. */
     int64_t pool_slot_for(int32_t unit, HeatEngine* heat);
+    /* Copy a hot-cache unit's already-relaid bytes into the class park before the caller
+     * frees the slab. The next file-tier read copies from the park instead of the drive.
+     * False when the park has no slot colder than this unit; the caller still drops to
+     * the file. Does not change tier or the slab: the caller does that. */
+    bool park_hot(int32_t unit, HeatEngine* heat);
+    bool ensure_park(int32_t klass);
+    int64_t park_left_ = -1;
     /* A pool slot for a budgeted victim when none is free: the host copy of a unit in a KV-lent
      * slot, which stays in VRAM without it. From a unit of `layer`, or of any layer when
      * negative; -1 when no unit may give one. Rationale at the definition. */

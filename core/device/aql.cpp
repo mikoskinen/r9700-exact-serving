@@ -21,7 +21,8 @@
  *     an invalidation. A slot is rewritten one lap after it was last read, so a system-scope
  *     acquire is placed at least once per half lap; without it every kernel after the first lap
  *     reads its predecessor's arguments. Slots are 1 KiB so no argument fetch shares a cache line
- *     with the next slot;
+ *     with the next slot. No fence makes a write through the BAR arrive: fn4 aql_hdp 1 flushes the
+ *     card's host data path in front of every doorbell (host_writes_out; upstream 8f2e511f);
  *   - host-written memory: the first dispatch after the host waits on any queue takes a
  *     system-scope acquire, since host writes for the next step follow such a wait;
  *   - copies touching host or peer memory carry the scope themselves, as do the barrier packets
@@ -61,6 +62,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -170,6 +172,15 @@ struct KernelRec {
     /* A chained form (RadKernelChainFn): its name carries "r4dchain". Only such a kernel gets a
      * chain record and may lose its barrier bit; a row's other kernels keep the bit. */
     bool        chained = false;
+    /* Lever IKA (RADIANCE_AQL_IKA=1): the kernel acquires and releases at agent scope ITSELF (libr4d R4D_IKA(): an agent
+     * acquire fence at entry, an agent release fence at every exit), so a played packet may drop the packet processor's
+     * acquire (when no line it reads can be stale in a scalar cache: Ctx::haz_mark) and its release. Set from the list
+     * the kernel's own library exports (r4d_ika_kernels), never guessed from a name alone. */
+    bool        ika = false;
+    /* Lever IKA form B (Qwen loop round 8; libr4d r4d_ika.h, r4d_ika_protocol() == 2): the kernel fences itself only when its
+     * hidden_global_offset_z reads non-zero; this is that argument's offset in the kernel's arguments (the tape's copy of a
+     * played dispatch gets 1 there, tape_note_dispatch), or -1 for a protocol-1 library (fences in every dispatch). */
+    int32_t     ika_flag = -1;
 };
 
 struct ModuleImage {
@@ -221,6 +232,9 @@ struct Dev {
     bool        has_vram = false;
     uint32_t    kfd_id = 0;             /* the driver's gpu_id: its sysfs and ioctls name it so */
     bool        host_kargs = false;     /* no large BAR: the argument ring lives in host memory */
+    /* The card's host data path flush register (HSA_AMD_AGENT_INFO_HDP_FLUSH), where the host
+     * writes arguments into VRAM; see host_writes_out (tp8 loop U1, upstream 8f2e511f). */
+    volatile uint32_t* hdp_flush = nullptr;
 };
 
 struct Global {
@@ -437,6 +451,18 @@ bool init_devices() {
             RAD_INFO("device: card %d (%s) keeps kernel arguments in pinned host memory, as a "
                      "test asked", i, bus);
         }
+        /* tp8 loop U1 (upstream 8f2e511f): the register fn4 aql_hdp 1 stores to in front of a
+         * doorbell. Read for every card whose arguments are VRAM; used only while the switch is 1. */
+        if (!g.dev[(size_t)i].host_kargs) {
+            hsa_amd_hdp_flush_t hdp{};
+            if (hsa_agent_get_info(g.dev[(size_t)i].agent,
+                                   (hsa_agent_info_t)HSA_AMD_AGENT_INFO_HDP_FLUSH,
+                                   &hdp) == HSA_STATUS_SUCCESS)
+                g.dev[(size_t)i].hdp_flush = hdp.HDP_MEM_FLUSH_CNTL;
+            if (!g.dev[(size_t)i].hdp_flush)
+                RAD_INFO("device: card %d (%s) gives no host data path flush register, so fn4 "
+                         "aql_hdp 1 flushes nothing there (tp8 loop U1)", i, bus);
+        }
     }
     /* Without the handler a fault falls back to the runtime's own handling, which the
      * memory-fault report below replaces; warn at startup. */
@@ -494,8 +520,72 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
 std::mutex g_names_mu;
 std::unordered_map<uint64_t, std::string> g_names;
 
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS, core/runtime/issue.cpp): this thread's time in a kernel's first-launch resolve on a
+ * card (the module lock's wait included), and how many; the issue path reads and clears them around a launch. */
+thread_local uint64_t t_resolve_ns = 0, t_resolve_n = 0;
+
+struct ResolveClock {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~ResolveClock() {
+        t_resolve_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++t_resolve_n;
+    }
+};
+
+/* ---- lever IKA (DRAFTER track round 50): in-kernel acquire / release
+ *
+ * A dependent packet's agent-scope acquire (the packet processor invalidating every CU's caches) and release cost
+ * 1.2-2.2 us between two dependent kernels on this card (drafter/kit/mes/mesp.cpp: a 200-packet chain, host-timed, tiny
+ * kernel acquire + release agent 3.86 / 4.84 (two modes) -> none / none 2.63 us; 64 x 256 blocks 6.05 / 7.09 -> 4.75). A
+ * kernel that runs LLVM's agent acquire itself at entry (global_inv scope:SCOPE_DEV in each wave: only the CUs it runs
+ * on) and an agent release at every exit (s_wait_storecnt 0) needs neither from the packet, except for the scalar cache,
+ * which LLVM's acquire does not invalidate: the packet keeps its acquire where a line it reads was read and then written
+ * since the last one (the plain rule's set; Ctx::haz_mark). cohbench3 (drafter/kit/mes): 0 stale elements in 300 trials
+ * x 3 sizes with the kernel's own acquire and the packets' acquire + release none, vs 1.2 M - 1.9 G with none and no
+ * kernel acquire. RADIANCE_AQL_IKA=1 at start: a kernel is IKA when the shared object holding its code exports
+ * `const char* const* r4d_ika_kernels(int* n)` naming it (an identifier, matched against the kernel's OWN identifier in
+ * its mangled name: aql.h ika_identifier; tp8 loop W3: the first form matched `<length><name>` behind a non-digit only,
+ * so libr4d's anonymous-namespace kernels, `_ZN12_GLOBAL__N_1<length><name>..`, never matched -- 32 of the 1,634
+ * kernels ds41-drafter-ika-f1349e59's libr4d names). */
+bool ika_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_AQL_IKA");
+        const bool v = e && e[0] == '1';
+        if (v) RAD_INFO("aql: lever IKA on (RADIANCE_AQL_IKA=1): kernels their library names as self-acquiring play "
+                        "without the packet's release, and without its acquire where Ctx::haz_mark allows");
+        return v;
+    }();
+    return on;
+}
+
+/* 0: not listed; 1: listed by a library whose kernels fence in every dispatch (protocol 1); 2: listed by a library of form B
+ * (r4d_ika_protocol() == 2: the kernel fences only when its hidden_global_offset_z is non-zero). */
+int ika_kernel(const Module* m, const std::string& name) {
+    if (!ika_on() || !m || !m->bundle) return 0;
+    Dl_info di{};
+    if (!dladdr(m->bundle, &di) || !di.dli_fbase) return 0;
+    void* h = di.dli_fname ? dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+    if (!h) h = dlopen(nullptr, RTLD_LAZY);
+    if (!h) return 0;
+    using ListFn = const char* const* (*)(int*);
+    auto fn = reinterpret_cast<ListFn>(dlsym(h, "r4d_ika_kernels"));
+    Dl_info fi{};
+    /* the list must be the module's own object's, not a dependency's */
+    if (!fn || !dladdr(reinterpret_cast<void*>(fn), &fi) || fi.dli_fbase != di.dli_fbase) return 0;
+    int n = 0;
+    const char* const* v = fn(&n);
+    if (!ika_listed(name, v, n)) return 0;
+    using ProtoFn = int (*)(void);
+    auto pf = reinterpret_cast<ProtoFn>(dlsym(h, "r4d_ika_protocol"));
+    Dl_info pi{};
+    if (!pf || !dladdr(reinterpret_cast<void*>(pf), &pi) || pi.dli_fbase != di.dli_fbase) return 1;
+    return pf() >= 2 ? 2 : 1;
+}
+
 KernelRec* resolve(Func* fn, int ord) {
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
+    const ResolveClock rclk;   /* tp8 loop P31: from here on this is a first launch on the card (or a refused kernel) */
     Module* m = fn->mod;
     std::lock_guard<std::mutex> lk(m->mu);
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
@@ -506,9 +596,21 @@ KernelRec* resolve(Func* fn, int ord) {
     std::string why;
     const ModuleImage* im = nullptr;
     const KernelMeta* meta = module_meta(m, d.isas, &im, sym, &why);
+    /* tp8 loop F24: a module's code object is loaded on a card at the first launch of any of its kernels, which may be in
+     * the middle of serving (a prefill form's first >= 1k-row pass); one that takes long says so (RADIANCE_AQL_PRELOAD=1
+     * loads every module at start instead) */
+    const bool first_load = meta && !m->loaded[ord];
+    const auto t_load = std::chrono::steady_clock::now();
     if (!meta || !module_load(m, ord, *im, &why)) {
         fn->err[ord] = why;
         return nullptr;
+    }
+    if (first_load) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load).count();
+        if (ms >= 1000.0)
+            RAD_WARN("device: card %d: the code object holding kernel %s took %.0f ms to load at that kernel's first launch "
+                     "(the module's first use on this card; RADIANCE_AQL_PRELOAD=1 loads every module at start, tp8 loop F24)",
+                     ord, fn->name.c_str(), ms);
     }
     hsa_executable_symbol_t s;
     if (hsa_executable_get_symbol_by_name(m->exec[ord], sym.c_str(), &d.agent, &s) !=
@@ -519,6 +621,7 @@ KernelRec* resolve(Func* fn, int ord) {
     auto k = std::make_unique<KernelRec>();
     k->name = fn->name;
     k->chained = k->name.find("r4dchain") != std::string::npos;
+    const int ika_form = ika_kernel(m, k->name);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                                    &k->kernarg_size);
@@ -554,6 +657,18 @@ KernelRec* resolve(Func* fn, int ord) {
         }
     }
     k->n_explicit = (uint16_t)k->ex_off.size();
+    /* Lever IKA: a protocol-1 library's listed kernel fences in every dispatch; a form-B (protocol 2) one only when told through
+     * its hidden_global_offset_z -- without that argument in its metadata it cannot be told, so it is not self-acquiring. */
+    if (ika_form == 1) {
+        k->ika = true;
+    } else if (ika_form == 2) {
+        const int32_t off = k->hid[(int)Hidden::GlobalOffsetZ];
+        k->ika = off >= 0 && k->hid_size[(int)Hidden::GlobalOffsetZ] == 8 && (uint32_t)off + 8u <= k->kernarg_size;
+        k->ika_flag = k->ika ? off : -1;
+        if (!k->ika)
+            RAD_WARN("aql: lever IKA: kernel %s is listed by a form-B library but takes no 8-byte hidden_global_offset_z: "
+                     "it keeps every packet fence", k->name.c_str());
+    }
     {
         std::lock_guard<std::mutex> nl(g_names_mu);
         g_names[k->object] = k->name;
@@ -595,10 +710,15 @@ struct Stream {
     hsa_queue_t*    q = nullptr;
     uint64_t        mask = 0;
     char*           karg = nullptr;           /* VRAM the CPU writes through the BAR, or host memory */
+    volatile uint32_t* hdp = nullptr;         /* Dev::hdp_flush where `karg` is VRAM (tp8 loop U1) */
     std::atomic<bool> busy{false};
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
     int64_t         last_sys_acq = -(int64_t)kQueuePackets;
+    /* Lever CHI (DRAFTER round 52, Qwen loop round 8): the latest packet that went out ORDERED (barrier bit) with an acquire of
+     * agent scope or wider -- the packet processor ran its acquire after everything before it had completed, so no scalar cache
+     * line of an argument slot written before it can survive it. */
+    int64_t         last_oacq = -2 * (int64_t)kQueuePackets;
     uint64_t        epoch = 0;                /* host epoch at the last system acquire */
     hsa_signal_t    ride{};                   /* rad_ride: the next dispatch's completion signal */
     bool            agent_only = false;       /* rad_xp_stream_create: never a system-scope acquire */
@@ -993,10 +1113,32 @@ inline int reserve(Stream* s, uint64_t* out) {
     return RAD_OK;
 }
 
+/* What the host wrote for the card, on its way before the packets that read it are announced
+ * (tp8 loop U1 = upstream 8f2e511f's first half, behind fn4 aql_hdp; 0 = the sfence alone, as before).
+ *
+ * An argument slot in VRAM is written through the BAR: the bytes sit in the processor's
+ * write-combining buffers until a store fence, and behind the link in the card's host data path,
+ * which hands them on to memory in its own time unless it is told to flush. Nothing orders that
+ * against the doorbell. A kernel the card starts soon enough after its packet was announced reads
+ * the slot as the launch a lap of the ring before left it. Upstream measured "soon enough" at a
+ * microsecond or two on an R9700, with failures only once the packets went without the packet
+ * processor's acquire (~0.9 us a launch): the margin is timing, not ordering. Here a live
+ * dispatch keeps that acquire (acquire_scope never answers none), a played packet that drops it
+ * (aql_acq rule / rule-w) reads an argument block written once at a_tape_end, and no launch
+ * chains on the DeepSeek line ('chained launches: off'). The store goes to the driver's flush
+ * register (HSA_AMD_AGENT_INFO_HDP_FLUSH), behind the slot's bytes and in front of the doorbell. */
+inline void host_writes_out(Stream* s) {
+    _mm_sfence();
+    if (s->hdp && rad::fn4::aql_hdp() == 1) *s->hdp = 1;
+}
+
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
+    if (((header >> HSA_PACKET_HEADER_BARRIER) & 1u) &&
+        ((header >> HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) & 3u) >= HSA_FENCE_SCOPE_AGENT)
+        s->last_oacq = (int64_t)idx;   /* lever CHI */
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
-    _mm_sfence();                       /* the argument slot, written before the header */
+    host_writes_out(s);                 /* the argument slot, written before the header */
     __atomic_store_n(reinterpret_cast<uint32_t*>(
                          static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) +
                          (idx & s->mask)),
@@ -1037,6 +1179,10 @@ struct TapeRec {
     /* A chained kernel (RadKernelChainFn): played from the queue's own argument slot with a chain
      * record, and without the barrier bit behind another chained kernel. */
     uint8_t  chain = 0;
+    /* Lever IKA: the kernel acquires / releases itself (KernelRec::ika, under RADIANCE_AQL_IKA=1), and haz_mark found no
+     * line it reads that a scalar cache could hold stale (tape_set_noacq bit 1): it plays without the packet's acquire. */
+    uint8_t  ika = 0;
+    uint8_t  ikaok = 0;
 };
 
 struct Tape {
@@ -1057,12 +1203,14 @@ inline bool capturing() { return t_tape && t_tape_pause == 0; }
 
 /* A dispatch just written at `p` on `s`, with its argument block `ka`. */
 void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16_t setup,
-                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain) {
+                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool ika = false,
+                        int32_t ika_flag = -1) {
     Tape* t = t_tape;
     TapeRec r;
     r.kind = kTapeDispatch;
     r.fence = fence;
     r.chain = chain ? 1 : 0;
+    r.ika = ika ? 1 : 0;
     r.s = s;
     r.pkt = *p;
     r.pkt.header = 0;
@@ -1070,6 +1218,12 @@ void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16
     const size_t off = (t->karg_host.size() + 63) & ~size_t(63);
     t->karg_host.resize(off + n);
     std::memcpy(t->karg_host.data() + off, ka, n);
+    /* Lever IKA form B: the played copy of a form-B kernel's arguments says "fence yourself" (the issued packet, written from
+     * `ka`, keeps 0 and its packet fences) */
+    if (ika && ika_flag >= 0 && (uint32_t)ika_flag + 8u <= n) {
+        const uint64_t one = 1;
+        std::memcpy(t->karg_host.data() + off + (uint32_t)ika_flag, &one, sizeof one);
+    }
     r.karg_off = (uint32_t)off;
     r.karg_len = n;
     t->rec.push_back(r);
@@ -1084,8 +1238,14 @@ inline uint16_t header(hsa_packet_type_t type, int acq, int rel, bool barrier = 
 
 /* Whether the packet at `idx` must acquire at system scope, and the bookkeeping if it does. */
 /* RADIANCE_AQL_ACQ: 0 unset, 1 rule or rule-w (Ctx::haz_mark marks the records), 2 none (PlayRun::put). */
-inline int aql_acq_mode() {   /* fn4: the aql_acq switch (runtime/fn4_switch.h), else the env at start */
-    return rad::fn4::aql_acq_none() ? 2 : rad::fn4::aql_acq_rule() != 0 ? 1 : 0;
+/* fn4: rule / rule-w is the aql_acq runtime switch (runtime/fn4_switch.h), else the env at start; none is
+ * start-time only, so it stays a constant here. */
+inline bool aql_acq_none_() {
+    static const bool none = rad::fn4::aql_acq_none();
+    return none;
+}
+inline int aql_acq_mode() {
+    return aql_acq_none_() ? 2 : rad::fn4::aql_acq_rule() != 0 ? 1 : 0;
 }
 
 inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
@@ -1194,14 +1354,22 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain);
+    /* Lever CHI (fn4 aql_chi, under RADIANCE_AQL_IKA=1): a chained record (its record on) fences itself (r4d_chain.h: an agent
+     * acquire after its wait, an agent release before its add), so it is recorded as self-acquiring; it is not a listed kernel
+     * and gets no form-B flag. */
+    if (capturing())
+        tape_note_dispatch(s, p, setup, ka, n, fence, chain,
+                           k->ika || (chain && ika_on() && rad::fn4::aql_chi() >= 1), k->ika ? k->ika_flag : -1);
+    /* tp8 loop W1: an aside packet (kFenceAside, lever WAITK's wait kernel) carries no ride and leaves the acquire
+     * bookkeeping to the next real packet; everything else as for any dispatch. */
+    const bool aside = (fence & kFenceAside) != 0;
     /* Attach the ride after the tape copied the packet: a recorded packet carries no signal, and
      * a play attaches whichever ride is pending then (PlayRun::put). */
-    if (s->ride.handle) {
+    if (s->ride.handle && !aside) {
         p->completion_signal = s->ride;
         s->ride.handle = 0;
     }
-    const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
+    const int acq = aside ? HSA_FENCE_SCOPE_AGENT : acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
      * the bit, since its completion must cover everything before it. */
@@ -1248,6 +1416,9 @@ struct PlayRun {
 
     void ring() {
         if (!unrung) return;
+        /* fn4 aql_hdp 1 (tp8 loop U1): the tape's argument blocks and any chained record put this
+         * run, through the host data path before the packets are announced. 0: as before. */
+        if (s->hdp && rad::fn4::aql_hdp() == 1) host_writes_out(s);
         hsa_queue_store_write_index_relaxed(s->q, next);
         hsa_signal_store_relaxed(s->q->doorbell_signal, (hsa_signal_value_t)(next - 1));
         unrung = 0;
@@ -1324,10 +1495,24 @@ struct PlayRun {
          *         every play), the first packet behind packets this thread did not play (`foreign`)
          *         and a system acquire stay.
          *   none  EXPERIMENT ONLY, unsafe in general: every agent-scope acquire becomes none. */
+        /* The rule is read only for a marked packet: only a pass recorded under it has marks, and a
+         * change of the switch re-records (the epoch), so the stock replay costs one constant test. */
+        /* Lever CHI (DRAFTER r53 form; fn4 aql_chi): a chained record that plays chained takes IKA's acquire drop too, when
+         * haz_mark allows it (ikaok) and its argument slot's previous use (one ring ago) is older than the queue's last ordered
+         * packet with an acquire (no scalar-cache line of the rewritten slot can be stale); the plain rule never drops a
+         * chained record's acquire, as before. */
+        const bool chi_ok = r.chain && chain && r.ika && r.ikaok && ika_on() && rad::fn4::aql_chi() >= 1 &&
+                            (int64_t)idx - (int64_t)(s->mask + 1) < s->last_oacq;
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_mode() == 2 || (aql_acq_mode() == 1 && r.noacq && !r.chain && !foreign)))
+            (aql_acq_none_() || (r.noacq && !r.chain && !foreign && aql_acq_mode() == 1) ||
+             (r.ika && r.ikaok && (!r.chain || chi_ok) && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
+        /* Lever IKA: the kernel released its writes at agent scope before its waves ended, so the packet's own agent
+         * release adds nothing; a packet a record or a ride completes keeps it (its signal orders other queues / the
+         * host after it). */
+        /* (lever CHI: a chained record fences itself only while its record is on, so only when it plays chained) */
+        if (r.ika && rel == HSA_FENCE_SCOPE_AGENT && !done.handle && (!r.chain || chain)) rel = HSA_FENCE_SCOPE_NONE;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
          * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
@@ -1343,6 +1528,7 @@ struct PlayRun {
             stamp->chained = chain;
         }
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
+        if (ordered && acq >= HSA_FENCE_SCOPE_AGENT) s->last_oacq = (int64_t)idx;   /* lever CHI */
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
@@ -1611,6 +1797,7 @@ int a_stream_create(RadStream* out, int high_priority) {
     }
     const uint64_t t_q2 = steady_ns();
     s->karg = static_cast<char*>(ka);
+    s->hdp = d.host_kargs ? nullptr : d.hdp_flush;
     s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
     *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
     _mm_sfence();
@@ -1655,10 +1842,17 @@ int a_stream_create(RadStream* out, int high_priority) {
     }
     g_queue_id_at[slot].store(s->id, std::memory_order_release);
     g_queue_by_id[slot].store(s->q, std::memory_order_release);
+    size_t live = 0;
     {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         G().streams.push_back(s.get());
+        for (const Stream* x : G().streams) live += x->ord == ord ? 1 : 0;
     }
+    /* lever WAITK's companion (DRAFTER round 49): RADIANCE_AQL_QLOG=1 logs each HSA queue the process creates, with the card's live
+     * count (creation order decides which queues share a CP pipe: 4 a card map cleanly, 8 do not -- drafter/kit/mes r49d / r49g) */
+    static const bool qlog = [] { const char* e = std::getenv("RADIANCE_AQL_QLOG"); return e && e[0] == '1'; }();
+    if (qlog) std::fprintf(stderr, "aql: queue created card %d stream id %u slot %u hp %d (live on the card %zu)\n", ord, s->id, slot,
+                           high_priority, live);
     *out = (RadStream)s.release();
     return RAD_OK;
 }
@@ -1905,6 +2099,61 @@ int a_event_record(RadEvent re, RadStream rs) {
     return RAD_OK;
 }
 
+/* Lever WAITK (DRAFTER track 21.11.2026 round 49; RADIANCE_AQL_WAITK, read once: 0 / unset = off, 1 = event waits, 2 = + ride waits):
+ * a wait whose signal is not yet 0 when it is enqueued gets a one-wave wait kernel (aql_blit.hip aql_wait_signal) on the same stream
+ * AHEAD of its barrier-AND, which then stays exactly as without the lever (packet, acquire scope, `waiters`): the barrier is processed
+ * after the kernel completes, so its dependency is already met. Why: a barrier-AND whose dependency is pending slows every packet of the
+ * other queues on its CP pipe by ~+40 us (FINDINGS DRAFTER note 00:18 21.11.; drafter/kit/mes). Not while a tape is captured (the
+ * recorded wait kernel would poll a retired signal at play; a played tape calls a_event_wait, which adds it then). Scheduling only:
+ * every kernel's bytes are unchanged.
+ * tp8 loop W1 (DECODE review): the kernel goes out as a kFenceAside packet (aql.h) -- without it, it was an ordinary dispatch, so
+ * (a) it took the system acquire owed after a host wait / a lap (acquire_scope) from the next real packet, which then ran at agent
+ * scope: host writes made between this wait's enqueue and that packet's were no longer covered; (b) it would complete a ride pending
+ * on the stream (the reason for the round-49 form's skip, now dropped: an aside packet leaves the ride to the next real dispatch,
+ * as the barrier does). One stderr line a minute (at most) counts what the lever did, so a card run can read that it acted. */
+std::atomic<int> g_waitk_test{-1};
+std::atomic<int64_t> g_waitk_kernels{0}, g_waitk_met{0}, g_waitk_captured{0};
+int waitk_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_AQL_WAITK");
+        const int v = waitk_mode_of(e);
+        if (v > 0) std::fprintf(stderr, "aql: wait-ahead kernels on (RADIANCE_AQL_WAITK=%s: mode %d, %s)\n", e, v,
+                                v >= 2 ? "event and ride waits" : "event waits");
+        return v;
+    }();
+    const int t = g_waitk_test.load(std::memory_order_relaxed);
+    return t >= 0 ? t : m;
+}
+void waitk_line(int mode) {
+    using clk = std::chrono::steady_clock;
+    static std::atomic<int64_t> next_ms{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now().time_since_epoch()).count();
+    int64_t n = next_ms.load(std::memory_order_relaxed);
+    if (now < n || !next_ms.compare_exchange_strong(n, now + 60000, std::memory_order_relaxed)) return;
+    if (n == 0) return;                               /* the first wait arms the minute */
+    std::fprintf(stderr, "aql: WAITK %d since start: %lld wait kernels, %lld waits met at enqueue, %lld in a tape capture (tp8 loop W1)\n",
+                 mode, (long long)g_waitk_kernels.load(std::memory_order_relaxed),
+                 (long long)g_waitk_met.load(std::memory_order_relaxed),
+                 (long long)g_waitk_captured.load(std::memory_order_relaxed));
+}
+void wait_ahead(Stream* s, hsa_signal_t h, int need) {
+    const int mode = waitk_mode();
+    if (mode < need || !h.handle) return;
+    const int plan = waitk_plan(mode, need, capturing(), (int64_t)hsa_signal_load_relaxed(h));
+    if (plan == kWaitkOff) {
+        g_waitk_captured.fetch_add(1, std::memory_order_relaxed);
+    } else if (plan == kWaitkMet) {
+        g_waitk_met.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const void* v = (const void*)&reinterpret_cast<const amd_signal_t*>(h.handle)->value;
+        set_next_fence(kFenceAside);
+        const int rc = rad_aql_blit_wait(v, s);
+        set_next_fence(0);
+        if (rc == 0) g_waitk_kernels.fetch_add(1, std::memory_order_relaxed);
+    }
+    waitk_line(mode);
+}
+
 /* The event lock is held across the enqueue so the signal cannot retire before this wait is
  * noted against it. */
 int a_event_wait(RadStream rs, RadEvent re) {
@@ -1925,6 +2174,7 @@ int a_event_wait(RadStream rs, RadEvent re) {
      * or the host needs system scope. */
     const int acq = e->cur->agent.handle == s->agent.handle ? HSA_FENCE_SCOPE_AGENT
                                                             : HSA_FENCE_SCOPE_SYSTEM;
+    wait_ahead(s, e->cur->h, 1);   /* lever WAITK */
     RAD_TRY(barrier(s, e->cur->h, hsa_signal_t{0}, acq, HSA_FENCE_SCOPE_NONE, &idx));
     e->cur->waiters.emplace_back(s->id, idx);
     return RAD_OK;
@@ -2088,11 +2338,21 @@ int a_tape_set_overlap(RadTape rt, int i, int on) {
     return RAD_OK;
 }
 
+int a_tape_rec_ika(RadTape rt, int i) {
+    const Tape* t = tape_of(rt);
+    if (!t || i < 0 || i >= (int)t->rec.size()) return RAD_E_INVAL;
+    const TapeRec& r = t->rec[(size_t)i];
+    /* 2: a chained record recorded self-acquiring by lever CHI (fn4 aql_chi; callers test > 0) */
+    return r.kind == kTapeDispatch && r.ika ? (r.chain ? 2 : 1) : 0;
+}
+
 int a_tape_set_noacq(RadTape rt, int i, int on) {
     Tape* t = tape_of(rt);
     if (!t || i < 0 || i >= (int)t->rec.size() || t->rec[(size_t)i].kind != kTapeDispatch)
         return RAD_E_INVAL;
-    t->rec[(size_t)i].noacq = on ? 1 : 0;
+    /* bit 0: the acquire rule's mark (any kernel); bit 1: lever IKA's (only a self-acquiring kernel, TapeRec::ika) */
+    t->rec[(size_t)i].noacq = (on & 1) ? 1 : 0;
+    t->rec[(size_t)i].ikaok = (on & 2) ? 1 : 0;
     return RAD_OK;
 }
 
@@ -2138,9 +2398,16 @@ struct Stamps {
     size_t       made = 0;
     std::deque<StampRow> rows;       /* issued, times not read yet */
     std::unordered_map<uint64_t, std::string> names;
+    /* tp8 loop D43 (RADIANCE_AQL_STAMP_DRAIN=1): a thread of its own reads the signals and writes the lines; the plays on
+     * card 0 then only take signals. Unset: a play reads them (as before), on the issuing rank thread, before its first
+     * packet. With the thread, `names` and `out` are the thread's alone until stamps_at_exit has joined it. */
+    bool         drain_th = false;
+    std::atomic<bool> th_stop{ false };
+    std::thread  th;
 };
 
 void stamps_at_exit();
+void stamps_drain_loop(Stamps* st);
 
 Stamps& stamps() {
     static Stamps* st = [] {
@@ -2152,6 +2419,14 @@ Stamps& stamps() {
         if (x->every) {
             RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card 0, "
                      "into %s", x->every, x->path.c_str());
+            /* tp8 loop D43: the reading off the plays' thread (the thread never calls stamps(): it is given x) */
+            const char* d = std::getenv("RADIANCE_AQL_STAMP_DRAIN");
+            x->drain_th = d && std::atoi(d) > 0;
+            if (x->drain_th) {
+                x->th = std::thread(stamps_drain_loop, x);
+                RAD_WARN("device: RADIANCE_AQL_STAMP_DRAIN=1 -- a thread of its own reads the stamps' signals and writes the "
+                         "lines; card 0's plays only take signals (tp8 loop D43)");
+            }
             std::atexit(stamps_at_exit);
         }
         return x;
@@ -2227,8 +2502,61 @@ void stamps_read(Stamps& st, bool wait) {
     if (wrote) std::fflush(st.out);
 }
 
+/* tp8 loop D43 (RADIANCE_AQL_STAMP_DRAIN=1): stamps_read's work on a thread of its own, every ~0.5 ms. Why (loop FINDINGS
+ * DECODE note 23:5x 19.11.): under the lock, a play's StampRun::begin read every signal that had reached 0 since the last
+ * play on card 0 -- a profiling-time call, a kernel-name lookup and a CSV line each -- on the rank thread that was about to
+ * write its first packet, so a pass that followed a few hundred stamped dispatches (a decode head after the tail, the
+ * drafter and the query pass) started on the card only after that read: the stamped runs' 'release -> the head's first
+ * kernel' (0.68-0.73 ms p50, lq198) is most likely that read (H: RADIANCE_PP_HEAD_PHASES's line in a stamped and an
+ * unstamped start tells), not the engine's issue. Here the lock is held only to take the
+ * finished rows off the queue and to give their signals back; the times are read and the lines written outside it.
+ * The same rows, in the same order, the same line format. */
+void stamps_drain_loop(Stamps* sp) {
+    Stamps& st = *sp;
+    std::vector<StampRow> got;
+    while (!st.th_stop.load(std::memory_order_acquire)) {
+        got.clear();
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            while (!st.rows.empty() && hsa_signal_load_scacquire(st.rows.front().h) == 0) {
+                got.push_back(st.rows.front());
+                st.rows.pop_front();
+            }
+        }
+        if (got.empty()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            continue;
+        }
+        /* Out of the pool until handed back below, so no play can reuse a signal before its times are read. */
+        const bool file = stamps_file(st);
+        for (const StampRow& w : got) {
+            hsa_amd_profiling_dispatch_time_t t{};
+            const bool timed = hsa_amd_profiling_get_dispatch_time(G().dev[0].agent, w.h, &t) ==
+                               HSA_STATUS_SUCCESS;
+            if (!file) continue;
+            std::fprintf(st.out, "%" PRIu64 ",%d,%u,%s,%d,%d,", w.pass, w.seq, w.queue,
+                         stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
+            if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
+            else std::fputc(',', st.out);
+            std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+        }
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            for (const StampRow& w : got)
+                if (w.own) st.free.push_back(w.h);
+        }
+        for (const StampRow& w : got)
+            if (!w.own) stamp_hold(w.h, false);
+        if (file) std::fflush(st.out);
+    }
+}
+
 void stamps_at_exit() {
     Stamps& st = stamps();
+    if (st.th.joinable()) {   /* tp8 loop D43: the thread's last lines first; then the rest as before */
+        st.th_stop.store(true, std::memory_order_release);
+        st.th.join();
+    }
     std::lock_guard<std::mutex> lk(st.mu);
     stamps_read(st, true);
     if (st.out) std::fclose(st.out);
@@ -2251,7 +2579,7 @@ struct StampRun {
         Stamps& st = stamps();
         if (!st.every || from >= to || t->rec[(size_t)from].s->ord != 0) return;
         std::lock_guard<std::mutex> lk(st.mu);
-        stamps_read(st, false);
+        if (!st.drain_th) stamps_read(st, false);   /* tp8 loop D43: with the drain thread, the thread reads them */
         if (from == 0) {
             st.tape = ++st.passes % (uint64_t)st.every == 0 ? t : nullptr;
             st.play = 0;
@@ -3014,6 +3342,7 @@ int a_ride_wait(RadStream rs, void* token) {
     Sig* g = (Sig*)token;
     if (!s || !g) return RAD_E_INVAL;
     uint64_t idx = 0;
+    wait_ahead(s, g->h, 2);   /* lever WAITK */
     const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_NONE, &idx);
     if (rc == RAD_OK) g->waiters.emplace_back(s->id, idx);
     sig_retire(g);
@@ -3644,9 +3973,10 @@ int a_vmem_commit(void* addr, int64_t bytes) {
     const Dev& d = G().dev[(size_t)dev];
     if (!card_has_room(dev, bytes, "vmem commit")) return RAD_E_NOMEM;
     hsa_amd_vmem_alloc_handle_t h{};
-    if (hsa_amd_vmem_handle_create(d.vram, (size_t)bytes, MEMORY_TYPE_NONE, 0, &h) !=
-        HSA_STATUS_SUCCESS) {
-        device_set_error("vmem: %lld bytes could not be backed on device %d", (long long)bytes, dev);
+    const hsa_status_t hs = hsa_amd_vmem_handle_create(d.vram, (size_t)bytes, MEMORY_TYPE_NONE, 0, &h);
+    if (hs != HSA_STATUS_SUCCESS) {
+        device_set_error("vmem: %lld bytes could not be backed on device %d (hsa %d, card_avail %lld)",
+                         (long long)bytes, dev, (int)hs, (long long)card_available(dev));
         return RAD_E_NOMEM;
     }
     if (hsa_amd_vmem_map(addr, (size_t)bytes, 0, h, 0) != HSA_STATUS_SUCCESS) {
@@ -4085,9 +4415,110 @@ bool ride_reusable(void* token) {
     std::lock_guard<std::mutex> lk(pool().mu);
     return reusable(g);
 }
+WaitkCounts waitk_counts() {
+    WaitkCounts c;
+    c.kernels = g_waitk_kernels.load(std::memory_order_relaxed);
+    c.met = g_waitk_met.load(std::memory_order_relaxed);
+    c.captured = g_waitk_captured.load(std::memory_order_relaxed);
+    return c;
+}
+void waitk_set_for_test(int mode) { g_waitk_test.store(mode < 0 ? -1 : mode >= 2 ? 2 : mode, std::memory_order_relaxed); }
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
+
+/* tp8 loop F24: every registered fat binary's code object on card `device` now, as its first launch would load it (resolve ->
+ * module_load: the same image choice, the same executable), so that no module is loaded while the engine serves. */
+int aql_code_preload(int device, AqlPreload* out) {
+    using namespace aql;
+    if (out) *out = AqlPreload{};
+    if (!G().ok || device < 0 || (size_t)device >= G().dev.size()) return RAD_E_UNSUPPORTED;
+    std::vector<Module*> mods;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        for (const auto& kv : r.by_handle)
+            if (kv.second && std::find(mods.begin(), mods.end(), kv.second) == mods.end()) mods.push_back(kv.second);
+    }
+    const std::vector<std::string>& isas = G().dev[(size_t)device].isas;
+    if (isas.empty()) return RAD_E_UNSUPPORTED;
+    const auto t0 = std::chrono::steady_clock::now();
+    AqlPreload p;
+    for (Module* m : mods) {
+        std::lock_guard<std::mutex> lk(m->mu);
+        if (m->loaded[device]) { ++p.already; continue; }
+        ModuleImage& im = m->image[isas.front()];
+        if (!im.parsed) {   /* as module_meta parses it */
+            im.parsed = true;
+            if (bundle_code_object(m->bundle, isas, &im.co, &im.size, &im.err)) {
+                std::vector<KernelMeta> ks;
+                if (!code_object_kernels(im.co, im.size, &ks, &im.err)) im.co = nullptr;
+                else for (KernelMeta& k : ks) im.meta.emplace(k.symbol, std::move(k));
+            } else {
+                im.co = nullptr;
+            }
+        }
+        if (!im.co) { ++p.none; continue; }   /* nothing for this card: its first launch reports it, as before */
+        std::string why;
+        if (module_load(m, device, im, &why)) { ++p.loaded; p.bytes += (int64_t)im.size; }
+        else ++p.failed;
+    }
+    p.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (out) *out = p;
+    return RAD_OK;
+}
+
+/* tp8 loop P31 (RADIANCE_AQL_PRELOAD=2): every registered kernel resolved on card `device` now, as its first launch there
+ * would (resolve: the module's code object, its symbol, the argument layout), so no first launch resolves while serving.
+ * A kernel that cannot resolve keeps the reason its first launch reports, as before. */
+int aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms, double* alloc_ms) {
+    using namespace aql;
+    if (resolved) *resolved = 0;
+    if (refused) *refused = 0;
+    if (ms) *ms = 0;
+    if (alloc_ms) *alloc_ms = -1;
+    if (!G().ok || device < 0 || (size_t)device >= G().dev.size()) return RAD_E_UNSUPPORTED;
+    /* HIP's own allocator on this card, used first by a library's first-use block (hipMalloc in libr4d's split_ctr / the stage
+     * ops' counter_for) -- once here, timed, so that first use is not inside a pass */
+    {
+        int prev = -1;
+        (void)hipGetDevice(&prev);
+        if (hipSetDevice(device) == hipSuccess) {
+            const auto a0 = std::chrono::steady_clock::now();
+            void* p = nullptr;
+            if (hipMalloc(&p, 64) == hipSuccess && p) (void)hipFree(p);
+            if (alloc_ms) *alloc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count();
+        }
+        if (prev >= 0) (void)hipSetDevice(prev);
+    }
+    std::vector<Func*> fns;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        fns.reserve(r.by_stub.size());
+        for (const auto& kv : r.by_stub)
+            if (kv.second) fns.push_back(kv.second);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t ok = 0, no = 0;
+    for (Func* fn : fns) {
+        if (fn->rec[device].load(std::memory_order_acquire)) continue;
+        if (resolve(fn, device)) ++ok;
+        else ++no;
+    }
+    t_resolve_ns = t_resolve_n = 0;   /* bring-up's, not an issue's */
+    if (resolved) *resolved = ok;
+    if (refused) *refused = no;
+    if (ms) *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return RAD_OK;
+}
+
+/* tp8 loop P31: this thread's first-launch resolve time and count since the last call (RADIANCE_SLOW_ISSUE_MS) */
+void aql_resolves_take(uint64_t* ns, uint64_t* n) {
+    if (ns) *ns = aql::t_resolve_ns;
+    if (n) *n = aql::t_resolve_n;
+    aql::t_resolve_ns = aql::t_resolve_n = 0;
+}
 
 const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {
@@ -4166,6 +4597,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.code_runs = a_code_runs;
         g_aql.tape_set_overlap = a_tape_set_overlap;
         g_aql.tape_set_noacq = a_tape_set_noacq;
+        g_aql.tape_rec_ika = a_tape_rec_ika;
         g_aql.tape_destroy = a_tape_destroy;
         g_aql.stream_gate = a_stream_gate;
         g_aql.gate_open = a_gate_open;
@@ -4309,12 +4741,26 @@ hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t st) {
  * The fill runs on the first queue this process made on the device (the owning rank's compute
  * stream) and is waited for. A device with no queue yet (a peer's buffers set up before its rank
  * starts) gets a temporary one for the call. Never recorded into a tape: it runs once. */
+/* tp8 loop P31: RADIANCE_AQL_MEMSET_OWNQ=1 runs every such fill on a queue of its own made for the call (as a device with no
+ * queue gets today) and waits for that queue only: the same bytes, complete when it returns, without waiting for the compute
+ * stream's backlog -- a library's first-use zeroing inside a launch (libr4d split_ctr / the stage ops' counter_for) otherwise
+ * waits there for every part already issued on the card. With RADIANCE_SLOW_ISSUE_MS=X a fill that took >= X ms says so. */
+static const bool g_memset_ownq = [] {
+    const char* e = std::getenv("RADIANCE_AQL_MEMSET_OWNQ");
+    return e && e[0] == '1' && !e[1];
+}();
+static std::atomic<int> g_memset_lines{0};
+}  // extern "C"
+namespace rad { double slow_issue_ms(); }
+extern "C" {
+
 hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (!G().ok) return real().memset_sync ? real().memset_sync(dst, value, bytes) : hipErrorNotSupported;
     int dev = -1;
     if (hipGetDevice(&dev) != hipSuccess) return ret(hipErrorInvalidDevice);
+    const auto t0 = std::chrono::steady_clock::now();
     Stream* s = nullptr;
-    {
+    if (!g_memset_ownq) {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         for (Stream* x : G().streams)
             if (x->ord == dev) { s = x; break; }
@@ -4329,6 +4775,20 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (rc >= 0) rc = stream_drain(s);
     --t_tape_pause;
     if (own) rad_stream_destroy(own);
+    const double sl = rad::slow_issue_ms();
+    if (sl > 0) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms >= sl) {
+            const int k = g_memset_lines.fetch_add(1, std::memory_order_relaxed);
+            if (k < 128)
+                std::fprintf(stderr, "radiance: aql: a synchronous hipMemset of %zu bytes on card %d took %.2f ms (%s; RADIANCE_SLOW_ISSUE_MS, "
+                                     "tp8 loop P31)%s\n", bytes, dev, ms,
+                             g_memset_ownq ? "on a queue of its own, RADIANCE_AQL_MEMSET_OWNQ=1"
+                                           : own ? "on a queue made for the call"
+                                                 : "on the card's first queue = a rank's compute stream: its backlog waited for",
+                             k == 127 ? " (the 128th: no more memset lines)" : "");
+        }
+    }
     return ret(rc < 0 ? hipErrorInvalidValue : hipSuccess);
 }
 
@@ -4393,6 +4853,9 @@ namespace rad {
 namespace aql {
 /* A build without the AQL backend hands out no ride. */
 bool ride_reusable(void*) { return false; }
+/* ... and issues no wait kernel (tp8 loop W1). */
+WaitkCounts waitk_counts() { return WaitkCounts{}; }
+void waitk_set_for_test(int) {}
 }  // namespace aql
 }  // namespace rad
 

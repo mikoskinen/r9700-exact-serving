@@ -25,6 +25,7 @@
 
 #include "mm/media.h"
 #include "server/oai.h"
+#include "format/radfile.h"
 
 #include <nlohmann/json.hpp>
 
@@ -33,6 +34,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
@@ -673,6 +675,25 @@ TEST(qwen35_a_prefill_span_changes_no_logit) {
     CHECK(log.find("spans up to 4 intervals from its second interval on; every other step is "
                    "planned at 64 tokens") != std::string::npos);
     CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
+}
+
+/* qfn-on-ds (Qwen loop round 18): RADIANCE_PF_TIMELINE=1 times a lone prefill's chunks with card-local events on rank 0's
+ * stream (before / after each model pass, after the step's own sampler / snapshots / drafter) and prints one line a prompt at
+ * its first token; it records events only and changes no logit. */
+TEST(qwen35_the_prefill_timeline_changes_no_logit_and_says_each_prompts_chunks) {
+    std::string log;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4" },
+                            { "RADIANCE_LOG_STEPS=1", "RADIANCE_PF_TIMELINE=1" }, &log);
+    CHECK(log.find("RADIANCE_PF_TIMELINE=1: a lone prefill's chunks are timed") != std::string::npos);
+    CHECK(log.find("prefill timeline (RADIANCE_PF_TIMELINE=1, one machine): request") != std::string::npos);
+    CHECK(log.find("rows@context: between | model pass + own sampler") != std::string::npos);
+    for (size_t a = log.find("prefill timeline"); a != std::string::npos; a = log.find("prefill timeline", a + 1)) {
+        const size_t e = log.find('\n', a);
+        std::fprintf(stderr, "  | %s\n", log.substr(a, e == std::string::npos ? std::string::npos : e - a).c_str());
+        if (e == std::string::npos) break;
+    }
 }
 
 /* Documents batched together share every step's GEMMs and occupy other state slots and KV
@@ -1738,12 +1759,12 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
                            completion(repetitive_prompt(), 64, 0.5, 99)));
         const std::vector<int32_t> greedy =
             tokens_of(post(plain.port, "/completion", completion(repetitive_prompt(), 64)));
-        const std::string oracle = world().dir / (std::string("oracle-") + f.name);
+        const std::string spec_oracle = world().dir / (std::string("oracle-") + f.name);
         std::string ids;
         for (int32_t t : a) ids += std::to_string(t) + " ";
-        REQUIRE(tiny::write_text(oracle, ids));
+        REQUIRE(tiny::write_text(spec_oracle, ids));
         std::vector<std::string> args = kSpec;
-        args.insert(args.end(), { "--debug-draft-oracle", oracle });
+        args.insert(args.end(), { "--debug-draft-oracle", spec_oracle });
         REQUIRE(spec.start(world().*f.model, args));
         int status = 0;
         const json sb = post(spec.port, "/completion", req, &status);
@@ -1756,11 +1777,145 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
         CHECK(a == b);
         CHECK(a != other);
         CHECK(a != greedy);
-        const int64_t drafted = timing(sb, "draft_n");
-        if (drafted <= 0) fprintf(stderr, "    %s: nothing drafted\n", f.name);
-        CHECK(drafted > 0);
+        /* Prompt lookup verifies a proposal only when it pays at the measured step cost
+         * (sched/lookup.h), and this sampled reply hardly repeats, so whether `spec` verified
+         * anything depends on the host's timings. The verify path at this temperature is held to
+         * the plain draw through the harness instead, which is always verified: it proposes the
+         * plain run's own reply with 30% of the drafts corrupted, so verifies accept and reject. */
+        const std::string oracle =
+            radtest::tmp_path(std::string("oracle-sampled-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : a) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server orc;
+        REQUIRE(orc.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                              "--debug-draft-oracle", oracle }));
+        const json ob = post(orc.port, "/completion", req);
+        CHECK_EQ(orc.stop(), 0);
+        if (a != tokens_of(ob)) fprintf(stderr, "    %s plain %s\n    %s oracle %s\n", f.name,
+                                        show(a).c_str(), f.name, show(tokens_of(ob)).c_str());
+        CHECK(a == tokens_of(ob));
+        const int64_t drafted = timing(ob, "draft_n"), accepted = timing(ob, "draft_n_accepted");
+        fprintf(stderr, "    %s: harness drafted %lld, accepted %lld (lookup drafted %lld)\n", f.name,
+                (long long)drafted, (long long)accepted,
+                (long long)std::max<int64_t>(0, timing(sb, "draft_n")));
+        CHECK(drafted > accepted);
+        CHECK(accepted > 0);
         CHECK_EQ(plain.stop(), 0);
         CHECK_EQ(spec.stop(), 0);
+    }
+}
+
+/* --spec-ngram K: prompt lookup alone at window K, here with single-token patterns allowed and,
+ * in the second arm, the adaptive window cutting each sequence's lookups to its own acceptance.
+ * Greedy text must equal one-token-a-step decoding token for token, a seeded draw must repeat
+ * its plain run's draw (a lookup draft is a point mass, for which accepting on agreement with the
+ * target's draw is the speculative-sampling rule: accept with probability p(x), else a draw from
+ * p without x), and the timings must show lookups made, some taken and some not. The code-edit
+ * prompt asks for a copy with a rename, the case prompt lookup is for. */
+TEST(spec_ngram_alone_returns_the_tokens_plain_decoding_returns) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<std::string> kArms[] = {
+        { "--spec-ngram", "4", "--spec-ngram-min", "1", "--no-prefix-cache" },
+        { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" } };
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        for (const std::vector<std::string>& arm : kArms) {
+            Server ng;
+            REQUIRE(ng.start(world().*f.model, arm));
+            CHECK(has(ng.output(), "speculation: prompt lookup only (--spec-ngram 4)"));
+            int64_t drafted = 0, accepted = 0;
+            for (const std::vector<int32_t>* p : { &repetitive_prompt(), &edit }) {
+                const json a = post(plain.port, "/completion", completion(*p, 48));
+                int status = 0;
+                const json b = post(ng.port, "/completion", completion(*p, 48), &status);
+                CHECK_EQ(status, 200);
+                const std::vector<int32_t> ta = tokens_of(a), tb = tokens_of(b);
+                CHECK_EQ(ta.size(), (size_t)48);
+                if (ta != tb)
+                    fprintf(stderr, "    %s %s plain %s\n    ngram %s\n", f.name, arm[3].c_str(),
+                            show(ta).c_str(), show(tb).c_str());
+                CHECK(ta == tb);
+                drafted += std::max<int64_t>(timing(b, "draft_n"), 0);
+                accepted += std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+            }
+            fprintf(stderr, "    %s %s %s: drafted %lld, accepted %lld\n", f.name, arm[2].c_str(),
+                    arm[3].c_str(), (long long)drafted, (long long)accepted);
+            CHECK(drafted > accepted);
+            CHECK(accepted > 0);
+
+            const json req = completion(repetitive_prompt(), 64, 0.7, 4321);
+            const std::vector<int32_t> sa = tokens_of(post(plain.port, "/completion", req));
+            const json sb = post(ng.port, "/completion", req);
+            if (sa != tokens_of(sb))
+                fprintf(stderr, "    %s seeded plain %s\n    ngram %s\n", f.name, show(sa).c_str(),
+                        show(tokens_of(sb)).c_str());
+            CHECK(sa == tokens_of(sb));
+            CHECK_EQ(ng.stop(), 0);
+        }
+        CHECK_EQ(plain.stop(), 0);
+    }
+}
+
+/* The verify path with rejections at every depth, on text that never repeats: the harness
+ * (--debug-draft-oracle) proposes from the plain run's own continuation with 30% of the
+ * drafts corrupted, so a verify accepts 0..4 drafts and rolls back the rest, on each family's
+ * recurrent state, conv window and sliding window. Text and logprobs must be the plain run's. */
+TEST(verifies_that_reject_at_every_depth_return_the_plain_tokens) {
+    REQUIRE(world().ok);
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        const std::vector<int32_t> p = prompt_ids(77, 50);
+        const json a = post(plain.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(plain.stop(), 0);
+        const std::vector<int32_t> ta = tokens_of(a);
+        REQUIRE(ta.size() == 40);
+        const std::string oracle = radtest::tmp_path(std::string("oracle-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : ta) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server ng;
+        REQUIRE(ng.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                             "--debug-draft-oracle", oracle }));
+        const json b = post(ng.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(ng.stop(), 0);
+        const std::vector<int32_t> tb = tokens_of(b);
+        if (ta != tb)
+            fprintf(stderr, "    %s plain %s\n    oracle %s\n", f.name, show(ta).c_str(),
+                    show(tb).c_str());
+        CHECK(ta == tb);
+        const int64_t drafted = timing(b, "draft_n"), accepted = timing(b, "draft_n_accepted");
+        fprintf(stderr, "    %s: drafted %lld, accepted %lld\n", f.name, (long long)drafted,
+                (long long)accepted);
+        CHECK(drafted > 2 * accepted);
+        CHECK(accepted > 4);
+        /* Every emitted token's logprobs are its own row's, verify row or decode row alike. */
+        double worst = 0;
+        const json& pa = a["completion_probabilities"];
+        const json& pb = b["completion_probabilities"];
+        REQUIRE(pa.size() == pb.size());
+        for (size_t i = 0; i < pa.size(); ++i)
+            worst = std::max(worst,
+                             std::fabs(pa[i]["top_logprobs"][0]["logprob"].get<double>() -
+                                       pb[i]["top_logprobs"][0]["logprob"].get<double>()));
+        fprintf(stderr, "    %s: worst |dlogprob| %.3g\n", f.name, worst);
+        CHECK(worst < 0.1);
     }
 }
 
@@ -1983,6 +2138,604 @@ TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
     }
 }
 
+/* tp8 loop D23 (fn4 draft_short_blk) on a live server: the tiny 31B's DFlash2 (block 8) declares no short block, so the
+ * server registers none and refuses every length by name (the switch then stays 0), and the text stays the plain greedy
+ * one with four requests in flight before and after the refusals; 0 is always taken. (DSpark on deepseek41 declares 2
+ * and 3 under RADIANCE_DS41_DSPARK_SHORT=2,3 -- the positive path's rule is sched_test's draft_short_blk cases; on cards
+ * the start line names the lengths and GET "short_blk" counts the passes.) */
+TEST(draft_short_blk_is_refused_where_no_short_block_is_served_and_the_text_stays) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(311 + i, 80 + 19 * i));
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const auto& p : prompts) plain.push_back(tokens_of(post(s.port, "/completion", completion(p, 40))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4",
+                                       "--draft-short-from", "1" }));
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    auto four = [&](const char* what) {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 40).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != plain[(size_t)i])
+                fprintf(stderr, "    %s, prompt %d\n    plain %s\n    got   %s\n", what, i, show(plain[(size_t)i]).c_str(),
+                        show(t).c_str());
+            CHECK(t == plain[(size_t)i]);
+        }
+    };
+    const json g0 = fn4get();
+    CHECK_EQ(g0["switches"].value("draft_short_blk", -9), 0);
+    CHECK_EQ(g0["short_blk"].value("declared_mask", (int64_t)-9), (int64_t)0);
+    four("before");
+    for (const int v : { 4, 2, 3 }) {
+        int st = 0;
+        const json r = post(s.port, "/admin/fn4", json{ { "draft_short_blk", v } }, &st);
+        CHECK_EQ(st, 400);
+        const bool named = r.dump().find("serves no short block") != std::string::npos;
+        if (!named) fprintf(stderr, "    POST draft_short_blk %d: %d %s\n", v, st, r.dump().c_str());
+        CHECK(named);
+    }
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "draft_short_blk", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    four("after the refusals");
+    const json g1 = fn4get();
+    CHECK_EQ(g1["switches"].value("draft_short_blk", -9), 0);
+    CHECK_EQ(g1["short_blk"].value("passes", (int64_t)-1), (int64_t)0);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(!has(s.output(), "fn4 draft_short_blk may run"));
+}
+
+/* The verify-path harness beside a draft head (DFlash2's block drafter here; DSpark's block of 5 on
+ * deepseek41, where --spec-ngram is refused beside the head): the harness's ids, a plain greedy run's
+ * reply with 30% of the drafts corrupted, replace each proposal the head publishes, at the head's own
+ * count, so every verify runs at the head's shape and accepts and rejects where the harness says. The
+ * text must stay the plain run's, the harness must have been both accepted and rejected, and the
+ * serve log says the head's proposals are replaced, no step is issued ahead and no tree is asked. */
+TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(61, 160);
+    std::vector<int32_t> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        plain = tokens_of(post(s.port, "/completion", completion(p, 48)));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE_EQ(plain.size(), (size_t)48);
+    const std::string oracle = radtest::tmp_path("oracle-head-g31.txt");
+    {
+        std::string ids;
+        for (int32_t t : plain) ids += std::to_string(t) + " ";
+        REQUIRE(tiny::write_text(oracle, ids));
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache",
+                                       "--debug-draft-oracle", oracle }));
+    const json r = post(s.port, "/completion", completion(p, 48));
+    /* The head can run the adaptive window: switched on in process, the same text and the harness
+     * still drafting; GET reports the scheduler's window; -1 returns to the configured (fixed) one. */
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    CHECK_EQ(fn4get().value("draft_capable", -9), 1);
+    CHECK_EQ(fn4get()["switches"].value("draft_adaptive", -9), 0);
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "draft_adaptive", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    const json ra = post(s.port, "/completion", completion(p, 48));
+    CHECK_EQ(fn4get()["switches"].value("draft_adaptive", -9), 1);
+    (void)post(s.port, "/admin/fn4", json{ { "draft_adaptive", -1 } }, &st);
+    CHECK_EQ(st, 200);
+    const json rf = post(s.port, "/completion", completion(p, 48));
+    CHECK_EQ(fn4get()["switches"].value("draft_adaptive", -9), 0);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(tokens_of(ra) == plain);
+    CHECK(tokens_of(rf) == plain);
+    CHECK(timing(ra, "draft_n") > 0);
+    const std::vector<int32_t> got = tokens_of(r);
+    if (got != plain)
+        fprintf(stderr, "    plain  %s\n    oracle %s\n", show(plain).c_str(), show(got).c_str());
+    CHECK(got == plain);
+    const int64_t drafted = timing(r, "draft_n"), accepted = timing(r, "draft_n_accepted");
+    fprintf(stderr, "    dflash2 + harness: drafted %lld, accepted %lld\n", (long long)drafted,
+            (long long)accepted);
+    CHECK(drafted > accepted);
+    CHECK(accepted > 0);
+    CHECK(has(s.output(), "every proposal of the draft head"));
+    CHECK(has(s.output(), "beside the draft head 'dflash2': no step is issued ahead"));
+    /* DFlash2 proposes trees where its plugin measured a gain; under the harness it proposes a chain. */
+    CHECK(has(s.output(), "draft trees: not asked"));
+}
+
+/* ds41-acc's confidence gate (dspark_conf; core/sched/draft_conf.h) on DFlash2's block head, with
+ * the test source of logits (RADIANCE_DEBUG_DRAFT_CONF: a hashed logit a proposal, so the gate cuts
+ * some sequences to nothing, some to a prefix, some not at all): the gate waits for the query pass
+ * before the step issued ahead is built and every site that caps a proposal takes its count. The
+ * greedy text must stay the plain run's alone and with four sequences in flight, under the
+ * reference rule, a threshold capped by the adaptive window and the observe mode; the counts must
+ * show cuts of several lengths; dspark_alt is refused where no branches are declared. */
+TEST(the_confidence_gate_cuts_a_block_heads_chain_and_keeps_the_plain_text) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(211 + i, 90 + 23 * i));
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const auto& p : prompts) plain.push_back(tokens_of(post(s.port, "/completion", completion(p, 40))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4" },
+                    { "RADIANCE_DEBUG_DRAFT_CONF=1", "RADIANCE_FN4_DSPARK_CONF=1" }));
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    auto stats = [&]() {
+        Call c;
+        std::string out;
+        if (!c.send(s.port, "GET", "/stats", "") || c.read(&out) != 200) return json();
+        return json::parse(out, nullptr, false);
+    };
+    auto same = [&](const char* what) {
+        const std::vector<int32_t> t = tokens_of(post(s.port, "/completion", completion(prompts[0], 40)));
+        if (t != plain[0]) fprintf(stderr, "    %s\n    plain %s\n    gated %s\n", what, show(plain[0]).c_str(), show(t).c_str());
+        CHECK(t == plain[0]);
+    };
+    CHECK_EQ(fn4get()["switches"].value("dspark_conf", -9), 1);
+    same("dspark_conf 1, one sequence");
+    /* four in flight: each row cut on its own */
+    {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 40).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != plain[(size_t)i])
+                fprintf(stderr, "    gate, four in flight, prompt %d\n    plain %s\n    gated %s\n", i,
+                        show(plain[(size_t)i]).c_str(), show(t).c_str());
+            CHECK(t == plain[(size_t)i]);
+        }
+    }
+    const json g1 = stats()["draft_conf"]["conf"];
+    const int64_t cuts1 = g1.value("cuts", (int64_t)0);
+    int lengths = 0;
+    for (const auto& h : g1["cut_hist"]) lengths += h.get<int64_t>() > 0;
+    fprintf(stderr, "    gate: %lld cuts, histogram %s\n", (long long)cuts1, g1["cut_hist"].dump().c_str());
+    CHECK(cuts1 > 0);
+    CHECK(lengths >= 3);
+    /* the rule capped by the adaptive window, at 0.6 */
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 160 }, { "draft_adaptive", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    same("dspark_conf 160, adaptive");
+    CHECK_EQ(fn4get()["switches"].value("dspark_conf", -9), 160);
+    /* observe: logits counted, nothing cut */
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 2 }, { "draft_adaptive", -1 } }, &st);
+    CHECK_EQ(st, 200);
+    const int64_t cuts2 = stats()["draft_conf"]["conf"].value("cuts", (int64_t)0);
+    same("dspark_conf 2 (observe)");
+    const json g3 = stats()["draft_conf"]["conf"];
+    CHECK_EQ(g3.value("cuts", (int64_t)-1), cuts2);
+    CHECK(g3["calib"].size() >= 2);
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    same("dspark_conf 0");
+    /* ds41-small: the load gate (dspark_conf_rows 1) -- one sequence is gated as before; four in flight
+     * read no plane (rows_gated grows, no cut), the text the plain run's either way */
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 1 }, { "dspark_conf_rows", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    same("dspark_conf 1, dspark_conf_rows 1, one sequence");   /* applied at that request's first step */
+    CHECK_EQ(fn4get()["switches"].value("dspark_conf_rows", -9), 1);
+    const json r1 = stats()["draft_conf"]["conf"];
+    CHECK(r1.value("rows_bounded", (int64_t)0) > 0);
+    {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 40).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != plain[(size_t)i])
+                fprintf(stderr, "    load gate 1, four in flight, prompt %d\n    plain %s\n    gated %s\n", i,
+                        show(plain[(size_t)i]).c_str(), show(t).c_str());
+            CHECK(t == plain[(size_t)i]);
+        }
+    }
+    const json r2 = stats()["draft_conf"]["conf"];
+    fprintf(stderr, "    load gate: bounded %lld -> %lld, gated %lld -> %lld cycles\n",
+            (long long)r1.value("rows_bounded", (int64_t)0), (long long)r2.value("rows_bounded", (int64_t)0),
+            (long long)r1.value("rows_gated", (int64_t)0), (long long)r2.value("rows_gated", (int64_t)0));
+    CHECK(r2.value("rows_gated", (int64_t)0) > r1.value("rows_gated", (int64_t)0));
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf_rows", 65 } }, &st);
+    CHECK_EQ(st, 400);
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 0 }, { "dspark_conf_rows", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    /* refused: a value outside the set, and branches the drafter does not declare */
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 3 } }, &st);
+    CHECK_EQ(st, 400);
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_alt", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(has(s.output(), "draft trees: not asked -- RADIANCE_DEBUG_DRAFT_CONF"));
+    CHECK(has(s.output(), "hashed confidence logits"));
+}
+
+/* Prompt lookup alone on a container that carries a draft head (DFlash2 here; DSpark on
+ * deepseek41): --spec-ngram K leaves the head out -- the plugin is told (RadBuildCtx::
+ * draft_head_off) and declares none of it, so the serve declares exactly the weights a plain one
+ * does, and no tree is asked -- and lookup drafts alone, fixed window and adaptive. Greedy text
+ * must equal one-token-a-step decoding, on a repetitive prompt and a code edit. */
+TEST(spec_ngram_alone_leaves_a_draft_head_out_and_returns_the_plain_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    /* "declare: N ops, W weights, ..." -- W, the weights the plugin declared */
+    auto weights = [](const std::string& log) {
+        const size_t at = log.find("declare: ");
+        if (at == std::string::npos) return std::string();
+        const size_t w = log.find(" weights", at), c = log.rfind(", ", w);
+        return (w == std::string::npos || c == std::string::npos || c < at) ? std::string()
+                                                                            : log.substr(c + 2, w - c - 2);
+    };
+    Server plain;
+    REQUIRE(plain.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+    const std::vector<std::string> kArms[] = {
+        { "--spec-ngram", "4", "--no-prefix-cache" },
+        { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" } };
+    for (const std::vector<std::string>& arm : kArms) {
+        Server ng;
+        REQUIRE(ng.start(world().g31_df2, arm));
+        const std::string log = ng.output();
+        CHECK(has(log, "speculation: prompt lookup only (--spec-ngram 4) -- the container's draft head is left out"));
+        CHECK(!has(log, "'dflash2' proposes"));
+        CHECK(!has(log, "draft trees: asked"));
+        CHECK(!weights(log).empty());
+        CHECK_EQ(weights(log), weights(plain.output()));
+        int64_t drafted = 0, accepted = 0;
+        for (const std::vector<int32_t>* p : { &repetitive_prompt(), &edit }) {
+            const std::vector<int32_t> ta = tokens_of(post(plain.port, "/completion", completion(*p, 48)));
+            int status = 0;
+            const json b = post(ng.port, "/completion", completion(*p, 48), &status);
+            CHECK_EQ(status, 200);
+            const std::vector<int32_t> tb = tokens_of(b);
+            CHECK_EQ(ta.size(), (size_t)48);
+            if (ta != tb)
+                fprintf(stderr, "    g31_df2 %s plain %s\n    ngram %s\n", arm.size() > 3 ? arm[3].c_str() : "fixed",
+                        show(ta).c_str(), show(tb).c_str());
+            CHECK(ta == tb);
+            drafted += std::max<int64_t>(timing(b, "draft_n"), 0);
+            accepted += std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+        }
+        fprintf(stderr, "    g31_df2 lookup alone (%s): drafted %lld, accepted %lld\n",
+                arm.size() > 3 ? arm[3].c_str() : "fixed", (long long)drafted, (long long)accepted);
+        CHECK(drafted > 0);
+        CHECK_EQ(ng.stop(), 0);
+    }
+    CHECK_EQ(plain.stop(), 0);
+}
+
+/* Depth 0 beside a draft head (sched/draft.h): the adaptive window may choose to draft nothing and
+ * verify nothing where a measured plain step pays more, with probes at the drafting depth. It
+ * changes only what a step verifies, so greedy text equals one-token-a-step decoding: started from
+ * the environment with a probe every 2 cycles, so the head moves between 0 and its window within a
+ * reply; switched off and on again in process. GET /admin/fn4 reports it as the scheduler runs it,
+ * and the counters show the probes ran. DFlash2 drafts trees, which the hybrid cannot take (a tree
+ * is verified only on a step issued ahead): refused by name. */
+TEST(depth_zero_beside_a_draft_head_keeps_the_plain_text) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<int32_t> rnd = prompt_ids(61, 160);
+    const std::vector<const std::vector<int32_t>*> prompts = { &repetitive_prompt(), &edit, &rnd };
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const std::vector<int32_t>* p : prompts)
+            plain.push_back(tokens_of(post(s.port, "/completion", completion(*p, 48))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--draft-window", "adaptive",
+                                       "--no-prefix-cache" },
+                    { "RADIANCE_DRAFT_DEPTH0=1", "RADIANCE_DRAFT_PROBE=2" }));
+    CHECK(has(s.output(), "draft depth 0: a step drafts nothing and verifies nothing"));
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    const json g0 = fn4get();
+    CHECK_EQ(g0["switches"].value("draft_adaptive", -9), 1);
+    CHECK_EQ(g0["switches"].value("draft_depth0", -9), 1);
+    CHECK_EQ(g0["switches"].value("draft_probe", -9), 2);
+    CHECK_EQ(g0["switches"].value("draft_hybrid", -9), 0);
+    auto run_all = [&](const char* arm) {
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            int status = 0;
+            const std::vector<int32_t> got = tokens_of(post(s.port, "/completion", completion(*prompts[i], 48),
+                                                            &status));
+            CHECK_EQ(status, 200);
+            if (got != plain[i])
+                fprintf(stderr, "    %s prompt %zu\n    plain %s\n    got   %s\n", arm, i, show(plain[i]).c_str(),
+                        show(got).c_str());
+            CHECK(got == plain[i]);
+        }
+    };
+    run_all("depth0 (env)");
+    const json g1 = fn4get();
+    const int64_t probes = g1["draft"].value("probe_cycles", (int64_t)-1);
+    fprintf(stderr, "    g31_df2 depth 0: %lld cycles at 0, %lld probe cycles, %lld moves\n",
+            (long long)g1["draft"].value("zero_cycles", (int64_t)-1), (long long)probes,
+            (long long)g1["draft"].value("zero_moves", (int64_t)-1));
+    CHECK(probes > 0);
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "draft_depth0", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    run_all("depth0 off");
+    CHECK_EQ(fn4get()["switches"].value("draft_depth0", -9), 0);
+    (void)post(s.port, "/admin/fn4", json{ { "draft_depth0", 1 }, { "draft_probe", 3 } }, &st);
+    CHECK_EQ(st, 200);
+    run_all("depth0 on again");
+    CHECK_EQ(fn4get()["switches"].value("draft_depth0", -9), 1);
+    CHECK_EQ(fn4get()["switches"].value("draft_probe", -9), 3);
+    std::string body;
+    {
+        Call c;
+        st = c.send(s.port, "POST", "/admin/fn4", R"({"draft_hybrid":1})") ? c.read(&body) : -1;
+    }
+    CHECK_EQ(st, 400);
+    CHECK(has(body, "no draft head that drafts chains"));
+    CHECK_EQ(s.stop(), 0);
+}
+
+/* The depth-0 context skip (fn4 draft_ctxskip, core/engine_draft.cpp) beside DFlash2's windowed block
+ * drafter, under depth 0 forced (draft_depth0 2, a probe every 4 cycles): a plain step's context pass is
+ * skipped and its tapped rows kept, and the drafter's window is refilled from them before each probe.
+ * Greedy text equals one-token-a-step decoding with the skip on and off. Two fresh servers, the skip set
+ * up on (1) and off (0), run the same requests in the same order, so their probes fall on the same steps:
+ * every proposal the drafter publishes (-v, "proposes") is the same in both, i.e. the refilled window
+ * is the window the per-step context passes write; the counters show steps skipped and refills run in
+ * the first and none in the second, until the switch turns it on in process. Unset, nothing is set up:
+ * no log line, no "ctxskip" report, and 1 is refused. */
+TEST(the_depth_zero_context_skip_keeps_the_plain_text_and_the_drafters_window) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<int32_t> rnd = prompt_ids(61, 160);
+    const std::vector<const std::vector<int32_t>*> prompts = { &repetitive_prompt(), &edit, &rnd };
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const std::vector<int32_t>* p : prompts)
+            plain.push_back(tokens_of(post(s.port, "/completion", completion(*p, 64))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    const std::vector<std::string> args = { "--num-speculative-tokens", "7", "--draft-window", "adaptive",
+                                            "--no-prefix-cache", "-v" };
+    {
+        Server u;
+        REQUIRE(u.start(world().g31_df2, args, { "RADIANCE_DRAFT_DEPTH0=2", "RADIANCE_DRAFT_PROBE=4" }));
+        CHECK(!has(u.output(), "draft context skip"));
+        CHECK(has(u.output(), "draft depth 0 FORCED"));
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(u.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        CHECK(!has(out, "\"ctxskip\": {"));
+        int st = 0;
+        (void)post(u.port, "/admin/fn4", json{ { "draft_ctxskip", 1 } }, &st);
+        CHECK_EQ(st, 400);
+        CHECK_EQ(u.stop(), 0);
+    }
+    struct Arm { int64_t drafted = 0, accepted = 0, skipped = 0, refills = 0, rows = 0; std::string proposals; };
+    auto fn4get = [](Server& s) {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    auto proposals = [](const std::string& log, size_t from) {
+        std::string o;
+        size_t at = from;
+        for (;;) {
+            const size_t k = log.find(" proposes", at);
+            if (k == std::string::npos) break;
+            const size_t b = log.rfind('\n', k), e = log.find('\n', k);
+            const size_t s0 = log.find("sequence ", b == std::string::npos ? 0 : b);
+            o += log.substr(s0, (e == std::string::npos ? log.size() : e) - s0) + "\n";
+            at = k + 9;
+        }
+        return o;
+    };
+    auto run_all = [&](Server& s, const char* arm) {
+        const json a = fn4get(s);
+        const size_t from = s.output().size();
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            int status = 0;
+            const std::vector<int32_t> got = tokens_of(post(s.port, "/completion", completion(*prompts[i], 64),
+                                                            &status));
+            CHECK_EQ(status, 200);
+            if (got != plain[i])
+                fprintf(stderr, "    %s prompt %zu\n    plain %s\n    got   %s\n", arm, i, show(plain[i]).c_str(),
+                        show(got).c_str());
+            CHECK(got == plain[i]);
+        }
+        const json b = fn4get(s);
+        Arm r;
+        r.drafted  = b["accept"].value("head_drafted", (int64_t)0) - a["accept"].value("head_drafted", (int64_t)0);
+        r.accepted = b["accept"].value("head_accepted", (int64_t)0) - a["accept"].value("head_accepted", (int64_t)0);
+        if (b.contains("ctxskip")) {
+            r.skipped = b["ctxskip"].value("skipped_steps", (int64_t)0) - a["ctxskip"].value("skipped_steps", (int64_t)0);
+            r.refills = b["ctxskip"].value("refill_passes", (int64_t)0) - a["ctxskip"].value("refill_passes", (int64_t)0);
+            r.rows    = b["ctxskip"].value("refill_rows", (int64_t)0) - a["ctxskip"].value("refill_rows", (int64_t)0);
+        }
+        r.proposals = proposals(s.output(), from);
+        fprintf(stderr, "    g31_df2 %s: head drafted %lld, accepted %lld; context passes skipped %lld, refills %lld "
+                        "(%lld rows); %zu proposals\n", arm, (long long)r.drafted, (long long)r.accepted,
+                (long long)r.skipped, (long long)r.refills, (long long)r.rows,
+                (size_t)std::count(r.proposals.begin(), r.proposals.end(), '\n'));
+        return r;
+    };
+    Server s1;
+    REQUIRE(s1.start(world().g31_df2, args,
+                     { "RADIANCE_DRAFT_DEPTH0=2", "RADIANCE_DRAFT_PROBE=4", "RADIANCE_DRAFT_CTXSKIP=1" }));
+    CHECK(has(s1.output(), "draft context skip (RADIANCE_DRAFT_CTXSKIP=1"));
+    const json g0 = fn4get(s1);
+    CHECK_EQ(g0["switches"].value("draft_ctxskip", -9), 1);
+    CHECK_EQ(g0["switches"].value("draft_depth0", -9), 2);
+    CHECK_EQ(g0["ctxskip"].value("capable", -9), 1);
+    const Arm on = run_all(s1, "ctxskip 1");
+    CHECK(on.skipped > 0);
+    CHECK(on.refills > 0);
+    CHECK(on.rows > 0);
+    CHECK(on.drafted > 0);
+    CHECK_EQ(s1.stop(), 0);
+
+    Server s0;
+    REQUIRE(s0.start(world().g31_df2, args,
+                     { "RADIANCE_DRAFT_DEPTH0=2", "RADIANCE_DRAFT_PROBE=4", "RADIANCE_DRAFT_CTXSKIP=0" }));
+    CHECK(has(s0.output(), "draft context skip (RADIANCE_DRAFT_CTXSKIP=0"));
+    CHECK_EQ(fn4get(s0)["switches"].value("draft_ctxskip", -9), 0);
+    const Arm off = run_all(s0, "ctxskip 0");
+    CHECK_EQ(off.skipped, 0);
+    CHECK_EQ(off.refills, 0);
+    /* The same probes over the same text: the refilled window proposes what the per-step one did. Each
+     * proposal is the drafter's whole block whatever window the step then verifies (the adaptive D moves
+     * with measured step times, so the drafted counts may differ); with no draft accepted every step
+     * emits one token, so the probes fall on the same steps in both. */
+    CHECK(!on.proposals.empty());
+    if (on.accepted == 0 && off.accepted == 0) {
+        if (on.proposals != off.proposals)
+            fprintf(stderr, "    proposals differ:\n    on:\n%s    off:\n%s", on.proposals.substr(0, 2000).c_str(),
+                    off.proposals.substr(0, 2000).c_str());
+        CHECK(on.proposals == off.proposals);
+    } else {
+        fprintf(stderr, "    drafts were accepted (%lld / %lld): the probes may fall on other steps, proposals not "
+                        "compared\n", (long long)on.accepted, (long long)off.accepted);
+    }
+    /* In process: on, and back to measured depth 0. */
+    int st = 0;
+    (void)post(s0.port, "/admin/fn4", json{ { "draft_ctxskip", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    const Arm flip = run_all(s0, "ctxskip 0 -> 1");
+    CHECK(flip.skipped > 0);
+    CHECK_EQ(fn4get(s0)["switches"].value("draft_ctxskip", -9), 1);
+    (void)post(s0.port, "/admin/fn4", json{ { "draft_depth0", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    (void)run_all(s0, "ctxskip 1, depth0 1");
+    CHECK_EQ(fn4get(s0)["switches"].value("draft_depth0", -9), 1);
+    CHECK_EQ(s0.stop(), 0);
+}
+
+/* The runtime switches through a running server (POST /admin/fn4, runtime/fn4_switch.h): a change
+ * is queued, applied at the next step release with every rank parked, and moves the epoch the
+ * recorded passes are keyed by, so the passes before it are not played after it; the text stays
+ * the same across the changes. GET reports what is applied, from its owner: a server with no draft
+ * head reports the fixed window and refuses an adaptive one in the response; gg_gemv is libr4d's
+ * (-1 where no loaded object serves it), and a value it does not know (3) is refused. */
+TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
+    REQUIRE(world().ok);
+    Server s;
+    REQUIRE(s.start(world().qwen35, kPlain));
+    auto get = [&]() {
+        Call c;
+        std::string out;
+        const int st = c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1;
+        CHECK_EQ(st, 200);
+        return json::parse(out, nullptr, false);
+    };
+    const json req = completion(prompt_ids(71, 120), 32);
+    const json g0 = get();
+    CHECK_EQ(g0.value("epoch", -1), 0);
+    CHECK_EQ(g0.value("draft_capable", -9), 0);
+    CHECK_EQ(g0["switches"].value("draft_adaptive", -9), 0);
+    CHECK_EQ(g0["switches"].value("aql_acq", -9), 0);
+    const int gg0 = g0["switches"].value("gg_gemv", -9);
+    const bool gg = gg0 >= 0;   /* a loaded libr4d serves it */
+    CHECK(gg0 == -1 || gg0 == 0);
+    const std::vector<int32_t> a = tokens_of(post(s.port, "/completion", req));
+    int st = 0;
+    std::string body;
+    {
+        Call c;
+        st = c.send(s.port, "POST", "/admin/fn4", R"({"draft_adaptive":1})") ? c.read(&body) : -1;
+    }
+    CHECK_EQ(st, 400);
+    CHECK(has(body, "cannot run the adaptive window"));
+    (void)post(s.port, "/admin/fn4", json{ { "gg_gemv", 3 } }, &st);
+    CHECK_EQ(st, 400);
+    /* Depth 0 and the hybrid need a drafting head: refused here, reported off. */
+    (void)post(s.port, "/admin/fn4", json{ { "draft_depth0", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    (void)post(s.port, "/admin/fn4", json{ { "draft_hybrid", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    CHECK_EQ(g0["switches"].value("draft_depth0", -9), 0);
+    CHECK_EQ(g0["switches"].value("draft_hybrid", -9), 0);
+    CHECK_EQ(g0["switches"].value("draft_hybrid_match", -9), 8);
+    json on = { { "epoch_bump", 1 }, { "aql_acq", 1 } };
+    if (gg) on["gg_gemv"] = 1;
+    const json p = post(s.port, "/admin/fn4", on, &st);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(p["pending"].value("aql_acq", -9), 1);
+    const std::vector<int32_t> b = tokens_of(post(s.port, "/completion", req));
+    const json g1 = get();
+    CHECK_EQ(g1.value("epoch", -1), 1);
+    CHECK(g1.value("applied_step", -1) >= 0);
+    CHECK(g1["pending"].empty());
+    CHECK_EQ(g1["switches"].value("aql_acq", -9), 1);
+    CHECK_EQ(g1["switches"].value("gg_gemv", -9), gg ? 1 : -1);
+    json off = { { "aql_acq", 0 } };
+    if (gg) off["gg_gemv"] = 0;
+    (void)post(s.port, "/admin/fn4", off, &st);
+    CHECK_EQ(st, 200);
+    const std::vector<int32_t> c = tokens_of(post(s.port, "/completion", req));
+    const json g2 = get();
+    CHECK_EQ(g2.value("epoch", -1), 2);
+    CHECK_EQ(g2["switches"].value("aql_acq", -9), 0);
+    CHECK_EQ(g2["switches"].value("gg_gemv", -9), gg ? 0 : -1);
+    CHECK_EQ(a.size(), (size_t)32);
+    CHECK(a == b);
+    CHECK(a == c);
+    (void)post(s.port, "/admin/fn4", json{ { "no_such_switch", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(has(s.output(), "fn4: switches"));
+    fprintf(stderr, "    runtime switches: gg_gemv %s on this host\n", gg ? "served (libr4d loaded)" : "not served");
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;
@@ -2169,6 +2922,9 @@ TEST(preemption_by_recompute_continues_each_stream_exactly) {
     }
     std::vector<std::string> args = kPlain;
     for (const std::string& a : small_pool_args()) args.push_back(a);
+    /* This case exists to exercise preemption-by-recompute itself, so the fresh-room gate (which
+     * deliberately admits a whole prompt and avoids that preemption) is off here. */
+    args.push_back("--prefill-room-gate"); args.push_back("off");
     auto pool_at = [&](int mib) -> int64_t {
         Server probe;
         probe.quiet = true;
@@ -3177,6 +3933,464 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
         if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
             REQUIRE(tiny::write_text(output, s.output()));
     }
+}
+
+/* Lever DLW (ds41-dlw, 11.11.2026): rad-sidecar quantises some of a container's plain weights into a sidecar, and
+ * RADIANCE_WEIGHT_SIDECAR serves its entries in place of the container's. The sidecar of llama.rad's bf16 head under
+ * the int8 rule llama_i8head.rad was converted with must give exactly that container's numbers: the same quantiser
+ * over the same values writes the same planes, and the loader reads them from the sidecar into the same stored form.
+ * Refused: a rule over a quantised entry (rad-sidecar), a sidecar written from another container, an entry the
+ * container does not hold, one of another shape. */
+TEST(lever_dlw_weight_sidecar) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_dlw");
+    REQUIRE(d.ok());
+    const std::string rule = "output.weight=rtn:codes=i8,group=128,scale=bf16,clamp=sym";
+    std::string slog;
+    const int st = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "head_i8.rad", "--quant", rule }, engine_env(),
+                             &slog);
+    if (st != 0) fprintf(stderr, "    rad-sidecar exited %d:\n%s\n", st, tail(slog).c_str());
+    REQUIRE_EQ(st, 0);
+    CHECK(has(slog, "1 entries of llama.rad"));
+    std::string rlog;
+    const std::string ref = w.reference(w.llama_i8head, w.corpus_short, &rlog);
+    REQUIRE(!ref.empty());
+    std::vector<std::string> a = { "--kld-record", d / "s1", "--kld-corpus", w.corpus_short, "--max-num-batched-tokens",
+                                   "512", "--max-num-seqs", "1" };
+    Ran s1 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "head_i8.rad") });
+    REQUIRE_RAN(s1);
+    CHECK(has(s1.log, "weight sidecar: 1 entries"));
+    CHECK(has(s1.log, "read from the weight sidecar"));
+    std::string why;
+    const bool same = same_recording(ref, d / "s1", &why);
+    if (!same) fprintf(stderr, "    sidecar vs llama_i8head.rad: %s\n", why.c_str());
+    CHECK(same);
+    /* unset: llama.rad's own numbers, which differ from the int8 head's */
+    const std::string ref0 = w.reference(w.llama_rad, w.corpus_short, &rlog);
+    REQUIRE(!ref0.empty());
+    CHECK(!same_recording(ref0, d / "s1", &why));
+
+    /* a quantised entry is not quantised again */
+    const int st2 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad.rad", "--quant",
+                                "blk.0.attn_qkv.weight=rtn:codes=i8,group=128,scale=bf16" }, engine_env(), &slog);
+    CHECK(st2 != 0);
+    CHECK(has(slog, "not a quantised one again"));
+    /* tp8 loop P30 (b): under --requant the same entry (E4M3 codes, a bf16 scale a 128x128 block: affine planes) is decoded and
+     * quantised again by the rule -- here the rule it was converted with, so the sidecar holds the container's own codes and scales
+     * and the engine serves llama.rad's numbers exactly (a decode -> re-encode round trip at the same grid) */
+    const int st2r = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "requant.rad", "--requant", "--quant",
+                                 "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" }, engine_env(), &slog);
+    if (st2r != 0) fprintf(stderr, "    rad-sidecar --requant exited %d:\n%s\n", st2r, tail(slog).c_str());
+    CHECK_EQ(st2r, 0);
+    CHECK(has(slog, "1 entries of llama.rad"));
+    a[1] = d / "s1r";
+    Ran s1r = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "requant.rad") });
+    REQUIRE_RAN(s1r);
+    CHECK(has(s1r.log, "weight sidecar: 1 entries"));
+    {
+        const std::string refq = w.reference(w.llama_rad, w.corpus_short, &rlog);
+        REQUIRE(!refq.empty());
+        std::string whyq;
+        const bool sameq = same_recording(refq, d / "s1r", &whyq);
+        if (!sameq) fprintf(stderr, "    --requant round trip vs llama.rad: %s\n", whyq.c_str());
+        CHECK(sameq);
+    }
+    /* a sidecar written from another container (llama_mxfp4.rad's plain head) */
+    const int st3 = tiny::run({ RAD_E2E_SIDECAR, w.llama_mxfp4, "-o", d / "other.rad", "--quant", rule }, engine_env(),
+                              &slog);
+    REQUIRE_EQ(st3, 0);
+    a[1] = d / "s2";
+    Ran s2 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "other.rad") });
+    CHECK(s2.status != 0);
+    CHECK(has(s2.log, "a sidecar serves only the container rad-sidecar read"));
+    /* hand-made sidecars: an entry the container does not hold, and its head at another shape */
+    rad::RadFile f;
+    REQUIRE_EQ(f.open(w.llama_rad.c_str()), 0);
+    const RadFileEntry* head = f.find("output.weight");
+    REQUIRE(head != nullptr);
+    auto handmade = [&](const std::string& path, const std::string& name, int64_t rows) {
+        rad::RadWriter wr;
+        if (wr.begin(path.c_str()) != 0) return false;
+        wr.set_arch(f.str(f.header().arch_id));
+        wr.meta_i("sidecar.container_bytes", f.size());
+        rad::RadWriter::Weight ww;
+        ww.name = name;
+        ww.enc = rad_enc_plain(RAD_BF16);
+        ww.rank = 2;
+        ww.shape[0] = rows;
+        ww.shape[1] = head->shape[1];
+        std::vector<uint8_t> zeros((size_t)(rows * head->shape[1] * 2), 0);
+        const void* pl[1] = { zeros.data() };
+        if (wr.add_weight(ww, pl) < 0) { wr.abort(); return false; }
+        return wr.finish() == 0;
+    };
+    REQUIRE(handmade(d / "noname.rad", "no.such.weight", head->shape[0]));
+    a[1] = d / "s3";
+    Ran s3 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "noname.rad") });
+    CHECK(s3.status != 0);
+    CHECK(has(s3.log, "is not an entry of"));
+    REQUIRE(handmade(d / "reshape.rad", "output.weight", head->shape[0] / 2));
+    a[1] = d / "s4";
+    Ran s4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "reshape.rad") });
+    CHECK(s4.status != 0);
+    CHECK(has(s4.log, "it does not reshape it"));
+
+    /* tp8 loop P30 (b): --keep -- the engine opens ONE sidecar, and the pair already serves the drafter's DLW sidecar; a second
+     * set joins it as one file. head_i8.rad kept + the --requant round trip of blk.0.attn_qkv made beside it: the kept entry's
+     * planes are head_i8.rad's byte for byte, the made one is the container's own codes (the round trip above), so the engine
+     * serves exactly llama_i8head.rad's recording -- what head_i8.rad alone serves. */
+    const int st5 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "both.rad", "--requant", "--keep", d / "head_i8.rad",
+                                "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st5 != 0) fprintf(stderr, "    rad-sidecar --keep exited %d:\n%s\n", st5, tail(slog).c_str());
+    REQUIRE_EQ(st5, 0);
+    CHECK(has(slog, "1 entries kept from head_i8.rad"));
+    {
+        rad::RadFile kf, bf;
+        REQUIRE_EQ(kf.open((d / "head_i8.rad").c_str()), 0);
+        REQUIRE_EQ(bf.open((d / "both.rad").c_str()), 0);
+        CHECK_EQ(bf.entry_count(), (int64_t)2);
+        const RadFileEntry* ke = kf.find("output.weight");
+        const RadFileEntry* be = bf.find("output.weight");
+        REQUIRE(ke != nullptr);
+        REQUIRE(be != nullptr);
+        CHECK(bf.find("blk.0.attn_qkv.weight") != nullptr);
+        char e1[160], e2[160];
+        rad_enc_format(&kf.encoding(*ke), e1, sizeof e1);
+        rad_enc_format(&bf.encoding(*be), e2, sizeof e2);
+        CHECK_EQ(std::string(e1), std::string(e2));
+        CHECK_EQ(std::string(kf.str(ke->quantizer)), std::string(bf.str(be->quantizer)));
+        bool planes_same = ke->n_planes == be->n_planes;
+        for (uint32_t k = 0; planes_same && k < ke->n_planes; ++k) {
+            const RadFilePlane& p = kf.plane(*ke, (int)k);
+            const RadFilePlane& q = bf.plane(*be, (int)k);
+            planes_same = p.bytes == q.bytes && std::memcmp(kf.data(p), bf.data(q), (size_t)p.bytes) == 0;
+        }
+        CHECK(planes_same);
+        int64_t cb = -1;
+        CHECK(bf.get_i("sidecar.container_bytes", &cb));
+        CHECK_EQ(cb, (int64_t)f.size());
+    }
+    a[1] = d / "s5";
+    Ran s5 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both.rad") });
+    REQUIRE_RAN(s5);
+    CHECK(has(s5.log, "weight sidecar: 2 entries"));
+    {
+        std::string why5;
+        const bool same5 = same_recording(ref, d / "s5", &why5);
+        if (!same5) fprintf(stderr, "    --keep head_i8.rad + the qkv round trip vs llama_i8head.rad: %s\n", why5.c_str());
+        CHECK(same5);
+    }
+    /* refused: a kept sidecar of another container; an entry both kept and made */
+    const int st6 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad2.rad", "--requant", "--keep", d / "other.rad",
+                                "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    CHECK(st6 != 0);
+    CHECK(has(slog, "a kept sidecar must come from the container read here"));
+    const int st7 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad3.rad", "--keep", d / "head_i8.rad", "--quant",
+                                rule }, engine_env(), &slog);
+    CHECK(st7 != 0);
+    CHECK(has(slog, "an entry is kept or made, not both"));
+    /* tp8 loop P30o: --keep-only GLOB copies only the kept entries it matches (both.rad holds output.weight +
+     * blk.0.attn_qkv.weight): a glob that matches one keeps one, byte for byte; a glob that matches none keeps none (and the
+     * rule's own entry is written); the filter runs before the kept-or-made check, so a rule may make an entry the
+     * kept file holds when the glob leaves it out; --keep-only without --keep is refused */
+    const int st8 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "only.rad", "--requant", "--keep", d / "both.rad",
+                                "--keep-only", "output.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st8 != 0) fprintf(stderr, "    rad-sidecar --keep-only exited %d:\n%s\n", st8, tail(slog).c_str());
+    REQUIRE_EQ(st8, 0);
+    CHECK(has(slog, "1 entries kept from both.rad"));
+    {
+        rad::RadFile kf, of;
+        REQUIRE_EQ(kf.open((d / "both.rad").c_str()), 0);
+        REQUIRE_EQ(of.open((d / "only.rad").c_str()), 0);
+        CHECK_EQ(of.entry_count(), (int64_t)2);
+        CHECK(of.find("output.weight") != nullptr);
+        CHECK(of.find("blk.0.attn_qkv.weight") != nullptr);   /* made by the rule: the kept copy was filtered out first */
+        const RadFileEntry* ke = kf.find("output.weight");
+        const RadFileEntry* oe = of.find("output.weight");
+        bool same = ke && oe && ke->n_planes == oe->n_planes;
+        for (uint32_t k = 0; same && k < ke->n_planes; ++k) {
+            const RadFilePlane& p = kf.plane(*ke, (int)k);
+            const RadFilePlane& q = of.plane(*oe, (int)k);
+            same = p.bytes == q.bytes && std::memcmp(kf.data(p), of.data(q), (size_t)p.bytes) == 0;
+        }
+        CHECK(same);
+    }
+    const int st9 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "none.rad", "--requant", "--keep", d / "both.rad",
+                                "--keep-only", "nothing.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    REQUIRE_EQ(st9, 0);
+    {
+        rad::RadFile nf;
+        REQUIRE_EQ(nf.open((d / "none.rad").c_str()), 0);
+        CHECK_EQ(nf.entry_count(), (int64_t)1);
+    }
+    const int st10 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad4.rad", "--keep-only", "output.*", "--quant",
+                                 rule }, engine_env(), &slog);
+    CHECK(st10 != 0);
+    CHECK(has(slog, "--keep-only without --keep"));
+    /* --keep repeatable, no rule: only.rad narrowed to output.weight + none.rad's blk.0.attn_qkv (the same rule as both.rad's,
+     * so the same bytes) -> two.rad holds both.rad's two entries and the engine serves llama_i8head.rad's recording again; a
+     * name two kept files hold is refused */
+    const int st11 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "two.rad", "--keep", d / "only.rad", "--keep-only",
+                                 "output.*", "--keep", d / "none.rad" }, engine_env(), &slog);
+    if (st11 != 0) fprintf(stderr, "    rad-sidecar --keep x2 exited %d:\n%s\n", st11, tail(slog).c_str());
+    REQUIRE_EQ(st11, 0);
+    CHECK(has(slog, "2 entries kept from only.rad,none.rad"));
+    {
+        rad::RadFile tf;
+        REQUIRE_EQ(tf.open((d / "two.rad").c_str()), 0);
+        CHECK_EQ(tf.entry_count(), (int64_t)2);
+        CHECK(tf.find("output.weight") != nullptr);
+        CHECK(tf.find("blk.0.attn_qkv.weight") != nullptr);
+    }
+    a[1] = d / "s11";
+    Ran s11 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "two.rad") });
+    REQUIRE_RAN(s11);
+    {
+        std::string why11;
+        const bool same11 = same_recording(ref, d / "s11", &why11);
+        if (!same11) fprintf(stderr, "    --keep only.rad (output.*) + --keep none.rad vs llama_i8head.rad: %s\n", why11.c_str());
+        CHECK(same11);
+    }
+    const int st12 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad5.rad", "--keep", d / "only.rad", "--keep",
+                                 d / "none.rad" }, engine_env(), &slog);
+    CHECK(st12 != 0);
+    CHECK(has(slog, "an entry is kept once"));
+}
+
+/* tp8 loop P30t: a TWIN entry -- rad-sidecar --twin GLOB writes a matching entry (made or kept) as '<name>#pf', and the engine
+ * opens it BESIDE the container's <name> instead of in its place (checked against <name>'s rank and shape; both resident, an
+ * architecture that knows twins declares it as its own weight -- deepseek41 under RADIANCE_DS41_TWIN). The llama plugin
+ * declares no twin, so a twin sidecar leaves llama.rad's recording as it is; a made entry beside a kept twin is served as
+ * before. Refused: a twin whose base the container does not hold, a sidecar holding a name and its twin both. */
+TEST(p30t_twin_sidecar_entries_stand_beside_the_container) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_twin");
+    REQUIRE(d.ok());
+    const std::string rule = "output.weight=rtn:codes=i8,group=128,scale=bf16,clamp=sym";
+    std::string slog, rlog;
+    const int st = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "twin.rad", "--quant", rule, "--twin", "output.*" },
+                             engine_env(), &slog);
+    if (st != 0) fprintf(stderr, "    rad-sidecar --twin exited %d:\n%s\n", st, tail(slog).c_str());
+    REQUIRE_EQ(st, 0);
+    CHECK(has(slog, "output.weight#pf"));
+    rad::RadFile f;
+    REQUIRE_EQ(f.open(w.llama_rad.c_str()), 0);
+    const RadFileEntry* head = f.find("output.weight");
+    REQUIRE(head != nullptr);
+    {
+        rad::RadFile tf;
+        REQUIRE_EQ(tf.open((d / "twin.rad").c_str()), 0);
+        CHECK_EQ(tf.entry_count(), (int64_t)1);
+        CHECK(tf.find("output.weight") == nullptr);
+        const RadFileEntry* te = tf.find("output.weight#pf");
+        REQUIRE(te != nullptr);
+        CHECK_EQ(te->rank, head->rank);
+        CHECK_EQ(te->shape[0], head->shape[0]);
+        CHECK_EQ(te->shape[1], head->shape[1]);
+        CHECK_EQ(std::string(tf.encoding(*te).scheme), std::string("affine"));
+        CHECK_EQ(std::string(tf.get_s("sidecar.twin", "")), std::string("output.*"));
+    }
+    const std::string ref0 = w.reference(w.llama_rad, w.corpus_short, &rlog);
+    REQUIRE(!ref0.empty());
+    std::vector<std::string> a = { "--kld-record", d / "t1", "--kld-corpus", w.corpus_short, "--max-num-batched-tokens",
+                                   "512", "--max-num-seqs", "1" };
+    Ran t1 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "twin.rad") });
+    REQUIRE_RAN(t1);
+    CHECK(has(t1.log, "1 twin(s) '<name>#pf'"));
+    {
+        std::string why;
+        const bool same = same_recording(ref0, d / "t1", &why);
+        if (!same) fprintf(stderr, "    a twin sidecar (unused by llama) vs llama.rad: %s\n", why.c_str());
+        CHECK(same);
+    }
+    /* a kept entry twinned (twin.rad's verbatim, the name kept) beside a made entry in its place: the made one is the --requant
+     * round trip of blk.0.attn_qkv (the container's own codes), so the engine serves llama.rad's numbers */
+    const int st2 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "mix.rad", "--requant", "--keep", d / "twin.rad",
+                                "--twin", "output.*", "--quant", "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st2 != 0) fprintf(stderr, "    rad-sidecar --keep --twin exited %d:\n%s\n", st2, tail(slog).c_str());
+    REQUIRE_EQ(st2, 0);
+    {
+        rad::RadFile mf;
+        REQUIRE_EQ(mf.open((d / "mix.rad").c_str()), 0);
+        CHECK_EQ(mf.entry_count(), (int64_t)2);
+        CHECK(mf.find("output.weight#pf") != nullptr);
+        CHECK(mf.find("output.weight") == nullptr);
+        CHECK(mf.find("blk.0.attn_qkv.weight") != nullptr);
+    }
+    a[1] = d / "t2";
+    Ran t2 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "mix.rad") });
+    REQUIRE_RAN(t2);
+    CHECK(has(t2.log, "weight sidecar: 2 entries"));
+    CHECK(has(t2.log, "1 twin(s) '<name>#pf'"));
+    {
+        std::string why;
+        const bool same = same_recording(ref0, d / "t2", &why);
+        if (!same) fprintf(stderr, "    a kept twin + the qkv round trip vs llama.rad: %s\n", why.c_str());
+        CHECK(same);
+    }
+    /* refused at open: a twin of a name the container does not hold; a name and its twin both */
+    auto handmade = [&](const std::string& path, const std::vector<std::string>& names) {
+        rad::RadWriter wr;
+        if (wr.begin(path.c_str()) != 0) return false;
+        wr.set_arch(f.str(f.header().arch_id));
+        wr.meta_i("sidecar.container_bytes", f.size());
+        std::vector<uint8_t> zeros((size_t)(head->shape[0] * head->shape[1] * 2), 0);
+        for (const std::string& n : names) {
+            rad::RadWriter::Weight ww;
+            ww.name = n;
+            ww.enc = rad_enc_plain(RAD_BF16);
+            ww.rank = 2;
+            ww.shape[0] = head->shape[0];
+            ww.shape[1] = head->shape[1];
+            const void* pl[1] = { zeros.data() };
+            if (wr.add_weight(ww, pl) < 0) { wr.abort(); return false; }
+        }
+        return wr.finish() == 0;
+    };
+    REQUIRE(handmade(d / "nobase.rad", { "no.such.weight#pf" }));
+    a[1] = d / "t3";
+    Ran t3 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "nobase.rad") });
+    CHECK(t3.status != 0);
+    CHECK(has(t3.log, "'no.such.weight' is not an entry of"));
+    REQUIRE(handmade(d / "both.rad", { "output.weight", "output.weight#pf" }));
+    a[1] = d / "t4";
+    Ran t4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both.rad") });
+    CHECK(t4.status != 0);
+    CHECK(has(t4.log, "a weight is replaced or twinned, not both"));
+}
+
+/* ================================================================== lever G: the tail grid (ds41-tailgrid) */
+/* fn4 sched_tail_grid (RADIANCE_SCHED_TAIL_GRID at start) on the tiny hybrid (gated delta net: linear state, its conv
+ * state and attention; the reference kernels), in the DS line's geometry scaled by four: --checkpoint-interval 512,
+ * --prefill-span 2, --max-num-batched-tokens 1088 -- the resume grid 512 + k x 1024 -- and F = 256. A conversation: a
+ * cold text, then two turns that each extend the previous prompt, then a repeat. Under the lever every request resumes
+ * at the previous prompt's FINE tail (the deepest multiple of 256 at or below N - 128), off the resume grid, from the
+ * snapshot the earlier request took there in the middle of its last cold chunk; with the switch at 0 at the grid point.
+ * Every reply and every probability in it equals a cold run's of the same prompt (a server without a prefix cache), under
+ * the lever and without it -- the cold text under the lever too (its last chunk is cut at the tail). The reference
+ * kernels round a row the same in any chunk, so this proves the STATE a fine snapshot restores (linear, conv, the blocks
+ * adopted below it), not the cards' form bands. */
+TEST(lever_g_a_turn_resumed_at_a_fine_tail_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    std::vector<int32_t> a = prompt_ids(61, 2000), b = a, c;
+    for (int32_t t : prompt_ids(62, 500)) b.push_back(t);
+    c = b;
+    for (int32_t t : prompt_ids(63, 700)) c.push_back(t);
+    const std::vector<std::string> geo = { "--num-speculative-tokens", "0", "--checkpoint-interval", "512",
+                                           "--prefill-span", "2", "--max-num-batched-tokens", "1088",
+                                           "--max-num-seqs", "2" };
+    const auto grid = [](int64_t p) { return p < 512 ? (int64_t)0 : 512 + (p - 512) / 1024 * 1024; };
+    const auto tail = [&](int64_t N, int64_t F) {
+        const int64_t g = grid(N - 1), f = F > 0 && N > 128 ? (N - 128) / F * F : 0;
+        return f > g && f > 512 ? f : g;
+    };
+    const int64_t Na = (int64_t)a.size(), Nb = (int64_t)b.size(), Nc = (int64_t)c.size();
+    /* the lengths this test is about: each prompt's fine tail off the grid, each turn past the previous tail */
+    REQUIRE(tail(Na, 256) > tail(Na, 0) && tail(Nb, 256) > tail(Nb, 0) && tail(Nc, 256) > tail(Nc, 0));
+    REQUIRE(tail(Na, 256) % 1024 != 512 && tail(Nb, 256) > tail(Na, 256) && tail(Nc, 256) > tail(Nb, 256));
+    std::vector<json> cold;
+    for (const std::vector<int32_t>* p : { &a, &b, &c }) {
+        Server s;
+        std::vector<std::string> args = geo;
+        args.push_back("--no-prefix-cache");
+        REQUIRE(s.start(world().qwen35, args));
+        cold.push_back(post(s.port, "/completion", completion(*p, 24, 0.0, 0, 3)));
+        CHECK_EQ(s.stop(), 0);
+        REQUIRE(cold.back().contains("completion_probabilities"));
+        CHECK_EQ(tokens_of(cold.back()).size(), (size_t)24);
+    }
+    for (int F : { 256, 0 }) {
+        Server s;
+        REQUIRE(s.start(world().qwen35, geo,
+                        F ? std::vector<std::string>{ "RADIANCE_SCHED_TAIL_GRID=" + std::to_string(F) }
+                          : std::vector<std::string>{}));
+        const json ra = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+        const json rb = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+        const json rc = post(s.port, "/completion", completion(c, 24, 0.0, 0, 3));
+        const json again = post(s.port, "/completion", completion(c, 24, 0.0, 0, 3));
+        const int64_t ca = timing(ra, "cache_n"), cb = timing(rb, "cache_n"), cc = timing(rc, "cache_n"),
+                      c2 = timing(again, "cache_n");
+        const bool same = tokens_of(ra) == tokens_of(cold[0]) && tokens_of(rb) == tokens_of(cold[1]) &&
+                          tokens_of(rc) == tokens_of(cold[2]) && tokens_of(again) == tokens_of(cold[2]) &&
+                          ra["completion_probabilities"] == cold[0]["completion_probabilities"] &&
+                          rb["completion_probabilities"] == cold[1]["completion_probabilities"] &&
+                          rc["completion_probabilities"] == cold[2]["completion_probabilities"] &&
+                          again["completion_probabilities"] == cold[2]["completion_probabilities"];
+        if (!(same && cb == tail(Na, F) && cc == tail(Nb, F) && c2 == tail(Nc, F)))
+            fprintf(stderr, "    sched_tail_grid %d: prompts %lld / %lld / %lld, cached %lld / %lld / %lld / %lld (want 0 / %lld / "
+                            "%lld / %lld), %s a cold run's\n", F, (long long)Na, (long long)Nb, (long long)Nc, (long long)ca,
+                    (long long)cb, (long long)cc, (long long)c2, (long long)tail(Na, F), (long long)tail(Nb, F),
+                    (long long)tail(Nc, F), same ? "equal to" : "NOT equal to");
+        CHECK(ca <= 0);
+        CHECK_EQ(cb, tail(Na, F));      /* the previous prompt's tail: fine under the lever, the grid point without */
+        CHECK_EQ(cc, tail(Nb, F));
+        CHECK_EQ(c2, tail(Nc, F));
+        CHECK(same);
+        CHECK_EQ(s.stop(), 0);
+        if (F) CHECK(s.log.find("lever G (fn4 sched_tail_grid 256") != std::string::npos);
+        else   CHECK(s.log.find("lever G (fn4 sched_tail_grid") == std::string::npos);   /* lever TI's start line names lever G whatever the grid */
+    }
+}
+
+/* tp8 loop P21 (b): sched_tail_grid 128 on the same tiny hybrid and geometry as above. The prompts are cut so that the fine
+ * tails are ODD multiples of 128 (no 256 grid holds them): 2,100 -> 1,920 and 3,100 -> 2,944 rows (F 256: 1,792 / 2,816), both
+ * past their resume grid points (1,536 / 2,560). A cold text, its extension and that again: every reply and every probability
+ * equals a cold run's (a server without a prefix cache), and each turn resumes at the previous prompt's fine tail -- the
+ * linear, conv and attention state a snapshot at a 128 multiple restores. */
+TEST(lever_g_at_128_resumes_at_an_odd_multiple_and_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    std::vector<int32_t> a = prompt_ids(71, 2100);   /* (words -> byte ids: cut to the lengths the tails are about) */
+    REQUIRE(a.size() >= 2100);
+    a.resize(2100);
+    std::vector<int32_t> b = a;
+    for (int32_t t : prompt_ids(72, 1000)) b.push_back(t);
+    REQUIRE(b.size() >= 3100);
+    b.resize(3100);
+    const std::vector<std::string> geo = { "--num-speculative-tokens", "0", "--checkpoint-interval", "512",
+                                           "--prefill-span", "2", "--max-num-batched-tokens", "1088",
+                                           "--max-num-seqs", "2" };
+    const int64_t ta = ((int64_t)a.size() - 128) / 128 * 128, tb = ((int64_t)b.size() - 128) / 128 * 128;
+    REQUIRE_EQ(ta, (int64_t)1920);
+    REQUIRE_EQ(tb, (int64_t)2944);
+    REQUIRE((ta / 128) % 2 == 1 && (tb / 128) % 2 == 1);
+    std::vector<json> cold;
+    for (const std::vector<int32_t>* p : { &a, &b }) {
+        Server s;
+        std::vector<std::string> args = geo;
+        args.push_back("--no-prefix-cache");
+        REQUIRE(s.start(world().qwen35, args));
+        cold.push_back(post(s.port, "/completion", completion(*p, 24, 0.0, 0, 3)));
+        CHECK_EQ(s.stop(), 0);
+        REQUIRE(cold.back().contains("completion_probabilities"));
+        CHECK_EQ(tokens_of(cold.back()).size(), (size_t)24);
+    }
+    Server s;
+    REQUIRE(s.start(world().qwen35, geo, std::vector<std::string>{ "RADIANCE_SCHED_TAIL_GRID=128" }));
+    const json ra = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+    const json rb = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    const json again = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    const int64_t ca = timing(ra, "cache_n"), cb = timing(rb, "cache_n"), c2 = timing(again, "cache_n");
+    const bool same = tokens_of(ra) == tokens_of(cold[0]) && tokens_of(rb) == tokens_of(cold[1]) &&
+                      tokens_of(again) == tokens_of(cold[1]) &&
+                      ra["completion_probabilities"] == cold[0]["completion_probabilities"] &&
+                      rb["completion_probabilities"] == cold[1]["completion_probabilities"] &&
+                      again["completion_probabilities"] == cold[1]["completion_probabilities"];
+    fprintf(stderr, "    sched_tail_grid 128: prompts %zu / %zu, cached %lld / %lld / %lld (want 0 / %lld / %lld), %s a cold run's\n",
+            a.size(), b.size(), (long long)ca, (long long)cb, (long long)c2, (long long)ta, (long long)tb,
+            same ? "equal to" : "NOT equal to");
+    CHECK(ca <= 0);
+    CHECK_EQ(cb, ta);
+    CHECK_EQ(c2, tb);
+    CHECK(same);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(s.log.find("lever G (fn4 sched_tail_grid 128") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

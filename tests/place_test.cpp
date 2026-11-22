@@ -446,6 +446,77 @@ TEST(the_expert_floor_places_every_expert) {
     CHECK(!q.unfit.empty());
 }
 
+/* Lever VA "shadow": RADIANCE_PLACE_SHADOW_SLOTS sets the shadow slots a class gets (8..32; unset or
+ * out of range the shipped 32), and every place that counts them agrees -- the expert floor's spare
+ * (weight_footprint) shrinks by the difference times each class's stride, and the plan gives each
+ * class min(count, residents / 4). Unset is the shipped arithmetic exactly. */
+TEST(the_shadow_slot_count_is_a_start_switch_every_counter_reads) {
+    Fixture f;
+    const rad_weight m = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {m}, false);
+    for (int l = 0; l < 8; ++l) {
+        const int64_t gu = l < 4 ? 600 * KiB : 1 * MiB, dn = l < 4 ? 300 * KiB : 500 * KiB;
+        std::vector<rad_weight> g, d;
+        for (int e = 0; e < 160; ++e) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            g.push_back(f.weight(b + "ffn_gate_up_exps." + std::to_string(e) + ".weight", gu,
+                                 RAD_ACCESS_CONDITIONAL, l, e));
+            d.push_back(f.weight(b + "ffn_down_exps." + std::to_string(e) + ".weight", dn,
+                                 RAD_ACCESS_CONDITIONAL, l, e));
+        }
+        f.op("moe_gemm", g, false);
+        f.op("moe_gemm", d, false);
+    }
+    auto spare_at = [&](const char* v) {
+        if (v) setenv("RADIANCE_PLACE_SHADOW_SLOTS", v, 1);
+        else unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+        WeightFootprint wf;
+        weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+        return wf.expert_spare;
+    };
+    unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+    CHECK_EQ(place_shadow_slots(), RAD_PLACE_SHADOW_SLOTS);
+    const int64_t s32 = spare_at(nullptr), s16 = spare_at("16"), s8 = spare_at("8");
+    CHECK_EQ(place_shadow_slots(), 8);
+    CHECK_EQ(spare_at("32"), s32);
+    CHECK_EQ(spare_at("7"), s32);        /* out of range: the shipped count */
+    CHECK_EQ(spare_at("33"), s32);
+    CHECK_EQ(spare_at("x"), s32);
+    /* Two classes (two strides): 16 fewer slots each, then 8 more fewer. */
+    CHECK(s32 > s16 && s16 > s8);
+    CHECK_EQ(s32 - s16, 2 * (s16 - s8));
+
+    /* The plan: two classes of 4 x 160 = 640 experts, three quarters of the experts' bytes resident
+     * (at least 128 of either class whichever fills first), each take min(count, residents / 4) =
+     * the count shadow slots. */
+    auto plan_at = [&](const char* v, Plan* p) {
+        if (v) setenv("RADIANCE_PLACE_SHADOW_SLOTS", v, 1);
+        else unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+        WeightFootprint wf;
+        weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = (wf.statics + wf.experts * 3 / 4 + wf.expert_spare) / MiB;
+        c.host_pool_mib = 4096;
+        PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+        return Planner(in).plan(p);
+    };
+    for (const char* v : { (const char*)nullptr, "16", "8" }) {
+        Plan p;
+        CHECK_OK(plan_at(v, &p));
+        const int64_t want = v ? std::atoll(v) : RAD_PLACE_SHADOW_SLOTS;
+        int dyn = 0;
+        for (const SlabClass& sc : p.classes)
+            if (sc.n_shadow > 0) {
+                ++dyn;
+                CHECK_EQ(sc.n_shadow, want);
+            }
+        CHECK(p.dynamic);
+        CHECK_EQ(dyn, 2);
+    }
+    unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+}
+
 TEST(planner_warm_starts_from_the_container_profile) {
     Fixture f;
     std::vector<rad_weight> ex;
@@ -723,6 +794,122 @@ TEST(heat_caps_what_one_histogram_credits) {
     h.observe_ids(0, small_ids, small, 1);
     CHECK_EQ(h.heat(c), 12.0f);
     CHECK(std::fabs(h.heat(a) - 400.0f * hp.decay) < 1e-3f);
+}
+
+/* A step with prefill rows counts as a share of a step (HeatParams::prefill_share): its decay is
+ * decay^share and its credit is scaled by the share. Share 0 leaves every heat where the decode
+ * steps left it and still prices the routing; share 1 is the plain step, bit for bit. */
+TEST(heat_credits_a_prefill_step_at_its_share) {
+    HeatFixture hf;
+    HeatEngine h, plain;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK_OK(plain.init(hf.plan, hp));
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5);
+
+    int32_t dec[8] = {0, 0, 0, 0, 10, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f);
+    plain.observe(0, dec, 8);
+    CHECK_EQ(h.heat(a), plain.heat(a));
+    CHECK_EQ(h.heat(a), 10.0f);
+
+    /* A prefill chunk at share 0: nothing decays, nothing is credited, the routing is counted. */
+    const uint64_t routed = h.stats().routed;
+    int32_t pf[8] = {0, 0, 0, 0, 0, 300, 0, 0};
+    h.observe(0, pf, 8, 1.0f, 0.0f);
+    CHECK_EQ(h.heat(a), 10.0f);
+    CHECK_EQ(h.heat(b), 0.0f);
+    CHECK_EQ(h.stats().routed, routed + 1);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    for (const Swap& s : sw) CHECK(s.promote != b);
+    for (const Swap& s : sw) h.abandon(s);
+
+    /* Share 0.5, under the cap: half the credit and half a step's decay. */
+    int32_t half[8] = {0, 0, 0, 0, 0, 8, 0, 0};
+    h.observe(0, half, 8, 1.0f, 0.5f);
+    CHECK(std::fabs(h.heat(a) - 10.0f * std::pow(hp.decay, 0.5f)) < 1e-4f);
+    CHECK(std::fabs(h.heat(b) - 4.0f) < 1e-5f);
+
+    /* The engine's share of a step's rows. */
+    CHECK_EQ(heat_step_share(1.0f, 8192, 0), 1.0f);
+    CHECK_EQ(heat_step_share(0.0f, 8192, 0), 0.0f);
+    CHECK_EQ(heat_step_share(0.0f, 4, 4), 1.0f);
+    CHECK_EQ(heat_step_share(0.0f, 0, 0), 1.0f);
+    CHECK(std::fabs(heat_step_share(0.0f, 8192, 3) - 3.0f / 8192.0f) < 1e-7f);
+    CHECK(std::fabs(heat_step_share(0.25f, 100, 20) - 0.4f) < 1e-6f);
+}
+
+/* Dual heat (HeatParams::prefill_decay): decode rows credit the decode heat, prefill rows a prefill
+ * heat that decays by prefill_decay at every credited step; the ranking reads their sum. A prompt
+ * leaves the decode heat as it found it, and its own heat is gone a few steps after it. */
+TEST(heat_dual_keeps_the_decode_heat_through_a_prompt) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK(h.dual());
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5);
+
+    int32_t dec[8] = {0, 0, 0, 0, 10, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f);                 /* a decode step */
+    CHECK_EQ(h.heat(a), 10.0f);
+
+    int32_t pf[8] = {0, 0, 0, 0, 0, 100, 0, 0};
+    h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f);                  /* a prefill step: decode heat untouched */
+    CHECK_EQ(h.heat(a), 10.0f);
+    CHECK_EQ(h.heat(b), 100.0f);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    bool b_in = false;
+    for (const Swap& s : sw) { b_in = b_in || s.promote == b; h.abandon(s); }
+    CHECK(b_in);                                             /* the prompt's expert comes in */
+
+    int32_t other[8] = {0, 0, 0, 0, 0, 0, 1, 0};
+    for (int k = 0; k < 3; ++k) h.observe(0, other, 8, 1.0f, 1.0f, 0.0f);
+    CHECK(std::fabs(h.heat(b) - 100.0f * 0.125f) < 1e-3f);   /* 0.5^3 */
+    CHECK(std::fabs(h.heat(a) - 10.0f * hp.decay * hp.decay * hp.decay) < 1e-4f);
+
+    /* A mixed step: a quarter decode rows. */
+    int32_t mix[8] = {0, 0, 0, 0, 8, 0, 0, 0};
+    const float before_a = h.heat(a), before_b = h.heat(b);
+    h.observe(0, mix, 8, 1.0f, 0.25f, 0.75f);
+    const float hd = (before_a) * std::pow(hp.decay, 0.25f) + 8.0f * 0.25f;   /* expert 4: decode part */
+    CHECK(std::fabs(h.heat(a) - (hd + 8.0f * 0.75f)) < 1e-3f);
+    CHECK(std::fabs(h.heat(b) - before_b * 0.5f) < 1e-3f);
+}
+
+/* HeatParams::decode_pin: under dual heat the decode-hottest residents are no promotion's victim, so
+ * a prompt takes only the rest of the resident set. Fixture: experts 0-3 resident, 4-7 pooled. */
+TEST(heat_decode_pin_keeps_the_decode_core_through_a_prompt) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.7f;
+    hp.decode_pin = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    std::vector<Swap> sw;
+    /* Decode heat on residents 0 and 1 (hot) and 2 (warm); 3 stays cold. */
+    int32_t dec[8] = {4, 3, 1, 0, 0, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f);
+    CHECK_OK(h.step(&sw));                     /* takes the thresholds: the top half of 4 = 0 and 1 */
+    for (const Swap& s : sw) h.abandon(s);
+    /* A prompt routes heavily to all four pooled experts. */
+    int32_t pf[8] = {0, 0, 0, 0, 60, 50, 40, 30};
+    h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f);
+    CHECK_OK(h.step(&sw));
+    const int32_t e0 = hf.unit_of_expert(0), e1 = hf.unit_of_expert(1);
+    const int32_t e2 = hf.unit_of_expert(2), e3 = hf.unit_of_expert(3);
+    bool demoted0 = false, demoted1 = false, demoted2 = false, demoted3 = false;
+    for (const Swap& s : sw) {
+        demoted0 = demoted0 || s.demote == e0; demoted1 = demoted1 || s.demote == e1;
+        demoted2 = demoted2 || s.demote == e2; demoted3 = demoted3 || s.demote == e3;
+        h.abandon(s);
+    }
+    CHECK(!demoted0 && !demoted1);             /* the decode core stays */
+    CHECK(demoted2 && demoted3);               /* the rest goes to the prompt */
+    CHECK_EQ(sw.size(), (size_t)2);
 }
 
 TEST(heat_respects_the_move_budget) {
@@ -2545,6 +2732,374 @@ TEST(a_recall_takes_the_slots_back_before_it_returns) {
     CHECK(resident_count(r.h, r.hf.plan) > r.planned);
 }
 
+/* ---- lever DL: the drafter's expert slab, lent to the trunk while the drafter does not draft. Two trunk
+ * layers of eight 1 MiB experts and a drafter layer of four 2 MiB experts (a stride of its own, so a class
+ * of its own), the drafter's hot enough to be resident; every unit carries its own byte pattern. Lent, the
+ * drafter's units are read at their host copies and pooled trunk units fill its slab; recalled, the trunk
+ * units leave and the drafter's are copied back, every byte the same throughout and no byte shared. */
+namespace {
+struct DraftLendRig {
+    static constexpr int kL = 2, kE = 8, kD = 4;
+    Fixture     f;
+    Plan        plan;
+    Config      cfg;
+    HeatEngine  h;
+    Mover       m;
+    RadStream   compute = nullptr;
+    ComputeWork work;
+    int         d = 0;
+    std::vector<int32_t> drafter, trunk, statics;
+    std::vector<std::vector<uint8_t>> want;   /* by unit: its bytes */
+    const char* lo = nullptr;                  /* the drafter's slab, [lo, hi) */
+    const char* hi = nullptr;
+
+    /* dense: lever Z0-W's case -- the drafter's own static weights beside its experts (a block's q_b and attn_kv,
+     * the walk's and the context pass's model-level ones) and a trunk layer's, all placed statically. */
+    explicit DraftLendRig(int32_t keep_from = kL, int vram_mib = 24, bool dense = false) {
+        const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("embed", {emb}, false);
+        if (dense) {
+            f.op("trunk_dense", { f.weight("blk.0.attn_q_b.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, 0, -1) }, false);
+            f.op("draft_dense", { f.weight("blk." + std::to_string(kL) + ".attn_q_b.weight", 3 * MiB, RAD_ACCESS_PER_TOKEN, kL, -1),
+                                  f.weight("blk." + std::to_string(kL) + ".attn_kv.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, kL, -1),
+                                  f.weight("blk." + std::to_string(kL) + ".attn_output_b.weight", 2 * MiB, RAD_ACCESS_PER_TOKEN, kL, -1) },
+                 false);
+            f.op("draft_model", { f.weight("dspark.fc.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, -1, -1),
+                                  f.weight("dspark.markov_w1.weight", 2 * MiB, RAD_ACCESS_PER_TOKEN, -1, -1) }, false);
+        }
+        for (int l = 0; l < kL; ++l) {
+            std::vector<rad_weight> g;
+            for (int e = 0; e < kE; ++e)
+                g.push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                     1 * MiB, RAD_ACCESS_CONDITIONAL, l, e));
+            f.op("moe" + std::to_string(l), g, false);
+        }
+        std::vector<rad_weight> dg;
+        for (int e = 0; e < kD; ++e)
+            dg.push_back(f.weight("blk." + std::to_string(kL) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                  2 * MiB, RAD_ACCESS_CONDITIONAL, kL, e));
+        f.op("moe_draft", dg, false);
+        cfg = base_config();
+        cfg.placement = "expert_tiered";
+        cfg.vram_weights_mib = vram_mib;
+        cfg.host_pool_mib = 64;
+        std::vector<RadFileProfile> prof;
+        for (int e = 0; e < kD; ++e) prof.push_back(RadFileProfile{kL, e, 0.9f, 0.0f});
+        for (int l = 0; l < kL; ++l)
+            for (int e = 0; e < kE; ++e) prof.push_back(RadFileProfile{l, e, 0.1f - 0.01f * (float)e, 0.0f});
+        PlannerInput in{&f.prog, &cfg, 0, 1, prof.data(), (int64_t)prof.size()};
+        (void)Planner(in).plan(&plan);
+        keep = keep_from;
+    }
+    int32_t keep = kL;
+    ~DraftLendRig() { if (compute) { rad_stream_sync(compute); rad_stream_destroy(compute); } }
+
+    char* addr(int32_t u) {
+        const MoveUnit& mu = plan.units[(size_t)u];
+        return (char*)m.residency()->lookup(mu.weights.front())->ptr - mu.offset.front();
+    }
+    int build() {
+        HeatParams hp;
+        RAD_TRY(h.init(plan, hp));
+        MoverConfig mc;
+        mc.turnover_slots = 0;
+        mc.draft_keep_from = keep;
+        RAD_TRY(m.init(f.prog, plan, mc));
+        RAD_TRY(rad_stream_create(&compute, 0));
+        RAD_TRY(m.bind_compute_stream(compute));
+        /* The load: each routed unit's own pattern where it was published (and, dense, each static unit's). */
+        want.assign(plan.units.size(), {});
+        for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
+            const MoveUnit& mu = plan.units[(size_t)u];
+            if (mu.expert < 0) {
+                if (mu.tier != Tier::VRAM || mu.slab_slot >= 0) continue;
+                statics.push_back(u);
+                want[(size_t)u].resize((size_t)mu.bytes);
+                for (size_t i = 0; i < want[(size_t)u].size(); ++i)
+                    want[(size_t)u][i] = (uint8_t)(u * 77 + i * 13 + (i >> 11));
+                RAD_TRY(rad_memcpy_async(addr(u), want[(size_t)u].data(), mu.bytes, compute));
+                continue;
+            }
+            (mu.layer >= kL ? drafter : trunk).push_back(u);
+            want[(size_t)u].resize((size_t)mu.bytes);
+            for (size_t i = 0; i < want[(size_t)u].size(); ++i)
+                want[(size_t)u][i] = (uint8_t)(u * 131 + i * 7 + (i >> 12));
+            RAD_TRY(rad_memcpy_async(addr(u), want[(size_t)u].data(), mu.bytes, compute));
+        }
+        RAD_TRY(rad_stream_sync(compute));
+        lo = nullptr;
+        for (int32_t u : drafter)
+            if (h.tier(u) == Tier::VRAM && (!lo || addr(u) < lo)) lo = addr(u);
+        RAD_TRY(m.draft_lend_setup());
+        hi = lo ? lo + m.draft_slab_bytes() : nullptr;
+        return RAD_OK;
+    }
+    int dispatch() {
+        RAD_TRY(m.begin_dispatch(d++, &h));
+        work.run(compute);
+        return m.balance(&h);
+    }
+    bool in_slab(int32_t u) { const char* p = addr(u); return lo && p >= lo && p < hi; }
+    /* Lever Z0-W: every static unit's bytes as loaded. */
+    bool statics_ok() {
+        rad_stream_sync(compute);
+        rad_stream_sync(m.transfer_stream());
+        for (int32_t u : statics)
+            if (std::memcmp(addr(u), want[(size_t)u].data(), want[(size_t)u].size()) != 0) return false;
+        return true;
+    }
+    /* Whether a trunk unit's bytes sit inside a static unit's. */
+    bool trunk_in_statics() {
+        for (int32_t t : trunk)
+            for (int32_t s : statics)
+                if (addr(t) >= addr(s) && addr(t) < addr(s) + plan.units[(size_t)s].bytes) return true;
+        return false;
+    }
+    /* Every routed unit's bytes as loaded, wherever it is published now. */
+    bool bytes_ok() {
+        rad_stream_sync(compute);
+        rad_stream_sync(m.transfer_stream());
+        for (int32_t u : drafter)
+            if (std::memcmp(addr(u), want[(size_t)u].data(), want[(size_t)u].size()) != 0) return false;
+        for (int32_t u : trunk)
+            if (std::memcmp(addr(u), want[(size_t)u].data(), want[(size_t)u].size()) != 0) return false;
+        return true;
+    }
+    /* No two routed units share a byte. */
+    bool disjoint() {
+        std::vector<std::pair<const char*, const char*>> sp;
+        for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u)
+            if (plan.units[(size_t)u].expert >= 0) sp.emplace_back(addr(u), addr(u) + plan.units[(size_t)u].bytes);
+        std::sort(sp.begin(), sp.end());
+        for (size_t i = 1; i < sp.size(); ++i)
+            if (sp[i].first < sp[i - 1].second) return false;
+        return true;
+    }
+    /* Dispatches until the lend is in `state` and every move has settled (a parked drafter unit stays
+     * busy on purpose). */
+    int drive(int state) {
+        for (Deadline dl; !dl.passed();) {
+            RAD_TRY(dispatch());
+            if (m.draft_lend_state() != state) continue;
+            bool busy = false;
+            for (int32_t u : trunk) busy = busy || h.busy(u);
+            if (state != Mover::kDlLent)
+                for (int32_t u : drafter) busy = busy || h.busy(u);
+            if (!busy) return RAD_OK;
+        }
+        return RAD_E_STATE;
+    }
+};
+}  /* namespace */
+
+TEST(the_drafters_slab_is_lent_to_the_trunk_and_taken_back_by_address) {
+    DraftLendRig r;
+    REQUIRE(r.plan.dynamic);
+    CHECK_OK(r.build());
+    REQUIRE(r.m.draft_lend_ready());
+    CHECK_EQ(r.m.draft_units(), (int64_t)DraftLendRig::kD);
+    CHECK_EQ(r.m.draft_resident(), (int64_t)DraftLendRig::kD);
+    CHECK(r.m.draft_keep_bytes() >= (int64_t)DraftLendRig::kD * 2 * MiB);
+    CHECK(r.m.draft_slab_bytes() >= (int64_t)DraftLendRig::kD * 2 * MiB);
+    for (int32_t u : r.drafter) CHECK(r.in_slab(u));
+    CHECK(r.bytes_ok());
+    const int32_t planned = resident_count(r.h, r.plan);
+
+    /* Not asked: nothing moves, nothing of the trunk enters the drafter's slab. */
+    for (int t = 0; t < 6; ++t) CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlResident);
+    CHECK_EQ(r.m.draft_lend_changes(), (uint64_t)0);
+    CHECK_EQ(r.m.loan(Mover::kLendDraft), (int64_t)0);
+    for (int32_t u : r.trunk) CHECK(!r.in_slab(u));
+    CHECK_EQ(r.m.stats().promotions, (uint64_t)0);
+
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        /* Lend: the drafter at its host copies, the trunk's pooled units in its slab. */
+        r.m.set_draft_lend(true);
+        CHECK_OK(r.drive(Mover::kDlLent));
+        CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlLent);
+        CHECK_EQ(r.m.draft_lends(), (uint64_t)(cycle + 1));
+        CHECK_EQ(r.m.draft_resident(), (int64_t)0);
+        for (int32_t u : r.drafter) {
+            CHECK(!r.in_slab(u));
+            CHECK(r.h.tier(u) == Tier::HostPinned);
+            CHECK(r.h.busy(u));                       /* parked: heat leaves it alone */
+        }
+        int32_t lent = 0;
+        for (int32_t u : r.trunk) lent += r.in_slab(u);
+        CHECK(lent > 0);
+        CHECK_EQ((int64_t)lent, r.m.draft_lent_units());
+        CHECK(resident_count(r.h, r.plan) - planned == lent - DraftLendRig::kD);
+        CHECK(r.bytes_ok());
+        CHECK(r.disjoint());
+        CHECK(r.m.loan_held(Mover::kLendDraft) > 0);
+
+        /* Recall: the trunk out, the drafter back in its slab, every byte the same. */
+        r.m.set_draft_lend(false);
+        CHECK_OK(r.drive(Mover::kDlResident));
+        CHECK_EQ(r.m.draft_reclaims(), (uint64_t)(cycle + 1));
+        CHECK_EQ(r.m.draft_resident(), (int64_t)DraftLendRig::kD);
+        CHECK_EQ(r.m.draft_lent_units(), (int64_t)0);
+        CHECK_EQ(r.m.loan_held(Mover::kLendDraft), (int64_t)0);
+        for (int32_t u : r.drafter) {
+            CHECK(r.in_slab(u));
+            CHECK(r.h.tier(u) == Tier::VRAM);
+        }
+        for (int32_t u : r.trunk) CHECK(!r.in_slab(u));
+        CHECK_EQ(resident_count(r.h, r.plan), planned);
+        CHECK(r.bytes_ok());
+        CHECK(r.disjoint());
+    }
+    /* Neither transition copied a drafter unit out: leaving is a change of address. */
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+}
+
+/* Lever Z0-W: the drafter's query-pass weights (here its block's q_b and attn_output_b, and the walk's markov_w1)
+ * are lent to the trunk and recalled with their own bytes back; the context pass's (the block's attn_kv,
+ * dspark.fc) and the trunk's static weights are never touched; a lend turned around twice ends where it began. */
+TEST(the_drafters_query_pass_weights_are_lent_and_come_back_byte_for_byte) {
+    DraftLendRig r(DraftLendRig::kL, 34, true);
+    REQUIRE(r.plan.dynamic);
+    CHECK_OK(r.build());
+    REQUIRE(r.statics.size() >= 3);
+    CHECK(r.statics_ok());
+    const int32_t first = r.m.draft_first_layer();
+    CHECK_EQ(first, (int32_t)DraftLendRig::kL);
+    std::vector<std::string> asked;
+    CHECK_OK(r.m.draft_w_setup([&](const std::string& n, int32_t layer) {
+        asked.push_back(n);
+        const bool drafter = n.rfind("dspark.", 0) == 0 || (first >= 0 && layer >= first);
+        return drafter && n != "dspark.fc.weight" && n.find(".attn_kv.") == std::string::npos;
+    }));
+    REQUIRE(r.m.draft_w_ready());
+    CHECK(std::find(asked.begin(), asked.end(), "blk.0.attn_q_b.weight") != asked.end());   /* asked, not lent */
+    CHECK(r.m.draft_w_bytes() >= 4 * MiB);     /* q_b + attn_output_b or markov_w1, each a stretch at least */
+    CHECK(r.m.draft_w_kept_bytes() >= 3 * MiB);  /* blk.0's q_b, attn_kv, dspark.fc */
+    CHECK_EQ(r.m.draft_w_setup([](const std::string&, int32_t) { return true; }), RAD_E_STATE);   /* carved once */
+    CHECK(!r.m.draft_w_lent());
+    CHECK_OK(r.m.draft_w_reclaim(&r.h));        /* nothing lent: nothing to do */
+    CHECK_EQ(r.m.draft_w_reclaims(), (uint64_t)0);
+    const int32_t planned = resident_count(r.h, r.plan);
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        CHECK_OK(r.m.draft_w_lend());
+        CHECK(r.m.draft_w_lent());
+        CHECK(r.m.loan(Mover::kLendDraftW) > 0);
+        for (Deadline dl; (r.m.draft_w_lent_units() == 0 || any_busy(r.h, r.plan)) && !dl.passed();) CHECK_OK(r.dispatch());
+        CHECK(r.m.draft_w_lent_units() > 0);
+        CHECK(r.trunk_in_statics());
+        CHECK(resident_count(r.h, r.plan) > planned);
+        CHECK(r.bytes_ok());                   /* every routed unit reads its own bytes where it is published */
+        CHECK(r.disjoint());
+        CHECK_OK(r.m.draft_w_reclaim(&r.h));
+        CHECK(!r.m.draft_w_lent());
+        CHECK_EQ(r.m.draft_w_reclaims(), (uint64_t)(cycle + 1));
+        CHECK_EQ(r.m.draft_w_lent_units(), (int64_t)0);
+        CHECK_EQ(r.m.loan_held(Mover::kLendDraftW), (int64_t)0);
+        CHECK(!r.trunk_in_statics());
+        CHECK(r.statics_ok());                 /* the lent weights' own bytes back, the kept ones never touched */
+        CHECK(r.bytes_ok());
+        CHECK(r.disjoint());
+    }
+    CHECK_EQ(r.m.draft_w_lends(), (uint64_t)2);
+}
+
+/* Without the setup the fourth lender is not there: draft_w_lend / draft_w_reclaim do nothing. */
+TEST(an_undeclared_weight_lend_is_todays_mover) {
+    DraftLendRig r(DraftLendRig::kL, 34, true);
+    CHECK_OK(r.build());
+    CHECK(!r.m.draft_w_ready());
+    CHECK_OK(r.m.draft_w_lend());
+    CHECK(!r.m.draft_w_lent());
+    CHECK_EQ(r.m.loan_ceiling(Mover::kLendDraftW), (int64_t)0);
+    for (int t = 0; t < 6; ++t) CHECK_OK(r.dispatch());
+    CHECK(!r.trunk_in_statics());
+    CHECK(r.statics_ok());
+}
+
+/* A recall that comes while the drafter is still parking (drops in quarantine, nothing lent yet), and a
+ * lend that comes while it is still loading back: each turns around from where it is, and nothing of the
+ * trunk ever lands in a slot the drafter's quarantine still holds. */
+TEST(a_lend_turned_around_half_way_leaves_no_slot_shared) {
+    DraftLendRig r;
+    REQUIRE(r.plan.dynamic);
+    CHECK_OK(r.build());
+    REQUIRE(r.m.draft_lend_ready());
+    r.m.set_draft_lend(true);
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlParking);
+    CHECK_EQ(r.m.loan(Mover::kLendDraft), (int64_t)0);   /* the drops are in quarantine */
+    r.m.set_draft_lend(false);
+    CHECK_OK(r.drive(Mover::kDlResident));
+    for (int32_t u : r.drafter) CHECK(r.in_slab(u));
+    for (int32_t u : r.trunk) CHECK(!r.in_slab(u));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+
+    /* Lent, recalled, and lent again before the drafter is home. */
+    r.m.set_draft_lend(true);
+    CHECK_OK(r.drive(Mover::kDlLent));
+    r.m.set_draft_lend(false);
+    for (Deadline dl; r.m.draft_lend_state() != Mover::kDlLoading && !dl.passed();) CHECK_OK(r.dispatch());
+    REQUIRE(r.m.draft_lend_state() == Mover::kDlLoading);
+    r.m.set_draft_lend(true);
+    for (int t = 0; t < 3; ++t) {
+        CHECK_OK(r.dispatch());
+        CHECK(r.disjoint());
+    }
+    CHECK_OK(r.drive(Mover::kDlLent));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+    /* Recalled and wanted again while the trunk's drops are still in quarantine: the drafter's slots were
+     * never covered, so the slab is lent again at once. */
+    r.m.set_draft_lend(false);
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlUnlending);
+    CHECK_EQ(r.m.loan(Mover::kLendDraft), (int64_t)0);
+    r.m.set_draft_lend(true);
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlLent);
+    CHECK(r.disjoint());
+    for (int32_t u : r.drafter) CHECK(!r.in_slab(u));
+    CHECK_OK(r.drive(Mover::kDlLent));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+    r.m.set_draft_lend(false);
+    CHECK_OK(r.drive(Mover::kDlResident));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+    CHECK_EQ(r.m.draft_resident(), (int64_t)DraftLendRig::kD);
+}
+
+/* Undeclared (draft_keep_from -1, RADIANCE_DRAFT_LEND unset), the mover is today's: no host copies, nothing
+ * set up, nothing moved however often the lend is asked for. Declared and never asked, the placement is
+ * the undeclared one's. */
+TEST(an_undeclared_drafter_lend_is_todays_mover) {
+    DraftLendRig u(-1);
+    CHECK_OK(u.build());
+    CHECK(!u.m.draft_lend_ready());
+    CHECK_EQ(u.m.draft_units(), (int64_t)0);
+    CHECK_EQ(u.m.draft_keep_bytes(), (int64_t)0);
+    std::vector<char*> home;
+    for (int32_t x = 0; x < (int32_t)u.plan.units.size(); ++x) home.push_back(u.addr(x));
+    u.m.set_draft_lend(true);
+    for (int t = 0; t < 8; ++t) CHECK_OK(u.dispatch());
+    CHECK_EQ(u.m.draft_lend_state(), (int)Mover::kDlResident);
+    CHECK_EQ(u.m.stats().promotions, (uint64_t)0);
+    CHECK_EQ(u.m.stats().demotions, (uint64_t)0);
+    for (int32_t x = 0; x < (int32_t)u.plan.units.size(); ++x) CHECK(u.addr(x) == home[(size_t)x]);
+
+    DraftLendRig k;
+    CHECK_OK(k.build());
+    REQUIRE(k.m.draft_lend_ready());
+    for (int t = 0; t < 8; ++t) CHECK_OK(k.dispatch());
+    for (int32_t x = 0; x < (int32_t)k.plan.units.size(); ++x)
+        CHECK(k.h.tier(x) == u.h.tier(x));
+    CHECK_EQ(k.m.stats().promotions, (uint64_t)0);
+    CHECK_EQ(k.m.stats().demotions, (uint64_t)0);
+    CHECK_EQ(k.m.flex_offered_bytes(), (int64_t)0);
+    CHECK(k.bytes_ok());
+}
+
 /* An idle server still fills what it is lent, via its own tick, so a loan made while idle is not
  * left empty until the next request pays for filling it. */
 TEST(an_idle_mover_fills_what_it_is_lent) {
@@ -2944,6 +3499,34 @@ TEST(the_stager_stages_ahead_and_releases_each_layer_when_the_next_starts) {
     CHECK_OK(st.end_pass(compute));
     CHECK(at_home(p0));
     CHECK(at_home(p1));
+
+    /* Lever PSK design 2: a pass that issues no op from layer 1 on (set_layer_end, Engine::psk_release) stages layer 0
+     * only; layer 1 stays at its pool slots. INT32_MAX (the default) stages both again. */
+    const uint64_t sl = m.stats().stage_layers;
+    st.set_layer_end(1);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_ring(p0));
+    CHECK(at_home(p1));
+    CHECK_OK(st.after_op(0, compute));
+    CHECK_OK(st.before_op(1, compute, &resync));
+    CHECK_OK(st.before_op(2, compute, &resync));
+    CHECK(in_ring(p0));
+    CHECK(at_home(p1));
+    CHECK_OK(st.after_op(2, compute));
+    CHECK_OK(st.end_pass(compute));
+    CHECK(at_home(p0));
+    CHECK(at_home(p1));
+    CHECK_EQ(m.stats().stage_layers, sl + 1);
+    st.set_layer_end(INT32_MAX);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_ring(p0));
+    CHECK(in_ring(p1));
+    CHECK_OK(st.end_pass(compute));
+    CHECK(at_home(p0));
+    CHECK(at_home(p1));
+    CHECK_EQ(m.stats().stage_layers, sl + 3);
     /* The copies are the mover stream's, and the region is this test's. */
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
@@ -3227,6 +3810,495 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
+}
+
+/* ---- lever SA (ds41-sahb, fn4 stage_short / stage_pick) --------------------------------------------------------
+ *
+ * The arming rule (sahb_arms, Engine::arena_step): only with the switch on, set up, a step with prefill rows of at
+ * least N tokens at the span's shared level (never the full plan, never another level), where RADIANCE_STAGE_MIXED
+ * lets it arm. Each refusal is its own case, and the one accepted case flips with each input. */
+TEST(sahb_the_short_stager_arms_only_at_the_span_level_and_n) {
+    /* stage_short, capable, enc, has_prefill, n_tok, level, level_rows, span_rows, mixed_ok */
+    CHECK(sahb_arms(1025, true, false, true, 1106, 4, 2112, 2112, true));      /* a c8 newcomer step */
+    CHECK(!sahb_arms(0, true, false, true, 1106, 4, 2112, 2112, true));        /* off: today */
+    CHECK(!sahb_arms(1025, false, false, true, 1106, 4, 2112, 2112, true));    /* not set up */
+    CHECK(!sahb_arms(1025, true, true, true, 1106, 4, 2112, 2112, true));      /* an encoder pass */
+    CHECK(!sahb_arms(1025, true, false, false, 1106, 4, 2112, 2112, true));    /* decode only */
+    CHECK(!sahb_arms(1200, true, false, true, 1106, 4, 2112, 2112, true));     /* fewer than N tokens */
+    CHECK(sahb_arms(1106, true, false, true, 1106, 4, 2112, 2112, true));      /* exactly N */
+    CHECK(!sahb_arms(1025, true, false, true, 3000, 0, 4160, 2112, true));     /* the full plan has its own ring */
+    CHECK(!sahb_arms(1025, true, false, true, 1106, 3, 1024, 2112, true));     /* another level */
+    CHECK(!sahb_arms(1025, true, false, true, 1106, 4, 2112, 0, true));        /* no span's shared level */
+    CHECK(!sahb_arms(1025, true, false, true, 1106, 4, 2112, 2112, false));    /* RADIANCE_STAGE_MIXED says no */
+    CHECK(sahb_arms(1, true, false, true, 2112, 4, 2112, 2112, true));         /* the level's top */
+}
+
+/* The pick: under stage_pick K a stage_short pass copies only the pooled units one of the last K recorded steps
+ * routed; the rest stay at their pool slots (read in place, as unarmed). The copies hold the pool's bytes. Controls:
+ * pick 0 copies every pooled unit, and a full-plan pass (set_short false) ignores the pick. */
+TEST(sahb_a_short_pass_copies_only_the_pooled_units_recent_steps_routed) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    std::vector<rad_weight> lw[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            lw[l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                     1 * MiB, RAD_ACCESS_CONDITIONAL, l, e));
+    f.op("attn0", {}, false);
+    f.op("moe0", lw[0], false);
+    f.op("attn1", {}, false);
+    f.op("moe1", lw[1], false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 12;
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    /* Each layer's pooled and resident experts. */
+    std::vector<int32_t> pooled[2], resident[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            (plan.weight[lw[l][(size_t)e]].tier == Tier::HostPinned ? pooled[l] : resident[l]).push_back(e);
+    REQUIRE(pooled[0].size() >= 2 && pooled[1].size() >= 2 && !resident[0].empty());
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) home[w] = m.residency()->lookup(w)->ptr;
+
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT), half = each * 8;
+    std::vector<char> region((size_t)(4 * half));
+    char* const low = region.data() + 2 * half;
+    auto at = [&](int l, int e) { return (const char*)m.residency()->lookup(lw[l][(size_t)e])->ptr; };
+    auto in_low = [&](int l, int e) { return at(l, e) >= low && at(l, e) < low + 2 * half; };
+    auto in_full = [&](int l, int e) { return at(l, e) >= region.data() && at(l, e) < region.data() + 2 * half; };
+    auto is_home = [&](int l, int e) { return at(l, e) == home[lw[l][(size_t)e]]; };
+
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), low, 2 * half, 64));
+    REQUIRE(st.enabled());
+    RadBatch b{};
+    b.n_tok = 128;
+    bool resync = false;
+
+    /* Step 100 routes each layer's first pooled expert and layer 0's first resident one. */
+    int32_t c0[8] = {}, c1[8] = {};
+    c0[pooled[0][0]] = 5;
+    c0[resident[0][0]] = 3;
+    c1[pooled[1][0]] = 2;
+    st.note_routed(0, c0, 8, 100);
+    st.note_routed(1, c1, 8, 100);
+    st.note_routed(7, c1, 8, 100);                      /* a layer the stager does not serve: ignored */
+    CHECK_EQ(st.sahb().big_steps, (int64_t)1);
+
+    st.set_ring(st.ring_low());
+    st.set_short(true, 1);
+    CHECK(st.begin_pass(&b));
+    CHECK_EQ(st.sahb().expect_units, (int64_t)2);      /* what step 100 would stream in place */
+    CHECK_EQ(st.sahb().expect_bytes, 2 * MiB);
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(resync);
+    CHECK(in_low(0, pooled[0][0]));
+    CHECK(in_low(1, pooled[1][0]));
+    for (int l = 0; l < 2; ++l)
+        for (size_t i = 1; i < pooled[l].size(); ++i) CHECK(is_home(l, pooled[l][i]));
+    for (int e : resident[0]) CHECK(is_home(0, e));    /* a resident unit is never staged */
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_EQ(std::memcmp(at(0, pooled[0][0]), home[lw[0][(size_t)pooled[0][0]]], (size_t)MiB), 0);
+    CHECK_EQ(std::memcmp(at(1, pooled[1][0]), home[lw[1][(size_t)pooled[1][0]]], (size_t)MiB), 0);
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    const int64_t dropped = (int64_t)(pooled[0].size() + pooled[1].size()) - 2;
+    CHECK_EQ(st.sahb().short_steps, (int64_t)1);
+    CHECK_EQ(st.sahb().short_layers, (int64_t)2);
+    CHECK_EQ(st.sahb().short_units, (int64_t)2);
+    CHECK_EQ(st.sahb().short_bytes, 2 * MiB);
+    CHECK_EQ(st.sahb().pick_kept, (int64_t)2);
+    CHECK_EQ(st.sahb().pick_dropped, dropped);
+
+    /* CONTROL: pick 0 copies every pooled unit of a short pass. */
+    st.set_short(true, 0);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_low(l, e));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sahb().short_steps, (int64_t)2);
+    CHECK_EQ(st.sahb().short_units, (int64_t)(2 + pooled[0].size() + pooled[1].size()));
+
+    /* CONTROL: a full-plan pass ignores the pick and is no short pass. */
+    st.set_ring(st.ring_full());
+    st.set_short(false, 1);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_full(l, e));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sahb().short_steps, (int64_t)2);
+
+    /* K: step 101 routes layer 0's second pooled expert only. Under pick 1 that one alone; under pick 2 both steps'. A
+     * histogram of an older step number adds stamps but no step. */
+    int32_t d0[8] = {};
+    d0[pooled[0][1]] = 1;
+    st.note_routed(0, d0, 8, 101);
+    st.note_routed(1, d0, 8, 99);
+    CHECK_EQ(st.sahb().big_steps, (int64_t)2);
+    st.set_ring(st.ring_low());
+    st.set_short(true, 1);
+    CHECK(st.begin_pass(&b));
+    CHECK_EQ(st.sahb().expect_units, (int64_t)1);
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_low(0, pooled[0][1]));
+    CHECK(is_home(0, pooled[0][0]));
+    CHECK(is_home(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    st.set_short(true, 2);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_low(0, pooled[0][0]));
+    CHECK(in_low(0, pooled[0][1]));
+    CHECK(in_low(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+
+    /* An unarmed pass (no ring) copies nothing and counts no short pass, whatever set_short says. */
+    st.set_ring(nullptr);
+    st.set_short(true, 1);
+    const int64_t ss = st.sahb().short_steps;
+    CHECK(!st.begin_pass(&b));
+    CHECK_EQ(st.sahb().short_steps, ss);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* ---- lever SP (ds41-int9, fn4 stage_full_min / stage_full_pick) ------------------------------------------------
+ *
+ * The streaming rule (sp_full_streams, Engine::arena_step): only with the switch on, a step that is no encoder pass, at
+ * the full plan (level 0), with fewer than N tokens. Each refusal is its own case, and the one accepted case flips with
+ * each input. On DeepSeek-V4.1 at --prefill-span 2 the full plan is 4160 rows and the span's shared level 2112, so a
+ * full-plan step has 2113 .. 4160 tokens: N 4097 streams a new turn's tail and every lone step below a long prompt's
+ * 4096-row chunk; N 4161 (above the full plan) streams every full-plan step. */
+TEST(sp_the_full_plan_streams_below_n_only) {
+    /* stage_full_min, enc, n_tok, level */
+    CHECK(sp_full_streams(3001, false, 2386, 0));      /* a scr3 new-turn tail of 2386 rows under N 3001 */
+    CHECK(!sp_full_streams(0, false, 2386, 0));        /* off: today (the full plan's ring) */
+    CHECK(!sp_full_streams(3001, true, 2386, 0));      /* an encoder pass */
+    CHECK(!sp_full_streams(3001, false, 3001, 0));     /* exactly N: armed as today */
+    CHECK(!sp_full_streams(3001, false, 4096, 0));     /* above N: armed as today */
+    CHECK(sp_full_streams(3002, false, 3001, 0));      /* one below N */
+    CHECK(!sp_full_streams(3001, false, 2000, 4));     /* the span's shared level (lever SA's, never SP's) */
+    CHECK(!sp_full_streams(3001, false, 900, 3));      /* another level */
+    CHECK(sp_full_streams(4161, false, 4160, 0));      /* N above the full plan: every full-plan step streams */
+    CHECK(sp_full_streams(4097, false, 4096, 0));      /* a long prompt's lone 4096-row chunk under N 4097 */
+    CHECK(!sp_full_streams(4096, false, 4096, 0));     /* ... and armed under N 4096 */
+    CHECK(sp_full_streams(1, false, 0, 0) && !sp_full_streams(1, false, 1, 0));   /* N 1: only an empty step */
+}
+
+/* The full pick and the counters: under stage_full_pick K an armed full-plan pass (set_full true) copies only the
+ * pooled units one of the last K recorded steps routed (lever SA's stamps); the rest stay at their pool slots (read in
+ * place). The copies hold the pool's bytes. Controls: K 0 copies every pooled unit (today's full plan, counted the
+ * same); a stage_short pass is never a full one; lever SA's counters never move for a full pass; a pass left
+ * unarmed by stage_full_min (no ring, `streamed`) copies nothing and counts a stream step only at the stager's size. */
+TEST(sp_a_full_pass_copies_only_the_picked_units_and_counts_the_full_plan) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    std::vector<rad_weight> lw[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            lw[l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                     1 * MiB, RAD_ACCESS_CONDITIONAL, l, e));
+    f.op("attn0", {}, false);
+    f.op("moe0", lw[0], false);
+    f.op("attn1", {}, false);
+    f.op("moe1", lw[1], false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 12;
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<int32_t> pooled[2], resident[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            (plan.weight[lw[l][(size_t)e]].tier == Tier::HostPinned ? pooled[l] : resident[l]).push_back(e);
+    REQUIRE(pooled[0].size() >= 2 && pooled[1].size() >= 2 && !resident[0].empty());
+    const int64_t n_pooled = (int64_t)(pooled[0].size() + pooled[1].size());
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) home[w] = m.residency()->lookup(w)->ptr;
+
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT), half = each * 8;
+    std::vector<char> region((size_t)(4 * half));
+    char* const low = region.data() + 2 * half;
+    auto at = [&](int l, int e) { return (const char*)m.residency()->lookup(lw[l][(size_t)e])->ptr; };
+    auto in_full = [&](int l, int e) { return at(l, e) >= region.data() && at(l, e) < region.data() + 2 * half; };
+    auto in_low = [&](int l, int e) { return at(l, e) >= low && at(l, e) < low + 2 * half; };
+    auto is_home = [&](int l, int e) { return at(l, e) == home[lw[l][(size_t)e]]; };
+
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), low, 2 * half, 64));
+    REQUIRE(st.enabled());
+    RadBatch b{};
+    b.n_tok = 2386;
+    bool resync = false;
+
+    /* Step 100 routes each layer's first pooled expert and layer 0's first resident one. */
+    int32_t c0[8] = {}, c1[8] = {};
+    c0[pooled[0][0]] = 5;
+    c0[resident[0][0]] = 3;
+    c1[pooled[1][0]] = 2;
+    st.note_routed(0, c0, 8, 100);
+    st.note_routed(1, c1, 8, 100);
+
+    /* stage_full_pick 1: an armed full-plan pass copies the two units step 100 routed, nothing else. */
+    st.set_ring(st.ring_full());
+    st.set_short(false, 0);
+    st.set_full(true, 1, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(resync);
+    CHECK(in_full(0, pooled[0][0]));
+    CHECK(in_full(1, pooled[1][0]));
+    for (int l = 0; l < 2; ++l)
+        for (size_t i = 1; i < pooled[l].size(); ++i) CHECK(is_home(l, pooled[l][i]));
+    for (int e : resident[0]) CHECK(is_home(0, e));    /* a resident unit is never staged */
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_EQ(std::memcmp(at(0, pooled[0][0]), home[lw[0][(size_t)pooled[0][0]]], (size_t)MiB), 0);
+    CHECK_EQ(std::memcmp(at(1, pooled[1][0]), home[lw[1][(size_t)pooled[1][0]]], (size_t)MiB), 0);
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    CHECK_EQ(st.sp().full_steps, (int64_t)1);
+    CHECK_EQ(st.sp().full_rows, (int64_t)2386);
+    CHECK_EQ(st.sp().full_layers, (int64_t)2);
+    CHECK_EQ(st.sp().full_units, (int64_t)2);
+    CHECK_EQ(st.sp().full_bytes, 2 * MiB);
+    CHECK_EQ(st.sp().full_pick_kept, (int64_t)2);
+    CHECK_EQ(st.sp().full_pick_dropped, n_pooled - 2);
+    CHECK_EQ(st.sp().stream_steps, (int64_t)0);
+    /* lever SA's counters do not move for a full pass */
+    CHECK_EQ(st.sahb().short_steps, (int64_t)0);
+    CHECK_EQ(st.sahb().short_units, (int64_t)0);
+    CHECK_EQ(st.sahb().pick_kept, (int64_t)0);
+    CHECK_EQ(st.sahb().pick_dropped, (int64_t)0);
+
+    /* CONTROL: stage_full_pick 0 = today's full plan, every pooled unit, counted as a full pass; no pick counted. */
+    st.set_full(true, 0, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_full(l, e));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK_EQ(std::memcmp(at(l, e), home[lw[l][(size_t)e]], (size_t)MiB), 0);
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sp().full_steps, (int64_t)2);
+    CHECK_EQ(st.sp().full_units, (int64_t)(2 + n_pooled));
+    CHECK_EQ(st.sp().full_bytes, (2 + n_pooled) * MiB);
+    CHECK_EQ(st.sp().full_pick_kept, (int64_t)2);
+    CHECK_EQ(st.sp().full_pick_dropped, n_pooled - 2);
+
+    /* CONTROL: the same pass with set_full false (an int8 engine never calls it) copies every pooled unit too and
+     * counts nothing of lever SP: the pick is SP's alone. */
+    st.set_full(false, 1, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_full(l, e));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sp().full_steps, (int64_t)2);
+    CHECK_EQ(st.sp().full_units, (int64_t)(2 + n_pooled));
+
+    /* K: step 101 routes layer 0's second pooled expert only. Under pick 1 that one alone; under pick 2 both steps'. */
+    int32_t d0[8] = {};
+    d0[pooled[0][1]] = 1;
+    st.note_routed(0, d0, 8, 101);
+    st.set_full(true, 1, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_full(0, pooled[0][1]));
+    CHECK(is_home(0, pooled[0][0]));
+    CHECK(is_home(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    st.set_full(true, 2, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_full(0, pooled[0][0]));
+    CHECK(in_full(0, pooled[0][1]));
+    CHECK(in_full(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    CHECK_EQ(st.sp().full_steps, (int64_t)4);
+
+    /* A stage_short pass is never a full one: lever SA's pick applies, lever SP counts nothing. */
+    const PrefillStager::SpStats before = st.sp();
+    b.n_tok = 1106;
+    st.set_ring(st.ring_low());
+    st.set_short(true, 1);
+    st.set_full(true, 2, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_low(0, pooled[0][1]));
+    CHECK(is_home(0, pooled[0][0]));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sahb().short_steps, (int64_t)1);
+    CHECK_EQ(st.sp().full_steps, before.full_steps);
+    CHECK_EQ(st.sp().full_units, before.full_units);
+    CHECK_EQ(st.sp().full_pick_kept, before.full_pick_kept);
+
+    /* stage_full_min: a full-plan step the engine left without a ring copies nothing; a stream step is counted when
+     * the stager's own size rule would have armed it, not below min_rows. */
+    st.set_short(false, 0);
+    st.set_ring(nullptr);
+    st.set_full(false, 0, true);
+    b.n_tok = 2386;
+    CHECK(!st.begin_pass(&b));
+    CHECK(!st.staged());
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    CHECK_EQ(st.sp().stream_steps, (int64_t)1);
+    CHECK_EQ(st.sp().stream_rows, (int64_t)2386);
+    CHECK_EQ(st.sp().full_steps, before.full_steps);
+    b.n_tok = 32;                                       /* below min_rows (64): no stream step */
+    CHECK(!st.begin_pass(&b));
+    CHECK_EQ(st.sp().stream_steps, (int64_t)1);
+    st.set_full(false, 0, false);                       /* unarmed for another reason: not SP's */
+    b.n_tok = 2386;
+    CHECK(!st.begin_pass(&b));
+    CHECK_EQ(st.sp().stream_steps, (int64_t)1);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* ---- lever HB (ds41-sahb, fn4 place_hb): the reserve by the long-memory prefill heat ----------------------------
+ *
+ * Fixture: experts 0-3 resident, 4-7 pooled; decode pin 0.5. Prompts route experts 5 and 6; decode rows route 0, 1
+ * (the pinned core) and 2. Without the reserve the prompts' experts leave once their prefill heat decays and the
+ * next prompt streams them; with place_hb 2 the reserve brings them in (ordinary swaps against the unprotected
+ * residents, never the decode core) and keeps them, so the next prompt streams none -- the price is expert 2, which
+ * decode wants, kept out. Back to 0 the ranking is today's again and 2 returns. A rank with the reserve and one
+ * without stream unequal amounts for the same prompt: the balance lever. */
+TEST(sahb_the_hb_reserve_keeps_the_prompts_experts_and_never_the_decode_core) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.7f;
+    hp.decode_pin = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    REQUIRE(h.dual());
+    int32_t e[8];
+    for (int i = 0; i < 8; ++i) e[i] = hf.unit_of_expert(i);
+    for (int i = 0; i < 4; ++i) REQUIRE(h.tier(e[i]) == Tier::VRAM);
+    for (int i = 4; i < 8; ++i) REQUIRE(h.tier(e[i]) != Tier::VRAM);
+    bool core_kept = true;
+    std::vector<Swap> sw;
+    auto step_apply = [&] {
+        CHECK_OK(h.step(&sw));
+        for (const Swap& s : sw) {
+            core_kept = core_kept && s.demote != e[0] && s.demote != e[1];
+            h.set_tier(s.promote, Tier::VRAM);
+            h.set_tier(s.demote, Tier::HostPinned);
+            h.set_busy(s.promote, false);
+            h.set_busy(s.demote, false);
+        }
+    };
+    const int32_t dec[8] = {4, 3, 2, 0, 0, 0, 0, 0};
+    const int32_t pf[8] = {0, 0, 0, 0, 0, 40, 30, 0};
+    auto decode = [&](int n) { for (int k = 0; k < n; ++k) { h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); step_apply(); } };
+    auto prompt = [&] { h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f); step_apply(); };
+    auto streamed = [&] { return (int)(h.tier(e[5]) != Tier::VRAM) + (int)(h.tier(e[6]) != Tier::VRAM); };
+
+    decode(1);
+    for (int p = 0; p < 3; ++p) { prompt(); decode(6); }
+    decode(40);
+    /* Off: today's ranking. The prompts' experts left; expert 2 is back; nothing reserved. */
+    const int streamed_off = streamed();
+    CHECK(streamed_off >= 1);
+    CHECK(h.tier(e[2]) == Tier::VRAM);
+    CHECK_EQ(h.hb_reserve(), 0);
+    CHECK_EQ(h.hb_stats().promotions, (int64_t)0);
+    CHECK(h.heat_prefill_long(e[5]) > 0.0f && h.heat_prefill_long(e[6]) > 0.0f);   /* kept all along */
+    CHECK(h.heat_prefill_long(e[2]) == 0.0f);
+
+    /* place_hb 2: the next step takes the reserve, the next observe ranks by it, and swaps bring 5 and 6 in. */
+    h.set_hb_reserve(2);
+    CHECK_EQ(h.hb_reserve(), 2);
+    decode(3);
+    CHECK_EQ(streamed(), 0);
+    CHECK(h.hb_stats().promotions >= (int64_t)streamed_off);
+    CHECK_EQ(h.hb_stats().reserved, (int64_t)2);
+    CHECK_EQ(h.hb_stats().resident, (int64_t)2);
+    CHECK(h.tier(e[2]) != Tier::VRAM);                 /* the price: decode's expert 2 is out */
+    /* They stay through a long decode stretch and more prompts. */
+    decode(60);
+    prompt();
+    decode(20);
+    CHECK_EQ(streamed(), 0);
+    CHECK(h.tier(e[0]) == Tier::VRAM && h.tier(e[1]) == Tier::VRAM);
+    CHECK(core_kept);
+
+    /* The balance: a second rank with the same history and no reserve streams what the first no longer does. */
+    {
+        HeatEngine g;
+        CHECK_OK(g.init(hf.plan, hp));
+        std::vector<Swap> gs;
+        auto g_apply = [&] {
+            CHECK_OK(g.step(&gs));
+            for (const Swap& s : gs) {
+                g.set_tier(s.promote, Tier::VRAM);
+                g.set_tier(s.demote, Tier::HostPinned);
+                g.set_busy(s.promote, false);
+                g.set_busy(s.demote, false);
+            }
+        };
+        g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply();
+        for (int p = 0; p < 3; ++p) {
+            g.observe(0, pf, 8, 1.0f, 0.0f, 1.0f); g_apply();
+            for (int k = 0; k < 6; ++k) { g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply(); }
+        }
+        for (int k = 0; k < 43 + 60; ++k) { g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply(); }
+        g.observe(0, pf, 8, 1.0f, 0.0f, 1.0f); g_apply();
+        for (int k = 0; k < 20; ++k) { g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply(); }
+        const int g_streamed = (int)(g.tier(e[5]) != Tier::VRAM) + (int)(g.tier(e[6]) != Tier::VRAM);
+        CHECK(g_streamed >= 1);
+        CHECK(g.tier(e[2]) == Tier::VRAM);
+    }
+
+    /* Back to 0: no bonus from the next observe on; decode's expert 2 wins its slot back. */
+    h.set_hb_reserve(0);
+    decode(30);
+    CHECK(h.tier(e[2]) == Tier::VRAM);
+    CHECK(core_kept);
+}
+
+/* place_hb without the dual heat is refused by the engine (set_hb_reserve keeps 0). */
+TEST(sahb_the_hb_reserve_needs_the_dual_heat) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    REQUIRE(!h.dual());
+    h.set_hb_reserve(4);
+    CHECK_EQ(h.hb_reserve(), 0);
 }
 
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
@@ -3588,6 +4660,61 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     weight_footprint(t.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.embedding, 0ll);
     CHECK_EQ(fp.hosted, 0ll);
+}
+
+/* Lever VA "emb": RADIANCE_DS41_EMB_RAM=1 makes a model-level table read only by embed_lookup_ggml (a
+ * token embedding in llama.cpp's blocks, DeepSeek-V4.1's) a token embedding the placement flag
+ * moves, as embed_lookup's; unset, it is not one (the start keeps it on the card, as before). A table
+ * a GEMM also reads stays out either way. */
+TEST(a_ggml_token_table_is_an_embedding_only_under_its_switch) {
+    Fixture f;
+    const rad_weight m = f.weight("token_embd.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_lookup_ggml", {m}, false);
+    f.op("embed_lookup_ggml", {m}, false);          /* a drafter's lookup of the same table */
+    const rad_weight w = f.weight("blk.0.ffn_down.weight", 4 * MiB, RAD_ACCESS_PER_TOKEN, 0, -1);
+    f.op("gemm", {w}, false);
+    const rad_weight o = f.weight("output.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("logits_gemm_ggml", {o}, false);
+    Fixture t;                                       /* tied: the lookup and the head */
+    const rad_weight tm = t.weight("token_embd.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    t.op("embed_lookup_ggml", {tm}, false);
+    t.op("logits_gemm_ggml", {tm}, false);
+
+    WeightFootprint fp;
+    unsetenv("RADIANCE_DS41_EMB_RAM");
+    CHECK(!embed_ggml_table());
+    CHECK(!is_embedding_table(f.prog, m));
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.embedding, 0ll);
+    CHECK_EQ(fp.hosted, 0ll);
+    const int64_t statics_off = fp.statics;
+
+    setenv("RADIANCE_DS41_EMB_RAM", "1", 1);
+    CHECK(embed_ggml_table());
+    CHECK(is_embedding_table(f.prog, m));
+    CHECK(!is_embedding_table(f.prog, w));
+    CHECK(!is_embedding_table(f.prog, o));
+    CHECK(!is_embedding_table(t.prog, tm));
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.embedding, 2 * MiB);
+    CHECK_EQ(fp.hosted, 2 * MiB);
+    CHECK_EQ(fp.statics, statics_off - 2 * MiB);
+    /* Placed in RAM: the pinned pool, read in place by the card. */
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 8;
+    c.host_pool_mib = 4;
+    c.embedding_placement = TablePlacement::Ram;
+    c.embedding_resolved = TablePlacement::Ram;
+    Plan plan;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    CHECK(plan.weight[m].tier == Tier::HostPinned);
+    CHECK(plan.weight[m].site == Site::DeviceZeroCopy);
+    CHECK_EQ(plan.embedding_host_bytes, 2 * MiB);
+    setenv("RADIANCE_DS41_EMB_RAM", "0", 1);
+    CHECK(!embed_ggml_table());
+    unsetenv("RADIANCE_DS41_EMB_RAM");
 }
 
 TEST(embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram) {
@@ -4659,6 +5786,331 @@ TEST(the_draft_floor_charges_only_the_trunk) {
     /* No drafter: the two floors agree. */
     wf.draft_experts = 0;
     CHECK_EQ(expert_vram_floor_draft_hosted(wf, 80), expert_vram_floor(wf, 80));
+}
+
+/* ---- lever LF (ds41-lf): the lent slots' fill by the long-memory decode heat, and the slot-class counters.
+ *
+ * Expert A was routed ten times long ago and nothing since: its placement heat has decayed to nothing (0.95 a
+ * step) while its long-memory heat (0.998 a step) still holds most of the ten. B and C were routed once on the
+ * last step. A loan of two slots is filled by placement heat with B and C (today's fill); under place_lf with A
+ * first. Either way only which unit sits in which slot changes: every unit's bytes stay where its table entry
+ * says, through the fill and the recall. The counters: the fill by lender (fills, fills_lf, fills_hot), the
+ * occupancy, the class a routed expert is counted under while it sits in a lent slot (a hit) and after the
+ * recall dropped it (a miss), and drop_recall. */
+namespace {
+struct LfCase {
+    int32_t a = -1, b = -1, c = -1;
+    bool    a_lent = false, b_lent = false, c_lent = false;
+    LentStats ls_fill, ls_end;
+    SlotStats ss_hit, ss_end;
+    uint8_t   cls_a = 255;
+    int       bad = 0;
+};
+int lf_case(bool lf, LfCase* out) {
+    LoanRig r(16);
+    RAD_TRY(r.build());
+    std::vector<int32_t> pooled;
+    for (int32_t e = 0; e < 16; ++e) {
+        const int32_t u = r.hf.unit_of_expert(e);
+        if (u >= 0 && r.hf.plan.units[(size_t)u].movable && r.h.tier(u) != Tier::VRAM) pooled.push_back(e);
+    }
+    if (pooled.size() < 3) return RAD_E_STATE;
+    const int32_t ea = pooled[0], eb = pooled[1], ec = pooled[2];
+    out->a = r.hf.unit_of_expert(ea);
+    out->b = r.hf.unit_of_expert(eb);
+    out->c = r.hf.unit_of_expert(ec);
+    std::vector<int32_t> counts(16, 0);
+    counts[(size_t)ea] = 10;
+    r.h.observe(0, counts.data(), 16);
+    counts.assign(16, 0);
+    for (int k = 0; k < 200; ++k) r.h.observe(0, counts.data(), 16);
+    counts[(size_t)eb] = 1;
+    counts[(size_t)ec] = 1;
+    r.h.observe(0, counts.data(), 16);
+    if (!(r.h.heat(out->a) < r.h.heat(out->b) && r.h.heat_long(out->a) > r.h.heat_long(out->b))) return RAD_E_STATE;
+
+    RAD_TRY(stamp_units(r, false, nullptr));
+    r.m.set_place_lf(lf);
+    /* The smallest loan that covers two lent slots (one a stretch: they are cut from each top). */
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    int64_t amount = 0;
+    for (; amount <= Loan::kAll; amount += Loan::kUnitTokens) {
+        RAD_TRY(r.m.set_loan(Mover::kLendKV, amount));
+        if (r.m.flex_offered_bytes() >= 2 * stride) break;
+    }
+    if (r.m.flex_offered_bytes() != 2 * stride) return RAD_E_STATE;
+    for (Deadline dl; (r.m.flex_used_bytes() < 2 * stride || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    out->a_lent = r.loan.inside(r.addr(out->a));
+    out->b_lent = r.loan.inside(r.addr(out->b));
+    out->c_lent = r.loan.inside(r.addr(out->c));
+    out->ls_fill = r.m.lent_stats();
+    out->cls_a = r.h.slot_class(out->a);
+    RAD_TRY(stamp_units(r, true, &out->bad));
+
+    /* Route A once while it sits where the fill put it, recall the loan, route A again. */
+    counts.assign(16, 0);
+    counts[(size_t)ea] = 1;
+    r.h.observe(0, counts.data(), 16);
+    out->ss_hit = r.h.slot_stats();
+    RAD_TRY(r.m.set_loan(Mover::kLendKV, 0));
+    for (Deadline dl; (r.m.loan_held(Mover::kLendKV) > 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    r.h.observe(0, counts.data(), 16);
+    out->ss_end = r.h.slot_stats();
+    out->ls_end = r.m.lent_stats();
+    RAD_TRY(stamp_units(r, true, &out->bad));
+    return RAD_OK;
+}
+}  /* namespace */
+
+TEST(lever_lf_fills_lent_slots_by_the_long_memory_heat) {
+    LfCase off, on;
+    CHECK_OK(lf_case(false, &off));
+    CHECK_OK(lf_case(true, &on));
+    /* Today's fill: the two units routed last; A stays pooled. */
+    CHECK(!off.a_lent);
+    CHECK(off.b_lent && off.c_lent);
+    CHECK_EQ(off.ls_fill.fills[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(off.ls_fill.fills_lf[Mover::kLendKV], (uint64_t)0);
+    CHECK_EQ(off.ls_fill.fills_hot[Mover::kLendKV], (uint64_t)2);
+    /* Lever LF: A first, then one of the two (equal long heat). */
+    CHECK(on.a_lent);
+    CHECK(on.b_lent != on.c_lent);
+    CHECK_EQ(on.ls_fill.fills[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(on.ls_fill.fills_lf[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(on.ls_fill.fills_hot[Mover::kLendKV], (uint64_t)1);
+    /* The occupancy: two slots covered, both held. */
+    CHECK_EQ(on.ls_fill.covered[Mover::kLendKV], (int64_t)2);
+    CHECK_EQ(on.ls_fill.held[Mover::kLendKV], (int64_t)2);
+    CHECK_EQ(on.ls_fill.covered[Mover::kLendArena], (int64_t)0);
+    /* A sits in a KV-lent slot: routed there it is a KV-class hit; after the recall a KV-class miss. */
+    CHECK_EQ((int)on.cls_a, (int)kSlotKV);
+    CHECK_EQ(on.ss_hit.hit[kSlotKV], (uint64_t)1);
+    CHECK_EQ(on.ss_end.miss[kSlotKV], (uint64_t)1);
+    CHECK_EQ(on.ss_end.hit[kSlotKV], (uint64_t)1);
+    /* Off, A never left the pool: its misses are cold-class ones (B and C were routed while pooled too). */
+    CHECK_EQ(off.ss_hit.hit[kSlotKV], (uint64_t)0);
+    CHECK(off.ss_end.miss[kSlotNone] >= 2);
+    /* The recall dropped both lent units, counted as recalls; nothing else dropped them. */
+    CHECK_EQ(on.ls_end.drop_recall[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(on.ls_end.drop_victim[Mover::kLendKV] + on.ls_end.drop_reserve[Mover::kLendKV], (uint64_t)0);
+    CHECK_EQ(on.ls_end.covered[Mover::kLendKV], (int64_t)0);
+    CHECK_EQ(on.ls_end.held[Mover::kLendKV], (int64_t)0);
+    /* Exact: every unit's bytes where its table entry says, after the fill and after the recall, both ways. */
+    CHECK_EQ(off.bad, 0);
+    CHECK_EQ(on.bad, 0);
+}
+
+/* ---- lever L2 (ds41-swl, fn4 heat_min_gain_x100 / heat_hyst_x100): the heat guard, settable between steps. The env
+ * forms (RADIANCE_HEAT_MIN_GAIN / _HYSTERESIS) parse to the switch's hundredths, the shipped values are 150 / 125 to
+ * the bit, and the bar `hot >= cold x hysteresis + min_gain` follows each setter from the next step() on, back to
+ * today's when set back. */
+TEST(lever_l2_heat_guard_parses_and_moves_the_bar) {
+    CHECK_EQ(heat_env_x100("1.5", 0, kHeatMinGainX100Max), 150);
+    CHECK_EQ(heat_env_x100("0.75", 0, kHeatMinGainX100Max), 75);
+    CHECK_EQ(heat_env_x100("1", 0, kHeatMinGainX100Max), 100);
+    CHECK_EQ(heat_env_x100("0", 0, kHeatMinGainX100Max), 0);
+    CHECK_EQ(heat_env_x100("100", 0, kHeatMinGainX100Max), 10000);
+    CHECK_EQ(heat_env_x100("100.01", 0, kHeatMinGainX100Max), -1);
+    CHECK_EQ(heat_env_x100("-0.5", 0, kHeatMinGainX100Max), -1);
+    CHECK_EQ(heat_env_x100("1.25", kHeatHystX100Min, kHeatHystX100Max), 125);
+    CHECK_EQ(heat_env_x100("0.9", kHeatHystX100Min, kHeatHystX100Max), -1);
+    CHECK_EQ(heat_env_x100("10.5", kHeatHystX100Min, kHeatHystX100Max), -1);
+    for (const char* bad : { "", "abc", "1.5x", "nan", " " })
+        CHECK_EQ(heat_env_x100(bad, 0, kHeatMinGainX100Max), -1);
+    CHECK_EQ(heat_env_x100(nullptr, 0, kHeatMinGainX100Max), -1);
+    const HeatParams shipped;
+    CHECK(heat_x100(150) == shipped.min_gain);
+    CHECK(heat_x100(125) == shipped.hysteresis);
+    CHECK(heat_x100(75) == 0.75f);
+    CHECK(heat_x100(100) == 1.0f);
+
+    HeatFixture hf;
+    HeatEngine h;
+    CHECK_OK(h.init(hf.plan, shipped));
+    CHECK_EQ(h.min_gain_x100(), (int64_t)150);
+    CHECK_EQ(h.hysteresis_x100(), (int64_t)125);
+    const int32_t hot = hf.unit_of_expert(7);
+    CHECK(hot >= 0 && h.tier(hot) != Tier::VRAM);
+    /* Every resident expert at heat 1, the pooled expert 7 at 2 (one credit, from zero: exact). */
+    std::vector<int32_t> counts(8, 0);
+    for (int32_t e = 0; e < 8; ++e) {
+        const int32_t u = hf.unit_of_expert(e);
+        if (u >= 0 && h.tier(u) == Tier::VRAM) counts[(size_t)e] = 1;
+    }
+    counts[7] = 2;
+    h.observe(0, counts.data(), 8);
+    CHECK(h.heat(hot) == 2.0f);
+    auto proposes = [&]() {
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        const bool got = !sw.empty() && sw[0].promote == hot;
+        for (const Swap& x : sw) h.abandon(x);
+        return got;
+    };
+    CHECK(!proposes());                          /* 2 < 1 x 1.25 + 1.5 */
+    h.set_min_gain(heat_x100(75));
+    CHECK_EQ(h.min_gain_x100(), (int64_t)75);
+    CHECK(proposes());                           /* 2 >= 1 x 1.25 + 0.75 */
+    h.set_hysteresis(heat_x100(200));
+    CHECK_EQ(h.hysteresis_x100(), (int64_t)200);
+    CHECK(!proposes());                          /* 2 < 1 x 2 + 0.75 */
+    h.set_hysteresis(heat_x100(125));
+    CHECK(proposes());
+    h.set_min_gain(heat_x100(100));
+    CHECK(!proposes());                          /* 2 < 1 x 1.25 + 1 */
+    h.set_min_gain(heat_x100(150));              /* today's, to the bit */
+    CHECK(h.min_gain() == shipped.min_gain && h.hysteresis() == shipped.hysteresis);
+    CHECK(!proposes());
+}
+
+/* ---- lever SWL (ds41-swl, fn4 place_swap_lent): a heat promotion may take a free LENT slot. The rig: a full loan, then
+ * swaps whose promotion takes a budgeted swap slot and whose victim is a lent unit (dropped: its lent slot comes free)
+ * until no budgeted slot is free -- every free slot is then a lent one, the state 63-74 % of DeepSeek's heat promotions
+ * starved in (res12). Off (today), the next promotion starves (starved_slab) and only its victim goes. On, it lands in
+ * a free lent slot, keeps its host copy (promote_to), is counted (lent.swaps) and classed (kSlotKV), and from there is a
+ * fill's unit: a demotion drops it by address, a shrinking loan's sweep (balance) and a synchronous recall (reclaim,
+ * with the promotion still in flight: the hard case) drop it without a copy across the link and leave no table entry
+ * naming a slot the loan gave back. Every unit's bytes stay where its table entry says throughout. */
+namespace {
+struct SwlCase {
+    int       swaps = 0;            /* swaps issued until the decisive one, that one included */
+    int32_t   hot = -1;             /* the decisive promotion's unit */
+    bool      taken = false;        /* right after the decisive swap: its promotion is in flight */
+    bool      hot_vram = false, hot_lent = false, victim_out = false, all_out = false, quiet = false;
+    uint64_t  starved = 0;          /* starved_slab on the decisive swap */
+    uint64_t  d2h = 0;              /* d2h bytes from the decisive swap through the drops of the lent units it concerns */
+    uint8_t   cls = 255;
+    int64_t   held_end = -1;
+    LentStats ls;
+    int       bad = 0;
+};
+/* mode 0: settle; a demotion of the promoted unit; then the loan shrunk to 0 (balance's sweep; its working-reserve
+ * rebuild may then demote budgeted units, a real copy, as today). mode 1: reclaim(0) at once, the promotion still in
+ * flight. */
+int swl_case(bool swl, int mode, SwlCase* out) {
+    LoanRig r(24);
+    RAD_TRY(r.build());
+    RAD_TRY(stamp_units(r, false, nullptr));
+    r.m.set_swap_lent(swl);
+    if (r.m.swap_lent() != swl) return RAD_E_STATE;
+    RAD_TRY(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    for (int k = 0; k < 64; ++k) {
+        int32_t hot = -1, cold = -1;
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+            if (!r.hf.plan.units[(size_t)u].movable || r.h.busy(u)) continue;
+            if (hot < 0 && r.h.tier(u) != Tier::VRAM) hot = u;
+            if (cold < 0 && r.h.tier(u) == Tier::VRAM && r.loan.inside(r.addr(u))) cold = u;
+        }
+        if (hot < 0 || cold < 0) return RAD_E_STATE;
+        const uint64_t st0 = r.m.stats().starved_slab, sw0 = r.m.lent_stats().swaps[Mover::kLendKV];
+        const uint64_t d2h0 = r.m.stats().d2h_bytes;
+        RAD_TRY(r.m.begin_dispatch(r.d++, &r.h));
+        r.work.run(r.compute);
+        Swap sw;
+        sw.promote = hot;
+        sw.demote = cold;
+        r.h.set_busy(hot, true);
+        r.h.set_busy(cold, true);
+        RAD_TRY(r.m.issue(sw, &r.h));                    /* the victim's drop goes out either way */
+        RAD_TRY(r.m.balance(&r.h));
+        ++out->swaps;
+        const bool starved = r.m.stats().starved_slab > st0;
+        const bool lent = r.m.lent_stats().swaps[Mover::kLendKV] > sw0;
+        if (!starved && !lent) {                         /* a budgeted slot took it: settle and go on */
+            for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+            if (r.loan.inside(r.addr(hot))) return RAD_E_STATE;
+            continue;
+        }
+        out->hot = hot;
+        out->starved = r.m.stats().starved_slab - st0;
+        out->taken = r.h.busy(hot);
+        if (mode == 1) {
+            RAD_TRY(r.m.reclaim(Mover::kLendKV, 0, &r.h));
+            out->hot_vram = r.h.tier(hot) == Tier::VRAM;
+            out->hot_lent = r.loan.inside(r.addr(hot));
+            out->d2h = r.m.stats().d2h_bytes - d2h0;
+        } else {
+            for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+            out->hot_vram = r.h.tier(hot) == Tier::VRAM;
+            out->hot_lent = r.loan.inside(r.addr(hot));
+            out->cls = r.h.slot_class(hot);
+            RAD_TRY(stamp_units(r, true, &out->bad));
+            if (out->hot_lent) {                         /* the heat engine's next victim is this unit: a drop */
+                RAD_TRY(r.m.begin_dispatch(r.d++, &r.h));
+                r.work.run(r.compute);
+                Swap dv;
+                dv.demote = hot;
+                r.h.set_busy(hot, true);
+                RAD_TRY(r.m.issue(dv, &r.h));
+                /* A drop publishes the host copy at issue (the fill may take the unit back once the slot clears). */
+                out->victim_out = r.h.tier(hot) != Tier::VRAM && !r.loan.inside(r.addr(hot));
+                for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+                RAD_TRY(stamp_units(r, true, &out->bad));
+            }
+            out->d2h = r.m.stats().d2h_bytes - d2h0;
+            RAD_TRY(r.m.set_loan(Mover::kLendKV, 0));
+            for (Deadline dl; (r.m.loan_held(Mover::kLendKV) > 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+                RAD_TRY(r.dispatch());
+        }
+        out->held_end = r.m.loan_held(Mover::kLendKV);
+        out->all_out = true;
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+            if (r.loan.inside(r.addr(u))) out->all_out = false;
+        out->quiet = !any_busy(r.h, r.hf.plan);
+        out->ls = r.m.lent_stats();
+        RAD_TRY(stamp_units(r, true, &out->bad));
+        return RAD_OK;
+    }
+    return RAD_E_STATE;
+}
+}  /* namespace */
+
+TEST(lever_swl_promotes_into_a_free_lent_slot_and_a_recall_drops_it) {
+    SwlCase off, on, fly;
+    CHECK_OK(swl_case(false, 0, &off));
+    CHECK_OK(swl_case(true, 0, &on));
+    CHECK_OK(swl_case(true, 1, &fly));
+    /* The same rig and the same swaps up to the decisive one: the budgeted swap slots ran out at the same point. */
+    CHECK(off.swaps >= 2);
+    CHECK_EQ(on.swaps, off.swaps);
+    CHECK_EQ(fly.swaps, off.swaps);
+    /* Off (today): the promotion starves and its unit is let go (the lent slots' fill may take it later); no heat
+     * promotion entered a lent slot. */
+    CHECK_EQ(off.starved, (uint64_t)1);
+    CHECK(!off.taken);
+    CHECK_EQ(off.ls.swaps[Mover::kLendKV], (uint64_t)0);
+    /* On: it lands in a KV-lent slot, classed as one, counted once. */
+    CHECK_EQ(on.starved, (uint64_t)0);
+    CHECK(on.taken);
+    CHECK(on.hot_vram && on.hot_lent);
+    CHECK_EQ((int)on.cls, (int)kSlotKV);
+    CHECK_EQ(on.ls.swaps[Mover::kLendKV], (uint64_t)1);
+    CHECK_EQ(on.ls.swaps[Mover::kLendArena], (uint64_t)0);
+    /* A demotion drops it by address (a victim drop, as every lent victim of the loop), and the shrink to 0 drops the
+     * rest (recall drops). */
+    CHECK(on.victim_out);
+    CHECK(on.ls.drop_victim[Mover::kLendKV] >= (uint64_t)(on.swaps + 1));
+    CHECK(on.ls.drop_recall[Mover::kLendKV] >= 1);
+    /* In flight at a synchronous recall: published, then dropped to its host copy before reclaim returns. */
+    CHECK_EQ(fly.starved, (uint64_t)0);
+    CHECK(fly.taken);
+    CHECK_EQ(fly.ls.swaps[Mover::kLendKV], (uint64_t)1);
+    CHECK(!fly.hot_vram && !fly.hot_lent);
+    CHECK(fly.ls.drop_recall[Mover::kLendKV] >= 1);
+    /* Every way: the lent units' drops crossed nothing over the link, the loan holds nothing at the end, no unit is read
+     * from inside it, nothing is left busy, and every unit's bytes are where its table entry says. */
+    for (const SwlCase* c : { &off, &on, &fly }) {
+        CHECK_EQ(c->d2h, (uint64_t)0);
+        CHECK_EQ(c->held_end, (int64_t)0);
+        CHECK(c->all_out);
+        CHECK(c->quiet);
+        CHECK_EQ(c->ls.held[Mover::kLendKV], (int64_t)0);
+        CHECK_EQ(c->bad, 0);
+    }
 }
 
 RAD_TEST_MAIN()

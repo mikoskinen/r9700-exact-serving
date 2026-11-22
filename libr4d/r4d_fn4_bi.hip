@@ -10,6 +10,7 @@
  */
 #include <hip/hip_runtime.h>
 
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <cstdint>
 
 #include "r4d_plugin.h"
@@ -31,7 +32,7 @@ __device__ __forceinline__ unsigned long long bi_mix(unsigned long long x) {
     return x;
 }
 
-__global__ __launch_bounds__(256) void bi_rowhash_kernel(BiArgs A) {
+__global__ __launch_bounds__(256) void bi_rowhash_kernel(BiArgs A) { R4D_IKA_ENTRY();
     __shared__ unsigned long long sh[256];
     for (long long r = blockIdx.x; r < A.rows; r += gridDim.x) {
         const uint16_t* p = (const uint16_t*)(A.x + r * A.xs);
@@ -63,7 +64,7 @@ struct BandArgs {
     int            ns, band;
 };
 
-__global__ __launch_bounds__(256) void bi_band_kernel(BandArgs A) {
+__global__ __launch_bounds__(256) void bi_band_kernel(BandArgs A) { R4D_IKA_ENTRY();
     const long long r = (long long)blockIdx.x * 256 + threadIdx.x;
     if (r >= A.rows) return;
     int lo = 0, hi = A.ns;   /* the last s with cu[s] <= r */
@@ -80,31 +81,7 @@ __global__ __launch_bounds__(256) void bi_band_kernel(BandArgs A) {
 
 extern "C" {
 
-/* operands: x (any dtype, rows of contiguous trailing extents), h (i32 [rows][2], out) */
-int r4d_rad_bi_rowhash(const RadArgs* a, RadStream stream) {
-    using namespace r4d_fn4bi;
-    if (!a || a->n_t < 2 || !a->t[0].data || !a->t[1].data) return RAD_E_INVAL;
-    const RadTensor &x = a->t[0], &h = a->t[1];
-    if (x.rank < 1 || h.rank != 2 || h.dtype != RAD_I32 || h.shape[1] != 2 || h.stride[1] != 1) return RAD_E_SHAPE;
-    const long long rows = (long long)x.shape[0];
-    if (rows < 1 || (long long)h.shape[0] != rows) return RAD_E_SHAPE;
-    long long inner = 1;
-    for (uint32_t d = x.rank; d-- > 1;) {
-        if ((long long)x.stride[d] != inner) return RAD_E_SHAPE;
-        inner *= (long long)x.shape[d];
-    }
-    const long long eb = (long long)rad_dtype_bytes(x.dtype, 1);
-    if (eb < 1) return RAD_E_DTYPE;
-    const long long bytes = inner * eb, xs = (x.rank > 1 ? (long long)x.stride[0] : 1) * eb;
-    if (((uintptr_t)x.data & 1u) || (xs & 1)) return RAD_E_ALIGN;
-    BiArgs P{};
-    P.x = (const uint8_t*)x.data; P.xs = xs; P.nu = bytes / 2; P.odd = (int)(bytes & 1);
-    P.h = (uint32_t*)h.data; P.hs = (long long)h.stride[0]; P.rows = rows;
-    const unsigned blocks = (unsigned)(rows < 4096 ? rows : 4096);
-    R4D_KLAUNCH(R4D_KNAME(bi_rowhash_kernel), dim3(blocks), dim3(256), (hipStream_t)stream, P);
-    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
-}
-
+/* qfn-on-ds: bi_rowhash is the ds41 line's (r4d_ds41_elem.hip, the same fingerprint); this file serves bi_band. */
 /* operands: cu_seqlens (i32 [S + 1]), band (i32 [M], out); params M, band */
 int r4d_rad_bi_band(const RadArgs* a, RadStream stream) {
     using namespace r4d_fn4bi;

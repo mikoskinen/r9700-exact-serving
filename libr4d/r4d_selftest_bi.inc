@@ -1,23 +1,29 @@
-/* r4d_selftest_bi.inc -- fn4 BI (batch invariance, Flash-Next, 11.11.2026): r4d_selftest --bicheck. Ported from the
- * ds41-bi line's (radiance-bi 060dff0, the DS agent's) with Flash-Next's TP4 cases and without its GGUF path.
- * Included once by r4d_selftest.cpp in front of main(); uses its helpers (find, dalloc, T, PI / PS / PF).
+/* r4d_selftest_bi.inc -- lever BI (batch invariance, ds41-bi, 11.11.2026): r4d_selftest --bicheck.
+ * Included once by r4d_selftest.cpp in front of main(); uses its helpers (find, dalloc, T, PI / PS / PF, mr_weights).
  *
  * USER RULING 11.11.: an answer that changes under load vs alone is a BUG. A row's bytes must not depend on what else is
- * in the launch. This mode measures it per op, on the card, at Flash-Next's per-rank shapes:
+ * in the launch. This mode measures it per op, on the card, at DeepSeek-V4.1-Flash's TP4 shapes (the declared graph of
+ * ds41-int3 1116248: every row-wise op the trunk issues):
  *
  *   for M in the sweep: one launch of M rows, row i holding content i (a function of (case, operand, i, element) only),
  *   and for probe rows p in { 0, M/2, M-1 }: the output row p of the M-row launch against the same content run ALONE
  *   (M = 1), byte for byte. Weights / tables are the same bytes at every M.
  *
  * The kernel row is the one the engine's band would take at that M (the highest-priority row of the op whose
- * constraints hold at M; a row with an init hook is skipped), so the forms switch where they switch in the engine. The
- * fn4 switches libr4d reads at load (RADIANCE_FN4_HC_READV, _HC_UPMIX, _HC_WRITEVEC, _HC_NORMWAVE, ...) take the run's
- * environment, so a run under the line's env sees the line's forms.
+ * constraints hold at M; a row with an init hook is skipped), so the forms switch where they switch in the engine
+ * (gemm_nt_ggml's decode kernel up to 48 rows and its WMMA forms above, gemm_nt's m16 / m64 / tiled rows, ...). The
+ * libr4d switches read at load (RADIANCE_DS41_GG_GEMV, _GG_PF, _GG_PF_TABLE, _F32_PF) take the run's environment, so
+ * one run under the stack's env and one under none cover both lines.
  *
- *   --bicheck [classes] [M list]   classes: comma list of hc,gemm,all (default all); M list: comma list (default
- *                                  1..64,65,80,96,127,128,129,192,256,512,1024,2112,4160) */
+ * One line a case:
+ *   BICHECK <label> [<row at the flip>] M=<sweep>: INVARIANT | FLIPS at M=<first differing M> (<n> of <m> M differ:
+ *     <list>) rows <rows by M band>
+ * and a summary line "BICHECK summary: <n> cases, <k> invariant, <f> flip, <s> skipped". A FLIP is a measurement, not
+ * a failure of the selftest (the exit status counts only launch / setup failures).
+ *
+ *   --bicheck [classes] [M list]   classes: comma list of gg,f32,bf16,norm,mhc,rope,elem,router,all (default all);
+ *                                  M list: comma list (default 1..64,65,80,96,127,128,129,192,256,512,1024,2112,4160) */
 #ifdef RAD_HAVE_HIP
-#include <map>
 namespace bi {
 
 uint64_t mix64(uint64_t x) {
@@ -44,7 +50,7 @@ uint16_t f32_to_f16(float f) {
 struct Case {
     std::string label, op, cls;
     std::vector<RadParam> ps;     /* without M */
-    std::string ggtype;           /* unused here (the ds41 port's GGUF weights) */
+    std::string ggtype;           /* a GGUF weight at operand 1 (native blocks), "" for none */
 };
 
 /* The op's schema, from the plugin. */
@@ -108,7 +114,7 @@ int64_t elems(const RadOpdDesc& d, int from) {
 struct Opd {
     RadOpdDesc da{}, db{};   /* at Ma and Mb */
     int role = 0;
-    bool absent = false, row = false;
+    bool absent = false, row = false, gg = false;
     int64_t row_elems = 0;   /* a row operand's elements a row */
     size_t eb = 0;           /* bytes an element */
     void* dev = nullptr;     /* Mmax rows (a row operand) or the fixed bytes */
@@ -160,50 +166,18 @@ struct Result {
     int fails = 0;
 };
 
-/* launch_row on a stream of its own (fn4 BI wide, 14.11.2026): hc_read's form G counters (hc_mix_ctr) are keyed on the
- * stream and the null stream gets none, so the bi_dec forms refused every launch from the null stream (RAD_E_SHAPE). */
-int launch_stream(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
-    /* blocking (the harness's hipMemset / hipMemcpy run on the null stream; a non-blocking stream raced them: B2 17:19) */
-    static hipStream_t s = [] { hipStream_t x = nullptr; return hipStreamCreate(&x) == hipSuccess ? x : nullptr; }();
-    RadArgs a;
-    std::memset(&a, 0, sizeof(a));
-    a.t = ts.data(); a.n_t = (int)ts.size();
-    a.p = ps.data(); a.n_p = (int)ps.size();
-    a.world_size = 1;
-    if (r->scratch) {
-        const int64_t need = r->scratch(&a);
-        if (need < 0) return (int)need;
-        if (need > 0) {
-            a.scratch = dalloc((size_t)need);
-            a.scratch_bytes = need;
-            if (!a.scratch) return RAD_E_NOMEM;
-        }
-    }
-    if (hipDeviceSynchronize() != hipSuccess) return RAD_E_STATE;   /* the operands' fills done before the launch */
-    const int rc = r->launch(&a, (RadStream)s);
-    if (rc != RAD_OK) return rc;
-    return hipDeviceSynchronize() == hipSuccess ? RAD_OK : RAD_E_STATE;
-}
-
 /* Run one case over the sweep. */
 Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep) {
     Result R;
     const RadOpSchema* sc = schema(pl, c.op.c_str());
     if (!sc) { R.skip = "no schema"; return R; }
-    /* R4D_BI_REF=<m> (fn4): the reference a probe row is compared with is that row as row 0 of an m-row launch (default 1:
-     * the row alone) -- e.g. 8, the first tiled height, to see whether the forms above it agree among themselves. */
-    static const long long REF = [] { const char* e = std::getenv("R4D_BI_REF"); const long long v = e ? std::atoll(e) : 1;
-                                      return v >= 1 && v <= 65536 ? v : 1LL; }();
-    const long long Mmax = *std::max_element(sweep.begin(), sweep.end()) + REF;
+    const long long Mmax = *std::max_element(sweep.begin(), sweep.end());
     const long long Ma = 37, Mb = 53;
     const std::vector<RadParam> pa = with_m(c.ps, Ma), pb = with_m(c.ps, Mb);
     /* the descriptions: any row of the op that has a shape hook (they agree across rows of one op) */
     RadShapeFn sh = nullptr;
     for (int k = 0; k < pl.kernel_count() && !sh; ++k)
         if (!std::strcmp(pl.kernel_at(k)->op, c.op.c_str()) && pl.kernel_at(k)->opd_shape) sh = pl.kernel_at(k)->opd_shape;
-    /* fn4 BI wide: gemm_nt_q_dec is gemm_nt_q's schema under its own name; its operands are gemm_nt_q's */
-    for (int k = 0; k < pl.kernel_count() && !sh && c.op == "gemm_nt_q_dec"; ++k)
-        if (!std::strcmp(pl.kernel_at(k)->op, "gemm_nt_q") && pl.kernel_at(k)->opd_shape) sh = pl.kernel_at(k)->opd_shape;
     if (!sh) { R.skip = "no shape hook"; return R; }
     std::vector<Opd> od((size_t)sc->n_operands);
     const uint64_t seed = std::hash<std::string>{}(c.label);
@@ -226,12 +200,26 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
             return R;
         }
         o.row_elems = o.row ? elems(o.da, 1) : 0;
+        o.gg = !c.ggtype.empty() && i == 1;
     }
     /* allocate and fill: row operands at Mmax rows, row i = content i */
     for (int i = 0; i < sc->n_operands; ++i) {
         Opd& o = od[(size_t)i];
         if (o.absent) continue;
         std::string why;
+        if (o.gg) {
+            const MrTy* ty = nullptr;
+            for (const MrTy& t : kMrTypes)
+                if (c.ggtype == t.name) ty = &t;
+            if (!ty) { R.skip = "GGUF type " + c.ggtype + " not generated"; return R; }
+            const int64_t N = o.da.shape[0], K = o.da.shape[1];
+            mr_weights(o.fixed, *ty, N, K, seed ^ 0x5bd1e995u);
+            o.da.dtype = RAD_U8; o.da.rank = 2; o.da.shape[1] = K / ty->qk * ty->bb; o.eb = 1;
+            o.dev = dalloc(o.fixed.size());
+            if (!o.dev) { R.skip = "alloc"; return R; }
+            st_memcpy(o.dev, o.fixed.data(), o.fixed.size(), hipMemcpyHostToDevice);
+            continue;
+        }
         const int64_t prev_lead = i > 0 && !od[(size_t)i - 1].absent && od[(size_t)i - 1].da.rank
                                       ? od[(size_t)i - 1].da.shape[0] : 0;
         if (o.row) {
@@ -280,7 +268,7 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
             }
             ts.push_back(T(base, o.da.dtype, shp));
         }
-        return launch_stream(r, ts, ps);
+        return launch_row(r, ts, ps);
     };
     /* output bytes of row `row` of the last launch (in the OUT / INOUT row operands) */
     auto outrow = [&](long long first, long long row, std::vector<uint8_t>& v) {
@@ -300,7 +288,7 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
     auto ref = [&](long long content) -> const std::vector<uint8_t>* {
         auto it = alone.find(content);
         if (it != alone.end()) return &it->second;
-        if (launch(REF, content, nullptr) != RAD_OK) return nullptr;
+        if (launch(1, content, nullptr) != RAD_OK) return nullptr;
         std::vector<uint8_t> v;
         outrow(content, 0, v);
         return &(alone[content] = v);
@@ -344,44 +332,88 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
 
 std::vector<Case> cases() {
     std::vector<Case> v;
-    /* the gated residual (Flash-Next: n 2560, hc 4, lowrank 320; the EXL3 line's mixing matrices are bf16) */
-    for (const char* mix : { "bf16", "e4m3" }) {
-        v.push_back({ fmt("hc_read block input (inject, codes) mix %s", mix), "hc_read", "hc",
-                      { PI("n", 2560), PI("hc", 4), PI("lowrank", 320), PF("eps", 1e-6), PS("dtype", "bf16"),
-                        PF("wadd", 1.0), PI("inject", 1), PI("group", 128), PI("rotate", 0), PS("mix", mix) }, "" });
-        v.push_back({ fmt("hc_read final mixer (no inject, no codes) mix %s", mix), "hc_read", "hc",
-                      { PI("n", 2560), PI("hc", 4), PI("lowrank", 320), PF("eps", 1e-6), PS("dtype", "bf16"),
-                        PF("wadd", 1.0), PI("inject", 0), PI("group", 0), PI("rotate", 0), PS("mix", mix) }, "" });
-    }
-    v.push_back({ "hc_write n=2560 hc=4", "hc_write", "hc", { PI("n", 2560), PI("hc", 4), PS("dtype", "bf16") }, "" });
-    v.push_back({ "hc_write n=2560 hc=4 (+ ss, W1b)", "hc_write", "hc",
-                  { PI("n", 2560), PI("hc", 4), PS("dtype", "bf16"), PF("eps", 1e-6) }, "" });
-    /* the trunk's int8 linears at TP4 (a rank's N x K) */
-    struct Gq { const char* lbl; long long N, K; };
-    for (const Gq& q : { Gq{ "attn q|gate", 3072, 2560 }, Gq{ "attn k / v", 256, 2560 }, Gq{ "attn o", 2560, 1536 },
-                         Gq{ "gdn in_proj qkvz", 4096, 2560 }, Gq{ "gdn out_proj", 2560, 1536 },
-                         Gq{ "shared gate_up", 1280, 2560 }, Gq{ "shared down", 2560, 640 } })
-        v.push_back({ fmt("gemm_nt_q i8a8 %s %lldx%lld", q.lbl, q.N, q.K), "gemm_nt_q", "gemm",
-                      { PI("N", q.N), PI("K", q.K), PI("group", 128), PS("dtype", "i8a8") }, "" });
-    v.push_back({ "gemm_nt bf16 router 512x2560", "gemm_nt", "gemm", { PI("N", 512), PI("K", 2560), PS("dtype", "bf16") }, "" });
-    v.push_back({ "gemm_nt bf16 shared gate 1x2560", "gemm_nt", "gemm", { PI("N", 1), PI("K", 2560), PS("dtype", "bf16") }, "" });
-    /* fn4 BI wide (14.11.2026): the trunk's int8 linears through gemm_nt_q_dec (the narrow tile, 64-token groups on grid.y)
-     * -- the form a step above 64 decode rows takes under bi_wide bit 1; class "wide" (M up to 512) */
-    for (const Gq& q : { Gq{ "attn q|gate", 3072, 2560 }, Gq{ "attn k / v", 256, 2560 }, Gq{ "attn o", 2560, 1536 },
-                         Gq{ "gdn in_proj qkvz", 4096, 2560 }, Gq{ "gdn out_proj", 2560, 1536 },
-                         Gq{ "shared gate_up", 1280, 2560 }, Gq{ "shared down", 2560, 640 } })
-        v.push_back({ fmt("gemm_nt_q_dec i8a8h %s %lldx%lld", q.lbl, q.N, q.K), "gemm_nt_q_dec", "wide",
-                      { PI("N", q.N), PI("K", q.K), PI("group", 128), PS("dtype", "i8a8h") }, "" });
-    /* the hc reads' bi_dec twin (hc_bi 5's one launch over a step's decode rows; up to 128 rows under bi_wide bit 2) --
-     * run under the line's RADIANCE_FN4_HC_READV (331: G16p) */
-    v.push_back({ "hc_read bi_dec block input (inject, codes) mix e4m3", "hc_read", "wide",
-                  { PI("n", 2560), PI("hc", 4), PI("lowrank", 320), PF("eps", 1e-6), PS("dtype", "bf16"),
-                    PF("wadd", 1.0), PI("inject", 1), PI("group", 128), PI("rotate", 0), PS("mix", "e4m3"),
-                    PI("bi_dec", 1) }, "" });
-    v.push_back({ "hc_read bi_dec final mixer (no inject, no codes) mix e4m3", "hc_read", "wide",
-                  { PI("n", 2560), PI("hc", 4), PI("lowrank", 320), PF("eps", 1e-6), PS("dtype", "bf16"),
-                    PF("wadd", 1.0), PI("inject", 0), PI("group", 0), PI("rotate", 0), PS("mix", "e4m3"),
-                    PI("bi_dec", 1) }, "" });
+    auto gg = [&](const char* lbl, long long N, long long K, const char* ty) {
+        v.push_back({ fmt("gemm_nt_ggml %s %s %lldx%lld", lbl, ty, N, K), "gemm_nt_ggml", "gg",
+                      { PI("N", N), PI("K", K), PS("type", ty), PS("dtype", "bf16") }, ty });
+    };
+    gg("attn_q_b", 8192, 1280, "q5_K");      gg("attn_q_b", 8192, 1280, "q6_K");
+    gg("attn_output_b", 5120, 2048, "q5_K"); gg("attn_output_b", 5120, 2048, "q6_K");
+    gg("attn_q_a", 1280, 5120, "q5_K");      gg("attn_q_a", 1280, 5120, "q6_K");
+    gg("attn_output_a", 1024, 4096, "q5_K"); gg("attn_output_a", 1024, 4096, "q6_K");
+    gg("attn_kv", 512, 5120, "q5_K");        gg("attn_kv", 512, 5120, "q6_K");
+    gg("shexp_gate_up", 1536, 5120, "q6_K"); gg("shexp_gate_up", 1536, 5120, "q8_0");
+    gg("shexp_down", 5120, 768, "q6_K");     gg("shexp_down", 5120, 768, "q8_0");
+    /* lever P (ds41-p1pass): the shared arm at ranks 1-3's widths (kSharedBlock: 768 / 512 / 512 / 512 of 2304), which a
+     * one-pass decode step of 17 .. 48 rows runs at the step's height */
+    gg("shexp_gate_up r1-3", 1024, 5120, "q6_K"); gg("shexp_gate_up r1-3", 1024, 5120, "q8_0");
+    gg("shexp_down r1-3", 5120, 512, "q6_K");     gg("shexp_down r1-3", 5120, 512, "q8_0");
+    gg("engram_kv", 25600, 6144, "q6_K");
+    v.push_back({ "logits_gemm_ggml head q6_K 32320x5120", "logits_gemm_ggml", "gg",
+                  { PI("n_vocab", 32320), PI("n_embd", 5120), PS("type", "q6_K"), PS("dtype", "bf16") }, "q6_K" });
+    for (const char* ty : { "q5_K", "q6_K" })
+        v.push_back({ fmt("rmsnorm_gemm_nt_ggml q_b %s 8192x1280 (K1 fold a)", ty), "rmsnorm_gemm_nt_ggml", "gg",
+                      { PI("N", 8192), PI("K", 1280), PS("type", ty), PS("dtype", "bf16"), PF("eps", 1e-20) }, ty });
+    for (const char* ty : { "q6_K", "q8_0" })
+        v.push_back({ fmt("swiglu_clamped_gemm_nt_ggml shexp_down %s 5120x768 (K1 fold e)", ty),
+                      "swiglu_clamped_gemm_nt_ggml", "gg",
+                      { PI("N", 5120), PI("K", 768), PS("type", ty), PS("dtype", "bf16"), PF("limit", 10) }, ty });
+    for (const char* ty : { "q6_K", "q8_0" })
+        v.push_back({ fmt("swiglu_clamped_gemm_nt_ggml shexp_down r1-3 %s 5120x512 (K1 fold e)", ty),
+                      "swiglu_clamped_gemm_nt_ggml", "gg",
+                      { PI("N", 5120), PI("K", 512), PS("type", ty), PS("dtype", "bf16"), PF("limit", 10) }, ty });
+    for (long long N : { 384LL, 96LL, 1024LL, 128LL, 32LL })
+        v.push_back({ fmt("gemm_nt_f32 %lldx5120 (%s)", N, N == 384 || N == 96 ? "router" : "compressor kvg / score"),
+                      "gemm_nt_f32", "f32", { PI("N", N), PI("K", 5120), PS("dtype", "bf16") }, "" });
+    struct Bf { const char* lbl; long long N, K; };
+    for (const Bf& b : { Bf{ "indexer attn_q_b", 4096, 1280 }, Bf{ "indexer proj", 32, 5120 },
+                         Bf{ "indexer attn_k", 128, 512 }, Bf{ "compressor kv", 512, 5120 } })
+        v.push_back({ fmt("gemm_nt bf16 %s %lldx%lld", b.lbl, b.N, b.K), "gemm_nt", "bf16",
+                      { PI("N", b.N), PI("K", b.K), PS("dtype", "bf16") }, "" });
+    for (long long n : { 5120LL, 1280LL, 512LL, 128LL })
+        v.push_back({ fmt("rmsnorm n=%lld", n), "rmsnorm", "norm", { PI("n", n), PF("eps", 1e-20), PS("dtype", "bf16") }, "" });
+    v.push_back({ "mhc_mix n=5120 hc=4", "mhc_mix", "mhc",
+                  { PI("n", 5120), PI("hc", 4), PI("iterations", 20), PF("eps", 1e-20), PF("hc_eps", 1e-6), PS("dtype", "bf16") }, "" });
+    v.push_back({ "mhc_collapse n=5120 hc=4", "mhc_collapse", "mhc", { PI("n", 5120), PI("hc", 4), PS("dtype", "bf16") }, "" });
+    v.push_back({ "mhc_collapse_rmsnorm n=5120 hc=4", "mhc_collapse_rmsnorm", "mhc",
+                  { PI("n", 5120), PI("hc", 4), PF("eps", 1e-20), PS("dtype", "bf16") }, "" });
+    v.push_back({ "mhc_post n=5120 hc=4", "mhc_post", "mhc", { PI("n", 5120), PI("hc", 4), PS("dtype", "bf16") }, "" });
+    v.push_back({ "mhc_post_collapse_rmsnorm n=5120 hc=4", "mhc_post_collapse_rmsnorm", "mhc",
+                  { PI("n", 5120), PI("hc", 4), PF("eps", 1e-20), PS("dtype", "bf16") }, "" });
+    v.push_back({ "mhc_contract n=5120 hc=4", "mhc_contract", "mhc", { PI("n", 5120), PI("hc", 4), PS("dtype", "bf16") }, "" });
+    v.push_back({ "stream_gate_add n=5120 hc=4", "stream_gate_add", "mhc",
+                  { PI("n", 5120), PI("hc", 4), PF("eps", 1e-20), PF("gate_eps", 1e-6), PS("dtype", "bf16") }, "" });
+    struct Rp { int nh, hd, off, inv; };
+    for (const Rp& r : { Rp{ 16, 512, 448, 0 }, Rp{ 16, 512, 448, 1 }, Rp{ 1, 128, 64, 0 }, Rp{ 1, 512, 448, 0 }, Rp{ 32, 128, 64, 0 } })
+        v.push_back({ fmt("ds41_rope_rows heads=%d dim=%d inverse=%d", r.nh, r.hd, r.inv), "ds41_rope_rows", "rope",
+                      { PI("n_head", r.nh), PI("head_dim", r.hd), PI("rot", 64), PI("off", r.off), PS("mode", "gptj"),
+                        PI("inverse", r.inv), PS("dtype", "bf16") }, "" });
+    struct Qr { int n, block; const char *fmt_, *scale; };
+    for (const Qr& q : { Qr{ 128, 32, "fp4_e2m1", "ue8m0" }, Qr{ 4096, 32, "fp4_e2m1", "ue8m0" }, Qr{ 512, 16, "fp4_e2m1", "e4m3" },
+                         Qr{ 512, 32, "fp8_e4m3", "ue8m0" }, Qr{ 8192, 32, "fp8_e4m3", "ue8m0" } })
+        v.push_back({ fmt("quant_roundtrip n=%d block=%d %s", q.n, q.block, q.fmt_), "quant_roundtrip", "rope",
+                      { PI("n", q.n), PI("block", q.block), PS("format", q.fmt_), PS("scale", q.scale), PS("dtype", "bf16") }, "" });
+    v.push_back({ "rmsnorm_rope_roundtrip n=128 fp4 (index key)", "rmsnorm_rope_roundtrip", "rope",
+                  { PI("n", 128), PF("eps", 1e-20), PI("n_head", 1), PI("head_dim", 128), PI("rot", 64), PI("off", 64),
+                    PS("mode", "gptj"), PI("inverse", 0), PI("block", 32), PS("format", "fp4_e2m1"), PS("scale", "ue8m0"),
+                    PS("dtype", "bf16") }, "" });
+    v.push_back({ "rmsnorm_rope_roundtrip n=512 fp8 (window key)", "rmsnorm_rope_roundtrip", "rope",
+                  { PI("n", 512), PF("eps", 1e-20), PI("n_head", 1), PI("head_dim", 512), PI("rot", 64), PI("off", 448),
+                    PS("mode", "gptj"), PI("inverse", 0), PI("block", 32), PS("format", "fp8_e4m3"), PS("scale", "ue8m0"),
+                    PS("dtype", "bf16") }, "" });
+    struct Rr { int nh, hd, off, inv, block; const char *fmt_, *scale; };
+    for (const Rr& r : { Rr{ 16, 512, 448, 1, 32, "fp8_e4m3", "ue8m0" }, Rr{ 1, 512, 448, 0, 16, "fp4_e2m1", "e4m3" },
+                         Rr{ 32, 128, 64, 0, 32, "fp4_e2m1", "ue8m0" } })
+        v.push_back({ fmt("rope_rows_roundtrip heads=%d dim=%d inverse=%d %s", r.nh, r.hd, r.inv, r.fmt_), "rope_rows_roundtrip", "rope",
+                      { PI("n_head", r.nh), PI("head_dim", r.hd), PI("rot", 64), PI("off", r.off), PS("mode", "gptj"),
+                        PI("inverse", r.inv), PI("block", r.block), PS("format", r.fmt_), PS("scale", r.scale), PS("dtype", "bf16") }, "" });
+    for (long long n : { 768LL, 2304LL })
+        v.push_back({ fmt("swiglu_clamped n=%lld", n), "swiglu_clamped", "elem", { PI("n", n), PF("limit", 10), PS("dtype", "bf16") }, "" });
+    for (long long n : { 5120LL, 20480LL, 6144LL })
+        v.push_back({ fmt("cast bf16 n=%lld", n), "cast", "elem", { PI("n", n), PS("from", "bf16"), PS("to", "bf16") }, "" });
+    v.push_back({ "softmax_pool n=512 ratio=2", "softmax_pool", "elem", { PI("n", 512), PI("ratio", 2), PS("dtype", "bf16") }, "" });
+    v.push_back({ "router_scored_topk 384 top6 sqrtsoftplus", "router_scored_topk", "router",
+                  { PI("n_expert", 384), PI("top_k", 6), PI("norm", 1), PF("route_scale", 1.5), PS("score", "sqrtsoftplus"),
+                    PS("dtype", "f32") }, "" });
     return v;
 }
 
@@ -392,128 +424,9 @@ std::vector<long long> default_sweep() {
     return m;
 }
 
-/* fn4 BI wide (14.11.2026): router_gemm_topk_scatter_inv (the fused router, an init hook, batch-wide sort outputs: not
- * run() material) at Flash-Next's TP4 rank-0 shape (K 2560, 512 experts, 128 local, top 10, shared gate). For each M:
- *   (a) every row's logits, ids, weights and gate against the same rows in 4-row launches (a sequence alone at depth 3);
- *   (b) logits and gate against the separate ops the engine issues above the fused band (gemm_nt at M, the engine's row);
- *   (c) sorted / offsets / counts / inverse against a host stable sort of the launch's own ids.
- * Returns the number of failing M. */
-int router_wide(const Plugin& pl, const std::vector<long long>& sweep) {
-    const RadKernelInfo* r = nullptr;
-    for (int k = 0; k < pl.kernel_count() && !r; ++k)
-        if (!std::strcmp(pl.kernel_at(k)->name, "router_gemm_topk_scatter_inv_bf16")) r = pl.kernel_at(k);
-    if (!r || !r->init) { std::printf("BICHECK router fused: SKIP (row absent)\n"); return 0; }
-    const long long K = 2560, NE = 512, NL = 128, TK = 10, BASE = 0;
-    long long Mmax = 4;
-    for (long long M : sweep) Mmax = std::max(Mmax, M);
-    Mmax = (Mmax + 3) / 4 * 4;
-    auto bf = [](uint64_t h) { return h_to_bf16(normalish(h) * 0.05f); };
-    std::vector<uint16_t> hx((size_t)(Mmax * K)), hw((size_t)(NE * K)), hg((size_t)K);
-    for (size_t i = 0; i < hx.size(); ++i) hx[i] = bf(key(11, 0, i / K, i % K));
-    for (size_t i = 0; i < hw.size(); ++i) hw[i] = bf(key(12, 1, i / K, i % K));
-    for (size_t i = 0; i < hg.size(); ++i) hg[i] = bf(key(13, 2, 0, i));
-    void* dx = dalloc(hx.size() * 2); void* dw = dalloc(hw.size() * 2); void* dg = dalloc(hg.size() * 2);
-    st_memcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
-    st_memcpy(dw, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
-    st_memcpy(dg, hg.data(), hg.size() * 2, hipMemcpyHostToDevice);
-    void* dlg = dalloc((size_t)(Mmax * NE * 2)); void* did = dalloc((size_t)(Mmax * TK * 4));
-    void* dew = dalloc((size_t)(Mmax * TK * 2)); void* dso = dalloc((size_t)(Mmax * TK * 4));
-    void* dof = dalloc((size_t)(NL + 1) * 4); void* dct = dalloc((size_t)NL * 4);
-    void* dgt = dalloc((size_t)Mmax * 2); void* dinv = dalloc((size_t)(Mmax * TK * 4));
-    struct Out { std::vector<uint16_t> lg, ew, gt; std::vector<int32_t> ids, so, of, ct, inv; };
-    /* one fused launch over rows [r0, r0 + M) of x, outputs at row r0 of each per-row buffer (batch outputs at 0) */
-    auto fused = [&](long long r0, long long M) -> int {
-        const std::vector<RadParam> ps = { PI("M", M), PI("K", K), PI("n_expert", NE), PI("n_local", NL), PI("top_k", TK),
-                                           PI("norm", 1), PS("dtype", "bf16"), PI("expert_base", BASE) };
-        void* inst = nullptr;
-        int rc = r->init(ps.data(), (int)ps.size(), 0, 1, &inst);
-        if (rc != RAD_OK) return rc;
-        std::vector<RadTensor> ts = {
-            T((uint16_t*)dx + r0 * K, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(dg, RAD_BF16, { 1, K }),
-            T((uint16_t*)dlg + r0 * NE, RAD_BF16, { M, NE }), T((int32_t*)did + r0 * TK, RAD_I32, { M, TK }),
-            T((uint16_t*)dew + r0 * TK, RAD_BF16, { M, TK }), T(dso, RAD_I32, { M * TK }), T(dof, RAD_I32, { NL + 1 }),
-            T(dct, RAD_I32, { NL }), T((uint16_t*)dgt + r0, RAD_BF16, { M, 1 }), T(dinv, RAD_I32, { M * TK }) };
-        RadArgs a; std::memset(&a, 0, sizeof a);
-        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
-        a.instance = inst;
-        rc = r->launch(&a, (RadStream)nullptr);
-        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_STATE;
-        if (r->fini) r->fini(inst);
-        return rc;
-    };
-    auto rd = [&](long long M, Out& o) {
-        o.lg.resize((size_t)(M * NE)); o.ew.resize((size_t)(M * TK)); o.gt.resize((size_t)M);
-        o.ids.resize((size_t)(M * TK)); o.so.resize((size_t)(M * TK)); o.of.resize((size_t)NL + 1); o.ct.resize((size_t)NL);
-        o.inv.resize((size_t)(M * TK));
-        st_memcpy(o.lg.data(), dlg, o.lg.size() * 2, hipMemcpyDeviceToHost);
-        st_memcpy(o.ew.data(), dew, o.ew.size() * 2, hipMemcpyDeviceToHost);
-        st_memcpy(o.gt.data(), dgt, o.gt.size() * 2, hipMemcpyDeviceToHost);
-        st_memcpy(o.ids.data(), did, o.ids.size() * 4, hipMemcpyDeviceToHost);
-        st_memcpy(o.so.data(), dso, o.so.size() * 4, hipMemcpyDeviceToHost);
-        st_memcpy(o.of.data(), dof, o.of.size() * 4, hipMemcpyDeviceToHost);
-        st_memcpy(o.ct.data(), dct, o.ct.size() * 4, hipMemcpyDeviceToHost);
-        st_memcpy(o.inv.data(), dinv, o.inv.size() * 4, hipMemcpyDeviceToHost);
-    };
-    /* (a)'s reference: every row in 4-row launches (per-row outputs only) */
-    Out ref;
-    for (long long r0 = 0; r0 < Mmax; r0 += 4)
-        if (fused(r0, 4) != RAD_OK) { std::printf("BICHECK router fused: FAIL (4-row launch at %lld)\n", r0); return 1; }
-    rd(Mmax, ref);
-    int bad = 0;
-    for (long long M : sweep) {
-        const int rc = fused(0, M);
-        if (rc != RAD_OK) { std::printf("  BIFAIL router fused M=%lld launch rc %d\n", M, rc); ++bad; continue; }
-        Out o; rd(M, o);
-        size_t dl = 0, di = 0, dwt = 0, dgg = 0;
-        for (size_t i = 0; i < (size_t)(M * NE); ++i) dl += o.lg[i] != ref.lg[i];
-        for (size_t i = 0; i < (size_t)(M * TK); ++i) { di += o.ids[i] != ref.ids[i]; dwt += o.ew[i] != ref.ew[i]; }
-        for (size_t i = 0; i < (size_t)M; ++i) dgg += o.gt[i] != ref.gt[i];
-        /* (c) host stable sort of this launch's ids */
-        std::vector<int32_t> cnt((size_t)NL, 0), off((size_t)NL + 1, 0), so((size_t)(M * TK), -1), inv((size_t)(M * TK), -1);
-        for (long long i = 0; i < M * TK; ++i) { const long long e = o.ids[(size_t)i] - BASE; if (e >= 0 && e < NL) ++cnt[(size_t)e]; }
-        for (long long e = 0; e < NL; ++e) off[(size_t)e + 1] = off[(size_t)e] + cnt[(size_t)e];
-        std::vector<int32_t> fillp(off.begin(), off.end() - 1);
-        for (long long i = 0; i < M * TK; ++i) {
-            const long long e = o.ids[(size_t)i] - BASE;
-            if (e < 0 || e >= NL) continue;
-            so[(size_t)fillp[(size_t)e]] = (int32_t)i; inv[(size_t)i] = fillp[(size_t)e]++;
-        }
-        size_t ds = 0;
-        for (long long e = 0; e < NL; ++e) ds += (o.of[(size_t)e] != off[(size_t)e]) + (o.ct[(size_t)e] != cnt[(size_t)e]);
-        ds += o.of[(size_t)NL] != off[(size_t)NL];
-        for (long long i = 0; i < M * TK; ++i) ds += (o.so[(size_t)i] != so[(size_t)i]) + (o.inv[(size_t)i] != inv[(size_t)i]);
-        /* (b) the separate ops' logits and gate at M (the engine's gemm_nt rows at this M) */
-        size_t dsl = 0, dsg = 0; std::string rows;
-        {
-            const std::vector<RadParam> pr = { PI("M", M), PI("N", NE), PI("K", K), PS("dtype", "bf16") };
-            const std::vector<RadParam> pg = { PI("M", M), PI("N", 1), PI("K", K), PS("dtype", "bf16") };
-            const RadKernelInfo* rr = pick(pl, "gemm_nt", pr); const RadKernelInfo* rg = pick(pl, "gemm_nt", pg);
-            void* yl = dalloc((size_t)(M * NE * 2)); void* yg = dalloc((size_t)M * 2);
-            int e1 = rr ? launch_row(rr, { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(yl, RAD_BF16, { M, NE }) }, pr) : -1;
-            int e2 = rg ? launch_row(rg, { T(dx, RAD_BF16, { M, K }), T(dg, RAD_BF16, { 1, K }), T(yg, RAD_BF16, { M, 1 }) }, pg) : -1;
-            rows = fmt("%s / %s", rr ? rr->name : "-", rg ? rg->name : "-");
-            if (e1 || e2) { dsl = dsg = (size_t)-1; }
-            else {
-                std::vector<uint16_t> hl((size_t)(M * NE)), hgg((size_t)M);
-                st_memcpy(hl.data(), yl, hl.size() * 2, hipMemcpyDeviceToHost);
-                st_memcpy(hgg.data(), yg, hgg.size() * 2, hipMemcpyDeviceToHost);
-                for (size_t i = 0; i < hl.size(); ++i) dsl += hl[i] != o.lg[i];
-                for (size_t i = 0; i < hgg.size(); ++i) dsg += hgg[i] != o.gt[i];
-            }
-        }
-        const bool good = dl == 0 && di == 0 && dwt == 0 && dgg == 0 && ds == 0 && dsl == 0 && dsg == 0;
-        if (!good) ++bad;
-        std::printf("BICHECK router fused M=%lld: %s | vs 4-row launches: logits %zu, ids %zu, weights %zu, gate %zu differ; "
-                    "sort vs host %zu; vs separate gemm_nt (%s): logits %zu, gate %zu\n", M, good ? "INVARIANT" : "FLIPS",
-                    dl, di, dwt, dgg, ds, rows.c_str(), dsl, dsg);
-        std::fflush(stdout);
-    }
-    return bad;
-}
-
 }  // namespace bi
 
-static void fn_bi_check(const Plugin& pl, const char* classes, const char* mlist) {
+static void ds_bi_check(const Plugin& pl, const char* classes, const char* mlist) {
     const std::string want = classes && *classes ? classes : "all";
     std::vector<long long> sweep;
     if (mlist && *mlist) {
@@ -526,17 +439,15 @@ static void fn_bi_check(const Plugin& pl, const char* classes, const char* mlist
         }
     }
     if (sweep.empty()) sweep = bi::default_sweep();
-    auto ev = [](const char* k) { const char* e = std::getenv(k); return e ? e : "(unset)"; };
-    std::printf("fn4 BI per-op check: a row as row 0 of an R4D_BI_REF=%s-row launch (unset: alone) vs the same row inside an "
-                "M-row launch, byte for byte; ", std::getenv("R4D_BI_REF") ? std::getenv("R4D_BI_REF") : "1");
-    std::printf("probe rows 0, M/2, M-1; %zu M values up to %lld; env RADIANCE_FN4_HC_READV=%s _HC_UPMIX=%s _HC_WRITEVEC=%s "
-                "_HC_NORMWAVE=%s _HC_SS=%s _HC_BI=%s\n",
-                sweep.size(), *std::max_element(sweep.begin(), sweep.end()), ev("RADIANCE_FN4_HC_READV"),
-                ev("RADIANCE_FN4_HC_UPMIX"), ev("RADIANCE_FN4_HC_WRITEVEC"), ev("RADIANCE_FN4_HC_NORMWAVE"),
-                ev("RADIANCE_FN4_HC_SS"), ev("RADIANCE_FN4_HC_BI"));
+    std::printf("lever BI per-op check: a row alone (M = 1) vs the same row inside an M-row launch, byte for byte; "
+                "probe rows 0, M/2, M-1; %zu M values up to %lld; env RADIANCE_DS41_GG_GEMV=%s _GG_PF=%s _F32_PF=%s\n",
+                sweep.size(), *std::max_element(sweep.begin(), sweep.end()),
+                std::getenv("RADIANCE_DS41_GG_GEMV") ? std::getenv("RADIANCE_DS41_GG_GEMV") : "(unset)",
+                std::getenv("RADIANCE_DS41_GG_PF") ? std::getenv("RADIANCE_DS41_GG_PF") : "(unset)",
+                std::getenv("RADIANCE_DS41_F32_PF") ? std::getenv("RADIANCE_DS41_F32_PF") : "(unset)");
     int n = 0, inv = 0, flip = 0, sk = 0;
     for (const bi::Case& c : bi::cases()) {
-        if (want != "all" && ("," + want + ",").find("," + c.cls + ",") == std::string::npos) continue;
+        if (want != "all" && !mr_in(want.c_str(), c.cls.c_str())) continue;
         ++n;
         dfree_all();
         const bi::Result R = bi::run(pl, c, sweep);
@@ -563,16 +474,6 @@ static void fn_bi_check(const Plugin& pl, const char* classes, const char* mlist
         std::fflush(stdout);
     }
     dfree_all();
-    if (("," + want + ",").find(",router,") != std::string::npos || want == "all") {
-        std::vector<long long> rs;
-        for (long long M : sweep) if (M <= 128) rs.push_back(M);
-        if (rs.empty()) rs = { 1, 4, 16, 64, 65, 96, 128 };
-        ++n;
-        const int rb = bi::router_wide(pl, rs);
-        if (rb) { ++flip; ++g_fail; } else ++inv;
-        dfree_all();
-    }
     std::printf("BICHECK summary: %d cases, %d invariant, %d flip, %d skipped\n", n, inv, flip, sk);
 }
-
 #endif

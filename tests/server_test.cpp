@@ -10,6 +10,7 @@
 #include "lora/slots.h"
 #include "server/liveview.h"
 #include "server/metrics.h"
+#include "runtime/fn4_switch.h"
 #include "text/chat.h"
 
 #include <condition_variable>
@@ -4977,6 +4978,955 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         g3.path = "/admin/control-vector";
         CHECK_EQ(f.srv->router().dispatch(g3).status, 200);   /* in-process */
     }
+}
+
+/* The runtime switches (runtime/fn4_switch.h, POST /admin/fn4). GET reports what is applied, read
+ * from its owner: no scheduler has registered here, so draft_adaptive is -1, and no loaded object
+ * serves gg_gemv (no libr4d in this binary), so it is -1. A body with any unknown switch, a value
+ * out of range, a value the owner does not take, a switch nothing serves or a non-number is refused
+ * whole, the reason in the response, and queues nothing. A good body is queued under "pending" and
+ * applied only at a step release (fn4::apply_pending, which the engine calls with every rank
+ * parked), where the epoch moves once. draft_adaptive=1 is refused unless the registered drafter
+ * can run the adaptive window; what GET reports is the scheduler's window the engine reads back
+ * (note_draft_adaptive). Loopback only without a key. */
+TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release) {
+    Fixture f;
+    const HttpResponse g = f.get("/admin/fn4");
+    CHECK_EQ(g.status, 200);
+    CHECK(has(g.body, "\"draft_adaptive\": -1"));
+    CHECK(has(g.body, "\"gg_gemv\": -1"));
+    CHECK(has(g.body, "\"ds41_argather\": -1"));     /* deepseek41's (levers D3, F4): not loaded here */
+    CHECK(has(g.body, "\"ds41_shexp_lane\": -1"));
+    CHECK(has(g.body, "\"ds41_kvfold\": -1"));       /* deepseek41's (lever K1 folds c, d, f) */
+    CHECK(has(g.body, "\"ds41_ofold\": -1"));
+    CHECK(has(g.body, "\"ds41_onefill\": -1"));
+    CHECK(has(g.body, "\"idx_split\": -1"));       /* deepseek41's (lever I1): not loaded here */
+    CHECK(has(g.body, "\"ds41_qnfold\": -1"));     /* deepseek41's (lever K1 folds a, e) */
+    CHECK(has(g.body, "\"ds41_swfold\": -1"));
+    CHECK(has(g.body, "\"dspark_walk\": -1"));      /* deepseek41's (lever W1, the full-vocabulary walk) */
+    CHECK(has(g.body, "\"ds41_bi\": -1"));          /* deepseek41's (lever BI, the step in segments) */
+    CHECK(has(g.body, "\"ds41_psk\": -1"));         /* deepseek41's (lever PSK, the prefill cone): not loaded here */
+    CHECK(has(g.body, "\"ds41_engdd\": -1"));       /* deepseek41's (lever E1, the Engram kv dedup): not loaded here */
+    CHECK(has(g.body, "\"draft_sample\": -1"));     /* the engine's (lever SD): no engine registered here */
+    CHECK(has(g.body, "\"aql_acq\": 0"));
+    CHECK(has(g.body, "\"epoch\": 0"));
+    CHECK(has(g.body, "\"draft_capable\": -1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"epoch_bump":1,"no_such_switch":1})").status, 400);
+    const HttpResponse gg = f.post("/admin/fn4", R"({"epoch_bump":1,"gg_gemv":1})");
+    CHECK_EQ(gg.status, 400);
+    CHECK(has(gg.body, "no loaded plugin serves it"));
+    for (const char* b : { R"({"ds41_argather":4})", R"({"ds41_shexp_lane":1})", R"({"ds41_kvfold":1})",
+                           R"({"ds41_ofold":1})", R"({"ds41_onefill":1})", R"({"dspark_walk":1})",
+                           R"({"ds41_bi":1})", R"({"ds41_psk":1})", R"({"ds41_psk":2})", R"({"ds41_psk_l20":1})",
+                           R"({"ds41_psk_l20":0})", R"({"dspark_pfctx":1})", R"({"dspark_pfctx":0})",
+                           R"({"ds41_psk_cr":1})", R"({"ds41_psk_cr":0})", R"({"ds41_psk":4})",
+                           R"({"ds41_engdd":1})" }) {
+        const HttpResponse r = f.post("/admin/fn4", b);
+        CHECK_EQ(r.status, 400);
+        CHECK(has(r.body, "no loaded plugin serves it"));
+    }
+    const HttpResponse ix = f.post("/admin/fn4", R"({"idx_split":1})");
+    CHECK_EQ(ix.status, 400);
+    CHECK(has(ix.body, "no loaded plugin serves it"));
+    for (const char* b : { R"({"ds41_qnfold":1})", R"({"ds41_swfold":1})" }) {
+        const HttpResponse r = f.post("/admin/fn4", b);
+        CHECK_EQ(r.status, 400);
+        CHECK(has(r.body, "no loaded plugin serves it"));
+    }
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":"on"})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":3})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":2})").status, 400);
+    /* lever SD: out of range, and 1 with no engine (so no coupled drafter) registered */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_sample":201})").status, 400);
+    const HttpResponse ds = f.post("/admin/fn4", R"({"draft_sample":1})");
+    CHECK_EQ(ds.status, 400);
+    CHECK(has(ds.body, "no engine has registered a drafter"));
+    const HttpResponse da = f.post("/admin/fn4", R"({"draft_adaptive":1})");
+    CHECK_EQ(da.status, 400);
+    CHECK(has(da.body, "no scheduler has registered a drafter"));
+    CHECK_EQ(f.post("/admin/fn4", R"([1])").status, 400);
+    CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
+    int sw[fn4::kSwitches];
+    int& adapt = sw[fn4::kDraftAdaptive];
+    adapt = 7;
+    CHECK(!fn4::apply_pending(3, sw));
+    CHECK_EQ(adapt, fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), (uint64_t)0);
+
+    /* A drafter that cannot run the adaptive window: 1 refused by name, 0 is no change. */
+    fn4::draft_register(false, false);
+    const HttpResponse dn = f.post("/admin/fn4", R"({"draft_adaptive":1})");
+    CHECK_EQ(dn.status, 400);
+    CHECK(has(dn.body, "cannot run the adaptive window"));
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_adaptive\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":0})").status, 200);
+    CHECK(!fn4::apply_pending(4, sw));
+    CHECK_EQ(fn4::epoch(), (uint64_t)0);
+
+    /* One that can: queued, applied at a step, the epoch moves once; GET reports the window the
+     * scheduler took (here the engine's read-back is played by hand). */
+    fn4::draft_register(true, false);
+    const HttpResponse p = f.post("/admin/fn4", R"({"draft_adaptive":1,"aql_acq":2,"epoch_bump":1})");
+    CHECK_EQ(p.status, 200);
+    CHECK(has(p.body, "\"pending\": {\"draft_adaptive\": 1, \"aql_acq\": 2, \"epoch_bump\": 1}"));
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 0);
+    CHECK(fn4::apply_pending(7, sw));
+    CHECK_EQ(adapt, 1);
+    fn4::note_draft_adaptive(true);
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 1);
+    CHECK_EQ(fn4::aql_acq_rule(), 2);
+    CHECK_EQ(fn4::epoch(), (uint64_t)1);
+    const HttpResponse g2 = f.get("/admin/fn4");
+    CHECK(has(g2.body, "\"pending\": {}"));
+    CHECK(has(g2.body, "\"applied_step\": 7"));
+    CHECK(has(g2.body, "\"aql_acq\": 2"));
+    CHECK(has(g2.body, "\"draft_capable\": 1"));
+    CHECK(!fn4::apply_pending(8, sw));
+    CHECK_EQ(adapt, fn4::kNoChange);
+    /* A value equal to the applied one is no change: no new epoch. A bump alone is one. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":1,"aql_acq":2})").status, 200);
+    CHECK(!fn4::apply_pending(9, sw));
+    CHECK_EQ(f.post("/admin/fn4", R"({"epoch_bump":1})").status, 200);
+    CHECK(fn4::apply_pending(10, sw));
+    CHECK_EQ(adapt, fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), (uint64_t)2);
+    /* -1 is the configured window (fixed here); the rule back to off. Left that way for the rest of
+     * the binary, with no drafter registered as capable. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":0,"draft_adaptive":-1})").status, 200);
+    CHECK(fn4::apply_pending(11, sw));
+    CHECK_EQ(adapt, 0);
+    fn4::note_draft_adaptive(false);
+    CHECK_EQ(fn4::aql_acq_rule(), 0);
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 0);
+    CHECK_EQ(fn4::epoch(), (uint64_t)3);
+
+    /* The scheduler's draft switches (draft_depth0, draft_probe, draft_hybrid, draft_hybrid_match):
+     * checked by range and by what the registered drafter can run, handed to the scheduler at the
+     * step release, and reported as the scheduler noted them; the counters as it noted them. */
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_depth0\": -1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":4})").status, 400);   /* ds41-int10: 3 is occupancy only, 4 past the range */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe":1})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":257})").status, 400);
+    fn4::draft_register(false, false);
+    fn4::hybrid_register(false);
+    const HttpResponse d0 = f.post("/admin/fn4", R"({"draft_depth0":1})");
+    CHECK_EQ(d0.status, 400);
+    CHECK(has(d0.body, "cannot run the adaptive window"));
+    const HttpResponse h0 = f.post("/admin/fn4", R"({"draft_hybrid":1})");
+    CHECK_EQ(h0.status, 400);
+    CHECK(has(h0.body, "no draft head that drafts chains"));
+    fn4::draft_register(true, true);
+    fn4::hybrid_register(true);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    fn4::note_sched(fn4::kDraftProbe, 16);
+    fn4::note_sched(fn4::kDraftHybrid, 0);
+    fn4::note_sched(fn4::kDraftHybridMatch, 8);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":1,"draft_probe":4,"draft_hybrid":1,"draft_hybrid_match":12})")
+                 .status, 200);
+    CHECK(fn4::apply_pending(12, sw));
+    CHECK_EQ(sw[fn4::kDraftAdaptive], fn4::kNoChange);
+    CHECK_EQ(sw[fn4::kDraftDepth0], 1);
+    CHECK_EQ(sw[fn4::kDraftProbe], 4);
+    CHECK_EQ(sw[fn4::kDraftHybrid], 1);
+    CHECK_EQ(sw[fn4::kDraftHybridMatch], 12);
+    CHECK_EQ(sw[fn4::kAqlAcq], fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), (uint64_t)4);
+    fn4::note_sched(fn4::kDraftDepth0, 1);
+    fn4::note_sched(fn4::kDraftProbe, 4);
+    fn4::note_sched(fn4::kDraftHybrid, 1);
+    fn4::note_sched(fn4::kDraftHybridMatch, 12);
+    fn4::note_draft_counts(5, 6, 1, 7, 8, 9);
+    const HttpResponse g3 = f.get("/admin/fn4");
+    CHECK(has(g3.body, "\"draft_depth0\": 1, \"draft_probe\": 4, \"draft_hybrid\": 1, \"draft_hybrid_match\": 12"));
+    CHECK(has(g3.body, "\"draft\": {\"zero_cycles\": 5, \"probe_cycles\": 6, \"zero_moves\": 1, "
+                       "\"hybrid_lookup\": 7, \"hybrid_head\": 8, \"hybrid_unahead\": 9, \"occ_cycles\": 0, "
+                       "\"occ_moves\": 0}"));
+    /* The same values again: no change, no epoch. Back off for the rest of the binary. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":1,"draft_hybrid":1})").status, 200);
+    CHECK(!fn4::apply_pending(13, sw));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":0,"draft_hybrid":0})").status, 200);
+    CHECK(fn4::apply_pending(14, sw));
+    CHECK_EQ(sw[fn4::kDraftDepth0], 0);
+    CHECK_EQ(sw[fn4::kDraftHybrid], 0);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    fn4::note_sched(fn4::kDraftHybrid, 0);
+    fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
+    fn4::draft_register(false, false);
+    fn4::hybrid_register(false);
+
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/admin/fn4";
+    q.body = R"({"epoch_bump":1})";
+    q.peer = "192.168.1.20:50122";
+    q.raw_peer = q.peer;
+    q.headers["Host"] = "127.0.0.1:8080";
+    CHECK_EQ(f.srv->router().dispatch(q).status, 403);
+    CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
+}
+
+/* Lever DL's switches (fn4_switch.h): draft_probe_backoff (0 .. 8) needs a drafter that runs the adaptive
+ * window; draft_lend (0, 1, 2 .. 4096, -1) needs the lend set up -- refused by name before any scheduler
+ * registered it (RADIANCE_DRAFT_LEND unset) and when it registered nothing to lend. GET reports a "lend"
+ * object only once registered. Runs after the case above, whose registrations it leaves as it found them. */
+TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
+    Fixture f;
+    const HttpResponse g = f.get("/admin/fn4");
+    CHECK(!has(g.body, "\"lend\": {"));
+    CHECK(has(g.body, "\"draft_probe_backoff\": "));
+    CHECK(has(g.body, "\"draft_lend\": "));
+    const HttpResponse l0 = f.post("/admin/fn4", R"({"draft_lend":1})");
+    CHECK_EQ(l0.status, 400);
+    CHECK(has(l0.body, "RADIANCE_DRAFT_LEND was not set at start"));
+    const HttpResponse lb = f.post("/admin/fn4", R"({"draft_lend_borrow":1})");
+    CHECK_EQ(lb.status, 400);
+    CHECK(has(lb.body, "RADIANCE_DRAFT_LEND was not set at start"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":5000})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-2})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe_backoff":9})").status, 400);
+    fn4::draft_register(false, false);
+    const HttpResponse b0 = f.post("/admin/fn4", R"({"draft_probe_backoff":1})");
+    CHECK_EQ(b0.status, 400);
+    CHECK(has(b0.body, "cannot run the adaptive window"));
+    fn4::lend_register(false);
+    const HttpResponse l1 = f.post("/admin/fn4", R"({"draft_lend":-1})");
+    CHECK_EQ(l1.status, 400);
+    CHECK(has(l1.body, "no drafter expert slab to lend"));
+    CHECK(has(f.get("/admin/fn4").body, "\"lend\": {\"capable\": 0"));
+
+    int sw[fn4::kSwitches];
+    fn4::draft_register(true, true);
+    fn4::lend_register(true);
+    fn4::note_sched(fn4::kDraftLend, 0);
+    fn4::note_sched(fn4::kDraftProbeBackoff, 0);
+    const uint64_t e0 = fn4::epoch();
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":1,"draft_probe_backoff":3})").status, 200);
+    CHECK(fn4::apply_pending(30, sw));
+    CHECK_EQ(sw[fn4::kDraftLend], 1);
+    CHECK_EQ(sw[fn4::kDraftProbeBackoff], 3);
+    CHECK_EQ(sw[fn4::kDraftDepth0], fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), e0 + 1);
+    fn4::note_sched(fn4::kDraftLend, 1);
+    fn4::note_sched(fn4::kDraftProbeBackoff, 3);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128);
+    fn4::note_lend_engine(2, 1, 0, 237, 0, 96, 2151);
+    const HttpResponse g1 = f.get("/admin/fn4");
+    CHECK(has(g1.body, "\"draft_probe_backoff\": 3, \"draft_lend\": 1"));
+    CHECK(has(g1.body, "\"lend\": {\"capable\": 1, \"lent_cycles\": 100, \"lent_plain_steps\": 80, \"lent_plain_ms\": 3200, "
+                       "\"lent_probe_steps\": 2, \"lent_probe_ms\": 300, \"transit_steps\": 9, \"transit_ms\": 450, "
+                       "\"backoff_k\": 3, \"probe_interval\": 128, \"state\": 2, \"lends\": 1, \"reclaims\": 0, "
+                       "\"lent_units\": 237, \"draft_resident\": 0, \"draft_units\": 96, \"slab_mib\": 2151, "
+                       "\"borrow_cycles\": 0, \"hyst_holds\": 0}"));
+    /* The borrow: 0 / 1, refused unless the lend is set up; its count at the end of "lend". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_borrow":2})").status, 400);
+    fn4::note_sched(fn4::kDraftLendBorrow, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_borrow":1})").status, 200);
+    CHECK(fn4::apply_pending(29, sw));
+    CHECK_EQ(sw[fn4::kDraftLendBorrow], 1);
+    fn4::note_sched(fn4::kDraftLendBorrow, 1);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41);
+    const HttpResponse g2 = f.get("/admin/fn4");
+    CHECK(has(g2.body, "\"draft_lend\": 1, \"draft_lend_borrow\": 1"));
+    CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41, \"hyst_holds\": 0}"));
+    /* Lever Z0-H, the lend's hysteresis: 0 .. 100, above 0 refused unless the lend is set up; its count last in "lend". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":101})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":-1})").status, 400);
+    fn4::note_sched(fn4::kDraftLendHyst, 0);   /* the scheduler reports it at its init (-1 before) */
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_lend_hyst\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":20})").status, 200);
+    CHECK(fn4::apply_pending(33, sw));
+    CHECK_EQ(sw[fn4::kDraftLendHyst], 20);
+    CHECK_EQ(sw[fn4::kDraftLend], fn4::kNoChange);
+    fn4::note_sched(fn4::kDraftLendHyst, 20);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41, 7);
+    const HttpResponse g3 = f.get("/admin/fn4");
+    CHECK(has(g3.body, "\"draft_lend_hyst\": 20"));
+    CHECK(has(g3.body, "\"borrow_cycles\": 41, \"hyst_holds\": 7}"));
+    fn4::lend_register(false);
+    const HttpResponse h0 = f.post("/admin/fn4", R"({"draft_lend_hyst":20})");
+    CHECK_EQ(h0.status, 400);
+    CHECK(has(h0.body, "no drafter expert slab to lend"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":0})").status, 200);   /* 0 is always taken */
+    CHECK(fn4::apply_pending(34, sw));
+    fn4::note_sched(fn4::kDraftLendHyst, 0);
+    fn4::lend_register(true);
+    /* Lever Z0-A, arena_d0 (the engine's): 0 / 1, 1 refused until the engine registered a rung below the largest. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":2})").status, 400);
+    const HttpResponse a0 = f.post("/admin/fn4", R"({"arena_d0":1})");
+    CHECK_EQ(a0.status, 400);
+    CHECK(has(a0.body, "no engine has registered its activation arena"));
+    fn4::arena_d0_register(false);
+    const HttpResponse a1 = f.post("/admin/fn4", R"({"arena_d0":1})");
+    CHECK_EQ(a1.status, 400);
+    CHECK(has(a1.body, "no decode rung below the largest"));
+    fn4::arena_d0_register(true);
+    fn4::note_sched(fn4::kArenaD0, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":1})").status, 200);
+    CHECK(fn4::apply_pending(35, sw));
+    CHECK_EQ(sw[fn4::kArenaD0], 1);
+    CHECK_EQ(sw[fn4::kDraftLendHyst], fn4::kNoChange);
+    fn4::note_sched(fn4::kArenaD0, 1);
+    CHECK(has(f.get("/admin/fn4").body, "\"arena_d0\": 1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":0})").status, 200);
+    CHECK(fn4::apply_pending(36, sw));
+    fn4::note_sched(fn4::kArenaD0, 0);
+    fn4::arena_d0_register(false);
+    /* Lever Z0-W, draft_lend_w (the engine's): 0 / 1, 1 refused until an engine registered the weight lend set up;
+     * its counters at the end of "lend" only then. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_w":2})").status, 400);
+    const HttpResponse w0 = f.post("/admin/fn4", R"({"draft_lend_w":1})");
+    CHECK_EQ(w0.status, 400);
+    CHECK(has(w0.body, "no engine has registered the drafter's weight lend"));
+    CHECK(!has(f.get("/admin/fn4").body, "\"w_lent\""));
+    fn4::draft_w_register(false);
+    const HttpResponse w1 = f.post("/admin/fn4", R"({"draft_lend_w":1})");
+    CHECK_EQ(w1.status, 400);
+    CHECK(has(w1.body, "RADIANCE_DRAFT_LEND_WEIGHTS"));
+    fn4::draft_w_register(true);
+    fn4::note_sched(fn4::kDraftLendW, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_w":1})").status, 200);
+    CHECK(fn4::apply_pending(37, sw));
+    CHECK_EQ(sw[fn4::kDraftLendW], 1);
+    fn4::note_sched(fn4::kDraftLendW, 1);
+    fn4::note_lend_w(1, 3, 2, 35, 302);
+    const HttpResponse gw = f.get("/admin/fn4");
+    CHECK(has(gw.body, "\"draft_lend_w\": 1"));
+    CHECK(has(gw.body, "\"hyst_holds\": 7, \"w_lent\": 1, \"w_lends\": 3, \"w_reclaims\": 2, \"w_lent_units\": 35, \"w_mib\": 302}"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_w":0})").status, 200);
+    CHECK(fn4::apply_pending(38, sw));
+    fn4::note_sched(fn4::kDraftLendW, 0);
+    fn4::note_lend_w(0, 0, 0, 0, 0);
+    fn4::draft_w_register(false);
+    /* Lever Z0-O, draft_occ (rows, 0 off .. 64) and draft_occ_k (cycles, 1 .. 4096), the scheduler's: draft_occ above 0
+     * refused without a drafter that runs the adaptive window; their counters close GET's "draft". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":65})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":-1})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ_k":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ_k":4097})").status, 400);
+    fn4::note_sched(fn4::kDraftOcc, 0);
+    fn4::note_sched(fn4::kDraftOccK, 32);
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_occ\": 0, \"draft_occ_k\": 32"));
+    fn4::draft_register(false, false);
+    const HttpResponse o0 = f.post("/admin/fn4", R"({"draft_occ":3})");
+    CHECK_EQ(o0.status, 400);
+    CHECK(has(o0.body, "cannot run the adaptive window"));
+    fn4::draft_register(true, true);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":3,"draft_occ_k":16})").status, 200);
+    CHECK(fn4::apply_pending(39, sw));
+    CHECK_EQ(sw[fn4::kDraftOcc], 3);
+    CHECK_EQ(sw[fn4::kDraftOccK], 16);
+    CHECK_EQ(sw[fn4::kDraftLendW], fn4::kNoChange);
+    fn4::note_sched(fn4::kDraftOcc, 3);
+    fn4::note_sched(fn4::kDraftOccK, 16);
+    fn4::note_draft_counts(5, 6, 1, 7, 8, 9, 400, 2);
+    const HttpResponse go = f.get("/admin/fn4");
+    CHECK(has(go.body, "\"draft_occ\": 3, \"draft_occ_k\": 16"));
+    CHECK(has(go.body, "\"hybrid_unahead\": 9, \"occ_cycles\": 400, \"occ_moves\": 2}"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":0,"draft_occ_k":32})").status, 200);
+    CHECK(fn4::apply_pending(40, sw));
+    fn4::note_sched(fn4::kDraftOcc, 0);
+    fn4::note_sched(fn4::kDraftOccK, 32);
+    fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
+    /* Lever LF, place_lf (the engine's, ds41-lf): 0 / 1, 1 refused until an engine registered dynamic placement
+     * on every rank; GET reports what the engine applied. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"place_lf":2})").status, 400);
+    const HttpResponse lf0 = f.post("/admin/fn4", R"({"place_lf":1})");
+    CHECK_EQ(lf0.status, 400);
+    CHECK(has(lf0.body, "no engine has registered its placement"));
+    fn4::place_lf_register(false);
+    const HttpResponse lf1 = f.post("/admin/fn4", R"({"place_lf":1})");
+    CHECK_EQ(lf1.status, 400);
+    CHECK(has(lf1.body, "placement is static here"));
+    fn4::place_lf_register(true);
+    fn4::note_sched(fn4::kPlaceLf, 0);
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_occ_k\": 32, \"place_lf\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"place_lf":1})").status, 200);
+    CHECK(fn4::apply_pending(41, sw));
+    CHECK_EQ(sw[fn4::kPlaceLf], 1);
+    CHECK_EQ(sw[fn4::kDraftOcc], fn4::kNoChange);
+    fn4::note_sched(fn4::kPlaceLf, 1);
+    CHECK(has(f.get("/admin/fn4").body, "\"place_lf\": 1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"place_lf":0})").status, 200);
+    CHECK(fn4::apply_pending(42, sw));
+    fn4::note_sched(fn4::kPlaceLf, 0);
+    fn4::place_lf_register(false);
+    /* Lever PSK design 2, ds41_psk_k (the scheduler's anchor stride, 1 .. 4096): after ds41_psk in the registry; no
+     * plugin takes a plan here */
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":4097})").status, 400);
+    fn4::note_sched(fn4::kDs41PskK, 8);
+    CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk\": -1, \"ds41_psk_k\": 8"));
+    /* levers PSK-L20 / PSK-DS (ds41-pskl20): appended after ds41_psk_k, deepseek41's (not loaded here: -1) */
+    /* lever PSK-CR (ds41-pskcr): ds41_psk_cr appended after dspark_pfctx, deepseek41's (-1 here); ds41-int8: then ds41_engdd
+     * (lever E1, deepseek41's: -1 here), sched_noa (lever NOA, the core's: 0), stage_short / stage_pick / place_hb (levers SA / HB) */
+    CHECK(has(f.get("/admin/fn4").body,
+              "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
+              "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
+              "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1, \"ds41_arcoded\": -1, "
+              "\"sched_row_cap\": 0, \"ds41_mix_wv\": -1, \"ds41_gq\": -1, \"ds41_e2\": -1, \"sched_cb_hold_ms\": 0, \"sched_cb_hold_k\": 2, \"exl3_x3d\": -1, "
+              "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0, \"ds41_wmk\": -1, \"ds41_moe1\": -1, \"sched_tail_grid\": 0, \"draft_dcap\": "));
+    /* ds41-int9: lever SP appended after place_hb; int9b: M1, IX-LDSR2, IX-NI; int10: ARC (plugins' switches: -1 here), then
+     * CAP48 (merged); int11: 1U-MX / 1U-GQ / 1U-E2 (plugins' switches: -1 here), then CBH (ds41-int10b, merged: 0 off, K 2);
+     * int12: X3D-F exl3_x3d (the exl3r4d plugin's: -1 here); int13: XPUSH ar_xpush (libr4d's: -1 here); int14c: lever A4
+     * gg_gemv_m16 (ds41-a4; libr4d's: -1 here), then ds41-swl's SWL / L2 (the engine's: -1 until one registers) */
+    CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
+    CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
+    CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
+    CHECK_EQ((int)fn4::kDsparkPfctx + 1, (int)fn4::kDs41PskCr);
+    CHECK_EQ((int)fn4::kDs41PskCr + 1, (int)fn4::kDs41Engdd);   /* ds41-int8's one order: psk_l20, dspark_pfctx, psk_cr, engdd, */
+    CHECK_EQ((int)fn4::kDs41Engdd + 1, (int)fn4::kSchedNoa);     /* noa, stage_short, stage_pick, place_hb */
+    CHECK_EQ((int)fn4::kSchedNoa + 1, (int)fn4::kStageShort);
+    CHECK_EQ((int)fn4::kStageShort + 1, (int)fn4::kStagePick);
+    CHECK_EQ((int)fn4::kStagePick + 1, (int)fn4::kPlaceHb);
+    CHECK_EQ((int)fn4::kPlaceHb + 1, (int)fn4::kStageFullMin);   /* ds41-int9: lever SP, appended */
+    CHECK_EQ((int)fn4::kStageFullMin + 1, (int)fn4::kStageFullPick);
+    CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kMhcFuse);   /* ds41-int9b: levers M1, IX-LDSR2, IX-NI, appended */
+    CHECK_EQ((int)fn4::kMhcFuse + 1, (int)fn4::kIxLds);
+    CHECK_EQ((int)fn4::kIxLds + 1, (int)fn4::kIxNi);
+    CHECK_EQ((int)fn4::kIxNi + 1, (int)fn4::kDs41Arcoded);   /* ds41-int10: lever ARC, appended */
+    CHECK_EQ((int)fn4::kDs41Arcoded + 1, (int)fn4::kSchedRowCap);   /* ds41-int10: lever CAP48 (ds41-cap48), merged after ARC */
+    CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kDs41MixWv);   /* ds41-int11: levers 1U-MX, 1U-GQ, 1U-E2, appended */
+    CHECK_EQ((int)fn4::kDs41MixWv + 1, (int)fn4::kDs41Gq);
+    CHECK_EQ((int)fn4::kDs41Gq + 1, (int)fn4::kDs41E2);
+    CHECK_EQ((int)fn4::kDs41E2 + 1, (int)fn4::kSchedCbHoldMs);   /* ds41-int11: lever CBH (ds41-int10b), merged after 1U-E2 */
+    CHECK_EQ((int)fn4::kSchedCbHoldMs + 1, (int)fn4::kSchedCbHoldK);
+    CHECK_EQ((int)fn4::kSchedCbHoldK + 1, (int)fn4::kExl3X3d);   /* ds41-int12: X3D-F (ds41-x3d-eng10), merged after CBH */
+    CHECK_EQ((int)fn4::kExl3X3d + 1, (int)fn4::kArXpush);   /* ds41-int13: XPUSH (FN's ar_xpush), appended */
+    CHECK_EQ((int)fn4::kArXpush + 1, (int)fn4::kGgGemvM16);   /* ds41-int14c: lever A4 (ds41-a4), appended */
+    CHECK_EQ((int)fn4::kGgGemvM16 + 1, (int)fn4::kPlaceSwapLent);   /* ds41-int14c: levers SWL / L2 (ds41-swl), appended */
+    CHECK_EQ((int)fn4::kPlaceSwapLent + 1, (int)fn4::kHeatMinGainX100);
+    CHECK_EQ((int)fn4::kHeatMinGainX100 + 1, (int)fn4::kHeatHystX100);
+    CHECK_EQ((int)fn4::kHeatHystX100 + 1, (int)fn4::kDs41Rfuse);   /* ds41-fuse: levers FUSE-R / FUSE-M, appended */
+    CHECK_EQ((int)fn4::kDs41Rfuse + 1, (int)fn4::kDs41MixFin);
+    CHECK_EQ((int)fn4::kDs41MixFin + 1, (int)fn4::kRouteCopyOv);   /* ds41-launch: lever RCO, merged after FUSE-M */
+    CHECK_EQ((int)fn4::kRouteCopyOv + 1, (int)fn4::kDs41Wmk);   /* ds41-wmk2: lever WMK, appended */
+    CHECK_EQ((int)fn4::kDs41Wmk + 1, (int)fn4::kDs41Moe1);   /* ds41-p1pass: lever P, deepseek41's, merged after WMK */
+    CHECK_EQ((int)fn4::kDs41Moe1 + 1, (int)fn4::kSchedTailGrid);   /* ds41-wmk2-rs: lever G, appended after P */
+    CHECK_EQ((int)fn4::kSchedTailGrid + 1, (int)fn4::kDraftDcap);   /* ds41-etp-spb: SPB's draft_dcap / draft_dcap_n / exl3_dng (ds41-nst: after G) */
+    CHECK_EQ((int)fn4::kDraftDcap + 1, (int)fn4::kDraftDcapN);
+    CHECK_EQ((int)fn4::kDraftDcapN + 1, (int)fn4::kExl3Dng);
+    CHECK_EQ((int)fn4::kExl3Dng + 1, (int)fn4::kDs41F32Dec);   /* ds41-etp-spd: lever SPD-F, libr4d's (ds41-nst2: after the night stack) */
+    CHECK_EQ((int)fn4::kDs41F32Dec + 1, (int)fn4::kExl3Xr);   /* ds41-etp-xr: lever XR / SPC order 3, exl3r4d's (ds41-nst3: after night stack 2) */
+    CHECK_EQ((int)fn4::kExl3Xr + 1, (int)fn4::kSwitches);
+    CHECK_EQ(fn4::switch_index("ds41_f32dec"), (int)fn4::kDs41F32Dec);
+    CHECK(!fn4::sched_switch(fn4::kDs41F32Dec));
+    CHECK_EQ(fn4::switch_index("exl3_xr"), (int)fn4::kExl3Xr);
+    CHECK(!fn4::sched_switch(fn4::kExl3Xr));
+    CHECK_EQ((int)fn4::kDs41Moe1, 72);
+    CHECK(fn4::sched_switch(fn4::kDraftDcap));
+    CHECK(fn4::sched_switch(fn4::kDraftDcapN));
+    CHECK(!fn4::sched_switch(fn4::kExl3Dng));
+    CHECK_EQ(fn4::switch_index("draft_dcap"), (int)fn4::kDraftDcap);
+    CHECK_EQ(fn4::switch_index("exl3_dng"), (int)fn4::kExl3Dng);
+    CHECK_EQ(fn4::switch_index("ds41_moe1"), (int)fn4::kDs41Moe1);
+    CHECK(!fn4::sched_switch(fn4::kDs41Moe1));
+    CHECK_EQ((int)fn4::kDs41PskK, 41);
+    CHECK_EQ((int)fn4::kPlaceHb, 49);
+    CHECK_EQ((int)fn4::kStageFullPick, 51);
+    CHECK_EQ((int)fn4::kIxNi, 54);
+    CHECK_EQ((int)fn4::kDs41Arcoded, 55);
+    CHECK_EQ((int)fn4::kSchedRowCap, 56);
+    CHECK_EQ((int)fn4::kDs41MixWv, 57);
+    CHECK_EQ((int)fn4::kDs41E2, 59);
+    CHECK_EQ((int)fn4::kSchedCbHoldMs, 60);
+    CHECK_EQ((int)fn4::kSchedCbHoldK, 61);
+    CHECK_EQ((int)fn4::kExl3X3d, 62);   /* X3D-F: exl3_x3d, the exl3r4d plugin's */
+    CHECK_EQ((int)fn4::kArXpush, 63);   /* XPUSH: ar_xpush, libr4d's */
+    CHECK_EQ((int)fn4::kGgGemvM16, 64);   /* lever A4: gg_gemv_m16, libr4d's */
+    CHECK_EQ((int)fn4::kPlaceSwapLent, 65);   /* ds41-swl: SWL, then L2's two (63..65 on ds41-swl) */
+    CHECK_EQ((int)fn4::kHeatHystX100, 67);
+    CHECK_EQ((int)fn4::kDs41Rfuse, 68);   /* ds41-fuse: FUSE-R, deepseek41's; FUSE-M, libr4d's */
+    CHECK_EQ((int)fn4::kDs41MixFin, 69);
+    CHECK_EQ((int)fn4::kRouteCopyOv, 70);   /* ds41-launch: lever RCO (route_copy_ov), the core's (68 on ds41-launch) */
+    CHECK_EQ((int)fn4::kDs41Wmk, 71);   /* ds41-wmk2: lever WMK (ds41_wmk), libr4d's */
+    CHECK_EQ((int)fn4::kSchedTailGrid, 73);   /* ds41-wmk2-rs: lever G (sched_tail_grid), the scheduler's */
+    CHECK_EQ((int)fn4::kDraftDcap, 74);   /* ds41-nst: SPB after G */
+    CHECK_EQ((int)fn4::kExl3Dng, 76);
+    CHECK_EQ((int)fn4::kDs41F32Dec, 77);   /* ds41-nst2: SPD-F after the night stack */
+    CHECK_EQ((int)fn4::kExl3Xr, 78);   /* ds41-nst3: XR / SPC after night stack 2 */
+    CHECK_EQ((int)fn4::kSwitches, 79);
+    CHECK_EQ(fn4::switch_index("sched_tail_grid"), (int)fn4::kSchedTailGrid);
+    CHECK_EQ(fn4::switch_index("ds41_wmk"), (int)fn4::kDs41Wmk);
+    CHECK(!fn4::sched_switch(fn4::kDs41Wmk));
+    {   /* ds41-wmk2: no plugin serves ds41_wmk here: refused (any value); GET "wmk" all zeros */
+        for (const char* b : { R"({"ds41_wmk":1})", R"({"ds41_wmk":0})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        CHECK(has(f.get("/admin/fn4").body, "\"wmk\": {\"in_force\": 0, \"launches\": 0, \"rows\": 0, \"declines\": 0}"));
+    }
+    CHECK_EQ(fn4::switch_index("ds41_rfuse"), (int)fn4::kDs41Rfuse);
+    CHECK_EQ(fn4::switch_index("ds41_mix_fin"), (int)fn4::kDs41MixFin);
+    CHECK(!fn4::sched_switch(fn4::kDs41Rfuse) && !fn4::sched_switch(fn4::kDs41MixFin));
+    {   /* ds41-fuse: no plugin serves ds41_rfuse / ds41_mix_fin here: refused (any value); GET "fuse" all zeros */
+        for (const char* b : { R"({"ds41_rfuse":1})", R"({"ds41_rfuse":0})", R"({"ds41_mix_fin":1})", R"({"ds41_mix_fin":0})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        CHECK(has(f.get("/admin/fn4").body, "\"fuse\": {\"rf_declared\": 0, \"rf_layers\": 0, \"rf_form1_passes\": 0, "
+                                            "\"rf_form2_passes\": 0, \"mixfin_launches\": 0, \"mixfin_rows\": 0, "
+                                            "\"rgs_launches\": 0, \"rgs_rows\": 0}"));
+    }
+    CHECK_EQ(fn4::switch_index("gg_gemv_m16"), (int)fn4::kGgGemvM16);
+    CHECK_EQ(fn4::switch_index("exl3_x3d"), (int)fn4::kExl3X3d);
+    CHECK_EQ(fn4::switch_index("ar_xpush"), (int)fn4::kArXpush);
+    CHECK(!fn4::sched_switch(fn4::kArXpush));
+    {   /* ds41-int13: no plugin serves ar_xpush here: refused (any value) */
+        for (const char* b : { R"({"ar_xpush":1})", R"({"ar_xpush":0})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        std::string xerr;
+        CHECK(!fn4::check("ar_xpush", 1, &xerr));
+        CHECK(xerr.find("no loaded plugin serves it") != std::string::npos);
+    }
+    {   /* ds41-swl: levers SWL / L2, the engine's (as place_lf): range-checked; a change refused until an engine registered
+         * dynamic placement on every rank (place_swap_lent 0 always takes); GET reports what the engine applied. */
+        CHECK_EQ(fn4::switch_index("place_swap_lent"), (int)fn4::kPlaceSwapLent);
+        CHECK_EQ(fn4::switch_index("heat_min_gain_x100"), (int)fn4::kHeatMinGainX100);
+        CHECK_EQ(fn4::switch_index("heat_hyst_x100"), (int)fn4::kHeatHystX100);
+        CHECK(fn4::sched_switch(fn4::kPlaceSwapLent) && fn4::sched_switch(fn4::kHeatMinGainX100) &&
+              fn4::sched_switch(fn4::kHeatHystX100));
+        for (const char* b : { R"({"place_swap_lent":2})", R"({"place_swap_lent":-1})", R"({"heat_min_gain_x100":-1})",
+                               R"({"heat_min_gain_x100":10001})", R"({"heat_hyst_x100":99})", R"({"heat_hyst_x100":1001})" })
+            CHECK_EQ(f.post("/admin/fn4", b).status, 400);
+        const HttpResponse s0 = f.post("/admin/fn4", R"({"place_swap_lent":1})");
+        CHECK_EQ(s0.status, 400);
+        CHECK(has(s0.body, "no engine has registered its placement"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"heat_min_gain_x100":100})").status, 400);
+        fn4::swl_register(false);
+        const HttpResponse s1 = f.post("/admin/fn4", R"({"heat_hyst_x100":125})");
+        CHECK_EQ(s1.status, 400);
+        CHECK(has(s1.body, "placement is static here"));
+        fn4::swl_register(true);
+        fn4::note_sched(fn4::kPlaceSwapLent, 0);
+        fn4::note_sched(fn4::kHeatMinGainX100, 150);
+        fn4::note_sched(fn4::kHeatHystX100, 125);
+        CHECK(has(f.get("/admin/fn4").body, "\"exl3_x3d\": -1, \"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": 0, "
+                                            "\"heat_min_gain_x100\": 150, "
+                                            "\"heat_hyst_x100\": 125, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0, \"ds41_wmk\": -1, \"ds41_moe1\": -1, \"sched_tail_grid\": 0, \"draft_dcap\": "));
+        int ssw[fn4::kSwitches];
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":0,"heat_min_gain_x100":150,"heat_hyst_x100":125})").status, 200);
+        CHECK(!fn4::apply_pending(70, ssw));                 /* today's values: nothing changes, no epoch */
+        CHECK_EQ(fn4::epoch(), e0);
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":1,"heat_min_gain_x100":75})").status, 200);
+        CHECK(fn4::apply_pending(71, ssw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(ssw[fn4::kPlaceSwapLent], 1);
+        CHECK_EQ(ssw[fn4::kHeatMinGainX100], 75);
+        CHECK_EQ(ssw[fn4::kHeatHystX100], fn4::kNoChange);
+        fn4::note_sched(fn4::kPlaceSwapLent, 1);
+        fn4::note_sched(fn4::kHeatMinGainX100, 75);
+        CHECK(has(f.get("/admin/fn4").body, "\"place_swap_lent\": 1, \"heat_min_gain_x100\": 75, \"heat_hyst_x100\": 125, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0, \"ds41_wmk\": -1, \"ds41_moe1\": -1, \"sched_tail_grid\": 0, \"draft_dcap\": "));
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":0,"heat_min_gain_x100":150})").status, 200);
+        CHECK(fn4::apply_pending(72, ssw));
+        CHECK_EQ(ssw[fn4::kPlaceSwapLent], 0);
+        CHECK_EQ(ssw[fn4::kHeatMinGainX100], 150);
+        /* back to unregistered for the cases below */
+        fn4::note_sched(fn4::kPlaceSwapLent, -1);
+        fn4::note_sched(fn4::kHeatMinGainX100, -1);
+        fn4::note_sched(fn4::kHeatHystX100, -1);
+        fn4::swl_register(false);
+    }
+    {   /* ds41-launch: lever RCO, the core's (as aql_acq): 0 / 1, read at recording; a change advances the epoch (every pass
+         * re-records); GET reports the switch and "rco" the recordings' counts (note_rco). */
+        CHECK_EQ(fn4::switch_index("route_copy_ov"), (int)fn4::kRouteCopyOv);
+        CHECK_EQ((int)fn4::kRouteCopyOv, 70);   /* 68 on ds41-launch; after FUSE-R / FUSE-M here */
+        CHECK(!fn4::sched_switch(fn4::kRouteCopyOv));
+        CHECK_EQ(fn4::route_copy_ov(), 0);
+        for (const char* b : { R"({"route_copy_ov":2})", R"({"route_copy_ov":-1})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "route_copy_ov takes 1"));
+        }
+        CHECK(has(f.get("/admin/fn4").body, "\"rco\": {\"in_force\": 0, \"recordings\": 0, \"copies\": 0, \"freed\": 0}"));
+        int rsw[fn4::kSwitches];
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"route_copy_ov":0})").status, 200);
+        CHECK(!fn4::apply_pending(73, rsw));                 /* today's value: pinned, no epoch */
+        CHECK_EQ(fn4::epoch(), e0);
+        CHECK_EQ(f.post("/admin/fn4", R"({"route_copy_ov":1})").status, 200);
+        CHECK(fn4::apply_pending(74, rsw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(fn4::route_copy_ov(), 1);
+        CHECK_EQ(fn4::value(fn4::kRouteCopyOv), 1);
+        fn4::note_rco(80, 79);
+        fn4::note_rco(6, 6);
+        CHECK(has(f.get("/admin/fn4").body, "\"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 1, \"ds41_wmk\": -1, \"ds41_moe1\": -1, \"sched_tail_grid\": 0, \"draft_dcap\": "));
+        CHECK(has(f.get("/admin/fn4").body, "\"rco\": {\"in_force\": 1, \"recordings\": 2, \"copies\": 86, \"freed\": 85}"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"route_copy_ov":0})").status, 200);
+        CHECK(fn4::apply_pending(75, rsw));
+        CHECK_EQ(fn4::epoch(), e0 + 2);
+        CHECK_EQ(fn4::route_copy_ov(), 0);
+        CHECK(has(f.get("/admin/fn4").body, "\"rco\": {\"in_force\": 0, \"recordings\": 2, \"copies\": 86, \"freed\": 85}"));
+    }
+    CHECK_EQ(fn4::switch_index("ds41_mix_wv"), (int)fn4::kDs41MixWv);
+    CHECK_EQ(fn4::switch_index("ds41_gq"), (int)fn4::kDs41Gq);
+    CHECK_EQ(fn4::switch_index("ds41_e2"), (int)fn4::kDs41E2);
+    CHECK(!fn4::sched_switch(fn4::kDs41MixWv) && !fn4::sched_switch(fn4::kDs41Gq) && !fn4::sched_switch(fn4::kDs41E2));
+    {   /* ds41-int11: no plugin serves the three here: refused (any value), and GET "i11" all 0 */
+        for (const char* b : { R"({"ds41_mix_wv":12})", R"({"ds41_mix_wv":0})", R"({"ds41_gq":1})", R"({"ds41_e2":1})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        const HttpResponse g11 = f.get("/admin/fn4");
+        CHECK(has(g11.body, "\"i11\": {\"gq\": {\"declared\": 0, \"qkv_pairs\": 0, \"out_pairs\": 0}, "
+                            "\"e2\": {\"declared\": 0, \"splits\": 0, \"rows\": 0}, "
+                            "\"mx\": {\"wide_launches\": 0, \"wide_rows\": 0}}"));
+        int64_t v[fn4::kI11Stats];
+        fn4::i11_stats(v);
+        for (int i = 0; i < fn4::kI11Stats; ++i) CHECK_EQ(v[i], (int64_t)0);
+        std::string err;
+        CHECK(!fn4::check("ds41_gq", 1, &err));
+        CHECK(err.find("no loaded plugin serves it") != std::string::npos);
+    }
+    CHECK_EQ(fn4::switch_index("sched_cb_hold_ms"), (int)fn4::kSchedCbHoldMs);
+    CHECK_EQ(fn4::switch_index("sched_cb_hold_k"), (int)fn4::kSchedCbHoldK);
+    CHECK(!fn4::sched_switch(fn4::kSchedCbHoldMs));   /* the scheduler reads both at every step it plans */
+    CHECK(!fn4::sched_switch(fn4::kSchedCbHoldK));
+    CHECK_EQ(fn4::switch_index("sched_row_cap"), (int)fn4::kSchedRowCap);
+    CHECK(!fn4::sched_switch(fn4::kSchedRowCap));   /* the scheduler reads it at every step it plans (fn4::sched_row_cap) */
+    CHECK_EQ(fn4::switch_index("ds41_arcoded"), (int)fn4::kDs41Arcoded);
+    CHECK(!fn4::sched_switch(fn4::kDs41Arcoded));
+    {   /* ds41-int10: no plugin serves ds41_arcoded here: refused (any value), and GET "arc" all 0 */
+        for (const char* b : { R"({"ds41_arcoded":1024})", R"({"ds41_arcoded":0})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        const HttpResponse ga = f.get("/admin/fn4");
+        CHECK(has(ga.body, "\"arc\": {\"coded_launches\": 0, \"coded_rows\": 0, \"plain_launches\": 0, \"plain_rows\": 0, "
+                           "\"below\": 0, \"declined\": 0, \"coded_all_ranks\": 0}"));
+        int64_t v[fn4::kArcStats];
+        fn4::arc_stats(v);
+        for (int i = 0; i < fn4::kArcStats; ++i) CHECK_EQ(v[i], (int64_t)0);
+        std::string err;
+        CHECK(!fn4::check("ds41_arcoded", 1024, &err));
+        CHECK(err.find("no loaded plugin serves it") != std::string::npos);
+    }
+    CHECK_EQ(fn4::switch_index("mhc_fuse"), (int)fn4::kMhcFuse);
+    CHECK_EQ(fn4::switch_index("ix_lds"), (int)fn4::kIxLds);
+    CHECK_EQ(fn4::switch_index("ix_ni"), (int)fn4::kIxNi);
+    CHECK(!fn4::sched_switch(fn4::kMhcFuse) && !fn4::sched_switch(fn4::kIxLds) && !fn4::sched_switch(fn4::kIxNi));
+    {   /* ds41-int9b: no plugin serves the three here: refused, and GET "i9b" all 0 */
+        for (const char* b : { R"({"mhc_fuse":1})", R"({"ix_lds":1})", R"({"ix_ni":1})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        const HttpResponse g9 = f.get("/admin/fn4");
+        CHECK(has(g9.body, "\"i9b\": {\"mhc\": {\"declared\": 0, \"pairs\": 0, \"rows\": 0, \"small\": 0}, "
+                           "\"ix\": {\"lds_launches\": 0, \"lds_rows\": 0, \"ni_launches\": 0, \"ni_cand_launches\": 0, \"bfr_launches\": 0}, "
+                           "\"ni\": {\"runs\": 0, \"dead_bytes\": 0}}"));
+        int64_t v[fn4::kI9bStats];
+        fn4::i9b_stats(v);
+        for (int i = 0; i < fn4::kI9bStats; ++i) CHECK_EQ(v[i], (int64_t)0);
+    }
+    CHECK_EQ(fn4::switch_index("stage_full_min"), (int)fn4::kStageFullMin);
+    CHECK_EQ(fn4::switch_index("stage_full_pick"), (int)fn4::kStageFullPick);
+    CHECK(fn4::sched_switch(fn4::kStageFullMin) && fn4::sched_switch(fn4::kStageFullPick));
+    CHECK(!fn4::sched_switch(fn4::kDs41PskL20) && !fn4::sched_switch(fn4::kDsparkPfctx) &&
+          !fn4::sched_switch(fn4::kDs41PskCr));
+    {   /* no plugin serves a plan, a replay plan or a reach here */
+        const int32_t ah[1] = { 0 }, rw[1] = { 4096 }, fl[1] = { 1 };
+        CHECK_EQ(fn4::psk_plan(7, 0, 1, ah, rw, fl), -1);
+        CHECK_EQ(fn4::psk_cr_reach(), -1);
+        int64_t st[fn4::kPskStats];
+        CHECK_EQ(fn4::psk_stats(st), 0);
+        for (int i = 0; i < fn4::kPskStats; ++i) CHECK_EQ(st[i], (int64_t)0);
+    }
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":4})").status, 200);
+    CHECK(fn4::apply_pending(41, sw));
+    CHECK_EQ(sw[fn4::kDs41PskK], 4);
+    CHECK_EQ(sw[fn4::kDraftOccK], fn4::kNoChange);
+    fn4::note_sched(fn4::kDs41PskK, 4);
+    CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk_k\": 4"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":8})").status, 200);
+    CHECK(fn4::apply_pending(42, sw));
+    fn4::note_sched(fn4::kDs41PskK, 8);
+    {
+        const int32_t ah[1] = { 0 }, rw[1] = { 4096 };
+        CHECK_EQ(fn4::psk_plan(7, 0, 1, ah, rw), -1);
+    }
+    /* Lever SA / HB (ds41-sahb): stage_short 0 .. 65536, stage_pick 0 .. 64, place_hb 0 .. 4096, appended after
+     * ds41_psk_k; stage_short / place_hb > 0 refused until an engine registered them capable; GET "sahb" once
+     * registered, per rank. */
+    {
+        const HttpResponse g0 = f.get("/admin/fn4");
+        CHECK(has(g0.body, "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, "
+                           "\"stage_full_min\": 0, \"stage_full_pick\": 0, \"mhc_fuse\": -1"));   /* ds41-int8: after sched_noa; int9: SP
+                                                                                        after; int9b: M1 / IX after */
+        CHECK(!has(g0.body, "\"sahb\": {"));
+        const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_short":1025})");
+        CHECK_EQ(s0.status, 400);
+        CHECK(has(s0.body, "no engine has registered it"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":-1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":65537})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_pick":65})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_hb":4097})").status, 400);
+        fn4::sahb_register(false, false);
+        const HttpResponse s1 = f.post("/admin/fn4", R"({"stage_short":1025})");
+        CHECK_EQ(s1.status, 400);
+        CHECK(has(s1.body, "no prefill stager with a span's shared level"));
+        const HttpResponse h1 = f.post("/admin/fn4", R"({"place_hb":64})");
+        CHECK_EQ(h1.status, 400);
+        CHECK(has(h1.body, "no dual heat on every rank"));
+        CHECK(has(f.get("/admin/fn4").body, "\"sahb\": {\"stage_capable\": 0, \"hb_capable\": 0, \"ranks\": []}"));
+        fn4::sahb_register(true, true);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":1025,"stage_pick":2,"place_hb":128})").status, 200);
+        CHECK(fn4::apply_pending(43, sw));
+        CHECK_EQ(sw[fn4::kStageShort], 1025);
+        CHECK_EQ(sw[fn4::kStagePick], 2);
+        CHECK_EQ(sw[fn4::kPlaceHb], 128);
+        CHECK_EQ(sw[fn4::kDs41PskK], fn4::kNoChange);
+        fn4::note_sched(fn4::kStageShort, 1025);
+        fn4::note_sched(fn4::kStagePick, 2);
+        fn4::note_sched(fn4::kPlaceHb, 128);
+        const int64_t v1[fn4::kSahbN] = { 3, 120, 700, 7340032000, 700, 900, 5, 230, 2236000000, 690, 3, 128, 128, 97,
+                                          41, 1073741824 };
+        fn4::note_sahb(1, v1);
+        const HttpResponse g1 = f.get("/admin/fn4");
+        CHECK(has(g1.body, "\"stage_short\": 1025, \"stage_pick\": 2, \"place_hb\": 128"));
+        CHECK(has(g1.body, "\"sahb\": {\"stage_capable\": 1, \"hb_capable\": 1, \"ranks\": [{\"rank\": 0, "
+                           "\"short_steps\": 0"));
+        CHECK(has(g1.body, "{\"rank\": 1, \"short_steps\": 3, \"short_layers\": 120, \"short_units\": 700, "
+                           "\"short_bytes\": 7340032000, \"pick_kept\": 700, \"pick_dropped\": 900, \"big_steps\": 5, "
+                           "\"expect_units\": 230, \"expect_bytes\": 2236000000, \"expect_sum_units\": 690, "
+                           "\"expect_n\": 3, \"hb_reserve\": 128, \"hb_reserved\": 128, \"hb_resident\": 97, "
+                           "\"hb_promotions\": 41, \"sa_recall_bytes\": 1073741824}]}"));
+        /* Pinned at the same value: no epoch, nothing handed over. */
+        const uint64_t e1 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":1025})").status, 200);
+        CHECK(!fn4::apply_pending(44, sw));
+        CHECK_EQ(fn4::epoch(), e1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":0,"stage_pick":0,"place_hb":0})").status, 200);
+        CHECK(fn4::apply_pending(45, sw));
+        CHECK_EQ(sw[fn4::kStageShort], 0);
+        CHECK_EQ(sw[fn4::kPlaceHb], 0);
+        fn4::note_sched(fn4::kStageShort, 0);
+        fn4::note_sched(fn4::kStagePick, 0);
+        fn4::note_sched(fn4::kPlaceHb, 0);
+        const int64_t z[fn4::kSahbN] = {};
+        fn4::note_sahb(0, z);
+        fn4::note_sahb(1, z);
+        fn4::sahb_register(false, false);
+    }
+    /* Lever SP (ds41-int9): stage_full_min 0 .. 1048576, stage_full_pick 0 .. 64, appended after place_hb; either > 0
+     * refused until an engine registered SP capable; GET "sp" once registered, per rank; the values handed to the
+     * engine at the release; pinned at the same value: no epoch. */
+    {
+        const HttpResponse g0 = f.get("/admin/fn4");
+        CHECK(has(g0.body, "\"place_hb\": 0, \"stage_full_min\": 0, \"stage_full_pick\": 0, \"mhc_fuse\": -1"));
+        CHECK(!has(g0.body, "\"sp\": {"));
+        const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_full_min":4097})");
+        CHECK_EQ(s0.status, 400);
+        CHECK(has(s0.body, "no engine has registered it"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_pick":1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":-1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":1048577})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_pick":65})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_pick":-1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":0,"stage_full_pick":0})").status, 200);   /* 0 always */
+        CHECK(!fn4::apply_pending(46, sw));                                                             /* same value */
+        fn4::sp_register(false);
+        const HttpResponse s1 = f.post("/admin/fn4", R"({"stage_full_min":4097})");
+        CHECK_EQ(s1.status, 400);
+        CHECK(has(s1.body, "no prefill stager on every rank"));
+        CHECK(has(f.get("/admin/fn4").body, "\"sp\": {\"capable\": 0, \"ranks\": []}"));
+        fn4::sp_register(true);
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":4161,"stage_full_pick":2})").status, 200);
+        CHECK(fn4::apply_pending(47, sw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(sw[fn4::kStageFullMin], 4161);
+        CHECK_EQ(sw[fn4::kStageFullPick], 2);
+        CHECK_EQ(sw[fn4::kStageShort], fn4::kNoChange);
+        CHECK_EQ(sw[fn4::kStagePick], fn4::kNoChange);
+        fn4::note_sched(fn4::kStageFullMin, 4161);
+        fn4::note_sched(fn4::kStageFullPick, 2);
+        CHECK_EQ(fn4::value(fn4::kStageFullMin), 4161);
+        CHECK_EQ(fn4::value(fn4::kStageFullPick), 2);
+        const int64_t v1[fn4::kSpN] = { 3, 7400, 120, 2900, 30408704000, 2800, 410, 5, 11800 };
+        fn4::note_sp(1, v1);
+        const HttpResponse g1 = f.get("/admin/fn4");
+        CHECK(has(g1.body, "\"stage_full_min\": 4161, \"stage_full_pick\": 2, \"mhc_fuse\": -1"));
+        CHECK(has(g1.body, "\"sp\": {\"capable\": 1, \"ranks\": [{\"rank\": 0, \"full_steps\": 0"));
+        CHECK(has(g1.body, "{\"rank\": 1, \"full_steps\": 3, \"full_rows\": 7400, \"full_layers\": 120, "
+                           "\"full_units\": 2900, \"full_bytes\": 30408704000, \"full_pick_kept\": 2800, "
+                           "\"full_pick_dropped\": 410, \"stream_steps\": 5, \"stream_rows\": 11800}]}"));
+        const uint64_t e1 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":4161})").status, 200);
+        CHECK(!fn4::apply_pending(48, sw));
+        CHECK_EQ(fn4::epoch(), e1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":0,"stage_full_pick":0})").status, 200);
+        CHECK(fn4::apply_pending(49, sw));
+        CHECK_EQ(sw[fn4::kStageFullMin], 0);
+        CHECK_EQ(sw[fn4::kStageFullPick], 0);
+        fn4::note_sched(fn4::kStageFullMin, 0);
+        fn4::note_sched(fn4::kStageFullPick, 0);
+        const int64_t z[fn4::kSpN] = {};
+        fn4::note_sp(0, z);
+        fn4::note_sp(1, z);
+        fn4::sp_register(false);
+    }
+    /* Lever CAP48 (ds41-cap48): sched_row_cap 0 .. 4096, the core's, appended after stage_full_pick; RADIANCE_DECODE_ROW_CAP
+     * unset here, so 0 until set; the scheduler reads it at every step (no hand-over at the release); pinned at the same
+     * value: no epoch. GET "cap" (the value in force + the scheduler's counts) only once a scheduler registered. */
+    {
+        CHECK_EQ(fn4::sched_row_cap(), 0);
+        const HttpResponse c0 = f.post("/admin/fn4", R"({"sched_row_cap":4097})");
+        CHECK_EQ(c0.status, 400);
+        CHECK(has(c0.body, "sched_row_cap takes 0 (off) or 1 .. 4096"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":-1})").status, 400);
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":48})").status, 200);
+        CHECK(fn4::apply_pending(50, sw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(sw[fn4::kSchedRowCap], fn4::kNoChange);   /* not handed over: read at every step */
+        CHECK_EQ(fn4::sched_row_cap(), 48);
+        CHECK_EQ(fn4::value(fn4::kSchedRowCap), 48);
+        CHECK(has(f.get("/admin/fn4").body, "\"ds41_arcoded\": -1, \"sched_row_cap\": 48, \"ds41_mix_wv\": -1, \"ds41_gq\": -1, \"ds41_e2\": -1, \"sched_cb_hold_ms\": 0"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":48})").status, 200);
+        CHECK(!fn4::apply_pending(51, sw));                 /* the same value: pinned, no epoch */
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":0})").status, 200);
+        CHECK(fn4::apply_pending(52, sw));
+        CHECK_EQ(fn4::sched_row_cap(), 0);
+        CHECK(has(f.get("/admin/fn4").body, "\"ds41_arcoded\": -1, \"sched_row_cap\": 0, \"ds41_mix_wv\": -1, \"ds41_gq\": -1, \"ds41_e2\": -1, \"sched_cb_hold_ms\": 0"));
+    }
+    /* Lever CBH (ds41-int10b): sched_cb_hold_ms 0 .. 60000 and sched_cb_hold_k 2 .. 64, the core's, appended after sched_row_cap;
+     * RADIANCE_SCHED_CB_HOLD_MS / _K unset here, so 0 / 2 until set; read at every step (no hand-over at the release); pinned at
+     * the same value: no epoch. GET "cbh" (the values in force + the scheduler's counts) only once a scheduler registered. */
+    {
+        CHECK_EQ(fn4::sched_cb_hold_ms(), 0);
+        CHECK_EQ(fn4::sched_cb_hold_k(), 2);
+        const HttpResponse h0 = f.post("/admin/fn4", R"({"sched_cb_hold_ms":60001})");
+        CHECK_EQ(h0.status, 400);
+        CHECK(has(h0.body, "sched_cb_hold_ms takes 0 (off) or 1 .. 60000"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_ms":-1})").status, 400);
+        const HttpResponse k0 = f.post("/admin/fn4", R"({"sched_cb_hold_k":1})");
+        CHECK_EQ(k0.status, 400);
+        CHECK(has(k0.body, "sched_cb_hold_k takes 2 .. 64"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_k":65})").status, 400);
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_ms":500,"sched_cb_hold_k":3})").status, 200);
+        CHECK(fn4::apply_pending(53, sw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(sw[fn4::kSchedCbHoldMs], fn4::kNoChange);   /* not handed over: read at every step */
+        CHECK_EQ(sw[fn4::kSchedCbHoldK], fn4::kNoChange);
+        CHECK_EQ(fn4::sched_cb_hold_ms(), 500);
+        CHECK_EQ(fn4::sched_cb_hold_k(), 3);
+        CHECK_EQ(fn4::value(fn4::kSchedCbHoldMs), 500);
+        CHECK(has(f.get("/admin/fn4").body, "\"ds41_e2\": -1, \"sched_cb_hold_ms\": 500, \"sched_cb_hold_k\": 3, \"exl3_x3d\": -1, "
+                                            "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, "
+                                            "\"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0, \"ds41_wmk\": -1, \"ds41_moe1\": -1, \"sched_tail_grid\": 0, \"draft_dcap\": "));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_ms":500})").status, 200);
+        CHECK(!fn4::apply_pending(54, sw));                 /* the same value: pinned, no epoch */
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_ms":0,"sched_cb_hold_k":2})").status, 200);
+        CHECK(fn4::apply_pending(55, sw));
+        CHECK_EQ(fn4::sched_cb_hold_ms(), 0);
+        CHECK_EQ(fn4::sched_cb_hold_k(), 2);
+        CHECK(has(f.get("/admin/fn4").body, "\"sched_cb_hold_ms\": 0, \"sched_cb_hold_k\": 2, \"exl3_x3d\": -1, \"ar_xpush\": -1, "
+                                            "\"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0, \"ds41_wmk\": -1, \"ds41_moe1\": -1, \"sched_tail_grid\": 0, \"draft_dcap\": "));
+    }
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
+    CHECK(fn4::apply_pending(31, sw));
+    CHECK_EQ(sw[fn4::kDraftLend], -1);
+    /* Back off. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":0,"draft_probe_backoff":0,"draft_lend_borrow":0})").status, 200);
+    CHECK(fn4::apply_pending(32, sw));
+    fn4::note_sched(fn4::kDraftLend, 0);
+    fn4::note_sched(fn4::kDraftLendBorrow, 0);
+    fn4::note_sched(fn4::kDraftProbeBackoff, 0);
+    fn4::note_lend_sched(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    fn4::note_lend_engine(0, 0, 0, 0, 0, 0, 0);
+    fn4::lend_register(false);
+    fn4::draft_register(false, false);
+}
+
+/* The depth-0 context skip (draft_ctxskip, the engine's): refused until the engine set it up
+ * (RADIANCE_DRAFT_CTXSKIP at start), handed over at the step release, reported as the engine runs it
+ * with its counters ("ctxskip", only once registered). draft_depth0 2 (forced, a test hook) is taken
+ * wherever 1 is; "accept" carries the head's and the lookup's verified and accepted drafts. */
+TEST(the_context_skip_and_forced_depth_zero_are_checked_and_reported) {
+    Fixture f;
+    const HttpResponse g = f.get("/admin/fn4");
+    CHECK(!has(g.body, "\"ctxskip\": {"));
+    CHECK(has(g.body, "\"draft_ctxskip\": "));
+    CHECK(has(g.body, "\"accept\": {\"head_drafted\": 0, \"head_accepted\": 0, \"lookup_drafted\": 0, "
+                      "\"lookup_accepted\": 0}"));
+    const HttpResponse c0 = f.post("/admin/fn4", R"({"draft_ctxskip":1})");
+    CHECK_EQ(c0.status, 400);
+    CHECK(has(c0.body, "RADIANCE_DRAFT_CTXSKIP was not set at start"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_ctxskip":2})").status, 400);
+    fn4::ctxskip_register(false);
+    const HttpResponse c1 = f.post("/admin/fn4", R"({"draft_ctxskip":1})");
+    CHECK_EQ(c1.status, 400);
+    CHECK(has(c1.body, "not set up here"));
+    CHECK(has(f.get("/admin/fn4").body, "\"ctxskip\": {\"capable\": 0"));
+
+    int sw[fn4::kSwitches];
+    fn4::ctxskip_register(true);
+    fn4::note_sched(fn4::kDraftCtxSkip, 0);
+    const uint64_t e0 = fn4::epoch();
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_ctxskip":1})").status, 200);
+    CHECK(fn4::apply_pending(40, sw));
+    CHECK_EQ(sw[fn4::kDraftCtxSkip], 1);
+    CHECK_EQ(sw[fn4::kDraftDepth0], fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), e0 + 1);
+    fn4::note_sched(fn4::kDraftCtxSkip, 1);
+    fn4::note_ctxskip(120, 7, 812, 3, 1, 16, 32, 7);
+    const HttpResponse g1 = f.get("/admin/fn4");
+    CHECK(has(g1.body, "\"draft_ctxskip\": 1"));
+    CHECK(has(g1.body, "\"ctxskip\": {\"capable\": 1, \"skipped_steps\": 120, \"refill_passes\": 7, "
+                       "\"refill_rows\": 812, \"dropped_rows\": 3, \"ring_full_refills\": 1, \"pending_rows\": 16, "
+                       "\"ring_slots\": 32, \"ring_mib\": 7}"));
+
+    /* draft_depth0 2: refused with 1 where the drafter cannot run the adaptive window, taken where it can. */
+    fn4::draft_register(false, false);
+    const HttpResponse d2 = f.post("/admin/fn4", R"({"draft_depth0":2})");
+    CHECK_EQ(d2.status, 400);
+    CHECK(has(d2.body, "draft_depth0=2 refused"));
+    fn4::draft_register(true, true);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":2})").status, 200);
+    CHECK(fn4::apply_pending(41, sw));
+    CHECK_EQ(sw[fn4::kDraftDepth0], 2);
+    fn4::note_sched(fn4::kDraftDepth0, 2);
+    fn4::note_draft_accept(40, 31, 9, 2);
+    const HttpResponse g2 = f.get("/admin/fn4");
+    CHECK(has(g2.body, "\"draft_depth0\": 2"));
+    /* ds41-int10: draft_depth0 3 (depth 0 by occupancy only) taken where 1 is, reported as the scheduler notes it; 4 refused */
+    {
+        const HttpResponse d4 = f.post("/admin/fn4", R"({"draft_depth0":4})");
+        CHECK_EQ(d4.status, 400);
+        CHECK(has(d4.body, "3 (occupancy only)"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":3})").status, 200);
+        CHECK(fn4::apply_pending(41, sw));
+        CHECK_EQ(sw[fn4::kDraftDepth0], 3);
+        fn4::note_sched(fn4::kDraftDepth0, 3);
+        CHECK(has(f.get("/admin/fn4").body, "\"draft_depth0\": 3"));
+    }
+    CHECK(has(g2.body, "\"accept\": {\"head_drafted\": 40, \"head_accepted\": 31, \"lookup_drafted\": 9, "
+                       "\"lookup_accepted\": 2}"));
+
+    /* Back off for the rest of the binary. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_ctxskip":0,"draft_depth0":0})").status, 200);
+    CHECK(fn4::apply_pending(42, sw));
+    CHECK_EQ(sw[fn4::kDraftCtxSkip], 0);
+    fn4::note_sched(fn4::kDraftCtxSkip, 0);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    fn4::note_ctxskip(0, 0, 0, 0, 0, 0, 0, 0);
+    fn4::note_draft_accept(0, 0, 0, 0);
+    fn4::ctxskip_register(false);
+    fn4::draft_register(false, false);
 }
 
 /* The policy oai.cpp's lists state, key by key, on every endpoint: a guarded key is served at its

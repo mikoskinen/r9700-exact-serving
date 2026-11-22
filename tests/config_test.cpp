@@ -346,6 +346,24 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
+/* The verify-path harness takes a draft head's count as readily as prompt lookup's: the file and the
+ * count reach their fields (the scheduler loads the ids; beside a head they replace its proposals),
+ * and the help says it works beside a head. */
+TEST(the_draft_oracle_pairs_with_a_draft_heads_count_or_with_prompt_lookup) {
+    Config c;
+    CHECK_EQ(parse({ "--debug-draft-oracle", "/o.txt", "--num-speculative-tokens", "5" }, &c), RAD_OK);
+    CHECK_EQ(c.debug_draft_oracle, std::string("/o.txt"));
+    CHECK_EQ(c.n_spec, 5);
+    CHECK_EQ(c.spec_ngram, 0);
+    Config d;
+    CHECK_EQ(parse({ "--debug-draft-oracle", "/o.txt", "--spec-ngram", "4" }, &d), RAD_OK);
+    CHECK_EQ(d.debug_draft_oracle, std::string("/o.txt"));
+    CHECK(d.spec_ngram > 0);
+    const std::string text = stderr_of([] { config_usage("radiance"); });
+    CHECK(has(text, "--debug-draft-oracle"));
+    CHECK(has(text, "beside a draft head"));
+}
+
 /* The reasoning budget is a count or unset (-1); a negative value cannot be given. */
 TEST(thinking_token_budget_takes_a_count_and_defaults_to_none) {
     Config c;
@@ -478,6 +496,17 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "auto:x" }, &c), RAD_E_INVAL);
 }
 
+/* --long-prefill-token-threshold is a token count; 0 (off) is the default. */
+TEST(long_prefill_token_threshold_takes_a_token_count) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.long_prefill_token_threshold, 0);
+    Config c;
+    CHECK_EQ(parse({ "--long-prefill-token-threshold", "1024" }, &c), RAD_OK);
+    CHECK_EQ(c.long_prefill_token_threshold, 1024);
+    CHECK_EQ(parse({ "--long-prefill-token-threshold", "-1" }, &c), RAD_E_INVAL);
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
@@ -519,7 +548,11 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
+        { "--pp-nodes", { "1" } }, { "--pp-rank", { "1" } }, { "--pp-peer", { "10.200.0.3:29517" } },
+        { "--pp-cut", { "0,20" } }, { "--node-link", { "verbs" } }, { "--pp-lanes", { "3" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--long-prefill-token-threshold", { "1024" } },
+        { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
@@ -819,6 +852,65 @@ TEST(the_p2p_mode_is_one_of_three_names) {
     CHECK_EQ(parse({ "--p2p", "yes" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "OFF" }, &c), RAD_E_INVAL);
+}
+
+/* tp8 S4: the two-node pipeline's options. The defaults are one machine; each option parses on
+ * its own (the combination is checked at startup, Engine::pp_check). */
+TEST(the_two_node_options_parse_and_default_to_one_machine) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.pp_nodes, 1);
+    CHECK_EQ(d.pp_rank, 0);
+    CHECK(d.pp_peer.empty());
+    CHECK_EQ(d.pp_port, 29517);
+    CHECK_EQ(d.pp_cut_h, 0);
+    CHECK_EQ(d.pp_cut_t, 0);
+    CHECK_EQ(d.node_link, 0);
+    CHECK_EQ(d.pp_lanes, 0);
+    CHECK_EQ(d.pp_lanes_now(), 1);   /* tp8 S5: one machine runs one lane */
+    Config c;
+    CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-rank", "1", "--pp-peer", "10.200.0.2:30001",
+                     "--pp-cut", "10,32", "--node-link", "verbs" }, &c), RAD_OK);
+    CHECK_EQ(c.pp_nodes, 2);
+    CHECK_EQ(c.pp_rank, 1);
+    CHECK_EQ(c.pp_peer, std::string("10.200.0.2"));
+    CHECK_EQ(c.pp_port, 30001);
+    CHECK_EQ(c.pp_cut_h, 10);
+    CHECK_EQ(c.pp_cut_t, 32);
+    CHECK_EQ(c.node_link, 1);
+    CHECK_EQ(c.pp_lanes_now(), 2);   /* tp8 S5: a two-node pipeline's default */
+    Config l;
+    CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-lanes", "1" }, &l), RAD_OK);
+    CHECK_EQ(l.pp_lanes_now(), 1);
+    CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-lanes", "4" }, &l), RAD_OK);
+    CHECK_EQ(l.pp_lanes_now(), 4);
+    Config l1;
+    CHECK_EQ(parse({ "--pp-lanes", "3" }, &l1), RAD_OK);
+    CHECK_EQ(l1.pp_lanes_now(), 1);   /* lanes without --pp-nodes 2: one machine, one lane */
+    Config t;
+    CHECK_EQ(parse({ "--pp-cut", "20", "--pp-peer", "gpu03" }, &t), RAD_OK);
+    CHECK_EQ(t.pp_cut_h, 0);
+    CHECK_EQ(t.pp_cut_t, 20);
+    CHECK_EQ(t.pp_peer, std::string("gpu03"));
+    CHECK_EQ(t.pp_port, 29517);
+    Config v6;
+    CHECK_EQ(parse({ "--pp-peer", "[fe80::1]:2000" }, &v6), RAD_OK);
+    CHECK_EQ(v6.pp_peer, std::string("fe80::1"));
+    CHECK_EQ(v6.pp_port, 2000);
+    CHECK_EQ(parse({ "--pp-peer", "fe80::1" }, &v6), RAD_OK);
+    CHECK_EQ(v6.pp_peer, std::string("fe80::1"));
+    Config x;
+    CHECK_EQ(parse({ "--pp-nodes", "3" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-rank", "2" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "20,10" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "20,20" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "-1,20" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "0:20" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-peer", "gpu03:0" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-peer", ":29517" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--node-link", "rdma" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-lanes", "0" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-lanes", "5" }, &x), RAD_E_INVAL);
 }
 
 TEST(the_state_cache_dtype_is_f32_or_f16) {
@@ -1380,8 +1472,9 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
 }
 
 /* --spec-ngram K is prompt lookup alone at window K: it sets the window, agrees with a matching
- * --num-speculative-tokens and refuses another; the pattern range must be a range. Off by
- * default, at the lengths 2..4. */
+ * --num-speculative-tokens and refuses another (0 and auto included); the pattern range must be a
+ * range. Off by default, at the lengths 2..4. The help says a head the container carries is left
+ * out (the engine tells the plugin, RadBuildCtx::draft_head_off). */
 TEST(spec_ngram_sets_the_window_and_refuses_another) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
@@ -1401,10 +1494,14 @@ TEST(spec_ngram_sets_the_window_and_refuses_another) {
         CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "3" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "auto" }, &f),
                  RAD_E_INVAL);
+        /* 0 turns speculation off, which lookup alone at K contradicts. */
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "0" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram-min", "5", "--spec-ngram-max", "3" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram-max", "16" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram", "65" }, &f), RAD_E_INVAL);
     }
+    const std::string help = stderr_of([] { config_usage("radiance"); });
+    CHECK(has(help, "declared, loaded or placed"));
     Config g;
     CHECK_EQ(parse({ "--spec-ngram-min", "1", "--spec-ngram-max", "8" }, &g), RAD_OK);
     CHECK_EQ(g.spec_ngram_min, 1);

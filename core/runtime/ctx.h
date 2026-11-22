@@ -20,6 +20,7 @@
 #include "arena.h"
 #include "rank_barrier.h"
 #include "residency.h"
+#include "rowprefetch.h"
 #include "stager.h"
 #include "device/device.h"
 
@@ -67,6 +68,10 @@ struct IssuePlan {
     int              gate_n_p = 0;
     /* Resolved::ranged_div: an issued value this does not divide is refused. 0 for most rows. */
     int64_t          ranged_div = 0;
+    /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance, taken in place of args.instance by an
+     * issue from a Ctx whose pass slot is 1 (qfn-on-ds Q5b S0: Ctx::set_ar_set; the DS side branch picked it by lane 1)
+     * (Resolved::instance1); null for every other row and without the env. */
+    void*            instance1 = nullptr;
 };
 
 /* Per declared op. Trivially copyable: it holds offsets into two flat Ctx-owned arrays (bucket
@@ -96,6 +101,9 @@ struct OpPlan {
     /* Its position in the declared order, or its anchor's for a core-appended op: what the second
      * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
     int32_t       order = 0;
+    /* A row gather (runtime/rowprefetch.h): on the host, its rows on the mapped tier are read
+     * ahead before the kernel runs. Matched by name once here, like `billed`. */
+    bool          row_gather = false;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -205,6 +213,12 @@ struct CtxDesc {
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
     uint64_t        (*arch_pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
+    /* --row-prefetch: a host gather's rows on the mapped tier are read ahead of (or beside) its
+     * kernel (runtime/rowprefetch.h). */
+    bool            row_prefetch = true;
+    /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches on
+     * stderr (TAPEDUMP lines) and which of them start unordered behind the one before. */
+    bool            tape_dump = false;
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
      * run_step), since a recording keyed on the batch would replay the wrong pass. */
@@ -219,6 +233,11 @@ struct CtxDesc {
      * library won its host row. */
     Registry*       registry    = nullptr;
 };
+
+/* tp8 loop P31 (issue.cpp): RADIANCE_SLOW_ISSUE_MS's value (0 = off), and the process's pass-line budget (the count so far) */
+double  slow_issue_ms();
+int64_t slow_issue_rows();   /* RADIANCE_SLOW_ISSUE_ROWS: the smallest pass that prints (default 512) */
+int     slow_pass_line_take();
 
 /* ------------------------------------------------------------------ Ctx */
 class Ctx : public RadCtx {
@@ -277,6 +296,13 @@ public:
      * the constraints on a second lane. */
     RadStream       cur_stream() const { return lane_ ? lane1_ : stream_; }
     int             lane()       const { return lane_; }
+    long long       ar_set1_issues() const { return ar_set1_issues_; }   /* tp8 loop M6F */
+    /* qfn-on-ds Q5b S0 (Qwen loop round 22): the pass slot whose collective set this Ctx's issues take -- 0 = the first set
+     * (every pass today), 1 = the second (Resolved::instance1 where RADIANCE_AR_SETS=2 built it): a newcomer's prefill pass on a
+     * rank's second Ctx beside its decode passes. By slot, not by lane: the Qwen line's lane 1 is a pass's own comm lane
+     * (step_pipelined's on1, the delta net's a|b at decode), whose collectives belong to the pass's set. */
+    int             ar_set() const { return ar_set_; }
+    void            set_ar_set(int s) { ar_set_ = s == 1 ? 1 : 0; }
     int             set_lane(int lane);
     /* Builds the second stream and its events on first use; free when no lane is asked for. */
     int             lane_init();
@@ -310,6 +336,21 @@ public:
     /* How many layers report routing (the heat engine's sweep). Zero on a dense model. */
     int               n_route_layers() const { return (int)route_.size(); }
     int64_t           route_n_expert() const { return route_n_expert_; }
+    /* Layer `layer`'s card-side counts row when the layer's last report named that row, i.e. its
+     * router writes this pass's counts there in stream order (rad_route_counts); null otherwise,
+     * including before the layer's first report. `n_expert` and `top_k` are that report's. The
+     * file stager reads it to fetch only the experts a small pass routes to. */
+    const int32_t* route_counts_live(int layer, int64_t* n_expert, int64_t* top_k) const {
+        if (!route_dev_ || layer < 0 || (size_t)layer >= route_.size()) return nullptr;
+        const int32_t* row = route_dev_ + (int64_t)layer * route_n_expert_;
+        const RadRouting& r = route_[(size_t)layer].routing;
+        if (r.expert_count != row || r.n_expert <= 0 || r.n_expert > route_n_expert_ ||
+            r.top_k <= 0)
+            return nullptr;
+        if (n_expert) *n_expert = r.n_expert;
+        if (top_k) *top_k = r.top_k;
+        return row;
+    }
 
     /* ---------------------------------------------------- the next-layer expert prefetch
      * (xprefetch.h). xp_open at bringup, after placement has made its pinned pools, with their
@@ -368,6 +409,16 @@ public:
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
      * tests read it. Teardown's drain is not counted. */
     int64_t     host_syncs()   const { return n_host_syncs_; }
+    /* Of those, the host-op joins that drained the stream because an operand is untracked by the
+     * host arena (host_join_drains); tests read it. */
+    int64_t     host_drains()  const { return n_host_drains_; }
+    /* Host gathers whose rows were read ahead from the mapped tier, and the pages they advised
+     * (runtime/rowprefetch.h); tests read them. */
+    int64_t     row_prefetch_calls() const { return rowpf_calls_; }
+    int64_t     row_prefetch_pages() const { return rowpf_pages_; }
+    /* Of the calls, those whose read-ahead ran beside the kernel (runtime/rowprefetch.h). */
+    int64_t     row_prefetch_beside_calls() const { return rowpf_beside_calls_; }
+    bool        row_prefetch_busy() const { return rowpf_worker_ && rowpf_worker_->busy(); }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -528,6 +579,11 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
+        /* The lanes whose last host-arena toucher its join waited on when recorded. A play
+         * re-records those events in the played stretches, but only the issue path raises
+         * host_touch_pending_, so a pass with two host ops would run the second unjoined. */
+        bool             touch[2] = { false, false };
+        RowPrefetch      rp{};             /* its rows read ahead at every play (rowprefetch.h) */
     };
     struct PassTape {
         uint64_t key = 0;
@@ -544,6 +600,8 @@ private:
         uint64_t used = 0;
         int32_t  dispatches = 0, unordered = 0;   /* its kernels, and those haz_mark left unordered */
         int32_t  noacq = 0, noacq_ordered = 0;    /* those the acquire rule plays without their acquire */
+        int32_t  ika_noacq = 0;                    /* lever IKA: self-acquiring kernels played without it besides */
+        int32_t  rco_copies = 0, rco_freed = 0;   /* lever RCO: routing copies tracked, dispatches after one unordered */
     };
     /* The byte ranges each device op of a recorded pass reads and writes, so haz_mark can leave
      * dispatches that depend on nothing still running without the barrier bit. Otherwise the
@@ -558,15 +616,31 @@ private:
         int32_t  rec0 = 0, rec1 = 0;      /* its dispatches in the tape */
         uint32_t op = 0;
         bool     opaque = false;
+        /* Lever RCO (fn4 route_copy_ov): a routing report's copy, the core's own dispatch with no op (`op` names
+         * none): its ranges are known, and the acquire rule treats it as it treats every op-less dispatch. */
+        bool     route_copy = false;
+        const KernelRow* row = nullptr;   /* for --debug-tape-dump only */
         uint32_t rd = 0, n_rd = 0, wr = 0, n_wr = 0;   /* into haz_rng_ */
     };
     std::vector<HazOp> haz_ops_;
     std::vector<std::pair<uintptr_t, uintptr_t>> haz_rng_;
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
+    /* Lever RCO: a routing report's copy of `bytes` from `src` to `dst`, recorded as tape records [rec0, rec1). */
+    void haz_note_route_copy(const void* src, void* dst, int64_t bytes, int rec0, int rec1);
+    uint64_t rco_told_ = 0;   /* draft pass kinds whose first recording under route_copy_ov was logged */
     int  haz_mark(PassTape& t);
+    bool tape_dump_ = false;  /* --debug-tape-dump (CtxDesc::tape_dump) */
+    bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    /* tp8 S5: a two-node pipeline node with lanes keeps kTapes a lane (each lane's batch is its own set
+     * of recordings, and the leader's lane step two: its head, a few dispatches, and its tail); kTapes
+     * everywhere else. */
+    size_t                   tape_cap_   = kTapes;
+public:
+    void set_tape_lanes(int lanes) { tape_cap_ = kTapes * (size_t)(lanes > 1 ? lanes : 1); }
+private:
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;
@@ -576,6 +650,7 @@ private:
     size_t                tape_seen_at_ = 0;
     std::vector<uint64_t> tape_refused_;       /* keys whose pass could not be recorded */
     uint64_t              tape_told_ = 0;      /* draft passes whose first recording was logged */
+    uint64_t              tape_told_epoch_ = 0; /* the fn4 epoch tape_told_ is for: a switch change logs each kind again */
     bool                  tape_on_ = false;    /* the backend can, and nothing needs every issue */
     bool                  record_passes_ = true;   /* CtxDesc::record_passes */
     PassTape*             rec_ = nullptr;      /* the tape being recorded, while one is */
@@ -730,7 +805,17 @@ private:
      * every step that does not ask for lane 1 runs exactly the single-lane path (lane_join, pass_key). */
     RadStream lane1_spare_ = nullptr;
     int       lane_       = 0;
+    /* tp8 loop M6F: collectives issued with the row's second instance set (RADIANCE_AR_SETS=2) */
+    long long ar_set1_issues_ = 0;
+    int       ar_set_ = 0;   /* qfn-on-ds Q5b S0: this Ctx's pass slot (set_ar_set) */
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
+    /* fn4 PF marks (16.11.2026, qwen/prefill): lane_join(from, 0x100 + k) records mark k on lane `from`'s stream at its
+     * current tail; lane_join(0x200 + k, to) makes lane `to` wait for that point only (not for everything issued on the
+     * other lane since). A wait on a mark never recorded joins the whole other lane instead. */
+    static constexpr int kLaneMarks = 16;
+    RadEvent  mark_ev_[kLaneMarks] = {};
+    int       mark_lane_[kLaneMarks] = {};
+    bool      mark_on_[kLaneMarks] = {};
     /* An op was issued on lane 1 since lane 1 was last joined into lane 0; lane 0 joins it before
      * an op outside the second lane's window (Ctx::issue_body). */
     bool      lane1_pending_ = false;
@@ -744,6 +829,20 @@ private:
     int       host_join(const RadOperand* opd, int n_opd);
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
     int       host_join_wait(bool drain);
+    /* Read ahead a host gather's rows on the mapped tier (runtime/rowprefetch.h): which tables
+     * this issue reads there, then the madvise over the rows `t[0]` names -- in front of the
+     * kernel, or beside it on rowpf_worker_ when longer than kRowAheadInline and its sampled rows
+     * are resident; row_prefetch_done() after the kernel returns stops and joins that. Off with
+     * --row-prefetch off (CtxDesc::row_prefetch). */
+    bool      row_prefetch_on_ = true;
+    RowPrefetchScratch rowpf_;
+    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;
+    std::unique_ptr<RowPrefetchWorker> rowpf_worker_;
+    bool      rowpf_beside_ = false;   /* a read-ahead runs beside the kernel being launched */
+    void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
+                                const RadTensor* t, RowPrefetch* out) const;
+    void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);
+    void      row_prefetch_done();
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */
@@ -837,7 +936,26 @@ private:
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
     int64_t n_host_syncs_ = 0;
+    int64_t n_host_drains_ = 0;
+    /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS, issue.cpp): this pass's issue_body time, issues, first-launch resolves and the
+     * slowest issue's op, summed by issue_body and read by run_step */
+    double   slow_in_ms_ = 0, slow_max_ms_ = 0;
+    int64_t  slow_n_ = 0, slow_res_n_ = 0;
+    uint64_t slow_res_ns_ = 0;
+    int32_t  slow_max_op_ = -1;
+    void slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, double own_ms,
+                         double launch_ms, uint64_t res_ns, uint64_t res_n);
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
+    /* tp8 loop D41 (RADIANCE_PP_HEAD_PHASES=N, a pipeline leader's rank 0; ctx.cpp): a decode HEAD part's run_step by phase,
+     * summed over N heads, then one line. ph_on_: this pass is one; ph_t_: the phase marks run_pass / play_pass set. */
+    bool     ph_on_ = false;
+    uint64_t ph_t_[8] = {};
+    uint64_t ph_ns_[8] = {}, ph_n_ = 0, ph_played_ = 0, ph_slow_ = 0, ph_pk_ = 0, ph_entry_ns_ = 0;
+    /* tp8 loop D41b: phase 0 split (the stager's begin_pass / the residency sync) and the host steps a play runs before
+     * its first recorded stretch by kind (0 table refresh, 1 host op, 2 route report, 3 expert prefetch, 4 KV stage):
+     * summed time and count over the same N heads */
+    uint64_t ph_stager_ns_ = 0, ph_sg_ns_ = 0, ph_k_ns_[5] = {}, ph_k_n_[5] = {};
+    void head_phase_line();
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};
     std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0};

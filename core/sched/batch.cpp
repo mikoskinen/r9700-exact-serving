@@ -163,9 +163,10 @@ void BatchBuilder::carve(Set& s, char* h) {
     {
         int64_t bt_n = 0;
         s.bt_base = od;
+        const int64_t R = bt_rows();   /* tp8 loop D47: S unless RADIANCE_PP_BG_ROWS set a BG lane's rows */
         for (Group& g : s.groups) {
             g.bt_fix = bt_n;
-            bt_n += align_up(S * g.max_blocks * (int64_t)sizeof(int32_t), k_carve_align) /
+            bt_n += align_up(R * g.max_blocks * (int64_t)sizeof(int32_t), k_carve_align) /
                     (int64_t)sizeof(int32_t);
         }
         pair(&s.bt_h0, &s.bt_d0, bt_n);
@@ -215,8 +216,8 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     /* The ring holds three worst-case builds before a long-context prefill waits on an upload two
      * builds back. A decode build's span is far smaller, so hundreds fit. */
     int64_t worst_pay = 0;
-    for (const Group& g : s.groups) worst_pay += max_seqs_ * g.max_blocks * (int64_t)sizeof(int32_t);
-    const int64_t worst_ranges = worst_pay / k_range_max + max_seqs_ * (int64_t)s.groups.size() + 1;
+    for (const Group& g : s.groups) worst_pay += bt_rows() * g.max_blocks * (int64_t)sizeof(int32_t);   /* tp8 loop D47 */
+    const int64_t worst_ranges = worst_pay / k_range_max + bt_rows() * (int64_t)s.groups.size() + 1;
     ranges_.reserve((size_t)worst_ranges);
     ring_.bytes = 3 * (s.host_bytes + worst_ranges * (int64_t)sizeof(RadCopyRange) + k_carve_align);
     ring_.host = static_cast<char*>(rad_dev_alloc(ring_.bytes, RAD_MEM_HOST_PINNED));
@@ -257,9 +258,25 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     for (BtMirror& m : bt_mirror_) {
         m.seq.assign((size_t)max_seqs_, 0);
         m.len.assign((size_t)max_seqs_, -1);
+        m.base.assign((size_t)max_seqs_, -1);
     }
     ranges_.clear();
     return RAD_OK;
+}
+
+/* tp8 prefill P0: see batch.h (lanes_rebase_). The first query at e.ctx_len reads keys down to ctx_len - window + 1,
+ * which lies in block ctx_len / block - ceil(window / block) or later (KVManager::recycle_window's target, the block
+ * one process's table starts at); the row's last query is at ctx_len + n_tokens - 1. */
+BatchBuilder::WinRow BatchBuilder::win_row(const KVGeom::G& L, const StepEntry& e, int64_t first, int64_t bt_len) const {
+    WinRow w;
+    w.n = bt_len;
+    if (!lanes_rebase_ || L.kind != RAD_KV_WINDOW || L.window <= 0 || L.block_size <= 0) return w;
+    const int64_t bs = L.block_size, fb = first / bs;
+    const int64_t want = std::max<int64_t>(0, (int64_t)e.ctx_len / bs - (L.window + bs - 1) / bs);
+    w.skip = std::min<int64_t>(std::max<int64_t>(0, want - fb), bt_len);
+    const int64_t end = ((int64_t)e.ctx_len + e.n_tokens + bs - 1) / bs - fb;   /* table entries up to the row's end */
+    w.n = std::max<int64_t>(0, std::min<int64_t>(bt_len, end) - w.skip);
+    return w;
 }
 
 void BatchBuilder::forget_tables() {
@@ -353,10 +370,12 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
     /* Report both the reservation and the block-table share of it: tables are carved for the
      * worst step, but a step uploads only the rows it filled. */
     RAD_INFO("step batch: %s pinned staging ring + %s device slab a rank (%s of it block "
-             "tables), %d KV group(s), %d derived buffer(s)",
+             "tables), %d KV group(s), %d derived buffer(s)%s",
              humanb(ring_.bytes).c_str(), humanb(set_.dev_bytes).c_str(),
              humanb(set_.dev_bytes - set_.bt_base).c_str(), (int)prog.kv_groups.size(),
-             (int)derived_.size());
+             (int)derived_.size(),
+             bt_rows() < max_seqs_ ? fmt("; block tables for %lld rows, not %lld (RADIANCE_PP_BG_ROWS / RADIANCE_PP_LANE_ROWS, "
+                                         "tp8 loop D47)", (long long)bt_rows(), (long long)max_seqs_).c_str() : "");
     return RAD_OK;
 }
 
@@ -364,11 +383,12 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
  * the builder. An uncharged reservation would eat --gpu-headroom-mib, where running out faults
  * inside the HIP runtime; the block tables grow with --max-num-seqs and the media staging with
  * --max-num-batched-tokens. Uses the same layout() and carve as init(). */
-int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg) {
+int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg, int64_t bt_rows) {
     BatchBuilder b;
     b.prog_ = &prog;
     b.cfg_ = cfg;
     b.kvgeom_ = kvg;
+    b.set_bt_rows(bt_rows);   /* tp8 loop D47: a BG lane's rows (0: --max-num-seqs) */
     if (b.layout(prog, cfg) < 0) return -1;
     b.size_set(b.set_, prog.kv_groups);
     const MediaBytes m = b.mm_on_ ? b.media_bytes() : MediaBytes{};
@@ -740,21 +760,39 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 }
                 bt_len = (int64_t)bt.size();
                 table_end = bt_len * L.block_size;
+                /* lever PSK-CR: a replay chunk writes no full-group entry (its global KV is the cache's) */
+                const bool mask = e.cr_replay && L.kind == RAD_KV_FULL;
                 for (int32_t j = 0; j < e.n_tokens; ++j) {
                     const int64_t pos = (int64_t)e.ctx_len + j;
-                    g.h_slot[t + j] = has_win
-                        ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
-                        : kvgeom_.slot((int)gi, bt, first, pos);
+                    g.h_slot[t + j] = mask ? -1
+                        : has_win ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
+                                  : kvgeom_.slot((int)gi, bt, first, pos);
                 }
+                /* tp8 prefill P0: under lanes a fixed window row from its first query's window (win_row); the slots
+                 * above are the manager's table's, the row and its `first` below the rebased view of the same blocks */
+                const WinRow wr = has_win ? WinRow{ 0, bt_len } : win_row(L, e, first, bt_len);
+                const bool rebased = lanes_rebase_ && !has_win && L.kind == RAD_KV_WINDOW && L.window > 0;
+                const int32_t* const bt_row = bt.empty() ? nullptr : bt.data() + wr.skip;
+                const int64_t row_base = rebased ? first / L.block_size + wr.skip : -1;
+                if (rebased) first += wr.skip * L.block_size;
                 /* Restage relative to what the card holds (BtMirror). The same sequence in the
                  * same row keeps entries below the first changed one and below the end of both
                  * old and new tables, so a decode step stages nothing or one appended block. A
                  * new or moved sequence restages the whole row, and its copies in other rows go
                  * unknown. Change marks are taken for every row. */
-                const int64_t nb = std::min<int64_t>((int64_t)bt.size(), pitch);
-                const int64_t chg = kv.take_table_changes(e.seq, (int32_t)gi);
+                const int64_t nb = std::min<int64_t>(rebased ? wr.n : (int64_t)bt.size(), pitch);
+                if (rebased && wr.n > pitch)
+                    RAD_ERR("kv group %d: sequence %llu's window row needs %lld blocks from position %lld, past the "
+                            "row's %lld: its last queries would miss keys", (int)gi, (unsigned long long)e.seq,
+                            (long long)wr.n, (long long)first, (long long)pitch);
+                /* tp8 S5: a piece of another lane's sequence (StepEntry::home) is restaged whole and
+                 * leaves the change marks to its home lane's builder, whose slab tracks the sequence:
+                 * taken here, that builder would keep a stale row. The row is unknown afterwards. */
+                const bool foreign = e.home >= 0;
+                int64_t chg = foreign ? 0 : kv.take_table_changes(e.seq, (int32_t)gi);
+                if (rebased) chg = chg >= wr.skip ? chg - wr.skip : 0;   /* the row's index of the first change */
                 int64_t lo = 0, hi = pitch;
-                if (m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq) {
+                if (!foreign && m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq && m.base[(size_t)i] == row_base) {
                     lo = std::min(std::min(chg, m.len[(size_t)i]), nb);
                     hi = std::max(nb, m.len[(size_t)i]);
                 } else {
@@ -766,18 +804,21 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                     const int64_t nc = nb > lo ? nb - lo : 0;
                     /* Guarded: an empty table's data() may be null, and memcpy's source must
                      * not be, even for zero bytes. */
-                    if (nc > 0) std::memcpy(w, bt.data() + lo, (size_t)nc * sizeof(int32_t));
+                    if (nc > 0) std::memcpy(w, bt_row + lo, (size_t)nc * sizeof(int32_t));
                     std::fill(w + nc, w + (hi - lo), -1);
                     stage(g.bt_fix + i * pitch + lo, np, hi - lo);
                     np += hi - lo;
                 }
                 m.seq[(size_t)i] = e.seq;
-                m.len[(size_t)i] = nb;
+                m.len[(size_t)i] = foreign ? -1 : nb;
+                m.base[(size_t)i] = row_base;
             } else {
                 /* A linear or conv group has one state slot per sequence; every token maps to it
                  * and the block-table row is that slot, so table-reading kernels need no second
                  * path. */
                 int32_t st = kv.state_slot(e.seq, (int32_t)gi);
+                /* lever PSK-CR: nor any linear state (the compressor tail a store would advance) */
+                if (e.cr_replay && L.kind == RAD_KV_LINEAR) st = -1;
                 for (int32_t j = 0; j < e.n_tokens; ++j) g.h_slot[t + j] = st;
                 pay[np + i] = st;
                 /* Every conv group, at its own row. Feeds only DeriveInput::conv_slot; conv
@@ -811,7 +852,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             }
             if (used < 0) used = 0;
             g.h_used[i] = (int32_t)used;
-            if (L.paged) {
+            if (L.paged || (e.cr_replay && L.kind == RAD_KV_LINEAR)) {   /* lever PSK-CR: no state slot, as above */
                 for (int64_t j = 0; j < g.sidx_pitch; ++j) g.h_sidx[i * g.sidx_pitch + j] = -1;
             } else {
                 kv.state_index_row(e.seq, (int32_t)gi, g.h_sidx + i * g.sidx_pitch,
@@ -886,6 +927,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 (long long)max_seqs_, (long long)max_tok_);
         return nullptr;
     }
+    if ((int64_t)plan.e.size() > bt_rows()) {   /* tp8 loop D47: a BG lane's slab (RADIANCE_PP_BG_ROWS) */
+        RAD_ERR("step plan of %d sequences exceeds this lane's block tables of %lld rows (RADIANCE_PP_BG_ROWS, tp8 loop D47)",
+                (int)plan.e.size(), (long long)bt_rows());
+        return nullptr;
+    }
     Set& s = set_;
     const int64_t n_seq = (int64_t)plan.e.size();
 
@@ -911,7 +957,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         if (kvgeom_.g[gi].paged) {
             int64_t need = 1;
             for (int64_t i = 0; i < n_seq; ++i) {
-                const int64_t n = (int64_t)kv.block_table(plan.e[(size_t)i].seq, (int32_t)gi).size();
+                const StepEntry& e = plan.e[(size_t)i];
+                int64_t n = (int64_t)kv.block_table(e.seq, (int32_t)gi).size();
+                /* tp8 prefill P0: a lane's window row is its own window's span (win_row) */
+                if (lanes_rebase_ && kvgeom_.g[gi].kind == RAD_KV_WINDOW && !kv.runtime_window(e.seq, (int32_t)gi, nullptr))
+                    n = win_row(kvgeom_.g[gi], e, kv.first_block_pos(e.seq, (int32_t)gi), n).n;
                 if (n > need) need = n;
             }
             const int64_t bs = kvgeom_.g[gi].block_size > 0 ? kvgeom_.g[gi].block_size : 1;
@@ -1317,9 +1367,15 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     last_n_seq_ = n_seq;
     last_n_tok_ = n_tok;
     last_tree_  = plan.spec_is_tree;
+    last_off_ = off;
+    last_used_ = used;
+    last_rng_at_ = rng_at;
+    last_n_rng_ = n_rng;
+    last_enc_ = false;
     ring_.head = off + used;
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
+    if (on_build) on_build(&o.batch[0]);
     return &o.batch[0];
 }
 
@@ -1453,6 +1509,7 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         B.enc_seg_h = enc_seg_h_host_.data();
         B.enc_seg_w = enc_seg_w_host_.data();
     }
+    last_enc_ = true;
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
     return &o.batch[0];

@@ -30,6 +30,7 @@
 #pragma once
 #include "planner.h"
 
+#include <cmath>
 #include <string>
 #include <atomic>
 #include <memory>
@@ -78,6 +79,46 @@ struct HeatParams {
      * 1024, 79.0% at 512 or 256. */
     float credit_cap = 512.0f;
 
+    /* How much of a step a histogram from a step with prefill rows counts as, 0..1: its decay and
+     * its credit are both scaled to that share (observe's `share`), so 0 leaves the heat exactly
+     * as the decode steps around the prompt left it and 1 is the step every histogram counted as
+     * before (bit for bit). The engine gives a step of `n` rows, `d` of them decode rows, the share
+     * (d + prefill_share * (n - d)) / n; a draft head's layers keep 1.
+     *
+     * Why: the cap bounds one chunk, not a prompt. Under expert parallelism a rank sees about
+     * 8192 x top-k / world selections of a chunk, always over the cap, and a decode step about
+     * top-k / world, so each chunk credits several hundred decode steps' worth and decays the
+     * decode heat once more. DeepSeek-V4.1-Flash EXL3 at TP4 (6.11.): after a 243k-token cold
+     * prefill (30 chunks) the routed experts ran 8.3 ms a step instead of 5.0 and the MoE
+     * all-reduce waited 10.7 ms instead of 5.0, recovering over ~200 decode steps as the moves
+     * put the decode set back. Placement never changes an output (the same kernel reads the same
+     * bytes from whichever tier holds them), so the share is exact. RADIANCE_HEAT_PREFILL. */
+    float prefill_share = 1.0f;
+
+    /* Dual heat (on when 0 < prefill_decay < 1): a decode heat and a prefill heat per unit, ranked
+     * by their sum. A step's decode rows credit the decode heat, which decays with them as one heat
+     * does (decay^decode share, so a prefill step leaves it as it was); its prefill rows credit the
+     * prefill heat (times prefill_gain), and the prefill heat decays by prefill_decay at every
+     * credited step, prefill or decode. During a prompt its chunks keep the prefill heat high and
+     * the ranking follows the prompt (its experts come in, as with one heat: 6.11. EXL3 TP4 at 47
+     * flags, prefill share 0 cost 31 % of a 266k prompt's prefill rate); after it, the prefill heat
+     * is gone within tens of steps (0.7^12 = 1.4 %) and the ranking is the decode heat the prompt
+     * left untouched, not one the prompt's chunks decayed under their own credit (one heat at
+     * share 1: 28.6 ms/step decoding right after that prompt against 23.5 at share 0).
+     * prefill_share is not read in this mode. RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN. */
+    float prefill_decay = 0.0f;
+    float prefill_gain = 1.0f;
+
+    /* Dual heat only: the fraction of a slab class's resident units, the hottest by DECODE heat,
+     * that no promotion may demote (0 = none). A prompt then fills the rest of the resident set
+     * and the decode core stays on the card through it, where unprotected it is evicted wholesale
+     * and comes back only as fast as its units' decode heat clears min_gain (at TP4 one token
+     * credits ~1.5 selections a rank, so most of a decode set sits below 1.5: 6.11., 26.8 ms/step
+     * decoding after a 266k prompt against 23.5 with no prompt credit). Thresholds are taken once
+     * a step (step()), so a unit's protection is one step stale. A unit with no decode heat is never
+     * protected. RADIANCE_HEAT_DECODE_PIN. */
+    float decode_pin = 0.0f;
+
     /* Dispatches to watch before moving anything. 0, because min_gain already requires
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
@@ -86,12 +127,66 @@ struct HeatParams {
     /* The hot VRAM cache's admission bar: the heat at which the file stager
      * may read a routed expert into a slab slot permanently instead of its per-pass buffer.
      * Absolute, not relative to a victim: admission happens when the unit is read anyway, and the
-     * shadow slots are the budget. A value near min_gain (1.5) admits anything routed twice
-     * lately and churns; 8 is roughly two consistently-routed steps of the verify union at
-     * MTP-d3, well above an occasional expert's credit of one or two. Eviction is free (the
-     * container is ground truth), so the cost of an admission mistake is one future re-read. */
-    float admit_heat = 8.0f;
+     * shadow slots are the budget. A file-tier miss is a pread plus a relayout every token until
+     * the expert stays, so anything routed in the last few steps is worth a slot: 0.5 survives
+     * one decay of a single credit. Eviction is free (the container is ground truth), so a
+     * mistake costs one future re-read, and the slot count — not this bar — bounds the cache. */
+    float admit_heat = 0.5f;
+
+    /* Lever LF (ds41-lf): the long-memory decode heat's decay a credited step. A second decode heat kept
+     * beside the one placement ranks, credited and decayed on the same pass (a decode share decays it by
+     * long_decay^share), only slower: 0.998 is a half-life of ~350 steps, so it ranks an expert by how often
+     * decode routed it over the last few hundred steps, not the last ~14. It never moves anything by itself;
+     * the mover's fill of lent slots ranks by it under fn4 place_lf 1 (Mover::fill). Outside (0, 1): the
+     * default. RADIANCE_PLACE_LF_DECAY. */
+    float long_decay = 0.998f;
+
+    /* The trunk's layer count: units of layers at or past it (a draft head's) are counted apart in the
+     * slot-class counters (kSlotDraftOwn), whatever slot holds them. -1: every layer is the trunk's. */
+    int32_t trunk_layers = -1;
+
+    /* Lever HB (ds41-sahb, fn4 place_hb): the long-memory prefill heat's decay, applied once a credited layer
+     * histogram of a step with prefill rows (dual heat only; a decode step leaves it). 0.8 weighs the last
+     * prompts 1, 0.8, 0.64, ...: the experts the recent prompts keep routing. Outside (0, 1): the default.
+     * RADIANCE_PLACE_HB_DECAY. */
+    float hb_decay = 0.8f;
 };
+
+/* Lever L2 (ds41-swl): the swap guard's two halves (HeatParams::min_gain, ::hysteresis) in hundredths, as fn4
+ * heat_min_gain_x100 / heat_hyst_x100 and RADIANCE_HEAT_MIN_GAIN / RADIANCE_HEAT_HYSTERESIS carry them. heat_x100(v) is
+ * the float the engine compares with (150 -> 1.5f and 125 -> 1.25f exactly: the shipped values). heat_env_x100 reads
+ * an env value ("1.5", "0.75", "1") as hundredths, rounded, in lo .. hi; -1 for null, empty, not a number or out of
+ * range (the caller then keeps the default). */
+inline float heat_x100(int v) { return (float)v / 100.0f; }
+int heat_env_x100(const char* s, int lo, int hi);
+constexpr int kHeatMinGainX100Max = 10000;           /* 0 .. 100.00 */
+constexpr int kHeatHystX100Min = 100, kHeatHystX100Max = 1000;   /* 1.00 .. 10.00 */
+
+/* Slot classes (ds41-lf, /stats experts.ranks[].slots): the slot a unit sits in while in VRAM, kept after it
+ * leaves (a miss is counted under the class of the slot its expert last sat in). kSlotNone: never in VRAM since
+ * start; kSlotTrunk: a budgeted slab slot or the static region (the plan's resident set and every swap's
+ * promotion); kSlotKV .. kSlotDraftW: a slot lent by that lender (Mover::kLendKV + 2 ..); kSlotDraftOwn: a draft
+ * head's own units, wherever they sit (HeatParams::trunk_layers). */
+enum SlotClass : uint8_t { kSlotNone = 0, kSlotTrunk = 1, kSlotKV = 2, kSlotArena = 3, kSlotDraft = 4,
+                           kSlotDraftW = 5, kSlotDraftOwn = 6, kSlotClasses = 7 };
+inline const char* slot_class_name(int c) {
+    static const char* const k[kSlotClasses] = { "cold", "trunk", "kv", "arena", "dslab", "dw", "draft" };
+    return c >= 0 && c < kSlotClasses ? k[c] : "?";
+}
+/* Routed experts by slot class, counted on observe's pricing pass with the same weight as HeatStats::routed:
+ * `hit[c]` resident in a class-c slot, `miss[c]` off the device with class c its last slot. */
+struct SlotStats { uint64_t hit[kSlotClasses] = {}, miss[kSlotClasses] = {}; };
+
+/* The share of a step (HeatParams::prefill_share) a histogram of a step with `n_tok` rows,
+ * `n_tok_decode` of them decode rows, is credited at: the decode rows in full, the prefill rows at
+ * `prefill_share`, over the rows. 1 for a pure decode step, `prefill_share` for a pure prefill one,
+ * and 1 whenever the share is 1 or the rows are unknown. */
+inline float heat_step_share(float prefill_share, int64_t n_tok, int64_t n_tok_decode) {
+    if (!(prefill_share < 1.0f) || n_tok <= 0 || n_tok_decode >= n_tok) return 1.0f;
+    const double d = n_tok_decode > 0 ? (double)n_tok_decode : 0.0, n = (double)n_tok;
+    const double p = prefill_share > 0.0f ? (double)prefill_share : 0.0;
+    return (float)((d + p * (n - d)) / n);
+}
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
  * together: a promotion without its demotion would grow the resident set past the slab. */
@@ -211,8 +306,18 @@ public:
      *
      * `weight` is how many of the layer's routing passes this histogram stands for (see
      * Ctx::last_histogram_reports): 1 for a non-speculative step, n_spec for a draft head. It
-     * scales the credit, not the decay, because every layer still decays exactly once a step. */
-    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f);
+     * scales the credit, not the decay, because every layer still decays exactly once a step.
+     *
+     * `share` is how much of a step the histogram's step counts as (HeatParams::prefill_share):
+     * the decay is decay^share and the credit is scaled by share. 1 is the plain step, exactly as
+     * without the parameter; 0 or less leaves every heat as it was and only prices the routing
+     * (hit rate, streamed bytes), so the counters still see every step. `pshare` is read only in
+     * dual-heat mode (HeatParams::prefill_decay): the step's prefill share. */
+    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f,
+                 float share = 1.0f, float pshare = 0.0f);
+    /* Dual heat (HeatParams::prefill_decay): `share` is the step's decode share and `pshare` its
+     * prefill share; see observe_dual. */
+    bool dual() const { return params_.prefill_decay > 0.0f && params_.prefill_decay < 1.0f; }
     /* The same, sparse: distinct expert ids and their counts. `counts` may be null for one each. */
     void observe_ids(int32_t layer, const int32_t* experts, const int32_t* counts, int32_t n);
     /* Starts fetching a histogram observe() will read. A row the card copied into host memory
@@ -281,15 +386,78 @@ public:
      * Engine-internal decisions must use the individual counters (`warm`), not a snapshot. */
     HeatStats stats() const { return stats_.snapshot(); }
 
+    /* ds41-lf. The slot class the mover published `unit` into (SlotClass; kept after it leaves VRAM). Called by
+     * the mover on the dispatch thread when a unit lands in a slot; a draft head's unit keeps kSlotDraftOwn. */
+    void set_slot_class(int32_t unit, uint8_t cls) {
+        if (unit < 0 || (size_t)unit >= pos_.size() || cls >= kSlotClasses) return;
+        uint8_t& c = scls_[(size_t)pos_[(size_t)unit]];
+        if (c != kSlotDraftOwn) c = cls;
+    }
+    uint8_t slot_class(int32_t unit) const { return scls_[(size_t)pos_[(size_t)unit]]; }
+    /* The long-memory decode heat (HeatParams::long_decay); lever LF's fill ranking. */
+    float heat_long(int32_t unit) const { return heat_l_[(size_t)pos_[(size_t)unit]]; }
+    /* ---- lever HB (ds41-sahb, fn4 place_hb): a reserve by the long-memory prefill heat -------------------------
+     *
+     * set_hb_reserve(R), R > 0, dual heat only: from the next step() on, the R units of each slab class with the
+     * highest long-memory prefill heat (heat_pl_, HeatParams::hb_decay; never one at zero) rank kResBonus above
+     * their heat -- above every unprotected resident and below every decode-pinned one (kPinBonus) -- so ordinary
+     * swaps promote them (against the coldest unprotected residents) and none of them is a victim while reserved.
+     * 0: no bonus (today's ranking; the heat itself is still kept, which changes no other heat). Placement only. */
+    void set_hb_reserve(int32_t r) { hb_r_ = r > 0 && dual() ? r : 0; }
+    /* ---- lever L2 (ds41-swl, fn4 heat_min_gain_x100 / heat_hyst_x100): the swap guard, settable ----------------
+     *
+     * step() and pick() read HeatParams::min_gain and ::hysteresis afresh on every call (the bar `hot >= cold x
+     * hysteresis + min_gain`), so a change made between steps (every rank thread parked) takes the next step; no
+     * ranking state depends on them. The x100 mirrors are for the HTTP thread. Placement only. */
+    void set_min_gain(float g) {
+        params_.min_gain = g;
+        guard_x100_[0] = (int64_t)std::lround((double)g * 100.0);
+    }
+    void set_hysteresis(float h) {
+        params_.hysteresis = h;
+        guard_x100_[1] = (int64_t)std::lround((double)h * 100.0);
+    }
+    float min_gain() const { return params_.min_gain; }
+    float hysteresis() const { return params_.hysteresis; }
+    /* For any thread: min_gain and hysteresis in hundredths, as last set (init or the setters). */
+    int64_t min_gain_x100() const { return guard_x100_[0]; }
+    int64_t hysteresis_x100() const { return guard_x100_[1]; }
+    int32_t hb_reserve() const { return hb_r_; }
+    float heat_prefill_long(int32_t unit) const {
+        return heat_pl_.empty() ? 0.0f : heat_pl_[(size_t)pos_[(size_t)unit]];
+    }
+    /* The reserve as the last step() set it: units holding it, of them resident; promotions it proposed (cumulative). */
+    struct HbStats { int64_t reserved = 0, resident = 0, promotions = 0; };
+    HbStats hb_stats() const { return HbStats{ hb_reserved_.load(), hb_resident_.load(), (int64_t)hb_promotions_.load() }; }
+    /* By value, readable from the HTTP thread (relaxed counters). */
+    SlotStats slot_stats() const {
+        SlotStats s;
+        for (int c = 0; c < kSlotClasses; ++c) { s.hit[c] = slot_hit_[c]; s.miss[c] = slot_miss_[c]; }
+        return s;
+    }
+
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
     std::string report() const;
 
 private:
     HeatParams params_;
+    Relaxed<int64_t> guard_x100_[2];   /* lever L2: min_gain, hysteresis x 100 (set_min_gain / set_hysteresis) */
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
     HeatCounters stats_;
+    /* ds41-lf: routed experts by slot class (slot_stats), and the class by position (set_slot_class). */
+    Relaxed<uint64_t> slot_hit_[kSlotClasses], slot_miss_[kSlotClasses];
+    std::vector<uint8_t> scls_;
+    /* Lever LF: the long-memory decode heat by position (HeatParams::long_decay). */
+    std::vector<float>   heat_l_;
+    /* observe's tail: the slot-class tallies of one pass into the counters, `passes` each. */
+    void add_slots(const uint32_t* hit, const uint32_t* miss, uint64_t passes) {
+        for (int c = 0; c < kSlotClasses; ++c) {
+            if (hit[c]) slot_hit_[c] += (uint64_t)hit[c] * passes;
+            if (miss[c]) slot_miss_[c] += (uint64_t)miss[c] * passes;
+        }
+    }
 
     /* Heat by position, not by unit. Each layer owns a run of positions whose front is indexed by
      * expert: expert e of layer l is at slot_lo_[l] + e, whether or not the plan has a unit for it
@@ -303,6 +471,25 @@ private:
      * translate (-1 for a hole); everything outside the position arrays is indexed by MoveUnit
      * index, as in the plan. */
     std::vector<float>   heat_;               /* by position */
+    /* Dual heat only (HeatParams::prefill_decay): the decode and prefill heats by position; heat_
+     * is their sum, which every ranking reads. Empty otherwise. */
+    std::vector<float>   heat_d_, heat_p_;
+    /* HeatParams::decode_pin: per slab class, the decode heat from which a resident unit is no
+     * victim (+inf: none), and step()'s scratch for finding it. */
+    std::vector<float>   pin_thr_;
+    std::vector<std::vector<float>> pin_tmp_;
+    void update_pin();
+    /* Lever HB: the long-memory prefill heat by position (dual heat only), the reserve's size, and per class the
+     * long prefill heat from which a unit holds it (+inf: none). */
+    std::vector<float>   heat_pl_;
+    int32_t              hb_r_ = 0;
+    std::vector<float>   hb_thr_;
+    std::vector<std::vector<float>> hb_tmp_;
+    Relaxed<int64_t>     hb_reserved_, hb_resident_;
+    Relaxed<uint64_t>    hb_promotions_;
+    void update_reserve();
+    void observe_dual(int32_t layer, const int32_t* counts, int32_t n, float w, uint64_t passes,
+                      float share, float pshare);
     std::vector<int32_t> pos_;                /* unit -> position */
     std::vector<int32_t> unit_at_;            /* position -> unit, -1 for a hole */
     /* Per position, what step() ranks it as: 0 not a candidate (fixed, in flight, or a hole), 1 a

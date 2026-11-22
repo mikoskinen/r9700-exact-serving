@@ -469,24 +469,90 @@ static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int3
                ctx.last_histogram_reports(layer, bank), rt ? rt->top_k : 0);
 }
 
-/* The drain alone, for the tally, where the heat engine is off or the engine is stopping
- * (`before_step` INT_MAX once the streams are drained). */
-void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
+/* The drain alone, for the tally and the miss log, where the heat engine is off or the engine is
+ * stopping (`before_step` INT_MAX once the streams are drained). */
+void Engine::xstats_drain(Rank& r, XsTally* xs, MissRank* ml, int before_step) {
     find_histograms(r, before_step);
-    std::lock_guard<std::mutex> lk(xs->mutex());
+    std::unique_lock<std::mutex> lk;
+    if (xs) lk = std::unique_lock<std::mutex>(xs->mutex());
     for (const Rank::HeatRow& hr : r.heat_rows) {
-        xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (ml) missl_credit(r, *ml, hr.layer, hr.bank, hr.h, before_step == INT_MAX ? -1 : before_step);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
     }
-    xs->note_dropped(r.ctx.route_dropped());
+    if (xs) xs->note_dropped(r.ctx.route_dropped());
+    if (ml) ml->end_drain();
+}
+
+/* RADIANCE_DEBUG_MISS_LOG (place/misslog.h): a unit's tier as the run phase reads it, the heat
+ * engine's where it runs and the plan's where the plan is static. Both on the rank thread. */
+void Engine::missl_credit(Rank& r, MissRank& ml, int layer, int bank, const int32_t* h,
+                          int now_step) {
+    const RadRouting* rt = r.ctx.last_routing(layer);
+    const int64_t n = rt ? std::min<int64_t>(rt->n_expert, r.ctx.route_n_expert())
+                         : r.ctx.route_n_expert();
+    const bool live = r.heat.enabled();
+    ml.credit(layer, r.ctx.last_histogram_step(layer, bank), h, n,
+              r.ctx.last_histogram_reports(layer, bank), now_step,
+              [&r, live](int32_t u) { return live ? r.heat.tier(u) : r.plan.units[(size_t)u].tier; });
+}
+
+void Engine::missl_issued(Rank& r, MissRank& ml, const RadBatch& b) {
+    const bool live = r.heat.enabled();
+    ml.issued(b.step, b.draft_pass, b.n_seq, b.n_seq_decode, b.n_tok,
+              [&r, live](int32_t u) { return live ? r.heat.tier(u) : r.plan.units[(size_t)u].tier; });
+}
+
+/* How much of a step a trunk histogram of step `step` counts as (HeatParams::prefill_share): its
+ * decode rows in full and its prefill rows at the share, over its rows. 1 where the share is 1, for
+ * a draft head's layers (past the model's layers; xstats files them the same way), and for a step
+ * the ring no longer holds. Under dual heat (HeatParams::prefill_decay) the decode share is the
+ * decode rows' fraction and *pshare the prefill rows'; elsewhere *pshare is 0. */
+float Engine::heat_share(const Rank& r, int layer, int step, float* pshare) const {
+    if (pshare) *pshare = 0.0f;
+    const float p = heat_dual_ ? 0.0f : heat_prefill_share_;
+    if (!(p < 1.0f) || step < 0 || layer >= (int)meta_.n_layers || r.heat_steps.empty()) return 1.0f;
+    const Rank::HeatStepRows& s = r.heat_steps[(size_t)(step % Rank::kHeatStepRing)];
+    if (s.step != step) return 1.0f;
+    const float sd = heat_step_share(p, s.n_tok, s.n_tok_decode);
+    if (heat_dual_ && pshare) *pshare = 1.0f - sd;
+    return sd;
+}
+
+/* The tokens of trunk step `step` as this rank issued it (Rank::heat_steps), or -1 when the ring no longer holds it. */
+int64_t Engine::step_rows(const Rank& r, int step) const {
+    if (step < 0 || r.heat_steps.empty()) return -1;
+    const Rank::HeatStepRows& s = r.heat_steps[(size_t)(step % Rank::kHeatStepRing)];
+    return s.step == step ? s.n_tok : -1;
+}
+
+/* Lever SA / HB's live counters (GET "sahb"), every step release with every rank parked. */
+void Engine::sahb_note() {
+    for (auto& r : ranks_) {
+        if (r->index >= fn4::kSahbRanks) continue;
+        const PrefillStager::SahbStats& a = r->stager.sahb();
+        const HeatEngine::HbStats h = r->heat.enabled() ? r->heat.hb_stats() : HeatEngine::HbStats{};
+        const int64_t v[fn4::kSahbN] = { a.short_steps, a.short_layers, a.short_units, a.short_bytes, a.pick_kept,
+                                         a.pick_dropped, a.big_steps, a.expect_units, a.expect_bytes,
+                                         a.expect_sum_units, a.expect_n,
+                                         r->heat.enabled() ? (int64_t)r->heat.hb_reserve() : 0, h.reserved,
+                                         h.resident, h.promotions, r->sa_recall_bytes };
+        fn4::note_sahb(r->index, v);
+        /* Lever SP (ds41-int9): GET "sp". */
+        const PrefillStager::SpStats& p = r->stager.sp();
+        const int64_t w[fn4::kSpN] = { p.full_steps, p.full_rows, p.full_layers, p.full_units, p.full_bytes,
+                                       p.full_pick_kept, p.full_pick_dropped, p.stream_steps, p.stream_rows };
+        fn4::note_sp(r->index, w);
+    }
 }
 
 void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
+    MissRank* const ml = missl_ ? missl_->rank(r.index) : nullptr;
     if (!r.heat.enabled()) {
-        if (xs) xstats_drain(r, xs, step);
+        if (xs || ml) xstats_drain(r, xs, ml, step);
         return;
     }
 
@@ -505,9 +571,17 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         /* A bank can hold several passes (a draft head reports once per pass into one bank), so
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
-        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        float pshare = 0.0f;
+        const float share = heat_share(r, hr.layer, r.ctx.last_histogram_step(hr.layer, hr.bank), &pshare);
+        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f, share, pshare);
+        /* Lever SA's pick (stage_pick): the routing of a trunk step of the stager's size, by unit. */
+        if (r.stager.enabled()) {
+            const int hs = r.ctx.last_histogram_step(hr.layer, hr.bank);
+            if (step_rows(r, hs) >= r.stager.min_rows()) r.stager.note_routed(hr.layer, hr.h, n_ex, hs);
+        }
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (ml) missl_credit(r, *ml, hr.layer, hr.bank, hr.h, step);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -516,6 +590,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         xs->note_dropped(r.ctx.route_dropped());
         xl.unlock();
     }
+    if (ml) ml->end_drain();
 
     /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
      * transfer stream, and the turnover slots are filled for it (below). Histograms are still
@@ -626,16 +701,104 @@ void Engine::xstats_close() {
             XsTally* xs = xstats_->tally(r->index);
             if (!xs) continue;
             if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
-            xstats_drain(*r, xs, INT_MAX);
+            xstats_drain(*r, xs, nullptr, INT_MAX);
         }
         if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     }
     (void)xstats_->write(true);
 }
 
+/* ------------------------------------------------------------------ RADIANCE_DEBUG_MISS_LOG
+ *
+ * Each rank's expert units by (routed layer, the rank's expert index): the histogram row's index
+ * (place/xstats.h), which is the unit's group expert. A debug log: a file that cannot be written
+ * is warned about and the engine serves without it. */
+int Engine::missl_open() {
+    const char* path = miss_log_path();
+    if (!path) return RAD_OK;
+    const int n_layer = ranks_[0]->ctx.n_route_layers();
+    const int64_t n_ex = ranks_[0]->ctx.route_n_expert();
+    if (n_layer <= 0 || n_ex <= 0) {
+        RAD_WARN("%s: '%s' routes no experts; %s is not written", kMissLogEnv,
+                 meta_.name ? meta_.name : "the model", path);
+        return RAD_OK;
+    }
+    MlInfo info;
+    info.model = meta_.name ? meta_.name : "";
+    info.arch = meta_.arch_id ? meta_.arch_id : "";
+    info.tp = (int)ranks_.size();
+    info.n_layer = n_layer;
+    info.n_trunk = (int)std::min<int64_t>(meta_.n_layers, n_layer);
+    info.n_expert = n_ex;
+    missl_ = std::make_unique<MissLog>();
+    missl_->init(path, info);
+    for (auto& rk : ranks_) {
+        const Plan& p = rk->plan;
+        const int64_t E = rk->ctx.route_n_expert();
+        const int L = rk->ctx.n_route_layers();
+        std::vector<int32_t> unit_of((size_t)std::max(L, 0) * (size_t)std::max<int64_t>(E, 0), -1);
+        std::vector<int64_t> bytes(p.units.size(), 0);
+        std::vector<uint8_t> cls(p.units.size(), (uint8_t)kMlOther);
+        const bool live = rk->heat.enabled();
+        for (size_t u = 0; u < p.units.size(); ++u) {
+            const MoveUnit& mu = p.units[u];
+            bytes[u] = mu.bytes;
+            cls[u] = ml_class(live ? rk->heat.tier((int32_t)u) : mu.tier);
+            /* Two units naming one (layer, expert): the later is the expert, as in the heat
+             * engine's index. */
+            if (mu.layer >= 0 && mu.layer < L && mu.expert >= 0 && mu.expert < E)
+                unit_of[(size_t)mu.layer * (size_t)E + (size_t)mu.expert] = (int32_t)u;
+        }
+        missl_->rank(rk->index)->init(rk->index, L, info.n_trunk, E, std::move(unit_of),
+                                      std::move(bytes), cls);
+    }
+    if (missl_->start() < 0) {
+        missl_.reset();
+        return RAD_OK;
+    }
+    RAD_INFO("miss log: %d routed layers (%d trunk), %lld experts a rank's row, %d rank%s, written "
+             "to %s every second and at shutdown", n_layer, info.n_trunk, (long long)n_ex,
+             info.tp, info.tp == 1 ? "" : "s", path);
+    return RAD_OK;
+}
+
+/* After the rank threads stop and before xstats_close: the banks still in the ring, read without
+ * crediting them, so xstats_close still finds them. */
+void Engine::missl_close() {
+    if (!missl_) return;
+    if (loop_status_.load(std::memory_order_acquire) >= 0) {
+        for (auto& r : ranks_) {
+            MissRank* ml = missl_->rank(r->index);
+            if (!ml) continue;
+            if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
+            find_histograms(*r, INT_MAX);
+            for (const Rank::HeatRow& hr : r->heat_rows)
+                missl_credit(*r, *ml, hr.layer, hr.bank, hr.h, -1);
+            ml->end_drain();
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    }
+    /* The heat engine's own pricing (/stats), beside the log's. */
+    std::string tail;
+    for (auto& r : ranks_) {
+        if (!r->heat.enabled()) continue;
+        const HeatStats hs = r->heat.stats();
+        tail += fmt("# heat rank %d dispatches %llu routed %llu routed_resident %llu "
+                    "stream_bytes %llu route_dropped %llu\n", r->index,
+                    (unsigned long long)hs.dispatches, (unsigned long long)hs.routed,
+                    (unsigned long long)hs.routed_resident, (unsigned long long)hs.stream_bytes,
+                    (unsigned long long)r->ctx.route_dropped());
+    }
+    /* ~Engine prints --profile-ops' final table set. */
+    if (cfg_.profile_ops) missl_->profile_mark(missl_->last_step(), true);
+    missl_->close(tail);
+    missl_.reset();
+}
+
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
+    MissRank* const ml = missl_ ? missl_->rank(index) : nullptr;
     if (r.ctx.bind_thread() < 0) {
         RAD_ERR("rank %d: could not bind its device", index);
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
@@ -649,7 +812,9 @@ void Engine::rank_loop(int index) {
         if (b) {
             /* This rank's view of the step, pointing at this card's staging. Its upload was issued
              * on this rank's stream, so no cross-rank fence is needed. */
-            const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
+            /* tp8 S5: the lane whose batch this release issues (sched_ on one lane) */
+            const RadBatch* mine = gen_ ? gen_->batch_for(index)
+                                        : issue_sched_.load(std::memory_order_acquire)->batch_for(index);
             if (!mine) {
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
                 step_status_.store(RAD_E_STATE, std::memory_order_release);
@@ -662,11 +827,67 @@ void Engine::rank_loop(int index) {
              * more later. An encoder pass is not a step of the token stream. */
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
+            /* The heat engine's prefill share reads each trunk step's rows at its drain. */
+            if ((heat_prefill_share_ < 1.0f || heat_dual_ || r.stager.enabled()) && what != kIssueSampler &&
+                b->enc == 0 && b->draft_pass == 0 && b->step >= 0) {
+                if (r.heat_steps.empty()) r.heat_steps.resize(Rank::kHeatStepRing);
+                Rank::HeatStepRows& hs = r.heat_steps[(size_t)(b->step % Rank::kHeatStepRing)];
+                hs.step = b->step;
+                hs.n_tok = b->n_tok;
+                hs.n_tok_decode = b->n_tok_decode;
+            }
+            /* RADIANCE_DEBUG_MISS_LOG: the tiers this pass will read. The mover publishes only
+             * between passes on this thread, so they are the ones run_step resolves. */
+            const bool ml_pass = ml && what != kIssueSampler && b->enc == 0;
+            if (ml_pass) missl_issued(r, *ml, *b);
+            const bool hiss = index == 0 && hiss_want_ && what != kIssueSampler;   /* tp8 loop D37 */
+            if (hiss) hiss_t0_ = rad_mono_ns();
+            /* qfn-on-ds lever TIP: the step's snapshot row inside it, named to the plugin for this issue only */
+            int64_t tip_row = 0;
+            /* Only a fresh prefill step of one sequence: a step issued ahead (Scheduler::step_next, always decode) is built in
+             * plan_next_ while plan() is still the previous step's (test tip4: the TIP step's row named to the decode step
+             * issued ahead behind it); the plan must be this batch's (rows and phase agree). */
+            const StepPlan* tpl = tip_on_ ? &issue_sched_.load(std::memory_order_acquire)->plan() : nullptr;
+            if (tpl && what != kIssueSampler && b->draft_pass == 0 && b->enc == 0 && (size_t)index < tip_.size() &&
+                b->phase == RAD_PHASE_PREFILL && b->n_seq == 1 && tpl->e.size() == 1 && tpl->n_tok == b->n_tok &&
+                tpl->e[0].is_prefill) {
+                TipRank& t = tip_[(size_t)index];
+                const StepEntry* te = nullptr;
+                tip_row = tip_row_of(*tpl, &te);
+                if (tip_row > 0 && te) {
+                    t.row = tip_row;
+                    t.seq = te->seq;
+                    t.ck = te->ckpt_slot;
+                    t.fail = 0;
+                    /* the sequence's slots are rank 0's (it hands out the ids; every rank's pools are laid out alike:
+                     * state_slots_of, as save_checkpoints takes them -- a follower's own manager does not hold the sequence) */
+                    const KVManager& kv = r.kv;
+                    if (!state_slots_of(te->seq, &t.slots)) t.slots.assign((size_t)kv.n_groups(), -1);
+                    t.slots.resize((size_t)kv.n_groups(), -1);
+                    t.staged.assign((size_t)kv.n_groups(), {});
+                    for (int32_t g = 0; g < kv.n_groups(); ++g) {
+                        const KVGroupPlan* p = kv.plan(g);
+                        if (!p || !p->stateful()) continue;
+                        t.staged[(size_t)g].assign((size_t)std::max<int64_t>(p->n_layers, 0), 0);
+                    }
+                    if (fn4::tip_set(index, (long long)tip_row, &Engine::tip_stage, &t) <= 0) {
+                        RAD_ERR("rank %d step %d: lever TIP: the plugin refused the snapshot row %lld", index, b->step,
+                                (long long)tip_row);
+                        step_status_.store(RAD_E_STATE, std::memory_order_release);
+                        tip_row = 0;
+                    }
+                } else {
+                    tip_row = 0;
+                }
+            }
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if (tip_row > 0) (void)fn4::tip_set(index, 0, nullptr, nullptr);
+            if (hiss) hiss_t1_ = rad_mono_ns();
+            if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
-            } else if (b->n_out > 0 && what != kIssueModel) {
+            } else if (b->n_out > 0 && what != kIssueModel && what != kIssueFollower) {
                 /* Wait for the scheduler's sampler staging, which runs while the device executes
                  * the forward pass enqueued above, so the wait is hidden behind device work. */
                 int bst = RAD_OK;
@@ -696,16 +917,47 @@ void Engine::rank_loop(int index) {
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
-int Engine::prepare_release(const RadBatch* b) {
+int Engine::prepare_release(const RadBatch* b, bool switches) {
     /* fn4: runtime switch changes (POST /admin/fn4) land here, with every rank thread parked, so
-     * every rank issues this step under one setting (runtime/fn4_switch.h). */
-    {
-        int adapt = -1;
-        if (fn4::apply_pending(b ? b->step : -1, &adapt) && adapt >= 0) sched_.set_draft_adaptive(adapt == 1);
+     * every rank issues this step under one setting (runtime/fn4_switch.h). Nothing queued: one
+     * atomic load, no lock. tp8 S5: a lane step's tail release (switches false) takes none, so its
+     * two leader passes run under the setting its head ran (and shipped to the follower) under. */
+    if (switches) {
+        int sw[fn4::kSwitches];
+        const bool fn4_changed = fn4::apply_pending(b ? b->step : -1, sw);
+        if (fn4_changed) fn4_apply_changes(sw);
+        /* Lever PSK design 2: the plugin's ds41_psk as the scheduler plans by it (2 / 3 anchors), read once and after
+         * every change (a request takes it at admission) */
+        if (fn4_changed || !psk_mode_read_) {
+            psk_mode_read_ = true;
+            sched_.set_psk_mode(fn4::value(fn4::kDs41Psk));
+            /* lever PSK-CR (ds41-pskcr): the plugin's ds41_psk_cr and the replay's reach, read with the mode */
+            sched_.set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
+            for (auto& ls : lane_sched_) {   /* tp8 S5: every lane's scheduler (none on one lane) */
+                ls->set_psk_mode(fn4::value(fn4::kDs41Psk));
+                ls->set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
+            }
+        }
     }
+    psk_release(b);
+    /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
+     * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
+    if (dl_capable_) {
+        const bool want = lsched().draft_lend_wanted();
+        for (auto& r : ranks_) r->mover.set_draft_lend(want);
+        uint64_t ch = 0;
+        const int state = draft_lend_state(&ch);
+        const Mover& m0 = ranks_[0]->mover;
+        fn4::note_lend_engine(state, (int64_t)m0.draft_lends(), (int64_t)m0.draft_reclaims(), m0.draft_lent_units(),
+                              m0.draft_resident(), m0.draft_units(), m0.draft_slab_bytes() >> 20);
+    }
+    /* Lever Z0-W: the drafter's query-pass weights lent while the slab's lend is wanted and this step runs no
+     * head; recalled (and copied back) before a step whose head runs. Every rank thread is parked. */
+    if (const int ws = draft_w_step(); ws < 0) return ws;
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
+    sahb_note();
     /* Grow the followers' pools to match rank 0's before the step's block table is used:
      * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
      * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
@@ -719,9 +971,211 @@ int Engine::prepare_release(const RadBatch* b) {
     /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
      * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
      * parked, so no allocation races the read. */
-    kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
+    kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     return RAD_OK;
+}
+
+/* fn4: the switch values apply_pending handed over (kNoChange where none), to their owners -- the
+ * scheduler's setters, the engine's own levers, every rank's mover and heat engine. Every rank thread
+ * is parked. A pipeline's follower runs the same (tp8 S4: its placement levers). */
+void Engine::fn4_apply_changes(const int* sw) {
+    /* tp8 S5: a scheduler switch reaches every lane's scheduler; the value noted is lane 0's (each
+     * lane runs the same setter on the same value). One lane: the call below is sched_'s alone. */
+    const auto each_lane = [this](const auto& set) {
+        auto v = set(sched_);
+        for (auto& ls : lane_sched_) (void)set(*ls);
+        return v;
+    };
+    {
+        {
+            /* Lever PSK design 2: the scheduler's anchor stride */
+            if (sw[fn4::kDs41PskK] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDs41PskK, each_lane([&](Scheduler& q) { return q.set_psk_k(sw[fn4::kDs41PskK]); }));
+            if (sw[fn4::kDraftAdaptive] != fn4::kNoChange)
+                fn4::note_draft_adaptive(each_lane([&](Scheduler& q) { return q.set_draft_adaptive(sw[fn4::kDraftAdaptive]); }));
+            if (sw[fn4::kDraftDepth0] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftDepth0, each_lane([&](Scheduler& q) { return q.set_draft_depth0(sw[fn4::kDraftDepth0]); }));
+            if (sw[fn4::kDraftProbe] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftProbe, each_lane([&](Scheduler& q) { return q.set_draft_probe(sw[fn4::kDraftProbe]); }));
+            if (sw[fn4::kDraftHybrid] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftHybrid, each_lane([&](Scheduler& q) { return q.set_draft_hybrid(sw[fn4::kDraftHybrid]); }));
+            if (sw[fn4::kDraftHybridMatch] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftHybridMatch,
+                                each_lane([&](Scheduler& q) { return q.set_draft_hybrid_match(sw[fn4::kDraftHybridMatch]); }));
+            if (sw[fn4::kDraftProbeBackoff] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftProbeBackoff,
+                                each_lane([&](Scheduler& q) { return q.set_draft_probe_backoff(sw[fn4::kDraftProbeBackoff]); }));
+            if (sw[fn4::kDraftLend] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftLend, each_lane([&](Scheduler& q) { return q.set_draft_lend(sw[fn4::kDraftLend]); }));
+            if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftLendBorrow, each_lane([&](Scheduler& q) { return q.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]); }));
+            if (sw[fn4::kDraftLendHyst] != fn4::kNoChange)   /* lever Z0-H */
+                fn4::note_sched(fn4::kDraftLendHyst, each_lane([&](Scheduler& q) { return q.set_draft_lend_hyst(sw[fn4::kDraftLendHyst]); }));
+            if (sw[fn4::kDraftOcc] != fn4::kNoChange)        /* lever Z0-O */
+                fn4::note_sched(fn4::kDraftOcc, each_lane([&](Scheduler& q) { return q.set_draft_occ(sw[fn4::kDraftOcc]); }));
+            if (sw[fn4::kDraftOccK] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftOccK, each_lane([&](Scheduler& q) { return q.set_draft_occ_k(sw[fn4::kDraftOccK]); }));
+            if (sw[fn4::kDraftDcap] != fn4::kNoChange)       /* SPB */
+                fn4::note_sched(fn4::kDraftDcap, each_lane([&](Scheduler& q) { return q.set_draft_dcap(sw[fn4::kDraftDcap]); }));
+            if (sw[fn4::kDraftDcapN] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftDcapN, each_lane([&](Scheduler& q) { return q.set_draft_dcap_n(sw[fn4::kDraftDcapN]); }));
+            if (sw[fn4::kDraftCostAge] != fn4::kNoChange)   /* DCA */
+                fn4::note_sched(fn4::kDraftCostAge, each_lane([&](Scheduler& q) { return q.set_draft_cost_age(sw[fn4::kDraftCostAge]); }));
+            /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
+             * it otherwise). */
+            if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
+                /* tp8 S5: not under lanes, which interleave the steps its ring keeps (engine_lanes.cpp) */
+                /* tp8 dev D4: taken under lanes when the ring is one region a lane (RADIANCE_PP_CTXSKIP_LANES=1) */
+                if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 && (lane_sched_.empty() || ctxs_.lanes > 1) ? 1 : 0;
+                fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
+            }
+            /* Lever Z0-W: the engine's own, acted on at the next release (draft_w_step; fn4 refuses 1 unless set up). */
+            if (sw[fn4::kDraftLendW] != fn4::kNoChange) {
+                dw_on_.store(sw[fn4::kDraftLendW] == 1 && dw_capable_ ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
+            }
+            /* Lever Z0-A: the engine's own, read by the next arena_step (fn4 refuses 1 unless set up). */
+            if (sw[fn4::kArenaD0] != fn4::kNoChange) {
+                arena_d0_.store(sw[fn4::kArenaD0] == 1 ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kArenaD0, arena_d0_.load(std::memory_order_relaxed));
+            }
+            /* Lever LF: every rank's mover, read by its next fill (fn4 refuses 1 unless every rank places
+             * dynamically). The slots already filled keep their units. */
+            if (sw[fn4::kPlaceLf] != fn4::kNoChange) {
+                const int on = sw[fn4::kPlaceLf] == 1 && lf_capable_ ? 1 : 0;
+                lf_on_.store(on, std::memory_order_relaxed);
+                for (auto& r : ranks_) r->mover.set_place_lf(on == 1);
+                fn4::note_sched(fn4::kPlaceLf, on);
+            }
+            /* Levers SWL / L2 (ds41-swl): every rank's mover (read by its next issue()) and heat engine (read by its
+             * next step()), every rank thread parked; fn4 refuses a change unless every rank places dynamically. The
+             * slots already taken and the units already resident stay where they are. */
+            if (sw[fn4::kPlaceSwapLent] != fn4::kNoChange) {
+                const int on = sw[fn4::kPlaceSwapLent] == 1 && swl_capable_ ? 1 : 0;
+                swl_on_.store(on, std::memory_order_relaxed);
+                for (auto& r : ranks_) r->mover.set_swap_lent(on == 1);
+                fn4::note_sched(fn4::kPlaceSwapLent, on);
+            }
+            if (sw[fn4::kHeatMinGainX100] != fn4::kNoChange) {
+                if (swl_capable_) {
+                    const int v = std::min(std::max(sw[fn4::kHeatMinGainX100], 0), kHeatMinGainX100Max);
+                    for (auto& r : ranks_)
+                        if (r->heat.enabled()) r->heat.set_min_gain(heat_x100(v));
+                }
+                fn4::note_sched(fn4::kHeatMinGainX100, (int)ranks_[0]->heat.min_gain_x100());
+            }
+            if (sw[fn4::kHeatHystX100] != fn4::kNoChange) {
+                if (swl_capable_) {
+                    const int v = std::min(std::max(sw[fn4::kHeatHystX100], kHeatHystX100Min), kHeatHystX100Max);
+                    for (auto& r : ranks_)
+                        if (r->heat.enabled()) r->heat.set_hysteresis(heat_x100(v));
+                }
+                fn4::note_sched(fn4::kHeatHystX100, (int)ranks_[0]->heat.hysteresis_x100());
+            }
+            /* Lever SA (ds41-sahb): read by the next arena_step (fn4 refuses stage_short > 0 unless set up). */
+            if (sw[fn4::kStageShort] != fn4::kNoChange) {
+                stage_short_.store(sa_capable_ ? std::max(0, sw[fn4::kStageShort]) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageShort, stage_short_.load(std::memory_order_relaxed));
+            }
+            if (sw[fn4::kStagePick] != fn4::kNoChange) {
+                stage_pick_.store(std::max(0, sw[fn4::kStagePick]), std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStagePick, stage_pick_.load(std::memory_order_relaxed));
+            }
+            /* Lever SAL (ds41-pf2): stage_short only on a step with no decode rows; read by the next arena_step. */
+            /* tp8 loop D23: the engine's own, read by the next drafter cycle's block_shape (fn4 refuses a length the
+             * drafter did not declare) */
+            if (sw[fn4::kDraftShortBlk] != fn4::kNoChange) {
+                short_blk_.store(sw[fn4::kDraftShortBlk] > 0 ? sw[fn4::kDraftShortBlk] : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kDraftShortBlk, short_blk_.load(std::memory_order_relaxed));
+            }
+            if (sw[fn4::kStageLone] != fn4::kNoChange) {
+                stage_lone_.store(sw[fn4::kStageLone] == 1 ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageLone, stage_lone_.load(std::memory_order_relaxed));
+            }
+            /* tp8 loop P23s: the BG lanes' inbox room / join window (RADIANCE_PP_BG_ROOM / _JOIN_MS in process), read by the
+             * next plan's lane_split_bg on this thread; only with a BG lane (else 0). The follower plans nothing: leader-only. */
+            if (sw[fn4::kPpBgRoom] != fn4::kNoChange) {
+                if (lanes_.bg_lane() >= 0) lanes_.set_bg_room(sw[fn4::kPpBgRoom]);
+                fn4::note_sched(fn4::kPpBgRoom, (int)lanes_.bg_room());
+            }
+            if (sw[fn4::kPpBgJoinMs] != fn4::kNoChange) {
+                if (lanes_.bg_lane() >= 0) lanes_.set_bg_join_ms(sw[fn4::kPpBgJoinMs]);
+                fn4::note_sched(fn4::kPpBgJoinMs, lanes_.bg_lane() >= 0 ? (int)lanes_.bg_join_ms() : 0);
+            }
+            /* tp8 MERGE: the decode lanes' merge (core/sched/lanes.h), read by step_loop_lanes at its next round on this thread;
+             * only with two decode lanes or more (else 0). The follower plans nothing: it notes the value and does nothing. */
+            if (sw[fn4::kPpMerge] != fn4::kNoChange) {
+                const bool can = n_lanes_ > 1 && n_lanes_ - lanes_.bg_n() >= 2;
+                pp_merge_.store(can ? std::max(0, std::min(127, sw[fn4::kPpMerge])) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kPpMerge, pp_merge_.load(std::memory_order_relaxed));
+            }
+            if (sw[fn4::kPpMergeMs] != fn4::kNoChange) {
+                pp_merge_ms_.store(std::max(0, std::min(60000, sw[fn4::kPpMergeMs])), std::memory_order_relaxed);
+                fn4::note_sched(fn4::kPpMergeMs, pp_merge_ms_.load(std::memory_order_relaxed));
+            }
+            /* Lever SP (ds41-int9): read by the next arena_step (fn4 refuses either > 0 unless set up). */
+            if (sw[fn4::kStageFullMin] != fn4::kNoChange) {
+                stage_full_min_.store(sp_capable_ ? std::max(0, sw[fn4::kStageFullMin]) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageFullMin, stage_full_min_.load(std::memory_order_relaxed));
+            }
+            if (sw[fn4::kStageFullPick] != fn4::kNoChange) {
+                stage_full_pick_.store(sp_capable_ ? std::max(0, sw[fn4::kStageFullPick]) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageFullPick, stage_full_pick_.load(std::memory_order_relaxed));
+            }
+            /* Lever HB: every named rank's heat engine, read by its next step() (every rank thread parked). */
+            if (sw[fn4::kPlaceHb] != fn4::kNoChange) {
+                const int R = hb_capable_ ? std::max(0, sw[fn4::kPlaceHb]) : 0;
+                place_hb_.store(R, std::memory_order_relaxed);
+                for (auto& r : ranks_)
+                    if (r->heat.enabled())
+                        r->heat.set_hb_reserve(r->index < 64 && ((hb_mask_ >> r->index) & 1) ? R : 0);
+                fn4::note_sched(fn4::kPlaceHb, R);
+            }
+        }
+    }
+}
+
+void Engine::psk_release(const RadBatch* b) {
+    int32_t end = INT32_MAX;
+    int64_t dec = 0;
+    psk_last_valid_ = false;
+    if (b && b->draft_pass == 0 && lsched().psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec, &psk_flags_)) {
+        /* tp8 S4: the follower of a two-node pipeline hands its plugin the same plan. */
+        psk_last_valid_ = true;
+        psk_last_dec_ = dec;
+        const int l = fn4::psk_plan(b->step, dec, (int)psk_ahead_.size(), psk_ahead_.data(), psk_rows_.data(),
+                                    psk_flags_.data());
+        if (l >= 0) end = l;
+        ++psk_planned_;
+        if (l >= 0 && l < (int)meta_.n_layers) ++psk_cut_passes_;
+        if (psk_planned_ == 1 || psk_planned_ % 256 == 0)
+            RAD_INFO("lever PSK design 2: %lld planned passes, %lld of them ended before the last layer; step %d: %zu "
+                     "prefill sequence(s) (the first's next target %d rows past its chunk), %lld decode rows -> the pass "
+                     "ends at layer %d", (long long)psk_planned_, (long long)psk_cut_passes_, b->step, psk_ahead_.size(),
+                     psk_ahead_.empty() ? 0 : psk_ahead_[0], (long long)dec, l);
+    }
+    for (auto& r : ranks_) r->stager.set_layer_end(end);
+    /* lever PSK's live counters (/stats "psk"): rank 0's stager counts what its armed passes did not stage */
+    if (psk_planned_ > 0)
+        fn4::note_psk_engine(psk_planned_, psk_cut_passes_, ranks_.empty() ? 0 : ranks_[0]->stager.layers_skipped());
+}
+
+/* Lever DL: the drafter's lend over every rank, as DraftController::LendSample counts it -- resident
+ * when every rank's drafter is home, lent when every rank's slab is lent, a transition otherwise --
+ * and the transitions so far. Any thread: the movers' state is atomic. */
+int Engine::draft_lend_state(uint64_t* changes) const {
+    uint64_t ch = 0;
+    bool home = true, lent = true;
+    for (const auto& r : ranks_) {
+        const int st = r->mover.draft_lend_state();
+        ch += r->mover.draft_lend_changes();
+        home = home && st == Mover::kDlResident;
+        lent = lent && st == Mover::kDlLent;
+    }
+    if (changes) *changes = ch;
+    return home ? DraftController::kLendResident : lent ? DraftController::kLendLent
+                                                       : DraftController::kLendTransit;
 }
 
 int Engine::issue_ahead(const RadBatch** out) {
@@ -729,8 +1183,13 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
-    for (int i = 0; i < block_rows_; ++i)
-        sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
+    /* ds41-acc: a confidence gate waits for the query pass here, so the step built next verifies
+     * each row's confident prefix (conf_gate); without one nothing waits. */
+    if (block_rows_ > 0) RAD_TRY(conf_gate());
+    for (int i = 0; i < block_rows_; ++i) {
+        const int cut = (size_t)i < conf_cut_.size() ? conf_cut_[(size_t)i] : -1;
+        sched_.expect_draft(block_row_[(size_t)i].seq, cut >= 0 ? std::min(block_steps_, cut) : block_steps_);
+    }
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -742,8 +1201,11 @@ int Engine::issue_ahead(const RadBatch** out) {
     RAD_TRY(prepare_release(nb));
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
+    const int pf1_ci = pf1_mark_a(nb);   /* qfn-on-ds RADIANCE_PF_TIMELINE (the plan is nb's; the ranks are parked) */
+    const uint64_t pf1_t = pf1_ci >= 0 ? rad_mono_ns() : 0;
     barrier_->arrive_and_wait();
     barrier_->arrive_and_wait();
+    pf1_mark_b(nb, pf1_ci, pf1_t);
     const int st = step_status_.load(std::memory_order_acquire);
     if (st < 0) {
         RAD_ERR("step %d, issued ahead, failed: %s -- the engine cannot continue", nb->step,
@@ -768,14 +1230,21 @@ void Engine::phase_mark(int p) {
  *   - sets `loop_status_`, which run_server watches to stop HTTP, so the process exits with the
  *     error instead of queueing requests nothing will drain (spec §17). */
 int Engine::fail_loop(int st) {
+    /* tp8 S4: the other node of a pipeline goes down with this one (node_link.h). */
+    if (pp_link_ && pp_link_->alive())
+        pp_link_->fail(fmt("the %s stopped on an error: %s", pp_leader() ? "leader" : "follower",
+                           rad_strerror(st < 0 ? st : RAD_E_STATE)));
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
     sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
+    for (auto& ls : lane_sched_) ls->shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
     loop_status_.store(st < 0 ? st : RAD_E_STATE, std::memory_order_release);
     return st;
 }
 
 int Engine::step_loop() {
+    /* tp8 S5: a two-node pipeline's leader with lanes runs their loop (engine_lanes.cpp) */
+    if (pp_leader() && n_lanes_ > 1) return step_loop_lanes();
     /* The batch is built on rank 0's stream into rank 0's memory, so this thread binds rank 0's
      * device; the backend's current device is thread-local and starts at device 0. */
     if (rad_dev_set(ranks_[0]->device) < 0)
@@ -784,10 +1253,30 @@ int Engine::step_loop() {
     int idle = 0;
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
-     * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ &&
+     * pass issued ahead would overwrite them.
+     *
+     * Nor under --debug-draft-oracle beside a draft head, which replaces each proposal the head
+     * publishes (Scheduler::set_draft) and so needs the proposal on the host before the verify is
+     * built: a step issued ahead verifies the head's tokens straight from the card (ADV_TRUNK),
+     * before the host has committed and so before it knows where the harness's ids start. Under
+     * the harness every step is built from the host's plan after the commit; the head's passes run
+     * as they do otherwise, behind the step, positioned by the card's acceptance. A tree drafter
+     * proposes a chain under the harness (Engine::declare asks for no trees). */
+    const bool oracle_head = sched_.debug_oracle_on() && (serial_drafting() || block_drafting());
+    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ && !oracle_head &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    /* tp8 S4: the leader of a two-node pipeline builds every step on the host after the previous
+     * one committed: a step issued ahead takes its rows from the leader's cards, which the follower
+     * does not have (engine_node.cpp). */
+    if (pp_on()) pipelining_ = false;
+    if (oracle_head)
+        RAD_WARN("--debug-draft-oracle beside the draft head '%s': no step is issued ahead of its "
+                 "commit, so the harness's ids replace the head's proposals before each verify is "
+                 "built (a verify-path test at the head's own shape, not a speed)", drafter_.name);
     early_ids_ = !cfg_.kld() && !embedding_;
+    /* qfn-on-ds (Qwen loop round 18): RADIANCE_PF_TIMELINE=1, a lone prefill's chunks on rank 0's card (engine_lanes.cpp) */
+    pf1_open();
+    struct Pf1Close { Engine* e; ~Pf1Close() { e->pf1_close(); } } pf1_close_at_return{ this };
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
      * it keeps a tree from running unverified should another path turn pipelining off. */
@@ -814,6 +1303,11 @@ int Engine::step_loop() {
     rad::StallWatch step_watch("step", 20000);
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
+        if (pp_link_ && !pp_link_->alive()) {
+            RAD_ERR("two-node pipeline: the link to the follower is down (%s): failing every request",
+                    pp_link_->why().c_str());
+            return fail_loop(RAD_E_IO);
+        }
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
@@ -859,6 +1353,9 @@ int Engine::step_loop() {
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
+        /* qfn-on-ds RADIANCE_PF_TIMELINE: this step is a lone prefill chunk with its prompt's first token (the plan is b's here) */
+        const bool pf1_tok = pf_tl_ && b->phase == RAD_PHASE_PREFILL && plan.e.size() == 1 && plan.e[0].is_prefill &&
+                             plan.e[0].produces_token;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
         kv_test_prepare(plan, b->step, ranks_);
 #endif
@@ -914,6 +1411,18 @@ int Engine::step_loop() {
                 rq->speculation_fixed = ranks_[0]->sampler.speculation_fixed(rq->id);
             }
             if (t_on) phase_mark(PH_BEGIN);
+            /* Lever SD: a prompt-lookup proposal (the hybrid's, or the lookup filling an empty one) was not drawn
+             * from the head's Q, so no coupled state may be applied to it, even one whose round and token happen to
+             * match: the verify keeps the agreement rule there. */
+            if (mtp_couple_)
+                for (const StepEntry& e : plan.e) {
+                    if (!e.produces_token || !e.ngram || e.n_spec <= 0) continue;
+                    ++couple_n_lookup_;
+                    for (auto& rk : ranks_) {
+                        const int cs = rk->sampler.set_mtp_couple(e.seq, nullptr, 0);
+                        if (cs < 0 && cs != RAD_E_NOTFOUND) return cs;
+                    }
+                }
             for (auto& rk : ranks_) {
                 const int s = rk->sampler.build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
@@ -944,47 +1453,8 @@ int Engine::step_loop() {
             RAD_INFO("%s", s.c_str());
         }
 
-        /* Restore the recurrent half of a prefix hit before the step that reads it (the adopted
-         * blocks carry the attention layers), copying from the snapshot's host slot. Enqueued on
-         * each rank's stream before the release, so no synchronisation is needed.
-         *
-         * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table.
-         * Taken only when the step has a restore. */
-        bool any_restore = false;
-        for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
-        if (any_restore) {
-            const int rs = sched_.locked([&]() -> int {
-                for (const StepEntry& e : plan.e) {
-                    if (e.ckpt_restore < 0) continue;
-                    if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the hit, in the blocks admit_one seeded. */
-                    if (ranks_[0]->kv.has_window_snapshot() &&
-                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
-                        RAD_ERR("sequence %llu: no window rows at %d to restore into",
-                                (unsigned long long)e.seq, (int)e.ctx_len);
-                        return RAD_E_STATE;
-                    }
-                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
-                        auto& rk = ranks_[ri];
-                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                        const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
-                                                                (int)ckpt_slots_.size(),
-                                                                e.ckpt_restore, rk->ctx.stream(),
-                                                                &ckpt_win_);
-                        if (s < 0) {
-                            RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
-                                    "rank %d: %s", (unsigned long long)e.seq,
-                                    (int)e.ckpt_restore, (int)ri, rad_strerror(s));
-                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                            return s;
-                        }
-                    }
-                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                }
-                return RAD_OK;
-            });
-            if (rs < 0) return fail_loop(rs);
-        }
+        /* Restore the recurrent half of a prefix hit before the step that reads it (restore_checkpoints). */
+        if (const int rs = restore_checkpoints(); rs < 0) return fail_loop(rs);
 
         /* Host time before the release, with the device idle; time between the two arrivals is
          * the ranks enqueueing. The split separates host-bound from device-bound steps. */
@@ -998,9 +1468,22 @@ int Engine::step_loop() {
                 build_status_ = RAD_OK;
             }
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
+            /* tp8 S4: the follower runs this step's other layers from the same staging. */
+            if (pp_link_) {
+                if (!pp_trunk_pending_[0]) {
+                    RAD_ERR("two-node pipeline: step %d was released without its build", b->step);
+                    return fail_loop(RAD_E_STATE);
+                }
+                pp_trunk_pending_[0] = false;
+                if (const int ss = pp_ship(b, true); ss < 0) return fail_loop(ss);
+            }
             /* An embedding program has no sampler to issue behind its pass. */
             issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
+            /* tp8 S5: the stage busy stamps (RADIANCE_PP_STAMPS on a pipeline node; null otherwise) */
+            const uint64_t pp_t0 = pp_stamps_ ? rad_mono_ns() : 0;
+            const int pf1_ci = pf1_mark_a(b);   /* qfn-on-ds RADIANCE_PF_TIMELINE (the ranks are parked) */
+            const uint64_t pf1_t = pf1_ci >= 0 ? rad_mono_ns() : 0;
             barrier_->arrive_and_wait();      /* release the ranks */
             {
                 /* Stage the sampler while the ranks enqueue and the device runs the pass. */
@@ -1013,6 +1496,15 @@ int Engine::step_loop() {
                 build_cv_.notify_all();
             }
             barrier_->arrive_and_wait();      /* wait for them */
+            pf1_mark_b(b, pf1_ci, pf1_t);
+            if (pp_stamps_) {
+                /* one lane: the pass is the head (to X1's publish) and the tail (from X2's arrival) */
+                const uint64_t t1 = rad_mono_ns();
+                const RadPpRing* x1 = pp_send_[RAD_PP_X1];
+                const RadPpRing* x2 = pp_recv_[RAD_PP_X2];
+                pp_stamp("head", 0, b->step, pp_t0, x1 && x1->ready_ns ? x1->ready_ns : t1);
+                pp_stamp("tail", 0, b->step, x2 && x2->taken_ns > pp_t0 ? x2->taken_ns : pp_t0, t1);
+            }
         } else {
             /* The forward pass was issued ahead and the previous step has now committed, so the
              * sampler is staged from the correct state and its chain queued behind the running
@@ -1063,6 +1555,7 @@ int Engine::step_loop() {
         /* Behind the step's last resolve and before its end event, so collect_step's wait covers it. */
         st = stream_probe_issue(b);
         if (st < 0) return fail_loop(st);
+        pf1_mark_c(b);   /* qfn-on-ds RADIANCE_PF_TIMELINE: the step's own sampler / snapshots / drafter passes end here */
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
@@ -1070,9 +1563,21 @@ int Engine::step_loop() {
          * commit. The card runs straight on while the host waits, commits and stages. */
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
+        const uint64_t pf1_f0 = pf_tl_ ? rad_mono_ns() : 0;
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        /* tp8 S4: a card's stage op that gave up leaves its ring's abort word set and its pass
+         * computed from nothing; the step's tokens are not read. */
+        if (pp_link_)
+            for (int k = 0; k < RAD_PP_N_RINGS; ++k)
+                for (RadPpRing* q : { pp_send_[k], pp_recv_[k] })
+                    if (q && __atomic_load_n(&q->abort, __ATOMIC_ACQUIRE)) {
+                        RAD_ERR("two-node pipeline: step %d: crossing X%d was aborted (%s): the step's "
+                                "tokens are not used", b->step, k + 1, pp_link_->alive() ? "a stage op gave up"
+                                                                                         : pp_link_->why().c_str());
+                        return fail_loop(RAD_E_IO);
+                    }
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
@@ -1093,8 +1598,11 @@ int Engine::step_loop() {
             const int n = (v && *v) ? (int)std::strtol(v, nullptr, 10) : 32;
             return n > 0 ? n : 32;
         }();
-        if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0)
+        if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0) {
             for (auto& rk : ranks_) rk->ctx.dump_profile();
+            /* RADIANCE_DEBUG_MISS_LOG: which step this table set stands behind. */
+            if (missl_) missl_->profile_mark(b->step, false);
+        }
 
         /* One line per step at -vv, the only log view of the loop itself. */
         RAD_TRACE("step %d: %lld tok / %lld seq, %lld logit row(s) -> tokens %s", b->step,
@@ -1131,6 +1639,9 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        pf1_finish(b, pf1_f0, pf1_tok);   /* qfn-on-ds RADIANCE_PF_TIMELINE: a prompt's line at its first token */
+        /* ds41-acc: the verifies against the confidence plane and the shadow tree's branches. */
+        dconf_commit(plan, so, b->step);
         /* The step has drained, so its counters are readable. A chunk that produced no row did not
          * wait, so its copy is read on a later step; a finished prompt or request always produced
          * a row. */
@@ -1318,7 +1829,7 @@ int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request
         stream_prev_[i] = r;
     }
     if (overflowed) {
-        (void)sched_.fail_prefilling(overflow_why.c_str());
+        (void)lsched().fail_prefilling(overflow_why.c_str());
         for (size_t i = 0; i < n; ++i) {
             const RadKVStream* sv = b->kv[i].stream;
             if (sv && sv->ctl) (void)rad_memset_async(sv->ctl + 3, 0, 4, st);
@@ -1365,7 +1876,7 @@ int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
 /* Hand each sequence's vector to its sink, and set eos for every sequence so the commit finishes
  * it: an embedding request is one step long. The token is never emitted (Request::embed). */
 int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 1);
@@ -1390,6 +1901,51 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* Restore the recurrent half of a prefix hit before the step that reads it (Engine::step_loop; tp8 S5 + S6: a lane step's
+ * head, lsched() its lane): enqueued on each rank's stream before the release. */
+int Engine::restore_checkpoints() {
+    /* Restore the recurrent half of a prefix hit before the step that reads it (the adopted
+     * blocks carry the attention layers), copying from the snapshot's host slot. Enqueued on
+     * each rank's stream before the release, so no synchronisation is needed.
+     *
+     * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table.
+     * Taken only when the step has a restore. */
+    const StepPlan& plan = lsched().plan();
+    bool any_restore = false;
+    for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
+    if (!any_restore) return RAD_OK;
+    return lsched().locked([&]() -> int {
+        for (const StepEntry& e : plan.e) {
+            if (e.ckpt_restore < 0) continue;
+            if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+            /* The window behind the hit, in the blocks admit_one seeded. */
+            if (ranks_[0]->kv.has_window_snapshot() &&
+                !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
+                RAD_ERR("sequence %llu: no window rows at %d to restore into",
+                        (unsigned long long)e.seq, (int)e.ctx_len);
+                return RAD_E_STATE;
+            }
+            for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                auto& rk = ranks_[ri];
+                if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
+                                                        (int)ckpt_slots_.size(),
+                                                        e.ckpt_restore, rk->ctx.stream(),
+                                                        &ckpt_win_);
+                if (s < 0) {
+                    RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
+                            "rank %d: %s", (unsigned long long)e.seq,
+                            (int)e.ckpt_restore, (int)ri, rad_strerror(s));
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    return s;
+                }
+            }
+            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+        }
+        return RAD_OK;
+    });
+}
+
 /* Snapshot after the step that produced the state. Linear state is what the chunk's last token
  * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
  * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
@@ -1399,12 +1955,12 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
  * snapshot (drafter_snap_) is saved behind the drafter's context pass (issue_block_drafter),
  * which writes only the drafter's groups. */
 int Engine::save_checkpoints() {
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     bool any_save = false;
     for (const StepEntry& e : plan.e)
         if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
     if (any_save) {
-        const int ss = sched_.locked([&]() -> int {
+        const int ss = lsched().locked([&]() -> int {
             for (const StepEntry& e : plan.e) {
                 if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
                 if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
@@ -1417,6 +1973,73 @@ int Engine::save_checkpoints() {
                     RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
+                }
+                /* Lever TI (ds41-pf2, fn4 sched_tail_inner): a snapshot at a row inside the entry (lever G's fine tail
+                 * taken inside the prompt's last chunk). Its window rows are held through the chunk (above); a CONV
+                 * window is the chunk end's after the save, so it is patched with the plugin's mapped ids of the rows
+                 * ending at the snapshot (rad_ckpt_conv_src: this step's, overwritten only by the next step, which the
+                 * stream orders behind these copies); a LINEAR state stays the chunk end's, which a resume at the tail
+                 * grid never reads (the plugin's declaration: the export exists only where that holds). */
+                const bool inside = e.ckpt_tok < e.n_tokens - 1;
+                /* qfn-on-ds lever TIP: the plugin staged the rows it reads at a piece start into this slot from inside the
+                 * step (tip_stage); the groups it lists free are saved as the step leaves them; any other row unstaged is
+                 * refused, since the step end's state would be saved under the snapshot's position */
+                if (inside && tip_on_) {
+                    for (auto& rk : ranks_) {
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        TipRank& t = tip_[(size_t)rk->index];
+                        int st = RAD_OK;
+                        if (t.ck != e.ckpt_slot || t.seq != e.seq || t.fail) {
+                            RAD_ERR("rank %d: lever TIP: sequence %llu's snapshot (slot %d, row %d) was not staged by its step "
+                                    "(staged slot %d, sequence %llu, %d failed copies)", rk->index, (unsigned long long)e.seq,
+                                    (int)e.ckpt_slot, (int)e.ckpt_tok + 1, (int)t.ck, (unsigned long long)t.seq, t.fail);
+                            st = RAD_E_STATE;
+                        }
+                        const KVManager& kv = rk->kv;
+                        for (int32_t g = 0; st >= 0 && g < kv.n_groups(); ++g) {
+                            const KVGroupPlan* p = kv.plan(g);
+                            if (!p || !p->stateful()) continue;
+                            const bool fr = std::find(t.free_groups.begin(), t.free_groups.end(), (int)g) != t.free_groups.end();
+                            for (int64_t l = 0; st >= 0 && l < p->n_layers; ++l) {
+                                if ((size_t)g < t.staged.size() && (size_t)l < t.staged[(size_t)g].size() &&
+                                    t.staged[(size_t)g][(size_t)l]) continue;
+                                if (!fr) {
+                                    RAD_ERR("rank %d: lever TIP: group %d layer %lld of sequence %llu was not staged inside its "
+                                            "step (no plugin op staged it); the step end's state would be saved under the "
+                                            "snapshot's position", rk->index, (int)g, (long long)l, (unsigned long long)e.seq);
+                                    st = RAD_E_STATE;
+                                    break;
+                                }
+                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->ctx.stream());
+                            }
+                        }
+                        t.row = 0; t.ck = -1;
+                        if (st < 0) {
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return st;
+                        }
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    ++tip_saves_;
+                    ++ti_saves_;
+                    RAD_INFO("lever TIP: sequence %llu's snapshot at position %lld saved from inside its %d-row step (row %d; "
+                             "%llu state rows staged on rank 0 so far, %llu snapshots)", (unsigned long long)e.seq,
+                             (long long)(e.ctx_len + e.ckpt_tok + 1), (int)e.n_tokens, (int)e.ckpt_tok + 1,
+                             (unsigned long long)tip_[0].rows, (unsigned long long)tip_saves_);
+                    continue;
+                }
+                int64_t row0 = 0;
+                if (inside) {
+                    if (!ti_capable_ && ranks_[0]->kv.has_conv_state()) {
+                        RAD_ERR("sequence %llu: a snapshot inside its chunk (row %d of %d) and no source of its CONV "
+                                "window there", (unsigned long long)e.seq, (int)e.ckpt_tok, (int)e.n_tokens);
+                        return RAD_E_STATE;
+                    }
+                    for (const StepEntry& o : plan.e) {
+                        if (&o == &e) break;
+                        row0 += o.n_tokens;
+                    }
+                    ++ti_saves_;
                 }
                 for (auto& rk : ranks_) {
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
@@ -1431,6 +2054,23 @@ int Engine::save_checkpoints() {
                         if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
                         return s;
                     }
+                    if (inside && rk->kv.has_conv_state()) {
+                        const void* ids = nullptr;
+                        int ctx = 0;
+                        const int64_t first = row0 + e.ckpt_tok + 1;
+                        if (fn4::ckpt_conv_src(rk->index, &ids, &ctx) <= 0 || !ids || ctx <= 0 || first < ctx) {
+                            RAD_ERR("rank %d: no source of sequence %llu's CONV window at row %lld for its snapshot "
+                                    "inside the chunk", rk->index, (unsigned long long)e.seq, (long long)first);
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return RAD_E_STATE;
+                        }
+                        const int ps = rk->kv.checkpoint_patch_conv(
+                            e.ckpt_slot, (const char*)ids + (first - ctx) * 4, ctx, rk->ctx.stream());
+                        if (ps < 0) {
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return ps;
+                        }
+                    }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
             }
@@ -1439,6 +2079,43 @@ int Engine::save_checkpoints() {
         if (ss < 0) return ss;
     }
     return RAD_OK;
+}
+
+/* qfn-on-ds lever TIP: the plugin's staging callback (rad_arch.h TipStage::put), on the rank's thread inside its issue: copy
+ * the sequence's (group, model layer) state row into the snapshot's checkpoint slot on the stream the plugin issues on. */
+int Engine::tip_stage(void* u, int group, int layer, void* stream) {
+    TipRank* t = static_cast<TipRank*>(u);
+    if (!t || !t->e || t->row <= 0 || t->ck < 0) return RAD_E_STATE;
+    Rank& rk = *t->e->ranks_[(size_t)t->rank];
+    const int64_t li = rk.ctx.kv_layer_index((rad_kvgroup)group, layer);
+    if (group < 0 || (size_t)group >= t->slots.size() || t->slots[(size_t)group] < 0 || li < 0 ||
+        (size_t)li >= t->staged[(size_t)group].size()) {
+        ++t->fail;
+        RAD_ERR("rank %d: lever TIP: no state row for group %d layer %d (layer row %lld)", t->rank, group, layer, (long long)li);
+        return RAD_E_STATE;
+    }
+    const int s = rk.kv.stage_state_row((int32_t)group, (int32_t)li, t->slots[(size_t)group], t->ck, (RadStream)stream);
+    if (s < 0) { ++t->fail; return s; }
+    t->staged[(size_t)group][(size_t)li] = 1;
+    ++t->rows;
+    return RAD_OK;
+}
+
+int64_t Engine::tip_row_of(const StepPlan& plan, const StepEntry** out) const {
+    *out = nullptr;
+    const StepEntry* hit = nullptr;
+    int64_t row0 = 0, at = 0;
+    for (const StepEntry& e : plan.e) {
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) {
+            if (hit) return 0;   /* two inside snapshots in one step: never planned (one prefill a TI step) */
+            hit = &e;
+            at = row0 + e.ckpt_tok + 1;
+        }
+        row0 += e.n_tokens;
+    }
+    if (!hit || plan.e.size() != 1) return 0;
+    *out = hit;
+    return at;
 }
 
 /* Scored rows (Request::token_scores): the logits row at a scored prompt's last position, copied
@@ -1470,7 +2147,7 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
 
     /* A scored step reads back the hidden rows and the candidates' table rows instead of whole
      * logits rows (BatchBuilder set the flag on the same facts). */
-    const RadBatch* b0 = sched_.batch_for(0);
+    const RadBatch* b0 = lsched().batch_for(0);
     score_only_ = b0 && b0->score_only;
     if (score_only_) {
         const Program& p = ranks_[0]->program;
@@ -1610,7 +2287,7 @@ int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at) {
 /* Wait for the sampled ids and build the scheduler's per-sequence arrays. The step path's only
  * host synchronisation: the host needs the tokens to commit and stream them (spec §5.4). */
 int Engine::collect_step(const RadBatch* b, StepOut& so) {
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
@@ -1811,12 +2488,58 @@ void Engine::loan_tick(bool idle) {
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
  * does not regrow until steps have been small for a while (arena_tick). */
+/* RADIANCE_STAGE_MIXED: which passes that carry decode rows the prefill stager may arm for (a lone
+ * prefill pass is armed by the size rule alone, stager.h).
+ *   unset / 1  any pass the size rule admits
+ *   0          none: a mixed step's routed GEMMs read the pool in place, as without the stager
+ *   2          only one whose prefill chunk leaves at least the stager's smallest pass of its prompt
+ *              for a later step (a long prompt beside decoding sequences), not a prompt's last or only
+ *              chunk
+ * On DeepSeek-V4.1 EXL3 at four ranks (79, 7.11.) a lone chunk staged ran 42 % faster at 2.9 bpw,
+ * a one-chunk prompt beside four decoders 8-12 % slower at both widths (the whole pooled set, 9-21
+ * GB a rank, crosses the link by DMA for a ~1-2k-row step whose compute cannot hide it), and the
+ * chunks of a 31k prompt beside four decoders 3.8 % faster at 2.25 bpw, 5.8 % slower at 2.9. */
+static int stage_mixed_mode() {
+    static const int mode = [] {
+        const char* e = getenv("RADIANCE_STAGE_MIXED");
+        if (!e || !*e) return 1;
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "2") || !std::strcmp(e, "continues")) return 2;
+        return 1;
+    }();
+    /* Said once, at the first step that asks, so a serve log shows which rule ran. */
+    static const bool said = [] {
+        if (mode != 1)
+            RAD_INFO("prefill staging: a pass with decode rows is %s (RADIANCE_STAGE_MIXED=%d)",
+                     mode == 0 ? "never staged" : "staged only while its prompt continues", mode);
+        return true;
+    }();
+    (void)said;
+    return mode;
+}
+
 int Engine::arena_step(const RadBatch* b) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
      * declares them small under shape_probe. */
-    const int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
+    int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
         b->n_tok, (int64_t)b->n_seq * (1 + std::max(cfg_.n_spec, 0)));
+    /* Lever Z0-A (fn4 arena_d0): with decode rungs declared below the one today's steps take
+     * (RADIANCE_DS41_ARENA_DECODE_ROWS=8,48), off every decode and verify step takes at least that one, as
+     * today; on, a decode step that verifies nothing and runs no head (one row a sequence, depth 0 or a
+     * plain probe) takes the smallest rung holding its own rows, as an NST 0 step does, unless the context
+     * skip refills in it (ctx_refill_due: refills are cut to the step's rung, 8-row passes would multiply
+     * them); under arena_d0 1 the skip keeps rows to the end of its ring (ctx_limit, RADIANCE_DRAFT_CTXSKIP_
+     * SLOTS), so refills come at probes and prefills. Placement only: plan_level gives a smaller rung only
+     * fewer rows of the same buffers. */
+    if (!b->enc && arena_dec_max_ > 0) {
+        const bool d0 = arena_d0_.load(std::memory_order_relaxed) == 1;
+        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !lsched().draft().head_runs() &&
+            !ctx_refill_due())
+            need = b->n_tok;
+        else   /* every other step, under either value, at least today's rung: the head never runs below it */
+            need = std::max<int64_t>(need, arena_dec_max_);
+    }
     const int level = arena_level(need);
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
@@ -1824,9 +2547,33 @@ int Engine::arena_step(const RadBatch* b) {
     /* Whether the next step continues a prompt, so the stager stages its first layers at this
      * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
      * hold). */
-    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    const bool more = b->phase != RAD_PHASE_DECODE && lsched().prefill_continues();
+    /* A mixed step (decode rows [0, n_tok_decode)) is staged only where RADIANCE_STAGE_MIXED allows
+     * (stage_mixed_mode). */
+    const int smode = stage_mixed_mode();
+    const bool lone = b->phase == RAD_PHASE_PREFILL || (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
+    const bool mixed_ok = smode == 1 || lone ||
+                          (smode == 2 && b->phase != RAD_PHASE_DECODE && lsched().prefill_has_more());
+    /* Lever SA (ds41-sahb, fn4 stage_short N): a step with prefill rows and at least N tokens at the span's shared
+     * level arms the stager with its ring at lever SA's place (sahb_arms); the step's loan stops below it
+     * (arena_lent_sa), and arena_tick lends it again after the step. 0: today's rule exactly. */
+    const int ssh = stage_short_.load(std::memory_order_relaxed);
+    /* Lever SAL (fn4 stage_lone 1): only a step with no decode rows (lone) arms through stage_short. */
+    const bool sal_ok = stage_lone_.load(std::memory_order_relaxed) == 0 || lone;
+    const bool sa = sal_ok && sahb_arms(ssh, sa_capable_, b->enc != 0, b->phase != RAD_PHASE_DECODE, b->n_tok, level,
+                                        arena_last_, arena_span_rows_, mixed_ok);
+    const int spick = stage_pick_.load(std::memory_order_relaxed);
+    /* Lever SP (ds41-int9, fn4 stage_full_min N / stage_full_pick K): a full-plan step of fewer than N tokens gets no
+     * ring (sp_full_streams: its pooled experts are read in place, as at every other level); an armed full-plan step
+     * copies only the pooled units the last K stager-size steps routed. Both 0: today's rule exactly. */
+    const bool sp_stream = sp_full_streams(stage_full_min_.load(std::memory_order_relaxed), b->enc != 0, b->n_tok, level);
+    const int fpick = stage_full_pick_.load(std::memory_order_relaxed);
     for (auto& r : ranks_) {
-        const int64_t allow = r->arena_lent[(size_t)level];
+        const int64_t allow = sa ? r->arena_lent_sa[(size_t)level] : r->arena_lent[(size_t)level];
+        /* Lever SA's VRAM price: the loan its step takes back beyond what the level itself would. */
+        if (sa)
+            r->sa_recall_bytes += std::max<int64_t>(
+                0, std::min(r->mover.loan(Mover::kLendArena), r->arena_lent[(size_t)level]) - allow);
         if (r->mover.loan(Mover::kLendArena) > allow ||
             r->mover.loan_held(Mover::kLendArena) > allow) {
             RAD_TRY(rad_dev_set(r->device));
@@ -1841,10 +2588,16 @@ int Engine::arena_step(const RadBatch* b) {
         /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
          * span's shared level keeps a place of its own for it (stager.h); every other level
          * lends both. */
-        char* const ring = level == 0 ? r->stager.ring_full()
-                         : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
+        char* const ring = !mixed_ok || sp_stream ? nullptr
+                         : level == 0 ? r->stager.ring_full()
+                         : arena_last_ == arena_span_rows_ && (r->arena_low_off >= 0 || sa)
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
+        /* Lever SA: this step's pick (stage_pick) applies to a stage_short step only. */
+        r->stager.set_short(sa, spick);
+        /* Lever SP: this step's full pick (stage_full_pick) applies to a full-plan step with its ring only; the counter
+         * of full-plan steps stage_full_min left unarmed. */
+        r->stager.set_full(level == 0 && ring != nullptr, fpick, sp_stream && mixed_ok);
         /* The next step's first layers go ahead only from the full plan, into the region at the
          * top that no level's buffers use. At the shared level the ring is memory the full plan
          * computes in, and a copy still going there when such a step starts would race it; a
@@ -1857,13 +2610,53 @@ int Engine::arena_step(const RadBatch* b) {
 
 int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_, rows); }
 
+/* Lever Z0-W (Mover::draft_w_lend / draft_w_reclaim), at a step's release with every rank parked: lent while
+ * fn4 draft_lend_w is 1, the scheduler wants the slab lent (depth 0 held, probes far apart) and this step's head
+ * does not run; otherwise recalled, which copies the weights back before the step is issued. A probe's first
+ * step (its head proposes) therefore pays one recall: ~0.3 GiB a rank over the link, the price DL's reload
+ * pays for the slab, at the steps D7 already leaves unsampled under the lend. */
+int Engine::draft_w_step() {
+    if (!dw_capable_) return RAD_OK;
+    const bool want = dw_on_.load(std::memory_order_relaxed) == 1 && lsched().draft_lend_wanted() &&
+                      !lsched().draft().head_runs();
+    if (want == dw_lent_) {
+        const Mover& m0 = ranks_[0]->mover;
+        fn4::note_lend_w(dw_lent_ ? 1 : 0, (int64_t)m0.draft_w_lends(), (int64_t)m0.draft_w_reclaims(),
+                         m0.draft_w_lent_units(), m0.draft_w_bytes() >> 20);
+        return RAD_OK;
+    }
+    for (auto& r : ranks_) {
+        RAD_TRY(rad_dev_set(r->device));
+        const int st = want ? r->mover.draft_w_lend() : r->mover.draft_w_reclaim(&r->heat);
+        if (st < 0) {
+            RAD_ERR("rank %d: %s the drafter's query-pass weights: %s", r->index, want ? "lending" : "recalling",
+                    rad_strerror(st));
+            return st;
+        }
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    dw_lent_ = want;
+    return RAD_OK;
+}
+
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
  * and lending after every chunk would refill and recall the slab each time. So the floor (the
  * largest step seen) holds for two seconds after it was last reached, then falls to the latest
- * step's size. */
+ * step's size. RADIANCE_ARENA_HOLD_MS sets the hold (unset: 2000): longer recalls the slab less
+ * often under steady prefill traffic (each recall drains both streams), at the price of decode steps
+ * that run without the loan for that long after a prompt. */
+static uint64_t arena_hold_ns() {
+    static const uint64_t ns = [] {
+        const char* e = getenv("RADIANCE_ARENA_HOLD_MS");
+        const long long ms = e && *e ? std::atoll(e) : 2000;
+        return (uint64_t)(ms > 0 ? ms : 2000) * 1000000ull;
+    }();
+    return ns;
+}
+
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
-    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
+    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > arena_hold_ns()) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
     }
@@ -2024,6 +2817,11 @@ void Engine::drain_completed() {
      * is seen exactly once. */
     sched_.take_completed(&done_);
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+    /* tp8 S5: every lane's (none on one lane) */
+    for (auto& ls : lane_sched_) {
+        ls->take_completed(&done_);
+        for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+    }
 }
 
 /* Zero freshly assigned recurrent slots before the step that reads them. The manager records the
@@ -2033,6 +2831,9 @@ void Engine::drain_completed() {
  * remainder_place). */
 void Engine::clear_fresh_states() {
     for (const StateClear& c : ranks_[0]->kv.state_clears()) {
+        /* tp8 S4 (review F4): a pipeline's follower zeroes the same slots of its own groups before the
+         * step (shipped with it); nothing on one machine. */
+        if (pp_link_) pp_clears_.emplace_back(c.group, c.slot);
         for (auto& rk : ranks_) {
             const KVGroupPlan* gp = rk->kv.plan(c.group);
             if (!gp || !gp->stateful()) continue;
@@ -2045,6 +2846,8 @@ void Engine::clear_fresh_states() {
     ranks_[0]->kv.clear_state_clears();
 }
 
+namespace { void install_follower_stop_signals(); }
+
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
@@ -2056,7 +2859,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     const bool video_gen = ranks_[0]->program.is_video_generator();
     const bool shape_gen = ranks_[0]->program.is_shape_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
-    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
+    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator && !pp_follower()) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
                 "rad_declare_audio_generator, rad_declare_video_generator, "
@@ -2283,8 +3086,24 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         img_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
-    } else
+    } else {
+    /* tp8 S5: lane 0 takes its share of the cards before init */
+    if (pp_on() && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    /* tp8 S5: the other lanes' schedulers (engine_lanes.cpp) */
+    if (pp_on() && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
+    /* tp8 S4: the rings, the second rendezvous and the link's threads. */
+    if (pp_on()) {
+        if (embedding_ || generator) {
+            RAD_ERR("two-node pipeline (tp8 S4): a text model only, not an embedding model or a generator");
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_TRY(pp_serve_setup());
+    }
+    /* Lever DL: the scheduler sees the drafter's lend once it was declared (start()). */
+    if (dl_declared_)
+        sched_.set_lend_view([this](uint64_t* ch) { return draft_lend_state(ch); }, dl_capable_);
+    }
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over
@@ -2294,6 +3113,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         for (auto& rk : ranks_)
             if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
         sched_.set_stage_rows(stage_rows);
+        for (auto& ls : lane_sched_) ls->set_stage_rows(stage_rows);   /* tp8 S5 */
         /* The shortest prompt a span pays for where routed experts are read from host memory: a
          * spanned step runs at the full plan, which lends the expert slab nothing, while every
          * other step runs at the span's shared level and lends it the span's extra rows. On
@@ -2302,11 +3122,52 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * the card there is no such cost and every lone prefill spans. */
         sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+        for (auto& ls : lane_sched_)   /* tp8 S5 */
+            ls->set_span_min(stage_rows > 0 && arena_span_rows_ > 0 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0)
+                                                                     : 0);
+    }
+    /* Lever TI (ds41-pf2): a plugin serving rad_ckpt_conv_src declares that a snapshot inside a step can be saved whole --
+     * its LINEAR states at lever G's tail grid are never read by the chunk a resume starts there, and its CONV window is
+     * read back from the step's mapped ids (save_checkpoints). Without it fn4 sched_tail_inner acts as 0. */
+    {
+        const void* ids = nullptr;
+        int ctx = 0;
+        ti_capable_ = fn4::ckpt_conv_src(-1, &ids, &ctx) > 0;
+        /* qfn-on-ds lever TIP (RADIANCE_FN4_TIP=1): a plugin serving rad_tip_set stages every state row it reads at a piece
+         * start from inside the step (straight into the checkpoint slot), the rest (rad_tip_free) as the step leaves them */
+        if (const char* tv = std::getenv("RADIANCE_FN4_TIP"); tv && *tv && *tv != '0') {
+            std::vector<TipRank> t(ranks_.size());
+            bool ok = cfg_.prefix_cache && !ranks_[0]->kv.has_window_snapshot();
+            for (size_t i = 0; ok && i < ranks_.size(); ++i) {
+                int fg[16];
+                const int nf = fn4::tip_free((int)i, fg, 16);
+                if (nf < 0) { ok = false; break; }
+                t[i].e = this;
+                t[i].rank = (int)i;
+                t[i].free_groups.assign(fg, fg + nf);
+            }
+            tip_on_ = ok;
+            if (ok) tip_ = std::move(t);
+            RAD_INFO("lever TIP (RADIANCE_FN4_TIP): %s", ok
+                     ? "on -- lever G's tail snapshot inside the prompt's last step at the start of its last piece, the plugin "
+                       "staging each state row between its op's two launches (with sched_tail_grid 2048 + sched_tail_inner 1)"
+                     : "NOT served (no plugin serves rad_tip_set on every rank, no prefix cache, or the model snapshots a "
+                       "window): lever TI acts as without it");
+        }
+        /* lever TIP alone (no plugin serving a CONV window's ids): lever TI takes a snapshot inside a step only where TIP
+         * stages it, at a piece start; elsewhere it cuts as lever G (a row the plugin refuses would fail the step) */
+        const bool tip_pieces = tip_on_ && !ti_capable_;
+        ti_capable_ = ti_capable_ || tip_on_;
+        sched_.set_tail_inner_pieces(tip_pieces);
+        for (auto& ls : lane_sched_) ls->set_tail_inner_pieces(tip_pieces);
+        sched_.set_tail_inner_capable(ti_capable_);
+        for (auto& ls : lane_sched_) ls->set_tail_inner_capable(ti_capable_);   /* tp8 S5 */
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
     if (const int xs = xstats_open(); xs < 0) return xs;
+    (void)missl_open();
 
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
@@ -2316,13 +3177,23 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
-    std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
+    /* tp8 S4 (robustness 5): a pipeline's follower serves no HTTP, so run_server's handler is not
+     * installed there; a stop signal ends its loop and tells the leader (kBye). */
+    if (pp_follower()) install_follower_stop_signals();
+    std::thread stepper([this] {
+        if (gen_) gen_loop();
+        else if (pp_follower()) (void)follower_loop();
+        else step_loop();
+    });
 
-    if (cfg_.kld() || cfg_.calib()) {
+    if (cfg_.kld() || cfg_.calib() || pp_follower()) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
+    /* A pipeline's follower serves only the leader: no HTTP, no requests; it runs until the leader
+     * stops or the link fails (follower_loop). */
+    int s = pp_follower() ? RAD_OK : cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
+    if (pp_follower() && stepper.joinable()) stepper.join();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
@@ -2332,6 +3203,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    pp_close(pp_follower() ? "the follower is stopping" : "the leader is stopping");
+    missl_close();
     xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
@@ -2483,6 +3356,18 @@ std::string Engine::engine_info() const {
 namespace {
 std::atomic<bool> g_signalled{false};
 void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
+/* tp8 S4: the same handler on a pipeline's follower (Engine::follower_loop polls it). */
+void install_follower_stop_signals() {
+    struct sigaction sa {};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+}  /* namespace */
+bool Engine::pp_stop_requested() const { return g_signalled.load(std::memory_order_relaxed); }
+namespace {
 
 /* ================================================================== sampling defaults */
 /* The sampler for a request that sends no sampler settings. Parsing and range checks live in
@@ -2614,6 +3499,8 @@ int Engine::run_server() {
      * hold the session table the sessions view reads. */
     server::SchedulerBridge sched_bridge(&sched_, ranks_.empty() ? nullptr : &ranks_[0]->sampler,
                                         ranks_.empty() ? nullptr : &ranks_[0]->tiers);
+    /* tp8 S5: a pipeline leader with lanes routes requests over them (core/sched/lanes.h) */
+    if (!lane_sched_.empty()) sched_bridge.set_lanes(&lanes_);
     server::TokenizerBridge tok_bridge(vocab_);
     server::ChatTemplateBridge chat_bridge;
     server::GrammarBridge grammar_bridge(vocab_view_.get());
@@ -2721,6 +3608,63 @@ int Engine::run_server() {
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
 
+                /* Every rank's own (ranks[]): the published tiers and the heat engine's counters, as for rank 0
+                 * above, and the drafter's lent trunk units (an atomic). */
+                const int32_t n_trunk = meta_.n_layers > 0 ? (int32_t)meta_.n_layers : n_layer;
+                for (const auto& rk : ranks_) {
+                    server::ExpertPlane::Rank er;
+                    er.rank = rk->index;
+                    const HeatEngine& rh = rk->heat;
+                    const bool rlive = rh.enabled();
+                    const Plan& rp = rk->plan;
+                    for (size_t u = 0; u < rp.units.size(); ++u) {
+                        const MoveUnit& mu = rp.units[u];
+                        if (mu.expert < 0 || mu.layer < 0) continue;
+                        const Tier t = rlive ? rh.tier_published((int32_t)u) : mu.tier;
+                        if (t == Tier::VRAM) {
+                            ++er.vram_units;
+                            if (mu.layer < n_trunk) ++er.trunk_vram_units; else ++er.draft_vram_units;
+                        } else if (t == Tier::HostPinned) {
+                            ++er.pinned_units;
+                        } else {
+                            ++er.other_units;
+                        }
+                    }
+                    const HeatStats rs = rh.stats();
+                    er.routed           = (int64_t)rs.routed;
+                    er.routed_resident  = (int64_t)rs.routed_resident;
+                    er.stream_bytes     = (int64_t)rs.stream_bytes;
+                    er.draft_lent_units = rk->mover.draft_lent_units();
+                    er.flex_bytes       = rk->mover.flex_used_bytes();
+                    /* ds41-lf: the slot classes' hits / misses and each lender's slots (relaxed counters). */
+                    if (rlive) {
+                        er.slots = true;
+                        const SlotStats ss = rh.slot_stats();
+                        for (int c = 0; c < kSlotClasses && c < server::ExpertPlane::Rank::kClasses; ++c) {
+                            er.slot_hit[c]  = (int64_t)ss.hit[c];
+                            er.slot_miss[c] = (int64_t)ss.miss[c];
+                        }
+                        const LentStats ls = rk->mover.lent_stats();
+                        for (int k = 0; k < LentStats::kN && k < server::ExpertPlane::Rank::kLenders; ++k) {
+                            er.lent_covered[k]      = ls.covered[k];
+                            er.lent_held[k]         = ls.held[k];
+                            er.lent_fills[k]        = (int64_t)ls.fills[k];
+                            er.lent_fills_lf[k]     = (int64_t)ls.fills_lf[k];
+                            er.lent_fills_hot[k]    = (int64_t)ls.fills_hot[k];
+                            er.lent_drop_victim[k]  = (int64_t)ls.drop_victim[k];
+                            er.lent_drop_reserve[k] = (int64_t)ls.drop_reserve[k];
+                            er.lent_drop_recall[k]  = (int64_t)ls.drop_recall[k];
+                        }
+                        er.place_lf = lf_on_.load(std::memory_order_relaxed);
+                        /* ds41-swl: each rank's own SWL / L2 state and its heat promotions into lent slots */
+                        er.place_swl = rk->mover.swap_lent() ? 1 : 0;
+                        er.heat_min_gain_x100 = (int)rh.min_gain_x100();
+                        er.heat_hyst_x100 = (int)rh.hysteresis_x100();
+                        for (int k = 0; k < LentStats::kN && k < server::ExpertPlane::Rank::kLenders; ++k)
+                            er.lent_swaps[k] = (int64_t)ls.swaps[k];
+                    }
+                    s.experts.ranks.push_back(er);
+                }
             }
 
             /* The link panel. All-reduce counts come from rank 0 only: the ranks are symmetric,
@@ -3025,7 +3969,8 @@ int Engine::run_server() {
          * are refused by name: LFM2-VL takes pictures only, and a token-budget processor (Gemma
          * 4's) sizes by soft tokens (--image-tokens, --video-max-frame-tokens), not pixel
          * bands. */
-        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next) &&
+        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next ||
+             vc.family == mm::Family::DeepSeek41) &&
             (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
              cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
             RAD_ERR("media: this model's processor takes pictures, not video, so the --video-* "
@@ -3043,9 +3988,9 @@ int Engine::run_server() {
             }
             if (cfg_.image_tokens)           vc.image_soft_tokens = *cfg_.image_tokens;
             if (cfg_.video_max_frame_tokens) vc.video_soft_tokens = *cfg_.video_max_frame_tokens;
-        } else if (vc.family == mm::Family::Glm5Next) {
-            /* GLM-5.3 budgets an image in tokens (max_image_tokens), so --image-tokens is its
-             * ceiling and the pixel bands do not apply. */
+        } else if (vc.family == mm::Family::Glm5Next || vc.family == mm::Family::DeepSeek41) {
+            /* GLM-5.3 and DeepSeek-V4.1 budget an image in tokens (max_image_tokens), so
+             * --image-tokens is its ceiling and the pixel bands do not apply. */
             if (cfg_.image_min_pixels || cfg_.image_max_pixels) {
                 RAD_ERR("media: this model's processor sizes images by a token budget, so "
                         "--image-min-pixels and --image-max-pixels do nothing; use "
@@ -3157,6 +4102,12 @@ int Engine::run_server() {
                          vc.max_image_tokens, mm_proc->config().max_image_tokens,
                          (long long)vc.max_image_tokens * vc.merge * vc.merge);
         }
+        else if (mm_proc->config().family == mm::Family::DeepSeek41)
+            RAD_INFO("media: images through '%s'; an image becomes a span of at most %d tokens "
+                     "(start, rows of up to %d x %d patches each ending in a newline, end), "
+                     "padded to its canvas rather than stretched; %lld patches a pass",
+                     ranks_[0]->program.encoder_name.c_str(), mm_proc->config().max_image_tokens,
+                     mm_proc->config().merge, mm_proc->config().merge, (long long)encd.max_patches);
         else if (mm_proc->config().family == mm::Family::Gemma4)
             RAD_INFO("media: %s%s through '%s'; an image becomes at most %d soft tokens (a "
                      "request's image_tokens may ask for 70..1120), a video %d a frame at %.3g "

@@ -427,4 +427,15 @@ RankSplit vram_budget_rank_split(int64_t common_weights_mib, int64_t common_kv_m
     return s;
 }
 
+KvPlaced kv_placed(int64_t free_read, int64_t free_now, int64_t placed_bytes, int64_t placed_streams,
+                   int64_t queue_bytes, int64_t slack, int64_t test_bytes) {
+    KvPlaced k;
+    /* Signed: a stream or an allocation given back since the read raised the free figure as much. */
+    k.unseen = (free_read - free_now) - placed_bytes - placed_streams * std::max<int64_t>(queue_bytes, 0) +
+               std::max<int64_t>(test_bytes, 0);
+    const int64_t over = k.unseen - std::max<int64_t>(slack, 0);
+    k.trim = over > 0 ? (over + kMiB - 1) / kMiB * kMiB : 0;
+    return k;
+}
+
 }  /* namespace rad */

@@ -125,6 +125,13 @@ struct FakeKV : IKVManager {
         }
     }
 
+    /* One paged group's pool, resized before any sequence holds a block of it (tp8 prefill P0's window pools). */
+    void resize_group(int g, int64_t blocks) {
+        total[(size_t)g] = blocks;
+        refcnt[(size_t)g].assign((size_t)blocks, 0);
+        freelist[(size_t)g].clear();
+        for (int64_t b = blocks - 1; b >= 0; --b) freelist[(size_t)g].push_back((int32_t)b);
+    }
     void retain(int32_t g, int32_t b) { ++refcnt[(size_t)g][(size_t)b]; }
     void release(int32_t g, int32_t b) {
         if (--refcnt[(size_t)g][(size_t)b] == 0) freelist[(size_t)g].push_back(b);
@@ -138,7 +145,75 @@ struct FakeKV : IKVManager {
 
     int64_t rows_for(int gi, int64_t n) const {
         const KVGeom::G& e = geom.g[(size_t)gi];
-        return e.paged ? (n + e.block_size - 1) / e.block_size : 1;
+        if (!e.paged) return 1;
+        /* WINDOW/RING recycle past their window; the real manager's blocks_for caps the same way. */
+        if ((e.kind == RAD_KV_WINDOW || e.kind == RAD_KV_RING) && e.window > 0 && n > e.window)
+            n = e.window;
+        return (n + e.block_size - 1) / e.block_size;
+    }
+
+    /* tp8 prefill P0: `slide` makes a fixed WINDOW group slide as KVManager's does (recycle_window): its table starts
+     * at block keep_from / block - (window_blocks - 1), window_blocks = ceil(window / block) + 1, never past the keep
+     * floor (set_keep_floor), and grows to the ensured end, so a test sees the blocks a sequence holds between its
+     * floor and its planned end and the table's first position (first_block_pos). Off: the group holds at most its
+     * window, as before (every other test). */
+    bool slide = false;
+    std::unordered_map<uint64_t, int64_t> keep_floor_of;
+    std::unordered_map<uint64_t, std::vector<int64_t>> first_of;   /* per sequence, per group: the first block */
+    bool slides(size_t gi) const { return slide && geom.g[gi].kind == RAD_KV_WINDOW && geom.g[gi].window > 0; }
+    int64_t win_blocks(size_t gi) const {
+        const KVGeom::G& e = geom.g[gi];
+        return (e.window + e.block_size - 1) / e.block_size + 1;
+    }
+    int64_t& first_blk(uint64_t id, size_t gi) {
+        std::vector<int64_t>& f = first_of[id];
+        if (f.size() < gs.size()) f.resize(gs.size(), 0);
+        return f[gi];
+    }
+    int64_t first_blk_c(uint64_t id, size_t gi) const {
+        auto it = first_of.find(id);
+        return it == first_of.end() || it->second.size() <= gi ? 0 : it->second[gi];
+    }
+    void recycle(uint64_t id, Seq& q, int64_t keep_from) {
+        auto fl = keep_floor_of.find(id);
+        if (fl != keep_floor_of.end() && fl->second >= 0 && keep_from > fl->second) keep_from = fl->second;
+        for (size_t i = 0; i < gs.size(); ++i) {
+            if (!slides(i)) continue;
+            const int64_t bs = geom.g[i].block_size;
+            int64_t& first = first_blk(id, i);
+            const int64_t target = std::max<int64_t>(first, keep_from / bs - (win_blocks(i) - 1));
+            while (first < target && !q.blocks[i].empty()) {
+                release((int32_t)i, q.blocks[i].front());
+                q.blocks[i].erase(q.blocks[i].begin());
+                q.dirty[i] = 0;
+                ++first;
+            }
+            if (q.blocks[i].empty()) first = target;
+        }
+    }
+    /* Blocks group i's table needs to reach n tokens (slide mode: from its first block). */
+    int64_t need_for(uint64_t id, const Seq& q, size_t i, int64_t n) const {
+        if (!slides(i)) return rows_for((int)i, n) - (int64_t)q.blocks[i].size();
+        const int64_t bs = geom.g[i].block_size;
+        return (n + bs - 1) / bs - first_blk_c(id, i) - (int64_t)q.blocks[i].size();
+    }
+    void set_keep_floor(uint64_t id, int64_t pos) override {
+        if (slide) keep_floor_of[id] = pos < 0 ? -1 : pos;
+    }
+    void trim_window(uint64_t id, int64_t keep_from) override {
+        if (!slide) return;
+        auto it = seqs.find(id);
+        if (it == seqs.end() || keep_from < 0) return;
+        recycle(id, it->second, std::min<int64_t>(keep_from, it->second.n));
+    }
+    int ensure_from(uint64_t id, int64_t n, int64_t keep_from) override {
+        if (!slide) return ensure(id, n);
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return RAD_E_NOTFOUND;
+        if (n <= it->second.n) return RAD_OK;
+        if (keep_from < 0 || keep_from > it->second.n) keep_from = it->second.n;
+        recycle(id, it->second, keep_from);
+        return grow(id, n);
     }
 
     int add_sequence(uint64_t id) override {
@@ -182,9 +257,18 @@ struct FakeKV : IKVManager {
         }
         seqs.erase(it);
         ring_floor.erase(id);
+        first_of.erase(id);
+        keep_floor_of.erase(id);
     }
 
     int ensure(uint64_t id, int64_t n) override {
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return RAD_E_NOTFOUND;
+        /* slide mode: as KVManager::ensure with no keep_from (the sequence's length) */
+        if (slide && n > it->second.n) recycle(id, it->second, it->second.n);
+        return grow(id, n);
+    }
+    int grow(uint64_t id, int64_t n) {
         auto it = seqs.find(id);
         if (it == seqs.end()) return RAD_E_NOTFOUND;
         Seq& q = it->second;
@@ -196,12 +280,12 @@ struct FakeKV : IKVManager {
                 if (q.state[i] < 0 && state_free[i].empty()) return RAD_E_FULL;
                 continue;
             }
-            int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
+            int64_t need = need_for(id, q, i, n);
             if (need > 0 && need > (int64_t)freelist[i].size()) return RAD_E_FULL;
         }
         for (size_t i = 0; i < gs.size(); ++i) {
             if (geom.g[i].paged) {
-                int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
+                int64_t need = need_for(id, q, i, n);
                 if (need > 0) q.dirty[i] = std::min<int64_t>(q.dirty[i], (int64_t)q.blocks[i].size());
                 for (int64_t k = 0; k < need; ++k) q.blocks[i].push_back(grab((int32_t)i));
             } else if (q.state[i] < 0) {
@@ -286,6 +370,7 @@ struct FakeKV : IKVManager {
             }
         }
         it->second.n = 0;
+        first_of.erase(id);
         return RAD_OK;
     }
 
@@ -296,7 +381,9 @@ struct FakeKV : IKVManager {
         if (n >= it->second.n) return RAD_OK;
         for (size_t i = 0; i < gs.size(); ++i) {
             if (!geom.g[i].paged) continue;   /* linear state is NOT rolled back (spec §10) */
-            int64_t keep = rows_for((int)i, n);
+            int64_t keep = slides(i) ? std::max<int64_t>(0, (n + geom.g[i].block_size - 1) / geom.g[i].block_size -
+                                                                first_blk(id, i))
+                                     : rows_for((int)i, n);
             std::vector<int32_t>& bl = it->second.blocks[i];
             while ((int64_t)bl.size() > keep) { release((int32_t)i, bl.back()); bl.pop_back(); }
             it->second.dirty[i] = std::min<int64_t>(it->second.dirty[i], (int64_t)bl.size());
@@ -376,7 +463,9 @@ struct FakeKV : IKVManager {
         for (int j = 0; j < n; ++j) out[j] = (s < 0 || j == 0) ? s : 1000 * j + s;
         return n;
     }
-    int64_t first_block_pos(uint64_t, int32_t) const override { return 0; }
+    int64_t first_block_pos(uint64_t id, int32_t g) const override {
+        return slides((size_t)g) ? first_blk_c(id, (size_t)g) * geom.g[(size_t)g].block_size : 0;
+    }
     int64_t take_table_changes(uint64_t id, int32_t g) const override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return 0;

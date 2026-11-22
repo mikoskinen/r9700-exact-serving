@@ -319,7 +319,7 @@ public:
      * with every live sequence that hit them. */
     int64_t unshared_tokens() const;
     /* Forget every entry, in VRAM or off it, and give back whatever the tiers held for them; every
-     * snapshot not handed out or reserved this step goes too (STALESNAP, the DeepSeek line's 23ee31a). */
+     * snapshot not handed out or reserved this step goes too (STALESNAP). */
     void    clear();
     /* Diagnostic: the LRU order, oldest first. */
     std::vector<BlockHash> lru_order() const;

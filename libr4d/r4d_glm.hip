@@ -1,8 +1,11 @@
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_moe_sort.h"
+#include "r4d_ds41_f32pf.h"
+#include "r4d_gemm_f32_tile.h"
 #include <climits>
 #include <cmath>
 
@@ -13,73 +16,32 @@ namespace {
 // k before their FMAs: at a decode pass's few rows a wave streams its weight row with no other
 // work to hide the load behind, and one step in flight left the router at 150 GB/s. Tail rows and
 // columns read a clamped valid address and are never stored.
-template <int R, int C, int U>
+//
+// WT is the weight's storage: float (f32), or uint16_t for bf16 weights (RADIANCE_DS41_ROUTER_BF16,
+// a DeepSeek-V4.1 router or compressor stored as the BF16 its checkpoint holds). A bf16 weight is
+// widened to the f32 value it stands for (exact) before the same fmaf in the same order, so both
+// storages give the same bytes for the same values. (gemm_f32_wval: r4d_gemm_f32_tile.h)
+template <int R, int C, int U, typename WT = float>
 __global__ void __launch_bounds__(128)
-    gemm_nt_f32_tile_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp, long yp,
-                            int m, int n, int k) {
+    gemm_nt_f32_tile_kernel(const uint16_t* x, const WT* w, float* y, long xp, long wp, long yp,
+                            int m, int n, int k) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
               r0 = blockIdx.y * R;
     if (c0 >= n) return;
-    const uint16_t* xr[R];
-    const float* wc[C];
-#pragma unroll
-    for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
-#pragma unroll
-    for (int c = 0; c < C; ++c) wc[c] = w + (long)(c0 + c < n ? c0 + c : n - 1) * wp;
-    float sum[R][C];
-#pragma unroll
-    for (int q = 0; q < R; ++q)
-#pragma unroll
-        for (int c = 0; c < C; ++c) sum[q][c] = 0;
-    int j = lane;
-    for (; j + 32 * (U - 1) < k; j += 32 * U) {
-        float weight[U][C];
-        uint16_t in[U][R];
-#pragma unroll
-        for (int u = 0; u < U; ++u)
-#pragma unroll
-            for (int c = 0; c < C; ++c) weight[u][c] = wc[c][j + 32 * u];
-#pragma unroll
-        for (int u = 0; u < U; ++u)
-#pragma unroll
-            for (int q = 0; q < R; ++q) in[u][q] = xr[q][j + 32 * u];
-#pragma unroll
-        for (int u = 0; u < U; ++u)
-#pragma unroll
-            for (int q = 0; q < R; ++q) {
-                const float v = bf16_to_f32(in[u][q]);
-#pragma unroll
-                for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, weight[u][c], sum[q][c]);
-            }
-    }
-    for (; j < k; j += 32) {
-#pragma unroll
-        for (int q = 0; q < R; ++q) {
-            const float v = bf16_to_f32(xr[q][j]);
-#pragma unroll
-            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, wc[c][j], sum[q][c]);
-        }
-    }
-#pragma unroll
-    for (int q = 0; q < R; ++q)
-#pragma unroll
-        for (int c = 0; c < C; ++c) {
-#pragma unroll
-            for (int mask = 16; mask; mask >>= 1) sum[q][c] += __shfl_xor(sum[q][c], mask, 32);
-        }
-    if (lane) return;
-#pragma unroll
-    for (int q = 0; q < R; ++q)
-        if (r0 + q < m)
-#pragma unroll
-            for (int c = 0; c < C; ++c)
-                if (c0 + c < n) y[(long)(r0 + q) * yp + c0 + c] = sum[q][c];
+    /* the tile's body: r4d_gemm_f32_tile.h (moved there unchanged, ds41-fuse; the router fusion runs it too) */
+    r4d_gf32::tile_wave<R, C, U, WT>(x, w, y, xp, wp, yp, m, n, k, c0, r0, lane);
 }
 
 template <int R, int C, int U = 1>
 int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
                   long n, long k) {
     const long m = x.shape[0];
+    if (w.dtype == RAD_BF16)
+        return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U, uint16_t>),
+                        dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)),
+                        dim3(128), 0, (const uint16_t*)x.data, (const uint16_t*)w.data,
+                        (float*)y.data, x.stride[0], w.stride[0], y.stride[0], (int)m, (int)n,
+                        (int)k);
     return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U>),
                     dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)),
                     dim3(128), 0, (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
@@ -89,9 +51,13 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
     const long n = r4d_geti_or(a, "N", 0), k = r4d_geti_or(a, "K", 0);
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    /* The weight is f32, or bf16 widened in the kernel (gemm_f32_wval): the same values, the same bytes. */
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
-    if (n < 1 || n > 512 || k < 1 || k > 16384 || x.rank != 2 || w.rank != 2 || y.rank != 2 ||
+    /* Any width: the grid spans n (a wave a C-column tile), so 512 was only the router's own. A
+     * compressor's fused kv|gate projection is 1024 wide. */
+    if (n < 1 || n > 65536 || k < 1 || k > 16384 || x.rank != 2 || w.rank != 2 || y.rank != 2 ||
         x.shape[0] < 1 || x.shape[0] > 65535 || x.shape[1] != k || w.shape[0] != n ||
         w.shape[1] != k || y.shape[0] != x.shape[0] || y.shape[1] != n || x.stride[1] != 1 ||
         w.stride[1] != 1 || y.stride[1] != 1 || x.stride[0] < k || w.stride[0] < k ||
@@ -105,6 +71,44 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
      * A projection of a few columns has too few waves for wide tiles at any M. */
     const long rows = x.shape[0];
+    /* lever GPF-b (r4d_ds41_f32pf.hip): the tiled prefill form when switched on (above 63 rows) or pinned; the same
+     * bits as every form here. */
+    if (n > 8 && r4d_f32pf_on()) {
+        const R4dF32PfCall c{ (const uint16_t*)x.data, w.data, (float*)y.data, (long)x.stride[0], (long)w.stride[0],
+                              (long)y.stride[0], (int)rows, (int)n, (int)k, w.dtype == RAD_BF16 };
+        const int rc = r4d_f32pf_gemm(stream, c);
+        if (rc != R4D_F32PF_DECLINE) return rc;
+    }
+    /* lever SPD-F (ds41-etp-spd, r4d_ds41_f32pf.h): ds41_f32dec's form for the decode band (rows <= 63, n > 8); 0 = the
+     * stock rule below. tile_wave forms 1..15 (R x C a wave, U steps of k in flight), tiled forms 20.. (K whole chunks, else
+     * the stock rule). Every form the stock bytes. */
+    if (n > 8 && rows < 64) {
+        const int f = r4d_f32dec_gemm_form((int)rows, (int)n);
+        int rc = R4D_F32PF_DECLINE;
+        switch (f) {
+            case 1: rc = gemm_f32_tile<8, 2, 8>(stream, x, w, y, n, k); break;
+            case 2: rc = gemm_f32_tile<8, 4, 8>(stream, x, w, y, n, k); break;
+            case 3: rc = gemm_f32_tile<4, 4, 8>(stream, x, w, y, n, k); break;
+            case 4: rc = gemm_f32_tile<4, 8, 8>(stream, x, w, y, n, k); break;
+            case 5: rc = gemm_f32_tile<2, 4, 16>(stream, x, w, y, n, k); break;
+            case 6: rc = gemm_f32_tile<2, 8, 16>(stream, x, w, y, n, k); break;
+            case 7: rc = gemm_f32_tile<4, 2, 16>(stream, x, w, y, n, k); break;
+            case 8: rc = gemm_f32_tile<8, 4, 4>(stream, x, w, y, n, k); break;
+            case 9: rc = gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k); break;   /* the stock forms, for the bench */
+            case 10: rc = gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k); break;
+            case 11: rc = gemm_f32_tile<4, 4, 16>(stream, x, w, y, n, k); break;
+            case 12: rc = gemm_f32_tile<1, 8, 16>(stream, x, w, y, n, k); break;
+            default:
+                if (f >= 20) {
+                    const R4dF32PfCall c{ (const uint16_t*)x.data, w.data, (float*)y.data, (long)x.stride[0],
+                                          (long)w.stride[0], (long)y.stride[0], (int)rows, (int)n, (int)k,
+                                          w.dtype == RAD_BF16 };
+                    rc = r4d_f32pf_gemm_code(stream, c, f);
+                }
+                break;
+        }
+        if (rc != R4D_F32PF_DECLINE) return rc;
+    }
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k);
@@ -192,7 +196,7 @@ template <int OWN>
 __global__ void __launch_bounds__(128)
     router_group_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
                              long lp, long bp, long ip, long wp, int m, int ne, int k, int ng,
-                             int kg, int norm, float factor) {
+                             int kg, int norm, float factor) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (r >= m) return;
     const int gs = ne / ng;
@@ -274,7 +278,7 @@ template <int OWN>
 __global__ void __launch_bounds__(128)
     router_sigmoid_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
                                long lp, long bp, long ip, long wp, int m, int ne, int k, int norm,
-                               float factor) {
+                               float factor) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (r >= m) return;
     (void)router_sigmoid_row<OWN>(logits, bias, ids, weights, lp, bp, ip, wp, r, ne, k, norm,
@@ -291,7 +295,7 @@ __global__ void __launch_bounds__(NW * 32)
                                   int32_t* sorted, int32_t* off, int32_t* cnt, uint16_t* gate,
                                   int32_t* inv, long lp, long bp, long ip, long wp, long gp, int m,
                                   int ne, int n_local, int k, int norm, float factor, int base,
-                                  r4d_moesort::Protect prot) {
+                                  r4d_moesort::Protect prot) { R4D_IKA_ENTRY();
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
@@ -429,7 +433,7 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
 #undef R4D_RSS_I
 }
 __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long gp, long yp, int n,
-                                      float limit) {
+                                      float limit) { R4D_IKA_ENTRY();
     const long r = blockIdx.x;
     const int i = blockIdx.y * 256 + threadIdx.x;
     if (i >= n) return;
@@ -439,7 +443,7 @@ __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long gp, 
 }
 // swiglu_step: the SiLU first, its value clipped above (Ling-3.0; vLLM's SwigluStepAndMul).
 __global__ void swiglu_step_kernel(const uint16_t* gu, uint16_t* y, long gp, long yp, int n,
-                                   float limit) {
+                                   float limit) { R4D_IKA_ENTRY();
     const long r = blockIdx.x;
     const int i = blockIdx.y * 256 + threadIdx.x;
     if (i >= n) return;
@@ -473,7 +477,7 @@ int clamped_body(const RadArgs* a, RadStream stream, bool step = false) {
 // before the absmax because the separate quantiser reads the stored bf16 bytes.
 __global__ void __launch_bounds__(256)
     swiglu_clamped_quant_kernel(const uint16_t* gu, uint16_t* y, uint8_t* q, float* s, long gp,
-                                long yp, long qp, long sp, int n, int nkb, float limit) {
+                                long yp, long qp, long sp, int n, int nkb, float limit) { R4D_IKA_ENTRY();
     const long r = blockIdx.x;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int kb = wave; kb < nkb; kb += (int)(blockDim.x >> 5)) {

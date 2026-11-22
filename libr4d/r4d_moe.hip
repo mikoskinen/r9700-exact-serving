@@ -38,6 +38,7 @@
 // atomic cursor would make `sorted_tok`, and every row of the GEMM output, depend on scheduling,
 // breaking the byte-level reproducibility of spec §17.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_plugin.h"
@@ -49,9 +50,12 @@
 
 #include <hip/hip_bf16.h>
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -273,7 +277,7 @@ __device__ __forceinline__ void router_topk_row(
 template <uint32_t NW, uint32_t MAXOWN>
 __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
-    uint32_t M, uint32_t n_expert, uint32_t top_k, uint32_t lg_ld, int norm) {
+    uint32_t M, uint32_t n_expert, uint32_t top_k, uint32_t lg_ld, int norm) { R4D_IKA_ENTRY();
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
     const uint32_t m = blockIdx.x * NW + wave;
     if (m >= M) return;
@@ -312,7 +316,7 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
     uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,
-    int32_t base, Protect prot) {
+    int32_t base, Protect prot) { R4D_IKA_ENTRY();
     __shared__ ScatterLds<NW> sl;
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
     for (uint32_t e = threadIdx.x; e < n_local; e += blockDim.x) sl.cnt[e] = 0;
@@ -329,8 +333,12 @@ constexpr uint32_t kScatterTile = 256;
 
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
-    int32_t base, Protect prot) {
+    int32_t base, Protect prot) { R4D_IKA_ENTRY();
+#ifdef R4D_EMU_HOST   // tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host)
+    int32_t* const s_h = (int32_t*)emu_dyn_lds();
+#else
     extern __shared__ int32_t s_h[];
+#endif
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) s_h[e] = 0;
     __syncthreads();
@@ -355,7 +363,7 @@ constexpr uint32_t kScanBatch = 16;
 
 __global__ __launch_bounds__(kMaxExpert) void scatter_scan_kernel(
     int32_t* __restrict__ bcnt, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
-    uint32_t n_tile, uint32_t n_expert) {
+    uint32_t n_tile, uint32_t n_expert) { R4D_IKA_ENTRY();
     constexpr uint32_t NW = kMaxExpert / kWave;
     __shared__ int32_t s_wt[NW];
     const uint32_t e = threadIdx.x, lane = e % kWave, wave = e / kWave;
@@ -401,7 +409,7 @@ template <bool INV>
 __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
     const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
     const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
-    uint32_t T, uint32_t n_expert, int32_t base, Protect prot, int32_t* __restrict__ inv) {
+    uint32_t T, uint32_t n_expert, int32_t base, Protect prot, int32_t* __restrict__ inv) { R4D_IKA_ENTRY();
     __shared__ int32_t s_id[kScatterTile];
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     const uint32_t i = b * kScatterTile + tid;
@@ -1442,7 +1450,7 @@ void moe_gemm_q_kernel(
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
     uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) { R4D_IKA_ENTRY();
     moe_gemm_q_kernel_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
 }
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
@@ -1806,7 +1814,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) { R4D_IKA_ENTRY();
     moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
 }
 template <int W4>
@@ -1836,7 +1844,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_w4_rows_kernel(
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
     uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) { R4D_IKA_ENTRY();
     const uint32_t row = blockIdx.x, n0 = blockIdx.y * 64u;
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     if (row >= T || n0 >= N) return;
@@ -1936,7 +1944,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
     uint16_t* __restrict__ Y,
     uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k, uint32_t a_sorted,
     uint32_t a_ld, uint32_t w_ld, uint32_t y_ld,
-    const uint32_t* __restrict__ map) {
+    const uint32_t* __restrict__ map) { R4D_IKA_ENTRY();
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
@@ -2160,13 +2168,13 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
  * The inverse permutation is built by its own pass: `sorted` permutes the live slots, so
  * `inv[sorted[i]] = i` is one scattered store per row. An unclaimed (dropped) slot keeps -1 and
  * contributes nothing. */
-__global__ void gather_inv_kernel(int32_t* __restrict__ inv, uint32_t T) {
+__global__ void gather_inv_kernel(int32_t* __restrict__ inv, uint32_t T) { R4D_IKA_ENTRY();
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < T) inv[i] = -1;
 }
 
 __global__ void gather_scatter_kernel(const int32_t* __restrict__ sorted,
-                                      int32_t* __restrict__ inv, uint32_t T) {
+                                      int32_t* __restrict__ inv, uint32_t T) { R4D_IKA_ENTRY();
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T) return;
     const int32_t f = sorted[i];
@@ -2188,17 +2196,22 @@ constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots 
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
-template <uint32_t NW>
+/* tp8 loop P35 (PREFILL round 30): F32 = the routing weights as F32 (deepseek41 / any sigmoid_router: rad_block_moe_fp8.h's `ew`),
+ * which gather_kernel<.., true> folds as fmaf(w, x, acc); here the same fmaf in the same slot order, so the same bytes. The BF16
+ * instantiation is the form as it was (the same loads and `acc += w * x`). */
+/* VAR (tp8 loop P35): the grid -- 0 tokens on x, column groups on y (the form as it was); 1 column groups on x, tokens on y (a
+ * token group's whole rows run in consecutive workgroups); 2 one workgroup a token group, each wave walking its token's column
+ * groups in order. Every column's arithmetic is the same in all three: the same bytes. */
+template <uint32_t NW, bool F32 = false, uint32_t VAR = 0>
 __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
-    uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    uint32_t sh_ld, uint32_t sg_ld, int sig) { R4D_IKA_ENTRY();
     const uint32_t lane = threadIdx.x % kWave;
     const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
-    const uint32_t t = blockIdx.x * NW + wave;
-    const uint32_t c = (blockIdx.y * kWave + lane) * kGatherWideCols;
+    const uint32_t t = (VAR == 1 ? blockIdx.y : blockIdx.x) * NW + wave;
     /* No barrier below, so a wave past the last token simply leaves. */
     if (t >= M) return;
 
@@ -2208,15 +2221,24 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
      * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
-    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    int32_t wl;
+    if constexpr (F32) wl = ((const int32_t*)ew)[(size_t)t * ew_ld + jl];   /* the F32 weight's bits */
+    else wl = (int32_t)((const uint16_t*)ew)[(size_t)t * ew_ld + jl];
     int32_t si[kGatherWideSlots];
     float   sw[kGatherWideSlots];
 #pragma unroll
     for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
         si[j] = __builtin_amdgcn_readlane(il, (int)j);
-        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+        if constexpr (F32) sw[j] = __int_as_float(__builtin_amdgcn_readlane(wl, (int)j));
+        else sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
     }
-    if (c >= n) return;
+    const uint32_t g0 = VAR == 2 ? 0u : (VAR == 1 ? blockIdx.x : blockIdx.y);
+    const uint32_t g1 = VAR == 2 ? (n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols) : g0 + 1;
+    for (uint32_t g = g0; g < g1; ++g) {
+    const uint32_t c = (g * kWave + lane) * kGatherWideCols;
+    if (c >= n) {
+        if constexpr (VAR == 2) continue; else return;
+    }
     /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
      * to scratch. Uniform branches over a constant trip count keep every slot in a register. A slot
      * is live exactly where gather_kernel's loop would use it. */
@@ -2247,8 +2269,13 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
             const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
 #pragma unroll
             for (uint32_t q = 0; q < 4; ++q) {
-                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
-                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                if constexpr (F32) {   /* gather_kernel<.., true>'s fold */
+                    acc[2 * q]     = fmaf(wj, bf16_to_f32((uint16_t)(d[q] & 0xFFFFu)), acc[2 * q]);
+                    acc[2 * q + 1] = fmaf(wj, bf16_to_f32((uint16_t)(d[q] >> 16)), acc[2 * q + 1]);
+                } else {
+                    acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
+                    acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                }
             }
         }
     }
@@ -2268,6 +2295,7 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
         o[q] = (uint32_t)lo | ((uint32_t)hi << 16);
     }
     *(uint4*)(y + (size_t)t * y_ld + c) = make_uint4(o[0], o[1], o[2], o[3]);
+    }   /* the column groups (one for VAR 0 / 1) */
 }
 
 /* ================================================================== scale_rows
@@ -2281,7 +2309,7 @@ template <uint32_t NTHR>
 __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ sc,
     const uint16_t* __restrict__ ad, uint16_t* __restrict__ y,
-    uint32_t M, uint32_t n, uint32_t x_ld, uint32_t s_ld, uint32_t a_ld, uint32_t y_ld, int sig) {
+    uint32_t M, uint32_t n, uint32_t x_ld, uint32_t s_ld, uint32_t a_ld, uint32_t y_ld, int sig) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     if (m >= M) return;
     const float v0 = bf16_to_f32(sc[(size_t)m * s_ld]);
@@ -2296,11 +2324,33 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 }  /* namespace */
 
 /* The gather's form, pinnable for tests: 0 the launcher's rule, 1 gather_kernel (a column per
- * thread), 2 gather_wide_kernel (a wave per token). The rule takes 2 past the self-scan bound where
+ * thread), 2 gather_wide_kernel (a wave per token); tp8 loop P35: 3 / 4 = 2 at VAR 1 / 2 (the grid's column groups first / a wave
+ * walking its token's row). The rule takes 2 past the self-scan bound where
  * the shape allows (r4d_rad_moe_gather); an impossible pin is refused. Both are bit-identical
  * (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
+/* tp8 loop P35 (PREFILL round 30; RADIANCE_DS41_GATHER_W=1, read at load): the rule also takes the wide form for F32 routing
+ * weights (deepseek41's sigmoid router), which until now always ran gather_kernel<256, true> (a column a thread: 2 bytes a lane,
+ * the slot loads serialised -- F23's 1.27 ms a 4,096-row call, ~230 GB/s). The same fmaf fold, slot order and narrows: the same
+ * bytes (r4d_selftest moe_gather_bf16: every F32 shape vs a column a thread and the host restatement). Unset = today (the pin 2
+ * takes F32 regardless: a test hook). */
+static int gather_w_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_GATHER_W");
+        const int on = e && !std::strcmp(e, "1");
+        if (on)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GATHER_W=1 (tp8 loop P35): moe_gather with F32 routing weights "
+                                 "takes the wide prefill form (a wave a token, the column groups first) past the self-scan bound (the same bytes)\n");
+        return on ? 1 : 0;
+    }();
+    return v;
+}
+[[maybe_unused]] static const int g_gather_w_load = gather_w_env();
+/* The F32 form's grid under the env (gather_wide_kernel's VAR), fixed by the one-card numbers (QUEUE P35; Xeon GPU2, r4d_selftest
+ * moe_gather_bf16, 5,120 columns, top 6, the shared arm on, us a call: 4,096 rows a column a thread 1,138-1,294, VAR 0 966, VAR 1
+ * 545, VAR 2 596; 2,048 rows 567-716 / 434-439 / 278.5 / 315; 1,150 rows 340-469 / 171-178 / 154-157 / 171-174): VAR 1. */
+static constexpr int kGatherWVar = 1;
 
 /* ============================================================== the plugin ABI entry points */
 
@@ -2653,7 +2703,7 @@ static inline long long r4d_blockmap_bytes(long long cap) {
  * waits for the map. Integer sums are order-independent. */
 __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
-    uint32_t* __restrict__ map) {
+    uint32_t* __restrict__ map) { R4D_IKA_ENTRY();
     constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
     __shared__ uint32_t s_cnt[kMaxExpert + 1];
     __shared__ int32_t  s_wt[kTiles][NW];
@@ -3269,18 +3319,44 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
-    const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
+    /* tp8 loop P35: F32 weights fit the wide form too (its F32 instantiation); the rule takes it there only under
+     * RADIANCE_DS41_GATHER_W=1 (gather_w_env), the pin 2 always. */
+    const bool f32w = ew->dtype == RAD_F32;
+    const bool wide_ok = !small && top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     const int gpin = g_moe_gather_pin;
-    if (gpin < 0 || gpin > 2) return R4D_NO(RAD_E_INVAL);
+    if (gpin < 0 || gpin > 4) return R4D_NO(RAD_E_INVAL);
     if (gpin >= 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
-    if ((gpin == 0 && wide_ok) || gpin >= 2) {
+    if ((gpin == 0 && wide_ok && (!f32w || gather_w_env())) || gpin >= 2) {
         constexpr uint32_t NW = 8;
         const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
+        const unsigned tg = (unsigned)((M + NW - 1) / NW);
+        /* the F32 form's grid: the pin's, else RADIANCE_DS41_GATHER_W's (P35_VAR below) */
+        const int var = gpin >= 2 ? gpin - 2 : (f32w ? kGatherWVar : 0);
+        if (f32w || var != 0) {
+#define R4D_GW_LAUNCH(F, V, GX, GY)                                                                                   \
+            hipLaunchKernelGGL((gather_wide_kernel<NW, F, V>), dim3(GX, GY), dim3(NW * kWave), 0, (hipStream_t)s,   \
+                               (const uint16_t*)ye->data, (const void*)ew->data, inv,                                  \
+                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,                          \
+                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                                       \
+                               sh ? (const uint16_t*)sh->data : nullptr, sh ? (const uint16_t*)sg->data : nullptr,     \
+                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
+            if (f32w) {
+                if (var == 1) R4D_GW_LAUNCH(true, 1, gw, tg);
+                else if (var == 2) R4D_GW_LAUNCH(true, 2, tg, 1);
+                else R4D_GW_LAUNCH(true, 0, tg, gw);
+            } else {
+                if (var == 1) R4D_GW_LAUNCH(false, 1, gw, tg);
+                else R4D_GW_LAUNCH(false, 2, tg, 1);
+            }
+#undef R4D_GW_LAUNCH
+            R4D_MOE_CHK();
+            return RAD_OK;
+        }
         hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
                            dim3(NW * kWave), 0, (hipStream_t)s,
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
+                           (const uint16_t*)ye->data, (const void*)ew->data, inv,
                            (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
                            (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
                            sh ? (const uint16_t*)sh->data : nullptr,
@@ -3458,6 +3534,19 @@ struct RgGeom {
     uint32_t M, K, n_expert, n_local, top_k, lg_ld;
     int32_t  norm, base;
     uint32_t sk, tpb, nrb, skg;
+    /* Qwen loop round 3 (FINDINGS F7, bench only: the op params rg_mt / rg_notail, never declared by an architecture):
+     * `mt` 16-row tiles a block, one after the other (1 = today's grid; each tile's items, chains and split sums are
+     * today's, so the bytes are), `notail` 1 = return after the GEMM part (no arrival, no ranking: a timing split). */
+    uint32_t mt, notail;
+    /* qfn-on-ds lever RGT (Qwen loop round 5, 21.11.2026; QUEUE Q11, FINDINGS F12): `tail` 1 = the ranking per row tile.
+     * Today the LAST block of the whole grid ranks every row (rows m = wave, wave + NW, ...: 3 / 4 rows a wave at 96 / 128
+     * rows) and sorts; F12 measured that tail at 9.1 / 38.2 / 38.5 us cold at 64 / 96 / 128 rows. Under `tail` each row
+     * tile (blockIdx.y) counts its own blocks on word 1 + blockIdx.y of the instance's counter slot; the tile's last block
+     * ranks the tile's rows (router_topk_row, per row and wave-local: the same ids / w bytes) and stages each slot's sort
+     * place in `sorted` (M x top_k int32, the op's own output, the index today's LDS list uses); word 0 counts the tiles
+     * done, and the last tile's block loads the staged list into the sort's LDS and runs today's sort over it (the same
+     * input in the same order: the same sorted / off / cnt / inverse bytes). */
+    uint32_t tail;
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
@@ -3470,7 +3559,11 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     RgGeom g, Protect prot, int32_t* __restrict__ inv = nullptr) {
     /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
      * shim sizes it for the larger. */
+#ifdef R4D_EMU_HOST   // tests/r4d_emu (r4d_emu_qrgt): the launch's dynamic LDS
+    unsigned char* const rg_smem = (unsigned char*)emu_dyn_lds();
+#else
     extern __shared__ __align__(16) unsigned char rg_smem[];
+#endif
     float* const red = (float*)rg_smem;
     const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
 
@@ -3480,9 +3573,13 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     const int       N   = gb ? 1 : (int)g.n_expert;
     const uint32_t  nt0 = gb ? 0u : blockIdx.x * g.tpb;
     const uint16_t* Wb  = gb ? Wg : W;
-    const int       m0  = (int)(blockIdx.y * 16u);
+    const uint32_t  MT  = g.mt > 1u ? g.mt : 1u;
 
     const uint32_t items = nti * (uint32_t)SK;
+    for (uint32_t t = 0; t < MT; ++t) {
+    const int m0 = (int)((blockIdx.y * MT + t) * 16u);
+    if (m0 >= (int)g.M) break;
+    if (t > 0) __syncthreads();   /* the previous tile's reduction has read `red` */
     for (uint32_t it = wave; it < items; it += NW) {
         const uint32_t j = it / (uint32_t)SK, ks = it % (uint32_t)SK;
         const rg_v8f acc = rg_item(A, Wb, (int)g.M, (int)g.K, N, (int)((nt0 + j) * 16u), m0,
@@ -3506,13 +3603,51 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
             else    ((__hip_bfloat16*)lg)[(size_t)m * g.lg_ld + (size_t)n] = (__hip_bfloat16)v;
         }
     }
+    }   /* the block's row tiles */
+    if (g.notail) return;   /* bench split (rg_notail): the GEMM part only */
+
+    __shared__ unsigned int s_arrived;
+    if (g.tail) {
+        /* lever RGT (RgGeom note): the tile's last block ranks the tile's rows, the last tile sorts. The same release /
+         * acquire pattern as below, once on the tile's word and once on word 0. */
+        __threadfence();
+        __syncthreads();
+        unsigned int* const tctr = ctr + 1u + blockIdx.y;
+        if (tid == 0)
+            s_arrived = __hip_atomic_fetch_add(tctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+        if (s_arrived + 1u != gridDim.x) return;
+        if (tid == 0) __hip_atomic_store(tctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const uint32_t r0 = blockIdx.y * MT * 16u;
+        const uint32_t r1 = r0 + MT * 16u < g.M ? r0 + MT * 16u : g.M;
+        const SlotSink stg{sorted, g.base, g.n_local, prot};   /* staged at today's LDS index m * top_k + lane */
+        for (uint32_t m = r0 + wave; m < r1; m += NW)
+            router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, stg);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0)
+            s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+        if (s_arrived + 1u != gridDim.y) return;
+        if (tid == 0) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        ScatterLds<NW>& sl = *reinterpret_cast<ScatterLds<NW>*>(rg_smem);
+        for (uint32_t e = tid; e < g.n_local; e += blockDim.x) sl.cnt[e] = 0;
+        const uint32_t T = g.M * g.top_k;
+        /* every staged value is in a register (and in LDS) before the barrier, so the sort's stores to `sorted` below
+         * cannot overtake a load of the staged list */
+        for (uint32_t i = tid; i < T; i += blockDim.x) sl.e[i] = sorted[i];
+        lds_barrier();
+        scatter_small_place<NW, INV>(sorted, off, cnt, T, g.n_local, sl, inv);
+        return;
+    }
 
     /* ---- the last block ranks. Every store is made visible device-wide before the arrival is
      * published; the block completing the count resets it for the next launch and acquires the
      * other blocks' logits. */
     __threadfence();
     __syncthreads();
-    __shared__ unsigned int s_arrived;
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
@@ -3539,7 +3674,7 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
     int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot) {
+    RgGeom g, Protect prot) { R4D_IKA_ENTRY();
     router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
 }
 template <uint32_t MAXOWN, uint32_t NW>
@@ -3560,7 +3695,7 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_inv_kerne
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
     int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot, int32_t* __restrict__ inv) {
+    RgGeom g, Protect prot, int32_t* __restrict__ inv) { R4D_IKA_ENTRY();
     router_gemm_topk_scatter_kernel_body<MAXOWN, NW, true>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot, inv);
 }
 template <uint32_t MAXOWN, uint32_t NW>
@@ -3652,6 +3787,31 @@ extern "C" void r4d_rad_router_gemm_topk_scatter_fini(void* inst) {
     }
     delete in;
 }
+
+/* qfn-on-ds lever RGT (Qwen loop round 5; RgGeom note): the fused decode router ranks per row tile from this many rows
+ * (0 = today's form at every height). RADIANCE_FN4_RG_TAIL at start, switch rg_tail between steps (r4d_rg_tail_set,
+ * reached through r4d_hc_bf16.hip's r4d_fn4_switch_fn). -1 until the environment is read. */
+static std::atomic<int> g_rg_tail{-1};
+static int rg_tail_rows() {
+    int v = g_rg_tail.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_RG_TAIL");
+        int on = (e && *e) ? std::atoi(e) : 0;
+        on = on < 0 ? 0 : on > (int)kRgMaxM ? (int)kRgMaxM : on;
+        int want = -1;
+        if (g_rg_tail.compare_exchange_strong(want, on, std::memory_order_relaxed) && on > 0)
+            std::fprintf(stderr, "radiance: libr4d: lever RGT (RADIANCE_FN4_RG_TAIL=%d): the fused decode router ranks per "
+                                 "16-row tile from %d rows (the same bytes)\n", on, on);
+        v = g_rg_tail.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_rg_tail_set(int value) {
+    if (value < 0 || value > (int)kRgMaxM) return -1;
+    g_rg_tail.store(value, std::memory_order_relaxed);
+    return 1;
+}
+extern "C" int r4d_rg_tail_get() { return rg_tail_rows(); }
 
 /* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
  * expert_offset, expert_count, gate?. The two optional ones come together or not at all. The
@@ -3749,7 +3909,16 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
     g.norm = (int32_t)norm;          g.base = (int32_t)base;
     g.sk = (uint32_t)cr.sk;          g.tpb = (uint32_t)tpb;
     g.nrb = (uint32_t)nrb;           g.skg = wg ? (uint32_t)cg.sk : 0u;
-    const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
+    /* bench only (RgGeom note): row tiles a block, the GEMM part alone */
+    const long long rg_mt = r4d_geti_or(a, "rg_mt", 1);
+    g.mt = rg_mt >= 2 && rg_mt <= 8 ? (uint32_t)rg_mt : 1u;
+    g.notail = r4d_geti_or(a, "rg_notail", 0) != 0 ? 1u : 0u;
+    /* lever RGT: the ranking per row tile from `rg_tail` rows (the op param for the bench, else the switch / start
+     * variable); at least two row tiles, else today's one-tile form is the same work with one arrival fewer */
+    const long long rg_tail = r4d_geti_or(a, "rg_tail", (long long)rg_tail_rows());
+    g.tail = rg_tail > 0 && M >= rg_tail && M > 16 * (long long)g.mt ? 1u : 0u;
+    const long long rtiles = (M + 15) / 16;
+    const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((rtiles + g.mt - 1) / g.mt));
     /* The chained form (r4d_chain.h) where the row resolved with `chain`. */
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M);
 

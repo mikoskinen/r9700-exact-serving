@@ -27,6 +27,7 @@
 // as sc*(<a,q> - zp*sum a) with the group's activation sum from Asum, as in
 // r4d_gemm_w4a8_asym_nt_m64.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
@@ -82,7 +83,7 @@ __global__ __launch_bounds__(R4D_W2A8_BOUNDS(MT, NPW)) void r4d_gemm_w2a8_nt_ker
     const signed char* __restrict__ A, const float* __restrict__ Ascale,
     const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
     const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C,
-    int M, int K, int N, int WV, int SK) {
+    int M, int K, int N, int WV, int SK) { R4D_IKA_ENTRY();
   extern __shared__ float redw2[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;

@@ -56,6 +56,7 @@
 // tolerance.
 #include <hip/hip_runtime.h>
 
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -444,7 +445,7 @@ __device__ __forceinline__ void hc_lds_barrier() {
  * weight is [vocab, n] and a wide output would need a different weight shape. */
 __global__ __launch_bounds__(kThreads)
 void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __restrict__ h,
-                     long rows, long n, int hc, long xrow, long hrow) {
+                     long rows, long n, int hc, long xrow, long hrow) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     if (r >= rows) return;
     const unsigned short* xp = x + r * xrow;
@@ -459,10 +460,10 @@ void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __res
  *
  * h[c][i] += inj[c] * y[i], in place on the unnormed stream: the read's normalisation feeds the
  * block input and gates only, never the residual. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
-                     unsigned short* __restrict__ h,
-                     long rows, long n, int hc, long yrow, long irow, long hrow) {
+__device__ __forceinline__
+void hc_write_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                          unsigned short* __restrict__ h,
+                          long rows, long n, int hc, long yrow, long irow, long hrow) {
     const long r = blockIdx.y;
     if (r >= rows) return;
     /* Gains go through LDS, not a register array: with a runtime `hc`, `g[c]` would be a dynamic
@@ -480,6 +481,21 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
         }
     }
 }
+/* The plain and chained forms (r4d_chain.h; qfn-on-ds lever HWC, hc_readv bit 13): every block leaves through the wrapper. */
+__global__ __launch_bounds__(kThreads)
+void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                     unsigned short* __restrict__ h,
+                     long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
+    hc_write_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+}
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_write(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                       unsigned short* __restrict__ h,
+                       long rows, long n, int hc, long yrow, long irow, long hrow) {
+    r4d_chain_wait();
+    hc_write_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+    r4d_chain_done();
+}
 
 /* The same write, eight elements a thread (fn4 hcw, rebased 9.11.2026 from the 1.15.1 line's b9ebe5f):
  * 16-byte loads and stores of `y` and every stream of `h` where the plain form moves 2 bytes a thread
@@ -489,10 +505,10 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
  * form's. One work item = (row, 8-element word); a row's gains are read per stream from `inj`
  * (8 bytes, cached), not staged: rows of one workgroup differ. Taken under hc_write_vec() when n,
  * both row pitches and both bases are 16-byte multiples. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
-                         unsigned short* __restrict__ h,
-                         long rows, long n, int hc, long yrow, long irow, long hrow) {
+__device__ __forceinline__
+void hc_write_vec_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                              unsigned short* __restrict__ h,
+                              long rows, long n, int hc, long yrow, long irow, long hrow) {
     const long wpr  = n >> 3;                                  /* 8-element words a row */
     const long item = (long)blockIdx.x * kThreads + threadIdx.x;
     if (item >= rows * wpr) return;
@@ -512,6 +528,20 @@ void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned sh
         *p = f2bf8(o);
     }
 }
+__global__ __launch_bounds__(kThreads)
+void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                         unsigned short* __restrict__ h,
+                         long rows, long n, int hc, long yrow, long irow, long hrow) { R4D_IKA_ENTRY();
+    hc_write_vec_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+}
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_write_vec(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                           unsigned short* __restrict__ h,
+                           long rows, long n, int hc, long yrow, long irow, long hrow) {
+    r4d_chain_wait();
+    hc_write_vec_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+    r4d_chain_done();
+}
 
 /* ============================================================== hc_project
  *
@@ -522,7 +552,7 @@ void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned sh
  * request's stream is the stock model's. */
 __global__ __launch_bounds__(kThreads)
 void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__ v,
-                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale) {
+                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     if (r >= rows || on[r] == 0) return;   /* a row's switch: the whole workgroup takes it */
     unsigned short* hp = h + r * hrow + (long)blockIdx.x * n;
@@ -795,7 +825,7 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
                       const unsigned short* __restrict__ fce,
                       unsigned short* __restrict__ x,
                       long rows, long n, int hc, int flat, float eps, float wadd,
-                      long hrow, long erow, long xrow) {
+                      long hrow, long erow, long xrow) { R4D_IKA_ENTRY();
     extern __shared__ unsigned short sM[];        /* [hc * n] nh, then [n] ne */
     __shared__ float s_part[kWaves][kHcMax];
     __shared__ float s_pe[kWaves];
@@ -1183,7 +1213,7 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                       float* __restrict__ scaleout,
                       long rows, long n, int hc, long lr, long ta, long hrow, long irow,
-                      float eps, float wadd) {
+                      float eps, float wadd) { R4D_IKA_ENTRY();
     hc_read_a_body<F8, HCP, PER>(h, w, downv, dld, injw, dout, inj, scaleout, rows, n, hc, lr, ta,
                                  hrow, irow, eps, wadd, blockIdx.x, blockIdx.y, gridDim.x - 1u);
 }
@@ -1244,7 +1274,7 @@ __device__ __forceinline__ void wave_dot_lds_rows(const float* __restrict__ sv, 
 template <int RG, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_up_kernel(const void* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
-                  unsigned short* __restrict__ ubuf, long rows, long hn, long lr) {
+                  unsigned short* __restrict__ ubuf, long rows, long hn, long lr) { R4D_IKA_ENTRY();
     const unsigned short* __restrict__ up = (const unsigned short*)upv;
     extern __shared__ __attribute__((aligned(16))) float sd[];   /* [RG * lr] */
     __shared__ unsigned short s_stage[kWaves][kWave * 8];   /* wave_dot_lds, one slot a wave */
@@ -1658,7 +1688,7 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                       float* __restrict__ qs, unsigned char* __restrict__ rq,
                       float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                       long rows, long n, int hc, long lr, long hrow, long xrow,
-                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                      long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     hc_up_mix_body<RG, F8, I8, RPT>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd, blockIdx.x, blockIdx.y);
 }
 
@@ -2107,7 +2137,43 @@ __device__ __forceinline__ void hc_read_s_down_body(
  * channels 32b + 4w .. + 3 (16 W_up rows). RG: the step's rows (1..16). W_up and its scales load
  * before the chain wait. */
 constexpr int kHcBCh = 32;                         /* channels a block */
-template <int RG, bool CH, bool I8>
+
+/* qfn-on-ds Q17 (Qwen loop round 4, 21.11.2026; bench only): the per-block phase timeline of the bi_dec decode read's
+ * kernels -- A' (G16 / G16p, region 0) and B3 at 16 rows a group (region 1). r4d_hc_tl(1) makes the launcher take the TL
+ * copies: the same bodies (TL = true) with thread 0 storing wall_clock64 (100 MHz) right after each block-wide barrier
+ * into the bench's buffer [region][block][k] (g_hc_tlp, allocated by r4d_hc_tl(1); 8 bytes of module memory otherwise), and
+ * in word 7 HW_ID1 << 32 | flags << 24 | blockIdx.y << 12 | blockIdx.x. The stamps write only that buffer: every output byte
+ * is the plain kernel's. TL = false (every engine launch) adds no instruction. */
+constexpr int kHcTlMax = 2048;                     /* blocks a region */
+constexpr int kHcTlW   = 8;                        /* words a block */
+__device__ unsigned long long* g_hc_tlp;
+template <bool TL>
+__device__ __forceinline__ void hc_tl_put(int region, int k) {
+    if constexpr (TL) {
+        unsigned long long* const tb = g_hc_tlp;
+        if (threadIdx.x != 0 || !tb) return;
+        const unsigned b = blockIdx.y * gridDim.x + blockIdx.x;
+        if (b < (unsigned)kHcTlMax)
+            tb[((unsigned long long)region * kHcTlMax + b) * kHcTlW + k] = (unsigned long long)wall_clock64();
+    }
+}
+template <bool TL>
+__device__ __forceinline__ void hc_tl_end(int region, unsigned flags) {
+    if constexpr (TL) {
+        unsigned long long* const tb = g_hc_tlp;
+        if (threadIdx.x != 0 || !tb) return;
+        const unsigned b = blockIdx.y * gridDim.x + blockIdx.x;
+        if (b >= (unsigned)kHcTlMax) return;
+        const unsigned long long t = (unsigned long long)wall_clock64();
+        const unsigned hw = (unsigned)__builtin_amdgcn_s_getreg((31 << 11) | 23);   /* HW_ID1 */
+        unsigned long long* const r = tb + ((unsigned long long)region * kHcTlMax + b) * kHcTlW;
+        r[5] = t;
+        r[7] = ((unsigned long long)hw << 32) | ((unsigned long long)(flags & 0xffu) << 24)
+               | ((unsigned long long)(blockIdx.y & 0xfffu) << 12) | (unsigned long long)(blockIdx.x & 0xfffu);
+    }
+}
+
+template <int RG, bool CH, bool I8, bool TL = false>
 __device__ __forceinline__ void hc_up_w_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
@@ -2121,6 +2187,7 @@ __device__ __forceinline__ void hc_up_w_body(
     __shared__ float s_usc[kWaves][16][4];
     __shared__ unsigned s_arrived;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(1, 0);
     const int col = lane & 15, hh = lane >> 4;
     const long i0 = (long)blockIdx.x * kHcBCh;
     const long iw = i0 + 4 * wave;
@@ -2181,6 +2248,7 @@ __device__ __forceinline__ void hc_up_w_body(
         for (int a = 0; a < 2; ++a)
             Npre[a][c] = nbf(bfw_f(a ? (hv2[c] >> 16) : (hv2[c] & 0xffffu)) * sc[c] * wv[a][c]);
     __syncthreads();
+    hc_tl_put<TL>(1, 1);
 
     /* ---- the up product: per quarter five WMMA steps, folded with the quarter's scale */
     float U[8];
@@ -2198,6 +2266,7 @@ __device__ __forceinline__ void hc_up_w_body(
 #pragma unroll
         for (int e = 0; e < 8; ++e) U[e] = fmaf(D[e], s_usc[wave][8 * hh + e][qq], U[e]);
     }
+    hc_tl_put<TL>(1, 4);   /* Q17 timeline: wave 0's up product done (word 4, B3 only) */
 
     /* ---- sigmoid, narrowed; the mix in the lane (D row 8hh + e = channel 2hh + e/4, stream e%4) */
     const float inv_hc = 1.0f / (float)hc;
@@ -2212,17 +2281,19 @@ __device__ __forceinline__ void hc_up_w_body(
         }
         *(uint32_t*)(x + (long)col * xrow + iw + 2 * hh) = f2bf2(acc[0], acc[1]);
     }
-    if (!q || !ctr) return;
+    if (!q || !ctr) { hc_tl_end<TL>(1, 2u); return; }
 
     /* ---- the 128-channel group's last block quantises it */
     const int nb = kUpTB / kHcBCh;
     __threadfence();
     __syncthreads();
+    hc_tl_put<TL>(1, 2);
     const unsigned slot = (unsigned)(i0 / kUpTB + (long)blockIdx.y * (n / kUpTB));
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
-    if (s_arrived + 1u != (unsigned)nb) return;
+    hc_tl_put<TL>(1, 3);
+    if (s_arrived + 1u != (unsigned)nb) { hc_tl_end<TL>(1, 0u); return; }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     const long base = (i0 / kUpTB) * kUpTB;
     for (int r = wave; r < RG && r < rows; r += kWaves) {
@@ -2240,6 +2311,7 @@ __device__ __forceinline__ void hc_up_w_body(
         if (rq) hc_rot_group(v, lane, rq + (long)r * rqrow + base, rqs + (long)r * rsrow + base / kUpTB);
     }
     if (tid == 0) __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    hc_tl_end<TL>(1, 1u);
 }
 
 #define R4D_HCW_PARAMS                                                                            \
@@ -2252,13 +2324,182 @@ __device__ __forceinline__ void hc_up_w_body(
 #define R4D_HCW_ARGS upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, lr, hrow, xrow, \
     qrow, srow, rqrow, rsrow, wadd
 template <int RG, bool I8>
-__global__ __launch_bounds__(kThreads) void hc_up_w_kernel(R4D_HCW_PARAMS) {
+__global__ __launch_bounds__(kThreads) void hc_up_w_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_w_body<RG, false, I8>(R4D_HCW_ARGS);
 }
 template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_w(R4D_HCW_PARAMS) {
     hc_up_w_body<RG, true, I8>(R4D_HCW_ARGS);
     r4d_chain_done();
+}
+/* qfn-on-ds Q17 (bench only, r4d_hc_tl): B3 with the phase timeline, region 1. The TL copies keep the plain kernels' VGPR
+ * count, so the same number of blocks is resident a WGP: B3 capped at the plain kernel's 118 VGPRs (the stamps alone took
+ * it to 127) and held there by a clobber of v117, A' G16p / G16 raised to the plain 194 / 130 by a clobber of the top
+ * register (the stamps let the compiler drop to 191 / 120). The bench prints the residency it measures. */
+/* qfn-on-ds lever HCO (Qwen loop round 4, 21.11.2026; RADIANCE_FN4_HC_OCC bit 2): B3 at 16 rows a group with the register budget
+ * of 16 waves a SIMD (<= 96 VGPRs: 8 blocks a WGP resident instead of 6 at 118). The same body, the same arithmetic in the same
+ * order (only the allocation moves): every output byte is hc_up_w_kernel<16>'s. R6 (hctl1): at 64 / 128 rows B3 runs 2.1 / 4.0
+ * rounds of ~12 us blocks at 6 a WGP. */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(16, 16))) void hc_up_w_o_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_w_body<RG, false, I8>(R4D_HCW_ARGS);
+}
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) void hc_up_w_tl_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    asm volatile("" ::: "v117");
+    hc_up_w_body<RG, false, I8, true>(R4D_HCW_ARGS);
+}
+/* (no timeline copy of HCO bit 2's B3: at the 16-waves budget the stamped body spills 18 VGPRs; under r4d_hc_tl B3 stays today's) */
+
+/* qfn-on-ds lever B3R (Qwen loop round 1, 20.11.2026; hc_readv bits 11-12): kernel B3 under bi_dec with GPB 16-row
+ * groups a block instead of one. The constant operands -- this lane's W_up row halves, their quarter scales, the norm
+ * weights -- load ONCE a block (today: once a 16-row group, so a 128-row read loads W_up's 3.28 MB eight times); then the
+ * block walks its groups in order. Per group everything is hc_up_w_body<16>'s: the group's d rows staged the same way,
+ * the same five WMMA steps a quarter with the same quarter-scale folds, the same mix, the same 128-channel quantiser in
+ * the group's last-arriving block on the same counter slot (i0 / kUpTB + g * (n / kUpTB)). A row's bytes do not depend on
+ * its group (its d row is one WMMA column) nor on which block walks the group, so every output byte is B3's. Unchained
+ * only (the chain wait sits before a single group's operands). */
+template <bool I8>
+__global__ __launch_bounds__(kThreads)
+void hc_up_w_gb_kernel(R4D_HCW_PARAMS, int gpb) { R4D_IKA_ENTRY();
+    constexpr int RG = 16;
+    constexpr int hc = 4;
+    constexpr int kLr = 320, kQ = kLr / 4, kStepsQ = kQ / 16;
+    __shared__ __attribute__((aligned(16))) unsigned short sd[RG * kLr];
+    __shared__ float s_usc[kWaves][16][4];
+    __shared__ unsigned s_arrived;
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int col = lane & 15, hh = lane >> 4;
+    const long i0 = (long)blockIdx.x * kHcBCh;
+    const long iw = i0 + 4 * wave;
+    const long gy = (rows + RG - 1) / RG;
+    const long gbeg = (long)blockIdx.y * gpb;
+    const long gend = gbeg + gpb < gy ? gbeg + gpb : gy;
+
+    /* ---- constant operands, once a block (hc_up_w_body's loads) */
+    const unsigned char* wr = upv + ((long)(col & 3) * n + iw + (col >> 2)) * uld;
+    uint2 wc[4][kStepsQ];
+#pragma unroll
+    for (int qq = 0; qq < 4; ++qq)
+#pragma unroll
+        for (int st = 0; st < kStepsQ; ++st) wc[qq][st] = *(const uint2*)(wr + qq * kQ + 40 * hh + 8 * st);
+    if (hh == 0) {
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq) s_usc[wave][col][qq] = ((const float*)(wr + kLr))[qq];
+    }
+    float wv[2][4];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int c = 0; c < hc; ++c) wv[a][c] = w[(long)c * n + iw + 2 * hh + a] + wadd;
+    const float inv_hc = 1.0f / (float)hc;
+    const int nb = kUpTB / kHcBCh;
+    const long base = (i0 / kUpTB) * kUpTB;
+
+#pragma unroll 1
+    for (long g = gbeg; g < gend; ++g) {
+        /* every thread is past group g - 1 (its sd reads, its s_arrived read) before sd / s_arrived are rewritten */
+        if (g > gbeg) __syncthreads();
+        /* W_up stays packed E4M3 across the groups: the opaque touch keeps the compiler from hoisting the bf16 widening
+         * out of the loop (80 more VGPRs: 247 a lane, half B3's occupancy); the widening is per group, as in B3 */
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq)
+#pragma unroll
+            for (int st = 0; st < kStepsQ; ++st) asm volatile("" : "+v"(wc[qq][st].x), "+v"(wc[qq][st].y));
+        const long r0 = g * RG;
+        const long grows = rows - r0 < RG ? rows - r0 : RG;
+        const unsigned short* const dg = dbuf + r0 * kLr;
+        const unsigned short* const hg = h + r0 * hrow;
+        const float* const sg = scalein + r0 * kHcMax;
+        unsigned short* const xg = x + r0 * xrow;
+
+        /* ---- one batch: d (uint4, contiguous rows), the mix items' h and scales */
+        constexpr int kD8 = RG * kLr / 8;
+        uint4 dq[(kD8 + kThreads - 1) / kThreads];
+#pragma unroll
+        for (int i = 0; i < (kD8 + kThreads - 1) / kThreads; ++i) {
+            const int k = tid + i * kThreads;
+            dq[i] = k < kD8 && k < (int)grows * (kLr / 8) ? ((const uint4*)dg)[k] : make_uint4(0u, 0u, 0u, 0u);
+        }
+        const int rr = col < (int)grows ? col : (int)grows - 1;
+        float sc[4];
+        uint32_t hv2[4];
+#pragma unroll
+        for (int c = 0; c < hc; ++c) {
+            sc[c] = sg[(long)rr * kHcMax + c];
+            hv2[c] = *(const uint32_t*)(hg + (long)rr * hrow + (long)c * n + iw + 2 * hh);
+        }
+#pragma unroll
+        for (int i = 0; i < (kD8 + kThreads - 1) / kThreads; ++i) {
+            const int k = tid + i * kThreads;
+            if (k < kD8) ((uint4*)sd)[k] = dq[i];
+        }
+        float Npre[2][4];
+#pragma unroll
+        for (int c = 0; c < hc; ++c)
+#pragma unroll
+            for (int a = 0; a < 2; ++a)
+                Npre[a][c] = nbf(bfw_f(a ? (hv2[c] >> 16) : (hv2[c] & 0xffffu)) * sc[c] * wv[a][c]);
+        __syncthreads();
+
+        /* ---- the up product: per quarter five WMMA steps, folded with the quarter's scale */
+        float U[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) U[e] = 0.0f;
+        const unsigned short* dr = sd + (long)rr * kLr + 40 * hh;
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq) {
+            v8f D = {};
+#pragma unroll
+            for (int st = 0; st < kStepsQ; ++st) {
+                const uint4 b = *(const uint4*)(dr + qq * kQ + 8 * st);
+                D = mma(hcg_e4m3_v8bf(wc[qq][st].x, wc[qq][st].y), hcg_v8bf(b.x, b.y, b.z, b.w), D);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) U[e] = fmaf(D[e], s_usc[wave][8 * hh + e][qq], U[e]);
+        }
+
+        /* ---- sigmoid, narrowed; the mix in the lane (D row 8hh + e = channel 2hh + e/4, stream e%4) */
+        if (col < RG && col < grows) {
+            float acc[2];
+#pragma unroll
+            for (int a = 0; a < 2; ++a) {
+                acc[a] = 0.0f;
+#pragma unroll
+                for (int c = 0; c < hc; ++c) acc[a] += nbf(sigmoidf_(U[4 * a + c])) * Npre[a][c];
+                acc[a] *= inv_hc;
+            }
+            *(uint32_t*)(xg + (long)col * xrow + iw + 2 * hh) = f2bf2(acc[0], acc[1]);
+        }
+        if (!q || !ctr) continue;
+
+        /* ---- the 128-channel group's last block quantises this group's rows */
+        __threadfence();
+        __syncthreads();
+        const unsigned slot = (unsigned)(i0 / kUpTB + g * (n / kUpTB));
+        if (tid == 0)
+            s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+        if (s_arrived + 1u != (unsigned)nb) continue;
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        unsigned char* const qg = q + r0 * qrow;
+        float* const qsg = qs + r0 * srow;
+        for (int r = wave; r < RG && r < grows; r += kWaves) {
+            const unsigned short* const xr = xg + (long)r * xrow + base;
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = bf2f(xr[lane * 4 + j]);
+            float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+            m = r4d_wave_max(m);
+            const float scq = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
+            const float inv = 1.0f / scq;
+            if (lane == 0) qsg[(long)r * srow + base / kUpTB] = scq;
+            const uint32_t pk = q8_pack4<I8>(v[0], v[1], v[2], v[3], inv);
+            *(unsigned*)(qg + (long)r * qrow + base + lane * 4) = (unsigned)pk;
+            if (rq) hc_rot_group(v, lane, rq + (r0 + r) * rqrow + base, rqs + (r0 + r) * rsrow + base / kUpTB);
+        }
+        if (tid == 0) __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
 }
 template <int MT>
 __global__ __launch_bounds__(kThreads)
@@ -2268,7 +2509,7 @@ void hc_read_s_down_kernel(const unsigned short* __restrict__ h, const float* __
                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                            float* __restrict__ scaleout, float* __restrict__ part,
                            unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                           float eps, float wadd, int ntd, long rows) {
+                           float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_s_down_body<MT, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                    hrow, irow, eps, wadd, ntd, rows);
 }
@@ -2294,7 +2535,7 @@ void hc_read_g_down_kernel(const unsigned short* __restrict__ h, const float* __
                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                            float* __restrict__ scaleout, float* __restrict__ part,
                            unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                           float eps, float wadd, int ntd, long rows) {
+                           float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                    hrow, irow, eps, wadd, ntd, rows);
 }
@@ -2313,12 +2554,43 @@ void r4dchain_hc_read_g_down(const unsigned short* __restrict__ h, const float* 
     r4d_chain_done();
 }
 
+/* qfn-on-ds lever HCO bit 4 (Qwen loop round 4, 21.11.2026; READY R6: A''s prologue + norm is 59-69 % of a block, the norm loop
+ * one row at a time -- 10 loads, wait for all, sum, wave sum, store -- behind the W_down fragment loads issued first): the norm
+ * rows with their loads DEPTH rows ahead (fully unrolled, static buffers), before the W_down loads. Every row's sum is the same
+ * expression in the same order (a thread's ten values in order, the wave sum, s_part[wave][r]); only when the loads are issued
+ * moves. */
+template <int RG, int DEPTH>
+__device__ __forceinline__ void hc_g_norm_rows_np(const unsigned short* __restrict__ h, long hrow, int c, int rr,
+                                                  int tid, int lane, int wave, float (*s_part)[RG]) {
+    uint32_t hv[DEPTH][kHcGPer];
+#pragma unroll
+    for (int d = 0; d < DEPTH && d < RG; ++d) {
+        const unsigned short* hr = h + (long)(d < rr ? d : rr - 1) * hrow + (long)c * kHcGN;
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) hv[d][p] = bfw(hr + tid + (long)p * kThreads);
+    }
+#pragma unroll
+    for (int r = 0; r < RG; ++r) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) { const float v = bfw_f(hv[r % DEPTH][p]); acc += v * v; }
+        if (r + DEPTH < RG) {
+            const int rn = r + DEPTH;
+            const unsigned short* hr = h + (long)(rn < rr ? rn : rr - 1) * hrow + (long)c * kHcGN;
+#pragma unroll
+            for (int p = 0; p < kHcGPer; ++p) hv[r % DEPTH][p] = bfw(hr + tid + (long)p * kThreads);
+        }
+        acc = wave_sum(acc);
+        if (lane == 0) s_part[wave][r] = acc;
+    }
+}
+
 /* fn4 BI (hc_bi 5, 12.11.2026; 204: the one-launch read +24..35 % at 64 rows): form G's kernel A' at 16 rows a block -- the
  * WMMA's full A height, half the blocks and half the weight loads of 8-row groups -- with N built in registers from h and
  * the norm weight (staged in LDS) instead of an [RG][n] LDS plane (16 rows would not fit). Every element of N is the same
  * expression in the same order (bf16(bf16(h) * scale * (w + wadd))), the scales the same per-row sums, the dots the same
  * WMMA sequence a row: each row's bytes are form G's (and its alone read's). Rows h must be 16-byte aligned. */
-template <int RG, bool CH>
+template <int RG, bool CH, bool TL = false, bool NP = false>
 __device__ __forceinline__ void hc_read_g16_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2334,6 +2606,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
     constexpr long HN = hc * kHcGN;
     constexpr long NG = HN / r4d_hc8::kDownGroup;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(0, 0);
     const int t = (int)blockIdx.x / hc, c = (int)blockIdx.x % hc;
     const bool itile = t == ntd;
     /* This block's row group: rows r0 .. r0 + rr - 1 of the step (RG a group, the last may be short). */
@@ -2349,6 +2622,10 @@ __device__ __forceinline__ void hc_read_g16_down_body(
     const long kslice = (long)c * kHcGN + (long)wave * kHcGSlice;   /* the wave's first K */
     const long kl = kslice + 16 * hh;                                /* the lane half's */
 
+    /* lever HCO bit 4: the norm rows first, their loads ahead (hc_g_norm_rows_np), then the constant operands (unchained
+     * only: h is read before the chain wait's place) */
+    static_assert(!(NP && CH), "the NP norm reads h before the chain wait");
+    if constexpr (NP) hc_g_norm_rows_np<RG, 4>(h, hrow, c, rr, tid, lane, wave, s_part);
     /* ---- constant operands, before the chain wait */
     uint4 wc[kHcGChunks];
     float wsc[3] = { 0.0f, 0.0f, 0.0f };
@@ -2377,6 +2654,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
 
     /* ---- the grouped norm of stream c for every row: form G's sums (a thread's ten elements in order, the wave sum,
      * the waves in order) */
+    if constexpr (!NP)
     for (int r = 0; r < RG; ++r) {
         const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
         uint32_t hv[kHcGPer];
@@ -2389,6 +2667,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
         if (lane == 0) s_part[wave][r] = acc;
     }
     __syncthreads();
+    hc_tl_put<TL>(0, 1);
     if (tid < RG) {
         float ss = 0.0f;
         for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
@@ -2396,6 +2675,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
         if (t == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
     }
     __syncthreads();
+    hc_tl_put<TL>(0, 2);
 
     /* ---- the dots: rows of N as A (rows past RG repeat the last; their D rows are dropped) */
     const int  rowl = col < rr ? col : rr - 1;
@@ -2467,6 +2747,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
 #pragma unroll
     for (int e = 0; e < 8; ++e) s_red[wave][col][8 * hh + e] = P[e];
     __syncthreads();
+    hc_tl_put<TL>(0, 3);
     const long pstride = (long)RG * kHcGTile;                 /* one stream's partials of a tile */
     float* const pt = part + (long)t * hc * pstride;
     if (tid < RG * kHcGTile) {
@@ -2483,7 +2764,8 @@ __device__ __forceinline__ void hc_read_g16_down_body(
         s_last = __hip_atomic_fetch_add(&tctr[t], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT)
                  + 1u == (unsigned)hc;
     __syncthreads();
-    if (!s_last) return;
+    hc_tl_put<TL>(0, 4);
+    if (!s_last) { hc_tl_end<TL>(0, 0u); return; }
     /* Every wave: a workgroup's waves may sit on both CUs of a WGP, each with its own cache. The
      * reset goes after the payload, so this acquire waits for no store. */
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -2508,6 +2790,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
             inj[(long)r * irow + n] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
         }
     }
+    hc_tl_end<TL>(0, 1u);
 }
 
 /* fn4 BI (hc_bi 5, 12.11.2026; x17: G16 at 64 rows still +35 % over today's forms): G16 with TWO 16-column tiles a block
@@ -2515,7 +2798,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
  * half the h reads), the two tiles' WMMAs fed by the same A fragments. Per tile the arithmetic is G16's (the same chunk
  * order, the same group-scale folds, the same wave and stream sums), so every row's bytes are G16's = form G's. The inject
  * tile (bf16 gains) keeps a block of its own: blocks p < ntd / 2 take tiles 2p, 2p + 1; block ntd / 2 the inject tile. */
-template <int RG, bool CH, bool PRE = false, int NTB = 2>
+template <int RG, bool CH, bool PRE = false, int NTB = 2, bool TL = false, bool NP = false>
 __device__ __forceinline__ void hc_read_g16p_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2531,6 +2814,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
     constexpr long HN = hc * kHcGN;
     constexpr long NG = HN / r4d_hc8::kDownGroup;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(0, 0);
     const int pb = (int)blockIdx.x / hc, c = (int)blockIdx.x % hc;
     const int npairs = ntd / NTB;
     const bool itile = pb == npairs;
@@ -2550,6 +2834,9 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
     const long kslice = (long)c * kHcGN + (long)wave * kHcGSlice;
     const long kl = kslice + 16 * hh;
 
+    /* lever HCO bit 4: the norm rows first, their loads ahead (hc_g_norm_rows_np), then the constant operands */
+    static_assert(!(NP && CH), "the NP norm reads h before the chain wait");
+    if constexpr (NP && !PRE) hc_g_norm_rows_np<RG, 4>(h, hrow, c, rr, tid, lane, wave, s_part);
     /* ---- constant operands, before the chain wait */
     uint4 wc[NTB][kHcGChunks];
     float wsc[NTB][3];
@@ -2587,6 +2874,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         __syncthreads();
     } else {
     /* ---- the grouped norm: G16's (= form G's) sums */
+        if constexpr (!NP)
         for (int r = 0; r < RG; ++r) {
             const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
             uint32_t hv[kHcGPer];
@@ -2599,6 +2887,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
             if (lane == 0) s_part[wave][r] = acc;
         }
         __syncthreads();
+        hc_tl_put<TL>(0, 1);
         if (tid < RG) {
             float ss = 0.0f;
             for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
@@ -2606,6 +2895,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
             if (pb == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
         }
         __syncthreads();
+        hc_tl_put<TL>(0, 2);
     }
 
     const int  rowl = col < rr ? col : rr - 1;
@@ -2693,6 +2983,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
             for (int e = 0; e < 8; ++e) s_red[u][wave][col][8 * hh + e] = P[u][e];
         }
     __syncthreads();
+    hc_tl_put<TL>(0, 3);
     const long pstride = (long)RG * kHcGTile;
     for (int u = 0; u < nt_here; ++u) {
         float* const pt = part + (long)tt[u] * hc * pstride;
@@ -2709,6 +3000,7 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         for (int u = 0; u < nt_here; ++u)
             s_last[u] = __hip_atomic_fetch_add(&tctr[tt[u]], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1u == (unsigned)hc;
     __syncthreads();
+    hc_tl_put<TL>(0, 4);
     for (int u = 0; u < nt_here; ++u) {
         if (!s_last[u]) continue;
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -2732,11 +3024,16 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         __syncthreads();
         if (tid == 0) __hip_atomic_store(&tctr[tt[u]], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
+    if constexpr (TL) {
+        unsigned fl = 0;
+        for (int u = 0; u < nt_here; ++u) fl |= s_last[u] ? (1u << u) : 0u;
+        hc_tl_end<TL>(0, fl);
+    }
 }
 /* fn4 BI (hc_readv bit 9): form G's per-row norm scales once a (stream, 16-row group), for G16p's PRE form -- the same
  * thread mapping (ten elements a thread in order), the wave sum, the waves in order, the same __frsqrt_rn. */
 __global__ __launch_bounds__(kThreads)
-void hc_g_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout, long hrow, float eps, long rows) {
+void hc_g_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout, long hrow, float eps, long rows) { R4D_IKA_ENTRY();
     __shared__ float s_part[kWaves][16];
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const int c = (int)blockIdx.x;
@@ -2769,7 +3066,7 @@ void hc_read_g16pp_down_kernel(const unsigned short* __restrict__ h, const float
                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                float* __restrict__ scaleout, float* __restrict__ part,
                                unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                               float eps, float wadd, int ntd, long rows) {
+                               float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                             hrow, irow, eps, wadd, ntd, rows);
 }
@@ -2781,9 +3078,111 @@ void hc_read_g16q_down_kernel(const unsigned short* __restrict__ h, const float*
                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                               float* __restrict__ scaleout, float* __restrict__ part,
                               unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                              float eps, float wadd, int ntd, long rows) {
+                              float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false, false, 4>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                                 hrow, irow, eps, wadd, ntd, rows);
+}
+/* qfn-on-ds lever HCO (RADIANCE_FN4_HC_OCC bit 1): A' G16p with the register budget of 8 waves a SIMD (<= 192 VGPRs: 4 blocks a WGP
+ * resident instead of 3 at 194; LDS 27,208 B x 4 fits). The same body and arithmetic: every output byte is
+ * hc_read_g16p_down_kernel<16>'s. R6 (hctl1): at 64 / 128 rows A' runs 2.2 / 4.1 rounds of ~10-13 us blocks at 3 a WGP. */
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void hc_read_g16p_down_o_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                const unsigned char* __restrict__ downv, long dld,
+                                const unsigned short* __restrict__ injw,
+                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                float* __restrict__ scaleout, float* __restrict__ part,
+                                unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
+    hc_read_g16p_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                      hrow, irow, eps, wadd, ntd, rows);
+}
+/* qfn-on-ds lever HCO bit 4: A' with the norm rows' loads ahead (NP), at today's budget (np) or with bit 1's (onp); G16 np */
+#define HC_G16_ARGS_DECL const unsigned short* __restrict__ h, const float* __restrict__ w,                              \
+                         const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,     \
+                         unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,                            \
+                         float* __restrict__ scaleout, float* __restrict__ part, unsigned int* __restrict__ tctr, long lr, \
+                         long hrow, long irow, float eps, float wadd, int ntd, long rows
+#define HC_G16_ARGS h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows
+template <int RG>
+__global__ __launch_bounds__(kThreads) void hc_read_g16p_down_np_kernel(HC_G16_ARGS_DECL) { R4D_IKA_ENTRY();
+    hc_read_g16p_down_body<RG, false, false, 2, false, true>(HC_G16_ARGS);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_read_g16p_down_onp_kernel(HC_G16_ARGS_DECL) { R4D_IKA_ENTRY();
+    hc_read_g16p_down_body<RG, false, false, 2, false, true>(HC_G16_ARGS);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads) void hc_read_g16_down_np_kernel(HC_G16_ARGS_DECL) { R4D_IKA_ENTRY();
+    hc_read_g16_down_body<RG, false, false, true>(HC_G16_ARGS);
+}
+#undef HC_G16_ARGS
+#undef HC_G16_ARGS_DECL
+/* qfn-on-ds Q17 (bench only, r4d_hc_tl): A' G16 / G16p with the phase timeline, region 0 */
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16p_down_tl_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                 const unsigned char* __restrict__ downv, long dld,
+                                 const unsigned short* __restrict__ injw,
+                                 unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                 float* __restrict__ scaleout, float* __restrict__ part,
+                                 unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                 float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
+    asm volatile("" ::: "v193");
+    hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                      hrow, irow, eps, wadd, ntd, rows);
+}
+/* qfn-on-ds Q17 / HCO (bench only): the timelines of HCO's A' instances at their budgets -- bit 1 (o: <= 192 VGPRs), bit 4 G16p
+ * (np: 191 untimed -> held <= 192) and G16 (np: 126 untimed -> held in the 121-144 granule by a clobber of v125) */
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void hc_read_g16p_down_tl_o_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                   const unsigned char* __restrict__ downv, long dld,
+                                   const unsigned short* __restrict__ injw,
+                                   unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                   float* __restrict__ scaleout, float* __restrict__ part,
+                                   unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                   float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
+    hc_read_g16p_down_body<RG, false, false, 2, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                      hrow, irow, eps, wadd, ntd, rows);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void hc_read_g16p_down_tl_np_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                    const unsigned char* __restrict__ downv, long dld,
+                                    const unsigned short* __restrict__ injw,
+                                    unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                    float* __restrict__ scaleout, float* __restrict__ part,
+                                    unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                    float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
+    hc_read_g16p_down_body<RG, false, false, 2, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                            hrow, irow, eps, wadd, ntd, rows);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16_down_tl_np_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                   const unsigned char* __restrict__ downv, long dld,
+                                   const unsigned short* __restrict__ injw,
+                                   unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                   float* __restrict__ scaleout, float* __restrict__ part,
+                                   unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                   float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
+    asm volatile("" ::: "v125");
+    hc_read_g16_down_body<RG, false, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                                 hrow, irow, eps, wadd, ntd, rows);
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16_down_tl_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                const unsigned char* __restrict__ downv, long dld,
+                                const unsigned short* __restrict__ injw,
+                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                float* __restrict__ scaleout, float* __restrict__ part,
+                                unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
+    asm volatile("" ::: "v129");
+    hc_read_g16_down_body<RG, false, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                           hrow, irow, eps, wadd, ntd, rows);
 }
 template <int RG>
 __global__ __launch_bounds__(kThreads)
@@ -2793,7 +3192,7 @@ void hc_read_g16p_down_kernel(const unsigned short* __restrict__ h, const float*
                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                               float* __restrict__ scaleout, float* __restrict__ part,
                               unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                              float eps, float wadd, int ntd, long rows) {
+                              float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16p_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                       hrow, irow, eps, wadd, ntd, rows);
 }
@@ -2819,7 +3218,7 @@ void hc_read_g16_down_kernel(const unsigned short* __restrict__ h, const float* 
                              unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                              float* __restrict__ scaleout, float* __restrict__ part,
                              unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
-                             float eps, float wadd, int ntd, long rows) {
+                             float eps, float wadd, int ntd, long rows) { R4D_IKA_ENTRY();
     hc_read_g16_down_body<RG, false>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
                                      hrow, irow, eps, wadd, ntd, rows);
 }
@@ -2904,7 +3303,7 @@ void hc_read_fused_kernel(const unsigned short* __restrict__ h, const float* __r
                           long rows, long n, int hc, long lr, long hrow, long xrow,
                           long qrow, long srow, long rqrow, long rsrow, float wadd,
                           unsigned int* __restrict__ sync,
-                          unsigned na, unsigned gxa, unsigned gxb, unsigned nb_all) {
+                          unsigned na, unsigned gxa, unsigned gxb, unsigned nb_all) { R4D_IKA_ENTRY();
     hc_read_fused_kernel_body<RG, I8, RPT, HCP, PER>(h, w, downv, dld, injw, dbuf, inj, scale, ta, irow, eps, upv, uld, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd, sync, na, gxa, gxb, nb_all);
 }
 template <int RG, bool I8, int RPT, int HCP, int PER>
@@ -2997,7 +3396,7 @@ void hc_read_a_2grid_kernel(const unsigned short* __restrict__ h, const float* _
                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                       float* __restrict__ scaleout,
                       long rows, long n, int hc, long lr, long ta, long hrow, long irow,
-                      float eps, float wadd) {
+                      float eps, float wadd) { R4D_IKA_ENTRY();
     extern __shared__ unsigned short sN[];          /* [hc * n], transposed per 256-element chunk */
     __shared__ float s_part[kWaves][kHcMax];
     __shared__ float s_scale[kHcMax];
@@ -3142,7 +3541,7 @@ void hc_up_mix_2grid_kernel(const void* __restrict__ upv, long uld,
                       float* __restrict__ qs, unsigned char* __restrict__ rq,
                       float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                       long rows, long n, int hc, long lr, long hrow, long xrow,
-                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                      long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     extern __shared__ float sd[];                   /* [RG * lr] */
     __shared__ unsigned short s_stage[kWaves][kWave * 8];   /* wave_dot_lds, one slot a wave */
     __shared__ unsigned short s_u[RG * kUpRows];
@@ -3350,7 +3749,7 @@ void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict
                    float* __restrict__ qs, unsigned char* __restrict__ rq,
                    float* __restrict__ rqs,
                    long rows, long n, int hc, long hrow, long xrow,
-                   long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                   long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     __shared__ float s_x[kUpTB];
     __shared__ float s_amax[kWaves];
 
@@ -3473,7 +3872,7 @@ __device__ __forceinline__ void hc_norm_scale_kernel_body(const unsigned short* 
 /* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
 __global__ __launch_bounds__(kThreads)
 void hc_norm_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
-                          long rows, long n, long hrow, float eps) {
+                          long rows, long n, long hrow, float eps) { R4D_IKA_ENTRY();
     hc_norm_scale_kernel_body(h, scaleout, rows, n, hrow, eps);
 }
 __global__ __launch_bounds__(kThreads)
@@ -3621,7 +4020,7 @@ void hc_down_tiled_kernel(const unsigned short* __restrict__ h, const float* __r
                           unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                           float* __restrict__ part,
                           long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                          long kc, float wadd) {
+                          long kc, float wadd) { R4D_IKA_ENTRY();
     hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
 }
 template <int RT, int NT, bool F8>
@@ -3656,7 +4055,7 @@ void hc_down_tiled_pipe_kernel(const unsigned short* __restrict__ h, const float
                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                                float* __restrict__ part,
                                long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                               long kc, float wadd) {
+                               long kc, float wadd) { R4D_IKA_ENTRY();
     constexpr int NT = kTNT;
     __shared__ unsigned short sA[RT * kTAP];
     __shared__ unsigned short sB[NT * kTAP];
@@ -3825,7 +4224,7 @@ __device__ __forceinline__ void hc_down_reduce_kernel_body(const float* __restri
 __global__ __launch_bounds__(kThreads)
 void hc_down_reduce_kernel(const float* __restrict__ part, unsigned short* __restrict__ dout,
                            unsigned short* __restrict__ inj, long rows, long lr, long ncol,
-                           long irow, int ksplit, float inv_hc) {
+                           long irow, int ksplit, float inv_hc) { R4D_IKA_ENTRY();
     hc_down_reduce_kernel_body(part, dout, inj, rows, lr, ncol, irow, ksplit, inv_hc);
 }
 __global__ __launch_bounds__(kThreads)
@@ -3917,7 +4316,7 @@ void hc_down_tiled_fr_kernel(const unsigned short* __restrict__ h, const float* 
                              unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                              float* __restrict__ part,
                              long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                             long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+                             long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) { R4D_IKA_ENTRY();
     hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
     hc_down_fold_reduce_tail<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
 }
@@ -4008,7 +4407,7 @@ void hc_down_tiled_fr2_kernel(const unsigned short* __restrict__ h, const float*
                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                               float* __restrict__ part,
                               long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                              long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+                              long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) { R4D_IKA_ENTRY();
     hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
     hc_down_fold_reduce_tail_v2<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
 }
@@ -4103,19 +4502,33 @@ static bool hc_write_vec(long rows) {
  * product at 32 rows a workgroup (hc_down_pf2_r32_kernel), bit 2 PF2's norm scales inside the down product
  * (hc_down_pf2_fs_kernel; lost in 138), bit 3 the norm scales from the preceding hc_write (W1b: hc_write's
  * optional `ss` output, the read's optional `ss` input, both [rows][kHcMax] f32, used from kHcSsMinRows rows;
- * see hc_ss_on), bits 4-5 the codes stage's groups a wave (W2, hc_quant_rows_g_kernel: 0 one, 1 two, 2 four, 3 five).
- * -1 until the environment is read. */
+ * see hc_ss_on), bits 4-5 the codes stage's groups a wave (W2, hc_quant_rows_g_kernel: 0 one, 1 two, 2 four, 3 five);
+ * bits 6-10 the bi_dec kernel-A' forms (G16, PF2 column split, G16p, scales once, G16q); bits 11-12 (qfn-on-ds lever B3R)
+ * kernel B3 under bi_dec past 16 rows with 1 (0, today), 2 (1), 4 (2) or every (3) 16-row group a block (b3r_gpb); bit 13
+ * (qfn-on-ds lever HWC) hc_write in its chained forms (hc_write_chain). -1 until the environment is read. */
 static std::atomic<int> g_hc_readv{-1};
 static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 2047) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 16383) : 0;
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
     }
     return v;
+}
+/* qfn-on-ds lever HWC (hc_readv bit 13, Qwen loop round 19): hc_write in its chained forms where its row chains, up to
+ * kHcWriteChainRows rows. The engine read (test ms15, in process A B B A 363 / 8555): full-row step 32 rows 24.20 / 24.24 ->
+ * 23.93 / 23.92 ms, 64 rows 34.94 / 34.96 -> 35.21 / 35.24 ms, 128 rows 52.46 / 52.36 -> 52.36 / 52.25 ms, 5 / 25 rows
+ * unchanged: a gain at 32 rows, a loss at 64 -- so the chain rule's own bound (r4d_chain_rows_ok, 32 rows) now. */
+constexpr long kHcWriteChainRows = kR4dChainMaxRows;
+static bool hc_write_chain() { return (hc_readv() & 8192) != 0; }
+/* qfn-on-ds lever B3R: 16-row groups a block of kernel B3 under bi_dec at `rows` decode rows (hc_readv bits 11-12) */
+static int b3r_gpb(long rows) {
+    const int code = (hc_readv() >> 11) & 3;
+    const long gy = (rows + 15) / 16;
+    return code == 0 ? 1 : code == 1 ? 2 : code == 2 ? 4 : (int)gy;
 }
 /* fn4 SP-serial (14.11.2026, switch hc_pinpf2, RADIANCE_FN4_HC_PINPF2 at start): 1 = a read whose K split is pinned to a
  * taller height (kc_rows > rows: SP's part reads) takes the PF2 form below kPf2MinRows too, where its band's `u` holds the
@@ -4193,9 +4606,11 @@ static int hc_bi() {
  * its recording (its plays do not call the launcher; the tape's issue check keeps them the same launches), a
  * profiled run issues every step live. Cumulative lines "fn4 formctr dev D readv V hc_bi B: FORM calls/rows-mean/max
  * [bd N] ..." to stderr at most every 2 s at an issue, and before any fn4 switch lands (rad_fn4_switch). */
-enum { kFcPf2, kFcTiled, kFcFused, kFcS, kFcG16q, kFcG16pp, kFcG16p, kFcG16, kFcG, kFcRowA, kFcA2, kFcApre, kFcA, kFcN };
+/* B3R (qfn-on-ds lever, hc_readv bits 11-12) counts kernel B3's grouped form beside the call's kernel-A' form, so a read
+ * that takes it is counted twice (once A's form, once B3R). */
+enum { kFcPf2, kFcTiled, kFcFused, kFcS, kFcG16q, kFcG16pp, kFcG16p, kFcG16, kFcG, kFcRowA, kFcA2, kFcApre, kFcA, kFcB3R, kFcN };
 static const char* const kFcName[kFcN] = {"pf2", "tiled", "fused", "S", "G16q", "G16pp", "G16p", "G16", "G", "rowA",
-                                          "A2", "Apre", "A"};
+                                          "A2", "Apre", "A", "B3R"};
 static std::atomic<unsigned long long> g_fc_calls[16][kFcN], g_fc_rows[16][kFcN], g_fc_bd[16][kFcN];
 static std::atomic<long> g_fc_max[16][kFcN];
 static std::atomic<long long> g_fc_last{0};
@@ -4242,6 +4657,40 @@ static void fc_add(int f, long rows, bool bd) {
  * 2 the down product, 4 the split-K reduce, 8 the up-mix, 16 the codes. A mask other than 31
  * leaves the outputs incomplete; r4d_selftest --perfhcv times the cumulative masks. */
 static std::atomic<int> g_hc_pf2_stages{31};
+/* qfn-on-ds Q17 (bench only): r4d_hc_tl(1) = the bi_dec read's A' (G16 / G16p) and B3 (16-row groups) launch their TL copies */
+static std::atomic<int> g_hc_tl{0};
+/* qfn-on-ds lever HCO: RADIANCE_FN4_HC_OCC bit mask (read once; r4d_hc_occ sets it): 1 A' G16p, 2 B3 at 16-row groups in their
+ * occupancy instances (hc_read_g16p_down_o_kernel / hc_up_w_o_kernel); 4 A' G16 / G16p with the norm rows' loads ahead
+ * (hc_g_norm_rows_np; with 1: G16p's onp instance). 0 / unset = today's kernels. -1 until read. */
+static std::atomic<int> g_hc_occ{-1};
+static int hc_occ() {
+    int v = g_hc_occ.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_OCC");
+        int want = -1;
+        g_hc_occ.compare_exchange_strong(want, (e && *e) ? (std::atoi(e) & 7) : 0, std::memory_order_relaxed);
+        v = g_hc_occ.load(std::memory_order_relaxed);
+        if (v > 0) std::fprintf(stderr, "radiance: libr4d: lever HCO (RADIANCE_FN4_HC_OCC=%d): the bi_dec read's%s%s%s (the same "
+                                        "bytes)\n", v, (v & 1) ? " A' G16p at the occupancy register budget;" : "",
+                                (v & 2) ? " B3 (16-row groups) at the occupancy register budget;" : "",
+                                (v & 4) ? " A' G16 / G16p with the norm rows' loads ahead" : "");
+    }
+    return v;
+}
+
+/* qfn-on-ds (Qwen loop round 7, QUEUE Q17): RADIANCE_FN4_HC_PRE_MIN=N (read once) -- hc_readv bit 9's form (G16pp: the norm
+ * scales once a (stream, group), then G16p reading them) only for bi_dec reads of at least N rows; below it the read takes the
+ * form bits 8 / 6 give (G16p from 32 rows, else G16). G16 / G16p / G16pp give the same bytes (their notes), so the floor moves
+ * no answer. 0 / unset = no floor (bit 9 as before). */
+static int hc_pre_min() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_PRE_MIN");
+        const int n = (e && *e) ? std::atoi(e) : 0;
+        if (n > 0) std::fprintf(stderr, "radiance: libr4d: hc_readv bit 9 (G16pp) from %d rows (RADIANCE_FN4_HC_PRE_MIN)\n", n);
+        return n > 0 ? n : 0;
+    }();
+    return v;
+}
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -4265,7 +4714,7 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
                          unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                          float* __restrict__ part,
                          long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
-                         long kc, float wadd) {
+                         long kc, float wadd) { R4D_IKA_ENTRY();
     constexpr int RT = kWideRT, NT16 = NT / 16;
     constexpr int kKV = kTKT / 8;                              /* 16-byte vectors a staged row */
     constexpr int kRS = kThreads / kKV;                        /* rows between a thread's A rows */
@@ -4435,7 +4884,7 @@ template <int RT, int NT, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_up_tiled_kernel(const void* __restrict__ upv, long uld,
                         const unsigned short* __restrict__ dbuf,
-                        unsigned short* __restrict__ ubuf, long rows, long hn, long lr) {
+                        unsigned short* __restrict__ ubuf, long rows, long hn, long lr) { R4D_IKA_ENTRY();
     __shared__ unsigned short sA[RT * kTAP];
     __shared__ unsigned short sB[NT * kTAP];
 
@@ -4815,7 +5264,7 @@ void hc_up_mix_tiled_p64_kernel(const void* __restrict__ upv, long uld,
                                 float* __restrict__ qs, unsigned char* __restrict__ rq,
                                 float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                                 long rows, long n, int hc, long lr, long hrow, long xrow,
-                                long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                                long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     hc_up_mix_tiled_kernel_body<RT, NT, F8, I8, true>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd);
 }
 /* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
@@ -4829,7 +5278,7 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
                             float* __restrict__ qs, unsigned char* __restrict__ rq,
                             float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                             long rows, long n, int hc, long lr, long hrow, long xrow,
-                            long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                            long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     hc_up_mix_tiled_kernel_body<RT, NT, F8, I8>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd);
 }
 template <int RT, int NT, bool F8, bool I8 = false>
@@ -4860,7 +5309,7 @@ void hc_up_mix_tiled_2grid_kernel(const void* __restrict__ upv, long uld,
                             float* __restrict__ qs, unsigned char* __restrict__ rq,
                             float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                             long rows, long n, int hc, long lr, long hrow, long xrow,
-                            long qrow, long srow, long rqrow, long rsrow, float wadd) {
+                            long qrow, long srow, long rqrow, long rsrow, float wadd) { R4D_IKA_ENTRY();
     __shared__ unsigned short sA[RT * kTAP];
     __shared__ unsigned short sB[NT * kTAP];
     __shared__ unsigned short s_u[RT * NT];
@@ -5040,7 +5489,7 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
                            const unsigned short* __restrict__ h, const float* __restrict__ w,
                            const float* __restrict__ scalein,
                            unsigned short* __restrict__ x,
-                           long rows, long n, long lr, long hrow, long xrow, float wadd) {
+                           long rows, long n, long lr, long hrow, long xrow, float wadd) { R4D_IKA_ENTRY();
     constexpr int CH = kWideCH, NT = HC * CH;
     constexpr int MW = RT / 16 / kWaves;                        /* m-tiles a wave */
     static_assert(MW >= 1 && MW * 16 * kWaves == RT, "the waves cover the rows");
@@ -5204,7 +5653,7 @@ void hc_up_mix_pf3_kernel(const unsigned short* __restrict__ ub, long lr_,
                           const unsigned short* __restrict__ h, const float* __restrict__ w,
                           const float* __restrict__ scalein,
                           unsigned short* __restrict__ x,
-                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) { R4D_IKA_ENTRY();
     constexpr int HC = 4, NT = HC * CH, NTT = NT / 16, PPC = CH / 16;
     constexpr int MW = RT / 16 / kWaves;
     static_assert(MW >= 1 && MW * 16 * kWaves == RT && CH % 16 == 0, "the waves cover the rows");
@@ -5346,7 +5795,7 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
                           const unsigned short* __restrict__ h, const float* __restrict__ w,
                           const float* __restrict__ scalein,
                           unsigned short* __restrict__ x,
-                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) { R4D_IKA_ENTRY();
     constexpr int HC = 4, CH = 16, NT = HC * CH;
     constexpr int MW = RT / 16 / kWaves, KST = kTKT / 16;
     constexpr int NSL = LR / kTKT;   /* slices */
@@ -5487,7 +5936,7 @@ __global__ __launch_bounds__(kThreads)
 void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
                           float* __restrict__ qs, unsigned char* __restrict__ rq,
                           float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
-                          long srow, long rqrow, long rsrow) {
+                          long srow, long rqrow, long rsrow) { R4D_IKA_ENTRY();
     const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const long item = (long)blockIdx.x * kWaves + wave;
     if (item >= rows * ngrp) return;
@@ -5505,7 +5954,7 @@ __global__ __launch_bounds__(kThreads)
 void hc_quant_rows_g_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
                             float* __restrict__ qs, unsigned char* __restrict__ rq,
                             float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
-                            long srow, long rqrow, long rsrow) {
+                            long srow, long rqrow, long rsrow) { R4D_IKA_ENTRY();
     const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const long npr = ngrp / G;
     const long item = (long)blockIdx.x * kWaves + wave;
@@ -5819,10 +6268,10 @@ __device__ __forceinline__ float hc_write_scale_wave(unsigned short* hp, const u
 /* hc_write with the next read's norm scales (fn4 hc_readv bit 3): one wave a (row, stream), a workgroup two rows'
  * four streams (so the four waves of a row read its `y` together, from cache after the first). `ssout` is
  * [rows][kHcMax], the read's scale layout. n a multiple of 256, every base and pitch 16-byte aligned. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
-                        unsigned short* __restrict__ h, float* __restrict__ ssout,
-                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
+__device__ __forceinline__
+void hc_write_ss_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                             unsigned short* __restrict__ h, float* __restrict__ ssout,
+                             long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
     __shared__ float s_t[kWaves][kThreads];
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long p = (long)blockIdx.x * kWaves + wave;
@@ -5833,6 +6282,20 @@ void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned sho
     const float sc = hc_write_scale_wave(h + r * hrow + (long)c * n, y + r * yrow, g, n, eps, lane, s_t[wave]);
     if (lane == 0) ssout[r * kHcMax + c] = sc;
 }
+__global__ __launch_bounds__(kThreads)
+void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                        unsigned short* __restrict__ h, float* __restrict__ ssout,
+                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) { R4D_IKA_ENTRY();
+    hc_write_ss_kernel_body(y, inj, h, ssout, rows, n, hc, yrow, irow, hrow, eps);
+}
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_write_ss(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                          unsigned short* __restrict__ h, float* __restrict__ ssout,
+                          long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
+    r4d_chain_wait();
+    hc_write_ss_kernel_body(y, inj, h, ssout, rows, n, hc, yrow, irow, hrow, eps);
+    r4d_chain_done();
+}
 
 __global__ __launch_bounds__(kThreads)
 void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
@@ -5841,7 +6304,7 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
                         const unsigned short* __restrict__ injw,
                         const unsigned char* __restrict__ up8, long uld,
                         uint4* __restrict__ plane, unsigned short* __restrict__ udec,
-                        long lr, long ncol, long ntt) {
+                        long lr, long ncol, long ntt) { R4D_IKA_ENTRY();
     __shared__ float s_t[kWaves][kThreads];
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long HN = (long)hc * n;
@@ -6068,7 +6531,7 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
                         unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                         float* __restrict__ part,
                         long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
-                        long irow, long kc, float wadd) {
+                        long irow, long kc, float wadd) { R4D_IKA_ENTRY();
     hc_down_pf2_body<kPf2RT>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                              irow, kc, wadd);
 }
@@ -6080,7 +6543,7 @@ void hc_down_pf2_fs_kernel(const unsigned short* __restrict__ h, const float* __
                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                            float* __restrict__ part,
                            long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
-                           long irow, long kc, float wadd, float* __restrict__ scaleout, float eps) {
+                           long irow, long kc, float wadd, float* __restrict__ scaleout, float eps) { R4D_IKA_ENTRY();
     hc_down_pf2_body<RT, true>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                                irow, kc, wadd, scaleout, eps);
 }
@@ -6090,7 +6553,7 @@ void hc_down_pf2_r32_kernel(const unsigned short* __restrict__ h, const float* _
                             unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
                             float* __restrict__ part,
                             long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
-                            long irow, long kc, float wadd) {
+                            long irow, long kc, float wadd) { R4D_IKA_ENTRY();
     hc_down_pf2_body<32>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                          irow, kc, wadd);
 }
@@ -6136,7 +6599,7 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
                             const void* __restrict__ fchv, const void* __restrict__ fcev, long fld,
                             unsigned short* __restrict__ x,
                             long rows, long n, int hc, int flat, float eps, float wadd,
-                            long hrow, long erow, long xrow) {
+                            long hrow, long erow, long xrow) { R4D_IKA_ENTRY();
     __shared__ unsigned short sAh[RT * kTAP];
     __shared__ unsigned short sAe[RT * kTAP];
     __shared__ unsigned short sBh[NT * kTAP];
@@ -6406,7 +6869,7 @@ void mtp_prefill_scale_kernel(const unsigned short* __restrict__ h,
                               const unsigned short* __restrict__ e,
                               float* __restrict__ rs, float* __restrict__ re,
                               long rows, long n, int hc, int flat, float eps, long hrow,
-                              long erow) {
+                              long erow) { R4D_IKA_ENTRY();
     const int  lane = threadIdx.x & (kWave - 1);
     const long row  = (long)blockIdx.x * kWaves + threadIdx.x / kWave;
     const long R    = rows * hc;
@@ -6448,7 +6911,7 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
                              const float* __restrict__ gain, const float* __restrict__ rscale,
                              const void* __restrict__ fcv, long fld,
                              float* __restrict__ eterm, unsigned short* __restrict__ x,
-                             long rows, long n, int hc, float wadd, long xrow) {
+                             long rows, long n, int hc, float wadd, long xrow) { R4D_IKA_ENTRY();
     constexpr int BM = 2 * MP_TM * 16, BN = 4 * MP_TN * 16;
     constexpr int CPR = MP_BK / 8;                      /* 16-byte chunks a staged row */
     constexpr int AL = BM * CPR / kThreads, WL = BN * CPR / kThreads;
@@ -6914,6 +7377,11 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
      * (hc_norm_scale_kernel) into `ss`, so a read handed `ss` always finds them. `eps` is the read's; a write asked
      * for scales without it is refused rather than guessed. */
     const RadTensor* ss = hc_ss_operand(r4d_opt(a, HCW_SS), (long)rows);
+    /* qfn-on-ds lever HWC (hc_readv bit 13, Qwen loop round 19): the write's chained forms (r4d_chain.h: the same bodies between
+     * a wait and an add) where the row chains and the step holds at most kHcWriteChainRows rows. Past arw_rows the write
+     * sits between two chained kernels (the two-shot all-reduce before it, the read after it); its plain form kept the
+     * barrier bit on both sides (Qwen loop prof5 stamps: 96 + 85-94 ordered gaps a trunk pass at 32-128 rows). */
+    const bool ch = hc_write_chain() && r4d_geti_or(a, "chain", 0) != 0 && (long)rows <= kHcWriteChainRows;
     float eps = 0.0f;
     if (ss) {
         const double e = r4d_getf(a, "eps", -1.0);
@@ -6922,7 +7390,7 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
         if ((n % kThreads) == 0 && (yrow % 8) == 0 && (hrow % 8) == 0 &&
             ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
             const long nb = ((long)rows * hc + kWaves - 1) / kWaves;
-            return R4D_EMIT(stream, hc_write_ss_kernel, dim3((unsigned)nb), dim3(kThreads), 0,
+            return R4D_EMIT(stream, (ch ? &r4dchain_hc_write_ss : &hc_write_ss_kernel), dim3((unsigned)nb), dim3(kThreads), 0,
                             (const unsigned short*)y->data, (const unsigned short*)inj->data,
                             (unsigned short*)h->data, (float*)ss->data, (long)rows, (long)n, (int)hc,
                             (long)yrow, (long)irow, (long)hrow, eps);
@@ -6935,21 +7403,21 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
         ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
         const long items = (long)rows * (long)(n / 8);
         const unsigned vblocks = (unsigned)((items + kThreads - 1) / kThreads);
-        const int wrc = R4D_EMIT(stream, hc_write_vec_kernel, dim3(vblocks), dim3(kThreads), 0,
+        const int wrc = R4D_EMIT(stream, (ch ? &r4dchain_hc_write_vec : &hc_write_vec_kernel), dim3(vblocks), dim3(kThreads), 0,
                                  (const unsigned short*)y->data,
                                  (const unsigned short*)inj->data, (unsigned short*)h->data,
                                  (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
         if (wrc != RAD_OK || !ss) return wrc;
     } else {
         const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
-        const int wrc = R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
+        const int wrc = R4D_EMIT(stream, (ch ? &r4dchain_hc_write : &hc_write_kernel), dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
                                  (const unsigned short*)y->data,
                                  (const unsigned short*)inj->data, (unsigned short*)h->data,
                                  (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
         if (wrc != RAD_OK || !ss) return wrc;
     }
     /* The scales the fused form could not take: the read's own pass, into `ss`. */
-    return R4D_EMIT(stream, hc_norm_scale_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0,
+    return R4D_EMIT(stream, (ch ? &r4dchain_hc_norm_scale : &hc_norm_scale_kernel), dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0,
                     (const unsigned short*)h->data, (float*)ss->data, (long)rows, (long)n, (long)hrow, eps);
 }
 
@@ -7639,7 +8107,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                            (int)hcg_nt, (long)rows);
-    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch) {
+    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch && rows >= hc_pre_min()) {
         /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them */
         fc_add(kFcG16pp, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, &hc_g_scale_kernel, dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
@@ -7656,7 +8124,14 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone), from 32 rows (x19 / x21 one card:
          * 16 rows +4 % slower, 32 -6 %, 64 -7 %) */
         fc_add(kFcG16p, (long)rows, bidec);
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16> : &hc_read_g16p_down_kernel<16>),
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16>
+                               : g_hc_tl.load(std::memory_order_relaxed)
+                                   ? ((hc_occ() & 4) ? &hc_read_g16p_down_tl_np_kernel<16>
+                                      : (hc_occ() & 1) ? &hc_read_g16p_down_tl_o_kernel<16> : &hc_read_g16p_down_tl_kernel<16>)
+                               : (hc_occ() & 4) ? ((hc_occ() & 1) ? &hc_read_g16p_down_onp_kernel<16>
+                                                                  : &hc_read_g16p_down_np_kernel<16>)
+                               : (hc_occ() & 1) ? &hc_read_g16p_down_o_kernel<16>
+                               : &hc_read_g16p_down_kernel<16>),
                            dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
                            (const unsigned char*)down->data, (long)dld,
@@ -7665,7 +8140,11 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (int)hcg_nt, (long)rows);
     } else if (hcg && g16) {
         fc_add(kFcG16, (long)rows, bidec);
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16> : &hc_read_g16_down_kernel<16>),
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16>
+                               : g_hc_tl.load(std::memory_order_relaxed)
+                                   ? ((hc_occ() & 4) ? &hc_read_g16_down_tl_np_kernel<16> : &hc_read_g16_down_tl_kernel<16>)
+                               : (hc_occ() & 4) ? &hc_read_g16_down_np_kernel<16>
+                               : &hc_read_g16_down_kernel<16>),
                            dim3((unsigned)((hcg_nt + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
                            (const unsigned char*)down->data, (long)dld,
@@ -7722,10 +8201,32 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     if (bidec_r && !fused) return R4D_NO(RAD_E_SHAPE);
     if (hcw && bidec && !(g_hc_pf2_stages.load(std::memory_order_relaxed) & 8)) {
         /* fn4 test hook (timing only): under bi_dec, mask bit 3 off skips kernel B3 */
+    } else if (hcw && bidec && rows > 16 && !hcg_ch && b3r_gpb(rows) > 1) {
+        /* qfn-on-ds lever B3R (hc_readv bits 11-12): B3 with GPB 16-row groups a block, W_up loaded once a block */
+        const int  gpb = b3r_gpb(rows);
+        const long gy  = (rows + 15) / 16;
+        unsigned int* const qctr = q ? mctr : nullptr;
+        fc_add(kFcB3R, (long)rows, bidec);
+#define HC_UPW_GB(I8_)                                                                           \
+        R4D_EMIT(s, &hc_up_w_gb_kernel<I8_>, dim3((unsigned)(n / kHcBCh), (unsigned)((gy + gpb - 1) / gpb)), \
+                 dim3(kThreads), 0,                                                               \
+                 (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,          \
+                 (const unsigned short*)h->data, (const float*)w->data,                          \
+                 (const float*)scale, (unsigned short*)x->data,                                   \
+                 q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,           \
+                 rq ? (unsigned char*)rq->data : nullptr,                                         \
+                 rq ? (float*)rqs->data : nullptr, qctr, (long)rows, (long)n, (long)lr,           \
+                 (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,                     \
+                 (long)rsrow, wadd, gpb)
+        emit_rc = i8 ? HC_UPW_GB(true) : HC_UPW_GB(false);
+#undef HC_UPW_GB
     } else if (hcw) {
         unsigned int* const qctr = q ? mctr : nullptr;
 #define HC_UPW_K(RG_, I8_)                                                                       \
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_> : &hc_up_w_kernel<RG_, I8_>),  \
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_>                                 \
+                               : (RG_ == 16 && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_up_w_tl_kernel<16, I8_> \
+                               : (RG_ == 16 && (hc_occ() & 2)) ? &hc_up_w_o_kernel<16, I8_>     \
+                               : &hc_up_w_kernel<RG_, I8_>),                                     \
                            dim3((unsigned)(n / kHcBCh), (unsigned)((rows + RG_ - 1) / RG_)),    \
                            dim3(kThreads), 0,                                                     \
                            (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf, \
@@ -7787,7 +8288,7 @@ extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
-extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 2047), std::memory_order_relaxed); }
+extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 8191), std::memory_order_relaxed); }
 /* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
  * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
  * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
@@ -7808,18 +8309,49 @@ extern "C" void r4d_hc_mix_ctr_release() {
 extern "C" void r4d_hc_read_pinpf2(int on) { g_hc_pinpf2.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 5) ? 0 : v, std::memory_order_relaxed); }
 extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (m & 31), std::memory_order_relaxed); }
+/* qfn-on-ds Q17 (bench only): the per-block phase timeline (g_hc_tlp's note). r4d_hc_tl(1) on, r4d_hc_tl_reset() zeroes the
+ * records before a launch, r4d_hc_tl_read(out, region, max) copies min(max, 2048) records of 8 words of a region (0 A', 1 B3)
+ * after it; a block that did not run reads 0. */
+static unsigned long long* g_hc_tl_buf = nullptr;   /* the bench's device buffer (r4d_hc_tl) */
+constexpr size_t kHcTlBytes = (size_t)2 * kHcTlMax * kHcTlW * sizeof(unsigned long long);
+/* qfn-on-ds lever HCO (bench / test hook): the occupancy instances' mask, as RADIANCE_FN4_HC_OCC */
+extern "C" void r4d_hc_occ(int m) { g_hc_occ.store(m < 0 ? 0 : (m & 7), std::memory_order_relaxed); }
+extern "C" void r4d_hc_tl(int on) {
+    if (on && !g_hc_tl_buf) {
+        void* p = nullptr;
+        if (hipMalloc(&p, kHcTlBytes) != hipSuccess) return;
+        if (hipMemset(p, 0, kHcTlBytes) != hipSuccess || hipMemcpyToSymbol(HIP_SYMBOL(g_hc_tlp), &p, sizeof p) != hipSuccess) {
+            (void)hipFree(p); return;
+        }
+        g_hc_tl_buf = (unsigned long long*)p;
+    }
+    g_hc_tl.store(on && g_hc_tl_buf ? 1 : 0, std::memory_order_relaxed);
+}
+extern "C" int r4d_hc_tl_reset() {
+    if (!g_hc_tl_buf) return -1;
+    return hipMemset(g_hc_tl_buf, 0, kHcTlBytes) == hipSuccess && hipDeviceSynchronize() == hipSuccess ? 0 : -1;
+}
+extern "C" int r4d_hc_tl_read(unsigned long long* out, int region, int max) {
+    if (!g_hc_tl_buf || region < 0 || region > 1 || max <= 0) return -1;
+    const int n = max < kHcTlMax ? max : kHcTlMax;
+    return hipMemcpy(out, g_hc_tl_buf + (size_t)region * kHcTlMax * kHcTlW, (size_t)n * kHcTlW * sizeof(unsigned long long),
+                     hipMemcpyDeviceToHost) == hipSuccess ? n : -1;
+}
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
  * parked): hc_read's two forms, hc_write's eight-wide form, hc_read's faster forms (hc_readv) and the
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */
 extern "C" int r4d_ar_sdma_set(int on);   /* fn4 SDMA-AR (r4d_ar_entry.hip) */
-extern "C" int rad_fn4_switch(const char* name, int value) {
+extern "C" int r4d_rg_tail_set(int value);   /* qfn-on-ds lever RGT (r4d_moe.hip): the router's ranking per row tile */
+/* qfn-on-ds: the Qwen line's libr4d switches, reached through libr4d's one rad_fn4_switch (r4d_ds41_ggml.hip), which takes
+ * the ds41 line's names first and hands every other name here. */
+extern "C" void r4d_fn4_fc_dump_if_on() { if (fc_on()) fc_dump(); }
+extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!name) return 0;
-    if (fc_on()) fc_dump();   /* fn4 engagement counter: the counts up to this switch */
     if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value < 0 ? 0 : (value > 2 ? 2 : value), std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 2047) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles */
+        if (value < 0 || value > 16383) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained) */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -7831,9 +8363,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     }
     if (!std::strcmp(name, "ar_lanethreads")) return r4d_ar_lane_threads_set(value);
     if (!std::strcmp(name, "ar_xpush")) return r4d_ar_xpush_set(value);   /* fn4 RSF */
+    if (!std::strcmp(name, "ar_fence")) return r4d_ar_fence_set(value);   /* fn4 PFF (qwen/prefill) */
     if (!std::strcmp(name, "kvs_vic")) return r4d_kv_vic_set(value);   /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md) */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
+    if (!std::strcmp(name, "rg_tail")) return r4d_rg_tail_set(value);   /* qfn-on-ds lever RGT (r4d_moe.hip) */
     if (!std::strcmp(name, "hc_pinpf2")) {   /* fn4 SP-serial: pinned parts below kPf2MinRows through PF2 */
         if (value < 0 || value > 1) return -1;
         g_hc_pinpf2.store(value, std::memory_order_relaxed);

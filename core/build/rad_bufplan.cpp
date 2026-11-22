@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 
 namespace rad {
 
@@ -149,7 +150,7 @@ int plan_buffers(Program& p, BufPlanReport* rep) {
 /* ------------------------------------------------------------------ a smaller step's plan */
 
 int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLevel* out,
-               std::string* why) {
+               std::string* why, bool top) {
     auto refuse = [&](const std::string& w) {
         if (why) *why = w;
         return RAD_E_STATE;
@@ -203,13 +204,89 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
     }
 
     const int64_t tr_end = pack(transient);
-    for (const Item& it : transient) lv.offset[it.idx] = full.arena_fixed_bytes + it.off;
-    lv.end = full.arena_fixed_bytes + tr_end;
-    if (lv.end > full.arena_bytes)
+    /* tp8 loop M6F step (b): `top` packs the same transients against the arena's end instead of the fixed region's, so a
+     * pass at this level and one at a level below `begin` never share a byte (kBufAlign-aligned: arena_bytes is) */
+    lv.top = top;
+    lv.begin = top ? (full.arena_bytes - tr_end) / kBufAlign * kBufAlign : full.arena_fixed_bytes;
+    for (const Item& it : transient) lv.offset[it.idx] = lv.begin + it.off;
+    lv.end = lv.begin + tr_end;
+    if (lv.end > full.arena_bytes || lv.begin < full.arena_fixed_bytes)
         return refuse(fmt("packing the smaller buffers took %lld bytes, more than the full plan's "
-                          "%lld", (long long)lv.end, (long long)full.arena_bytes));
+                          "%lld", (long long)(full.arena_fixed_bytes + tr_end), (long long)full.arena_bytes));
     *out = std::move(lv);
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ the decode rung's rows */
+
+int shift_level(const ArenaLevel& lv, int64_t begin, int64_t arena_fixed_bytes, int64_t arena_bytes,
+                ArenaLevel* out, std::string* why) {
+    const int64_t at = (begin + kBufAlign - 1) / kBufAlign * kBufAlign;
+    const int64_t size = lv.end - lv.begin;
+    if (lv.top || lv.begin != arena_fixed_bytes || size < 0 || at < arena_fixed_bytes || at + size > arena_bytes) {
+        if (why)
+            *why = fmt("a %lld-row level of %lld bytes cannot start at %lld (the fixed region ends at %lld, the arena at %lld%s)",
+                       (long long)lv.rows, (long long)size, (long long)at, (long long)arena_fixed_bytes,
+                       (long long)arena_bytes, lv.top || lv.begin != arena_fixed_bytes ? "; not a bottom level" : "");
+        return RAD_E_STATE;
+    }
+    ArenaLevel s = lv;
+    const int64_t d = at - lv.begin;
+    for (size_t i = 0; i < s.offset.size(); ++i)
+        if (s.offset[i] >= lv.begin && s.offset[i] < lv.end && s.decl[i].kind == RAD_BUF_TRANSIENT &&
+            s.decl[i].domain != RAD_DOMAIN_HOST)
+            s.offset[i] += d;
+    s.begin = at;
+    s.end = at + size;
+    *out = std::move(s);
+    return RAD_OK;
+}
+
+/* Lever VA "arena" (RADIANCE_DS41_ARENA_DECODE_ROWS, Engine::probe_arena_levels): the decode rung's
+ * rows, from kArenaDecodeRowsMin to kArenaDecodeRowsMax and below the ladder's first rung `lo`.
+ *
+ * The ladder's 256-row floor is there because "a tiled kernel may write padding rows of its last
+ * tile". For deepseek41 that was audited kernel by kernel at every step of 1..64 rows (10.11.2026,
+ * libr4d and exl3r4d at the ds41-stack sources: every GEMM form -- gg_gemv, the multi-row forms, the
+ * 48-row WMMA and 32-row tiled ggml forms, bf16 m64, gemm_nt_f32's tiles --, the EXL3 expert GEMMs,
+ * the MoE sort / gather / gather all-reduce, attention's decode / WMMA / scalar forms, the indexer,
+ * the norms, mHC, rope and round trips, the lookups and the samplers): none stores a row at or past
+ * the rows it is issued for (each tiled store is guarded by min(r0 + tile, M)), and the plugin issues
+ * every activation over brows / bcol views of the step's rows, so no row count reaches a kernel from
+ * the level. Up to 64 rows is what the audit covers; a step at the rung has at most that many. */
+static constexpr int64_t kArenaDecodeRowsMin = 8, kArenaDecodeRowsMax = 64;
+std::vector<int64_t> arena_decode_rows_list(const char* s, std::string* bad) {
+    std::vector<int64_t> out;
+    if (bad) bad->clear();
+    if (!s) return out;
+    std::string w;
+    for (const char* p = s;; ++p) {
+        if (*p == ',' || *p == '\0') {
+            if (!w.empty()) {
+                char* end = nullptr;
+                const long long v = std::strtoll(w.c_str(), &end, 10);
+                if (end && *end == '\0' && v > 0) out.push_back((int64_t)v);
+                else if (bad) *bad += (bad->empty() ? "" : ",") + w;
+            }
+            w.clear();
+            if (*p == '\0') break;
+        } else if (*p != ' ') {
+            w += *p;
+        }
+    }
+    return out;
+}
+
+bool arena_decode_rows_ok(int64_t rows, int64_t lo, std::string* why) {
+    auto no = [&](const std::string& w) {
+        if (why) *why = w;
+        return false;
+    };
+    if (rows < kArenaDecodeRowsMin || rows > kArenaDecodeRowsMax)
+        return no(fmt("not from %lld to %lld rows (the rows deepseek41's kernels were audited at)",
+                      (long long)kArenaDecodeRowsMin, (long long)kArenaDecodeRowsMax));
+    if (rows >= lo) return no(fmt("not below the ladder's first rung (%lld rows)", (long long)lo));
+    return true;
 }
 
 }  /* namespace rad */

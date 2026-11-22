@@ -1,0 +1,247 @@
+/* r4d_ds41_ggml_layout.cpp -- the native-block GEMMs' weight layout: affine planes (a GGUF import)
+ * relayouted into llama.cpp's blocks at load, through libquant's definition of them. Pure host.
+ *
+ * libref's hooks (libref/ref_ggml.cpp: ref_ggml_layout, ref_ggml_relayout, ref_ggml_unrelayout),
+ * restated here because a plugin links nothing of another: the operand must carry exactly the
+ * type's encoding with every plane selected in order; the stored form is u8 [rows, K / block *
+ * block_bytes], the type's native blocks rows back to back (pack_of), tagged "ggml_<type>" like
+ * libref's so a weight both libraries read is stored once. The unrelayout unpacks the blocks
+ * back into the planes and writes the shared tables (an IQ grid). The row length is `K` for the
+ * GEMMs and `n_embd` for the vocabulary ops. Only the types the kernels decode are served (pack
+ * and dequant both written in libquant): q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s (r4d_ds41_ggml),
+ * and mxfp4 (r4d_ds41_mxfp4: OCP MXFP4's planes, fp4_e2m1 codes and an e8m0 per 32, packed into
+ * block_mxfp4 {e, qs[16]}, 17 bytes a block of 32). */
+#include "r4d_plugin.h"
+
+#include "lq_ggml_dequant.h"
+#include "lq_ggml_planes.h"
+
+#include <cstring>
+#include <vector>
+
+namespace {
+
+const lq::ggml::PlaneKind* gg_kind_named(const char* s) {
+    if (!s) return nullptr;
+    for (uint32_t t = 0; t < 64; ++t) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t);
+        if (k && !std::strcmp(k->name, s) && lq::ggml::pack_of(t) && lq::ggml::dequant_of(t)) return k;
+    }
+    return nullptr;
+}
+
+const lq::ggml::PlaneKind* gg_kind_of(const RadParam* p, int n_p) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    return gg_kind_named(t && t->kind == RAD_P_STR ? t->sval : nullptr);
+}
+
+/* An integer parameter, a range read as its ceiling (libref's pint). */
+int64_t gg_pint(const RadParam* p, int n_p, const char* key) {
+    const RadParam* q = rad_param_find(p, n_p, key);
+    if (!q) return 0;
+    if (q->kind == RAD_P_RANGE) return (int64_t)q->ihi;
+    return q->kind == RAD_P_INT ? (int64_t)q->ival : 0;
+}
+
+/* The selection must be exactly the type's encoding, every plane in order. */
+int gg_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+             int n_planes, const lq::ggml::PlaneKind** out) {
+    const lq::ggml::PlaneKind* k = gg_kind_of(p, n_p);
+    if (operand != 1 || !k || !enc || !sel) return RAD_E_DTYPE;
+    const RadEncoding want = lq::ggml::encoding_of(k->type);
+    if (!rad_enc_equal(enc, &want) || n_planes != want.n_planes) return RAD_E_DTYPE;
+    for (int i = 0; i < n_planes; ++i)
+        if (sel[i] != i) return RAD_E_SHAPE;
+    *out = k;
+    return RAD_OK;
+}
+
+/* Plane i's row r, or null for a TABLE or per-tensor plane (pack and unpack do not touch those). */
+uint8_t* gg_plane_row(const RadEncoding* enc, const RadTensor* planes, int i, int64_t r) {
+    const RadEncPlane& pl = enc->plane[i];
+    if (pl.kind == RAD_PLANE_TABLE || (pl.block[0] == 0 && pl.block[1] == 0)) return nullptr;
+    const int64_t cols = planes[i].rank >= 2 ? planes[i].shape[1] : 0;
+    return (uint8_t*)planes[i].data + r * rad_enc_row_bytes(pl.dtype, cols);
+}
+
+int64_t gg_rows(const RadTensor* planes) { return planes[0].rank >= 1 ? planes[0].shape[0] : 0; }
+
+int64_t gg_row_len(const RadParam* p, int n_p) {
+    const int64_t K = gg_pint(p, n_p, "K");
+    return K > 0 ? K : gg_pint(p, n_p, "n_embd");
+}
+
+/* A stable tag per type (the RadLayout keeps the pointer). */
+const char* gg_tag(const lq::ggml::PlaneKind* k) {
+    static const char* const kTags[][2] = {
+        { "q8_0", "ggml_q8_0" },     { "q5_K", "ggml_q5_K" },       { "q6_K", "ggml_q6_K" },
+        { "iq4_nl", "ggml_iq4_nl" }, { "iq2_xxs", "ggml_iq2_xxs" }, { "iq1_s", "ggml_iq1_s" },
+        { "mxfp4", "ggml_mxfp4" },
+    };
+    for (const auto& t : kTags)
+        if (!std::strcmp(t[0], k->name)) return t[1];
+    static thread_local char tag[32];
+    snprintf(tag, sizeof tag, "ggml_%s", k->name);
+    return tag;
+}
+
+}  // namespace
+
+extern "C" int r4d_ds41_ggml_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                    const int* sel, const RadTensor* planes, int n_planes,
+                                    RadLayout* out) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = gg_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    if (K <= 0 || K % k->block || rows <= 0) return RAD_E_SHAPE;
+    std::memset(out, 0, sizeof *out);
+    out->tag = gg_tag(k);
+    out->dtype = RAD_U8;
+    out->rank = 2;
+    out->shape[0] = rows;
+    out->shape[1] = K / k->block * (int64_t)k->block_bytes;
+    out->align = 64;
+    out->bytes = out->shape[0] * out->shape[1];
+    return RAD_OK;
+}
+
+extern "C" int r4d_ds41_ggml_relayout(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel,
+                                      const RadTensor* planes, int n_planes, void* dst,
+                                      int64_t dst_bytes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = gg_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
+    if (K <= 0 || K % k->block || rows <= 0 || dst_bytes < rows * rb) return RAD_E_SHAPE;
+    const lq::ggml::PackFn pack = lq::ggml::pack_of(k->type);
+    std::vector<const uint8_t*> row((size_t)n_planes);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int i = 0; i < n_planes; ++i) row[(size_t)i] = gg_plane_row(enc, planes, i, r);
+        pack(row.data(), nb, (uint8_t*)dst + r * rb);
+    }
+    return RAD_OK;
+}
+
+extern "C" int r4d_ds41_ggml_unrelayout(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel, const void* src,
+                                        int64_t src_bytes, const RadTensor* planes, int n_planes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = gg_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
+    if (K <= 0 || K % k->block || rows <= 0 || src_bytes < rows * rb) return RAD_E_SHAPE;
+    std::vector<uint8_t*> row((size_t)n_planes);
+    std::vector<void*> all((size_t)n_planes);
+    for (int i = 0; i < n_planes; ++i) all[(size_t)i] = planes[i].data;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int i = 0; i < n_planes; ++i) row[(size_t)i] = gg_plane_row(enc, planes, i, r);
+        k->unpack((const uint8_t*)src + r * rb, nb, row.data());
+    }
+    lq::ggml::write_shared(k->type, *enc, all.data());
+    return RAD_OK;
+}
+
+/* gemm_nt_ggml_pair (lever 1U-GQ, ds41-int11): its weights are operands 1 and 3, each the type's native blocks at K, as
+ * gemm_nt_ggml (operand 1) stores them -- the same tag and bytes, so one stored form serves both ops. */
+extern "C" int r4d_ds41_ggml_pair_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                         const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (operand != 1 && operand != 3) return RAD_E_DTYPE;
+    return r4d_ds41_ggml_layout(p, n_p, 1, enc, sel, planes, n_planes, out);
+}
+extern "C" int r4d_ds41_ggml_pair_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                           const int* sel, const RadTensor* planes, int n_planes, void* dst,
+                                           int64_t dst_bytes) {
+    if (operand != 1 && operand != 3) return RAD_E_DTYPE;
+    return r4d_ds41_ggml_relayout(p, n_p, 1, enc, sel, planes, n_planes, dst, dst_bytes);
+}
+extern "C" int r4d_ds41_ggml_pair_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                             const int* sel, const void* src, int64_t src_bytes,
+                                             const RadTensor* planes, int n_planes) {
+    if (operand != 1 && operand != 3) return RAD_E_DTYPE;
+    return r4d_ds41_ggml_unrelayout(p, n_p, 1, enc, sel, src, src_bytes, planes, n_planes);
+}
+
+/* moe_gemm_mxil (lever WIL, DRAFTER track 19.11.2026 round 27): GGUF MXFP4 blocks re-arranged into 16-row x 1-block
+ * tiles of 272 bytes -- tile (row group g, block b) at (g nb + b) 272 holds, for lane L = r + 16 h of the WMMA form
+ * (r the group's row, h 0 / 1), the block's code bytes qs[4 h .. 4 h + 3] and qs[8 + 4 h .. 8 + 4 h + 3] at 8 L, and the
+ * 16 rows' E8M0 exponents at 256 + r (r4d_ds41_mxfp4_mr.hip, xm_wm_kernel's IL note). The same bytes as the native
+ * blocks, moved: the stored size, the planes it is made from and the inverse are the native form's; the rows (an
+ * expert's N, a table entry's weight) must be whole groups of 16. Tagged apart so no reader of native blocks gets it. */
+namespace {
+constexpr int64_t kIlTile = 272;
+void il_pack(const uint8_t* blk, uint8_t* dst, int64_t rows, int64_t nb) {
+    for (int64_t g = 0; g < rows / 16; ++g)
+        for (int64_t b = 0; b < nb; ++b) {
+            uint8_t* t = dst + (g * nb + b) * kIlTile;
+            for (int64_t r = 0; r < 16; ++r) {
+                const uint8_t* q = blk + ((16 * g + r) * nb + b) * 17;
+                for (int h = 0; h < 2; ++h) {
+                    std::memcpy(t + 8 * (r + 16 * h), q + 1 + 4 * h, 4);
+                    std::memcpy(t + 8 * (r + 16 * h) + 4, q + 9 + 4 * h, 4);
+                }
+                t[256 + r] = q[0];
+            }
+        }
+}
+void il_unpack(const uint8_t* src, uint8_t* blk, int64_t rows, int64_t nb) {
+    for (int64_t g = 0; g < rows / 16; ++g)
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint8_t* t = src + (g * nb + b) * kIlTile;
+            for (int64_t r = 0; r < 16; ++r) {
+                uint8_t* q = blk + ((16 * g + r) * nb + b) * 17;
+                for (int h = 0; h < 2; ++h) {
+                    std::memcpy(q + 1 + 4 * h, t + 8 * (r + 16 * h), 4);
+                    std::memcpy(q + 9 + 4 * h, t + 8 * (r + 16 * h) + 4, 4);
+                }
+                q[0] = t[256 + r];
+            }
+        }
+}
+bool il_type_ok(const RadParam* p, int n_p) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    return t && t->kind == RAD_P_STR && t->sval && !std::strcmp(t->sval, "mxfp4");
+}
+}  // namespace
+
+extern "C" int r4d_ds41_mxil_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                    const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (!il_type_ok(p, n_p)) return RAD_E_DTYPE;
+    const int rc = r4d_ds41_ggml_layout(p, n_p, operand, enc, sel, planes, n_planes, out);
+    if (rc != RAD_OK) return rc;
+    if (out->shape[0] % 16) return RAD_E_SHAPE;
+    out->tag = "r4d_mxfp4_il16";
+    return RAD_OK;
+}
+
+extern "C" int r4d_ds41_mxil_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                      const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (!il_type_ok(p, n_p)) return RAD_E_DTYPE;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    if (K <= 0 || K % 32 || rows <= 0 || rows % 16) return RAD_E_SHAPE;
+    const int64_t nb = K / 32;
+    if (dst_bytes < rows * nb * 17) return RAD_E_SHAPE;
+    std::vector<uint8_t> blk((size_t)(rows * nb * 17));
+    const int rc = r4d_ds41_ggml_relayout(p, n_p, operand, enc, sel, planes, n_planes, blk.data(), (int64_t)blk.size());
+    if (rc != RAD_OK) return rc;
+    il_pack(blk.data(), (uint8_t*)dst, rows, nb);
+    return RAD_OK;
+}
+
+extern "C" int r4d_ds41_mxil_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                        const void* src, int64_t src_bytes, const RadTensor* planes, int n_planes) {
+    if (!il_type_ok(p, n_p)) return RAD_E_DTYPE;
+    const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
+    if (K <= 0 || K % 32 || rows <= 0 || rows % 16) return RAD_E_SHAPE;
+    const int64_t nb = K / 32;
+    if (src_bytes < rows * nb * 17) return RAD_E_SHAPE;
+    std::vector<uint8_t> blk((size_t)(rows * nb * 17));
+    il_unpack((const uint8_t*)src, blk.data(), rows, nb);
+    return r4d_ds41_ggml_unrelayout(p, n_p, operand, enc, sel, blk.data(), (int64_t)blk.size(), planes, n_planes);
+}

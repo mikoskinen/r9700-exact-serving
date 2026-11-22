@@ -2,6 +2,7 @@
  * projects in parallel before one workgroup per token forms the Sinkhorn matrix.
  * Mixing weights are declared f32; activations are bf16, coefficients stay f32. */
 #include <hip/hip_runtime.h>
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
@@ -48,7 +49,7 @@ struct Dense {
 };
 template <class Out>
 __global__ void mhc_partial_kernel(const uint16_t* h, const float* fn, Out out, int width, int mix,
-                                   int chunk0, long hp, long fp) {
+                                   int chunk0, long hp, long fp) { R4D_IKA_ENTRY();
     __shared__ float sums[4];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int j = blockIdx.y, chunk = chunk0 + blockIdx.x;
@@ -72,7 +73,7 @@ __global__ void mhc_partial_kernel(const uint16_t* h, const float* fn, Out out, 
 template <class Out>
 __global__ void mhc_partial_rows4_coeff4_kernel(const uint16_t* h, const float* fn, Out out,
                                                 int width, int mix, int chunk0, long hp, long fp,
-                                                long rows) {
+                                                long rows) { R4D_IKA_ENTRY();
     __shared__ float sums[4][4][4];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int first_j = blockIdx.y * 4, chunk = chunk0 + blockIdx.x;
@@ -147,7 +148,7 @@ template <class Out, int R>
 __global__ __launch_bounds__(128) void mhc_partial_vec_kernel(const uint16_t* h, const float* fn,
                                                               Out out, int mix, int chunk0,
                                                               int count, long hp, long fp,
-                                                              long rows, long items) {
+                                                              long rows, long items) { R4D_IKA_ENTRY();
     const int lane = threadIdx.x & 31;
     const long item = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (item >= items) return;
@@ -218,7 +219,7 @@ __global__ __launch_bounds__(128) void mhc_partial_vec_kernel(const uint16_t* h,
 __global__ void mhc_pre_kernel(const uint16_t* h, const float* fn, const float* scale,
                                const float* base, uint16_t* x, float* post, float* comb, int n,
                                int hc, int iterations, float eps, float heps, long hp, long fp,
-                               long xp, long pp, long cp) {
+                               long xp, long pp, long cp) { R4D_IKA_ENTRY();
     __shared__ float sums[8], inverse, coefficients[80], pre[8], c[64];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const long r = blockIdx.x;
@@ -350,7 +351,7 @@ __device__ __forceinline__ float glm_warp_mix(int lane, long row, const float* s
 template <class In>
 __global__ __launch_bounds__(256) void mhc_pre_glm_wide_kernel(
     const uint16_t* h, const float* scale, const float* base, uint16_t* x, float* post, float* comb,
-    int iterations, float eps, float heps, long hp, long xp, long pp, long cp, In in) {
+    int iterations, float eps, float heps, long hp, long xp, long pp, long cp, In in) { R4D_IKA_ENTRY();
     __shared__ float spre[4];
     const int tid = threadIdx.x;
     const long row = blockIdx.x;
@@ -374,7 +375,7 @@ __global__ __launch_bounds__(256) void mhc_pre_glm_wide_kernel(
 
 __global__ void mhc_post_kernel(const uint16_t* x, const uint16_t* h, const float* post,
                                 const float* comb, uint16_t* out, int n, int hc, long xp, long hp,
-                                long pp, long cp, long op) {
+                                long pp, long cp, long op) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= n * hc) return;
@@ -390,7 +391,7 @@ __global__ void mhc_post_kernel(const uint16_t* x, const uint16_t* h, const floa
 // loaded once instead of once per output stream. Every output keeps mhc_post_kernel's order.
 __global__ void mhc_post_vec_kernel(const uint16_t* x, const uint16_t* h, const float* post,
                                     const float* comb, uint16_t* out, int n, long xp, long hp,
-                                    long pp, long cp, long op) {
+                                    long pp, long cp, long op) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i >= n) return;
@@ -428,7 +429,7 @@ __global__ void mhc_post_vec_kernel(const uint16_t* x, const uint16_t* h, const 
 }
 
 __global__ void mhc_contract_kernel(const uint16_t* h, uint16_t* x, int n, int hc, long hp,
-                                    long xp) {
+                                    long xp) { R4D_IKA_ENTRY();
     const long r = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;

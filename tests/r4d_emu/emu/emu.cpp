@@ -244,15 +244,14 @@ emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     std::memcpy(pb.v, &b, 8);
     return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return rad_fp8e4m3_to_f32(v); });
 }
-/* v_wmma_i32_16x16x16_iu8 (gfx12, wave32): the fp8 form's layout, eight int8 (sa / sb: signed) or uint8 a lane;
- * each output is c plus its 16 products, exact in int32 (no order to model). The clamp is not modelled: the libr4d
- * callers pass false and sum at most 128 * 127 * 127 a block. */
-static uint8_t g_ia[64][2][32][8], g_ib[64][2][32][8];
+/* v_wmma_i32_16x16x16_iu8 (gfx12, wave32; tp8 loop P30t-psk): the fp8 form's operand layout -- eight bytes a lane, A row
+ * M at lane M + 16 * (K / 8), element K % 8, B the same by column -- each byte signed when its flag says so, exact int32 sums
+ * onto C (no clamp: a 128-K block of int8 products stays far inside int32, as libr4d's tiles rely on). */
 emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool) {
     const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
     const unsigned par = S.xparity[t]++ & 1u;
-    std::memcpy(g_ia[w][par][l], &a, 8);
-    std::memcpy(g_ib[w][par][l], &b, 8);
+    std::memcpy(g_qa[w][par][l], &a, 8);
+    std::memcpy(g_qb[w][par][l], &b, 8);
     wmma_whole_wave(w);
     wave_barrier(w);
     const int N = l & 15, h = l >> 4;
@@ -261,9 +260,8 @@ emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool) {
         const int M = 8 * h + e;
         int acc = c[e];
         for (int k = 0; k < 16; ++k) {
-            const uint8_t av = g_ia[w][par][M + 16 * (k >> 3)][k & 7];
-            const uint8_t bv = g_ib[w][par][N + 16 * (k >> 3)][k & 7];
-            acc += (sa ? (int)(int8_t)av : (int)av) * (sb ? (int)(int8_t)bv : (int)bv);
+            const uint8_t xa = g_qa[w][par][M + 16 * (k >> 3)][k & 7], xb = g_qb[w][par][N + 16 * (k >> 3)][k & 7];
+            acc += (sa ? (int)(int8_t)xa : (int)xa) * (sb ? (int)(int8_t)xb : (int)xb);
         }
         d[e] = acc;
     }
@@ -281,7 +279,8 @@ int emu_update_dpp(int old, int src, int ctrl, int row_mask, int bank_mask, bool
     const int* s = exchange(src, &l, kOpDpp | (ctrl & 0xffff));
     const int r = l & 15, k = ctrl & 15;
     int from;
-    if (ctrl > 0x100 && ctrl < 0x110)      from = r + k < 16 ? l + k : -1;     /* row_shl */
+    if (ctrl >= 0 && ctrl < 0x100)         from = (l & ~3) | ((ctrl >> (2 * (l & 3))) & 3);   /* quad_perm */
+    else if (ctrl > 0x100 && ctrl < 0x110) from = r + k < 16 ? l + k : -1;     /* row_shl */
     else if (ctrl > 0x110 && ctrl < 0x120) from = r - k >= 0 ? l - k : -1;     /* row_shr */
     else if (ctrl >= 0x160 && ctrl < 0x170) from = (l & 16) | (r ^ k);         /* row_xmask */
     else { std::fprintf(stderr, "emu: dpp_ctrl 0x%x is not emulated\n", ctrl); std::abort(); }
@@ -298,9 +297,23 @@ int emu_permlanex16(int, int src, unsigned sel_lo, unsigned sel_hi, bool, bool) 
     const unsigned sel = (r < 8 ? sel_lo >> (4 * r) : sel_hi >> (4 * (r - 8))) & 15u;
     return s[(16 - (l & 16)) | (int)sel];
 }
-emu_v8s emu_load_tr_b128(const void*) {
-    std::fprintf(stderr, "emu: global_load_tr_b128 is not emulated\n");
-    std::abort();
+/* global_load_tr_b128: lane 8g+e gives the address of 8 consecutive 16-bit values; lane 8g+i receives
+ * value i of lanes 8g..8g+7, in lane order (an 8x8 transpose in each group of eight lanes). Each lane
+ * reads its own 16 bytes, then four exchanges (two values a word) hand every lane the whole wave's. */
+emu_v8s emu_load_tr_b128(const void* p) {
+    const unsigned short* sp = (const unsigned short*)p;
+    int all[4][32], l = 0;
+    for (int k = 0; k < 4; ++k) {
+        const int w = (int)((unsigned)sp[2 * k] | ((unsigned)sp[2 * k + 1] << 16));
+        std::memcpy(all[k], exchange(w, &l, kOpBpermute), sizeof all[k]);
+    }
+    const int g = l >> 3, i = l & 7;
+    emu_v8s out;
+    for (int e = 0; e < 8; ++e) {
+        const unsigned w = (unsigned)all[i >> 1][8 * g + e];
+        out[e] = (short)(unsigned short)((i & 1) ? (w >> 16) : (w & 0xffffu));
+    }
+    return out;
 }
 
 /* Dynamic LDS: a mapping whose last page is inaccessible, the buffer placed against it with its

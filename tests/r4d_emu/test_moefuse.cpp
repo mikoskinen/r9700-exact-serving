@@ -601,12 +601,296 @@ void gather_inverse_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* router_scored_topk_scatter (r4d_ds41_elem.hip) against router_scored_topk's own launch, then
+ * moe_scatter's kernel over its ids: every output byte for byte, at DeepSeek-V4.1's 384 experts top-6
+ * (whole, and the EP-4 slices of 96) and the sigmoid cases' shapes, for each named score, with and
+ * without the gate and the inverse, ties and NaN rows included. */
+void scored_scatter_cases(std::mt19937& rng, int& cases, int& fails) {
+    const RouterShape shapes[] = {
+        { 1, 384, 6, 1, 0, 0, 0, nullptr, true },      { 1, 384, 6, 1, 0, 96, 96, nullptr, true },
+        { 4, 384, 6, 1, 0, 96, 288, nullptr, true },   { 8, 384, 6, 1, 1, 96, 0, nullptr, true },
+        { 16, 384, 6, 1, 2, 96, 192, nullptr, true },  { 48, 384, 6, 1, 0, 0, 0, nullptr, false },
+        { 170, 384, 6, 1, 0, 96, 96, nullptr, true },  { 6, 288, 8, 1, 0, 0, 0, nullptr, true },
+        { 33, 288, 8, 0, 1, 0, 0, nullptr, true },     { 24, 288, 8, 1, 1, 96, 32, "3,7,90", true },
+        { 48, 512, 8, 1, 0, 0, 0, nullptr, true },     { 5, 300, 10, 1, 2, 0, 0, "0,299", true },
+    };
+    const char* const scores[] = { "sqrtsoftplus", "sigmoid", "softmax" };
+    std::uniform_int_distribution<int> ud(-1000, 1000);
+    for (const RouterShape& sh : shapes)
+        for (const char* score : scores) {
+            const int M = sh.M, ne = sh.ne, k = sh.k, T = M * k;
+            const int nl = sh.nl ? sh.nl : ne, base = sh.base;
+            const int lp = ne + 5, bp = 2, ip = k + 3, wp = k + 1, gp = 3;
+            const float factor = 1.5f;
+            std::vector<float> lg((size_t)M * lp), bias((size_t)ne * bp);
+            for (auto& v : lg) v = sh.mode == 1 ? (float)(ud(rng) % 8) * 0.5f : (float)ud(rng) / 200;
+            for (auto& v : bias)
+                v = sh.mode == 1 ? (float)(ud(rng) % 5) * 0.125f : (float)ud(rng) / 2000;
+            if (sh.mode == 2)
+                for (int r = 0; r < M; r += 2) {
+                    for (int e = 0; e < ne; ++e) lg[(size_t)r * lp + e] = NAN;
+                    for (int j = 0; j < r % 5; ++j)
+                        lg[(size_t)r * lp + (size_t)(ud(rng) + 1000) % ne] = 0.25f * (float)j;
+                }
+            RadTensor t[9]{};
+            auto mat = [](RadTensor& x, void* d, uint32_t dt, int r, int c, int ld) {
+                x.data = d; x.dtype = dt; x.rank = 2; x.shape[0] = r; x.shape[1] = c;
+                x.stride[0] = ld; x.stride[1] = 1;
+            };
+            auto vec = [](RadTensor& x, void* d, uint32_t dt, int n, int ld = 1) {
+                x.data = d; x.dtype = dt; x.rank = 1; x.shape[0] = n; x.stride[0] = ld;
+            };
+            mat(t[0], lg.data(), RAD_F32, M, ne, lp);
+            vec(t[1], bias.data(), RAD_F32, ne, bp);
+            std::vector<RadParam> p(10);
+            p[0] = { "M", RAD_P_INT, M };
+            p[1] = { "n_expert", RAD_P_INT, ne };
+            p[2] = { "top_k", RAD_P_INT, k };
+            p[3] = { "norm", RAD_P_INT, sh.norm };
+            p[4].key = "route_scale"; p[4].kind = RAD_P_F64; p[4].dval = factor;
+            p[5].key = "dtype"; p[5].kind = RAD_P_STR; p[5].sval = "f32";
+            p[6].key = "score"; p[6].kind = RAD_P_STR; p[6].sval = score;
+            p[7] = { "n_local", RAD_P_INT, nl };
+            p[8] = { "expert_base", RAD_P_INT, base };
+            p[9].key = "protect"; p[9].kind = RAD_P_STR; p[9].sval = sh.protect;
+            const int n_p = sh.protect ? 10 : 9;
+            /* the separate launches: router_scored_topk, then moe_scatter's kernel over its ids */
+            std::vector<int32_t> ids_ref((size_t)M * ip, kPoison);
+            std::vector<float> w_ref((size_t)M * wp, -7.25f);
+            mat(t[2], ids_ref.data(), RAD_I32, M, k, ip);
+            mat(t[3], w_ref.data(), RAD_F32, M, k, wp);
+            RadArgs sel{};
+            sel.t = t; sel.n_t = 4; sel.p = p.data(); sel.n_p = 7;
+            ++cases;
+            if (r4d_rad_router_scored_topk(&sel, nullptr) != RAD_OK) {
+                std::printf("FAIL router_scored_topk launch M=%d ne=%d score %s\n", M, ne, score);
+                ++fails;
+                continue;
+            }
+            std::vector<int32_t> flat((size_t)T);
+            for (int i = 0; i < T; ++i) flat[(size_t)i] = ids_ref[(size_t)(i / k) * ip + i % k];
+            const Scatter ks = scatter_kernel(flat, nl, base, sh.protect, true);
+            const Scatter kp = scatter_kernel(flat, nl, base, sh.protect, false);
+            for (int with_inv = 0; with_inv < 2; ++with_inv) {
+                std::vector<int32_t> ids((size_t)M * ip, kPoison), sorted((size_t)T + 4, kPoison),
+                    off((size_t)nl + 5, kPoison), cnt((size_t)nl + 4, kPoison),
+                    inv((size_t)T + 4, kPoison);
+                std::vector<float> w((size_t)M * wp, -7.25f);
+                std::vector<uint16_t> gate((size_t)(M + 2) * gp, kGatePoison);
+                RadTensor tf[9];
+                std::memcpy(tf, t, sizeof tf);
+                mat(tf[2], ids.data(), RAD_I32, M, k, ip);
+                mat(tf[3], w.data(), RAD_F32, M, k, wp);
+                vec(tf[4], sorted.data(), RAD_I32, T);
+                vec(tf[5], off.data(), RAD_I32, nl + 1);
+                vec(tf[6], cnt.data(), RAD_I32, nl);
+                mat(tf[7], sh.gate ? gate.data() : nullptr, RAD_BF16, M, 1, gp);
+                vec(tf[8], inv.data(), RAD_I32, T);
+                RadArgs a{};
+                a.t = tf; a.n_t = with_inv ? 9 : 8; a.p = p.data(); a.n_p = n_p;
+                ++cases;
+                const int rc = r4d_rad_router_scored_topk_scatter(&a, nullptr);
+                const Scatter& ref = with_inv ? ks : kp;
+                int bad = 0;
+                bad += ids != ids_ref;
+                bad += std::memcmp(w.data(), w_ref.data(), w.size() * 4) != 0;
+                bad += std::memcmp(sorted.data(), ref.sorted.data(), (size_t)T * 4) != 0;
+                bad += std::memcmp(off.data(), ref.off.data(), (size_t)(nl + 1) * 4) != 0;
+                bad += std::memcmp(cnt.data(), ref.cnt.data(), (size_t)nl * 4) != 0;
+                if (with_inv) bad += std::memcmp(inv.data(), ks.inv.data(), (size_t)T * 4) != 0;
+                for (int i = 0; i < 4; ++i)
+                    bad += sorted[(size_t)T + i] != kPoison || off[(size_t)nl + 1 + i] != kPoison ||
+                           cnt[(size_t)nl + i] != kPoison || inv[(size_t)T + i] != kPoison;
+                if (!with_inv)
+                    for (int i = 0; i < T; ++i) bad += inv[(size_t)i] != kPoison;
+                for (int r = 0; r < M + 2; ++r)
+                    for (int c = 0; c < gp; ++c) {
+                        const uint16_t want = sh.gate && r < M && c == 0 ? 0x3f80 : kGatePoison;
+                        bad += gate[(size_t)r * gp + c] != want;
+                    }
+                if (rc != RAD_OK || bad) {
+                    std::printf("FAIL router_scored_topk_scatter %s at M=%d ne=%d k=%d mode %d slice "
+                                "%d+%d%s%s (rc %d, %d mismatching outputs)\n",
+                                score, M, ne, k, sh.mode, base, nl, sh.protect ? " protect" : "",
+                                with_inv ? " with inverse" : "", rc, bad);
+                    ++fails;
+                }
+            }
+        }
+    /* past the sort's one workgroup: refused */
+    {
+        const int M = 171, ne = 384, k = 6;
+        std::vector<float> lg((size_t)M * ne, 0.5f), bias((size_t)ne, 0.f), w((size_t)M * k, 0.f);
+        std::vector<int32_t> ids((size_t)M * k), sorted((size_t)M * k), off((size_t)ne + 1),
+            cnt((size_t)ne);
+        RadTensor t[7]{};
+        t[0].data = lg.data(); t[0].dtype = RAD_F32; t[0].rank = 2; t[0].shape[0] = M; t[0].shape[1] = ne; t[0].stride[0] = ne; t[0].stride[1] = 1;
+        t[1].data = bias.data(); t[1].dtype = RAD_F32; t[1].rank = 1; t[1].shape[0] = ne; t[1].stride[0] = 1;
+        t[2].data = ids.data(); t[2].dtype = RAD_I32; t[2].rank = 2; t[2].shape[0] = M; t[2].shape[1] = k; t[2].stride[0] = k; t[2].stride[1] = 1;
+        t[3].data = w.data(); t[3].dtype = RAD_F32; t[3].rank = 2; t[3].shape[0] = M; t[3].shape[1] = k; t[3].stride[0] = k; t[3].stride[1] = 1;
+        t[4].data = sorted.data(); t[4].dtype = RAD_I32; t[4].rank = 1; t[4].shape[0] = M * k; t[4].stride[0] = 1;
+        t[5].data = off.data(); t[5].dtype = RAD_I32; t[5].rank = 1; t[5].shape[0] = ne + 1; t[5].stride[0] = 1;
+        t[6].data = cnt.data(); t[6].dtype = RAD_I32; t[6].rank = 1; t[6].shape[0] = ne; t[6].stride[0] = 1;
+        std::vector<RadParam> p(7);
+        p[0] = { "M", RAD_P_INT, M }; p[1] = { "n_expert", RAD_P_INT, ne }; p[2] = { "top_k", RAD_P_INT, k };
+        p[3] = { "norm", RAD_P_INT, 1 };
+        p[4].key = "route_scale"; p[4].kind = RAD_P_F64; p[4].dval = 1.5;
+        p[5].key = "dtype"; p[5].kind = RAD_P_STR; p[5].sval = "f32";
+        p[6].key = "score"; p[6].kind = RAD_P_STR; p[6].sval = "sqrtsoftplus";
+        RadArgs a{};
+        a.t = t; a.n_t = 7; a.p = p.data(); a.n_p = 7;
+        ++cases;
+        if (r4d_rad_router_scored_topk_scatter(&a, nullptr) == RAD_OK) {
+            std::printf("FAIL router_scored_topk_scatter served M*top_k=%d past the sort's bound\n", M * k);
+            ++fails;
+        }
+    }
+}
+
+/* mhc_mix (r4d_ds41_elem.hip) three ways -- no scratch (one wave a row walks the chunks), scratch with the
+ * split and finish kernels, and scratch with the one-launch form (the last workgroup of a row group
+ * finishes it, mix_split_kernel FIN) -- pre, post and comb byte for byte, the one-launch form twice in a
+ * row (its counters reset themselves), at hc 4 over the row heights each split form serves. */
+void mix_fuse_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct Shape { long rows, n; };
+    const Shape shapes[] = { { 1, 1280 }, { 3, 1024 }, { 8, 1024 }, { 9, 768 }, { 24, 512 }, { 25, 512 }, { 1, 5120 } };
+    const int hc = 4, mix = hc * (hc + 2), iters = 20;
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    for (const Shape& sh : shapes) {
+        const long rows = sh.rows, n = sh.n, width = hc * n;
+        std::vector<uint16_t> h((size_t)(rows * width));
+        for (auto& v : h) { const float x = ud(rng); uint32_t u; std::memcpy(&u, &x, 4); v = (uint16_t)(u >> 16); }
+        std::vector<float> fn((size_t)(mix * width)), scale = { 0.75f, 0.5f, 1.25f }, base((size_t)mix);
+        for (auto& v : fn) v = ud(rng) * 0.02f;
+        for (auto& v : base) v = ud(rng) * 0.1f;
+        auto run = [&](int form, std::vector<float>& pre, std::vector<float>& post, std::vector<float>& comb) {
+            pre.assign((size_t)(rows * hc), -7.f); post.assign((size_t)(rows * hc), -7.f);
+            comb.assign((size_t)(rows * hc * hc), -7.f);
+            RadTensor t[7]{};
+            auto mat = [](RadTensor& x, void* d, uint32_t dt, long r, long c) {
+                x.data = d; x.dtype = dt; x.rank = 2; x.shape[0] = r; x.shape[1] = c; x.stride[0] = c; x.stride[1] = 1;
+            };
+            mat(t[0], h.data(), RAD_BF16, rows, width);
+            mat(t[1], fn.data(), RAD_F32, mix, width);
+            t[2].data = scale.data(); t[2].dtype = RAD_F32; t[2].rank = 1; t[2].shape[0] = 3; t[2].stride[0] = 1;
+            t[3].data = base.data(); t[3].dtype = RAD_F32; t[3].rank = 1; t[3].shape[0] = mix; t[3].stride[0] = 1;
+            mat(t[4], pre.data(), RAD_F32, rows, hc);
+            mat(t[5], post.data(), RAD_F32, rows, hc);
+            mat(t[6], comb.data(), RAD_F32, rows, hc * hc);
+            std::vector<RadParam> p(6);
+            p[0] = { "M", RAD_P_INT, rows }; p[1] = { "n", RAD_P_INT, n }; p[2] = { "hc", RAD_P_INT, hc };
+            p[3] = { "iterations", RAD_P_INT, iters };
+            p[4].key = "eps"; p[4].kind = RAD_P_F64; p[4].dval = 1e-6;
+            p[5].key = "hc_eps"; p[5].kind = RAD_P_F64; p[5].dval = 1e-6;
+            RadArgs a{};
+            a.t = t; a.n_t = 7; a.p = p.data(); a.n_p = 6;
+            std::vector<float> scr;
+            if (form > 0) {
+                const int64_t need = r4d_rad_mhc_mix_scratch(&a);
+                scr.assign((size_t)(need / 4 + 64), 0.f);
+                a.scratch = scr.data(); a.scratch_bytes = (int64_t)scr.size() * 4;
+            }
+            r4d_ds41_mix_fuse_force(form == 2 ? 1 : 0);
+            const int rc = r4d_rad_mhc_mix(&a, nullptr);
+            r4d_ds41_mix_fuse_force(-1);
+            return rc;
+        };
+        std::vector<float> p0, q0, c0, p1, q1, c1, p2, q2, c2, p3, q3, c3;
+        ++cases;
+        const int r0 = run(0, p0, q0, c0), r1 = run(1, p1, q1, c1), r2 = run(2, p2, q2, c2), r3 = run(2, p3, q3, c3);
+        auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        };
+        const bool ok = !r0 && !r1 && !r2 && !r3 && same(p0, p1) && same(q0, q1) && same(c0, c1) &&
+                        same(p1, p2) && same(q1, q2) && same(c1, c2) && same(p2, p3) && same(q2, q3) &&
+                        same(c2, c3) && p2[0] != -7.f;
+        if (!ok) {
+            std::printf("FAIL mhc_mix one-launch form at rows %ld n %ld (rc %d %d %d %d; nosplit=split %d, "
+                        "split=fused %d, fused twice %d)\n", rows, n, r0, r1, r2, r3,
+                        same(p0, p1) && same(q0, q1) && same(c0, c1), same(p1, p2) && same(q1, q2) && same(c1, c2),
+                        same(p2, p3) && same(q2, q3) && same(c2, c3));
+            ++fails;
+        }
+    }
+}
+
+/* mhc_post_collapse_rmsnorm as the all-reduce's word-partitioned epilogue (r4d_ds41_pcn_words, fusion 2's single-card
+ * step) against the norm kernel itself: out, xc and y byte for byte at decode heights, every block count from one to
+ * more blocks than words, the counters reset (run twice), f32 and bf16 gains. */
+extern "C" int r4d_ds41_pcn_words(const RadArgs* a, RadStream s, int nb, unsigned* ctr);
+void pcn_words_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct Sh { int M, n, hc; bool wf32; };
+    const Sh shapes[] = { { 1, 5120, 4, true }, { 2, 5120, 4, true }, { 6, 5120, 4, true }, { 8, 5120, 4, false },
+                          { 3, 1024, 4, true }, { 33, 1024, 4, true }, { 5, 2048, 8, false } };
+    const int nbs[] = { 1, 3, 64, 257, 4096 };
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    auto bf = [](float x) { uint32_t u; std::memcpy(&u, &x, 4); return (uint16_t)(u >> 16); };
+    for (const Sh& sh : shapes) {
+        const int M = sh.M, n = sh.n, hc = sh.hc;
+        std::vector<uint16_t> xin((size_t)M * n), h((size_t)M * hc * n), wb((size_t)n);
+        std::vector<float> post((size_t)M * hc), comb((size_t)M * hc * hc), pre((size_t)M * hc), wf((size_t)n);
+        for (auto& v : xin) v = bf(ud(rng));
+        for (auto& v : h) v = bf(ud(rng));
+        for (auto& v : post) v = ud(rng);
+        for (auto& v : comb) v = ud(rng) * 0.5f;
+        for (auto& v : pre) v = ud(rng);
+        for (int i = 0; i < n; ++i) { wf[(size_t)i] = 1.0f + ud(rng) * 0.1f; wb[(size_t)i] = bf(wf[(size_t)i]); }
+        auto run = [&](int nb, std::vector<uint16_t>& out, std::vector<uint16_t>& x, std::vector<uint16_t>& y,
+                       std::vector<unsigned>* ctr) {
+            out.assign((size_t)M * hc * n, 0x7e57); x.assign((size_t)M * n, 0x7e57); y.assign((size_t)M * n, 0x7e57);
+            RadTensor t[9]{};
+            auto mat = [](RadTensor& q, void* d, uint32_t dt, long r, long c) {
+                q.data = d; q.dtype = dt; q.rank = 2; q.shape[0] = r; q.shape[1] = c; q.stride[0] = c; q.stride[1] = 1;
+            };
+            mat(t[0], xin.data(), RAD_BF16, M, n);
+            mat(t[1], h.data(), RAD_BF16, M, (long)hc * n);
+            mat(t[2], post.data(), RAD_F32, M, hc);
+            mat(t[3], comb.data(), RAD_F32, M, (long)hc * hc);
+            mat(t[4], out.data(), RAD_BF16, M, (long)hc * n);
+            mat(t[5], pre.data(), RAD_F32, M, hc);
+            mat(t[6], x.data(), RAD_BF16, M, n);
+            t[7].data = sh.wf32 ? (void*)wf.data() : (void*)wb.data(); t[7].dtype = sh.wf32 ? RAD_F32 : RAD_BF16;
+            t[7].rank = 1; t[7].shape[0] = n; t[7].stride[0] = 1;
+            mat(t[8], y.data(), RAD_BF16, M, n);
+            std::vector<RadParam> p(3);
+            p[0] = { "n", RAD_P_INT, n }; p[1] = { "hc", RAD_P_INT, hc };
+            p[2].key = "eps"; p[2].kind = RAD_P_F64; p[2].dval = 1e-6;
+            RadArgs a{};
+            a.t = t; a.n_t = 9; a.p = p.data(); a.n_p = 3;
+            return ctr ? r4d_ds41_pcn_words(&a, nullptr, nb, ctr->data()) : r4d_rad_mhc_post_collapse_rmsnorm(&a, nullptr);
+        };
+        std::vector<uint16_t> o0, x0, y0;
+        const int r0 = run(0, o0, x0, y0, nullptr);
+        std::vector<unsigned> ctr((size_t)M, 0u);
+        for (int nb : nbs) {
+            for (int rep = 0; rep < 2; ++rep) {
+                std::vector<uint16_t> o1, x1, y1;
+                ++cases;
+                const int r1 = run(nb, o1, x1, y1, &ctr);
+                bool zero = true;
+                for (unsigned c : ctr) zero = zero && c == 0;
+                if (r0 || r1 || o0 != o1 || x0 != x1 || y0 != y1 || !zero) {
+                    int dy = 0;
+                    for (size_t i = 0; i < y0.size(); ++i) dy += y0[i] != y1[i];
+                    std::printf("FAIL pcn_words M=%d n=%d hc=%d nb=%d rep %d (rc %d %d; out %d xc %d y %d (%d differ) "
+                                "counters %s)\n", M, n, hc, nb, rep, r0, r1, o0 == o1, x0 == x1, y0 == y1, dy,
+                                zero ? "zero" : "LEFT");
+                    ++fails;
+                }
+            }
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
     std::mt19937 rng(23);
     int fails = 0, cases = 0;
     router_scatter_cases(rng, cases, fails);
+    scored_scatter_cases(rng, cases, fails);
+    mix_fuse_cases(rng, cases, fails);
+    pcn_words_cases(rng, cases, fails);
     swiglu_quant_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);

@@ -143,6 +143,7 @@
 { "RadBuildCtx", "gen_max_pixels", 184, 8 },
 { "RadBuildCtx", "gen_max_refs", 192, 8 },
 { "RadBuildCtx", "expert_file_tier", 200, 4 },
+{ "RadBuildCtx", "draft_head_off", 204, 4 },
 { "RadAudioGenBatch", "", 0, 344 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },

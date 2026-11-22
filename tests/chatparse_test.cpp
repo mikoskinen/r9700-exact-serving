@@ -2099,6 +2099,44 @@ TEST(deepseek41_reads_the_dsml_its_encoder_writes) {
     CHECK(gr.trigger_words == std::vector<std::string>{ "<｜DSML｜ calls>" });
 }
 
+TEST(deepseek41_reads_unconstrained_dsml_tags) {
+    /* The observed session reply: prose, then a bare tool-name opener, the model's DSML marker
+     * on the argument tags, and no `invoke` prefix on the first call. The format grammar opens a
+     * call only at name_prefix, so the reader has to recover this shape after finish(). */
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(rad::arch::deepseek41_chat_format(), &f, &why));
+    CHECK_OK(chat_format_check(f, &why));
+    const json tools = json::parse(R"([
+      {"type":"function","function":{"name":"skill_view","parameters":{"type":"object",
+       "properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},
+      {"type":"function","function":{"name":"read_file","parameters":{"type":"object",
+       "properties":{"limit":{"type":"integer"}},"required":["limit"]}}}])");
+    ReplyOptions ro;
+    ro.tools = &tools;
+    ro.generation_prompt = "</think>";
+    const auto chat = parser_of(f, ro);
+    REQUIRE(chat != nullptr);
+    const std::string D = "\xEF\xBD\x9C" "DSML" "\xEF\xBD\x9C";
+    const std::string reply =
+        "Looking at the template.\n"
+        "<skill_view\">\n"
+        "<" + D + " parameter name=\"file_path\" string=\"true\">/home/don/x</" + D + " parameter>\n"
+        "</invoke>\n"
+        "<" + D + " invoke name=\"read_file\">\n"
+        "<" + D + " parameter name=\"limit\" string=\"false\">40</" + D + " parameter>\n"
+        "</invoke>\n"
+        "</calls>";
+    const ReplyMessage m = reply_parse(*chat, reply);
+    CHECK_EQ(m.content, std::string("Looking at the template."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].name, std::string("skill_view"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"file_path\":\"/home/don/x\"}"));
+    CHECK_EQ(m.calls[1].name, std::string("read_file"));
+    CHECK_EQ(m.calls[1].arguments, std::string("{\"limit\":40}"));
+    CHECK(m.calls[0].closed && m.calls[1].closed);
+}
+
 TEST(json_arguments_behind_a_name_tag_read_as_one_object) {
     std::shared_ptr<const ReplyParser> p = object_format(false);
     REQUIRE(p != nullptr);

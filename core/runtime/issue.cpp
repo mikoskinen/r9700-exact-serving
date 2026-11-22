@@ -10,6 +10,7 @@
  * the host. See ctx.h for the cost budget (spec §3.2).
  */
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -51,6 +52,21 @@ static inline bool operand_fits(const RadTensor& t, int64_t offset, const RadTen
         span += (t.shape[d] - 1) * t.stride[d];
     }
     return span < rad_tensor_numel(&decl);
+}
+
+/* A weight stored in GGUF native blocks (q8_0: 34 bytes a 32-element block, codes and scale side by side) is declared at its codes
+ * plane's element shape, so a stored row is LONGER than shape[1] x bits / 8 and operand_fits() under-counts the end of a row view
+ * near the weight's last rows (tp8 loop lq216: lever FCS's rank-3 quarter of the q8_0 dspark.fc, byte offset 3 x 1280 x 16,320,
+ * refused although it ends exactly at the stored end). For such a weight a ROW view is judged in stored bytes: whole rows (no
+ * column narrowing), its byte offset a whole number of stored rows, its rows ending inside the stored bytes. Only reached where
+ * operand_fits() refused, so every view it took before is taken as before. */
+static inline bool block_rows_fit(const rad::WeightInfo& wi, int bits, const RadTensor& decl, const RadOperand& o,
+                                  const RadTensor& t, int64_t byte_off) {
+    if (bits < 8 || decl.rank != 2 || t.rank != 2 || o.cols > 0 || decl.shape[0] <= 0 || wi.stored_bytes <= 0) return false;
+    if (wi.stored_bytes <= rad_tensor_numel(&decl) * (int64_t)(bits >> 3)) return false;   /* rows not longer than the shape */
+    if (wi.stored_bytes % decl.shape[0]) return false;
+    const int64_t rb = wi.stored_bytes / decl.shape[0], rows = t.shape[0];
+    return byte_off >= 0 && byte_off % rb == 0 && rows > 0 && rows <= decl.shape[0] && byte_off + rows * rb <= wi.stored_bytes;
 }
 
 std::string tensor_shape_str(const RadTensor& t) {
@@ -251,6 +267,30 @@ int Ctx::bind_weight_tables() {
 }
 
 static const bool g_dbg_issue = std::getenv("RADIANCE_DEBUG_ISSUE") != nullptr;
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS=X, > 0; read once): every rank times each issue (own = issue_body up to the launch,
+ * launch = the kernel's host launch or a host-site op's run) and its first-launch kernel resolves on the card (the AQL
+ * backend's); an issue of >= X ms prints one line, and run_step one line a pass whose issue took >= max(10, 5 X) ms (its
+ * issues' sum, the rest = the plugin's own code between issues, the slowest issue), at most 128 lines of each a process.
+ * Timing only: the issue order, arguments and bytes are unchanged. Unset / 0: nothing timed. */
+static const double g_slow_issue_ms = [] {
+    const char* e = std::getenv("RADIANCE_SLOW_ISSUE_MS");
+    const double v = e && *e ? std::atof(e) : 0.0;
+    if (v > 0)
+        std::fprintf(stderr, "radiance: RADIANCE_SLOW_ISSUE_MS=%g (tp8 loop P31): an issue of >= %g ms and a pass issue of >= "
+                             "%g ms print a line (at most 128 each) in passes of >= RADIANCE_SLOW_ISSUE_ROWS rows\n", v, v,
+                     std::max(10.0, 5.0 * v));
+    return v > 0 ? v : 0.0;
+}();
+/* RADIANCE_SLOW_ISSUE_ROWS=N (default 512): only passes of >= N rows print (the first big passes, not a1's decode recordings) */
+static const int64_t g_slow_issue_rows = [] {
+    const char* e = std::getenv("RADIANCE_SLOW_ISSUE_ROWS");
+    const long long v = e && *e ? std::atoll(e) : 512;
+    return (int64_t)(v > 0 ? v : 1);
+}();
+static std::atomic<int> g_slow_issue_lines{0}, g_slow_pass_lines{0};
+double slow_issue_ms() { return g_slow_issue_ms; }
+int64_t slow_issue_rows() { return g_slow_issue_rows; }
+int slow_pass_line_take() { return g_slow_pass_lines.fetch_add(1, std::memory_order_relaxed); }
 /* RADIANCE_DEBUG_ISSUE: entries walked and wall time spent in weight-table refreshes, reported
  * separately from the rest of `own`. */
 static double g_wtab_us = 0.0, g_wtab_us_p = 0.0;
@@ -622,8 +662,11 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 }
 
 int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
-    const auto t_iss0 = g_dbg_issue ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
+    const auto t_iss0 = g_dbg_issue || g_slow_issue_ms > 0 ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    if (g_slow_issue_ms > 0) aql_resolves_take(nullptr, nullptr);   /* tp8 loop P31: this issue's resolves only */
+#endif
     /* Step already aborted. rad_arch_step is void and keeps issuing; skip the rest so the first
      * error stays the reported one. */
     if (step_status_ < 0) return step_status_;
@@ -786,6 +829,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                       fmt("weight '%s' has no pointer at issue: the load phase "
                                           "never bound it and no residency table claims it",
                                           program_->weights[wh].name.c_str()));
+            int64_t wd = 0;   /* the view's byte offset (block_rows_fit) */
             if (o.offset) {
                 int64_t d;
                 if (!byte_delta(w_bits_[wh], o.offset, &d))
@@ -795,14 +839,16 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                               program_->weights[wh].name.c_str(),
                                               (long long)o.offset, rad_dtype_name(tt.dtype)));
                 tt.data = static_cast<char*>(tt.data) + d;
+                wd = d;
             }
             if (o.rows > 0) tt.shape[0] = o.rows;
             narrow_cols(o, &tt);
             /* Same fit check as a buffer: an overrunning slice reads the next weight in the slab
              * and yields plausible numbers. Only a sliced operand can overrun, so whole-weight
-             * issues skip it. */
+             * issues skip it. A GGUF block weight's row view is judged in its stored bytes. */
             if ((o.offset || o.rows > 0 || o.cols > 0) &&
-                !operand_fits(tt, o.offset, w_tmpl_[wh]))
+                !operand_fits(tt, o.offset, w_tmpl_[wh]) &&
+                !block_rows_fit(program_->weights[wh], w_bits_[wh], w_tmpl_[wh], o, tt, wd))
                 return abort_step_msg(h, RAD_E_SHAPE,
                                       fmt("operand %d reaches past weight '%s': %s at offset "
                                           "%lld, declared %s", i,
@@ -965,6 +1011,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      *
      * The device caches host-arena memory, so rad_dev_host_wrote after the launch makes the
      * host's writes visible to later kernels. */
+    const bool touch0 = host_touch_pending_[0], touch1 = host_touch_pending_[1];
     if (dom == RAD_DOMAIN_HOST) {
         /* Timed apart from the op: it is the cost of stopping the pipeline. */
         if (profiling_) {
@@ -976,6 +1023,26 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         } else {
             const int js = host_join(opd, n_opd);
             if (js < 0) return abort_step(h, b, dom, ip, n, js);
+        }
+    }
+
+    /* A host gather from the mapped tier: every page its rows cover is asked for now, so the
+     * kernel's faults wait on reads already in flight rather than issuing them one at a time
+     * (runtime/rowprefetch.h). After the join, since the ids may be a device op's output. Timed
+     * with the op when profiling: it is the op's own read. */
+    RowPrefetch rowpf{};
+    if (dom == RAD_DOMAIN_HOST && p.row_gather && row_prefetch_on_ &&
+        !(ip.row && ip.row->fetches_rows)) {
+        row_prefetch_plan(ip.args, opd, n_opd, t, &rowpf);
+        if (rowpf.n) {
+            if (profiling_) {
+                const auto r0 = std::chrono::steady_clock::now();
+                row_prefetch_run(rowpf, t, n);
+                prof_ms_[(size_t)h] += std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - r0).count();
+            } else {
+                row_prefetch_run(rowpf, t, n);
+            }
         }
     }
 
@@ -1035,6 +1102,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         th.args = ip.args;
         th.n = n;
         th.drain = host_join_drains(opd, n_opd);
+        th.touch[0] = touch0;
+        th.touch[1] = touch1;
+        th.rp = rowpf;
         for (int i = 0; i < n_opd; ++i) th.t[i] = t[i];
         TapeStep st;
         st.kind = kTapeHost;
@@ -1062,6 +1132,16 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             gate_args.n_p = ip.gate_n_p;
             la = &gate_args;
         }
+    }
+    /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective issued from the second pass slot takes the row's second instance set,
+     * so a pass on a rank's second Ctx never shares an instance's slots with one on the first (qfn-on-ds Q5b S0: by the
+     * Ctx's slot, ar_set_, not by lane 1 -- the Qwen line's lane 1 carries a pass's own collectives) */
+    RadArgs set_args;
+    if (ip.instance1 && ar_set_ == 1) {
+        set_args = *la;
+        set_args.instance = ip.instance1;
+        la = &set_args;
+        ++ar_set1_issues_;
     }
 
     int s;
@@ -1139,9 +1219,22 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             g_iss_own_p = g_iss_own;
             g_iss_lau_p = g_iss_lau;
         }
+    } else if (g_slow_issue_ms > 0) {
+        /* tp8 loop P31: the same launch, timed */
+        const auto ta = std::chrono::steady_clock::now();
+        s = ip.launch(la, cur_stream());
+        const auto tb = std::chrono::steady_clock::now();
+        uint64_t rns = 0, rn = 0;
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+        aql_resolves_take(&rns, &rn);
+#endif
+        using msd = std::chrono::duration<double, std::milli>;
+        slow_issue_note(h, b, dom, ip, n, msd(ta - t_iss0).count(), msd(tb - ta).count(), rns, rn);
     } else {
         s = ip.launch(la, cur_stream());
     }
+    /* A read-ahead beside a host gather stops with its kernel (runtime/rowprefetch.h). */
+    if (rowpf_beside_) row_prefetch_done();
     if (hold) {
         /* Always released, by a barrier unless the launch ended the hold itself
          * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
@@ -1187,6 +1280,7 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.rec0 = rec0;
     o.rec1 = rec1;
     o.op = (uint32_t)(&p - plans_.data());
+    o.row = ip.row;
     const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
     o.opaque = p.collective || !sc || sc->n_operands != n_opd || !ip.row || !ip.row->concurrent;
     std::pair<uintptr_t, uintptr_t> rd[MAX_OPERANDS + 1], wr[MAX_OPERANDS + 1];
@@ -1231,9 +1325,109 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     haz_ops_.push_back(o);
 }
 
+/* Lever RCO (fn4 route_copy_ov): a routing report's copy as a hazard op of its own -- it reads [src, +bytes) and writes
+ * [dst, +bytes) -- so haz_mark orders it behind whatever wrote its source and lets a dispatch that touches neither range
+ * start beside it. Only a copy that is exactly one tape record: anything else stays op-less (ordered and opaque). */
+void Ctx::haz_note_route_copy(const void* src, void* dst, int64_t bytes, int rec0, int rec1) {
+    if (rec0 < 0 || rec1 != rec0 + 1 || bytes <= 0 || !src || !dst) return;
+    HazOp o;
+    o.rec0 = rec0;
+    o.rec1 = rec1;
+    o.op = UINT32_MAX;
+    o.route_copy = true;
+    const uintptr_t s = (uintptr_t)src, d = (uintptr_t)dst;
+    o.rd = (uint32_t)haz_rng_.size();
+    o.n_rd = 1;
+    haz_rng_.push_back({ s, s + (uintptr_t)bytes });
+    o.wr = (uint32_t)haz_rng_.size();
+    o.n_wr = 1;
+    haz_rng_.push_back({ d, d + (uintptr_t)bytes });
+    haz_ops_.push_back(o);
+}
+
 /* See "a host launch is a join" in Ctx::issue_body. */
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS): one issue's times into the pass's sums; a slow one gets its line. */
+void Ctx::slow_issue_note(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, double own_ms, double launch_ms,
+                          uint64_t res_ns, uint64_t res_n) {
+    const double t = own_ms + launch_ms;
+    slow_in_ms_ += t;
+    ++slow_n_;
+    slow_res_ns_ += res_ns;
+    slow_res_n_ += (int64_t)res_n;
+    if (t > slow_max_ms_) { slow_max_ms_ = t; slow_max_op_ = (int32_t)h; }
+    if (t < g_slow_issue_ms || !batch_ || batch_->n_tok < g_slow_issue_rows) return;
+    const int k = g_slow_issue_lines.fetch_add(1, std::memory_order_relaxed);
+    if (k >= 128) return;
+    const OpInfo* oi = (size_t)h < plans_.size() ? plans_[h].info : nullptr;
+    const char* kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
+    std::fprintf(stderr, "radiance: slow issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card %d rank %d step %lld (%lld rows) "
+                         "lane %d: op '%s' kernel %s (band %d, %s, n %lld): own %.2f ms + launch %.2f ms, %llu first-launch "
+                         "resolve(s) %.2f ms in it%s\n",
+                 device_, rank_, batch_ ? (long long)batch_->step : -1LL, batch_ ? (long long)batch_->n_tok : -1LL, lane_,
+                 oi ? oi->op.c_str() : "<?>", kname, band, dom == RAD_DOMAIN_HOST ? "host" : "device", (long long)n,
+                 own_ms, launch_ms, (unsigned long long)res_n, (double)res_ns / 1e6,
+                 k == 127 ? " (the 128th: no more issue lines)" : "");
+}
+
 int Ctx::host_join(const RadOperand* opd, int n_opd) {
     return host_join_wait(host_join_drains(opd, n_opd));
+}
+
+/* The tables a row gather's issue reads from the mapped tier (runtime/rowprefetch.h):
+ * every weight operand, taken whole, that holds at least n_vocab rows -- the gathers' own shape
+ * rule, which leaves out a codebook or a scalar scale -- at its stored row pitch. Nothing when
+ * the ids (operand 0) are not a buffer or raw pointer, or no table is mapped. */
+void Ctx::row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd, const RadTensor* t,
+                            RowPrefetch* out) const {
+    out->n = 0;
+    if (n_opd < 2 || (opd[0].kind != RAD_OPK_BUF && opd[0].kind != RAD_OPK_RAW) || !t[0].data)
+        return;
+    long long vocab = 0, voff = 0;
+    if (!rad_args_geti(&a, "n_vocab", &vocab) || vocab <= 0) return;
+    rad_args_geti(&a, "vocab_offset", &voff);
+    for (int i = 1; i < n_opd && out->n < kRowTablesMax; ++i) {
+        const RadOperand& o = opd[i];
+        if (o.kind != RAD_OPK_WEIGHT || o.offset || o.rows > 0 || o.cols > 0) continue;
+        if (o.handle == RAD_NULL_HANDLE || (size_t)o.handle >= program_->weights.size()) continue;
+        const WeightInfo& w = program_->weights[o.handle];
+        if (w.tier != Tier::Mapped || !t[i].data) continue;
+        const int64_t rows = w.stored_rank ? w.stored_shape[0] : (w.decl.rank ? w.decl.shape[0] : 0);
+        const int64_t bytes = w.stored_bytes > 0 ? w.stored_bytes : w.logical_bytes;
+        if (rows < vocab || rows <= 0 || bytes <= 0 || bytes % rows) continue;
+        out->opd[out->n] = (int8_t)i;
+        out->row_bytes[out->n] = bytes / rows;
+        ++out->n;
+    }
+    out->rows = vocab;
+    out->voff = voff;
+}
+
+void Ctx::row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n) {
+    const int64_t have = rad_tensor_numel(&t[0]);
+    const int64_t m = have > 0 && have < n ? have : n;
+    if (m > 0 && rp.n > 0 && m * rp.n > kRowAheadInline && t[0].data &&
+        row_pages_resident(rp, t[0], m, t)) {
+        /* Long and its sampled rows resident: beside the kernel (rowprefetch.h);
+         * row_prefetch_done() after its launch. */
+        if (!rowpf_worker_) rowpf_worker_ = std::make_unique<RowPrefetchWorker>();
+        rowpf_worker_->start(rp, t[0], m, t);
+        rowpf_beside_ = true;
+        ++rowpf_calls_;
+        ++rowpf_beside_calls_;
+        return;
+    }
+    const int64_t pages = row_prefetch(rp, t[0], m, t, &rowpf_);
+    if (pages < 0) return;
+    ++rowpf_calls_;
+    rowpf_pages_ += pages;
+}
+
+/* The kernel a read-ahead ran beside has returned (or never launched): stop the helper and wait
+ * until it no longer reads the ids, before anything may write them. */
+void Ctx::row_prefetch_done() {
+    if (!rowpf_beside_) return;
+    rowpf_beside_ = false;
+    rowpf_pages_ += rowpf_worker_->finish();
 }
 
 /* Whether any operand is untracked by the host arena, so the join must drain the stream. */
@@ -1249,7 +1443,10 @@ bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
 
 int Ctx::host_join_wait(bool drain) {
     ++n_host_syncs_;
-    if (drain) return rad_stream_sync(cur_stream());
+    if (drain) {
+        ++n_host_drains_;
+        return rad_stream_sync(cur_stream());
+    }
     for (int l = 0; l < 2; ++l) {
         if (!host_touch_pending_[l]) continue;
         RAD_TRY(rad_event_sync(host_touch_ev_[l]));
@@ -1261,6 +1458,7 @@ int Ctx::host_join_wait(bool drain) {
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
+    row_prefetch_done();   /* no helper outlives the op that started it */
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     const char*     pname = ip.row ? ip.row->plugin.c_str() : "<unknown plugin>";

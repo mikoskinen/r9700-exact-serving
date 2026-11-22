@@ -515,6 +515,16 @@ inline int map_tap(RadBuilder* b, const char* declared, const char* src, int dim
     return rad_decl_name_map(b, &m);
 }
 
+/* The elementwise product of two checkpoint tensors of one shape (RAD_MAP_MUL): a gain shipped as
+ * two factors. */
+inline int map_mul(RadBuilder* b, const char* declared, const char* a, const char* c) {
+    RadNameMap m = map_base(declared, RAD_MAP_MUL);
+    m.n_src  = 2;
+    m.src[0] = a;
+    m.src[1] = c;
+    return rad_decl_name_map(b, &m);
+}
+
 /* An EMA codebook: the embedding sums over max(cluster usage, 1e-5), row by row (RAD_MAP_EMA). */
 inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const char* usage) {
     RadNameMap m = map_base(declared, RAD_MAP_EMA);
@@ -1116,6 +1126,28 @@ inline int64_t vocab_head_rows(const Geom& g) {
  * the batch, so the operand names the group and layer and the core resolves it like a weight
  * handle. */
 inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, layer); }
+/* qfn-on-ds lever TIP (Qwen loop round 21): a prompt's tail snapshot taken at a row INSIDE its last prefill step -- the start of
+ * the step's last piece, so no piece boundary moves -- instead of cutting the step there. The engine sets it around the step
+ * (the plugin's rad_tip_set); a block whose per-sequence state op runs over the step's rows runs it in two launches, [0, row)
+ * and [row, T) (cu = {0, row, T} on the card: the second launch's cu is cu + 1, its context row's position), and between
+ * them calls put() for every state row that launch pair writes: the engine copies the sequence's (group, layer) row into its
+ * staging blob on the stream the block issues on, and saves the blob as the snapshot. Null / row 0: no snapshot inside. */
+struct TipStage {
+    int64_t        row = 0;
+    const int32_t* cu = nullptr;
+    /* lever TIF (Qwen loop round 23): {R, row} on the card, for a row inside the SECOND piece of a two-piece step (the delta
+     * net's piece path splits that piece's state ops at the row); null where the plugin did not upload it */
+    const int32_t* cu_in = nullptr;
+    int  (*stage)(void* u, int group, int layer, void* stream) = nullptr;
+    void* u = nullptr;
+    bool on() const { return row > 0 && cu && stage; }
+    /* A refusal is not this rank's step failure: the engine counts it and refuses the snapshot at its save (the engine then
+     * stops with the reason). Failing the step here on one rank would leave the others inside a collective (test tip1 / F60: rank 0
+     * waited in an all-reduce its peers had left). */
+    void put(RadCtx* c, rad_kvgroup g, int layer) const {
+        if (stage) (void)stage(u, (int)g, layer, rad_stream(c));
+    }
+};
 /* fn4 kvs_apart (qwen/KV-STREAM-EXACT.md): a streamed group's RING whatever view the pass is on -- `cols` -1 on a KV operand
  * (core/runtime/issue.cpp); meaningful only in a pass staged on a stage funded beside the ring (kv_stage_apart_wait 2),
  * where a store keeps the ring current; elsewhere it resolves as kv_cache. */

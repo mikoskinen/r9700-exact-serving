@@ -12,6 +12,7 @@
 // No fp8-P leg and no non-CONTIG alternative here; r4d_attn_prefill_h256_gqa6.hip documents the
 // full option set.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
@@ -53,6 +54,23 @@
 // fragment for fp8, 16 for bf16), costing 2 or 4 x HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold
 // converted fragments and cost occupancy. Results are unchanged.
 #define O_KRAW  16777216
+// O_KFIRST (Qwen loop round 12, lever KRW): with O_KRAW at TILE 16 (one m-tile), the tile's raw K round is issued BEFORE the
+// V tile's fetch, so the V and K loads of a tile are in flight together (one round trip a tile instead of two); the raw K
+// is held across the V staging (+32 VGPRs over O_KRAW alone). Results are unchanged (the same conversions and WMMAs).
+#define O_KFIRST 1073741824
+// O_TLS (Qwen loop round 12, COORD 13:06; bench instance only): each wave sums its phases in 100 MHz ticks -- the tile's
+// block-table + barriers, the V tile's fetch + LDS store, QK (K loads, conversions, the WMMA chain up to its result), the
+// softmax (mask, max, rescale, P), PV (V reads from LDS, conversions, WMMA issue) -- and lane 0 writes 8 words at
+// g_attn_tlp[(seq * kv_heads + kvh) * splits + split]; the arithmetic is the option word's without O_TLS
+#define O_TLS 4
+#ifdef R4D_EMU_HOST
+#define R4DT_NOW() 0ull
+#define R4DT_USE(x) ((void)(x))
+#else
+#define R4DT_NOW() ((unsigned long long)wall_clock64())
+#define R4DT_USE(x) asm volatile("" :: "s"(x))   /* the value read: the stamp after it waits for its producer */
+#endif
+static __device__ unsigned long long* g_attn_tlp;
 // O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), and with O_K6 the
 // k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V4    33554432
@@ -129,6 +147,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
+    constexpr int KFIRST = ((OPT & O_KFIRST) && KRAW && TILE == 16) ? 1 : 0;
+    constexpr bool TLS  = (OPT & O_TLS) != 0;
     static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
     static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
                   "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
@@ -200,6 +220,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     const int t_lo = tb + sp * tps;
     if (t_lo >= ntl) return;
     const int t_hi = min(t_lo + tps, ntl);
+    const unsigned long long tl_ent = TLS ? R4DT_NOW() : 0ull;
+    unsigned tl_bar = 0, tl_v = 0, tl_qk = 0, tl_sm = 0, tl_pv = 0, tl_pro = 0;
 
     // TREE: the block's parents staged once, so each row's walk below reads LDS rather than a
     // chain of dependent global loads. Every early return above is uniform across the block.
@@ -422,14 +444,35 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     int blk[NB];
     if (BTS) load_bt(t_lo * NB, blk);
     if (GPREV) fetchV(t_lo * TILE, blk);
+    if constexpr (TLS) {   /* the q fragments in: the prologue ends here */
+        uint32_t qw; __builtin_memcpy(&qw, &qf[NKS - 1], 4);
+        R4DT_USE(__builtin_amdgcn_readfirstlane((int)qw));
+        tl_pro = (unsigned)(R4DT_NOW() - tl_ent);
+    }
 
     for (int ti = t_lo; ti < t_hi; ++ti) {
+        const unsigned long long tl_a = TLS ? R4DT_NOW() : 0ull;
+        unsigned long long tl_b = 0, tl_c = 0, tl_d = 0, tl_e = 0, tl_f = 0;
         const int k0 = ti * TILE;
         int blkn[NB];
         if (BTS && ti + 1 < t_hi) {
             load_bt((ti + 1) * NB, blkn);
         }
+        // KFIRST: this tile's raw K round goes out before the V fetch (MT == 1: the m-tile loop's only row block)
+        typedef typename std::conditional<KVP != 0, uint4, uint2>::type krawf_t;
+        krawf_t krawf[KFIRST ? NKS : 1];
+        if constexpr (KFIRST) {
+            int kk = min(k0 + c, ctx - 1);
+            if (WIN && kk < wlo0) kk = wlo0;
+            const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
+            const uint8_t* growf = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
+                                 + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB) * (KVP ? 2 : 1);
+            #pragma unroll
+            for (int t = 0; t < NKS; ++t)
+                krawf[t] = *(const krawf_t*)(growf + (16 * t + 8 * h) * (KVP ? 2 : 1));
+        }
         if (LDSB) lds_barrier(); else __syncthreads();
+        if constexpr (TLS) tl_b = R4DT_NOW();
 
         if (KLDS) {
             #pragma unroll 1
@@ -455,7 +498,9 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
         }
         if constexpr (V4) { fetchV4(k0, blk); storeV4(); }
         else { if (!GPREV) fetchV(k0, blk); storeV(); }
+        if constexpr (TLS) tl_c = R4DT_NOW();
         if (LDSB) lds_barrier(); else __syncthreads();
+        if constexpr (TLS) tl_d = R4DT_NOW();
         if (GPREV && ti + 1 < t_hi) fetchV(k0 + TILE, blkn);
 
         #pragma unroll 1
@@ -472,7 +517,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
             // A fragment's raw K: 8 elements of 1 byte (fp8) or 2 (bf16).
             typedef typename std::conditional<KVP != 0, uint4, uint2>::type kraw_t;
             kraw_t kraw[KRAW ? NKS : 1];
-            if constexpr (KRAW) {
+            if constexpr (KFIRST) {
+                #pragma unroll
+                for (int t = 0; t < NKS; ++t) kraw[t] = krawf[t];
+            } else if constexpr (KRAW) {
                 #pragma unroll
                 for (int t = 0; t < NKS; ++t)
                     kraw[t] = *(const kraw_t*)(grow + (16 * t + 8 * h) * (KVP ? 2 : 1));
@@ -530,6 +578,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 if (SGB) sched_barrier();
                 #pragma unroll
                 for (int j = 0; j < PF; ++j) s = D::wmma(kb[j], qf[g + j], s);
+            }
+            if constexpr (TLS) {   /* the WMMA chain's result in: QK ends here */
+                R4DT_USE(__builtin_amdgcn_readfirstlane((int)__builtin_bit_cast(uint32_t, s[0])));
+                tl_e = R4DT_NOW();
             }
             float sc[8];
             #pragma unroll
@@ -593,6 +645,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 // plus 32 (G & 1) + 8 ((G >> 1) & 1) + 128 (G >> 1), a compile-time offset below.
                 const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0)
                                       + (VSK ? 16 * (c >> 3) : 0);
+                if constexpr (TLS) {   /* P packed: the softmax ends here */
+                    R4DT_USE(__builtin_amdgcn_readfirstlane((int)pw[3]));
+                    tl_f = R4DT_NOW();
+                }
                 #pragma unroll
                 for (int g = 0; g < NKS; g += PF) {
                     frag16 vb[PF];
@@ -623,6 +679,18 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
         if (BTS) {
             #pragma unroll
             for (int i = 0; i < NB; ++i) blk[i] = blkn[i];
+        }
+        if constexpr (TLS) {   /* PV issued (its tail completes in the next tile's first phase) */
+            const unsigned long long tl_g = R4DT_NOW();
+            tl_bar += (unsigned)((tl_b - tl_a) + (tl_d - tl_c)); tl_v += (unsigned)(tl_c - tl_b);
+            tl_qk += (unsigned)(tl_e - tl_d); tl_sm += (unsigned)(tl_f - tl_e); tl_pv += (unsigned)(tl_g - tl_f);
+        }
+    }
+    if constexpr (TLS) {
+        if (lane == 0 && g_attn_tlp) {
+            unsigned long long* rr = g_attn_tlp + (((size_t)seq * gridDim.y + kvh) * gridDim.x + sp) * 8;
+            rr[0] = tl_ent; rr[1] = R4DT_NOW(); rr[2] = tl_bar; rr[3] = tl_v; rr[4] = tl_qk; rr[5] = tl_sm; rr[6] = tl_pv;
+            rr[7] = ((unsigned long long)(t_hi - t_lo) << 32) | tl_pro;
         }
     }
 
@@ -692,7 +760,7 @@ template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
          int WIN = 0>
 __global__ __launch_bounds__(NWARPS * 32)
 void r4d_attn_decode_kernel(const R4DArgs a, int splits)
-{
+{ R4D_IKA_ENTRY();
     r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
 }
 template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
@@ -876,7 +944,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0, SPAN>(a, splits, tile,
                                                                          R4DGateQuant{});
 }
@@ -893,7 +961,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int tile,
                                             const R4DGateQuant gq)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, GQ>(a, splits, tile, gq);
 }
 
@@ -905,7 +973,11 @@ template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu (test_qwalk): the host has no extern __shared__; the launch's dynamic LDS */
+    float* sw = (float*)emu_dyn_lds();
+#else
     extern __shared__ float sw[];
+#endif
     __shared__ float red[HEAD_DIM];
     const int job = blockIdx.x, d = threadIdx.x;
     const int tok = job / a.q_heads;
@@ -1022,7 +1094,7 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0, SPAN>(a, splits, tile, R4DGateQuant{});
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
@@ -1037,7 +1109,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
                                         const R4DGateQuant gq)
-{
+{ R4D_IKA_ENTRY();
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, GQ>(a, splits, tile, gq);
 }
 

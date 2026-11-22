@@ -83,11 +83,19 @@ Mover::~Mover() {
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
     if (gate_) rad_event_destroy(gate_);
+    for (ClassPools& c : pools_)
+        if (c.park_base) rad_dev_free(c.park_base, RAD_MEM_HOST_PINNED);
+    /* Lever DL's host copies are always the mover's own (outside the budget). */
+    for (ClassPools& c : pools_)
+        if (c.keep_base) rad_dev_free(c.keep_base, RAD_MEM_HOST_MAPPED);
+    /* Lever Z0-W's host copies too. */
+    for (DwStretch& d : dw_)
+        if (d.host) rad_dev_free(d.host, RAD_MEM_HOST_PINNED);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
             if (c.slab_base) rad_dev_free(c.slab_base, RAD_MEM_DEVICE);
-            if (c.pool_base) rad_dev_free(c.pool_base, RAD_MEM_HOST_PINNED);
+            if (c.pool_base && c.pool_base != c.keep_base) rad_dev_free(c.pool_base, RAD_MEM_HOST_PINNED);
         }
         if (static_vram_) rad_dev_free(static_vram_, RAD_MEM_DEVICE);
         if (stage_) rad_dev_free(stage_, RAD_MEM_HOST_PINNED);
@@ -156,6 +164,44 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         }
     }
 
+    /* ---- lever DL: the drafter's classes, and the host copies their resident units keep ------
+     *
+     * A class is the drafter's when every unit in it is a routed unit of a layer at or above
+     * draft_keep_from (classes are per stride, and the drafter's experts have a stride of their
+     * own). Its units resident in VRAM get a pool slot past the plan's pooled ones, filled from
+     * their VRAM slots by draft_lend_setup; promotions keep it. Nothing else of the plan moves. */
+    dl_units_.clear();
+    dl_classes_.clear();
+    dl_ready_ = false;
+    dl_want_ = false;
+    dl_slab_bytes_ = dl_keep_bytes_ = 0;
+    dl_state_.store(kDlResident, std::memory_order_relaxed);
+    std::vector<int64_t> n_keep(plan.classes.size(), 0);
+    if (cfg.draft_keep_from >= 0 && plan.dynamic) {
+        const size_t nc = plan.classes.size();
+        std::vector<int64_t> drafter(nc, 0), other(nc, 0);
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.slab_class < 0) continue;
+            const bool d = mu.expert >= 0 && mu.layer >= cfg.draft_keep_from && !mu.host_forced &&
+                           (mu.tier == Tier::HostPinned || (mu.tier == Tier::VRAM && mu.slab_slot >= 0));
+            ++(d ? drafter : other)[(size_t)mu.slab_class];
+        }
+        for (size_t c = 0; c < nc; ++c)
+            if (drafter[c] > 0 && other[c] == 0) {
+                pools_[c].keep = true;
+                dl_classes_.push_back((int32_t)c);
+            }
+        for (size_t u = 0; u < plan.units.size(); ++u) {
+            const MoveUnit& mu = plan.units[u];
+            if (mu.slab_class < 0 || !pools_[(size_t)mu.slab_class].keep) continue;
+            dl_units_.push_back((int32_t)u);
+            if (mu.tier != Tier::VRAM) continue;
+            const size_t c = (size_t)mu.slab_class;
+            unit_[u].pool_slot = n_pool[c] + n_keep[c]++;
+            pool_layer_[c].push_back(mu.layer);
+        }
+    }
+
     /* ---- allocate ------------------------------------------------------------------------- */
     int64_t total_shadow = 0, total_turn = 0, total_slab = 0, total_pool = 0;
     for (size_t c = 0; c < plan.classes.size(); ++c) {
@@ -172,12 +218,18 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         /* Flex slots are added later by lend_from(), once the lender's memory is carved. */
         cp.n_fixed = slab_slots;
         cp.n_work = shadow + sc.n_stage;
+        /* The first place_shadow_slots() (RAD_PLACE_SHADOW_SLOTS unless RADIANCE_PLACE_SHADOW_SLOTS)
+         * of the shadow range are the swap budget heat promotes into. The rest is the file-tier hot
+         * cache; a heat promotion that takes one of those keeps it, and the cache never fills. The
+         * turnover cap is the shipped count scaled to the class's shadow slots over that budget, so
+         * a class with the whole budget keeps the shipped cap whatever the budget is. */
+        cp.n_hot_lo = n_slab[c] + std::min<int64_t>(shadow, place_shadow_slots());
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
-                                      shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
+                                      shadow * RAD_PLACE_TURNOVER_SLOTS / place_shadow_slots());
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         total_slab += slab_slots;
-        total_pool += n_pool[c];
+        total_pool += n_pool[c] + n_keep[c];
         if (slab_slots > 0) {
             /* Tail padding: a kernel assembling a packed code window from a wide read may read a
              * few bytes past the last slot; without padding that runs off the allocation and
@@ -193,8 +245,30 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         for (int64_t s = n_slab[c]; s < slab_slots; ++s) cp.slab.add_free(s);
         total_shadow += shadow + sc.n_stage;
 
-        cp.pool.init(n_pool[c], sc.stride);
-        if (n_pool[c] > 0) {
+        cp.pool.init(n_pool[c] + n_keep[c], sc.stride);
+        if (cp.keep && n_pool[c] + n_keep[c] > 0) {
+            /* Lever DL: the drafter's pool, its planned pooled units and the host copies, in one
+             * mapped allocation of the mover's own. Outside --host-pool-mib on purpose: charged to
+             * the budget it would change the split (the expert floor counts the pool's room), and
+             * the plan must stay today's. The bytes the planner charged for the pooled part stay
+             * unreserved in the budget pool. */
+            const int64_t bytes = (n_pool[c] + n_keep[c]) * sc.stride;
+            cp.keep_base = rad_dev_alloc(bytes, RAD_MEM_HOST_MAPPED);
+            if (!cp.keep_base) {
+                RAD_ERR("mover: no pinned host memory for the drafter's '%s' pool and host copies: "
+                        "%lld slots of %s", sc.name.c_str(), (long long)(n_pool[c] + n_keep[c]),
+                        humanb(sc.stride).c_str());
+                return RAD_E_NOMEM;
+            }
+            cp.pool_base = cp.keep_base;
+            cp.pool_dev = rad_dev_device_ptr(cp.pool_base);
+            if (!cp.pool_dev) {
+                RAD_WARN("mover: the drafter's '%s' host pool has no device address; a kernel reading "
+                         "it zero-copy would fault", sc.name.c_str());
+                cp.pool_dev = cp.pool_base;
+            }
+            dl_keep_bytes_ += n_keep[c] * sc.stride;
+        } else if (n_pool[c] > 0) {
             cp.pool_base = reserve(sc.name.c_str(), n_pool[c] * sc.stride, RAD_MEM_HOST_PINNED);
             if (!cp.pool_base) {
                 RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s",
@@ -262,6 +336,15 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.tier != Tier::SSD) continue;
+            for (int32_t wi : mu.weights)
+                if (weight_file_relaid(prog, prog.weights[wi], prog.ctx.world_size) && !relayout_) {
+                    RAD_ERR("mover: '%s' is on the file tier and its kernel relayouts it, but no "
+                            "relayout function was set", prog.weights[wi].name.c_str());
+                    return RAD_E_STATE;
+                }
+        }
         /* Staging slots are sized by the widest unit actually on the file tier, not the widest
          * class. The widest class is usually the embedding table (gigabytes, and never on the
          * file tier), and sizing on it would reserve pinned memory for a weight that never
@@ -498,7 +581,7 @@ int Mover::prefetch_to_op(int32_t op_index) {
      * a read outside [first_use_op, last_use_op]. */
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
         const UnitState& us = unit_[(size_t)u];
-        if (us.site != Site::DeviceStaged || us.slab_slot < 0) continue;
+        if (us.site != Site::DeviceStaged || us.slab_slot < 0 || us.hot) continue;
         if (unit_in_flight(u)) continue;   /* its copy has not landed; the slot is not ours yet */
         const MoveUnit& mu = plan_->units[(size_t)u];
         if (mu.last_use_op >= 0 && mu.last_use_op < op_index) release_slot(u);
@@ -792,6 +875,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     fat_.clear();
     fbase_.clear();
     frec_.clear();
+    park_cp_.clear();
     const size_t staged0 = rd->staged.size(), skipped0 = rd->skipped.size(),
                  promoted0 = rd->promoted.size();
     const int64_t used0 = rd->used;
@@ -809,18 +893,77 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             rd->skipped.push_back(u);
             continue;
         }
+        /* Already-relaid bytes in the host park: copy them, do not read the container.
+         * A hot-cache slot keeps the copy; otherwise it lands in this layer's buffer. */
+        if (us.park_slot >= 0) {
+            ClassPools& cp = pools_[(size_t)us.klass];
+            const char* src = (const char*)cp.park_base + us.park_slot * cp.stride;
+            bool admitted = false;
+            if (plan_->dynamic && heat_ && heat_->admit_hot(u) && !unit_in_flight(u)) {
+                const int rec = free_move_record();
+                int64_t slot = -1;
+                if (rec >= 0) slot = cp.slab.take_where([&](int64_t s) {
+                    return s >= cp.n_hot_lo && s < cp.n_fixed;
+                });
+                if (slot >= 0 && record_gate() < 0) { cp.slab.add_free(slot); slot = -1; }
+                if (slot >= 0) {
+                    char* base = cp.slot_ptr(slot);
+                    Move& m = moves_[(size_t)rec];
+                    m.state = Move::State::Copying;
+                    m.kind = Move::Kind::Admit;
+                    m.unit = u;
+                    m.slab_slot = slot;
+                    m.pool_slot = -1;
+                    ++copying_[(size_t)u];
+                    us.slab_slot = slot;
+                    us.hot = true;
+                    us.site = Site::Device;
+                    heat_->set_busy(u, true);
+                    ++stats_.ssd_promotions;
+                    park_cp_.push_back(ParkCopy{ base, src, us.bytes });
+                    rd->promoted.push_back(u);
+                    fbase_.push_back(base);
+                    frec_.push_back((int32_t)rec);
+                    hot_bytes += us.bytes;
+                    admitted = true;
+                }
+            }
+            if (!admitted) {
+                const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
+                if (off + need > cap) {
+                    RAD_ERR("file stager: a routed layer's file-tier units need more than the %s buffer "
+                            "the plan sized for the largest one", humanb(cap).c_str());
+                    return RAD_E_SCRATCH;
+                }
+                park_cp_.push_back(ParkCopy{ dst + off, src, us.bytes });
+                rd->staged.push_back(u);
+                fat_.push_back(off);
+                off += need;
+            }
+            continue;
+        }
+        /* A deposit copies the container's bytes into a pool slot the GEMM zero-copies as the
+         * stored form, so a relaid weight cannot take it. The hot cache can: the read relays
+         * into the slot (FileExt.relay) and the slot keeps the stored form. No free slot, and a
+         * relaid weight still takes the buffer path below, which relays and discards. */
+        const bool relaid = std::any_of(mu.weights.begin(), mu.weights.end(), [&](int32_t wi) {
+            return weight_file_relaid(*prog_, prog_->weights[wi], prog_->ctx.world_size);
+        });
         /* The hot VRAM cache: heat past the admission bar and a free
          * budgeted slot, and this pass's read lands in the slot and stays there. The read is
          * one the stager makes anyway; the slot is the whole cost, and eviction is
          * bookkeeping (the container is ground truth), so a mistake costs one future
          * re-read. No free slot, no heat, or no move record: the buffer path below, as
-         * before. */
+         * before. A relaid weight sets FileExt.relay so the copy is the stored form, not the
+         * container's bytes. */
         if (plan_->dynamic && heat_ && heat_->admit_hot(u) && !unit_in_flight(u)) {
             ClassPools& cp = pools_[(size_t)us.klass];
             const int rec = free_move_record();
             int64_t slot = -1;
             if (rec < 0) ++stats_.no_record;
-            else slot = cp.slab.take_where([&](int64_t s) { return s < cp.n_fixed; });
+            else slot = cp.slab.take_where([&](int64_t s) {
+                return s >= cp.n_hot_lo && s < cp.n_fixed;
+            });
             if (slot >= 0 && record_gate() < 0) { cp.slab.add_free(slot); slot = -1; }
             if (slot >= 0) {
                 char* const base = cp.slot_ptr(slot);
@@ -833,19 +976,68 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 ++copying_[(size_t)u];
                 us.slab_slot = slot;
                 us.hot = true;
+                us.site = Site::Device;   /* not a staging slot: prefetch must not release it at last_use_op */
                 heat_->set_busy(u, true);
+                /* Not evictable. Heat's step swaps up to 64 VRAM victims a step; marking the
+                 * cache evictable hands it that budget and the working set never settles.
+                 * Admission and the full-cache eviction below own these slots. */
                 ++stats_.ssd_promotions;
                 for (size_t k = 0; k < mu.weights.size(); ++k) {
                     const WeightInfo& w = prog_->weights[mu.weights[k]];
                     if (w.stored_bytes <= 0) continue;  /* nothing to read, nothing to place */
+                    const bool rw = weight_file_relaid(*prog_, w, prog_->ctx.world_size);
                     fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                             base + mu.offset[k], true, false });
+                                             base + mu.offset[k], true, false, rw ? &w : nullptr });
                 }
                 rd->promoted.push_back(u);
                 fbase_.push_back(base);
                 frec_.push_back((int32_t)rec);
                 hot_bytes += us.bytes;
                 continue;
+            }
+            /* The cache is full. A routed expert that lost the race still takes the buffer
+             * this step, but a colder hot-cache unit gives its slot up: the slot returns
+             * after quarantine, so the next token admits instead of re-reading. A unit in a
+             * protected layer may still be named by a kernel, so it is not a victim. */
+            if (rec >= 0 && record_gate() >= 0) {
+                int32_t victim = -1;
+                float cold = 0;
+                const float mine = heat_->heat(u);
+                for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+                    const UnitState& vs = unit_[(size_t)v];
+                    if (!vs.hot || vs.klass != us.klass || vs.slab_slot < 0) continue;
+                    if (copying_[(size_t)v] || heat_->busy(v)) continue;
+                    const int32_t layer = plan_->units[(size_t)v].layer;
+                    bool held = false;
+                    for (int p = 0; p < n_protect && !held; ++p)
+                        held = protect && protect[p] >= 0 && protect[p] == layer;
+                    if (held) continue;
+                    const float h = heat_->heat(v);
+                    /* 4x colder, not merely colder: decay 0.95, so an expert routed a few
+                     * steps ago still beats a one-token newcomer. Otherwise a full cache
+                     * rotates its working set every step. */
+                    if (h * 4.0f >= mine) continue;
+                    if (victim < 0 || h < cold) { victim = v; cold = h; }
+                }
+                if (victim >= 0) {
+                    (void)park_hot(victim, heat_);
+                    UnitState& vs = unit_[(size_t)victim];
+                    Move& m2 = moves_[(size_t)rec];
+                    m2.state = Move::State::Published;
+                    m2.kind = Move::Kind::Evict;
+                    m2.unit = victim;
+                    m2.slab_slot = vs.slab_slot;
+                    m2.pool_slot = -1;
+                    vs.slab_slot = -1;
+                    vs.tier = Tier::SSD;
+                    vs.site = Site::DeviceStaged;
+                    vs.hot = false;
+                    republish(victim);
+                    ++stats_.demotions;
+                    heat_->set_tier(victim, Tier::SSD);
+                    heat_->set_busy(victim, true);
+                    heat_->set_evictable(victim, false);
+                }
             }
         }
         /* A free pool slot and this read deposits the unit into the pool: its window's copy list
@@ -855,7 +1047,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
          * relabelled back to the file tier, copyless (the container holds every unit's bytes),
          * provided it is colder than this one (pick_victim). The slot it gives up feeds a later
          * deposit after the quarantine; this read takes the buffer path. */
-        if (plan_->dynamic && heat_ && !unit_in_flight(u)) {
+        if (!relaid && plan_->dynamic && heat_ && !unit_in_flight(u)) {
             ClassPools& cp = pools_[(size_t)us.klass];
             const int rec = free_move_record();
             int64_t g = -1;
@@ -929,8 +1121,12 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
-            fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                     dst + off + mu.offset[k], false, false });
+            const bool rw = weight_file_relaid(*prog_, w, prog_->ctx.world_size);
+            FileExt fe{ (int64_t)w.file_offset, w.stored_bytes,
+                        dst + off + mu.offset[k], false, false, rw ? &w : nullptr };
+            fe.unit = u;
+            fe.park_off = mu.offset[k];
+            fext_.push_back(fe);
         }
         rd->staged.push_back(u);
         fat_.push_back(off);
@@ -967,7 +1163,18 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             res_.publish(mu.weights[j], fbase_[k - promoted0] + mu.offset[j]);
         stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
     }
-    if (fext_.empty()) return RAD_OK;
+    if (fext_.empty()) {
+        if (!park_cp_.empty()) {
+            if (after) RAD_TRY(rad_event_wait(mover_, after));
+            for (const ParkCopy& c : park_cp_)
+                RAD_TRY(rad_memcpy_async(c.dst, c.src, c.bytes, mover_));
+            park_cp_.clear();
+            for (int32_t rec : frec_) RAD_TRY(rad_event_record(moves_[(size_t)rec].ev, mover_));
+            RAD_TRY(rad_event_record(done, mover_));
+            rd->copied = true;
+        }
+        return RAD_OK;
+    }
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(fext_.begin(), fext_.end(),
                      [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
@@ -989,9 +1196,79 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     }
 
     if (after) RAD_TRY(rad_event_wait(mover_, after));
+    for (const ParkCopy& c : park_cp_)
+        RAD_TRY(rad_memcpy_async(c.dst, c.src, c.bytes, mover_));
+    park_cp_.clear();
 
     const int64_t A = DirectFile::alignment();
     const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
+    /* A relaid weight is converted on the host into a pinned window, then copied to the card.
+     * The relayout is host code; it must not write the card buffer. */
+    {
+        std::vector<FileExt> relaid;
+        for (const FileExt& e : fext_) if (e.relay) relaid.push_back(e);
+        if (!relaid.empty()) {
+            if (!relayout_) {
+                RAD_ERR("file tier: a weight is placed to be relaid on the read and no relayout "
+                        "was set");
+                return RAD_E_STATE;
+            }
+            if (relay_in_.empty()) relay_in_.resize(1);
+            fext_.erase(std::remove_if(fext_.begin(), fext_.end(),
+                                       [](const FileExt& e) { return e.relay != nullptr; }),
+                        fext_.end());
+            for (const FileExt& e : relaid) {
+                if (e.bytes > W) {
+                    RAD_ERR("file tier: '%s' relays to %s, more than a %s read window",
+                            e.relay->name.c_str(), humanb(e.bytes).c_str(), humanb(W).c_str());
+                    return RAD_E_SCRATCH;
+                }
+                const int w = win_next_;
+                win_next_ = (win_next_ + 1) % n_windows_;
+                char* win = windows_ + (int64_t)w * W;
+                if (win_rec_[(size_t)w]) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+                    stats_.ssd_wait_ns += (uint64_t)std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                    win_rec_[(size_t)w] = 0;
+                }
+                RAD_TRY(read_relaid(*e.relay, win, W, &relay_in_[0]));
+                if (e.unit >= 0) {
+                    UnitState& us = unit_[(size_t)e.unit];
+                    if (us.klass >= 0 && ensure_park(us.klass)) {
+                        ClassPools& cp = pools_[(size_t)us.klass];
+                        if (us.park_slot < 0) {
+                            int64_t g = cp.park.take();
+                            if (g < 0 && heat_) {
+                                int32_t who = -1;
+                                float cold = heat_->heat(e.unit);
+                                for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+                                    const UnitState& vs = unit_[(size_t)v];
+                                    if (vs.klass != us.klass || vs.park_slot < 0 || vs.hot) continue;
+                                    const float h = heat_->heat(v);
+                                    if (h >= cold) continue;
+                                    who = v;
+                                    cold = h;
+                                }
+                                if (who >= 0) {
+                                    g = unit_[(size_t)who].park_slot;
+                                    unit_[(size_t)who].park_slot = -1;
+                                }
+                            }
+                            if (g >= 0) us.park_slot = g;
+                        }
+                        if (us.park_slot >= 0)
+                            std::memcpy((char*)cp.park_base + us.park_slot * cp.stride + e.park_off,
+                                        win, (size_t)e.bytes);
+                    }
+                }
+                RAD_TRY(rad_memcpy_async(e.dst, win, e.bytes, mover_));
+                RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+                win_rec_[(size_t)w] = 1;
+            }
+        }
+    }
     struct Seg { int64_t fs = 0, fe = 0, ws = 0; };     /* file [fs, fe) read to window offset ws */
     struct Cp  { int64_t wo = 0, bytes = 0; char* dst = nullptr; };
     std::vector<Seg> segs;
@@ -1013,7 +1290,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
 
         /* Pack the window: extend the current run while the next weight starts within the
          * read-through gap of its end, start another run otherwise, and split a weight the window
-         * cannot finish across this window and the next. */
+         * cannot finish across this window and the next. Relaid weights were converted above. */
         segs.clear();
         cps.clear();
         while (i < fext_.size()) {
@@ -1064,6 +1341,42 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     return RAD_OK;
 }
 
+/* One weight relaid on the read: its selected planes' span, aligned out to the O_DIRECT block,
+ * read into this thread's host input in one pread (the aligned path, which touches no shared
+ * bounce, so threads read at once), then the relayout writes the stored form to `dst`. Each plane
+ * is whole (weight_file_relaid), so it is one range of the container. */
+int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (!relayout_ || !in || w.n_sel <= 0) return RAD_E_STATE;
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("file tier: '%s' relays to %s and the pinned space for it is %s", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int k = 0; k < w.n_sel; ++k) {
+        const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[k]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[k] + len);
+    }
+    const int64_t A = DirectFile::alignment();
+    const int64_t a0 = lo / A * A, n = align_up(hi - a0, A);
+    if (in->cap < n) {
+        std::free(in->p);
+        in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)n);
+        in->cap = in->p ? n : 0;
+        if (!in->p) return RAD_E_NOMEM;
+    }
+    RAD_TRY(file_.read((uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
+    for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
+    const int st = relayout_(w, pt, dst, w.stored_bytes);
+    if (st < 0)
+        RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
+                w.layout_tag.c_str(), rad_strerror(st));
+    return st;
+}
+
 void Mover::release_slot(int32_t unit) {
     const int rec = free_move_record();
     if (rec < 0) { ++stats_.no_record; return; }
@@ -1089,7 +1402,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
         /* A unit that kept its host copy is dropped, not demoted: its pool slot still holds its
          * bytes, so there is nothing to copy and no second pool slot to take. */
-        if (!promote && us.pool_slot >= 0 && us.slab_slot >= 0) return drop(unit, heat) >= 0;
+        if (!promote && us.pool_slot >= 0 && us.slab_slot >= 0) return drop(unit, heat, kDropVictim) >= 0;
 
         /* A hot-cache unit has no pool slot to demote into and needs none:
          * the container holds its bytes, so the eviction is bookkeeping — free the slot,
@@ -1097,6 +1410,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
          * The quarantine below is the same as any demotion's: kernels issued in earlier
          * layers may still name the slot. */
         if (!promote && us.hot && us.slab_slot >= 0) {
+            (void)park_hot(unit, heat);
             const int rec = free_move_record();
             if (rec < 0) { ++stats_.no_record; return false; }
             if (record_gate() < 0) return false;
@@ -1121,9 +1435,16 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         }
 
         if (promote) {
-            const int64_t slot = cp.slab.take();
+            /* Budgeted swap slots only (the file tier's hot cache sits above n_hot_lo), unless lever SWL lets a
+             * free lent slot take the promotion: the lowest free slot either way, so a budgeted one goes first. Into
+             * a lent slot the unit keeps its host copy (promote_to), as fill()'s units do. */
+            const bool swl = swap_lent_.load(std::memory_order_relaxed);
+            const int64_t slot = cp.slab.take_where([&](int64_t s) {
+                return s < cp.n_hot_lo || (swl && s >= cp.n_fixed);
+            });
             if (slot < 0) { ++stats_.starved_slab; return false; }
             if (promote_to(unit, slot) < 0) { cp.slab.add_free(slot); return false; }
+            if (const int ld = lender_of(cp, slot); ld >= 0 && ld < LentStats::kN) ++lent_.swaps[ld];   /* ds41-swl */
             return true;
         }
 
@@ -1167,7 +1488,9 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
 /* ------------------------------------------------------------------ the loan */
 static const char* lender_name(int lender) {
-    return lender == Mover::kLendKV ? "KV cache" : "activation arena";
+    return lender == Mover::kLendKV ? "KV cache"
+         : lender == Mover::kLendArena ? "activation arena"
+         : lender == Mover::kLendDraftW ? "drafter's query-pass weights" : "drafter's expert slab";
 }
 
 static char* align_down_ptr(char* p) {
@@ -1193,6 +1516,8 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         const UnitState& us = unit_[u];
         if (us.klass < 0 || us.tier != Tier::HostPinned || us.pool_slot < 0) continue;
         if (!plan_->units[u].movable) continue;
+        /* The drafter's slab is lent to the trunk, never to the drafter's own classes. */
+        if (lender == kLendDraft && pools_[(size_t)us.klass].keep) continue;
         ++want[(size_t)us.klass];
     }
     std::vector<double> weight(nc, 0.0);
@@ -1318,20 +1643,53 @@ int64_t Mover::loan_ceiling(int lender) const {
 
 void Mover::count_flex() {
     int64_t used = 0, offered = 0;
+    int64_t cov[LentStats::kN] = {}, held[LentStats::kN] = {};
     for (const ClassPools& cp : pools_) {
         if (cp.flex_ptr.empty()) continue;
         used += cp.slab.held_from(cp.n_fixed) * cp.stride;
-        for (const ClassPools::Lent& l : cp.lent)
+        for (const ClassPools::Lent& l : cp.lent) {
             offered += (cp.slab.target(l.seg) - l.first) * cp.stride;
+            /* ds41-lf: each lender's occupancy, in slots. */
+            if (l.lender >= 0 && l.lender < LentStats::kN) {
+                cov[l.lender] += cp.slab.target(l.seg) - l.first;
+                held[l.lender] += cp.slab.held_in(l.seg);
+            }
+        }
     }
     flex_used_.store(used, std::memory_order_relaxed);
     flex_offered_.store(offered, std::memory_order_relaxed);
+    for (int k = 0; k < LentStats::kN; ++k) { lent_.covered[k] = cov[k]; lent_.held[k] = held[k]; }
 }
 
-int Mover::drop(int32_t unit, HeatEngine* heat) {
+/* ds41-lf: the slot-class bookkeeping (counters only; nothing here moves a unit). */
+int Mover::lender_of(const ClassPools& cp, int64_t slot) const {
+    if (slot < 0 || !cp.is_flex(slot)) return -1;
+    for (const ClassPools::Lent& l : cp.lent)
+        if (slot >= l.first && slot < l.first + (int64_t)l.need.size()) return l.lender;
+    return -1;
+}
+
+void Mover::note_slot(int32_t unit, HeatEngine* heat) const {
+    if (!heat || unit < 0 || (size_t)unit >= unit_.size()) return;
+    const UnitState& us = unit_[(size_t)unit];
+    if (us.klass < 0 || us.slab_slot < 0) return;
+    const int ld = lender_of(pools_[(size_t)us.klass], us.slab_slot);
+    heat->set_slot_class(unit, ld < 0 ? (uint8_t)kSlotTrunk : (uint8_t)(kSlotKV + ld));
+}
+
+void Mover::count_drop(const ClassPools& cp, int64_t slot, int cause) {
+    const int ld = lender_of(cp, slot);
+    if (ld < 0 || ld >= LentStats::kN) return;
+    if (cause == kDropVictim) ++lent_.drop_victim[ld];
+    else if (cause == kDropReserve) ++lent_.drop_reserve[ld];
+    else if (cause == kDropRecall) ++lent_.drop_recall[ld];
+}
+
+int Mover::drop(int32_t unit, HeatEngine* heat, int cause) {
     const int rec = free_move_record();
     if (rec < 0) { ++stats_.no_record; return RAD_E_FULL; }
     UnitState& us = unit_[(size_t)unit];
+    if (us.klass >= 0) count_drop(pools_[(size_t)us.klass], us.slab_slot, cause);
     Move& m = moves_[(size_t)rec];
     m.state = Move::State::Published;       /* nothing to copy: the host copy never went away */
     m.kind = Move::Kind::Drop;
@@ -1419,6 +1777,69 @@ int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
  * prompt. Prefer a slot the unit's own layer started in, then a same-layer donor, then any free
  * slot, then any donor. At TP1 (26K-token prompts, 256 decoded tokens between) this takes a
  * layer's staging from 162 copies to 112. */
+/* The hot cache holds the relaid form. A copyless drop back to the file throws that work
+ * away and the next route pays the relayout again. Copy the bytes into a pinned park the
+ * placement pool does not own (that pool is full, and it stores the container form). The
+ * caller still frees the slab. The next file-tier read copies from the park. */
+bool Mover::ensure_park(int32_t klass) {
+    ClassPools& cp = pools_[(size_t)klass];
+    if (cp.park_base) return true;
+    if (park_left_ < 0) {
+        const char* e = std::getenv("RAD_PARK_MIB");
+        park_left_ = ((e && *e) ? std::atoll(e) : 1280) << 20;
+    }
+    if (cp.stride <= 0 || park_left_ < cp.stride) return false;
+    const int64_t share = std::min(park_left_, ((int64_t)1280 << 20) / 2);
+    int64_t n = share / cp.stride;
+    if (n > 1024) n = 1024;
+    if (n < 1) return false;
+    void* p = rad_dev_alloc(n * cp.stride, RAD_MEM_HOST_PINNED);
+    if (!p) return false;
+    cp.park_base = p;
+    cp.park.init(n, cp.stride);
+    for (int64_t s = 0; s < n; ++s) cp.park.add_free(s);
+    park_left_ -= n * cp.stride;
+    RAD_WARN("mover: parked %lld relaid slots of %s (%s left)",
+             (long long)n, humanb(cp.stride).c_str(), humanb(park_left_).c_str());
+    return true;
+}
+
+bool Mover::park_hot(int32_t unit, HeatEngine* heat) {
+    UnitState& us = unit_[(size_t)unit];
+    if (!us.hot || us.slab_slot < 0 || us.klass < 0) return false;
+    if (us.park_slot >= 0) return true;
+    ClassPools& cp = pools_[(size_t)us.klass];
+    if (!ensure_park(us.klass)) return false;
+    int64_t g = cp.park.take();
+    if (g < 0 && heat) {
+        int32_t who = -1;
+        float cold = heat->heat(unit);
+        for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+            const UnitState& vs = unit_[(size_t)v];
+            if (vs.klass != us.klass || vs.park_slot < 0 || vs.hot) continue;
+            if (copying_[(size_t)v]) continue;
+            const float h = heat->heat(v);
+            if (h >= cold) continue;
+            who = v;
+            cold = h;
+        }
+        if (who >= 0) {
+            g = unit_[(size_t)who].park_slot;
+            unit_[(size_t)who].park_slot = -1;
+        }
+    }
+    if (g < 0) return false;
+    char* dst = (char*)cp.park_base + g * cp.stride;
+    if (rad_memcpy_async(dst, cp.slot_ptr(us.slab_slot), us.bytes, mover_) < 0 ||
+        rad_stream_sync(mover_) < 0) {
+        cp.park.add_free(g);
+        return false;
+    }
+    us.park_slot = g;
+    stats_.d2h_bytes += (uint64_t)us.bytes;
+    return true;
+}
+
 int64_t Mover::pool_slot_for(int32_t unit, HeatEngine* heat) {
     const UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
@@ -1482,8 +1903,10 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     /* Into a lent slot the host copy stays: the loan can be recalled at any time, and a unit
      * that kept its pool slot goes back by a change of address instead of needing a pool slot and
      * a link copy just as the cache wants its memory. The quarantine then has no pool slot to
-     * free. Every pool unit keeps its slot on promotion: the pool is one cache, so the later demotion is a copyless drop for natives and deposits alike. */
-    m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
+     * free. Every pool unit keeps its slot on promotion: the pool is one cache, so the later demotion is a copyless drop for natives and deposits alike.
+     * A drafter class under lever DL (ClassPools::keep) keeps it into a budgeted slot too, so the
+     * drafter leaves the card by a change of address whenever its slab is lent. */
+    m.pool_slot = cp.is_flex(slot) || cp.keep ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
     ++copying_[(size_t)unit];
@@ -1500,7 +1923,9 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
         if (us.klass != (int32_t)klass || us.tier != Tier::HostPinned || us.pool_slot < 0) continue;
         if (!plan_->units[(size_t)u].movable) continue;
         if (heat && heat->busy(u)) continue;
-        cand.push_back(Cand{ heat ? heat->heat(u) : 0.0f, plan_->units[(size_t)u].layer, u });
+        /* Lever LF (place_lf): the long-memory decode heat ranks the candidates instead (same tie-break). */
+        const float key = !heat ? 0.0f : place_lf_ ? heat->heat_long(u) : heat->heat(u);
+        cand.push_back(Cand{ key, plan_->units[(size_t)u].layer, u });
     }
     std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.h > b.h; });
 
@@ -1538,6 +1963,12 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
                 if (heat) heat->set_busy(u, false);
                 return RAD_OK;
             }
+            /* ds41-lf: the fill's counters, by lender. */
+            if (const int ld = lender_of(pools_[klass], slot); ld >= 0 && ld < LentStats::kN) {
+                ++lent_.fills[ld];
+                if (place_lf_) ++lent_.fills_lf[ld];
+                if (heat && heat->heat(u) >= 1.0f) ++lent_.fills_hot[ld];
+            }
             ++issued;
             ++added[k.second];
             if (!us.empty()) q.push({ k.first + 1, k.second });
@@ -1549,6 +1980,8 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
 
 int Mover::balance(HeatEngine* heat, bool turnover) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
+    /* Lever DL first: a recall sets the loan to 0 here and the sweep below drops what it covered. */
+    RAD_TRY(draft_advance(heat));
 
     for (size_t c = 0; c < pools_.size(); ++c) {
         ClassPools& cp = pools_[c];
@@ -1584,7 +2017,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
                     left = true;
                     continue;
                 }
-                if (drop(u, heat) < 0) { left = true; break; }
+                if (drop(u, heat, kDropRecall) < 0) { left = true; break; }
                 drained = true;
             }
             cp.strand_check = left;
@@ -1624,7 +2057,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),
                               colder);
             for (size_t i = 0; i < k; ++i) {
-                if (drop(drop_cand_[i].second, heat) < 0) break;
+                if (drop(drop_cand_[i].second, heat, kDropReserve) < 0) break;
                 drained = true;
                 --short_by;
             }
@@ -1700,6 +2133,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         if (us.klass < 0 || us.slab_slot < 0) continue;
         ClassPools& cp = pools_[(size_t)us.klass];
         if (!cp.is_flex(us.slab_slot) || cp.slab.covered(us.slab_slot)) continue;
+        count_drop(cp, us.slab_slot, kDropRecall);
         if (us.pool_slot < 0) {
             const int64_t from = us.slab_slot;
             int64_t to = cp.slab.take();
@@ -1711,6 +2145,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
             if (to >= 0) {
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
                 us.slab_slot = to;
+                note_slot(u, heat);
             } else if (g >= 0) {
                 RAD_TRY(rad_memcpy_async((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(from),
                                          us.bytes, mover_));
@@ -1790,6 +2225,301 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ lever Z0-W */
+int Mover::draft_w_setup(const std::function<bool(const std::string&, int32_t)>& lendable) {
+    if (!dw_.empty()) {   /* before anything changes: a second call leaves the first one's lend as it is */
+        RAD_ERR("mover: draft_w_setup called twice; its stretches are carved once");
+        return RAD_E_STATE;
+    }
+    dw_ready_ = false;
+    if (!plan_ || !plan_->dynamic || !static_vram_ || !prog_ || !lendable) return RAD_OK;
+    if (!mover_ || !compute_) {
+        RAD_ERR("mover: the drafter's weight lend is set up after the compute stream is bound");
+        return RAD_E_STATE;
+    }
+    /* Every statically placed weight, [lo, hi) in the static region (a weight's extent runs to the next
+     * weight of its unit, or the unit's padded end), and whether it may be lent. */
+    struct Iv { int64_t lo, hi; bool lend; };
+    std::vector<Iv> iv;
+    for (size_t u = 0; u < plan_->units.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.tier != Tier::VRAM || us.static_off < 0 || us.slab_slot >= 0) continue;
+        const MoveUnit& mu = plan_->units[u];
+        /* An encoder tower's unit (read once a request: Planner::pin_towers' test) is never the drafter's, whatever
+         * its layer: a tower declared past the drafter's stages (deepseek41's vision blocks) has layers the
+         * caller's `layer >= first` would take, and an encoder pass reads it while depth 0 holds. */
+        const bool tower = mu.access == RAD_ACCESS_PER_REQUEST && mu.expert < 0;
+        for (size_t k = 0; k < mu.weights.size() && k < mu.offset.size(); ++k) {
+            const int64_t a = us.static_off + mu.offset[k];
+            const int64_t b = us.static_off + (k + 1 < mu.offset.size() ? mu.offset[k + 1] : mu.bytes);
+            if (b <= a) continue;
+            const WeightInfo& w = prog_->weights[(size_t)mu.weights[k]];
+            iv.push_back(Iv{ a, b, !tower && lendable(w.name, mu.layer) });
+        }
+    }
+    std::sort(iv.begin(), iv.end(), [](const Iv& x, const Iv& y) { return x.lo < y.lo; });
+    /* Stretches: runs of lendable weights; the bytes between two of them (a unit's alignment pad)
+     * belong to no weight and join the run, a weight that is not lendable ends it. */
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    int64_t kept = 0;
+    for (size_t i = 0; i < iv.size(); ++i) {
+        if (!iv[i].lend) continue;
+        if (!runs.empty() && i > 0 && iv[i - 1].lend && runs.back().second <= iv[i].lo) runs.back().second = iv[i].hi;
+        else runs.push_back({ iv[i].lo, iv[i].hi });
+    }
+    for (size_t i = 0; i < iv.size(); ++i) if (!iv[i].lend) kept += iv[i].hi - iv[i].lo;
+    std::vector<LoanStrip> strips;
+    int64_t bytes = 0;
+    for (const auto& r : runs) {
+        const int64_t n = r.second - r.first;
+        if (n <= 2 * (int64_t)RAD_ALIGN_UNIT) continue;
+        DwStretch d;
+        d.dev = (char*)static_vram_ + r.first;
+        d.bytes = n;
+        d.host = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+        if (!d.host) {
+            RAD_ERR("mover: no pinned host memory for a %s copy of the drafter's weights", humanb(n).c_str());
+            return RAD_E_NOMEM;
+        }
+        /* The weights as loaded, byte for byte: what a recall puts back. */
+        RAD_TRY(rad_memcpy_async(d.host, d.dev, n, mover_));
+        dw_.push_back(d);
+        LoanStrip st;
+        st.top = d.dev + n;
+        st.bytes = n;
+        st.unit_bytes = 1;
+        st.unit_tokens = 1;
+        strips.push_back(st);
+        bytes += n;
+    }
+    RAD_TRY(rad_stream_sync(mover_));
+    dw_kept_bytes_ = kept;
+    if (strips.empty()) return RAD_OK;
+    int64_t before = 0;
+    for (const ClassPools& cp : pools_) before += (int64_t)cp.flex_ptr.size();
+    RAD_TRY(lend_from(kLendDraftW, strips));
+    int64_t slots = -before;
+    for (const ClassPools& cp : pools_) slots += (int64_t)cp.flex_ptr.size();
+    dw_bytes_ = bytes;
+    dw_ready_ = slots > 0 && loan_ceiling(kLendDraftW) > 0;
+    RAD_INFO("mover: lever Z0-W: %zu stretch(es) of the drafter's query-pass weights, %s (a pinned host copy each), "
+             "lend %lld trunk slots while the drafter does not draft; %s of its static weights stay%s",
+             dw_.size(), humanb(bytes).c_str(), (long long)slots, humanb(kept).c_str(),
+             dw_ready_ ? "" : " -- nothing to lend");
+    return RAD_OK;
+}
+
+int Mover::draft_w_lend() {
+    if (!dw_ready_ || dw_lent_) return RAD_OK;
+    RAD_TRY(set_loan(kLendDraftW, loan_ceiling(kLendDraftW)));
+    dw_lent_ = true;
+    ++dw_lends_;
+    return RAD_OK;
+}
+
+int Mover::draft_w_reclaim(HeatEngine* heat) {
+    if (!dw_ready_ || !dw_lent_) return RAD_OK;
+    /* Every unit in a stretch back to its host copy, both streams drained (Mover::reclaim)... */
+    RAD_TRY(reclaim(kLendDraftW, 0, heat));
+    /* ...then the weights' own bytes, from their copies, before anything else reads them. */
+    for (const DwStretch& d : dw_) RAD_TRY(rad_memcpy_async(d.dev, d.host, d.bytes, mover_));
+    RAD_TRY(rad_stream_sync(mover_));
+    dw_lent_ = false;
+    ++dw_reclaims_;
+    return RAD_OK;
+}
+
+int32_t Mover::draft_first_layer() const {
+    int32_t lo = -1;
+    if (!plan_) return lo;
+    for (int32_t u : dl_units_) {
+        const int32_t l = plan_->units[(size_t)u].layer;
+        if (l >= 0 && (lo < 0 || l < lo)) lo = l;
+    }
+    return lo;
+}
+
+int64_t Mover::draft_w_lent_units() const {
+    int64_t lent = 0;
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.klass < 0 || us.slab_slot < 0) continue;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        if (!cp.is_flex(us.slab_slot)) continue;
+        for (const ClassPools::Lent& l : cp.lent)
+            if (l.lender == kLendDraftW && us.slab_slot >= l.first && us.slab_slot < l.first + (int64_t)l.need.size())
+                ++lent;
+    }
+    return lent;
+}
+
+/* ------------------------------------------------------------------ lever DL */
+int Mover::draft_lend_setup() {
+    dl_ready_ = false;
+    if (!plan_ || !plan_->dynamic || dl_classes_.empty()) return RAD_OK;
+    if (!mover_ || !compute_) {
+        RAD_ERR("mover: the drafter's lend is set up after the compute stream is bound");
+        return RAD_E_STATE;
+    }
+    /* The host copies, from the VRAM slots the load filled: the stored form, byte for byte, as a
+     * demotion copies it (the slab layout is the pool layout). */
+    int64_t copied = 0;
+    for (int32_t u : dl_units_) {
+        const UnitState& us = unit_[(size_t)u];
+        if (us.slab_slot < 0 || us.pool_slot < 0) continue;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        RAD_TRY(rad_memcpy_async((char*)cp.pool_base + us.pool_slot * cp.stride, cp.slot_ptr(us.slab_slot),
+                                 us.bytes, mover_));
+        copied += us.bytes;
+    }
+    RAD_TRY(rad_stream_sync(mover_));
+    /* The drafter's whole budgeted slab (resident, shadow and staging slots), one stretch a class,
+     * lent in bytes from the top. */
+    std::vector<LoanStrip> strips;
+    dl_slab_bytes_ = 0;
+    for (int32_t c : dl_classes_) {
+        const ClassPools& cp = pools_[(size_t)c];
+        if (!cp.slab_base || cp.n_fixed <= 0) continue;
+        LoanStrip st;
+        st.top = (char*)cp.slab_base + cp.n_fixed * cp.stride;
+        st.bytes = cp.n_fixed * cp.stride;
+        st.unit_bytes = 1;
+        st.unit_tokens = 1;
+        strips.push_back(st);
+        dl_slab_bytes_ += st.bytes;
+    }
+    int64_t before = 0;
+    for (const ClassPools& cp : pools_) before += (int64_t)cp.flex_ptr.size();
+    RAD_TRY(lend_from(kLendDraft, strips));
+    int64_t slots = -before;
+    for (const ClassPools& cp : pools_) slots += (int64_t)cp.flex_ptr.size();
+    dl_ready_ = slots > 0 && loan_ceiling(kLendDraft) > 0;
+    dl_count();
+    RAD_INFO("mover: lever DL: %lld drafter units in %zu class(es), %s of host copies filled (outside "
+             "--host-pool-mib); the drafter's slab, %s, lends %lld trunk slots while the drafter "
+             "does not draft%s", (long long)dl_units_.size(), dl_classes_.size(), humanb(copied).c_str(),
+             humanb(dl_slab_bytes_).c_str(), (long long)slots, dl_ready_ ? "" : " -- nothing to lend");
+    return RAD_OK;
+}
+
+void Mover::dl_count() {
+    int64_t res = 0, lent = 0;
+    for (int32_t u : dl_units_) {
+        const UnitState& us = unit_[(size_t)u];
+        if (us.slab_slot >= 0 && us.tier == Tier::VRAM && !unit_in_flight(u)) ++res;
+    }
+    /* Trunk units whose slot is in the drafter's memory (a kLendDraft segment). */
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.klass < 0 || us.slab_slot < 0) continue;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        if (!cp.is_flex(us.slab_slot)) continue;
+        for (const ClassPools::Lent& l : cp.lent)
+            if (l.lender == kLendDraft && us.slab_slot >= l.first &&
+                us.slab_slot < l.first + (int64_t)l.need.size())
+                ++lent;
+    }
+    dl_resident_.store(res, std::memory_order_relaxed);
+    dl_lent_units_.store(lent, std::memory_order_relaxed);
+}
+
+/* The state machine (mover.h, lever DL), one step a dispatch. Parking and loading leave a unit that
+ * cannot move now (a copy in flight, no free record, no free slot) for a later call; every edge
+ * is guarded by what the slots hold, never by time. */
+int Mover::draft_advance(HeatEngine* heat) {
+    if (!dl_ready_) return RAD_OK;
+    const int st0 = dl_state_.load(std::memory_order_relaxed);
+    int st = st0;
+    if (dl_want_) {
+        /* A recall not yet past its drops: the drafter's slots were never covered again, so the slab is
+         * still the trunk's alone; lend it again at once rather than empty and refill it. */
+        if (st == kDlUnlending) {
+            RAD_TRY(set_loan(kLendDraft, loan_ceiling(kLendDraft)));
+            st = kDlLent;
+            dl_set(st);
+            dl_lends_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (st == kDlResident || st == kDlLoading) {
+            /* No drafter slot is covered from here on: nothing can be promoted into one, and each
+             * slot leaves the class's range as its unit drops and its quarantine clears. */
+            for (int32_t c : dl_classes_) pools_[(size_t)c].slab.set_target(0, 0);
+            st = kDlParking;
+            dl_set(st);
+        }
+        if (st == kDlParking) {
+            bool left = false;
+            for (int32_t u : dl_units_) {
+                UnitState& us = unit_[(size_t)u];
+                if (us.slab_slot < 0) continue;
+                if (unit_in_flight(u)) { left = true; continue; }   /* its promotion lands first */
+                if (drop(u, heat) < 0) { left = true; break; }       /* no record free: next call */
+            }
+            bool clear = !left;
+            for (int32_t c : dl_classes_)
+                if (pools_[(size_t)c].slab.top_held(0) >= 0) clear = false;
+            /* And nothing of an earlier loan still in the drafter's memory (a lend after a recall
+             * that had not finished). */
+            if (clear && loan_held(kLendDraft) == 0) {
+                RAD_TRY(set_loan(kLendDraft, loan_ceiling(kLendDraft)));
+                st = kDlLent;
+                dl_set(st);
+                dl_lends_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        /* Parked units are busy to the heat engine: nothing may propose them while their class has
+         * no slot (a quarantine's retire clears the flag; it is set again here). */
+        if (heat)
+            for (int32_t u : dl_units_)
+                if (unit_[(size_t)u].slab_slot < 0 && !unit_in_flight(u) && !heat->busy(u))
+                    heat->set_busy(u, true);
+        dl_count();
+        return RAD_OK;
+    }
+
+    /* Recall. */
+    if (st == kDlParking || st == kDlLent) {
+        if (loan_[kLendDraft] > 0) RAD_TRY(set_loan(kLendDraft, 0));   /* the sweep in balance() drops */
+        st = kDlUnlending;
+        dl_set(st);
+        dl_reclaims_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (st == kDlUnlending) {
+        /* A trunk unit still in the drafter's memory, a copy landing there or a quarantine. */
+        if (loan_held(kLendDraft) > 0) { dl_count(); return RAD_OK; }
+        for (int32_t c : dl_classes_) {
+            ClassPools& cp = pools_[(size_t)c];
+            cp.slab.set_target(0, cp.n_fixed);
+        }
+        st = kDlLoading;
+        dl_set(st);
+    }
+    if (st == kDlLoading) {
+        bool left = false;
+        for (int32_t u : dl_units_) {
+            UnitState& us = unit_[(size_t)u];
+            if (us.slab_slot >= 0 && us.tier == Tier::VRAM && !unit_in_flight(u)) continue;   /* home */
+            left = true;
+            if (us.slab_slot >= 0 || unit_in_flight(u) || us.pool_slot < 0) continue;      /* on its way */
+            ClassPools& cp = pools_[(size_t)us.klass];
+            /* The lowest free slot, so the units pack at the bottom and the working slots stay free
+             * above them, as the plan laid them out. */
+            const int64_t slot = cp.slab.take();
+            if (slot < 0) continue;
+            if (heat) heat->set_busy(u, true);
+            if (promote_to(u, slot) < 0) {   /* no record left: next call */
+                cp.slab.add_free(slot);
+                break;
+            }
+        }
+        if (!left) {
+            st = kDlResident;
+            dl_set(st);
+        }
+    }
+    dl_count();
+    return RAD_OK;
+}
+
 void Mover::queue_move_copy(void* dst, const void* src, int64_t bytes, int rec) {
     move_segs_.push_back(RadCopySeg{ src, dst, bytes });
     move_recs_.push_back((int32_t)rec);
@@ -1832,6 +2562,7 @@ int Mover::retire(HeatEngine* heat) {
                 us.site = Site::Device;
                 ++stats_.promotions;
                 if (heat) heat->set_tier(m.unit, Tier::VRAM);
+                note_slot(m.unit, heat);
                 break;
             case Move::Kind::Demote:
                 /* Out of a lent slot, the unit was a donor (donor_slot): any other unit there is
@@ -1872,6 +2603,7 @@ int Mover::retire(HeatEngine* heat) {
                     heat->set_tier(m.unit, Tier::VRAM);
                     heat->set_busy(m.unit, false);
                 }
+                note_slot(m.unit, heat);
                 m.clear();
                 continue;
             case Move::Kind::Deposit:
@@ -1889,6 +2621,7 @@ int Mover::retire(HeatEngine* heat) {
                 us.slab_slot = m.to_slot;
                 --pools_[(size_t)us.klass].n_donated;
                 ++stats_.relocated;
+                note_slot(m.unit, heat);
                 break;
             case Move::Kind::Release:
             case Move::Kind::Drop:

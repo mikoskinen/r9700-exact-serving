@@ -134,10 +134,19 @@ struct SplitF32Proj {
     bool takes(int64_t rows) const { return min_rows && rows >= min_rows; }
     void step(RadCtx* ctx, int64_t rows, RadOperand input, rad_weight weight,
               RadOperand output) const {
+        step_part(ctx, rows, input, weight);
+        step_gather(ctx, rows, output);
+    }
+    /* step()'s two halves, for a caller that issues the gather (a collective) at a point of its own
+     * (deepseek41's RADIANCE_DS41_PIPE2: both pieces' projections before any all-reduce goes to the
+     * second lane): this rank's columns into `part`, then the all_gather. The same two ops. */
+    void step_part(RadCtx* ctx, int64_t rows, RadOperand input, rad_weight weight) const {
         RadOperand slice = RAD_W(weight);
         slice.offset = first_col * k;
         slice.rows = cols;
         RAD_ISSUE_N(ctx, op_part, rows, input, slice, brows(part, rows));
+    }
+    void step_gather(RadCtx* ctx, int64_t rows, RadOperand output) const {
         RAD_ISSUE_N(ctx, op_gather, rows * cols, brows(part, rows), output);
     }
 };

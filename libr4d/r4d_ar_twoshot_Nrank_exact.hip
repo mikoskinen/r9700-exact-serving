@@ -42,6 +42,9 @@
 #include "r4d_ar_wide.h"
 #include "r4d_ar_shards.h"
 #include "r4d_chain.h"
+#include "r4d_ar_hc.h"      // the MoE gather's words (moe_gather_all_reduce's two-shot form)
+#include "r4d_ar_xpush.h"   // ds41-int13 XPUSH: the interleaved first hop (R4D_AR8_FORM_XPUSH)
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -106,23 +109,10 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
   // phase 1: my contribution to each peer-owned shard -> owner's region A
   auto push1 = [&](int j) {
     const int p0 = w0 + j * pw, p1 = p0 + pw < w1 ? p0 + pw : w1;
+    /* ds41-int13 XPUSH (fn4-x3-sp3 808866c2; r4d_ar_xpush.h): the peer loop inside the word loop, so every link
+     * carries phase-1 bytes at once; the same stores as the loop below, in another order: the same bits. */
     if constexpr (FORM == R4D_AR8_FORM_XPUSH) {
-      const int4* s1[NPEERS];
-      int lim[NPEERS], lmax = p0;
-#pragma unroll
-      for (int i = 0; i < NPEERS; ++i) {
-        const int owner = peers.rank[i];
-        s1[i] = in4 + (size_t)R4D_TS_OFF(owner);
-        lim[i] = p1 < R4D_TS_LEN(owner) ? p1 : R4D_TS_LEN(owner);
-        lmax = lim[i] > lmax ? lim[i] : lmax;
-      }
-      for (int k = p0 + tid; k < lmax; k += nt) {
-        int4 v[NPEERS];
-#pragma unroll
-        for (int i = 0; i < NPEERS; ++i) if (k < lim[i]) v[i] = s1[i][k];
-#pragma unroll
-        for (int i = 0; i < NPEERS; ++i) if (k < lim[i]) pa[i][k] = v[i];
-      }
+      r4d_ar_push1_xpush<NPEERS>(in4, pa, peers.rank, sh.off, p0, p1, tid, nt);
       return;
     }
     for (int i = 0; i < NPEERS; ++i) {
@@ -237,135 +227,8 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
   if (CHAIN) r4d_chain_done();
 }
 
-// ---- the coded form: both pushes carry ~12.2 bits a bf16 value instead of 16, losslessly
-//
-// The prefill overlap's reductions are link-bound, and a residual stream's bf16 words have few
-// distinct exponents: on the 31B (4x R9700, 64 groups of 512 x 5376 values from a 9.9k-token
-// prefill) 2.5-3.2 bits of exponent entropy against 8 stored. A chunk is one int4 word (8
-// values); 8 consecutive chunks (64 values) form a group that shares a base exponent, and each
-// value keeps its sign, its 7 mantissa bits and a 4-bit exponent offset (0 = an exact zero, 1..15 =
-// base .. base + 14), 8 values to 3 dwords. A group holding a subnormal, an inf or NaN, or an
-// exponent range past 14 (0.02% of groups there) is stored raw in a shadow area, its base byte
-// 0xFF. A region (one source's shard in an owner's scratch) is [3 dwords a chunk][a base byte a
-// group][the shadow, 16 bytes a chunk]; A and B are two regions in a slot. A wave codes 32
-// consecutive chunks: the group's exponents meet by lane shuffles, and the packed dwords are
-// redistributed so every store a wave makes is contiguous, keeping the P2P writes coalesced.
-//
-// Decoding gives back the same bf16 values, so the reduce folds the same numbers in the same rank
-// order: the bytes are the plain kernel's. Four-card microbenchmark (the real payload above, the
-// two-shot of a 1024-row slice beside the w4a8 prefill GEMM): byte-identical; the reduction 1383
-// us at the plain lane launch (2 x 256) against 996 us coded at 4 x 1024, with the GEMM beside it
-// 746 -> 724 us. Below 1024 threads a launch codes too slowly (2 x 256: 2492 us).
-__device__ __forceinline__ unsigned r4d_arc_shfl(unsigned v, int src) {
-  return (unsigned)__builtin_amdgcn_ds_bpermute(src << 2, (int)v);
-}
-struct R4dArcEnc { unsigned w[3]; unsigned base; };
-// Code this lane's chunk; every lane of the wave calls (a lane past the end with valid false).
-__device__ __forceinline__ R4dArcEnc r4d_arc_enc(int4 v, bool valid) {
-  const unsigned d[4] = {(unsigned)v.x, (unsigned)v.y, (unsigned)v.z, (unsigned)v.w};
-  unsigned emin = 255u, emax = 0u, bad = 0u;
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu;
-    if (e) { emin = e < emin ? e : emin; emax = e > emax ? e : emax; }
-    bad |= (unsigned)(e == 0u && m != 0u) | (unsigned)(e == 255u);
-  }
-  if (!valid) { emin = 255u; emax = 0u; bad = 0u; }
-  const int lane = (int)(threadIdx.x & 31u);
-#pragma unroll
-  for (int s = 1; s < 8; s <<= 1) {
-    const unsigned a = r4d_arc_shfl(emin, lane ^ s), b = r4d_arc_shfl(emax, lane ^ s);
-    const unsigned c = r4d_arc_shfl(bad, lane ^ s);
-    emin = a < emin ? a : emin; emax = b > emax ? b : emax; bad |= c;
-  }
-  R4dArcEnc r;
-  const unsigned base = emin == 255u ? 1u : emin;
-  r.base = (bad || emax > base + 14u) ? 0xFFu : base;
-  unsigned c[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu, sg = u >> 15;
-    c[i] = (sg << 11) | (m << 4) | (e ? (e - base + 1u) & 15u : 0u);
-  }
-  r.w[0] = c[0] | (c[1] << 12) | (c[2] << 24);
-  r.w[1] = (c[2] >> 8) | (c[3] << 4) | (c[4] << 16) | (c[5] << 28);
-  r.w[2] = (c[5] >> 4) | (c[6] << 8) | (c[7] << 20);
-  return r;
-}
-__device__ __forceinline__ int4 r4d_arc_dec(const unsigned (&w)[3], unsigned base) {
-  unsigned c[8];
-  c[0] = w[0] & 0xfffu; c[1] = (w[0] >> 12) & 0xfffu; c[2] = (w[0] >> 24) | ((w[1] & 0xfu) << 8);
-  c[3] = (w[1] >> 4) & 0xfffu; c[4] = (w[1] >> 16) & 0xfffu; c[5] = (w[1] >> 28) | ((w[2] & 0xffu) << 4);
-  c[6] = (w[2] >> 8) & 0xfffu; c[7] = w[2] >> 20;
-  unsigned u[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const unsigned off = c[i] & 15u;
-    u[i] = ((c[i] >> 11) << 15) | ((off ? base + off - 1u : 0u) << 7) | ((c[i] >> 4) & 0x7fu);
-  }
-  int4 v;
-  v.x = (int)(u[0] | (u[1] << 16)); v.y = (int)(u[2] | (u[3] << 16));
-  v.z = (int)(u[4] | (u[5] << 16)); v.w = (int)(u[6] | (u[7] << 16));
-  return v;
-}
-struct R4dArcRegion { unsigned* packed; unsigned* bases; int4* shadow; };
-__host__ __device__ constexpr size_t r4d_arc_shadow_off(long SL) {
-  return ((size_t)12 * SL + (size_t)SL / 8 + 15) & ~(size_t)15;
-}
-__host__ __device__ constexpr size_t r4d_arc_region_bytes(long SL) {
-  return (r4d_arc_shadow_off(SL) + (size_t)16 * SL + 255) & ~(size_t)255;
-}
-__device__ __forceinline__ R4dArcRegion r4d_arc_region(const void* p, int SL) {
-  char* b = (char*)p;
-  return R4dArcRegion{(unsigned*)b, (unsigned*)(b + (size_t)12 * SL), (int4*)(b + r4d_arc_shadow_off(SL))};
-}
-// A wave's coded chunks [k0, k0 + 32) (k0 a multiple of 32) into ND regions, every store contiguous.
-template <int ND>
-__device__ __forceinline__ void r4d_arc_put(R4dArcRegion (&dst)[ND], int k0, const R4dArcEnc& e,
-                                            int4 raw, bool valid) {
-  const int lane = (int)(threadIdx.x & 31u);
-#pragma unroll
-  for (int j = 0; j < 3; ++j) {
-    const int p = 32 * j + lane, sl = p / 3, wi = p - sl * 3;
-    const unsigned a0 = r4d_arc_shfl(e.w[0], sl), a1 = r4d_arc_shfl(e.w[1], sl);
-    const unsigned a2 = r4d_arc_shfl(e.w[2], sl), vs = r4d_arc_shfl(valid ? 1u : 0u, sl);
-    const unsigned val = wi == 0 ? a0 : wi == 1 ? a1 : a2;
-    if (vs) {
-#pragma unroll
-      for (int q = 0; q < ND; ++q) dst[q].packed[(size_t)k0 * 3 + p] = val;
-    }
-  }
-  const unsigned b0 = r4d_arc_shfl(e.base, 0), b1 = r4d_arc_shfl(e.base, 8);
-  const unsigned b2 = r4d_arc_shfl(e.base, 16), b3 = r4d_arc_shfl(e.base, 24);
-  if (lane == 0 && valid) {
-#pragma unroll
-    for (int q = 0; q < ND; ++q) dst[q].bases[k0 / 32] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-  }
-  if (valid && e.base == 0xFFu) {
-#pragma unroll
-    for (int q = 0; q < ND; ++q) dst[q].shadow[k0 + lane] = raw;
-  }
-}
-// A wave's chunks [k0, k0 + 32) back from a region; every lane calls.
-__device__ __forceinline__ int4 r4d_arc_get(const R4dArcRegion& src, int k0, bool valid) {
-  const int lane = (int)(threadIdx.x & 31u);
-  unsigned ld[3];
-#pragma unroll
-  for (int j = 0; j < 3; ++j) ld[j] = valid ? src.packed[(size_t)k0 * 3 + 32 * j + lane] : 0u;
-  unsigned w[3];
-#pragma unroll
-  for (int i = 0; i < 3; ++i) {
-    const int q = 3 * lane + i, sl = q & 31, j = q >> 5;
-    const unsigned a0 = r4d_arc_shfl(ld[0], sl), a1 = r4d_arc_shfl(ld[1], sl);
-    const unsigned a2 = r4d_arc_shfl(ld[2], sl);
-    w[i] = j == 0 ? a0 : j == 1 ? a1 : a2;
-  }
-  const unsigned base = ((valid ? src.bases[k0 / 32] : 0u) >> ((lane >> 3) * 8)) & 0xffu;
-  if (base == 0xFFu) return valid ? src.shadow[k0 + lane] : make_int4(0, 0, 0, 0);
-  return r4d_arc_dec(w, base);
-}
+// ---- the coded form (its codec: r4d_ar_coded.h, the description there)
+#include "r4d_ar_coded.h"
 
 // The coded two-shot, bf16 only; the launcher checks that each shard is a whole number of waves'
 // 32 chunks and that a slot holds two regions.
@@ -377,6 +240,7 @@ __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
     int slot_stride16, int rank, int drain, int acq, int pub,
     long long* gate, unsigned int* gate_ctr) {
   if (CHAIN) r4d_chain_wait();
+  r4d_ar_prio(acq);   /* fn4 PF prio */
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
@@ -506,6 +370,117 @@ __global__ void r4dchain_ar_twoshot_coded(R4D_ARTC_PARAMS) {
 }
 #undef R4D_ARTC_ARGS
 #undef R4D_ARTC_PARAMS
+
+// ---- moe_gather_all_reduce's two-shot form (four ranks, exact wire, bf16): the MoE gather in
+// front of the plain two-shot's reduce and assemble, for a message from the one-shot's `ts_min` on
+// (the unfused all-reduce goes two-shot there too).
+//
+// Phase 1 is the plain kernel's push with the gather as its source: every word of the message is
+// gathered once, on this rank, by r4d_ar_gather_word_list over the block's slot list
+// (r4d_ar_gather_list: every row's live slots, ascending) -- a word of my own shard into `y4`, where
+// the reduce reads my contribution from, a word of a peer's shard straight into that owner's region
+// A for me. From the first handshake on it is the plain kernel's lockstep body at one piece: the
+// same seq take (one step: handshakes 2s-1 and 2s), slots, block partition of the shard space,
+// fold (fp32, ascending rank, one rounding) and region B, so it shares an instance with every other
+// launch of the wide family.
+//
+// The bytes are moe_gather's word (r4d_ar_hc.h) folded as the exact all-reduce folds: the same as
+// moe_gather + all_reduce, and as the one-shot form (r4d_ar_gather_hc_write_wide_kernel at hc 0).
+// In place is safe: `y4` is written, never read as input (the gather reads ye / ew / sorted / sh /
+// sg); my shard's word k is stored in phase 1 and read back in the reduce by the same thread (the
+// same k loop over the same block range), then overwritten by it; the assemble writes peer shards'
+// words, which phase 1 never stored here.
+template <int WS>
+__global__ void r4d_ar_gather_twoshot_kernel(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    R4DArShardOff<WS> sh, int wpr, int slot_stride16, int rank, int drain, int acq, int pub,
+    R4dArGather G, long long* gate, unsigned int* gate_ctr) {
+  constexpr int NPEERS = WS - 1;
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq, s_slot;
+  __shared__ int   s_i[R4D_ARGL_TAB];
+  __shared__ float s_w[R4D_ARGL_TAB];
+  __shared__ int   s_n[R4D_ARGL_ROWS];
+  __shared__ float s_g[R4D_ARGL_ROWS];
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
+  const unsigned int v0 = 2u * s_seq - 1u;
+  const int parity = (int)s_slot;
+
+  r4d_ar_gather_list(G, s_i, s_w, s_n, s_g);
+  const int K = G.top_k;
+
+  const int sh_max = sh.sh_max;
+  const int w = (sh_max + nb - 1) / nb;    // block b owns words [w0,w1) of the SHARD space
+  const int w0 = b * w;
+  int w1 = w0 + w; if (w1 > sh_max) w1 = sh_max;
+
+  // region A of my slot in every peer's scratch (B sits at +sh_max)
+  int4* pa[NPEERS];
+#pragma unroll
+  for (int p = 0; p < NPEERS; ++p)
+    pa[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
+
+  // phase 1: gather every shard's words of my range; mine stay in y4, a peer's go to its region A
+  for (int o = 0; o < WS; ++o) {
+    const int off = sh.off[o], len = sh.off[o + 1] - off;
+    const int lim = w1 < len ? w1 : len;
+    int4* dst = o == rank ? y4 + off : pa[o < rank ? o : o - 1];
+    for (int k = w0 + tid; k < lim; k += nt) {
+      const int gw = off + k, row = gw / wpr, i0 = (gw - row * wpr) * 8;
+      dst[k] = r4d_ar_gather_word_list(G, s_i + row * K, s_w + row * K, s_n[row],
+                                       G.sh ? s_g[row] : 0.0f, row, i0);
+    }
+  }
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0, drain, acq, pub);
+
+  // reduce my shard (fp32, ascending rank, my contribution from y4) fused with the phase-2 push:
+  // the plain kernel's reduce2 at one piece
+  const int4* src[WS];
+#pragma unroll
+  for (int r = 0; r < WS; ++r)
+    src[r] = (r == rank) ? (y4 + (size_t)sh.off[rank])
+                         : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
+  int4* my_out = y4 + (size_t)sh.off[rank];
+  {
+    const int my_len = sh.off[rank + 1] - sh.off[rank];
+    const int my_lim = w1 < my_len ? w1 : my_len;
+    for (int k = w0 + tid; k < my_lim; k += nt) {
+      float acc[8];
+#pragma unroll
+      for (int l = 0; l < 8; ++l) acc[l] = 0.0f;
+#pragma unroll
+      for (int r = 0; r < WS; ++r) {
+        const int4 v = src[r][k];
+        const __hip_bfloat16* pv = reinterpret_cast<const __hip_bfloat16*>(&v);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) acc[l] += r4d_ar_to_f(pv[l]);
+      }
+      int4 o;
+      __hip_bfloat16* po = reinterpret_cast<__hip_bfloat16*>(&o);
+#pragma unroll
+      for (int l = 0; l < 8; ++l) r4d_ar_from_f(acc[l], po[l]);
+      my_out[k] = o;
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) pa[p][sh_max + k] = o;  // region B
+    }
+  }
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0 + 1u, drain, acq, pub);
+  // As in the plain kernel: every remote store of both phases has retired behind its flag and every
+  // peer's push to this rank has been waited on; only the local assemble is left.
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+
+  // assemble: every peer-owned shard from my region B
+  for (int p = 0; p < NPEERS; ++p) {
+    const int owner = peers.rank[p];
+    const int4* srcB = my_base + ((size_t)parity * WS + owner) * (size_t)slot_stride16 + sh_max;
+    int4* dst = y4 + (size_t)sh.off[owner];
+    const int len = sh.off[owner + 1] - sh.off[owner];
+    const int lim = w1 < len ? w1 : len;
+    for (int k = w0 + tid; k < lim; k += nt) dst[k] = srcB[k];
+  }
+}
 
 // --- host side ---
 template <int WS>
@@ -723,4 +698,91 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
   ar_twoshot_launch<8>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, 0L, 0L,
                        shard_weights, pieces, timeline, form);
+}
+
+/* moe_gather_all_reduce's two-shot form fits: a slot list in the block's LDS (M rows, M * top_k
+ * slots), a message of at least a word a rank, and both regions of its longest shard in a slot. */
+int r4d_ar_gather_twoshot_ok(long M, long n, long top_k, long slot_stride16) {
+  if (M < 1 || n < 8 || n % 8 || top_k < 1 || top_k > R4D_ARG_SLOTS) return 0;
+  if (M > R4D_ARGL_ROWS || M * top_k > R4D_ARGL_TAB) return 0;
+  const long n16 = M * n / 8;
+  if (n16 < 4 || M * n > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return 0;
+  long off[5];
+  const long sh_max = r4d_ar_shard_table(n16, 4, nullptr, off);
+  return 2 * sh_max <= slot_stride16 ? 1 : 0;
+}
+
+void r4d_ar_gather_twoshot_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                 long y, long M, long n, long ye, long ew, long sorted, long sh,
+                                 long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
+                                 long top_k, long sig, long rank, long stream, long nblocks,
+                                 long nthreads, long drain, long acq, long pub, long gate,
+                                 long gate_ctr) {
+  constexpr int WS = 4, NPEERS = 3;
+  if (rank < 0 || rank >= WS)
+    throw std::runtime_error("moe_gather_ar (two-shot): rank " + std::to_string(rank) +
+                             " out of range for four ranks");
+  if (!r4d_ar_gather_twoshot_ok(M, n, top_k, slot_stride16))
+    throw std::runtime_error("moe_gather_ar (two-shot): M " + std::to_string(M) + ", n " +
+                             std::to_string(n) + ", top_k " + std::to_string(top_k) +
+                             " outside the form (slot list, word a rank, slot stride)");
+  if (!ye || !ew || !sorted || ye_ld % 8 || (sh && sh_ld < n) || (sh != 0) != (sg != 0))
+    throw std::runtime_error("moe_gather_ar (two-shot): the gather's operands are not 16B rows");
+  const long n16 = M * n / 8;
+  long off[WS + 1];
+  const long sh_max = r4d_ar_shard_table(n16, WS, nullptr, off);
+  R4DArShardOff<WS> shd{};
+  for (int s = 0; s <= WS; ++s) shd.off[s] = (int)off[s];
+  shd.sh_max = (int)sh_max;
+
+  int nb = (int)nblocks;
+  if (nb < 1) nb = 2;
+  if (nb > sh_max) nb = (int)sh_max;
+  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+  int nt = (int)nthreads;
+  if (nt < 64) nt = 64;
+  if (nt > 1024) nt = 1024;
+
+  R4DArWidePeers<int4, NPEERS> peers{};
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  for (int i = 0; i < NPEERS; ++i) {
+    if (!ps[i] || !pf[i])
+      throw std::runtime_error("moe_gather_ar (two-shot): null peer scratch/flag pointer at index " +
+                               std::to_string(i));
+    peers.scratch[i] = (int4*)ps[i];
+    peers.flags[i] = (unsigned int*)pf[i];
+    peers.rank[i] = (i < (int)rank) ? i : i + 1;
+  }
+  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
+  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  r4d_ar_check_extent(my_scratch, slot_bytes, "moe_gather_ar", "my_scratch");
+  r4d_ar_check_extent(my_flags, flag_bytes, "moe_gather_ar", "my_flags");
+  r4d_ar_check_extent(seq_ctrs, 2L * R4D_AR_WIDE_MAX_BLOCKS * (long)sizeof(unsigned int),
+                      "moe_gather_ar", "seq_ctrs");
+  for (int i = 0; i < NPEERS; ++i) {
+    r4d_ar_check_extent(ps[i], slot_bytes, "moe_gather_ar", "peer scratch");
+    r4d_ar_check_extent(pf[i], flag_bytes, "moe_gather_ar", "peer flags");
+  }
+
+  /* Zeroed including padding: passed by value, so its tail padding is part of the kernel-argument
+   * bytes a recorded pass's audit compares (as ar_gather_hc_write_wide_launch's). `sig` bit 0: the
+   * shared gate's sigmoid; bit 1: f32 slot weights. */
+  R4dArGather G;
+  std::memset(&G, 0, sizeof G);
+  G.ye = (const unsigned short*)ye;
+  G.ew = (const unsigned short*)ew;
+  G.sorted = (const int*)sorted;
+  G.sh = (const unsigned short*)sh;
+  G.sg = (const unsigned short*)sg;
+  G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
+  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)(sig & 1); G.ew_f32 = (int)((sig >> 1) & 1);
+
+  hipStream_t st = (hipStream_t)stream;
+  r4d_ar_gather_twoshot_kernel<WS><<<nb, nt, 0, st>>>(
+      (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,
+      shd, (int)(n / 8), (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
+      (long long*)gate, (unsigned int*)gate_ctr);
 }

@@ -4,7 +4,7 @@
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS. Re-run cmake if a new file does not
 # appear.
 set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen
-                  lora kvstream)
+                  lora kvstream net)
 
 set(RAD_CORE_SRC "")
 foreach(d ${RAD_CORE_DIRS})
@@ -19,9 +19,27 @@ endforeach()
 file(GLOB _top CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(REMOVE_ITEM _top ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 list(APPEND RAD_CORE_SRC ${_top})
+# llama.cpp's block layouts as affine planes, shared with libquant's `ggml` quantiser, so a GGUF's
+# blocks import as the same planes that quantiser writes (format/checkpoint.cpp). Compiled from
+# libquant's own sources: the plugin stays buildable out of tree, and both read one definition.
+list(APPEND RAD_CORE_SRC ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_dequant.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
 
 add_library(rad_core STATIC ${RAD_CORE_SRC})
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
+# The two-node link's RDMA data path (net/node_link_verbs.cpp, tp8 S4) compiles where rdma-core's
+# headers are found; libibverbs itself is opened at run time, so the binary does not link it and a
+# host without rdma-core runs everything else. Without the headers the file builds the stub that
+# refuses `--node-link verbs` by name.
+find_path(RAD_VERBS_INCLUDE_DIR infiniband/verbs.h)
+if(RAD_VERBS_INCLUDE_DIR)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/net/node_link_verbs.cpp PROPERTIES
+    COMPILE_DEFINITIONS RAD_HAVE_VERBS=1 INCLUDE_DIRECTORIES ${RAD_VERBS_INCLUDE_DIR})
+  message(STATUS "radiance: the two-node link's RDMA verbs path builds against ${RAD_VERBS_INCLUDE_DIR}")
+else()
+  message(STATUS "radiance: no infiniband/verbs.h -- the two-node link builds TCP only")
+endif()
 target_compile_definitions(rad_core PUBLIC RAD_VERSION="${PROJECT_VERSION}")
 if(RAD_ENABLE_KV_ROLLBACK_TEST_HOOK)
   # Scheduler is embedded in Engine and its test-only callback changes its class layout.
@@ -32,6 +50,7 @@ target_include_directories(rad_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/abi
   ${CMAKE_SOURCE_DIR}/vendor)
+target_include_directories(rad_core PRIVATE ${CMAKE_SOURCE_DIR}/libquant)
 
 if(TARGET rad_vendor)
   target_link_libraries(rad_core PUBLIC rad_vendor)

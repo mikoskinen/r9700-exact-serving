@@ -51,10 +51,36 @@ namespace arch {
  * 1025..2048 with 4 rows has reach 2048 + 4 > qsa_exact_to 2051 and decodes SPARSE, while 1..3 read its exact seqused
  * (<= 2051: dense). The two launches agree while a row's keys fit the sparse 4-row launch's 64 one-tile segments
  * (1024 keys) and part beyond. 4 reads the bound (fn4_attbi_sparse); 0..3 keep today's choice and bytes. */
+/* 5 (20.11.2026, qwen-port round 3, s5-bt: L03.att first-differing in 16 of 20 probes, every one a DENSE step of 22
+ * sequences x 2 rows): as 4, and a step with no sparse sequence (every bound + rows <= qsa_exact_to: reach 2050 at 2 rows
+ * beside a 1025..2048 context, or every context <= 1024) takes the same per-sequence launches (att_bi 3's pinned runs of
+ * dense decode sequences, each prefill sequence alone-shaped, a 1-row sequence sparse as alone). 1..4 enter only a
+ * sparse step: a dense step issues ONE attn_paged over its n_seq sequences, whose split law (r4d_decode_splits: units =
+ * kv_heads x n_seq, 256 / units segments at q_len x gqa <= 32, 128 / units above) gives a sequence of ctx > 16 x
+ * (256 / units) keys other segments than its alone launch (2 KV heads a rank: 22 sequences -> 5 segments -> past 80
+ * keys; 4 sequences at depth 3 -> 16 -> past 256). Steps without KV streaming only; the declares do not change. */
+/* 6 (20.11.2026, qwen loop round 3, FINDINGS F4 / dep4 / dep5: 5 of 12 long prompts answer otherwise at depth 4 / 5 than
+ * at depth 3, each depth stable in its own start): as 5, and every SPARSE decode row splits its selected keys by the law
+ * of kGqBiPin (4) rows -- the published depth 3's -- at any verify depth 1 .. 1 + max_spec, in multi-sequence steps
+ * (op_attn_gq_pin for runs of whole sequences) and in a sequence's alone sparse decode step (taken through the same
+ * launches). The split law reads a launch's rows as sequences (r4d_decode_splits: 256 / (kv_heads x rows) segments;
+ * 2 KV heads a rank, ~2,049 selected keys = 129 16-key tiles: 4 rows 32 segments of 5 tiles, 5 rows 25 of 6, 6 rows 21
+ * of 7), so without the pin a row's bytes move with its sequence's depth. At a depth-3 start every full-depth row keeps
+ * today's bytes; rows below depth 3 (a cut window) and above it take the depth-3 law (a new reference there). Dense rows
+ * keep 5's launches (their law gives one-tile segments at any depth up to 4 at gqa 6). The enabler of a depth rule. */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
                                    const int v = e && *e ? std::atoi(e) : 0;
-                                   return v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   return v >= 6 ? 6 : v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+    return f;
+}
+/* fn4 PF probe ATP (Qwen loop round 9, 21.11.2026, QUEUE Q8's upper-bound read; qwen4exp switch sp_route bit 64): every
+ * gated sparse attention launch of a PREFILL step (op_attn_gq over a chunk of prompt rows, the pipelined pieces' and the
+ * plain form) issued twice -- the repeat reads the same q, KV, selection and gate and rewrites the same output, codes and
+ * scales, so the bytes are today's -- to read the attention's marginal cost on the prefill critical path (QPF-PROBE's form
+ * for the gathers / reads): what a P-2 union walk that removes part of its KV traffic can win at most. 0 = today. */
+inline std::atomic<int>& fn4_attprobe_flag() {
+    static std::atomic<int> f{0};
     return f;
 }
 /* fn4 kvs_bi (15.11.2026, qwen/KV-STREAM-EXACT.md; switch kvs_bi / RADIANCE_FN4_KVS_BI, a mask; 0 = today): KV streaming
@@ -217,6 +243,11 @@ struct AttnGatedFP8 {
     static constexpr int64_t kGqBiRows = 64;
     rad_op     op_attn_gq_bi = 0;
     int64_t    gq_bi_qd = 0;
+    /* fn4 att_bi 6 (qwen loop round 3, 20.11.2026): op_attn_gq with split_rows = kGqBiPin at EVERY verify depth, the alone
+     * decode step included, so a sparse decode row's selected keys split as at the published depth 3 whatever its
+     * sequence's depth is (= op_attn_gq_bi itself where 1 + max_spec == kGqBiPin). Declared beside op_attn_gq_bi. */
+    static constexpr int64_t kGqBiPin = 4;
+    rad_op     op_attn_gq_pin = 0;
     /* fn4 att_bi 3: op_attn as attn_paged_pin with split_rows = 1 (a dense decode sequence's alone launch is one sequence),
      * declared beside op_attn_gq_bi where a plugin declares attn_paged_pin (libr4d); 0 otherwise. */
     rad_op     op_attn_bi = 0;
@@ -293,7 +324,7 @@ struct AttnGatedFP8 {
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
         const int64_t T = batch->n_tok;
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
-        return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
+        return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) && pieces->last_ok(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
                !(T <= qk_fuse_now(fused_rows)) && batch->positions && !rope_mixed(batch) &&
@@ -641,6 +672,30 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                 RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq_bi, rd, 4));
                 RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq_bi, wr, 3));
             }
+            /* att_bi 6: the depth-3 law at every depth (kGqBiPin); the same op where the start's depth is 3 */
+            if (op_attn_gq_bi && gq_bi_qd == kGqBiPin) {
+                op_attn_gq_pin = op_attn_gq_bi;
+            } else if (op_attn_gq_bi) {
+                op_attn_gq_pin = RAD_OP(b, "attn_paged_gate_quant",
+                                    RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
+                                               RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                               RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
+                                               RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                               RAD_INT("max_seqs", kGqBiRows),
+                                               RAD_INT("max_ctx", g.max_ctx),
+                                               RAD_STR("q_dtype", g.dtype),
+                                               RAD_STR("kv_dtype", g.kv_dtype),
+                                               RAD_INT("group", RAD_FP8_BLOCK),
+                                               RAD_STR("act", "sigmoid"),
+                                               RAD_INT("split_rows", kGqBiPin)),
+                                    RAD_NOWEIGHTS);
+                if (op_attn_gq_pin) {
+                    const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, w.qg };
+                    const rad_buf wr[3] = { w.attn.x, w.attn.cq(), w.attn.cs() };
+                    RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq_pin, rd, 4));
+                    RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq_pin, wr, 3));
+                }
+            }
         }
     }
 
@@ -883,14 +938,21 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int abf0 = fn4_attbi_flag().load(std::memory_order_relaxed);
     /* fn4 kvs_bi bit 1: a streamed group's decode sequences in their alone (sparse, own-launch) form, ring or stage */
     const bool kvs_alone = ring_addressed && (fn4_kvsbi_flag().load(std::memory_order_relaxed) & 1) != 0;
-    if (gated && abf0 > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
+    /* att_bi 5: a dense step through the same per-sequence launches (its 1-row sequences sparse, as alone; the selection
+     * is computed every step); not with a streamed group (the dense path stages the layer itself) */
+    const bool dense_bi = !sparse && abf0 >= 5 && qsa_sel && qsa_sequ && op_attn_gq && op_attn_bi &&
+                          !(kvb && kvb->stream);
+    /* att_bi 6: a SPARSE decode step of one sequence (alone) through the same launches, so its rows take the pinned law
+     * as beside load; its dense steps and every prefill stay on today's path */
+    const bool lone6 = abf0 >= 6 && batch->n_seq == 1 && gated && op_attn_gq_pin;
+    if ((gated || dense_bi) && abf0 > 0 && (batch->n_seq > 1 || lone6) && batch->draft_pass == 0 &&
         table && used && kvb && kvb->seqused_h && (!ring_bound || kvs_alone) && qsa_exact_to > 0 && op_attn && op_gq &&
         !(pieces && pieces->cuts(T))) {
         int64_t D = 0, DT = 0;
         batch_split(batch, &D, &DT);
         const int64_t qd = D > 0 ? DT / D : 0;
         std::vector<int64_t> bq;
-        if ((D == 0 || DT == D * qd) && attbi_rows(batch, kvb, D, DT, T, bq)) {
+        if ((D == 0 || DT == D * qd) && (!lone6 || (D == 1 && DT == T)) && attbi_rows(batch, kvb, D, DT, T, bq)) {
             const int64_t ns = batch->n_seq;
             std::vector<int64_t> r0(ns), nr(ns);
             std::vector<char> sp(ns);
@@ -901,6 +963,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 sp[s2] = fn4_attbi_sparse(abf0, (int64_t)kvb->seqused_h[s2], nr[s2], qsa_exact_to, g.max_ctx);
                 /* kvs_bi bit 1: alone, a streamed decode sequence is ring-bound, hence sparse at every context */
                 if (kvs_alone && s2 < D) sp[s2] = 1;
+                /* att_bi 6 alone: entered only where the step took the sparse path */
+                if (lone6) sp[s2] = 1;
             }
             /* every sequence in launches of its own (12.11. x04c: long prompts): a sparse launch's split law reads its
              * row count as the sequence count (r4d_decode_splits: units = kv_heads x rows), so a sequence's rows inside a
@@ -910,8 +974,11 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 const int64_t pitch = kvb->block_table_pitch;
                 /* att_bi 2: a run of sparse decode sequences in launches of up to kGqBiRows rows (whole sequences) */
                 const int abf = abf0;
-                const bool one = abf >= 2 && op_attn_gq_bi &&
-                                 qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows;
+                /* att_bi 6: the pinned law (kGqBiPin rows) at every verify depth 1 .. 1 + max_spec */
+                const bool pin6 = abf >= 6 && op_attn_gq_pin && qd > 0 && qd <= 1 + g.max_spec && qd <= kGqBiRows;
+                const bool one = pin6 || (abf >= 2 && op_attn_gq_bi &&
+                                          qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows);
+                const rad_op op_one = pin6 ? op_attn_gq_pin : op_attn_gq_bi;
                 /* att_bi 3: a run of dense decode sequences in one op_attn_bi launch + one gate_quant (fn4_attbi_flag's note) */
                 /* no q_len x gqa bound: above 32 the law reads the block table's depth, the step's pitch, which the
                  * per-sequence launches of att_bi 1 / 2 pass too (praw2(table + s2 * pitch, .., 1, pitch)) */
@@ -948,7 +1015,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         while (e2 < D && sp[e2] && (e2 - s2 + 1) * qd <= kGqBiRows) ++e2;
                         const int64_t rows = (e2 - s2) * qd;
                         resolve_sel(a0, rows);
-                        RAD_ISSUE_N(c, op_attn_gq_bi, 1,
+                        RAD_ISSUE_N(c, op_one, 1,
                                     brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
                                     brow_slice(qsa_sel, a0, rows, qsa_topk + 1),
                                     brow_slice(qsa_sequ, a0, rows, 1),
@@ -1000,6 +1067,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * attention and out projection can finish a piece's rows and hand off its reduction while the
      * next piece's attention runs. Each piece is launched as a step of the piece's width would
      * launch it. */
+    /* fn4 PF probe ATP (sp_route bit 64): a prefill step's gated sparse launches issued twice (the same bytes) */
+    const int atp_n = batch->phase == RAD_PHASE_PREFILL && batch->draft_pass == 0 &&
+                      fn4_attprobe_flag().load(std::memory_order_relaxed) ? 2 : 1;
     if (gated && !own_ar && pieces && pieces->cuts(T) && !op_add) {
         const int64_t chunk = qsa_gq_rows();
         const int64_t qw = g.q_dim(), hd = g.head_dim;
@@ -1008,6 +1078,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             for (int64_t off = p0; off < p0 + pn; off += chunk) {
                 const int64_t rows = (p0 + pn - off) < chunk ? (p0 + pn - off) : chunk;
                 resolve_sel(off, rows);
+                for (int rep = 0; rep < atp_n; ++rep)
                 RAD_ISSUE_N(c, op_attn_gq, 1,
                             brow_slice(w.q, off, rows, qw),
                             kv_cache(kv, layer),
@@ -1032,6 +1103,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
             resolve_sel(off, rows);
+            for (int rep = 0; rep < atp_n; ++rep)
             RAD_ISSUE_N(c, op_attn_gq, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),

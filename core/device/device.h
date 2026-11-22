@@ -362,6 +362,11 @@ struct DeviceBackend {
      * only where no line the dispatch reads can be stale; see Ctx::haz_mark. A system-scope
      * acquire is never dropped. Null on a backend without tapes. */
     int     (*tape_set_noacq)(RadTape t, int i, int on);
+    /* Lever IKA (RADIANCE_AQL_IKA=1): 1 if dispatch `i`'s kernel acquires and releases at agent scope itself (its
+     * library names it in r4d_ika_kernels), else 0. Such a dispatch plays without its packet's release, and without
+     * its acquire where tape_set_noacq's bit 1 is set (Ctx::haz_mark: no line it reads can be stale in a scalar
+     * cache). Null on a backend without it. */
+    int     (*tape_rec_ika)(RadTape t, int i);
 };
 
 
@@ -380,6 +385,8 @@ void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
 int     tape_set_noacq(RadTape t, int i, bool on);
+int     tape_set_noacq_bits(RadTape t, int i, int bits);   /* bit 0 the rule's mark, bit 1 lever IKA's */
+int     tape_rec_ika(RadTape t, int i);                     /* 0 where the backend has no lever IKA */
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);
@@ -418,6 +425,14 @@ constexpr int kTapeOverlapRun = 6;
  * and the number of allocations since process start. It does not see a
  * kernel plugin that calls hipMalloc directly; see the ledger in dispatch.cpp. */
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count);
+
+/* tp8 loop F66 (lever KVP, RADIANCE_KV_PLACED): per card, what the engine itself has placed there -- the
+ * live RAD_MEM_DEVICE bytes of rad_dev_alloc (charged to the device the allocating thread last selected
+ * with rad_dev_set) and the live streams (hardware queues, whose rings and save areas the driver backs
+ * with VRAM). Engine::configure_kv takes the card's free-memory drop since the budget's reading less
+ * these as what the budget never saw (GPU page tables of mapped host memory, a plugin's own hipMalloc).
+ * 0 / 0 for a device the ledger has not seen. */
+void rad_dev_ledger_of(int device, int64_t* device_bytes, int64_t* streams);
 
 /* Event handles created and not yet destroyed, process-wide. */
 int64_t rad_dev_live_events(void);
@@ -525,6 +540,21 @@ int64_t aql_pageable_bytes(void);
  * build's exported symbols and see every dlopen'ed plugin's device code, card or not. Serves as
  * the host backend's code_mark in a HIP build. */
 size_t  aql_code_registered(void);
+/* tp8 loop F24 (RADIANCE_AQL_PRELOAD=1, Engine::plan): every registered fat binary's code object loaded on `device` now, as
+ * the first launch of one of its kernels would (the AQL backend otherwise loads a module there, mid-serve if that is when its
+ * first kernel runs). RAD_E_UNSUPPORTED without the AQL backend. */
+struct AqlPreload {
+    int64_t loaded = 0, already = 0, none = 0, failed = 0;   /* modules: loaded now / before / no code for the card / refused */
+    int64_t bytes = 0;                                       /* the code objects' bytes loaded now */
+    double  ms = 0;
+};
+int     aql_code_preload(int device, AqlPreload* out);
+/* tp8 loop P31 (RADIANCE_AQL_PRELOAD=2): every registered kernel resolved on `device` now (its first launch's lookup:
+ * symbol, argument layout), after aql_code_preload, and HIP's allocator used once there (`alloc_ms`: its time, -1 = not
+ * reached). RAD_E_UNSUPPORTED without the AQL backend. */
+int     aql_code_resolve_all(int device, int64_t* resolved, int64_t* refused, double* ms, double* alloc_ms);
+/* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS): the calling thread's first-launch resolve time (ns) and count since its last call. */
+void    aql_resolves_take(uint64_t* ns, uint64_t* n);
 #endif
 
 /* ------------------------------------------------------------------ the error slot */

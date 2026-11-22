@@ -24,6 +24,7 @@
 #include "sample/grammar.h"
 #include "sample/sampler.h"
 #include "sched/scheduler.h"
+#include "sched/lanes.h"   /* tp8 S5 */
 #include "rad_builder.h"
 #include "text/chat.h"
 #include "text/chatfmt.h"
@@ -128,6 +129,18 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
     o.checkpoints_written = m.checkpoints_written;
+    o.psk_mode = m.psk_mode;                     o.psk_k = m.psk_k;   /* lever PSK design 2 */
+    o.psk_latched = m.psk_latched;               o.psk_planned_steps = m.psk_planned_steps;
+    o.psk_ckpt_anchor = m.psk_ckpt_anchor;       o.psk_ckpt_dropped = m.psk_ckpt_dropped;
+    o.psk_fallback_resumes = m.psk_fallback_resumes;
+    o.psk_fallback_tokens = m.psk_fallback_tokens;
+    o.psk_cr = m.psk_cr;                         o.psk_cr_hits = m.psk_cr_hits;   /* lever PSK-CR */
+    o.psk_cr_rows = m.psk_cr_rows;               o.psk_cr_resume_tokens = m.psk_cr_resume_tokens;
+    o.psk_cr_fb_unplanned = m.psk_cr_fb_unplanned;
+    o.psk_cr_fb_geometry = m.psk_cr_fb_geometry;
+    o.psk_cr_fb_adopt = m.psk_cr_fb_adopt;       o.psk_cr_not_needed = m.psk_cr_not_needed;
+    o.psk_tail_only = m.psk_tail_only;           o.psk_tail_only_refused = m.psk_tail_only_refused;
+    o.psk_cr_cheaper = m.psk_cr_cheaper;         o.psk_cr_end_ckpts = m.psk_cr_end_ckpts;   /* ds41-pskcr2 */
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;
@@ -166,6 +179,10 @@ public:
     explicit SchedulerBridge(Scheduler* s, const Sampler* sampler = nullptr,
                              const IdleTiers* tiers = nullptr)
         : s_(s), sampler_(sampler), tiers_(tiers) {}
+    /* tp8 S5: a two-node pipeline's lanes (core/sched/lanes.h): a request goes to the lane
+     * LaneSet::pick names, a cancel or reap to the lane holding it, and the published copies are
+     * every lane's. Null: one scheduler, s_ (the published path). */
+    void set_lanes(const LaneSet* lanes) { lanes_ = lanes && lanes->n() > 1 ? lanes : nullptr; }
 
     int admit(const SamplingParams& sp, std::string* why) const override {
         if (!sampler_) return RAD_OK;
@@ -196,7 +213,10 @@ public:
             (*ids)[i] = ps[i]->id;
             sinks[i] = ps[i]->sink;
         }
-        s_->add_all(ps.data(), n, rc.data());
+        /* tp8 S5: one API request's sequences go to one lane together, admitted before a step of
+         * that lane can see any of them */
+        Scheduler* to = lanes_ ? lanes_->lane(lanes_->pick()) : s_;
+        to->add_all(ps.data(), n, rc.data());
         for (size_t i = 0; i < n; ++i) {
             if (rc[i] >= 0) continue;
             RAD_WARN("server: scheduler refused request %llu: %s",
@@ -208,8 +228,16 @@ public:
         }
     }
 
-    void cancel(uint64_t id) override { s_->cancel(id); }
-    void reap(uint64_t id) override { s_->reap(id); }
+    /* tp8 MERGE: a request may move between lanes (LaneSet::merge_into / split_from) between at()'s lookup and the call: a
+     * NOTFOUND asks the owner again (a move takes the lanes' lock once, so the second lookup finds it) */
+    void cancel(uint64_t id) override {
+        for (int k = 0; k < 3; ++k)
+            if (at(id)->cancel(id) != RAD_E_NOTFOUND) break;
+    }
+    void reap(uint64_t id) override {
+        for (int k = 0; k < 3; ++k)
+            if (at(id)->reap(id) != RAD_E_NOTFOUND) break;
+    }
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
@@ -284,7 +312,8 @@ public:
      * running request whose prompt is not yet all in the KV. The table reports it separately. */
     int requests(std::vector<RequestStat>* out) const override {
         std::vector<Scheduler::ReqStat> raw(256);
-        const int n = s_->observed_requests(raw.data(), (int)raw.size());
+        const int n = lanes_ ? lanes_->observed_requests(raw.data(), (int)raw.size())
+                             : s_->observed_requests(raw.data(), (int)raw.size());
         out->clear();
         out->reserve((size_t)n);
         for (int i = 0; i < n; ++i) {
@@ -321,12 +350,19 @@ public:
     /* Both read the copy the engine thread publishes (Scheduler::publish), never the
      * scheduler's live state: every caller is an observer. */
     SchedMetrics metrics() const override {
-        return bridge_metrics(s_->observed_metrics());
+        return bridge_metrics(lanes_ ? lanes_->observed_metrics() : s_->observed_metrics());
     }
 
 private:
+    /* The lane holding `id` (tp8 S5), else s_. */
+    Scheduler* at(uint64_t id) const {
+        if (!lanes_) return s_;
+        Scheduler* o = lanes_->owner(id);
+        return o ? o : s_;
+    }
     /* Declared in the constructor's initialiser order (-Wreorder). */
     Scheduler*            s_;
+    const LaneSet*        lanes_ = nullptr;
     const Sampler*        sampler_ = nullptr;
     const IdleTiers*      tiers_ = nullptr;
     /* Ids start at 1: zero is the "no request" value the sink and the metrics use. */

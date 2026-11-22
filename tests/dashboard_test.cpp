@@ -105,6 +105,21 @@ void populated(LiveSnapshot& s) {
     s.experts.layer_units = { 3, 3 };
     s.experts.layer_resident = { 2, 3 };
     s.experts.promotions = 9; s.experts.demotions = 8; s.experts.readmits = 2;
+    for (int r = 0; r < 2; ++r) {   /* every rank's own (ExpertPlane::ranks, ds41-z0) */
+        ExpertPlane::Rank er;
+        er.rank = r; er.vram_units = 4 + r; er.pinned_units = 2 - r; er.trunk_vram_units = 3 + r; er.draft_vram_units = 1;
+        er.routed = 100 * (r + 1); er.routed_resident = 90 * (r + 1); er.stream_bytes = 1000 + r; er.draft_lent_units = 7 * r;
+        er.flex_bytes = 5 << 20;
+        if (r == 1) {   /* ds41-lf: the slot classes and the lenders' slots */
+            er.slots = true;
+            er.slot_hit[1] = 80; er.slot_hit[2] = 9; er.slot_miss[0] = 4; er.slot_miss[3] = 2;
+            er.lent_covered[0] = 30; er.lent_held[0] = 28; er.lent_fills[2] = 11; er.lent_fills_lf[2] = 6;
+            er.lent_fills_hot[2] = 5; er.lent_drop_victim[1] = 3; er.lent_drop_reserve[0] = 2; er.lent_drop_recall[2] = 1;
+            er.place_lf = 1;
+            er.place_swl = 1; er.heat_min_gain_x100 = 75; er.heat_hyst_x100 = 125; er.lent_swaps[1] = 13;   /* ds41-swl */
+        }
+        s.experts.ranks.push_back(er);
+    }
     s.experts.distinct_promoted = 7; s.experts.dispatches = 20; s.experts.refused = 3;
     s.experts.no_candidate = 1; s.experts.routed = 100; s.experts.routed_resident = 80;
     s.experts.flex_bytes = 1 << 20; s.experts.flex_capacity = 2 << 20;
@@ -214,6 +229,37 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s.value("running", (int64_t)0), (int64_t)1);
     CHECK_EQ(s.value("kv_tokens_cached", (int64_t)0), (int64_t)300);
     CHECK_EQ(s.value("kv_tokens_max", (int64_t)0), (int64_t)6000);
+    /* lever PSK's live counters (ds41-int7-pskglue): present, and 0 with no plan made and no plugin serving it */
+    REQUIRE(s.contains("psk"));
+    CHECK_EQ(s["psk"].value("mode", 99), -1);
+    CHECK_EQ(s["psk"].value("cr", 99), -1);
+    for (const char* k : { "latched", "planned_steps", "ckpt_anchor", "ckpt_dropped", "fallback_resumes", "fallback_tokens",
+                           "engine_planned_passes", "passes_ended_early", "stager_layers_skipped", "plugin_planned_passes",
+                           "cut_passes", "layers_skipped", "rows_skipped_l21_29", "rows_skipped_l30_39", "plan_mismatch",
+                           "l20_cut_passes", "l20_rows_skipped", "l20_cone_empty", "l20_layers_not_staged",
+                           /* lever PSK-CR (ds41-pskcr) */
+                           "cr_hits", "cr_rows_replayed", "cr_resume_tokens", "cr_fallbacks", "cr_fallback_unplanned",
+                           /* ds41-pskcr2 */
+                           "cr_cheaper", "cr_end_snapshots",
+                           "cr_fallback_geometry", "cr_fallback_adopt", "cr_not_needed", "tail_only_latched",
+                           "tail_only_refused", "cr_passes", "cr_layer_rows_run", "cr_layer_rows_skipped",
+                           "cr_chains_skipped", "cr_mixed_passes" }) {
+        CHECK(s["psk"].contains(k));
+        CHECK_EQ(s["psk"].value(k, (int64_t)-1), (int64_t)0);
+    }
+    /* lever PSK-DS's (ds41-pskl20): present, mode -1 and 0s with no plugin serving it */
+    REQUIRE(s.contains("dspark_pfctx"));
+    CHECK_EQ(s["dspark_pfctx"].value("mode", (int64_t)99), (int64_t)-1);
+    for (const char* k : { "passes", "rows_skipped", "rows_run" }) {
+        CHECK(s["dspark_pfctx"].contains(k));
+        CHECK_EQ(s["dspark_pfctx"].value(k, (int64_t)-1), (int64_t)0);
+    }
+    /* lever E1's live counters (ds41-e1): present, and 0 with no plugin serving them */
+    REQUIRE(s.contains("engdd"));
+    for (const char* k : { "passes", "rows_deduped", "rows_pooled", "guard48", "low_share", "steps", "no_pool" }) {
+        CHECK(s["engdd"].contains(k));
+        CHECK_EQ(s["engdd"].value(k, (int64_t)-1), (int64_t)0);
+    }
     REQUIRE(s["draft_positions"].size() == 2);
     CHECK_NEAR(s["draft_positions"][1]["rate"].get<double>(), 0.25, 1e-12);
     CHECK_EQ(s["draft_positions"][1]["reached"].get<int64_t>(), (int64_t)8);
@@ -230,6 +276,35 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
         CHECK_EQ(s["experts"]["tiers"][t].value("name", ""), std::string(tier_name((Tier)t)));
         CHECK_EQ(s["experts"]["tiers"][t].value("units", (int64_t)0), (int64_t)(t + 1));
     }
+    REQUIRE(s["experts"]["ranks"].size() == 2);
+    CHECK_EQ(s["experts"]["ranks"][1].value("rank", -1), 1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("vram", (int64_t)0), (int64_t)5);
+    CHECK_EQ(s["experts"]["ranks"][1].value("trunk_vram", (int64_t)0), (int64_t)4);
+    CHECK_EQ(s["experts"]["ranks"][1].value("draft_vram", (int64_t)0), (int64_t)1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("routed_res", (int64_t)0), (int64_t)180);
+    CHECK_EQ(s["experts"]["ranks"][1].value("draft_lent_units", (int64_t)0), (int64_t)7);
+    CHECK_EQ(s["experts"]["ranks"][0].value("stream_bytes", 0.0), 1000.0);
+    /* ds41-lf: only a rank that counts them carries the slot classes and the lenders. */
+    CHECK(!s["experts"]["ranks"][0].contains("slots"));
+    CHECK_EQ(s["experts"]["ranks"][1]["slots"]["hit"].value("trunk", (int64_t)0), (int64_t)80);
+    CHECK_EQ(s["experts"]["ranks"][1]["slots"]["hit"].value("kv", (int64_t)0), (int64_t)9);
+    CHECK_EQ(s["experts"]["ranks"][1]["slots"]["miss"].value("cold", (int64_t)0), (int64_t)4);
+    CHECK_EQ(s["experts"]["ranks"][1]["slots"]["miss"].value("arena", (int64_t)0), (int64_t)2);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["kv"].value("covered", (int64_t)0), (int64_t)30);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["kv"].value("held", (int64_t)0), (int64_t)28);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["dslab"].value("fills", (int64_t)0), (int64_t)11);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["dslab"].value("fills_lf", (int64_t)0), (int64_t)6);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["dslab"].value("fills_hot", (int64_t)0), (int64_t)5);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["arena"].value("drop_victim", (int64_t)0), (int64_t)3);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["kv"].value("drop_reserve", (int64_t)0), (int64_t)2);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["dslab"].value("drop_recall", (int64_t)0), (int64_t)1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("place_lf", 0), 1);
+    /* ds41-swl: lever SWL's heat promotions into lent slots and the rank's SWL / L2 state */
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["arena"].value("swaps", (int64_t)0), (int64_t)13);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["kv"].value("swaps", (int64_t)-1), (int64_t)0);
+    CHECK_EQ(s["experts"]["ranks"][1].value("place_swl", 0), 1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("heat_min_gain_x100", 0), 75);
+    CHECK_EQ(s["experts"]["ranks"][1].value("heat_hyst_x100", 0), 125);
     CHECK_EQ(s["link"].value("stream_bytes", (int64_t)0), (int64_t)700);
     CHECK_EQ(s["link"].value("kv_stream_bytes", (int64_t)0), (int64_t)600);
     CHECK(s["link"].value("kv_streaming", false));

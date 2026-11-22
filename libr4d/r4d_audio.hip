@@ -9,6 +9,7 @@
 // Sequenced operands follow every sequenced op here: `cu_seqlens` holds row indices of the
 // operands themselves, and each sequence is padded on its own.
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_f32_tile.h"
@@ -79,7 +80,7 @@ __global__ __launch_bounds__(256) void conv1d_igemm_kernel(
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int r_beg, int r_end,
     int cin, int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld,
-    int res_ld, int act) {
+    int res_ld, int act) { R4D_IKA_ENTRY();
     constexpr int BP = 2 * TP * 16, BC = 4 * TC * 16;
     constexpr int CPR = C1_BK / 8;
     constexpr int AL = BP * CPR / 256, WL = BC * CPR / 256;
@@ -217,7 +218,7 @@ __global__ __launch_bounds__(kT) void conv1d_direct_kernel(
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int r_beg, int r_end,
     int cin, int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld,
-    int res_ld, int act) {
+    int res_ld, int act) { R4D_IKA_ENTRY();
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     const int64_t total = (int64_t)(r_end - r_beg) * cout;
     if (t >= total) return;
@@ -252,7 +253,7 @@ __global__ __launch_bounds__(256) void conv_t1d_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, const int* __restrict__ cu, uint16_t* __restrict__ y,
     int n_seq, int r_beg, int r_end, int cin, int cout, int s, int P, int taps, int x_ld,
-    int y_ld) {
+    int y_ld) { R4D_IKA_ENTRY();
     constexpr int BP = 2 * TP * 16, BC = 4 * TC * 16;
     constexpr int CPR = C1_BK / 8;
     constexpr int AL = BP * CPR / 256, WL = BC * CPR / 256;
@@ -433,7 +434,7 @@ __global__ __launch_bounds__(r4d_f32::kThr) void conv1d_f32_kernel(
     const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
     const float* res, const int* __restrict__ cu, float* y, int n_seq, int rows, int cin,
     int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld, int res_ld,
-    int act) {
+    int act) { R4D_IKA_ENTRY();
     constexpr int TM = 8, BM = 16 * TM, BN = 16 * TN;
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
@@ -464,7 +465,7 @@ __global__ __launch_bounds__(kT) void conv1d_f32_direct_kernel(
     const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
     const float* res, const int* __restrict__ cu, float* y, int n_seq, int rows, int cin,
     int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld, int res_ld,
-    int act) {
+    int act) { R4D_IKA_ENTRY();
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     if (t >= (int64_t)rows * cout) return;
     const int co = (int)(t % cout);
@@ -531,7 +532,7 @@ template <int TN>
 __global__ __launch_bounds__(r4d_f32::kThr) void conv_t1d_f32_kernel(
     const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
     const int* __restrict__ cu, float* __restrict__ y, int n_seq, int rows, int cin, int cout,
-    int s, int P, int taps, int x_ld, int y_ld) {
+    int s, int P, int taps, int x_ld, int y_ld) { R4D_IKA_ENTRY();
     constexpr int TM = 8, BM = 16 * TM, BN = 16 * TN;
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN, ph = blockIdx.z;
@@ -559,7 +560,7 @@ __global__ __launch_bounds__(r4d_f32::kThr) void conv_t1d_f32_kernel(
 // parameters are stored as logarithms and exponentiated here, as the reference does each pass.
 __global__ __launch_bounds__(kT) void snake_kernel(
     const uint16_t* __restrict__ x, const float* __restrict__ alpha, const float* __restrict__ beta,
-    uint16_t* __restrict__ y, int n, int lg, int x_ld, int y_ld, int64_t total) {
+    uint16_t* __restrict__ y, int n, int lg, int x_ld, int y_ld, int64_t total) { R4D_IKA_ENTRY();
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     if (t >= total) return;
     const int64_t r = t / n;
@@ -640,7 +641,7 @@ __global__ __launch_bounds__(kT) void cfg_topk_kernel(
     const int* __restrict__ frame, int* __restrict__ ids, int V, int K, int rep, int cond_k,
     float cfg, float temp, uint64_t stream, const float* __restrict__ cfgs,
     const int* __restrict__ lane, int* __restrict__ hist, int n_hist, int sup_lo, int sup_hi,
-    float pen, float top_p) {
+    float pen, float top_p) { R4D_IKA_ENTRY();
     __shared__ int sh[8];
     __shared__ int s_pre[kT];
     __shared__ double s_z[kT];
@@ -794,7 +795,7 @@ __device__ __forceinline__ float ldtab(const void* t, int f32, size_t i) {
 __global__ __launch_bounds__(kT) void rvq_embed_kernel(
     const int* __restrict__ codes, int64_t kp, int64_t rp, const void* __restrict__ t0,
     int t0_f32, const void* __restrict__ t1, int t1_f32, void* __restrict__ y, int y_f32, int D,
-    int K, int voc, int off0, int r0, int r1, float scale, int y_ld, int round1, int clamp) {
+    int K, int voc, int off0, int r0, int r1, float scale, int y_ld, int round1, int clamp) { R4D_IKA_ENTRY();
     const int r = blockIdx.x;
     auto cl = [clamp](int c) { return clamp > 0 && c > clamp - 1 ? clamp - 1 : c; };
     const int c0 = cl(codes[(size_t)r * rp]) + off0;
@@ -824,7 +825,7 @@ __global__ __launch_bounds__(kT) void vq_encode_kernel(
     void* __restrict__ x, int x_f32, int x_ld, const void* __restrict__ iw, int iw_f32,
     const void* __restrict__ ib, int ib_f32, const void* __restrict__ cb, int cb_f32,
     const void* __restrict__ ow, int ow_f32, const void* __restrict__ ob, int ob_f32,
-    int* __restrict__ codes, int64_t code_st, int n, int dim, int bins) {
+    int* __restrict__ codes, int64_t code_st, int n, int dim, int bins) { R4D_IKA_ENTRY();
     __shared__ float part[kT / 32][kVqMaxDim];
     __shared__ float e[kVqMaxDim], eh[kVqMaxDim];
     __shared__ float wbest[kT / 32];
@@ -898,7 +899,7 @@ __global__ __launch_bounds__(kT) void vq_encode_kernel(
 __global__ __launch_bounds__(kT) void frame_store_kernel(
     const int* __restrict__ codes, int64_t kp, int64_t rp, const int* __restrict__ lane,
     const int* __restrict__ frame, const int* __restrict__ status, int* __restrict__ dst, int n,
-    int K, int stride, int rep, int skip, int n_status, int64_t n_dst) {
+    int K, int stride, int rep, int skip, int n_status, int64_t n_dst) { R4D_IKA_ENTRY();
     const int t = blockIdx.x * kT + threadIdx.x;
     if (t >= n * K) return;
     const int i = t / K, k = t % K;
@@ -912,7 +913,7 @@ __global__ __launch_bounds__(kT) void frame_mix_kernel(
     const uint16_t* __restrict__ hid, int plane, const float* __restrict__ logits,
     const float* __restrict__ scale, const int* __restrict__ lane, const int* __restrict__ frame,
     const int* __restrict__ status, uint16_t* __restrict__ dst, int D, int L, int stride, int rep,
-    int h_ld, int d_ld) {
+    int h_ld, int d_ld) { R4D_IKA_ENTRY();
     __shared__ float w[16];
     const int i = blockIdx.x;
     const int ln = lane[i], f = frame[i];
@@ -941,7 +942,7 @@ __global__ __launch_bounds__(kT) void frame_mix_kernel(
 __global__ __launch_bounds__(kT) void ras_pick_kernel(
     const int* __restrict__ first, const int* __restrict__ alt, const int* __restrict__ lane,
     int* __restrict__ hist, int* __restrict__ ids, int n, int W, int lo, int hi, int rep,
-    int clear, long long n_hist) {
+    int clear, long long n_hist) { R4D_IKA_ENTRY();
     const int i = blockIdx.x * kT + threadIdx.x;
     if (i >= n) return;
     const int f = first[rep * i];
@@ -962,7 +963,7 @@ __global__ __launch_bounds__(kT) void ras_pick_kernel(
 
 __global__ __launch_bounds__(kT) void end_status_kernel(
     const int* __restrict__ ids, const int* __restrict__ lane, int* __restrict__ status, int n,
-    int rep, int end) {
+    int rep, int end) { R4D_IKA_ENTRY();
     const int i = blockIdx.x * kT + threadIdx.x;
     if (i >= n) return;
     const int v = ids[rep * i];
@@ -972,7 +973,7 @@ __global__ __launch_bounds__(kT) void end_status_kernel(
 // ---------------------------------------------------------------------------- rows
 __global__ __launch_bounds__(kT) void resample_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int n, int in, int out, int x_ld,
-    int y_ld) {
+    int y_ld) { R4D_IKA_ENTRY();
     const int j = blockIdx.x;
     const float sc = (float)in / (float)out;
     const int src = min((int)floorf((float)j * sc), in - 1);
@@ -981,7 +982,7 @@ __global__ __launch_bounds__(kT) void resample_kernel(
 
 __global__ __launch_bounds__(kT) void fourier_kernel(
     const float* __restrict__ t, const float* __restrict__ w, uint16_t* __restrict__ y, int h,
-    int rnd, int y_ld) {
+    int rnd, int y_ld) { R4D_IKA_ENTRY();
     const int r = blockIdx.x;
     const float two_pi = 6.28318530717958647692f;
     const float tv = rnd ? bfr(bfr(t[r]) * two_pi) : t[r] * two_pi;
@@ -997,7 +998,7 @@ __global__ __launch_bounds__(kT) void win_input_kernel(
     const uint16_t* __restrict__ lat, const uint16_t* __restrict__ cond,
     const int* __restrict__ lcu, const int* __restrict__ wlane, const int* __restrict__ pair,
     uint16_t* __restrict__ y, int S, int C, int Z, int D, int stride, int l_ld, int c_ld,
-    int y_ld) {
+    int y_ld) { R4D_IKA_ENTRY();
     const int row = lcu[0] + blockIdx.x;
     if (row >= lcu[S]) return;
     const int e = seq_of(lcu, S, row);
@@ -1014,7 +1015,7 @@ __global__ __launch_bounds__(kT) void win_prep_kernel(
     const int* __restrict__ flags, const float* __restrict__ t, const uint32_t* __restrict__ seed,
     const int* __restrict__ widx, const int* __restrict__ wlane, const int* __restrict__ pair,
     const int* __restrict__ lcu, const uint16_t* __restrict__ prev, uint16_t* __restrict__ noise,
-    uint16_t* __restrict__ lat, int n, int stride, int ov, int l_ld, int p_ld, int nz_ld) {
+    uint16_t* __restrict__ lat, int n, int stride, int ov, int l_ld, int p_ld, int nz_ld) { R4D_IKA_ENTRY();
     const int e = blockIdx.y;
     if (pair[e] == -2) return;
     const int f = flags[e];
@@ -1048,7 +1049,7 @@ __global__ __launch_bounds__(kT) void win_handon_kernel(
     const int* __restrict__ flags, const int* __restrict__ pair, const int* __restrict__ wlane,
     const int* __restrict__ lcu, const uint16_t* __restrict__ cond, const uint16_t* __restrict__ lat,
     uint16_t* __restrict__ prev, uint16_t* __restrict__ pcond, int n, int D, int stride, int ov,
-    int l_ld, int c_ld, int p_ld, int pc_ld) {
+    int l_ld, int c_ld, int p_ld, int pc_ld) { R4D_IKA_ENTRY();
     const int e = blockIdx.y;
     if (pair[e] == -2 || !(flags[e] & kLast)) return;
     const int len = lcu[e + 1] - lcu[e], L = wlane[e];
@@ -1067,7 +1068,7 @@ __global__ __launch_bounds__(kT) void win_handon_kernel(
 __global__ __launch_bounds__(kT) void win_join_kernel(
     const int* __restrict__ flags, const int* __restrict__ pair, const int* __restrict__ wlane,
     const int* __restrict__ lcu, const uint16_t* __restrict__ prev, uint16_t* __restrict__ lat,
-    int n, int stride, int ov, int l_ld, int p_ld) {
+    int n, int stride, int ov, int l_ld, int p_ld) { R4D_IKA_ENTRY();
     const int e = blockIdx.y;
     const int f = flags[e];
     if (pair[e] == -2 || !(f & kLast) || !(f & kJoin)) return;
@@ -1080,7 +1081,7 @@ __global__ __launch_bounds__(kT) void win_join_kernel(
 
 __global__ __launch_bounds__(kT) void chan_split_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int n, int P, int rows, int x_ld,
-    int y_ld, int64_t total) {
+    int y_ld, int64_t total) { R4D_IKA_ENTRY();
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     if (t >= total) return;
     const int c = (int)(t % n);
@@ -1095,7 +1096,7 @@ __device__ __forceinline__ float il_ld(const float* p, int64_t i) { return p[i];
 
 template <typename T>
 __global__ __launch_bounds__(kT) void interleave2_kernel(
-    const T* __restrict__ a, const T* __restrict__ b, float* __restrict__ y, int64_t rows) {
+    const T* __restrict__ a, const T* __restrict__ b, float* __restrict__ y, int64_t rows) { R4D_IKA_ENTRY();
     const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
     if (r >= rows) return;
     y[2 * r] = il_ld(a, r);
@@ -1106,7 +1107,7 @@ __global__ __launch_bounds__(kT) void interleave2_kernel(
 // y[i] = start + i step, or with `period` > 0 start + (i % period) step: positions that restart
 // every `period` rows.
 __global__ __launch_bounds__(kT) void iota_kernel(int* __restrict__ y, int n, int start, int step,
-                                                  int period) {
+                                                  int period) { R4D_IKA_ENTRY();
     const int i = blockIdx.x * kT + threadIdx.x;
     if (i < n) y[i] = start + (period > 0 ? i % period : i) * step;
 }
@@ -1117,20 +1118,20 @@ struct IntAffine { int src[kAffMax], mul[kAffMax], add[kAffMax]; };
 
 __global__ __launch_bounds__(kAffMax) void int_affine_kernel(const int* __restrict__ x,
                                                              int* __restrict__ y, IntAffine p,
-                                                             int n) {
+                                                             int n) { R4D_IKA_ENTRY();
     const int j = threadIdx.x;
     if (j < n) y[j] = (p.src[j] < 0 ? 0 : x[p.src[j]]) * p.mul[j] + p.add[j];
 }
 
 __global__ __launch_bounds__(kT) void cu_repeat_kernel(const int* __restrict__ len,
-                                                       int* __restrict__ y, int n, int mult) {
+                                                       int* __restrict__ y, int n, int mult) { R4D_IKA_ENTRY();
     const int j = blockIdx.x * kT + threadIdx.x;
     if (j < n) y[j] = j * len[0] * mult;
 }
 
 __global__ __launch_bounds__(kT) void sub_i32_kernel(const int* __restrict__ x,
                                                      const int* __restrict__ s, int* __restrict__ y,
-                                                     int n) {
+                                                     int n) { R4D_IKA_ENTRY();
     const int j = blockIdx.x * kT + threadIdx.x;
     if (j < n) y[j] = x[j] - s[0];
 }
@@ -1145,7 +1146,7 @@ constexpr int kSmallSeq = 32;
 __global__ __launch_bounds__(kT) void attn_small_h256_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int* __restrict__ cu, uint16_t* __restrict__ o, int q_ld, int k_ld, int v_ld, int o_ld,
-    float scale, int causal) {
+    float scale, int causal) { R4D_IKA_ENTRY();
     constexpr int HD = 256;
     __shared__ __attribute__((aligned(16))) uint16_t sk[kSmallSeq * HD];
     __shared__ __attribute__((aligned(16))) uint16_t sv[kSmallSeq * HD];

@@ -199,6 +199,11 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_pre_finish` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `chunk` `dtype` | `part`, `h`, `scale`w, `base`w → `x`, `post`, `comb` |
 | `mhc_post` | `M`(range) `n` `hc` `dtype` | `x`, `h`, `post`, `comb` → `out` |
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
+| `mhc_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` | `h`, `fn`w, `scale`w, `base`w → `pre`, `post`, `comb` |
+| `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
+| `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
+| `mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: mhc_post, mhc_collapse over out, rmsnorm over xc; each rounded before the next reads it; out must not alias h) |
+| `mhc_post_collapse_rmsnorm_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`:inout, `comb`:inout → `out`; `pre` → `xc`; `w`w → `y`; `fn`w, `scale`w, `base`w → `pre_o` (device-only: mhc_post_collapse_rmsnorm, then mhc_mix over out writing pre_o, post and comb; hc 4, n a multiple of 1024) |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt `bi_dec`/opt `kc_rows`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`?; in `ss`? |
 | `hc_codes` | `M`(range) `n` `group`/opt `rotate`/opt `codes_i8`/opt | `x` → `q`, `scale`, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` `eps`:f64/opt | `y`, `inj`, `h`:inout → `ss`? |
@@ -256,6 +261,21 @@ no plane to feed `rmsnorm` as a gain.
 
 **`rmsnorm_add`** is the residual add and the next norm in one pass, as every real implementation
 does it. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.md` §2.3).
+
+**`mhc_collapse_rmsnorm`** and **`mhc_post_collapse_rmsnorm`** (device-only) are DeepSeek-V4.1's
+sublayer entry in one launch: `mhc_collapse` then `rmsnorm`, and `mhc_post`, `mhc_collapse` over its
+`out` and `rmsnorm`. Each step stores its output in the activation dtype before the next reads it,
+so they are bit-identical to the chain. libr4d declares them with `replaces`, and `rad-kbench`'s
+fusion oracle holds each to libr4d's own chain byte for byte. libref has no row: an architecture
+asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not resolve, so a
+host deployment runs the chain.
+
+**`mhc_post_collapse_rmsnorm_mix`** (device-only) is `mhc_post_collapse_rmsnorm` followed by `mhc_mix`
+over its `out`: the next connection's gates from the streams the post just wrote, `post` and `comb` read
+as the post's gates and then written as the mix's (`pre_o` the mix's pre gates). libr4d forms the
+mix's projection from the post's output in LDS, in `mhc_mix`'s per-partial order, then runs its finish
+and the norm in the post op's order: bit-identical to the two ops. DeepSeek-V4.1 declares it beside the
+pair under RADIANCE_DS41_MHC_FUSE and issues it in their place per launch (the mhc_fuse switch, lever M1).
 
 **`gelu_mul`** is `silu_mul` with the tanh GELU: Gemma's gated FFN is trained with
 `gelu_pytorch_tanh`, while the unary `gelu` is the exact erf form. Both split the fused `gate_up`
@@ -816,6 +836,10 @@ may not have arrived.
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
+| `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
+| `rmsnorm_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `eps`:f64 `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w, `g`w → `h`, `y` (device-only: rmsnorm (x, g → h; n = K), then gemm_nt_ggml (h, w → y)) |
+| `swiglu_clamped_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `limit`:f64 | `gate_up`, `w`w → `h`, `y` (device-only: swiglu_clamped (gate_up [M, 2K] → h; n = K), then gemm_nt_ggml (h, w → y)) |
+| `gemm_nt_ggml_pair` | `M`(range) `N` `N2` `K` `type` `dtype` | `a`, `w`w, `a2`?, `w2`w → `y`, `y2` (device-only: gemm_nt_ggml (a, w → y) and gemm_nt_ggml (a2, w2 → y2; N2), a2 absent = a) |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
 a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, so one op covers
@@ -991,6 +1015,22 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
 | `rope_rows` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` (the same rotation; at 64+ rows and 4+ heads one angle a (token, pair), byte-identical) |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
+| `rope_rows` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `dtype` | `x`:inout, `cos_sin`, `positions` |
+| `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
+| `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
+| `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
+| `rmsnorm_rope_roundtrip_kv_store` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `block_size` `kv_dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions`, `slot_mapping`, `kv_cache`:inout (device-only: rmsnorm_rope_roundtrip, then kv_store of y's row as one entry [K = y[0, n/2) \| V = y[n/2, n)] of a [n_blocks, 1, block_size, n] cache) |
+| `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
+| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt `window_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `attn_sparse_sink_rope_roundtrip` | `attn_sparse_sink`'s, then `rot` `off` `mode` `inverse` `block` `format`:str `block_scale`:str | `attn_sparse_sink`'s operands, then `cos_sin` (device-only: attn_sparse_sink, then rope_rows_roundtrip over `out` with n_head = heads, head_dim = dim, scale = block_scale, at the attention's positions) |
+| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
+| `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
+| `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
+| `entry_store` | `M`(range) `n` `block_size` `dtype` `format`/opt | `x`, `page`, `cache`:inout |
+| `window_store` | `M`(range) `n` `block_size` `format`:str `dtype` | `x`, `slot_mapping`, `kv_cache`:inout (the fp8 window slot: e4m3 codes and a scale byte a block of 32, kv_store's slot rule) |
+| `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
+| `bi_rowhash` | `M`(range) | `x` → `h` (debug, lever BI's tracer: a 64-bit fingerprint of each row's bytes as two i32, an order-free fold, so a function of the row's bytes alone; deepseek41 declares it only under RADIANCE_DS41_BITRACE) |
+| `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
 | `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
 | `embed_attn` | `M`(range) `head_dim` `gqa` `causal` `max_seqlen`/opt `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `ministral_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `qkv`:inout, `pos` |
@@ -1029,6 +1069,70 @@ length and the total query rows must be a multiple of `n_seq`. Pass it: the sche
 steps (one sequence's prefill chunk beside other sequences' decode rows, each with its own verify
 window) whenever prefill and decode coexist, and those are not uniform. `q_len` is then the batch
 maximum, which selects the band; the per-sequence lengths come from `cu_seqlens` alone.
+
+**`index_score`**, **`index_candidates`** and **`index_topk`** are DeepSeek-V4's two-level
+indexer. A score row is as wide as the context, so a whole prefill chunk's plane is chunk x context
+f32: an architecture scores a step in runs of rows instead, each into one run-sized plane, and
+selects from it before the next run. `row_part` p makes `score` one run of R rows: score row `i` is
+step row `p R + i`, read from the step's `q`, `w` and `positions` and found in `cu_seqlens` as that
+row, and a row past the step scores `-inf` everywhere. Every row is the unsplit op's row, so runs of
+equal height score the step bit for bit. `keep` lives from the candidate layer to the last layer that
+reads it, for every row of the step, so it is one bit a block: i32 `[M, ceil(ceil(width / block) /
+32)]`, bit `b % 32` of word `b / 32` set when block `b` is kept and the bits past the last block 0.
+`index_topk` reads it with the same `block`. `index_score` may read it too (the candidate
+restriction): with `keep` and `block`, keep row `i` for score row `i` (at least the rows the run
+holds, at most score's), only the kept blocks' positions are scored and every other position scores
+`-inf` without a key read. A kept position's score is the unrestricted op's, bit for bit, so
+`index_topk` through the same keep selects exactly what it selects from the unrestricted score: a
+layer past the candidate layer then scores at most `topk_blocks * block` positions a row instead of
+the whole context.
+libr4d's runtime switch `ix_ni` (lever IX-NI, ds41-int9b) leaves a score row's words past its reach
+`(pos + 1) / ratio` unwritten (a row past the step: all of them) instead of `-inf`; `index_topk` reads a
+row only below its reach, and under the same switch `index_candidates` does too -- a `-inf` never moves
+a block's maximum, so its keep words are the same -- so no selection changes. `ix_lds` (lever IX-LDSR2)
+is a faster form of the prefill score over MXFP4 keys with the same bits.
+
+**MXFP4 index keys.** `entry_store` `format` `mxfp4` stores each block of 32 of an entry's `n` values
+(`n` a multiple of 32) the way `quant_roundtrip` (`fp4_e2m1`, `ue8m0`, block 32) quantises it, packed:
+`n/2` bytes of e2m1 codes (value `2i` in byte `i`'s low nibble, `2i+1` in its high nibble, bit 3 the
+sign), then `n/32` ue8m0 scale bytes (scale `2^(e-127)`: the power of two at or above
+`max(amax, 6 * 2^-126) * f32(1/6)`), then zeros to a multiple of 16 bytes -- 80 bytes for 128 values,
+in the cache's bf16 slots (`heads * block_size * slot` of them, 40). `index_score` `key_format`
+`mxfp4` reads such a cache (an entry `ratio` slots of `slot`) and unpacks each value to the bf16 it
+encodes. For values `quant_roundtrip` already produced -- a block `c_i * 2^k`, `c_i` e2m1 codes, as
+DeepSeek-V4's index keys are -- the packing is exact: the rule picks `2^k / 2^j` with `c_max * 2^j` in
+(3, 6], and every `|c_i| <= c_max` times `2^j` is again a code; so every score is the bf16 cache's,
+bit for bit, at 80 bytes an entry instead of 256. `bf16` (or the parameter absent) is the plain form.
+
+**Packed compressed latent.** `entry_store` `format` `nvfp4` stores each block of 16 of an entry's `n`
+values (`n` a multiple of 32) as e2m1 codes with one OCP e4m3 scale: `n/2` code bytes (value `2i` in byte
+`i`'s low nibble), then `n/16` scale bytes, then zeros to a multiple of 16 -- 288 bytes (144 bf16 slots)
+for DeepSeek-V4's 512-value latent. The latent is `quant_roundtrip` (`fp4_e2m1`, `e4m3`, block 16)
+output, every value `c_i * s` exactly; re-deriving `s` by the rule is not always exact (with a subnormal
+e4m3 scale the block's largest code can be 4), so the scale is searched among `amax / c` for `c` = 6, 4,
+3, 2, 1.5, 1, 0.5 -- the first that is an e4m3 value and turns every value back into itself (the block's
+own scale is among them) -- and only a block no candidate reproduces takes the rule's scale, lossy.
+`attn_sparse_sink` `latent_format` `nvfp4` reads such a compressed cache (`window` a multiple of 32; the
+window cache stays bf16): a value is code times scale in f32, whose bf16 is the stored one, so every
+output is the bf16 cache's, bit for bit, at 288 bytes an entry instead of 1024.
+
+**Packed window keys (fp8 window slot).** `window_store` `format` `fp8_e4m3` stores a key row of `n` values
+(`n` a multiple of 32) at its slot (`slot_mapping`, `kv_store`'s rule: a negative slot or one past the cache
+stores nothing) as `n` e4m3 codes (value `d` at byte `d`), then `n/32` scale bytes (block `j` = values
+`[32 j, 32 j + 32)` at byte `n + j`), then zeros to a multiple of 16 -- 528 bytes (264 bf16 slots) for
+DeepSeek-V4's 512-value latent. A value is `e4m3(code) * f32(e << 23)` (scale `2^(e-127)`) in f32. A block's
+`k` (`e = k + 127`) is 120 when its amax (a NaN as 0) is inf, 0 when it is 0, else the least `k` with
+`amax <= 448 * 2^k` (`amax = 1.m * 2^E`: `E - 8`, or `E - 7` when `1.m > 1.75`), at least -126; each code is
+`fp8(v * 2^-k)` (round to nearest even, saturating at 448, a NaN to `0x7f | sign`). DeepSeek-V4's window key is
+`quant_roundtrip` (`fp8_e4m3`, `ue8m0`, block 32) output over the whole row (the rope part included), every
+block `c_i * 2^K` with `c_i` e4m3 values and one `K` in [-22, 120] (an inf only at `K` = 120 with `c >= 256`, a
+NaN only where an input was one); the least `k` above is at most `K`, and every `c_i * 2^K` is again an e4m3
+value times `2^k` (a finer grid, still at most 448), so the codes are exact and every decoded value is the
+stored bf16's value -- a NaN decodes to a NaN. `rmsnorm_rope_roundtrip_kv_store` `kv_dtype` `fp8_e4m3` stores
+`y`'s row into such a slot the same way (the same bytes), and `attn_sparse_sink` `window_format` `fp8_e4m3`
+reads such a window cache (`[blocks, 1, bs, 264]`; with `ratio > 0` the `window` a multiple of 32): its decode
+band and scalar kernel take each value as that f32, WMMA as its bf16, so every output is the bf16 window's,
+bit for bit, at 528 bytes a key instead of 1024. libref serves both; libavx refuses `window_format`.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
@@ -1198,6 +1302,41 @@ holding its token's finished head, so it also writes it into the paged cache at 
 Its parameters are the two ops' own, its operands the prologue's followed by `slot_mapping` and
 `kv_cache`. Byte-identical to the pair at either cache width: the store converts each element as
 `kv_store` does, and q, k and v are still written in place as the prologue leaves them.
+
+**`rope_rows_roundtrip`** (device-only) is `rope_rows` then `quant_roundtrip` over all `n_head *
+head_dim` columns of `x`, in place; **`rmsnorm_rope_roundtrip`** (device-only) is `rmsnorm` (`x`,
+`w` → `y`) followed by the same two over `y`. They are DeepSeek-V4.1's attention output, compressed
+latent and index query, and its window and index keys. Each step rounds where its own op stores, so
+both are bit-identical to the chain; as with `mhc_collapse_rmsnorm`, libr4d declares them with
+`replaces`, libref has no row, and an architecture declares the chain where they do not resolve.
+
+**`rmsnorm_rope_roundtrip_kv_store`** (device-only) is `rmsnorm_rope_roundtrip` followed by `kv_store`
+of `y`'s row (`n_head_kv` 1, `head_dim` n / 2: the row's halves are K and V, so the row is one cache
+entry); **`attn_sparse_sink_rope_roundtrip`** (device-only) is `attn_sparse_sink` followed by
+`rope_rows_roundtrip` over its output. libr4d serves the first in one pass (each bf16 the quantiser
+stores in `y` is also stored at the row's slot, as `kv_store` would copy it) and the second, up to 48
+rows, as the decode kernel with the inverse rope and the round trip in its epilogue (every other pass
+as the two ops' launches). Both are bit-identical to their chains; DeepSeek-V4.1 declares them beside
+the chains under RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD and picks per step (the ds41_kvfold /
+ds41_ofold switches). `kv_dtype` `fp8_e4m3` takes `window_store`'s fp8 window slot (above) as the cache.
+
+**`rmsnorm_gemm_nt_ggml`** and **`swiglu_clamped_gemm_nt_ggml`** (device-only) are an activation's producer
+(`rmsnorm`, `swiglu_clamped`) followed by `gemm_nt_ggml` over its output `h`; both outputs are the chain's. libr4d
+serves them in one launch in the decode band (up to 48 rows) while lever D2's multi-row form is on (`gg_gemv` 2):
+the form's kernel computes the producer's values in its activation staging, each rounded to bf16 where the
+producer stores it (the norm's sum of squares in rmsnorm's own partition, kR4dSumLanes), and one block column also
+stores them to `h`. Every other pass (another `gg_gemv` form, prefill heights, a bf16 gain) is the two ops'
+launches. The GGUF weight is operand 1, as `gemm_nt_ggml`'s, so both read one stored form. DeepSeek-V4.1 declares
+them beside the pairs under RADIANCE_DS41_QNFOLD / RADIANCE_DS41_SWFOLD (lever K1 folds a and e) and picks per step
+(the ds41_qnfold / ds41_swfold switches).
+
+**`gemm_nt_ggml_pair`** (device-only) is two `gemm_nt_ggml` over the same rows: `y = a . w^T` and `y2 = a2 . w2^T`
+(`a2` absent reads `a`), both weights of one GGUF `type` at one `K`, each stored as `gemm_nt_ggml` stores its weight
+(operands 1 and 3, one stored form for both ops). libr4d serves it in one launch in the decode band (up to 48 rows)
+while lever D2's multi-row form is on (`gg_gemv` 2): one form for the pair, each weight's rows in their own blocks of
+one grid, every output the form's own operations -- the two launches' bytes. Every other pass is the two
+`gemm_nt_ggml` launches. DeepSeek-V4.1 declares it beside a layer's `q_a` + `attn_kv` (one input, the attention norm's
+output) and beside its two `attn_output_a` groups under RADIANCE_DS41_GQ (lever 1U-GQ, the ds41_gq switch's mask).
 
 | op | params | operands |
 |---|---|---|
@@ -2126,9 +2265,13 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
 | `router_gemm_topk_scatter_inv` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse` |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
+| `moe_gemm_ggml` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `type` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
+| `router_scored_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `score`:str `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_group_topk` | `M`(range) `n_expert` `top_k` `n_group` `topk_group` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
+| `router_scored_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `score`:str `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
+| `router_gemm_f32_scored_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `score`:str `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `bias`w → `logits`, `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
@@ -2267,6 +2410,12 @@ takes the largest key below round `j-1`'s winner. A row without NaN ranks gives 
 serial scan with a strict `>`. A NaN rank is never selected, and a row with fewer than `top_k`
 other ranks names expert 0 in its empty slots, weighted by expert 0's `p`.
 
+**`router_scored_topk`** is `router_sigmoid_topk` with the score function named, and required so
+that a kernel compiled for one function never resolves for another: `sigmoid` is
+`router_sigmoid_topk`, `sqrtsoftplus` is `sqrt(softplus(logit))` with softplus linear above 20
+(torch's default threshold; DeepSeek-V4 routes 6 of 384 this way with `route_scale` 1.5), and
+`softmax` is over all `n_expert` logits. Selection, ties, weights and `norm` are
+`router_sigmoid_topk`'s.
 **`router_sigmoid_group_topk`** is the group-limited form (DeepSeek-V3's `noaux_tc` with
 `n_group > 1`, Ling-3.0's 8 groups of 64 experts, 4 kept). The experts fall into `n_group` equal
 groups of at least two; a group's rank is the sum of its two largest `p + bias`; the `topk_group`
@@ -2285,6 +2434,22 @@ separate launches write, including a row with fewer than `top_k` non-NaN ranks (
 whose empty slots carry expert 0 into the sort as `ids` does (`r4d_selftest`). Bounded like
 `router_topk_scatter` (`M * top_k <= 1024`, one workgroup) and refused past it. With `inverse` the
 sort is `moe_scatter_inv`'s.
+
+**`router_scored_topk_scatter`** (device-only) is `router_sigmoid_topk_scatter` with the score
+function named as in `router_scored_topk` (`sigmoid`, `sqrtsoftplus`, `softmax`): the selection is
+`router_scored_topk`'s row (libr4d runs the same row function in both), then `moe_scatter` (or
+`moe_scatter_inv`) over its ids and, with `gate`, the shared arm's `fill`. Every output is the bytes
+the separate launches write. Bounded like `router_sigmoid_topk_scatter` (`M * top_k <= 1024`, one
+workgroup) and refused past it. DeepSeek-V4.1 issues it in place of its `router_scored_topk` and
+`moe_scatter` (one dispatch fewer a MoE layer).
+
+**`router_gemm_f32_scored_topk_scatter`** (device-only) is `gemm_nt_f32` (`a` `[M, K]` bf16 times the
+router projection `b` `[n_expert, K]`, f32 or bf16 widened, into f32 `logits`) followed by
+`router_scored_topk_scatter` over those logits without the gate, in one launch: libr4d runs the GEMM's
+own tile body, and the GEMM's last workgroup to finish runs the selection's row function and the small
+sort. Every output is the bytes the separate launches write. Decode band only (`M <= 48`,
+`n_expert <= 384`, score `sqrtsoftplus`). DeepSeek-V4.1's lever FUSE-R issues it in place of its router's
+`gemm_nt_f32`, `router_scored_topk` and `moe_scatter` (two dispatches fewer a MoE layer).
 
 **`router_gemm_topk_scatter_inv`** (device-only) is `router_gemm_topk_scatter` whose sort also
 writes `inverse`, every slot's row in `sorted_tok` (-1 for a dropped slot), as `moe_scatter_inv`
@@ -2530,15 +2695,19 @@ or that slice; only the slice needs the token stride carried separately.
 |---|---|---|
 | `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt `overlap`/opt | `x`:inout, `y`:out? |
 | `all_gather` | `world_size` `numel` `dtype` `row`/opt | `x` → `y` |
-| `reduce_scatter_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt | `x`:inout, `y`:out? |
-| `all_gather_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt | `x`:inout, `y`:out? |
+| `reduce_scatter_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt `bound`/opt | `x`:inout, `y`:out? |
+| `all_gather_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt `bound`/opt | `x`:inout, `y`:out? |
 
-`reduce_scatter_rows` / `all_gather_rows` (fn4 SP-hc, test builds): the two halves of the four-rank two-shot over
-WHOLE-ROW shards of `x` [rows][row] -- rank r owns rows [r q, (r + 1) q), q = ceil(rows / world_size) -- in place
-(`y` absent or `x`). The reduce-scatter leaves the sum of each rank's shard on that rank (other rows unchanged); the
-all-gather sends each rank's shard rows to every rank, on the ti8 wire (`raw` 0: every rank, the owner too, stores the
-decode of the owner's words) or as raw words (`raw` 1). A sequence-parallel residual runs its per-row ops on the shard
-between them.
+`reduce_scatter_rows` / `all_gather_rows` (fn4 SP-hc's kernels; tp8 loop P20 in the two-node DeepSeek fork): the two
+halves of the four-rank two-shot over WHOLE-ROW shards of `x` [rows][row] -- rank r owns rows [r q, (r + 1) q), q =
+ceil(rows / world_size) -- in place (`y` absent or `x`). The reduce-scatter leaves the sum of each rank's shard on that
+rank (other rows unchanged); with `raw` 1 it folds every rank's words in fp32 in ascending rank and rounds once, the exact
+all-reduce's arithmetic, so a reduce-scatter followed by a raw all-gather holds the exact all-reduce's bytes on every rank.
+The all-gather sends each rank's shard rows to every rank, as raw words (`raw` 1) or on the ti8 wire (`raw` 0: every rank,
+the owner too, stores the decode of the owner's words). A sequence-parallel residual runs its per-row ops on the shard
+between them. `bound` (elements, default `numel`'s top) is the instance a backend sizes its scratch from: a wide row's gather
+(4 x 5120, deepseek41's streams under RADIANCE_DS41_SPHC) names the all-reduce's bound and rides its instance, the
+launch checking its longest shard against the slot.
 
 `exact` separates the exact sum from a lossy wire, and a caller must state it: a request that does
 not accept a lossy wire gets no kernel rather than the quantised one.
@@ -2592,8 +2761,10 @@ device code.
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `ar_mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `world_size` `dtype` `wire`/opt | `x`:inout, `h`, `post`, `comb`, `out`:out, `pre`, `xc`:out, `w`w, `y`:out |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
+| `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
 
@@ -2617,6 +2788,12 @@ The norm-carrying forms are two-rank only, except `ar_rmsnorm_quant_i8`, which a
 exact-wire four-rank form (below), as `ar_hc_write` and `ar_gather_hc_write` do. At other widths
 the arch blocks issue the plain ops.
 
+`ar_mhc_post_collapse_rmsnorm` (device-only, four ranks, exact wire) is `all_reduce` of `x` followed by
+`mhc_post_collapse_rmsnorm` over the reduced `x`: `x` as the four-rank exact all-reduce leaves it, then `out`, `xc`
+and `y` as that op writes them, byte for byte. It is the wide one-shot (same handshake, slots and block partition as
+the plain all-reduce, so they share an instance) with the post/collapse of each 16-byte word as its epilogue; the
+block that completes a row runs the norm over the stored `xc` in the norm's own summation order. `M` up to 8192.
+
 `ar_hc_write` is `all_reduce` of `y` followed by `hc_write` of the reduced `y`, for a block whose
 output feeds a gated residual rather than a norm; `y` is inout as `x` is above. It serves both
 wires, one op per wire: a caller declares the rotated form beside the exact one and issues whichever
@@ -2628,6 +2805,12 @@ and a constraint on an absent key does not hold.
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`
 mean what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On either wire it is byte-identical
 to the three kernels it replaces.
+
+`moe_gather_all_reduce` is `moe_gather` followed by the exact `all_reduce` of its output, for a
+MoE block whose reduced output feeds neither a norm junction nor a gated residual write (DeepSeek
+V4.1's hyper-connection post): `ar_gather_hc_write` without the write, four ranks, exact wire. Its
+transport is the one-shot, so a caller keeps it to decode-sized `M`; byte-identical to the two
+kernels it replaces at any `M`.
 
 `ar_rmsnorm_quant_i8` is the exact `all_reduce` of `x` followed by `rmsnorm_quant_i8`'s junction
 over the reduced sum, at two ranks and at four. At four it is the exact one-shot's transport with
@@ -2647,13 +2830,53 @@ its own width. The bytes are the pair's; the launch the junction would take is s
 and a post-norm, no `out_bf16`, and `n` of at most 8192 (the norm's register form), and runs the
 whole form elsewhere (the host mailbox included), which keeps every promise `sp` makes.
 
+## Stage crossings
+
+| op | params | operands |
+|---|---|---|
+| `stage_send` | `M`(range) `ring` `parts` `sender`/opt | `ring`, `x0`, `x1`?, `x2`?, `x3`?, `x4`?, `x5`?, `x6`?, `x7`?, `x8`?, `x9`?, `x10`?, `x11`? |
+| `stage_recv` | `M`(range) `ring` `parts` `sender`/opt | `ring` → `y0`, `y1`?, `y2`?, `y3`?, `y4`?, `y5`?, `y6`?, `y7`?, `y8`?, `y9`?, `y10`?, `y11`? |
+
+A two-node pipeline's step crosses the machine boundary twice (`abi/rad_pp.h`, tp8 S4): `X1` from the
+leader into the follower's first layer, `X2` from the follower back into the leader's next layer.
+The plugin places both ops, because only it knows what is live at its cut: the inputs of the op the
+receiving layer starts with, so that op computes in the other process what it would have computed
+in one. `ring` is the core's ring for that crossing on this node, a raw pointer the plugin passes
+from `rad_pp_info`; `x0`..`x11` / `y0`..`y11` are the crossing's parts, each `[rows, ...]` at its own
+dtype and dense, packed verbatim at 256-byte-aligned offsets (no conversion, so the crossing moves no
+number). A part's rows are its own (tp8 S6: a general cut's crossing carries the residual stream over
+the step's rows and a kv source's new entries over the compressor's work rows); the ring's `rows` is
+part 0's, and the receiver checks every part's bytes. A part need not be a multiple of 16 bytes: the
+card copies a part that is in 16-byte words, any other in 4-byte words.
+
+- `stage_send` publishes the payload with the ring's `ready` counter once the core's link has taken
+  the last one off (`sent`). Only rank `sender` (default 0) writes; the residual stream is
+  replicated over the tensor-parallel ranks (spec §9), so one copy crosses.
+- `stage_recv` waits until the other node's payload has `landed`, checks that its rows, parts, each
+  part's bytes and the total are this step's (a mismatch is two nodes out of step, a failure, never a copy) and that its
+  trailer holds the number of the payload it waits for (a stale or overwritten payload of the same
+  shape, a failure), copies it out and counts the rank in `taken`. Every rank receives. It fails on
+  the ring's `abort` word, which the link sets when the peer is gone, and past the ring's deadline.
+- A payload ends in a `RAD_PP_TRAILER` (64-byte) trailer at the aligned end of its parts, whose
+  first word is the payload's number (`ready` + 1) and whose second is its layout word
+  (`rad_pp_layout` over the parts' bytes, which the receiver computes from its own parts); the
+  ring's `bytes` counts it. A card that gives up stores `abort` 2 (the abort seen), 3 (the
+  deadline), 4 (another step's shape, the layout word included) or 5 (a stale trailer).
+
+The counters are read and written by the kernels themselves at run time, so a recorded pass
+replays. Neither op has a cold form (its ring belongs to a running core): the shape hooks answer
+unsupported, and rad-kbench and the op oracle skip them.
+
 ## Vocabulary edges
 
 | op | params | operands |
 |---|---|---|
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
+| `embed_lookup_planes` | `M`(range) `n_embd` `n_vocab` `group` `dtype` `vocab_offset`/opt `mult`:f64/opt | `tokens`, `codes`w, `scale`w, `table`w? → `x` |
 | `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
+| `logits_gemm_ggml` | `M`(range) `n_vocab` `n_embd` `type` `dtype` | `x`, `lm_head`w → `logits` |
+| `embed_lookup_ggml` | `M`(range) `n_embd` `n_vocab` `type` `dtype` `vocab_offset`/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
@@ -3470,6 +3693,7 @@ candidates, and what enters the head from the trunk.
 |---|---|---|
 | `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | BF16 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
 | `dflash_markov_greedy_f32` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | F32 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
+| `dspark_walk_step` | `M` `step` `steps` `rank` `n_vocab` `N` `vocab_off` `world` `anchor_stride`/opt `dtype` `form`/opt | F32 `logits`, `anchor`, `prev`?, `pred`w, `succ`w, `keys`:inout? → `tokens` |
 
 `dflash_markov_greedy` implements the DSpark full-vocabulary greedy walk, not DFlash2's
 candidate-lattice selector. For every position it adds `sum_r pred[previous,r] * succ[token,r]`
@@ -3482,6 +3706,46 @@ pinned llama.cpp reference also uses F32 base logits, but reduction orders may d
 argmax chooses the last equal maximum; its GPU reduction uses a backend-specific order. This op's
 lower-id tie rule is not a claim of reference tie equivalence. Near-tie proposal equivalence is
 therefore not established.
+
+`dspark_walk_step` is the same walk on a vocabulary-sharded head (tensor parallelism; lever W1 of
+DeepSeek-V4.1): one step on one rank's shard `[vocab_off, vocab_off + N)` of the `n_vocab` ids, issued
+`steps` times with an `all_gather` of `keys` between steps and once more at `step = steps`. Step `l`'s
+predecessor is the greatest of step `l-1`'s gathered keys `prev` (an F32 `[M, 4 * world]` plane of 16-byte
+slots, each a u64 key and 8 bytes of padding: libr4d's all-gather moves whole 16-byte words a row; the
+anchor at `l = 0`), written to `tokens[s][l-1]`. Each column's score
+`logits[s * steps + l][j] + sum_r pred[prev, r] * succ[vocab_off + j, r]` is summed by `fma` in rank
+order, keyed as `(ordered score bits) << 32 | ~id` (ties to the lower id; a NaN score is never chosen,
+-0 counts as +0) and the shard's greatest key is max-ed into `keys[s]` (the u64 of a 16-byte slot, an F32 `[M, 4]`
+plane, zeroed before the step). The key is order-free, so every rank derives the same token from the same
+gathered bytes. `form` (default 0) only picks how a block reads `succ` (1: the block's rows staged through
+LDS as whole lines); every id's chain is the same, so the bits are. libr4d only; no libref oracle
+(tests/r4d_emu/test_ds41walk holds it to a host walk).
+
+Beside the walk, two ops a deployment may run (arch/deepseek41: the confidence head from a sidecar,
+`RADIANCE_DS41_DSPARK_CONF`, and the shadow tree's branches, `RADIANCE_DS41_DSPARK_ALT`); neither
+changes a proposal:
+
+| op | params | operands |
+|---|---|---|
+| `dspark_conf` | `M` `steps` `n_embd` `rank` `n_vocab` `anchor_stride`/opt `bias`:f64/opt `dtype` | `x`, `anchor`, `tokens`, `pred`w, `w` → `conf` |
+| `dspark_alt` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `n_alt` `dtype` | `cand`, `unary`, `anchor`, `tokens`, `pred`w, `succ`w → `alt` |
+
+`dspark_conf` is the release's confidence head (inference/model.py `DSparkConfidenceHead`, `mtp.{n-1}.
+confidence_head.proj`, `[1, n_embd + rank]`, no bias) over a query pass's rows: `conf[s, j] = bias +
+w[:n_embd] . x[s*steps + j] + w[n_embd:] . pred[pid]`, `x` the head's input before its final norm,
+`pred` the Markov head's predecessor table, `pid` the anchor (`anchor[s * anchor_stride]`) at `j = 0`
+and the walk's proposal `tokens[s, j-1]` after (an out-of-range id adds nothing); f32. Row `j`'s
+value is a logit for proposal `j`. The reference applies nothing to it; the engine's `dspark_conf`
+switch verifies the longest prefix whose sigmoid clears a threshold (exllamav3's rule). `w` is an
+input buffer, not a container weight: the release's tensor is not in the containers.
+
+`dspark_alt` gives each sequence `n_alt` other first proposals, each continued by the walk: row 0's
+candidates scored as `dflash_select` scores them, the best whose id is valid and is not the walk's
+own first proposal `tokens[s, 0]` (ties to the lower index), then rows `1 .. steps-1` walked greedily
+from each (`dflash_select`'s rule). `alt[s, a*steps + l]` is branch `a`'s token at position `l`; a
+branch with no candidate left is -1 throughout. The engine compares them with the tokens the target
+emits (a shadow of a position-1 tree, never verified). libr4d's row sums a candidate's edge in
+another order than `dflash_select`'s, so a near-tie may rank otherwise there.
 
 ### DFlash2
 

@@ -131,7 +131,7 @@ std::vector<common_chat_msg_span> common_chat_split_by_role(const std::string & 
     return spans;
 }
 
-json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
+json common_chat_msg::to_json_oaicompat(bool concat_typed_text, bool media_typed) const {
     if (!content.empty() && !content_parts.empty()) {
         throw std::runtime_error("Cannot specify both content and content_parts");
     }
@@ -141,7 +141,10 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty()) {
         jmsg["content"] = content;
     } else if (!content_parts.empty()) {
-        if (concat_typed_text || contains_media()) {
+        /* RADIANCE: a template that names `media_marker` parts renders them itself (DeepSeek-V4.1's,
+         * which joins every block with "\n\n" as its encoding.py does); every other template gets
+         * the joined string as before. */
+        if (concat_typed_text || (contains_media() && !media_typed)) {
             std::string text;
             bool last_was_media_marker = false;
             // join parts with newline, do not add newline before or after media markers
@@ -443,7 +446,8 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
     return msgs;
 }
 
-static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c) {
+static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c,
+                                   bool media_typed = false) {
     if (!c.supports_string_content && !c.supports_typed_content) {
         LOG_WRN("%s: Neither string content nor typed content is supported by the template. This is unexpected and may lead to issues.\n", __func__);
     }
@@ -457,7 +461,7 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
             json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ true);
             messages.push_back(jmsg);
         } else if (only_typed_accepted) {
-            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
+            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false, media_typed);
             if (jmsg.at("content").is_string()) {
                 jmsg["content"] = json::array({
                     json{
@@ -468,7 +472,7 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
             }
             messages.push_back(jmsg);
         } else {
-            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
+            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false, media_typed);
             messages.push_back(jmsg);
         }
     }
@@ -2379,7 +2383,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
     const auto & src             = tmpl.source();
     const auto & caps            = tmpl.original_caps();
-    params.messages              = render_message_to_json(inputs.messages, tmpl.original_caps());
+    params.messages              = render_message_to_json(inputs.messages, tmpl.original_caps(),
+                                                          src.find("media_marker") != std::string::npos);
     params.tool_choice           = inputs.tool_choice;
     params.reasoning_format      = inputs.reasoning_format;
     params.enable_thinking       = inputs.enable_thinking;

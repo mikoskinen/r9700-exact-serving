@@ -10,9 +10,20 @@
 #include "fn4_switch.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
+
+namespace rad {
+/* tp8 S5 (core/engine_node.cpp): the part of a pipeline leader's pass being issued, 0 for a whole pass. */
+int pp_pass_part();
+int pp_pass_seg();
+int pp_pass_bands();   /* tp8 loop D46: the pass's band / tail band words (0: none) */
+/* tp8 loop P10 (core/engine_node.cpp): passes of at least this many rows are issued live (0 = no such rule) */
+int64_t pp_live_rows();
+}  /* namespace rad */
 
 namespace rad {
 
@@ -56,17 +67,23 @@ bool ls_meet(const LineSet& a, const LineSet& b) {
  * acquire. 0 off, 1 rule (a store leaves no stale line behind on its own CU), 2 rule-w (it may:
  * every line written in the window is risky). */
 int acq_rule_mode() { return rad::fn4::aql_acq_rule(); }   /* fn4: the aql_acq switch, else the env at start */
+bool acq_rule_on() { return acq_rule_mode() != 0; }
+}  // namespace
+
+namespace {
 /* fn4 (13.11.2026, 227: the prefill comm lane's waves slow the compute beside them): RADIANCE_FN4_LANE_LOWPRIO=1 at start
  * creates the second lane at the device's low queue priority (scheduling only; the same launches and bytes). */
 int lane1_prio() {
     static const int p = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_LOWPRIO"); return e && *e && *e != '0' ? -1 : 0; }();
     return p;
 }
-bool acq_rule_on() { return acq_rule_mode() != 0; }
 }  // namespace
 
+/* qfn-on-ds: the Qwen line's eager second lane (fn4 4f74a8fa, qwen/build2/STALL.md) is opt-in in the merged tree --
+ * RADIANCE_FN4_LANE_EAGER=1 at start (the Qwen line's env sets it; there it was on unless =0), so the DeepSeek line keeps
+ * its lazy build unless asked. */
 bool ctx_lane_eager() {
-    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_EAGER"); return !(e && *e == '0'); }();
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_EAGER"); return e && *e && *e != '0'; }();
     return on;
 }
 
@@ -88,6 +105,13 @@ int Ctx::init(const CtxDesc& d) {
     arch_step_ = d.arch_step;
     arch_pass_key_ = d.arch_pass_key;
     profiling_ = d.profile_ops;
+    /* RADIANCE_DEBUG_TAPE_DUMP=1: haz_mark lists each recorded pass's dispatches with their read and write
+     * ranges once a key (TAPEDUMP lines on stderr), as CtxDesc::tape_dump, which nothing else sets. */
+    tape_dump_ = d.tape_dump || [] { const char* e = std::getenv("RADIANCE_DEBUG_TAPE_DUMP"); return e && *e && *e != '0'; }();
+    /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
+     * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
+    row_prefetch_on_ = d.row_prefetch;
+    rowpf_.reserve(4096);
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -130,6 +154,8 @@ int Ctx::init(const CtxDesc& d) {
 void Ctx::shutdown() {
     oracle_close();
     xp_close();
+    row_prefetch_done();
+    rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
@@ -161,6 +187,10 @@ void Ctx::shutdown() {
         if (lane_ev_[i]) { rad_event_destroy(lane_ev_[i]); lane_ev_[i] = nullptr; }
         if (host_touch_ev_[i]) { rad_event_destroy(host_touch_ev_[i]); host_touch_ev_[i] = nullptr; }
         host_touch_pending_[i] = false;
+    }
+    for (int i = 0; i < kLaneMarks; ++i) {   /* fn4 PF marks */
+        if (mark_ev_[i]) { rad_event_destroy(mark_ev_[i]); mark_ev_[i] = nullptr; }
+        mark_on_[i] = false;
     }
     if (own_lane1_ && lane1_) rad_stream_destroy(lane1_);
     if (lane1_spare_) rad_stream_destroy(lane1_spare_);   /* built at init, never taken: nothing was issued on it */
@@ -196,12 +226,12 @@ int Ctx::prepare() {
      * hold more rows than their header says and be written late. */
     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
-    /* fn4 BI's tracer (bi_rowhash, declared only under RADIANCE_FN4_BITRACE) reads every step on the host: no
+    /* lever BI's tracer (bi_rowhash, declared only under RADIANCE_DS41_BITRACE) reads every step on the host: no
      * recorded passes, as for the calibration tap. */
     const bool trace = std::any_of(program_->ops.begin(), program_->ops.end(),
                                    [](const OpInfo& o) { return o.op == "bi_rowhash"; });
     tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps && !trace;
-    if (trace && rank_ == 0) RAD_INFO("recorded passes: off, the program traces rows (bi_rowhash, RADIANCE_FN4_BITRACE)");
+    if (trace && rank_ == 0) RAD_INFO("recorded passes: off, the program traces rows (bi_rowhash, RADIANCE_DS41_BITRACE)");
     if (taps && record_passes_ && tape_supported() && rank_ == 0)
         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;
@@ -419,6 +449,7 @@ int Ctx::bind_ops() {
         }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
+        p.row_gather = row_gather_op(oi.op);
         p.collective = p.billed;
         p.lora_site  = oi.lora_site;
         p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
@@ -445,6 +476,7 @@ int Ctx::bind_ops() {
                     ip.args.scratch       = arena_.scratch();
                     ip.args.scratch_bytes = r.scratch_bytes;
                     ip.args.instance      = r.instance;
+                    ip.instance1          = r.instance1;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
                     ip.args.wgp_count     = wgp_count_;
@@ -753,9 +785,17 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
                 route_bank_ = bank;
             }
             int32_t* const row = route_dev_ + (int64_t)layer * route_n_expert_;
-            if (copy && r->expert_count != row)
+            if (copy && r->expert_count != row) {
+                /* Lever RCO (fn4 route_copy_ov): while a pass is recorded, the copy is noted with its two
+                 * ranges, so haz_mark can leave the dispatch after it unordered (it stays op-less otherwise:
+                 * ordered and opaque, as before). */
+                const int m0 = rec_ && fn4::route_copy_ov() == 1 ? tape_mark() : -1;
                 RAD_TRY(rad_memcpy_async(row, r->expert_count, n * (int64_t)sizeof(int32_t),
                                          stream_));
+                if (m0 >= 0)
+                    haz_note_route_copy(r->expert_count, row, n * (int64_t)sizeof(int32_t), m0,
+                                        tape_mark());
+            }
             if (route_lo_ > route_hi_) {
                 route_lo_ = route_hi_ = layer;
             } else {
@@ -996,6 +1036,11 @@ void Ctx::dump_profile() const {
         waited += wait;
     }
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
+    if (rowpf_calls_)
+        fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
+                        "page(s) ahead of their kernel, %lld of them beside it "
+                        "(runtime/rowprefetch.h; --row-prefetch off turns it off)\n\n",
+                (long long)rowpf_calls_, (long long)rowpf_pages_, (long long)rowpf_beside_calls_);
 }
 
 /* ================================================================== the step driver */
@@ -1038,6 +1083,26 @@ int Ctx::set_lane(int lane) {
 }
 
 int Ctx::lane_join(int from, int to) {
+    /* fn4 PF marks (qwen/prefill; see ctx.h). Recording a mark changes no order; waiting on one orders `to` behind that
+     * point of the other lane only, so the caller names what it depends on. */
+    if (to >= 0x100 && to < 0x100 + kLaneMarks) {
+        if (from < 0 || from > 1) return RAD_E_INVAL;
+        const int k = to - 0x100;
+        if (!lane1_) { mark_on_[k] = false; return RAD_OK; }
+        if (!mark_ev_[k]) RAD_TRY(rad_event_create_local(&mark_ev_[k]));
+        RAD_TRY(rad_event_record(mark_ev_[k], from ? lane1_ : stream_));
+        mark_on_[k] = true;
+        mark_lane_[k] = from;
+        return RAD_OK;
+    }
+    if (from >= 0x200 && from < 0x200 + kLaneMarks) {
+        if (to < 0 || to > 1) return RAD_E_INVAL;
+        const int k = from - 0x200;
+        if (!lane1_) return RAD_OK;
+        if (!mark_on_[k] || mark_lane_[k] == to) return lane_join(to ^ 1, to);
+        mark_on_[k] = false;   /* one wait a recording */
+        return rad_event_wait(to ? lane1_ : stream_, mark_ev_[k]);
+    }
     if (from == to) return RAD_OK;
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     /* No lane 1 yet: nothing to order, and a later lane 1 starts behind lane 0 (lane_init). Every
@@ -1087,6 +1152,9 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b or sgen_b carries, which
      * no key below reads. */
     if (b->gen) return 0;
+    /* tp8 loop P10 (RADIANCE_PP_SEND_ASYNC): a pass this node's send ring may cross from a side stream (its payload's rows
+     * are at most the pass's) is issued live, so no tape leaves the side stream's launches out */
+    if (const int64_t live = pp_live_rows(); live > 0 && b->n_tok >= live) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -1124,12 +1192,26 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix(geometry);
     }
     mix((uint64_t)level_);
-    mix(fn4::epoch());   /* fn4: a runtime switch change records new passes (fn4_switch.h) */
+    /* fn4 (runtime/fn4_switch.h): a runtime switch change records new passes. Mixed here, after the
+     * architecture's part, so it keys the passes of a plugin with no pass-key callback as well
+     * (deepseek41's decode, verify and draft passes, keyed by the bucketed bound). Epoch 0 (no
+     * change applied) mixes nothing: every key is the one this function gave before the switches. */
+    if (const uint64_t fe = fn4::epoch()) mix(fe);
     mix(dense_epoch_);
     mix(domain_epoch_.load(std::memory_order_relaxed));
     ptr(arena_.base());
     mix((lane1_ ? 1u : 0u) | (host_touch_pending_[0] ? 2u : 0u) | (host_touch_pending_[1] ? 4u : 0u) |
         (scratch_open_[0] ? 8u : 0u) | (scratch_open_[1] ? 16u : 0u));
+    /* tp8 S5: a two-node pipeline leader issues a lane step's pass in two parts on one batch
+     * (abi/rad_pp.h RAD_PP_PART_*): each part is its own recording. The whole pass (one machine, one
+     * lane, the follower) mixes nothing: every key is the one this function gave before. */
+    if (const int pp = pp_pass_part()) mix(0x7070000ull + (uint64_t)pp);
+    /* tp8 dev M4: a follower segment's layers (RAD_PP_PART_SEG): each its own recording */
+    if (pp_pass_part() == 3 /* RAD_PP_PART_SEG */) mix(0x7071000ull + (uint64_t)pp_pass_seg());
+    /* tp8 loop D46: a band / tail band pass is its own recording (fn4 pp_tband 3 makes DECODE passes, which are recorded, tail
+     * band passes: the follower's part then ends at t - 1 with layer t - 1's key chain, the leader's tail starts there). Zero on
+     * every other pass: every key is the one this function gave before. */
+    if (const int bw = pp_pass_bands()) mix(0x7072000ull + (uint64_t)bw);
     return h | 1;
 }
 
@@ -1194,12 +1276,50 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->touch_pending[1] = host_touch_pending_[1];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
-    if (haz_mark(*out) < 0) {
+    /* Qwen loop round 7 (FINDINGS F20): the "recorded pass" lines (the acquire rule's and lever IKA's counts) once a draft pass
+     * kind AND fn4 epoch -- a switch change re-records every pass (its key mixes the epoch), and its counts are the A / B
+     * reading of an in-process switch (aql_acq); before this they were logged at the first epoch only. */
+    if (const uint64_t fe = fn4::epoch(); fe != tape_told_epoch_) {
+        tape_told_epoch_ = fe;
+        tape_told_ = 0;
+    }
+    {
+        /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches
+         * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
+        const int db = b->draft_pass + 8;
+        /* RADIANCE_DEBUG_TAPE_DUMP=2 (tp8 S4 hw): every recording of rank 0, audits included, with its step, so a
+         * pass "issued differently from its recording" can be read dispatch by dispatch */
+        static const bool every = [] { const char* e = std::getenv("RADIANCE_DEBUG_TAPE_DUMP"); return e && !std::strcmp(e, "2"); }();
+        haz_dump_ = tape_dump_ && db >= 0 && db < 64 && (every ? rank_ == 0 : !(tape_told_ & (1ull << db)));
+        if (haz_dump_ && every)
+            fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld step %d key %llx\n", rank_, b->draft_pass,
+                    (long long)b->n_tok, b->step, (unsigned long long)key);
+        else if (haz_dump_)
+            fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld\n", rank_, b->draft_pass,
+                    (long long)b->n_tok);
+    }
+    const int hm = haz_mark(*out);
+    haz_dump_ = false;
+    if (hm < 0) {
         tape_destroy(t);
         out->dev = nullptr;
         return 0;
     }
     const int bit = b->draft_pass + 8;
+    /* Lever RCO: what the routing copies' ranges freed in this recording (rank 0's, for GET "rco"), and one line for
+     * the first recording of each draft pass kind under the switch -- comparable with the start's "recorded pass"
+     * lines (its unordered count rises by the freed ones; the acquire rule's counts stay). */
+    if (rank_ == 0 && out->rco_copies > 0) {
+        fn4::note_rco(out->rco_copies, out->rco_freed);
+        if (bit >= 0 && bit < 64 && !(rco_told_ & (1ull << bit))) {
+            rco_told_ |= 1ull << bit;
+            RAD_INFO("route copy overlap (fn4 route_copy_ov 1): draft pass %d at %lld token(s) -- %d routing copies "
+                     "recorded with their ranges, %d dispatch(es) after one play unordered; %d of the %d dispatches "
+                     "unordered, the acquire rule plays %d (%d of them ordered) without their acquire",
+                     b->draft_pass, (long long)b->n_tok, out->rco_copies, out->rco_freed, out->unordered,
+                     out->dispatches, out->noacq, out->noacq_ordered);
+        }
+    }
     if (rank_ == 0 && bit >= 0 && bit < 64 && !(tape_told_ & (1ull << bit))) {
         tape_told_ |= 1ull << bit;
         RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- %d records, %d of the %d "
@@ -1210,11 +1330,26 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
                  (size_t)std::count_if(out->steps.begin(), out->steps.end(),
                                        [](const TapeStep& st) { return st.kind == kTapeTable; }),
                  out->route.size());
+        /* Lever IKA (tp8 loop W3): the pass's self-acquiring dispatches, which play without their packet's release
+         * unless a record or a ride completes on them; 0 (and no line) unless RADIANCE_AQL_IKA=1 and a module names
+         * its kernels. */
+        int ika_recs = 0, chi_recs = 0;
+        for (int i = 0, nr = tape_len(t); i < nr; ++i) {
+            const int v = tape_rec_ika(t, i);
+            ika_recs += v > 0 ? 1 : 0;
+            chi_recs += v == 2 ? 1 : 0;   /* lever CHI (fn4 aql_chi): chained records recorded self-acquiring */
+        }
         if (acq_rule_on())
             RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- the acquire rule plays %d of the %d "
-                     "dispatches (%d of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=%s)",
+                     "dispatches (%d of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=%s)"
+                     "; lever IKA %d more",
                      b->draft_pass, (long long)b->n_tok, out->noacq, out->dispatches, out->noacq_ordered,
-                     acq_rule_mode() == 2 ? "rule-w" : "rule");
+                     acq_rule_mode() == 2 ? "rule-w" : "rule", out->ika_noacq);
+        if (ika_recs > 0)
+            RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- lever IKA: %d of the %d dispatches are "
+                     "self-acquiring (packet release dropped unless a record or ride completes on one), %d "
+                     "of them without the acquire the rule keeps (tp8 loop W3); %d chained (lever CHI)",
+                     b->draft_pass, (long long)b->n_tok, ika_recs, out->dispatches, out->ika_noacq, chi_recs);
     }
     return 1;
 }
@@ -1276,6 +1411,9 @@ int Ctx::haz_mark(PassTape& t) {
     struct AW {
         uint32_t id = 0;
         LineSet  r, w, risky;
+        /* Lever IKA: the lines a SCALAR cache could hold stale (read, then written, in the window: the plain rule's
+         * set). A self-acquiring kernel (tape_rec_ika) invalidates its CUs' vector caches itself, not the scalar one. */
+        LineSet  risky_rw;
         bool     unknown = true;
     };
     const bool acq_rule = acq_rule_on(), acq_w = acq_rule_mode() == 2;
@@ -1292,6 +1430,10 @@ int Ctx::haz_mark(PassTape& t) {
         return ls_merge(std::move(v));
     };
     t.noacq = t.noacq_ordered = 0;
+    t.ika_noacq = 0;
+    t.rco_copies = t.rco_freed = 0;
+    for (const HazOp& o : haz_ops_)
+        if (o.route_copy && o.rec0 >= 0 && o.rec1 <= n) ++t.rco_copies;
     for (int i = 0; i < n; ++i) {
         int kind = 0;
         uint32_t qid = 0;
@@ -1309,6 +1451,7 @@ int Ctx::haz_mark(PassTape& t) {
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
         if (kind != 0) {
+            if (haz_dump_) fprintf(stderr, "TAPEDUMP r%d %d q%u event\n", rank_, i, qid);
             q->infl.clear(); q->opaque = true; q->run = 0;
             if (aw) aw->unknown = true;
             continue;
@@ -1317,22 +1460,57 @@ int Ctx::haz_mark(PassTape& t) {
 
         const int32_t op = first_of[(size_t)i];
         bool ok = op >= 0 && !q->opaque && !haz_ops_[(size_t)op].opaque && q->run < kTapeOverlapRun;
+        int32_t clash = -1;
         if (ok) {
             const HazOp& h = haz_ops_[(size_t)op];
             for (int32_t x : q->infl) {
                 const HazOp& f = haz_ops_[(size_t)x];
                 if (overlaps(h.rd, h.n_rd, f.wr, f.n_wr) || overlaps(h.wr, h.n_wr, f.rd, f.n_rd) ||
-                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; break; }
+                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; clash = x; break; }
             }
+        }
+        if (haz_dump_) {
+            const int32_t own = part_of[(size_t)i];
+            const HazOp* h = own >= 0 ? &haz_ops_[(size_t)own] : nullptr;
+            const OpPlan* pl = h && !h->route_copy ? &plans_[h->op] : nullptr;   /* a routing copy names no op */
+            const char* why = ok                                 ? "U"
+                              : own < 0                          ? "O noop"
+                              : op < 0                           ? "O cont"
+                              : h->opaque                        ? "O opaque"
+                              : q->opaque                        ? "O after-opaque"
+                              : q->run >= kTapeOverlapRun        ? "O run-cap"
+                                                                 : "O clash";
+            std::string rr;
+            if (h && op >= 0 && !h->opaque) {
+                rr = " rd";
+                for (uint32_t k = 0; k < h->n_rd; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->rd + k].first,
+                              (unsigned long long)(haz_rng_[h->rd + k].second - haz_rng_[h->rd + k].first));
+                rr += " wr";
+                for (uint32_t k = 0; k < h->n_wr; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->wr + k].first,
+                              (unsigned long long)(haz_rng_[h->wr + k].second - haz_rng_[h->wr + k].first));
+            }
+            fprintf(stderr, "TAPEDUMP r%d %d q%u hop%d op%d decl%d %s %s %s%s%s\n", rank_, i, qid, own,
+                    h ? (int)h->op : -1, pl && pl->info ? pl->info->index : -1,
+                    pl && pl->info ? pl->info->op.c_str() : h && h->route_copy ? "route_copy" : "-",
+                    h && h->row && h->row->info && h->row->info->name ? h->row->info->name : "-", why,
+                    clash >= 0 ? fmt(" with hop%d", clash).c_str() : "", rr.c_str());
         }
         if (aw) {
             const int32_t own = part_of[(size_t)i];
-            if (own < 0 || haz_ops_[(size_t)own].opaque) {
+            /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it. */
+            if (own < 0 || haz_ops_[(size_t)own].opaque || haz_ops_[(size_t)own].route_copy) {
                 aw->unknown = true;
             } else {
                 const HazOp& h = haz_ops_[(size_t)own];
                 const LineSet rd = lines_of(h.rd, h.n_rd), wr = lines_of(h.wr, h.n_wr);
-                if (aw->unknown || ls_meet(rd, aw->risky)) {
+                /* Lever IKA: a self-acquiring kernel the rule would hold to its packet acquire may still drop it
+                 * when no line it reads is in the scalar-cache set; then no invalidation happened for the window
+                 * (its own reached only its CUs' vector caches), so the window goes on as for a marked packet. */
+                const bool keep = aw->unknown || ls_meet(rd, aw->risky);
+                const bool ika_drop = keep && !aw->unknown && tape_rec_ika(t.dev, i) > 0 && !ls_meet(rd, aw->risky_rw);
+                if (keep && !ika_drop) {
                     /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
                      * it touch lines after the invalidation too. */
                     aw->r = rd;
@@ -1344,13 +1522,20 @@ int Ctx::haz_mark(PassTape& t) {
                             aw->w = ls_unite(aw->w, lines_of(f.wr, f.n_wr));
                         }
                     aw->risky = acq_w ? aw->w : ls_inter(aw->r, aw->w);
+                    aw->risky_rw = ls_inter(aw->r, aw->w);
                     aw->unknown = false;
                 } else {
-                    const int sc = tape_set_noacq(t.dev, i, true);
+                    const int sc = ika_drop ? tape_set_noacq_bits(t.dev, i, 2) : tape_set_noacq(t.dev, i, true);
                     if (sc < 0) return sc;
-                    ++t.noacq;
-                    if (!ok) ++t.noacq_ordered;
-                    aw->risky = ls_unite(aw->risky, ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r)));
+                    if (ika_drop) {
+                        ++t.ika_noacq;
+                    } else {
+                        ++t.noacq;
+                        if (!ok) ++t.noacq_ordered;
+                    }
+                    const LineSet cross = ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r));
+                    aw->risky_rw = ls_unite(aw->risky_rw, ls_unite(cross, ls_inter(rd, wr)));
+                    aw->risky = ls_unite(aw->risky, cross);
                     aw->risky = ls_unite(aw->risky, acq_w ? wr : ls_inter(rd, wr));
                     aw->r = ls_unite(aw->r, rd);
                     aw->w = ls_unite(aw->w, wr);
@@ -1360,6 +1545,8 @@ int Ctx::haz_mark(PassTape& t) {
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);
             if (sc < 0) return sc;
+            /* lever RCO: started beside a routing copy that would have ordered it */
+            if (i > 0 && part_of[(size_t)i - 1] >= 0 && haz_ops_[(size_t)part_of[(size_t)i - 1]].route_copy) ++t.rco_freed;
             q->infl.push_back(op);
             ++q->run;
             ++t.unordered;
@@ -1431,13 +1618,59 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
     return true;
 }
 
+/* tp8 loop D41 (RADIANCE_PP_HEAD_PHASES=N, > 0; read once; unset / 0 = nothing timed): rank 0 of a pipeline leader times each
+ * whole decode HEAD part's run_step by phase -- the stager + residency sync, kvstream_enter, the pass key + tape lookup, the
+ * host steps a play runs before its first recorded stretch, that stretch's play, the rest of the pass, the joins / flush
+ * after it -- and every N heads prints their means (N 1 = 2048). Why (loop FINDINGS DECODE note 21:2x): lq198's stamps put
+ * the head's first kernel 0.68-0.73 ms (p50) after its release and only 9-16 us before run_step returned: the card waits for
+ * host time that comes before the first packet. Timing only: no issue, argument or byte changes. */
+static const uint64_t g_head_phases = [] {
+    const char* e = std::getenv("RADIANCE_PP_HEAD_PHASES");
+    const long long v = e && *e ? std::atoll(e) : 0;
+    return (uint64_t)(v <= 0 ? 0 : v == 1 ? 2048 : v);
+}();
+static inline uint64_t ph_now() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void Ctx::head_phase_line() {
+    const double n = (double)std::max<uint64_t>(1, ph_n_);
+    auto us = [&](int i) { return (double)ph_ns_[i] / n / 1e3; };
+    std::fprintf(stderr, "radiance: rank 0 decode head issue by phase (RADIANCE_PP_HEAD_PHASES, tp8 loop D41): %llu heads (%llu played, "
+                         "%llu issued live), mean us: stager + residency %.1f, kvstream %.1f, key + lookup %.1f, host steps before the "
+                         "first recorded stretch %.1f, that stretch's play %.1f (%.0f packets), the rest of the pass %.1f, joins + flush "
+                         "%.1f; run_step %.1f; %llu heads over 1 ms\n",
+                 (unsigned long long)ph_n_, (unsigned long long)ph_played_, (unsigned long long)(ph_n_ - ph_played_), us(0), us(1),
+                 us(2), us(3), us(4), (double)ph_pk_ / (double)std::max<uint64_t>(1, ph_played_), us(5), us(6), us(7),
+                 (unsigned long long)ph_slow_);
+    /* tp8 loop D41b: the same heads' phase 0 split and pre-stretch host steps by kind (us a head; steps a head) */
+    auto kus = [&](uint64_t ns) { return (double)ns / n / 1e3; };
+    auto kn = [&](int k) { return (double)ph_k_n_[k] / n; };
+    std::fprintf(stderr, "radiance: rank 0 decode head issue, the parts (RADIANCE_PP_HEAD_PHASES, tp8 loop D41b): stager begin_pass %.1f + "
+                         "residency sync %.1f us; host steps before the first stretch: table refresh %.1f us (%.2f), host op %.1f (%.2f), "
+                         "route report %.1f (%.2f), expert prefetch %.1f (%.2f), KV stage %.1f (%.2f) a head\n",
+                 kus(ph_sg_ns_), us(0) - kus(ph_sg_ns_), kus(ph_k_ns_[0]), kn(0), kus(ph_k_ns_[1]), kn(1), kus(ph_k_ns_[2]), kn(2),
+                 kus(ph_k_ns_[3]), kn(3), kus(ph_k_ns_[4]), kn(4));
+    ph_n_ = ph_played_ = ph_slow_ = ph_pk_ = 0;
+    for (uint64_t& x : ph_ns_) x = 0;
+    ph_sg_ns_ = 0;
+    for (int k = 0; k < 5; ++k) ph_k_ns_[k] = ph_k_n_[k] = 0;
+}
+
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
+    bool ph_first = ph_on_;   /* tp8 loop D41: the first recorded stretch of a timed head */
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
+        /* tp8 loop D41b: a host step before the first recorded stretch of a timed head, timed by kind */
+        const int pk = !ph_first || st.kind == kTapePlay ? -1
+                       : st.kind == kTapeTable ? 0 : st.kind == kTapeHost ? 1 : st.kind == kTapeRoute ? 2
+                       : (st.kind == kTapeXp || st.kind == kTapeXpMark || st.kind == kTapeXpStep) ? 3 : 4;
+        const uint64_t pk0 = pk >= 0 ? ph_now() : 0;
         switch (st.kind) {
         case kTapePlay:
+            if (ph_first) { ph_t_[3] = ph_now(); ph_pk_ += (uint64_t)std::max(0, st.b - st.a); }
             rc = tape_play(t.dev, st.a, st.b);
+            if (ph_first) { ph_t_[4] = ph_now(); ph_first = false; }
             if (rc < 0) step_fail_ = fmt("a recorded pass could not be submitted: %s",
                                          rad_dev_last_error());
             break;
@@ -1453,10 +1686,15 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeHost: {
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
+            /* What the recorded join waited on (TapeHost::touch): the stretches played before this
+             * step re-recorded those events. */
+            for (int l = 0; l < 2; ++l) host_touch_pending_[l] = host_touch_pending_[l] || th.touch[l];
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;
+                if (th.rp.n) row_prefetch_run(th.rp, th.t, th.n);
                 rc = th.launch(&th.args, cur_stream());
+                row_prefetch_done();
                 rad_dev_host_wrote();
             }
             lane_ = l0;
@@ -1492,6 +1730,7 @@ int Ctx::play_pass(PassTape& t) {
             lane_ = l0;
             break;
         }
+        if (pk >= 0) { ph_k_ns_[pk] += ph_now() - pk0; ++ph_k_n_[pk]; }   /* tp8 loop D41b */
         if (rc < 0) {
             if (step_status_ >= 0) step_status_ = rc;
             return rc;
@@ -1529,6 +1768,7 @@ int Ctx::run_pass(const RadBatch* b) {
         bump(pc_played_);
         pc_dispatched_.fetch_add(t->dispatches, std::memory_order_relaxed);
         pc_unordered_.fetch_add(t->unordered, std::memory_order_relaxed);
+        if (ph_on_) { ph_t_[2] = ph_now(); ++ph_played_; }   /* tp8 loop D41: key + lookup done */
         return play_pass(*t);
     }
 
@@ -1570,7 +1810,7 @@ int Ctx::run_pass(const RadBatch* b) {
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
     nt.used = ++tape_clock_;
-    if (tapes_.size() < kTapes) {
+    if (tapes_.size() < tape_cap_) {
         tapes_.push_back(std::move(nt));
     } else {
         PassTape* lru = &tapes_[0];
@@ -1583,6 +1823,7 @@ int Ctx::run_pass(const RadBatch* b) {
 
 int Ctx::run_step(const RadBatch* b) {
     if (!b) return RAD_E_INVAL;
+    ph_entry_ns_ = g_head_phases > 0 ? ph_now() : 0;   /* tp8 loop D41 */
     if (!arch_step_) {
         RAD_WARN("Ctx::run_step: no architecture step function was installed");
         return RAD_E_STATE;
@@ -1591,6 +1832,7 @@ int Ctx::run_step(const RadBatch* b) {
     /* Before the residency sync, which carries any weights a declining stager gave back into the
      * tables (runtime/stager.h). */
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
+    ph_stager_ns_ = g_head_phases > 0 ? ph_now() : 0;   /* tp8 loop D41b: the stager's part of phase 0 */
 
     sync_residency();
 
@@ -1598,11 +1840,31 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    /* tp8 loop P31 (RADIANCE_SLOW_ISSUE_MS): this pass's issue, timed on this rank's thread */
+    const double slow_ms = slow_issue_ms();
+    const auto slow_t0 = slow_ms > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (slow_ms > 0) {
+        slow_in_ms_ = slow_max_ms_ = 0;
+        slow_n_ = slow_res_n_ = 0;
+        slow_res_ns_ = 0;
+        slow_max_op_ = -1;
+    }
+    /* tp8 loop D41: a whole decode head on a pipeline leader's rank 0 (the stager + residency sync above are in phase 0) */
+    ph_on_ = g_head_phases > 0 && rank_ == 0 && pp_pass_part() == 1 /* RAD_PP_PART_HEAD */ && pp_pass_seg() == 0 &&
+             b->phase == RAD_PHASE_DECODE && b->draft_pass == 0;
+    if (ph_on_) {
+        ph_t_[0] = ph_entry_ns_;
+        ph_t_[1] = ph_now();
+        ph_t_[2] = ph_t_[3] = ph_t_[4] = 0;
+        ph_sg_ns_ += ph_stager_ns_ - ph_entry_ns_;   /* tp8 loop D41b */
+    }
     kvstream_enter(this, b);
+    if (ph_on_) ph_t_[5] = ph_now();
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
+    if (ph_on_) ph_t_[6] = ph_now();
 
     /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the
      * compute stream, so work left on lane 1 could be read by the sampler or freed while in
@@ -1626,6 +1888,34 @@ int Ctx::run_step(const RadBatch* b) {
 
     if (profiling_) profile_collect();
     flush_issued();
+    if (ph_on_) {   /* tp8 loop D41: 0 entry, 1 after the stager + residency, 5 after kvstream, 2 key + lookup, 3 / 4 the first
+                     * stretch, 6 run_pass's return, now the end; a live / recorded pass has no 2 / 3 / 4: all of it in 'the rest' */
+        const uint64_t t7 = ph_now(), t0 = ph_t_[0], t1 = ph_t_[1], t5 = ph_t_[5], t6 = ph_t_[6];
+        const uint64_t t2 = ph_t_[2] ? ph_t_[2] : t5, t3 = ph_t_[3] ? ph_t_[3] : t2, t4 = ph_t_[4] ? ph_t_[4] : t3;
+        ph_ns_[0] += t1 - t0; ph_ns_[1] += t5 - t1; ph_ns_[2] += t2 - t5; ph_ns_[3] += t3 - t2; ph_ns_[4] += t4 - t3;
+        ph_ns_[5] += t6 - t4; ph_ns_[6] += t7 - t6; ph_ns_[7] += t7 - t0;
+        if (t7 - t0 > 1000000) ++ph_slow_;
+        if (++ph_n_ >= g_head_phases) head_phase_line();
+        ph_on_ = false;
+    }
+    if (slow_ms > 0) {
+        const double wall =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slow_t0).count();
+        if (wall >= std::max(10.0, 5.0 * slow_ms) && b->n_tok >= slow_issue_rows()) {
+            const int k = slow_pass_line_take();
+            if (k < 128) {
+                const OpInfo* oi = slow_max_op_ >= 0 && (size_t)slow_max_op_ < plans_.size()
+                                       ? plans_[(size_t)slow_max_op_].info : nullptr;
+                std::fprintf(stderr, "radiance: slow pass issue (RADIANCE_SLOW_ISSUE_MS, tp8 loop P31): card %d rank %d step %d "
+                                     "(%lld rows) issued in %.2f ms: %lld issue(s) %.2f ms (the slowest '%s' %.2f ms), the rest %.2f ms "
+                                     "(the plugin's code between issues, lane joins, the stager), %lld first-launch resolve(s) "
+                                     "%.2f ms%s\n",
+                             device_, rank_, b->step, (long long)b->n_tok, wall, (long long)slow_n_, slow_in_ms_,
+                             oi ? oi->op.c_str() : "-", slow_max_ms_, wall - slow_in_ms_, (long long)slow_res_n_,
+                             (double)slow_res_ns_ / 1e6, k == 127 ? " (the 128th: no more pass lines)" : "");
+            }
+        }
+    }
     return step_status_;
 }
 

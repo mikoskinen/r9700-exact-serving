@@ -543,6 +543,11 @@ extern "C" int r4d_shape_hc_project(const RadParam* p, int n_p, int operand, Rad
 extern "C" int r4d_shape_ar_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return r4d_shape_hc_write(p, n_p, operand, out);
 }
+/* ar_mhc_post_collapse_rmsnorm: mhc_post_collapse_rmsnorm's operands (r4d_ds41_elem_shapes.inc), x the message. */
+extern "C" int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+extern "C" int r4d_shape_ar_mhc_pcn(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return r4d_shape_mhc_post_collapse_rmsnorm(p, n_p, operand, out);
+}
 
 /* moe_gather's five and ar_hc_write's three, in that order; the gather's `y` and the reduction's are
  * one operand. */
@@ -561,6 +566,22 @@ extern "C" int r4d_shape_ar_gather_hc_write(const RadParam* p, int n_p, int oper
         opd(D, M, n),
         in_unit(opd(D, M, hc)),
         opd(D, M, hc * n),
+    };
+    R4D_PICK(l);
+}
+
+/* moe_gather's five and the message: the gather's `y` is the all-reduce's, reduced in place. */
+extern "C" int r4d_shape_moe_gather_ar(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), k = pi(p, n_p, "top_k");
+    if (M <= 0 || n <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M * k, n),
+        opd(D, M, k),
+        opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),
+        opd(D, M, n),
+        opd(D, M),
+        opd(D, M, n),
     };
     R4D_PICK(l);
 }
@@ -1316,6 +1337,26 @@ extern "C" int r4d_shape_gdn_gated_rmsnorm(const RadParam* p, int n_p, int opera
     R4D_PICK(l);
 }
 
+/* qfn-on-ds lever GNQ8: `M` tokens, `n` = heads x channels; x / z / o as one [M, n] plane (the (token, head) rows of
+ * gdn_gated_rmsnorm), the codes and scales as quant_act_i8g's. */
+extern "C" int r4d_shape_gdn_gated_rmsnorm_i8g(const RadParam* p, int n_p, int operand,
+                                               RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t n  = pi(p, n_p, "n");
+    const int64_t ch = pi(p, n_p, "channels");
+    const int64_t gr = pi(p, n_p, "group");
+    if (ch <= 0 || gr <= 0 || n % ch || n % gr) return RAD_E_SHAPE;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_F32,  ch),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_I8,   M, n),
+        opd((uint32_t)RAD_F32,  M, n / gr),
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * Collectives (shims in r4d_ar_entry.hip).
  *
@@ -2003,6 +2044,21 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* tp8 loop P30o: quant_act_fp8_ue8m0 -- the fp8 pair at group 32 (the release's act_quant) */
+extern "C" int r4d_shape_quant_act_fp8_ue8m0(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 32);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g != 32 || n % 32) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, n / g),
+    };
+    R4D_PICK(l);
+}
+
 /* The QSA work list. `M` is the token count and `work` the block bound: two different extents,
  * hence two parameters. */
 extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2378,6 +2434,13 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* DeepSeek-V4.1's ops, in this unit for the helpers above. */
+#include "r4d_ds41_elem_shapes.inc"
+#include "r4d_ds41_sparse_shapes.inc"
+#include "r4d_ds41_ggml_shapes.inc"
+#include "r4d_ds41_mxfp4_shapes.inc"
+#include "r4d_ds41_walk_shapes.inc"
+#include "r4d_ds41_wsamp_shapes.inc"
 extern "C" int r4d_shape_dflash_markov(const RadParam* p, int n_p, int operand,
                                          RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M");

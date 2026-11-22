@@ -18,6 +18,7 @@
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_chain.h"
@@ -303,7 +304,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) { R4D_IKA_ENTRY();
     qsa_select_kernel_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
 }
 template <bool Signed>
@@ -428,7 +429,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld) { R4D_IKA_ENTRY();
 
     /* The first digit's 4096 bins; afterwards [0, kBins) is the later digits' histogram and the
      * rest holds the collected keys. */
@@ -940,7 +941,7 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     uint32_t* __restrict__ ck, int32_t* __restrict__ ci, int32_t* __restrict__ cc,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk) { R4D_IKA_ENTRY();
 
     constexpr int LT = kLocalThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[LT / kWave];
@@ -1010,7 +1011,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) {
+    int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) { R4D_IKA_ENTRY();
 
     constexpr int NT = kMergeThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];
@@ -1123,7 +1124,7 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_part_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, int32_t* __restrict__ lists, int lpitch,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk, int parts, int part) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk, int parts, int part) { R4D_IKA_ENTRY();
 
     constexpr int LT = kLocalThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[LT / kWave];
@@ -1193,7 +1194,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_lists_kernel(
     const int32_t* __restrict__ pos, const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int32_t* __restrict__ slab, int spitch,
-    int topk, int ratio, int nseq, int t_ld, int o_ld, int parts, int part) {
+    int topk, int ratio, int nseq, int t_ld, int o_ld, int parts, int part) { R4D_IKA_ENTRY();
 
     constexpr int NT = kMergeThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];

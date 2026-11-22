@@ -17,11 +17,16 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
 
 using namespace r4d_iqr;
+
+extern "C" int r4d_iqr_relayout_gpu(const void* codes, void* dst, int64_t N, int64_t K, uint32_t bits,
+                                   uint32_t L, uint32_t entries, const void* table, const void* mad,
+                                   int64_t dst_bytes, void* stream);
 
 /* Operand indices of `gemm_nt_q` (r4d_rows.cpp). */
 enum { IL_B = 2, IL_BSCALE = 3 };
@@ -83,7 +88,14 @@ bool scale_form(const RadEncoding* enc, int want_planes, uint32_t* out) {
 bool classify(const RadEncoding* enc, const char* tr, Form* f, int64_t* entries) {
     *f = Form{};
     *entries = 0;
-    if (!enc || std::strncmp(enc->transform, tr, RAD_ENC_STR) != 0) return false;
+    if (!enc) return false;
+    if (rad_enc_is(enc, "stored")) {
+        const RadEncPlane* fp = rad_enc_plane(enc, "form");
+        if (!fp || fp->kind != RAD_PLANE_TABLE) return false;
+        *f = form((uint32_t)fp->block[0]);
+        return f->kind != 0 && f->kind != kStored;
+    }
+    if (std::strncmp(enc->transform, tr, RAD_ENC_STR) != 0) return false;
     const RadEncPlane& cp = enc->plane[0];
     if (std::strncmp(cp.role, "codes", RAD_ENC_STR) != 0) return false;
     if (rad_enc_is(enc, "trellis")) {
@@ -184,7 +196,7 @@ void lfill(RadLayout* out, const char* tag, uint32_t dt, long long d0, long long
 /* The selected planes by role. */
 struct Planes {
     const RadTensor *codes = nullptr, *aux = nullptr, *scale = nullptr, *scale2 = nullptr,
-                    *mad = nullptr, *colf = nullptr;
+                    *mad = nullptr, *colf = nullptr, *lane = nullptr;
 };
 bool planes_of(const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, Planes* o) {
     if (!sel || !pl) return false;
@@ -195,6 +207,8 @@ bool planes_of(const RadEncoding* enc, const int* sel, const RadTensor* pl, int 
         else if (!std::strncmp(r, "scale.1", RAD_ENC_STR)) o->scale2 = &pl[i];
         else if (!std::strncmp(r, "trellis.mad", RAD_ENC_STR)) o->mad = &pl[i];
         else if (!std::strncmp(r, "scale.col", RAD_ENC_STR)) o->colf = &pl[i];
+        else if (!std::strncmp(r, "lane", RAD_ENC_STR)) o->lane = &pl[i];
+        else if (!std::strncmp(r, "form", RAD_ENC_STR)) continue;
         else if (!std::strncmp(r, "zero", RAD_ENC_STR) || !std::strncmp(r, "table", RAD_ENC_STR) ||
                  !std::strncmp(r, "grid", RAD_ENC_STR) || !std::strncmp(r, "trellis", RAD_ENC_STR))
             o->aux = &pl[i];
@@ -208,6 +222,12 @@ int weight_view(const RadParam* p, int n_p, const RadEncoding* enc, const int* s
                 const RadTensor* pl, int n, Geom* g, Form* f, int64_t* entries, Planes* v) {
     int rc = geom(p, n_p, g);
     if (rc != RAD_OK) return rc;
+    if (rad_enc_is(enc, "stored")) {
+        if (!classify(enc, "", f, entries) || !built(word(*f))) return RAD_E_DTYPE;
+        if (!planes_of(enc, sel, pl, n, v) || !v->lane) return RAD_E_SHAPE;
+        if (!r4d_enc::dims(*v->lane, 1, weight_bytes(*f, g->N, g->K))) return RAD_E_SHAPE;
+        return RAD_OK;
+    }
     const char* d = r4d_pgets(p, n_p, "dtype");
     const bool rot = d && std::strcmp(d, "i8a8h") == 0;
     if (!classify(enc, rot ? "fwht128" : "", f, entries) || !built(word(*f))) return RAD_E_DTYPE;
@@ -389,6 +409,13 @@ int scale_view(const RadParam* p, int n_p, const RadEncoding* enc, const int* se
                const RadTensor* pl, int n, Geom* g, Form* f, Planes* v) {
     int rc = geom(p, n_p, g);
     if (rc != RAD_OK) return rc;
+    if (rad_enc_is(enc, "stored")) {
+        int64_t entries = 0;
+        if (!classify(enc, "", f, &entries) || !built(word(*f))) return RAD_E_DTYPE;
+        if (!planes_of(enc, sel, pl, n, v) || !v->scale) return RAD_E_SHAPE;
+        if (!r4d_enc::dims(*v->scale, 1, scale_bytes(*f, g->N, g->K))) return RAD_E_SHAPE;
+        return RAD_OK;
+    }
     const char* d = r4d_pgets(p, n_p, "dtype");
     const bool rot = d && std::strcmp(d, "i8a8h") == 0;
     int64_t entries = 0;
@@ -480,7 +507,62 @@ int scale_unrelayout(const Form& f, const Geom& g, const Planes& v, const uint8_
     return RAD_OK;
 }
 
+/* Byte-compare the card unpack against this file's walk. A miss is a wrong answer, so a boot
+ * is not allowed until this returns 0. */
+int relayout_selfcheck_one(uint32_t bits, uint32_t L, long long N, long long K) {
+    Form f;
+    f.kind = kTrellisMad;
+    f.bits = bits;
+    f.L = L;
+    f.lrun = 8;
+    Geom g{ N, K, K / 128 };
+    const int64_t entries = (int64_t)1 << L;
+    const int64_t packed = N * (K * (int64_t)bits / 8);
+    const int64_t wbytes = weight_bytes(f, N, K);
+    std::vector<uint8_t> codes((size_t)packed), table((size_t)entries), mad(8);
+    std::vector<uint8_t> host((size_t)wbytes), gpu((size_t)wbytes, 0xA5);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t)(i * 17u + 3u);
+    const uint32_t A = 0x13579Bu, B = 0x2468ACu;
+    std::memcpy(mad.data(), &A, 4);
+    std::memcpy(mad.data() + 4, &B, 4);
+    for (int64_t st = 0; st < entries; ++st) {
+        const uint32_t h = (((uint32_t)st & 0xFFFFFFu) * (A & 0xFFFFFFu) + B) & 0x3F3F3F3Fu;
+        const int q = (int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) - 126;
+        table[(size_t)st] = (uint8_t)q;
+    }
+    RadTensor tc{}, tt{}, tm{};
+    tc.data = codes.data(); tc.rank = 2; tc.shape[0] = N; tc.shape[1] = K; tc.dtype = bits == 2 ? RAD_U2 : RAD_U3;
+    tt.data = table.data(); tt.rank = 2; tt.shape[0] = entries; tt.shape[1] = 1; tt.dtype = RAD_I8;
+    tm.data = mad.data(); tm.rank = 1; tm.shape[0] = 2; tm.dtype = RAD_U32;
+    Planes v;
+    v.codes = &tc; v.aux = &tt; v.mad = &tm;
+    const int rh = weight_relayout(f, g, entries, v, host.data(), wbytes);
+    if (rh != RAD_OK) return 1000 + rh;
+    const int rg = r4d_iqr_relayout_gpu(codes.data(), gpu.data(), N, K, bits, L, (uint32_t)entries,
+                                        table.data(), mad.data(), wbytes, nullptr);
+    if (rg != RAD_OK) return 2000 + rg;
+    for (int64_t i = 0; i < wbytes; ++i) {
+        if (host[(size_t)i] != gpu[(size_t)i]) {
+            fprintf(stderr, "E iqr relayout mismatch bits=%u L=%u N=%lld K=%lld at %lld host=%02x gpu=%02x\n",
+                    bits, L, N, K, (long long)i, host[(size_t)i], gpu[(size_t)i]);
+            return 1;
+        }
+    }
+    fprintf(stderr, "I iqr relayout match bits=%u L=%u N=%lld K=%lld bytes=%lld\n",
+            bits, L, N, K, (long long)wbytes);
+    return 0;
+}
+
 }  /* namespace */
+
+extern "C" int r4d_iqr_relayout_selfcheck(void) {
+    const int a = relayout_selfcheck_one(2, 15, 256, 512);
+    if (a) return a;
+    const int b = relayout_selfcheck_one(3, 16, 256, 256);
+    if (b) return b;
+    const int c = relayout_selfcheck_one(2, 15, 512, 1280);
+    return c;
+}
 
 /* ==================================================================== the hooks */
 
@@ -494,12 +576,20 @@ extern "C" int r4d_rad_layout_iqr(const RadParam* p, int n_p, int operand, const
         int64_t entries = 0;
         const int rc = weight_view(p, n_p, enc, sel, pl, n, &g, &f, &entries, &v);
         if (rc != RAD_OK) return rc;
+        if (rad_enc_is(enc, "stored")) {
+            lfill(out, "r4d.iqr.w", R4D_DT_IQR_W | word(f), g.N, g.K, weight_bytes(f, g.N, g.K));
+            return RAD_OK;
+        }
         lfill(out, "r4d.iqr.w", R4D_DT_IQR_W | word(f), g.N, g.K, weight_bytes(f, g.N, g.K));
         return RAD_OK;
     }
     if (operand == IL_BSCALE) {
         const int rc = scale_view(p, n_p, enc, sel, pl, n, &g, &f, &v);
         if (rc != RAD_OK) return rc;
+        if (rad_enc_is(enc, "stored")) {
+            lfill(out, "r4d.iqr.s", R4D_DT_IQR_S | word(f), g.N, g.nkb, scale_bytes(f, g.N, g.K));
+            return RAD_OK;
+        }
         lfill(out, "r4d.iqr.s", R4D_DT_IQR_S | word(f), g.N, g.nkb, scale_bytes(f, g.N, g.K));
         return RAD_OK;
     }
@@ -516,12 +606,24 @@ extern "C" int r4d_rad_relayout_iqr(const RadParam* p, int n_p, int operand,
         int64_t entries = 0;
         const int rc = weight_view(p, n_p, enc, sel, pl, n, &g, &f, &entries, &v);
         if (rc != RAD_OK) return rc;
+        if (rad_enc_is(enc, "stored")) {
+            const int64_t bytes = weight_bytes(f, g.N, g.K);
+            if (bytes != dst_bytes || !v.lane || !v.lane->data) return RAD_E_SHAPE;
+            std::memcpy(dst, v.lane->data, (size_t)bytes);
+            return RAD_OK;
+        }
         if (v.aux && !v.aux->data) return RAD_E_SHAPE;
         return weight_relayout(f, g, entries, v, (uint8_t*)dst, dst_bytes);
     }
     if (operand == IL_BSCALE) {
         const int rc = scale_view(p, n_p, enc, sel, pl, n, &g, &f, &v);
         if (rc != RAD_OK) return rc;
+        if (rad_enc_is(enc, "stored")) {
+            const int64_t bytes = scale_bytes(f, g.N, g.K);
+            if (bytes != dst_bytes || !v.scale || !v.scale->data) return RAD_E_SHAPE;
+            std::memcpy(dst, v.scale->data, (size_t)bytes);
+            return RAD_OK;
+        }
         if (v.scale2 && !v.scale2->data) return RAD_E_SHAPE;
         return scale_relayout(f, g, v, (uint8_t*)dst, dst_bytes);
     }

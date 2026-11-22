@@ -11,6 +11,9 @@
 #include <tuple>
 #include <vector>
 
+/* a unit that names its dynamic LDS at file scope (extern __shared__, which the host lacks) reads
+ * the launch's instead when this is defined (r4d_ds41_sparse.hip) */
+#define R4D_EMU_HOST 1
 #define __global__
 #define __device__
 #define __host__
@@ -19,7 +22,8 @@
 #define __forceinline__ inline
 #define __launch_bounds__(n)
 /* R4D_WAVES (r4d_common.h) names a kernel attribute; on the host it becomes an empty attribute */
-#define amdgpu_waves_per_eu(lo, hi)
+/* variadic: lever XWO (DRAFTER round 28) names one argument, amdgpu_waves_per_eu(12) */
+#define amdgpu_waves_per_eu(...)
 #define __align__(n) __attribute__((aligned(n)))
 
 struct dim3 {
@@ -30,9 +34,12 @@ typedef void* hipStream_t;
 typedef int hipError_t;
 enum { hipSuccess = 0 };
 inline hipError_t hipGetLastError() { return 0; }
+/* every launch here succeeds; a unit that names the error in a throw still compiles */
+inline const char* hipGetErrorString(hipError_t) { return "hipSuccess"; }
 /* one device, with the R9700's 64 KiB of LDS a workgroup, which launchers size dynamic LDS by */
 struct hipDeviceProp_t { size_t sharedMemPerBlock; int multiProcessorCount; };
 inline hipError_t hipGetDevice(int* d) { *d = 0; return hipSuccess; }
+inline hipError_t hipSetDevice(int) { return hipSuccess; }   /* one device (r4d_moe.hip's counter block fini) */
 /* no graphs: a stream never captures */
 enum hipStreamCaptureStatus { hipStreamCaptureStatusNone = 0 };
 inline hipError_t hipStreamIsCapturing(hipStream_t, hipStreamCaptureStatus* s) {
@@ -41,6 +48,10 @@ inline hipError_t hipStreamIsCapturing(hipStream_t, hipStreamCaptureStatus* s) {
 }
 /* every launch runs to completion before it returns */
 inline hipError_t hipDeviceSynchronize() { return hipSuccess; }
+/* lever XPG (DRAFTER round 28, r4d_ds41_mxfp4_mr.hip xm_pg_grid): the IL forms' grid capped at the resident blocks. The emu
+ * answers 4 blocks a CU (the card's gate_up form) so a capped grid -- each block looping over its items -- is what the emu runs */
+template <class K>
+inline hipError_t hipOccupancyMaxActiveBlocksPerMultiprocessor(int* nb, K, int, size_t) { *nb = 4; return hipSuccess; }
 /* __device__ variables are host globals, so a symbol copy is a memcpy */
 enum hipMemcpyKind { hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3 };
 #define HIP_SYMBOL(s) (&(s))
@@ -82,10 +93,14 @@ inline unsigned long long __ballot(int p) { return emu_ballot(p != 0); }
 inline int __popcll(unsigned long long v) { return __builtin_popcountll(v); }
 /* v_readfirstlane_b32: a cross-lane op is a wave barrier here, so every lane is active, lane 0 first */
 #define __builtin_amdgcn_readfirstlane(v) emu_readlane((v), 0)
-/* DPP16 row_shl, row_shr and row_xmask with every row and bank written; a source outside the row
+/* DPP16 quad_perm, row_shl, row_shr and row_xmask with every row and bank written; a source outside the row
  * reads 0 under bound_ctrl, else leaves `old`. Other controls and masks are reported. */
 int emu_update_dpp(int old, int src, int ctrl, int row_mask, int bank_mask, bool bound_ctrl);
 #define __builtin_amdgcn_update_dpp(o, s, c, rm, bm, bc) emu_update_dpp((o), (s), (c), (rm), (bm), (bc))
+/* v_mov_b32 with DPP (every row and bank written, so `old` is never read) */
+#define __builtin_amdgcn_mov_dpp(s, c, rm, bm, bc) emu_update_dpp(0, (s), (c), (rm), (bm), (bc))
+/* s_prefetch_data: an L2 hint, nothing to emulate */
+#define __builtin_amdgcn_s_prefetch_data(p, n) ((void)(p), (void)(n))
 /* v_permlanex16_b32: lane L reads the lane of the other row of sixteen that L's selector names */
 int emu_permlanex16(int old, int src, unsigned sel_lo, unsigned sel_hi, bool fi, bool bc);
 #define __builtin_amdgcn_permlanex16(o, s, lo, hi, fi, bc) emu_permlanex16((o), (s), (lo), (hi), (fi), (bc))
@@ -103,6 +118,13 @@ inline unsigned emu_perm(unsigned a, unsigned b, unsigned sel) {
     return r;
 }
 #define __builtin_amdgcn_perm(a, b, s) emu_perm((a), (b), (s))
+/* v_alignbyte_b32: the 64-bit {a, b} (b low) shifted right by 8 x (s & 3) bits' bytes, its low 32 bits (the drafter's
+ * MXFP4 forms, r4d_ds41_mxfp4_mr.hip) */
+inline unsigned emu_alignbyte(unsigned a, unsigned b, unsigned s) {
+    const unsigned long long d = ((unsigned long long)a << 32) | b;
+    return (unsigned)(d >> (8u * (s & 3u)));
+}
+#define __builtin_amdgcn_alignbyte(a, b, s) emu_alignbyte((a), (b), (s))
 /* HIP's __byte_perm: result byte i is the byte of {y, x} (x low) that the low three bits of
  * nibble i of s name; only the low four nibbles are read */
 inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) {
@@ -140,6 +162,11 @@ inline emu_v8f emu_wmma_bf16(emu_v8bf a, emu_v8bf b, emu_v8f c) {
 #define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) emu_wmma_bf16((a), (b), (c))
 typedef _Float16 emu_v8h __attribute__((ext_vector_type(8)));
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
+/* libr4d's v8hf (r4d_dt16.h) is an __fp16 vector: the same bits */
+typedef __fp16 emu_v8fp16 __attribute__((ext_vector_type(8)));
+inline emu_v8f emu_wmma_f16(emu_v8fp16 a, emu_v8fp16 b, emu_v8f c) {
+    return emu_wmma_f16(__builtin_bit_cast(emu_v8h, a), __builtin_bit_cast(emu_v8h, b), c);
+}
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) emu_wmma_f16((a), (b), (c))
 /* v_wmma_f32_16x16x16_fp8_fp8 (gfx12, wave32): the bf16 form's layout with eight E4M3 bytes a
  * lane, element e in byte e. Each output is c plus its 16 products in k order: not the hardware's
@@ -148,7 +175,7 @@ emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
 typedef int emu_v2i __attribute__((ext_vector_type(2)));
 emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c);
 #define __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c) emu_wmma_fp8((a), (b), (c))
-/* v_wmma_i32_16x16x16_iu8 (gfx12): the fp8 form's layout at int8 / uint8, exact int32 sums (emu.cpp) */
+/* v_wmma_i32_16x16x16_iu8 (gfx12): the fp8 form's layout, exact int32 sums (emu.cpp) */
 typedef int emu_v8i __attribute__((ext_vector_type(8)));
 emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool clamp);
 #define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, cl) \
@@ -189,7 +216,7 @@ inline float emu_fdot2(V a, V b, float c, bool) {
 #define HALO_KLAUNCH(kernel, grid, block, stream, ...) emu_launch(&kernel, grid, block, __VA_ARGS__)
 #define HALO_EMIT(stream, kernel, grid, block, lds, ...) \
     emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), __VA_ARGS__)
-/* global_load_tr_b128: not emulated; reported when reached */
+/* global_load_tr_b128: emulated by exchanges (emu.cpp) */
 emu_v8s emu_load_tr_b128(const void* p);
 #define __builtin_amdgcn_global_load_tr_b128_v8i16(p) emu_load_tr_b128((const void*)(p))
 /* v_cvt_pk_fp8_f32 (gfx12, OCP E4M3): converts a and b into the low half of `old` (hi false) or
@@ -334,10 +361,23 @@ struct alignas(4) uchar4 { unsigned char x, y, z, w; };
 inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, unsigned char d) {
     return uchar4{a, b, c, d};
 }
+/* qfn-on-ds (r4d_emu_gnq8): the GDN gated norm's operands and its scale */
+struct alignas(8) ushort4 { unsigned short x, y, z, w; };
+inline ushort4 make_ushort4(unsigned short a, unsigned short b, unsigned short c, unsigned short d) {
+    return ushort4{a, b, c, d};
+}
+inline float __frsqrt_rn(float a) { return (float)(1.0 / std::sqrt((double)a)); }
 /* v_cvt_pk_f32_fp8 (gfx12): two E4M3 codes of `w`'s low (hi false) or high half to f32, exact */
 typedef float emu_v2f __attribute__((ext_vector_type(2)));
 emu_v2f emu_cvt_pk_f32_fp8(int w, bool hi);
 #define __builtin_amdgcn_cvt_pk_f32_fp8(w, hi) emu_cvt_pk_f32_fp8((w), (hi))
+/* the double <-> 64-bit reinterpretations (r4d_ds41_sparse.hip's expf) */
+inline long long __double_as_longlong(double d) { long long u; std::memcpy(&u, &d, 8); return u; }
+inline double __longlong_as_double(long long u) { double d; std::memcpy(&d, &u, 8); return d; }
+/* s_barrier's wave-scope form, after a wavefront fence: here a cross-lane op, so a wave barrier */
+#define __builtin_amdgcn_wave_barrier() ((void)emu_ballot(true))
+/* v_exp_f32: 2^x within an ulp on the card; exp2 here (no test compares it with a host value) */
+#define __builtin_amdgcn_exp2f(x) std::exp2((float)(x))
 /* a system-scope fence orders nothing more between fibers on one thread */
 inline void __threadfence_system() {}
 /* every copy completes before it returns, as every launch does */

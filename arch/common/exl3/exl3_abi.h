@@ -72,6 +72,15 @@ extern "C" {
 
 #define EXL3_IFACE_VERSION 12
 
+/* qfn-on-ds (20.11.2026, the merged DeepSeek + Qwen tree): this header is the UNION of the two lines' interfaces, which
+ * both moved on from v8 under their own numbers -- the ds41 line's v9 `bi` and v10 `xring` (gate_up parameters, optional)
+ * and lever P's moe_exl3_gate_up_dk / moe_exl3_down_dk names; the fn4 line's v10 `map` and v12 `band` (optional trailing
+ * operands of gate_up / down / down_mod4). Each line's out-of-tree exl3r4d keeps its own copy: the Qwen line's
+ * (exl3-main37 630ecea) exports the v12 operand lists below without `bi` / `xring`, the ds41 line's exports the pre-v10
+ * operand lists with them. An architecture issues what its own library exports: MoeFP8 leaves the map / band slots off
+ * for a block declared in the ds41 form (rad_block_moe_fp8.h issue_exl3), and passes bi / xring only under that line's
+ * expert tensor parallel. The number stays 12 (the in-tree code checks none; the libraries check their own). */
+
 /* v12 (fn4 BI-dual, 11.11.2026; v11 is the fn4-dsgd branch's gate_up_down limit, not on this branch; the ds41 line's
  * v8-based form of this is its own number): THE DUAL-FORM DOWN. moe_exl3_down and moe_exl3_down_mod4 take one more
  * OPTIONAL operand, last: `band`, i32 [M] -- a value a token row of the op (the rows `a` / sorted_tok's tokens count,
@@ -376,6 +385,15 @@ static inline const Exl3Positions* exl3_positions(int op) {
     }
 }
 
+/* qfn-on-ds: an op's operand count without the fn4 line's trailing optional slots (v10 `map`, v12 `band`) -- the
+ * operand list a library built on the ds41 line's interface exports (gate_up 14, down 10, down_mod4 16). */
+static inline int exl3_n_opd_ds(const Exl3Positions* p) {
+    int n = p->n_opd;
+    if (p->map >= 0 && p->map < n) n = p->map;
+    if (p->band >= 0 && p->band < n) n = p->band;
+    return n;
+}
+
 #define EXL3_OP_GATE_UP "moe_exl3_gate_up"
 #define EXL3_OP_DOWN    "moe_exl3_down"
 #define EXL3_OP_PREP_GU "moe_exl3_prep_gu"
@@ -418,8 +436,24 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         /* v8: the SwiGLU clamp (DeepSeek's swiglu_limit): gate = min(gate, limit), up = clamp(up, -limit, limit)
          * before silu(gate) * up; absent or 0 is none */
         { "limit",    RAD_P_F64, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* v9 (DeepSeek's lever 1U-ETP, ds41-etp-plug): 1 = a row's bytes do not depend on the launch's token count -- a
+         * library whose decode band picks a form by the token count (exl3r4d: split-K 2 at <= 2 tokens where the grid
+         * fits, split-K 1 above) takes the one form at every count; absent or 0 is the library's own rule. The
+         * result is defined as without it (a summation order, not a different product). */
+        { "bi",       RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* v10 (DeepSeek's lever XR, ds41-etp-xr-plug): MiB of the prefill band's scratch for a copy ring -- in the map
+         * form the launch may copy the routed experts whose codes sit in a host pool (rad_host_pool_ranges) onto the
+         * card inside the GEMM launch, while the resident experts compute, and read the copies (the same bytes);
+         * absent or 0 is no ring. A placement of the same bytes, not a different product. */
+        { "xring",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* qfn-on-ds lever DRZ-K (the Qwen line's exl3r4d, Qwen loop round 18): 1 = this op keeps its dead-row stores under
+         * exl3_drz 1 (the architecture declares a layer so under RADIANCE_FN4_DRZ_KEEP); absent or 0 is the switch's word */
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
-    static const RadParamSpec p_dn[] = { EXL3_GEMM_PARAMS };
+    static const RadParamSpec p_dn[] = {
+        EXL3_GEMM_PARAMS,
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* qfn-on-ds lever DRZ-K, as gate_up's */
+    };
 #undef EXL3_GEMM_PARAMS
     static const RadParamSpec p_pg[] = {
         { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
@@ -470,6 +504,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
         { "N_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
         { "K_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "drz_keep", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* qfn-on-ds lever DRZ-K, as gate_up's */
     };
     static const RadOperandSpec gate_up_down[18] = {
         { "a",             RAD_OPD_IN,   0 },
@@ -668,6 +703,39 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
     return i >= 0 && i < 8 ? &s[i] : 0;
 }
 
+/* Lever P (ds41-p1pass, 13.11.2026): THE DECODE BAND'S ARITHMETIC ABOVE THE DECODE BAND. Two more op names,
+ * moe_exl3_gate_up_dk / moe_exl3_down_dk, with moe_exl3_gate_up's / moe_exl3_down's parameters, operands and result
+ * definition to the letter -- what they add is a PROMISE about the bytes: a library's row for them writes, for every
+ * (token, slot), exactly the bytes its DECODE-BAND row of moe_exl3_gate_up / moe_exl3_down writes for that token in a
+ * pass of at most 16 tokens, whatever the pass's other tokens (the decode band is M-invariant per row, and a run longer
+ * than a pass's 16 rows is taken 16 at a time). An architecture that must give a decode row the same bytes at any
+ * step height (batch invariance) and today cuts a decode segment into passes of <= 16 tokens declares them over the
+ * heights above 16 it wants as ONE pass and issues them for decode rows only; a prefill segment of the same height keeps
+ * moe_exl3_gate_up / moe_exl3_down (whose M > 16 rows are free to round differently: exl3r4d's MTX form does). Names of
+ * their own, not a parameter of the old ops, so the eight schemas above stay what every other library exports (a
+ * loader refuses a library whose schema for a shared name differs). Two-class form only. exl3_dk_schema_at(0 / 1). */
+#define EXL3_OP_GATE_UP_DK "moe_exl3_gate_up_dk"
+#define EXL3_OP_DOWN_DK    "moe_exl3_down_dk"
+static inline int exl3_dk_schema_count(void) { return 2; }
+static inline const RadOpSchema* exl3_dk_schema_at(int i) {
+    static RadOpSchema s[2];
+    static int made = 0;
+    if (!made) {
+        s[0] = *exl3_schema_at(0);
+        s[0].op = EXL3_OP_GATE_UP_DK;
+        s[0].doc = "moe_exl3_gate_up at more than 16 tokens with the decode band's bytes: every (token, slot) row is "
+                   "what the library's decode-band moe_exl3_gate_up writes for that token in a pass of <= 16 tokens "
+                   "(lever P; a_rot 0, h_rot 1). docs/OPS-exl3.md.";
+        s[1] = *exl3_schema_at(1);
+        s[1].op = EXL3_OP_DOWN_DK;
+        s[1].doc = "moe_exl3_down at more than 16 tokens with the decode band's bytes: every (token, slot) row is "
+                   "what the library's decode-band moe_exl3_down writes for that token in a pass of <= 16 tokens "
+                   "(lever P; h_rot 1). docs/OPS-exl3.md.";
+        made = 1;
+    }
+    return i >= 0 && i < 2 ? &s[i] : 0;
+}
+
 /* ===================================================================== THE PLANES
  *
  * A table's entry e is one plane of one expert, exactly as the container holds it (the canonical
@@ -808,7 +876,10 @@ static inline void exl3_gd_params(const RadParam* p, int n_p, RadParam* pg, int*
     int ng = 0, nd = 0;
     for (int i = 0; i < n_p; ++i) {
         const char* k = p[i].key;
-        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
+        /* qfn-on-ds lever DRZ-K (Qwen loop round 18, F53): drz_keep is not a shape parameter -- the halves' shape / layout
+         * hooks take exactly the nine / five below, which a tenth key could push one of off the fixed counts (the
+         * launcher hands drz_keep to both halves itself, exl3r4d launch_gd) */
+        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot") || !strcmp(k, "drz_keep")) continue;
         if (ng < 9) pg[ng++] = p[i];
         if (!strcmp(k, "N") || !strcmp(k, "K") || !strcmp(k, "N_odd") || !strcmp(k, "K_odd")) continue;
         if (nd < 6) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */
@@ -860,7 +931,7 @@ static inline void exl3_gd4_params(const RadParam* p, int n_p, RadParam* pg, int
     for (int i = 0; i < n_p; ++i) {
         const char* k = p[i].key;
         int shape = 0;
-        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
+        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot") || !strcmp(k, "drz_keep")) continue;   /* DRZ-K: as above */
         if (ng < 13) pg[ng++] = p[i];
         for (int c = 0; c < EXL3_MAX_CLS; ++c) shape |= !strcmp(k, nq[c]) || !strcmp(k, kq[c]);
         if (!shape && nd < 5) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */

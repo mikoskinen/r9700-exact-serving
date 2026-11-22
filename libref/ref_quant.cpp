@@ -376,6 +376,56 @@ int ref_quant_act_fp8(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------- quant_act_fp8_ue8m0 */
+/* DeepSeek-V4's released activation quantiser (inference/kernel.py act_quant with scale_fmt "ue8m0",
+ * the form inference/model.py's linear() runs before every block-FP8 weight; tp8 loop P30o): per
+ * `group` contiguous elements (32 there) amax = max(|x|, 1e-4) in f32, the scale is the power of two
+ * at or above amax * f32(1/448) -- ceil(log2) read off the product's IEEE bits, the product and not
+ * the quotient --, and q = E4M3(clamp(x / scale, +-448)) rounded to nearest even. x / scale is exact
+ * (a power of two), so no reciprocal rounds. The scale is stored as an f32 (the same value the
+ * release keeps as an e8m0 byte), [M, ceil(n/group)]. Never 1 for a zero group: the floor gives
+ * 2^-21 there, as the release does. */
+static inline float ue8m0_pow2_ceil(float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    const int e = (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) ? 1 : 0);
+    const uint32_t r = (uint32_t)(e + 127) << 23;
+    float f;
+    std::memcpy(&f, &r, 4);
+    return f;
+}
+int ref_quant_act_fp8_ue8m0(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *q = &a->t[1], *s = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = numel(x) / n;
+    if (rows <= 0 || numel(q) < rows * n) return RAD_E_SHAPE;
+    int64_t g = p_int(a, "group", 0);
+    if (g <= 0 || g > n) g = n;
+    const int64_t ngrp = (n + g - 1) / g;
+    if (numel(s) < rows * ngrp) return RAD_E_SHAPE;
+    const float inv = 1.0f / 448.0f;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(x, r, n), qb = rowoff(q, r, n);
+        const int64_t xs = laststride(x), qs = laststride(q);
+        for (int64_t gi = 0; gi < ngrp; ++gi) {
+            const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
+            float amax = 0.0f;
+            for (int64_t k = k0; k < k1; ++k) amax = std::max(amax, std::fabs(ldt(x, xb + k * xs)));
+            amax = std::max(amax, 1e-4f);
+            const float sc = ue8m0_pow2_ceil(amax * inv);
+            for (int64_t k = k0; k < k1; ++k) {
+                const float v = std::min(std::max(ldt(x, xb + k * xs) / sc, -448.0f), 448.0f);
+                stt(q, qb + k * qs, v);
+            }
+            stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------- quant_cols_fp8 */
 /* E4M3 codes with ONE scale per column over all M rows: scale[c] = amax_r |x[r, c]| times 1/448
  * in f32 (1 for an all-zero column), y = clamp(x * (1/scale), +-448) rounded to nearest even. The

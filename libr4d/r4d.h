@@ -415,6 +415,17 @@ void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scr
                            long y, long inj, long h, long M, long n, long hc, long irow,
                            long hrow, long rank, long stream, long nblocks, long nthreads,
                            long drain, long acq, long pub, long gate, long gate_ctr);
+// The 4-rank exact one-shot of `y` [M][n] bf16, in place, with DeepSeek-V4.1's mhc_post -> mhc_collapse -> rmsnorm
+// (mhc_post_collapse_rmsnorm) as its epilogue: byte-identical to that all-reduce then that op (r4d_ds41_pcn.h). Buffers,
+// peer order, flag values, slots and block partition are r4d_ar_oneshot_4rank_exact's. ctr: M zeroed row counters.
+void r4d_ar_mhc_pcn_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                          long peer_flags0, long peer_flags1, long peer_flags2,
+                          long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                          long y, long M, long n, long hc, long h, long hrow, long post, long ptp, long comb,
+                          long cbp, long out, long orow, long pre, long pp, long pst, long xc, long xrow,
+                          long wgt, long wf32, long ynorm, long yrow, double eps, long ctr, long rank,
+                          long stream, long nblocks, long nthreads, long drain, long acq, long pub,
+                          long gate, long gate_ctr);
 // r4d_ar_hc_write_4rank with the MoE gather as its prologue, byte-identical to moe_gather, the
 // 4-rank exact all-reduce, then hc_write. Gather operands, `inv` and the grid rule are
 // r4d_ar_gather_hc_write's; buffers, peer order, flag values and slots are
@@ -460,7 +471,7 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
                                 long acq, long pub, long gate, long gate_ctr, long chain,
-                                long form = 0, long timeline = 0);   /* fn4 RSF: form 3 = XPUSH (r4d_ar_shards.h) */
+                                long form = 0, long timeline = 0);   /* ds41-int13 / fn4 RSF XPUSH: form 3 = R4D_AR8_FORM_XPUSH (r4d_ar_shards.h); fn4 timeline */
 // The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
 // same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
 // and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.
@@ -471,7 +482,22 @@ void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, lo
                                       long slot_stride16, long inp, long out, long n_elem,
                                       long rank, long stream, long nblocks, long nthreads,
                                       long drain, long acq, long pub, long gate, long gate_ctr,
-                                      long chain, long xpush = 0);
+                                      long chain, long xpush = 0);   /* fn4 (the Qwen line): xpush */
+// moe_gather_all_reduce's two-shot form (four ranks, exact wire, bf16; r4d_ar_twoshot_Nrank_exact.hip):
+// the MoE gather (r4d_ar_gather_hc_write_4rank's gather operands, words and arithmetic) as the
+// plain two-shot's phase-1 source, then its reduce and assemble on the same instance (flags, seq,
+// slots, block partition, fold). Byte-identical to moe_gather + the exact all-reduce, and to the
+// one-shot form. r4d_ar_gather_twoshot_ok: the call fits the form (a slot list of M <= 256 rows
+// and M * top_k <= 2048 slots in LDS, a word a rank, both regions of the longest shard in a slot).
+int  r4d_ar_gather_twoshot_ok(long M, long n, long top_k, long slot_stride16);
+void r4d_ar_gather_twoshot_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                 long y, long M, long n, long ye, long ew, long sorted, long sh,
+                                 long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
+                                 long top_k, long sig, long rank, long stream, long nblocks,
+                                 long nthreads, long drain, long acq, long pub, long gate,
+                                 long gate_ctr);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -500,13 +526,16 @@ void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long slot_stride_bytes, long inp, long out, long n_elem,
                               long dtype, long rank, long stream, long nblocks,
                               long nthreads, long drain, long acq, long pub);
-/* fn4 SP-hc (r4d_ar_sp_rows.hip): the four-rank two-shot's halves over whole-row shards, in place on `buf`
- * [n_rows][row]; `op` 0 the reduce-scatter (ti8), 1 the all-gather on the ti8 wire, 2 the all-gather raw. */
+/* fn4 SP-hc (r4d_ar_sp_rows.hip; the ds41 line's tp8 loop P20 uses it too): the four-rank two-shot's halves over
+ * whole-row shards, in place on `buf` [n_rows][row]; `op` 0 the reduce-scatter (ti8, lossy), 1 the all-gather on the ti8
+ * wire, 2 the all-gather raw, 3 the reduce-scatter raw (the exact all-reduce's fold: fp32 over the ranks in ascending
+ * order, one rounding). */
 void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
                           long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
                           long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
                           long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
-                          long xpush = 0);   /* fn4 RSF: the raw reduce-scatter's pushes interleaved over the peers */
+                          long xpush = 0,    /* fn4 RSF: the raw reduce-scatter's pushes interleaved over the peers */
+                          long tl = 0);      /* fn4 PF timeline (qwen/prefill): a block's stamps, R4D_AR_TL_WORDS a block */
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,
@@ -763,6 +792,9 @@ void r4d_hc_mix_ctr_release(void);
 int r4d_ar_lane_threads_set(int threads);
 /* fn4 RSF: the four-rank exact two-shot's first hop and SP's raw reduce-scatter pushes interleaved over the peers (0 / 1) */
 int r4d_ar_xpush_set(int on);
+/* fn4 PFF (qwen/prefill): the four-rank prefill collectives' cache maintenance form 0..7 (r4d_ar_entry.hip ar_fence);
+ * 8 = lever FAS (qfn-on-ds round 15): the drain-1 fence at every four-rank size */
+int r4d_ar_fence_set(int v);
 int r4d_kv_vic_set(int on);   /* fn4 kvs_vic: kv_resolve victims by compaction (1) or serially (0) */
 // fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
 // (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.

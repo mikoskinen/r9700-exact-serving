@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 
 namespace rad {
 
@@ -104,6 +105,11 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     max_seqs_ = cfg.max_seqs > 0 ? cfg.max_seqs : 1;
     max_ctx_  = cfg.max_ctx > 0 ? cfg.max_ctx : 0;
     max_tok_  = cfg.max_tok > 0 ? cfg.max_tok : 0;
+    win_steps_ = window_steps(cfg);
+    if (win_steps_ > 1)
+        RAD_INFO("KV manager: a window group's pool holds %lld steps' tokens beside the %lld windows "
+                 "(RADIANCE_PP_WIN_STEPS, %d lanes): a newcomer's chunks over the lanes from its keep floor",
+                 (long long)win_steps_, (long long)max_seqs_, cfg.pp_lanes_now());
 
     if (groups.empty()) {
         RAD_ERR("KV manager: no KV groups were declared; the architecture plugin declares at "
@@ -631,8 +637,8 @@ int KVManager::carve_into(Pool& kv_pool) {
         const int64_t used = pool_->used();
         const int rc = pool_->commit(0, used);
         if (rc < 0) {
-            RAD_ERR("KV pool: the carve reserved %s of address space and the card would not back "
-                    "it", humanb(used).c_str());
+            RAD_ERR("KV pool: the carve reserved %s of address space and the card would not back it: %s",
+                    humanb(used).c_str(), rad_dev_last_error());
             return rc;
         }
     }
@@ -1008,7 +1014,15 @@ bool KVManager::can_grow(uint64_t id, int64_t n_tokens) const {
         const auto& p = plans_[g];
         if (p.paged()) {
             const int64_t first = s->first_block_pos[g] / p.block_size;
-            const int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            /* A window recycles; ensure() and make_room cap the table at the window. Counting
+             * the whole prompt here refuses every long QSA chat (DS41 window pool is ~4800
+             * tokens) while can_ever_fit, which caps, still says yes — the admission gate then
+             * waits forever. */
+            if (p.kind == RAD_KV_WINDOW) {
+                if (s->win[g].set) want = window_table_len(p, s->win[g], n_tokens) - first;
+                else               want = std::min(want, window_seq_cap(p));
+            }
             int64_t need = want - (int64_t)s->blocks[g].size();
             if (need < 0) need = 0;
             /* ensure() takes one copy-on-write block for a partially filled block; include it
@@ -1393,7 +1407,22 @@ int64_t KVManager::window_seq_cap(const KVGroupPlan& p) const {
 }
 
 int64_t KVManager::window_pool_cap(const KVGroupPlan& p) const {
-    return max_seqs_ * (p.window_blocks + 1) + step_blocks(p);
+    return max_seqs_ * (p.window_blocks + 1) + win_steps_ * step_blocks(p);
+}
+
+int64_t KVManager::window_steps(const Config& cfg) {
+    const int n = cfg.pp_lanes_now();
+    if (n <= 1) return 1;
+    const char* v = std::getenv("RADIANCE_PP_WIN_STEPS");
+    if (!v || !*v) return 1;
+    char* end = nullptr;
+    const long long k = std::strtoll(v, &end, 10);
+    if (!end || *end || k < 1 || k > 2 * n - 1) {
+        RAD_WARN("RADIANCE_PP_WIN_STEPS=%s: not a count from 1 to %d (2 x %d lanes - 1): the window pool holds 1 "
+                 "step's tokens beside the windows", v, 2 * n - 1, n);
+        return 1;
+    }
+    return (int64_t)k;
 }
 
 int64_t KVManager::step_blocks(const KVGroupPlan& p) const {
@@ -1409,6 +1438,8 @@ int64_t KVManager::step_blocks(const KVGroupPlan& p) const {
  * the table is below a sliding floor to recycle; the ring's blocks are rewritten in place and
  * the table never moves (SeqWindow). */
 void KVManager::recycle_window(Seq* s, int64_t keep_from) {
+    /* tp8 S5: a piece of this prompt still in flight in another lane's step reads from here */
+    if (s->keep_floor >= 0 && keep_from > s->keep_floor) keep_from = s->keep_floor;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
         if (p.kind != RAD_KV_WINDOW || s->win[g].set) continue;
@@ -1426,6 +1457,10 @@ void KVManager::recycle_window(Seq* s, int64_t keep_from) {
     }
 }
 
+void KVManager::set_keep_floor(uint64_t id, int64_t pos) {
+    if (Seq* s = find(id)) s->keep_floor = pos < 0 ? -1 : pos;
+}
+
 void KVManager::trim_window(uint64_t id, int64_t keep_from) {
     Seq* s = find(id);
     if (!s || keep_from < 0) return;
@@ -1436,7 +1471,20 @@ void KVManager::trim_window(uint64_t id, int64_t keep_from) {
 int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
-    if (n_tokens <= s->n_tokens) return RAD_OK;
+    /* Below the sequence's length nothing grows -- but a window group that does not reach n_tokens yet: lever PSK-CR's
+     * cone replay (ds41-pskcr) adopts the cached groups up to its end and starts the sequence below it with no window
+     * held, and its chunks grow the window groups as any prefill's. Every other path keeps the window groups at the
+     * sequence's length (seed_window, adopt, ensure), so this changes nothing there. */
+    bool short_win = false;
+    if (n_tokens <= s->n_tokens) {
+        for (size_t g = 0; g < plans_.size() && !short_win; ++g) {
+            const auto& p = plans_[g];
+            if (p.kind != RAD_KV_WINDOW || s->win[g].set || !p.paged()) continue;
+            const int64_t first = s->first_block_pos[g] / p.block_size;
+            short_win = first + (int64_t)s->blocks[g].size() < ceil_div(n_tokens, p.block_size);
+        }
+        if (!short_win) return RAD_OK;
+    }
     if (keep_from < 0 || keep_from > s->n_tokens) keep_from = s->n_tokens;
 
     /* Pass 0: recycle what the window has slid past. It only frees, so it cannot fail, and the
@@ -1503,7 +1551,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
             grab_state((int32_t)g, &s->state[g]);
         }
     }
-    s->n_tokens = n_tokens;
+    if (n_tokens > s->n_tokens) s->n_tokens = n_tokens;   /* a window grown below the length leaves it */
     return RAD_OK;
 }
 
@@ -1758,6 +1806,72 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
         }
     }
     return RAD_OK;
+}
+
+bool KVManager::has_conv_state() const {
+    for (const auto& p : plans_) if (p.kind == RAD_KV_CONV && p.n_layers > 0) return true;
+    return false;
+}
+
+int KVManager::checkpoint_patch_conv(int32_t ck_slot, const void* ids, int64_t ctx, RadStream s) {
+    if (!ck_store_ || !ck_store_->in_use(ck_slot)) {
+        RAD_ERR("checkpoint patch of slot %d: the store does not hold that slot", (int)ck_slot);
+        return RAD_E_INVAL;
+    }
+    char* ck = (char*)checkpoint_ptr(ck_slot);
+    if (!ck || !ids || ctx <= 0) return RAD_E_INVAL;
+    /* the blob's walk (checkpoint_copy): every stateful group in plans_ order, n_layers rows of layer_bytes_per_state */
+    int64_t off = 0;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (!p.stateful()) continue;
+        const int64_t nbytes = p.layer_bytes_per_state();
+        if (p.kind == RAD_KV_CONV && p.n_layers > 0) {
+            if (nbytes < ctx * 4 || p.conv_slots <= 0 || nbytes % p.conv_slots != 0 || nbytes / p.conv_slots != 4) {
+                RAD_ERR("checkpoint patch of slot %d: CONV group %d rows of %lld bytes (%lld slots) do not hold %lld "
+                        "4-byte ids", (int)ck_slot, (int)g, (long long)nbytes, (long long)p.conv_slots, (long long)ctx);
+                return RAD_E_INVAL;
+            }
+            for (int64_t j = 0; j < p.n_layers; ++j) {
+                const int cs = rad_memcpy_async(ck + off + j * nbytes, ids, ctx * 4, s);
+                if (cs < 0) {
+                    RAD_ERR("checkpoint patch of slot %d: the device refused group %d layer row %lld: %s", (int)ck_slot,
+                            (int)g, (long long)j, rad_strerror(cs));
+                    return cs;
+                }
+            }
+        }
+        off += nbytes * p.n_layers;
+    }
+    return RAD_OK;
+}
+
+int64_t KVManager::state_rows_off(int32_t g) const {
+    int64_t off = 0;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const KVGroupPlan& p = plans_[i];
+        if (!p.stateful()) continue;
+        if ((int32_t)i == g) return off;
+        off += p.layer_bytes_per_state() * p.n_layers;
+    }
+    return -1;
+}
+
+int KVManager::stage_state_row(int32_t g, int32_t layer, int32_t slot, int32_t ck_slot, RadStream s) const {
+    if (!ck_store_ || !ck_store_->in_use(ck_slot) || window_ck_bytes_ > 0) {
+        RAD_ERR("lever TIP: checkpoint slot %d is not held in this rank's store, or the model's snapshots carry a window "
+                "section", (int)ck_slot);
+        return RAD_E_INVAL;
+    }
+    const KVGroupPlan* p = plan(g);
+    const int64_t off = state_rows_off(g);
+    char* ck = (char*)checkpoint_ptr(ck_slot);
+    if (!p || off < 0 || !ck || layer < 0 || layer >= p->n_layers) return RAD_E_INVAL;
+    const int64_t nbytes = p->layer_bytes_per_state();
+    if (off + (int64_t)(layer + 1) * nbytes > checkpoint_bytes_) return RAD_E_STATE;
+    const void* st = state_ptr(g, layer, slot);
+    if (!st) return RAD_E_STATE;
+    return rad_memcpy_async(ck + off + (int64_t)layer * nbytes, st, nbytes, s);
 }
 
 int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStream s,

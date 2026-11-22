@@ -317,6 +317,14 @@ public:
     int64_t window_pool_cap(const KVGroupPlan& p) const;
     /* ceil(max_tok / block): the blocks one step's tokens can fill. */
     int64_t step_blocks(const KVGroupPlan& p) const;
+    /* tp8 prefill P0: the steps' tokens a WINDOW group's pool holds beside the max_seqs windows (window_pool_cap: k x
+     * step_blocks). One machine and --pp-lanes 1: 1. A pipeline of N lanes holds up to 2N - 1 steps' rows of one prompt
+     * uncommitted -- N lanes' steps in flight and N - 1 inboxes with a lent chunk -- each from the keep floor, so the
+     * newcomer's chunks run back to back over the lanes only when the pool holds them (a lend the pool refuses is not
+     * made: the walk stops, never preempts). RADIANCE_PP_WIN_STEPS=k (1 .. 2N - 1, both nodes the same) sets it;
+     * default 1, today's pool. */
+    static int64_t window_steps(const Config& cfg);
+    int64_t win_steps() const { return win_steps_; }
 
     /* Recycles a committed chunk's window blocks. ensure() keeps a chunk's blocks beside the
      * window and only the next ensure() recycles them, so a prefill waiting for its next chunk
@@ -326,6 +334,10 @@ public:
      * A sequence with a runtime window retains its reference and rewrites its ring in place, so
      * nothing below the floor may be recycled and this is a no-op for it. */
     void trim_window(uint64_t seq, int64_t keep_from);
+    /* tp8 S5: a two-node pipeline's lanes run pieces of one prompt in several steps at once. While
+     * any is in flight its first query `pos` reads keys down to pos - window + 1, so no recycle of
+     * this sequence's window groups (ensure, trim_window) may pass `pos`. -1 lifts it. */
+    void set_keep_floor(uint64_t seq, int64_t pos);
 
     /* ---------------- the runtime window (R-SWA; see SeqWindow) ---------------- */
     /* Mark a WINDOW group as carrying per-sequence runtime windows of `window_tokens`. Call before
@@ -602,6 +614,22 @@ public:
                         const std::vector<int32_t>* win = nullptr);
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                            const std::vector<int32_t>* win = nullptr);
+    /* Lever TI (ds41-pf2): after checkpoint_save of a snapshot whose position lies inside the step that wrote the state,
+     * overwrite each CONV group's window in slot `ck_slot` -- the first `ctx` 4-byte ids of every layer's row, the
+     * layout a prefill leaves (ngram_ids / ple_conv: the last conv_width - 1 ids at offset zero) -- with the `ctx` ids at
+     * `ids` (device: the mapped ids of the snapshot's last ctx rows), enqueued on `s` behind the save. The rest of each
+     * row is the save's (a prefill writes none of it). RAD_E_INVAL on a bad slot, a CONV group whose rows hold fewer
+     * than `ctx` ids or are not 4-byte ids; RAD_OK with no CONV group. */
+    int checkpoint_patch_conv(int32_t ck_slot, const void* ids, int64_t ctx, RadStream s);
+    bool has_conv_state() const;
+    /* qfn-on-ds lever TIP (Qwen loop round 21): a snapshot written row by row from inside the step that writes the state.
+     * A checkpoint slot's state section is every stateful group in plans_ order, n_layers rows of layer_bytes_per_state
+     * (checkpoint_copy's walk); state_rows_off is a group's offset in it (-1: not stateful). stage_state_row copies layer
+     * `layer` (the group's own layer index) of state slot `slot` into that row of checkpoint slot `ck` on `s` (the store
+     * is pinned host memory) -- RAD_E_INVAL on a slot the store does not hold or a model whose snapshots carry a window
+     * section (none is staged). */
+    int64_t state_rows_off(int32_t g) const;
+    int stage_state_row(int32_t g, int32_t layer, int32_t slot, int32_t ck, RadStream s) const;
 
     /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
      * A WINDOW group keeps only the blocks its window can still read, so the prefix cache's block
@@ -664,6 +692,10 @@ private:
          * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
          * zero; kNoDirty is unchanged. Mutable because take_table_changes() clears it. */
         mutable std::vector<int64_t> dirty_from;
+        /* tp8 S5 (set_keep_floor): the lowest position a query still in flight elsewhere reads from
+         * (a piece of the prompt in another lane's step); a window group keeps what it reads. -1:
+         * none, always on one lane. */
+        int64_t keep_floor = -1;
         /* fn4 preempt_keep: preempted with its states and partial blocks kept, its whole blocks given to the cache;
          * kept_whole the tokens they covered */
         bool     kept = false;
@@ -707,6 +739,7 @@ private:
     int64_t   max_seqs_ = 0;
     int64_t   max_ctx_ = 0;
     int64_t   max_tok_ = 0;      /* --max-num-batched-tokens; the buffer floor is one of these */
+    int64_t   win_steps_ = 1;    /* tp8 prefill P0: window_steps(cfg) */
     bool    snap_drafter_ = false;   /* set_drafter_window_snapshot */
     /* plan_groups() computes these; carve() spends against them and ceiling() reports on them. */
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */

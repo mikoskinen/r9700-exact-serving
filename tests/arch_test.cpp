@@ -852,6 +852,91 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
     CHECK(lint.empty());
 }
 
+/* tp8 loop D42 (SDF, rad_block_moe_fp8.h kMoeSdfBit): bit 2 of MoeFP8::shexp_lane's word moves the shared arm's down
+ * ahead of the routed down at a pass of T <= kMoeShexpLaneRows and changes nothing else -- the same issues (op, n,
+ * lane, every operand) with one block moved, so the same kernels over the same operands (the bytes cannot move); at a
+ * wider pass and with the bit clear the issue list is today's. Control: the block really moved (the lists differ). */
+TEST(sdf_moves_only_the_shared_down_ahead_of_the_routed_down) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    RadBuildCtx ctx = build_ctx();
+    RadBuilder b;
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_fp8::probe(&meta, &probe));
+    const int rc = hyv3_fp8::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    auto& moe = hyv3_fp8::models[0].layers[1].moe;
+    REQUIRE(moe.op_sgate != 0 && moe.op_dn != 0 && moe.sh_down.op != 0);
+    static std::atomic<int> word{0};
+    const std::atomic<int>* const keep = moe.shexp_lane;
+    moe.shexp_lane = &word;
+    auto run = [&](int v, RadBatch batch) {
+        word.store(v);
+        RadCtx c{};
+        c.b = &b;
+        c.batch = &batch;
+        hyv3_fp8::step(&c, &batch);
+        return c.issues;
+    };
+    auto same = [](const RecIssue& x, const RecIssue& y) {
+        if (x.op != y.op || x.n != y.n || x.lane != y.lane || x.opd.size() != y.opd.size()) return false;
+        for (size_t i = 0; i < x.opd.size(); ++i) {
+            const RadOperand &p = x.opd[i], &q = y.opd[i];
+            if (p.kind != q.kind || p.dtype != q.dtype || p.handle != q.handle || p.raw != q.raw || p.offset != q.offset ||
+                p.rows != q.rows || p.cols != q.cols)
+                return false;
+        }
+        return true;
+    };
+    auto same_list = [&](const std::vector<RecIssue>& x, const std::vector<RecIssue>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); ++i)
+            if (!same(x[i], y[i])) return false;
+        return true;
+    };
+    auto first_of = [](const std::vector<RecIssue>& v, rad_op h) {
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].op == h) return (int)i;
+        return -1;
+    };
+    const rad_op gather = moe.op_gar ? moe.op_gar : moe.op_gather;
+    for (const RadBatch& batch : { decode_batch(), prefill_batch() }) {   /* 4 and 64 rows: both in the band */
+        const std::vector<RecIssue> a = run(0, batch), b4 = run(4, batch), a2 = run(2, batch), b6 = run(6, batch);
+        CHECK(!a.empty());
+        /* today's order: ... routed down, the shared down's launches, the gather */
+        const int dn = first_of(a, moe.op_dn), g = first_of(a, gather), sd = first_of(a, moe.sh_down.op);
+        CHECK(dn >= 0 && g > dn && sd > dn && sd < g);
+        if (!(dn >= 0 && g > dn && sd > dn && sd < g)) continue;
+        /* the expected list: the block (dn, g) moved in front of the routed down */
+        std::vector<RecIssue> want(a.begin(), a.begin() + dn);
+        want.insert(want.end(), a.begin() + dn + 1, a.begin() + g);
+        want.push_back(a[(size_t)dn]);
+        want.insert(want.end(), a.begin() + g, a.end());
+        CHECK(same_list(b4, want));
+        CHECK(!same_list(b4, a));   /* control: the bit did move it */
+        const int sd4 = first_of(b4, moe.sh_down.op), dn4 = first_of(b4, moe.op_dn);
+        CHECK(sd4 >= 0 && dn4 > sd4);
+        /* the lane form's own bits keep their meaning: 2 (F4P, prefill-height only) at these heights = 0, and 6 = 4 */
+        CHECK(same_list(a2, a));
+        CHECK(same_list(b6, b4));
+    }
+    /* a pass above the band (128 rows): the bit changes nothing */
+    RadBatch wide = prefill_batch();
+    wide.n_tok = 128;
+    wide.n_seq = 2;
+    wide.max_q_len = 64;
+    wide.max_ctx_len = 64;
+    static const int32_t kWideOut[] = { 63, 127 };
+    wide.out_ids = kWideOut;
+    {
+        const std::vector<RecIssue> a = run(0, wide), b4 = run(4, wide);
+        CHECK(!a.empty());
+        CHECK(same_list(b4, a));
+    }
+    word.store(0);
+    moe.shexp_lane = keep;
+}
+
 TEST(hyv3_fp8_tensor_parallel_partitions_experts_and_shared_width) {
     RadModelMeta meta = hyv3_fp8_test_meta();
     for (int rank = 0; rank < 2; ++rank) {
@@ -2742,6 +2827,7 @@ TEST(exl3_experts_issue_each_op_at_its_schema_count_split_and_fused) {
     src.cfg.rows = ROWS;
     REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
     REQUIRE_EQ(src.cfg.expert_exl3, 1);
+    src.cfg.exl3_v12 = 1;   /* qfn-on-ds: the Qwen line's EXL3 form (qwen4exp sets it after probe) */
     MoeFP8::Wire w{};
     auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
         return decl_b(&b, name, dt, { rows, cols });
@@ -2806,6 +2892,117 @@ TEST(exl3_experts_issue_each_op_at_its_schema_count_split_and_fused) {
             for (const auto& issue : ctx.issues) CHECK(issue.op != moe.op_dn || !fused);
         }
     fn4_exl3_gd_flag().store(saved);
+}
+
+/* qfn-on-ds lever DRZ-K (Qwen loop round 18): RADIANCE_FN4_DRZ_KEEP names the layers whose EXL3 ops are declared with
+ * drz_keep 1 (exl3r4d then keeps their dead-row stores under exl3_drz 1). A listed layer's gate_up, down and fused chain
+ * carry it; an unlisted layer, the variable unset, and "prot" on a layer without a protected expert declare exactly
+ * today's parameters (the negative controls). */
+TEST(flashnext_drz_keep_declares_drz_keep_on_the_named_layers_only) {
+    using namespace rad::arch;
+    RadEncoding gu{}, dn{};
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 1, &gu), RAD_OK);
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 0, &dn), RAD_OK);
+    const int64_t D = 256, F = 128, NE = 8, TK = 2, ROWS = 32;
+    const char* saved_env = std::getenv("RADIANCE_FN4_DRZ_KEEP");
+    const std::string saved = saved_env ? saved_env : "";
+    /* the EXL3 ops' parameter lists of layer 3 declared under `env` (nullptr: unset): {op -> its drz_keep, -1 absent} */
+    auto declare_with = [&](const char* env, std::vector<std::pair<std::string, long long>>* out, size_t* n_params) {
+        if (env) setenv("RADIANCE_FN4_DRZ_KEEP", env, 1); else unsetenv("RADIANCE_FN4_DRZ_KEEP");
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", gu }, { "ffn_down_exps", dn } };
+        Names nm("");
+        Geom g{};
+        g.n_embd = D;
+        g.max_tok = ROWS;
+        g.world = 1;
+        g.rank = 0;
+        MoeFP8::Src src{};
+        src.router = "mlp.gate.weight";
+        src.experts = "mlp.experts";
+        src.cfg.n_expert = src.cfg.n_expert_all = NE;
+        src.cfg.top_k = TK;
+        src.cfg.n_ff_exp = F;
+        src.cfg.rows = ROWS;
+        REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+        src.cfg.exl3_v12 = 1;
+        MoeFP8::Wire w{};
+        auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
+            return decl_b(&b, name, dt, { rows, cols });
+        };
+        w.h.x = buf("h", RAD_BF16, ROWS, D);
+        REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", D), RAD_OK);
+        w.logits = buf("logits", RAD_BF16, ROWS, NE);
+        w.ids = buf("ids", RAD_I32, ROWS, TK);
+        w.ew = buf("ew", RAD_BF16, ROWS, TK);
+        w.eoff = decl_b(&b, "offset", RAD_I32, { NE + 1 });
+        w.ecnt = decl_b(&b, "count", RAD_I32, { NE });
+        w.sorted = decl_b(&b, "sorted", RAD_I32, { ROWS * TK });
+        w.egu = buf("gate_up", RAD_BF16, ROWS * TK, 2 * F);
+        w.eff.x = buf("ff", RAD_BF16, ROWS * TK, F);
+        REQUIRE_EQ(w.eff.declare_qs(&b, nm, g, "ff", F, ROWS * TK), RAD_OK);
+        w.edn = buf("down", RAD_BF16, ROWS * TK, D);
+        MoeFP8 moe;
+        REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+        REQUIRE(moe.op_x3gd != 0u);
+        out->clear();
+        *n_params = 0;
+        for (const RecOp& op : b.ops) {
+            if (op.op.rfind("moe_exl3_", 0) != 0) continue;
+            long long v = -1;
+            for (const RecParam& q : op.p) if (q.key == "drz_keep") v = q.ival;
+            out->push_back({ op.op, v });
+            *n_params += op.p.size();
+        }
+    };
+    std::vector<std::pair<std::string, long long>> unset_ops, keep_ops, other_ops, prot_ops;
+    size_t n_unset = 0, n_keep = 0, n_other = 0, n_prot = 0;
+    declare_with(nullptr, &unset_ops, &n_unset);
+    declare_with("34,3,44", &keep_ops, &n_keep);
+    declare_with("34,44,46,47", &other_ops, &n_other);
+    declare_with("prot", &prot_ops, &n_prot);   /* the fake container keeps no bf16 expert */
+    if (saved_env) setenv("RADIANCE_FN4_DRZ_KEEP", saved.c_str(), 1); else unsetenv("RADIANCE_FN4_DRZ_KEEP");
+    REQUIRE_EQ(unset_ops.size(), (size_t)3);   /* gate_up, down, the fused chain */
+    REQUIRE_EQ(keep_ops.size(), unset_ops.size());
+    for (size_t i = 0; i < unset_ops.size(); ++i) {
+        CHECK_EQ(unset_ops[i].second, -1LL);
+        CHECK_EQ(other_ops[i].second, -1LL);
+        CHECK_EQ(prot_ops[i].second, -1LL);
+        CHECK(keep_ops[i].first == unset_ops[i].first);
+        CHECK_EQ(keep_ops[i].second, 1LL);
+    }
+    /* the named layer adds exactly one parameter an op; every control declares today's lists */
+    CHECK_EQ(n_keep, n_unset + unset_ops.size());
+    CHECK_EQ(n_other, n_unset);
+    CHECK_EQ(n_prot, n_unset);
+}
+
+/* F53 (Qwen loop round 18): a resolved geometry carries M LAST (the band sets it after the declared keys), so drz_keep
+ * declared before it must not take one of exl3_gd_params' fixed nine / five places: both halves of the fused chain still
+ * parse, with the same parameters as without it (the start refused 'shape this kernel does not serve' when it did). */
+TEST(exl3_gd_params_leave_drz_keep_out_of_the_halves_shape_parameters) {
+    auto I = [](const char* k, long long v) { RadParam q{}; q.key = k; q.kind = RAD_P_INT; q.ival = v; return q; };
+    auto S = [](const char* k, const char* v) { RadParam q{}; q.key = k; q.kind = RAD_P_STR; q.sval = v; return q; };
+    const RadParam all[10] = { I("N", 1280), I("K", 2560), I("n_expert", 128), I("top_k", 10), S("dtype", "exl3k4"),
+                               S("codebook", "mul1"), I("N_odd", 1280), I("K_odd", 2560), I("drz_keep", 1), I("M", 16) };
+    int ng0 = 0, nd0 = 0;
+    for (int with = 0; with <= 1; ++with) {
+        RadParam q[10];
+        int n = 0;
+        for (const RadParam& x : all) if (with || std::strcmp(x.key, "drz_keep") != 0) q[n++] = x;
+        RadParam pg[15], pd[14];
+        int ng = 0, nd = 0;
+        exl3_gd_params(q, n, pg, &ng, pd, &nd);
+        Exl3Geom gg{}, gd{};
+        CHECK_EQ(exl3_geom_parse(pg, ng, EXL3_GATE_UP, exl3_geom_two_classes(pg, ng), &gg), RAD_OK);
+        CHECK_EQ(exl3_geom_parse(pd, nd, EXL3_DOWN, exl3_geom_two_classes(pd, nd), &gd), RAD_OK);
+        CHECK_EQ((long long)gg.M, 16LL);
+        CHECK_EQ((long long)gd.M, 16LL);
+        CHECK(rad_param_find(pg, ng, "drz_keep") == nullptr);
+        CHECK(rad_param_find(pd, nd, "drz_keep") == nullptr);
+        if (!with) { ng0 = ng; nd0 = nd; }
+        else { CHECK_EQ(ng, ng0); CHECK_EQ(nd, nd0); }
+    }
 }
 
 /* A quantised container may keep one linear as the checkpoint holds it. Flash-Next's recipe leaves
@@ -12661,6 +12858,752 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
             CHECK_EQ(ar_overlap, ar - 1);
             CHECK(!c.joins.empty());
         }
+}
+
+/* qfn-on-ds lever P2S (Qwen loop round 17): at four ranks under SP-hc in its hc_sp 2 order, moe_pair puts two pipelined pieces'
+ * routed experts through ONE pass. An 8,192-row step of one sequence = four 2,048-row pieces: at 0 and 3 (the pair ORDER, each
+ * piece's own pass) every routed GEMM and sort is a piece tall; at 1 every one is two pieces tall (two pairs a layer, half the
+ * issues); at 4 only the first pair is joint (pieces 2 and 3 alone). Every mode issues the same gathers (a piece each) and the
+ * same reduce-scatters, every operand fits its buffer (CHECK_PASSES), and no step fails. 0 is the control. The published
+ * start's RADIANCE_FN4_GATHER_INV=1 (the joint pass needs the inverse sort and gather: MoeFP8::pair_ok). */
+TEST(flashnext_p2s_pairs_pieces_routed_experts_under_hc_sp_2) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);   /* the published start's: the joint pass gathers through the inverse table */
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    int64_t g0 = -1, rs0 = -1, ga0 = -1;
+    for (int mode : { 0, 3, 1, 4 })
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            CHECK(m.pipe_on);
+            CHECK(m.sp_on);
+            CHECK_EQ(m.moecfg.rows, 4096);
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(mode);
+            const auto pf = kit(b, {}, { 8192 }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int64_t gemm1 = 0, gemm2 = 0, gemm_other = 0, sort2 = 0, rs = 0, gather = 0, gather_wide = 0;
+            int64_t sort2_hi = 0, inv_past = 0;   /* the second pair's sort reads ids rows [4096, 8192); no gather's slot
+                                                   * table starts past its pass's scratch (2 x 2048 x top_k entries) */
+            const int64_t k = m.moecfg.top_k;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const bool routed = o->op.rfind("moe_gemm", 0) == 0 || o->op.rfind("moe_exl3", 0) == 0;
+                if (routed && o->op.find("shexp") == std::string::npos) {
+                    if (i.n == 2048) ++gemm1; else if (i.n == 4096) ++gemm2; else ++gemm_other;
+                }
+                if (o->op.rfind("moe_scatter", 0) == 0 && i.n == 4096) {
+                    ++sort2;
+                    sort2_hi += !i.opd.empty() && i.opd[0].offset == 4096 * k;
+                }
+                if (o->op == "moe_gather_inv" && i.opd.size() > 2 && i.opd[2].offset + 2048 * k > 2 * 2048 * k) ++inv_past;
+                if (o->op == "reduce_scatter_rows") ++rs;
+                if (o->op.rfind("moe_gather", 0) == 0) { ++gather; gather_wide += i.n != 2048; }
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK_EQ(gemm_other, 0);
+            CHECK_EQ(gather_wide, 0);
+            if (mode == 0) {
+                CHECK(gemm1 > 0);
+                CHECK_EQ(gemm2, 0);
+                CHECK_EQ(sort2, 0);
+                g0 = gemm1, rs0 = rs, ga0 = gather;
+                continue;
+            }
+            CHECK_EQ(rs, rs0);
+            CHECK_EQ(gather, ga0);
+            if (mode == 3) {            /* the order alone: today's passes */
+                CHECK_EQ(gemm1, g0);
+                CHECK_EQ(gemm2, 0);
+                CHECK_EQ(sort2, 0);
+            } else if (mode == 1) {     /* two pairs a layer: the second at rows [4096, 8192) */
+                CHECK_EQ(gemm1, 0);
+                CHECK_EQ(gemm2 * 2, g0);
+                CHECK(sort2 > 0);
+                CHECK_EQ(sort2_hi * 2, sort2);
+            } else {                    /* the first pair joint, pieces 2 and 3 alone */
+                CHECK_EQ(gemm2 * 4, g0);
+                CHECK_EQ(gemm1 * 2, g0);
+                CHECK(sort2 > 0);
+                CHECK_EQ(sort2_hi, 0);
+            }
+            CHECK_EQ(inv_past, 0);
+        }
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
+/* qfn-on-ds lever PSP (Qwen loop round 19): sp_route bit 512 lets a pipelined step's PARTIAL last piece take SP, so P2S pairs it
+ * with the full piece before it. A 2,560-row step of one sequence = a 2,048-row piece + a 512-row partial one, at moe_pair 1
+ * under hc_sp 2: at sp_route 0 (control) the partial piece keeps today's whole forms (two routed passes, 2,048 + 512 rows; no
+ * read pinned to 512 rows); at 512 one joint routed pass of 2,560 rows, more reduce-scatters (the partial piece's own), and
+ * its connection reads through the SP-serial twin pinned to the piece's tiles (kc_rows 512: the K split reading it whole
+ * gives). Every operand fits its buffer and no step fails at both. RADIANCE_FN4_SPSERIAL=1 declares the twins (BEST's start);
+ * without them the bit changes nothing (third arm). */
+TEST(flashnext_psp_pairs_a_partial_last_piece_under_hc_sp_2) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    int64_t rs0 = -1, g0 = -1;
+    for (int arm : { 0, 1, 2 }) {   /* 0: sp_route 0; 1: sp_route 512; 2: 512 without the SP-serial twins */
+        if (arm == 2) unsetenv("RADIANCE_FN4_SPSERIAL"); else setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            CHECK(m.pipe_on);
+            CHECK(m.sp_on);
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm == 0 ? 0 : 512);
+            const auto pf = kit(b, {}, { 2560 }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int64_t g2048 = 0, g512 = 0, g2560 = 0, g_other = 0, rs = 0, kc512 = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const bool routed = o->op.rfind("moe_gemm", 0) == 0 || o->op.rfind("moe_exl3", 0) == 0;
+                if (routed && o->op.find("shexp") == std::string::npos) {
+                    if (i.n == 2048) ++g2048; else if (i.n == 512) ++g512; else if (i.n == 2560) ++g2560; else ++g_other;
+                }
+                if (o->op == "reduce_scatter_rows") ++rs;
+                if (o->op == "hc_read")
+                    for (const RecParam& q : o->p) if (q.key == "kc_rows" && q.ival == 512) ++kc512;
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK_EQ(g_other, 0);
+            if (arm != 1) {             /* today's forms: two routed passes a layer, no read pinned to the partial piece */
+                CHECK(g2048 > 0);
+                CHECK_EQ(g512, g2048);
+                CHECK_EQ(g2560, 0);
+                CHECK_EQ(kc512, 0);
+                if (arm == 0) { rs0 = rs; g0 = g2048; } else { CHECK_EQ(rs, rs0); CHECK_EQ(g2048, g0); }
+            } else {                    /* PSP: one joint pass a layer, the partial piece's reduce-scatters, its pinned reads */
+                CHECK_EQ(g2048, 0);
+                CHECK_EQ(g512, 0);
+                CHECK_EQ(g2560, g0);
+                CHECK(rs > rs0);
+                CHECK(kc512 > 0);
+            }
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
+/* The same lever at an odd piece count: a 5,120-row step = 2,048 + 2,048 + a 1,024-row partial piece. Control: the step leaves the
+ * hc_sp 2 order (a partial piece), no joint pass (P2S takes even counts only), three routed passes a layer. PSP: the pair (0, 1)
+ * in one 4,096-row pass and the partial piece single in the SP order, its reads pinned to 1,024 rows. */
+TEST(flashnext_psp_pairs_the_full_pieces_of_an_odd_step_and_keeps_the_last_single) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    int64_t rs0 = -1, g0 = -1;
+    for (int arm : { 0, 1 })
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm ? 512 : 0);
+            const auto pf = kit(b, {}, { 5120 }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int64_t g2048 = 0, g1024 = 0, g4096 = 0, g_other = 0, rs = 0, kc1024 = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const bool routed = o->op.rfind("moe_gemm", 0) == 0 || o->op.rfind("moe_exl3", 0) == 0;
+                if (routed && o->op.find("shexp") == std::string::npos) {
+                    if (i.n == 2048) ++g2048; else if (i.n == 1024) ++g1024; else if (i.n == 4096) ++g4096; else ++g_other;
+                }
+                if (o->op == "reduce_scatter_rows") ++rs;
+                if (o->op == "hc_read")
+                    for (const RecParam& q : o->p) if (q.key == "kc_rows" && q.ival == 1024) ++kc1024;
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK_EQ(g_other, 0);
+            if (!arm) {
+                CHECK(g2048 > 0);
+                CHECK_EQ(g2048, 2 * g1024);
+                CHECK_EQ(g4096, 0);
+                CHECK_EQ(kc1024, 0);
+                rs0 = rs; g0 = g1024;
+            } else {
+                CHECK_EQ(g2048, 0);
+                CHECK_EQ(g4096, g0);
+                CHECK_EQ(g1024, g0);
+                CHECK(rs > rs0);
+                CHECK(kc1024 > 0);
+            }
+        }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
+/* qfn-on-ds lever TIP (Qwen loop round 21): a prompt's tail snapshot at the start of the step's LAST PIECE, taken inside the
+ * step (rad_tip_set names the row). Every state op of the step -- each delta-net layer's convolution, solve and scan, the
+ * PLE's ids and convolution -- runs [0, row) and [row, T) in two launches, and each of its state rows is staged exactly once
+ * BETWEEN them (the issue before the stage call is the first launch's last op at `row` rows; the next of that op kind runs
+ * T - row rows); every other issue is the control's (row 0). At 2,560 rows (two pieces) the delta net takes its piece path
+ * (staged after piece 0's scan), at 5,120 (three pieces) the split. Negative control: a row that is not a piece start fails
+ * the step; the hooks refuse without RADIANCE_FN4_TIP's declare (tip_free -1 on a model with no pipelined step: not here). */
+namespace tipt {
+struct St { int group, layer; size_t at; };
+std::vector<St> st;
+int cb(void*, int g, int l, void* s) { st.push_back({ g, l, ((RadCtx*)s)->issues.size() }); return 0; }
+}  // namespace tipt
+TEST(flashnext_tip_stages_every_state_row_between_its_ops_two_launches) {
+    setenv("RADIANCE_FN4_TIP", "1", 1);
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int64_t T : { 2560, 5120 }) {
+        const int64_t row = (T - 1) / 2048 * 2048;
+        std::map<std::pair<std::string, int64_t>, int64_t> ctl;
+        for (int arm : { 0, 1, 2 }) {   /* 0: no row; 1: the last piece's start; 2: a row inside a piece (refused) */
+            const int rank = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.pipe_on);
+            int fg[8];
+            const int nf = qwen4exp_fp8::tip_free(rank, fg, 8);
+            CHECK(nf >= 0);
+            if (m.qsacfg.kv_tail) { CHECK_EQ(nf, 1); CHECK_EQ(fg[0], (int)m.qsacfg.kv_tail); }
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(512);
+            tipt::st.clear();
+            if (arm) CHECK_EQ(qwen4exp_fp8::tip_set(rank, arm == 1 ? row : row + 1000, &tipt::cb, nullptr), 1);
+            const auto pf = kit(b, {}, { (int)T }, 8192);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            CHECK_EQ(qwen4exp_fp8::tip_set(rank, 0, nullptr, nullptr), 1);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            const RadCtx& c = *v[0];
+            if (arm == 2) {                                   /* the negative control */
+                CHECK(!c.step_fail.empty());
+                CHECK(c.step_fail.find("lever TIP") != std::string::npos);
+                CHECK(tipt::st.empty());
+                continue;
+            }
+            CHECK_PASSES(b, v);
+            CHECK(c.step_fail.empty());
+            int64_t n_gdn = 0;
+            for (const auto& l : m.layers) n_gdn += l.full ? 0 : 1;
+            REQUIRE(n_gdn > 0);
+            auto opname = [&](size_t i) { const RecOp* o = b.op_of(c.issues[i].op); return o ? o->op : std::string("?"); };
+            static const char* kState[] = { "gdn_conv_prep", "gdn_kkt_solve", "gdn_chunk_scan", "ngram_ids", "ple_conv" };
+            auto state_op = [&](const std::string& o) { for (const char* k : kState) if (o == k) return true; return false; };
+            std::map<std::pair<std::string, int64_t>, int64_t> other;
+            int64_t at_row = 0, at_rest = 0;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const std::string o = opname(i);
+                if (state_op(o)) { at_row += c.issues[i].n == row; at_rest += c.issues[i].n == T - row; continue; }
+                ++other[{ o, c.issues[i].n }];
+            }
+            if (arm == 0) {
+                CHECK(tipt::st.empty());
+                ctl = other;
+                continue;
+            }
+            CHECK(other == ctl);                               /* nothing but the state ops changed */
+            /* every delta-net layer's state and window, the PLE's two windows: once each */
+            const int64_t want = 2 * n_gdn + (m.ple_layer >= 0 ? 2 : 0);
+            CHECK_EQ((int64_t)tipt::st.size(), want);
+            std::map<std::pair<int, int>, int> seen;
+            for (const tipt::St& s : tipt::st) {
+                ++seen[{ s.group, s.layer }];
+                REQUIRE(s.at > 0 && s.at < c.issues.size());
+                const std::string before = opname(s.at - 1);
+                const bool gdn = s.group == (int)m.kv_state || s.group == (int)m.kv_conv;
+                if (gdn) CHECK_EQ(before, std::string("gdn_chunk_scan"));
+                else CHECK(before == "ngram_ids" || before == "ple_conv");
+                CHECK_EQ(c.issues[s.at - 1].n, row);           /* the first launch, [0, row) */
+                size_t j = s.at;
+                while (j < c.issues.size() && opname(j) != (gdn ? std::string("gdn_conv_prep") : before)) ++j;
+                REQUIRE(j < c.issues.size());
+                CHECK_EQ(c.issues[j].n, T - row);              /* the next of its kind: the second launch, [row, T) */
+            }
+            for (const auto& kv : seen) CHECK_EQ(kv.second, 1);
+            CHECK(at_row >= 3 * n_gdn);
+            CHECK(at_rest >= 3 * n_gdn);
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+    unsetenv("RADIANCE_FN4_TIP");
+}
+
+/* qfn-on-ds lever TIF (Qwen loop round 23, sched_tail_inner 3): lever TIP's inside snapshot at a 64-aligned row INSIDE the step's
+ * last piece (lever G's 256-grid tail), not only at a piece start. A two-piece step (2,048 + 512) splits piece 1's delta-net
+ * state ops at the row (the piece path: conv / solve / scan over [2,048, row) then [row, T), the rows staged between them); a
+ * three-piece step (2,048 + 2,048 + 1,024) splits its whole-T launches at the row as TIP does; the PLE's windows split at the
+ * row. Every other issue is the no-row control's. Negative controls: a row inside the last piece off the 64 grid and a row
+ * inside an earlier piece fail the step with the lever's reason and stage nothing. */
+TEST(flashnext_tif_stages_a_row_inside_the_last_piece) {
+    setenv("RADIANCE_FN4_TIP", "1", 1);
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int64_t T : { 2560, 5120 }) {
+        const int64_t L = (T - 1) / 2048 * 2048, row = L + 256;
+        std::map<std::pair<std::string, int64_t>, int64_t> ctl;
+        for (int arm : { 0, 1, 2, 3 }) {   /* 0: no row; 1: the TIF row; 2: off the 64 grid (refused); 3: in an earlier piece (refused) */
+            const int rank = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.pipe_on);
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(512 | 8192);
+            tipt::st.clear();
+            const int64_t r = arm == 1 ? row : arm == 2 ? row + 32 : 1024;
+            if (arm) CHECK_EQ(qwen4exp_fp8::tip_set(rank, r, &tipt::cb, nullptr), 1);
+            const auto pf = kit(b, {}, { (int)T }, 8192);
+            pf->b.positions_h = pf->pos.data();
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            CHECK_EQ(qwen4exp_fp8::tip_set(rank, 0, nullptr, nullptr), 1);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            const RadCtx& c = *v[0];
+            if (arm >= 2) {                                   /* the negative controls */
+                CHECK(!c.step_fail.empty());
+                CHECK(c.step_fail.find("lever TIP") != std::string::npos);
+                CHECK(tipt::st.empty());
+                continue;
+            }
+            CHECK_PASSES(b, v);
+            CHECK(c.step_fail.empty());
+            int64_t n_gdn = 0;
+            for (const auto& l : m.layers) n_gdn += l.full ? 0 : 1;
+            REQUIRE(n_gdn > 0);
+            auto opname = [&](size_t i) { const RecOp* o = b.op_of(c.issues[i].op); return o ? o->op : std::string("?"); };
+            static const char* kState[] = { "gdn_conv_prep", "gdn_kkt_solve", "gdn_chunk_scan", "ngram_ids", "ple_conv" };
+            auto state_op = [&](const std::string& o) { for (const char* k : kState) if (o == k) return true; return false; };
+            std::map<std::pair<std::string, int64_t>, int64_t> other;
+            int64_t convs = 0;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const std::string o = opname(i);
+                if (o == "gdn_conv_prep") ++convs;
+                if (state_op(o)) continue;
+                ++other[{ o, c.issues[i].n }];
+            }
+            const bool two = T <= 4096;                        /* the two-piece path: piece 0, then piece 1 (split under TIF) */
+            if (arm == 0) {
+                CHECK(tipt::st.empty());
+                CHECK_EQ(convs, (two ? 2 : 1) * n_gdn);
+                ctl = other;
+                continue;
+            }
+            CHECK(other == ctl);                               /* nothing but the state ops changed */
+            CHECK_EQ(convs, (two ? 3 : 2) * n_gdn);            /* one more launch a layer: the split at the row */
+            const int64_t want = 2 * n_gdn + (m.ple_layer >= 0 ? 2 : 0);
+            CHECK_EQ((int64_t)tipt::st.size(), want);
+            std::map<std::pair<int, int>, int> seen;
+            for (const tipt::St& s2 : tipt::st) {
+                ++seen[{ s2.group, s2.layer }];
+                REQUIRE(s2.at > 0 && s2.at < c.issues.size());
+                const std::string before = opname(s2.at - 1);
+                const bool gdn = s2.group == (int)m.kv_state || s2.group == (int)m.kv_conv;
+                if (gdn) {
+                    CHECK_EQ(before, std::string("gdn_chunk_scan"));
+                    CHECK_EQ(c.issues[s2.at - 1].n, two ? row - 2048 : row);   /* [R, row) on the piece path, [0, row) whole */
+                } else {
+                    CHECK(before == "ngram_ids" || before == "ple_conv");
+                    CHECK_EQ(c.issues[s2.at - 1].n, row);
+                }
+                size_t j = s2.at;
+                while (j < c.issues.size() && opname(j) != (gdn ? std::string("gdn_conv_prep") : before)) ++j;
+                REQUIRE(j < c.issues.size());
+                CHECK_EQ(c.issues[j].n, T - row);              /* the next of its kind: [row, T) */
+            }
+            for (const auto& kv : seen) CHECK_EQ(kv.second, 1);
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+    unsetenv("RADIANCE_FN4_TIP");
+}
+
+/* qfn-on-ds lever GPF (Qwen loop round 22, sp_route bit 4096): a pipelined step of one sequence in TWO pieces runs the delta
+ * net a piece at a time (its piece path: the in-projection, the a|b GEMM, convolution, solve and scan per piece), so a second
+ * piece inside libr4d's narrow band (<= 64 rows) projects alone where a three-piece step of the same rows projects them in its
+ * T-row launch (test tip5: a hit resuming one piece before an 11-row last piece answered otherwise than its cold). With the
+ * bit, a (2048, <= 64) step runs the delta net whole: ONE convolution a layer and no in-projection / a|b launch of the last
+ * piece's rows; at 65 rows the piece path stays (two convolutions a layer, as without the bit); a three-piece step issues the
+ * same list with and without it. Negative control: the bit off issues the piece path at 11 and 64 rows. No step fails. */
+TEST(flashnext_gpf_runs_a_two_piece_step_whole_when_its_last_piece_is_narrow) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    struct Out { int64_t conv = 0, conv_last = 0, gemm_last = 0, gemmq_last = 0; std::vector<std::pair<std::string, int64_t>> list; };
+    auto run = [&](int64_t T, bool gpf) -> Out {
+        const int rank = 1;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        Out o;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) return o;
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        CHECK(m.pipe_on);
+        if (!m.pipe_on) return o;
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_sproute_flag().store(gpf ? 512 | 4096 : 512);
+        const auto pf = kit(b, {}, { (int)T }, 8192);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        CHECK(c.step_fail.empty());
+        const int64_t last = T - (T - 1) / 2048 * 2048;
+        for (const RecIssue& i : c.issues) {
+            const RecOp* op = b.op_of(i.op);
+            if (!op) continue;
+            o.list.push_back({ op->op, i.n });
+            if (op->op == "gdn_conv_prep") { ++o.conv; o.conv_last += i.n == last; }
+            if (op->op == "gemm_nt" && i.n == last) ++o.gemm_last;
+            if (op->op == "gemm_nt_q" && i.n == last) ++o.gemmq_last;
+        }
+        return o;
+    };
+    int64_t n_gdn = 0;
+    {
+        MetaKV mk2 = q4_small();
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(1, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, mk2.meta(), &ctx); }), RAD_OK);
+        for (const auto& l : qwen4exp_fp8::g_model[1].layers) n_gdn += l.full ? 0 : 1;
+    }
+    REQUIRE(n_gdn > 0);
+    for (int64_t T : { 2048 + 11, 2048 + 64 }) {
+        const Out off = run(T, false), on = run(T, true);
+        CHECK_EQ(off.conv, 2 * n_gdn);                 /* the control: the piece path, two convolutions a layer */
+        CHECK_EQ(off.conv_last, n_gdn);
+        CHECK_EQ(on.conv, n_gdn);                      /* GPF: one a layer, over the whole step */
+        CHECK_EQ(on.conv_last, (int64_t)0);
+        CHECK_EQ(off.gemm_last - on.gemm_last, n_gdn);     /* the a|b GEMM of the last piece's rows alone: gone */
+        CHECK_EQ(off.gemmq_last - on.gemmq_last, n_gdn);   /* the in-projection of the last piece's rows alone: gone */
+    }
+    {
+        const Out off = run(2048 + 65, false), on = run(2048 + 65, true);   /* above the band: the piece path either way */
+        CHECK_EQ(on.conv, 2 * n_gdn);
+        CHECK(on.list == off.list);
+    }
+    {
+        const Out off = run(4096 + 11, false), on = run(4096 + 11, true);   /* three pieces: whole either way */
+        CHECK_EQ(on.conv, n_gdn);
+        CHECK(on.list == off.list);
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
+/* qfn-on-ds lever HCP (Qwen loop round 23, sp_route bit 8192; QUEUE Q44 lever TIF's premise): libr4d's hc_read splits K by the
+ * launch's row tiles, so a row read inside a 1,200-row last piece, a full piece or a 267-row tail step sums in three orders.
+ * With the bit every connection read of a prefill segment that starts past the prompt's first interval (position >= a pass)
+ * and has more than 64 rows goes through op_read_sp (kc_rows = the full piece's rows): the same issues, row counts and order,
+ * only the op handle moves from op_read / op_read_kt[t] to op_read_sp -- a two-piece step (2,048 + 1,792 at 10,240, PSP on),
+ * a 267-row tail step at 14,080 (whole, or SP-serial parts), a mixed step's prefill segment at 4,096 under hc_bi 5 (its decode
+ * reads unchanged), a three-piece step. Negative controls: a prompt's first interval (1,170 rows at 0) issues the same list;
+ * the bit off pins nothing; a mixed step without hc_bi (one read over decode + prefill rows) is never pinned. No step fails. */
+TEST(flashnext_hcp_reads_a_prefill_segment_past_the_first_interval_at_a_full_pieces_split) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    using List = std::vector<std::pair<rad_op, int64_t>>;
+    struct Sets { std::set<rad_op> sp, other; };
+    auto run = [&](const std::vector<int>& dq, int pq, int32_t ctx0, int hcbi, int sps, bool hcp, Sets* sets) -> List {
+        const int rank = 1;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        List o;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) return o;
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        CHECK(m.pipe_on);
+        if (sets) {
+            *sets = Sets{};
+            auto add = [&](const rad::arch::HyperConn& h) {
+                if (h.op_read_sp) sets->sp.insert(h.op_read_sp);
+                if (h.op_read) sets->other.insert(h.op_read);
+                for (int t = 2; t <= rad::arch::HyperConn::kSpTiles; ++t)
+                    if (h.op_read_kt[t] && h.op_read_kt[t] != h.op_read_sp) sets->other.insert(h.op_read_kt[t]);
+            };
+            for (const auto& l : m.layers) { add(l.hc_mix); add(l.hc_ffn); }
+            add(m.mixer);
+        }
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_hcbi_flag().store(hcbi);
+        qwen4exp_fp8::fn4_spser_flag().store(sps);
+        qwen4exp_fp8::fn4_sproute_flag().store(hcp ? 512 | 8192 : 512);
+        const auto pf = kit(b, dq, { pq }, ctx0);
+        pf->b.positions_h = pf->pos.data();
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_spser_flag().store(0);
+        qwen4exp_fp8::fn4_hcbi_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        CHECK(c.step_fail.empty());
+        for (const RecIssue& i : c.issues) o.push_back({ i.op, i.n });
+        return o;
+    };
+    /* the moves on -> off: every differing issue is a > 64-row read moved from op_read / op_read_kt to op_read_sp; returns
+     * their count (-1 on any other difference); `left`: the on list's reads still outside op_read_sp at > 64 rows */
+    auto moved = [](const List& off, const List& on, const Sets& s, int* left) -> int {
+        if (off.size() != on.size()) return -1;
+        int n = 0;
+        if (left) *left = 0;
+        for (size_t i = 0; i < off.size(); ++i) {
+            if (left && s.other.count(on[i].first) && on[i].second > 64) ++*left;
+            if (off[i] == on[i]) continue;
+            if (off[i].second != on[i].second || on[i].second <= 64 || !s.other.count(off[i].first) || !s.sp.count(on[i].first))
+                return -1;
+            ++n;
+        }
+        return n;
+    };
+    Sets s;
+    (void)run({}, 1170, 0, 0, 0, false, &s);
+    REQUIRE(!s.sp.empty());
+    REQUIRE(!s.other.empty());
+    for (int hcbi : { 0, 5 }) {
+        {   /* a two-piece step, its last piece 1,792 rows (PSP: SP, its parts read_kt(1,792) without the bit) */
+            const List off = run({}, 2048 + 1792, 10240, hcbi, 0, false, nullptr), on = run({}, 2048 + 1792, 10240, hcbi, 0, true, nullptr);
+            int left = -1;
+            CHECK(moved(off, on, s, &left) > 0);
+            CHECK_EQ(left, 0);
+        }
+        {   /* three pieces (2,048 + 2,048 + 300): the partial one pinned, the full ones keep their split (a moved handle only) */
+            const List off = run({}, 4096 + 300, 10240, hcbi, 0, false, nullptr), on = run({}, 4096 + 300, 10240, hcbi, 0, true, nullptr);
+            int left = -1;
+            CHECK(moved(off, on, s, &left) > 0);
+            CHECK_EQ(left, 0);
+        }
+        for (int sps : { 0, 1 }) {   /* a 267-row tail step at 14,080: whole, or SP-serial parts (hc_bi 5) */
+            const List off = run({}, 267, 14080, hcbi, sps, false, nullptr), on = run({}, 267, 14080, hcbi, sps, true, nullptr);
+            int left = -1;
+            CHECK(moved(off, on, s, &left) > 0);
+            CHECK_EQ(left, 0);
+        }
+        {   /* negative control: a prompt's first interval is never pinned */
+            const List off = run({}, 1170, 0, hcbi, 1, false, nullptr), on = run({}, 1170, 0, hcbi, 1, true, nullptr);
+            CHECK(on == off);
+        }
+        {   /* a mixed step: four decode sequences of 4 rows + a 500-row chunk at 4,096 */
+            const List off = run({ 4, 4, 4, 4 }, 500, 4096, hcbi, 1, false, nullptr), on = run({ 4, 4, 4, 4 }, 500, 4096, hcbi, 1, true, nullptr);
+            const int mv = moved(off, on, s, nullptr);
+            if (hcbi == 5) CHECK(mv > 0);    /* its prefill segment's reads */
+            else           CHECK_EQ(mv, 0);  /* one read over decode + prefill rows: never pinned */
+        }
+    }
+    {   /* the bit off pins nothing: off == off */
+        const List a = run({}, 267, 14080, 5, 1, false, nullptr), b2 = run({}, 267, 14080, 5, 1, false, nullptr);
+        CHECK(a == b2);
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
+/* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
+ * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
+ * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's
+ * read once there -- then ONE all_gather_rows over the block input's 8,192 rows and its codes a piece at a time (four hc_codes);
+ * the embedding, its all-reduce and the K / V store stay whole; with bit 2048 too (3072) the embedding's all-reduce is one raw
+ * reduce_scatter_rows over the 8,192 rows instead. Control arms keep today's pass (gather + mtp_enter over 8,192
+ * rows, four piece reads, no gather of x): the bit off; the bit on with drafting rows in the pass; the bit on without the
+ * declare (RADIANCE_FN4_MSP unset: nothing declared). Every operand fits and no step fails. */
+TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    /* 0: bit off; 1: MSP; 2: bit on, drafting rows; 3: bit on, not declared; 4: MSP + 2048; 5: MSP on a model with a media path
+     * (Flash-Next declares a vision tower: line 74 read a no-op while the condition refused such a model); 6: bit on, media rows
+     * in the pass (today's path) */
+    for (int arm : { 0, 1, 2, 3, 4, 5, 6 }) {
+        if (arm == 3) unsetenv("RADIANCE_FN4_MSP"); else setenv("RADIANCE_FN4_MSP", "1", 1);
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.have_mtp);
+            CHECK_EQ(m.mtp.msp_ag != 0, arm != 3);
+            CHECK_EQ(m.mtp.msp_rows, arm != 3 ? (int64_t)2048 : (int64_t)0);
+            CHECK_EQ(m.mtp.msp_rs != 0, arm != 3);
+            const int64_t HN = m.hccfg.hc * m.g.n_embd, D = m.g.n_embd;
+            if (arm == 5) m.mtp.media = true;
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_sproute_flag().store(arm == 0 ? 0 : arm == 4 ? 3072 : 1024);
+            const auto pf = kit(b, {}, { 8192 }, 2048);
+            auto his = history_pass(b, *pf);
+            if (arm != 2) { his->b.n_draft_out = 0; his->b.draft_out_ids = nullptr; }
+            static const int32_t mm_row0 = 0;
+            if (arm == 6) { his->b.n_mm_rows = 1; his->b.mm_rows = &mm_row0; }
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get(), his.get() }, rank, 4);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[1];
+            CHECK(c.step_fail.empty());
+            int64_t enter_n = 0, enter_at = -1, gath_n = 0, gath_at = -1, rd_attn = 0, rd_at = -1, ag = 0, codes = 0, kv = 0;
+            int64_t e_ar = 0, e_rs = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                const int64_t nn = i.n == RAD_N_BATCH ? his->b.n_tok : i.n;   /* RAD_ISSUE: the batch's rows */
+                if (i.op == m.mtp.op_enter) { enter_n += nn; enter_at = i.opd.back().offset; }
+                if (i.op == m.mtp.op_gather) { gath_n += nn; gath_at = i.opd.back().offset; }
+                if (i.op == m.mtp.hc_attn.op_read) { ++rd_attn; rd_at = i.opd[0].offset; }
+                if (o->op == "all_gather_rows") { ++ag; CHECK_EQ(i.n, (int64_t)8192 * D); }
+                if (m.mtp.hc_attn.op_codes && i.op == m.mtp.hc_attn.op_codes) ++codes;
+                if (m.mtp.op_embed_ar && i.op == m.mtp.op_embed_ar) ++e_ar;
+                if (m.mtp.msp_rs && i.op == m.mtp.msp_rs) { ++e_rs; CHECK_EQ(i.n, (int64_t)8192 * D); }
+                if (o->op == "kv_store" || o->op == "qk_norm_rope_gate_kv_store") ++kv;
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            CHECK(kv > 0);
+            CHECK_EQ(e_ar + e_rs, (int64_t)1);   /* the embedding's one collective: the reduce-scatter at 3072 only */
+            CHECK_EQ(e_rs, arm == 4 ? (int64_t)1 : (int64_t)0);
+            m.mtp.media = false;
+            if (arm == 1 || arm == 4 || arm == 5) {
+                CHECK_EQ(enter_n, (int64_t)2048);
+                CHECK_EQ(enter_at, (int64_t)rank * 2048 * HN);
+                CHECK_EQ(gath_n, (int64_t)2048);
+                CHECK_EQ(gath_at, (int64_t)rank * 2048 * HN);
+                CHECK_EQ(rd_attn, (int64_t)1);
+                CHECK_EQ(rd_at, (int64_t)rank * 2048 * HN);
+                CHECK_EQ(ag, (int64_t)1);
+                CHECK_EQ(codes, m.hccfg.quant ? (int64_t)4 : (int64_t)0);
+            } else {
+                CHECK_EQ(enter_n, (int64_t)8192);
+                CHECK_EQ(gath_n, (int64_t)8192);
+                CHECK_EQ(rd_attn, (int64_t)4);
+                CHECK_EQ(ag, (int64_t)0);
+                CHECK_EQ(codes, (int64_t)0);
+            }
+        }
+    }
+    unsetenv("RADIANCE_FN4_MSP");
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
 }
 
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */

@@ -326,6 +326,10 @@ void store_first_level(const Grid& g, float resid, BlockScale* b) {
 
 int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
     *g = Grid{};
+    /* rad-convert --cpu forces the host loop even when a recipe rule says gpu=1. */
+    const char* force_cpu = std::getenv("RAD_CONVERT_FORCE_CPU");
+    const bool host_only = force_cpu && force_cpu[0] && std::strcmp(force_cpu, "0") != 0;
+    g->gpu = !host_only && rad_param_geti(o, n_o, "gpu", 1) != 0;
     const char* codes = rad_param_gets(o, n_o, "codes", nullptr);
     if (const char* vf = rad_param_gets(o, n_o, "vq", nullptr)) {
         /* One codeword a line, its integers separated by spaces; a line "# unit X" names the

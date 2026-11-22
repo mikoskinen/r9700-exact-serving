@@ -130,6 +130,7 @@ uint32_t Builder::err(int code, const char* f, ...) {
     /* First class wins; later errors are usually consequences, and the list keeps them all. */
     if (status_ == RAD_OK) status_ = code;
     RAD_ERR("declare: %s", msg);
+    std::fprintf(stderr, "radiance: builder: %s\n", msg);
     return RAD_NULL_HANDLE;
 }
 
@@ -516,6 +517,8 @@ static Geometry display_geometry(const OpInfo& oi, const Band& b) {
 }
 
 void Builder::resolve_bands(OpInfo& oi) {
+    std::fprintf(stderr, "radiance: dbg resolve_bands op=%s key=%s lo=%lld hi=%lld\n",
+                 oi.op.c_str(), oi.ranged_key.c_str(), (long long)oi.range_lo, (long long)oi.range_hi);
     /* The bucket table comes from core/plugin/: boundaries are the union of candidate kernels'
      * constraint values on the ranged parameter, clamped to the declared range, and both domains
      * resolve at each band's upper bound (the worst case, the only safe value to select and size
@@ -544,6 +547,7 @@ void Builder::resolve_bands(OpInfo& oi) {
     };
     oi.bands = reg_.build_bands(oi.op, oi.ranged_key, oi.range_lo, oi.range_hi, oi.base,
                                 oi.weights.empty() ? nullptr : &accept);
+    std::fprintf(stderr, "radiance: dbg bands=%zu\n", oi.bands.size());
 
     if (oi.bands.empty()) {
         /* No rows for this op at all; add one band so the miss report names it. */
@@ -590,17 +594,35 @@ void Builder::resolve_bands(OpInfo& oi) {
     }
 }
 
+/* tp8 loop M6F: RADIANCE_AR_SETS=2 (read once) gives every collective row a second instance (Resolved::instance1) for passes
+ * issued on a rank's second stream, so a BG body there and a decode pass on stream 0 never share an instance's slots;
+ * unset or anything else: one set, as before. */
+static int ar_sets() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_AR_SETS");
+        return e && e[0] == '2' && !e[1] ? 2 : 1;
+    }();
+    return v;
+}
+
 /* init() once per resolved instance (op, band, domain), after the whole graph has resolved
  * (spec §2.1; see rad_build.h). A negative init means the kernel refused an instance it matched:
  * the band becomes a miss reported here rather than at the first launch. */
 void Builder::finish_instances() {
+    int sets1 = 0;   /* tp8 loop M6F: collective rows given a second instance set */
     for (size_t i = 1; i < prog_.ops.size(); ++i) {
         OpInfo& oi = prog_.ops[i];
         for (Band& b : oi.bands) {
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance set, right after the first, so every
+                 * rank builds both in the same declared order */
+                if (s >= 0 && ar_sets() >= 2 && r.row->collective && !prog_.ctx.shape_probe) {
+                    s = reg_.init_instance_set(r, prog_.ctx.rank, prog_.ctx.world_size, 1);
+                    sets1 += s >= 0 && r.instance1 ? 1 : 0;
+                }
                 if (s >= 0) continue;
 
                 err(s, "%s: kernel %s matched %s and then its init() refused the instance: %s",
@@ -613,6 +635,9 @@ void Builder::finish_instances() {
             }
         }
     }
+    if (sets1 > 0 && prog_.ctx.rank == 0)
+        RAD_INFO("RADIANCE_AR_SETS=2 (tp8 loop M6F): %d collective instance(s) have a second set, taken by passes issued from "
+                 "a rank's second pass slot (Ctx::set_ar_set 1; qfn-on-ds Q5b S0)", sets1);
 }
 
 /* Hand each tune request the instance finish_instances() made for its kernel: a collective's
@@ -825,6 +850,20 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     bool resolved = true;
     for (const Band& b : oi.bands)
         if (!b.dom[RAD_DOMAIN_DEVICE] && !b.dom[RAD_DOMAIN_HOST]) resolved = false;
+
+    if (!resolved) {
+        fprintf(stderr, "radiance: unresolved op '%s' (%zu band(s), %zu weight(s)):\n", opname,
+                oi.bands.size(), oi.weights.size());
+        for (const Band& bd : oi.bands)
+            for (int d = 0; d < RAD_N_DOMAINS; ++d)
+                if (!bd.dom[d])
+                    fprintf(stderr, "  band hi=%lld dom%d: %s\n", (long long)bd.hi, d,
+                            bd.miss[d].empty() ? "(no kernel matched)" : bd.miss[d].c_str());
+        for (int i = 0; i < n_w; ++i)
+            if (w[i] > 0 && w[i] < prog_.weights.size())
+                fprintf(stderr, "  weight %d dtype=%u name=%s\n", i,
+                        prog_.weights[w[i]].decl.dtype, prog_.weights[w[i]].name.c_str());
+    }
 
     prog_.ops.push_back(std::move(oi));
     op_bufs_.emplace_back();
@@ -1043,7 +1082,7 @@ int Builder::decl_name_map(const RadNameMap* m) {
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
         m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
-        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS && m->mode != RAD_MAP_MUL) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -1052,6 +1091,11 @@ int Builder::decl_name_map(const RadNameMap* m) {
             m->declared, m->mode == RAD_MAP_EMA ? "codebook" : "weight-norm",
             m->mode == RAD_MAP_EMA ? "the embedding sums and the cluster usage"
                                    : "the magnitude and the direction", m->n_src);
+        return RAD_E_INVAL;
+    }
+    if (m->mode == RAD_MAP_MUL && m->n_src != 2) {
+        err(RAD_E_INVAL, "name map for '%s': a product map names its two factors, not %d",
+            m->declared, m->n_src);
         return RAD_E_INVAL;
     }
     if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&
@@ -2244,7 +2288,12 @@ int Builder::drafter_short_block(int64_t block) {
             (long long)(prog_.drafter_tree ? 2 : lead));
         return RAD_E_INVAL;
     }
-    prog_.drafter_short_block = block;
+    /* tp8 loop D19: a further call declares a further short block (the engine's RADIANCE_DRAFT_SHORT_TIERS picks among
+     * them by load); the first stays drafter_short_block, so a plugin calling once is served as before. */
+    if (prog_.drafter_short_blocks.empty()) prog_.drafter_short_block = block;
+    if (std::find(prog_.drafter_short_blocks.begin(), prog_.drafter_short_blocks.end(), block) ==
+        prog_.drafter_short_blocks.end())
+        prog_.drafter_short_blocks.push_back(block);
     return RAD_OK;
 }
 
@@ -2273,6 +2322,84 @@ int Builder::drafter_tree(rad_buf parents) {
     }
     prog_.drafter_tree    = true;
     prog_.drafter_parents = parents;
+    return RAD_OK;
+}
+
+/* A chain block drafter's confidence plane and its alternative branches (rad_builder.h). Both are
+ * read by the engine behind the query pass and change no proposal. */
+static int64_t drafter_plane_numel(const Program& p, rad_buf b) {
+    const RadBufDecl& d = p.buffers[b].decl;
+    int64_t n = 1;
+    for (uint32_t i = 0; i < d.rank; ++i) n *= d.shape[i];
+    return d.rank ? n : 0;
+}
+
+int Builder::drafter_confidence(rad_buf conf, int64_t pitch) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_confidence after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK || prog_.drafter_tree) {
+        err(RAD_E_STATE, "drafter_confidence: %s. A confidence plane cuts a chain block drafter's "
+                         "proposal; declare it after rad_declare_drafter, without rad_drafter_tree.",
+            prog_.drafter.kind == RAD_DRAFT_NONE   ? "no drafter is declared"
+            : prog_.drafter.kind != RAD_DRAFT_BLOCK ? "the declared drafter is a SERIAL head"
+                                                    : "the drafter proposes trees");
+        return RAD_E_STATE;
+    }
+    if (conf == RAD_NULL_HANDLE || (size_t)conf >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "drafter_confidence '%s': buffer %u is not a declared buffer",
+            prog_.drafter_name.c_str(), (unsigned)conf);
+        return RAD_E_INVAL;
+    }
+    if (prog_.buffers[conf].decl.dtype != RAD_F32) {
+        err(RAD_E_DTYPE, "drafter_confidence '%s': buffer '%s' is not f32", prog_.drafter_name.c_str(),
+            prog_.buffers[conf].name.c_str());
+        return RAD_E_DTYPE;
+    }
+    if (pitch < prog_.drafter.depth || drafter_plane_numel(prog_, conf) < pitch * prog_.ctx.max_seqs) {
+        err(RAD_E_SHAPE, "drafter_confidence '%s': buffer '%s' must hold %lld sequences of %lld logits "
+                         "(the pitch, at least the drafter's depth %d)",
+            prog_.drafter_name.c_str(), prog_.buffers[conf].name.c_str(), (long long)prog_.ctx.max_seqs,
+            (long long)pitch, prog_.drafter.depth);
+        return RAD_E_SHAPE;
+    }
+    prog_.drafter_conf       = conf;
+    prog_.drafter_conf_pitch = pitch;
+    return RAD_OK;
+}
+
+int Builder::drafter_alternatives(rad_buf alt, int64_t n_alt, int64_t pitch) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_alternatives after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK || prog_.drafter_tree) {
+        err(RAD_E_STATE, "drafter_alternatives: a chain block drafter's branches; declare them after "
+                         "rad_declare_drafter, without rad_drafter_tree");
+        return RAD_E_STATE;
+    }
+    if (alt == RAD_NULL_HANDLE || (size_t)alt >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "drafter_alternatives '%s': buffer %u is not a declared buffer",
+            prog_.drafter_name.c_str(), (unsigned)alt);
+        return RAD_E_INVAL;
+    }
+    if (prog_.buffers[alt].decl.dtype != RAD_I32) {
+        err(RAD_E_DTYPE, "drafter_alternatives '%s': buffer '%s' is not i32", prog_.drafter_name.c_str(),
+            prog_.buffers[alt].name.c_str());
+        return RAD_E_DTYPE;
+    }
+    if (n_alt < 1 || n_alt > 8 || pitch < 1 ||
+        drafter_plane_numel(prog_, alt) < n_alt * pitch * prog_.ctx.max_seqs) {
+        err(RAD_E_SHAPE, "drafter_alternatives '%s': buffer '%s' must hold %lld sequences of %lld branches "
+                         "of %lld tokens (1 to 8 branches)",
+            prog_.drafter_name.c_str(), prog_.buffers[alt].name.c_str(), (long long)prog_.ctx.max_seqs,
+            (long long)n_alt, (long long)pitch);
+        return RAD_E_SHAPE;
+    }
+    prog_.drafter_alt       = alt;
+    prog_.drafter_n_alt     = n_alt;
+    prog_.drafter_alt_pitch = pitch;
     return RAD_OK;
 }
 
@@ -2843,6 +2970,16 @@ int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_short_block(block);
+}
+
+int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_confidence(conf, pitch);
+}
+
+int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_alternatives(alt, n_alt, pitch);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

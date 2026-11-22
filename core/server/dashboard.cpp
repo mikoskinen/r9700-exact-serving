@@ -14,6 +14,7 @@
  */
 #include "server.h"
 #include "../runtime/fn4_switch.h"
+#include "../sched/draft_conf.h"
 #include "oai.h"
 
 #include "rad_internal.h"
@@ -91,10 +92,13 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
 
 /* ------------------------------------------------------------------ /admin/fn4
  *
- * fn4 (9.11.2026, test builds): GET reports the runtime switches (runtime/fn4_switch.h); POST takes
- * {"<switch>": 0|1, ...} (draft_adaptive also -1), queues them for the next step release and answers
- * with the state, the queued values under "pending". Loopback only without --api-key, as the
- * control vector. */
+ * Runtime switches for in-process A/B blocks (test builds; runtime/fn4_switch.h): GET reports what
+ * each switch's owner applies; POST takes {"<switch>": n, ...} (an integer or a boolean;
+ * "epoch_bump": 1 a new epoch with no switch changed), queues them for the next step release and
+ * answers with the state, the queued values under "pending". Every key is checked before any is
+ * queued -- an unknown switch, a value its owner does not take (the plugin serving gg_gemv, the
+ * drafter for draft_adaptive=1), a switch nothing serves -- and a refused body changes nothing and
+ * names the reason. Loopback only without --api-key, as the control vector. */
 HttpResponse Server::handle_fn4(const HttpRequest& req) {
     if (opt_.api_key.empty() && !local_operator(req)) {
         ApiError e;
@@ -108,13 +112,19 @@ HttpResponse Server::handle_fn4(const HttpRequest& req) {
         json body = parse_json_bounded(req.body.empty() ? "{}" : req.body, 0, &over, &deep);
         if (body.is_discarded() || !body.is_object() || over || deep)
             return error_response(err_bad("body", "expected {\"<switch>\": 0|1, ...}"), req.peer);
+        std::vector<std::pair<std::string, int>> sets;
         for (auto it = body.begin(); it != body.end(); ++it) {
             int v = 0;
-            if (it->is_boolean())               v = it->get<bool>() ? 1 : 0;
-            else if (it->is_number_integer())   v = it->get<int>();
-            else return error_response(err_bad(it.key(), "0, 1 or a boolean"), req.peer);
+            if (it->is_boolean())             v = it->get<bool>() ? 1 : 0;
+            else if (it->is_number_integer()) v = it->get<int>();
+            else return error_response(err_bad(it.key(), "an integer or a boolean"), req.peer);
             std::string why;
-            if (!fn4::request(it.key(), v, &why)) return error_response(err_bad(it.key(), why), req.peer);
+            if (!fn4::check(it.key(), v, &why)) return error_response(err_bad(it.key(), why), req.peer);
+            sets.emplace_back(it.key(), v);
+        }
+        for (const auto& kv : sets) {
+            std::string why;
+            if (!fn4::request(kv.first, kv.second, &why)) return error_response(err_bad(kv.first, why), req.peer);
         }
         RAD_INFO("fn4: switches %s queued by an admin request%s", body.dump().c_str(),
                  req.peer.empty() ? "" : (" from " + req.peer).c_str());
@@ -354,6 +364,98 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["linear_hit_rate"] = m.linear_hit_rate;
         o["linear_cached_tokens"] = (double)m.linear_cached_tokens;
         o["checkpoints_written"] = (double)m.checkpoints_written;
+        /* Lever PSK (ds41-int7-pskglue): live, cumulative. The scheduler's (design 2): its mode and K, requests admitted
+         * planned, steps carrying a plan, snapshots at a planned request's targets and dropped off them, planned admissions
+         * whose hit resumed below its attention match (the anchor below) and the tokens recomputed; the engine's: passes
+         * handed a plan, those that ended before the last layer, routed layers rank 0's stager did not stage for them; the
+         * plugin's (rank 0): planned passes, passes with a cut (designs 1 and 2), layers skipped whole, layer-rows not run
+         * at layers 21-29 and 30-39, plans dropped as not matching their pass. All 0 with PSK unset, 0 or not served. */
+        {
+            int64_t eg[3], pl[fn4::kPskStats];
+            fn4::psk_engine(eg);
+            fn4::psk_stats(pl);
+            json p;
+            p["mode"] = m.psk_mode;
+            p["k"] = m.psk_k;
+            p["latched"] = m.psk_latched;
+            p["planned_steps"] = m.psk_planned_steps;
+            p["ckpt_anchor"] = m.psk_ckpt_anchor;
+            p["ckpt_dropped"] = m.psk_ckpt_dropped;
+            p["fallback_resumes"] = m.psk_fallback_resumes;
+            p["fallback_tokens"] = m.psk_fallback_tokens;
+            p["engine_planned_passes"] = eg[0];
+            p["passes_ended_early"] = eg[1];
+            p["stager_layers_skipped"] = eg[2];
+            p["plugin_planned_passes"] = pl[0];
+            p["cut_passes"] = pl[1];
+            p["layers_skipped"] = pl[2];
+            p["rows_skipped_l21_29"] = pl[3];
+            p["rows_skipped_l30_39"] = pl[4];
+            p["plan_mismatch"] = pl[5];
+            /* lever PSK-L20 (ds41-pskl20): passes whose layer 20 was cut, its cone-part rows not run, passes it ran its
+             * all-row part only, planned passes told to end at it (its experts not staged) */
+            p["l20_cut_passes"] = pl[6];
+            p["l20_rows_skipped"] = pl[7];
+            p["l20_cone_empty"] = pl[8];
+            p["l20_layers_not_staged"] = pl[9];
+            /* lever PSK-CR (ds41-pskcr), counted only while ds41_psk_cr is 1: the scheduler's -- the switch as run, hits
+             * served by a cone replay, the tokens their replay chunks covered and the positions they resumed at, hits a
+             * replay would have served but did not (fallbacks: the request not planned, the geometry, the adoption),
+             * hits whose snapshot already sat at the grid point, requests latched tail-only (ds41_psk 4) and admitted
+             * under 4 without ds41_psk_cr (planned as 2); the plugin's (rank 0) -- replay passes cut, their layer-rows
+             * run and not run below the first PSK layer, kv-source compressor chains skipped, replay passes beside other
+             * rows */
+            p["cr"] = m.psk_cr;
+            p["cr_hits"] = m.psk_cr_hits;
+            p["cr_rows_replayed"] = m.psk_cr_rows;
+            p["cr_resume_tokens"] = m.psk_cr_resume_tokens;
+            p["cr_fallbacks"] = m.psk_cr_fb_unplanned + m.psk_cr_fb_geometry + m.psk_cr_fb_adopt;
+            p["cr_fallback_unplanned"] = m.psk_cr_fb_unplanned;
+            p["cr_fallback_geometry"] = m.psk_cr_fb_geometry;
+            p["cr_fallback_adopt"] = m.psk_cr_fb_adopt;
+            p["cr_not_needed"] = m.psk_cr_not_needed;
+            p["tail_only_latched"] = m.psk_tail_only;
+            p["tail_only_refused"] = m.psk_tail_only_refused;
+            /* ds41-pskcr2: hits that took the snapshot below (or a cold prefill) as the cheaper exact path -- it
+             * recomputes at most one grid step, less than a replay's passes -- and snapshots taken at a replay's end */
+            p["cr_cheaper"] = m.psk_cr_cheaper;
+            p["cr_end_snapshots"] = m.psk_cr_end_ckpts;
+            p["cr_passes"] = pl[10];
+            p["cr_layer_rows_run"] = pl[11];
+            p["cr_layer_rows_skipped"] = pl[12];
+            p["cr_chains_skipped"] = pl[13];
+            p["cr_mixed_passes"] = pl[14];
+            o["psk"] = std::move(p);
+        }
+        /* Lever PSK-DS (ds41-pskl20): the switch (-1 not served), DSpark context passes cut, their rows not run, the rows
+         * they ran -- live, cumulative, rank 0's. */
+        {
+            int64_t pc[4];
+            fn4::dspark_pfctx_stats(pc);
+            json p;
+            p["mode"] = pc[0];
+            p["passes"] = pc[1];
+            p["rows_skipped"] = pc[2];
+            p["rows_run"] = pc[3];
+            o["dspark_pfctx"] = std::move(p);
+        }
+        /* Lever E1 (ds41-e1): live, cumulative, the plugin's (rank 0): Engram layer passes deduplicated, rows not looked up /
+         * copied / multiplied in them, rows pooled in them, layer passes kept whole by the 48-row guard, below the repeat
+         * share, with no launch above the band, and steps with a deduplicated layer. All 0 with lever E1 unset, 0 or not
+         * served. */
+        {
+            int64_t e[7];
+            fn4::engdd_stats(e);
+            json d;
+            d["passes"] = e[0];
+            d["rows_deduped"] = e[1];
+            d["rows_pooled"] = e[2];
+            d["guard48"] = e[3];
+            d["low_share"] = e[4];
+            d["steps"] = e[5];
+            d["no_pool"] = e[6];
+            o["engdd"] = std::move(d);
+        }
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
          * prompt tokens the attention cache held and admission computed again. */
@@ -398,6 +500,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             pos.push_back(std::move(p));
         }
         o["draft_positions"] = std::move(pos);
+        /* ds41-acc: the confidence gate's counts and calibration, and the shadow tree
+         * (core/sched/draft_conf.h); zeros where the drafter declares neither plane. */
+        o["draft_conf"] = json::parse(dconf::tracker().json(), nullptr, false);
 
         /* Live request table: counters and timestamps. `decode_tps` is the request's own average
          * since its first token. */
@@ -491,6 +596,53 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["staged_bytes"]   = (double)s.experts.staged_bytes;
             e["stage_overflow"] = s.experts.stage_overflow;
             e["stage_copies"]   = s.experts.stage_copies;
+            if (!s.experts.ranks.empty()) {
+                json rk = json::array();
+                for (const auto& r : s.experts.ranks) {
+                    json x;
+                    x["rank"]             = r.rank;
+                    x["vram"]             = r.vram_units;
+                    x["pinned"]           = r.pinned_units;
+                    x["other"]            = r.other_units;
+                    x["trunk_vram"]       = r.trunk_vram_units;
+                    x["draft_vram"]       = r.draft_vram_units;
+                    x["routed"]           = r.routed;
+                    x["routed_res"]       = r.routed_resident;
+                    x["stream_bytes"]     = (double)r.stream_bytes;
+                    x["draft_lent_units"] = r.draft_lent_units;
+                    x["flex_bytes"]       = (double)r.flex_bytes;
+                    if (r.slots) {   /* ds41-lf */
+                        static const char* const kC[7] = { "cold", "trunk", "kv", "arena", "dslab", "dw", "draft" };
+                        static const char* const kL[4] = { "kv", "arena", "dslab", "dw" };
+                        json hit, miss, lent;
+                        for (int c = 0; c < 7; ++c) { hit[kC[c]] = r.slot_hit[c]; miss[kC[c]] = r.slot_miss[c]; }
+                        for (int k = 0; k < 4; ++k) {
+                            json l;
+                            l["covered"]      = r.lent_covered[k];
+                            l["held"]         = r.lent_held[k];
+                            l["fills"]        = r.lent_fills[k];
+                            l["fills_lf"]     = r.lent_fills_lf[k];
+                            l["fills_hot"]    = r.lent_fills_hot[k];
+                            l["drop_victim"]  = r.lent_drop_victim[k];
+                            l["drop_reserve"] = r.lent_drop_reserve[k];
+                            l["drop_recall"]  = r.lent_drop_recall[k];
+                            l["swaps"]        = r.lent_swaps[k];   /* ds41-swl */
+                            lent[kL[k]] = std::move(l);
+                        }
+                        json sl;
+                        sl["hit"]  = std::move(hit);
+                        sl["miss"] = std::move(miss);
+                        x["slots"]    = std::move(sl);
+                        x["lent"]     = std::move(lent);
+                        x["place_lf"] = r.place_lf;
+                        x["place_swl"] = r.place_swl;                       /* ds41-swl */
+                        x["heat_min_gain_x100"] = r.heat_min_gain_x100;
+                        x["heat_hyst_x100"] = r.heat_hyst_x100;
+                    }
+                    rk.push_back(std::move(x));
+                }
+                e["ranks"] = std::move(rk);
+            }
             o["experts"] = std::move(e);
         }
 

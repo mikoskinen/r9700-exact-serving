@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstdlib>
 #include <unordered_map>
 #include <cstring>
 
@@ -237,6 +238,26 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
         s += fmt("    %-32s %12s  %-9s live [%d,%d] @ %lld\n", big[i]->name.c_str(),
                  humanb(big[i]->bytes).c_str(), bld_buf_kind_name(big[i]->decl.kind),
                  big[i]->first_def, big[i]->last_use, (long long)big[i]->arena_offset);
+    /* RADIANCE_DEBUG_GRAPH_ALIAS=name[,name...] (a debug aid; unset: nothing here): each named buffer's arena bytes and
+     * every other buffer of the same arena that shares any of them -- a transient whose live range is disjoint, which may
+     * write those bytes once the named buffer's last declared use has run (tp8 loop FINDINGS F43) */
+    if (const char* al = std::getenv("RADIANCE_DEBUG_GRAPH_ALIAS"); al && *al) {
+        const std::string want = std::string(",") + al + ",";
+        for (size_t i = 1; i < p.buffers.size(); ++i) {
+            const BufferInfo& a = p.buffers[i];
+            if (want.find("," + a.name + ",") == std::string::npos) continue;
+            s += fmt("  alias %s: %lld B %s live [%d,%d] @ %lld (%s arena)\n", a.name.c_str(), (long long)a.bytes,
+                     bld_buf_kind_name(a.decl.kind), a.first_def, a.last_use, (long long)a.arena_offset,
+                     a.decl.domain == RAD_DOMAIN_HOST ? "host" : "device");
+            for (size_t j = 1; j < p.buffers.size(); ++j) {
+                const BufferInfo& o = p.buffers[j];
+                if (j == i || o.decl.domain != a.decl.domain) continue;
+                if (o.arena_offset + o.bytes <= a.arena_offset || a.arena_offset + a.bytes <= o.arena_offset) continue;
+                s += fmt("    shares %-40s %12lld B %-9s live [%d,%d] @ %lld\n", o.name.c_str(), (long long)o.bytes,
+                         bld_buf_kind_name(o.decl.kind), o.first_def, o.last_use, (long long)o.arena_offset);
+            }
+        }
+    }
     s += "\n";
 
     /* ---------------------------------------------------------------- KV groups */

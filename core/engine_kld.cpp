@@ -37,9 +37,15 @@ int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
     std::vector<char> live(n, 0);
     size_t next = 0, n_live = 0, finished = 0;
     int64_t held = 0;
+    /* tp8 S5: a pipeline leader's lanes take the documents in turn, document d to lane d mod N, so a
+     * rerun batches identically; one lane: sched_ takes them all as before. */
+    const bool lanes = !lane_sched_.empty();
     if (!fit_pool) {
         std::vector<int> rc(n, RAD_OK);
-        sched_.add_all(reqs.data(), n, rc.data());
+        if (lanes)
+            for (size_t d = 0; d < n; ++d) sched_of((int)(d % (size_t)n_lanes_)).add_all(&reqs[d], 1, &rc[d]);
+        else
+            sched_.add_all(reqs.data(), n, rc.data());
         for (size_t d = 0; d < n; ++d) {
             if (rc[d] >= 0) continue;
             RAD_ERR("%s: the scheduler refused document %zu (%zu tokens): %s", tag, d,
@@ -54,7 +60,7 @@ int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
     while (finished < n) {
         while (next < n && (n_live == 0 || kv.can_ever_fit(held + len[next]))) {
             int rc = RAD_OK;
-            sched_.add_all(&reqs[next], 1, &rc);
+            (lanes ? sched_of((int)(next % (size_t)n_lanes_)) : sched_).add_all(&reqs[next], 1, &rc);
             if (rc < 0) {
                 RAD_ERR("%s: the scheduler refused document %zu (%zu tokens): %s", tag, next,
                         (size_t)(len[next] - kSlack), rad_strerror(rc));
@@ -78,7 +84,12 @@ int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
                         rad_strerror(sinks[d]->status()));
                 ++*bad;
             }
-            sched_.reap(sinks[d]->id);
+            if (lanes) {
+                Scheduler* o = lanes_.owner(sinks[d]->id);
+                (o ? *o : sched_).reap(sinks[d]->id);
+            } else {
+                sched_.reap(sinks[d]->id);
+            }
             sinks[d].reset();
             live[d] = 0;
             --n_live;
@@ -290,9 +301,17 @@ int Engine::run_calib() {
  * checks the count. Each rank copies on its own stream behind the step; KL mode does not
  * pipeline, so the next step waits for this. */
 int Engine::score_rows(const RadBatch* b, const StepOut& so) {
+    RAD_TRY(score_rows_issue(b, so));
+    return score_rows_take(b, so);
+}
+
+/* tp8 dev 1b: score_rows in two: the scored rows' copies, on every rank's stream at this point of it (a lane step whose
+ * model part another lane's follows on the stream copies them before that part rewrites the logits), then the wait and
+ * the scoring. */
+int Engine::score_rows_issue(const RadBatch* b, const StepOut& so) {
     const int64_t n = b->n_out - so.n_rows;
     if (n <= 0) return RAD_OK;
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     std::vector<KldSpan> spans;
     int64_t row = 0;
     for (const StepEntry& e : plan.e) {
@@ -312,6 +331,21 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
         if (!src) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(kld_host_[r], src + (int64_t)so.n_rows * kld_width_[r],
                                  n * kld_width_[r] * (int64_t)sizeof(float), rk.ctx.stream()));
+    }
+    RAD_TRY(rad_dev_set(ranks_[0]->device));
+    return RAD_OK;
+}
+
+int Engine::score_rows_take(const RadBatch* b, const StepOut& so) {
+    const int64_t n = b->n_out - so.n_rows;
+    if (n <= 0) return RAD_OK;
+    const StepPlan& plan = lsched().plan();
+    std::vector<KldSpan> spans;
+    int64_t row = 0;
+    for (const StepEntry& e : plan.e) {
+        if (!(e.req && e.req->score && e.is_prefill && e.hidden_row < 0)) continue;
+        spans.push_back({ e.req->id, (int64_t)e.ctx_len, (int64_t)e.n_tokens, row });
+        row += e.n_tokens;
     }
     for (size_t r = 0; r < kld_width_.size(); ++r) {
         RAD_TRY(rad_dev_set(ranks_[r]->device));

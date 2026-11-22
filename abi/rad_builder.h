@@ -262,6 +262,7 @@ typedef struct RadBuildCtx {
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      weight_prefetch_off;
 
+
     /* ---- appended in ABI 31 (tree verification) */
     /* Nonzero: grow the block drafter's proposals into a tree (rad_drafter_tree) where the plugin
      * can. The engine sets it where the plugin's probe said trees pay (RadArchProbe::tree_pays)
@@ -301,7 +302,23 @@ typedef struct RadBuildCtx {
      * drive has to be stored whole, so a plugin that can lay its routed experts out either way
      * keeps them whole for this; 0 leaves it free to split them across the ranks by width. */
     int      expert_file_tier;
+    /* ---- appended after ABI 37 (DS41 prompt-lookup head-off; no field above moves) */
+    /* Nonzero from --spec-ngram: the deployment drafts by prompt lookup only, in the core, and
+     * verifies up to `max_spec` drafts a step. The plugin declares no draft head, so a head the
+     * container carries stays off the card, but sizes every verify buffer, state ring and kernel
+     * band for `max_spec` as at any speculative serve. rad_ctx_draft_head() below is the test.
+     * The engine refuses to start when a head is declared anyway, rather than load one it was
+     * told to leave out.
+     *
+     * Trailing and zero-defaulted, so every plugin built against an ABI-37 layout is unchanged. */
+    int      draft_head_off;
 } RadBuildCtx;
+
+/* Whether a declare should include the container's draft head: the deployment speculates and
+ * does not draft by prompt lookup alone. */
+static inline int rad_ctx_draft_head(const RadBuildCtx* ctx) {
+    return ctx && ctx->max_spec > 0 && !ctx->draft_head_off;
+}
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
@@ -620,7 +637,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_MUL = 8 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -681,8 +699,13 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * RAD_MAP_MUL is the elementwise product of src[0] and src[1], two tensors of one shape: a gain a
+ * checkpoint ships as two factors that the model only ever multiplies (DeepSeek-V4.1's Engram gate,
+ * q_weight * k_weight, which llama.cpp's converter folds into one engram_gate the same way). Two
+ * bf16 factors multiply exactly in f32.
+ *
+ * TRANSPOSE, EMA, TAP, COLS and MUL are computed at convert in f32, like WNORM, and stored as the
+ * recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 
@@ -855,6 +878,25 @@ int rad_chain_on(void);
  * a tree's from two decoding sequences on, a chain's never). */
 /* ---- appended in ABI 27 (a block drafter's short block) */
 int rad_drafter_short_block(RadBuilder* b, int64_t block);
+
+/* A chain BLOCK drafter's confidence plane: an f32 buffer of at least [max_seqs, pitch] whose row i
+ * holds, once a query pass has run, a logit for each proposal of that pass's i-th sequence (entry j
+ * for proposal j, the token at draft position j + 1; DSpark's confidence head). The engine copies it
+ * from rank 0 behind the pass. Under the engine's `dspark_conf` switch (core/runtime/fn4_switch.h) a
+ * sequence then verifies the longest prefix of its proposal whose sigmoid clears a threshold, so it
+ * changes how many drafts a verify carries, never a proposal or an emitted token. Called once, after
+ * rad_declare_drafter; refused for a serial drafter and beside rad_drafter_tree. Additive export;
+ * RAD_ABI_VERSION does not move. */
+int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch);
+
+/* A chain BLOCK drafter's alternative branches: an i32 buffer of at least [max_seqs, n_alt * pitch]
+ * whose row i holds, once a query pass has run, `n_alt` other proposals of that pass's i-th
+ * sequence, branch a at [a * pitch, (a + 1) * pitch), each starting with another first token than
+ * the proposal's (DSpark: the walk's next-best first tokens, each walked on), -1 where there is none.
+ * The engine compares them with the tokens the target emits (`dspark_alt` switch): a shadow of a
+ * tree that branches at the first draft, measured, never verified. Called once, after
+ * rad_declare_drafter. Additive export; RAD_ABI_VERSION does not move. */
+int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch);
 
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and

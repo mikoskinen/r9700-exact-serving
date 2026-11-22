@@ -121,6 +121,38 @@ struct SchedMetrics {
     int64_t prefix_held_tokens = 0;
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
+    /* Lever PSK design 2 (ds41-int7-pskglue), live and cumulative: the plugin's ds41_psk as the scheduler plans by it
+     * (-1 none) and ds41_psk_k; requests admitted planned (latched, on every admission path); steps that carried a
+     * plan; snapshots taken at a planned request's target and dropped off one; admissions of a planned request whose
+     * prefix hit resumed at a snapshot below its attention match (the anchor below), and the tokens that recomputed. */
+    int32_t psk_mode = -1;
+    int32_t psk_k = 0;
+    int64_t psk_latched = 0;
+    int64_t psk_planned_steps = 0;
+    int64_t psk_ckpt_anchor = 0;
+    int64_t psk_ckpt_dropped = 0;
+    int64_t psk_fallback_resumes = 0;
+    int64_t psk_fallback_tokens = 0;
+    /* Lever PSK-CR (ds41-pskcr), live and cumulative, counted only while ds41_psk_cr is 1: the switch as run (-1 none);
+     * hits served by a cone replay, the tokens their replay chunks covered (from - at summed) and the positions they
+     * resumed at (at summed); hits a replay would have served but did not, by reason -- the request not planned, the
+     * geometry (a trunk group the cache holds no window of, a runtime window, no reach), the adoption refused -- and
+     * hits whose snapshot was already at the grid point (no replay needed); requests latched tail-only (ds41_psk 4 with
+     * ds41_psk_cr 1) and admitted under 4 without it (planned as 2). ds41-pskcr2: hits with no snapshot at their grid
+     * point that resumed at the snapshot below (or cold) because that recomputes at most one grid step -- the cheaper
+     * exact path (Scheduler::psk_cr_resume) -- and snapshots taken at a replay's end. */
+    int32_t psk_cr = -1;
+    int64_t psk_cr_hits = 0;
+    int64_t psk_cr_rows = 0;
+    int64_t psk_cr_resume_tokens = 0;
+    int64_t psk_cr_fb_unplanned = 0;
+    int64_t psk_cr_fb_geometry = 0;
+    int64_t psk_cr_fb_adopt = 0;
+    int64_t psk_cr_not_needed = 0;
+    int64_t psk_tail_only = 0;
+    int64_t psk_tail_only_refused = 0;
+    int64_t psk_cr_cheaper = 0;
+    int64_t psk_cr_end_ckpts = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */

@@ -23,6 +23,7 @@
 // Entry points return a negative code rather than throwing, as in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
+#include "r4d_ika.h"   // lever IKA (DRAFTER track round 50): R4D_IKA_ENTRY()
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
@@ -85,7 +86,7 @@ __device__ __forceinline__ void embed_lookup_body(
 #define R4D_EL_PARAMS const int32_t* __restrict__ tok, const uint16_t* __restrict__ wte,         \
     uint16_t* __restrict__ x, uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, \
     float mult
-__global__ __launch_bounds__(kThreads) void embed_lookup_kernel(R4D_EL_PARAMS) {
+__global__ __launch_bounds__(kThreads) void embed_lookup_kernel(R4D_EL_PARAMS) { R4D_IKA_ENTRY();
     embed_lookup_body(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_embed_lookup(R4D_EL_PARAMS) {
@@ -112,7 +113,7 @@ template <uint32_t V, bool Q>
 __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
     uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd, int32_t n_vocab,
-    int32_t vocab_off, uint32_t x_ld) {
+    int32_t vocab_off, uint32_t x_ld) { R4D_IKA_ENTRY();
     const uint32_t per_row = n_embd / V;
     const uint64_t g = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
     if (g >= (uint64_t)M * per_row) return;
@@ -170,7 +171,7 @@ __device__ __forceinline__ void gather_rows_body(
 }
 #define R4D_GR_PARAMS const uint16_t* __restrict__ x, const int32_t* __restrict__ idx,           \
     uint16_t* __restrict__ y, uint32_t n, int32_t src_rows, uint32_t x_ld, uint32_t y_ld
-__global__ __launch_bounds__(kThreads) void gather_rows_kernel(R4D_GR_PARAMS) {
+__global__ __launch_bounds__(kThreads) void gather_rows_kernel(R4D_GR_PARAMS) { R4D_IKA_ENTRY();
     gather_rows_body(x, idx, y, n, src_rows, x_ld, y_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_gather_rows(R4D_GR_PARAMS) {
@@ -179,6 +180,24 @@ __global__ __launch_bounds__(kThreads) void r4dchain_gather_rows(R4D_GR_PARAMS) 
     r4d_chain_done();
 }
 #undef R4D_GR_PARAMS
+/* The same rows 16 bytes a thread step (ds41-e1: lever E1 gathers up to 4k rows of 25600 bf16 a step, where the 2-byte
+ * form above runs far under the copy rate), for a gather of more than 48 rows where every row and both pitches are whole
+ * 16-byte words and both bases are 16-byte aligned (gather_rows_bf16_emit decides); a row is moved whole, a dead index
+ * writes zeros: the same bytes. */
+__global__ __launch_bounds__(kThreads) void gather_rows_w16_kernel(
+    const uint4* __restrict__ x, const int32_t* __restrict__ idx, uint4* __restrict__ y,
+    uint32_t n16, int32_t src_rows, uint32_t x_ld16, uint32_t y_ld16) { R4D_IKA_ENTRY();
+    const uint32_t m = blockIdx.x;
+    const int32_t r = idx[m];
+    uint4* __restrict__ dst = y + (size_t)m * y_ld16;
+    if (r < 0 || r >= src_rows) {
+        const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+        for (uint32_t i = threadIdx.x; i < n16; i += kThreads) dst[i] = z;
+        return;
+    }
+    const uint4* __restrict__ src = x + (size_t)r * x_ld16;
+    for (uint32_t i = threadIdx.x; i < n16; i += kThreads) dst[i] = src[i];
+}
 
 // ---------------------------------------------------------------- byte row gather / scatter
 //
@@ -191,7 +210,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_gather_rows(R4D_GR_PARAMS) 
 // ragged path.
 __global__ __launch_bounds__(kThreads) void gather_rows_u8_kernel(
     const uchar4* __restrict__ x, const int32_t* __restrict__ idx, uchar4* __restrict__ y,
-    uint32_t n4, int32_t src_rows, uint32_t x_ld4, uint32_t y_ld4) {
+    uint32_t n4, int32_t src_rows, uint32_t x_ld4, uint32_t y_ld4) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const int32_t r = idx[m];
     uchar4* __restrict__ dst = y + (size_t)m * y_ld4;
@@ -208,7 +227,7 @@ __global__ __launch_bounds__(kThreads) void gather_rows_u8_kernel(
 // zero-fill would be data loss here.
 __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
     const uchar4* __restrict__ v, const int32_t* __restrict__ idx, uchar4* __restrict__ x,
-    uint32_t n4, int32_t dst_rows, uint32_t v_ld4, uint32_t x_ld4) {
+    uint32_t n4, int32_t dst_rows, uint32_t v_ld4, uint32_t x_ld4) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const int32_t r = idx[m];
     if (r < 0 || r >= dst_rows) return;
@@ -259,7 +278,7 @@ __device__ __forceinline__ void rmsnorm_body(
     uint16_t* __restrict__ y, uint32_t n, float eps, float wadd, float mult, uint32_t x_ld,      \
     uint32_t y_ld, uint32_t M
 template <bool WF32, uint32_t THR, typename TX = uint16_t>
-__global__ __launch_bounds__(THR) void rmsnorm_kernel(R4D_RN_PARAMS) {
+__global__ __launch_bounds__(THR) void rmsnorm_kernel(R4D_RN_PARAMS) { R4D_IKA_ENTRY();
     rmsnorm_body<WF32, THR, TX>(x, w, y, n, eps, wadd, mult, x_ld, y_ld, M);
 }
 template <bool WF32, uint32_t THR, typename TX = uint16_t>
@@ -314,7 +333,7 @@ __device__ __forceinline__ void add_rmsnorm_body(
     const void* __restrict__ w, uint16_t* __restrict__ y, uint32_t n, float eps, float wadd,     \
     float mult, uint32_t x_ld, uint32_t a_ld, uint32_t y_ld, uint32_t M
 template <bool WF32, uint32_t THR>
-__global__ __launch_bounds__(THR) void add_rmsnorm_kernel(R4D_ARN_PARAMS) {
+__global__ __launch_bounds__(THR) void add_rmsnorm_kernel(R4D_ARN_PARAMS) { R4D_IKA_ENTRY();
     add_rmsnorm_body<WF32, THR>(x, a, w, y, n, eps, wadd, mult, x_ld, a_ld, y_ld, M);
 }
 template <bool WF32, uint32_t THR>
@@ -331,7 +350,7 @@ __global__ __launch_bounds__(THR) void r4dchain_add_rmsnorm(R4D_ARN_PARAMS) {
 // rmsnorm does, so the two agree bit for bit where rmsnorm's gain is one.
 __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
-    uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld, uint32_t M) { R4D_IKA_ENTRY();
     __shared__ float lds[kThreads / kWave];
     const uint32_t m = blockIdx.x;
     if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
@@ -354,7 +373,7 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
 __global__ __launch_bounds__(kThreads) void binary_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
     uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step,
-    float div) {
+    float div) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ ar = a + (size_t)m * a_ld;
     const uint16_t* __restrict__ br = b + (size_t)m * b_ld;
@@ -374,7 +393,7 @@ __global__ __launch_bounds__(kThreads) void binary_kernel(
 __global__ __launch_bounds__(kThreads) void binary_f32_kernel(
     const float* __restrict__ a, const float* __restrict__ b, float* y, uint32_t n,
     uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step, float div,
-    uint64_t total) {
+    uint64_t total) { R4D_IKA_ENTRY();
     for (uint64_t t = (uint64_t)blockIdx.x * kThreads + threadIdx.x; t < total;
          t += (uint64_t)gridDim.x * kThreads) {
         const uint64_t m = t / n;
@@ -386,11 +405,35 @@ __global__ __launch_bounds__(kThreads) void binary_f32_kernel(
     }
 }
 
+// ref_add / ref_mul over int32 (a drafter's ids and positions), computed as libref computes them:
+// each operand read as f32, the f32 sum (or product), `div` applied to that rounded back to int32,
+// then st_dt's integer store -- round to nearest even, saturate to [-2^31, 2^31 - 1], NaN to 0.
+// Not a wrapping integer add: identical to one while |a|, |b| and |a + b| stay below 2^24.
+__device__ __forceinline__ float i32_sat_round(float v) {
+    if (v != v) return 0.0f;
+    const float r = rintf(v);
+    return r < -0x1p31f ? -0x1p31f : (r > 0x1p31f ? 0x1p31f : r);
+}
+__global__ __launch_bounds__(kThreads) void binary_i32_kernel(
+    const int32_t* __restrict__ a, const int32_t* __restrict__ b, int32_t* y, uint32_t n,
+    uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, float div, uint64_t total) { R4D_IKA_ENTRY();
+    for (uint64_t t = (uint64_t)blockIdx.x * kThreads + threadIdx.x; t < total;
+         t += (uint64_t)gridDim.x * kThreads) {
+        const uint64_t m = t / n;
+        const uint32_t i = (uint32_t)(t - m * n);
+        const float u = (float)a[m * a_ld + i], v = (float)b[m * b_ld + i];
+        float r = mul ? u * v : u + v;
+        if (div != 1.0f) r = i32_sat_round(r) / div;
+        const float q = i32_sat_round(r);
+        y[m * y_ld + i] = q >= 0x1p31f ? INT32_MAX : (int32_t)q;
+    }
+}
+
 // ref_mul_weight over an f32 weight (a layer scale kept f32): y = x * w, one row of n elements
 // broadcast down the rows, or with `w_step` 0 one element for the whole op.
 __global__ __launch_bounds__(kThreads) void mul_wf32_kernel(
     const uint16_t* __restrict__ x, const float* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t x_ld, uint32_t y_ld, uint32_t w_step) {
+    uint32_t n, uint32_t x_ld, uint32_t y_ld, uint32_t w_step) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -403,7 +446,7 @@ __global__ __launch_bounds__(kThreads) void mul_wf32_kernel(
 template <typename TX, typename TW>
 __global__ __launch_bounds__(kThreads) void mul_weight_f32_kernel(
     const TX* __restrict__ x, const TW* __restrict__ w, float* __restrict__ y, uint32_t n,
-    uint32_t x_ld, uint32_t y_ld, uint32_t w_step, uint64_t total) {
+    uint32_t x_ld, uint32_t y_ld, uint32_t w_step, uint64_t total) { R4D_IKA_ENTRY();
     for (uint64_t t = (uint64_t)blockIdx.x * kThreads + threadIdx.x; t < total;
          t += (uint64_t)gridDim.x * kThreads) {
         const uint64_t m = t / n;
@@ -419,7 +462,7 @@ __global__ __launch_bounds__(kThreads) void mul_weight_f32_kernel(
 // head of an interleaved [tokens, heads, 2*head_dim] projection, `n` wide inside a stride of 2n.
 __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+    uint32_t n, uint32_t x_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -436,7 +479,7 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
 // R9700). Elementwise, so the split changes no bits.
 __global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
-    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -447,7 +490,7 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
 /* The f32 leg, for logits the gemm writes as f32. Same shape as the bf16 leg, with no rounding. */
 __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
     const float* __restrict__ x, float* __restrict__ y,
-    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const float* __restrict__ xr = x + (size_t)m * x_ld;
     float* __restrict__ yr = y + (size_t)m * y_ld;
@@ -491,7 +534,7 @@ static uint32_t softcap_blocks_per_row(int n) {
 // it is f32 or bf16 (the checkpoint's layer_scalar is bf16), selected by `s_dt`.
 __global__ __launch_bounds__(kThreads) void scale_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ s, uint32_t s_dt,
-    uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+    uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const float sv = (s_dt == RAD_F32) ? ((const float*)s)[0] : bf16_to_f32(((const uint16_t*)s)[0]);
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
@@ -510,7 +553,7 @@ __global__ __launch_bounds__(kThreads) void scale_kernel(
 constexpr uint32_t kSiluPer = 4;
 __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    uint32_t n, uint32_t gu_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -536,7 +579,7 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
 // "gelu_tanh" epilogue so the two agree bit for bit.
 __global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    uint32_t n, uint32_t gu_ld, uint32_t y_ld) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -583,7 +626,7 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos,
     uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj,
     float theta, float rscale, uint32_t row_pitch,
-    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3) {
+    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3) { R4D_IKA_ENTRY();
     const uint32_t m = blockIdx.x;
     const uint32_t half = rot / 2;
     const float div = rscale != 0.0f ? rscale : 1.0f;
@@ -631,7 +674,7 @@ __global__ __launch_bounds__(kThreads) void rope_rows_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t M,
     uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj,
     float theta, float rscale, uint32_t row_pitch,
-    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3) {
+    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3) { R4D_IKA_ENTRY();
     const uint32_t half = rot / 2;
     const uint32_t rpb = kThreads / half;                 // rows a block; half <= kThreads
     const uint32_t m = blockIdx.x * rpb + threadIdx.x / half, i = threadIdx.x % half;
@@ -679,7 +722,7 @@ __global__ __launch_bounds__(kThreads) void kv_store_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint16_t* __restrict__ kv,
     uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
-    uint32_t k_ld, uint32_t v_ld) {
+    uint32_t k_ld, uint32_t v_ld) { R4D_IKA_ENTRY();
     const uint32_t t = blockIdx.x;
     const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
@@ -708,7 +751,7 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
     uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
-    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv) {
+    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv) { R4D_IKA_ENTRY();
     const uint32_t t = blockIdx.x;
     const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
@@ -754,7 +797,7 @@ __global__ __launch_bounds__(kThreads) void kv_store_streamed_kernel(
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
     const int32_t* __restrict__ res, uint8_t* __restrict__ host,
     uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t blocks, uint32_t slots,
-    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv) {
+    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv) { R4D_IKA_ENTRY();
     const uint32_t t = blockIdx.x;
     const int32_t s = slot[t];
     if (s < 0) return;
@@ -824,7 +867,7 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
     uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
-    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv, uint32_t row) {
+    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv, uint32_t row) { R4D_IKA_ENTRY();
     const uint32_t t = blockIdx.x;
     const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
@@ -953,6 +996,13 @@ static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src
     if (M <= 0 || n <= 0 || src_rows <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
+    /* more than 48 rows (a decode / logits gather keeps the 2-byte body, as does the chained form), each of whole
+     * 16-byte words: 8 bf16 a word in every row, both pitches and both bases */
+    if (!chain && M > 48 && n % 8 == 0 && x_ld % 8 == 0 && y_ld % 8 == 0 && ((unsigned long)x & 15) == 0 &&
+        ((unsigned long)y & 15) == 0)
+        return R4D_EMIT(stream, gather_rows_w16_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                        (const uint4*)x, (const int32_t*)idx, (uint4*)y, (uint32_t)(n / 8), (int32_t)src_rows,
+                        (uint32_t)(x_ld / 8), (uint32_t)(y_ld / 8)) == RAD_OK ? 0 : -4;
     return R4D_EMIT(stream, (chain ? r4dchain_gather_rows : gather_rows_kernel),
                     dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uint16_t*)x, (const int32_t*)idx,
@@ -1020,7 +1070,7 @@ constexpr uint32_t kShortNormMax = 256;
 template <bool WF32>
 __global__ __launch_bounds__(256) void rmsnorm_short_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, uint32_t M) { R4D_IKA_ENTRY();
     const uint32_t lane = threadIdx.x & (kWave - 1);
     const uint32_t m = blockIdx.x * (256u / kWave) + threadIdx.x / kWave;
     if (m >= M) return;
@@ -1164,7 +1214,7 @@ extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld
 // T is the element's bits: uint16_t for bf16, uint32_t for f32.
 template<typename T>
 __global__ __launch_bounds__(kThreads) void fill_kernel(T* __restrict__ y, uint32_t n,
-                                                        uint32_t y_ld, T v) {
+                                                        uint32_t y_ld, T v) { R4D_IKA_ENTRY();
     T* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = v;
 }
@@ -1399,7 +1449,7 @@ constexpr uint32_t kLgVec  = 8;    // bf16 per 128-bit load
 
 __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
-    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) { R4D_IKA_ENTRY();
     __shared__ float lds[kWaves][kLgRows];
     const uint32_t j = blockIdx.x;
     if (j >= N) return;
@@ -1456,7 +1506,7 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
 constexpr uint32_t kLgCols = 4, kLgKi = 2;   // columns a wave; 2048-wide chunks of n_embd 4096
 __global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
-    uint32_t M, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    uint32_t M, uint32_t N, uint32_t a_ld, uint32_t c_ld) { R4D_IKA_ENTRY();
     constexpr uint32_t C = kLgCols, KI = kLgKi, K = KI * kThreads * kLgVec, V = KI * kLgVec;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const uint32_t j0 = (blockIdx.x * kWaves + wave) * C;
@@ -1972,14 +2022,16 @@ extern "C" int r4d_rad_rmsnorm_p(const RadArgs* a, RadStream s) {
 
 enum { BI_A = 0, BI_B, BI_Y };
 
-/* Both rows of each op share this: every operand bf16, or (add_f32) every operand f32. */
+/* Every row of each op shares this: every operand bf16, or (add_f32) every operand f32, or
+ * (add_i32) every operand int32. */
 static int binary(const RadArgs* a, int mul, RadStream s) {
     const RadTensor* A = r4d_opt(a, BI_A);
     const RadTensor* B = r4d_opt(a, BI_B);
     const RadTensor* Y = r4d_opt(a, BI_Y);
     if (!A || !B || !Y) return R4D_NO(RAD_E_INVAL);
     const bool f32 = Y->dtype == RAD_F32;
-    const uint32_t dt = f32 ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16;
+    const bool i32 = Y->dtype == RAD_I32;
+    const uint32_t dt = f32 ? (uint32_t)RAD_F32 : i32 ? (uint32_t)RAD_I32 : (uint32_t)RAD_BF16;
     if (A->dtype != dt || B->dtype != dt || Y->dtype != dt) return R4D_NO(RAD_E_DTYPE);
     /* `div` is add's alone (mul's schema has none); 0 and non-finite values are refused, as libref
      * refuses them. */
@@ -2007,6 +2059,15 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
         if (b_ld == 0) return R4D_NO(RAD_E_STRIDE);   /* 0 means broadcast; a real pitch cannot be 0 */
     }
 
+    if (i32) {
+        const uint64_t total = (uint64_t)M * (uint64_t)n;
+        const uint64_t blocks = std::min<uint64_t>((total + kThreads - 1) / kThreads, 65536u);
+        hipLaunchKernelGGL(binary_i32_kernel, dim3((uint32_t)blocks), dim3(kThreads), 0,
+                           (hipStream_t)s, (const int32_t*)A->data, (const int32_t*)B->data,
+                           (int32_t*)Y->data, (uint32_t)n, (uint32_t)a_ld, (uint32_t)b_ld,
+                           (uint32_t)y_ld, mul, (float)div, total);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     if (f32) {
         const uint64_t total = (uint64_t)M * (uint64_t)n;
         const uint64_t blocks = std::min<uint64_t>((total + kThreads - 1) / kThreads, 65536u);

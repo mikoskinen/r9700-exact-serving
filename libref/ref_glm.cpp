@@ -2,6 +2,7 @@
 #include "ref_ops.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 using namespace ref;
 
 /* Routing and index head gates are F32 projections in GLM, even with BF16 hidden states. */
@@ -13,7 +14,9 @@ int ref_gemm_nt_f32(const RadArgs* a, RadStream) {
         x.shape[1] != k || w.shape[0] != n || w.shape[1] != k || y.shape[0] != x.shape[0] ||
         y.shape[1] != n)
         return RAD_E_SHAPE;
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    /* f32 weights, or bf16 ones (RADIANCE_DS41_ROUTER_BF16): ldt widens either to the same value. */
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
 #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < x.shape[0]; ++r)
@@ -28,7 +31,15 @@ int ref_gemm_nt_f32(const RadArgs* a, RadStream) {
 }
 
 /* Single-group noaux_tc routing: correction changes selection, never the mixture weights. */
-int ref_router_sigmoid_topk(const RadArgs* a, RadStream) {
+namespace {
+enum class Score { Sigmoid, SqrtSoftplus, Softmax };
+
+/* torch.nn.functional.softplus with its default threshold: x itself above 20. */
+float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }
+
+/* The shared body: scores from the logits, the correction bias picks top_k experts, the unbiased
+ * scores of the picks are the weights, renormalised (+1e-20) when `norm`, times route_scale. */
+int router_topk_scored(const RadArgs* a, Score score) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &weights = a->t[3];
     const int64_t ne = p_int(a, "n_expert", 0), k = p_int(a, "top_k", 0);
@@ -44,8 +55,19 @@ int ref_router_sigmoid_topk(const RadArgs* a, RadStream) {
     for (int64_t r = 0; r < lg.shape[0]; ++r) {
         float scores[512], select[512], chosen[512];
         int index[512];
+        float mx = -INFINITY, den = 0;
         for (int64_t e = 0; e < ne; ++e) {
-            scores[e] = act_sigmoid(ldt(&lg, rowoff(&lg, r, ne) + e * laststride(&lg)));
+            const float l = ldt(&lg, rowoff(&lg, r, ne) + e * laststride(&lg));
+            scores[e] = l;
+            mx = std::max(mx, l);
+        }
+        for (int64_t e = 0; e < ne; ++e) {
+            if (score == Score::Sigmoid) scores[e] = act_sigmoid(scores[e]);
+            else if (score == Score::SqrtSoftplus) scores[e] = std::sqrt(softplus(scores[e]));
+            else { scores[e] = std::exp(scores[e] - mx); den += scores[e]; }
+        }
+        for (int64_t e = 0; e < ne; ++e) {
+            if (score == Score::Softmax) scores[e] /= den;
             select[e] = scores[e] + ldt(&bias, e * laststride(&bias));
         }
         float sum = 0;
@@ -66,6 +88,23 @@ int ref_router_sigmoid_topk(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+}
+
+int ref_router_sigmoid_topk(const RadArgs* a, RadStream) {
+    return router_topk_scored(a, Score::Sigmoid);
+}
+
+/* router_sigmoid_topk with the score function named: "sigmoid", "sqrtsoftplus" (DeepSeek-V4's
+ * sqrt(softplus(logit))) or "softmax" (over all n_expert logits). */
+int ref_router_scored_topk(const RadArgs* a, RadStream) {
+    const char* sc = p_str(a, "score", "");
+    Score score;
+    if (!std::strcmp(sc, "sigmoid")) score = Score::Sigmoid;
+    else if (!std::strcmp(sc, "sqrtsoftplus")) score = Score::SqrtSoftplus;
+    else if (!std::strcmp(sc, "softmax")) score = Score::Softmax;
+    else return RAD_E_UNSUPPORTED;
+    return router_topk_scored(a, score);
 }
 
 /* Group-limited noaux_tc routing (DeepSeek-V3's, Ling-3.0's): the experts fall into `n_group`

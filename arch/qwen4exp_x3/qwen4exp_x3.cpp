@@ -23,16 +23,21 @@ RAD_ARCH_PLUGIN(qwen4exp_x3, "qwen4exp", "exl3", "0.1.0",
                 "Qwen4-Exp (Qwen3.8-Flash-Next) from an EXL3 checkpoint: qwen4exp_fp8 under the exl3 "
                 "descriptor (EXL3 routed experts, bf16 elsewhere)")
 /* fn4 runtime switches (the core's runtime/fn4_switch.h, between steps, every rank parked): "exl3_dual" 0 / 1 -- fn4
- * BI-dual (the EXL3 downs take the step's row bands; RADIANCE_FN4_X3DUAL=1 declares); "moe_pair" 0 / 1 / 2 --
- * fn4 P2x (qwen4exp_fp8's step_pipelined); "exl3_mapshare" 0 / 1 --
+ * BI-dual (the EXL3 downs take the step's row bands; RADIANCE_FN4_X3DUAL=1 declares); "moe_pair" 0 .. 4 --
+ * fn4 P2x / qfn-on-ds P2S (qwen4exp_fp8's step_pipelined); "exl3_mapshare" 0 / 1 --
  * MoeFP8's EXL3 ops with or without the pass's shared routing map (fn4_exl3_map_flag); "exl3_gd" 0 / 1 -- the decode
  * band's fused moe_exl3_gate_up_down in place of the split pair (fn4_exl3_gd_flag; rad_block_moe_fp8.h). Every other
  * name is not this plugin's (0). */
+/* qfn-on-ds: this plugin's switches are the Qwen line's, which the core checks by its own ranges and never asks a plugin
+ * about; for every other name (the ds41 line's plugin switches, checked through rad_fn4_accepts) it is not the owner. */
+extern "C" int rad_fn4_accepts(const char*, int) { return 0; }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
     if (std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (qwen4exp_fp8's step_pipelined; RADIANCE_FN4_P2X=1 declares) */
-        if (value < 0 || value > 2) return -1;
-        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
+        if (value < 0 || value > 4) return -1;
+        /* qfn-on-ds P2S (Qwen loop round 17): 3 (the pair order, each piece's own pass) needs no two-piece buffers; 1 / 2 / 4 a
+         * joint pass -- the same rule as qwen4exp_fp8's own rad_fn4_switch (before this, 3 / 4 were refused here: p2s1) */
+        if (value && value != 3 && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -48,15 +53,34 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_spser_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "sp_ple") == 0) {   /* fn4 SP-PLE: a pipelined SP-hc step keeps the layers before the PLE's replicated (qwen/SP-SERIAL-EXACT.md; fn4-x3-spx 4f5c712e) */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (measurement only) */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen4exp_fp8's step_pipelined; RADIANCE_FN4_SP_ROUTE declares) */
+        if (value < 0 || value > 16383) return -1;   /* 8192: lever HCP (qwen4exp_fp8's connection reads: a prefill segment past the first interval at a full piece's K split); 4096: lever GPF (qwen4exp_fp8's step_pipelined: a (R, <= 64)-row step's mixer whole, ArPieces::min_last); 2048 (with 1024): MSP's embedding by a raw reduce-scatter; 1024: lever MSP (qwen4exp_fp8's MTP history pass a piece a rank, rad_block_mtp_hc.h step_msp; RADIANCE_FN4_MSP=1 declares); 512: lever PSP (qwen4exp_fp8's step_pipelined: the partial last piece SP); bits 2 / 4: PF probes, 8: PF marks, 16: SPO-tail, 32: PF-ORDER (qwen4exp_fp8's step_pipelined), 64: PF probe ATP (a prefill step's gated sparse attention twice, rad_block_attn_gated_fp8.h), 128: PF probe X3P (a prefill-height pass's EXL3 experts twice, rad_block_moe_fp8.h), 256: PF probe NOWAIT (qwen4exp_fp8's step_pipelined: lane 0 never waits for lane 1; wrong bytes) */
+        if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
+        qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
+        rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);
+        rad::arch::fn4_x3probe_flag().store((value & 128) ? 1 : 0, std::memory_order_relaxed);
         return 1;
     }
     if (std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */
         if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SPHC")) return -1;
         qwen4exp_fp8::fn4_sp_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (std::strcmp(name, "gnq8") == 0) {   /* qfn-on-ds lever GNQ8: the GDN prefill gated norm writes the codes (RADIANCE_FN4_GNQ8 declares) */
+        if (value < 0 || value > 1) return -1;
+        if (value && !rad::arch::fn4_gnq8_declared()) return -1;
+        rad::arch::fn4_gnq8_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (std::strcmp(name, "arw_rows") == 0) {   /* fn4 ARW: the fused exact write's row cap (0 = none) */
@@ -76,7 +100,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
+        if (value < 0 || value > 6) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path; 5: + dense steps; 6: + the depth-3 sparse law at every depth */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -86,8 +110,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
-        if (value < 0 || value > 2) return -1;
+    if (std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head; 3: + its decode rows in one launch at any depth) */
+        if (value < 0 || value > 3) return -1;
         qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
@@ -111,3 +135,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     return qwen4exp_fp8::pass_key(c, batch, used_max_h);
 }
+/* qfn-on-ds lever TIP (Qwen loop round 21): qwen4exp_fp8's hooks under this key too (RADIANCE_FN4_TIP=1 declares) */
+extern "C" int rad_tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
+    return qwen4exp_fp8::tip_set(rank, row, stage, u);
+}
+extern "C" int rad_tip_free(int rank, int* groups, int max) { return qwen4exp_fp8::tip_free(rank, groups, max); }

@@ -64,7 +64,8 @@
 
 namespace r4d_iqr {
 
-enum Kind : uint32_t { kSigned = 1, kZero = 2, kTable = 3, kGrid = 4, kTrellis = 5, kTrellisMad = 6 };
+enum Kind : uint32_t { kSigned = 1, kZero = 2, kTable = 3, kGrid = 4, kTrellis = 5, kTrellisMad = 6,
+                       kStored = 7 };
 /* Scale forms. kRowF32: one f32 a row over the whole K times one f32 a 128-K block shared by every
  * row (libquant's tcq_colf; 1 without it): a GEMM folds the block's factor with the activation's
  * per-128 scale and the row's in its epilogue, so its K loop reads no weight scale a row. */

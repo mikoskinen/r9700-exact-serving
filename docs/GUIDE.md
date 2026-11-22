@@ -1407,12 +1407,15 @@ radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's 
 radiance --model m.rad --num-speculative-tokens 4             # a head drafts; lookup fills in where it declines
 ```
 
-`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) for a
-container that declares no draft head; one that declares a head is refused at startup, because the
-head would draft in lookup's place (serve it with `--num-speculative-tokens N`). Without the flag,
-prompt lookup still drafts for every sequence a declared head declines, and is the only drafter when
-speculation is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
-(`speculation: prompt lookup only -- this container declares no draft head`), and the drafts count in `draft_n` /
+`--spec-ngram K` sets the window to K (leave `--num-speculative-tokens` unset; a different value is
+refused). On a container that carries a draft head, the head is left out: the plugin is told so
+(`RadBuildCtx::draft_head_off`) and declares none of it, so its weights are neither loaded nor
+placed, while every verify buffer is still sized for K drafts; a plugin that declares its head anyway
+is refused at startup. Without the flag, prompt lookup still drafts for every sequence a declared
+head declines, and is the only drafter when speculation is on (`--num-speculative-tokens N`) and the
+container has no head. Startup says which (`speculation: prompt lookup only (--spec-ngram K) -- the
+container's draft head is left out: ...`, or `... -- this container declares no draft head`), and
+the drafts count in `draft_n` /
 `draft_n_accepted` and the `radiance:draft_*` metrics like a head's. Prompt lookup reads the
 committed sequence, so a step is not issued ahead of the previous one's readback.
 
@@ -2159,7 +2162,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a draft head the container carries is not declared, loaded or placed; sets the window to K (leave `--num-speculative-tokens` unset or give K) (§4.6) |
 | `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
 | `--draft-short-from N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
@@ -2248,7 +2251,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-graph` | print the declared graph and the selection table, and exit |
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
-| `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
+| `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's. It also works beside a draft head (`--num-speculative-tokens N` on a container that declares one): the ids replace each proposal the head publishes, at the head's own count, so the verify runs at the head's shape; no step is then issued ahead of its commit, so the run is not a speed measurement, and a tree drafter proposes a chain |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--proceed-with-incompatible-configuration` | start on a machine configuration startup refuses (§1.1: CWSR off where cards serve). **Unsupported**: all guarantees are off, and the log and the startup report say so |
 | `--profile-ops` | per-op device timing |
@@ -4153,6 +4156,15 @@ TranslateGemma 18.3 ms a step, against 19.8-20.5.
 | `RADIANCE_G4_CALIB_LAYERS` | `lo:hi`: the same for `arch/gemma4`'s tap, which takes the Gemma 4 31B's Grams from its bf16 checkpoint (docs/GEMMA4-31B-GPTQ.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: time every dispatch of one recorded pass in N on card 0, each with a completion signal of its own, without changing its barriers or chains (`--profile-ops` plays no recorded pass). One CSV line a dispatch (pass, record, queue, kernel, ordered, chained, start and end in ns) goes to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`); `scripts/stampgaps.py` summarises it per kind of pass. AQL backend only |
+| `RADIANCE_HEAT_PREFILL` | `0`..`1`: how much of a step the heat engine credits a step with prefill rows at -- its decode rows in full, its prefill rows at this share -- scaling both that step's credit and its decay (default 1, every step a whole step). `0` keeps a prompt's routing from turning the resident set towards the prompt's experts: under expert parallelism each 8192-token chunk credits several hundred decode steps' worth even under the credit cap, and the decode after a long cold prompt then reads its experts across the link until the moves put the decode set back. Placement does not change outputs |
+| `RADIANCE_HEAT_MOVES`, `RADIANCE_PLACE_TURNOVER` | the heat engine's swaps a step per slab class (default 64) and the lent slots each class keeps free for them (default 3 x moves - 32 shadow = 160; `RADIANCE_PLACE_TURNOVER` sets it outright, never above the default). Every kept slot is KV loan that holds no expert: at 64 moves and two slab classes, 320 slots (2.8 GiB a card on DeepSeek-V4.1-Flash EXL3 2.25 bpw). Fewer moves converge more slowly after the routing shifts |
+| `RADIANCE_ARENA_LEVEL_MAX` | rows: the activation arena's smaller levels stop at this size (the span's shared level apart; unset or 0 = every rung, 4x apart up to the chunk). A rung just under the chunk lends little beyond the full plan, yet its steps find the prefill stager's ring lent, so they run unstaged; at `--max-num-batched-tokens 4160` with `--prefill-span 2`, 1024 leaves 256 / 1024 / 2112 and stages every step above 1024 tokens |
+| `RADIANCE_STAGE_MIXED` | which passes that carry decode rows the prefill stager may stage (a lone prefill pass is staged by the size rule alone). Unset or `1`: any. `0`: none -- a chunk that shares its step with decoding sequences reads the pool in place, as without the stager. `2`: only a chunk that leaves more of its prompt for a later step (a long prompt beside decoders), not a prompt's last or only chunk. On DeepSeek-V4.1 EXL3 at four ranks a lone chunk staged ran 42 % faster at 2.9 bpw, a one-chunk prompt beside four decoders 8-12 % slower (the whole pooled set crosses the link for a step whose compute cannot hide it), the chunks of a 31k prompt beside four decoders 3.8 % faster at 2.25 bpw and 5.8 % slower at 2.9 |
+| `RADIANCE_STAGE_SPAN` | `0`: the prefill stager keeps no place at the `--prefill-span` shared level, which then lends that room to the expert slab like any other level; its steps (every chunk that shares a step with decoding, and a lone chunk of at most the shared size) are not staged, full-plan steps are. Unset: the shared level keeps the ring's room and stages its steps (as allowed by `RADIANCE_STAGE_MIXED`) |
+| `RADIANCE_ARENA_HOLD_MS` | ms the activation arena's loan floor (the largest recent step) holds before the arena is lent to the expert slab again (default 2000). Longer recalls the slab less often under steady prefill traffic -- each recall drains both streams before the step -- at the price of decode steps that run without the loan for that long after a prompt |
+| `RADIANCE_HEAT_PREFILL_DECAY`, `RADIANCE_HEAT_PREFILL_GAIN` | dual heat: a step's decode rows credit a decode heat (decaying as the one heat does, with them), its prefill rows a prefill heat (times the gain, default 1) that decays by this factor (0 < d < 1, e.g. 0.7) at every step; placement ranks their sum. A prompt's experts come in while it prefills and the prefill heat is gone within tens of steps after it, leaving the decode heat as the prompt found it. Unset: one heat (`RADIANCE_HEAT_PREFILL` applies) |
+| `RADIANCE_HEAT_DECODE_PIN` | with dual heat: the fraction (0..0.99) of each slab class's resident units, the hottest by decode heat, that no promotion may demote, so a prompt fills only the rest and the decode core stays on the card through it (e.g. 0.8). Thresholds are taken once a step; a unit with no decode heat is never protected |
+| `RADIANCE_HEAT_CREDIT_CAP` | the most selections one histogram credits (`HeatParams::credit_cap`, default 512); above 0 |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

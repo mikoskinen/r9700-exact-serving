@@ -112,6 +112,46 @@ __global__ __launch_bounds__(kThreads) void r4dchain_quant_act_fp8(R4D_QAF_PARAM
 }
 #undef R4D_QAF_PARAMS
 
+/* tp8 loop P30o: DeepSeek-V4's released activation quantiser (inference/kernel.py act_quant with scale_fmt "ue8m0", the form
+ * its linear() runs before every block-FP8 weight): per (row, 32 columns) amax = max(|x|, 1e-4), scale = the power of two at or
+ * above amax * f32(1/448) (ceil(log2) from the product's IEEE bits: fast_round_scale), q = E4M3(clamp(x / scale, +-448)). The
+ * same block / wave / lane mapping as above (a lane four columns, a wave 128): a group is eight consecutive lanes, so its amax
+ * is three xor steps. x / scale is x * (1 / scale) exactly (a power of two and its reciprocal), so no rounding differs from
+ * the release's division. A ragged tail is refused at the shim (the release asserts n % 32 == 0). */
+constexpr uint32_t kUeGroup = 32;
+__global__ __launch_bounds__(kThreads) void quant_act_fp8_ue8m0_kernel(
+    const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t K, uint32_t x_ld,
+    uint32_t q_ld, uint32_t s_ld) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const size_t xrow = (size_t)row * x_ld, qrow = (size_t)row * q_ld;
+    const uint32_t nkb = (K + kGroup - 1) / kGroup;
+    for (uint32_t kb = wave; kb < nkb; kb += kWaves) {
+        const uint32_t c0 = kb * kGroup + lane * 4u;
+        float v[4];
+        float m = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t c = c0 + (uint32_t)j;
+            v[j] = c < K ? __uint_as_float((uint32_t)x[xrow + c] << 16) : 0.0f;
+            m = fmaxf(m, fabsf(v[j]));
+        }
+        m = r4d_xor_max<8>(m);          /* the eight lanes of this 32-column group */
+        m = fmaxf(m, 1e-4f);
+        const uint32_t u = __float_as_uint(m * (1.0f / 448.0f));
+        const int e = (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) ? 1 : 0);
+        const float sc = __uint_as_float((uint32_t)(e + 127) << 23);
+        const float inv = __uint_as_float((uint32_t)(127 - e) << 23);
+        if ((lane & 7u) == 0u && c0 < K) s[(size_t)row * s_ld + c0 / kUeGroup] = sc;
+        int pk = 0;
+        pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[0] * inv, -448.0f), 448.0f),
+                                             fminf(fmaxf(v[1] * inv, -448.0f), 448.0f), pk, false);
+        pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[2] * inv, -448.0f), 448.0f),
+                                             fminf(fmaxf(v[3] * inv, -448.0f), 448.0f), pk, true);
+        if (c0 < K) *(uint32_t*)(q + qrow + c0) = (uint32_t)pk;
+    }
+}
+
 }  // namespace
 
 extern "C" int r4d_quant_act_fp8_group(void) { return (int)kGroup; }
@@ -201,6 +241,30 @@ extern "C" int r4d_rad_quant_act_fp8(const RadArgs* a, RadStream stream) {
  * rotated at convert reads it as noise. */
 extern "C" int r4d_rad_had_quant_act_fp8(const RadArgs* a, RadStream stream) {
     return rad_quant_act_fp8(a, stream, true);
+}
+
+/* tp8 loop P30o: quant_act_fp8_ue8m0 (the release's act_quant at group 32, a power-of-two scale), the activation of the
+ * block-FP8 GEMMs at dtype fp8a8e8. */
+extern "C" int r4d_rad_quant_act_fp8_ue8m0(const RadArgs* a, RadStream stream) {
+    const RadTensor* x  = r4d_opt(a, QF_X);
+    const RadTensor* q  = r4d_opt(a, QF_Q);
+    const RadTensor* sc = r4d_opt(a, QF_S);
+    if (!x || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (x->rank < 2 || q->rank != 2 || sc->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    if (x->dtype != RAD_BF16 || q->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const long long M = x->shape[0], K = r4d_numel(x) / (x->shape[0] > 0 ? x->shape[0] : 1);
+    const long long grp = (long long)kUeGroup;
+    if (r4d_geti_or(a, "group", grp) != grp || K % grp) return R4D_NO(RAD_E_SHAPE);
+    if (q->shape[0] != M || q->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
+    if (sc->shape[0] != M || sc->shape[1] != K / grp) return R4D_NO(RAD_E_SHAPE);
+    const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    if (xp < 0 || qp < 0 || sp < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0) return RAD_OK;
+    if (R4D_EMIT(stream, quant_act_fp8_ue8m0_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                 (const uint16_t*)r4d_addr(x), (uint8_t*)r4d_addr(q), (float*)r4d_addr(sc), (uint32_t)K,
+                 (uint32_t)xp, (uint32_t)qp, (uint32_t)sp) != RAD_OK)
+        return R4D_NO(RAD_E_DEVICE);
+    return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 
 /* The int8 pair, for the int8 trunk GEMMs (gemm_i8a8_*). Separate ops for the same reason as the

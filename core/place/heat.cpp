@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <functional>
 
 namespace rad {
 
@@ -12,11 +14,26 @@ namespace {
 constexpr int32_t kLanes = 16;
 /* What the movable units with no layer are padded to. */
 constexpr int32_t kBlock = 64;
+/* HeatParams::decode_pin: what a protected resident adds to its ranking heat, above any heat. */
+constexpr float kPinBonus = 1.0e9f;
+/* Lever HB: what a reserved unit adds to its ranking heat -- above any heat, below a pinned resident's bonus. */
+constexpr float kResBonus = 1.0e5f;
 }  /* namespace */
+
+int heat_env_x100(const char* s, int lo, int hi) {
+    if (!s || !*s) return -1;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || *end || !(v == v) || v < -1.0e9 || v > 1.0e9) return -1;
+    const long r = std::lround(v * 100.0);
+    return r < lo || r > hi ? -1 : (int)r;
+}
 
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     params_ = params;
     stats_ = HeatCounters{};
+    guard_x100_[0] = (int64_t)std::lround((double)params_.min_gain * 100.0);   /* lever L2's mirrors */
+    guard_x100_[1] = (int64_t)std::lround((double)params_.hysteresis * 100.0);
 
     const size_t n = plan.units.size();
     tier_.assign(n, Tier::VRAM);
@@ -113,10 +130,29 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
 
     const size_t np = unit_at_.size();
     heat_.assign(np, 0.0f);
+    heat_d_.assign(dual() ? np : 0, 0.0f);
+    heat_p_.assign(dual() ? np : 0, 0.0f);
+    pin_thr_.assign((size_t)n_cls_, INFINITY);
+    /* Lever HB: kept wherever the dual heat is; ranks nothing until set_hb_reserve. */
+    if (!(params_.hb_decay > 0.0f && params_.hb_decay < 1.0f)) params_.hb_decay = HeatParams{}.hb_decay;
+    heat_pl_.assign(dual() ? np : 0, 0.0f);
+    hb_thr_.assign((size_t)n_cls_, INFINITY);
+    hb_r_ = 0;
     rank_as_.assign(np, 0u);
     routed_as_.assign(np, 0u);
     miss_bytes_.assign(np, 0);
     for (size_t u = 0; u < n; ++u) set_place((int32_t)u);
+    /* ds41-lf: the slot classes (the plan's resident set sits in trunk slots; a draft head's units are counted
+     * apart) and the long-memory decode heat. Counters only: nothing here ranks or moves a unit. */
+    if (!(params_.long_decay > 0.0f && params_.long_decay < 1.0f)) params_.long_decay = HeatParams{}.long_decay;
+    heat_l_.assign(np, 0.0f);
+    scls_.assign(np, kSlotNone);
+    for (size_t u = 0; u < n; ++u) {
+        const size_t p = (size_t)pos_[u];
+        if (params_.trunk_layers >= 0 && layer_of_[u] >= params_.trunk_layers) scls_[p] = kSlotDraftOwn;
+        else if (tier_[u] == Tier::VRAM) scls_[p] = kSlotTrunk;
+    }
+    for (int c = 0; c < kSlotClasses; ++c) { slot_hit_[c] = Relaxed<uint64_t>(0); slot_miss_[c] = Relaxed<uint64_t>(0); }
 
     /* Each slot's lowest movable unit index, for step()'s tie test. */
     min_unit_.assign((size_t)n_layer_ + 1, INT32_MAX);
@@ -153,6 +189,17 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
              (double)params_.credit_cap, (double)params_.admit_heat);
+    if (dual())
+        RAD_INFO("heat engine: dual heat -- decode rows credit a decode heat, prefill rows a prefill "
+                 "heat (x%.2f) that decays %.3f a step; placement ranks their sum "
+                 "(RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)", (double)params_.prefill_gain,
+                 (double)params_.prefill_decay);
+    if (dual() && params_.decode_pin > 0.0f)
+        RAD_INFO("heat engine: the decode-hottest %.0f%% of each class's resident units are no "
+                 "promotion's victim (RADIANCE_HEAT_DECODE_PIN)", 100.0 * (double)params_.decode_pin);
+    if (!dual() && params_.prefill_share != 1.0f)
+        RAD_INFO("heat engine: a step with prefill rows counts as its decode share plus %.3f of its "
+                 "prefill share (RADIANCE_HEAT_PREFILL)", (double)params_.prefill_share);
     return RAD_OK;
 }
 
@@ -188,7 +235,8 @@ void HeatEngine::observe_ids(int32_t layer, const int32_t* experts, const int32_
  * usually a crowd (every resident unit not routed to lately sits at zero). When the last is
  * credited the layer is rebuilt from its positions. Ties created by decay are not counted, which
  * can only cause an unneeded rebuild. */
-void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight) {
+void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight,
+                         float share, float pshare) {
     if (!enabled_ || layer < 0 || layer >= n_layer_ || !counts) return;
     if (!(weight > 0.0f)) weight = 1.0f;
     /* Routing passes this histogram stands for (see heat.h: observe); at least one. */
@@ -198,22 +246,61 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     const int32_t lo = slot_lo_[l], len = slot_lo_[l + 1] - lo;
     /* Positions past the histogram's or the layer's last expert get no credit. */
     const int32_t n = std::max(0, std::min(n_expert, n_ex_[l]));
-    const float d = params_.decay;
 
     /* The histogram arrives by DMA and is not in cache. Prefetching every line at once overlaps
      * the misses with each other and with the decay; a caller sweeping layers may prefetch
      * earlier still. */
     prefetch(counts, n);
 
+    if (dual()) {
+        int64_t total = 0;
+        for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
+        const float cap = params_.credit_cap;
+        const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+        observe_dual(layer, counts, n, w, passes, share, pshare);
+        return;
+    }
+
+    /* A step that counts for nothing (HeatParams::prefill_share 0 on a prefill step): priced as
+     * any histogram, so hit rate and streamed bytes still cover it, and no heat or end moves. */
+    if (!(share > 0.0f)) {
+        int32_t routed = 0, resident = 0;
+        int64_t miss = 0;
+        uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
+        for (int32_t j = 0; j < n; ++j) {
+            if (counts[j] <= 0) continue;
+            const size_t q = (size_t)(lo + j);
+            routed += routed_as_[q] != 0;
+            resident += routed_as_[q] == 2;
+            miss += miss_bytes_[q];
+            if (routed_as_[q] == 2) ++sh[scls_[q]];
+            else if (routed_as_[q] == 1) ++sm[scls_[q]];
+        }
+        stats_.routed += (uint64_t)routed * passes;
+        stats_.routed_resident += (uint64_t)resident * passes;
+        stats_.stream_bytes += (uint64_t)miss * passes;
+        add_slots(sh, sm, passes);
+        ++stats_.dispatches;
+        return;
+    }
+    /* A part of a step decays by decay^share, so shares adding to one step decay as that step.
+     * share 1 takes the plain constant (no pow), the same bits as before the parameter. */
+    const float d = share < 1.0f ? std::pow(params_.decay, share) : params_.decay;
+
     /* The credit cap (HeatParams::credit_cap) scales the whole histogram, preserving order.
      * Pricing ignores the cap. */
     int64_t total = 0;
     for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
     const float cap = params_.credit_cap;
-    const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+    float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+    if (share < 1.0f) w *= share;
 
     float* __restrict h = heat_.data() + lo;
     for (int32_t j = 0; j < len; ++j) h[j] *= d;
+    /* Lever LF's long-memory heat: the same credit, decayed by long_decay^share. */
+    const float dl = share < 1.0f ? std::pow(params_.long_decay, share) : params_.long_decay;
+    float* __restrict hl = heat_l_.data() + lo;
+    for (int32_t j = 0; j < len; ++j) hl[j] *= dl;
 
     bool ends = end_ok_[l] != 0;
     float hot = ends && end_n_off_[l] > 0 ? end_hot_[l] * d : -INFINITY;
@@ -221,15 +308,19 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     int32_t n_cold = ends ? end_n_cold_[l] : 0;
     int32_t routed = 0, resident = 0;
     int64_t miss = 0;
+    uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
     auto credit = [&](int32_t j) {
         const int32_t c = counts[j];
         const size_t q = (size_t)(lo + j);
         const float was = h[j];
         const float x = was + (float)c * w;
         h[j] = x;
+        hl[j] += (float)c * w;
         routed += routed_as_[q] != 0;
         resident += routed_as_[q] == 2;
         miss += miss_bytes_[q];
+        if (routed_as_[q] == 2) ++sh[scls_[q]];
+        else if (routed_as_[q] == 1) ++sm[scls_[q]];
         if (rank_as_[q] == 1) hot = std::max(hot, x);
         else if (rank_as_[q] == 2 && was <= cold && --n_cold <= 0) ends = false;
     };
@@ -255,6 +346,7 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     stats_.routed += (uint64_t)routed * passes;
     stats_.routed_resident += (uint64_t)resident * passes;
     stats_.stream_bytes += (uint64_t)miss * passes;
+    add_slots(sh, sm, passes);
     ++stats_.dispatches;
 }
 
@@ -316,6 +408,139 @@ void HeatEngine::set_place(int32_t unit) {
         : vram ? 2u : 1u;
     routed_as_[p] = vram ? 2u : 1u;
     miss_bytes_[p] = vram ? 0 : bytes_[u];
+}
+
+/* Dual heat (HeatParams::prefill_decay): the decode heat decays by decay^share and takes the
+ * histogram's credit times `share` (the step's decode rows); the prefill heat decays by
+ * prefill_decay and takes it times `pshare` x prefill_gain (its prefill rows). A layer is credited
+ * once a step, so every step decays the prefill heat once. heat_ is their sum. Two heats decayed
+ * by different factors can change places by decay alone, so the layer's ends are rebuilt rather
+ * than updated (one pass over the layer's positions, which the decay makes anyway). Pricing as in
+ * observe(). */
+void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, float w,
+                              uint64_t passes, float share, float pshare) {
+    const size_t l = (size_t)layer;
+    const int32_t lo = slot_lo_[l], len = slot_lo_[l + 1] - lo;
+    const float sd = share > 1.0f ? 1.0f : (share > 0.0f ? share : 0.0f);
+    const float sp = pshare > 1.0f ? 1.0f : (pshare > 0.0f ? pshare : 0.0f);
+    const float dd = sd >= 1.0f ? params_.decay : (sd > 0.0f ? std::pow(params_.decay, sd) : 1.0f);
+    const float dp = params_.prefill_decay;
+    const float wd = w * sd, wp = w * sp * params_.prefill_gain;
+    float* __restrict hd = heat_d_.data() + lo;
+    float* __restrict hq = heat_p_.data() + lo;
+    float* __restrict h = heat_.data() + lo;
+    for (int32_t j = 0; j < len; ++j) {
+        hd[j] *= dd;
+        hq[j] *= dp;
+        h[j] = hd[j] + hq[j];
+    }
+    /* Lever LF's long-memory heat: the decode heat's credit, decayed by long_decay^share. */
+    const float dl = sd >= 1.0f ? params_.long_decay : (sd > 0.0f ? std::pow(params_.long_decay, sd) : 1.0f);
+    float* __restrict hl = heat_l_.data() + lo;
+    if (dl != 1.0f)
+        for (int32_t j = 0; j < len; ++j) hl[j] *= dl;
+    /* Lever HB: the long-memory prefill heat decays once a credited histogram of a step with prefill rows. */
+    float* __restrict hpl = heat_pl_.data() + lo;
+    if (sp > 0.0f)
+        for (int32_t j = 0; j < len; ++j) hpl[j] *= params_.hb_decay;
+    /* HeatParams::decode_pin: a protected resident ranks far above any heat, so it is never the
+     * cold end. Only residents (rank_as_ 2) and only for the ranking: the heats stay apart. */
+    const bool pin = params_.decode_pin > 0.0f;
+    const auto pinned_bonus = [&](int32_t j) -> float {
+        const size_t q = (size_t)(lo + j);
+        if (!pin || rank_as_[q] != 2) return 0.0f;
+        const int32_t u = unit_at_[q];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        return c >= 0 && hd[j] >= pin_thr_[(size_t)c] ? kPinBonus : 0.0f;
+    };
+    /* Lever HB (set_hb_reserve): a reserved unit, resident or not, ranks kResBonus above its heat. */
+    const bool hb = hb_r_ > 0;
+    const auto reserve_bonus = [&](int32_t j) -> float {
+        if (!hb || !(hpl[j] > 0.0f)) return 0.0f;
+        const int32_t u = unit_at_[(size_t)(lo + j)];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        return c >= 0 && hpl[j] >= hb_thr_[(size_t)c] ? kResBonus : 0.0f;
+    };
+    if (pin)
+        for (int32_t j = 0; j < len; ++j) h[j] += pinned_bonus(j);
+    if (hb)
+        for (int32_t j = 0; j < len; ++j) h[j] += reserve_bonus(j);
+    int32_t routed = 0, resident = 0;
+    int64_t miss = 0;
+    uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
+    for (int32_t j = 0; j < n; ++j) {
+        const int32_t c = counts[j];
+        if (c <= 0) continue;
+        const size_t q = (size_t)(lo + j);
+        hd[j] += (float)c * wd;
+        hq[j] += (float)c * wp;
+        if (sp > 0.0f) hpl[j] += (float)c * w * sp;
+        h[j] = hd[j] + hq[j] + pinned_bonus(j) + reserve_bonus(j);
+        hl[j] += (float)c * wd;
+        routed += routed_as_[q] != 0;
+        resident += routed_as_[q] == 2;
+        miss += miss_bytes_[q];
+        if (routed_as_[q] == 2) ++sh[scls_[q]];
+        else if (routed_as_[q] == 1) ++sm[scls_[q]];
+    }
+    end_rebuild(l);
+    stats_.routed += (uint64_t)routed * passes;
+    stats_.routed_resident += (uint64_t)resident * passes;
+    stats_.stream_bytes += (uint64_t)miss * passes;
+    add_slots(sh, sm, passes);
+    ++stats_.dispatches;
+}
+
+/* HeatParams::decode_pin's thresholds: per class, the decode heat of the k-th decode-hottest resident
+ * unit, k = decode_pin x the class's resident candidates. Never at or below zero, so a unit with no
+ * decode heat is never protected; +inf where k is 0. */
+void HeatEngine::update_pin() {
+    pin_tmp_.resize((size_t)n_cls_);
+    for (auto& v : pin_tmp_) v.clear();
+    for (size_t p = 0; p < heat_d_.size(); ++p) {
+        if (rank_as_[p] != 2) continue;
+        const int32_t u = unit_at_[p];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        if (c >= 0) pin_tmp_[(size_t)c].push_back(heat_d_[p]);
+    }
+    for (size_t c = 0; c < pin_tmp_.size(); ++c) {
+        std::vector<float>& v = pin_tmp_[c];
+        const size_t k = (size_t)((double)params_.decode_pin * (double)v.size());
+        if (k == 0) { pin_thr_[c] = INFINITY; continue; }
+        std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t)(k - 1), v.end(), std::greater<float>());
+        pin_thr_[c] = std::max(v[k - 1], 1e-6f);
+    }
+}
+
+/* Lever HB's thresholds: per class, the long-memory prefill heat of the R-th hottest candidate (movable, not in
+ * flight: rank_as_ 1 or 2), never at or below zero; +inf where the class has none. Also the reserve's counts. */
+void HeatEngine::update_reserve() {
+    hb_tmp_.resize((size_t)n_cls_);
+    for (auto& v : hb_tmp_) v.clear();
+    for (size_t p = 0; p < heat_pl_.size(); ++p) {
+        if (!rank_as_[p] || !(heat_pl_[p] > 0.0f)) continue;
+        const int32_t u = unit_at_[p];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        if (c >= 0) hb_tmp_[(size_t)c].push_back(heat_pl_[p]);
+    }
+    for (size_t c = 0; c < hb_tmp_.size(); ++c) {
+        std::vector<float>& v = hb_tmp_[c];
+        if (v.empty()) { hb_thr_[c] = INFINITY; continue; }
+        const size_t k = std::min(v.size(), (size_t)hb_r_);
+        std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t)(k - 1), v.end(), std::greater<float>());
+        hb_thr_[c] = std::max(v[k - 1], 1e-30f);
+    }
+    int64_t held = 0, res = 0;
+    for (size_t p = 0; p < heat_pl_.size(); ++p) {
+        if (!rank_as_[p] || !(heat_pl_[p] > 0.0f)) continue;
+        const int32_t u = unit_at_[p];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        if (c < 0 || heat_pl_[p] < hb_thr_[(size_t)c]) continue;
+        ++held;
+        res += rank_as_[p] == 2;
+    }
+    hb_reserved_ = Relaxed<int64_t>(held);
+    hb_resident_ = Relaxed<int64_t>(res);
 }
 
 void HeatEngine::end_rebuild(size_t slot) {
@@ -439,6 +664,10 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!enabled_) return RAD_OK;
     const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
+    /* The next step's protection (HeatParams::decode_pin), from this step's decode heats. */
+    if (dual() && params_.decode_pin > 0.0f) update_pin();
+    /* Lever HB: the next step's reserve, from this step's long prefill heats. */
+    if (hb_r_ > 0) update_reserve();
 
     /* Test the best pair from the layers' ends first. If it fails the guard, every pair does,
      * and the dispatch proposes nothing after one entry per layer. The ends' counts also give the
@@ -566,6 +795,11 @@ int HeatEngine::step(std::vector<Swap>* out) {
         s.promote = hot[best * k + m_of[best]].unit;
         s.demote = cold[best * k + m_of[best]].unit;
         ++m_of[best];
+        /* Lever HB: a promotion the reserve's bonus carried (between kResBonus and the pin's bonus). */
+        if (hb_r_ > 0) {
+            const float hh = hot[best * k + m_of[best] - 1].h;
+            if (hh >= 0.5f * kResBonus && hh < 0.5f * kPinBonus) ++hb_promotions_;
+        }
         /* The caller owns the pair until it publishes or abandons it. */
         set_busy(s.promote, true);
         set_busy(s.demote, true);
