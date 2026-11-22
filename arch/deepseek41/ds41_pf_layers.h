@@ -47,9 +47,15 @@ constexpr int kGroups = 9;
  * the selection's gather); a: the attention + its output projections; r: the attention all-reduce + post / collapse / norm into
  * the FFN input; f: the MoE (router, experts, shared arm, gather, all-reduce); o: the layer's end (a crossing's send, the next
  * layer's post / collapse / norm) */
+/* tp8 loop P53 (RADIANCE_DS41_PF_OPS=2): finer groups that split three of the above where they start -- p: the attention's output
+ * projections (o_a groups, the mix, o_b; a is then the attention core), m: the post / collapse / norm into the FFN input (r is
+ * then the attention all-reduce or an SP layer's reduce-scatter), h: an SP layer's FFN-input all-gather, g: the MoE's
+ * reduce-scatter (an SP layer) or its one all-reduce over the step (lever A9; f is then the MoE pass). Printed after o. */
+constexpr int kGP = 9, kGM = 10, kGH = 11, kGG = 12;
+constexpr int kGroups2 = 13;
 inline const char* gname(int g) {
-    static const char* const n[kGroups] = { "e", "n", "q", "c", "i", "a", "r", "f", "o" };
-    return g >= 0 && g < kGroups ? n[g] : "?";
+    static const char* const n[kGroups2] = { "e", "n", "q", "c", "i", "a", "r", "f", "o", "p", "m", "h", "g" };
+    return g >= 0 && g < kGroups2 ? n[g] : "?";
 }
 inline int sub_id(int l, int g) { return kSub + l * 16 + g; }
 inline bool is_sub(int id) { return id >= kSub; }

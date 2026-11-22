@@ -1218,3 +1218,65 @@ TEST(pf_ops_fold_into_the_layer_lines_and_name_the_groups) {
     CHECK(u.add(pass(0, 1100, 1.0f, false)).empty());
     CHECK_EQ(u.flush().size(), (size_t)1);
 }
+
+/* tp8 loop P53 (RADIANCE_DS41_PF_OPS=2): the finer marks p / m / h / g split a / r / f where they start; a record with them folds
+ * into the per-layer lines exactly as the same record with only P42's nine groups (and as one without any mark), the ops lines
+ * name them after o with each split group's time divided as the marks say, and the by-group total adds to the same layer sum */
+TEST(pf_ops2_finer_groups_split_a_r_f_and_fold_the_same) {
+    using namespace ds41pfl;
+    CHECK_EQ(std::string(gname(kGP)), std::string("p"));
+    CHECK_EQ(std::string(gname(kGM)), std::string("m"));
+    CHECK_EQ(std::string(gname(kGH)), std::string("h"));
+    CHECK_EQ(std::string(gname(kGG)), std::string("g"));
+    CHECK_EQ(std::string(gname(kGroups2)), std::string("?"));
+    CHECK_EQ(sub_g(sub_id(39, kGG)), kGG);
+    CHECK_EQ(sub_l(sub_id(39, kGG)), 39);
+    CHECK(sub_id(38, kGG) < sub_id(39, 0));   /* a layer's 16 slots hold the 13 groups */
+    /* a leader head pass of layer 3 (no receive) of `rows` rows: in 0.5, n 1, q 2, then a 6 / r 4 / f 12 / o 1 ms a 1k rows,
+     * where level 2 splits a = 2 + p 4, r = 1.5 + m 1 + h 1.5, f = 9 + g 3 (the same marks' times summed) */
+    auto pass = [](int64_t pos0, int64_t rows, int level) {
+        Rec r;
+        r.pos0 = pos0;
+        r.rows = rows;
+        const float k = (float)rows / 1000.0f;
+        r.lms.push_back({ 3, 0.5f * k });
+        if (level == 0) {
+            r.lms.back().second += 26.0f * k;
+            return r;
+        }
+        std::vector<std::pair<int, float>> g = { { 1, 1.0f }, { 2, 2.0f } };
+        if (level == 1) {
+            g.insert(g.end(), { { 5, 6.0f }, { 6, 4.0f }, { 7, 12.0f }, { 8, 1.0f } });
+        } else {
+            g.insert(g.end(), { { 5, 2.0f }, { kGP, 4.0f }, { 6, 1.5f }, { kGM, 1.0f }, { kGH, 1.5f }, { 7, 9.0f }, { kGG, 3.0f },
+                                { 8, 1.0f } });
+        }
+        for (const auto& q : g) r.lms.push_back({ sub_id(3, q.first), q.second * k });
+        return r;
+    };
+    std::vector<std::string> lines[3];
+    for (int level = 0; level < 3; ++level) {
+        Acc a(4096, 128);
+        const int64_t P[4] = { 0, 2000, 4000, 6000 };
+        for (int i = 0; i < 4; ++i) CHECK(a.add(pass(P[i], 2000, level)).empty());
+        lines[level] = a.flush();
+        CHECK_EQ(lines[level].size(), (size_t)(level ? 4 : 2));
+    }
+    if (lines[0].size() == 2 && lines[1].size() == 4 && lines[2].size() == 4) {
+        for (int level = 1; level < 3; ++level) {   /* the per-layer lines: one text at every level */
+            CHECK_EQ(lines[level][0], lines[0][0]);
+            CHECK_EQ(lines[level][1], lines[0][1]);
+        }
+        CHECK(has(lines[0][0], "body 2 chunks / 4000 rows: ms a 1k rows by layer: pre 0.00, 3 26.50; layers sum 26.50"));
+        CHECK(has(lines[1][2], "3 [in 0.50 n 1.00 q 2.00 a 6.00 r 4.00 f 12.00 o 1.00]; by group: in 0.50, n 1.00, q 2.00, a 6.00, "
+                               "r 4.00, f 12.00, o 1.00"));
+        CHECK(has(lines[2][2], "3 [in 0.50 n 1.00 q 2.00 a 2.00 r 1.50 f 9.00 o 1.00 p 4.00 m 1.00 h 1.50 g 3.00]; by group: in 0.50, "
+                               "n 1.00, q 2.00, a 2.00, r 1.50, f 9.00, o 1.00, p 4.00, m 1.00, h 1.50, g 3.00"));
+        CHECK(has(lines[2][3], "3 [in 1.00/1.00 n 2.00/2.00 q 4.00/4.00 a 4.00/4.00 r 3.00/3.00 f 18.00/18.00 o 2.00/2.00 p 8.00/8.00 "
+                               "m 2.00/2.00 h 3.00/3.00 g 6.00/6.00]"));
+        /* level 1's lines carry none of the finer names */
+        CHECK(!has_quiet(lines[1][2], " p ") && !has_quiet(lines[1][2], " g ") && !has_quiet(lines[1][3], " m "));
+    }
+    /* control: a mark with a group past the table names "?" (a wrong group id would show, not vanish) */
+    CHECK_EQ(std::string(gname(13)), std::string("?"));
+}

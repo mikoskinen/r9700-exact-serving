@@ -10791,25 +10791,33 @@ static void pf_pass_note(RadCtx* x, const RadBatch* b, int bits) {
 static constexpr int64_t kPflRows = 256;
 static constexpr int64_t kPflEvents = 16384;   /* the event pool's cap (records hold ~45 a pass) */
 static constexpr int64_t kPflEventsOps = 32768;   /* tp8 loop P42 step 2: with the group marks (~10 a layer: ~240 a follower pass) */
+static constexpr int64_t kPflEventsOps2 = 49152;  /* tp8 loop P53: PF_OPS=2's finer marks (~14 a layer) */
 static std::atomic<long long> g_pfl_min{-2};   /* -2 unread, -1 off, else the rows of a prompt that gets its own lines */
 /* tp8 loop P42 step 2 (RADIANCE_DS41_PF_OPS=1, read with PF_LAYERS on): marks at each issued layer's op groups (ds41pfl::gname)
- * -- events only, the issue the same; -2 unread, 0 off, 1 on */
+ * -- events only, the issue the same; -2 unread, 0 off, 1 on, 2 = 1 + the finer marks of tp8 loop P53 (PREFILL round 63: p / m /
+ * h / g split a / r / f into the attention core | its output projections, the attention all-reduce | the post / collapse / norm
+ * into the FFN input | an SP layer's FFN-input all-gather, the MoE | its reduce-scatter or one all-reduce) */
 static std::atomic<int> g_pfl_ops{-2};
-static bool pfl_ops() {
+static int pfl_ops_level() {
     int v = g_pfl_ops.load(std::memory_order_relaxed);
-    if (v != -2) return v > 0;
+    if (v != -2) return v;
     const char* e = std::getenv("RADIANCE_DS41_PF_OPS");
-    const int n = e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
+    const int n = e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : e && !std::strcmp(e, "2") ? 2 : 0;
     if (e && *e && !n && std::strcmp(e, "0") && std::strcmp(e, "off"))
-        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=%s is not 1 / on or 0 / off: off\n", e);
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=%s is not 1 / on, 2 or 0 / off: off\n", e);
     int unread = -2;
     if (g_pfl_ops.compare_exchange_strong(unread, n) && n > 0)
-        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=1 (tp8 loop P42 step 2): with RADIANCE_DS41_PF_LAYERS, rank 0 also "
-                        "marks each issued layer's op groups (e Engram, n input norm / mix, q attention inputs + window store, c "
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PF_OPS=%d (tp8 loop P42 step 2%s): with RADIANCE_DS41_PF_LAYERS, rank 0 "
+                        "also marks each issued layer's op groups (e Engram, n input norm / mix, q attention inputs + window store, c "
                         "compressor chain + stores, i indexer, a attention + output projections, r attention all-reduce + FFN input, "
-                        "f MoE, o layer end); two more lines a prompt (ops by layer and group)\n");
-    return g_pfl_ops.load(std::memory_order_relaxed) > 0;
+                        "f MoE, o layer end%s); two more lines a prompt (ops by layer and group)\n", n,
+                n >= 2 ? " + tp8 loop P53" : "",
+                n >= 2 ? "; finer: a = the attention core, p its output projections, r = the attention all-reduce (an SP "
+                         "layer's reduce-scatter), m the post / collapse / norm into the FFN input, h an SP layer's FFN-input "
+                         "all-gather, f = the MoE pass, g its reduce-scatter (SP) or one all-reduce over the step (lever A9)" : "");
+    return g_pfl_ops.load(std::memory_order_relaxed);
 }
+static bool pfl_ops() { return pfl_ops_level() > 0; }
 static long long pfl_min() {
     long long v = g_pfl_min.load(std::memory_order_relaxed);
     if (v != -2) return v;
@@ -10855,7 +10863,8 @@ static RadEvent pfl_ev() {   /* g_pfl_mu held */
         return e;
     }
     RadEvent e = nullptr;
-    if (g_pfl_made >= (pfl_ops() ? kPflEventsOps : kPflEvents) || !rad_event_create_local || rad_event_create_local(&e) < 0 || !e)
+    if (g_pfl_made >= (pfl_ops_level() >= 2 ? kPflEventsOps2 : pfl_ops() ? kPflEventsOps : kPflEvents) || !rad_event_create_local ||
+        rad_event_create_local(&e) < 0 || !e)
         return nullptr;
     ++g_pfl_made;
     return e;
@@ -10895,6 +10904,7 @@ static void pfl_poll(bool lone) {
 struct PflScope {
     bool on = false;
     bool ops = false;   /* tp8 loop P42 step 2: the group marks (RADIANCE_DS41_PF_OPS) */
+    bool ops2 = false;  /* tp8 loop P53: the finer marks (RADIANCE_DS41_PF_OPS=2) */
     RadStream s = nullptr;
     PflPend p;
     PflScope(RadCtx* x, const Model& m, const RadBatch* b, const std::vector<BiSeg>& sg) {
@@ -10919,10 +10929,15 @@ struct PflScope {
         p.r.rows = sg[0].n;
         on = true;
         ops = pfl_ops();
+        ops2 = pfl_ops_level() >= 2;
     }
     /* tp8 loop P42 step 2: op group g of layer l starts here */
     void sub(int l, int g) {
         if (ops) layer(ds41pfl::sub_id(l, g));
+    }
+    /* tp8 loop P53: a finer group (ds41pfl::kGroups2) of layer l starts here (RADIANCE_DS41_PF_OPS=2 only) */
+    void sub2(int l, int g) {
+        if (ops2) layer(ds41pfl::sub_id(l, g));
     }
     /* tp8 loop P42 step 2: the rows layer l runs after lever PSK's cut (the ops lines' "rows a/b" of the last two chunks) */
     void rows(int l, int64_t n) {
@@ -12633,6 +12648,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 ob_fn(p0 + pa, pn - pa);
                 bt_pt(x, m, oa_split(L) ? 0 : m.oa, T, "oa", l);
             } else {
+                pfl.sub2(l, ds41pfl::kGP);   /* tp8 loop P53: p = the attention's output projections (o_a groups, mix, o_b) */
                 dense(oa_gg, false, oa_fn);
                 bt_pt(x, m, oa_split(L) ? 0 : m.oa, T, "oa", l);
                 if (late) mix_a_sp();
@@ -12664,6 +12680,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             RAD_ISSUE_N(x, m.sp_rs_a, T * D, brows(m.attn_out, T), RAD_NONE);
         } else if (L.ar_attn)
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.ar_attn, n * D, R(m.attn_out, r0, n), RAD_NONE); });
+        pfl.sub2(l, ds41pfl::kGM);   /* tp8 loop P53: m = post / collapse / norm into the FFN input (+ the ffn mix) */
         t_mhc_f.clear();
         /* post / collapse / norm (+ the ffn mix: lever M1) over the rows `cur` names (P15 bit 1: one piece at a time) */
         const auto pcn_f_issue = [&] {
@@ -12706,6 +12723,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         else if (sp_l) {
             /* tp8 loop P20: post / collapse / norm (+ the ffn mix) over this rank's quarter, the FFN input gathered raw */
             with_rows(sp0, spn, pcn_f_issue);
+            pfl.sub2(l, ds41pfl::kGH);   /* tp8 loop P53: h = the FFN input's all-gather (an SP layer) */
             RAD_ISSUE_N(x, m.sp_ag_f, T * D, brows(m.act.x, T), RAD_NONE);
             h_sh = true;
         } else
@@ -12863,6 +12881,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const TwinScope tws(sg.size() == 1 && !sg[0].dec, T);   /* tp8 loop P30t: the lone prompt segment's pass */
                 L.moe.pass(x, T, 0, T, false, nullptr);
             }
+            pfl.sub2(l, ds41pfl::kGG);   /* tp8 loop P53: g = the MoE's reduce-scatter (an SP layer) */
             RAD_ISSUE_N(x, m.sp_rs_f, T * D, brows(m.act.x, T), RAD_NONE);
             if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
         } else
@@ -12953,6 +12972,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (onear) {
+                    pfl.sub2(l, ds41pfl::kGG);   /* tp8 loop P53: g = the MoE's one all-reduce over the step (lever A9) */
                     if (bsp && bsp->before_ar) bsp->before_ar(x, bsp->ar_arg);   /* tp8 loop D24 */
                     L.moe.issue_ar(x, 0, T, false);
                     if (l == 0) g_bi_onear.fetch_add(1, std::memory_order_relaxed);
