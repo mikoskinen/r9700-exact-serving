@@ -666,7 +666,11 @@
  *                   ds41-swk 3602fc5a, which refuses 1): 2 -- the same kernels with the K loop's WMMA pairs as gfx1201's 2:4 sparse
  *                   v_swmmac_f32_16x16x32_f16, each token's K over two sparse-A rows, 8 tokens a pass, the rows' sums added once
  *                   and moved into the WMMA's D layout (rule B, its own reference); 3 -- 2 with the other index nibble order (the
- *                   card decides which of 2 / 3 is the right one; the wrong one is far off, not a rounding).
+ *                   card decides which of 2 / 3 is the right one; the wrong one is far off, not a rounding). The card named 2
+ *                   (Xeon GPU2 slot s4, COORD 11:54 22.11.). 4 (tp8 loop DECODE round 67 = QUEUE X15; plugin ds41-swk
+ *                   d4b42d9) -- 2 + the codebook fold's twins: with exl3_x3d 5 (X5F) the fold's kernels take the same sparse K loop
+ *                   over the integer codes and apply the fold in SWK's row layout before the split-K sum (rule B, its own
+ *                   reference); elsewhere 4 = 2; at 2 / 3 the fold keeps its own WMMA kernel.
  *   pp_tband       engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
