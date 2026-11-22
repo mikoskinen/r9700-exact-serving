@@ -14264,6 +14264,22 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
                 CHECK_PASSES(b, v);
                 CHECK(v[0]->step_fail.empty());
                 bool lane1 = false;
+                {   /* S4 lane safety (round 31): a part reads no buffer it did not write first -- the transients by the lint's
+                     * 'unwritten', the PERSIST / DERIVED / concurrent ones here -- so another lane's parts issued between this
+                     * lane's head and tail (engine_lanes.cpp) cannot change what the tail reads (b_h: X2's receive rewrites it) */
+                    std::set<rad_buf> wr;
+                    std::vector<std::string> early;
+                    for (const RecIssue& is : v[0]->issues) {
+                        const RecOp* o = b.op_of(is.op);
+                        if (!o) continue;
+                        for (rad_buf h : o->reads)
+                            if (h && h <= b.bufs.size() && !wr.count(h) && b.bufs[h - 1].d.kind != RAD_BUF_TRANSIENT)
+                                early.push_back(b.bufs[h - 1].name + " by " + o->op);
+                        for (rad_buf h : o->writes) wr.insert(h);
+                    }
+                    CHECK(early.empty());
+                    if (!early.empty() && rank == 0) fprintf(stderr, "    arm %d T %lld reads first: %s\n", arm, (long long)k->b.n_tok, early[0].c_str());
+                }
                 check_pass(b, *v[0], arm, k->b.n_tok, &lane1, m.b_h, span == 1);
                 CHECK_EQ(lane1, span == 1 && pf);   /* the pipelined form: the blocks' collectives on the second lane */
                 if (span && !pf) CHECK_EQ(m.spser_noted, 1);   /* the MIXED step ran SP-serial (one run) on this part */
