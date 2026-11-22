@@ -670,7 +670,9 @@
  *                   (Xeon GPU2 slot s4, COORD 11:54 22.11.). 4 (tp8 loop DECODE round 67 = QUEUE X15; plugin ds41-swk
  *                   d4b42d9) -- 2 + the codebook fold's twins: with exl3_x3d 5 (X5F) the fold's kernels take the same sparse K loop
  *                   over the integer codes and apply the fold in SWK's row layout before the split-K sum (rule B, its own
- *                   reference); elsewhere 4 = 2; at 2 / 3 the fold keeps its own WMMA kernel.
+ *                   reference); elsewhere 4 = 2; at 2 / 3 the fold keeps its own WMMA kernel. 5 (QUEUE X15b / X15c; plugin
+ *                   ds41-swk 104f670 / b2cca12) -- 4 at K = 2 only: the K = 2.5 layers under exl3_x3d 5 run SWK's own twins (the
+ *                   fold's K2.5 twins lost to them, Xeon GPU2 slots s6 / s7); the arm the cards run (ORDER 14:46 4 (a)).
  *   pp_tband       engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
