@@ -1407,6 +1407,8 @@ private:
      * computed prompt then, not only at its close; once a request (SchedReq::pub_prompt). */
     void publish_prompt_done(SchedReq& s);
     bool pub_prompt_ = false;
+    /* tp8 loop P55b (lever PPO, RADIANCE_PREFIX_PROMPT_ONLY=1 at init): publish_prefix gives the cache a request's prompt rows only */
+    bool pub_prompt_only_ = false;
     int64_t pub_prompt_n_ = 0, pub_prompt_tok_ = 0;
     /* tp8 loop D55b: RADIANCE_SCHED_PUB_PROMPT=2 also publishes at every committed prefill chunk (publish_chunk_done), so a
      * running prompt's computed head is in the cache chunk by chunk; RADIANCE_SCHED_PUB_HOLD_MS=N holds a fresh waiting request

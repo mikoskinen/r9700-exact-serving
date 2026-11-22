@@ -153,6 +153,8 @@ struct SchedMetrics {
     int64_t psk_tail_only_refused = 0;
     int64_t psk_cr_cheaper = 0;
     int64_t psk_cr_end_ckpts = 0;
+    /* tp8 loop P55b (lever PPO, RADIANCE_PREFIX_PROMPT_ONLY=1): publishes cut to the prompt, and the decode-written rows kept out */
+    int64_t ppo_withheld = 0, ppo_rows = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */

@@ -287,6 +287,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      d57_ & 2 ? "the hold reads committed ends, lent pieces included"
                               : "the hold misses a prompt whose piece runs in another lane and reads its planned end (before D57)");
     }
+    {   /* tp8 loop P55b (lever PPO, RADIANCE_PREFIX_PROMPT_ONLY=1): a closing request publishes the rows of its PROMPT only -- the
+         * rows its decode steps wrote (its reply) never enter the prefix cache. Why: a later prompt through the reply would adopt them
+         * where it resumes without a snapshot (lever PSK-CR's replay at the grid point under its hit adopts every row's global KV up
+         * to there), and a decode pass's rows round otherwise than a prefill of the same tokens (the decode bands' sum orders: LEVERS
+         * BI FLIP 49 / BI-x3; STALESNAP's measured answer change on decode-written rows) -- the follow-up would not answer as its cold
+         * run. With it, such a prompt resumes at the deepest snapshot of the prompt before and prefills the reply (or hits what lever
+         * RPF's warm request prefilled). Unset = today (every computed row published). */
+        const char* e = std::getenv("RADIANCE_PREFIX_PROMPT_ONLY");
+        pub_prompt_only_ = e && !std::strcmp(e, "1");
+        if (pub_prompt_only_ && lane_ <= 0 && cfg.prefix_cache)
+            RAD_INFO("scheduler: RADIANCE_PREFIX_PROMPT_ONLY=1 (tp8 loop P55b, lever PPO) -- a closing request publishes its prompt's rows "
+                     "only: the rows its decode steps wrote never enter the prefix cache (a later hit through a reply resumes at the snapshot "
+                     "before it and prefills the reply, as its cold run does)");
+    }
     {   /* tp8 loop D56 (fn4 sched_lane_room, RADIANCE_SCHED_LANE_ROOM its start value): the room gates count every lane's runners
          * (room_runners); 0 = this lane's (today). The switch is read at every gate; the start line once. */
         if (fn4::sched_lane_room() > 0 && lane_ <= 0)
@@ -1143,7 +1157,14 @@ bool Scheduler::publish_prefix(SchedReq& s) {
             pub_blocks_[i] = kv_->block_table(s.req->id, cg[i]);
         }
         if (ok) {
-            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed);
+            /* lever PPO (pub_prompt_only_): the prompt's rows only; a request still in its prompt publishes what it computed */
+            int64_t n_pub = s.req->n_computed;
+            if (pub_prompt_only_ && n_pub > (int64_t)s.req->prompt.size()) {
+                ++m_.ppo_withheld;
+                m_.ppo_rows += n_pub - (int64_t)s.req->prompt.size();
+                n_pub = (int64_t)s.req->prompt.size();
+            }
+            const int rc = pc_->insert(*s.req, pub_blocks_, n_pub);
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));

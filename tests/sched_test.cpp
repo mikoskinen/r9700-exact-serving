@@ -8163,6 +8163,43 @@ TEST(a_sequence_stops_at_the_context_whatever_max_tokens_says) {
     CHECK(f.sch.find(big)->output.capacity() <= (size_t)(170 + RAD_SCHED_MAX_SPEC));
 }
 
+/* tp8 loop P55b (lever PPO, RADIANCE_PREFIX_PROMPT_ONLY=1, read at init): a closing request publishes its prompt's rows only --
+ * the rows its decode steps wrote never enter the prefix cache (a later prompt through the reply would adopt them where lever
+ * PSK-CR replays at the grid point under its hit, and a decode pass's rows round otherwise than a prefill's). Unset: every computed
+ * row, as before. */
+TEST(p55b_ppo_a_closing_request_publishes_its_prompt_rows_only_under_the_env) {
+    for (int on = 0; on < 2; ++on) {
+        if (on) setenv("RADIANCE_PREFIX_PROMPT_ONLY", "1", 1);
+        else unsetenv("RADIANCE_PREFIX_PROMPT_ONLY");
+        Fixture f;
+        f.build(/*blocks=*/64, /*states=*/64);
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(160, /*max_tokens=*/40, 0, /*ignore_eos=*/true);
+        for (int k = 0; k < 200 && f.sch.find(a) && f.sch.find(a)->state != ReqState::Finished; ++k) {
+            if (f.sch.step() == nullptr) break;
+            f.commit_plain();
+        }
+        const Request* ra = f.sch.find(a);
+        REQUIRE(ra != nullptr);
+        CHECK_EQ((int)ra->state, (int)ReqState::Finished);
+        CHECK_EQ((int)ra->output.size(), 40);
+        int64_t pub = -1;
+        for (const auto& p : f.pc.published)
+            if (p.seq == a) pub = std::max(pub, p.n_tokens);
+        const SchedMetrics m = f.sch.metrics();
+        if (on) {
+            CHECK_EQ(pub, (int64_t)160);
+            CHECK_EQ(m.ppo_withheld, (int64_t)1);
+            CHECK(m.ppo_rows >= 38 && m.ppo_rows <= 40);   /* the rows its decode steps computed (the last token's is not) */
+        } else {
+            CHECK(pub > 160);
+            CHECK_EQ(m.ppo_withheld, (int64_t)0);
+            CHECK_EQ(m.ppo_rows, (int64_t)0);
+        }
+    }
+    unsetenv("RADIANCE_PREFIX_PROMPT_ONLY");
+}
+
 /* The cache's reserve is measured against what is held, not what is backed. An elastic pool that
  * has handed its unused top back to the card reads almost no free blocks however little is held,
  * and trimming against that would drain the whole cache after every request. */

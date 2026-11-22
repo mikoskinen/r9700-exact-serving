@@ -9285,7 +9285,10 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
  * 3 lanes W(1,3) (the KV copy checked) with RPF, 3 lanes W(1,3) without it. Each arm's follow-up reply (text, calls, finish, token
  * counts, token ids with their log-probabilities and top 2) = one process serving that follow-up body ALONE (cold); with RPF the
  * leader names one warm request served (status 200) and the follower none, without it no RPF line; the follow-up's attention-cached
- * tokens are printed (with RPF they include the reply); 0 E lines; KV-copy checks > 0 and 0 differ where copied. */
+ * tokens are printed (with RPF they include the reply); 0 E lines; KV-copy checks > 0 and 0 differ where copied. P55b: two more arms
+ * with lever PPO (RADIANCE_PREFIX_PROMPT_ONLY=1, both nodes: a closing request publishes its prompt's rows only, so no follow-up
+ * adopts rows a decode step wrote) -- alone and with RPF=1: the same one-process replies; PPO alone re-prefills the reply (fewer
+ * cached tokens than the control), RPF + PPO hits the warm request's prefilled reply. */
 namespace {
 ojson p55_first_body() {
     ojson none = ojson::object();
@@ -9355,12 +9358,16 @@ TEST(p55_rpf_warm_request_through_the_lanes_keeps_the_follow_up_one_process_cold
     REQUIRE(world().ok);
     /* mode 1 = RADIANCE_RPF=1 (every tool-call reply), 2 = RADIANCE_RPF=2 (only a body with "rpf": true: the in-process arm, the
      * second conversation is its control), 0 = unset */
-    struct Arm { const char* name; const char* cut; int lanes; int mode; bool kv; };
-    for (const Arm a : { Arm{ "RPF=1, 2 lanes", "0,2", 2, 1, false }, Arm{ "RPF=1, 3 lanes, wrap-around", "1,3", 3, 1, true },
-                         Arm{ "RPF=2 opt-in + control, 3 lanes", "1,3", 3, 2, true },
-                         Arm{ "no RPF, 3 lanes, wrap-around", "1,3", 3, 0, true } }) {
+    /* ppo: RADIANCE_PREFIX_PROMPT_ONLY=1 on both nodes (P55b, lever PPO: a closing request publishes its prompt's rows only) */
+    struct Arm { const char* name; const char* cut; int lanes; int mode; bool kv; bool ppo; };
+    for (const Arm a : { Arm{ "RPF=1, 2 lanes", "0,2", 2, 1, false, false }, Arm{ "RPF=1, 3 lanes, wrap-around", "1,3", 3, 1, true, false },
+                         Arm{ "RPF=2 opt-in + control, 3 lanes", "1,3", 3, 2, true, false },
+                         Arm{ "no RPF, 3 lanes, wrap-around", "1,3", 3, 0, true, false },
+                         Arm{ "PPO, 3 lanes, wrap-around", "1,3", 3, 0, true, true },
+                         Arm{ "RPF=1 + PPO, 3 lanes, wrap-around", "1,3", 3, 1, true, true } }) {
         std::vector<std::string> env = kSplitEnv;
         if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (a.ppo) env = cat(env, { "RADIANCE_PREFIX_PROMPT_ONLY=1" });
         Serving pp;
         if (a.mode) pp.lenv_more = { "RADIANCE_RPF=" + std::to_string(a.mode) };
         REQUIRE(pp.start(a.cut, cat(p55_ext(), { "--pp-lanes", std::to_string(a.lanes) }), env));
@@ -9437,9 +9444,72 @@ TEST(p55_rpf_warm_request_through_the_lanes_keeps_the_follow_up_one_process_cold
         } else {
             CHECK_EQ(count_of(llog, "lever RPF"), (size_t)0);
         }
+        CHECK_EQ(count_of(llog, "RADIANCE_PREFIX_PROMPT_ONLY=1 (tp8 loop P55b"), a.ppo ? (size_t)1 : (size_t)0);
         if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
         if (differ || elines || (a.mode && !warm200))
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
+
+/* tp8 loop P55b (PREFILL round 64): lever PPO (RADIANCE_PREFIX_PROMPT_ONLY=1, both nodes) on the mechanism it closes -- a follow-up
+ * through a LONG reply. Token ids end to end (/completion), so the follow-up is the first request's prompt + its reply's tokens + 40
+ * new ids, no re-render: P1 = 1,300 ids, a greedy 600-token reply (ignore_eos), then the follow-up's 24 greedy tokens. Without PPO the
+ * reply's rows (written by DECODE steps) are in the prefix cache and the follow-up's hit runs through them; with PPO the cache holds
+ * P1's rows only and the follow-up prefills the reply. At 3 lanes W(1,3) with the KV copy checked, each arm: the follow-up's tokens =
+ * one process serving the follow-up alone (cold); its attention-cached tokens printed (PPO: at most P1's 1,300; without: past them --
+ * on cards those adopted rows are a decode pass's bytes, not a prefill's: the exactness exposure PPO closes); the PPO arm's leader
+ * names the lever once; 0 E lines; KV-copy checks 0 differ. */
+TEST(p55b_ppo_a_follow_up_through_a_long_reply_hits_the_prompt_only_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    std::vector<int32_t> p1;
+    for (int i = 0; i < 1300; ++i) p1.push_back(100 + (i * 37) % 200);
+    const std::vector<std::string> ext = { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "4096" };
+    std::vector<int32_t> want;
+    std::vector<int32_t> follow_ref;
+    for (int ppo = 0; ppo < 2; ++ppo) {
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        if (ppo) env = cat(env, { "RADIANCE_PREFIX_PROMPT_ONLY=1" });
+        Serving pp;
+        REQUIRE(pp.start("1,3", cat(ext, { "--pp-lanes", "3" }), env));
+        const Drafted r1 = complete_drafted(pp.port, p1, 600);
+        CHECK_EQ(r1.tok.size(), (size_t)600);
+        std::vector<int32_t> follow = p1;
+        follow.insert(follow.end(), r1.tok.begin(), r1.tok.end());
+        for (int i = 0; i < 40; ++i) follow.push_back(150 + (i * 11) % 90);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const double c0 = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        const Drafted r2 = complete_drafted(pp.port, follow, 24);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const double cached = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total") - c0;
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        if (follow_ref != follow) {   /* the reference: one process serving this follow-up alone (the replies agree: greedy, same model) */
+            Serving one;
+            REQUIRE(one.start("", ext));
+            want = complete_drafted(one.port, follow, 24).tok;
+            kill(one.lead.child.pid, SIGTERM);
+            CHECK_EQ(one.lead.finish(60), 0);
+            follow_ref = follow;
+        }
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        const bool same = !r2.tok.empty() && r2.tok == want;
+        fprintf(stderr, "    P55b %-8s W(1,3) 3 lanes: reply %zu tokens; follow-up of %zu tokens %s one process cold (%zu tokens); attention-cached "
+                        "at the follow-up %.0f (P1 %zu); KV-copy checks %lld, %lld differ; %zu E lines\n",
+                ppo ? "PPO" : "control", r1.tok.size(), follow.size(), same ? "=" : "DIFFERS from", want.size(), cached, p1.size(), checks,
+                kdiff, elines);
+        CHECK(same);
+        CHECK_EQ(elines, (size_t)0);
+        CHECK(checks > 0);
+        CHECK_EQ(kdiff, 0);
+        CHECK_EQ(count_of(llog, "RADIANCE_PREFIX_PROMPT_ONLY=1 (tp8 loop P55b"), ppo ? (size_t)1 : (size_t)0);
+        if (ppo) CHECK(cached <= (double)p1.size());
+        if (!same || elines) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
     }
 }
 

@@ -420,6 +420,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
              * recomputes at most one grid step, less than a replay's passes -- and snapshots taken at a replay's end */
             p["cr_cheaper"] = m.psk_cr_cheaper;
             p["cr_end_snapshots"] = m.psk_cr_end_ckpts;
+            /* tp8 loop P55b (lever PPO): closes whose publish was cut to the prompt, and the reply rows kept out of the cache */
+            p["ppo_withheld"] = m.ppo_withheld;
+            p["ppo_rows_kept_out"] = m.ppo_rows;
             p["cr_passes"] = pl[10];
             p["cr_layer_rows_run"] = pl[11];
             p["cr_layer_rows_skipped"] = pl[12];
