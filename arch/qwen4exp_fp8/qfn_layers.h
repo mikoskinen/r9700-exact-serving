@@ -13,10 +13,11 @@
  *
  * RADIANCE_FN4_LAYERS_MODE picks what the node declares besides its layers:
  *   proxy  (default)  the stage timing proxy (S1): the node runs alone, without the other machine; it keeps the embedding, the
- *                     PLE table, the final mixer, the MTP head and lm_head whatever its layers (the engine samples from its
- *                     logits). Its first layer, when that is not layer 0, reads the embedding's stream as layer 0 does (the
- *                     synthetic boundary input); a gap between two of its ranges passes the wide stream on. Answers are not
- *                     the model's; each held layer's work a step is. Any ranges run.
+ *                     final mixer, the MTP head and lm_head whatever its layers (the engine samples from its logits), and the
+ *                     PLE (n-gram embedding) only where its layer is held. Its first layer, when that is not layer 0, reads
+ *                     the embedding's stream as layer 0 does (the synthetic boundary input); a gap between two of its ranges
+ *                     passes the wide stream on. Answers are not the model's; each held layer's work a step is. Any ranges
+ *                     with at least one delta-net layer run (qwen4exp_fp8.cpp declare: the trunk's format is read from one).
  *   strict            the node's own part of W(h, t) (S2): the leader holds [0, h) and [t, n_layer) -- layer 0, the PLE layer
  *                     (its token ids stay on the leader, so the crossing into the follower carries the stream only) and the
  *                     last layer (the final mixer, the MTP head and lm_head read it) -- the follower [h, t). Cross-layer reads

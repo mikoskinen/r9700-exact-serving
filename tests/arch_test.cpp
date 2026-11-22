@@ -13973,6 +13973,150 @@ TEST(flashnext_layers_ranges_parse_pairs_and_crossing_bytes) {
     CHECK_EQ(L::crossing_row_bytes(4, 2560, true), (int64_t)20496);
 }
 
+/* Qwen tp8 S1 (Qwen loop round 30): the layer-range proxy in qwen4exp_fp8 (RADIANCE_FN4_LAYERS, proxy mode). On the eight-layer
+ * fixture (attention at 3 and 7, the PLE at layer 1) at four ranks with the published start's SP forms (SP-hc 2 + P2S + PSP,
+ * SP-serial, hc_bi 5): a node declares weights and KV binds for its layers only (the n-gram embedding only where layer 1 is
+ * held), and every pass -- decode, a MIXED step (SP-serial), a pipelined 2,048 + 1,792-row prefill (SP-hc), a verify with the
+ * MTP head's history pass and round -- lints clean, fails nothing and issues ops of exactly its layers (+ the shell). Ranges:
+ * 4:8 (no PLE, the leader's tail), 0:4 (layer 0 + the PLE), 1:3,5:8 (the PLE as the first layer, a gap 3..4). Controls:
+ * unset issues all eight layers (the detector is not vacuous); 0:8 = every layer = the published declare (graph and issue
+ * fingerprints equal unset's); refusals: a node without a delta-net layer (3:4), strict mode (S2), a range past the trunk. */
+TEST(flashnext_layers_proxy_declares_and_runs_only_its_layers) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int NL = 8;
+    auto layer_of = [](const std::string& name) {   /* blk.N.* -> N (the trunk's and the MTP head's), else -1 */
+        if (name.rfind("blk.", 0) != 0) return -1;
+        return std::atoi(name.c_str() + 4);
+    };
+    auto declare = [&](const char* spec, int rank, RadBuilder& b) {
+        if (spec) setenv("RADIANCE_FN4_LAYERS", spec, 1); else unsetenv("RADIANCE_FN4_LAYERS");
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        const int rc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        unsetenv("RADIANCE_FN4_LAYERS");
+        return rc;
+    };
+    /* the trunk layers (< NL) whose weights an issued op reads, over the passes */
+    auto issued_layers = [&](const RadBuilder& b, const std::vector<std::unique_ptr<RadCtx>>& v) {
+        std::set<int> s;
+        for (const auto& c : v)
+            for (const RecIssue& i : c->issues)
+                if (const RecOp* o = b.op_of(i.op))
+                    for (rad_weight w : o->w)
+                        if (w && w <= b.weights.size()) {
+                            const int l = layer_of(b.weights[w - 1].name);
+                            if (l >= 0 && l < NL) s.insert(l);
+                        }
+        return s;
+    };
+    auto run_all = [&](RadBuilder& b, int rank, std::set<int>* layers, uint64_t* ih) {
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_hcbi_flag().store(5);
+        qwen4exp_fp8::fn4_spser_flag().store(1);
+        qwen4exp_fp8::fn4_sproute_flag().store(512);
+        std::vector<std::unique_ptr<RadCtx>> all;
+        std::vector<const Kit*> kits;
+        const auto dc = kit(b, { 1, 1, 1, 1 }, {});
+        const auto mx = kit(b, { 4, 4, 4, 4 }, { 500 }, 4096);
+        mx->b.positions_h = mx->pos.data();
+        const auto pf = kit(b, {}, { 2048 + 1792 }, 10240);
+        pf->b.positions_h = pf->pos.data();
+        int spser = 0;
+        for (const Kit* k : { dc.get(), mx.get(), pf.get() }) {
+            m.spser_noted = 0;
+            auto v = run_passes(b, qwen4exp_fp8::step, { k }, rank, 4);
+            CHECK_PASSES(b, v);
+            if (k == mx.get()) spser = m.spser_noted;
+            for (auto& c : v) all.push_back(std::move(c));
+            kits.push_back(k);
+        }
+        CHECK_EQ(spser, 1);   /* the MIXED step ran SP-serial */
+        const auto ver = kit(b, std::vector<int>(4, 4), {});
+        const auto his = history_pass(b, *ver);
+        const auto r2 = round_pass(b, 4, 2);
+        auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get(), r2.get() }, rank, 4);
+        CHECK_PASSES(b, v);
+        for (auto& c : v) all.push_back(std::move(c));
+        kits.push_back(ver.get()); kits.push_back(his.get()); kits.push_back(r2.get());
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_spser_flag().store(0);
+        qwen4exp_fp8::fn4_hcbi_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        for (const auto& c : all) CHECK(c->step_fail.empty());
+        *layers = issued_layers(b, all);
+        *ih = issue_hash(b, all, kits);
+    };
+    for (int rank = 0; rank < 4; ++rank) {
+        /* controls: unset (every layer issued) and 0:8 (every layer = the published declare and steps) */
+        RadBuilder b0, b8;
+        REQUIRE_EQ(declare(nullptr, rank, b0), RAD_OK);
+        const uint64_t g0 = graph_hash(b0);
+        std::set<int> l0;
+        uint64_t i0 = 0;
+        run_all(b0, rank, &l0, &i0);
+        CHECK_EQ((int)l0.size(), NL);
+        CHECK_EQ(qwen4exp_fp8::g_model[rank].ple_layer, (int64_t)1);
+        REQUIRE_EQ(declare("0:8", rank, b8), RAD_OK);
+        CHECK(!qwen4exp_fp8::g_model[rank].lr.on);
+        CHECK_EQ(graph_hash(b8), g0);
+        std::set<int> l8;
+        uint64_t i8 = 0;
+        run_all(b8, rank, &l8, &i8);
+        CHECK_EQ(i8, i0);
+        for (const char* spec : { "4:8", "0:4", "1:3,5:8" }) {
+            namespace L = rad::arch::qfnlayers;
+            L::Spec s;
+            std::string err;
+            REQUIRE_EQ(L::parse(spec, nullptr, NL, &s, &err), 0);
+            RadBuilder b;
+            REQUIRE_EQ(declare(spec, rank, b), RAD_OK);
+            const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            CHECK(m.lr.on && !m.lr.strict);
+            CHECK_EQ(m.ple_layer, s.held(1) ? (int64_t)1 : (int64_t)-1);
+            CHECK(graph_hash(b) != g0);
+            /* weights and KV binds: the held layers', each held layer some (blk.NL = the MTP head, the shell) */
+            std::set<int> wl, kl;
+            for (const RecWeight& w : b.weights) { const int l = layer_of(w.name); if (l >= 0 && l < NL) wl.insert(l); }
+            for (const auto& bd : b.binds) if (bd.first < NL) kl.insert(bd.first);
+            std::set<int> held;
+            for (int l = 0; l < NL; ++l) if (s.held(l)) held.insert(l);
+            CHECK(wl == held);
+            CHECK(kl == held);
+            CHECK(std::find_if(b.weights.begin(), b.weights.end(),
+                               [&](const RecWeight& w) { return layer_of(w.name) == NL; }) != b.weights.end());
+            std::set<int> li;
+            uint64_t ih = 0;
+            run_all(b, rank, &li, &ih);
+            CHECK(li == held);
+            CHECK(ih != i0);
+        }
+        /* refusals */
+        RadBuilder r1, r2, r3;
+        CHECK_EQ(declare("3:4", rank, r1), RAD_E_UNSUPPORTED);   /* only an attention layer: no delta net to read the format */
+        setenv("RADIANCE_FN4_LAYERS_MODE", "strict", 1);
+        CHECK_EQ(declare("2:6", rank, r2), RAD_E_UNSUPPORTED);   /* strict = S2, not built */
+        unsetenv("RADIANCE_FN4_LAYERS_MODE");
+        CHECK_EQ(declare("0:9", rank, r3), RAD_E_INVAL);
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's
