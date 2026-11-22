@@ -232,6 +232,11 @@ struct CtxDesc {
      * reference library's host rows. Null: the oracle checks a band only where the reference
      * library won its host row. */
     Registry*       registry    = nullptr;
+    /* qfn-on-ds F65 (lever BGL stage 2b): CUs every queue this Ctx creates leaves to the card's other queues
+     * (rad_stream_cu_keep; 0 = the whole card). A second Ctx a rank whose passes run beside the first's: its collectives
+     * and chained launches spin on peer cards, so without a region it cannot enter, its spinners can hold every slot a
+     * first-Ctx collective's blocks need while their twins on a peer wait behind the second Ctx (FINDINGS F65). */
+    int             cu_keep     = 0;
 };
 
 /* tp8 loop P31 (issue.cpp): RADIANCE_SLOW_ISSUE_MS's value (0 = off), and the process's pass-line budget (the count so far) */
@@ -811,6 +816,9 @@ private:
      * process's SVM buffers: 46-231 s on the first prefill step that takes lane 1. Until adopted it is not lane1_, so
      * every step that does not ask for lane 1 runs exactly the single-lane path (lane_join, pass_key). */
     RadStream lane1_spare_ = nullptr;
+    int       cu_keep_     = 0;         /* qfn-on-ds F65: CtxDesc::cu_keep */
+    int       keep_cus(RadStream s);    /* applies cu_keep_ to a stream this Ctx made (said once a Ctx) */
+    bool      cu_keep_said_ = false;
     int       lane_       = 0;
     /* tp8 loop M6F: collectives issued with the row's second instance set (RADIANCE_AR_SETS=2) */
     long long ar_set1_issues_ = 0;

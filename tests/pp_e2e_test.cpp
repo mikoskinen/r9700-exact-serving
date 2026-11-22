@@ -2292,7 +2292,10 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
             if (const size_t at = log.rfind(kOv); at != std::string::npos) ov = std::atoll(log.c_str() + at + kOv.size());
             fprintf(stderr, "    BGL run 3 (stage 2b): %lld lane-0 steps issued beside a lane-1 step in flight\n", ov);
             CHECK(ov >= 0);
+            /* qfn-on-ds F65: the second Ctx asks for its CU keep (default 8) at bring-up; the host backend has no CUs and says so */
+            CHECK(log.find("F65 CU keep: the backend has no CU masks") != std::string::npos);
         }
+        if (k == 2) CHECK(log.find("F65 CU keep") == std::string::npos);   /* =2 runs one step at a time: no keep */
         CHECK(lent > 0);
         CHECK(steps > 0 && steps <= lent);
         CHECK(rows >= 680);

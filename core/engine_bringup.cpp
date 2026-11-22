@@ -4914,7 +4914,19 @@ int Engine::start() {
         /* qfn-on-ds lever BGL stage 2: lane 1's Ctx, the same program / pools / plugin step, its own streams and arena, issuing
          * from pass slot 1 (S0: the second collective / instance set) */
         if (!pp_on() && LaneSet::bg1m2_env()) {
-            RAD_TRY(r->bg_ctx.init(d));
+            /* qfn-on-ds F65 (Qwen loop round 25): under stage 2b (=3) lane 1's queues leave RADIANCE_BGL_CU_KEEP CUs
+             * (default 8 = one WGP an engine on a 64-CU R9700) to lane 0 alone. bgl3 hung with both Ctx's queues of every
+             * rank at r4dchain_ar_hc_write_wide<4>: two queues whose collectives and chained launches spin on peer cards are
+             * two engines on one card (libr4d r4d_ar_entry.hip R4D_AR_MAX_BLOCKS note), and one queue's spinners can hold
+             * the slots the other's collective needs while its twin on a peer waits behind the first. Lane 0 never waits
+             * on lane 1 on the card (bg_done_ is issued after lane 1's end event has completed), so a region lane 1 cannot
+             * enter keeps lane 0 moving, and lane 0's progress frees lane 1's. Unset under =2 (one step at a time). */
+            CtxDesc bd = d;
+            if (LaneSet::bg1m3_env()) {
+                const char* ck = std::getenv("RADIANCE_BGL_CU_KEEP");
+                bd.cu_keep = ck && *ck ? std::atoi(ck) : 8;
+            }
+            RAD_TRY(r->bg_ctx.init(bd));
             r->bg_ctx.set_ar_set(1);
             RAD_TRY(r->bg_sampler.clone_from(r->sampler));
             r->bg_ready = true;

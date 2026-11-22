@@ -3724,6 +3724,48 @@ int a_dma_lane(int device, char* out, int cap) {
     return RAD_OK;
 }
 
+/* qfn-on-ds F65 (rad_stream_cu_keep): the queue dispatches only to the card's first n_cu - keep CUs, keep rounded up to
+ * whole WGPs (pairs: "devices with work group processors must even-index contiguous pairwise CU enable",
+ * hsa_amd_queue_cu_set_mask). The KFD spreads the mask's bits over the shader engines (consecutive pairs to consecutive
+ * SE / SH), so the CUs left out are the last WGP slots of every engine, not one engine. Read back with
+ * hsa_amd_queue_cu_get_mask; `out_cus` = the enabled CUs it reports. */
+int a_stream_cu_keep(RadStream rs, int keep, int* out_cus) {
+    Stream* s = ours(rs);
+    if (out_cus) *out_cus = 0;
+    if (!s || keep < 0) { device_set_error("rad_stream_cu_keep: null or foreign stream, or a negative count"); return RAD_E_INVAL; }
+    uint32_t n_cu = 0;
+    if (hsa_agent_get_info(s->agent, (hsa_agent_info_t)HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT, &n_cu) != HSA_STATUS_SUCCESS ||
+        n_cu < 4) {
+        device_set_error("rad_stream_cu_keep: device %d reports %u compute units", s->ord, n_cu);
+        return RAD_E_DEVICE;
+    }
+    keep = (keep + 1) & ~1;
+    if (keep > (int)n_cu - 2) {
+        device_set_error("rad_stream_cu_keep: keeping %d of %u CUs leaves this queue no WGP", keep, n_cu);
+        return RAD_E_INVAL;
+    }
+    const uint32_t nbits = (n_cu + 31u) & ~31u;
+    std::vector<uint32_t> m(nbits / 32u, 0u);
+    const uint32_t on = n_cu - (uint32_t)keep;
+    for (uint32_t i = 0; i < on; ++i) m[i / 32u] |= 1u << (i % 32u);
+    const hsa_status_t st = keep ? hsa_amd_queue_cu_set_mask(s->q, nbits, m.data()) : hsa_amd_queue_cu_set_mask(s->q, 0, nullptr);
+    if (st != HSA_STATUS_SUCCESS && st != HSA_STATUS_CU_MASK_REDUCED) {
+        const char* why = nullptr;
+        hsa_status_string(st, &why);
+        device_set_error("rad_stream_cu_keep: hsa_amd_queue_cu_set_mask(%u of %u CUs) on device %d: %s", on, n_cu, s->ord,
+                         why ? why : "?");
+        return RAD_E_DEVICE;
+    }
+    std::vector<uint32_t> g(nbits / 32u, 0u);
+    int got = -1;
+    if (hsa_amd_queue_cu_get_mask(s->q, nbits, g.data()) == HSA_STATUS_SUCCESS) {
+        got = 0;
+        for (uint32_t w : g) got += __builtin_popcount(w);
+    }
+    if (out_cus) *out_cus = got;
+    return st == HSA_STATUS_CU_MASK_REDUCED ? 1 : RAD_OK;
+}
+
 void* a_link_gate(RadStream rs) {
     Stream* s = ours(rs);
     hsa_signal_t* g = s ? gate_signal(s->ord) : nullptr;
@@ -4603,6 +4645,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.gate_open = a_gate_open;
         g_aql.gate_room = a_gate_room;
         g_aql.event_dma = a_event_dma;
+        g_aql.stream_cu_keep = a_stream_cu_keep;   /* qfn-on-ds F65 */
         return &g_aql;
     }();
     return b;
