@@ -75,7 +75,7 @@ int env_val(const char* k) {
 /* The Qwen line's POST ranges for its own switches (0 .. hi; its request()). */
 int qwen_hi(int i) {
     return i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
-         : i == kHcReadV ? 131071 : (i == kArLaneThreads || i == kArLaneThreadsS) ? 1024 : i == kHcUpMix ? 15
+         : i == kHcReadV ? 262143 : (i == kArLaneThreads || i == kArLaneThreadsS) ? 1024 : i == kHcUpMix ? 15
          : (i == kArLaneBlocks || i == kArLaneBlocksS) ? 24
          : i == kExl3PfPrep ? 2 : i == kMoePair ? 4 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 6 : i == kBiSeg ? 3
          : i == kArwRows ? 4096 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3

@@ -25543,7 +25543,9 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     const double pa = st_time_us(launch, 50, hs);
     pl.pf2_stages_hc(31);
     const double pt = st_time_us(launch, 50, hs);
-    /* the timeline: reps launches, every block's record */
+    /* the timeline: reps launches, every block's record (round 35: a lambda, run for today's kernels and again for the HCX / B3X arm,
+     * whose TL copies carry their own stamps: HCX region 0, B3X region 1) */
+    auto timeline = [&](bool xa, bool xb, double pa, double pt) -> bool {
     struct Rec { unsigned long long w[8]; };
     std::vector<Rec> rec[2];
     std::vector<double> span[2], spread[2], gapab;
@@ -25552,7 +25554,7 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     std::vector<unsigned long long> buf((size_t)2048 * 8);
     pl.tl_hc(1);
     for (int rep = 0; rep < reps; ++rep) {
-        if (pl.tl_hc_reset() != 0) { ok(nm.c_str(), false, "r4d_hc_tl_reset failed"); pl.tl_hc(0); return; }
+        if (pl.tl_hc_reset() != 0) { ok(nm.c_str(), false, "r4d_hc_tl_reset failed"); pl.tl_hc(0); return false; }
         (void)st_time_us(launch, 1, hs);
         (void)st_stream_sync(hs);
         unsigned long long a_end = 0, b_start = ~0ull;
@@ -25603,9 +25605,15 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     auto meani = [](const std::vector<int>& v) { double s = 0; for (int x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size(); };
     auto maxi = [](const std::vector<int>& v) { int m = 0; for (int x : v) m = std::max(m, x); return m; };
     auto pct = [](std::vector<double> v, double q) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[(size_t)std::min<double>((double)v.size() - 1, q * (double)v.size())]; };
-    static const char* const kPhA[5] = { "prologue + norm", "scale", "dots", "partials + fence + atomic", "finish" };
+    static const char* const kPhA0[5] = { "prologue + norm", "scale", "dots", "partials + fence + atomic", "finish" };
+    /* HCX (round 35): words 1 / 2 = the norm's two barriers, 3 = tile 0's barrier, 4 = the partials' fence + barrier, 5 = end */
+    static const char* const kPhAx[5] = { "prologue + norm", "scale", "N + tile 0", "tiles 1.. + partials + fence", "atomic + finish" };
     /* B3: word 4 = wave 0's up product done (after word 1, before word 2) */
-    static const char* const kPhB[5] = { "operands + d stage", "up product (wave 0)", "mix + x + fence", "atomic", "quantise" };
+    static const char* const kPhB0[5] = { "operands + d stage", "up product (wave 0)", "mix + x + fence", "atomic", "quantise" };
+    /* B3X (round 35): word 4 = wave 0 at pass 1's start, 2 = thread 0's passes done, 3 = the quantiser's barrier */
+    static const char* const kPhBx[5] = { "operands + d stage", "pass 0 (wave 0)", "pass 1 (wave 0)", "barrier", "quantise" };
+    const char* const* kPhA = xa ? kPhAx : kPhA0;
+    const char* const* kPhB = xb ? kPhBx : kPhB0;
     static const int kB3From[5] = { 0, 1, 4, 2, 3 }, kB3To[5] = { 1, 4, 2, 3, 5 };
     for (int g = 0; g < 2; ++g) {
         if (rec[g].empty()) { std::printf("HCTL M=%lld %s: no records\n", (long long)M, g ? "B3" : "A'"); continue; }
@@ -25634,13 +25642,16 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
         std::printf("HCTL M=%lld %s %s (%s, %.0f blocks a launch, %d reps): span %.2f us (plain: %s %.2f us), start spread %.2f us, "
                     "block %.2f us (p50 %.2f, p90 %.2f), in flight mean %.1f max %d, one WGP max %d (%.0f WGPs), rounds %.2f | phase us: %s\n",
                     (long long)M, g_cold > 0 ? "cold" : "warm", g ? "B3" : "A'",
-                    g ? "hc_up_w 16" : (M >= 32 ? "G16p" : "G16"), meani(nblk[g]), reps, mean(span[g]),
+                    g ? (xb ? "B3X hc_up_wx 16" : "hc_up_w 16") : (xa ? "HCX" : (M >= 32 ? "G16p" : "G16")), meani(nblk[g]), reps, mean(span[g]),
                     g ? "whole read" : "A' alone", g ? pt : pa, mean(spread[g]), lm, pct(lat, 0.5), pct(lat, 0.9),
                     mean(fly_mean[g]), maxi(fly_max[g]), maxi(wgp_max[g]), meani(wgps[g]), lm > 0 ? mean(span[g]) / lm : 0.0, ph.c_str());
     }
     if (!gapab.empty())
         std::printf("HCTL M=%lld %s: A' last block out -> B3 first block in %.2f us (p50 %.2f, min %.2f)\n", (long long)M,
                     g_cold > 0 ? "cold" : "warm", mean(gapab), pct(gapab, 0.5), pct(gapab, 0.0));
+    return true;
+    };
+    if (!timeline(false, false, pa, pt)) return;
     /* qfn-on-ds lever HCX (RADIANCE_FN4_HC_X = the arm: 4 / 5 / 10 W_down tiles a block of kernel A'): the arm's bytes against
      * today's (HC_X 0 = G16p from 32 rows, G16 below), then A' alone and the whole read, today / arm / today / arm (the order
      * cancels a drift), each st_time_us of 50 launches (warm, or --cold N's flush before each) */
@@ -25670,9 +25681,19 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
                     "%.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f)\n", (long long)M, g_cold > 0 ? "cold" : "warm", xarm, barm,
                     a0, a1, a0 > 0 ? 100.0 * (a1 - a0) / a0 : 0.0, ta[0][0], ta[0][1], ta[1][0], ta[1][1],
                     w0, w1, w0 > 0 ? 100.0 * (w1 - w0) / w0 : 0.0, tw[0][0], tw[0][1], tw[1][0], tw[1][1]);
+        /* round 35: the arm's own phase timeline (its TL copies), timeline vs plain bytes first */
+        arm_on(true);
+        std::vector<uint8_t> otl;
+        const bool okt = grab(true, otl);
+        size_t d4 = 0;
+        if (okt) for (size_t i = 0; i < otl.size() && i < ox.size(); ++i) d4 += otl[i] != ox[i];
+        std::printf("HCTL M=%lld HC_X %d B3X %d: the arm's timeline launch vs its plain launch: %s\n", (long long)M, xarm, barm,
+                    !okt ? "launch failed" : d4 ? fmt("%zu bytes differ", d4).c_str() : "every output byte identical");
+        pl.tl_hc(0);
+        (void)timeline(xarm != 0, barm != 0, a1, w1);
         arm_on(false);
         pl.pf2_stages_hc(31);
-        diff += d3;
+        diff += d3 + d4;
     }
     pl.readv_hc(0);
     pl.norm_hc_wave(0);
@@ -26178,6 +26199,97 @@ static void hc_ss_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
                 "(%+.2f us, %.3fx)\n", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm",
                 tw[0], tw[1], tr[0], tr[1], tp[0], tp[1], tp[1] - tp[0], tp[0] / tp[1]);
     ok(nm.c_str(), true);
+}
+
+/* qfn-on-ds lever SSB (Qwen loop round 35, hc_readv bit 17): --perfhcssb M [iters] -- the decode pair as the hero start runs it
+ * at M (>= 32) rows: hc_write with `ss` (bit 3, the eight-wide form) and then the bi_dec hc read (hc_readv 331 | 8: A' G16p, B3
+ * in 16-row groups), the read handed the write's `ss`. Reference = bit 17 off, HC_X 0, B3X 0 (A' runs its own norm pass and
+ * ignores `ss`). Arm = R4D_SELFTEST_SSB (default 1: bit 17 on) + RADIANCE_FN4_HC_X (lever HCX) + R4D_SELFTEST_B3X (lever B3X).
+ * Every output byte of the read (x, inj, codes + scales, rotated codes + scales) after the same write: arm vs reference (MUST
+ * be identical) and a control -- the arm with `ss` overwritten (x 2) after the write (MUST differ when bit 17 is on: proves
+ * A' read `ss`). Then A' alone (stage hook) and the whole read, reference / arm / reference / arm, iters launches each. */
+static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
+    const std::string nm = fmt("hc_write + bi_dec hc_read at M=%lld: lever SSB (hc_readv bit 17) byte-identical", (long long)M);
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.write_hc_vec || !pl.pf2_stages_hc) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (M < 32 || M > 256) { std::printf("--perfhcssb: 32 <= M <= 256\n"); return; }
+    if (iters < 1) iters = 50;
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, true)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    g.pr.push_back(PI("bi_dec", 1));
+    g.ar.p = g.pr.data(); g.ar.n_p = (int)g.pr.size();
+    if (g.rr->scratch) {
+        const int64_t need = g.rr->scratch(&g.ar);
+        if (need > g.ar.scratch_bytes) { g.ar.scratch = dalloc((size_t)need); g.ar.scratch_bytes = need; }
+    }
+    auto envi = [](const char* k, int dflt) { const char* e = std::getenv(k); return e && *e ? std::atoi(e) : dflt; };
+    const int sarm = envi("R4D_SELFTEST_SSB", 1) ? 1 : 0, xarm = envi("RADIANCE_FN4_HC_X", 0), barm = envi("R4D_SELFTEST_B3X", 0) ? 1 : 0;
+    pl.norm_hc_wave(1); pl.write_hc_vec(1); pl.pf2_stages_hc(31);
+    g.set(true, false);
+    auto arm_set = [&](bool on) {
+        pl.readv_hc(331 | 8 | (on && sarm ? 131072 : 0));
+        if (pl.x_hc) pl.x_hc(on ? xarm : 0);
+        if (pl.b3x_hc) pl.b3x_hc(on ? barm : 0);
+    };
+    auto outs = [&](std::vector<uint8_t>& o) {
+        o.clear();
+        for (auto [p, b] : { std::pair<void*, size_t>{ g.d_x, g.xb }, { g.d_inj, g.ib }, { g.d_q, g.qb }, { g.d_qs, g.sb }, { g.d_rq, g.qb },
+                             { g.d_rs, g.sb } }) {
+            const size_t at = o.size();
+            o.resize(at + b);
+            st_memcpy(o.data() + at, p, b, hipMemcpyDeviceToHost);
+        }
+    };
+    /* `spoil`: after the write, the handed scales x 2 (the control) */
+    auto grab = [&](bool on, bool spoil, std::vector<uint8_t>& o) -> bool {
+        arm_set(on);
+        g.reset();
+        if (g.rw->launch(&g.aw, (RadStream)g.hs) != RAD_OK || st_stream_sync(g.hs) != hipSuccess) return false;
+        if (spoil) {
+            std::vector<float> sv(g.ssb / 4);
+            st_memcpy(sv.data(), g.d_ss, g.ssb, hipMemcpyDeviceToHost);
+            for (float& v : sv) v *= 2.0f;
+            st_memcpy(g.d_ss, sv.data(), g.ssb, hipMemcpyHostToDevice);
+        }
+        if (g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK || st_stream_sync(g.hs) != hipSuccess) return false;
+        outs(o);
+        return true;
+    };
+    std::vector<uint8_t> o0, o1, oc;
+    const bool okb = grab(false, false, o0) && grab(true, false, o1) && grab(true, true, oc);
+    size_t diff = 0, dctl = 0;
+    if (okb) {
+        for (size_t i = 0; i < o0.size() && i < o1.size(); ++i) diff += o0[i] != o1[i];
+        for (size_t i = 0; i < o0.size() && i < oc.size(); ++i) dctl += o0[i] != oc[i];
+    }
+    std::printf("SSB M=%lld SSB %d HC_X %d B3X %d vs reference (bit 17 off, HC_X 0, B3X 0): %s; control (ss x 2 after the write): %s\n",
+                (long long)M, sarm, xarm, barm, !okb ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical",
+                !okb ? "--" : dctl ? fmt("%zu bytes differ (A' read ss)", dctl).c_str() : "identical (ss not read)");
+    /* timing: one write (h, ss in place), then the read alone; reads leave h and ss as they are */
+    double ta[2][2] = { { 0, 0 }, { 0, 0 } }, tw[2][2] = { { 0, 0 }, { 0, 0 } };
+    bool okt = true;
+    arm_set(false);
+    g.reset();
+    okt = g.rw->launch(&g.aw, (RadStream)g.hs) == RAD_OK && st_stream_sync(g.hs) == hipSuccess;
+    auto launch = [&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); };
+    for (int rep = 0; rep < 2 && okt; ++rep)
+        for (int a2 = 0; a2 < 2; ++a2) {
+            arm_set(a2 != 0);
+            pl.pf2_stages_hc(3);
+            ta[a2][rep] = st_time_us(launch, iters, g.hs);
+            pl.pf2_stages_hc(31);
+            tw[a2][rep] = st_time_us(launch, iters, g.hs);
+        }
+    const double a0 = (ta[0][0] + ta[0][1]) / 2, a1 = (ta[1][0] + ta[1][1]) / 2;
+    const double w0 = (tw[0][0] + tw[0][1]) / 2, w1 = (tw[1][0] + tw[1][1]) / 2;
+    std::printf("SSB M=%lld %s SSB %d HC_X %d B3X %d: A' alone %.2f -> %.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f), whole read %.2f -> "
+                "%.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f)\n", (long long)M, g_cold > 0 ? "cold" : "warm", sarm, xarm, barm,
+                a0, a1, a0 > 0 ? 100.0 * (a1 - a0) / a0 : 0.0, ta[0][0], ta[0][1], ta[1][0], ta[1][1],
+                w0, w1, w0 > 0 ? 100.0 * (w1 - w0) / w0 : 0.0, tw[0][0], tw[0][1], tw[1][0], tw[1][1]);
+    arm_set(false);
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0); pl.pf2_stages_hc(31);
+    ok(nm.c_str(), okb && okt && diff == 0 && (sarm == 0 || dctl > 0),
+       !okb || !okt ? "launch failed" : diff ? "the arm's bytes differ" : (sarm && !dctl) ? "the control did not move: A' did not read ss" : "");
 }
 
 /* fn4 hc_upmix: the up-mix's other tiles against the stock one, byte for byte on every output (hc_readv 3
@@ -43410,6 +43522,9 @@ static void usage(void) {
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
                 "  --perfhcq M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at 1 / 2 / 4 / 5\n"
                 "             groups a wave (fn4 W2), and from 512 rows PF2's codes stage alone.\n"
+                "  --perfhcssb M [iters]: hc_write + the bi_dec hc read (331 | 8) at M rows: lever SSB (bit 17,\n"
+                "             A' on the write's scales) + RADIANCE_FN4_HC_X / R4D_SELFTEST_B3X arms vs the reference: bytes,\n"
+                "             a spoiled-scales control, A' alone and the whole read (R4D_SELFTEST_SSB=0: SSB off).\n"
                 "  --perfhcs M [iters]:  hc_write + hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows,\n"
                 "             hc_readv 3 against 11 (fn4 W1b: the read's norm scales from the write).\n"
                 "  --perfhcw M [iters]:  hc_write at Qwen3.8-Flash-Next's shape and M rows, the plain\n"
@@ -43609,6 +43724,8 @@ int main(int argc, char** argv) {
     int hcv_it = 50;
     long long hcs_m = 0;
     int hcs_it = 50;
+    long long hcssb_m = 0;   /* --perfhcssb (qfn-on-ds lever SSB, round 35) */
+    int hcssb_it = 50;
     long long hcq_m = 0;
     int hcq_it = 50;
     long long hcu_m = 0;
@@ -44069,6 +44186,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcq_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcq_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcssb")) {
+            /* qfn-on-ds lever SSB: the write + bi_dec read pair, A' on the write's scales (hc_readv bit 17) */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcssb_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcssb_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcs")) {
             /* The write + read pair with the norm scales handed over (fn4 hc_readv bit 3) at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -44226,6 +44348,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("gated residual codes-stage timing (W2)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcssb_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_ssb_bench(pl, hcssb_m, hcssb_it);
+        dfree_all();
+#else
+        skip("lever SSB pair", "built without HIP");
 #endif
         return 0;
     }

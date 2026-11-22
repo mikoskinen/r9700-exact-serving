@@ -2360,7 +2360,7 @@ __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) voi
  * four re-reads x and quantises). Per (row, channel) the arithmetic is hc_up_w_body's word for word (the same W_up rows / halves,
  * quarter folds, d columns, Npre, sigmoid, mix and 1/4; the quantiser's same reads of the same bf16 x values, wave max, scale,
  * pack and rotation), so every output byte (x, q, qs, rq, rqs) is B3's at every height. */
-template <int RG, bool CH, bool I8>
+template <int RG, bool CH, bool I8, bool TL = false>
 __device__ __forceinline__ void hc_up_wx_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
@@ -2376,6 +2376,7 @@ __device__ __forceinline__ void hc_up_wx_body(
     __shared__ float s_usc[kSub][kWaves][16][4];
     __shared__ __attribute__((aligned(16))) unsigned short sx[RG][kUpTB]; /* this block's x rows (the quantiser's input) */
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(1, 0);
     const int col = lane & 15, hh = lane >> 4;
     const long i0 = (long)blockIdx.x * kUpTB;
     const long r0 = (long)blockIdx.y * RG;
@@ -2432,11 +2433,14 @@ __device__ __forceinline__ void hc_up_wx_body(
         if (k < kD8) ((uint4*)sd)[k] = dq[i];
     }
     __syncthreads();
+    hc_tl_put<TL>(1, 1);
 
     const unsigned short* dr = sd + (long)rr * kLr + 40 * hh;
     const float inv_hc = 1.0f / (float)hc;
 #pragma unroll
     for (int hf = 0; hf < kSub / kPass; ++hf) {
+        /* round 35 timeline (TL only): word 4 = wave 0 at pass 1's start (pass 0 = word 1 -> 4, pass 1 = word 4 -> 2) */
+        if (hf == 1) hc_tl_put<TL>(1, 4);
         /* ---- the up product of the pass's two sub-tiles: per (sub-tile, quarter) five WMMA steps folded with the quarter's scale
          * (hc_up_w_body's chain per sub-tile); a quarter's five d fragments read once for both */
         float U[kPass][8];
@@ -2500,10 +2504,12 @@ __device__ __forceinline__ void hc_up_wx_body(
             }
         }
     }
-    if (!q) return;
+    hc_tl_put<TL>(1, 2);
+    if (!q) { hc_tl_end<TL>(1, 2u); return; }
 
     /* ---- the 128-channel group = this block: quantise its rows from LDS (hc_up_w_body's last block's code on the same values) */
     __syncthreads();
+    hc_tl_put<TL>(1, 3);
     const long base = i0;
     for (int r = wave; r < RG && r < rows; r += kWaves) {
         float v[4];
@@ -2518,10 +2524,17 @@ __device__ __forceinline__ void hc_up_wx_body(
         *(unsigned*)(q + (long)r * qrow + base + lane * 4) = (unsigned)pk;
         if (rq) hc_rot_group(v, lane, rq + (long)r * rqrow + base, rqs + (long)r * rsrow + base / kUpTB);
     }
+    hc_tl_end<TL>(1, 1u);
 }
 template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) void hc_up_wx_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_wx_body<RG, false, I8>(R4D_HCW_ARGS);
+}
+/* qfn-on-ds round 35 (bench only, r4d_hc_tl): B3X with the phase timeline, region 1 (words 0 start, 1 d staged, 4 pass 1 start
+ * (wave 0), 2 passes done (thread 0), 3 the quantiser's barrier, 5 end) */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) void hc_up_wx_tl_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_wx_body<RG, false, I8, true>(R4D_HCW_ARGS);
 }
 template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_wx(R4D_HCW_PARAMS) {
@@ -3441,7 +3454,7 @@ void r4dchain_hc_read_g16p_down(const unsigned short* __restrict__ h, const floa
  * over its 320-wide slice with the same group-scale folds, the waves' partials summed 0..7 ascending from 0, the streams' by the
  * tile's last block 0..3 ascending; the norm = G16p's loop), so every output byte is G16p's = G16's = form G's at every height:
  * no reference change, and a floor (RADIANCE_FN4_HC_X_MIN) moves no answer. */
-template <int RG, bool CH, int NTS, bool PRE = false>
+template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false>
 __device__ __forceinline__ void hc_read_g16x_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -3457,6 +3470,7 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
     constexpr long HN = hc * kHcGN;
     constexpr long NG = HN / r4d_hc8::kDownGroup;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    hc_tl_put<TL>(0, 0);
     const int pb = (int)blockIdx.x / hc, c = (int)blockIdx.x % hc;
     const int nsets = ntd / NTS;
     const bool itile = pb == nsets;
@@ -3516,6 +3530,14 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
     if constexpr (PRE) {
         if (tid < RG) s_scale[tid] = scaleout[(long)(tid < rr ? tid : rr - 1) * kHcMax + c];
         __syncthreads();
+        hc_tl_put<TL>(0, 1);
+        hc_tl_put<TL>(0, 2);
+    } else {
+    /* NPX (qfn-on-ds round 35, RADIANCE_FN4_HC_X_NP / the bench's arm): the same rows' sums with their loads four rows ahead
+     * (hc_g_norm_rows_np, lever HCO bit 4's helper), AFTER the chain wait so h is the predecessor's -- the same expression in the
+     * same order a row, only when the loads are issued moves */
+    if constexpr (NPX) {
+        hc_g_norm_rows_np<RG, 4>(h, hrow, c, rr, tid, lane, wave, s_part);
     } else {
     for (int r = 0; r < RG; ++r) {
         const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
@@ -3528,7 +3550,9 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
         acc = wave_sum(acc);
         if (lane == 0) s_part[wave][r] = acc;
     }
+    }
     __syncthreads();
+    hc_tl_put<TL>(0, 1);
     if (tid < RG) {
         float ss = 0.0f;
         for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
@@ -3536,6 +3560,7 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
         if (pb == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
     }
     __syncthreads();
+    hc_tl_put<TL>(0, 2);
     }
 
     const int  rowl = col < rr ? col : rr - 1;
@@ -3600,6 +3625,7 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
 #pragma unroll
             for (int e = 0; e < 8; ++e) s_red[u & 1][wave][col][8 * hh + e] = P[e];
             __syncthreads();
+            if (u == 0) hc_tl_put<TL>(0, 3);
             put_part(u);
         }
     } else {
@@ -3625,14 +3651,17 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
 #pragma unroll
         for (int e = 0; e < 8; ++e) s_red[0][wave][col][8 * hh + e] = D[e];
         __syncthreads();
+        hc_tl_put<TL>(0, 3);
         put_part(0);
     }
     __threadfence();
     __syncthreads();
+    hc_tl_put<TL>(0, 4);
     if (tid == 0)
         for (int u = 0; u < nt_here; ++u)
             s_last[u] = __hip_atomic_fetch_add(&tctr[tile_of(u)], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1u == (unsigned)hc;
     __syncthreads();
+    unsigned tl_fl = 0;
     for (int u = 0; u < nt_here; ++u) {
         if (!s_last[u]) continue;
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -3656,7 +3685,10 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
         }
         __syncthreads();
         if (tid == 0) __hip_atomic_store(&tctr[tu], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        tl_fl = 1u;
     }
+    hc_tl_end<TL>(0, tl_fl);
+    (void)tl_fl;
 }
 #define HC_G16X_DECL const unsigned short* __restrict__ h, const float* __restrict__ w,                               \
                      const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,      \
@@ -3664,14 +3696,20 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
                      float* __restrict__ scaleout, float* __restrict__ part, unsigned int* __restrict__ tctr, long lr,  \
                      long hrow, long irow, float eps, float wadd, int ntd, long rows
 #define HC_G16X_ARGS h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows
-template <int RG, int NTS, bool PRE = false>
+template <int RG, int NTS, bool PRE = false, bool NPX = false>
 __global__ __launch_bounds__(kThreads) void hc_read_g16x_down_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
-    hc_read_g16x_down_body<RG, false, NTS, PRE>(HC_G16X_ARGS);
+    hc_read_g16x_down_body<RG, false, NTS, PRE, false, NPX>(HC_G16X_ARGS);
 }
-template <int RG, int NTS, bool PRE = false>
+template <int RG, int NTS, bool PRE = false, bool NPX = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_read_g16x_down(HC_G16X_DECL) {
-    hc_read_g16x_down_body<RG, true, NTS, PRE>(HC_G16X_ARGS);
+    hc_read_g16x_down_body<RG, true, NTS, PRE, false, NPX>(HC_G16X_ARGS);
     r4d_chain_done();
+}
+/* qfn-on-ds round 35 (bench only, r4d_hc_tl): HCX with the phase timeline, region 0 -- stamps after the norm's two barriers, tile 0's
+ * barrier, the partials' fence + barrier, and the end (flag = this block finished a tile) */
+template <int RG, int NTS, bool NPX = false>
+__global__ __launch_bounds__(kThreads) void hc_read_g16x_down_tl_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
+    hc_read_g16x_down_body<RG, false, NTS, false, true, NPX>(HC_G16X_ARGS);
 }
 
 template <int RG>
@@ -4978,7 +5016,7 @@ static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 131071) : 0;   /* bits 0-13 + bit 14 (PF probe HCF) + bits 15 / 16 (levers HCX / B3X) */
+        const int on = (e && *e) ? (std::atoi(e) & 262143) : 0;   /* bits 0-13 + bit 14 (PF probe HCF) + bits 15 / 16 (levers HCX / B3X) + bit 17 (lever SSB) */
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
@@ -5170,6 +5208,18 @@ static int hc_x_width() {
         const char* e = std::getenv("RADIANCE_FN4_HC_X");
         const int n = (e && *e) ? hc_x_ok(std::atoi(e)) : 0;
         return n > 0 ? n : 5;
+    }();
+    return v;
+}
+/* qfn-on-ds round 35 (lever HCX's NPX arm): RADIANCE_FN4_HC_X_NP=1 (read once) = HCX's norm rows with their loads four rows ahead,
+ * after the chain wait (hc_g_norm_rows_np); the same bytes. The bench sets the env per arm. */
+static bool hc_x_np() {
+    static const bool v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_X_NP");
+        const bool on = e && *e && *e != '0';
+        if (on) std::fprintf(stderr, "radiance: libr4d: lever HCX's NPX arm (RADIANCE_FN4_HC_X_NP): the norm rows' loads four rows ahead "
+                                     "after the chain wait (the same bytes)\n");
+        return on;
     }();
     return v;
 }
@@ -8616,6 +8666,23 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
              (long)dld, injw ? (const unsigned short*)injw->data : nullptr, dbuf,                 \
              inj ? (unsigned short*)inj->data : nullptr, scale, (long)rows, (long)n, (int)hc,     \
              (long)lr, (long)ta, (long)hrow, (long)irow, eps, wadd)
+    /* qfn-on-ds lever SSB (Qwen loop round 35; hc_readv bit 17 with bits 3 + 8): the bi_dec read's kernel A' takes the norm
+     * scales its hc_write handed (`ss`, fn4 W1b: hc_write_scale_wave = thread 8L + e's ten squares in chunk order, the k-th
+     * wave_sum over threads 32k .. 32k + 31, k ascending, then rsqrt(ss / n + eps) -- G16 / G16p's norm loop term for term), so
+     * G16pp's / HCX's PRE bodies read them and no block runs the norm pass, and no hc_g_scale launch either; B3 reads the same
+     * `scale`. From 32 rows (the G16p / HCX heights; G16 below keeps its pass). The same bytes by construction. */
+    const RadTensor* const ssb_in = (bidec && !bidec_r && hcg && g16 && rows >= 32 && (hc_readv() & 131072) != 0
+                                     && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0)
+                                        ? hc_ss_operand(r4d_opt(a, HCR_SS), (long)rows) : nullptr;
+    if (ssb_in) {
+        scale = (float*)ssb_in->data;
+        static const bool said = [] {
+            std::fprintf(stderr, "radiance: libr4d: lever SSB (hc_readv bit 17): the bi_dec read's kernel A' takes the norm scales its "
+                                 "hc_write handed (`ss`, bit 3) from 32 rows -- no norm pass in A', no scale launch (the same bits)\n");
+            return true;
+        }();
+        (void)said;
+    }
     if (hcg && hcs) {
 #define HC_S_K(MT_)                                                                              \
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_s_down<MT_> : &hc_read_s_down_kernel<MT_>), \
@@ -8637,12 +8704,14 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         const int nts = hc_x();
         const dim3 gx((unsigned)((hcg_nt / nts + 1) * hc), (unsigned)hcg_gy);
         /* with bit 9 (from RADIANCE_FN4_HC_PRE_MIN rows): the norm scales once a (stream, group) first (G16pp's), the blocks read them */
-        const bool xpre = (hc_readv() & 512) != 0 && rows >= hc_pre_min();
-        if (xpre)
+        const bool xpre = ((hc_readv() & 512) != 0 && rows >= hc_pre_min()) || ssb_in != nullptr;
+        if (xpre && !ssb_in)
             emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_g_scale : &hc_g_scale_kernel), dim3((unsigned)hc, (unsigned)hcg_gy),
                                dim3(kThreads), 0, (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
-#define HC_X_K(NTS_, PRE_)                                                                       \
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16x_down<16, NTS_, PRE_> : &hc_read_g16x_down_kernel<16, NTS_, PRE_>), \
+#define HC_X_K(NTS_, PRE_, NPX_)                                                                 \
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16x_down<16, NTS_, PRE_, NPX_>          \
+                               : (!PRE_ && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_read_g16x_down_tl_kernel<16, NTS_, NPX_> \
+                               : &hc_read_g16x_down_kernel<16, NTS_, PRE_, NPX_>), \
                            gx, dim3(kThreads), 0,                                                \
                            (const unsigned short*)h->data, (const float*)w->data,                \
                            (const unsigned char*)down->data, (long)dld,                          \
@@ -8650,8 +8719,10 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd, \
                            (int)hcg_nt, (long)rows)
         if (emit_rc == RAD_OK) {
-            if (xpre) { if (nts == 4) HC_X_K(4, true); else if (nts == 5) HC_X_K(5, true); else HC_X_K(10, true); }
-            else      { if (nts == 4) HC_X_K(4, false); else if (nts == 5) HC_X_K(5, false); else HC_X_K(10, false); }
+            const bool xnp = hc_x_np();
+            if (xpre)     { if (nts == 4) HC_X_K(4, true, false); else if (nts == 5) HC_X_K(5, true, false); else HC_X_K(10, true, false); }
+            else if (xnp) { if (nts == 4) HC_X_K(4, false, true); else if (nts == 5) HC_X_K(5, false, true); else HC_X_K(10, false, true); }
+            else          { if (nts == 4) HC_X_K(4, false, false); else if (nts == 5) HC_X_K(5, false, false); else HC_X_K(10, false, false); }
         }
 #undef HC_X_K
     } else if (hcg && g16 && (hc_readv() & 1024) != 0 && (hcg_nt % 4) == 0 && !hcg_ch && rows >= 32) {
@@ -8664,12 +8735,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                            (int)hcg_nt, (long)rows);
-    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && rows >= hc_pre_min()) {
+    } else if (hcg && g16 && (((hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && rows >= hc_pre_min()) || ssb_in)) {
         /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them; chained under `chain`
          * (qfn-on-ds round 34: the twins r4dchain_hc_g_scale / r4dchain_hc_read_g16pp_down; before, !chain kept it off in BEST) */
         fc_add(kFcG16pp, (long)rows, bidec);
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_g_scale : &hc_g_scale_kernel), dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
-                           (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
+        if (!ssb_in)   /* lever SSB: the write's scales are already in `scale` */
+            emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_g_scale : &hc_g_scale_kernel), dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
+                               (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
         if (emit_rc == RAD_OK)
             emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16pp_down<16> : &hc_read_g16pp_down_kernel<16>),
                                dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
@@ -8764,7 +8836,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         unsigned int* const qctr = q ? mctr : nullptr;
         fc_add(kFcB3X, (long)rows, bidec);
 #define HC_UPWX_K(I8_)                                                                           \
-        R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_wx<16, I8_> : &hc_up_wx_kernel<16, I8_>),            \
+        R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_wx<16, I8_>                                         \
+                     : g_hc_tl.load(std::memory_order_relaxed) ? &hc_up_wx_tl_kernel<16, I8_>       \
+                     : &hc_up_wx_kernel<16, I8_>),                                                  \
                  dim3((unsigned)(n / kUpTB), (unsigned)((rows + 15) / 16)), dim3(kThreads), 0,    \
                  (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,          \
                  (const unsigned short*)h->data, (const float*)w->data,                          \
@@ -8930,7 +9004,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 131071) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained); 14: PF probe HCF (timing only); 15: lever HCX; 16: lever B3X */
+        if (value < 0 || value > 262143) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained); 14: PF probe HCF (timing only); 15: lever HCX; 16: lever B3X; 17: lever SSB (A' takes the write's scales) */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
