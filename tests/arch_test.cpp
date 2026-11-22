@@ -13994,7 +13994,8 @@ extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
  * layers 2..5 only, no embedding / head / drafter / PLE, stage_recv X1 + stage_send X2; both name the crossings at 20,480 B a
  * row and 1 part with and without RADIANCE_FN4_HC_SS=1 (S3a: the scales do not cross); without the core's rings a pass fails. Controls: the fake
  * off = the published declare (graph fingerprint); refusals: a cut with the PLE layer at h (W(1, 6)), the last layer on the
- * follower (W(2, 8)), RADIANCE_FN4_LAYERS beside --pp-nodes 2. */
+ * follower (W(2, 8)), RADIANCE_FN4_LAYERS beside --pp-nodes 2. S5 prerequisite (round 31): both nodes declare the same KV groups
+ * in the same order with the same geometry (= the one-machine list; the follower's PLE state groups bound to layer 1, not zero). */
 TEST(flashnext_pp_nodes_declare_their_part_and_the_crossings) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
@@ -14021,9 +14022,22 @@ TEST(flashnext_pp_nodes_declare_their_part_and_the_crossings) {
             RadBuilder b0b;
             REQUIRE_EQ(declare(-1, 2, 6, rank, b0b), RAD_OK);
             CHECK_EQ(graph_hash(b0b), g0);
+            /* S5 prerequisite (round 31): both nodes' KV groups by position -- name, kind, geometry, zero (the engine indexes them
+             * by position on both nodes); the one-machine control's list is the leader's */
+            auto kv_list = [](const RadBuilder& x) {
+                std::vector<std::string> v;
+                for (const RecKV& k : x.kv_groups)
+                    v.push_back(k.name + " " + std::to_string((int)k.d.kind) + " " + std::to_string((int)k.d.dtype) + " " +
+                                std::to_string((long long)k.d.conv_width) + " " + std::to_string((long long)k.d.n_head_kv) + " " +
+                                std::to_string((long long)k.d.head_dim) + " " + std::to_string((long long)k.d.window) +
+                                (k.zero ? " zero" : ""));
+                return v;
+            };
+            std::vector<std::string> kvn[2];
             for (int node : { 0, 1 }) {
                 RadBuilder b;
                 REQUIRE_EQ(declare(node, 2, 6, rank, b), RAD_OK);
+                kvn[node] = kv_list(b);
                 const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
                 CHECK(m.pp && m.lr.on && m.lr.strict);
                 CHECK_EQ(m.pp_rank, node);
@@ -14041,7 +14055,15 @@ TEST(flashnext_pp_nodes_declare_their_part_and_the_crossings) {
                 }
                 for (const auto& bd : b.binds) if (bd.first < NL) kl.insert(bd.first);
                 CHECK(wl == want);
-                CHECK(kl == want);
+                /* the follower binds the PLE layer (1) to its two state groups too (S5 prerequisite, pp_ple_groups) */
+                std::set<int> wantk = want;
+                if (node == 1) wantk.insert(1);
+                CHECK(kl == wantk);
+                int ple_groups = 0;
+                for (const auto& bd : b.binds)
+                    if (bd.first == 1 && bd.second >= 1 && bd.second <= b.kv_groups.size() &&
+                        b.kv_groups[bd.second - 1].name.find("kv_ple_") != std::string::npos) ++ple_groups;
+                CHECK_EQ(ple_groups, 2);
                 CHECK_EQ(tok, node == 0);
                 CHECK_EQ(head, node == 0);
                 CHECK_EQ(mtp, node == 0);
@@ -14077,6 +14099,11 @@ TEST(flashnext_pp_nodes_declare_their_part_and_the_crossings) {
                 const auto v = run_passes(b, qwen4exp_fp8::step, { dc.get() }, rank, 4);
                 CHECK(!v[0]->step_fail.empty());
             }
+            CHECK(kvn[0] == kv_list(b0));
+            CHECK(kvn[1] == kvn[0]);
+            if (kvn[1] != kvn[0] && rank == 0)
+                for (int node : { 0, 1 })
+                    for (const std::string& k : kvn[node]) fprintf(stderr, "    node %d: %s\n", node, k.c_str());
             RadBuilder r1, r2, r3;
             CHECK_EQ(declare(0, 1, 6, rank, r1), RAD_E_UNSUPPORTED);   /* the PLE layer (1) at the cut: X1 would need the ids */
             CHECK_EQ(declare(1, 1, 6, rank, r1), RAD_E_UNSUPPORTED);
@@ -14097,7 +14124,10 @@ TEST(flashnext_pp_nodes_declare_their_part_and_the_crossings) {
  * X2's send last (no embedding, no head). Each stage op carries the step's rows of h_wide. Decode, a two-prompt
  * prefill and a MIXED step; every pass lints clean and fails nothing; the leader's verify + MTP history + round run, a drafter
  * pass on the follower is refused. S3b: the same parts of a 3,840-row pipelined prefill in a spanned start with the published SP
- * switches (a pipeline node runs no SP form: the blocks' all-reduces on lane 1, the stage ops on lane 0). */
+ * switches (the blocks' all-reduces on lane 1, the stage ops on lane 0). S3b-SP (round 31): those passes run SP-hc (hc_sp 2 + P2S
+ * + PSP) and a MIXED step runs SP-serial (one run, and sp_serial 2's two halves on lane 1) on every part; a sending node gathers
+ * the wide stream's rows (all_gather_rows over h_wide) after its last layer and before its send, lane 0 joined behind lane 1's
+ * gathers; without an SP form no gather precedes a send. S3c (round 31): a node's decode pass has a pass key. */
 TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
     setenv("RADIANCE_FN4_HC_SS", "1", 1);
     MetaKV mk = q4_small();
@@ -14106,9 +14136,14 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
     static RadPpRing rings[RAD_PP_N_RINGS];
     auto layer_of = [](const std::string& name) { return name.rfind("blk.", 0) == 0 ? std::atoi(name.c_str() + 4) : -1; };
     /* the issue sequence of one pass against its part: stage ops (ring), layers of weight-reading ops, the embedding, the head */
-    auto check_pass = [&](const RadBuilder& b, const RadCtx& c, int arm, int64_t T, bool* lane1_ar) {
+    /* sp_form (round 31, S3b-SP): the pass ran an SP form (SP-hc pieces or SP-serial runs), so every rank holds only its rows of
+     * the wide stream after a layer's write: a sending node gathers them (all_gather_rows over h_wide) after its last layer's
+     * ops and before its send, and lane 0 waits for lane 1 in between where the gathers went to lane 1. Without an SP form
+     * no such gather precedes a send. */
+    auto check_pass = [&](const RadBuilder& b, const RadCtx& c, int arm, int64_t T, bool* lane1_ar, rad_buf hb, bool sp_form) {
         int i_send1 = -1, i_recv1 = -1, i_send2 = -1, i_recv2 = -1, i_embed = -1, i_logits = -1, n_stage = 0;
         int first_layer_at = -1, last_layer_at = -1, lo_max = -1, hi_min = 1 << 30;
+        std::vector<int> agh;   /* the wide stream's gathers, by issue */
         std::set<int> layers;
         *lane1_ar = false;
         for (size_t i = 0; i < c.issues.size(); ++i) {
@@ -14116,7 +14151,11 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
             if (!o) continue;
             int ring = -1;
             for (const RecParam& q : o->p) if (q.key == "ring") ring = (int)q.ival;
-            if (o->op == "all_reduce" && c.issues[i].lane == 1) *lane1_ar = true;
+            /* a collective on the second lane (the SP forms reduce-scatter and gather in place of the all-reduce) */
+            if ((o->op == "all_reduce" || o->op == "reduce_scatter_rows" || o->op == "all_gather_rows") && c.issues[i].lane == 1)
+                *lane1_ar = true;
+            if (o->op == "all_gather_rows" && std::find(o->reads.begin(), o->reads.end(), hb) != o->reads.end())
+                agh.push_back((int)i);
             if (o->op == "stage_send" || o->op == "stage_recv") {
                 ++n_stage;
                 int& at = o->op == "stage_send" ? (ring == RAD_PP_X1 ? i_send1 : i_send2) : (ring == RAD_PP_X1 ? i_recv1 : i_recv2);
@@ -14140,6 +14179,20 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
                 }
         }
         const int nis = (int)c.issues.size();
+        /* the gathers between the sending node's last layer op (lo_max: layer h - 1 on the leader; last_layer_at on the
+         * follower) and its send */
+        auto gathers_before = [&](int from, int send) {
+            if (send < 0) return;
+            int n = 0, last = -1;
+            for (int i : agh) if (i > from && i < send) { ++n; last = i; }
+            CHECK_EQ(n > 0, sp_form);
+            if (n == 0 || c.issues[(size_t)last].lane != 1) return;
+            bool joined = false;   /* lane 0 waits for lane 1 after the last gather, before the send */
+            for (const RecJoin& j : c.joins) if (j.from == 1 && j.to == 0 && (int)j.at > last && (int)j.at <= send) joined = true;
+            CHECK(joined);
+        };
+        if (arm == 0 || arm == 1) gathers_before(lo_max, i_send1);
+        if (arm == 3) gathers_before(last_layer_at, i_send2);
         if (arm == 0) {
             CHECK_EQ(n_stage, 2);
             CHECK(i_embed >= 0 && i_embed < first_layer_at);
@@ -14199,17 +14252,44 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
                 qwen4exp_fp8::fn4_sproute_flag().store(512);
             }
             std::vector<std::pair<std::vector<int>, std::vector<int>>> shapes;
-            if (span) shapes = { { {}, { 2048 + 1792 } } };
+            /* span: the pipelined prefill (SP-hc pieces under hc_sp 2 + P2S + PSP, round 31) and a MIXED step (SP-serial) */
+            if (span) shapes = { { {}, { 2048 + 1792 } }, { { 4, 4, 4, 4 }, { 500 } } };
             else      shapes = { { { 1, 1, 1, 1 }, {} }, { {}, { 64, 64 } }, { { 4, 4 }, { 100 } } };
             for (const auto& dq_pq : shapes) {
-                const auto k = kit(b, dq_pq.first, dq_pq.second, dq_pq.second.empty() ? 0 : (span ? 10240 : 9000));
+                const bool pf = dq_pq.first.empty();
+                const auto k = kit(b, dq_pq.first, dq_pq.second, dq_pq.second.empty() ? 0 : (span ? (pf ? 10240 : 4096) : 9000));
                 k->b.positions_h = k->pos.data();
+                m.spser_noted = 0;
                 const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, 4);
                 CHECK_PASSES(b, v);
                 CHECK(v[0]->step_fail.empty());
                 bool lane1 = false;
-                check_pass(b, *v[0], arm, k->b.n_tok, &lane1);
-                CHECK_EQ(lane1, span == 1);   /* the pipelined form: the blocks' all-reduces on the second lane */
+                check_pass(b, *v[0], arm, k->b.n_tok, &lane1, m.b_h, span == 1);
+                CHECK_EQ(lane1, span == 1 && pf);   /* the pipelined form: the blocks' collectives on the second lane */
+                if (span && !pf) CHECK_EQ(m.spser_noted, 1);   /* the MIXED step ran SP-serial (one run) on this part */
+            }
+            if (span) {   /* SP-serial's two halves (sp_serial 2: every collective on the second lane) */
+                qwen4exp_fp8::fn4_spser_flag().store(2);
+                const auto k = kit(b, { 4, 4, 4, 4 }, { 1000 }, 4096);   /* both halves' parts > 64 rows a rank */
+                k->b.positions_h = k->pos.data();
+                m.spser_noted = 0;
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, 4);
+                CHECK_PASSES(b, v);
+                CHECK(v[0]->step_fail.empty());
+                bool lane1 = false;
+                check_pass(b, *v[0], arm, k->b.n_tok, &lane1, m.b_h, true);
+                CHECK(lane1);
+                CHECK_EQ(m.spser_noted, 2);
+                qwen4exp_fp8::fn4_spser_flag().store(1);
+            }
+            /* S3c (round 31): a node's decode pass is recorded, keyed by shape as one machine's (the core mixes the part); was 0
+             * on a node since S3a */
+            if (!span) {
+                const auto dk = kit(b, { 1 }, {});
+                std::vector<int32_t> used(64, 4096);
+                RadCtx kc{};
+                kc.rank = rank; kc.world = 4;
+                CHECK(qwen4exp_fp8::pass_key(&kc, &dk->b, used.data()) != 0);
             }
             if (span) {
                 qwen4exp_fp8::fn4_sproute_flag().store(0);
