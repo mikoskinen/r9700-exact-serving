@@ -2801,6 +2801,51 @@ int parse_rerank_request(const std::string& body, const OaiDeps& d, const OaiLim
     return RAD_OK;
 }
 
+/* ================================================================== lever RPF (oai.h) */
+
+int rpf_warm_body(const std::string& body, const ParsedMessage& m, std::string* out) {
+    if (m.tool_calls.empty() || m.open_call) return -1;
+    for (const auto& t : m.tool_calls)
+        if (t.id.empty() || t.name.empty()) return -1;
+    json b = json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (!b.is_object()) return -1;
+    auto ms = b.find("messages");
+    if (ms == b.end() || !ms->is_array()) return -1;
+    if (auto n = b.find("n"); n != b.end() && !(n->is_number_integer() && n->get<int64_t>() == 1)) return -1;
+    /* the client's own next prompt, cc_sim's append_turn: role, content, reasoning_content (when the reply has it), tool_calls */
+    json am = json::object();
+    am["role"] = "assistant";
+    am["content"] = m.content;
+    if (!m.reasoning.empty()) am["reasoning_content"] = m.reasoning;
+    json tcs = json::array();
+    for (const auto& t : m.tool_calls) {
+        json f = json::object();
+        f["name"] = t.name;
+        f["arguments"] = t.arguments;
+        json c = json::object();
+        c["id"] = t.id;
+        c["type"] = "function";
+        c["function"] = std::move(f);
+        tcs.push_back(std::move(c));
+    }
+    am["tool_calls"] = std::move(tcs);
+    ms->push_back(std::move(am));
+    for (const auto& t : m.tool_calls) {
+        json tm = json::object();
+        tm["role"] = "tool";
+        tm["tool_call_id"] = t.id;
+        tm["content"] = "";
+        ms->push_back(std::move(tm));
+    }
+    for (const char* k : { "stream", "stream_options", "max_completion_tokens", "logprobs", "top_logprobs", "n",
+                           "ignore_eos", "min_tokens" })
+        b.erase(k);
+    b["max_tokens"] = 1;
+    b["stream"] = false;
+    *out = b.dump();
+    return 0;
+}
+
 /* ================================================================== responses */
 
 static json tool_calls_json(const std::vector<ToolCall>& tcs) {

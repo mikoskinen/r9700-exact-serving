@@ -393,6 +393,15 @@ struct TimingsOut {
     double  ttft_ms = -1.0, total_ms = -1.0;   /* < 0: the body's arrival is not known */
 };
 
+/* qfn-on-ds lever RPF (reply prefill ahead; Qwen loop round 26, QUEUE Q47): the body of the warm request that prefills a
+ * finished reply before the client's next turn arrives -- the OpenAI chat body `body` with the reply `m` appended as the
+ * assistant message (content, reasoning_content when non-empty, tool_calls with their ids) and one tool message a call with
+ * EMPTY content (the next prompt's tool-result headers: the form row cc21x measured with cc_sim3w2.py), max_tokens 1, not
+ * streamed. The next turn's prompt shares every token through those headers, so its prefix hit can resume inside the reply's
+ * last piece. -1 (and `out` untouched) when it does not apply: no complete call, a call without an id, `n` other than 1, no
+ * messages array, a body that does not parse. */
+int rpf_warm_body(const std::string& body, const ParsedMessage& m, std::string* out);
+
 /* `timings` is added at the top level when it is valid. */
 std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOut>& choices,
                                  const UsageOut& u, const TimingsOut& t = TimingsOut());

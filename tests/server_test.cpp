@@ -624,6 +624,102 @@ TEST(a_complete_tool_call_is_reported_as_tool_calls) {
     CHECK(c["message"]["content"].is_null());
 }
 
+/* qfn-on-ds lever RPF (Qwen loop round 26): the warm body is the client's next prompt through the reply + empty tool headers,
+ * max_tokens 1, not streamed; and the server serves it after a tool-call reply only under RADIANCE_RPF=1. */
+TEST(lever_rpf_warm_body_is_the_history_through_the_reply_and_empty_tool_headers) {
+    const std::string body =
+        R"({"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":13000,"stream":true,)"
+        R"("stream_options":{"include_usage":true},"n":1,"temperature":0,"reasoning_effort":"xhigh",)"
+        R"("tools":[{"type":"function","function":{"name":"get_weather"}}]})";
+    ParsedMessage m;
+    m.reasoning = "think";
+    m.tool_calls.push_back(ToolCall{ "call_a", "get_weather", "{\"city\":\"berlin\"}" });
+    m.tool_calls.push_back(ToolCall{ "call_b", "get_weather", "{\"city\":\"oslo\"}" });
+    std::string out;
+    CHECK_EQ(rpf_warm_body(body, m, &out), 0);
+    json w = json::parse(out);
+    CHECK_EQ((int)w["messages"].size(), 4);
+    CHECK_EQ(w["messages"][1]["role"].get<std::string>(), std::string("assistant"));
+    CHECK_EQ(w["messages"][1]["content"].get<std::string>(), std::string(""));
+    CHECK_EQ(w["messages"][1]["reasoning_content"].get<std::string>(), std::string("think"));
+    CHECK_EQ(w["messages"][1]["tool_calls"][1]["id"].get<std::string>(), std::string("call_b"));
+    CHECK_EQ(w["messages"][1]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
+             std::string("{\"city\":\"berlin\"}"));
+    CHECK_EQ(w["messages"][2]["role"].get<std::string>(), std::string("tool"));
+    CHECK_EQ(w["messages"][2]["tool_call_id"].get<std::string>(), std::string("call_a"));
+    CHECK_EQ(w["messages"][3]["tool_call_id"].get<std::string>(), std::string("call_b"));
+    CHECK_EQ(w["messages"][3]["content"].get<std::string>(), std::string(""));
+    CHECK_EQ(w["max_tokens"].get<int>(), 1);
+    CHECK(w["stream"].get<bool>() == false);
+    CHECK(!w.contains("stream_options"));
+    CHECK(!w.contains("n"));
+    CHECK_EQ(w["reasoning_effort"].get<std::string>(), std::string("xhigh"));
+    CHECK_EQ((int)w["tools"].size(), 1);
+    /* where it does not apply, nothing is written */
+    std::string none = "untouched";
+    ParsedMessage plain;
+    plain.content = "hello";
+    CHECK_EQ(rpf_warm_body(body, plain, &none), -1);
+    ParsedMessage open = m;
+    open.open_call = true;
+    CHECK_EQ(rpf_warm_body(body, open, &none), -1);
+    ParsedMessage noid = m;
+    noid.tool_calls[1].id.clear();
+    CHECK_EQ(rpf_warm_body(body, noid, &none), -1);
+    CHECK_EQ(rpf_warm_body(R"({"messages":[{"role":"user","content":"hi"}],"n":2})", m, &none), -1);
+    CHECK_EQ(rpf_warm_body(R"({"prompt":"hi"})", m, &none), -1);
+    CHECK_EQ(rpf_warm_body("not json", m, &none), -1);
+    CHECK_EQ(none, std::string("untouched"));
+}
+
+static bool rpf_wait_submitted(FakeScheduler& s, size_t n) {
+    for (int i = 0; i < 400; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (s.submitted.size() >= n) return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
+
+TEST(lever_rpf_serves_one_warm_request_after_a_tool_call_reply_only_under_the_env) {
+    const char* req = R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":128,)"
+                      R"("tools":[{"type":"function","function":{"name":"get_weather"}}]})";
+    for (int arm = 0; arm < 4; ++arm) {
+        /* arm 0: env on, a tool-call reply, blocking; 1: env on, streamed; 2: env on, a plain reply; 3: env unset (control) */
+        if (arm == 3) unsetenv("RADIANCE_RPF");
+        else setenv("RADIANCE_RPF", "1", 1);
+        size_t first_len = 0;
+        {
+            Fixture f;
+            f.sched.reply = arm == 2 ? "hello" : "TOOL:get_weather:{\"city\":\"berlin\"}";
+            std::string body = req;
+            if (arm == 1) body.insert(body.size() - 1, R"(,"stream":true)");
+            HttpResponse r = f.post("/v1/chat/completions", body);
+            CHECK_EQ(r.status, 200);
+            if (arm == 1) {
+                const std::string all = drain(r);
+                CHECK(all.find("tool_calls") != std::string::npos);
+            }
+            CHECK(rpf_wait_submitted(f.sched, 1));
+            if (arm <= 1) {
+                CHECK(rpf_wait_submitted(f.sched, 2));
+                std::lock_guard<std::mutex> lk(f.sched.mu);
+                CHECK_EQ((int)f.sched.submitted.size(), 2);
+                CHECK_EQ(f.sched.seen[1].max_tokens, 1);
+                first_len = f.sched.prompts[0].size();
+                CHECK(f.sched.prompts[1].size() > first_len);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                std::lock_guard<std::mutex> lk(f.sched.mu);
+                CHECK_EQ((int)f.sched.submitted.size(), 1);
+            }
+        }
+    }
+    unsetenv("RADIANCE_RPF");
+}
+
 TEST(hyv3_native_markup_flows_through_openai_tools_api) {
     const json tools = json::parse(R"([{
       "type":"function","function":{"name":"lookup_weather","parameters":{"type":"object",
