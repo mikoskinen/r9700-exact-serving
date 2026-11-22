@@ -524,6 +524,13 @@ private:
     /* The leader: every build crosses (BatchBuilder::Wire); a trunk step with `run`, at its
      * release. */
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
+    int  pp_draft_flush();   /* the drafter builds queued since the last frame onto the link, in order (pp_ship's first part) */
+    /* tp8 loop D79 (RADIANCE_PP_DRAFT_SHIP=1, the leader): pp_draft_flush also at a lane's drafter wait (lane_tail_finish), while the
+     * host would idle on the card, not on the next head's path; the link's message order is the same (no frame goes out between a
+     * drafter build and either point). Counted: flushes, builds sent there, ms in those sends */
+    bool    pp_draft_ship_ = false;
+    int64_t pp_dship_n_ = 0, pp_dship_builds_ = 0;
+    double  pp_dship_ms_ = 0;
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
     void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0, int band = 0, int lflags = 0, int tband = 0, int rband = 0,
