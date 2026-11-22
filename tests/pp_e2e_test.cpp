@@ -2247,13 +2247,16 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
     CHECK(ref_log.find("lever BGL") == std::string::npos);
     /* runs 0 / 1: stage 1 (lane 1's steps on the rank's own Ctx); run 2: stage 2 WIP -- lane 1's steps on a second Ctx a rank and a
      * second sampler driver, every kernel instance doubled (RADIANCE_AR_SETS=all), still one step at a time */
-    for (int k = 0; k < 3; ++k) {
+    /* run 3: stage 2b -- lane 1's step issued whole on the second Ctx and finished by event while lane 0 steps on */
+    for (int k = 0; k < 4; ++k) {
         Serving one;
-        const std::vector<std::string> env = k < 2 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=1" }
-                                                   : std::vector<std::string>{ "RADIANCE_BG_LANE_1M=2", "RADIANCE_AR_SETS=all" };
+        const std::vector<std::string> env = k < 2  ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=1" }
+                                           : k == 2 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=2", "RADIANCE_AR_SETS=all" }
+                                                    : std::vector<std::string>{ "RADIANCE_BG_LANE_1M=3", "RADIANCE_AR_SETS=all" };
         std::vector<std::string> env2 = env;
-        if (k == 2) if (const char* dv = std::getenv("BGL2_DBG")) env2.push_back(std::string("RADIANCE_BGL2_DBG=") + dv);
+        if (k >= 2) if (const char* dv = std::getenv("BGL2_DBG")) env2.push_back(std::string("RADIANCE_BGL2_DBG=") + dv);
         if (k < 2 && std::getenv("BGL2_ONLY")) continue;
+        if (k < 3 && std::getenv("BGL3_ONLY")) continue;
         std::vector<std::string> ext2 = ext;
         if (std::getenv("BGL2_PLACE")) { ext2.push_back("--placement"); ext2.push_back(std::getenv("BGL2_PLACE")); }
         REQUIRE(one.start("", ext2, env2));
@@ -2281,8 +2284,15 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "%s\n", tail(log, 30).c_str());
         CHECK(log.find("lever BGL (RADIANCE_BG_LANE_1M=1") != std::string::npos);
-        CHECK((log.find("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank") != std::string::npos) == (k == 2));
-        if (k == 2) CHECK(log.find("RADIANCE_AR_SETS=all (tp8 loop M6F): ") != std::string::npos);
+        CHECK((log.find("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank") != std::string::npos) == (k >= 2));
+        if (k >= 2) CHECK(log.find("RADIANCE_AR_SETS=all (tp8 loop M6F): ") != std::string::npos);
+        if (k == 3) {
+            long long ov = -1;
+            static const std::string kOv = "lever BGL stage 2b: ";
+            if (const size_t at = log.rfind(kOv); at != std::string::npos) ov = std::atoll(log.c_str() + at + kOv.size());
+            fprintf(stderr, "    BGL run 3 (stage 2b): %lld lane-0 steps issued beside a lane-1 step in flight\n", ov);
+            CHECK(ov >= 0);
+        }
         CHECK(lent > 0);
         CHECK(steps > 0 && steps <= lent);
         CHECK(rows >= 680);

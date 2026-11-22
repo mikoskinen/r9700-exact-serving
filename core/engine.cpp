@@ -1326,13 +1326,39 @@ int Engine::step_loop() {
         ahead = nullptr;
         /* qfn-on-ds lever BGL: lane 1 (the BG lane) steps when lane 0 lent it a newcomer; else lane 0, which may lend the next
          * one to lane 1 (the planners: lane 1 plans before lane 0 plans again) */
+        /* lever BGL stage 2b: a lane-1 step in flight whose end event (stashed while lane 0 is selected) has completed is finished
+         * now -- every rank's first Ctx first waits for its second Ctx's end (bg_done_), so lane 0's next step reads the newcomer
+         * behind it */
+        if (bgl2b_ && bgf_.on && !issued) {
+            const int q = rad_event_query(bgio_in_ ? step_end_ : bgio_.step_end);
+            if (q < 0) return fail_loop(q);
+            if (q == 1) {
+                lane_select(1);
+                for (size_t r = 0; r < ranks_.size(); ++r)
+                    if (const int ws = rad_event_wait(ranks_[r]->ctx.stream(), bg_done_[r]); ws < 0) return fail_loop(ws);
+                StepOut so1 = std::move(bgf_.so);
+                bgf_.so = StepOut{};
+                bgf_.on = false;
+                bgl_flight_ms_ += (double)(rad_mono_ns() - bgf_.t0) / 1e6;
+                if (const int fs = finish_step(bgf_.b, so1, lsched().plan(), bgf_.pf1_tok, t_on); fs < 0) return fail_loop(fs);
+                continue;
+            }
+        }
         if (bgl1m_ && !issued) {
-            const int lane = lanes_.inbox_n(1) > 0 ? 1 : 0;
+            const int lane = (!bgf_.on && lanes_.inbox_n(1) > 0) ? 1 : 0;
             lanes_.set_planners({ 1 - lane });
-            /* stage 2 (WIP, serial): every rank's first Ctx drained before a lane-1 step starts on its second -- a block the commit
-             * just freed may still be written behind a lane-0 step on a follower rank (one stream orders that today) */
-            if (lane == 1 && ranks_[0]->bg_ready)
+            if (lane == 1 && bgl2b_) {
+                /* stage 2b: the second Ctx waits on the card for everything the first issued so far (a block the commit just freed
+                 * may still be written behind a lane-0 step on a follower rank) -- no host wait */
+                for (size_t r = 0; r < ranks_.size(); ++r) {
+                    if (const int es = rad_event_record(bg_gate_[r], ranks_[r]->ctx.stream()); es < 0) return fail_loop(es);
+                    if (const int ws = rad_event_wait(ranks_[r]->bg_ctx.stream(), bg_gate_[r]); ws < 0) return fail_loop(ws);
+                }
+            } else if (lane == 1 && ranks_[0]->bg_ready) {
+                /* stage 2a (serial): every rank's first Ctx drained before a lane-1 step starts on its second */
                 for (auto& rk : ranks_) (void)rk->ctx.sync_all();
+            }
+            if (lane == 0 && bgf_.on) ++bgl_overlap_steps_;
             lane_select(lane);
         }
         if (issued) lsched().promote_next();
@@ -1586,12 +1612,47 @@ int Engine::step_loop() {
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
+        /* lever BGL stage 2b: lane 1's step goes out whole on the second Ctx and is finished by its event at the loop's top
+         * (finish_step), while lane 0 steps on */
+        if (bgl2b_ && cur_sched_ != &sched_) {
+            for (size_t r = 0; r < ranks_.size(); ++r) {
+                st = rad_event_record(bg_done_[r], ranks_[r]->bg_ctx.stream());
+                if (st < 0) return fail_loop(st);
+            }
+            bgf_.b = b;
+            bgf_.so = std::move(so);
+            so = StepOut{};
+            bgf_.pf1_tok = pf1_tok;
+            bgf_.on = true;
+            bgf_.t0 = rad_mono_ns();
+            lane_select(0);
+            continue;
+        }
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
+        if (const int fs = finish_step(b, so, plan, pf1_tok, t_on); fs < 0) return fail_loop(fs);
+    }
+    if (bgl1m_) {   /* qfn-on-ds lever BGL: what the BG lane took (the test side reads this line at the stop) */
+        const LaneSet::Counts c = lanes_.counts();
+        RAD_INFO("lever BGL: %lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s); kept home: a prefix restore "
+                 "%lld, no room %lld, not a planner %lld", (long long)c.bg, (long long)c.bg_rows, (long long)bgl_steps_,
+                 (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
+                 (long long)c.bg_skip[LaneSet::kBgOrder]);
+        if (bgl2b_)
+            RAD_INFO("lever BGL stage 2b: %lld lane-0 step(s) issued while a lane-1 step was in flight; lane-1 steps %.1f ms issue to "
+                     "finish on average", (long long)bgl_overlap_steps_, bgl_steps_ > 0 ? bgl_flight_ms_ / (double)bgl_steps_ : 0.0);
+    }
+    return RAD_OK;
+}
+
+/* The step's second half: its readback, commit and drafter's finish (step_loop; lever BGL stage 2b: a lane-1 step finished by event).
+ * Returns RAD_OK or the status step_loop fails on. */
+int Engine::finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bool pf1_tok, bool t_on) {
+    int st = RAD_OK;
         const uint64_t pf1_f0 = pf_tl_ ? rad_mono_ns() : 0;
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
-        if (st < 0) return fail_loop(st);
+        if (st < 0) return st;
         /* tp8 S4: a card's stage op that gave up leaves its ring's abort word set and its pass
          * computed from nothing; the step's tokens are not read. */
         if (pp_link_)
@@ -1601,14 +1662,14 @@ int Engine::step_loop() {
                         RAD_ERR("two-node pipeline: step %d: crossing X%d was aborted (%s): the step's "
                                 "tokens are not used", b->step, k + 1, pp_link_->alive() ? "a stage op gave up"
                                                                                          : pp_link_->why().c_str());
-                        return fail_loop(RAD_E_IO);
+                        return RAD_E_IO;
                     }
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
         if (cfg_.kld()) {
             st = score_rows(b, so);
-            if (st < 0) return fail_loop(st);
+            if (st < 0) return st;
         }
 
         /* Buffer probe after the trunk step; drafters dump after their own passes. */
@@ -1663,7 +1724,7 @@ int Engine::step_loop() {
 #endif
         st = lsched().commit(res);
         if (t_on) phase_mark(PH_COMMIT);
-        if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return st; }
         pf1_finish(b, pf1_f0, pf1_tok);   /* qfn-on-ds RADIANCE_PF_TIMELINE: a prompt's line at its first token */
         /* ds41-acc: the verifies against the confidence plane and the shadow tree's branches. */
         dconf_commit(plan, so, b->step);
@@ -1672,7 +1733,7 @@ int Engine::step_loop() {
          * a row. */
         if (so.n_rows > 0) {
             st = stream_probe_take(b, res.n_prefill_done > 0, res.n_finished > 0);
-            if (st < 0) return fail_loop(st);
+            if (st < 0) return st;
         }
 
         /* With the ids read ahead of the drafter's passes, the commit streamed the tokens while
@@ -1681,7 +1742,7 @@ int Engine::step_loop() {
         if (so.early) {
             st = rad_event_sync(step_end_);
             if (st < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step,
-                                  rad_strerror(st)); return fail_loop(st); }
+                                  rad_strerror(st)); return st; }
             so.early = false;
         }
 
@@ -1689,7 +1750,7 @@ int Engine::step_loop() {
          * acceptance against the host's and publish its proposals. Each driver returns
          * immediately for a kind that is not its own. */
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
-        if (st < 0) return fail_loop(st);
+        if (st < 0) return st;
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
         lsched().step_finished();
@@ -1704,7 +1765,7 @@ int Engine::step_loop() {
          * step loop works on) */
         if (bgl1m_ && cur_sched_ != &sched_) {
             /* stage 2 (WIP, serial): the lane-1 step drained on every rank's second Ctx before lane 0 reads its newcomer */
-            if (ranks_[0]->bg_ready)
+            if (ranks_[0]->bg_ready && !bgl2b_)
                 for (auto& rk : ranks_) (void)rk->bg_ctx.sync_all();
             lane_select(0);
         }
@@ -1728,14 +1789,6 @@ int Engine::step_loop() {
                 phase_n_ = 0;
             }
         }
-    }
-    if (bgl1m_) {   /* qfn-on-ds lever BGL: what the BG lane took (the test side reads this line at the stop) */
-        const LaneSet::Counts c = lanes_.counts();
-        RAD_INFO("lever BGL: %lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s); kept home: a prefix restore "
-                 "%lld, no room %lld, not a planner %lld", (long long)c.bg, (long long)c.bg_rows, (long long)bgl_steps_,
-                 (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
-                 (long long)c.bg_skip[LaneSet::kBgOrder]);
-    }
     return RAD_OK;
 }
 
@@ -3149,6 +3202,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         }
         n_lanes_ = 2;
         bgl1m_ = true;
+        bgl2b_ = LaneSet::bg1m3_env();
+        if (bgl2b_) RAD_TRY(bgl2b_setup());
     }
     /* tp8 S5: lane 0 takes its share of the cards before init */
     if ((pp_on() || bgl1m_) && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);

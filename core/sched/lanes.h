@@ -158,6 +158,9 @@ public:
     /* RADIANCE_BG_LANE_1M=2: stage 2 -- as 1, plus a second Ctx a rank for lane 1's steps (Rank::bg_ctx; WIP: built and budgeted,
      * the loop does not issue on it yet) */
     static bool bg1m2_env();
+    /* RADIANCE_BG_LANE_1M=3: stage 2b -- as 2, with lane 1's step issued whole on the second Ctx and finished by its event while lane 0
+     * steps on (the overlap) */
+    static bool bg1m3_env();
     /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N, 1 .. 256; with BG lanes, the same value on both nodes): a BG lane's step slab carves
      * its block tables for N rows instead of --max-num-seqs (each row --max-model-len wide: at 32 x 1 M that is ~512 MiB a card
      * a lane, the whole of a BG lane's slab), and lane_split_bg lends into a BG lane only while its inbox holds fewer than N

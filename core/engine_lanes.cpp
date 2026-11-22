@@ -309,6 +309,47 @@ void Engine::lane_select(int l) {
     /* qfn-on-ds lever BGL stage 2: lane 1's steps on each rank's second Ctx / sampler (the ranks are parked here) */
     if (bgl1m_)
         for (auto& rk : ranks_) rk->use_bg = l == 1 && rk->bg_ready;
+    /* stage 2b: the per-step single copies follow the lane (Engine::BgLaneIO) */
+    if (bgl2b_ && (l == 1) != bgio_in_) {
+        std::swap(step_end_, bgio_.step_end);
+        std::swap(tok_end_, bgio_.tok_end);
+        std::swap(readback_.p, bgio_.rb_p);
+        std::swap(readback_.n, bgio_.rb_n);
+        std::swap(slots_host_, bgio_.slots_host);
+        std::swap(serial_row_, bgio_.serial_row);
+        std::swap(serial_rounds_, bgio_.serial_rounds);
+        std::swap(serial_rows_, bgio_.serial_rows);
+        std::swap(serial_done_, bgio_.serial_done);
+        std::swap(draft_out_, bgio_.draft_out);
+        bgio_in_ = l == 1;
+    }
+}
+
+/* lever BGL stage 2b: lane 1's events, pinned slot readback and the per-rank cross-Ctx events */
+int Engine::bgl2b_setup() {
+    for (auto& rk : ranks_)
+        if (!rk->bg_ready) {
+            RAD_ERR("RADIANCE_BG_LANE_1M=3 (lever BGL stage 2b): rank %d has no second Ctx", rk->index);
+            return RAD_E_STATE;
+        }
+    bg_gate_.assign(ranks_.size(), nullptr);
+    bg_done_.assign(ranks_.size(), nullptr);
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        RAD_TRY(rad_dev_set(ranks_[r]->device));
+        RAD_TRY(rad_event_create_as(&bg_gate_[r], RAD_EVENT_LOCAL));
+        RAD_TRY(rad_event_create_as(&bg_done_[r], RAD_EVENT_LOCAL));
+    }
+    if (!ranks_.empty()) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    RAD_TRY(rad_event_create_as(&bgio_.step_end, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    RAD_TRY(rad_event_create_as(&bgio_.tok_end, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    const int64_t slot_bytes = cfg_.max_seqs * (int64_t)sizeof(StepSlot);
+    bgio_.slots_host = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
+    if (!bgio_.slots_host) return RAD_E_NOMEM;
+    std::memset(bgio_.slots_host, 0, (size_t)slot_bytes);
+    RAD_INFO("lever BGL stage 2b (RADIANCE_BG_LANE_1M=3): lane 1's step goes out whole on the second Ctx (trunk, sampler, drafter passes, "
+             "readback) and is finished when its end event completes, while lane 0 steps on; the second Ctx waits on the card for the "
+             "first before each lane-1 step, the first for the second at its finish");
+    return RAD_OK;
 }
 
 void Engine::pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1) {

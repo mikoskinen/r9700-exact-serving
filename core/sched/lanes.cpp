@@ -82,11 +82,15 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
 
 bool LaneSet::bg1m_env() {   /* qfn-on-ds lever BGL */
     const char* v = std::getenv("RADIANCE_BG_LANE_1M");
-    return v && (!std::strcmp(v, "1") || !std::strcmp(v, "2"));
+    return v && (!std::strcmp(v, "1") || !std::strcmp(v, "2") || !std::strcmp(v, "3"));
 }
-bool LaneSet::bg1m2_env() {   /* qfn-on-ds lever BGL stage 2 */
+bool LaneSet::bg1m2_env() {   /* qfn-on-ds lever BGL stage 2 (2a serial, 3 = 2b overlapped) */
     const char* v = std::getenv("RADIANCE_BG_LANE_1M");
-    return v && !std::strcmp(v, "2");
+    return v && (!std::strcmp(v, "2") || !std::strcmp(v, "3"));
+}
+bool LaneSet::bg1m3_env() {   /* qfn-on-ds lever BGL stage 2b */
+    const char* v = std::getenv("RADIANCE_BG_LANE_1M");
+    return v && !std::strcmp(v, "3");
 }
 
 int LaneSet::bg_env() {

@@ -337,6 +337,32 @@ private:
      * steps the step loop runs between lane 0's (stage 1: one queue; Engine::step_loop) */
     bool                          bgl1m_ = false;
     int64_t                       bgl_steps_ = 0;   /* lane-1 steps run (lever BGL) */
+    /* lever BGL stage 2b (RADIANCE_BG_LANE_1M=3): lane 1's per-step single copies, swapped with the engine's own by lane_select (so
+     * every helper acts on the selected lane's), lane 1's step in flight, and the cross-Ctx events (bg_gate_: a rank's first Ctx
+     * before a lane-1 step; bg_done_: a rank's second Ctx at the end of one) */
+    bool                          bgl2b_ = false;
+    bool                          bgio_in_ = false;
+    struct BgLaneIO {
+        RadEvent step_end = nullptr, tok_end = nullptr;
+        int32_t* rb_p = nullptr;
+        int64_t  rb_n = 0;
+        StepSlot* slots_host = nullptr;
+        std::vector<Scheduler::SerialRow> serial_row;
+        int serial_rounds = 0, serial_rows = 0, serial_done = 0;
+        std::vector<int32_t> draft_out;
+    } bgio_;
+    struct BgFlight {
+        bool on = false;
+        const RadBatch* b = nullptr;
+        StepOut so;
+        bool pf1_tok = false;
+        uint64_t t0 = 0;
+    } bgf_;
+    std::vector<RadEvent>         bg_gate_, bg_done_;
+    int64_t                       bgl_overlap_steps_ = 0;   /* lane-0 steps issued while a lane-1 step was in flight */
+    double                        bgl_flight_ms_ = 0;       /* lane-1 steps' issue-to-finish ms, summed */
+    int  bgl2b_setup();
+    int  finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bool pf1_tok, bool t_on);
     Scheduler*                    cur_sched_ = &sched_;
     std::atomic<Scheduler*>       issue_sched_{ &sched_ };
     Scheduler& lsched() { return *cur_sched_; }
