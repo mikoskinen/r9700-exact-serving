@@ -892,6 +892,9 @@
  *   rg_tail         libr4d (qfn-on-ds lever RGT, 21.11.2026): the fused decode router (router_gemm_topk_scatter) ranks
  *                   each 16-row tile's rows in that tile's last block and sorts in the last tile's, from N rows (at
  *                   least two tiles); the same bytes; 0 today (the grid's last block ranks every row)  RADIANCE_FN4_RG_TAIL
+ *                   + lever RGU's form (Qwen loop round 36): 256 / 512 = the router GEMM's 20 / 40-step load batch,
+ *                   1024 / 2048 / 3072 = at most 4 / 2 / 1 column tiles a block; the same bytes; range 0..4095 (libr4d
+ *                   refuses a row field above 128 and 768 in the batch field)
  *   gnq8            qwen4exp (qfn-on-ds lever GNQ8, 21.11.2026): a delta-net layer's prefill rows take gdn_gated_rmsnorm_i8g
  *                   (the gated norm writes quant_act_i8g's codes of its output in the same pass; the pair's bytes) instead
  *                   of gdn_gated_rmsnorm + quant_act_i8g; RADIANCE_FN4_GNQ8 declares it; 0 today        RADIANCE_FN4_GNQ8

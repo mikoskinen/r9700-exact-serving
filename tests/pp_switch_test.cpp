@@ -278,7 +278,7 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
  * round 28 -- the core held 16383 until round 29, so R58b's POST 24939 was refused; bits 15 / 16: levers HCX / B3X, round 34; bit 17: lever SSB, round 35), att_bi 0..6 (6: loop
  * round 3), bi_seg 0..3, sp_route 0..65535 (bits 1024 / 2048: lever MSP, loop round 20; 4096: lever GPF, round 22; 8192: lever HCP,
  * round 23; 16384: PF probe QSP, round 27; 32768: lever QRS, round 29), ar_laneblocks_s 0..24 / ar_lanethreads_s 0..1024 (lever LSK, round 27), resume_cold
- * 0..3 (2 / 3: lever TIP's resume points, rounds 21 / 22) -- and
+ * 0..3 (2 / 3: lever TIP's resume points, rounds 21 / 22), rg_tail 0..4095 (rows + 256 x lever RGU's form, round 36) -- and
  * refuses one past each, naming the range; a refused value is never queued. */
 TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
@@ -286,7 +286,7 @@ TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     std::string why;
     struct R { const char* name; int hi; };
     for (const R& r : { R{ "hc_readv", 262143 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 65535 }, R{ "resume_cold", 3 },
-                      R{ "ar_laneblocks_s", 24 }, R{ "ar_lanethreads_s", 1024 } }) {
+                      R{ "ar_laneblocks_s", 24 }, R{ "ar_lanethreads_s", 1024 }, R{ "rg_tail", 4095 } }) {
         const int i = fn4::switch_index(r.name);
         REQUIRE(i >= 0);
         fn4::requests(n0.data(), v0.data());
@@ -314,6 +314,9 @@ TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     CHECK(fn4::request("hc_readv", 8555 | 32768 | 65536, &why));
     CHECK(fn4::request("hc_readv", 8555 | 131072, &why));                  /* lever SSB (round 35) */
     CHECK(fn4::request("hc_readv", 8555 | 32768 | 65536 | 131072, &why));
+    CHECK(fn4::request("rg_tail", 64 | 256, &why));                          /* lever RGU (round 36) on BEST's RGT 64 */
+    CHECK(fn4::request("rg_tail", 64 | 512 | 2048, &why));
+    CHECK(fn4::request("rg_tail", 64, &why));
     CHECK(fn4::request("resume_cold", 0, &why));   /* the scheduler's: back to off for the cases after */
     int sw[fn4::kSwitches];
     (void)fn4::apply_pending(8, sw);

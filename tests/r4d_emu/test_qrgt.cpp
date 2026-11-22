@@ -105,7 +105,7 @@ std::string cmp(const Out& a, const Out& b) {
 }
 
 int run(const Shape& s, int64_t M, const std::vector<uint16_t>& x, const std::vector<uint16_t>& wr,
-        const std::vector<uint16_t>& wg, void* inst, int tail, int mt, int norm, Out& o) {
+        const std::vector<uint16_t>& wg, void* inst, int tail, int mt, int norm, Out& o, int ku = 0, int tpb = -1) {
     o.init(M, s);
     const int64_t T = M * s.tk;
     std::vector<RadTensor> t = { tens(x.data(), RAD_BF16, { M, s.K }), tens(wr.data(), RAD_BF16, { s.ne, s.K }),
@@ -118,6 +118,8 @@ int run(const Shape& s, int64_t M, const std::vector<uint16_t>& x, const std::ve
                                 pint("top_k", s.tk), pint("norm", norm), pstr("dtype", "bf16"), pint("expert_base", s.base),
                                 pint("rg_tail", tail) };
     if (mt > 1) p.push_back(pint("rg_mt", mt));
+    if (ku > 0) p.push_back(pint("rg_ku", ku));     /* lever RGU (round 36): the op params; absent = the switch's form */
+    if (tpb >= 0) p.push_back(pint("rg_tpb", tpb));
     if (s.protect) p.push_back(pstr("protect", s.protect));
     RadArgs a{};
     a.t = t.data();
@@ -206,6 +208,76 @@ int main(int argc, char** argv) {
             check(ra == RAD_OK && rb == RAD_OK && cmp(a, b).empty(), "M 16: rg_tail 1 = today's form (one row tile)", cmp(a, b));
         }
         r4d_rad_router_gemm_topk_scatter_fini(inst);
+    }
+    /* lever RGU (Qwen loop round 36, QUEUE Q65): the GEMM's 20-step load batch (rg_ku 20) and the tile cap a block (rg_tpb 4 /
+     * 2 / 1), alone and together, under today's tail and RGT, byte for byte against today's form -- at K 1280 (split 4: one
+     * 20-step batch an item; the gate's split 20: 4 single steps) and K 2560 (two batches; the gate's 8 steps = today's batch);
+     * then the switch's form bits (no op param: the switch decides) = the op params' bytes, and the switch's range. */
+    {
+        const Shape q[] = { { "Qwen tp4 rank at K 1280 (RGU)", 512, 1280, 10, 128, 128, true, 1, "7" },
+                            { "Qwen tp4 rank at K 2560 (RGU)", 512, 2560, 10, 128, 128, true, 1, "7" } };
+        for (const Shape& s : q) {
+            std::printf("%s\n", s.name);
+            void* inst = nullptr;
+            if (r4d_rad_router_gemm_topk_scatter_init(nullptr, 0, 0, 1, &inst) != RAD_OK || !inst) { check(false, "init"); continue; }
+            std::vector<uint16_t> wr((size_t)(s.ne * s.K)), wg((size_t)s.K), x;
+            for (auto& v : wr) v = bf((float)((uni() * 2.0 - 1.0) * 0.08));
+            for (auto& v : wg) v = bf((float)((uni() * 2.0 - 1.0) * 0.08));
+            std::vector<int64_t> Ms = s.K == 1280 ? std::vector<int64_t>{ 5, 33, 128 } : std::vector<int64_t>{ 5, 64 };
+            if (quick) Ms = { 33 };
+            for (const int64_t M : Ms) {
+                rows(x, M, s.K, s.ne, wr);
+                for (const int tail : { 0, 1 }) {
+                    Out ref;
+                    const int r0 = run(s, M, x, wr, wg, inst, tail, 1, s.norm, ref, 8, 0);
+                    struct A { int ku, tpb; } arms[] = { { 20, 0 }, { 40, 0 }, { 8, 4 }, { 8, 2 }, { 8, 1 }, { 20, 2 }, { 20, 1 },
+                                                         { 40, 2 }, { 40, 1 } };
+                    for (const A& a : arms) {
+                        Out got, again;
+                        const int r1 = run(s, M, x, wr, wg, inst, tail, 1, s.norm, got, a.ku, a.tpb);
+                        const int r2 = run(s, M, x, wr, wg, inst, tail, 1, s.norm, again, a.ku, a.tpb);
+                        const std::string d1 = cmp(ref, got), d2 = cmp(got, again);
+                        check(r0 == RAD_OK && r1 == RAD_OK && r2 == RAD_OK && d1.empty() && d2.empty(),
+                              fmt("M %lld rg_tail %d: rg_ku %d rg_tpb %d = today's form, every output byte; again = the first",
+                                  (long long)M, tail, a.ku, a.tpb),
+                              fmt("rc %d %d %d; vs today: %s; again: %s", r0, r1, r2, d1.c_str(), d2.c_str()));
+                    }
+                }
+            }
+            /* the switch's form fields: 512 + 2048 (ku 40, cap 2) with no op param = the op params' bytes; the switch back to 0 */
+            {
+                const int64_t M = 33;
+                rows(x, M, s.K, s.ne, wr);
+                Out a, b, c;
+                run(s, M, x, wr, wg, inst, 0, 1, s.norm, a, 40, 2);
+                const int sw = r4d_rg_tail_set(512 + 2048);
+                run(s, M, x, wr, wg, inst, 0, 1, s.norm, b);
+                (void)r4d_rg_tail_set(0);
+                run(s, M, x, wr, wg, inst, 0, 1, s.norm, c);
+                check(sw == 1 && cmp(a, b).empty() && cmp(a, c).empty(), "switch rg_tail 2560 (RGU: KU 40, cap 2) = the op params' bytes = form 0",
+                      fmt("set %d; %s / %s", sw, cmp(a, b).c_str(), cmp(a, c).c_str()));
+            }
+            /* negative control at the wide form: one activation element changed -> logits differ */
+            {
+                const int64_t M = 33;
+                rows(x, M, s.K, s.ne, wr);
+                Out a, c;
+                run(s, M, x, wr, wg, inst, 0, 1, s.norm, a, 20, 1);
+                std::vector<uint16_t> x2 = x;
+                x2[(size_t)(20 * s.K + 1)] ^= 0x0100;
+                run(s, M, x2, wr, wg, inst, 0, 1, s.norm, c, 20, 1);
+                const std::string dx = cmp(a, c);
+                check(dx.find("logits") != std::string::npos, "negative control (rg_ku 20 rg_tpb 1): one activation changed -> logits differ",
+                      dx.empty() ? "no difference seen" : dx);
+            }
+            r4d_rad_router_gemm_topk_scatter_fini(inst);
+        }
+        const int a = r4d_rg_tail_set(64 + 256), b = r4d_rg_tail_get(), c = r4d_rg_tail_set(129 + 256), d = r4d_rg_tail_get(),
+                  e = r4d_rg_tail_set(128 + 512 + 3072), f = r4d_rg_tail_set(64 + 768), g = r4d_rg_tail_get(),
+                  i = r4d_rg_tail_set(4096), h = r4d_rg_tail_set(0);
+        check(a == 1 && b == 320 && c == -1 && d == 320 && e == 1 && f == -1 && g == 128 + 512 + 3072 && i == -1 && h == 1,
+              "switch rg_tail with RGU's form: 320 applied, a row field 129 refused, 3712 applied, KU code 3 refused, 4096 refused, 0 applied",
+              fmt("%d %d %d %d %d %d %d %d %d", a, b, c, d, e, f, g, i, h));
     }
     std::printf("%d cases, %d failed\n", g_cases, g_fail);
     return g_fail ? 1 : 0;

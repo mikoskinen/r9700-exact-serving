@@ -4885,6 +4885,79 @@ static void router_rg_perf(const Plugin& pl, int64_t M, int iters) {
                 ok(what.c_str(), diff.empty(), diff.c_str());
             }
         }
+        /* Qwen loop round 36 (lever RGU, QUEUE Q65): the GEMM's 20-step load batch (op param rg_ku 20) and the tile cap a
+         * block (rg_tpb 4 / 2 / 1), alone and together, at the engine's tail (BEST: rg_tail 64 -> RGT from 64 rows): the GEMM
+         * part alone and the whole launch, each against today's form timed in the same run, then every output byte of each
+         * arm against today's (poisoned 0x5a before each run). Arms: A today, K ku 20, W ku 40, T4 / T2 / T1 tile caps, K2 / K1
+         * = ku 20 + cap 2 / 1, W2 / W1 = ku 40 + cap 2 / 1. */
+        struct Arm { const char* nm; long long ku, tpb; };
+        const Arm arms[] = { { "A ", 8, 0 }, { "K ", 20, 0 }, { "W ", 40, 0 }, { "T4", 8, 4 }, { "T2", 8, 2 }, { "T1", 8, 1 },
+                             { "K2", 20, 2 }, { "K1", 20, 1 }, { "W2", 40, 2 }, { "W1", 40, 1 } };
+        const long long tail = M >= 64 ? 1 : 0;
+        auto run2 = [&](const Arm& r, long long notail, bool timed) -> double {
+            std::vector<RadParam> ps = f.ps;
+            if (notail) ps.push_back(PI("rg_notail", 1));
+            ps.push_back(PI("rg_tail", tail));
+            ps.push_back(PI("rg_ku", r.ku));
+            ps.push_back(PI("rg_tpb", r.tpb));
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            std::vector<RadTensor> ts = f.ts;
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1; a.instance = f.inst;
+            int rc = f.r->launch(&a, nullptr);
+            if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+            if (rc != RAD_OK) { std::printf("  RGU %s refused (rc %d)\n", r.nm, rc); return -1.0; }
+            return timed ? st_time_us([&](int) { f.r->launch(&a, nullptr); }, iters, nullptr) : 0.0;
+        };
+        for (long long notail : { 1LL, 0LL }) {
+            double a0 = -1.0;
+            for (const Arm& r : arms) {
+                const double us = run2(r, notail, true);
+                if (us < 0) continue;
+                if (r.ku == 8 && r.tpb == 0) a0 = us;
+                std::printf("  RGU M=%lld %s %-14s rg_ku %2lld rg_tpb %lld  %8.2f us  (%+.1f %% vs A)\n", (long long)M, r.nm,
+                            notail ? "GEMM part" : "whole launch", r.ku, r.tpb, us, a0 > 0 ? 100.0 * (us - a0) / a0 : 0.0);
+            }
+        }
+        auto grab2 = [&](const Arm& r, std::vector<std::vector<uint8_t>>& h) -> bool {
+            for (const B& b : outs) st_memset(b.d, 0x5a, b.n);
+            if (st_stream_sync(nullptr) != hipSuccess) return false;
+            if (run2(r, 0, false) < 0) return false;
+            h.assign(sizeof(outs) / sizeof(outs[0]), {});
+            for (size_t i = 0; i < h.size(); ++i) {
+                h[i].resize(outs[i].n);
+                st_memcpy(h[i].data(), outs[i].d, outs[i].n, hipMemcpyDeviceToHost);
+            }
+            return true;
+        };
+        std::vector<std::vector<uint8_t>> rref, rgot;
+        if (grab2(arms[0], rref)) {
+            for (const Arm& r : arms) {
+                if (!grab2(r, rgot)) continue;
+                std::string diff;
+                for (size_t i = 0; i < rref.size() && diff.empty(); ++i)
+                    for (size_t j = 0; j < rref[i].size(); ++j)
+                        if (rref[i][j] != rgot[i][j]) { diff = fmt("%s byte %zu (0x%02x vs 0x%02x)", outs[i].name, j, rref[i][j], rgot[i][j]); break; }
+                const std::string what = fmt("RGU M=%lld %s (rg_ku %lld rg_tpb %lld, rg_tail %lld) vs A", (long long)M, r.nm, r.ku,
+                                             r.tpb, tail);
+                std::printf("  %s: %s\n", what.c_str(), diff.empty() ? "every output byte identical" : ("DIFFERENT at " + diff).c_str());
+                ok(what.c_str(), diff.empty(), diff.c_str());
+            }
+            /* a control that must move: an activation element changed -> the logits differ from A's */
+            {
+                std::vector<uint16_t> h2 = ha;
+                h2[(size_t)((M - 1) * K + 3)] ^= 0x0100;
+                st_memcpy(d_a, h2.data(), h2.size() * 2, hipMemcpyHostToDevice);
+                std::vector<std::vector<uint8_t>> c;
+                const bool g = grab2(arms[1], c);
+                st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+                const bool moved = g && c[0] != rref[0];
+                std::printf("  RGU M=%lld control (one activation changed, arm K): %s\n", (long long)M,
+                            moved ? "logits differ (the compare sees a change)" : "NO DIFFERENCE SEEN");
+                ok(fmt("RGU M=%lld control moves", (long long)M).c_str(), moved, "the compare did not see a changed activation");
+            }
+        }
     }
     rgi->fini(inst);
 }
