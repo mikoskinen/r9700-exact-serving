@@ -846,7 +846,7 @@ static void route(const Plugin& pl, const char* tlist) {
      * 64 rows: 49..64-row calls in gg_wk_kernel / the head's G2 at four row tiles instead of the GPF prefill form); default 1 */
     /* tp8 loop D25 step 2 (DECODE round 21): modes 6 / 7 (5 + another 49..64-row launch code) too, the band 64 as 5's */
     /* tp8 loop D27 (DECODE round 22): mode 9 (8 + the per-shape 33..48-row table) too */
-    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); const int v = e ? std::atoi(e) : 1; return v >= 1 && v <= 20 ? v : 1; }();   /* DRAFTER r31: 11 / 12 too; r32: 13 / 14; r33: 15; r35: 16; r36: 17; r48: 19 / 20 (the cap was 18: a 19 ran mode 1) */
+    const int rmode = [] { const char* e = std::getenv("R4D_WMKROUTE_MODE"); const int v = e ? std::atoi(e) : 1; return v >= 1 && v <= 21 ? v : 1; }();   /* DRAFTER r31: 11 / 12 too; r32: 13 / 14; r33: 15; r35: 16; r36: 17; r48: 19 / 20 (the cap was 18: a 19 ran mode 1); r104: 21 (HR2) */
     const int64_t band = rmode >= 5 ? 64 : 48;
     const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 56, 63, 64, 97, 130 };
     const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
