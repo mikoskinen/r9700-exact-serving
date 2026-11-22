@@ -1138,6 +1138,23 @@ extern "C" void r4d_gemm_fp8a8_pin_nt(int nt) {
     g_nt_force.store(v, std::memory_order_relaxed);
 }
 
+/* qfn-on-ds lever F8W (Qwen loop round 28, 22.11.2026; start env RADIANCE_FN4_F8_CHAIN_WIDE=1, unset = today): the narrow
+ * dispatch above 64 rows (fn4 BI wide: grid.y carries 64-token groups) keeps the row's `chain` instead of dropping it, so a
+ * 65-512-row decode launch runs r4dchain_gemm_fp8a8 (the same body: the same bytes) instead of the plain kernel behind a
+ * barrier. aql.cpp blocks_of() counts the 3-D grid, so the chain target covers every block. prof5 stamps at c32 (128 rows):
+ * 574 us of idle before the 216 fp8 GEMMs a trunk pass, 255 us at c16 where they chain. */
+static bool f8_chain_wide() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_FN4_F8_CHAIN_WIDE");
+        const bool v = e && e[0] == '1' && e[1] == '\0';
+        if (v)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_FN4_F8_CHAIN_WIDE=1: gemm_fp8a8's narrow dispatch keeps its "
+                                 "chained form above 64 rows (Qwen loop lever F8W)\n");
+        return v;
+    }();
+    return on;
+}
+
 // Bytes of f32 scratch one r4d_gemm_fp8a8_nt_m16 call needs, or 0 when it will not split. The
 // caller may pass more, or none (the launch then runs unsplit: correct but slow, and unreported).
 // The bound is max_m() so the query and the band cannot drift apart.
@@ -1207,7 +1224,7 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
      * scales with NT on both sides (4096*NT bytes against FN * (256+8) = 4224*NT), so it fits. */
     uint32_t nt = (M > 48) ? 4u : ((M > 32) ? 3u : ((M > 16) ? 2u : 1u));
     if (const uint32_t f = g_nt_force.load(std::memory_order_relaxed)) { if ((uint32_t)M <= f * 16u) nt = f; }
-    if (gy > 1) { nt = 4u; chain = false; }
+    if (gy > 1) { nt = 4u; if (!f8_chain_wide()) chain = false; }
     /* `Full` drops the column guard, so it must mean all NT tiles are live, not just M % 16 == 0.
      * Otherwise (e.g. M = 48, NT = 4) the epilogue writes past a split-K scratch sized for M, over
      * the arrival counter, and the finisher hangs. */
