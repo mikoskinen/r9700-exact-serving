@@ -4248,9 +4248,12 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
     }
     /* form = RADIANCE_PP_LEAD_SEG_FORM; post = 1: POST 131074 before the set and 2 after it, then the set again (in process);
      * tb = RADIANCE_PP_TAIL_BAND (5 with the copy + the follower's load report: D51); xenv = START DC8's other levers */
+    /* tp8 loop D76 (DECODE round 70): lenv = the LEADER's own env beside them (BEST S1P14F-STK runs START MCM's scheduler levers
+     * leader-only: SEND_ASH / PUB_PROMPT 2 + PUB_HOLD_MS / LANE_ROOM, with RADIANCE_PP_ALLOW_DIFF naming the env keys + switches) */
     struct Arm { const char* name; int lanes; int k; const char* cut; const char* form; const char* tb = "1"; bool post = false;
-                 bool skip = false; const char* xenv = nullptr; };
+                 bool skip = false; const char* xenv = nullptr; const char* lenv = nullptr; };
     long long d64_all = 0, tb_all = 0, d64b_all = 0;
+    int stk_arms = 0;
     int skip_differ = -1;   /* the smallest differ count over the negative controls */
     for (const Arm a : { Arm{ "D64 4L BG2", 4, 2, "2,5", "131074" }, Arm{ "D64 3L BG1", 3, 1, "2,5", "131074" },
                          Arm{ "D64 2L BG1", 2, 1, "2,5", "131074" }, Arm{ "D64 W(3,5) 4L", 4, 2, "3,5", "131074" },
@@ -4259,6 +4262,14 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
                               "RADIANCE_LLAMA_PP_TBAND_COPY=1 RADIANCE_PP_NODE_IDLE=1 RADIANCE_PP_LOAD_REPORT_MS=5 RADIANCE_PP_TBAND_BOUND_MS=100 "
                               "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1" },
                          Arm{ "D64 1 lane", 1, 0, "2,5", "131074" },
+                         /* tp8 loop D76: START DC8S's all-levers arm (t5ssl5) beside BEST STK's leader-only scheduler levers */
+                         Arm{ "D76 DC8 levers + STK leader", 4, 2, "2,5", "131074", "5", false, false,
+                              "RADIANCE_LLAMA_PP_TBAND_COPY=1 RADIANCE_PP_NODE_IDLE=1 RADIANCE_PP_LOAD_REPORT_MS=5 RADIANCE_PP_TBAND_BOUND_MS=100 "
+                              "RADIANCE_PP_BG_SPLIT=2 RADIANCE_HOST_SPIN=1812 RADIANCE_HOST_SLACK=1",
+                              "RADIANCE_PP_SEND_ASH=32 RADIANCE_SCHED_PUB_PROMPT=2 RADIANCE_SCHED_PUB_HOLD_MS=3000 RADIANCE_SCHED_LANE_ROOM=1" },
+                         Arm{ "D76 D51 + STK leader, heads whole", 4, 2, "2,5", "2", "5", false, false,
+                              "RADIANCE_LLAMA_PP_TBAND_COPY=1 RADIANCE_PP_NODE_IDLE=1 RADIANCE_PP_LOAD_REPORT_MS=5 RADIANCE_PP_TBAND_BOUND_MS=100",
+                              "RADIANCE_PP_SEND_ASH=32 RADIANCE_SCHED_PUB_PROMPT=2 RADIANCE_SCHED_PUB_HOLD_MS=3000 RADIANCE_SCHED_LANE_ROOM=1" },
                          /* tp8 loop D64b: + 262144 -- the band step's tail in segments too, from t - j: W(2,4)'s tail [4, 6) declares
                           * boundary 5, so a band pass's tail [3, 6) runs [3, 5) + [5, 6) */
                          Arm{ "D64b W(2,4) 4L BG2", 4, 2, "2,4", "393217" }, Arm{ "D64b W(2,4) 3L BG1", 3, 1, "2,4", "393217" },
@@ -4289,6 +4300,14 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
         ex.push_back(std::to_string(a.lanes));
         Serving pp;
         pp.model = world6().llama_rad;
+        if (a.lenv) {   /* tp8 loop D76: the leader's own env; the rendezvous accepts the named keys + switches (BEST's XAD) */
+            std::string w;
+            for (const char* c = a.lenv;; ++c) {
+                if (*c == ' ' || !*c) { if (!w.empty()) pp.lenv_more.push_back(w); w.clear(); if (!*c) break; } else w += *c;
+            }
+            env.push_back("RADIANCE_PP_ALLOW_DIFF=switches,env RADIANCE_SCHED_PUB_PROMPT,env RADIANCE_SCHED_PUB_HOLD_MS,"
+                          "env RADIANCE_SCHED_LANE_ROOM");
+        }
         REQUIRE(pp.start(a.cut, ex, env));
         auto post = [&](int v) {
             std::string out;
@@ -4365,6 +4384,22 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
         }
         CHECK(llog.find("fn4 pp_lead_seg starts at ") != std::string::npos);
         if (!std::strcmp(a.form, "131074")) CHECK(llog.find("starts with tail band heads in segments (D64)") != std::string::npos);
+        if (a.lenv) {   /* tp8 loop D76: the leader took BEST STK's scheduler levers, the follower none of them (leader-only env) */
+            const bool l_ash = llog.find("RADIANCE_PP_SEND_ASH=32 -- a row-sharded X1 payload of >= 32 rows") != std::string::npos;
+            const bool l_pub = llog.find("RADIANCE_SCHED_PUB_PROMPT=2 (tp8 loop D55)") != std::string::npos;
+            const bool l_hold = llog.find("RADIANCE_SCHED_PUB_HOLD_MS=3000 (tp8 loop D55b)") != std::string::npos;
+            const bool l_room = llog.find("RADIANCE_SCHED_LANE_ROOM=1 (tp8 loop D56)") != std::string::npos;
+            const bool f_any = flog.find("RADIANCE_PP_SEND_ASH=32 --") != std::string::npos ||
+                               flog.find("RADIANCE_SCHED_LANE_ROOM=1 (tp8 loop D56)") != std::string::npos;
+            fprintf(stderr, "    D76 %-30s leader: SEND_ASH %d, PUB_PROMPT 2 %d, PUB_HOLD_MS %d, LANE_ROOM %d; follower took one: %d\n", a.name,
+                    (int)l_ash, (int)l_pub, (int)l_hold, (int)l_room, (int)f_any);
+            CHECK(l_ash);
+            CHECK(l_pub);
+            CHECK(l_hold);
+            CHECK(l_room);
+            CHECK(!f_any);
+            ++stk_arms;
+        }
         if (!std::strcmp(a.form, "393217")) {   /* tp8 loop D64b: tails in segments from t - j (form 1: M9 as built, so the tail segments
                                                      * do not wait for a busy decode lane on the stand-in's short set) */
             CHECK(d64b > 0);
@@ -4379,6 +4414,7 @@ TEST(d64_tail_band_heads_in_lead_segments_serve_one_process_tokens) {
     CHECK(d64_all > 0);
     CHECK(d64b_all > 0);
     CHECK(skip_differ > 0);
+    CHECK_EQ(stk_arms, 2);   /* tp8 loop D76 */
 }
 
 /* tp8 loop D36 (RADIANCE_PP_LEAD_SEG_BAND=1, the leader): P28's band steps through LSP's head segments -- a band step's head
