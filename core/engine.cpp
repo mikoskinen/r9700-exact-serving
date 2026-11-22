@@ -844,10 +844,16 @@ void Engine::rank_loop(int index) {
             if (hiss) hiss_t0_ = rad_mono_ns();
             /* qfn-on-ds lever TIP: the step's snapshot row inside it, named to the plugin for this issue only */
             int64_t tip_row = 0;
-            if (tip_on_ && what != kIssueSampler && b->draft_pass == 0 && b->enc == 0 && (size_t)index < tip_.size()) {
+            /* Only a fresh prefill step of one sequence: a step issued ahead (Scheduler::step_next, always decode) is built in
+             * plan_next_ while plan() is still the previous step's (test tip4: the TIP step's row named to the decode step
+             * issued ahead behind it); the plan must be this batch's (rows and phase agree). */
+            const StepPlan* tpl = tip_on_ ? &issue_sched_.load(std::memory_order_acquire)->plan() : nullptr;
+            if (tpl && what != kIssueSampler && b->draft_pass == 0 && b->enc == 0 && (size_t)index < tip_.size() &&
+                b->phase == RAD_PHASE_PREFILL && b->n_seq == 1 && tpl->e.size() == 1 && tpl->n_tok == b->n_tok &&
+                tpl->e[0].is_prefill) {
                 TipRank& t = tip_[(size_t)index];
                 const StepEntry* te = nullptr;
-                tip_row = tip_row_of(issue_sched_.load(std::memory_order_acquire)->plan(), &te);
+                tip_row = tip_row_of(*tpl, &te);
                 if (tip_row > 0 && te) {
                     t.row = tip_row;
                     t.seq = te->seq;
