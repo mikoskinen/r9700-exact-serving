@@ -60,6 +60,14 @@ Server::Server(const Deps& d, const ServerOptions& o)
         RAD_INFO("lever RPF (RADIANCE_RPF=1): after every OpenAI chat reply of one choice that ends in tool calls, a 1-token "
                  "request of the history through the reply + its tool-result headers (empty) is served in-process at once "
                  "(the client form of row cc21x moved into the server)");
+    } else if (e && std::atoi(e) == 2) {
+        /* tp8 loop P55 (DeepSeek PREFILL round 64): the same, only for a request whose body carries "rpf": true at its top
+         * level, so one start reads the lever's arm and its control side by side (an unknown field is ignored by the parser,
+         * oai.cpp; the warm request's body keeps it, and its own 1-token reply never ends in a call) */
+        rpf_ = true;
+        rpf_opt_in_ = true;
+        RAD_INFO("lever RPF (RADIANCE_RPF=2): as RADIANCE_RPF=1, for the requests whose body carries \"rpf\": true only "
+                 "(an in-process arm beside its control)");
     }
     register_routes();
 }
@@ -399,6 +407,12 @@ void Server::stop() {
 
 void Server::rpf_after(const std::string& body, const ParsedMessage& m, const std::string& rid) {
     if (!rpf_ || stopping_.load()) return;
+    if (rpf_opt_in_) {   /* RADIANCE_RPF=2: the request asked for it */
+        const json b = json::parse(body, nullptr, /*allow_exceptions=*/false);
+        if (!b.is_object()) return;
+        const auto f = b.find("rpf");
+        if (f == b.end() || !f->is_boolean() || !f->get<bool>()) return;
+    }
     std::string wb;
     if (rpf_warm_body(body, m, &wb) < 0) return;
     rpf_live_.fetch_add(1);

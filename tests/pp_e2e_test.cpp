@@ -9276,6 +9276,173 @@ TEST(d58_chat_and_anthropic_endpoints_with_tools_serve_one_process_replies) {
     }
 }
 
+/* tp8 loop P55 (PREFILL round 64, COORD 19:10 S2): lever RPF (RADIANCE_RPF=1 on the leader: qfn-on-ds 0a021e94's server, the
+ * reply prefilled ahead) through the lanes. After a chat reply that ends in a tool call the leader's server serves the warm request
+ * (the history through the reply + one EMPTY tool message a call, max_tokens 1) in-process, not waited for; the client's follow-up
+ * (the same history + the tool's result) then hits what the warm request prefilled. The first turn is a forced call to ping (no
+ * arguments: the grammar's one fully bounded call, D58's control) after a ~1.3k-token user message, so every prompt prefills in
+ * several 256-token chunks; the client's follow-up repeats the reply's own call ids, as Claude Code does. Arms: 2 lanes W(0,2) and
+ * 3 lanes W(1,3) (the KV copy checked) with RPF, 3 lanes W(1,3) without it. Each arm's follow-up reply (text, calls, finish, token
+ * counts, token ids with their log-probabilities and top 2) = one process serving that follow-up body ALONE (cold); with RPF the
+ * leader names one warm request served (status 200) and the follower none, without it no RPF line; the follow-up's attention-cached
+ * tokens are printed (with RPF they include the reply); 0 E lines; KV-copy checks > 0 and 0 differ where copied. */
+namespace {
+ojson p55_first_body() {
+    ojson none = ojson::object();
+    none["type"] = "object";
+    none["properties"] = ojson::object();
+    ojson fn = ojson::object();
+    fn["name"] = "ping";
+    fn["parameters"] = none;
+    fn["description"] = "Takes no arguments.";
+    ojson tool = ojson::object();
+    tool["type"] = "function";
+    tool["function"] = fn;
+    std::string ask = "Check the service, then report. ";
+    for (int i = 0; ask.size() < 1300; ++i) ask += "Line " + std::to_string(i) + " of the incident log says the service answered slowly. ";
+    ojson q = ojson::object();
+    q["model"] = "tiny";
+    q["messages"] = ojson::array({ { { "role", "system" }, { "content", "You are an operator. Use the tools." } },
+                                   { { "role", "user" }, { "content", ask } } });
+    q["tools"] = ojson::array({ tool });
+    q["tool_choice"] = { { "type", "function" }, { "function", { { "name", "ping" } } } };
+    q["parallel_tool_calls"] = false;
+    q["chat_template_kwargs"] = { { "enable_thinking", false } };
+    q["max_tokens"] = 160;
+    q["temperature"] = 0.0;
+    return q;
+}
+/* The client's next prompt after `reply` (the first turn's response body): cc_sim's append_turn -- the assistant message as the
+ * reply gave it (content, reasoning_content when non-empty, the calls with their ids) and one tool result a call. */
+bool p55_follow_body(const ojson& first, const std::string& reply, ojson* out) {
+    const json j = json::parse(reply, nullptr, false);
+    if (!j.is_object() || !j.contains("choices") || !j["choices"].is_array() || j["choices"].empty()) return false;
+    const json& m = j["choices"][0]["message"];
+    if (!m.contains("tool_calls") || !m["tool_calls"].is_array() || m["tool_calls"].empty()) return false;
+    ojson am = ojson::object();
+    am["role"] = "assistant";
+    am["content"] = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : std::string();
+    if (m.contains("reasoning_content") && m["reasoning_content"].is_string() && !m["reasoning_content"].get<std::string>().empty())
+        am["reasoning_content"] = m["reasoning_content"].get<std::string>();
+    ojson tcs = ojson::array();
+    ojson q = first;
+    for (const json& tc : m["tool_calls"]) {
+        ojson c = ojson::object();
+        c["id"] = tc.value("id", std::string());
+        c["type"] = "function";
+        c["function"] = { { "name", tc["function"].value("name", std::string()) },
+                          { "arguments", tc["function"].value("arguments", std::string()) } };
+        tcs.push_back(std::move(c));
+    }
+    am["tool_calls"] = tcs;
+    q["messages"].push_back(am);
+    for (const ojson& c : tcs) q["messages"].push_back({ { "role", "tool" }, { "tool_call_id", c["id"] }, { "content", "pong: up, 41 ms" } });
+    q["tool_choice"] = "auto";
+    q.erase("parallel_tool_calls");
+    q["max_tokens"] = 24;
+    q["logprobs"] = true;
+    q["top_logprobs"] = 2;
+    *out = std::move(q);
+    return true;
+}
+std::vector<std::string> p55_ext() {
+    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "8192",
+             "--override-chat-template", std::string(RAD_CHAT_FIXTURES) + "/qwen3.6/chat_template.jinja" };
+}
+}  /* namespace */
+
+TEST(p55_rpf_warm_request_through_the_lanes_keeps_the_follow_up_one_process_cold) {
+    REQUIRE(world().ok);
+    /* mode 1 = RADIANCE_RPF=1 (every tool-call reply), 2 = RADIANCE_RPF=2 (only a body with "rpf": true: the in-process arm, the
+     * second conversation is its control), 0 = unset */
+    struct Arm { const char* name; const char* cut; int lanes; int mode; bool kv; };
+    for (const Arm a : { Arm{ "RPF=1, 2 lanes", "0,2", 2, 1, false }, Arm{ "RPF=1, 3 lanes, wrap-around", "1,3", 3, 1, true },
+                         Arm{ "RPF=2 opt-in + control, 3 lanes", "1,3", 3, 2, true },
+                         Arm{ "no RPF, 3 lanes, wrap-around", "1,3", 3, 0, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        if (a.kv) env = cat(env, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        Serving pp;
+        if (a.mode) pp.lenv_more = { "RADIANCE_RPF=" + std::to_string(a.mode) };
+        REQUIRE(pp.start(a.cut, cat(p55_ext(), { "--pp-lanes", std::to_string(a.lanes) }), env));
+        /* conversations: mode 2 runs an opted-in one, then a second one (another system line) without the field */
+        struct Conv { bool opt; std::string fin1; bool built = false, warm = false; D58Form ff{ "follow-up", kD58Chat, ojson::object(), -1 };
+                      D58Reply got; double cached = 0; };
+        std::vector<Conv> cv;
+        cv.push_back({ a.mode == 2, "" });
+        if (a.mode == 2) cv.push_back({ false, "" });
+        for (size_t k = 0; k < cv.size(); ++k) {
+            Conv& c = cv[k];
+            ojson first = p55_first_body();
+            if (k) first["messages"][0]["content"] = "You are the second operator. Use the tools.";
+            if (c.opt) first["rpf"] = true;
+            std::string hd, out;
+            const int st1 = post_raw(pp.port, kD58Chat, first.dump(), &hd, &out);
+            CHECK_EQ(st1, 200);
+            const json r1 = json::parse(out, nullptr, false);
+            c.fin1 = r1.is_object() ? r1.value(json::json_pointer("/choices/0/finish_reason"), std::string()) : std::string();
+            CHECK_EQ(c.fin1, std::string("tool_calls"));
+            ojson follow;
+            c.built = p55_follow_body(first, out, &follow);
+            CHECK(c.built);
+            if (c.built) c.ff.body = follow;
+            /* the client's tool time: where RPF acts, the warm request is served before the follow-up arrives (bounded wait) */
+            const bool acts = a.mode == 1 || c.opt;
+            c.warm = acts && pp.lead.wait_for("lever RPF: warm request " + std::to_string(k + 1) + " after", 120);
+            if (!acts) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            const double c0 = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total");
+            c.got = d58_ask(pp.port, c.ff);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            c.cached = metric(get(pp.port, "/metrics"), "radiance:attn_cached_tokens_total") - c0;
+        }
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        long long checks = -1, kdiff = -1;
+        if (const size_t at = flog.rfind(" checks, "); at != std::string::npos)
+            if (const size_t b = flog.rfind("(", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "(%lld checks, %lld differ)", &checks, &kdiff);
+        const size_t elines = count_of(llog, "\nE ") + count_of(flog, "\nE ");
+        const size_t rpf_lines = count_of(llog, "lever RPF: warm request "), rpf_f = count_of(flog, "lever RPF");
+        const size_t w1 = llog.find("lever RPF: warm request 1 after");
+        const bool warm200 = w1 != std::string::npos && llog.find("status 200 in", w1) != std::string::npos;
+        int differ = 0;
+        for (size_t k = 0; k < cv.size(); ++k) {
+            Conv& c = cv[k];
+            /* one process serving that follow-up body alone, cold */
+            Serving one;
+            REQUIRE(one.start("", p55_ext()));
+            const D58Reply want = d58_ask(one.port, c.ff);
+            kill(one.lead.child.pid, SIGTERM);
+            CHECK_EQ(one.lead.finish(60), 0);
+            const bool same = c.got.status == 200 && c.got.why.empty() && want.status == 200 && want.why.empty() && d58_same(c.got, want);
+            differ += !same;
+            fprintf(stderr, "    P55 %-32s W(%s) conversation %zu%s: first finish '%s'; follow-up %s one process cold (prompt %lld tokens, "
+                            "%zu token ids); attention-cached at the follow-up %.0f\n",
+                    a.name, a.cut, k + 1, c.opt ? " (\"rpf\": true)" : "", c.fin1.c_str(), same ? "=" : "DIFFERS from",
+                    c.got.view.value("prompt_tokens", -1LL), c.got.ids.size(), c.cached);
+            if (!same) fprintf(stderr, "      pair: %s\n      one:  %s\n", d58_brief(c.got).c_str(), d58_brief(want).c_str());
+            CHECK(same);
+            CHECK(!c.got.ids.empty());
+            if (a.mode == 1 || c.opt) CHECK(c.warm);
+        }
+        fprintf(stderr, "    P55 %-32s W(%s): warm request lines %zu (the first status 200: %s), follower RPF lines %zu; KV-copy checks %lld, "
+                        "%lld differ; %zu E lines\n",
+                a.name, a.cut, rpf_lines, warm200 ? "yes" : "no", rpf_f, checks, kdiff, elines);
+        CHECK_EQ(elines, (size_t)0);
+        CHECK_EQ(rpf_f, (size_t)0);
+        if (a.mode) {
+            CHECK(warm200);
+            CHECK_EQ(rpf_lines, (size_t)1);   /* mode 1: one tool-call reply; mode 2: the opted-in one only */
+        } else {
+            CHECK_EQ(count_of(llog, "lever RPF"), (size_t)0);
+        }
+        if (a.kv) { CHECK(checks > 0); CHECK_EQ(kdiff, 0); }
+        if (differ || elines || (a.mode && !warm200))
+            fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+    }
+}
+
 /* tp8 loop D59: D58's seventeen chat / messages forms with tools UNDER KV PRESSURE through the lanes -- Claude Code's sessions share
  * one system + tools head and each grows its own tail; when the pool is short the scheduler preempts by recompute, and a preempted
  * request here carries what D53 / D56's /completion cases never did: a tool-call grammar (lazy or whole-reply) part-way through its

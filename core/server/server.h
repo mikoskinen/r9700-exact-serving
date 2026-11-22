@@ -460,6 +460,7 @@ private:
      * own, not waited for, as cc21x's client did it -- the reply is prefilled while the client runs its tools. stop() waits
      * for the live ones (they see `stopping_` as a closed peer and cancel). */
     bool                 rpf_ = false;
+    bool                 rpf_opt_in_ = false;   /* RADIANCE_RPF=2 (tp8 loop P55): only bodies with "rpf": true */
     std::atomic<int>     rpf_live_{0};
     std::atomic<int64_t> rpf_sent_{0};
     void rpf_after(const std::string& body, const ParsedMessage& m, const std::string& rid);

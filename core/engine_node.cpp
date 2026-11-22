@@ -245,8 +245,10 @@ bool node_own_env(const std::string& k) {
     /* tp8 loop D20 (loop FINDINGS F57): the leader's drafter knobs, whole keys (the follower declares no drafter: deepseek41
      * lr_settle; its engine runs no query pass) -- D18's short block, D19's tiers */
     /* tp8 loop item 7: the stuck-loop watchdog and its test hook are each process's own (they change no byte it computes) */
+    /* tp8 loop P55: lever RPF (RADIANCE_RPF) is the leader's HTTP server's -- its warm request is an ordinary request through
+     * the pair, and the follower serves no client */
     static const char* own_key[] = { "RADIANCE_DS41_DSPARK_SHORT", "RADIANCE_DRAFT_SHORT_TIERS", "RADIANCE_STUCK_EXIT_S",
-                                     "RADIANCE_DEBUG_HANG_STEP" };
+                                     "RADIANCE_DEBUG_HANG_STEP", "RADIANCE_RPF" };
     for (const char* o : own_key)
         if (k == o) return true;
     return false;

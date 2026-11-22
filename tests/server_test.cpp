@@ -720,6 +720,43 @@ TEST(lever_rpf_serves_one_warm_request_after_a_tool_call_reply_only_under_the_en
     unsetenv("RADIANCE_RPF");
 }
 
+/* tp8 loop P55 (DeepSeek PREFILL round 64): RADIANCE_RPF=2 = lever RPF only for a request whose body carries "rpf": true -- arm 0:
+ * blocking with the field -> the warm request (max_tokens 1, a longer prompt); arm 1: streamed with it -> the same; arm 2: the same
+ * tool-call reply without the field -> none; arm 3: "rpf": false -> none; arm 4: "rpf": "yes" (not a boolean) -> none. */
+TEST(lever_rpf_2_serves_the_warm_request_only_for_a_body_that_asks_for_it) {
+    const char* req = R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":128,)"
+                      R"("tools":[{"type":"function","function":{"name":"get_weather"}}]})";
+    setenv("RADIANCE_RPF", "2", 1);
+    for (int arm = 0; arm < 5; ++arm) {
+        Fixture f;
+        f.sched.reply = "TOOL:get_weather:{\"city\":\"berlin\"}";
+        std::string body = req;
+        if (arm == 0 || arm == 1) body.insert(body.size() - 1, R"(,"rpf":true)");
+        if (arm == 3) body.insert(body.size() - 1, R"(,"rpf":false)");
+        if (arm == 4) body.insert(body.size() - 1, R"(,"rpf":"yes")");
+        if (arm == 1) body.insert(body.size() - 1, R"(,"stream":true)");
+        HttpResponse r = f.post("/v1/chat/completions", body);
+        CHECK_EQ(r.status, 200);
+        if (arm == 1) {
+            const std::string all = drain(r);
+            CHECK(all.find("tool_calls") != std::string::npos);
+        }
+        CHECK(rpf_wait_submitted(f.sched, 1));
+        if (arm <= 1) {
+            CHECK(rpf_wait_submitted(f.sched, 2));
+            std::lock_guard<std::mutex> lk(f.sched.mu);
+            CHECK_EQ((int)f.sched.submitted.size(), 2);
+            CHECK_EQ(f.sched.seen[1].max_tokens, 1);
+            CHECK(f.sched.prompts[1].size() > f.sched.prompts[0].size());
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            std::lock_guard<std::mutex> lk(f.sched.mu);
+            CHECK_EQ((int)f.sched.submitted.size(), 1);
+        }
+    }
+    unsetenv("RADIANCE_RPF");
+}
+
 TEST(hyv3_native_markup_flows_through_openai_tools_api) {
     const json tools = json::parse(R"([{
       "type":"function","function":{"name":"lookup_weather","parameters":{"type":"object",
