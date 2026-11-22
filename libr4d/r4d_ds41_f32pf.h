@@ -46,6 +46,17 @@ int r4d_f32pf_known(int v);
 int r4d_f32dec_get();
 int r4d_f32dec_set(int v);    /* 1 applied, -1 an unknown value */
 int r4d_f32dec_known(int v);
+/* Lever DTKG (DRAFTER track round 110; rule B for the drafter's PROPOSALS only, as lever DTK): the DSpark drafter's router
+ * (128 experts) selects its top KE of its declared top-k in process, in passes of at most ROWS rows (0 = every pass) -- carried
+ * by fn4 drafter_mx's hundreds (rad_fn4_switch: drafter_mx = form + 100 KE + 1000 (ROWS / 8)). The slots KE .. k - 1 of each
+ * row are written as dropped (id -1, weight 0: moe_scatter drops an id outside the slice, the gather skips a -1 inverse), the
+ * kept slots' weights renormalised over the KE as a declared top-KE router's: the same ids, weights and live rows as lever
+ * DTK's start-time top_k KE (r4d_selftest SPD_PART=dtk). code = 100 KE + 1000 G; 0 = off. */
+int r4d_dtk_known(int code);
+void r4d_dtk_set(int code);
+int r4d_dtk_get();
+/* the router kernels' k argument for a call: k, or k | (KE << 16) where the lever applies (n_expert 128, KE < k, m <= ROWS) */
+int r4d_dtk_pack(int ne, int k, int m);
 /* the form for a call: 0 = the stock rule; gemm forms 1..15 tile_wave (R, C, U) forms, 20.. the tiled forms above
  * (code = 20 + index into kF32Forms, any M); router forms 1.. (R, C, U, NW) of the fused launch */
 int r4d_f32dec_gemm_form(int rows, int n);

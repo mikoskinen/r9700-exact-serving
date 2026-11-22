@@ -316,6 +316,29 @@ int r4d_f32dec_set(int v) {
 }
 int r4d_f32dec_get() { return g_f32dec.load(std::memory_order_relaxed); }
 
+/* Lever DTKG (DRAFTER track round 110; r4d_ds41_f32pf.h): the DSpark router's in-process top-KE in passes of <= ROWS rows. */
+static std::atomic<int> g_dtk_code{ 0 };
+int r4d_dtk_known(int code) {
+    if (code == 0) return 1;
+    const int ke = (code / 100) % 10, g = code / 1000;
+    return code % 100 == 0 && ke >= 1 && ke <= 2 && g >= 0 && g <= 8 ? 1 : 0;
+}
+void r4d_dtk_set(int code) {
+    const int prev = g_dtk_code.exchange(r4d_dtk_known(code) ? code : 0, std::memory_order_relaxed);
+    if (prev != code && code)
+        std::fprintf(stderr, "radiance: libr4d: lever DTKG (drafter_mx + %d): the DSpark router (128 experts) selects its top %d in "
+                             "every pass of at most %d rows (0 = any; proposals only; dropped slots id -1, weight 0)\n",
+                     code, (code / 100) % 10, 8 * (code / 1000));
+}
+int r4d_dtk_get() { return g_dtk_code.load(std::memory_order_relaxed); }
+int r4d_dtk_pack(int ne, int k, int m) {
+    const int code = g_dtk_code.load(std::memory_order_relaxed);
+    if (!code || ne != 128) return k;
+    const int ke = (code / 100) % 10, rows = 8 * (code / 1000);
+    if (ke < 1 || ke >= k || (rows > 0 && m > rows)) return k;
+    return k | (ke << 16);
+}
+
 /* The rule (switch 1 / 2 / 3): a form per height band -- rows <= 8, 9 .. 16, 17 .. 48 (the router) / 63 (gemm_nt_f32) -- by the
  * one-card bench (SPEED-D b1, 15.11.2026, r4d_selftest --case spdf32 on gpu02 03:00, us a call warm / cold):
  *   router (K 5120, 384 experts): <= 8 the stock 2x2 (no form beats it warm and cold); 9-16 form 3, 4x4 U8 16 waves (16 rows

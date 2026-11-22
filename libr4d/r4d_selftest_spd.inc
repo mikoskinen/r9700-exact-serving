@@ -626,6 +626,156 @@ static void rgm_part(const Plugin& pl, void (*pin)(int, int)) {
     f2->fini(inst);
 }
 
+/* ---- lever DTKG (DRAFTER track round 110; SPD_PART=dtk): fn4 drafter_mx + 100 KE + 1000 G selects the DSpark router's (128
+ * experts, top 3) top KE in passes of <= 8 G rows (G 0: every pass). Checks, under ds41_f32dec 1 / 9 / 12 (the stock fused form,
+ * RGK's form 21, RGD's form 22) and the three-launch chain, M 1..64, ETP and an EP slice:
+ *   (a) top 2 of a top-3 call = a declared top-2 call: logits; ids / weights of slots 0, 1 (bytes); slot 2 = id -1, weight 0;
+ *       expert_count, expert_offset; sorted_tok's live rows = the top-2 call's with slot r 2 + j renamed r 3 + j, -1 past them;
+ *   (b) the fused launch = the chain under the switch (6 outputs + tails), as the rgm part checks without it;
+ *   (c) the gate: a pass above 8 G rows = the switch off, byte for byte (rule A outside the gate). */
+static void dtk_part(const Plugin& pl) {
+    const RadKernelInfo* rg = find(pl, "gemm_nt_f32_bf16");
+    const RadKernelInfo* rs = find(pl, "router_scored_topk_f32");
+    const RadKernelInfo* rc = find(pl, "moe_scatter_i32");
+    const RadKernelInfo* f2 = find(pl, "router_gemm_f32_scored_topk_scatter_bf16");
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    if (!rg || !rs || !rc || !f2 || !f2->init || !f2->fini || !sw) { ok("spdf32 dtk", false, "router ops / rad_fn4_switch absent"); return; }
+    const int FORM = [] { const char* e = std::getenv("DTK_FORM"); return e && *e ? std::atoi(e) : 7; }();   /* drafter_mx's form part */
+    if (sw("drafter_mx", FORM + 200) != 1 || sw("drafter_mx", FORM + 1200) != 1 || sw("drafter_mx", FORM + 300) == 1 ||
+        sw("drafter_mx", FORM + 9200) == 1) {
+        ok("spdf32 dtk: drafter_mx takes form + 200 / + 1200, refuses + 300 / + 9200", false, "switch values");
+        sw("drafter_mx", FORM);
+        return;
+    }
+    sw("drafter_mx", FORM);
+    void* inst = nullptr;
+    if (f2->init(nullptr, 0, 0, 1, &inst) != RAD_OK || !inst) { ok("spdf32 dtk init", false, "no instance"); return; }
+    constexpr int64_t K = 5120, NE = 128, MX = 64;
+    const double scale = 1.5;
+    const size_t tail = 64;
+    fuse::g_rs = 0xD7C0FFEEull;
+    std::vector<uint16_t> wb((size_t)(NE * K));
+    for (auto& v : wb) v = bf((float)(gauss() * 0.02));
+    std::vector<float> bias((size_t)NE);
+    for (auto& v : bias) v = (float)(gauss() * 0.05);
+    std::vector<uint16_t> x((size_t)(MX * K));
+    for (int64_t r = 0; r < MX; ++r) {
+        const double rs_ = std::ldexp(1.0, (int)(rnd() % 5) - 2);
+        for (int64_t i = 0; i < K; ++i) x[(size_t)(r * K + i)] = bf((float)(gauss() * rs_));
+    }
+    void* dw = up(wb);
+    void* db = up(bias);
+    void* dx = up(x);
+    if (!dw || !db || !dx) { ok("spdf32 dtk alloc", false, "hipMalloc failed"); dfree_all(); f2->fini(inst); return; }
+    /* one call's six outputs: logits, ids, weights, sorted, offsets, counts */
+    struct Out { void* o[6]; std::array<size_t, 6> sz; };
+    auto mk = [&](int64_t M, int64_t TK, int64_t NL) {
+        Out r{};
+        r.sz = { (size_t)(M * NE * 4) + tail, (size_t)(M * TK * 4) + tail, (size_t)(M * TK * 4) + tail, (size_t)(M * TK * 4) + tail,
+                 (size_t)(NL + 1) * 4 + tail, (size_t)NL * 4 + tail };
+        for (int j = 0; j < 6; ++j) { r.o[j] = dalloc(r.sz[(size_t)j]); if (r.o[j]) st_memset(r.o[j], 0xA5, r.sz[(size_t)j]); }
+        return r;
+    };
+    auto run = [&](bool fused, int64_t M, int64_t TK, int64_t NL, int64_t base, Out& o) -> int {
+        std::vector<RadParam> psel = { PI("M", M), PI("n_expert", NE), PI("top_k", TK), PI("norm", 1), PF("route_scale", scale),
+                                       PS("score", "sqrtsoftplus"), PS("dtype", "f32") };
+        std::vector<RadParam> psort = { PI("M", M), PI("n_expert", NL), PI("top_k", TK), PI("expert_base", base) };
+        std::vector<RadParam> pf2 = { PI("M", M), PI("K", K), PI("n_expert", NE), PI("n_local", NL), PI("top_k", TK), PI("norm", 1),
+                                      PF("route_scale", scale), PS("score", "sqrtsoftplus"), PS("dtype", "bf16"), PI("expert_base", base) };
+        if (fused) {
+            std::vector<RadTensor> tf2 = { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(db, RAD_F32, { NE }),
+                                           T(o.o[0], RAD_F32, { M, NE }), T(o.o[1], RAD_I32, { M, TK }), T(o.o[2], RAD_F32, { M, TK }),
+                                           T(o.o[3], RAD_I32, { M * TK }), T(o.o[4], RAD_I32, { NL + 1 }), T(o.o[5], RAD_I32, { NL }) };
+            RadArgs af2 = args(tf2, pf2, inst);
+            return f2->launch(&af2, nullptr);
+        }
+        std::vector<RadParam> pg = { PI("M", M), PI("N", NE), PI("K", K), PS("dtype", "bf16") };
+        std::vector<RadTensor> tg = { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(o.o[0], RAD_F32, { M, NE }) };
+        std::vector<RadTensor> tsel = { T(o.o[0], RAD_F32, { M, NE }), T(db, RAD_F32, { NE }), T(o.o[1], RAD_I32, { M, TK }),
+                                        T(o.o[2], RAD_F32, { M, TK }) };
+        std::vector<RadTensor> tsort = { T(o.o[1], RAD_I32, { M, TK }), T(o.o[3], RAD_I32, { M * TK }), T(o.o[4], RAD_I32, { NL + 1 }),
+                                         T(o.o[5], RAD_I32, { NL }) };
+        RadArgs ag = args(tg, pg), asel = args(tsel, psel), asort = args(tsort, psort);
+        int c = rg->launch(&ag, nullptr);
+        if (c == RAD_OK) c = rs->launch(&asel, nullptr);
+        if (c == RAD_OK) c = rc->launch(&asort, nullptr);
+        return c;
+    };
+    std::string fa, fb, fc;
+    int na = 0, nb = 0, nc = 0;
+    for (int val : { 1, 9, 12 }) {
+        sw("ds41_f32dec", val);
+        for (int64_t M : { 1, 2, 3, 5, 8, 9, 16, 17, 24, 32, 33, 40, 48, 49, 64 }) {
+            for (int lay : { 0, 1 }) {
+                const int64_t NL = lay ? NE / 4 : NE, base = lay ? NE / 4 : 0;
+                for (int fused : { 1, 0 }) {
+                    Out o2 = mk(M, 2, NL), o3 = mk(M, 3, NL);
+                    sw("drafter_mx", FORM);
+                    const int c2 = run(fused, M, 2, NL, base, o2);
+                    sw("drafter_mx", FORM + 200);
+                    const int c3 = run(fused, M, 3, NL, base, o3);
+                    st_stream_sync(nullptr);
+                    const auto L2 = bytes(o2.o[0], o2.sz[0]), L3 = bytes(o3.o[0], o3.sz[0]);
+                    std::vector<int32_t> i2((size_t)(M * 2)), i3((size_t)(M * 3)), s2((size_t)(M * 2)), s3((size_t)(M * 3));
+                    std::vector<uint32_t> w2((size_t)(M * 2)), w3((size_t)(M * 3));
+                    std::vector<int32_t> off2((size_t)(NL + 1)), off3((size_t)(NL + 1)), cn2((size_t)NL), cn3((size_t)NL);
+                    auto get = [&](auto& v, const void* d) { const auto b = bytes(d, v.size() * 4); std::memcpy(v.data(), b.data(), b.size()); };
+                    get(i2, o2.o[1]); get(i3, o3.o[1]); get(w2, o2.o[2]); get(w3, o3.o[2]); get(s2, o2.o[3]); get(s3, o3.o[3]);
+                    get(off2, o2.o[4]); get(off3, o3.o[4]); get(cn2, o2.o[5]); get(cn3, o3.o[5]);
+                    std::string why;
+                    if (c2 != RAD_OK || c3 != RAD_OK) why = fmt("rc %d %d", c2, c3);
+                    else if (L2 != L3) why = "logits";
+                    else if (off2 != off3) why = "expert_offset";
+                    else if (cn2 != cn3) why = "expert_count";
+                    for (int64_t r = 0; why.empty() && r < M; ++r) {
+                        for (int j = 0; j < 2; ++j)
+                            if (i3[(size_t)(r * 3 + j)] != i2[(size_t)(r * 2 + j)] || w3[(size_t)(r * 3 + j)] != w2[(size_t)(r * 2 + j)])
+                                why = fmt("row %lld slot %d ids / weights", (long long)r, j);
+                        if (why.empty() && (i3[(size_t)(r * 3 + 2)] != -1 || w3[(size_t)(r * 3 + 2)] != 0u))
+                            why = fmt("row %lld slot 2 not dropped (%d)", (long long)r, i3[(size_t)(r * 3 + 2)]);
+                    }
+                    const int64_t live = off2[(size_t)NL];
+                    for (int64_t i = 0; why.empty() && i < M * 3; ++i) {
+                        int32_t want = -1;
+                        if (i < live) { const int32_t v = s2[(size_t)i]; want = v < 0 ? v : (v / 2) * 3 + (v % 2); }
+                        if (s3[(size_t)i] != want) why = fmt("sorted_tok[%lld] %d vs %d", (long long)i, s3[(size_t)i], want);
+                    }
+                    ++na;
+                    if (!why.empty()) fa += fmt(" f32dec %d M %lld %s %s: %s;", val, (long long)M, lay ? "EP" : "ETP", fused ? "fused" : "chain", why.c_str());
+                }
+                /* (b) fused = chain under the switch; (c) gate G 1 (<= 8 rows): above it = the switch off */
+                Out of = mk(M, 3, NL), oc = mk(M, 3, NL), og = mk(M, 3, NL), oo = mk(M, 3, NL);
+                sw("drafter_mx", FORM + 200);
+                const int c4 = run(true, M, 3, NL, base, of), c5 = run(false, M, 3, NL, base, oc);
+                sw("drafter_mx", FORM + 1200);
+                const int c6 = run(true, M, 3, NL, base, og);
+                sw("drafter_mx", FORM);
+                const int c7 = run(true, M, 3, NL, base, oo);
+                st_stream_sync(nullptr);
+                int fb1 = -1, fc1 = -1;
+                for (int j = 0; j < 6 && fb1 < 0; ++j) if (bytes(of.o[j], of.sz[(size_t)j]) != bytes(oc.o[j], oc.sz[(size_t)j])) fb1 = j;
+                for (int j = 0; j < 6 && fc1 < 0; ++j)
+                    if (bytes(og.o[j], og.sz[(size_t)j]) != bytes(M > 8 ? oo.o[j] : of.o[j], M > 8 ? oo.sz[(size_t)j] : of.sz[(size_t)j])) fc1 = j;
+                ++nb; ++nc;
+                if (c4 != RAD_OK || c5 != RAD_OK || fb1 >= 0)
+                    fb += fmt(" f32dec %d M %lld %s: %s;", val, (long long)M, lay ? "EP" : "ETP", fb1 >= 0 ? fmt("output %d", fb1).c_str() : fmt("rc %d %d", c4, c5).c_str());
+                if (c6 != RAD_OK || c7 != RAD_OK || fc1 >= 0)
+                    fc += fmt(" f32dec %d M %lld %s: %s;", val, (long long)M, lay ? "EP" : "ETP", fc1 >= 0 ? fmt("output %d", fc1).c_str() : fmt("rc %d %d", c6, c7).c_str());
+            }
+        }
+    }
+    sw("drafter_mx", FORM);
+    sw("ds41_f32dec", 0);
+    ok(fmt("spdf32 dtk (a): drafter_mx %d + 200 at a top-3 DSpark router = a declared top-2 call (logits, slots 0-1 ids / weights, slot 2 "
+           "dropped, offsets, counts, sorted renamed), ds41_f32dec 1 / 9 / 12, fused + chain, ETP + EP, M 1..64 (%d cases)", FORM, na).c_str(),
+       fa.empty(), fa);
+    ok(fmt("spdf32 dtk (b): the fused launch = the chain under the switch, 6 outputs + tails (%d cases)", nb).c_str(), fb.empty(), fb);
+    ok(fmt("spdf32 dtk (c): + 1200 (<= 8 rows): a pass above 8 rows = the switch off, at <= 8 rows = + 200, byte for byte (%d cases)", nc).c_str(),
+       fc.empty(), fc);
+    dfree_all();
+    f2->fini(inst);
+}
+
 static void spd_case(const Plugin& pl) {
     auto pin = (void (*)(int, int))dlsym(pl.h, "r4d_f32dec_pin");
     if (!pin) { ok("spdf32", false, "r4d_f32dec_pin absent (a plugin without lever SPD-F)"); return; }
@@ -634,6 +784,7 @@ static void spd_case(const Plugin& pl) {
     if (!part || !std::strcmp(part, "gemm") || !std::strcmp(part, "all")) gemm_part(pl, pin);
     if (!part || !std::strcmp(part, "attn") || !std::strcmp(part, "all")) attn_part(pl);
     if (part && (!std::strcmp(part, "rgm") || !std::strcmp(part, "all"))) rgm_part(pl, pin);
+    if (part && (!std::strcmp(part, "dtk") || !std::strcmp(part, "all"))) dtk_part(pl);
     pin(-1, -1);
 }
 

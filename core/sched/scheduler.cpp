@@ -308,9 +308,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "where its whole rest fits beside the rest of EVERY lane's running requests, as one process's gate counts its one "
                      "running set; one lane: unchanged (fn4 sched_lane_room 1)");
     }
-    {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
+    {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h). ON BY DEFAULT
+         * since tp8 loop F83 (22.11., lq247b-d53, BEST S1P14F-STK12's start without the env): 21 prompts of 17.6k at once filled every
+         * lane, so no BG lane took the newcomers as in lq187 / lq191 / lq192 -- lane 1 planned 4,096 rows of its own (option D's
+         * over-budget first prefill + lever NOA's room, both read as max_tok less its own plan) beside a lent 2,048, the build refused
+         * 6,144 > 4,160, and the lane re-planned the same plan every ~1 ms for 9 min. RADIANCE_PP_PLAN_RESERVED=0 = the rule before.
+         * One process (no lanes): lane_reserved_ is 0, nothing changes. */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
-        plan_reserved_ = e && !std::strcmp(e, "1");
+        plan_reserved_ = !(e && !std::strcmp(e, "0"));
+        if (!plan_reserved_ && lane_ <= 0)
+            RAD_WARN("scheduler: RADIANCE_PP_PLAN_RESERVED=0 -- the rule before tp8 loop F71 / F83: under lanes a plan may take the step's "
+                     "max_tok room beside the rows lent to its lane, and such a step is refused and re-planned (a burst livelocks a lane)");
     }
     {   /* lever BI's chunking: RADIANCE_SCHED_BI_CHUNK's start line once a process; the value is the fn4 switch
          * sched_bi_chunk's, read at every step planned (step()) */

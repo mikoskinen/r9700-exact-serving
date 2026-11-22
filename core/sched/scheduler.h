@@ -1254,10 +1254,10 @@ private:
     /* tp8 loop D53 (lane_take_inbox): pieces left in this lane's inbox because an earlier piece of their sequence was not taken
      * yet (the run's count), and since when (mono us) the current wait lasts (0: none) */
     int64_t  lane_order_waits_ = 0, lane_order_wait_us_ = 0;
-    /* tp8 loop F71 (RADIANCE_PP_PLAN_RESERVED=1 at init; unset: false = as before): lane_reserved_ counts as planned where a plan may
-     * take the step's max_tok room (lever NOA's room, option D's over-budget first prefill), so the inbox pieces lane_take_inbox
-     * appends never take the step past max_tok. room_taken() = the rows those rules see as planned. */
-    bool     plan_reserved_ = false;
+    /* tp8 loop F71 (on by default since tp8 loop F83, 22.11.; RADIANCE_PP_PLAN_RESERVED=0 at init = the rule before): lane_reserved_
+     * counts as planned where a plan may take the step's max_tok room (lever NOA's room, option D's over-budget first prefill), so the
+     * inbox pieces lane_take_inbox appends never take the step past max_tok. room_taken() = the rows those rules see as planned. */
+    bool     plan_reserved_ = true;
     int64_t  room_taken() const { return plan_.n_tok + (plan_reserved_ ? lane_reserved_ : 0); }
     void    lane_plan_begin();
     void    lane_plan_end();

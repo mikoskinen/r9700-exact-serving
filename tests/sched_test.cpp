@@ -15061,12 +15061,22 @@ TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_la
  * the lane re-plans the same plan -- with no BG lane to take the newcomers it makes no step at all. With the env the inbox rows count:
  * NOA's newcomer waits a step, every step stays within max_tok, nothing is named, every prompt completes. Planning only (which step a
  * newcomer rides), never a pass's arithmetic. */
+/* tp8 loop F83 (22.11., lq247b-d53 on BEST S1P14F-STK12 = sched_bi_chunk 3 + sched_noa 2 posted at start, no RADIANCE_PP_PLAN_RESERVED):
+ * the same livelock on the pair under a burst of 21 long prompts (every lane busy, no BG lane free), lane 1 'E ... 2048 rows of other
+ * lanes' pieces (1) beside 4096 of its own ... step budget 4160' for 9 min. The rule is ON BY DEFAULT since: modes 0 = env "0" (the rule
+ * before: named, refused, no progress), 1 = env unset (the default: fixed), 2 = env "1" (fixed); each at fn4 sched_lane_room 0 and 1
+ * (BEST STK's lever D56 does not enter either rule: the stall is there without it, the fix holds with it). */
 TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
-    int named_off = -1, named_on = -1;
-    for (int on : { 0, 1 }) {
-        if (on) setenv("RADIANCE_PP_PLAN_RESERVED", "1", 1);
-        else unsetenv("RADIANCE_PP_PLAN_RESERVED");
+    int named_off = -1, named_on = -1, named_def = -1;
+    for (int mode : { 0, 1, 2 })
+    for (int room : { 0, 1 }) {
+        const int on = mode != 0;
+        if (mode == 0) setenv("RADIANCE_PP_PLAN_RESERVED", "0", 1);
+        else if (mode == 1) unsetenv("RADIANCE_PP_PLAN_RESERVED");
+        else setenv("RADIANCE_PP_PLAN_RESERVED", "1", 1);
         DstSwitches restore;
+        struct RoomOff { ~RoomOff() { DstSwitches::set("sched_lane_room", 0); } } room_off;
+        CHECK(DstSwitches::set("sched_lane_room", room));
         Lanes L;
         L.grid = 2048;
         L.cfg.prefill_span = 2;
@@ -15111,11 +15121,12 @@ TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
         });
         int named = 0;
         for (size_t at = err.find("rows of other lanes' pieces"); at != std::string::npos; at = err.find("rows of other lanes' pieces", at + 1)) ++named;
-        (on ? named_on : named_off) = named;
+        (mode == 0 ? named_off : mode == 1 ? named_def : named_on) = std::max(mode == 0 ? named_off : mode == 1 ? named_def : named_on, named);
         const Request* rb = L.req(0, big);
         const Request* rq = L.req(1, q);
-        fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=%s: %d steps, %d plans refused, %d over max_tok (most %lld rows), %d steps with a lent piece, %d "
-                        "'rows of other lanes' pieces' lines; big %lld / 4096, newcomers %lld / 1200, %lld / 1000 computed\n", on ? "1" : "unset", steps, refused,
+        fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=%s, sched_lane_room %d: %d steps, %d plans refused, %d over max_tok (most %lld rows), %d steps with a "
+                        "lent piece, %d 'rows of other lanes' pieces' lines; big %lld / 4096, newcomers %lld / 1200, %lld / 1000 computed\n",
+                mode == 0 ? "0" : mode == 1 ? "unset (default)" : "1", room, steps, refused,
                 over, (long long)most, lent_seen, named, rb ? (long long)rb->n_computed : -1LL, rq ? (long long)rq->n_computed : -1LL,
                 L.req(1, q2) ? (long long)L.req(1, q2)->n_computed : -1LL);
         CHECK_EQ(over, 0);   /* a plan over max_tok is never built (BatchBuilder refuses it) */
@@ -15135,8 +15146,9 @@ TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
         CHECK_EQ(refused, 0);
         CHECK(most <= L.max_tok);
     }
-    CHECK(named_off > 0);   /* the case the env fixes is there without it */
+    CHECK(named_off > 0);   /* the case the rule fixes is there with the env at 0 (the rule before) */
     CHECK_EQ(named_on, 0);
+    CHECK_EQ(named_def, 0);   /* tp8 loop F83: the default is the fixed rule */
     unsetenv("RADIANCE_PP_PLAN_RESERVED");
 }
 
