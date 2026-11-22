@@ -961,10 +961,18 @@ static const RadOperandSpec oKvLenTrim[] = {
 /* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
 static const RadParamSpec pPrefetch[] = {
     { "bytes", RAD_P_INT, RAD_REQUIRED },
-    /* DRAFTER track round 85 (lever PFX): w1 .. w7's bytes, read by the same launch (absent / 0: that weight not read) */
-    P_INTO("bytes1"), P_INTO("bytes2"), P_INTO("bytes3"), P_INTO("bytes4"), P_INTO("bytes5"), P_INTO("bytes6"), P_INTO("bytes7"),
 };
 static const RadOperandSpec oPrefetch[] = {
+    { "w", RAD_OPD_WEIGHT, 0 },
+};
+/* DRAFTER track round 85 (lever PFX): prefetch_multi = prefetch over up to eight weights in ONE launch (w1 .. w7 and their
+ * bytes1 .. bytes7 optional; absent / 0: that weight not read). Its own op, so a plugin asks rad_op_declared for it and an older
+ * library (one weight a prefetch) is never handed parameters its schema lacks. */
+static const RadParamSpec pPrefetchMulti[] = {
+    { "bytes", RAD_P_INT, RAD_REQUIRED },
+    P_INTO("bytes1"), P_INTO("bytes2"), P_INTO("bytes3"), P_INTO("bytes4"), P_INTO("bytes5"), P_INTO("bytes6"), P_INTO("bytes7"),
+};
+static const RadOperandSpec oPrefetchMulti[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
     { "w1", RAD_OPD_WEIGHT, 1 }, { "w2", RAD_OPD_WEIGHT, 1 }, { "w3", RAD_OPD_WEIGHT, 1 }, { "w4", RAD_OPD_WEIGHT, 1 },
     { "w5", RAD_OPD_WEIGHT, 1 }, { "w6", RAD_OPD_WEIGHT, 1 }, { "w7", RAD_OPD_WEIGHT, 1 },
@@ -3911,7 +3919,10 @@ static const RadOpSchema kSchemas[] = {
            "slice alone."),
     SCHEMA("prefetch", pPrefetch, oPrefetch,
            "read a weight's leading bytes so they are in the cache when the next kernel streams "
-           "them; writes nothing. w1 .. w7 (bytes1 .. bytes7) are read by the same launch."),
+           "them; writes nothing."),
+    SCHEMA("prefetch_multi", pPrefetchMulti, oPrefetchMulti,
+           "prefetch over up to eight weights (w .. w7, bytes .. bytes7) in one launch: one dispatch beside a "
+           "collective instead of one a weight; writes nothing."),
     SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
            "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
            "q, k and v projections, in one dispatch; v from the raw k under v_from_k. n_head 0 "
@@ -10099,6 +10110,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "read a weight's leading bytes, 16 a lane over 64 workgroups, so the next kernel streaming the "
   "weight finds them in the 64 MB on-die cache; meant for a second lane beside a collective",
   "any weight, any stored form; `bytes` clamped to what the tensor states",
+  "any",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPrefetch), ROW(tPrefetch), nullptr,
+  nullptr, nullptr, r4d_rad_prefetch, nullptr, r4d_rad_layout_any, nullptr, nullptr, nullptr },
+{ "prefetch_multi", "prefetch_multi", "misc",
+  "prefetch over up to eight weights in one launch (lever PFX, DRAFTER track round 85): each weight's bytes in turn, eight "
+  "16-byte loads in flight a lane, over 64 workgroups",
+  "any weights, any stored form; each `bytes` clamped to what its tensor states",
   "any",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cPrefetch), ROW(tPrefetch), nullptr,

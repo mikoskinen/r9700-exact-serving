@@ -6328,12 +6328,13 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                     hs_now(), d.hs_ok ? "declared" : "NOT declared: ", why ? why : "");
     }
 
-    /* Lever PFX (Layer::dpfx, pfx_now's comment): a `prefetch` of each stage's attention weights where a library serves the op
-     * and the deployment did not turn the reads off (--weight-prefetch off); none (the host backend: libref serves no
-     * `prefetch`) -> the bit reads nothing (no stage has reads to issue). */
+    /* Lever PFX (Layer::dpfx, pfx_now's comment): one prefetch_multi of each stage's attention weights where a library declares and
+     * serves the op and the deployment did not turn the reads off (--weight-prefetch off); none (the host backend, a libr4d before
+     * round 85) -> the bit reads nothing (no stage has reads to issue). */
     if (pfx_env() && !m.zero && !ctx->shape_probe) {
         size_t nw = 0, nd = 0;
-        const bool lib = rad_op_declared(b, "prefetch") && !ctx->weight_prefetch_off;
+        /* libr4d's prefetch_multi (round 85): an older library has only the one-weight prefetch -> nothing declared here */
+        const bool lib = rad_op_declared(b, "prefetch_multi") && !ctx->weight_prefetch_off;
         static const char* const kBytes[8] = { "bytes", "bytes1", "bytes2", "bytes3", "bytes4", "bytes5", "bytes6", "bytes7" };
         for (auto& L : d.st) {
             L.dpfx = 0;
@@ -6349,16 +6350,16 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
              * launch: the op then does not resolve here and the stage reads nothing) */
             std::vector<RadParam> ps;
             for (size_t i = 0; i < L.dpfx_w.size(); ++i) ps.push_back(RAD_INT(kBytes[i], (int64_t)64 << 20));
-            const rad_op h = rad_decl_op(b, "prefetch", ps.data(), (int)ps.size(), L.dpfx_w.data(), (int)L.dpfx_w.size());
+            const rad_op h = rad_decl_op(b, "prefetch_multi", ps.data(), (int)ps.size(), L.dpfx_w.data(), (int)L.dpfx_w.size());
             if (h && rad_op_resolved(b, h)) { L.dpfx = h; nd += L.dpfx_w.size(); }
         }
         rad_note(b, "DSpark lever PFX (RADIANCE_DS41_DSPARK_PFX): %zu of %zu stage attention weight reads declared%s", nd, nw,
-                 lib ? "" : " (no `prefetch` here, or --weight-prefetch off)");
+                 lib ? "" : " (no prefetch_multi here: libr4d before round 85, or --weight-prefetch off)");
         if (ctx->rank == 0)
             fprintf(stderr, "radiance: deepseek41: DSpark lever PFX (RADIANCE_DS41_DSPARK_PFX, fn4 dspark_mhr + 256, now %s): %zu of %zu "
                             "stage attention weight reads declared (wq_a, wkv, wq_b, wo_a: one prefetch a stage, behind the all-reduce "
                             "before it)%s\n",
-                    pfx_now() ? "on" : "off", nd, nw, lib ? "" : " -- no library serves `prefetch` here, or --weight-prefetch off");
+                    pfx_now() ? "on" : "off", nd, nw, lib ? "" : " -- no library declares prefetch_multi here (libr4d before round 85), or --weight-prefetch off");
     }
 
     /* Lever DQR (Layer::attn_q, g_sw_dmr's comment + 32): declared beside each stage's attention above; one line here */
