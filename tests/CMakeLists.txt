@@ -662,7 +662,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph ds41dqr ds41biw)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph ds41dqr ds41biw ds41wcn)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -718,6 +718,9 @@ if(R4D_EMU_BUILT)
   # ds41-etp-spd: lever SPD-F -- the decode band's f32 projection forms (the router's fused launch, gemm_nt_f32) pinned by
   # r4d_f32dec_pin against the stock forms, byte for byte.
   set_tests_properties(r4d_emu_ds41spd PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # Lever WCN (DRAFTER round 87): the IL gate_up / down forms (drafter_mx 7 / 8 / 4 / 6) against drafter_mx 2's native
+  # WMMA form, byte for byte.
+  set_tests_properties(r4d_emu_ds41wcn PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)
