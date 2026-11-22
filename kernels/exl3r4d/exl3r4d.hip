@@ -201,6 +201,12 @@ static_assert(EXL3R4D_SWK != 2 || EXL3R4D_SWK_BLK == 8, "SWK 2: 8 tokens a pass 
 #define EXL3R4D_SWK_ABOUND 0 // b32 loads a 32-deep step (TIMING ONLY, wrong outputs: the real form's A-load cost bound); 0 = the loads
 #endif
 static_assert(EXL3R4D_SWK_DMOVE == 0 || EXL3R4D_SWK_DMOVE == 1 || EXL3R4D_SWK_DMOVE == 2 || EXL3R4D_SWK_DMOVE == 9, "SWK_DMOVE: 0 / 1 / 2 / 9");
+#ifndef EXL3R4D_X17_PIN   // tp8 DECODE round 68, QUEUE X17: a schedule pin on the K = 2.5 SW 2 K loops (bit 1: the fold's twins, FOLD; bit 2: SWK's
+#define EXL3R4D_X17_PIN 0    // own twins, !FOLD); 0 = no pin (the compiler's own order, as b2cca12). A pin moves issue order only: the same instructions on
+#endif                       // the same registers' values, so the same bytes (Xeon slot BYTES pinned vs unpinned = 0 differ)
+#ifndef EXL3R4D_X17_FORM   // X17's form: 1 = X3D's served pin per step (the step's loads, its decode, the pair's SWMMACs on the odd step);
+#define EXL3R4D_X17_FORM 1   // 2 = per K-loop body (PF steps): every load of the body first, then the decode, then the SWMMACs (the order the compiler
+#endif                       // chose for SWK's own K2.5 twins: one 24-load clause at the top; the fold's twins spread their loads behind SALU waits)
 #ifndef EXL3R4D_X15_INSUM   // SWK x X5F (tp8 DECODE round 67, QUEUE X15c): 1 = the fold's SW 2 twins take each token's row sum from the
 #define EXL3R4D_X15_INSUM 0  // compressed A fragments the K loop already loads (x5_dot8 on the odd step, lanes t / t + 8 / t + 16 / t + 24 joined
 #endif                       // after the loop) instead of the X6 S2 pre-pass -- its own bits (another sum order); 0 = the pre-pass (X15 / X15b)
@@ -1311,6 +1317,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   [[maybe_unused]] const bool b96w = plan.woff[0][1] == 0, b96p = plan.woff[1][1] != plan.woff[0][1];
   [[maybe_unused]] const unsigned b96o = b96w ? 0u : wvo[0][0];
   [[maybe_unused]] constexpr int kB96H = kB96 ? b96_holder<BITS>() : 0;
+  // X17 (tp8 DECODE round 68): the K = 2.5 SW 2 K loop pinned (EXL3R4D_X17_PIN bit 1 the fold's twins, bit 2 SWK's own); kX17L = a tile's weight
+  // loads a step in the mode (G3 3 words, G2D a b32 + a b64, UB96 one b96, U4 two pairs) -- the pin's load group = those + SW 2's four A dwords
+  [[maybe_unused]] constexpr bool kX17 = EXL3R4D_X17_PIN != 0 && SW >= 2 && K25 != K25_OFF &&
+                                         ((FOLD && (EXL3R4D_X17_PIN & 1)) || (!FOLD && (EXL3R4D_X17_PIN & 2)));
+  [[maybe_unused]] constexpr int kX17L = K25 == K25_G3 ? 3 : K25 == K25_G2D ? 2 : K25 == K25_UB96 ? 1 : 4;
   static_assert(!kB96 || (kB96H >= 0 && (kB96H & 3) >= 1), "b96_holder: no lane holds the tile's last word");
   // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
   // takes the global form
@@ -1473,6 +1484,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
+      if constexpr (kX17 && EXL3R4D_X17_FORM == 1) { /* X17 form 1: X3D's served SW pin on the K = 2.5 step */ \
+        __builtin_amdgcn_sched_group_barrier(0x020, kX17L * NPW + 4, 0);           \
+        __builtin_amdgcn_sched_group_barrier(0x002, 40 * NPW, 0);                   \
+        if (u & 1) __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);             \
+      }                                                                              \
       break;                                                                         \
     }                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                \
@@ -1525,6 +1541,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
         const int ls = ks + u + PF - 1 < kps ? ks + u + PF - 1 : kps - 1; \
         EXL3_LOAD(ls, wb[(u + PF - 1) % PF], ab[(u + PF - 1) % PF]); \
         EXL3_COMPUTE(wb[u], ab[u]); \
+      } \
+      if constexpr (kX17 && EXL3R4D_X17_FORM == 2) { /* X17 form 2: the body's loads, its decode, its SWMMACs */ \
+        __builtin_amdgcn_sched_group_barrier(0x020, PF * (kX17L * NPW + 4), 0); \
+        __builtin_amdgcn_sched_group_barrier(0x002, PF * 40 * NPW, 0); \
+        __builtin_amdgcn_sched_group_barrier(0x008, PF / 2 * NPW, 0); \
       } \
     } \
   _Pragma("unroll") \
