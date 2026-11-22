@@ -2344,13 +2344,14 @@ static std::atomic<long long> g_dkp_passes{0};       /* lever DKP: the first-pas
 static bool emg_now() { return (dmr_raw() & 128) != 0; }  /* lever EMG (round 74) */
 /* Lever PFX (DRAFTER track 22.11.2026 round 85; Layer::dpfx; dspark_mhr + 256, start env RADIANCE_DS41_DSPARK_PFX=1 adds it to the
  * start value, =0 declares the reads with the bit off; unset declares nothing): at a DSpark query pass each stage's attention
- * weights (wq_a, wkv, wq_b, wo_a: 29.8 MB a stage at q8_0) are read into L2 / the 64 MiB on-die cache by libr4d `prefetch` right
- * behind the all-reduce in front of the stage (the embedding's for stage 0, the previous stage's MoE all-reduce else), on the
- * same queue: the reads name no buffer, so they play unordered beside the collective while the card's memory is idle, and the
- * stage's first dependent dispatch waits for them. The stage's dense calls then stream those weights from the cache. Reads
- * only: every byte the pass writes is today's (rule A). drafter/kit/mes/pfx.cpp (one R9700, a 53-us all-reduce stand-in,
- * cold weight sets, Q8IL forms): q_a + kv / q_b / o_a / o_b chain 102.5 -> 86.6 us at 32 rows, 101.9 -> 86.3 at 24, 107.7 ->
- * 97.7 at 40; the reads must fit the window (each us past it is paid; o_b's 11 MB is left out for that). */
+ * weights (wq_a, wkv, wq_b, wo_a: 29.8 MB a stage at q8_0) are read into L2 / the 64 MiB on-die cache by ONE libr4d
+ * prefetch_multi on lane 1, issued right before the all-reduce in front of the stage (the embedding's for stage 0, the previous
+ * stage's MoE all-reduce else) behind a join from lane 0 (dpfx_lane1): the read runs beside the collective while the card's
+ * memory is idle, and the stage's dense calls then stream those weights from the cache. Reads only: every byte the pass writes
+ * is today's (rule A). drafter/kit/mes/pfx.cpp (one R9700, a second queue behind an event = lane 1, a 53-us all-reduce
+ * stand-in, cold weight sets, native q8_0): the read 48.2 us, ending 2.6 us before the stand-in; q_a + kv / q_b / o_a / o_b
+ * chain 115.6 -> 89.6 us at 32 rows, 120.5 -> 99.7 at 40. o_b's 11 MB is left out: 40.9 MB (~66 us) would run past a
+ * 53-59 us window into the stage's own dense calls (a read beside a dense call slowed it 14.8 -> 36.7 us). */
 static bool pfx_now() { return (dmr_raw() & 256) != 0; }
 static bool pfx_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_PFX");
@@ -2364,7 +2365,18 @@ static void dpfx_issue(RadCtx* x, const Layer& L) {
     for (size_t i = 0; i < n; ++i) o[i] = RAD_W(L.dpfx_w[i]);
     rad_issue(x, L.dpfx, o, (int)n, RAD_N_BATCH);
 }
-static void dpfx_after_ar(RadCtx* x, void* a) { dpfx_issue(x, *(const Layer*)a); }
+/* On LANE 1, behind a join from lane 0, issued right BEFORE the collective (the read must not be issued behind it on lane 0: the
+ * all-reduce is opaque to haz_mark, so the next lane-0 dispatch keeps its barrier bit and would start when the collective has
+ * finished -- DECODE NOTE 03:16 on lever WSP). The join orders the read behind lane 0's work so far (the dispatch before the
+ * collective); lane 0 goes on with the collective, which the read then runs beside; the runtime joins lane 1 back at the step's
+ * end. The lane rules (rad_runtime.h): no collective, no counter, no buffer -- the read names weights only (rad_arch.h's
+ * prefetch_beside, lever D24's form). */
+static void dpfx_lane1(RadCtx* x, const Layer& L) {
+    if (!L.dpfx) return;
+    if (rad_lane_join(x, 0, 1) == RAD_OK && rad_lane(x, 1) == RAD_OK) dpfx_issue(x, L);
+    rad_lane(x, 0);
+}
+static void dpfx_before_ar(RadCtx* x, void* a) { dpfx_lane1(x, *(const Layer*)a); }
 /* lever EMG: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
 static bool emg_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_EMG");
@@ -9015,8 +9027,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     if (ek >= 0) {
         const int64_t o = ek * d.Q;
         RAD_ISSUE_N(x, d.ema_g, S + 1, brows(d.x, T), brow_slice(d.ema_ia, o, S + 1, 1), brows(d.xa, S + 1));
+        if (pfx0) dpfx_lane1(x, d.st[0]);   /* lever PFX: stage 0's attention weights on lane 1 beside the embedding's all-reduce */
         RAD_ISSUE_N(x, d.ema_ar, (S + 1) * D, brows(d.xa, S + 1), RAD_NONE);
-        if (pfx0) dpfx_issue(x, d.st[0]);   /* lever PFX: stage 0's attention weights beside the embedding's all-reduce */
         void* h0p = d.ema_eh && emg_now() && !g_emg_bad.load(std::memory_order_relaxed) ? rad_buf_ptr(x, d.h0) : nullptr;
         if (h0p) {   /* lever EMG (round 74): h0 [T, hc x D] packed = [hc x T, D] rows; ie4[hc r + i] = ie[r] */
             RAD_ISSUE_N(x, d.ema_eh, c.hc * T, brows(d.xa, S + 1), brow_slice(d.ema_ie4, o * c.hc, c.hc * T, 1),
@@ -9034,8 +9046,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                             "of %lld rows (%lld sequences x %lld + the mask row; counted at issue: a recorded pass once)\n",
                     (long long)(S + 1), (long long)T, (long long)S, (long long)blk);
     } else {
+        if (d.embed_ar && pfx0) dpfx_lane1(x, d.st[0]);   /* lever PFX: as on the EMA pass */
         if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
-        if (d.embed_ar && pfx0) dpfx_issue(x, d.st[0]);   /* lever PFX: as on the EMA pass */
         for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
     }
     if (dpr && g.rank == 0 && g_dpr_passes.fetch_add(1, std::memory_order_relaxed) == 0)
@@ -9184,16 +9196,16 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             MoeFP8::Beside bs;
             bs.fn = dsp_mix_f_beside;
             bs.arg = &mb;
-            if (pfx && nx && nx->dpfx) {   /* lever PFX: the next stage's attention weights beside this MoE all-reduce */
-                bs.after_ar = dpfx_after_ar;
-                bs.after_arg = (void*)nx;
+            if (pfx && nx && nx->dpfx) {   /* lever PFX: the next stage's attention weights on lane 1 beside this MoE all-reduce */
+                bs.before_ar = dpfx_before_ar;
+                bs.ar_arg = (void*)nx;
             }
             if (Tq != T) L.moe.step_rows(x, Tq, &bs);   /* lever DHS: the block over its first N rows */
             else L.moe.step(x, batch, bs);
         } else if (pfx && nx && nx->dpfx) {   /* lever PFX: as in the dmr branch, nothing beside the routed gate_up */
             MoeFP8::Beside bs;
-            bs.after_ar = dpfx_after_ar;
-            bs.after_arg = (void*)nx;
+            bs.before_ar = dpfx_before_ar;
+            bs.ar_arg = (void*)nx;
             L.moe.step(x, batch, bs);
         } else {
             L.moe.step(x, batch);

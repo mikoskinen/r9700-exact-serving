@@ -686,12 +686,6 @@ struct MoeFP8 {
          * lane beside the collective. It must touch nothing the block reads or writes. */
         void (*before_ar)(RadCtx*, void*) = nullptr;
         void* ar_arg = nullptr;
-        /* Opt-in too (deepseek41, DRAFTER track round 85, lever PFX): work the caller issues right AFTER that same pass's gather +
-         * all-reduce, before anything else the block issues behind it -- a read of weights the next layer streams, on the same
-         * queue beside the collective (no buffer named: nothing in flight is a hazard, so it plays unordered and the next
-         * dependent dispatch waits for it). It must touch nothing the block reads or writes. */
-        void (*after_ar)(RadCtx*, void*) = nullptr;
-        void* after_arg = nullptr;
     };
     void step(RadCtx* c, const RadBatch* batch, const Beside& beside) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
@@ -2877,7 +2871,6 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* A write that takes the all-reduce does it once for the whole step, deciding on T, so this
      * pass must ask with T, not its own rows. */
     if (own_ar && issues_ar(T, rows) && !gar) issue_ar(c_, r0, rows, false);
-    if (beside && beside->after_ar && own_ar && r0 + rows == T && issues_ar(T, rows)) beside->after_ar(c_, beside->after_arg);
     if (op_add)
         RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd),
