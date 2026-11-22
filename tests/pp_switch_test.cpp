@@ -274,8 +274,8 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
 }
 
 /* qfn-on-ds (Qwen loop round 1, 20.11.2026): the core's range check for the Qwen line's plugin switches takes what the
- * merged libr4d / qwen4exp serve -- hc_readv 0..32767 (bits 11-12: lever B3R; bit 13: lever HWC, loop round 19; bit 14: PF probe HCF,
- * round 28 -- the core held 16383 until round 29, so R58b's POST 24939 was refused), att_bi 0..6 (6: loop
+ * merged libr4d / qwen4exp serve -- hc_readv 0..65535 (bits 11-12: lever B3R; bit 13: lever HWC, loop round 19; bit 14: PF probe HCF,
+ * round 28 -- the core held 16383 until round 29, so R58b's POST 24939 was refused; bit 15: lever HCX, round 34), att_bi 0..6 (6: loop
  * round 3), bi_seg 0..3, sp_route 0..65535 (bits 1024 / 2048: lever MSP, loop round 20; 4096: lever GPF, round 22; 8192: lever HCP,
  * round 23; 16384: PF probe QSP, round 27; 32768: lever QRS, round 29), ar_laneblocks_s 0..24 / ar_lanethreads_s 0..1024 (lever LSK, round 27), resume_cold
  * 0..3 (2 / 3: lever TIP's resume points, rounds 21 / 22) -- and
@@ -285,7 +285,7 @@ TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
     std::string why;
     struct R { const char* name; int hi; };
-    for (const R& r : { R{ "hc_readv", 32767 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 65535 }, R{ "resume_cold", 3 },
+    for (const R& r : { R{ "hc_readv", 65535 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 65535 }, R{ "resume_cold", 3 },
                       R{ "ar_laneblocks_s", 24 }, R{ "ar_lanethreads_s", 1024 } }) {
         const int i = fn4::switch_index(r.name);
         REQUIRE(i >= 0);
@@ -309,6 +309,8 @@ TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     CHECK(fn4::request("hc_readv", 363 | 8192, &why));
     /* ... and R58b's HCF cell (BEST's 8555 with the probe's bit 14) */
     CHECK(fn4::request("hc_readv", 8555 | 16384, &why));
+    /* ... and lever HCX's cell (BEST's 8555 with bit 15) */
+    CHECK(fn4::request("hc_readv", 8555 | 32768, &why));
     CHECK(fn4::request("resume_cold", 0, &why));   /* the scheduler's: back to off for the cases after */
     int sw[fn4::kSwitches];
     (void)fn4::apply_pending(8, sw);

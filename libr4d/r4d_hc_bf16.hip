@@ -4743,13 +4743,14 @@ static bool hc_write_vec(long rows) {
  * bits 6-10 the bi_dec kernel-A' forms (G16, PF2 column split, G16p, scales once, G16q); bits 11-12 (qfn-on-ds lever B3R)
  * kernel B3 under bi_dec past 16 rows with 1 (0, today), 2 (1), 4 (2) or every (3) 16-row group a block (b3r_gpb); bit 13
  * (qfn-on-ds lever HWC) hc_write in its chained forms (hc_write_chain); bit 14 (qfn-on-ds PF probe HCF, Qwen loop round 28: TIMING
- * ONLY, wrong bytes) a decode (bi_dec) read of more than 16 rows reads only its first 16. -1 until the environment is read. */
+ * ONLY, wrong bytes) a decode (bi_dec) read of more than 16 rows reads only its first 16; bit 15 (qfn-on-ds lever HCX, round 34) kernel
+ * A' with NTS W_down tiles a block (hc_x). -1 until the environment is read. */
 static std::atomic<int> g_hc_readv{-1};
 static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 32767) : 0;   /* bits 0-13 + bit 14 (PF probe HCF) */
+        const int on = (e && *e) ? (std::atoi(e) & 65535) : 0;   /* bits 0-13 + bit 14 (PF probe HCF) + bit 15 (lever HCX) */
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
@@ -4930,24 +4931,18 @@ static int hc_pre_min() {
     return v;
 }
 
-/* qfn-on-ds lever HCX (Qwen loop round 34, QUEUE Q56): RADIANCE_FN4_HC_X = NTS (4, 5 or 10; read once, r4d_hc_x sets it) -- the
- * bi_dec read's kernel A' as hc_read_g16x_down (NTS W_down tiles a block, N built once a block) wherever G16p would run (bit 8,
- * >= 32 rows) and rows >= RADIANCE_FN4_HC_X_MIN (default 32); the same bytes as G16p (its note). 0 / unset / another value =
- * today's kernels. -1 until read. */
-static std::atomic<int> g_hc_x{-1};
+/* qfn-on-ds lever HCX (Qwen loop round 34, QUEUE Q56): hc_readv bit 15 (32768, in process) -- the bi_dec read's kernel A' as
+ * hc_read_g16x_down (NTS W_down tiles a block, N built once a block) wherever bit 8 would run G16p (>= 32 rows) and rows >=
+ * RADIANCE_FN4_HC_X_MIN (default 32); NTS = RADIANCE_FN4_HC_X (4, 5 or 10; default 5; read once). The same bytes as G16p (its
+ * note), so neither the bit nor the floor moves an answer. The bench hook r4d_hc_x(NTS) turns it on without the bit (0 = off). */
 static int hc_x_ok(int v) { return v == 4 || v == 5 || v == 10 ? v : 0; }
-static int hc_x() {
-    int v = g_hc_x.load(std::memory_order_relaxed);
-    if (v < 0) {
+static std::atomic<int> g_hc_x_bench{0};
+static int hc_x_width() {
+    static const int v = [] {
         const char* e = std::getenv("RADIANCE_FN4_HC_X");
-        int want = -1;
-        g_hc_x.compare_exchange_strong(want, (e && *e) ? hc_x_ok(std::atoi(e)) : 0, std::memory_order_relaxed);
-        v = g_hc_x.load(std::memory_order_relaxed);
-        if (v > 0) std::fprintf(stderr, "radiance: libr4d: lever HCX (RADIANCE_FN4_HC_X=%d): the bi_dec read's kernel A' with %d "
-                                        "W_down tiles a block, N built once a block, from %d rows (the same bytes as G16p)\n",
-                                v, v, [] { const char* m = std::getenv("RADIANCE_FN4_HC_X_MIN"); const int n = (m && *m) ? std::atoi(m) : 0;
-                                           return n > 0 ? n : 32; }());
-    }
+        const int n = (e && *e) ? hc_x_ok(std::atoi(e)) : 0;
+        return n > 0 ? n : 5;
+    }();
     return v;
 }
 static int hc_x_min() {
@@ -4957,6 +4952,20 @@ static int hc_x_min() {
         return n > 0 ? n : 32;
     }();
     return v;
+}
+static int hc_readv();
+static int hc_x() {
+    const int b = g_hc_x_bench.load(std::memory_order_relaxed);
+    if (b > 0) return b;
+    if (!(hc_readv() & 32768)) return 0;
+    static const bool said = [] {
+        std::fprintf(stderr, "radiance: libr4d: lever HCX (hc_readv bit 15): the bi_dec read's kernel A' with %d W_down tiles a block, "
+                             "N built once a block, from %d rows (RADIANCE_FN4_HC_X / _MIN; the same bytes as G16p)\n",
+                     hc_x_width(), hc_x_min());
+        return true;
+    }();
+    (void)said;
+    return hc_x_width();
 }
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
@@ -8605,8 +8614,8 @@ static unsigned long long* g_hc_tl_buf = nullptr;   /* the bench's device buffer
 constexpr size_t kHcTlBytes = (size_t)2 * kHcTlMax * kHcTlW * sizeof(unsigned long long);
 /* qfn-on-ds lever HCO (bench / test hook): the occupancy instances' mask, as RADIANCE_FN4_HC_OCC */
 extern "C" void r4d_hc_occ(int m) { g_hc_occ.store(m < 0 ? 0 : (m & 7), std::memory_order_relaxed); }
-/* qfn-on-ds lever HCX (bench / test hook): the tiles a block of kernel A' (4, 5, 10; else 0 = off), as RADIANCE_FN4_HC_X */
-extern "C" void r4d_hc_x(int m) { g_hc_x.store(hc_x_ok(m), std::memory_order_relaxed); }
+/* qfn-on-ds lever HCX (bench / test hook): kernel A' with NTS tiles a block on (4, 5, 10) without hc_readv bit 15, or off (else) */
+extern "C" void r4d_hc_x(int m) { g_hc_x_bench.store(hc_x_ok(m), std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
     if (on && !g_hc_tl_buf) {
         void* p = nullptr;
@@ -8642,7 +8651,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 32767) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained); 14: PF probe HCF (timing only) */
+        if (value < 0 || value > 65535) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained); 14: PF probe HCF (timing only); 15: lever HCX */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }

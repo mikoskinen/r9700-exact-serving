@@ -770,7 +770,9 @@
  *                   once, G16q); 2048 / 4096 / 6144 (qfn-on-ds lever B3R, 20.11.2026) kernel B3 under bi_dec past 16 rows
  *                   with 2 / 4 / every 16-row group(s) a block, W_up loaded once a block (the same bytes); 8192 (qfn-on-ds lever
  *                   HWC, 21.11.2026) hc_write's chained forms up to 128 rows (the same bodies); 16384 (qfn-on-ds PF probe HCF,
- *                   Qwen loop round 28) every decode read of more than 16 rows reads 16 (WRONG BYTES, timing only); 0..32767
+ *                   Qwen loop round 28) every decode read of more than 16 rows reads 16 (WRONG BYTES, timing only); 32768
+ *                   (qfn-on-ds lever HCX, Qwen loop round 34) kernel A' with RADIANCE_FN4_HC_X (5) W_down tiles a block, N
+ *                   built once a block, from RADIANCE_FN4_HC_X_MIN (32) rows (the same bytes); 0..65535
  *   ar_lanethreads  libr4d (rad_fn4_switch): the prefill all-reduce lane's block    RADIANCE_FN4_AR_LANE_THREADS
  *                   width -- 0 the resolved tunable, 256 / 512 / 1024
  *   hc_upmix        libr4d (rad_fn4_switch): hc_read's up-mix tile                  RADIANCE_FN4_HC_UPMIX
