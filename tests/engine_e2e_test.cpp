@@ -4233,7 +4233,8 @@ TEST(p30t_twin_sidecar_entries_stand_beside_the_container) {
         if (!same) fprintf(stderr, "    a kept twin + the qkv round trip vs llama.rad: %s\n", why.c_str());
         CHECK(same);
     }
-    /* refused at open: a twin of a name the container does not hold; a name and its twin both */
+    /* refused at open: a twin of a name the container does not hold; a name and its twin both are served (DRAFTER round 96,
+     * lever A8K: the twin stands beside the sidecar's own replacement of its base, each under its own name) */
     auto handmade = [&](const std::string& path, const std::vector<std::string>& names) {
         rad::RadWriter wr;
         if (wr.begin(path.c_str()) != 0) return false;
@@ -4260,8 +4261,9 @@ TEST(p30t_twin_sidecar_entries_stand_beside_the_container) {
     REQUIRE(handmade(d / "both.rad", { "output.weight", "output.weight#pf" }));
     a[1] = d / "t4";
     Ran t4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both.rad") });
-    CHECK(t4.status != 0);
-    CHECK(has(t4.log, "a weight is replaced or twinned, not both"));
+    CHECK(t4.status == 0);
+    CHECK(has(t4.log, "1 of them beside a base this sidecar replaces (lever A8K)"));
+    CHECK(!has(t4.log, "a weight is replaced or twinned, not both"));
 }
 
 /* ================================================================== lever G: the tail grid (ds41-tailgrid) */

@@ -884,7 +884,7 @@ int Engine::open_weight_sidecar() {
         RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds no entries", path);
         return RAD_E_FORMAT;
     }
-    int64_t bytes = 0, replaced = 0, twins = 0, twin_bytes = 0;
+    int64_t bytes = 0, replaced = 0, twins = 0, twin_bytes = 0, twin_on_replaced = 0;
     std::map<std::string, int> forms;
     for (int64_t i = 0; i < side->entry_count(); ++i) {
         const RadFileEntry& s = side->entry(i);
@@ -901,11 +901,10 @@ int Engine::open_weight_sidecar() {
                     twin ? " (a twin '<name>#pf' stands beside a container entry of that name)" : "");
             return RAD_E_NOTFOUND;
         }
-        if (twin && side->find(base)) {
-            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds both '%s' and its twin '%s': a weight is replaced or twinned, not both",
-                    path, base.c_str(), name.c_str());
-            return RAD_E_INVAL;
-        }
+        /* DRAFTER round 96 (lever A8K): a twin may also stand beside a base this sidecar REPLACES (the DSpark kv: the DLW's q8_0
+         * in the container base's place for the context pass, an int8 twin '<name>#pf' for the query pass). Each name resolves to
+         * its own entry (sources(): the sidecar answers both), so nothing is served twice under one name; counted on the line. */
+        if (twin && side->find(base)) ++twin_on_replaced;
         bool same = s.rank == m->rank;
         for (uint32_t k = 0; same && k < s.rank && k < RAD_MAX_RANK; ++k) same = s.shape[k] == m->shape[k];
         if (!same) {
@@ -940,8 +939,10 @@ int Engine::open_weight_sidecar() {
     RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s%s, read from %s "
              "(RADIANCE_WEIGHT_SIDECAR): %s", (long long)side->entry_count(), humanb(bytes).c_str(),
              humanb(replaced).c_str(),
-             twins ? fmt("; %lld twin(s) '<name>#pf', %s BESIDE the container's entries (tp8 loop P30t)", (long long)twins,
-                         humanb(twin_bytes).c_str()).c_str()
+             twins ? fmt("; %lld twin(s) '<name>#pf', %s BESIDE the container's entries (tp8 loop P30t)%s", (long long)twins,
+                         humanb(twin_bytes).c_str(),
+                         twin_on_replaced ? fmt(", %lld of them beside a base this sidecar replaces (lever A8K)",
+                                                (long long)twin_on_replaced).c_str() : "").c_str()
                    : "",
              path, fl.c_str());
     side_ = std::move(side);

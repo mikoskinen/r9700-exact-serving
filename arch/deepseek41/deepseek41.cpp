@@ -383,6 +383,12 @@ struct Layer {
      * both groups in one launch, each split K as alone, the split finisher writing quant_act_i8g's codes; = o_a + a8_bq to the
      * byte); 0 where no library serves it, two groups are not the model's, or RADIANCE_DS41_DSPARK_A8B=0 */
     rad_op o_ap = 0;
+    /* lever A8K (DRAFTER round 96): the query pass's kv on an int8 twin of the DLW's q8_0 kv (a sidecar's '<attn_kv>#pf', i8a8
+     * group 128; the context pass keeps the q8_0 wkv) -- its GEMM over the stage input's int8 pair, and PFX's read list with the
+     * twin in wkv's place; 0 where not declared */
+    rad_weight wkv8 = 0;
+    rad_op kv8 = 0, dpfx8 = 0;
+    std::vector<rad_weight> dpfx8_w;
     /* lever A8D fold (c) (round 95): pcn_a + a8_xq (the stage input's quantiser, stages past the first) as ONE op (libr4d
      * mhc_post_collapse_rmsnorm_i8g: pcn_a's pass with quant_act_i8g's codes of y; = pcn_a + a8_xq to the byte); 0 where no library
      * serves it or RADIANCE_DS41_DSPARK_A8B=0 */
@@ -2369,9 +2375,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dfz = fz && fz[0] == '1' && !fz[1] ? 1024 : 0;
         if (fz && *fz && !dfz && std::strcmp(fz, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DSF=%s is not 0 / 1: lever DSF not declared\n", fz);
+        const char* kz = std::getenv("RADIANCE_DS41_DSPARK_A8K");   /* lever A8K (round 96): 1 = on at start, 0 = declared, off */
+        const int dkz = kz && kz[0] == '1' && !kz[1] ? 2048 : 0;
+        if (kz && *kz && !dkz && std::strcmp(kz, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_A8K=%s is not 0 / 1: lever A8K not declared\n", kz);
         int unread = -1;
         g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk |
-                                                     dg | dz | dgz | dfz);
+                                                     dg | dz | dgz | dfz | dkz);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2461,6 +2471,23 @@ static int a8b_env() {
     if (!q || !*q) return 1;
     return !std::strcmp(q, "1") ? 1 : !std::strcmp(q, "0") ? 0 : -1;
 }
+/* Lever A8K (DRAFTER track round 96; Layer::wkv8 / kv8 / dpfx8; dspark_mhr + 2048): under A8D, the query pass's kv projection on an
+ * int8 TWIN of the DLW's q8_0 kv -- a sidecar entry '<blk.N.attn_kv.weight>#pf' (rtn int8 + a bf16 scale a (row, 128) from the
+ * container's bf16 original, drafter/kit/a8d/mk-a8k-sidecar.sh), served by gemm_nt_q i8a8 over the stage input's int8 pair (the
+ * pair q_a reads), unordered beside q_a as the q8_0 GEMM was. The context pass keeps the q8_0 wkv (its rows above 64 would take
+ * the prefill tile: kit/mes/pfx.cpp --bi8 2), and the query pass's own block keys are overwritten by the next context pass, so
+ * no key of one pass reaches another: rule B (proposals only; the narrow tile's kv rows are the same at every M, pfx --bi8 1 shape
+ * 6: 0 of 882 launches differ). Start env RADIANCE_DS41_DSPARK_A8K=1 sets the bit, =0 declares it off (in process: POST
+ * dspark_mhr X + 2048); unset declares nothing. One card (drafter/kit/mes/pfx.cpp orders p / q and l / m, 32 / 40 rows, the served
+ * stage forms after round 95, two runs): stage 0 -4.8..-6.9 / -3.4..-3.5 us, stages 1-2 -2.5..-3.0 / -2.6..-2.8 us host-timed = -9.8..-12.9
+ * / -8.8..-9.1 us a 16 / 8-seq pass. q_a + kv as ONE launch (a pair kernel, each weight split as alone: the same bytes) measured
+ * -1.3..+0.7 us a stage against the two unordered launches: not kept (drafter/out/r96-pair-libr4d-not-kept.diff). */
+static bool a8k_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_A8K");
+    return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
+}
+static bool a8k_now() { return (dmr_raw() & 2048) != 0; }
+static std::atomic<long long> g_a8k_passes{0};   /* the first-pass line */
 static std::atomic<int> g_dsp_swf{0};   /* lever DSF on GSE: the DSpark MoE's swfold_live word (1 / 0; set at each query pass) */
 static std::atomic<long long> g_dsf_passes{0};   /* the first-pass line */
 static bool pfx_env() {
@@ -2470,10 +2497,12 @@ static bool pfx_env() {
 static std::atomic<long long> g_pfx_passes{0};   /* the first-pass line */
 static void dpfx_issue(RadCtx* x, const Layer& L) {
     if (!L.dpfx) return;
+    const bool k8 = L.dpfx8 && L.kv8 && a8k_now();   /* lever A8K: the int8 kv twin in wkv's place */
+    const std::vector<rad_weight>& ws = k8 ? L.dpfx8_w : L.dpfx_w;
     RadOperand o[8];
-    const size_t n = std::min<size_t>(8, L.dpfx_w.size());
-    for (size_t i = 0; i < n; ++i) o[i] = RAD_W(L.dpfx_w[i]);
-    rad_issue(x, L.dpfx, o, (int)n, RAD_N_BATCH);
+    const size_t n = std::min<size_t>(8, ws.size());
+    for (size_t i = 0; i < n; ++i) o[i] = RAD_W(ws[i]);
+    rad_issue(x, k8 ? L.dpfx8 : L.dpfx, o, (int)n, RAD_N_BATCH);
 }
 /* On LANE 1, behind a join from lane 0, issued right BEFORE the collective (the read must not be issued behind it on lane 0: the
  * all-reduce is opaque to haz_mark, so the next lane-0 dispatch keeps its barrier bit and would start when the collective has
@@ -3393,7 +3422,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ||
                (value == 3 && g_sw_walk_ok.load(std::memory_order_relaxed) && g_sw_walk3_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 2047 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE; + 1024: lever DSF on GSE) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 4095 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE; + 1024: lever DSF on GSE; + 2048: lever A8K) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3532,7 +3561,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) + PFX / GSE / DSF (rounds 85 / 91 / 92) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) + PFX / GSE / DSF (rounds 85 / 91 / 92) + A8K (round 96) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5582,6 +5611,20 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
     L.wq_b = lw(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW, m.ar * HD,
                 (m.ar + 1) * HD);
     L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
+    L.wkv8 = 0;
+    if (a8d_env() > 0 && a8k_env()) {   /* lever A8K: the sidecar's int8 twin of the kv, where it holds one (P30t's name form) */
+        const std::string tn = std::string(nm.f("blk.%d.attn_kv.weight", l)) + kTwinSfx;
+        RadEncoding te{};
+        if (weight_enc(b, tn.c_str(), &te)) {
+            const char* tname = m.nm.ckpt("%s", tn.c_str());
+            L.wkv8 = lw(b, m, tname, hd, D, grp);
+            if (!L.wkv8 || !m.wsc.count(L.wkv8) || std::strcmp(m.wdt.at(L.wkv8), "i8a8") ||
+                iqr_grp(m, L.wkv8) != (int64_t)RAD_FP8_BLOCK) {
+                fprintf(stderr, "radiance: deepseek41: lever A8K: %s is not an int8 IQR view at group 128 (i8a8)\n", tname);
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+    }
     L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
     L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
                   m.ar * g.n_head, (m.ar + 1) * g.n_head);
@@ -5665,6 +5708,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
             L.a8_xq = a8_quant(b, Q, D, d.xn, d.a8xq, d.a8xs);
             L.q_a = iqr_gemm(b, m, Q, L.wq_a, c.q_lora, D, d.a8xq, d.a8xs, d.qr);
             L.kv_g = linear(b, m, Q, L.wkv, hd, D, d.xn, d.kv_);
+            L.kv8 = L.wkv8 ? iqr_gemm(b, m, Q, L.wkv8, hd, D, d.a8xq, d.a8xs, d.kv_) : 0;   /* lever A8K: beside it */
             L.q_an = a8_rmsq(b, m, Q, L.q_norm, c.q_lora, d.qr, d.a8qq, d.a8qs);
             L.q_b = iqr_gemm(b, m, Q, L.wq_b, HD, c.q_lora, d.a8qq, d.a8qs, d.q);
             if (!L.a8_xq) return RAD_E_INVAL;
@@ -5995,6 +6039,25 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             }
             rad_note(b, "DSpark lever A8D (RADIANCE_DS41_DSPARK_A8D): the stages' %d attention linears as gemm_nt_q i8a8 over the "
                         "drafter's own int8 pairs (rmsnorm_quant_i8g / quant_act_i8g), kv at q8_0", n_all - (int)d.st.size());
+            /* lever A8K (round 96): every stage's kv twin or none (a sidecar holds the three or none) */
+            int n_k8 = 0;
+            for (const Layer& L : d.st) n_k8 += L.wkv8 ? 1 : 0;
+            if (a8k_env()) {
+                if (n_k8 != 0 && n_k8 != (int)d.st.size()) {
+                    fprintf(stderr, "radiance: deepseek41: lever A8K: %d of the DSpark stages' %d kv linears have an int8 twin "
+                                    "('<attn_kv>#pf'): every stage or none\n", n_k8, (int)d.st.size());
+                    return RAD_E_UNSUPPORTED;
+                }
+                rad_note(b, n_k8 ? "DSpark lever A8K (RADIANCE_DS41_DSPARK_A8K): the query pass's kv on its int8 twin (gemm_nt_q i8a8 over "
+                                   "the stage input's pair), the context pass's on the DLW's q8_0"
+                                 : "lever A8K (RADIANCE_DS41_DSPARK_A8K): the sidecar holds no int8 kv twin -- not declared");
+                if (g.rank == 0 && !ctx->shape_probe)
+                    fprintf(stderr, "radiance: deepseek41: lever A8K (RADIANCE_DS41_DSPARK_A8K, fn4 dspark_mhr + 2048, now %s): %s\n",
+                            a8k_now() ? "on" : "off",
+                            n_k8 ? "the query pass's kv on its int8 twin '<attn_kv>#pf' in each stage, the context pass's at the DLW's "
+                                   "q8_0 (rule B: proposals only)"
+                                 : "not declared -- the sidecar holds no '<attn_kv>#pf' int8 twin");
+            }
             if (g.rank == 0 && !ctx->shape_probe)
                 fprintf(stderr, "radiance: deepseek41: lever A8D (RADIANCE_DS41_DSPARK_A8D=1): the DSpark stages' %d attention linears "
                                 "(q_a, q_b, o_a x %d, o_b) as int8 IQR views served by gemm_nt_q i8a8 in <= %lld-row launches, kv at "
@@ -6762,6 +6825,16 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             for (size_t i = 0; i < L.dpfx_w.size(); ++i) ps.push_back(RAD_INT(kBytes[i], (int64_t)64 << 20));
             const rad_op h = rad_decl_op(b, "prefetch_multi", ps.data(), (int)ps.size(), L.dpfx_w.data(), (int)L.dpfx_w.size());
             if (h && rad_op_resolved(b, h)) { L.dpfx = h; nd += L.dpfx_w.size(); }
+            /* lever A8K: the same list with the int8 kv twin in wkv's place (issued while the bit is on) */
+            L.dpfx8 = 0;
+            L.dpfx8_w.clear();
+            if (L.dpfx && L.kv8 && L.wkv8) {
+                L.dpfx8_w = L.dpfx_w;
+                for (rad_weight& w : L.dpfx8_w)
+                    if (w == L.wkv) w = L.wkv8;
+                const rad_op h8 = rad_decl_op(b, "prefetch_multi", ps.data(), (int)ps.size(), L.dpfx8_w.data(), (int)L.dpfx8_w.size());
+                if (h8 && rad_op_resolved(b, h8)) L.dpfx8 = h8;
+            }
         }
         rad_note(b, "DSpark lever PFX (RADIANCE_DS41_DSPARK_PFX): %zu of %zu stage attention weight reads declared%s", nd, nw,
                  lib ? "" : " (no prefetch_multi here: libr4d before round 85, or --weight-prefetch off)");
@@ -9548,8 +9621,14 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             const bool gqp = !a8 && gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
             if (a8) {
                 const int64_t G = RAD_FP8_BLOCK;
+                const bool k8 = L.kv8 && a8k_now();   /* lever A8K: the int8 twin over q_a's pair, unordered beside q_a as the q8_0 */
                 a8_gemm_issue(x, m, L.q_a, T, { d.a8xq, D, 0, D }, { d.a8xs, D / G, 0, D / G }, L.wq_a, { d.qr, c.q_lora, 0, c.q_lora });
-                lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));   /* q8_0 */
+                if (k8) a8_gemm_issue(x, m, L.kv8, T, { d.a8xq, D, 0, D }, { d.a8xs, D / G, 0, D / G }, L.wkv8, { d.kv_, c.head_dim, 0, c.head_dim });
+                else lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));   /* q8_0 */
+                if (k8 && g.rank == 0 && si == 0 && g_a8k_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+                    fprintf(stderr, "radiance: deepseek41: lever A8K: first query pass issued with kv on its int8 twin (gemm_nt_q i8a8 over "
+                                    "the stage input's pair, beside q_a) at %lld rows%s (counted at issue: a recorded pass once)\n", (long long)T,
+                            L.dpfx8 && pfx_now() ? "; PFX reads the twin in wkv's place" : "");
                 a8_rmsq_issue(x, L.q_an, T, brows(d.qr, T), L.q_norm, brows(d.a8qq, T), brows(d.a8qs, T));
                 a8_gemm_issue(x, m, L.q_b, T, { d.a8qq, c.q_lora, 0, c.q_lora }, { d.a8qs, c.q_lora / G, 0, c.q_lora / G }, L.wq_b,
                               { d.q, HD, 0, HD });
