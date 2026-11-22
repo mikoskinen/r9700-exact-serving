@@ -789,12 +789,23 @@ static __device__ __forceinline__ void x4_raw_frags(const unsigned (&a)[NPW], co
 // SWK (EXL3R4D_SWK 1, TIMING ONLY): a tile pair of k-steps as one 2:4 sparse matrix instruction a tile -- B (dense 32 x 16) = the
 // even step's decoded fragment then the odd step's (each lane's 8 + 8 halves of its column n), A = one activation fragment.
 typedef _Float16 swk_v16h __attribute__((ext_vector_type(16)));
+// The instruction as inline asm, NOT __builtin_amdgcn_swmmac_f32_16x16x32_f16_w32: this compiler declares the llvm.amdgcn.swmmac.*
+// intrinsics without `nocallback` (the dense llvm.amdgcn.wmma.* have it), so the AMDGPU attributor takes a kernel that calls one as
+// calling unknown code and gives it every implicit argument (hostcall buffer, heap, queue / dispatch pointers, multigrid, default
+// queue, completion action: kernarg 280 B) -- which the AQL backend refuses (core/device/aql.cpp: 'takes the implicit argument
+// hidden_hostcall_buffer') = perfmoe's 'launch failed rc=-15' on Xeon GPU2 (COORDINATOR 10:54 22.11.). The asm form emits the same
+// instruction on the same registers (host compile, tp8/dev/r66) with the served kernels' lean argument set. Its operands: D (= C,
+// tied), A (8 halves: two of every four K kept), B (16 halves), the index VGPR read at index_key 0.
+static __device__ __forceinline__ v8f swk_swmmac(v8h a, swk_v16h b, v8f c, int idx) {
+  asm("v_swmmac_f32_16x16x32_f16 %0, %1, %2, %3" : "+v"(c) : "v"(a), "v"(b), "v"(idx));
+  return c;
+}
 template <int NPW>
 static __device__ __forceinline__ void swk_pair(const v8h (&w0)[NPW], const v8h (&w1)[NPW], v8h af, v8f (&acc)[NPW], int idx) {
 #pragma unroll
   for (int j = 0; j < NPW; j++) {
     const swk_v16h b = __builtin_shufflevector(w0[j], w1[j], 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    acc[j] = __builtin_amdgcn_swmmac_f32_16x16x32_f16_w32(af, b, acc[j], idx);
+    acc[j] = swk_swmmac(af, b, acc[j], idx);
   }
 }
 // SWK 2: lane (h, n = lane % 16) holds row r = 8 h + v of the sparse product in acc[v] (token v's first K half for h 0, its
