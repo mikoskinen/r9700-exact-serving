@@ -322,6 +322,10 @@ static const RadParamSpec pRmsQuantFp8[] = { P_INT("M"), P_INT("n"), P_F64("eps"
                                              P_INT("group"), P_STR("dtype"), P_F64O("wadd") };
 static const RadOperandSpec oRmsQuantFp8[] = { OPD("x"), INOUT_O("residual"), WGT("w"),
                                                OUT("q"), OUT("scale"), OUT_O("out_bf16") };
+/* libr4d's rmsnorm_quant_i8g (r4d_rows.cpp pRmsNormQuantI8 / oRmsNormQuantI8, the same spellings) */
+static const RadParamSpec pRmsQuantI8g[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"), P_F64O("wadd") };
+static const RadOperandSpec oRmsQuantI8g[] = { OPD("x"), INOUT_O("residual"), WGT("w"), OUT("q"), OUT("scale"),
+                                               OUT_O("out_bf16"), WGT_O("w_post"), WGT_O("scalar") };
 static const RadParamSpec pGatedQuantFp8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
                                                P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGatedQuantFp8[] = { OPD("gate_up"), OUT("q"), OUT("scale"),
@@ -1555,6 +1559,9 @@ static const RadOpSchema kSchemas[] = {
   "E4M3 codes with one scale per column over all M rows: scale[c] = amax_r |x[r, c]| / 448 (1 for "
   "an all-zero column), y = clamp(x / scale, +-448). An attention's values for its fp8 P.V, where "
   "a column's scale multiplies out of the sum over keys." },
+{ "rmsnorm_quant_i8g", ARR(pRmsQuantI8g), ARR(oRmsQuantI8g),
+  "rmsnorm_quant_i8 with quant_act_i8g's quantiser on its pass: row-major int8 codes and an f32 scale per (row, 128 "
+  "columns); byte-identical to the chain ending in quant_act_i8g. out_bf16 may be x's own buffer." },
 { "rmsnorm_quant_fp8", ARR(pRmsQuantFp8), ARR(oRmsQuantFp8),
   "RMS norm with an optional residual add, then the E4M3 quantiser, in one pass. The residual "
   "add is STORED BEFORE THE VARIANCE READS IT, so the sum the norm is taken over is the bf16 "
@@ -2757,6 +2764,9 @@ SIMPLE("ref_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per
 SIMPLE("ref_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
        "RMS norm, optional residual add, and the E4M3 quantiser in one pass",
        "bf16 in, fp8_e4m3 out, f32 scale", ref_rmsnorm_quant_fp8),
+SIMPLE("ref_rmsnorm_quant_i8g", "rmsnorm_quant_i8g", "quant",
+       "RMS norm then quant_act_i8g's int8 quantiser in one pass (no residual junction weights)",
+       "bf16 in, i8 out, f32 scale per (row, 128)", ref_rmsnorm_quant_i8g),
 SIMPLE("ref_gated_quant_fp8", "gated_quant_fp8", "quant",
        "act(gate) * up over a packed [M, 2n] plane, then the E4M3 quantiser",
        "bf16 in, fp8_e4m3 out, f32 scale", ref_gated_quant_fp8),

@@ -143,6 +143,7 @@ int ref_had_quant_act_i8g  (const RadArgs*, RadStream);
 int ref_givens_dense_quant(const RadArgs*, RadStream);
 int ref_givens_rotate(const RadArgs*, RadStream);
 int ref_rmsnorm_quant_fp8  (const RadArgs*, RadStream);
+int ref_rmsnorm_quant_i8g  (const RadArgs*, RadStream);   /* libr4d's (DRAFTER lever A8D's host row) */
 int ref_gated_quant_fp8    (const RadArgs*, RadStream);
 int ref_gemm_nt_q_gated    (const RadArgs*, RadStream);
 int ref_dflash_select      (const RadArgs*, RadStream);
@@ -472,6 +473,7 @@ REF_SHAPE_FN(ref_had_quant_act_i8g);
 REF_SHAPE_FN(ref_givens_dense_quant);
 REF_SHAPE_FN(ref_givens_rotate);
 REF_SHAPE_FN(ref_rmsnorm_quant_fp8);
+REF_SHAPE_FN(ref_rmsnorm_quant_i8g);
 REF_SHAPE_FN(ref_gated_quant_fp8);
 REF_SHAPE_FN(ref_gemm_nt_q_gated);
 REF_SHAPE_FN(ref_dflash_select);

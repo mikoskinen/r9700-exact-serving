@@ -2669,6 +2669,22 @@ int ref_rmsnorm_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdD
     return o.finish("rmsnorm_quant_fp8", operand, out);
 }
 
+/* libr4d's rmsnorm_quant_i8g: int8 codes and an f32 scale per (row, 128 columns); the optional junction weights last */
+int ref_rmsnorm_quant_i8g_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });                       /* x */
+    o.t(D, { M, n });                       /* residual, inout */
+    o.t(D, { n });                          /* w, the gain */
+    o.t((uint32_t)RAD_I8, { M, n });        /* q */
+    o.t((uint32_t)RAD_F32, { M, scale_groups(n, 128) });   /* scale */
+    o.t((uint32_t)RAD_BF16, { M, n });      /* out_bf16 */
+    o.t(D, { n });                          /* w_post */
+    o.t(D, { 1 });                          /* scalar */
+    return o.finish("rmsnorm_quant_i8g", operand, out);
+}
+
 int ref_gated_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

@@ -705,7 +705,8 @@ static inline void fp8_row(const float* v, int64_t n, int64_t g, const RadTensor
  * Unlike ref_rmsnorm_add, the variance also uses the narrowed sum. `wadd` is added to each gain in
  * f32, as in ref_rmsnorm.
  */
-int ref_rmsnorm_quant_fp8(const RadArgs* a, RadStream) {
+/* `gforce` > 0: the group whatever the params say (rmsnorm_quant_i8g's schema has no `group`: 128, quant_act_i8g's). */
+static int rmsnorm_quant_rows(const RadArgs* a, int64_t gforce) {
     if (a->n_t < 5) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[2], *q = &a->t[3], *s = &a->t[4];
     const RadTensor* res = t_in(a, 1);
@@ -715,7 +716,7 @@ int ref_rmsnorm_quant_fp8(const RadArgs* a, RadStream) {
     const float   eps  = p_f32(a, "eps", 1e-6f);
     const float   wadd = p_f32(a, "wadd", 0.0f);
     if (n <= 0) return RAD_E_SHAPE;
-    int64_t g = p_int(a, "group", 0);
+    int64_t g = gforce > 0 ? gforce : p_int(a, "group", 0);
     if (g <= 0 || g > n) g = n;
     const int64_t ngrp = (n + g - 1) / g;
     const int64_t rows = numel(x) / n;
@@ -750,6 +751,18 @@ int ref_rmsnorm_quant_fp8(const RadArgs* a, RadStream) {
         fp8_row(v.data(), n, g, q, s, r);
     }
     return RAD_OK;
+}
+
+int ref_rmsnorm_quant_fp8(const RadArgs* a, RadStream) { return rmsnorm_quant_rows(a, 0); }
+
+/* ------------------------------------------------------------- rmsnorm_quant_i8g */
+/* libr4d's rmsnorm_quant_i8g (DRAFTER lever A8D's host row): the same pass with an int8 `q` (fp8_row then takes quant_act_i8g's
+ * codes, amax / 127) per (row, 128 columns), quant_act_i8g's group -- the norm, its bf16 narrowing, then the codes of those
+ * values, as the unfused rmsnorm + quant_act_i8g. The residual junction (w_post / scalar) is not served here. */
+int ref_rmsnorm_quant_i8g(const RadArgs* a, RadStream) {
+    if (a->n_t > 6 && ((a->t[6].data) || (a->n_t > 7 && a->t[7].data))) return RAD_E_UNSUPPORTED;
+    if (a->n_t < 5 || a->t[3].dtype != RAD_I8) return RAD_E_DTYPE;
+    return rmsnorm_quant_rows(a, 128);
 }
 
 /* ------------------------------------------------------------- gated_quant_fp8 */
