@@ -77,7 +77,7 @@ int qwen_hi(int i) {
          : i == kHcReadV ? 16383 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
          : i == kExl3PfPrep ? 2 : i == kMoePair ? 4 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 6 : i == kBiSeg ? 3
          : i == kArwRows ? 4096 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3
-         : i == kArFence ? 8 : i == kSpRoute ? 8191 : i == kRgTail ? 128 : i == kDraftDmask ? (1 << 30) - 1
+         : i == kArFence ? 8 : i == kSpRoute ? 16383 : i == kRgTail ? 128 : i == kDraftDmask ? (1 << 30) - 1
          : i == kExl3Drz ? 7 : i == kResumeCold ? 3   /* resume_cold 2: + a spanned chunk's last piece start (lever TIP); 3: every piece start (with lever GPF) */
          : 1;   /* exl3_drz 4..7: DRZ's reading values (exl3r4d accepts 0, 1, 4..7; F43) */
 }

@@ -325,6 +325,16 @@ struct Model {
     int64_t     bi_td = 0;       /* this step's decode rows */
     int64_t     bi_qd = 1;       /* rows a decode sequence (1 + n_spec) */
     std::vector<int64_t> bi_cut;
+    /* qfn-on-ds lever HCP (Qwen loop round 23, sp_route bit 8192; bi_segments sets it a step): a prefill segment's
+     * connection reads past the prompt's first interval at the K split of a FULL piece (HyperConn::op_read_sp), whatever
+     * the segment's rows -- hcp_pos0[i] the first position of segment [bi_cut[i], bi_cut[i + 1]) (-1: a decode segment or
+     * no host positions); hcp_pos_step a pure prefill step's first position (bi_cut empty: one read). hcp_n: reads pinned
+     * (rank 0's engine line). */
+    bool        hcp = false;
+    std::vector<int64_t> hcp_pos0;
+    int64_t     hcp_pos_step = -1;
+    mutable uint64_t hcp_n = 0;
+    bool        hcp_noted = false;
 };
 
 static Model g_model[MAX_RANKS];
@@ -421,6 +431,7 @@ static std::atomic<int>& fn4_biseg_flag() {
 }
 /* fn4 BI: the step's segments (Model::bi_cut) when hc_bi or bi_seg is on; the reads take them under hc_bi
  * (bi_read), every LinearFP8 under bi_seg (rad::arch::bi_cuts, this rank thread's, cleared at a step without). */
+static std::atomic<int>& fn4_sproute_flag();
 static void bi_segments(Model& m, const RadBatch* batch) {
     m.bi_mode = fn4_hcbi_flag().load(std::memory_order_relaxed);
     m.bi_on = m.bi_mode > 0;
@@ -429,10 +440,16 @@ static void bi_segments(Model& m, const RadBatch* batch) {
     m.bi_cut.clear();
     bi_cuts() = BiCuts{};
     bi_wide_rows() = 0;
-    if (!m.bi_on && !seg) return;
+    /* lever HCP (sp_route bit 8192): on for a trunk step with host positions (the core always hands them) */
+    m.hcp = (fn4_sproute_flag().load(std::memory_order_relaxed) & 8192) != 0 && batch->positions_h &&
+            batch->draft_pass == 0 && !batch->enc;
+    m.hcp_pos0.clear();
+    m.hcp_pos_step = -1;
     const int64_t T = batch->n_tok;
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
+    if (m.hcp && td == 0 && T > 0) m.hcp_pos_step = batch->positions_h[0];   /* a pure prefill step (the fallback reads) */
+    if (!m.bi_on && !seg) return;
     m.bi_td = td;
     m.bi_qd = sd > 0 && td % sd == 0 ? td / sd : 1;   /* a decode sequence's rows (1 + n_spec) */
     /* fn4 BI wide (bi_wide bit 1): the decode rows above the narrow band through the linears' gemm_nt_q_dec */
@@ -444,6 +461,35 @@ static void bi_segments(Model& m, const RadBatch* batch) {
             if (batch->positions_h[r] != batch->positions_h[r - 1] + 1) m.bi_cut.push_back(r);
     m.bi_cut.push_back(T);
     if (seg && m.bi_cut.size() > 2) bi_cuts() = BiCuts{m.bi_cut.data(), (int)m.bi_cut.size()};
+    if (m.hcp)
+        for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
+            m.hcp_pos0.push_back(m.bi_cut[i] >= td ? (int64_t)batch->positions_h[m.bi_cut[i]] : -1);
+}
+/* lever HCP (Qwen loop round 23, sp_route bit 8192; QUEUE Q44 lever TIF's premise): libr4d's hc_read splits the down product's
+ * K by the launch's row tiles (r4d_hc_bf16.hip hc_down_kchunk: a 2,038 / 2,048-row read 2 ways, 1,200 rows 3, 267 rows 9), so a
+ * prompt's rows read inside a 1,792-row last piece, a 2,038-row last piece or a 267-row tail step sum K in three orders, and
+ * every row after differs -- the reason a prefix hit is exact only where the cold run cut its chunk (resume_cold), and lever
+ * G's 256 cut moves the cold's bytes (g2k1 / tip0: lA 9 / 12). HCP reads every prefill segment that starts past the prompt's
+ * first interval (its first position >= a pass's rows) and has more than 64 rows (the 128-row tile, kTileMinRows) through
+ * op_read_sp: kc_rows = the full piece's rows (16 tiles), the split a full piece reads with today, whatever the segment's,
+ * whole or a rank's part (libr4d nrt_k: a part of > 64 rows at the 128-row tile). Full pieces keep their bytes; a shorter
+ * piece, a tail step and a hit's rows take the full piece's order, so where a row lies in which piece no longer moves it. A
+ * prompt's first interval (every newcomer shorter than a pass) is never pinned: no resume point lies inside it. Off = today. */
+static bool hcp_seg_ok(const Model& m, int64_t a) {
+    if (!m.hcp) return false;
+    const int64_t R = m.pass_rows > 0 ? m.pass_rows : 2048;
+    if (m.bi_cut.size() < 2 || m.hcp_pos0.size() + 1 != m.bi_cut.size()) return m.hcp_pos_step >= R;
+    for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
+        if (a >= m.bi_cut[i] && a < m.bi_cut[i + 1]) return m.hcp_pos0[i] >= R;
+    return false;
+}
+/* a prefill read of rows [a, a + n) of segment row `a0`'s: through op_read_sp where HCP pins it */
+static bool hcp_pins(const Model& m, const HyperConn& h, int64_t a0, int64_t n) {
+    return n > 64 && h.op_read_sp && n <= h.c.read_rows && hcp_seg_ok(m, a0);
+}
+static void hcp_read(RadCtx* c, const Model& m, const HyperConn& h, int64_t T, int64_t a, int64_t n, bool ss) {
+    if (hcp_pins(m, h, a, n)) { h.read_sp(c, T, a, n, ss); ++m.hcp_n; return; }
+    h.read(c, T, a, n, ss);
 }
 /* fn4 BI (switch bi_seg 2): the lm_head at each output row's ALONE height class. logits_gemm (fp8 / i8 head) runs a
  * matvec at M <= 2 and WMMA from M = 3; within WMMA a row's bytes do not depend on M (lm_wmma_body: each 128-column scale
@@ -491,7 +537,7 @@ static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
 constexpr int64_t kBiDecRows = 8;
 static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t a, int64_t b, bool ss) {
     const bool dec = m.bi_mode >= 3 && a < m.bi_td;
-    if (!dec) { hcx.read(c, T, a, b - a, ss); return; }
+    if (!dec) { hcp_read(c, m, hcx, T, a, b - a, ss); return; }   /* lever HCP: past the first interval, a full piece's K split */
     /* hc_bi 5 (12.11.2026, 199: hc_bi 3's 8-row reads cost 15.7 % at c16): the decode rows in one launch through the
      * twin (libr4d bi_dec: form G in 8-row groups, B3 in 16-row groups; each row's bytes as at 3). */
     if (m.bi_mode == 5 && hcx.op_read_bd) {
@@ -507,7 +553,7 @@ static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t
     for (int64_t p = a; p < b; p += pc) hcx.read(c, T, p, std::min(pc, b - p), ss);
 }
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
-    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) { hcx.read(c, T, r0, n, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) { hcp_read(c, m, hcx, T, r0, n, ss); return; }
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
         const int64_t a = std::max(m.bi_cut[i], r0), b = std::min(m.bi_cut[i + 1], r0 + n);
         if (b > a) bi_read_seg(c, m, hcx, T, a, b, ss);
@@ -515,7 +561,13 @@ static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, 
 }
 /* read_pieces under hc_bi: each segment in pieces of the read's band. */
 static void bi_read_pieces(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, bool ss = false) {
-    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) { hcx.read_pieces(c, T, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode >= 3 && m.bi_td > 0))) {
+        if (!m.hcp) { hcx.read_pieces(c, T, ss); return; }
+        const int64_t pr = hcx.c.read_rows;   /* lever HCP: read_pieces' pieces, each through hcp_read */
+        if (pr <= 0 || T <= pr) { hcp_read(c, m, hcx, T, 0, T, ss); return; }
+        for (int64_t r0 = 0; r0 < T; r0 += pr) hcp_read(c, m, hcx, T, r0, T - r0 < pr ? T - r0 : pr, ss);
+        return;
+    }
     const int64_t piece = hcx.c.read_rows > 0 ? hcx.c.read_rows : T;
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
         for (int64_t a = m.bi_cut[i]; a < m.bi_cut[i + 1]; a += piece)
@@ -2451,9 +2503,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
     auto hrm = [&](const HyperConn& h, int64_t p, bool ss, bool on) {
         if (hqnm(p, on) <= 0) return;
-        if (sp_pm(p, on) && rn(p) != R) h.read_kt(c, hq0m(p, on), hqnm(p, on), rn(p), ss);   /* lever PSP: the piece's own split */
+        /* lever HCP: a partial piece's rows (a rank's part under PSP, or the piece whole) at the full piece's split */
+        if (sp_pm(p, on) && rn(p) != R) {
+            if (hcp_pins(m, h, r0(p), hqnm(p, on))) { h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss); ++m.hcp_n; }
+            else h.read_kt(c, hq0m(p, on), hqnm(p, on), rn(p), ss);   /* lever PSP: the piece's own split */
+        }
         else if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
-        else h.read(c, T, hq0m(p, on), hqnm(p, on), ss);
+        else hcp_read(c, m, h, T, hq0m(p, on), hqnm(p, on), ss);
     };
     auto hr = [&](const HyperConn& h, int64_t p, bool ss) { hrm(h, p, ss, spL); };
     /* SP's collectives on piece p of a_x (the block output; the next block input) and of the wide stream */
@@ -3116,7 +3172,8 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto rd = [&](const HyperConn& h, const SpSer::Run& r, bool ss) {
         for (const SpSer::Part& p : r.mine) {
             if (p.dec)             bi_read_seg(c, m, h, T, p.a, p.a + p.n, ss);
-            else if (p.n == p.seg) h.read(c, T, p.a, p.n, ss);
+            else if (p.n == p.seg) hcp_read(c, m, h, T, p.a, p.n, ss);   /* lever HCP: the full piece's split */
+            else if (hcp_pins(m, h, p.a, p.n)) { h.read_sp(c, T, p.a, p.n, ss); ++m.hcp_n; }
             else                   h.read_kt(c, p.a, p.n, p.seg, ss);
         }
     };
@@ -3325,6 +3382,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
                         brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
                         brows(m.b_logits, batch->n_out));
         bt_pt(c, m, m.b_logits, 0, batch->n_out, "logits", -1, 1);
+    }
+    if (m.hcp && !m.hcp_noted && m.g.rank == 0 && (m.hcp_n > 0 || !m.mixer.op_read_sp)) {   /* lever HCP: said once */
+        m.hcp_noted = true;
+        if (m.mixer.op_read_sp)
+            fprintf(stderr, "radiance: qwen4exp: lever HCP (sp_route bit 8192): a prefill segment past the prompt's first interval "
+                            "reads its connections at a full piece's K split (op_read_sp, kc_rows %lld) whatever its rows -- first "
+                            "in a %lld-row step at position %lld, %llu reads pinned so far\n",
+                    (long long)m.mixer.c.read_rows, (long long)batch->n_tok, (long long)m.hcp_pos_step,
+                    (unsigned long long)m.hcp_n);
+        else
+            fprintf(stderr, "radiance: qwen4exp: lever HCP (sp_route bit 8192) is INERT: the connections have no op_read_sp "
+                            "(RADIANCE_FN4_SPHC=1 at start with a span declares it)\n");
     }
     bt_flush(c, m, batch);
     bi_cuts() = BiCuts{};   /* fn4 BI: the cuts are this trunk step's only */
@@ -3575,7 +3644,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 8191) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes), 4096: lever GPF (a two-piece step's mixer a piece at a time only where its last piece is wider than 64 rows; other bytes for (R, <= 64)-row steps) */
+        if (value < 0 || value > 16383) return -1;   /* 8192: lever HCP (a prefill segment past the first interval reads its connections at a full piece's K split, op_read_sp; other bytes for partial pieces / tail and hit steps); bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes), 4096: lever GPF (a two-piece step's mixer a piece at a time only where its last piece is wider than 64 rows; other bytes for (R, <= 64)-row steps) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);

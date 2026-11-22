@@ -13289,6 +13289,128 @@ TEST(flashnext_gpf_runs_a_two_piece_step_whole_when_its_last_piece_is_narrow) {
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds lever HCP (Qwen loop round 23, sp_route bit 8192; QUEUE Q44 lever TIF's premise): libr4d's hc_read splits K by the
+ * launch's row tiles, so a row read inside a 1,792-row last piece, a 2,038-row one or a 267-row tail step sums in three orders.
+ * With the bit every connection read of a prefill segment that starts past the prompt's first interval (position >= a pass)
+ * and has more than 64 rows goes through op_read_sp (kc_rows = the full piece's rows): the same issues, row counts and order,
+ * only the op handle moves from op_read / op_read_kt[t] to op_read_sp -- a two-piece step (2,048 + 1,792 at 10,240, PSP on),
+ * a 267-row tail step at 14,080 (whole, or SP-serial parts), a mixed step's prefill segment at 4,096 under hc_bi 5 (its decode
+ * reads unchanged), a three-piece step. Negative controls: a prompt's first interval (1,170 rows at 0) issues the same list;
+ * the bit off pins nothing; a mixed step without hc_bi (one read over decode + prefill rows) is never pinned. No step fails. */
+TEST(flashnext_hcp_reads_a_prefill_segment_past_the_first_interval_at_a_full_pieces_split) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    using List = std::vector<std::pair<rad_op, int64_t>>;
+    struct Sets { std::set<rad_op> sp, other; };
+    auto run = [&](const std::vector<int>& dq, int pq, int32_t ctx0, int hcbi, int sps, bool hcp, Sets* sets) -> List {
+        const int rank = 1;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        List o;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) return o;
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        CHECK(m.pipe_on);
+        if (sets) {
+            *sets = Sets{};
+            auto add = [&](const rad::arch::HyperConn& h) {
+                if (h.op_read_sp) sets->sp.insert(h.op_read_sp);
+                if (h.op_read) sets->other.insert(h.op_read);
+                for (int t = 2; t <= rad::arch::HyperConn::kSpTiles; ++t)
+                    if (h.op_read_kt[t] && h.op_read_kt[t] != h.op_read_sp) sets->other.insert(h.op_read_kt[t]);
+            };
+            for (const auto& l : m.layers) { add(l.hc_mix); add(l.hc_ffn); }
+            add(m.mixer);
+        }
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_hcbi_flag().store(hcbi);
+        qwen4exp_fp8::fn4_spser_flag().store(sps);
+        qwen4exp_fp8::fn4_sproute_flag().store(hcp ? 512 | 8192 : 512);
+        const auto pf = kit(b, dq, { pq }, ctx0);
+        pf->b.positions_h = pf->pos.data();
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_spser_flag().store(0);
+        qwen4exp_fp8::fn4_hcbi_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        CHECK(c.step_fail.empty());
+        for (const RecIssue& i : c.issues) o.push_back({ i.op, i.n });
+        return o;
+    };
+    /* the moves on -> off: every differing issue is a > 64-row read moved from op_read / op_read_kt to op_read_sp; returns
+     * their count (-1 on any other difference); `left`: the on list's reads still outside op_read_sp at > 64 rows */
+    auto moved = [](const List& off, const List& on, const Sets& s, int* left) -> int {
+        if (off.size() != on.size()) return -1;
+        int n = 0;
+        if (left) *left = 0;
+        for (size_t i = 0; i < off.size(); ++i) {
+            if (left && s.other.count(on[i].first) && on[i].second > 64) ++*left;
+            if (off[i] == on[i]) continue;
+            if (off[i].second != on[i].second || on[i].second <= 64 || !s.other.count(off[i].first) || !s.sp.count(on[i].first))
+                return -1;
+            ++n;
+        }
+        return n;
+    };
+    Sets s;
+    (void)run({}, 1170, 0, 0, 0, false, &s);
+    REQUIRE(!s.sp.empty());
+    REQUIRE(!s.other.empty());
+    for (int hcbi : { 0, 5 }) {
+        {   /* a two-piece step, its last piece 1,792 rows (PSP: SP, its parts read_kt(1,792) without the bit) */
+            const List off = run({}, 2048 + 1792, 10240, hcbi, 0, false, nullptr), on = run({}, 2048 + 1792, 10240, hcbi, 0, true, nullptr);
+            int left = -1;
+            CHECK(moved(off, on, s, &left) > 0);
+            CHECK_EQ(left, 0);
+        }
+        {   /* three pieces (2,048 + 2,048 + 300): the partial one pinned, the full ones keep their split (a moved handle only) */
+            const List off = run({}, 4096 + 300, 10240, hcbi, 0, false, nullptr), on = run({}, 4096 + 300, 10240, hcbi, 0, true, nullptr);
+            int left = -1;
+            CHECK(moved(off, on, s, &left) > 0);
+            CHECK_EQ(left, 0);
+        }
+        for (int sps : { 0, 1 }) {   /* a 267-row tail step at 14,080: whole, or SP-serial parts (hc_bi 5) */
+            const List off = run({}, 267, 14080, hcbi, sps, false, nullptr), on = run({}, 267, 14080, hcbi, sps, true, nullptr);
+            int left = -1;
+            CHECK(moved(off, on, s, &left) > 0);
+            CHECK_EQ(left, 0);
+        }
+        {   /* negative control: a prompt's first interval is never pinned */
+            const List off = run({}, 1170, 0, hcbi, 1, false, nullptr), on = run({}, 1170, 0, hcbi, 1, true, nullptr);
+            CHECK(on == off);
+        }
+        {   /* a mixed step: four decode sequences of 4 rows + a 500-row chunk at 4,096 */
+            const List off = run({ 4, 4, 4, 4 }, 500, 4096, hcbi, 1, false, nullptr), on = run({ 4, 4, 4, 4 }, 500, 4096, hcbi, 1, true, nullptr);
+            const int mv = moved(off, on, s, nullptr);
+            if (hcbi == 5) CHECK(mv > 0);    /* its prefill segment's reads */
+            else           CHECK_EQ(mv, 0);  /* one read over decode + prefill rows: never pinned */
+        }
+    }
+    {   /* the bit off pins nothing: off == off */
+        const List a = run({}, 267, 14080, 5, 1, false, nullptr), b2 = run({}, 267, 14080, 5, 1, false, nullptr);
+        CHECK(a == b2);
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's
