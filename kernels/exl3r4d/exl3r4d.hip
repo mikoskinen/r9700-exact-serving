@@ -167,6 +167,7 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #define EXL3R4D_X6_VDOT 0   // live row of the run broadcast in its lane half (v_permlane16, 4 dwords) and 4 x NPW v_dot2_f32_f16 into the row's
 #endif                      // own f32 accumulator; TIMING ONLY (the accumulators are folded into acc unordered: wrong outputs). 0 = served.
                             // 2 = the same dots with real outputs (the rows' sums moved into the D layout at the loop's end): rule B.
+                            // 3 = 2 with the K loop run once a 4-row window of the run (4 rows unrolled, not 16: a smaller kernel).
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -704,6 +705,29 @@ static __device__ __forceinline__ void decode_frags_k25(const unsigned (&R0)[NPW
 // X6w (EXL3R4D_X6_VDOT 1, TIMING ONLY): a k-step's dots without the WMMA -- lane l (column l % 16, k half l / 16) holds its 8
 // decoded weights; each of the run's nrv rows' 8 activations of the same k positions sit in lane 16 (l / 16) + r of the B
 // fragment, broadcast to the lane half by v_permlane16 (selector nibbles all r), then 4 v_dot2_f32_f16 a tile into vacc[j][r].
+// X6w VDOT 3: the same dots over a window of RW rows from row rg (the K loop runs once a window: rows rg .. rg + RW - 1)
+template <int NPW, int RW>
+static __device__ __forceinline__ void x6w_vdotw(const v8h (&wf)[NPW], v8h af, float (&vacc)[NPW][RW], int nrv, int rg) {
+  union { v8h f; unsigned u[4]; } a;
+  a.f = af;
+  union { v8h f; v2h h[4]; } w[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) w[j].f = wf[j];
+#pragma unroll
+  for (int r = 0; r < RW; r++) {
+    if (rg + r < nrv) {   // wave-uniform
+      const unsigned sel = 0x11111111u * (unsigned)(rg + r);
+      v2h xb[4];
+#pragma unroll
+      for (int q = 0; q < 4; q++)
+        xb[q] = __builtin_bit_cast(v2h, (unsigned)__builtin_amdgcn_permlane16(a.u[q], a.u[q], sel, sel, false, false));
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int q = 0; q < 4; q++) vacc[j][r] = __builtin_amdgcn_fdot2(w[j].h[q], xb[q], vacc[j][r], false);
+    }
+  }
+}
 template <int NPW>
 static __device__ __forceinline__ void x6w_vdot(const v8h (&wf)[NPW], v8h af, float (&vacc)[NPW][16], int nrv) {
   union { v8h f; unsigned u[4]; } a;
@@ -1016,6 +1040,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // X6w (EXL3R4D_X6_VDOT 1, TIMING ONLY): the run's rows' own dot accumulators
   [[maybe_unused]] float vacc[NPW][16];
   [[maybe_unused]] const int nrv = min(chunk, r1 - rc);
+  [[maybe_unused]] float vacc4[NPW][4];   // X6w VDOT 3: one 4-row window's dots
   if constexpr (EXL3R4D_X6_VDOT && (X3D || K25 != K25_OFF)) {
 #pragma unroll
     for (int j = 0; j < NPW; j++)
@@ -1224,7 +1249,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       v8h wfs_[NPW];                                                                 \
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(x0_, x1_, wfs_);           \
       else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
-      if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
+      if constexpr (EXL3R4D_X6_VDOT == 3) x6w_vdotw<NPW, 4>(wfs_, A_, vacc4, nrv, rg_); /* X6w: a window's dots */ \
+      else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
@@ -1253,7 +1279,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       v8h wfs_[NPW];                                                                 \
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(r0_, r1_, wfs_);           \
       else decode_frags_k25<NPW, FOLD>(r0_, r1_, wfs_);                              \
-      if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
+      if constexpr (EXL3R4D_X6_VDOT == 3) x6w_vdotw<NPW, 4>(wfs_, A_, vacc4, nrv, rg_); /* X6w: a window's dots */ \
+      else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
@@ -1282,6 +1309,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     }                                                                                \
   } while (0)
 
+  // X6w VDOT 3: the K loop once a 4-row window of the run (rows rg_ .. rg_ + 3; one pass at <= 4 rows); otherwise once
+  const int rg_end_ = EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF) ? nrv : 1;
+  for (int rg_ = 0; rg_ < rg_end_; rg_ += 4) {
+  if constexpr (EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF)) {
+#pragma unroll
+    for (int j = 0; j < NPW; j++)
+#pragma unroll
+      for (int r = 0; r < 4; r++) vacc4[j][r] = 0.f;
+  }
   // Loads are unconditional (the step index clamps to the last one): with a branch around the prefetch, the
   // compiler cannot count the loads in flight on the join and waits for ALL of them before the next WMMA, which
   // serialized the prefetch with the math every other step (exl3_moe_wmma.hip:714-716; FACTS-exl3 trap 11).
@@ -1311,6 +1347,25 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #pragma unroll
   for (int u = 0; u < PF - 1; u++)  // the last kps % PF steps, already loaded into stages 0..
     if (ks + u < kps) EXL3_COMPUTE(wb[u], ab[u]);
+  if constexpr (EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF)) {   // the window's rows into the D layout (VDOT 2's move)
+    const int hh = lane >> 4;
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+      if (rg_ + r < nrv) {   // wave-uniform
+#pragma unroll
+        for (int j = 0; j < NPW; j++) {
+          const float o = swap16(vacc4[j][r]);
+          const float full = hh ? o + vacc4[j][r] : vacc4[j][r] + o;
+#pragma unroll
+          for (int e = 0; e < 8; e++) {
+            const float t = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((8 * hh + e) * 4, __builtin_bit_cast(int, full)));
+            if ((lane & 15) == rg_ + r) acc[j][e] = t;
+          }
+        }
+      }
+    }
+  }
+  }   // X6w VDOT 3's windows
 #undef EXL3_LOAD
 #undef EXL3_COMPUTE
 #undef WOFF_
