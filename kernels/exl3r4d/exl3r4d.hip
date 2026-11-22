@@ -168,6 +168,14 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #endif                      // own f32 accumulator; TIMING ONLY (the accumulators are folded into acc unordered: wrong outputs). 0 = served.
                             // 2 = the same dots with real outputs (the rows' sums moved into the D layout at the loop's end): rule B.
                             // 3 = 2 with the K loop run once a 4-row window of the run (4 rows unrolled, not 16: a smaller kernel).
+#ifndef EXL3R4D_SWK  // SWK (tp8 DECODE round 64, QUEUE X12): 1 = the X3D / K25U K loops' WMMA PAIRS (k-steps 2i and 2i + 1 of a tile) as
+#define EXL3R4D_SWK 0   // ONE gfx1201 2:4 sparse v_swmmac_f32_16x16x32_f16 -- A = the odd step's activation fragment (the even step's A
+#endif                  // load is dead and dropped: one A fragment a 32-deep step, as the real form's), B = the two steps' decoded
+                        // fragments (16 halves a lane, 512 weights an instruction), a lane-made index VGPR; an odd kps's last step one
+                        // dense WMMA. TIMING ONLY (wrong outputs): the issue count and register shape of lever SWK. 0 = served.
+#ifndef EXL3R4D_SWK_BLK  // SWK: the rows a pass of the X3D / K25U kernels (16 = served; 8 = the real form's tile: 8 tokens x 2 rows),
+#define EXL3R4D_SWK_BLK 16  // so a timing-only build can carry the real form's pass count (an expert of 9-16 rows decodes twice)
+#endif
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -761,6 +769,17 @@ static __device__ __forceinline__ void x4_raw_frags(const unsigned (&a)[NPW], co
     out[j] = x.f;
   }
 }
+// SWK (EXL3R4D_SWK 1, TIMING ONLY): a tile pair of k-steps as one 2:4 sparse matrix instruction a tile -- B (dense 32 x 16) = the
+// even step's decoded fragment then the odd step's (each lane's 8 + 8 halves of its column n), A = one activation fragment.
+typedef _Float16 swk_v16h __attribute__((ext_vector_type(16)));
+template <int NPW>
+static __device__ __forceinline__ void swk_pair(const v8h (&w0)[NPW], const v8h (&w1)[NPW], v8h af, v8f (&acc)[NPW], int idx) {
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const swk_v16h b = __builtin_shufflevector(w0[j], w1[j], 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    acc[j] = __builtin_amdgcn_swmmac_f32_16x16x32_f16_w32(af, b, acc[j], idx);
+  }
+}
 static __device__ __forceinline__ v8f x4_mma(v8h wf, v8h af, v8f c) {
 #if EXL3R4D_ABLATE_MMA
   union { v8h f; unsigned u[4]; } w, a;
@@ -831,7 +850,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   const int vl = RAW ? (int)blockIdx.x * p.tpw + col_local * NPW : col_local * NPW;
   // non-RAW: local tile 0 .. 8 MATS - 1 of this 128-column block; RAW: a tile of the [MATS][ntiles] space
   const int mat = RAW ? vl / ntiles : vl / 8, nt0 = RAW ? vl % ntiles : cb * 8 + vl % 8;
-  const int chunk = APREP ? p.chunk : EXL3_BLOCK;
+  const int chunk = APREP ? p.chunk : (X3D || K25 != K25_OFF) ? EXL3R4D_SWK_BLK : EXL3_BLOCK;   // SWK_BLK: 16 = served
 
   // This lane's row of the 16-row block: in the run or not, and live (sorted_tok >= 0) or dropped. The load is
   // unconditional (clamped to the chunk's first row, which is in the run).
@@ -1041,6 +1060,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   [[maybe_unused]] float vacc[NPW][16];
   [[maybe_unused]] const int nrv = min(chunk, r1 - rc);
   [[maybe_unused]] float vacc4[NPW][4];   // X6w VDOT 3: one 4-row window's dots
+  static_assert(!(EXL3R4D_SWK && EXL3R4D_X6_VDOT), "SWK: the WMMA K loop only (VDOT 0)");
+  [[maybe_unused]] v8h swk_prev[NPW];   // SWK (TIMING ONLY): the even k-step's decoded fragments, multiplied with the odd step's
+  [[maybe_unused]] const int swk_idx = (int)((lane & 1) ? 0xEEEEEEEEu : 0x44444444u);   // SWK: a lane-made index VGPR (timing only)
   if constexpr (EXL3R4D_X6_VDOT && (X3D || K25 != K25_OFF)) {
 #pragma unroll
     for (int j = 0; j < NPW; j++)
@@ -1251,10 +1273,18 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
       if constexpr (EXL3R4D_X6_VDOT == 3) x6w_vdotw<NPW, 4>(wfs_, A_, vacc4, nrv, rg_); /* X6w: a window's dots */ \
       else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
+      else if constexpr (EXL3R4D_SWK == 1) { /* SWK: the even step's fragments wait for the odd step's (u = the step's parity) */ \
+        if ((u & 1) == 0) { _Pragma("unroll") for (int j = 0; j < NPW; j++) swk_prev[j] = wfs_[j]; }                \
+        else swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                         \
+      }                                                                              \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
-      if constexpr (EXL3R4D_X6_SGB == 1 && !EXL3R4D_X6_VDOT) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
+      if constexpr (EXL3R4D_X6_SGB == 1 && EXL3R4D_SWK == 1) { /* SWK under the served pin: loads, decode, then the pair's SWMMACs */ \
+        __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + 2, 0);                \
+        __builtin_amdgcn_sched_group_barrier(0x002, 32 * NPW, 0);                   \
+        if (u & 1) __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);             \
+      } else if constexpr (EXL3R4D_X6_SGB == 1 && !EXL3R4D_X6_VDOT) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
         __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + 2, 0);                \
         __builtin_amdgcn_sched_group_barrier(0x002, 32 * NPW, 0);                   \
         __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);                        \
@@ -1281,6 +1311,10 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else decode_frags_k25<NPW, FOLD>(r0_, r1_, wfs_);                              \
       if constexpr (EXL3R4D_X6_VDOT == 3) x6w_vdotw<NPW, 4>(wfs_, A_, vacc4, nrv, rg_); /* X6w: a window's dots */ \
       else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
+      else if constexpr (EXL3R4D_SWK == 1) { /* SWK: as the X3D path */            \
+        if ((u & 1) == 0) { _Pragma("unroll") for (int j = 0; j < NPW; j++) swk_prev[j] = wfs_[j]; }                \
+        else swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                         \
+      }                                                                              \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
@@ -1371,6 +1405,13 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   } else {
     [[maybe_unused]] constexpr int rg_ = 0;
     EXL3_KLOOP();
+    if constexpr (EXL3R4D_SWK == 1 && (X3D || K25 != K25_OFF)) {   // SWK: an odd kps's last (even) step has no partner: one dense WMMA
+      static_assert(PF % 2 == 0, "SWK: the step's parity is u's (ks advances by an even PF)");
+      if (kps & 1) {
+#pragma unroll
+        for (int j = 0; j < NPW; j++) acc[j] = mma(swk_prev[j], ab[0], acc[j]);
+      }
+    }
   }
 #undef EXL3_KLOOP
 #undef EXL3_LOAD
@@ -1666,7 +1707,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
       if (G == 1) return;
       continue;
     }
-    for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+    for (int rc = run.r0; rc < run.r1; rc += EXL3R4D_SWK_BLK)
       moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true, K25_OFF, FOLD>(p, w, rc, run.r1, lds, tk0,
                                                                          G == 1 ? -1 : cb);
   }
@@ -1706,7 +1747,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_
       if (G == 1) return;
       continue;
     }
-    for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+    for (int rc = run.r0; rc < run.r1; rc += EXL3R4D_SWK_BLK)
       moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE, FOLD>(p, w, rc, run.r1, lds, tk0,
                                                                                          G == 1 ? -1 : cb);
   }
@@ -1772,7 +1813,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdx_
       const int cb = cg * G + g;
       if (cb >= ncb) break;
       if (cb * 128 >= width) { zero_rows(p, r0, r1, cb); continue; }
-      for (int rc = r0; rc < r1; rc += EXL3_BLOCK) {
+      for (int rc = r0; rc < r1; rc += EXL3R4D_SWK_BLK) {
         if constexpr (MODE == 0) moe_pass<2, 2, 1, false, false, 0, false, 0, false, true>(p, w, rc, r1, lds, 0, cb);
         else moe_pass<EXL3R4D_K25, 2, 1, false, false, 0, false, 0, false, false, K25_U4>(p, w, rc, r1, lds, 0, cb);
       }
