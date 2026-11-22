@@ -570,7 +570,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
                   ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f
-                  ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk ds41a8f ds41a8b)
+                  ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk ds41a8f ds41a8b ds41dtkg)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -627,6 +627,7 @@ else()
                 ${R4D_EMU}/test_ds41tsk.cpp
                 ${R4D_EMU}/test_ds41a8f.cpp
                 ${R4D_EMU}/test_ds41a8b.cpp
+                ${R4D_EMU}/test_ds41dtkg.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -666,7 +667,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk ds41a8f ds41a8b)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk ds41a8f ds41a8b ds41dtkg)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -728,6 +729,9 @@ if(R4D_EMU_BUILT)
   # Lever GSE (DRAFTER round 91; DECODE review round 64 = QUEUE W30): the GLU gate_up (moe_gemm_mxil_glu) against drafter_mx 7's
   # IL gate_up + swiglu_clamped, byte for byte into the down's input.
   set_tests_properties(r4d_emu_ds41glu PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # Lever DTKG (DRAFTER round 110; DECODE review round 71 = QUEUE W40): the DSpark router's in-process top KE of a top-3 call against a
+  # call declared top-KE, every fused form, the chain's selection, the row gate and the trunk untouched, byte for byte.
+  set_tests_properties(r4d_emu_ds41dtkg PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
   # Lever TSK (served ds41_tsk 2): the compressing layers' decode-band attention in key chunks + merge -- batch invariance
   # (a row alone / in another pass = inside the pass), determinism, ds41_tsk 2 / 3 = 1, packed = bf16, the declines.
   set_tests_properties(r4d_emu_ds41tsk PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)

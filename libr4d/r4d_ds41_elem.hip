@@ -39,6 +39,9 @@
 #include <mutex>
 #include <type_traits>
 #include <utility>
+#ifdef R4D_EMU_HOST
+#include <vector>   /* rgk_scratch's host block (tests/r4d_emu) */
+#endif
 
 #ifndef R4D_EMU_HOST
 /* split_ctr's counter blocks (r4d_gemm_fp8a8.hip), for mhc_mix's one-launch form */
@@ -2067,8 +2070,15 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowkey_kernel(
 constexpr long kRgkRows = 64, kRgkExperts = 384;
 unsigned long long* rgk_scratch(RadStream s, const void* lg) {
 #ifdef R4D_EMU_HOST
-    (void)s; (void)lg;
-    return nullptr;
+    /* the host emulator: a host block a (stream, logits) as below, so forms 21 / 22 (RGK's keyed rows, RGM / RGD's WMMA logits) run
+     * there too (tests/r4d_emu/test_ds41dtkg.cpp, tp8 loop QUEUE W40; before, the emulator took form 19 / NOMEM for them) */
+    static std::mutex mu;
+    static std::map<std::pair<RadStream, const void*>, std::vector<unsigned long long>> blocks;
+    const auto key = std::make_pair(s, lg);
+    std::lock_guard<std::mutex> lk(mu);
+    auto& b = blocks[key];
+    if (b.empty()) b.assign((size_t)kRgkRows * kRgkExperts * (8 + 4) / 8, 0ull);
+    return b.data();
 #else
     static std::mutex mu;
     static std::map<std::pair<RadStream, const void*>, unsigned long long*> blocks;
