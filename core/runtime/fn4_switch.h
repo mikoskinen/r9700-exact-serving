@@ -655,6 +655,13 @@
  *                   word is in both sets; the merge's maximum is the global argmax, the lower id on a tie): rule A. Read at every
  *                   sampler run (live issue). Unset: 1 where RADIANCE_SAMPLE_NARROW=1 at start (which declares the narrow chain),
  *                   else 0; 1 needs that env. A follower switch (each node's own sampler); one machine takes it.
+ *   exl3_x6w        exl3r4d (X6w, tp8 loop DECODE round 62 = QUEUE X6w-S; plugin ds41-x6w-rt; 117 here, after sample_narrow): 0
+ *                   (today) or 1 -- the decode band's X3D-F (K = 2) and K25U (K = 2.5: gate_up G3, down U4) kernels with the K loop's
+ *                   WMMAs replaced by per-row v_dot2_f32_f16 dots over 4-row windows of a run (each row's two half sums joined in
+ *                   one order, moved into the WMMA's D layout; split-K, epilogue unchanged): a row's bytes depend on its own
+ *                   activations and the weights alone, NOT the WMMA form's bytes -- rule B (user 18.11.; COORDINATOR 02:43
+ *                   22.11.: its own reference, deterministic and the same alone and beside load). -1 when no loaded object serves
+ *                   it (an exl3r4d before ds41-x6w-rt). A plugin switch: a pipeline's follower takes it from its leader.
  *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
@@ -891,7 +898,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
               kExl3Xr, kSchedTailInner, kStageLone, kDraftCostAge, kDraftShortBlk, kDs41Prefetch, kDs41AttnDec, kDs41Sphc,
               kDs41SphcAttn, kDs41SphcSeg, kPpBgRoom, kPpBgJoinMs, kDs41Twin, kDs41Tsk, kDraftHeadCut,
-              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kAqlCik, kHostSlack, kPpTbandBound, kSampleNarrow, kSwitches };
+              kPpFolReserve, kPpLeadSeg, kPpSegSet, kExl3X3dPf, kPpTband, kPpMerge, kPpMergeMs, kPpRband, kSchedSrf, kAqlHdp, kDs41Csplit, kSchedLaneRoom, kPpSendAsh, kAqlWaitk, kAqlIka, kDs41Rr1, kDsparkMhr, kDsparkHs, kHostSpin, kPpBgSplit, kAqlCik, kHostSlack, kPpTbandBound, kSampleNarrow, kExl3X6w, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

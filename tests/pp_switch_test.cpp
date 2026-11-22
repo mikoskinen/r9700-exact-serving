@@ -301,7 +301,7 @@ TEST(sched_lane_room_is_the_leaders_alone_after_ds41_csplit) {
     const int i = fn4::switch_index("sched_lane_room");
     REQUIRE(i == (int)fn4::kSchedLaneRoom);
     CHECK_EQ(i, (int)fn4::kDs41Csplit + 1);
-    CHECK_EQ(i + 13, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
+    CHECK_EQ(i + 14, (int)fn4::kSwitches);   /* tp8 loop P46: pp_send_ash 105 after it; W1s: aql_waitk 106; W3s: aql_ika 107 */
     CHECK(!fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -321,7 +321,7 @@ TEST(pp_send_ash_follows_the_leaders_request_after_sched_lane_room) {
     const int i = fn4::switch_index("pp_send_ash");
     REQUIRE(i == (int)fn4::kPpSendAsh);
     CHECK_EQ(i, (int)fn4::kSchedLaneRoom + 1);
-    CHECK_EQ(i + 12, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
+    CHECK_EQ(i + 13, (int)fn4::kSwitches);   /* tp8 loop W1s: aql_waitk 106 after it; W3s: aql_ika 107 */
     CHECK(fn4::follower_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
     std::vector<int32_t> value(fn4::kSwitches, 0);
@@ -343,7 +343,7 @@ TEST(aql_waitk_follows_the_leaders_request_after_pp_send_ash) {
     const int i = fn4::switch_index("aql_waitk");
     REQUIRE(i == (int)fn4::kAqlWaitk);
     CHECK_EQ(i, (int)fn4::kPpSendAsh + 1);
-    CHECK_EQ(i + 11, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
+    CHECK_EQ(i + 12, (int)fn4::kSwitches);   /* tp8 loop W3s: aql_ika 107 after it */
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -381,7 +381,7 @@ TEST(aql_ika_follows_the_leaders_request_after_aql_waitk) {
     const int i = fn4::switch_index("aql_ika");
     REQUIRE(i == (int)fn4::kAqlIka);
     CHECK_EQ(i, (int)fn4::kAqlWaitk + 1);
-    CHECK_EQ(i + 10, (int)fn4::kSwitches);
+    CHECK_EQ(i + 11, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_AQL_IKA") == nullptr);
@@ -416,7 +416,7 @@ TEST(dspark_mhr_and_dspark_hs_follow_the_leaders_request_after_ds41_rr1) {
     REQUIRE(h == (int)fn4::kDsparkHs);
     CHECK_EQ(m, (int)fn4::kDs41Rr1 + 1);
     CHECK_EQ(h, m + 1);
-    CHECK_EQ(h + 7, (int)fn4::kSwitches);
+    CHECK_EQ(h + 8, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(m));
     CHECK(fn4::follower_switch(h));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -444,7 +444,7 @@ TEST(host_spin_follows_the_leaders_request_after_dspark_hs) {
     const int i = fn4::switch_index("host_spin");
     REQUIRE(i == (int)fn4::kHostSpin);
     CHECK_EQ(i, (int)fn4::kDsparkHs + 1);
-    CHECK_EQ(i + 6, (int)fn4::kSwitches);
+    CHECK_EQ(i + 7, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
     std::vector<int32_t> value(fn4::kSwitches, 0);
@@ -478,7 +478,7 @@ TEST(pp_bg_split_is_the_leaders_and_the_follower_leaves_it) {
     const int i = fn4::switch_index("pp_bg_split");
     REQUIRE(i == (int)fn4::kPpBgSplit);
     CHECK_EQ(i, (int)fn4::kHostSpin + 1);
-    CHECK_EQ(i + 5, (int)fn4::kSwitches);
+    CHECK_EQ(i + 6, (int)fn4::kSwitches);
     CHECK(!fn4::follower_switch(i));
     CHECK(fn4::sched_switch(i));
     std::string e;
@@ -504,7 +504,7 @@ TEST(aql_cik_follows_the_leaders_request_after_pp_bg_split) {
     const int i = fn4::switch_index("aql_cik");
     REQUIRE(i == (int)fn4::kAqlCik);
     CHECK_EQ(i, (int)fn4::kPpBgSplit + 1);
-    CHECK_EQ(i + 4, (int)fn4::kSwitches);
+    CHECK_EQ(i + 5, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_AQL_CIK") == nullptr);
@@ -536,7 +536,7 @@ TEST(host_slack_follows_the_leaders_request_after_aql_cik) {
     const int i = fn4::switch_index("host_slack");
     REQUIRE(i == (int)fn4::kHostSlack);
     CHECK_EQ(i, (int)fn4::kAqlCik + 1);
-    CHECK_EQ(i + 3, (int)fn4::kSwitches);
+    CHECK_EQ(i + 4, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_HOST_SLACK") == nullptr);
@@ -568,7 +568,7 @@ TEST(pp_tband_bound_follows_the_leaders_request_after_host_slack) {
     const int i = fn4::switch_index("pp_tband_bound");
     REQUIRE(i == (int)fn4::kPpTbandBound);
     CHECK_EQ(i, (int)fn4::kHostSlack + 1);
-    CHECK_EQ(i + 2, (int)fn4::kSwitches);
+    CHECK_EQ(i + 3, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
@@ -602,7 +602,7 @@ TEST(sample_narrow_follows_the_leaders_request_after_pp_tband_bound) {
     const int i = fn4::switch_index("sample_narrow");
     REQUIRE(i == (int)fn4::kSampleNarrow);
     CHECK_EQ(i, (int)fn4::kPpTbandBound + 1);
-    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK_EQ(i + 2, (int)fn4::kSwitches);
     CHECK(fn4::follower_switch(i));
     CHECK(!fn4::sched_switch(i));
     REQUIRE(std::getenv("RADIANCE_SAMPLE_NARROW") == nullptr);
@@ -626,6 +626,35 @@ TEST(sample_narrow_follows_the_leaders_request_after_pp_tband_bound) {
     CHECK_EQ(fn4::sample_narrow(), 0);   /* set to 0 above: the switch, not the env */
     CHECK(fn4::check("sample_narrow", 1, &e));
     unsetenv("RADIANCE_SAMPLE_NARROW");
+}
+
+/* tp8 loop DECODE round 62 (QUEUE X6w-S): exl3_x6w is switch 117, after sample_narrow, the exl3r4d plugin's (X6w's per-row dots
+ * in the decode band, rule B) -- a plugin switch, so a pipeline's follower takes it from its leader; not the scheduler's; with no
+ * exl3r4d loaded (this process) nothing serves it: a request is refused with a reason on the leader and NAMED as skipped on a
+ * follower (never applied as a core value), and its value reads -1 (unserved). */
+TEST(exl3_x6w_is_the_exl3r4d_plugins_switch_after_sample_narrow) {
+    const int i = fn4::switch_index("exl3_x6w");
+    REQUIRE(i == (int)fn4::kExl3X6w);
+    CHECK_EQ(i, 117);
+    CHECK_EQ(i, (int)fn4::kSampleNarrow + 1);
+    CHECK_EQ(i + 1, (int)fn4::kSwitches);
+    CHECK(std::string(fn4::switch_name(i)) == "exl3_x6w");
+    CHECK(fn4::follower_switch(i));
+    CHECK(!fn4::sched_switch(i));
+    std::string e;
+    CHECK(!fn4::check("exl3_x6w", 1, &e));
+    CHECK(!e.empty());
+    CHECK(fn4::check("bogus_x6w", 1, &e) == false);
+    CHECK(e.find("exl3_x6w") != std::string::npos);   /* the unknown-switch reason lists it */
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    std::vector<std::string> skipped;
+    count[(size_t)i] = 1;
+    value[(size_t)i] = 1;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 0);
+    CHECK_EQ(taken[(size_t)i], 1u);
+    REQUIRE(skipped.size() == 1u);
+    CHECK(skipped[0].rfind("exl3_x6w", 0) == 0);
 }
 
 RAD_TEST_MAIN()
