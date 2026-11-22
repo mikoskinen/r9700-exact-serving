@@ -1483,7 +1483,7 @@ extern int g_xm_on;
 int xm_cu_count();
 template <class K>
 unsigned xm_pg_grid(K kern, unsigned grid, unsigned thr, unsigned lds) {
-    if (!g_xm_pg && g_xm_on < 6) return grid;   /* drafter_mx 6 / 7 */
+    if (!g_xm_pg && g_xm_on < 6) return grid;   /* drafter_mx 6 / 7 / 8 */
     int nb = 0;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kern, (int)thr, (size_t)lds) != hipSuccess || nb < 1) return grid;
     const long long cap = (long long)nb * xm_cu_count();
@@ -1503,8 +1503,10 @@ int xm_launch_wil(RadStream s, int PD, const MxMrArgs& A, unsigned grid, unsigne
     /* lever XWO (round 28; drafter_mx 7): the gate_up (PD 9's caller) at 12 waves a SIMD = 99 VGPRs, PD 4, 6 blocks a WGP at the
      * resident grid -- tools/dbench, five lq168 record sets, A B A B: pass -2.8..-6.4 % at 32 rows, +0.3..-6.5 % at 40 vs drafter_mx 6
      * (the same bytes: PD only moves when a block's words are loaded) */
-    if (PD == 9 && g_xm_on == 7)
+    if (PD == 9 && g_xm_on == 7)   /* + lever WCN (round 87, the same bytes) */
         return R4D_EMIT(s, (xm_wm_kernel<1, 1, 4, 16, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 4, 16, 1>, grid, thr, lds)), dim3(thr), lds, A);
+    if (PD == 9 && g_xm_on == 8)   /* drafter_mx 8 (round 87): 7's gate_up WITHOUT lever WCN (the in-process A of a pair run) */
+        return R4D_EMIT(s, (xm_wm_kernel<1, 1, 4, 80, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 4, 80, 1>, grid, thr, lds)), dim3(thr), lds, A);
     if (PD == 9) return R4D_EMIT(s, (xm_wm_kernel<1, 1, 9, 0, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 9, 0, 1>, grid, thr, lds)), dim3(thr), lds, A);
 #define XM_WIL(pd) if (PD == pd) return R4D_EMIT(s, (xm_wm_kernel<1, 1, pd, 0, 1>), dim3(grid), dim3(thr), lds, A);
     XM_WIL(2) XM_WIL(6) XM_WIL(9) XM_WIL(12) XM_WIL(16)
@@ -1733,9 +1735,12 @@ __global__ __launch_bounds__(128) void xm_a8_kernel(MxMrArgs A) { R4D_IKA_ENTRY_
 /* ------------------------------------------------------------------ the switch, the pin, the rule */
 int env_drafter_mx() {
     const char* v = std::getenv("RADIANCE_DS41_DRAFTER_MX");
-    const int on = (v && *v >= '1' && *v <= '7' && !v[1]) ? *v - '0' : 0;
+    const int on = (v && *v >= '1' && *v <= '8' && !v[1]) ? *v - '0' : 0;
     if (v && *v && !on && std::strcmp(v, "0"))
-        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3 / 4 / 5 / 6 / 7: the stock MXFP4 grouped GEMM\n", v);
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_DRAFTER_MX=%s is not 0 / 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8: the stock MXFP4 grouped GEMM\n", v);
+    if (on == 8)
+        std::fprintf(stderr, "radiance: libr4d: moe_gemm_mxil takes drafter_mx 7's forms WITHOUT lever WCN (RADIANCE_DS41_DRAFTER_MX=8, the fn4 switch "
+                             "drafter_mx 8: the same bytes; the A arm of WCN's A / B)\n");
     if (on == 7)
         std::fprintf(stderr, "radiance: libr4d: moe_gemm_mxil takes drafter_mx 6's forms with the gate_up at 12 waves a SIMD, 4 blocks in flight a lane "
                              "(RADIANCE_DS41_DRAFTER_MX=7, the fn4 switch drafter_mx 7, lever XWO: drafter_mx 2's bytes; on the 17-byte rows = 6)\n");
@@ -1771,7 +1776,7 @@ int g_xm_il = 0;                          /* lever WIL (bench hook r4d_mx_mr_il)
 }  // namespace
 
 int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
-void r4d_mx_mr_set(int on) { g_xm_on = on >= 2 && on <= 7 ? on : (on ? 1 : 0); }
+void r4d_mx_mr_set(int on) { g_xm_on = on >= 2 && on <= 8 ? on : (on ? 1 : 0); }   /* 8 (round 87): 7 without lever WCN */
 int r4d_mx_mr_get() { return g_xm_on; }
 
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
