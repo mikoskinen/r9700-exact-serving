@@ -3758,11 +3758,26 @@ int a_stream_cu_keep(RadStream rs, int keep, int* out_cus) {
     }
     std::vector<uint32_t> g(nbits / 32u, 0u);
     int got = -1;
-    if (hsa_amd_queue_cu_get_mask(s->q, nbits, g.data()) == HSA_STATUS_SUCCESS) {
+    const hsa_status_t gs = hsa_amd_queue_cu_get_mask(s->q, nbits, g.data());
+    if (gs == HSA_STATUS_SUCCESS) {
         got = 0;
         for (uint32_t w : g) got += __builtin_popcount(w);
     }
     if (out_cus) *out_cus = got;
+    /* F66 (bgl4 / bgl5: the read-back counted 64 of 64): every word set and read back, the agent's CU count and both statuses,
+     * once a device, so a mask the runtime did not keep is named from the log */
+    {
+        static std::atomic<uint32_t> said{0};
+        const uint32_t bit = 1u << (s->ord & 31);
+        if (!(said.fetch_or(bit) & bit)) {
+            std::string ws, wg;
+            for (size_t i = 0; i < m.size(); ++i) ws += fmt("%s%08x", i ? " " : "", m[i]);
+            for (size_t i = 0; i < g.size(); ++i) wg += fmt("%s%08x", i ? " " : "", g[i]);
+            RAD_INFO("device %d: CU keep %d of %u CUs: hsa_amd_queue_cu_set_mask(%u bits) = %d, set [%s], "
+                     "hsa_amd_queue_cu_get_mask = %d, read back [%s] (%d bits on)", s->ord, keep, n_cu, nbits, (int)st, ws.c_str(),
+                     (int)gs, wg.c_str(), got);
+        }
+    }
     return st == HSA_STATUS_CU_MASK_REDUCED ? 1 : RAD_OK;
 }
 
