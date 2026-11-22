@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <string>
@@ -271,6 +272,10 @@ public:
     void set_policy(std::unique_ptr<CheckpointPolicy> p);
     /* The drafter's refill window (CheckpointPolicy::set_floor), held across set_policy. */
     void set_drafter_floor(int64_t tokens);
+    /* qfn-on-ds F72 (Qwen loop round 27; RADIANCE_PREFIX_UNREST=1 at start, off = today): insert() retires a publisher's
+     * own snapshots that rest on an entry the cache keeps another publisher's copy of (see Stats::unrested). Tests set it. */
+    void set_unrest(bool on) { unrest_ = on; }
+    bool unrest() const { return unrest_; }
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
@@ -384,7 +389,7 @@ public:
      * read by its forward by now, and the ones it reserved have been saved into (the engine
      * issues the save before the next step is planned); until this call they keep their slots
      * against retention, reserve_checkpoint's eviction and expiry. */
-    void begin_step() { handed_.clear(); reserved_.clear(); }
+    void begin_step();
 
     /* ---------------- expiry ----------------
      *
@@ -458,6 +463,10 @@ public:
         /* Entries whose bytes a later publisher's took over (republish): no snapshot rested on
          * the first copy, and the publisher's snapshots rest on its own. */
         int64_t republished = 0;
+        /* qfn-on-ds F72 (Qwen loop round 27): a publisher's own snapshots retired because an entry below them keeps another
+         * publisher's bytes (pinned under another snapshot, or read by a live sequence, so republish could not take it): a
+         * hit would resume their state over bytes they were not computed from. */
+        int64_t unrested = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -486,6 +495,9 @@ private:
     };
     struct Ckpt {
         uint64_t  session = 0;
+        /* F72: the request whose step computed this state (the reserving session); take_over re-indexes `session` for
+         * retention, this stays */
+        uint64_t  owner = 0;
         int64_t   pos = 0;
         BlockHash prefix;
         int32_t   slot = -1;
@@ -560,6 +572,7 @@ private:
     std::vector<int32_t> per_;            /* blocks of groups_[i] an entry holds */
     std::vector<int32_t> entry_groups_;   /* the group of each of an entry's blocks */
     bool        has_linear_ = false;
+    bool        unrest_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST"); return e && *e && *e != '0'; }();
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;
     mutable std::list<BlockHash> lru_;    /* front = oldest; resident entries only */
@@ -587,6 +600,15 @@ private:
     bool reserved(const BlockHash& h) const {
         return std::find(reserved_.begin(), reserved_.end(), h) != reserved_.end();
     }
+    /* F72: snapshots insert() found resting on bytes the cache does not hold while they were handed out or reserved this
+     * step: invalid from then on, retired at their commit or at the next begin_step. */
+    std::vector<BlockHash> unrested_;
+    bool unrested(const BlockHash& h) const {
+        return std::find(unrested_.begin(), unrested_.end(), h) != unrested_.end();
+    }
+    /* F72: retire the snapshots `owner` computed on chain `hs` deeper than entry `kept_b` (they rest on its own copy of an
+     * entry the cache holds another publisher's bytes for), whichever session indexes them now; returns how many. */
+    int64_t retire_unrested(uint64_t owner, const std::vector<BlockHash>& hs, int64_t kept_b);
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;
     int64_t drafter_floor_ = 0;

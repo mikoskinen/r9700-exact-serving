@@ -462,6 +462,10 @@ int PrefixCache::insert(uint64_t session,
         if (d != ck_by_prefix_.end()) under = d->second.pos / block_size_;
     }
     int64_t taken = 0;
+    /* qfn-on-ds F72: the first entry below `under` that keeps a copy which is not this request's -- pinned under another
+     * publisher's snapshot, or one republish() cannot move (a live sequence reads it, a copy out, off the card). This
+     * request's snapshots deeper on the chain were computed from ITS copy, so they go (retire_unrested below). */
+    int64_t kept_b = -1;
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
@@ -479,6 +483,8 @@ int PrefixCache::insert(uint64_t session,
         if (it != map_.end() && (it->second.in_lru || has_linear_)) {
             if (b < under && !it->second.pinned && republish(h, it->second, blocks, b, now))
                 ++taken;
+            else if (unrest_ && b < under && kept_b < 0 && !(it->second.in_lru && holds_own(it->second, blocks, b)))
+                kept_b = b;                                                /* F72 */
             continue;                                                      /* touched below */
         }
         if (it != map_.end()) {
@@ -515,6 +521,16 @@ int PrefixCache::insert(uint64_t session,
     }
     /* Deepest first, as in lookup: the first block ends most recent. */
     for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);
+    /* F72: no snapshot of this request stays deeper than an entry the cache holds another copy of; nothing then rests on
+     * this request's copies past that entry, so they are not pinned below either. */
+    if (kept_b >= 0) {
+        const int64_t gone = retire_unrested(session, hs, kept_b);
+        RAD_INFO("prefix cache: session %llu: entry %lld (token %lld) keeps another publisher's bytes (a snapshot rests on "
+                 "them or a live sequence reads them); %lld of this request's snapshots deeper on the chain, computed from "
+                 "its own copy, retired", (unsigned long long)session, (long long)kept_b,
+                 (long long)(kept_b * block_size_), (long long)gone);
+        if (under > kept_b) under = kept_b;
+    }
     /* The snapshot rests on what the cache now holds wherever that is this request's own copy
      * (published, adopted or taken over above); those bytes stay from here on. */
     for (int64_t b = 0; b < under; ++b) {
@@ -1019,7 +1035,7 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     }
 
     Ckpt c;
-    c.session = session; c.pos = pos; c.prefix = prefix; c.slot = slot;
+    c.session = session; c.owner = session; c.pos = pos; c.prefix = prefix; c.slot = slot;
     c.used = c.made = ++clock_;
     c.used_ns = rad_mono_ns();
     ck_by_prefix_.emplace(prefix, c);
@@ -1037,6 +1053,13 @@ void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
     reserved_.erase(std::remove(reserved_.begin(), reserved_.end(), prefix), reserved_.end());
     auto it = ck_by_prefix_.find(prefix);
     if (it == ck_by_prefix_.end()) return;
+    if (unrested(prefix)) {   /* F72: its chain's bytes are another publisher's now */
+        unrested_.erase(std::remove(unrested_.begin(), unrested_.end(), prefix), unrested_.end());
+        const uint64_t sess = it->second.session;
+        retire_ckpt(it);
+        unindex_ckpt(sess, prefix);
+        return;
+    }
     /* One that lost its slot since the reservation holds nothing to serve. */
     if (it->second.slot < 0) return;
     it->second.valid = true;
@@ -1046,6 +1069,48 @@ void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
 
 
 /* ------------------------------------------------------------------ the linear half of a session */
+
+void PrefixCache::begin_step() {
+    handed_.clear();
+    reserved_.clear();
+    /* F72: snapshots found unrested while handed out or reserved: their step is over (read, or saved and committed). */
+    for (const BlockHash& h : unrested_) {
+        auto it = ck_by_prefix_.find(h);
+        if (it == ck_by_prefix_.end()) continue;
+        const uint64_t sess = it->second.session;
+        retire_ckpt(it);
+        unindex_ckpt(sess, h);
+    }
+    unrested_.clear();
+}
+
+int64_t PrefixCache::retire_unrested(uint64_t owner, const std::vector<BlockHash>& hs, int64_t kept_b) {
+    std::vector<BlockHash> keys;
+    for (const auto& kvp : ck_by_prefix_) {
+        const Ckpt& c = kvp.second;
+        const int64_t p = c.pos;
+        if (c.owner != owner || p <= kept_b * block_size_ || p % block_size_ != 0 || p / block_size_ > (int64_t)hs.size() ||
+            hs[(size_t)(p / block_size_ - 1)] != kvp.first)
+            continue;
+        keys.push_back(kvp.first);
+    }
+    int64_t n = 0;
+    for (const BlockHash& k : keys) {
+        auto it = ck_by_prefix_.find(k);
+        if (it == ck_by_prefix_.end()) continue;
+        ++n;
+        ++stats_.unrested;
+        if (handed(k) || reserved(k)) {   /* in use this step: invalid now, retired when its step is over */
+            it->second.valid = false;
+            if (!unrested(k)) unrested_.push_back(k);
+            continue;
+        }
+        const uint64_t sess = it->second.session;   /* the index it is under now (take_over may have moved it) */
+        retire_ckpt(it);
+        unindex_ckpt(sess, k);
+    }
+    return n;
+}
 
 void PrefixCache::retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator it) {
     if (it == ck_by_prefix_.end()) return;

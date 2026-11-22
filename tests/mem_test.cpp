@@ -4971,6 +4971,67 @@ TEST(a_head_a_short_prompt_published_first_takes_the_bytes_a_longer_prompts_snap
     CHECK_EQ(x.f.pc.stats().republished, 2ll);
 }
 
+/* qfn-on-ds F72 (Qwen loop round 27; test t4p1 on gpu02): a hit must not resume a snapshot over bytes it was not computed
+ * from. A long request recomputes a head another request published (that one still live, so republish cannot take the
+ * entry; or pinned under that one's snapshot) and commits snapshots from ITS copy; the cache keeps the other copy. Today
+ * (unrest off) a hit of the long chain resumes at the long request's snapshot over the other copy -- t4p1's re-sent root
+ * answered otherwise than cold. With RADIANCE_PREFIX_UNREST (set_unrest) insert() retires those snapshots: the hit resumes
+ * where the bytes under it are the ones its state saw (none with a live reader; the pinning publisher's own at 16), and the
+ * long request's snapshots at or below the first kept entry would stay. Both reasons a copy stays (live reader, pinned) and the control (unrest off) are read. */
+TEST(f72_a_snapshot_is_not_resumed_over_another_publishers_copy_of_its_head) {
+    for (int reason : { 0, 1 }) {          /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+        for (bool on : { false, true }) {
+            TierFixture x;
+            CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            x.f.pc.set_unrest(on);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            /* the other publisher: the head (entries 0 and 1) and its own tail */
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            if (reason == 1) {             /* a snapshot of its own at 16 rests on entry 0: pinned */
+                const auto okeys = chain_of(other);
+                CHECK_OK(x.f.kv.add_sequence(1));
+                CHECK_OK(x.f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(x.f, 1, okeys, 16);
+                std::vector<std::vector<int32_t>> bt;
+                for (int32_t g : x.f.pc.cached_groups()) bt.push_back(x.f.kv.block_table(1, g));
+                CHECK_OK(x.f.pc.insert(1, other, {}, bt, (int64_t)other.size()));
+                x.f.kv.free_sequence(1);   /* not live: only the pin keeps its copy */
+            } else {
+                publish(x.f, 1, other, (int64_t)other.size());   /* sequence 1 stays live on the head */
+            }
+            /* the long request: its own blocks, snapshots at 16 (on entry 0 only) and at 320, then the publish */
+            CHECK_OK(x.f.kv.add_sequence(2));
+            CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+            ckpt_at(x.f, 2, keys, 320);
+            CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+            /* entry 0 stays the other's in both cases; under the pin (reason 1) entry 1 rests on no snapshot and is taken */
+            CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 0ll);
+            std::vector<std::vector<int32_t>> hit;
+            const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+            REQUIRE(hit.size() == 1u && hit[0].size() >= 2u);
+            CHECK(hit[0][0] != mine[0]);                     /* the cache's head is the other publisher's */
+            if (!on) {
+                CHECK_EQ(h.n_linear_tokens, 320);            /* today: resumes over bytes its state never saw (F72) */
+                CHECK_EQ(x.f.pc.stats().unrested, 0ll);
+            } else {
+                /* no snapshot over the other copy: none at all (live reader), or the other's own at 16 (pinned) */
+                CHECK_EQ(h.n_linear_tokens, reason ? 16 : 0);
+                CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+                /* the long request's 320 is gone; the pinning publisher's 16 stays (insert's take_over indexes it under 2) */
+                const auto left = x.f.pc.checkpoints(2);
+                CHECK(std::find(left.begin(), left.end(), (int64_t)320) == left.end());
+                CHECK_EQ(left.size(), reason ? 1u : 0u);
+            }
+            if (reason == 0) x.f.kv.free_sequence(1);
+            x.f.kv.free_sequence(2);
+        }
+    }
+}
+
 TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
     /* The old copy goes only when nothing else reads it: a running sequence that adopted the
      * short request's head may have snapshots of its own resting on it. */
