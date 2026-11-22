@@ -587,6 +587,67 @@ __device__ __forceinline__ void xw_stage(const MxMrArgs& A, uint8_t* xs, int r0,
     }
 }
 
+/* xw_stage for NT 1 with the thread's token hoisted (DRAFTER round 87, lever WCN): at NT 1 a thread's unit row n = idx & 15 is the
+ * same at every idx (256 threads), so its token (one dependent load of `sorted`) is read once an item, not once a slab; the same
+ * values staged in the same places. */
+__device__ __forceinline__ void xw_stage1(const MxMrArgs& A, uint8_t* xs, int tok, int b0, int b1) {
+    const int np = (b1 - b0) * 64;
+    for (int idx = (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
+        const int n = idx & 15, jh = (idx >> 4) & 3, bb = idx >> 6;
+        r4d_u32x4 o = { 0u, 0u, 0u, 0u };
+        if (tok >= 0) {
+            const int q = 8 * (jh >> 1) + 4 * (jh & 1);
+            const uint16_t* p = A.x + (long long)tok * A.x_ld + (long long)(b0 + bb) * 32 + q;
+            uint32_t d0, d1, e0, e1;
+            if (A.x_al) {
+                const uint2 a = *(const uint2*)(const void*)p;
+                const uint2 c = *(const uint2*)(const void*)(p + 16);
+                d0 = a.x; d1 = a.y; e0 = c.x; e1 = c.y;
+            } else {
+                d0 = ldg_u16(p) | (ldg_u16(p + 1) << 16); d1 = ldg_u16(p + 2) | (ldg_u16(p + 3) << 16);
+                e0 = ldg_u16(p + 16) | (ldg_u16(p + 17) << 16); e1 = ldg_u16(p + 18) | (ldg_u16(p + 19) << 16);
+            }
+            o[0] = (d0 & 0xffffu) | (e0 << 16);
+            o[1] = (d0 >> 16) | (e0 & 0xffff0000u);
+            o[2] = (d1 & 0xffffu) | (e1 << 16);
+            o[3] = (d1 >> 16) | (e1 & 0xffff0000u);
+        }
+        *(r4d_u32x4*)(xs + (((bb * 2 + (jh >> 1)) * 2 + (jh & 1)) * 16 + n) * 16) = o;
+    }
+}
+
+/* Lever WCN's staging pipeline (round 87): slab s + 1's activations (16 blocks, NT 1, 256 threads: 4 units a thread at blocks
+ * tid / 64 + 4 k) loaded into registers while slab s is computed, packed and stored after the slab -- unconditional loads (a dead
+ * row reads row 0 and stores zeros), so the wait before the store counts the weight loads behind them. The same values in the
+ * same places as xw_stage / xw_stage1. Needs x_al, SS 16, UK % 16 == 0. */
+__device__ __forceinline__ void xw_ld16(const MxMrArgs& A, int tok, int b0, r4d_u32x4 (&rg)[4]) {
+    const int t = (int)threadIdx.x, jh = (t >> 4) & 3, q = 8 * (jh >> 1) + 4 * (jh & 1);
+    const uint16_t* base = A.x + (long long)(tok >= 0 ? tok : 0) * A.x_ld + q;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint16_t* p = base + (long long)(b0 + (t >> 6) + 4 * k) * 32;
+        const uint2 a = *(const uint2*)(const void*)p;
+        const uint2 c = *(const uint2*)(const void*)(p + 16);
+        rg[k][0] = a.x; rg[k][1] = a.y; rg[k][2] = c.x; rg[k][3] = c.y;
+    }
+}
+__device__ __forceinline__ void xw_st16(uint8_t* xs, int tok, const r4d_u32x4 (&rg)[4]) {
+    const int t = (int)threadIdx.x, n = t & 15, jh = (t >> 4) & 3;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int bb = (t >> 6) + 4 * k;
+        const uint32_t d0 = rg[k][0], d1 = rg[k][1], e0 = rg[k][2], e1 = rg[k][3];
+        r4d_u32x4 o = { 0u, 0u, 0u, 0u };
+        if (tok >= 0) {
+            o[0] = (d0 & 0xffffu) | (e0 << 16);
+            o[1] = (d0 >> 16) | (e0 & 0xffff0000u);
+            o[2] = (d1 & 0xffffu) | (e1 << 16);
+            o[3] = (d1 >> 16) | (e1 & 0xffff0000u);
+        }
+        *(r4d_u32x4*)(xs + (((bb * 2 + (jh >> 1)) * 2 + (jh & 1)) * 16 + n) * 16) = o;
+    }
+}
+
 /* xw_stage split in two (DRAFTER track, xm_wq AB 16): the slab's units into registers (global / L2 loads in flight while the
  * current slab is computed), then into LDS. UPT units a thread at 256 threads (16 blocks x NT tiles x 64 units). */
 template <int NT>
@@ -680,6 +741,8 @@ __global__ __launch_bounds__(kXmThreads) __attribute__((amdgpu_waves_per_eu((AB 
 void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
     using Q = Mx<MX_FP4>;
     constexpr int MT = 16 * NT;
+    /* lever WCN (round 87) on the IL forms; AB bit 64 (bench) keeps the loop before it for an in-process A / B */
+    constexpr bool WCN = IL != 0 && (AB & 64) == 0;
     XM_TL_IN(AB)
     R4D_DYN_LDS(r4d_u32x4, xm_lds);
     uint8_t* const smem = (uint8_t*)xm_lds;
@@ -736,6 +799,21 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
         for (int r = 0; r < WR; ++r) sb[r] = (int)((uintptr_t)wr[r] & 3u);
         r4d_u32x4 raw[PD][WR];
         auto load = [&](int b, r4d_u32x4 (&rw)[WR]) {
+            if constexpr (WCN) {
+                /* lever WCN (round 87): unconditional (a block past K re-reads the last one, never used), so the compiler's
+                 * wait before a block's words counts the younger loads (loadcnt 2 (PD - 1)) instead of draining them all */
+                const int bc = b < A.UK ? b : A.UK - 1;
+#pragma unroll
+                for (int r = 0; r < WR; ++r) {
+                    const uint8_t* tp = wr[r] + (long long)bc * kXmIlTile;
+                    const uint64_t v = *(mx_gu64)(const void*)(tp + 8 * lane);
+                    rw[r][0] = (uint32_t)v; rw[r][1] = (uint32_t)(v >> 32);
+                    /* the scale's aligned word, its byte taken where the block is computed (a byte load became a d16
+                     * partial write, and a shift here waits for the load) */
+                    rw[r][2] = *(mx_gu32)(const void*)(tp + 256 + (nl & ~3));
+                }
+                return;
+            }
             if (b < A.UK) {
 #pragma unroll
                 for (int r = 0; r < WR; ++r) {
@@ -760,7 +838,10 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
 #pragma unroll
             for (int r = 0; r < WR; ++r) {
                 const r4d_u32x4 w = rw[r];
-                if constexpr (IL != 0) {
+                if constexpr (WCN) {
+                    q0[r] = w[0]; q1[r] = w[1];
+                    d[r] = mx_e8m0_half((w[2] >> (8 * (nl & 3))) & 0xffu);
+                } else if constexpr (IL != 0) {
                     q0[r] = w[0]; q1[r] = w[1];
                     d[r] = mx_e8m0_half(w[2]);
                 } else {
@@ -774,7 +855,7 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
                 d[r] = mx_e8m0_half(h ? e1 : e0);
                 }
             }
-            load(b + PD, rw);
+            if constexpr (!WCN) load(b + PD, rw);
             r4d_u32x4 bw[WR][2];
 #pragma unroll
             for (int r = 0; r < WR; ++r) {
@@ -789,6 +870,9 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
                     }
                 }
             }
+            /* lever WCN (round 87): the next words issued after the words in hand are spent (table lookups + scale), so the
+             * load lands in the same registers and the loop carries no copy of a load in flight */
+            if constexpr (WCN) { sched_barrier(); load(b + PD, rw); }
             if constexpr ((AB & 1) != 0) {
 #pragma unroll
                 for (int r = 0; r < WR; ++r)
@@ -800,7 +884,7 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
             const xw_v8f z = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
-                if (t >= nt) break;
+                if constexpr (NT > 1 || !WCN) if (t >= nt) break;   /* WCN, NT 1: nt is 1 here (ml > 0); no branch around the block's math */
                 const r4d_u32x4 a0 = *(const r4d_u32x4*)(xb + (((t * 2 + 0) * 2 + h) * 16 + nl) * 16);
                 const r4d_u32x4 a1 = *(const r4d_u32x4*)(xb + (((t * 2 + 1) * 2 + h) * 16 + nl) * 16);
 #pragma unroll
@@ -811,7 +895,50 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
                     for (int i = 0; i < 8; ++i) acc[r][t][i] = __builtin_fmaf(d[r], P[i], acc[r][t][i]);
                 }
             }
+            /* lever WCN: the next block's words are not decoded ahead of this block's math (that wait drained the loads behind) */
+            if constexpr (WCN) sched_barrier();
         };
+        if (WCN && NT == 1 && A.SS % PD == 0 && A.UK % PD == 0) {
+            /* lever WCN (round 87): the PD-aligned K loop -- every slab a whole number of PD groups, every block computed and
+             * every load issued without a branch; the staging's token read once an item (xw_stage1). Each output's operations
+             * and their order are the loop below's (blocks in K order, the same WMMAs, one fma a block). */
+            const int ntok = (int)(threadIdx.x & 15) < mc ? mx_moe_tok(A.sorted, r0 + (int)(threadIdx.x & 15), A.top_k, A.a_sorted, A.AR) : -1;
+            if ((AB & 4) == 0 && (AB & 128) == 0 && A.SS == 16 && A.UK % 16 == 0 && A.x_al && blockDim.x == 256) {
+                /* the staging pipeline (xw_ld16 / xw_st16): no slab waits for its own activations */
+                r4d_u32x4 sx[4];
+                xw_ld16(A, ntok, 0, sx);
+                lds_barrier();
+                xw_st16(xs, ntok, sx);
+                lds_barrier();
+                if (16 < A.UK) xw_ld16(A, ntok, 16, sx);
+                for (int b0 = 0; b0 < A.UK; b0 += 16) {
+#pragma unroll 1
+                    for (int bb = b0; bb < b0 + 16; bb += PD) {
+#pragma unroll
+                        for (int k = 0; k < PD; ++k) block(bb + k, xs + (bb + k - b0) * 1024, raw[k]);
+                    }
+                    if (b0 + 16 < A.UK) {
+                        lds_barrier();
+                        xw_st16(xs, ntok, sx);
+                        lds_barrier();
+                        if (b0 + 32 < A.UK) xw_ld16(A, ntok, b0 + 32, sx);
+                    }
+                }
+            } else
+            for (int b0 = 0; b0 < A.UK; b0 += A.SS) {
+                const int b1 = min(b0 + A.SS, A.UK);
+                if constexpr ((AB & 4) == 0) {
+                    lds_barrier();
+                    xw_stage1(A, xs, ntok, b0, b1);
+                    lds_barrier();
+                }
+#pragma unroll 1
+                for (int bb = b0; bb < b1; bb += PD) {
+#pragma unroll
+                    for (int k = 0; k < PD; ++k) block(bb + k, xs + (bb + k - b0) * NT * 1024, raw[k]);
+                }
+            }
+        } else
         for (int b0 = 0; b0 < A.UK; b0 += A.SS) {
             const int b1 = min(b0 + A.SS, A.UK);
             if constexpr ((AB & 4) == 0) {
@@ -1369,6 +1496,8 @@ int xm_launch_wil(RadStream s, int PD, const MxMrArgs& A, unsigned grid, unsigne
 #define XM_WPE(pd, ab) if (g_xm_wpe == ab && PD == 9 && g_xm_wpe_pd == pd) \
         return R4D_EMIT(s, (xm_wm_kernel<1, 1, pd, ab, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, pd, ab, 1>, grid, thr, lds)), dim3(thr), lds, A);
     XM_WPE(9, 16) XM_WPE(8, 16) XM_WPE(6, 16) XM_WPE(4, 16) XM_WPE(4, 32) XM_WPE(9, 24) XM_WPE(6, 24)
+    XM_WPE(4, 80) XM_WPE(8, 80)   /* round 87: the served gate_up (PD 4, 12 waves a SIMD) without lever WCN, the in-process A */
+    XM_WPE(4, 144) XM_WPE(8, 144) /* round 87: WCN without its staging pipeline (AB 16 + 128) */
 #undef XM_WPE
 #endif
     /* lever XWO (round 28; drafter_mx 7): the gate_up (PD 9's caller) at 12 waves a SIMD = 99 VGPRs, PD 4, 6 blocks a WGP at the
@@ -1647,7 +1776,13 @@ int r4d_mx_mr_get() { return g_xm_on; }
 
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
 static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap, int il = g_xm_il) {
-    if (!xm_has_w(WR, NT, PD, AB) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
+#ifdef R4D_XM_TL
+    /* bench (round 87, the tail oracle): the IL form's ablations at PD 4 / 9 (AB 4 no staging, 6 + no decode, 7 loads only) */
+    const bool il_ab = il && WR == 1 && NT == 1 && (PD == 4 || PD == 9) && (AB == 4 || AB == 6 || AB == 7);
+#else
+    const bool il_ab = false;
+#endif
+    if ((!xm_has_w(WR, NT, PD, AB) && !il_ab) || (WN != 1 && WN != 2 && WN != 4 && WN != 8)) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
     A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.wtab = c.wtab; A.w_ld = c.w_ld; A.w_es = c.w_es;
     A.y = c.y; A.y_ld = c.y_ld; A.sorted = c.sorted; A.off = c.off;
@@ -1674,8 +1809,15 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
     std::snprintf(g_xm_last, sizeof g_xm_last, "wmma WR%d NT%d PD%d%s WN%d SS%d RB%d grid %lld lds %lld", WR, NT, PD, AB ? " ABL" : "", WN, A.SS,
                   A.RB, grid, lds);
     if (il) {   /* lever WIL: 16-row groups, so N % 16 == 0; WR 1 NT 1 only */
-        if (WR != 1 || NT != 1 || AB != 0 || c.N % 16) return R4D_MX_MR_DECLINE;
-        std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-IL WR1 NT1 PD%d WN%d SS%d RB%d grid %lld lds %lld", PD, WN, A.SS, A.RB, grid, lds);
+        if (WR != 1 || NT != 1 || (AB != 0 && !il_ab) || c.N % 16) return R4D_MX_MR_DECLINE;
+        std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-IL WR1 NT1 PD%d AB%d WN%d SS%d RB%d grid %lld lds %lld", PD, AB, WN, A.SS, A.RB, grid, lds);
+#ifdef R4D_XM_TL
+        if (il_ab) {
+#define XM_WAB(pd, ab) if (PD == pd && AB == ab) return R4D_EMIT(s, (xm_wm_kernel<1, 1, pd, ab, 1>), dim3((unsigned)grid), dim3(32u * WN), (unsigned)lds, A);
+            XM_WAB(9, 4) XM_WAB(9, 6) XM_WAB(9, 7) XM_WAB(4, 4) XM_WAB(4, 6) XM_WAB(4, 7)
+#undef XM_WAB
+        }
+#endif
         return xm_launch_wil(s, PD, A, (unsigned)grid, 32u * WN, (unsigned)lds);
     }
     return xm_launch_w(s, WR, NT, PD, AB, A, (unsigned)grid, 32u * WN, (unsigned)lds);

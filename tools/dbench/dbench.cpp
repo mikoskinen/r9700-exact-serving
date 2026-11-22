@@ -136,6 +136,23 @@ static Route route_counts(const std::vector<int32_t>& off, int64_t tokens) {
     return r;
 }
 
+/* --route live:L0,L1,L2 (DRAFTER round 87, the tail oracle; = pfs --live): stage st's tokens x top_k slots spread over L live
+ * experts 0, kE / L, 2 kE / L, ... (slot i -> expert (i % L) kE / L), assigned round robin over the tokens by route_counts */
+static Route route_live(int64_t tokens, int64_t L) {
+    L = std::max<int64_t>(1, std::min<int64_t>(kE, L));
+    std::vector<int32_t> cnt((size_t)kE, 0), off((size_t)kE + 1, 0);
+    for (int64_t i = 0; i < tokens * kTopK; ++i) cnt[(size_t)((i % L) * kE / L)]++;
+    for (int64_t e = 0; e < kE; ++e) off[(size_t)e + 1] = off[(size_t)e] + cnt[(size_t)e];
+    return route_counts(off, tokens);
+}
+/* the flush (round 87): a READ of the buffer (a D2D copy's dirty lines would be written back inside the next call's window) */
+__global__ void dbench_flush_read(const uint4* p, size_t n, uint32_t* sink) {
+    uint32_t a = 0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { const uint4 v = p[i]; a ^= v.x ^ v.y ^ v.z ^ v.w; }
+    if (a == 0x9e3779b9u) *sink = a;
+}
+static int64_t g_flush_mb = 0;   /* --flush MB (round 87): a D2D copy of MB between calls, each call timed alone (cold L2 / MALL) */
+
 static int g_rec_start = 0;   /* --rec-start: the first matching record taken (then every `stride`-th) */
 static std::vector<std::vector<int32_t>> read_records(const char* path, int64_t tokens, int want, int stride, int64_t ne = -1) {
     if (ne < 0) ne = kE;
@@ -355,6 +372,7 @@ static bool parse_form(const std::string& n0, Form* f) {
     }
     {   /* wWRnNT[pPD][wWN]: the WMMA form (rule B) */
         int a = 0, b = 0, c = 0, d = 0, ab = 0;
+        if (std::sscanf(n.c_str(), "w%dn%dp%da%dw%d", &a, &b, &d, &ab, &c) == 5) { f->on = 1; f->h = 1024 + d + 16 * ab; f->r = a; f->mt = b; f->wn = c; return true; }
         if (std::sscanf(n.c_str(), "w%dn%dp%da%d", &a, &b, &d, &ab) == 4) { f->on = 1; f->h = 1024 + d + 16 * ab; f->r = a; f->mt = b; return true; }
         if (std::sscanf(n.c_str(), "w%dn%dp%dw%d", &a, &b, &d, &c) == 4) { f->on = 1; f->h = 1024 + d; f->r = a; f->mt = b; f->wn = c; return true; }
         if (std::sscanf(n.c_str(), "w%dn%dp%d", &a, &b, &d) == 3) { f->on = 1; f->h = 1024 + d; f->r = a; f->mt = b; return true; }
@@ -496,6 +514,7 @@ int main(int argc, char** argv) {
         else if (a == "--route-x7") route_x7 = nx();
         else if (a == "--quad") quad = 1;
         else if (a == "--tl") g_tl = std::atoi(nx().c_str());
+        else if (a == "--flush") g_flush_mb = std::atoll(nx().c_str());
 #ifdef R4D_XM_TL
         else if (a == "--wpe") { const int ab = std::atoi(nx().c_str()); const int pd = std::atoi(nx().c_str()); r4d_mx_wpe(ab, pd); }
 #endif
@@ -642,6 +661,9 @@ int main(int argc, char** argv) {
         std::vector<Route> rts;
         if (route == "synth") {
             for (int st = 0; st < stages; ++st) rts.push_back(route_synth(tk, 0, 0xD5A2Cull + (uint64_t)tk + 1000003ull * (uint64_t)st));
+        } else if (route.rfind("live:", 0) == 0) {
+            const auto ls = split(route.substr(5));
+            for (int st = 0; st < stages; ++st) rts.push_back(route_live(tk, std::atoll(ls[(size_t)st % ls.size()].c_str())));
         } else if (quad) {
             auto recs = read_records(route.c_str(), tk, 12, rec_stride, 32);
             if ((int)recs.size() < 12) { std::printf("tokens %lld: %zu records (need 12)\n", (long long)tk, recs.size()); continue; }
@@ -745,8 +767,21 @@ int main(int argc, char** argv) {
             std::vector<hipEvent_t> ev((nc + 1) * (size_t)iters);
             for (auto& e : ev) CK(hipEventCreate(&e));
             for (int w = 0; w < 5; ++w) for (auto& c : calls) c.launch(s);
+            static void* fl_a = nullptr; static void* fl_b = nullptr;
+            const size_t flb = (size_t)g_flush_mb << 20;
+            std::vector<hipEvent_t> ev2;   /* --flush: an end event a call (the interval = the call alone, behind its flush) */
+            if (flb) {
+                if (!fl_a) { CK(hipMalloc(&fl_a, flb)); CK(hipMalloc(&fl_b, 64)); CK(hipMemset(fl_a, 0x5a, flb)); CK(hipDeviceSynchronize());
+                             dbench_flush_read<<<dim3(1024), dim3(256), 0, s>>>((const uint4*)fl_a, flb / 16, (uint32_t*)fl_b); CK(hipStreamSynchronize(s)); }
+                ev2.resize(nc * (size_t)iters);
+                for (auto& e : ev2) CK(hipEventCreate(&e));
+            }
             for (int it = 0; it < iters; ++it) {
-                for (size_t i = 0; i < nc; ++i) { CK(hipEventRecord(ev[(size_t)it * (nc + 1) + i], s)); calls[i].launch(s); }
+                for (size_t i = 0; i < nc; ++i) {
+                    if (flb) dbench_flush_read<<<dim3(1024), dim3(256), 0, s>>>((const uint4*)fl_a, flb / 16, (uint32_t*)fl_b);
+                    CK(hipEventRecord(ev[(size_t)it * (nc + 1) + i], s)); calls[i].launch(s);
+                    if (flb) CK(hipEventRecord(ev2[(size_t)it * nc + i], s));
+                }
                 CK(hipEventRecord(ev[(size_t)it * (nc + 1) + nc], s));
             }
             CK(hipStreamSynchronize(s));
@@ -755,11 +790,14 @@ int main(int argc, char** argv) {
             for (int it = 0; it < iters; ++it) {
                 float tot = 0;
                 for (size_t i = 0; i < nc; ++i) {
-                    float ms = 0; CK(hipEventElapsedTime(&ms, ev[(size_t)it * (nc + 1) + i], ev[(size_t)it * (nc + 1) + i + 1]));
+                    float ms = 0;
+                    if (flb) CK(hipEventElapsedTime(&ms, ev[(size_t)it * (nc + 1) + i], ev2[(size_t)it * nc + i]));
+                    else CK(hipEventElapsedTime(&ms, ev[(size_t)it * (nc + 1) + i], ev[(size_t)it * (nc + 1) + i + 1]));
                     t[i].push_back(ms * 1000.f); tot += ms * 1000.f;
                 }
                 pass.push_back(tot);
             }
+            for (auto& e : ev2) CK(hipEventDestroy(e));
             for (auto& e : ev) CK(hipEventDestroy(e));
             auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return (double)v[v.size() / 2]; };
             const double pm = med(pass);
