@@ -69,12 +69,9 @@ extern "C" int rad_fn4_get(const char* name, int* value) __attribute__((weak));
 extern "C" int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch) __attribute__((weak));
 extern "C" int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch) __attribute__((weak));
 extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) __attribute__((weak));   /* tp8 loop D18 */
-/* rad_op_declared without the reference library's vocabulary (abi/rad_builder.h), weak: an older core answers
- * rad_op_declared's way (libref's host row counts). Asked for an optional op libref also declares (lever GSE). */
+/* rad_op_declared without the reference library's vocabulary (abi/rad_builder.h), weak: null under an older core (lever GSE's
+ * check then takes option c's env proxy). Asked for an optional op libref also declares. */
 extern "C" int rad_op_declared_native(RadBuilder* b, const char* op) __attribute__((weak));
-static int ds41_op_native(RadBuilder* b, const char* op) {
-    return rad_op_declared_native ? rad_op_declared_native(b, op) : rad_op_declared(b, op);
-}
 static int ds41_switch(const char* name) {
     int v = 0;
     return rad_fn4_get && rad_fn4_get(name, &v) > 0 ? v : 0;
@@ -5455,16 +5452,27 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_GSE=%s is not 0 / 1\n", std::getenv("RADIANCE_DS41_GSE"));
         return RAD_E_INVAL;
     }
+    /* round 94 (PREFILL NOTE 08:44's DEFECT, option c): libref's host row (1baeac8b) registers moe_gemm_mxil_glu's schema on every
+     * start, so rad_op_declared answers yes on a home whose libr4d has no device kernel for it (the default / off / chain homes: the
+     * card declare then fails); the op's device kernel is the IKA home's libr4d only, whose starts set RADIANCE_AQL_IKA=1 (host
+     * declares of the IKA arm too) -- required here, so any other start takes the 'not declared' note as before 1baeac8b. */
+    const char* ika = std::getenv("RADIANCE_AQL_IKA");
+    const bool ika_on = ika && !std::strcmp(ika, "1");
     if (gse_env() > 0) {
-        /* Not rad_op_declared: libref declares a host row for the op (host declares, the host backend), so on a card
-         * whose libr4d lacks it (the default / off / chain homes) the declare would have no device kernel -- fatal
-         * (FINDINGS PREFILL NOTE 08:44 + UPDATE 08:54). Only a non-reference library's declaration counts. */
-        if (!d.wil || !ds41_op_native(b, "moe_gemm_mxil_glu")) {
-            rad_note(b, "lever GSE (RADIANCE_DS41_GSE): %s -- not declared", !d.wil ? "needs lever WIL (RADIANCE_DS41_DSPARK_WIL=1)"
-                                                                                : "no loaded kernel plugin serves moe_gemm_mxil_glu");
+        /* moe_gemm_mxil_glu's device kernel is in some libr4d builds only (the IKA home's), while libref declares its host row on
+         * every start: rad_op_declared would answer yes on a card whose libr4d lacks it and the declare would fail there (FINDINGS
+         * PREFILL NOTE 08:44). A core that exports rad_op_declared_native (DECODE W31: non-reference libraries' vocabularies only)
+         * answers exactly that; under an older core option c (the DRAFTER's round 94): the IKA home's starts set RADIANCE_AQL_IKA=1. */
+        const bool native = rad_op_declared_native != nullptr;
+        const bool served = native ? rad_op_declared_native(b, "moe_gemm_mxil_glu") != 0
+                                   : ika_on && rad_op_declared(b, "moe_gemm_mxil_glu") != 0;
+        if (!d.wil || !served) {
+            const char* why = !d.wil ? "needs lever WIL (RADIANCE_DS41_DSPARK_WIL=1)"
+                            : (native || ika_on) ? "no loaded kernel plugin serves moe_gemm_mxil_glu"
+                                                 : "needs the IKA home (RADIANCE_AQL_IKA=1: its libr4d alone serves moe_gemm_mxil_glu on a card)";
+            rad_note(b, "lever GSE (RADIANCE_DS41_GSE): %s -- not declared", why);
             if (g.rank == 0 && !ctx->shape_probe)
-                fprintf(stderr, "radiance: deepseek41: lever GSE (RADIANCE_DS41_GSE) not declared: %s\n",
-                        !d.wil ? "needs lever WIL" : "no loaded kernel plugin serves moe_gemm_mxil_glu");
+                fprintf(stderr, "radiance: deepseek41: lever GSE (RADIANCE_DS41_GSE) not declared: %s\n", why);
         } else {
             d.gse = true;
             rad_note(b, "DSpark drafter routed gate_up's GLU form declared (lever GSE, RADIANCE_DS41_GSE; dspark_mhr + 512 issues it): "
