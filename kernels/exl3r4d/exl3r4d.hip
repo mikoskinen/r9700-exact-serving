@@ -193,11 +193,14 @@ static_assert(EXL3R4D_SWK != 2 || EXL3R4D_SWK_BLK == 8, "SWK 2: 8 tokens a pass 
 #ifndef EXL3R4D_SWK_DMOVE  // SWK 2's D-layout move (tp8 DECODE round 66, QUEUE X14): 0 = the ds_bpermute pulls + __shfl_xor butterflies
 #define EXL3R4D_SWK_DMOVE 0  // (round 64's form); 1 = the same data moves on VALU lane ops -- the pulls as v_permlane16_var + v_permlanex16_var
 #endif                       // (one select VGPR), the butterflies' exchanges as DPP (quad_perm [1,0,3,2] / [2,3,0,1], row_xmask:4) -- the same
-                             // adds (IEEE commutative: the same bits); 9 = NO move (TIMING ONLY, wrong outputs: the move's cost bound)
+                             // adds (IEEE commutative: the same bits); 9 = NO move (TIMING ONLY, wrong outputs: the move's cost bound);
+                             // 2 = form 1 in the K25U (K = 2.5) twins only, form 0 in the X3D-F (K = 2) twins -- Xeon GPU2 slot s5 (COORD 12:43):
+                             // form 1 vs 0 a layer-chain K2.5 -30.2 / -34.6 / -41.5 / -24.3 us, K2 +4.0 / +5.7 / +4.4 / +2.0 us (c8 / c16 / c32
+                             // / 16-row shapes), the bytes of form 0 in every cell
 #ifndef EXL3R4D_SWK_ABOUND   // SWK 2 (tp8 DECODE round 66, QUEUE X14): 1 = the compressed A fragment made from registers instead of its four
 #define EXL3R4D_SWK_ABOUND 0 // b32 loads a 32-deep step (TIMING ONLY, wrong outputs: the real form's A-load cost bound); 0 = the loads
 #endif
-static_assert(EXL3R4D_SWK_DMOVE == 0 || EXL3R4D_SWK_DMOVE == 1 || EXL3R4D_SWK_DMOVE == 9, "SWK_DMOVE: 0 / 1 / 9");
+static_assert(EXL3R4D_SWK_DMOVE == 0 || EXL3R4D_SWK_DMOVE == 1 || EXL3R4D_SWK_DMOVE == 2 || EXL3R4D_SWK_DMOVE == 9, "SWK_DMOVE: 0 / 1 / 2 / 9");
 // SW (the form of ONE instance, a template argument of moe_pass and the x3d / k25 kernels, so one build holds the served kernels and
 // the SWK twins that fn4 exl3_x6w 2 / 3 picks at launch): 0 served, 1 timing pairs, 2 the real form, 3 = 2 with the other nibble order.
 #define EXL3R4D_SWK_T (EXL3R4D_SWK == 2 && EXL3R4D_SWK_IDXSWAP ? 3 : EXL3R4D_SWK)
@@ -1634,9 +1637,10 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     }
   }
   if (SK > 1) splitk_reduce<NPW>(acc, lds, col_local, ksplit, SK, lane);
-  if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) {   // SWK 2: rows -> tokens (EXL3R4D_SWK_DMOVE: 0 LDS form, 1 lane-op form, 9 none)
-    if constexpr (EXL3R4D_SWK_DMOVE == 1) swk_to_dlayout_dpp<NPW>(acc, lane);
-    else if constexpr (EXL3R4D_SWK_DMOVE == 0) swk_to_dlayout<NPW>(acc, lane);
+  if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) {   // SWK 2: rows -> tokens (EXL3R4D_SWK_DMOVE: 0 LDS form, 1 lane-op form, 2 lane-op in K25U, 9 none)
+    constexpr bool lane_ops = EXL3R4D_SWK_DMOVE == 1 || (EXL3R4D_SWK_DMOVE == 2 && K25 != K25_OFF);
+    if constexpr (lane_ops) swk_to_dlayout_dpp<NPW>(acc, lane);
+    else if constexpr (EXL3R4D_SWK_DMOVE != 9) swk_to_dlayout<NPW>(acc, lane);
   }
   if constexpr (XSM) {
     if (xsn > 1 && !xs_combine<NPW>(p, acc, xunit, xsl)) return;   // the first slice leaves; the second sums
