@@ -5596,9 +5596,9 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.n_ff_exp = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: this rank's slice (MoeFP8's even ROW / COL shard) */
     /* lever WIL: moe_gemm_mxil serves up to 512 tokens a call (drafter_mx's bound); a larger drafter block keeps moe_gemm_ggml */
     if (d.wil && Q <= 512) s.cfg.expert_ggml_op = "moe_gemm_mxil";
-    if (d.gse && s.cfg.expert_ggml_op) s.cfg.expert_ggml_glu = "moe_gemm_mxil_glu";   /* lever GSE: declared beside the pair */
     else if (d.wil && l == d.base)
         rad_note(b, "lever WIL: the drafter's %lld rows exceed moe_gemm_mxil's 512: moe_gemm_ggml kept", (long long)Q);
+    if (d.gse && s.cfg.expert_ggml_op) s.cfg.expert_ggml_glu = "moe_gemm_mxil_glu";   /* lever GSE: declared beside the pair */
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;

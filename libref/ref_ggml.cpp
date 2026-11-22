@@ -588,4 +588,37 @@ int ref_moe_gemm_mxil_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return ref_moe_gemm_ggml_shape(p, n_p, operand, out);
 }
 
+/* moe_gemm_mxil_glu (libr4d's lever GSE, DRAFTER track 22.11.2026 round 91): moe_gemm_mxil into a bf16 [T, N] plane (gate rows
+ * [0, N / 2), up rows [N / 2, N)), then swiglu_clamped (limit) over it into y [T, N / 2] -- the pair's values; the same stored
+ * form and layout hooks as moe_gemm_mxil. */
+int ref_moe_gemm_mxil_glu(const RadArgs* a, RadStream s) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor& Y = a->t[4];
+    const int64_t N = p_int(a, "N", 0);
+    if (N <= 0 || N % 16 || Y.rank != 2 || Y.shape[1] != N / 2 || Y.shape[0] < 1 || !Y.data) return RAD_E_SHAPE;
+    const int64_t T = Y.shape[0];
+    std::vector<uint16_t> gu((size_t)(T * N));
+    std::vector<RadTensor> ts(a->t, a->t + a->n_t);
+    RadTensor& G = ts[4];
+    G = Y; G.data = gu.data(); G.dtype = RAD_BF16; G.shape[1] = N; G.stride[0] = N; G.stride[1] = 1;
+    RadArgs b = *a;
+    b.t = ts.data();
+    const int rc = ref_moe_gemm_mxil(&b, s);
+    if (rc != RAD_OK) return rc;
+    RadTensor t2[2] = { G, Y };
+    RadParam p2[3];
+    std::memset(p2, 0, sizeof p2);
+    p2[0].key = "M"; p2[0].kind = RAD_P_INT; p2[0].ival = T;
+    p2[1].key = "n"; p2[1].kind = RAD_P_INT; p2[1].ival = N / 2;
+    p2[2].key = "limit"; p2[2].kind = RAD_P_F64; p2[2].dval = p_f32(a, "limit", 0);
+    RadArgs c = *a;
+    c.t = t2; c.n_t = 2; c.p = p2; c.n_p = 3;
+    return ref_swiglu_clamped(&c, s);
+}
+int ref_moe_gemm_mxil_glu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int rc = ref_moe_gemm_ggml_shape(p, n_p, operand, out);
+    if (rc == RAD_OK && operand == 4 && out->rank == 2) out->shape[1] /= 2;   /* y = swiglu_clamped(gate, up) */
+    return rc;
+}
+
 #endif /* REF_HAVE_GGML */

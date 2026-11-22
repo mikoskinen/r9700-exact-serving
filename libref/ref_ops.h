@@ -209,6 +209,7 @@ int ref_window_store       (const RadArgs*, RadStream);
 int ref_gemm_nt_ggml       (const RadArgs*, RadStream);
 int ref_moe_gemm_ggml      (const RadArgs*, RadStream);
 int ref_moe_gemm_mxil      (const RadArgs*, RadStream);   /* libr4d lever WIL's op over its tile-interleaved form */
+int ref_moe_gemm_mxil_glu  (const RadArgs*, RadStream);   /* libr4d lever GSE's: moe_gemm_mxil then swiglu_clamped */
 int ref_logits_gemm_ggml   (const RadArgs*, RadStream);
 int ref_embed_lookup_ggml  (const RadArgs*, RadStream);
 #endif
@@ -528,6 +529,7 @@ REF_SHAPE_FN(ref_window_store);
 REF_SHAPE_FN(ref_gemm_nt_ggml);
 REF_SHAPE_FN(ref_moe_gemm_ggml);
 REF_SHAPE_FN(ref_moe_gemm_mxil);
+REF_SHAPE_FN(ref_moe_gemm_mxil_glu);
 REF_SHAPE_FN(ref_logits_gemm_ggml);
 REF_SHAPE_FN(ref_embed_lookup_ggml);
 #endif

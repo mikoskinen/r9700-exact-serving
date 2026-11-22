@@ -573,6 +573,8 @@ static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"),
     P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
 static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
                                                OPD("expert_offset"), OUT("y") };
+static const RadParamSpec pMoeGemmMxilGlu[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
+    P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype"), P_F64("limit") };
 static const RadParamSpec pLogitsGgml[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"), P_STR("type"),
     P_STR("dtype") };
 static const RadOperandSpec oLogitsGgml[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
@@ -1777,6 +1779,10 @@ static const RadOpSchema kSchemas[] = {
   "moe_gemm_ggml at type=mxfp4 with each expert's native blocks stored tile-interleaved (libr4d's lever WIL, tag "
   "r4d_mxfp4_il16: 16-row x 1-block tiles of 272 bytes, the native blocks' bytes moved): the same values, so each "
   "output row equals moe_gemm_ggml's for its row and expert." },
+{ "moe_gemm_mxil_glu", ARR(pMoeGemmMxilGlu), ARR(oMoeGemmGgml),
+  "moe_gemm_mxil's gate_up (gate rows [0, N / 2), up rows [N / 2, N)) with swiglu_clamped (limit) applied to its output: "
+  "y [M x top_k, N / 2] = swiglu_clamped(moe_gemm_mxil(...)), the down projection's input (libr4d's lever GSE, the same "
+  "stored form and tag r4d_mxfp4_il16)." },
 { "logits_gemm_ggml", ARR(pLogitsGgml), ARR(oLogitsGgml),
   "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`, read as gemm_nt_ggml reads its "
   "weight: logits[M, n_vocab] (f32) = x[M, n_embd] . lm_head^T." },
@@ -2915,6 +2921,9 @@ ROW_GGML("ref_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.c
 { "ref_moe_gemm_mxil", "moe_gemm_mxil", "moe", "grouped GEMM over tile-interleaved MXFP4 experts (moved back, then ref_moe_gemm_ggml)",
   SHAPE_ANY, DT_FLOAT, RAD_DOMAIN_HOST, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, ref_moe_gemm_mxil,
   nullptr, ref_mxil_layout, ref_mxil_relayout, ref_moe_gemm_mxil_shape, ref_mxil_unrelayout },
+{ "ref_moe_gemm_mxil_glu", "moe_gemm_mxil_glu", "moe", "ref_moe_gemm_mxil into a [T, N] plane, then ref_swiglu_clamped",
+  SHAPE_ANY, DT_FLOAT, RAD_DOMAIN_HOST, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, ref_moe_gemm_mxil_glu,
+  nullptr, ref_mxil_layout, ref_mxil_relayout, ref_moe_gemm_mxil_glu_shape, ref_mxil_unrelayout },
 ROW_GGML("ref_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llama.cpp native blocks", DT_FLOAT, ref_logits_gemm_ggml),
 ROW_GGML("ref_embed_lookup_ggml", "embed_lookup_ggml", "vocab", "embedding gather from llama.cpp native blocks", DT_FLOAT, ref_embed_lookup_ggml),
 #endif
