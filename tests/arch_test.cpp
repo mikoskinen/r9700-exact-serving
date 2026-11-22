@@ -937,6 +937,175 @@ TEST(sdf_moves_only_the_shared_down_ahead_of_the_routed_down) {
     moe.shexp_lane = keep;
 }
 
+/* Lever SL2 (DRAFTER round 102, rad_block_moe_fp8.h kMoeLateBit): bit 4 (+ 16) of MoeFP8::shexp_lane's word, at a one-segment
+ * pass of T <= kMoeShexpLaneRows rows whose shared arm is lane-safe, moves ONLY the shared arm (its gate, gate_up, activation and
+ * down) to lane 1 -- forked behind the router chain and joined in front of the gather -- and changes nothing else: the same
+ * issues (op, n, every operand) as the one-lane list, lane 0's subsequence in today's order, every lane-1 issue after the routed
+ * down, and no write on one lane meets a buffer the other lane touches while the two run unordered (rule A: the same kernels
+ * over the same operands). A wider pass, an arm that is not lane-safe and the bit clear issue today's list; 16 + 1 (the low
+ * bits' lane form) and 16 + 4 (SDF) issue 16's. Control: the bit really moved the arm (the lists differ). (tp8 loop PREFILL
+ * round 61, the candidate's read of the DRAFTER's SL2 patch-r102-sl2.mbox.) */
+TEST(sl2_late_lane_form_moves_only_the_shared_arm_to_lane_one) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "";
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_bf16::probe(&meta, &probe));
+    RadBuilder b;
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    b.encs = {
+        { "attn_q.weight", plain }, { "attn_k.weight", plain },
+        { "attn_v.weight", plain }, { "attn_output.weight", plain },
+        { "ffn_gate_up.weight", plain }, { "ffn_down.weight", plain },
+        { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain },
+        { "ffn_gate_up_shexp.weight", plain }, { "ffn_down_shexp.weight", plain },
+        { "output.weight", plain },
+    };
+    RadBuildCtx ctx = build_ctx();
+    const int rc = hyv3_bf16::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    auto& moe = hyv3_bf16::models[0].layers[1].moe;
+    REQUIRE(moe.shexp_lane_ok && moe.op_dn != 0 && moe.sh_gate_up.op != 0 && moe.sh_down.op != 0);
+    static std::atomic<int> word{0};
+    const std::atomic<int>* const keep = moe.shexp_lane;
+    moe.shexp_lane = &word;
+    auto run = [&](int v, RadBatch batch) {
+        word.store(v);
+        RadCtx c{};
+        c.b = &b;
+        c.batch = &batch;
+        hyv3_bf16::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(c.lane, 0);
+        CHECK_LINT(b, &c);
+        return c;
+    };
+    auto key = [](const RecIssue& x) {   /* an issue without its lane */
+        std::string k = std::to_string(x.op) + "/" + std::to_string(x.n);
+        for (const RadOperand& p : x.opd)
+            k += "|" + std::to_string(p.kind) + "," + std::to_string(p.dtype) + "," + std::to_string(p.handle) + "," +
+                 std::to_string((unsigned long long)(uintptr_t)p.raw) + "," + std::to_string(p.offset) + "," + std::to_string(p.rows) + "," + std::to_string(p.cols);
+        return k;
+    };
+    auto keys = [&](const std::vector<RecIssue>& v, int lane) {   /* lane -1: all, in order */
+        std::vector<std::string> k;
+        for (const RecIssue& x : v)
+            if (lane < 0 || x.lane == lane) k.push_back(key(x));
+        return k;
+    };
+    auto same_list = [&](const RadCtx& x, const RadCtx& y) {
+        if (x.issues.size() != y.issues.size() || x.joins.size() != y.joins.size()) return false;
+        for (size_t i = 0; i < x.issues.size(); ++i)
+            if (x.issues[i].lane != y.issues[i].lane || key(x.issues[i]) != key(y.issues[i])) return false;
+        for (size_t i = 0; i < x.joins.size(); ++i)
+            if (x.joins[i].at != y.joins[i].at || x.joins[i].from != y.joins[i].from || x.joins[i].to != y.joins[i].to) return false;
+        return true;
+    };
+    /* issue i (lane li) runs before issue j (i < j) on another lane only through a join li -> lj issued in (i, j] */
+    auto ordered = [](const RadCtx& c, size_t i, size_t j) {
+        const int li = c.issues[i].lane, lj = c.issues[j].lane;
+        if (li == lj) return true;
+        for (const RecJoin& jn : c.joins)
+            if (jn.from == li && jn.to == lj && jn.at > i && jn.at <= j) return true;
+        return false;
+    };
+    auto bufs_of = [&](const RecIssue& x, bool writes_only) {
+        std::set<rad_buf> s;
+        const RecOp* o = b.op_of(x.op);
+        for (const RadOperand& p : x.opd) {
+            if (p.kind != RAD_OPK_BUF || p.handle == 0) continue;
+            if (writes_only && !(o && std::find(o->writes.begin(), o->writes.end(), (rad_buf)p.handle) != o->writes.end())) continue;
+            s.insert((rad_buf)p.handle);
+        }
+        return s;
+    };
+    const rad_op gather = moe.op_gar ? moe.op_gar : moe.op_gather;
+    const rad_op routed_gu = moe.op_gu_glu ? moe.op_gu_glu : moe.op_gu;
+    for (const RadBatch& batch : { decode_batch(), prefill_batch() }) {   /* 4 and 64 rows: both in the band */
+        const RadCtx a = run(0, batch), l = run(16, batch), l17 = run(17, batch), l20 = run(20, batch);
+        REQUIRE(!a.issues.empty() && !l.issues.empty());
+        for (const RecIssue& x : a.issues) CHECK_EQ(x.lane, 0);
+        /* the same issues, only lanes and order moved */
+        std::vector<std::string> ka = keys(a.issues, -1), kl = keys(l.issues, -1);
+        std::sort(ka.begin(), ka.end());
+        std::sort(kl.begin(), kl.end());
+        CHECK(ka == kl);
+        CHECK(!same_list(a, l));   /* control: the bit moved something */
+        /* lane 1 = the shared arm only, after the routed down; lane 0 = today's list without it, in today's order */
+        std::vector<RecIssue> rest;
+        int n1 = 0, sgate1 = 0, sgu1 = 0, sdown1 = 0, sgate_a = 0;
+        for (const RecIssue& x : a.issues) sgate_a += x.op == moe.op_sgate;   /* 0 where the fused router wrote the gate */
+        int last_dn = -1, first1 = -1, last1 = -1, gat = -1;
+        for (size_t i = 0; i < l.issues.size(); ++i) {
+            const RecIssue& x = l.issues[i];
+            if (x.op == moe.op_dn) last_dn = (int)i;
+            if (x.op == gather && gat < 0) gat = (int)i;
+            if (x.lane != 1) continue;
+            ++n1;
+            if (first1 < 0) first1 = (int)i;
+            last1 = (int)i;
+            sgate1 += x.op == moe.op_sgate;
+            sgu1 += x.op == moe.sh_gate_up.op;
+            sdown1 += x.op == moe.sh_down.op;
+            CHECK(x.op != moe.op_dn && x.op != routed_gu && x.op != gather && x.op != moe.op_add && x.op != moe.op_router &&
+                  x.op != moe.op_topk && x.op != moe.op_scatter && x.op != moe.op_sigmoid_scatter);
+        }
+        CHECK(n1 >= 3);
+        CHECK_EQ(sgate1, sgate_a);
+        CHECK(sgu1 >= 1);
+        CHECK(sdown1 >= 1);
+        CHECK(last_dn >= 0 && first1 > last_dn);
+        CHECK(gat > last1);
+        for (const RecIssue& x : a.issues) {
+            bool arm = false;
+            for (const RecIssue& y : l.issues)
+                if (y.lane == 1 && key(y) == key(x)) arm = true;
+            if (!arm) rest.push_back(x);
+        }
+        CHECK(keys(rest, -1) == keys(l.issues, 0));
+        CHECK_EQ((int)rest.size() + n1, (int)a.issues.size());
+        /* the fork (0 -> 1) before the first lane-1 issue, the join (1 -> 0) after the last one and before the gather */
+        int fork = -1, join = -1;
+        for (const RecJoin& jn : l.joins) {
+            if (jn.from == 0 && jn.to == 1 && (int)jn.at <= first1) fork = (int)jn.at;
+            if (jn.from == 1 && jn.to == 0 && (int)jn.at > last1 && (int)jn.at <= gat) join = (int)jn.at;
+        }
+        CHECK(fork >= 0);
+        CHECK(join >= 0);
+        /* no write on one lane meets a buffer the other lane touches while they are unordered */
+        int clash = 0;
+        for (size_t i = 0; i < l.issues.size(); ++i)
+            for (size_t j = i + 1; j < l.issues.size(); ++j) {
+                if (ordered(l, i, j)) continue;
+                const std::set<rad_buf> wi = bufs_of(l.issues[i], true), wj = bufs_of(l.issues[j], true);
+                const std::set<rad_buf> ti = bufs_of(l.issues[i], false), tj = bufs_of(l.issues[j], false);
+                bool meet = false;
+                for (rad_buf h : wi) meet |= tj.count(h) > 0;
+                for (rad_buf h : wj) meet |= ti.count(h) > 0;
+                clash += meet;
+            }
+        CHECK_EQ(clash, 0);
+        /* the low bits' lane form and SDF give way to the late form */
+        CHECK(same_list(l17, l));
+        CHECK(same_list(l20, l));
+    }
+    /* a pass above the band (128 rows): the bit changes nothing */
+    RadBatch wide = prefill_batch();
+    wide.n_tok = 128;
+    wide.n_seq = 2;
+    wide.max_q_len = 64;
+    wide.max_ctx_len = 64;
+    static const int32_t kWideOut[] = { 63, 127 };
+    wide.out_ids = kWideOut;
+    CHECK(same_list(run(16, wide), run(0, wide)));
+    /* an arm that is not lane-safe: the bit changes nothing */
+    moe.shexp_lane_ok = false;
+    CHECK(same_list(run(16, decode_batch()), run(0, decode_batch())));
+    moe.shexp_lane_ok = true;
+    word.store(0);
+    moe.shexp_lane = keep;
+}
+
 /* DRAFTER round 54 (lever RR1, rad_block_moe_fp8.h MoeFP8::rr1_live): with the switch on, the end routing report of a step of
  * ONE pass from row 0 names the core's counts row (taken in place: no copy), every other report names the block's own counts
  * buffer as before; the issued ops are the same list (the lever is the report's pointer only); a step of two passes, a core
