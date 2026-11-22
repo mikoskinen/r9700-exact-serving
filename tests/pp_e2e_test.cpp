@@ -5186,12 +5186,14 @@ TEST(plan_reserved_serves_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; int bg; const char* cut; };
+    /* tp8 loop F83: the rule is the default since; the 4-lane arm runs with the env unset (the default), the 3-lane one with it at 1 */
+    struct Arm { int lanes; int bg; const char* cut; bool env1; };
     long long lent_all = 0;
-    for (const Arm a : { Arm{ 4, 2, "1,3" }, Arm{ 3, 1, "0,2" } }) {
+    for (const Arm a : { Arm{ 4, 2, "1,3", false }, Arm{ 3, 1, "0,2", true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + std::to_string(a.bg));
-        for (const char* v : { "RADIANCE_PP_PLAN_RESERVED=1", "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1",
+        if (a.env1) env.push_back("RADIANCE_PP_PLAN_RESERVED=1");
+        for (const char* v : { "RADIANCE_PP_FOL_ORDER=2", "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1",
                                "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
         std::vector<std::string> ex = ext;
@@ -5217,8 +5219,9 @@ TEST(plan_reserved_serves_one_process_tokens) {
         };
         const long long lent = occ(llog, " lent to other lanes") - occ(llog, " 0 lent to other lanes");
         const long long named = occ(llog, "rows of other lanes' pieces");
-        fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=1, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld prompts with lent chunks; "
-                        "%lld 'rows of other lanes' pieces' lines\n", a.bg, a.lanes, a.cut, differ, ref.size() + ref_b.size(), lent, named);
+        fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld prompts with lent chunks; "
+                        "%lld 'rows of other lanes' pieces' lines\n", a.env1 ? "1" : "unset (default)", a.bg, a.lanes, a.cut, differ,
+                ref.size() + ref_b.size(), lent, named);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK_EQ(named, 0LL);
