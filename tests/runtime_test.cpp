@@ -3827,4 +3827,72 @@ TEST(the_loader_reads_which_kernels_fetch_their_own_rows) {
     CHECK(plain > 0);
 }
 
+/* tp8 loop W36 (DECODE review of the DRAFTER's lever SL2, MoeFP8::pass kMoeLateBit): the DSpark drafter's last stage forks lane 1
+ * MID-pass -- behind the router chain and the scatter lane 0 has already issued (rad_lane_join(0, 1), then lane 1 taken and lane 0
+ * back at once, so a lane built here starts behind that point) -- lane 0 then issues the route report, the routed gate_up and down,
+ * and only after them, in program order, the late form switches to lane 1 and issues the shared arm (it reads the MoE input the
+ * pre-fork chain wrote), the stage's ffn mix (Beside::fn: writes the streams) and the shared down; back on lane 0, one 1 -> 0 join
+ * in front of the gather, which reads both lanes' results. On the host backend (a stream is a worker thread): the pre-fork producer
+ * is a late write (a missing 0 -> 1 join lets lane 1 read the poison), lane 1's chain holds a late copy (a missing 1 -> 0 join lets
+ * the gather read before it lands; two of them, so lane 1's chain outlasts lane 0's routed one, which holds one). Four steps over the
+ * same persistent buffers with a new value and the poison each step; the lane is built mid-step in the first. Mutants: no fork join, no final join -- each must fail. */
+TEST(w36_sl2_late_fork_lane1_issued_after_lane0_joins_before_the_gather) {
+    ord_setup();
+    for (int mutant = 0; mutant < 3; ++mutant) {   /* 0: as served; 1: no 0 -> 1 fork join; 2: the 1 -> 0 join after the gather (each must miss) */
+        Fixture f;
+        f.P.arena_bytes = 16384;
+        const rad_buf inp = f.add_buffer("dspark.act_x", RAD_I32, 4, 1, 0);       /* the MoE input (the pre-fork norm writes it) */
+        const rad_buf rr = f.add_buffer("dspark.route_rep", RAD_I32, 4, 1, 256);  /* the route report / routed gate_up */
+        const rad_buf ro = f.add_buffer("dspark.expert_down", RAD_I32, 4, 1, 512);
+        const rad_buf sg = f.add_buffer("dspark.shared_gate_up", RAD_I32, 4, 1, 768);
+        const rad_buf h0 = f.add_buffer("dspark.h0", RAD_I32, 4, 1, 1024);        /* the ffn mix's stream (Beside::fn) */
+        const rad_buf so = f.add_buffer("dspark.shared_out", RAD_I32, 4, 1, 1280);
+        const rad_buf g1 = f.add_buffer("dspark.gather_a", RAD_I32, 4, 1, 1536), g2 = f.add_buffer("dspark.gather_b", RAD_I32, 4, 1, 1792);
+        const rad_buf g3 = f.add_buffer("dspark.gather_c", RAD_I32, 4, 1, 2048);
+        const rad_op prod = f.add_op("rope", "M", { 8192 }, { k_late_write }, { "late_write" }, nullptr, {});
+        const rad_op cp = f.add_op("rope", "M", { 8192 }, { k_copy }, { "copy" }, nullptr, {});
+        const rad_op slow = f.add_op("rope", "M", { 8192 }, { k_late_copy }, { "late_copy" }, nullptr, {});
+        for (rad_op o : { prod, cp, slow }) f.P.ops[o].bands[0].dom[RAD_DOMAIN_DEVICE].scratch_bytes = 0;
+        CHECK_OK(f.start());
+        const auto put = [&](Ctx& c, rad_op op, rad_buf a, rad_buf b) {
+            const RadOperand o2[2] = { RAD_B(a), RAD_B(b) };
+            CHECK_OK(c.issue(op, o2, 2, RAD_N_BATCH));
+        };
+        int bad = 0;
+        for (int round = 0; round < 4; ++round) {
+            const int32_t v = 9100 + 10 * mutant + round;
+            *g_ord_value = v;
+            for (rad_buf d : { inp, rr, ro, sg, h0, so, g1, g2, g3 }) dev_put(f, f.ctx.buf_ptr(d), -7);   /* the poison */
+            CHECK_OK(f.step(4, round, [&](Ctx& c) {
+                const RadOperand o1[1] = { RAD_B(inp) };
+                CHECK_OK(c.issue(prod, o1, 1, RAD_N_BATCH));   /* the router chain + scatter ahead of the fork (late) */
+                if (mutant != 1) CHECK_OK(c.lane_join(0, 1));   /* the fork: lane 1 behind everything issued so far */
+                CHECK_OK(c.set_lane(1));                        /* taken now (a lane built here starts behind this point) */
+                CHECK_OK(c.set_lane(0));
+                put(c, cp, inp, rr);                            /* lane 0: route report, routed gate_up, routed down */
+                put(c, slow, rr, ro);
+                CHECK_OK(c.set_lane(1));                        /* lane 1, issued after lane 0's chain */
+                put(c, cp, inp, sg);                            /* shared gate_up (reads the MoE input) */
+                put(c, slow, sg, h0);                           /* the ffn mix (Beside::fn) */
+                put(c, slow, h0, so);                           /* shared down (slow too: lane 1's chain outlasts lane 0's) */
+                CHECK_OK(c.set_lane(0));
+                if (mutant != 2) CHECK_OK(c.lane_join(1, 0));   /* in front of the gather */
+                put(c, cp, ro, g1);                             /* the gather reads both lanes */
+                put(c, cp, so, g2);
+                put(c, cp, h0, g3);
+                if (mutant == 2) CHECK_OK(c.lane_join(1, 0));   /* the mutant joins only after the gather (the step stays well formed) */
+            }));
+            const bool ok = dev_get(f, f.ctx.buf_ptr(g1)) == v && dev_get(f, f.ctx.buf_ptr(g2)) == v && dev_get(f, f.ctx.buf_ptr(g3)) == v;
+            if (mutant == 0) {
+                CHECK_EQ(dev_get(f, f.ctx.buf_ptr(g1)), v);
+                CHECK_EQ(dev_get(f, f.ctx.buf_ptr(g2)), v);
+                CHECK_EQ(dev_get(f, f.ctx.buf_ptr(g3)), v);
+            } else if (!ok) {
+                ++bad;
+            }
+        }
+        if (mutant != 0) CHECK(bad > 0);   /* each mutant reads the poison or a stale value in at least one of its three steps */
+    }
+}
+
 RAD_TEST_MAIN_HOST_KARGS()
