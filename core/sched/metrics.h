@@ -155,6 +155,11 @@ struct SchedMetrics {
     int64_t psk_cr_end_ckpts = 0;
     /* tp8 loop P55b (lever PPO, RADIANCE_PREFIX_PROMPT_ONLY=1): publishes cut to the prompt, and the decode-written rows kept out */
     int64_t ppo_withheld = 0, ppo_rows = 0;
+    /* tp8 loop P57 (lever PRD, RADIANCE_SCHED_PREEMPT_REPLAY=1): preemptions whose output is replayed in decode form, the tokens
+     * stashed, the replay steps, the steps whose card verify disagreed with the known tokens (a decode-form replay that is not
+     * the unpreempted run's bytes: 0 on an exact build under greedy sampling), replays finished, and preemptions left to the
+     * prefill-form recompute (not eligible) */
+    int64_t prd_kept = 0, prd_tokens = 0, prd_steps = 0, prd_diff = 0, prd_done = 0, prd_refused = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */

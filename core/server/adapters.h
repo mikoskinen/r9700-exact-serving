@@ -142,6 +142,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.psk_tail_only = m.psk_tail_only;           o.psk_tail_only_refused = m.psk_tail_only_refused;
     o.psk_cr_cheaper = m.psk_cr_cheaper;         o.psk_cr_end_ckpts = m.psk_cr_end_ckpts;   /* ds41-pskcr2 */
     o.ppo_withheld = m.ppo_withheld;             o.ppo_rows = m.ppo_rows;                   /* tp8 loop P55b */
+    o.prd_kept = m.prd_kept;   o.prd_tokens = m.prd_tokens;   o.prd_steps = m.prd_steps;   /* tp8 loop P57 (lever PRD) */
+    o.prd_diff = m.prd_diff;   o.prd_done = m.prd_done;       o.prd_refused = m.prd_refused;
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;

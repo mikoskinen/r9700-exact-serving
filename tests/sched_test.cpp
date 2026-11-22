@@ -2308,6 +2308,169 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
 }
 
+/* tp8 loop P57 (lever PRD, RADIANCE_SCHED_PREEMPT_REPLAY=1): A REQUEST PREEMPTED BY RECOMPUTE REPLAYS ITS OUTPUT IN DECODE FORM.
+ * The model here is greedy and reads how each row of a request's reply was written: the token after position q is
+ * 3000 + (7 q + 13 id) % 1000, plus one once any reply row at or below q was written by a PREFILL entry -- the card's
+ * case (F84: a prefill row rounds otherwise than the decode verify row of the same token, and a later decode reads it).
+ * The drafter proposes the next two tokens right and a third wrong. Two requests share a pool that cannot hold both whole
+ * (22 blocks of 16 against 13 + 12): the low-priority one is preempted after ~16 tokens. Reference = a pool that never
+ * preempts. Today (env unset) its recompute re-prefills the reply and the answer moves (the negative control); with the env
+ * its prompt prefills again as a cold prompt, the reply rides verify rows at the drafter's count with the known tokens,
+ * every reply row is decode-written, and both answers are the reference's, token for token. */
+namespace {
+struct PrdRun {
+    std::vector<int32_t> out_a, out_b;
+    std::vector<char> form_a;     /* 'p' / 'd' a position of A's sequence: which entry kind last wrote it */
+    SchedMetrics m;
+    int replay_steps_drafted = 0; /* A's decode entries with n_spec > 0 while it replayed */
+    int replay_entries = 0;
+    int64_t a_prompt_target = -1; /* the produces_token prefill entry's end after the preemption */
+};
+int32_t prd_tok(uint64_t id, int64_t q, bool shifted) { return 3000 + (int32_t)((7 * q + 13 * (int64_t)id) % 1000) + (shifted ? 1 : 0); }
+PrdRun prd_run(int64_t blocks, bool env) {
+    struct Env { ~Env() { unsetenv("RADIANCE_SCHED_PREEMPT_REPLAY"); } } guard;
+    if (env) setenv("RADIANCE_SCHED_PREEMPT_REPLAY", "1", 1); else unsetenv("RADIANCE_SCHED_PREEMPT_REPLAY");
+    PrdRun out;
+    Fixture f;
+    f.build(blocks, /*states=*/64);
+    f.cfg.n_spec = 3;
+    const int st = f.start();
+    CHECK_OK(st);
+    if (st < 0) return out;
+    const uint64_t a = f.submit(160, 40, /*priority=*/0, /*ignore_eos=*/true);
+    const uint64_t b = f.submit(160, 24, /*priority=*/5, /*ignore_eos=*/true);
+    CHECK(a && b);
+    if (!a || !b) return out;
+    std::map<uint64_t, std::vector<char>> form;
+    form[a].assign(400, 0);
+    form[b].assign(400, 0);
+    auto shifted = [&](uint64_t id, int64_t q) {   /* a prefill-written reply row at or below q */
+        const Request* r = f.sch.find(id);
+        const int64_t np = r ? (int64_t)r->prompt.size() : 160;
+        for (int64_t p = np; p <= q && p < 400; ++p) if (form[id][(size_t)p] == 'p') return true;
+        return false;
+    };
+    bool preempted = false;
+    for (int step = 0; step < 2000; ++step) {
+        /* the drafter: two right, one wrong, for every request that decodes */
+        for (uint64_t id : { a, b }) {
+            const Request* r = f.sch.find(id);
+            if (!r || r->state != ReqState::Running) continue;
+            const int64_t c = r->n_computed;
+            if (c < (int64_t)r->prompt.size() || c + 1 < (int64_t)(r->prompt.size() + r->output.size())) continue;
+            const bool sh = shifted(id, c);
+            int32_t d[3] = { prd_tok(id, c, sh), prd_tok(id, c + 1, sh), prd_tok(id, c + 2, sh) + 500 };
+            CHECK_OK(f.sch.set_draft(id, d, 3));
+        }
+        const RadBatch* bt = f.sch.step();
+        if (!bt) break;
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            std::vector<char>& fm = form[e.seq];
+            const int64_t n = e.is_prefill ? e.n_tokens : 1 + e.n_spec;
+            for (int64_t k = 0; k < n && e.ctx_len + k < 400; ++k) fm[(size_t)(e.ctx_len + k)] = e.is_prefill ? 'p' : 'd';
+            if (e.is_prefill) {
+                if (e.produces_token) {
+                    tok[i] = prd_tok(e.seq, e.ctx_len + e.n_tokens - 1, shifted(e.seq, e.ctx_len + e.n_tokens - 1));
+                    if (e.seq == a && preempted) out.a_prompt_target = e.ctx_len + e.n_tokens;
+                }
+                continue;
+            }
+            int32_t k = 0;
+            while (k < e.n_spec && e.draft && e.draft[k] == prd_tok(e.seq, e.ctx_len + k, shifted(e.seq, e.ctx_len + k))) ++k;
+            acc[i] = k;
+            tok[i] = prd_tok(e.seq, e.ctx_len + k, shifted(e.seq, e.ctx_len + k));
+            if (e.seq == a && preempted && f.sch.metrics().prd_kept > f.sch.metrics().prd_done) {
+                ++out.replay_entries;
+                if (e.n_spec > 0) ++out.replay_steps_drafted;
+            }
+        }
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = acc.data();
+        res.token = tok.data();
+        res.eos = eos.data();
+        const int cr = f.sch.commit(res);
+        CHECK_OK(cr);
+        if (cr < 0) break;
+        if (f.sch.metrics().preemptions > 0) preempted = true;
+        const Request* ra = f.sch.find(a);
+        const Request* rb = f.sch.find(b);
+        if ((!ra || ra->state == ReqState::Finished) && (!rb || rb->state == ReqState::Finished)) break;
+    }
+    if (const Request* ra = f.sch.find(a)) out.out_a = ra->output;
+    if (const Request* rb = f.sch.find(b)) out.out_b = rb->output;
+    out.form_a = form[a];
+    out.m = f.sch.metrics();
+    return out;
+}
+}  /* namespace */
+
+TEST(p57_prd_a_preempted_request_replays_its_output_in_decode_form_under_the_env) {
+    const PrdRun ref = prd_run(4096, false);
+    REQUIRE_EQ(ref.out_a.size(), 40u);
+    REQUIRE_EQ(ref.out_b.size(), 24u);
+    CHECK_EQ(ref.m.preemptions, 0);
+    for (int64_t q = 160; q < 199; ++q) CHECK_EQ(ref.form_a[(size_t)q], 'd');   /* the unpreempted reply: decode rows */
+
+    /* today: the recompute re-prefills the reply -> A's answer moves (the negative control); B is untouched */
+    const PrdRun off = prd_run(22, false);
+    CHECK(off.m.preemptions >= 1);
+    CHECK_EQ(off.m.prd_kept, 0);
+    CHECK(off.out_b == ref.out_b);
+    REQUIRE_EQ(off.out_a.size(), 40u);
+    CHECK(off.out_a != ref.out_a);
+    int pf_rows = 0;
+    for (int64_t q = 160; q < 199; ++q) pf_rows += off.form_a[(size_t)q] == 'p';
+    CHECK(pf_rows > 0);
+
+    /* the lever: the same pool and requests, A's answer = the reference's; every reply row decode-written */
+    const PrdRun on = prd_run(22, true);
+    CHECK(on.m.preemptions >= 1);
+    CHECK(on.m.prd_kept >= 1);
+    CHECK_EQ(on.m.prd_done, on.m.prd_kept);
+    CHECK(on.m.prd_tokens >= 2);
+    CHECK_EQ(on.m.prd_diff, 0);          /* the card's own verify agreed with the known tokens at every replay step */
+    CHECK_EQ(on.m.prd_refused, 0);
+    CHECK(on.out_a == ref.out_a);
+    CHECK(on.out_b == ref.out_b);
+    for (int64_t q = 160; q < 199; ++q) CHECK_EQ(on.form_a[(size_t)q], 'd');
+    CHECK_EQ(on.a_prompt_target, 160);   /* the recompute's prefill ends at the prompt */
+    /* the replay ran at the drafter's shape: verify rows, several tokens a step */
+    CHECK(on.replay_steps_drafted > 0);
+    CHECK(on.m.prd_steps < on.m.prd_tokens);
+    fprintf(stderr, "    P57 PRD: off -- %lld preemption(s), %d reply rows prefill-written, A differs from the reference; on -- %lld "
+                    "preemption(s), %lld tokens replayed in %lld steps (%d of %d drafted), %lld card disagreements, A = B = the "
+                    "reference\n", (long long)off.m.preemptions, pf_rows, (long long)on.m.preemptions, (long long)on.m.prd_tokens,
+            (long long)on.m.prd_steps, on.replay_steps_drafted, on.replay_entries, (long long)on.m.prd_diff);
+}
+
+/* lever PRD: a request whose sampler reads its output (here a repetition penalty) recomputes as before, counted */
+TEST(p57_prd_leaves_a_penalised_request_to_the_recompute) {
+    struct Env { ~Env() { unsetenv("RADIANCE_SCHED_PREEMPT_REPLAY"); } } guard;
+    setenv("RADIANCE_SCHED_PREEMPT_REPLAY", "1", 1);
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    auto ra = f.request(160, 64);
+    ra->sp.rep_penalty = 1.1f;
+    const uint64_t a = f.add(std::move(ra));
+    auto rb = f.request(160, 64);
+    rb->priority = 5;
+    const uint64_t b = f.add(std::move(rb));
+    REQUIRE(a && b);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);   /* both at 160: A is preempted */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.metrics().prd_refused, 1);
+    CHECK_EQ(f.sch.metrics().prd_kept, 0);
+    CHECK_EQ(f.sch.find(a)->output.size(), 1u);   /* kept: the recompute re-prefills prompt ++ output */
+}
+
 /* ================================================================== the step batch */
 /* A PREEMPTED PREFILL WAITS FOR ROOM FOR THE WHOLE RECOMPUTE plus one block per running
  * sequence. Admitting it on a shortfall is what makes the prefill loop: the next decode takes

@@ -430,6 +430,19 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["cr_mixed_passes"] = pl[14];
             o["psk"] = std::move(p);
         }
+        /* tp8 loop P57 (lever PRD, RADIANCE_SCHED_PREEMPT_REPLAY=1): preemptions whose output replays in decode form, the tokens
+         * stashed, replay steps, steps whose card verify disagreed with the known tokens, replays finished, preemptions that
+         * recomputed in prefill form (not eligible). All 0 with the env unset. */
+        {
+            json p;
+            p["kept"] = m.prd_kept;
+            p["tokens"] = m.prd_tokens;
+            p["steps"] = m.prd_steps;
+            p["steps_card_differs"] = m.prd_diff;
+            p["done"] = m.prd_done;
+            p["refused"] = m.prd_refused;
+            o["preempt_replay"] = std::move(p);
+        }
         /* Lever PSK-DS (ds41-pskl20): the switch (-1 not served), DSpark context passes cut, their rows not run, the rows
          * they ran -- live, cumulative, rank 0's. */
         {

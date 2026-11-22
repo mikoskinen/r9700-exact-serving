@@ -301,6 +301,21 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "only: the rows its decode steps wrote never enter the prefix cache (a later hit through a reply resumes at the snapshot "
                      "before it and prefills the reply, as its cold run does)");
     }
+    {   /* tp8 loop P57 (lever PRD, RADIANCE_SCHED_PREEMPT_REPLAY=1): a request preempted by recompute replays its output in DECODE
+         * form. Why (F84, lq250: 1 of 32 greedy requests differs after a preemption, deterministically): a recompute's lookup keys
+         * on the prompt (PCBinding::lookup), so it re-prefills every row of its reply in prefill form, where the unpreempted run
+         * wrote them as decode verify rows -- other sum orders (LEVERS BI FLIP 49 / BI-x3), and a later decode reads them. With it,
+         * the prompt is prefilled again as its cold run's (target = the prompt), and the reply rides decode verify steps with the
+         * known tokens as the proposal: the rows a decode step writes whatever its verify shape (what load identity shows). The
+         * leader's scheduler only; unset = today. */
+        const char* e = std::getenv("RADIANCE_SCHED_PREEMPT_REPLAY");
+        prd_on_ = e && !std::strcmp(e, "1");
+        if (prd_on_ && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_PREEMPT_REPLAY=1 (tp8 loop P57, lever PRD) -- a request preempted by recompute prefills its "
+                     "prompt again as its cold run and replays its output as decode verify rows (the known tokens as the proposal, "
+                     "nothing sent again); a request with a grammar, penalties, a thinking budget, scores or an embedding recomputes "
+                     "as before");
+    }
     {   /* tp8 loop D56 (fn4 sched_lane_room, RADIANCE_SCHED_LANE_ROOM its start value): the room gates count every lane's runners
          * (room_runners); 0 = this lane's (today). The switch is read at every gate; the start line once. */
         if (fn4::sched_lane_room() > 0 && lane_ <= 0)
@@ -853,6 +868,8 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.lent_hold = false;   /* tp8 M56 (lanes): a recycled slot holds nothing back */
     s.srf_kv = false;      /* tp8 loop P44 */
     s.pub_prompt = false;  /* tp8 loop D55: a recycled slot's request has not published its prompt */
+    s.rp_toks.clear();     /* tp8 loop P57 (lever PRD): a recycled slot replays nothing */
+    s.rp_at = 0;
     s.pub_held = false;    /* tp8 loop D55b */
     s.drafter_reset();
     /* A new request's text, so a new estimate. */
@@ -2551,6 +2568,7 @@ bool Scheduler::preempt_back() {
      * is published first: the recompute adopts it from the cache, and under pressure the cache gives
      * the blocks back (the newest entries last). */
     const bool published = publish_prefix(s);
+    prd_stash(s);   /* tp8 loop P57 (lever PRD): the output to replay in decode form (off / not eligible: nothing) */
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -2575,6 +2593,93 @@ bool Scheduler::preempt_back() {
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
     ++m_.preemptions;
     return published;
+}
+
+/* ------------------------------------------------------------------ tp8 loop P57: lever PRD */
+/* Why a preempted request recomputes as before (nullptr: it replays its output in decode form). Each of these reads its
+ * output or advances host state at every sampled token (a grammar's matcher, the penalties' window, the reasoning budget's
+ * count, scored rows, a pooled answer), which a replay's discarded samples would disturb. */
+const char* Scheduler::prd_refused(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const SamplingParams& sp = r.sp;
+    if (r.embed) return "an embedding request";
+    if (r.token_scores) return "scored rows";
+    if (!sp.grammar.empty() || sp.grammar_program) return "a grammar";
+    if (sp.rep_penalty != 1.0f || sp.freq_penalty != 0.0f || sp.pres_penalty != 0.0f || sp.dry_multiplier != 0.0f ||
+        sp.ngram_ban_n > 0)
+        return "a penalty";
+    if (sp.thinking_budget >= 0) return "a thinking budget";
+    return nullptr;
+}
+
+/* At preempt_back, after the publish: the output goes to SchedReq::rp_toks and Request::output starts empty again, so the
+ * recompute is planned as the cold prompt (seq_len = the prompt: its chunk plan, tail grid, PSK targets and snapshots as
+ * its first run's) and every output token then comes back through decode verify rows (prd_fill / prd_next). A request
+ * preempted again while it replays keeps the whole stash (its output is a prefix of it). */
+void Scheduler::prd_stash(SchedReq& s) {
+    if (!prd_on_ || !s.req) return;
+    Request& r = *s.req;
+    const bool replaying = s.rp_left() > 0;
+    if (r.output.empty() && !replaying) return;   /* preempted inside its prompt: nothing generated yet */
+    if (!replaying) {
+        if (const char* no = prd_refused(s)) {
+            ++m_.prd_refused;
+            if (prd_lines_ < 1000) {
+                ++prd_lines_;
+                RAD_INFO("lever PRD: request %llu preempted at %zu output tokens recomputes in prefill form (%s)",
+                         (unsigned long long)r.id, r.output.size(), no);
+            }
+            return;
+        }
+        s.rp_toks = r.output;
+    }
+    s.rp_at = 0;
+    r.output.clear();
+    s.rp_steps = 0;
+    s.rp_diff = 0;
+    s.rp_from_us = mono_us();
+    ++m_.prd_kept;
+    m_.prd_tokens += (int64_t)s.rp_toks.size();
+    if (prd_lines_ < 1000) {
+        ++prd_lines_;
+        RAD_INFO("lever PRD: request %llu preempted at %zu output tokens (%lld of %lld positions computed%s): its prompt of %zu "
+                 "prefills again, its output replays in decode form", (unsigned long long)r.id, s.rp_toks.size(),
+                 (long long)r.n_computed, (long long)((int64_t)r.prompt.size() + (int64_t)s.rp_toks.size()),
+                 replaying ? ", again while replaying" : "", r.prompt.size());
+    }
+}
+
+/* step()'s decode branch, after every gate and cap: the proposal is the known continuation, as many tokens as the drafter
+ * proposed (its own verify shape) and no further than one short of the stash's end (the last known token is the bonus of
+ * the step that reaches it). A chain. */
+void Scheduler::prd_fill(SchedReq& s) {
+    const int64_t left = s.rp_left();
+    if (left <= 0) return;
+    int64_t k = std::min<int64_t>((int64_t)s.n_draft, left - 1);
+    if (k < 0) k = 0;
+    for (int64_t j = 0; j < k; ++j) s.draft[j] = s.rp_toks[(size_t)(s.rp_at + j)];
+    s.n_draft = (int32_t)k;
+    s.draft_tree = false;
+}
+
+/* The next known token for Request::output, in place of the card's sample `card_tok` (counted when they differ). */
+int32_t Scheduler::prd_next(SchedReq& s, int32_t card_tok) {
+    const int32_t t = s.rp_toks[(size_t)s.rp_at++];
+    if (card_tok != t) ++s.rp_diff;
+    return t;
+}
+
+/* The stash is spent: Request::output is the whole output again, and the request decodes on from its last token. */
+void Scheduler::prd_close(SchedReq& s) {
+    ++m_.prd_done;
+    if (prd_lines_ < 1000) {
+        ++prd_lines_;
+        RAD_INFO("lever PRD: request %llu replayed %zu output tokens in decode form: %lld steps, %lld of them with the card's own "
+                 "verify not the known tokens, %.2f s since its preemption", (unsigned long long)s.req->id, s.rp_toks.size(),
+                 (long long)s.rp_steps, (long long)s.rp_diff, (double)(mono_us() - s.rp_from_us) / 1e6);
+    }
+    s.rp_toks.clear();
+    s.rp_at = 0;
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -2604,7 +2709,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
                 (void)kv_->release_idle_states();
         }
         if (!preempted_can_prefill(s)) {
-            if (!(pool_idle() && preempt_wait_overdue(s) && kv_->can_ever_fit(s.seq_len())))
+            if (!(pool_idle() && preempt_wait_overdue(s) && kv_->can_ever_fit(s.seq_len() + s.rp_left())))
                 return kAdmitWait;
         }
     }
@@ -3102,7 +3207,9 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s, bool all_lanes) const {
     const Request& r = *s.req;
     std::vector<const SchedReq*> run;
     room_runners(&run, all_lanes);
-    const int64_t target = s.seq_len();
+    /* tp8 loop P57 (lever PRD): a request that replays its output waits for room for all of it, as the recompute of prompt ++
+     * output does (rp_left 0 otherwise) */
+    const int64_t target = s.seq_len() + s.rp_left();
     /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
      * no new block. */
     const int64_t hit = (cfg_.prefix_cache && pc_) ? pc_->lookup(r, nullptr, nullptr).n_attn_tokens : 0;
@@ -3753,6 +3860,8 @@ const RadBatch* Scheduler::step() {
              * the limit, so the one token itself always fits. */
             const int64_t spare = ctx_limit_ - 1 - (int64_t)r.n_computed;
             if (ctx_limit_ > 0 && s.n_draft > spare) s.n_draft = spare > 0 ? (int32_t)spare : 0;
+            /* tp8 loop P57 (lever PRD): a replaying request verifies its known continuation at the drafter's count */
+            if (s.rp_left() > 0) prd_fill(s);
             want = 1 + s.n_draft;
             if (want > budget) want = 0;
         }
@@ -4533,6 +4642,8 @@ const RadBatch* Scheduler::step_next_locked() {
         if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) return nullptr;
         SchedReq& s = *reqs_[(size_t)e.slot];
         if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
+        /* tp8 loop P57 (lever PRD): a replay step's tokens are the host's stash, not the card's samples */
+        if (s.rp_left() > 0) return nullptr;
         Request& r = *s.req;
         /* A mid-prompt chunk continues as a prefill from where the host knows it is. A grammar
          * that cannot rewind decides at commit whether the next step may speculate; one that can,
@@ -4703,6 +4814,10 @@ int Scheduler::commit(StepResult& res) {
         /* `ignore_eos` drops the token's termination and nothing else: max_tokens and the stop
          * strings below still end the request. See Request::ignore_eos. */
         bool eos = res.eos && res.eos[i] && !r.ignore_eos;
+        /* tp8 loop P57 (lever PRD): this entry replays known output -- its tokens are the stash's, sent to the client before the
+         * preemption, and none of them ended the request */
+        const bool rp = s.rp_left() > 0;
+        if (rp) eos = false;
 
         bool overflowed = false;
         /* A token whose requested logprobs could not be computed (TokenLogprobs::token -1) fails
@@ -4743,6 +4858,13 @@ int Scheduler::commit(StepResult& res) {
                 /* The answer is the pooled vector the engine already put in the sink; there is
                  * no token to emit, and `eos` ends the request below. */
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
+            } else if (e.produces_token && res.token && rp) {
+                /* lever PRD: the replayed prompt's last row -- its known first output token, nothing sent again */
+                lane_prompt_note(s);
+                const int64_t d0 = s.rp_diff;
+                r.output.push_back(prd_next(s, res.token[i]));
+                if (s.rp_diff != d0) ++m_.prd_diff;
+                s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
             } else if (e.produces_token && res.token) {
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
                 lane_prompt_note(s);   /* tp8 prefill P0: the prompt's lanes line (one lane: nothing) */
@@ -4812,6 +4934,18 @@ int Scheduler::commit(StepResult& res) {
                 if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
                 if (!server::sink_push(r.sink, t, lp)) overflowed = true;
             };
+            if (rp) {
+                /* lever PRD: a replay step -- the accepted proposal is the stash's next tokens (prd_fill), then the known token in
+                 * place of the card's sample; nothing sent again. A shortfall in the card's own verify (an acceptance under the
+                 * proposal, or another token) is counted: the rows past it are rolled back above and computed again next step. */
+                const int64_t d0 = s.rp_diff;
+                for (int32_t j = 0; j < a; ++j) r.output.push_back(s.rp_toks[(size_t)s.rp_at++]);
+                r.output.push_back(prd_next(s, res.token ? res.token[i] : -1));
+                if (a < e.n_spec && s.rp_diff == d0) ++s.rp_diff;
+                if (s.rp_diff != d0) ++m_.prd_diff;
+                ++s.rp_steps;
+                ++m_.prd_steps;
+            } else {
             /* On a tree step the accepted drafts are the path's nodes, in path order. */
             const int32_t* path = res.path ? res.path + (size_t)i * RAD_SCHED_MAX_SPEC : nullptr;
             for (int32_t j = 0; j < a; ++j) {
@@ -4819,6 +4953,7 @@ int Scheduler::commit(StepResult& res) {
                 emit(d >= 0 && d < e.n_spec ? s.draft[d] : s.draft[j], j);
             }
             if (res.token) emit(res.token[i], a);
+            }
             r.n_computed = valid;
             /* The gate's pending proposal against what this step emitted (lookup.h). */
             if (lookup_gate_on_ && s.look.started) {
@@ -4829,9 +4964,9 @@ int Scheduler::commit(StepResult& res) {
                 ts.nb = (int64_t)r.output.size();
                 lookup_.advance(s.look, ts);
             }
-            step_decode_tok_ += 1 + a;
+            if (!rp) step_decode_tok_ += 1 + a;   /* lever PRD: a replay's rows are no new tokens */
 
-            if (e.n_spec > 0) {
+            if (e.n_spec > 0 && !rp) {   /* lever PRD: its forced proposal says nothing about the drafter */
                 draft_.observe(e.n_spec, a);
                 if (e.ngram) { acc_look_d_ += e.n_spec; acc_look_a_ += a; }
                 else         { acc_head_d_ += e.n_spec; acc_head_a_ += a; }
@@ -4862,6 +4997,7 @@ int Scheduler::commit(StepResult& res) {
         s.n_draft = 0;
         r.n_draft = 0;
         s.entry = -1;
+        if (rp && s.rp_left() == 0) prd_close(s);   /* tp8 loop P57: the whole output is back; it decodes on */
 
         /* A request the next step carries finishes now but keeps its blocks, which that step
          * writes; its commit finds the request not running and returns them. */

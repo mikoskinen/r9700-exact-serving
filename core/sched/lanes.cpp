@@ -371,6 +371,13 @@ SchedMetrics LaneSet::observed_metrics() const {
         m.lookup_held += o.lookup_held;
         m.lookup_held_drafts += o.lookup_held_drafts;
         m.lookup_held_hits += o.lookup_held_hits;
+        /* tp8 loop P57 (lever PRD): every lane's preemptions */
+        m.prd_kept += o.prd_kept;
+        m.prd_tokens += o.prd_tokens;
+        m.prd_steps += o.prd_steps;
+        m.prd_diff += o.prd_diff;
+        m.prd_done += o.prd_done;
+        m.prd_refused += o.prd_refused;
         if (o.step > m.step) m.step = o.step;
     }
     if (m.draft_tokens > 0) m.draft_acceptance = (float)((double)m.draft_accepted / (double)m.draft_tokens);
@@ -1173,17 +1180,26 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
     /* As commit()'s prefill entry that produces a token, then its finish. */
     const int32_t W = conv_window();
     bool overflowed = false, lp_failed = false;
-    const bool eos = res.eos && res.eos[i] && !r.ignore_eos;
+    /* tp8 loop P57 (lever PRD): a replayed prompt's last piece -- its known first output token, nothing sent again */
+    const bool rp = s.rp_left() > 0;
+    const bool eos = !rp && res.eos && res.eos[i] && !r.ignore_eos;
     if (!s.first_tok_us) s.first_tok_us = mono_us();
     lane_prompt_note(s);
+    if (rp) {
+        const int64_t d0 = s.rp_diff;
+        r.output.push_back(prd_next(s, res.token[i]));
+        if (s.rp_diff != d0) ++m_.prd_diff;
+    } else {
     r.output.push_back(res.token[i]);
     const TokenLogprobs* lp = res.lp && res.first_row && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                                   ? &res.lp[res.first_row[i]] : nullptr;
     if (lp && lp->token < 0) lp_failed = true;
     else overflowed = !server::sink_push(r.sink, res.token[i], lp);
+    }
     s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
     s.n_draft = 0;
     r.n_draft = 0;
+    if (rp && s.rp_left() == 0) prd_close(s);
     if (overflowed) close_request(s, ReqState::Failed, "sink_overflow", false);
     else if (lp_failed)
         close_request(s, ReqState::Failed, "logprobs", false, true, RAD_E_STATE,

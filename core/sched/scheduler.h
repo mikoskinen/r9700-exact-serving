@@ -98,6 +98,15 @@ struct SchedReq {
     std::vector<uint32_t> ctx_kept;
     int64_t  ctx_lo = 0;
 
+    /* tp8 loop P57 (lever PRD, RADIANCE_SCHED_PREEMPT_REPLAY=1): the output a request had when it was preempted by recompute,
+     * which it replays in DECODE form (Scheduler::prd_*): its prompt is prefilled again as a cold prompt, then each of these
+     * tokens is computed as a decode verify row (the drafter's count filled with the known next tokens), nothing sent to the
+     * client again. Request::output holds the replayed part rp_toks[0, rp_at) meanwhile; empty when not replaying. */
+    std::vector<int32_t> rp_toks;
+    int64_t  rp_at = 0;
+    int64_t  rp_steps = 0, rp_diff = 0, rp_from_us = 0;   /* its replay's steps, the steps the card's verify disagreed, start */
+    int64_t  rp_left() const { return (int64_t)rp_toks.size() - rp_at; }
+
     /* Clears all drafter state for the sequence in this slot, on admission and on preemption.
      * Slots are recycled, so anything not reset here leaks into an unrelated sequence: a stale
      * `draft_filled`, for one, empties the next prefill's history pass (hs = max(draft_filled,
@@ -1414,6 +1423,16 @@ private:
     bool pub_prompt_ = false;
     /* tp8 loop P55b (lever PPO, RADIANCE_PREFIX_PROMPT_ONLY=1 at init): publish_prefix gives the cache a request's prompt rows only */
     bool pub_prompt_only_ = false;
+    /* tp8 loop P57 (lever PRD, RADIANCE_SCHED_PREEMPT_REPLAY=1 at init): a request preempted by recompute replays its output in
+     * decode form (SchedReq::rp_toks). prd_stash at preempt_back; prd_fill in step()'s decode branch (the known tokens as the
+     * proposal); prd_take at a commit (the known tokens emitted, nothing pushed to the sink). */
+    bool prd_on_ = false;
+    int64_t prd_lines_ = 0;
+    const char* prd_refused(const SchedReq& s) const;
+    void prd_stash(SchedReq& s);
+    void prd_fill(SchedReq& s);
+    void prd_close(SchedReq& s);
+    int32_t prd_next(SchedReq& s, int32_t card_tok);
     int64_t pub_prompt_n_ = 0, pub_prompt_tok_ = 0;
     /* tp8 loop D55b: RADIANCE_SCHED_PUB_PROMPT=2 also publishes at every committed prefill chunk (publish_chunk_done), so a
      * running prompt's computed head is in the cache chunk by chunk; RADIANCE_SCHED_PUB_HOLD_MS=N holds a fresh waiting request

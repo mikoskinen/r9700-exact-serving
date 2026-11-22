@@ -6926,16 +6926,20 @@ TEST(preemption_by_recompute_on_the_pipeline_serves_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { const char* name; const char* cut; int lanes; bool best; };
+    struct Arm { const char* name; const char* cut; int lanes; bool best; bool prd = false; };
     const std::vector<std::string> kBest = { "RADIANCE_PP_BG_LANE=2", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOL_ORDER=2",
                                              "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16" };
     long long pre_all = 0;
     const char* only = std::getenv("PP_E2E_PREEMPT_ARM");   /* a debugging aid: the arms whose name holds this text */
     for (const Arm a : { Arm{ "1 lane", "0,2", 1, false }, Arm{ "2 lanes", "0,2", 2, false }, Arm{ "3 lanes, wrap-around", "1,3", 3, false },
-                         Arm{ "2 lanes, wrap-around", "1,3", 2, false }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true } }) {
+                         Arm{ "2 lanes, wrap-around", "1,3", 2, false }, Arm{ "BEST's shape 4 lanes BG 2", "1,3", 4, true },
+                         /* tp8 loop P57: lever PRD -- a preempted request's output replays in decode form (the leader's env) */
+                         Arm{ "2 lanes, wrap-around, PRD", "1,3", 2, false, true },
+                         Arm{ "BEST's shape 4 lanes BG 2, PRD", "1,3", 4, true, true } }) {
         if (only && !std::strstr(a.name, only)) continue;
         std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
         if (a.best) env = cat(env, kBest);
+        if (a.prd) env = cat(env, { "RADIANCE_SCHED_PREEMPT_REPLAY=1" });
         const std::vector<std::string> ex = preempt_shape(a.lanes);
         /* the device size: bisect [64, 512) MiB on the pair's own pool (each probe a start and a stop) */
         auto pool_at = [&](int mib) -> long long {
@@ -6996,6 +7000,21 @@ TEST(preemption_by_recompute_on_the_pipeline_serves_one_process_tokens) {
         CHECK_EQ(differ, 0);
         CHECK(!notowner);
         if (std::strcmp(a.cut, "0,2") != 0) CHECK(checks > 0);
+        /* tp8 loop P57: with PRD every preemption that had output replays it (a kept line, then its replayed line); none without */
+        {
+            auto count = [&](const char* t) { size_t n = 0, at = 0; while ((at = llog.find(t, at)) != std::string::npos) { ++n; ++at; } return (long long)n; };
+            const long long kept = count("its output replays in decode form"), done = count(" output tokens in decode form: "),
+                            refused = count("recomputes in prefill form");
+            fprintf(stderr, "      lever PRD lines: %lld kept, %lld replayed, %lld refused\n", kept, done, refused);
+            if (a.prd) {
+                CHECK(kept > 0);
+                CHECK(done > 0 && done <= kept);
+                CHECK(llog.find("RADIANCE_SCHED_PREEMPT_REPLAY=1 (tp8 loop P57") != std::string::npos);
+            } else {
+                CHECK_EQ(kept + done + refused, 0);
+            }
+            CHECK_EQ(refused, 0);
+        }
         if (differ || notowner || !(pre > 0))
             fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         pre_all += pre > 0 ? (long long)pre : 0;

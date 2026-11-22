@@ -104,6 +104,7 @@ struct SchedMetrics {
     int64_t psk_cr_fb_adopt = 0, psk_cr_not_needed = 0, psk_tail_only = 0, psk_tail_only_refused = 0;
     int64_t psk_cr_cheaper = 0, psk_cr_end_ckpts = 0;   /* ds41-pskcr2 */
     int64_t ppo_withheld = 0, ppo_rows = 0;             /* tp8 loop P55b (lever PPO) */
+    int64_t prd_kept = 0, prd_tokens = 0, prd_steps = 0, prd_diff = 0, prd_done = 0, prd_refused = 0;   /* tp8 loop P57 */
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
     /* Exact cumulative counts behind the EWMA rates above, for comparing runs.
