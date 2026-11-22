@@ -156,9 +156,10 @@ inline int pair_of(const Spec& s, int n_layer, int ple_layer, int* h, int* t, st
 }
 
 /* Bytes one row of a crossing carries: the wide hc stream (hc streams x n_embd bf16) and, where the hc write hands its norm
- * scales to the next read (RADIANCE_FN4_HC_SS, W1b: `ss`), hc f32 scales. Flash-Next: 4 x 2,560 x 2 = 20,480 B (+ 16). */
+ * scales to the next read (RADIANCE_FN4_HC_SS, W1b: `ss`), the handoff buffer's row (rad_block_hc.h Wire::ss: [T, 8] f32 =
+ * 32 B). Flash-Next: 4 x 2,560 x 2 = 20,480 B (+ 32). */
 inline int64_t crossing_row_bytes(int64_t hc, int64_t n_embd, bool ss) {
-    return hc * n_embd * 2 + (ss ? hc * 4 : 0);
+    return hc * n_embd * 2 + (ss ? 8 * 4 : 0);
 }
 
 }  /* namespace qfnlayers */

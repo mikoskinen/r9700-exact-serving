@@ -103,6 +103,7 @@
 #include <arch/rad_block_vit.h>
 
 #include "qfn_layers.h"   /* Qwen tp8 S1: a node's trunk-layer ranges (RADIANCE_FN4_LAYERS / _MODE) */
+#include "rad_pp.h"       /* Qwen tp8 S2: the two-node pipeline (rad_pp_info, the stage crossings) */
 
 #include <chrono>
 #include <thread>
@@ -353,6 +354,16 @@ struct Model {
     rad::arch::qfnlayers::Spec lr{};
     std::vector<int> lr_next;
     int lr_first = 0, lr_last = -1;   /* the first / last held layer (every layer: 0 / n_layer - 1) */
+    /* Qwen tp8 S2 (Qwen loop round 30): a node of the two-node pipeline (--pp-nodes 2, abi/rad_pp.h), W(h, t): the leader
+     * (pp_rank 0) holds [0, h) and [t, n_layer) with the embedding, the PLE layer, the final mixer, lm_head and the MTP
+     * head; the follower [h, t) and nothing else. m.lr is the node's strict spec. The crossings carry the wide stream
+     * (+ the hc_ss handoff row where declared): X1 after layer h - 1's write (leader -> follower), X2 after layer t - 1's
+     * (follower -> leader). op_x1 / op_x2: this node's stage_send / stage_recv of each. */
+    bool pp = false;
+    int  pp_rank = 0, pp_h = 0, pp_t = 0;
+    rad_op op_x1 = 0, op_x2 = 0;
+    int  pp_parts = 0;
+    int64_t pp_row = 0;
 };
 
 static Model g_model[MAX_RANKS];
@@ -364,6 +375,9 @@ static int64_t lr_after(const Model& m, int64_t l) {
     if (!m.lr.on) return l + 1 < (int64_t)m.layers.size() ? l + 1 : -1;
     return l >= 0 && l < (int64_t)m.lr_next.size() ? (int64_t)m.lr_next[(size_t)l] : -1;
 }
+/* Qwen tp8 S2: the embedding, the stream's entry, the final mixer, lm_head and the MTP head -- one machine, a proxy node, or
+ * the leader of the two-node pipeline (never its follower) */
+static bool lr_shell(const Model& m) { return !m.pp || m.pp_rank == 0; }
 
 /* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1 at start, the engine's too): a prompt's tail snapshot at the
  * START OF THE LAST PIECE of its last pipelined prefill step, taken inside the step instead of cutting the step there (lever
@@ -1002,15 +1016,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * below differs from the published declare. */
     {
         std::string err;
-        if (rad::arch::qfnlayers::parse(std::getenv("RADIANCE_FN4_LAYERS"), std::getenv("RADIANCE_FN4_LAYERS_MODE"),
-                                        (int)g.n_layer, &m.lr, &err) < 0) {
+        /* Qwen tp8 S2: a pipeline node's ranges come from its cut (--pp-nodes 2 --pp-cut h,t), strict (the DS line's form) */
+        const RadPpInfo pp = rad_pp_query();
+        if (pp.nodes == 2) {
+            const int n = (int)g.n_layer;
+            if (std::getenv("RADIANCE_FN4_LAYERS") && *std::getenv("RADIANCE_FN4_LAYERS")) {
+                fprintf(stderr, "radiance: qwen4exp: RADIANCE_FN4_LAYERS and --pp-nodes 2 both name the layers; unset the former\n");
+                return RAD_E_INVAL;
+            }
+            /* the leader holds layer 0 (the embedding's stream, the PLE's token ids) and the last layer (the mixer, the head) */
+            if (pp.cut_h <= 0 || pp.cut_t <= pp.cut_h || pp.cut_t >= n || (pp.rank != 0 && pp.rank != 1)) {
+                fprintf(stderr, "radiance: qwen4exp: --pp-cut %d,%d (node %d): the follower's layers must lie inside (0, %d) "
+                                "and leave the leader layer 0 and the last one\n", pp.cut_h, pp.cut_t, pp.rank, n);
+                return RAD_E_INVAL;
+            }
+            const std::string spec = pp.rank == 1 ? std::to_string(pp.cut_h) + ":" + std::to_string(pp.cut_t)
+                                                  : "0:" + std::to_string(pp.cut_h) + "," + std::to_string(pp.cut_t) + ":" +
+                                                        std::to_string(n);
+            if (rad::arch::qfnlayers::parse(spec.c_str(), "strict", n, &m.lr, &err) < 0 || !m.lr.on ||
+                m.lr.leader != (pp.rank == 0)) {
+                fprintf(stderr, "radiance: qwen4exp: --pp-cut %d,%d: %s\n", pp.cut_h, pp.cut_t,
+                        err.empty() ? "not a two-node split of the trunk" : err.c_str());
+                return RAD_E_INVAL;
+            }
+            m.pp = true;
+            m.pp_rank = pp.rank;
+            m.pp_h = pp.cut_h;
+            m.pp_t = pp.cut_t;
+        } else if (rad::arch::qfnlayers::parse(std::getenv("RADIANCE_FN4_LAYERS"), std::getenv("RADIANCE_FN4_LAYERS_MODE"),
+                                               (int)g.n_layer, &m.lr, &err) < 0) {
             fprintf(stderr, "radiance: qwen4exp: %s\n", err.c_str());
             return RAD_E_INVAL;
         }
-        if (m.lr.on && m.lr.strict) {
+        if (m.lr.on && m.lr.strict && !m.pp) {
             fprintf(stderr, "radiance: qwen4exp: RADIANCE_FN4_LAYERS=%s with RADIANCE_FN4_LAYERS_MODE=strict: a node's own part "
-                            "of W(h, t) is Qwen tp8 step S2 (the crossings and stage ops), not in this build -- run the stage "
-                            "alone with the proxy mode\n", m.lr.text.c_str());
+                            "of W(h, t) is declared by the two-node engine (--pp-nodes 2 --pp-rank r --pp-cut h,t), not by "
+                            "the env -- run the stage alone with the proxy mode\n", m.lr.text.c_str());
             return RAD_E_UNSUPPORTED;
         }
         m.lr_first = 0;
@@ -1304,6 +1345,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 rad_note(b, "ple_layer_ids = %s is outside the %lld layers declared, so the n-gram "
                             "embedding is not in this build.", ple, (long long)g.n_layer);
                 m.ple_layer = -1;
+            } else if (m.pp && [&] {   /* Qwen tp8 S2: the PLE layer below the cut, so X1 carries no token ids */
+                           int h = 0, t = 0;
+                           std::string err;
+                           if (rad::arch::qfnlayers::pair_of(m.lr, (int)g.n_layer, (int)m.ple_layer, &h, &t, &err) == 0) return false;
+                           fprintf(stderr, "radiance: qwen4exp: --pp-cut %d,%d: %s\n", m.pp_h, m.pp_t, err.c_str());
+                           return true;
+                       }()) {
+                return RAD_E_UNSUPPORTED;
             } else if (!lr_held(m, m.ple_layer)) {
                 /* Qwen tp8 S1: the n-gram embedding is its layer's; a node that does not hold that layer declares none of it */
                 rad_note(b, "ple_layer_ids = %s: layer %lld is another node's (RADIANCE_FN4_LAYERS=%s), so this node declares "
@@ -1682,6 +1731,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           nm.ckpt("model.language_model.embed_tokens.weight")));
     RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
                               nm.ckpt("model.language_model.embed_tokens.weight")));
+    /* Qwen tp8 S2: the embedding, its all-reduce, the stream's entry and lm_head are the leader's (lr_shell); a pipeline
+     * follower declares none of them (its stream arrives in X1) */
+    if (lr_shell(m)) {
     m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
                      RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     m.w_lm_head = decl_w(b, nm.f("output.weight"),
@@ -1719,6 +1771,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The stream's initial value: hc identical copies of the embedding. */
     RAD_ARCH_TRY(m.enter.declare(b, g, m.hccfg.hc, m.a_x.x, m.b_h));
+    }   /* lr_shell */
 
     /* The control vector's per-token switch, when this deployment found one (HcProject). All zeros
      * is the stock model, so a request that does not ask for the vector is unaffected. */
@@ -2127,9 +2180,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                                      "their peer scratch instance" : "");
     }
 
+    /* ---- Qwen tp8 S2: the two crossings of W(h, t). Each carries what the next layer's connection read takes after a
+     * layer's hc_ffn.write: the wide stream's rows [T, hc x n_embd] bf16 (20,480 B a row on Flash-Next) and, where the writes
+     * hand their norm scales on (RADIANCE_FN4_HC_SS: hc_ss, [T, 8] f32), that row too -- the same two operands the read takes
+     * in one process, so no arithmetic moves across the cut. X1 after layer h - 1 (leader -> follower), X2 after layer
+     * t - 1 (follower -> leader); declared alike on both nodes so the rendezvous compares them. Every Flash-Next state is
+     * its own layer's and the PLE layer sits below h (its token ids stay on the leader), so nothing else crosses. */
+    if (m.pp) {
+        std::vector<rad_buf> pb = { m.b_h };
+        if (m.b_hss) pb.push_back(m.b_hss);
+        m.pp_parts = (int)pb.size();
+        m.pp_row = rad::arch::qfnlayers::crossing_row_bytes(m.hccfg.hc, g.n_embd, m.b_hss != 0);
+        rad_pp_declare_crossing(RAD_PP_X1, m.pp_row, m.pp_parts);
+        rad_pp_declare_crossing(RAD_PP_X2, m.pp_row, m.pp_parts);
+        auto stage = [&](bool send, int ring) {
+            rad_op h = RAD_OP(b, send ? "stage_send" : "stage_recv",
+                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", m.pp_parts)),
+                              RAD_NOWEIGHTS);
+            if (h == RAD_NULL_HANDLE) return h;
+            if (send) rad_op_reads(b, h, pb.data(), (int)pb.size());
+            else      rad_op_writes(b, h, pb.data(), (int)pb.size());
+            return h;
+        };
+        const bool lead = m.pp_rank == 0;
+        m.op_x1 = stage(lead, RAD_PP_X1);    /* the leader sends X1, the follower receives it */
+        m.op_x2 = stage(!lead, RAD_PP_X2);   /* the follower sends X2, the leader receives it */
+        if (!m.op_x1 || !m.op_x2) {
+            fprintf(stderr, "radiance: qwen4exp: --pp-nodes 2: stage_send / stage_recv did not resolve (a kernel library with "
+                            "the stage ops: libr4d r4d_stage.hip, libref ref_stage.cpp)\n");
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+
     /* ---- the 97th connection: no write half, no fp8 copy. It produces the bf16 hidden state the
      * lm_head reads; its `hc_norm` takes the place of a final norm (the checkpoint has no
-     * `model.language_model.norm.weight`). */
+     * `model.language_model.norm.weight`). (Qwen tp8 S2: the leader's, with the gather and lm_head) */
+    if (lr_shell(m)) {
     {
         HyperConn::Config mc = m.hccfg;
         mc.inject = 0;
@@ -2157,8 +2243,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         RAD_WEIGHTS(m.w_lm_head)),
                     {m.b_hout}, {m.b_logits});
     if (!m.op_embed || !m.op_gather || !m.op_logits) return RAD_E_INVAL;
-    /* Qwen tp8 S1: the node's line (rank 0's real declare; a note in the graph) */
-    if (m.lr.on) {
+    }   /* lr_shell */
+    /* Qwen tp8 S1 / S2: the node's line (rank 0's real declare; a note in the graph) */
+    if (m.lr.on && m.pp) {
+        char line[1024];
+        snprintf(line, sizeof line,
+                 "Qwen tp8 S2: node %d of the two-node pipeline W(%d, %d) (strict, declare only until S3): layers %s, %d of "
+                 "%lld; %s; crossings X1 / X2 of %d part(s), %lld B a row (the wide stream%s)",
+                 m.pp_rank, m.pp_h, m.pp_t, m.lr.text.c_str(), m.lr.n_own, (long long)g.n_layer,
+                 m.pp_rank == 0 ? "the leader: the embedding, the PLE layer, the final mixer, lm_head and the MTP head"
+                                : "the follower: no embedding, mixer, head or drafter",
+                 m.pp_parts, (long long)m.pp_row, m.b_hss ? " + the hc_ss row" : "");
+        rad_note(b, "%s", line);
+        if (g.rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: qwen4exp: %s\n", line);
+    } else if (m.lr.on) {
         int full = 0;
         for (int64_t l = 0; l < g.n_layer; ++l)
             if (lr_held(m, l)) full += m.layers[(size_t)l].full;
@@ -2186,7 +2284,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * rad-convert declares at a non-zero max_spec). */
     const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
                                     "mtp_num_hidden_layers", 0);
-    if (nextn > 0 && rad_ctx_draft_head(ctx)) {
+    if (nextn > 0 && rad_ctx_draft_head(ctx) && lr_shell(m)) {   /* (Qwen tp8 S2: the leader's) */
         const char* mpre = "mtp";
         /* Sized at max_tok, not max_logit_rows: the history pass that fills the head's own K and V
          * has one row per token over a whole prefill chunk. */
@@ -3490,6 +3588,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
+
+    /* Qwen tp8 S2: a pipeline node is declared (its layers, the crossings, the stage ops); its passes by part are S3 */
+    if (m.pp) {
+        rad_step_fail(c, "qwen4exp: --pp-nodes 2 declares this node's part of W(h, t) only; its step loops by part are Qwen tp8 "
+                         "step S3, not in this build -- time a stage alone with RADIANCE_FN4_LAYERS (proxy)");
+        return;
+    }
 
     /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {

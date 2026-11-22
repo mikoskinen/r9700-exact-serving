@@ -13970,7 +13970,124 @@ TEST(flashnext_layers_ranges_parse_pairs_and_crossing_bytes) {
     CHECK_EQ(L::parse("0:24", "fast", n, &s, &err), -1);
     /* the crossing row: 4 streams x 2,560 bf16 = 20,480 B; with the hc_ss scales + 16 B */
     CHECK_EQ(L::crossing_row_bytes(4, 2560, false), (int64_t)20480);
-    CHECK_EQ(L::crossing_row_bytes(4, 2560, true), (int64_t)20496);
+    CHECK_EQ(L::crossing_row_bytes(4, 2560, true), (int64_t)20512);   /* + the hc_ss row, [T, 8] f32 */
+}
+
+/* Qwen tp8 S2 (Qwen loop round 30): this test binary links no core, so the pipeline's weak entry points are faked here -- off
+ * (one machine: rad_pp_query answers nodes 1) unless a case turns them on; the crossings a declare names are recorded. */
+namespace {
+struct FakePp { bool on = false; RadPpInfo info{}; int64_t row[RAD_PP_N_RINGS] = {}; int parts[RAD_PP_N_RINGS] = {}; };
+FakePp& fake_pp() { static FakePp f; return f; }
+}  /* namespace */
+extern "C" int rad_pp_info(RadPpInfo* out) {
+    if (!fake_pp().on) return -1;
+    *out = fake_pp().info;
+    return 0;
+}
+extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
+    if (ring >= 0 && ring < RAD_PP_N_RINGS) { fake_pp().row[ring] = row_bytes; fake_pp().parts[ring] = parts; }
+}
+
+/* Qwen tp8 S2: a node of the two-node pipeline (--pp-nodes 2 --pp-rank r --pp-cut h,t; here the fake rad_pp_info) declares its
+ * strict part of W(2, 6) on the eight-layer fixture (PLE at layer 1, attention at 3 and 7) at four ranks: the leader the weights /
+ * KV binds of layers 0, 1, 6, 7, the embedding, lm_head and the MTP head (blk.8), stage_send X1 + stage_recv X2; the follower
+ * layers 2..5 only, no embedding / head / drafter / PLE, stage_recv X1 + stage_send X2; both name the crossings at 20,480 B a
+ * row and 1 part (+ the hc_ss row: 20,512 B, 2 parts under RADIANCE_FN4_HC_SS=1); a step refuses (S3). Controls: the fake
+ * off = the published declare (graph fingerprint); refusals: a cut with the PLE layer at h (W(1, 6)), the last layer on the
+ * follower (W(2, 8)), RADIANCE_FN4_LAYERS beside --pp-nodes 2. */
+TEST(flashnext_pp_nodes_declare_their_part_and_the_crossings) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int NL = 8;
+    auto layer_of = [](const std::string& name) { return name.rfind("blk.", 0) == 0 ? std::atoi(name.c_str() + 4) : -1; };
+    auto declare = [&](int node, int h, int t, int rank, RadBuilder& b) {
+        FakePp& f = fake_pp();
+        f = FakePp{};
+        f.on = node >= 0;
+        f.info.nodes = 2; f.info.rank = node; f.info.cut_h = h; f.info.cut_t = t; f.info.lanes = 1;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        const int rc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        f.on = false;
+        return rc;
+    };
+    for (int ss : { 0, 1 }) {
+        if (ss) setenv("RADIANCE_FN4_HC_SS", "1", 1); else unsetenv("RADIANCE_FN4_HC_SS");
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b0;
+            REQUIRE_EQ(declare(-1, 0, 0, rank, b0), RAD_OK);   /* control: one machine */
+            CHECK(!qwen4exp_fp8::g_model[rank].pp);
+            const uint64_t g0 = graph_hash(b0);
+            RadBuilder b0b;
+            REQUIRE_EQ(declare(-1, 2, 6, rank, b0b), RAD_OK);
+            CHECK_EQ(graph_hash(b0b), g0);
+            for (int node : { 0, 1 }) {
+                RadBuilder b;
+                REQUIRE_EQ(declare(node, 2, 6, rank, b), RAD_OK);
+                const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+                CHECK(m.pp && m.lr.on && m.lr.strict);
+                CHECK_EQ(m.pp_rank, node);
+                CHECK_EQ(m.lr.leader, node == 0);
+                std::set<int> want;
+                for (int l = 0; l < NL; ++l) if ((l >= 2 && l < 6) == (node == 1)) want.insert(l);
+                std::set<int> wl, kl;
+                bool tok = false, head = false, mtp = false;
+                for (const RecWeight& w : b.weights) {
+                    const int l = layer_of(w.name);
+                    if (l >= 0 && l < NL) wl.insert(l);
+                    mtp = mtp || l == NL;
+                    tok = tok || w.name == "token_embd.weight";
+                    head = head || w.name == "output.weight";
+                }
+                for (const auto& bd : b.binds) if (bd.first < NL) kl.insert(bd.first);
+                CHECK(wl == want);
+                CHECK(kl == want);
+                CHECK_EQ(tok, node == 0);
+                CHECK_EQ(head, node == 0);
+                CHECK_EQ(mtp, node == 0);
+                CHECK_EQ((int)b.drafter.kind, node == 0 ? (int)RAD_DRAFT_SERIAL : 0);
+                CHECK_EQ(m.ple_layer, node == 0 ? (int64_t)1 : (int64_t)-1);
+                int send0 = 0, recv0 = 0, send1 = 0, recv1 = 0, embed = 0, logits = 0;
+                for (const RecOp& o : b.ops) {
+                    int ring = -1, parts = -1;
+                    for (const RecParam& q : o.p) { if (q.key == "ring") ring = (int)q.ival; if (q.key == "parts") parts = (int)q.ival; }
+                    if (o.op == "stage_send" || o.op == "stage_recv") {
+                        CHECK_EQ(parts, 1 + ss);
+                        CHECK_EQ(o.op == "stage_send" ? (int)o.reads.size() : (int)o.writes.size(), 1 + ss);
+                    }
+                    send0 += o.op == "stage_send" && ring == RAD_PP_X1;
+                    recv0 += o.op == "stage_recv" && ring == RAD_PP_X1;
+                    send1 += o.op == "stage_send" && ring == RAD_PP_X2;
+                    recv1 += o.op == "stage_recv" && ring == RAD_PP_X2;
+                    embed += o.op == "embed_lookup";
+                    logits += o.op == "logits_gemm";
+                }
+                CHECK_EQ(send0, node == 0 ? 1 : 0);
+                CHECK_EQ(recv0, node == 1 ? 1 : 0);
+                CHECK_EQ(send1, node == 1 ? 1 : 0);
+                CHECK_EQ(recv1, node == 0 ? 1 : 0);
+                CHECK_EQ(embed > 0, node == 0);
+                CHECK_EQ(logits > 0, node == 0);
+                CHECK_EQ(fake_pp().row[RAD_PP_X1], (int64_t)(4 * 2560 * 2 + 32 * ss));
+                CHECK_EQ(fake_pp().row[RAD_PP_X2], (int64_t)(4 * 2560 * 2 + 32 * ss));
+                CHECK_EQ(fake_pp().parts[RAD_PP_X1], 1 + ss);
+                CHECK_EQ(fake_pp().parts[RAD_PP_X2], 1 + ss);
+                /* a step refuses until S3 */
+                const auto dc = kit(b, { 1, 1 }, {});
+                const auto v = run_passes(b, qwen4exp_fp8::step, { dc.get() }, rank, 4);
+                CHECK(!v[0]->step_fail.empty());
+            }
+            RadBuilder r1, r2, r3;
+            CHECK_EQ(declare(0, 1, 6, rank, r1), RAD_E_UNSUPPORTED);   /* the PLE layer (1) at the cut: X1 would need the ids */
+            CHECK_EQ(declare(1, 1, 6, rank, r1), RAD_E_UNSUPPORTED);
+            CHECK_EQ(declare(1, 2, 8, rank, r2), RAD_E_INVAL);          /* the follower would hold the last layer */
+            setenv("RADIANCE_FN4_LAYERS", "2:6", 1);
+            CHECK_EQ(declare(1, 2, 6, rank, r3), RAD_E_INVAL);          /* two names for the layers */
+            unsetenv("RADIANCE_FN4_LAYERS");
+        }
+    }
+    unsetenv("RADIANCE_FN4_HC_SS");
+    fake_pp() = FakePp{};
 }
 
 /* Qwen tp8 S1 (Qwen loop round 30): the layer-range proxy in qwen4exp_fp8 (RADIANCE_FN4_LAYERS, proxy mode). On the eight-layer
