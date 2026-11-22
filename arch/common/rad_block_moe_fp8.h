@@ -132,6 +132,20 @@ static const int kMoeSdfBit = 4;
  * routed gate_up's GLU form declared (Config::expert_ggml_glu, MoeFP8::op_gu_glu) this bit issues it -- the gate_up writes the
  * down's input (swiglu_clamped in its epilogue) and the swiglu_clamped launch is left out; the same bytes into the down. */
 static const int kMoeGluBit = 8;
+/* Lever SL2 (DRAFTER track 22.11.2026 round 102; deepseek41's DSpark drafter, its LAST stage's own word, dspark_mhr + 4096): the
+ * LATE lane form. At a pass of one segment (r0 0, all T <= kMoeShexpLaneRows rows) where declare found the arm lane-safe
+ * (shexp_lane_ok), lane 1 forks behind the router chain and the scatter, right before this pass's route report -- not ahead of
+ * the router as the low bits' form 1 does -- and takes the shared arm (its gate / ones fill and gate_up, then the caller's
+ * Beside::fn, then the arm's down or its fold e), joined back in front of the gather; lane 0 issues the route report, the routed
+ * gate_up and the routed down right behind it (with lever GSE: nothing between them). Beside::fn then runs on lane 1, so every
+ * buffer it touches must be rad_buf_concurrent (Ctx::lane1_ rule 3: the caller declares them). The low bits' lane form is not
+ * taken on a pass that takes this one. The same ops over the same operands, only their lanes and queue order: the bytes do not
+ * move (rule A). One card (drafter/kit/mes/pfs.cpp, the drafter's third stage, 300 plays x 4 ABBA, card clock): order c = this
+ * form with the barrier bits Ctx::haz_mark gives it, vs its control j (the one-lane issue inside the same fork / join packets)
+ * -6.5 / -5.8 us a 16 / 8-seq pass, the stage's own window vs today's served issue (order F) 231.1 -> 225.4 / 229.1 -> 224.6 us;
+ * order m (the routed gate_up unordered right behind the fork's event packet, which haz_mark orders) -9.0 / -8.5; at the first
+ * stage the lanes lose (+4.6 us at 16 seqs), forked ahead of the router they lose +6..+8 (pfs order y). */
+static const int kMoeLateBit = 16;
 
 struct MoeFP8 {
     struct Config {
@@ -517,7 +531,9 @@ struct MoeFP8 {
      * concurrent buffers, none a quantiser of the block's input). Null: one lane, as before.
      * The word's low two bits are that lane form (0 / 1 / 2, below in pass()); bit 2 (+ 4, tp8 loop D42 SDF) issues
      * the shared arm's down AHEAD of the routed down at a pass of T <= kMoeShexpLaneRows whose arm stays on lane 0
-     * (kMoeSdfBit): the same ops over the same operands, only their queue order (the hazard marks order them). */
+     * (kMoeSdfBit): the same ops over the same operands, only their queue order (the hazard marks order them).
+     * Bit 4 (+ 16, lever SL2, kMoeLateBit): the late lane form -- the arm and Beside::fn on lane 1 forked behind the router
+     * chain, right before the route report (pass() below). */
     const std::atomic<int>* shexp_lane = nullptr;
     bool shexp_lane_ok = false;
     /* Optional, set by the architecture with Config::shared_one_external: read at every pass, > 0 =
@@ -2583,7 +2599,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool glu_now = op_gu_glu && (sl_w & kMoeGluBit) && act_bf16() && !c.expert_exl3 && !c.expert_iqr;
     /* tp8 loop P30t: a twin pass's shared arm stays on lane 0 (its int8 quantiser writes the block input's pair) */
     const bool sh_twin = shared && sh_tw && twin_now && twin_now();
-    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && ((r0 == 0 && rows == T) || (piece && sl_v == 2)) &&
+    /* lever SL2 (kMoeLateBit): the late lane form at a one-segment decode-height pass; it replaces the low bits' form there */
+    const bool want_late = shared && shexp_lane_ok && (sl_w & kMoeLateBit) && r0 == 0 && rows == T && T <= kMoeShexpLaneRows &&
+                           !sh_twin;
+    const bool want_lane1 = !want_late && shared && shexp_lane_ok && shexp_lane &&
+                            ((r0 == 0 && rows == T) || (piece && sl_v == 2)) &&
                             ((sl_v == 1 && T <= kMoeShexpLaneRows) || (sl_v == 2 && T > kMoeShexpLaneRows)) && !sh_twin;
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
@@ -2694,6 +2714,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * router and scatter are issued and before those weights are issued. The stager's copy is
      * ordered behind the router on this stream, so it reads this pass. The report at the end of
      * the step still samples the last pass for the heat engine. */
+    /* lever SL2: the late fork -- lane 1 starts behind everything lane 0 has issued so far (the router chain and the scatter);
+     * its work is issued below, after lane 0's routed down. Forked right BEFORE the route report: the report's copy then is the
+     * dispatch the fork's event packet orders (it reads the scatter's counts, so it is ordered anyway), and the routed gate_up
+     * keeps its unordered start beside the copy (lever RCO); forked after the copy, the gate_up itself would be the ordered one
+     * (one card, pfs orders c vs p: -0.6..-0.8 us a pass). A lane built here starts behind the same point (lane_init), so the lane
+     * is taken now, not at the first lane-1 issue. A lane that cannot be had: one lane, as before. */
+    const bool late = want_late && rad_lane_join(c_, 0, 1) == RAD_OK && rad_lane(c_, 1) == RAD_OK && rad_lane(c_, 0) == RAD_OK;
+    if (want_late && !late) rad_lane(c_, 0);
+    const bool arm0 = shared && !lane1 && !late;   /* the shared arm on lane 0 (the one-lane issue) */
     if (r0 == 0) {
         route_report_at(c_, false);
         rr1_fresh = true;   /* lever RR1: the core's row now holds this pass's counts */
@@ -2753,13 +2782,13 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
                     brows(w.egu, rows * k));
-    if (shared && !lane1) shared_up(c_, T, r0, rows, gate_done);
-    if (beside && beside->fn && r0 == 0) beside->fn(c_, beside->arg);
+    if (arm0) shared_up(c_, T, r0, rows, gate_done);
+    if (beside && beside->fn && r0 == 0 && !late) beside->fn(c_, beside->arg);   /* lever SL2: on lane 1 below */
     if (c.expert_iqr)
         gq_iqr.step(c_, w.egu, rows * k, 0, rows * k);
     else if (!c.expert_exl3 && !glu_now)   /* EXL3: inside gate_up; lever GSE: inside the GLU gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
-    if (shared && !lane1 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
+    if (arm0 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
     /* The shared arm's down: after the routed down and the protected experts (as before), or with SDF right here
      * (tp8 loop D42, kMoeSdfBit: a decode-height pass, the arm on lane 0) */
     const auto sh_down_issue = [&] {
@@ -2767,7 +2796,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         else if (sh_twin) sh_down_tw.step(c_, sff_tw, w.sout, T, r0, rows);   /* tp8 loop P30t */
         else sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     };
-    const bool sdf = shared && !lane1 && (sl_w & kMoeSdfBit) && T <= kMoeShexpLaneRows;
+    const bool sdf = arm0 && (sl_w & kMoeSdfBit) && T <= kMoeShexpLaneRows;
     if (sdf) sh_down_issue();
     if (c.expert_exl3)
         issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
@@ -2809,7 +2838,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared && !lane1 && !sdf) sh_down_issue();
+    if (arm0 && !sdf) sh_down_issue();
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {
@@ -2865,7 +2894,21 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. With Config::gather_ar_rows a single-pass step this short
      * gathers and reduces in one kernel, byte for byte the two it replaces. */
-    if (lane1) rad_lane_join(c_, 1, 0);
+    /* lever SL2: lane 1's work, issued behind lane 0's routed chain (forked above, before the route report): the arm's gate /
+     * ones fill and gate_up, the caller's Beside::fn, the arm's down (or its fold e); joined back below as the low bits' form is */
+    if (late) {
+        rad_lane(c_, 1);
+        shared_up(c_, T, r0, rows, gate_done);
+        if (beside && beside->fn) beside->fn(c_, beside->arg);
+        if (swf) {
+            sh_fold();
+        } else {
+            gq_sh.step(c_, w.sgu, T, r0, rows);
+            sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        }
+        rad_lane(c_, 0);
+    }
+    if (lane1 || late) rad_lane_join(c_, 1, 0);
     if (beside && beside->before_ar && own_ar && r0 + rows == T && issues_ar(T, rows)) beside->before_ar(c_, beside->ar_arg);
     int64_t gar_lim = gar_rows;
     if (gar_live) {

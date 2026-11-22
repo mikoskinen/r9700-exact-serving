@@ -509,6 +509,7 @@ struct Dsp {
     bool wil = false;                     /* lever WIL (dsp_wil_env): the routed experts as moe_gemm_mxil (tile-interleaved) */
     bool gse = false;                     /* lever GSE (gse_env): the routed gate_up's GLU form declared beside the pair */
     bool dsf = false;                     /* lever DSF on GSE (dsf_env, round 92): the shared arm's fold e declared beside GSE */
+    bool sl2 = false;                     /* lever SL2 (sl2_env, round 102): the last stage's late lane form declared */
     /* lever A8D (round 94, a8d_env): the stages' attention dense linears are int8 IQR views (a sidecar's i8*bf16[1x128]) served
      * as gemm_nt_q i8a8 (libr4d's narrow tile) over the drafter's own activation pairs: x (q_a + kv), q (q_b), o (o_a's groups),
      * b (o_b), each [Q, K] int8 + f32 [Q, K / 128]; oa8: the o_a groups' own [Q, o_rank] outputs (the int8 GEMM writes C at
@@ -2380,9 +2381,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dkz = kz && kz[0] == '1' && !kz[1] ? 2048 : 0;
         if (kz && *kz && !dkz && std::strcmp(kz, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_A8K=%s is not 0 / 1: lever A8K not declared\n", kz);
+        const char* lz = std::getenv("RADIANCE_DS41_DSPARK_SL2");   /* lever SL2 (round 102): 1 = on at start, 0 = declared, off */
+        const int dlz = lz && lz[0] == '1' && !lz[1] ? 4096 : 0;
+        if (lz && *lz && !dlz && std::strcmp(lz, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_SL2=%s is not 0 / 1: lever SL2 not declared\n", lz);
         int unread = -1;
         g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk |
-                                                     dg | dz | dgz | dfz | dkz);
+                                                     dg | dz | dgz | dfz | dkz | dlz);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2488,6 +2493,24 @@ static bool a8k_env() {
     return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
 }
 static bool a8k_now() { return (dmr_raw() & 2048) != 0; }
+/* Lever SL2 (DRAFTER track 22.11.2026 round 102; dspark_mhr + 4096, start env RADIANCE_DS41_DSPARK_SL2=1 declares it and sets the bit,
+ * =0 declares it off; unset declares nothing): the LAST stage's MoE in MoeFP8's late lane form (kMoeLateBit, rad_block_moe_fp8.h) --
+ * lane 1 forked behind the router chain, right before the route report, runs the ones fill, the shared gate_up, the stage's
+ * ffn mix (mix_f, the Beside::fn of the dmr branch) and the shared down / its fold e; lane 0 the route report, the routed
+ * gate_up and the routed down right behind it; joined in front of the gather. The mix's buffers (the streams h0 / h1, pre_f, post,
+ * comb) and the MoE's input act.x are rad_buf_concurrent where it is declared (Ctx::lane1_ rule 3; the mix's partials then fit
+ * lane 1's scratch region). Stages 0 / 1 keep g_dsp_sdf's one-lane issue (the late form loses at stage 0: +4.6 us at 16 seqs).
+ * Issue order and lanes only: every byte is today's (rule A). One card (drafter/kit/mes/pfs.cpp order c = this engine form vs its
+ * control j, 300 plays x 4 ABBA, served IKA libr4d, drafter/kit/r102p.sh): -6.5 / -5.8 us a 16 / 8-seq pass card clock, host p50
+ * -8.6 / -9.1; the third stage's own window vs today's served issue (order F) 231.1 -> 225.4 / 229.1 -> 224.6 us. */
+static int sl2_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_SL2");
+    if (!q || !*q) return 0;
+    return !std::strcmp(q, "0") || !std::strcmp(q, "1") ? 1 : -1;
+}
+static bool sl2_now() { return (dmr_raw() & 4096) != 0; }
+static std::atomic<int> g_dsp_sl2{0};   /* lever SL2: the LAST stage's shexp_lane word (g_dsp_sdf's value + kMoeLateBit; set at each query pass) */
+static std::atomic<long long> g_sl2_passes{0};   /* the first-pass line */
 static std::atomic<long long> g_a8k_passes{0};   /* the first-pass line */
 static std::atomic<int> g_dsp_swf{0};   /* lever DSF on GSE: the DSpark MoE's swfold_live word (1 / 0; set at each query pass) */
 static std::atomic<long long> g_dsf_passes{0};   /* the first-pass line */
@@ -3423,7 +3446,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ||
                (value == 3 && g_sw_walk_ok.load(std::memory_order_relaxed) && g_sw_walk3_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 4095 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE; + 1024: lever DSF on GSE; + 2048: lever A8K) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 8191 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE; + 1024: lever DSF on GSE; + 2048: lever A8K; + 4096: lever SL2) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3562,7 +3585,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) + PFX / GSE / DSF (rounds 85 / 91 / 92) + A8K (round 96) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) + PFX / GSE / DSF (rounds 85 / 91 / 92) + A8K (round 96) + SL2 (round 102) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5887,8 +5910,9 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     gq.max_tok = std::max<int64_t>(g.max_tok, Q);
     DS_TRY(L.moe.declare(b, nm, gq, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
-    /* lever SDD (dspark_mhr 6): the drafter's own word, never a lane form (low bits 0) -- kMoeSdfBit or 0, set by dsp_query */
-    L.moe.shexp_lane = &g_dsp_sdf;
+    /* lever SDD (dspark_mhr 6): the drafter's own word, never a lane form (low bits 0) -- kMoeSdfBit or 0, set by dsp_query;
+     * lever SL2 (round 102): the last stage reads its own word, g_dsp_sdf's value + kMoeLateBit where SL2 is declared and on */
+    L.moe.shexp_lane = &L == &d.st.back() ? &g_dsp_sl2 : &g_dsp_sdf;
     /* lever DSF on GSE (round 92): the drafter's own fold e word, 1 / 0 set by dsp_query (the trunk's ds41_swfold never reaches it) */
     if (s.cfg.shared_swfold) {
         L.moe.swfold_live = &g_dsp_swf;
@@ -6375,6 +6399,32 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
     }
     for (auto& L : d.st) DS_TRY(dsp_stage_ops(b, m, L));
+    /* lever SL2 (round 102): the last stage's late lane form -- declared where the start env names it (0 / 1) and that stage's MoE
+     * found its shared arm lane-safe; the buffers lane 1 then touches stay out of the sharing pool (Ctx::lane1_ rule 3) */
+    d.sl2 = false;
+    if (sl2_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_SL2=%s is not 0 / 1\n", std::getenv("RADIANCE_DS41_DSPARK_SL2"));
+        return RAD_E_INVAL;
+    }
+    if (sl2_env() > 0 && !d.st.empty()) {
+        const MoeFP8& mo = d.st.back().moe;
+        if (!mo.shexp_lane_ok || !mo.op_sgate) {
+            rad_note(b, "lever SL2 (RADIANCE_DS41_DSPARK_SL2): the last DSpark stage's shared arm is not lane-safe -- not declared");
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever SL2 (RADIANCE_DS41_DSPARK_SL2) not declared: the last stage's shared arm "
+                                "is not lane-safe (MoeFP8::shexp_lane_ok)\n");
+        } else {
+            for (rad_buf h : { d.h0, d.h1, d.pre_f, d.post, d.comb, d.act.x }) DS_TRY(rad_buf_concurrent(b, h));
+            d.sl2 = true;
+            rad_note(b, "DSpark drafter's last stage MoE in the late lane form declared (lever SL2, RADIANCE_DS41_DSPARK_SL2; "
+                        "dspark_mhr + 4096 issues it)");
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever SL2 (RADIANCE_DS41_DSPARK_SL2=%s): the last DSpark stage's shared arm, "
+                                "ffn mix and shared down on lane 1 forked behind its router, the routed gate_up + down on lane 0, "
+                                "issued at dspark_mhr + 4096 (%s at start)\n",
+                        std::getenv("RADIANCE_DS41_DSPARK_SL2"), sl2_now() ? "on" : "off");
+        }
+    }
 
     /* ---- the head: the last stage's ffn gates collapse the streams, its norm, the trunk's lm_head */
     d.contract = op(b, "mhc_collapse", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
@@ -9478,6 +9528,14 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
 
     /* lever SDD (dspark_mhr 6): the stages' MoE read this word at their issue below (the same value on every rank) */
     g_dsp_sdf.store((dmr_now() >= 6 ? kMoeSdfBit : 0) | (gse_now() ? kMoeGluBit : 0), std::memory_order_relaxed);   /* + lever GSE */
+    /* lever SL2 (round 102): the last stage's word = the same + the late lane form where it is declared and on */
+    {
+        const bool sl2 = d.sl2 && sl2_now();
+        g_dsp_sl2.store(g_dsp_sdf.load(std::memory_order_relaxed) | (sl2 ? kMoeLateBit : 0), std::memory_order_relaxed);
+        if (sl2 && !m.zero && g.rank == 0 && g_sl2_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+            fprintf(stderr, "radiance: deepseek41: lever SL2: first query pass issued with the last stage's MoE in the late lane form "
+                            "(%lld rows; counted at issue: a recorded pass once)\n", (long long)T);
+    }
     /* lever DSF on GSE (round 92): the fold at SDD's place (ahead of the routed down) only with GSE's GLU gate_up issued */
     {
         const int swf = d.dsf && dsf_now() && gse_now() && dmr_now() >= 6 ? 1 : 0;
