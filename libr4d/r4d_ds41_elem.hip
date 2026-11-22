@@ -3117,6 +3117,106 @@ __global__ __launch_bounds__(THR) void post_collapse_norm_kernel(
     }
 }
 
+/* lever A8D fold (c) (DRAFTER track round 95; the op mhc_post_collapse_rmsnorm_i8g): post_collapse_norm_kernel (L256 false,
+ * the same THR from r4d_act_threads) with quant_act_i8g's codes of the y row it stores -- the DSpark stages' pcn_a + the A8D
+ * stage input's quantiser (q_a's pair) in one launch. Every expression above the quantiser is post_collapse_norm_kernel's
+ * (a copy, so that kernel's code is untouched); y is also staged in LDS (bf16, n <= kPcnQ8MaxN) and, behind a barrier,
+ * q8_row_i8g (r4d_q8.h: the standalone quantiser's group / lane map, scale and rounding) writes q [M, n] / s [M, n / 128]. */
+constexpr uint32_t kPcnQ8MaxN = 8192;
+template <bool WF32, uint32_t THR, int HCM>
+__global__ __launch_bounds__(THR) void post_collapse_norm_q8_kernel(
+    const uint16_t* __restrict__ xin, long xp, const uint16_t* __restrict__ h, long hp,
+    const float* __restrict__ post, long ptp, const float* __restrict__ comb, long cbp,
+    uint16_t* __restrict__ out, long op, const float* __restrict__ pre, long pp, long pst,
+    uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
+    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M,
+    signed char* __restrict__ q8, uint32_t q_ld, float* __restrict__ s8, uint32_t s_ld) { R4D_IKA_ENTRY();
+    __shared__ float lds[THR / kFzWave];
+    __shared__ uint16_t yrow[kPcnQ8MaxN];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const uint16_t* __restrict__ xir = xin + (long)m * xp;
+    const uint16_t* __restrict__ hr = h + (long)m * hp;
+    uint16_t* __restrict__ orow = out + (long)m * op;
+    const float* __restrict__ pr = pre + (long)m * pp;
+    uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    float pj[HCM], pk[HCM], cb[HCM][HCM];
+#pragma unroll
+    for (int k = 0; k < HCM; ++k) {
+        const int kk = k < hc ? k : hc - 1;
+        pj[k] = pr[(long)kk * pst];
+        pk[k] = post[(long)m * ptp + kk];
+#pragma unroll
+        for (int j = 0; j < HCM; ++j) cb[j][k] = comb[(long)m * cbp + (j < hc ? j : hc - 1) * hc + kk];
+    }
+    const bool one = n <= (uint32_t)kFzCols * THR;
+    float xv[kFzCols], gv[kFzCols];
+    float ss = 0.0f;
+#pragma unroll 1
+    for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+        uint32_t hv[kFzCols][HCM], xi[kFzCols];
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+#pragma unroll
+            for (int j = 0; j < HCM; ++j) hv[c][j] = hr[(long)(j < hc ? j : hc - 1) * n + i];
+            xi[c] = xir[i];
+            gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        }
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = i0 + (uint32_t)c * THR;
+            float v = 0;
+#pragma unroll
+            for (int k = 0; k < HCM; ++k) {
+                if (k >= hc) continue;
+                float u = 0;
+#pragma unroll
+                for (int j = 0; j < HCM; ++j)
+                    if (j < hc) u += cb[j][k] * bf16_to_f32((uint16_t)hv[c][j]);
+                u += pk[k] * bf16_to_f32((uint16_t)xi[c]);
+                const uint16_t o = f32_to_bf16(u);
+                if (i < n) orow[(long)k * n + i] = o;
+                v += pj[k] * ds_bf(o);
+            }
+            const uint16_t b = ds_bf16(v);
+            xv[c] = bf16_to_f32(b);
+            if (i < n) {
+                xr[i] = b;
+                ss += xv[c] * xv[c];
+            }
+        }
+    }
+    ss = fz_block_sum<THR / kFzWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    if (one) {
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = threadIdx.x + (uint32_t)c * THR;
+            if (i < n) { const uint16_t yb = f32_to_bf16(xv[c] * s * (gv[c] + wadd) * mult); yr[i] = yb; yrow[i] = yb; }
+        }
+    } else {
+#pragma unroll 1
+        for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+            uint16_t xb[kFzCols];
+#pragma unroll
+            for (int c = 0; c < kFzCols; ++c) {
+                const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+                xb[c] = xr[i];
+                gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+            }
+#pragma unroll
+            for (int c = 0; c < kFzCols; ++c) {
+                const uint32_t i = i0 + (uint32_t)c * THR;
+                if (i < n) { const uint16_t yb = f32_to_bf16(bf16_to_f32(xb[c]) * s * (gv[c] + wadd) * mult); yr[i] = yb; yrow[i] = yb; }
+            }
+        }
+    }
+    __syncthreads();   /* publishes yrow */
+    q8_row_i8g<THR>(yrow, q8 + (size_t)m * q_ld, s8 + (size_t)m * s_ld, n);
+}
+
 // quant_rt_body's format and scale names.
 bool fz_quant_fmt(const RadArgs* a, int* fmt, int* sc) {
     const char* fs = r4d_gets(a, "format");
@@ -3504,6 +3604,58 @@ int post_collapse_norm_body(const RadArgs* a, RadStream stream, bool l256, bool 
 #undef FZ_PCN_W
 #undef FZ_PCN_T
 #undef FZ_PCN
+}
+
+/* lever A8D fold (c) (round 95): mhc_post_collapse_rmsnorm_i8g = post_collapse_norm_body's default form (thr from
+ * r4d_act_threads, L256 off) + q [M, n] int8 / scale [M, n / 128] f32 (operands 9 / 10); n a multiple of 128 up to kPcnQ8MaxN. */
+int post_collapse_norm_q8_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 11) return RAD_E_INVAL;
+    const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
+    if (n <= 0 || n > (long)kPcnQ8MaxN || n % 128 || hc < 2 || hc > 8) return R4D_NO(RAD_E_SHAPE);
+    const RadTensor &xi = a->t[0], &h = a->t[1], &po = a->t[2], &cb = a->t[3], &o = a->t[4];
+    const RadTensor &pre = a->t[5], &x = a->t[6], &w = a->t[7], &y = a->t[8], &qt = a->t[9], &st = a->t[10];
+    if (!w.data || !y.data || !qt.data || !st.data) return R4D_NO(RAD_E_INVAL);
+    if (xi.rank != 2 || xi.shape[0] < 1 || xi.shape[0] > 65535) return R4D_NO(RAD_E_SHAPE);
+    const long rows = xi.shape[0];
+    if (xi.dtype != RAD_BF16 || h.dtype != RAD_BF16 || po.dtype != RAD_F32 || cb.dtype != RAD_F32 ||
+        o.dtype != RAD_BF16 || pre.dtype != RAD_F32 || x.dtype != RAD_BF16 || y.dtype != RAD_BF16 || qt.dtype != RAD_I8 ||
+        st.dtype != RAD_F32)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!mat(xi, RAD_BF16, rows, n) || !mat(h, RAD_BF16, rows, hc * n) ||
+        !mat(po, RAD_F32, rows, hc) || !mat(cb, RAD_F32, rows, hc * hc) ||
+        !mat(o, RAD_BF16, rows, hc * n) || o.data == h.data || !mat_s(pre, RAD_F32, rows, hc) ||
+        !mat(x, RAD_BF16, rows, n) || !mat(qt, RAD_I8, rows, n) || !mat(st, RAD_F32, rows, n / 128))
+        return R4D_NO(RAD_E_SHAPE);
+    if (((uintptr_t)qt.data & 3) || (qt.stride[0] & 3)) return R4D_NO(RAD_E_ALIGN);
+    if (!r4d_contig(&w)) return R4D_NO(RAD_E_STRIDE);
+    if (w.dtype != RAD_F32 && w.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (r4d_numel(&w) < n) return R4D_NO(RAD_E_SHAPE);
+    long long My = 0;
+    const long long y_ld = r4d_rows_pitch(&y, n, &My);
+    if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (My < rows) return R4D_NO(RAD_E_SHAPE);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    const int thr = r4d_act_threads((int)rows, (int)n);   /* = post_collapse_norm_body's default form: the same y bytes */
+#define FZ_PCQ(WF, T, HM)                                                                          \
+    R4D_EMIT(stream, (post_collapse_norm_q8_kernel<WF, T, HM>),                                    \
+             dim3(r4d_cliff_rows((uint32_t)rows, 1, T / kFzWave)), dim3(T), 0,                     \
+             (const uint16_t*)xi.data, (long)xi.stride[0], (const uint16_t*)h.data,                \
+             (long)h.stride[0], (const float*)po.data, (long)po.stride[0],                         \
+             (const float*)cb.data, (long)cb.stride[0], (uint16_t*)o.data, (long)o.stride[0],      \
+             (const float*)pre.data, (long)pre.stride[0], (long)pre.stride[1], (uint16_t*)x.data,  \
+             (uint32_t)x.stride[0], (const void*)w.data, (uint16_t*)y.data, (uint32_t)y_ld,        \
+             (uint32_t)n, (int)hc, eps, wadd, mult, (uint32_t)rows, (signed char*)qt.data,         \
+             (uint32_t)qt.stride[0], (float*)st.data, (uint32_t)st.stride[0])
+#define FZ_PCQ_T(WF, HM)                                                                           \
+    return thr == 1024 ? FZ_PCQ(WF, 1024, HM) : thr == 512 ? FZ_PCQ(WF, 512, HM) : FZ_PCQ(WF, 256, HM)
+#define FZ_PCQ_W(WF)                                                                               \
+    do { if (hc <= 4) FZ_PCQ_T(WF, 4); FZ_PCQ_T(WF, 8); } while (0)
+    if (w.dtype == RAD_F32) FZ_PCQ_W(true);
+    FZ_PCQ_W(false);
+#undef FZ_PCQ_W
+#undef FZ_PCQ_T
+#undef FZ_PCQ
 }
 
 /* ==================================================================== mhc_post_collapse_rmsnorm_mix (lever M1)
@@ -3895,6 +4047,10 @@ extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return post_collapse_norm_body(a, s, false);
+}
+/* lever A8D fold (c) (DRAFTER round 95): + quant_act_i8g's codes of y (declared in r4d_ds41_elem.inc beside its row) */
+extern "C" int r4d_rad_mhc_post_collapse_rmsnorm_i8g(const RadArgs* a, RadStream s) {
+    return post_collapse_norm_q8_body(a, s);
 }
 /* lever DPH (DRAFTER track round 68): mhc_post_collapse_rmsnorm with the norm's sum of squares in rmsnorm_bf16's own
  * 256-lane partition -- out, xc and y the chain's bytes at every M (tools/dbench/dph) */

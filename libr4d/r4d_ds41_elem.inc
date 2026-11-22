@@ -292,6 +292,18 @@ static int r4d_pairq_unrelayout(const RadParam* p, int n_p, int operand, const R
                                 const void* src, int64_t src_bytes, const RadTensor* pl, int n) {
     return r4d_rad_unrelayout_i8_block(p, n_p, pairq_gemm_opd(operand), enc, sel, src, src_bytes, pl, n);
 }
+/* lever A8D fold (c) (DRAFTER round 95): mhc_post_collapse_rmsnorm + quant_act_i8g of its y (r4d_ds41_elem.hip) */
+extern "C" int r4d_rad_mhc_post_collapse_rmsnorm_i8g(const RadArgs* a, RadStream stream);
+static const RadOperandSpec oDs41PostCollapseNormI8g[] = {
+    { "x", RAD_OPD_IN, 0 },   { "h", RAD_OPD_IN, 0 },  { "post", RAD_OPD_IN, 0 },
+    { "comb", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }, { "pre", RAD_OPD_IN, 0 },
+    { "xc", RAD_OPD_OUT, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+    { "q", RAD_OPD_OUT, 0 },  { "scale", RAD_OPD_OUT, 0 },
+};
+static const RadConstraint cDs41PostCollapseNormI8g[] = {
+    C_GE("M", 1),  C_LE("M", 65535), C_GE("n", 128), C_LE("n", 8192), C_DIV("n", 128),
+    C_GE("hc", 2), C_LE("hc", 8),    C_IN("dtype", "bf16"),
+};
 static const RadParamSpec pDs41PairQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype") };
 static const RadOperandSpec oDs41PairQ[] = {
     { "a", RAD_OPD_IN, 0 },       { "a_scale", RAD_OPD_IN, 0 },
@@ -416,6 +428,9 @@ static const RadConstraint cDs41PairQ[] = {
            "(fn, scale, base -> pre_o, post, comb): every output as the two ops leave them. post and comb are read "
            "as the post's gates and then written as the mix's. A sublayer's output into the next connection's "
            "collapse, norm and gates in one op (DeepSeek-V4.1's attention connection, lever M1)."),
+    SCHEMA("mhc_post_collapse_rmsnorm_i8g", pDs41CollapseNorm, oDs41PostCollapseNormI8g,
+           "mhc_post_collapse_rmsnorm, then quant_act_i8g (group 128) of y into q / scale: out, xc, y, q and scale as the "
+           "two ops leave them. out must not alias h."),
     SCHEMA("gemm_nt_q_pair_i8g", pDs41PairQ, oDs41PairQ,
            "two gemm_nt_q (dtype i8a8) of one shape: y_j = a[:, j K .. (j + 1) K] @ dequant(b_j)^T with a_scale's "
            "columns of that window, j = 0, 1; then quant_act_i8g (group 128) of each bf16 y_j into q's columns j N .. "
@@ -615,6 +630,13 @@ static const RadConstraint cDs41PairQ[] = {
   "bf16 x, h, out, xc and y, f32 post, comb, pre, w, fn, scale, base and pre_o", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41PcnMix), NOTUNE, nullptr, nullptr, r4d_rad_mhc_post_collapse_rmsnorm_mix,
   r4d_rad_mhc_post_collapse_rmsnorm_mix_scratch, nullptr, nullptr, r4d_shape_mhc_post_collapse_rmsnorm_mix },
+{ "mhc_post_collapse_rmsnorm_i8g_bf16", "mhc_post_collapse_rmsnorm_i8g", "norm",
+  "mhc_post_collapse_rmsnorm_bf16's pass (its workgroup a row, r4d_act_threads) with y staged in LDS and quant_act_i8g's "
+  "codes of it on the same pass (lever A8D fold c)",
+  "M 1..65535, n a multiple of 128 up to 8192, hc 2..8",
+  "bf16 x, h, out, xc and y, f32 post, comb and pre, f32 or bf16 w, int8 q with an f32 scale per (row, 128)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41PostCollapseNormI8g), NOTUNE, nullptr, nullptr,
+  r4d_rad_mhc_post_collapse_rmsnorm_i8g, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 { "gemm_i8a8_pairq_m16", "gemm_nt_q_pair_i8g", "gemm",
   "gemm_i8a8_nt_m16 over both weights in ONE launch (blocks [0, N/128) the first, the rest the second), each split K as it "
   "splits alone, its finisher writing quant_act_i8g's codes of the bf16 sums into the pair (lever A8D fold b)",

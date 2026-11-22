@@ -383,6 +383,10 @@ struct Layer {
      * both groups in one launch, each split K as alone, the split finisher writing quant_act_i8g's codes; = o_a + a8_bq to the
      * byte); 0 where no library serves it, two groups are not the model's, or RADIANCE_DS41_DSPARK_A8B=0 */
     rad_op o_ap = 0;
+    /* lever A8D fold (c) (round 95): pcn_a + a8_xq (the stage input's quantiser, stages past the first) as ONE op (libr4d
+     * mhc_post_collapse_rmsnorm_i8g: pcn_a's pass with quant_act_i8g's codes of y; = pcn_a + a8_xq to the byte); 0 where no library
+     * serves it or RADIANCE_DS41_DSPARK_A8B=0 */
+    rad_op pcn_a8 = 0;
     /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): ar_attn declared a second time at `overlap` 1 (the narrow launch beside
      * compute) for piece 0 of a pipelined pass; 0 otherwise */
     rad_op ar_attn_ov = 0;
@@ -2447,8 +2451,9 @@ static int a8d_env() {
     return !std::strcmp(q, "1") ? 1 : !std::strcmp(q, "0") ? 0 : -1;
 }
 static std::atomic<long long> g_a8d_passes{0};   /* the first-pass line */
-/* Lever A8D fold (b) (DRAFTER track round 95; Layer::o_ap): RADIANCE_DS41_DSPARK_A8B=0 keeps the o_a groups + their quantisers as
- * four ops (round 94's form, the same bytes); unset / 1 declares the pair op where a library serves it. Oracle (one card, pfx
+/* Lever A8D folds (b) + (c) (DRAFTER track round 95; Layer::o_ap / Layer::pcn_a8): RADIANCE_DS41_DSPARK_A8B=0 keeps the o_a groups
+ * + their quantisers as four ops and pcn_a + the stage input's quantiser as two (round 94's form, the same bytes); unset / 1
+ * declares the fused ops where a library serves them. Oracle (one card, pfx
  * order O vs E, 32 / 40 rows): -6.3 / -5.2 us a stage; the groups' finishers as two launches into one pair would be ORDERED by
  * haz_mark (a column window's span covers the other's: pfx T +2.6 / +6.4 us), hence one launch. */
 static int a8b_env() {
@@ -5840,9 +5845,13 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                                             RAD_STR("dtype", "bf16") };
         L.pcn_f = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.ffn_norm }, { d.attn_out, d.h0, d.post, d.comb, d.pre_a },
                         { d.h1, d.x, d.act.x });
-        if (l > d.base)
+        if (l > d.base) {
             L.pcn_a = fused(b, "mhc_post_collapse_rmsnorm", pcp, { L.attn_norm }, { d.act.x, d.h1, d.post, d.comb, d.pre_f },
                             { d.h0, d.x, d.xn });
+            if (L.pcn_a && d.a8d && a8b_env() > 0)   /* lever A8D fold (c): beside it, issued in place of it + a8_xq */
+                L.pcn_a8 = fused(b, "mhc_post_collapse_rmsnorm_i8g", pcp, { L.attn_norm }, { d.act.x, d.h1, d.post, d.comb, d.pre_f },
+                                 { d.h0, d.x, d.xn, d.a8xq, d.a8xs });
+        }
     }
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
@@ -9517,7 +9526,11 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         };
         if (!dmr) mix_a();
         const bool kvfold = dmrv >= 2 && L.kv_fs;   /* lever DMR 2: the window key as the trunk's fold c */
-        if (pa)
+        const bool pc8 = pa && d.a8d && L.pcn_a8;   /* lever A8D fold (c): pcn_a writes the stage input's pair too */
+        if (pc8)
+            RAD_ISSUE_N(x, L.pcn_a8, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T), brows(d.h0, T),
+                        brows(d.pre_f, T), brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T), brows(d.a8xq, T), brows(d.a8xs, T));
+        else if (pa)
             RAD_ISSUE_N(x, L.pcn_a, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T), brows(d.h0, T),
                         brows(d.pre_f, T), brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
         else if (!(dpr && si == 0))   /* lever DPR: stage 0's collapse would write d.x's own bytes */
@@ -9528,7 +9541,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             const bool a8 = d.a8d;   /* lever A8D: the stage's attention linears on the int8 pairs (dsp_stage_ops' order) */
             if (a8) {
                 if (!pa) a8_rmsq_issue(x, L.norm_a, T, brows(d.x, T), L.attn_norm, brows(d.a8xq, T), brows(d.a8xs, T), brows(d.xn, T));
-                else RAD_ISSUE_N(x, L.a8_xq, T, brows(d.xn, T), brows(d.a8xq, T), brows(d.a8xs, T));
+                else if (!pc8) RAD_ISSUE_N(x, L.a8_xq, T, brows(d.xn, T), brows(d.a8xq, T), brows(d.a8xs, T));
             } else if (!pa)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
             if (dmr && !dml) mix_a();
@@ -9542,12 +9555,14 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                               { d.q, HD, 0, HD });
                 if (g.rank == 0 && si == 0 && g_a8d_passes.fetch_add(1, std::memory_order_relaxed) == 0)
                     fprintf(stderr, "radiance: deepseek41: lever A8D: first query pass issued with the stages' attention linears "
-                                    "on the int8 pairs at %lld rows; o's pair %s; o_a + o_b's pair %s (counted at issue: a recorded pass "
-                                    "once)\n", (long long)T,
+                                    "on the int8 pairs at %lld rows; o's pair %s; o_a + o_b's pair %s; stages 1-2's input pair %s (counted "
+                                    "at issue: a recorded pass once)\n", (long long)T,
                             dof && L.o_f8 ? "from rope_rows_roundtrip_i8g (fold a)" : dof ? "by quant_act_i8g after o_f (no library serves "
                             "rope_rows_roundtrip_i8g)" : "by quant_act_i8g (DOF off)",
                             L.o_ap ? "as gemm_nt_q_pair_i8g (fold b)" : a8b_env() > 0 ? "as 2 GEMMs + 2 quantisers (no library serves "
-                            "gemm_nt_q_pair_i8g)" : "as 2 GEMMs + 2 quantisers (RADIANCE_DS41_DSPARK_A8B=0)");
+                            "gemm_nt_q_pair_i8g)" : "as 2 GEMMs + 2 quantisers (RADIANCE_DS41_DSPARK_A8B=0)",
+                            d.st.size() > 1 && d.st[1].pcn_a8 ? "from mhc_post_collapse_rmsnorm_i8g (fold c)"
+                            : d.st.size() > 1 && d.st[1].pcn_a ? "by quant_act_i8g after pcn_a" : "by quant_act_i8g (no pcn_a)");
             } else {
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
             else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
