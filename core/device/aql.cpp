@@ -1769,7 +1769,8 @@ struct PlayRun {
         const PlayOut po = play_order(pq, rec, knobs);
         const bool chain = po.chain, ahead_chain = po.ahead_chain, ordered = po.ordered;
         if (po.cko_order) cik_bump(cik_tl().cko_order, 1);
-        if (ahead_chain) cik_bump(cik_tl().cko_chain, 1);
+        /* counted when it plays chained to the ahead base: not when lever CRD / CRB turned it ordered (PREFILL NOTE 16:39's remark) */
+        if (ahead_chain && !ordered) cik_bump(cik_tl().cko_chain, 1);
         /* Lever CTA: an ordered chained record (target 0) plays from its block in the tape's copy (constant record), else from
          * the queue's slot with the record written now. */
         const bool cta = chain && ordered && r.karg_t0 && cta_on();
