@@ -1258,6 +1258,11 @@ private:
      * counts as planned where a plan may take the step's max_tok room (lever NOA's room, option D's over-budget first prefill), so the
      * inbox pieces lane_take_inbox appends never take the step past max_tok. room_taken() = the rows those rules see as planned. */
     bool     plan_reserved_ = true;
+    /* tp8 loop F83 (RADIANCE_PP_INBOX_DEFER=0 at init = as before): lane_take_inbox keeps only the lent pieces that fit beside this
+     * lane's own plan within max_tok; the rest wait in its inbox for its next step (as D47's / D53's waits). Only where the plan
+     * would otherwise be refused by the build and re-planned unchanged (the F83 livelock); inbox_defer_n_ = such steps. */
+    bool     inbox_defer_ = true;
+    int64_t  inbox_defer_n_ = 0;
     int64_t  room_taken() const { return plan_.n_tok + (plan_reserved_ ? lane_reserved_ : 0); }
     void    lane_plan_begin();
     void    lane_plan_end();

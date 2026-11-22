@@ -15066,14 +15066,19 @@ TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_la
  * lanes' pieces (1) beside 4096 of its own ... step budget 4160' for 9 min. The rule is ON BY DEFAULT since: modes 0 = env "0" (the rule
  * before: named, refused, no progress), 1 = env unset (the default: fixed), 2 = env "1" (fixed); each at fn4 sched_lane_room 0 and 1
  * (BEST STK's lever D56 does not enter either rule: the stall is there without it, the fix holds with it). */
+/* + the F83 guard (RADIANCE_PP_INBOX_DEFER, on by default): mode 3 = the room rule before (env 0) with the guard -- the overrun is
+ * still named, but the lent piece waits a step instead of the plan being refused: every step built, every prompt done; mode 0 = both
+ * off = the livelock. */
 TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
-    int named_off = -1, named_on = -1, named_def = -1;
-    for (int mode : { 0, 1, 2 })
+    int named_off = -1, named_on = -1, named_def = -1, named_guard = -1;
+    for (int mode : { 0, 3, 1, 2 })
     for (int room : { 0, 1 }) {
-        const int on = mode != 0;
-        if (mode == 0) setenv("RADIANCE_PP_PLAN_RESERVED", "0", 1);
+        const int on = mode != 0 && mode != 3;
+        if (mode == 0 || mode == 3) setenv("RADIANCE_PP_PLAN_RESERVED", "0", 1);
         else if (mode == 1) unsetenv("RADIANCE_PP_PLAN_RESERVED");
         else setenv("RADIANCE_PP_PLAN_RESERVED", "1", 1);
+        if (mode == 0) setenv("RADIANCE_PP_INBOX_DEFER", "0", 1);
+        else unsetenv("RADIANCE_PP_INBOX_DEFER");
         DstSwitches restore;
         struct RoomOff { ~RoomOff() { DstSwitches::set("sched_lane_room", 0); } } room_off;
         CHECK(DstSwitches::set("sched_lane_room", room));
@@ -15121,21 +15126,41 @@ TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
         });
         int named = 0;
         for (size_t at = err.find("rows of other lanes' pieces"); at != std::string::npos; at = err.find("rows of other lanes' pieces", at + 1)) ++named;
-        (mode == 0 ? named_off : mode == 1 ? named_def : named_on) = std::max(mode == 0 ? named_off : mode == 1 ? named_def : named_on, named);
+        int& nm = mode == 0 ? named_off : mode == 1 ? named_def : mode == 2 ? named_on : named_guard;
+        nm = std::max(nm, named);
         const Request* rb = L.req(0, big);
         const Request* rq = L.req(1, q);
         fprintf(stderr, "    RADIANCE_PP_PLAN_RESERVED=%s, sched_lane_room %d: %d steps, %d plans refused, %d over max_tok (most %lld rows), %d steps with a "
                         "lent piece, %d 'rows of other lanes' pieces' lines; big %lld / 4096, newcomers %lld / 1200, %lld / 1000 computed\n",
-                mode == 0 ? "0" : mode == 1 ? "unset (default)" : "1", room, steps, refused,
+                mode == 0 ? "0 + RADIANCE_PP_INBOX_DEFER=0" : mode == 3 ? "0 (+ the F83 guard, default)" : mode == 1 ? "unset (default)" : "1", room,
+                steps, refused,
                 over, (long long)most, lent_seen, named, rb ? (long long)rb->n_computed : -1LL, rq ? (long long)rq->n_computed : -1LL,
                 L.req(1, q2) ? (long long)L.req(1, q2)->n_computed : -1LL);
         CHECK_EQ(over, 0);   /* a plan over max_tok is never built (BatchBuilder refuses it) */
+        if (mode == 3) {
+            /* tp8 loop F83's guard alone: the room rule before still plans 2,204 own rows beside the piece (named), but the piece
+             * waits in the inbox for the lane's next step -- no plan refused by the build ('exceeds the pools', BatchBuilder), every
+             * step within max_tok, every prompt done. (A null plan here can also be lane 0 with nothing to plan while its prompt's
+             * piece waits in lane 1's inbox: `refused` counts those too, so the build's own line is what is held to 0.) */
+            int pools = 0;
+            for (size_t at = err.find("exceeds the pools sized at"); at != std::string::npos; at = err.find("exceeds the pools sized at", at + 1)) ++pools;
+            CHECK(named > 0);
+            CHECK_EQ(pools, 0);
+            CHECK(refused <= 2);
+            CHECK(rb && rb->n_computed >= 4096);
+            CHECK(rq && rq->n_computed >= 1200);
+            CHECK(L.req(1, q2) && L.req(1, q2)->n_computed >= 1000);
+            CHECK(most <= L.max_tok);
+            continue;
+        }
         if (!on) {
             /* as before: the lane's plan (4 decoders + 1,200 by D's over-budget rule + 1,000 by NOA = 2,204 of its own) beside the
              * 2,048 set aside = 4,252 > 4,160 -- named, refused, re-planned the same, refused again: with no BG lane to take the
              * newcomers (lq187 / lq192 had one) the lane makes no step */
             CHECK(named > 0);
             CHECK(refused > 0);
+            /* the build's own refusal line is there (the detector mode 3 holds to 0) */
+            CHECK(err.find("exceeds the pools sized at") != std::string::npos);
             continue;
         }
         CHECK(lent_seen > 0);
@@ -15149,7 +15174,9 @@ TEST(lanes_an_inbox_piece_counts_against_an_over_budget_first_prefill) {
     CHECK(named_off > 0);   /* the case the rule fixes is there with the env at 0 (the rule before) */
     CHECK_EQ(named_on, 0);
     CHECK_EQ(named_def, 0);   /* tp8 loop F83: the default is the fixed rule */
+    CHECK(named_guard > 0);   /* the guard's case was there (named) and ran (mode 3's checks) */
     unsetenv("RADIANCE_PP_PLAN_RESERVED");
+    unsetenv("RADIANCE_PP_INBOX_DEFER");
 }
 
 /* tp8 dev M5 (RADIANCE_PP_LEND_MIXED=1): a newcomer that option D cuts beside decode rows (sched_bi_chunk 3, lever DST's
