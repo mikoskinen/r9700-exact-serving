@@ -5003,7 +5003,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_known(value) ? 1 : -1;   /* lever SPD-F */
-    if (!std::strcmp(name, "drafter_mx")) return value >= 0 && value <= 8 ? 1 : -1;   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both), 4 / 5 / 6 / 7: 2's bytes faster (6: lever XPG, 7: + XWO); 8: 7 without lever WCN (round 87, its A arm) */
+    if (!std::strcmp(name, "drafter_mx"))   /* 2: the WMMA form, 3: fp8 x fp8 (rule B both), 4 / 5 / 6 / 7: 2's bytes faster (6: lever XPG, 7: + XWO); 8: 7 without lever WCN (round 87, its A arm) */
+        return value >= 0 && value % 100 <= 8 && r4d_dtk_known(value - value % 100) ? 1 : -1;   /* + 100 KE + 1000 G: lever DTKG (round 110) */
     if (!std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
@@ -5020,7 +5021,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 21 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "ds41_attn_dec")) return r4d_attn_dec_sw_set(value);
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
-    if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
+    if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value % 100); r4d_dtk_set(value - value % 100); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
     if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_set(value);
@@ -5045,7 +5046,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ds41_wmk")) { *applied = wmk_now(); return 1; }
     if (!std::strcmp(name, "ds41_attn_dec")) { *applied = r4d_attn_dec_sw_get(); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { *applied = r4d_gg_mr_m16_get(); return 1; }
-    if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
+    if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get() + r4d_dtk_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }
     if (!std::strcmp(name, "f32_pf")) { *applied = r4d_f32pf_get(); return 1; }

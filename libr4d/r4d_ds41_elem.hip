@@ -1590,8 +1590,11 @@ __device__ __forceinline__ int router_scored_row(const float* logits, long lp, c
         const int e = lane + 32 * i;
         key[i] = e < ne ? ds_rank_key(p[i] + bv[i], e) : 0ull;
     }
+    /* lever DTKG (r4d_ds41_f32pf.h): k = the slots a row holds | (the slots it selects << 16); without the high half both are k */
+    const int ks = (k >> 16) ? (k >> 16) : k;
+    k &= 0xffff;
     unsigned long long below = ~0ull, mine = 0;
-    for (int j = 0; j < k; ++j) {
+    for (int j = 0; j < ks; ++j) {
         unsigned long long best = 0;
 #pragma unroll
         for (int i = 0; i < OWN; ++i) {
@@ -1610,12 +1613,16 @@ __device__ __forceinline__ int router_scored_row(const float* logits, long lp, c
         if ((e >> 5) == i) chosen = v;
     }
     float total = 0;
-    for (int j = 0; j < k; ++j)
+    for (int j = 0; j < ks; ++j)
         total += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(chosen), j));
     const float mult = norm ? factor / (total + 1e-20f) : factor;
-    if (lane < k) {
+    if (lane < ks) {
         ids[r * ip + lane] = e;
         weights[r * wp + lane] = chosen * mult;
+    } else if (lane < k) {   /* a dropped slot (lever DTKG): outside every slice, weight 0 */
+        ids[r * ip + lane] = -1;
+        weights[r * wp + lane] = 0.0f;
+        return INT_MIN / 2;
     }
     return e;
 }
@@ -1646,12 +1653,14 @@ __global__ void __launch_bounds__(NW * 32)
                                  int32_t* off, int32_t* cnt, uint16_t* gate, long gp, int32_t* inv,
                                  int m, int ne, int n_local, int k, int norm, float factor, int base,
                                  r4d_moesort::Protect prot) { R4D_IKA_ENTRY();
+    const int kpk = k;   /* lever DTKG: the row functions take k | (KE << 16); the slots a row holds below */
+    k &= 0xffff;
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
     for (int r = wave; r < m; r += (int)NW) {
         const int e = router_scored_row<OWN, SCORE>(logits, lp, bias, bp, ids, ip, weights, wp, r,
-                                                    ne, k, norm, factor, lane) -
+                                                    ne, kpk, norm, factor, lane) -
                       base;
         if (lane < k)
             sl.e[r * k + lane] =
@@ -1667,6 +1676,7 @@ template <int SCORE>
 int router_emit(RadStream stream, const RadTensor& lg, const RadTensor& bias, const RadTensor& ids,
                 const RadTensor& w, int ne, int k, int norm, float factor) {
     const long m = lg.shape[0];
+    k = r4d_dtk_pack(ne, k, (int)m);   /* lever DTKG */
     const dim3 grid((unsigned)((m + 3) / 4));
 #define ROUTER(OWN)                                                                                \
     return R4D_EMIT(stream, (router_scored_kernel<OWN, SCORE>), grid, dim3(128), 0,                \
@@ -1724,6 +1734,7 @@ int router_scored_scatter_emit(RadStream stream, const RadTensor& lg, const RadT
                                long long gp, const RadTensor* inv, int m, int ne, int nl, int k,
                                int norm, float factor, int base, const r4d_moesort::Protect& prot) {
     const int nw = m <= 8 ? 8 : m <= 16 ? 16 : 32;
+    k = r4d_dtk_pack(ne, k, m);   /* lever DTKG */
 #define R4D_RSC_I(OWN, NW, INV)                                                                    \
     return R4D_EMIT(stream, (router_scored_scatter_kernel<OWN, SCORE, NW, INV>), dim3(1),         \
                     dim3((NW) * 32), 0, (const float*)lg.data, (long)lg.stride[0],                 \
@@ -1839,6 +1850,8 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_scored_scatter_kernel(
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
     r4d_moesort::Protect prot, unsigned* ctr) { R4D_IKA_ENTRY();
+    const int kpk = k;   /* lever DTKG: the row functions take k | (KE << 16); the slots a row holds below */
+    k &= 0xffff;
     static_assert(RW >= 1 && NW % RW == 0, "the 2-D map's row groups divide the waves");
     constexpr int CW = (int)NW / RW;   /* expert groups a workgroup */
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
@@ -1859,7 +1872,7 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_scored_scatter_kernel(
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
     for (int r = wave; r < m; r += (int)NW) {
-        const int e = router_scored_row<OWN, SCORE>(lg, lp, bias, bp, ids, ip, weights, wp, r, ne, k,
+        const int e = router_scored_row<OWN, SCORE>(lg, lp, bias, bp, ids, ip, weights, wp, r, ne, kpk,
                                                     norm, factor, lane) -
                       base;
         if (lane < k)
@@ -1890,6 +1903,8 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowsel_kernel(
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
     r4d_moesort::Protect prot, unsigned* ctr) { R4D_IKA_ENTRY();
+    const int kpk = k;   /* lever DTKG: the row functions take k | (KE << 16); the slots a row holds below */
+    k &= 0xffff;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     const int c0 = ((int)blockIdx.x * (int)NW + wave) * C, r0 = (int)blockIdx.y * R;
     if (c0 < ne && r0 < m) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
@@ -1906,7 +1921,7 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowsel_kernel(
     if (!s_last) return;
     __threadfence();   // the row group's logits from its other workgroups
     for (int r = r0 + wave; r < r0 + R && r < m; r += (int)NW) {
-        const int e = router_scored_row<OWN, SCORE>(lg, lp, bias, bp, ids, ip, weights, wp, r, ne, k, norm, factor, lane) -
+        const int e = router_scored_row<OWN, SCORE>(lg, lp, bias, bp, ids, ip, weights, wp, r, ne, kpk, norm, factor, lane) -
                       base;
         if (lane < k)
             sorted[r * k + lane] = e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
@@ -1965,8 +1980,10 @@ __device__ __forceinline__ int router_keyed_row(const unsigned long long* keys, 
         const int e = lane + 32 * i;
         key[i] = e < ne ? keys[r * kp + e] : 0ull;
     }
+    const int ks = (k >> 16) ? (k >> 16) : k;   /* lever DTKG: as router_scored_row */
+    k &= 0xffff;
     unsigned long long below = ~0ull, mine = 0;
-    for (int j = 0; j < k; ++j) {
+    for (int j = 0; j < ks; ++j) {
         unsigned long long best = 0;
 #pragma unroll
         for (int i = 0; i < OWN; ++i) {
@@ -1980,12 +1997,16 @@ __device__ __forceinline__ int router_keyed_row(const unsigned long long* keys, 
     const int e = mine ? (int)~(uint32_t)mine : 0;
     const float chosen = sc[r * kp + e];
     float total = 0;
-    for (int j = 0; j < k; ++j)
+    for (int j = 0; j < ks; ++j)
         total += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(chosen), j));
     const float mult = norm ? factor / (total + 1e-20f) : factor;
-    if (lane < k) {
+    if (lane < ks) {
         ids[r * ip + lane] = e;
         weights[r * wp + lane] = chosen * mult;
+    } else if (lane < k) {
+        ids[r * ip + lane] = -1;
+        weights[r * wp + lane] = 0.0f;
+        return INT_MIN / 2;
     }
     return e;
 }
@@ -1995,6 +2016,8 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowkey_kernel(
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
     r4d_moesort::Protect prot, unsigned* ctr, unsigned long long* keys, float* sc) { R4D_IKA_ENTRY();
+    const int kpk = k;   /* lever DTKG: the row functions take k | (KE << 16); the slots a row holds below */
+    k &= 0xffff;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     const int cb = (int)blockIdx.x * (int)NW * C, c0 = cb + wave * C, r0 = (int)blockIdx.y * R;
     if (c0 < ne && r0 < m) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
@@ -2020,7 +2043,7 @@ __global__ __launch_bounds__(NW * 32) void router_gemm_rowkey_kernel(
     if (!s_last) return;
     __threadfence();   // the row group's keys from its other workgroups
     for (int r = r0 + wave; r < r0 + R && r < m; r += (int)NW) {
-        const int e = router_keyed_row<OWN>(keys, sc, ne, ids, ip, weights, wp, r, ne, k, norm, factor, lane) - base;
+        const int e = router_keyed_row<OWN>(keys, sc, ne, ids, ip, weights, wp, r, ne, kpk, norm, factor, lane) - base;
         if (lane < k)
             sorted[r * k + lane] = e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
     }
@@ -2179,6 +2202,8 @@ __global__ __launch_bounds__(kRgmS * 32) void router_wm_rowkey_kernel(
     const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
     int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
     r4d_moesort::Protect prot, unsigned* ctr, unsigned long long* keys, float* sc) { R4D_IKA_ENTRY();
+    const int kpk = k;   /* lever DTKG: the row functions take k | (KE << 16); the slots a row holds below */
+    k &= 0xffff;
     __shared__ float sp[kRgmS * ET * 256];
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     const int e0 = (int)blockIdx.x * 16 * ET, r0 = (int)blockIdx.y * 16;
@@ -2207,7 +2232,7 @@ __global__ __launch_bounds__(kRgmS * 32) void router_wm_rowkey_kernel(
     if (!s_last) return;
     __threadfence();   // the row group's keys from its other workgroups
     for (int r = r0 + wave; r < r0 + 16 && r < m; r += kRgmS) {
-        const int e = router_keyed_row<OWN>(keys, sc, ne, ids, ip, weights, wp, r, ne, k, norm, factor, lane) - base;
+        const int e = router_keyed_row<OWN>(keys, sc, ne, ids, ip, weights, wp, r, ne, kpk, norm, factor, lane) - base;
         if (lane < k)
             sorted[r * k + lane] = e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
     }
@@ -2291,6 +2316,7 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
              const RadTensor& ids, const RadTensor& wts, const RadTensor& sorted, const RadTensor& off,
              const RadTensor& cnt, const RadTensor* inv, int m, int ne, int K, int nl, int k, int norm, float factor,
              int base, const r4d_moesort::Protect& prot, unsigned* ctr) {
+    k = r4d_dtk_pack(ne, k, m);   /* lever DTKG: every form below passes k to its kernel */
 #define RGS_L(R, C, U, NW, INV)                                                                                   \
     R4D_EMIT(stream, (router_gemm_scored_scatter_kernel<R, C, U, WT, 12, SCORE, NW, INV>),                       \
              dim3((unsigned)((ne + (NW) * (C) - 1) / ((NW) * (C))), (unsigned)((m + (R) - 1) / (R))),             \
