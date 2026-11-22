@@ -5573,23 +5573,38 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
 
 /* Lever A8D (round 94): an RMS norm with quant_act_i8g's quantiser on its pass (libr4d rmsnorm_quant_i8g: = rmsnorm then
  * quant_act_i8g to the byte), x [rows, n] -> the pair (q8 [rows, n] int8, s8 [rows, n / 128] f32); and the quantiser alone. */
-static rad_op a8_rmsq(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n, rad_buf x, rad_buf q8, rad_buf s8) {
-    return op(b, "rmsnorm_quant_i8g",
-              { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
-              { w }, { x }, { q8, s8 });
+static rad_op a8_rmsq(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n, rad_buf x, rad_buf q8, rad_buf s8,
+                      rad_buf ob = 0) {   /* ob: the bf16 norm output too (out_bf16: kv's q8_0 input at stage 0) */
+    const std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") };
+    return ob ? op(b, "rmsnorm_quant_i8g", ps, { w }, { x }, { q8, s8, ob }) : op(b, "rmsnorm_quant_i8g", ps, { w }, { x }, { q8, s8 });
 }
 static rad_op a8_quant(RadBuilder* b, int64_t rows, int64_t n, rad_buf x, rad_buf q8, rad_buf s8) {
     return op(b, "quant_act_i8g",
               { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("group", (int64_t)RAD_FP8_BLOCK), RAD_STR("dtype", "bf16") },
               {}, { x }, { q8, s8 });
 }
-/* ... their issues: gemm_nt_q's operands (iqr_gemm: a, a_scale, b, b_scale, y; the optional a_sum / b_ref null, as lin_issue) */
-static void a8_gemm_issue(RadCtx* x, const Model& m, rad_op h, int64_t rows, RadOperand q8, RadOperand s8, rad_weight w,
-                          RadOperand y) {
-    RAD_ISSUE_N(x, h, rows, q8, s8, RAD_W(w), RAD_W(m.wsc.at(w)), y, RAD_NONE, RAD_NONE);
+/* ... their issues: gemm_nt_q's operands (iqr_gemm: a, a_scale, b, b_scale, y; the optional a_sum / b_ref null, as lin_issue).
+ * Rule B: a pass above kA8Rows rows issues each GEMM in kA8Rows-row launches -- libr4d's narrow 8-bit tile (M <= 64) gives a row
+ * the same bits at every M (kit/mes/pfx.cpp --bi8, rounds 93-94: 0 of 756 launches differ, q_a / q_b / o_a / o_b and the round-93
+ * shapes), the prefill tile above 64 rows other ones (--bi8 2: 7-42 values a 64-row block, the split-K order) -- so a sequence's
+ * proposals do not depend on how many rows its pass has. An operand: a column window [c0, c0 + w) of a buffer `pitch` wide. */
+static constexpr int64_t kA8Rows = 64;
+struct A8Opd { rad_buf b; int64_t pitch, c0, w; };
+static RadOperand a8v(const A8Opd& o, int64_t r0, int64_t n) {
+    const bool full = o.c0 == 0 && o.w == o.pitch;
+    if (r0 == 0) return full ? brows(o.b, n) : bcol(o.b, o.c0, o.w, n);
+    return full ? brow_slice(o.b, r0, n, o.pitch) : bcol_at(o.b, r0, o.pitch, o.c0, o.w, n);
 }
-static void a8_rmsq_issue(RadCtx* x, rad_op h, int64_t rows, RadOperand in, rad_weight w, RadOperand q8, RadOperand s8) {
-    RAD_ISSUE_N(x, h, rows, in, RAD_NONE, RAD_W(w), q8, s8, RAD_NONE, RAD_NONE, RAD_NONE);
+static void a8_gemm_issue(RadCtx* x, const Model& m, rad_op h, int64_t rows, const A8Opd& q8, const A8Opd& s8, rad_weight w,
+                          const A8Opd& y) {
+    for (int64_t r0 = 0; r0 < rows; r0 += kA8Rows) {
+        const int64_t n = std::min<int64_t>(kA8Rows, rows - r0);
+        RAD_ISSUE_N(x, h, n, a8v(q8, r0, n), a8v(s8, r0, n), RAD_W(w), RAD_W(m.wsc.at(w)), a8v(y, r0, n), RAD_NONE, RAD_NONE);
+    }
+}
+static void a8_rmsq_issue(RadCtx* x, rad_op h, int64_t rows, RadOperand in, rad_weight w, RadOperand q8, RadOperand s8,
+                          RadOperand ob = RAD_NONE) {
+    RAD_ISSUE_N(x, h, rows, in, RAD_NONE, RAD_W(w), q8, s8, ob, RAD_NONE, RAD_NONE);
 }
 
 /* One stage's query-pass block: Layer::layer()'s window-only path over the drafter's rows, its
@@ -5616,11 +5631,11 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
         /* lever A8D (round 94): its ops in dsp_query's issue order (the planner's liveness): the stage input's pair (norm_a as
          * rmsnorm_quant_i8g, or a8_xq after pcn_a), q_a and kv_g over it back to back, q_an as rmsnorm_quant_i8g into q_b's pair */
         const bool a8 = d.a8d;
-        L.norm_a = a8 ? a8_rmsq(b, m, Q, L.attn_norm, D, d.x, d.a8xq, d.a8xs) : rmsnorm(b, m, Q, L.attn_norm, D, d.x, d.xn);
-        if (a8) {
+        L.norm_a = a8 ? a8_rmsq(b, m, Q, L.attn_norm, D, d.x, d.a8xq, d.a8xs, d.xn) : rmsnorm(b, m, Q, L.attn_norm, D, d.x, d.xn);
+        if (a8) {   /* kv stays the DLW's q8_0 (the context pass's wkv: its rows do not depend on the row count), over the bf16 x_n */
             L.a8_xq = a8_quant(b, Q, D, d.xn, d.a8xq, d.a8xs);
             L.q_a = iqr_gemm(b, m, Q, L.wq_a, c.q_lora, D, d.a8xq, d.a8xs, d.qr);
-            L.kv_g = iqr_gemm(b, m, Q, L.wkv, hd, D, d.a8xq, d.a8xs, d.kv_);
+            L.kv_g = linear(b, m, Q, L.wkv, hd, D, d.xn, d.kv_);
             L.q_an = a8_rmsq(b, m, Q, L.q_norm, c.q_lora, d.qr, d.a8qq, d.a8qs);
             L.q_b = iqr_gemm(b, m, Q, L.wq_b, HD, c.q_lora, d.a8qq, d.a8qs, d.q);
             if (!L.a8_xq) return RAD_E_INVAL;
@@ -5686,7 +5701,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                 L.o_a.push_back(iqr_gemm(b, m, Q, L.wo_a[(size_t)j], c.o_rank, gd, d.a8oq, d.a8os, d.a8oa[(size_t)j]));
             for (int j = 0; j < m.gr; ++j) L.a8_bq.push_back(a8_quant(b, Q, c.o_rank, d.a8oa[(size_t)j], d.a8bq, d.a8bs));
             L.o_b = iqr_gemm(b, m, Q, L.wo_b, D, m.gr * c.o_rank, d.a8bq, d.a8bs, d.attn_out);
-            bool ok = L.a8_oq != 0;
+            bool ok = L.a8_oq != 0 && L.kv_g != 0;
             for (int j = 0; j < m.gr; ++j) ok = ok && L.o_a[(size_t)j] && L.a8_bq[(size_t)j];
             if (!ok) return RAD_E_INVAL;
         }
@@ -5887,10 +5902,14 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         return RAD_E_INVAL;
     }
     if (!m.zero) {
-        int n_iqr = 0, n_i8 = 0, n_all = 0;
+        /* kv: the DLW's q8_0 (GGUF), also the context pass's (an int8 wkv there would take the prefill tile above 64 rows: a key's
+         * bits would follow the step's row count); q_a, q_b, o_a's groups, o_b: i8a8 */
+        int n_iqr = 0, n_i8 = 0, n_all = 0, kv_gguf = 0;
         for (const Layer& L : d.st) {
-            std::vector<rad_weight> ws = { L.wq_a, L.wkv, L.wq_b, L.wo_b };
+            std::vector<rad_weight> ws = { L.wq_a, L.wq_b, L.wo_b };
             ws.insert(ws.end(), L.wo_a.begin(), L.wo_a.end());
+            if (m.wsc.count(L.wkv)) ++n_iqr;
+            else if (m.wty.count(L.wkv)) ++kv_gguf;
             for (rad_weight w : ws) {
                 ++n_all;
                 if (!m.wsc.count(w)) continue;
@@ -5898,9 +5917,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 if (!std::strcmp(m.wdt.at(w), "i8a8") && iqr_grp(m, w) == (int64_t)RAD_FP8_BLOCK) ++n_i8;
             }
         }
+        n_all += (int)d.st.size();   /* + the kv linears */
         if (n_iqr > 0) {
             const char* why = a8d_env() <= 0 ? "set RADIANCE_DS41_DSPARK_A8D=1 (lever A8D) to serve them"
-                            : n_i8 != n_all ? "lever A8D serves only every one of them as i8a8 (int8 + a bf16 scale a (row, 128))"
+                            : n_i8 + (int)d.st.size() != n_all || kv_gguf != (int)d.st.size()
+                                ? "lever A8D serves q_a / q_b / o_a / o_b as i8a8 (int8 + a bf16 scale a (row, 128)) and kv as the DLW's GGUF "
+                                  "q8_0 (drafter/kit/a8d/a8d-i8.recipe)"
                             : !rad_op_declared(b, "rmsnorm_quant_i8g") || !rad_op_declared(b, "quant_act_i8g")
                                 ? "no loaded kernel plugin declares rmsnorm_quant_i8g / quant_act_i8g" : nullptr;
             if (why) {
@@ -5924,12 +5946,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 if (!d.a8oa.back()) return RAD_E_INVAL;
             }
             rad_note(b, "DSpark lever A8D (RADIANCE_DS41_DSPARK_A8D): the stages' %d attention linears as gemm_nt_q i8a8 over the "
-                        "drafter's own int8 pairs (rmsnorm_quant_i8g / quant_act_i8g)", n_all);
+                        "drafter's own int8 pairs (rmsnorm_quant_i8g / quant_act_i8g), kv at q8_0", n_all - (int)d.st.size());
             if (g.rank == 0 && !ctx->shape_probe)
                 fprintf(stderr, "radiance: deepseek41: lever A8D (RADIANCE_DS41_DSPARK_A8D=1): the DSpark stages' %d attention linears "
-                                "(q_a, kv, q_b, o_a x %d, o_b) as int8 IQR views served by gemm_nt_q i8a8; stage input and q_an as "
-                                "rmsnorm_quant_i8g, quant_act_i8g after pcn_a / the attention / each o_a group (rule B: proposals "
-                                "only)\n", n_all, (int)m.gr);
+                                "(q_a, q_b, o_a x %d, o_b) as int8 IQR views served by gemm_nt_q i8a8 in <= %lld-row launches, kv at "
+                                "the DLW's q8_0; stage input and q_an as rmsnorm_quant_i8g, quant_act_i8g after pcn_a / the attention "
+                                "/ each o_a group (rule B: proposals only)\n", n_all - (int)d.st.size(), (int)m.gr, (long long)kA8Rows);
         } else if (a8d_env() > 0) {
             rad_note(b, "lever A8D (RADIANCE_DS41_DSPARK_A8D): the stages' attention linears are not IQR views (no int8 sidecar) -- "
                         "not declared");
@@ -9466,17 +9488,19 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         } else {
             const bool a8 = d.a8d;   /* lever A8D: the stage's attention linears on the int8 pairs (dsp_stage_ops' order) */
             if (a8) {
-                if (!pa) a8_rmsq_issue(x, L.norm_a, T, brows(d.x, T), L.attn_norm, brows(d.a8xq, T), brows(d.a8xs, T));
+                if (!pa) a8_rmsq_issue(x, L.norm_a, T, brows(d.x, T), L.attn_norm, brows(d.a8xq, T), brows(d.a8xs, T), brows(d.xn, T));
                 else RAD_ISSUE_N(x, L.a8_xq, T, brows(d.xn, T), brows(d.a8xq, T), brows(d.a8xs, T));
             } else if (!pa)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
             if (dmr && !dml) mix_a();
             const bool gqp = !a8 && gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
             if (a8) {
-                a8_gemm_issue(x, m, L.q_a, T, brows(d.a8xq, T), brows(d.a8xs, T), L.wq_a, brows(d.qr, T));
-                a8_gemm_issue(x, m, L.kv_g, T, brows(d.a8xq, T), brows(d.a8xs, T), L.wkv, brows(d.kv_, T));
+                const int64_t G = RAD_FP8_BLOCK;
+                a8_gemm_issue(x, m, L.q_a, T, { d.a8xq, D, 0, D }, { d.a8xs, D / G, 0, D / G }, L.wq_a, { d.qr, c.q_lora, 0, c.q_lora });
+                lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));   /* q8_0 */
                 a8_rmsq_issue(x, L.q_an, T, brows(d.qr, T), L.q_norm, brows(d.a8qq, T), brows(d.a8qs, T));
-                a8_gemm_issue(x, m, L.q_b, T, brows(d.a8qq, T), brows(d.a8qs, T), L.wq_b, brows(d.q, T));
+                a8_gemm_issue(x, m, L.q_b, T, { d.a8qq, c.q_lora, 0, c.q_lora }, { d.a8qs, c.q_lora / G, 0, c.q_lora / G }, L.wq_b,
+                              { d.q, HD, 0, HD });
                 if (g.rank == 0 && si == 0 && g_a8d_passes.fetch_add(1, std::memory_order_relaxed) == 0)
                     fprintf(stderr, "radiance: deepseek41: lever A8D: first query pass issued with the stages' attention linears "
                                     "on the int8 pairs at %lld rows (counted at issue: a recorded pass once)\n", (long long)T);
@@ -9538,8 +9562,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                 const int64_t G = RAD_FP8_BLOCK;
                 RAD_ISSUE_N(x, L.a8_oq, Tq, brows(ob, Tq), brows(d.a8oq, Tq), brows(d.a8os, Tq));
                 for (int j = 0; j < m.gr; ++j)
-                    a8_gemm_issue(x, m, L.o_a[(size_t)j], Tq, bcol(d.a8oq, j * gd, gd, Tq),
-                                  bcol(d.a8os, j * gd / G, gd / G, Tq), L.wo_a[(size_t)j], brows(d.a8oa[(size_t)j], Tq));
+                    a8_gemm_issue(x, m, L.o_a[(size_t)j], Tq, { d.a8oq, HD, j * gd, gd }, { d.a8os, HD / G, j * gd / G, gd / G },
+                                  L.wo_a[(size_t)j], { d.a8oa[(size_t)j], c.o_rank, 0, c.o_rank });
                 for (int j = 0; j < m.gr; ++j)
                     RAD_ISSUE_N(x, L.a8_bq[(size_t)j], Tq, brows(d.a8oa[(size_t)j], Tq),
                                 bcol(d.a8bq, j * c.o_rank, c.o_rank, Tq), bcol(d.a8bs, j * c.o_rank / G, c.o_rank / G, Tq));
@@ -9551,7 +9575,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                     lin_issue(x, m, L.o_a[(size_t)j], Tq, bcol(ob, j * gd, gd, Tq), L.wo_a[(size_t)j],
                               bcol(d.oa, j * c.o_rank, c.o_rank, Tq));
             if (dml) mix_a();   /* lever DML: beside o_a, o_b unordered behind its finish (step()'s `late`) */
-            if (a8) a8_gemm_issue(x, m, L.o_b, Tq, brows(d.a8bq, Tq), brows(d.a8bs, Tq), L.wo_b, brows(d.attn_out, Tq));
+            if (a8) {
+                const int64_t G = RAD_FP8_BLOCK, ok = m.gr * c.o_rank;
+                a8_gemm_issue(x, m, L.o_b, Tq, { d.a8bq, ok, 0, ok }, { d.a8bs, ok / G, 0, ok / G }, L.wo_b, { d.attn_out, D, 0, D });
+            }
             else lin_issue(x, m, L.o_b, Tq, brows(d.oa, Tq), L.wo_b, brows(d.attn_out, Tq));
         }
         if (wsp_pre && si == 0) {   /* lever WSP: part 1 beside stage 0's attention all-reduce on LANE 1, issued right before it
