@@ -214,6 +214,12 @@ public:
     /* ---------------------------------------------------------- op schemas (§2.3) */
     const RadOpSchema* schema(std::string_view op) const;
     const Plugin*      schema_owner(std::string_view op) const;
+    /* Does a kernel library that is not a reference implementation declare `op`? schema() also
+     * answers for an op only a reference library (libref) declares; this does not. Every
+     * declaration counts, not only the one that fixed the schema, so a --kernels list that ranks
+     * the reference first answers the same. A library whose device rows were left out here (no
+     * code for this card, or the host backend) still counts: its vocabulary is loaded. */
+    bool               declared_native(std::string_view op) const;
     std::vector<std::string> op_names() const;      /* sorted; the vocabulary this set implements */
 
     /* Check a declared parameter set against the op's schema; a misspelled op fails with the
@@ -345,6 +351,7 @@ private:
     std::deque<QuantRow>     quants_;
     std::unordered_map<std::string, std::vector<const KernelRow*>> by_op_;
     std::unordered_map<std::string, SchemaEntry> schemas_;
+    std::unordered_map<std::string, int> native_ops_;   /* declared_native(): op -> declaring non-reference libraries */
     std::vector<std::string> load_errors_;
 
     mutable std::mutex           mu_;

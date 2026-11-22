@@ -192,6 +192,42 @@ TEST(the_reference_library_sorts_last_with_no_hierarchy) {
     CHECK(r3.plugin("radtest_reference") == nullptr);
 }
 
+/* declared_native (rad_op_declared_native): an op counts only when a kernel library that is not a
+ * reference declares it. The order fixtures declare the same ops, one of them as the reference: with
+ * the reference alone the vocabulary has the op (schema()) but no native declaration; with both, the
+ * answer does not depend on which of them fixed the schema (the reference named first owns it). */
+TEST(declared_native_ignores_a_reference_librarys_vocabulary) {
+    Registry r;
+    const int st = r.load_dir(order_dir(), {});
+    if (st == RAD_E_IO) {
+        fprintf(stderr, "    (no order fixture in %s -- build the radtest_ord_* targets)\n",
+                order_dir().c_str());
+        return;
+    }
+    CHECK_OK(st);
+    CHECK(r.schema("t_gemm") != nullptr);
+    CHECK(r.declared_native("t_gemm"));
+    CHECK(!r.declared_native("t_no_such_op"));
+
+    Registry ref_only;
+    CHECK_OK(ref_only.load_dir(order_dir(), { "radtest_reference" }));
+    CHECK(ref_only.schema("t_gemm") != nullptr);
+    CHECK(!ref_only.declared_native("t_gemm"));
+
+    Registry ref_first;
+    CHECK_OK(ref_first.load_dir(order_dir(), { "radtest_reference", "radtest_base" }));
+    CHECK(ref_first.schema_owner("t_gemm") && ref_first.schema_owner("t_gemm")->reference);
+    CHECK(ref_first.declared_native("t_gemm"));
+
+    Registry base_only;
+    CHECK_OK(base_only.load_dir(order_dir(), { "radtest_base" }));
+    CHECK(base_only.declared_native("t_gemm"));
+
+    /* close() forgets it with the rest */
+    r.close();
+    CHECK(!r.declared_native("t_gemm"));
+}
+
 TEST(abi_mismatch_is_refused_by_name_with_both_versions) {
     Registry r;
     const int st = r.load_plugin(bad_dir() + "/radtest_badabi.so", 0);

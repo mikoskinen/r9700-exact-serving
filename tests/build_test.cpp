@@ -953,6 +953,23 @@ TEST(glm_index_cache_pages_are_sized_by_the_real_pool_consumer) {
     CHECK_EQ(b.program().kv_groups[group].bytes_per_block, (int64_t)(2 * 136));
 }
 
+/* libref declares host rows for optional device ops (lever GSE's moe_gemm_mxil_glu) so host declares resolve them;
+ * with libref alone the op is in the vocabulary (rad_op_declared) but no device library declares it, which
+ * is what deepseek41 asks before declaring GSE (a card whose libr4d lacks the op takes the pair: tp8 loop
+ * FINDINGS PREFILL 08:44 / 08:54). */
+TEST(a_reference_librarys_ops_are_declared_but_not_native) {
+    Registry reg;
+    REQUIRE_EQ(reg.load_dir(home() + "/kernels", { "libref" }), RAD_OK);
+    REQUIRE(reg.plugin("libref") && reg.plugin("libref")->reference);
+    Builder b(reg, make_meta(), make_ctx());
+    RadBuilder* h = &b;
+    for (const char* op : { "moe_gemm_mxil_glu", "moe_gemm_mxil", "rmsnorm" }) {
+        CHECK_EQ(rad_op_declared(h, op), 1);
+        CHECK_EQ(rad_op_declared_native(h, op), 0);
+    }
+    CHECK_EQ(rad_op_declared_native(h, "t_no_such_op"), 0);
+}
+
 TEST(a_kv_group_with_no_layers_is_an_error) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
@@ -1214,6 +1231,11 @@ TEST(the_c_surface_drives_the_builder) {
     CHECK_EQ(rad_op_declared(h, "t_gemm"), 1);
     CHECK_EQ(rad_op_declared(h, "t_no_such_op"), 0);
     CHECK_EQ(rad_op_declared(h, nullptr), 0);
+    /* The same without a reference library's vocabulary: the test kernels are an ordinary library. */
+    CHECK_EQ(rad_op_declared_native(h, "t_gemm"), 1);
+    CHECK_EQ(rad_op_declared_native(h, "t_no_such_op"), 0);
+    CHECK_EQ(rad_op_declared_native(h, nullptr), 0);
+    CHECK_EQ(rad_op_declared_native(nullptr, "t_gemm"), 0);
     CHECK_EQ(b.status(), RAD_OK);
 
     /* A weight declared twice is refused now; the container has one entry for it. */

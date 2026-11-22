@@ -858,6 +858,10 @@ int Builder::op_declared(const char* op) const {
     return op && reg_.schema(op) ? 1 : 0;
 }
 
+int Builder::op_declared_native(const char* op) const {
+    return op_declared(op) && reg_.declared_native(op) ? 1 : 0;
+}
+
 int Builder::op_resolved(rad_op h) const {
     if (h == 0 || h >= prog_.ops.size()) return 0;
     const OpInfo& o = prog_.ops[h];
@@ -2840,6 +2844,11 @@ int rad_op_resolved(RadBuilder* b, rad_op h) {
 int rad_op_declared(RadBuilder* b, const char* op) {
     if (!b) return 0;
     return B(b)->op_declared(op);
+}
+
+int rad_op_declared_native(RadBuilder* b, const char* op) {
+    if (!b) return 0;
+    return B(b)->op_declared_native(op);
 }
 
 int rad_op_reads(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {

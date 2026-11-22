@@ -208,6 +208,7 @@ int Registry::commit_(Staged& s, int order) {
     p.close        = dl_fn<RadPluginCloseFn>(s.handle, "rad_plugin_close");
 
     std::vector<const RadOpSchema*> staged_schemas;
+    std::vector<const char*> declared_ops;   /* every op it declares, re-declarations too (declared_native) */
     std::vector<std::pair<const RadKernelInfo*, int>> staged_rows;   /* the row and its index */
     std::vector<const RadQuantizerInfo*> staged_quants;
     int n_declared_schemas = 0;
@@ -319,6 +320,7 @@ int Registry::commit_(Staged& s, int order) {
                     return RAD_E_INVAL;
                 }
             }
+            declared_ops.push_back(sch->op);
             std::string diff;
             auto it = schemas_.find(sch->op);
             if (it != schemas_.end()) {
@@ -512,6 +514,8 @@ int Registry::commit_(Staged& s, int order) {
     p.n_schemas = n_declared_schemas;
     p.n_kernels = (int)staged_rows.size();
     for (const RadOpSchema* sch : staged_schemas) schemas_[sch->op] = SchemaEntry{sch, p.name};
+    if (p.kind == RAD_PLUGIN_KERNEL && !p.reference)
+        for (const char* op : declared_ops) ++native_ops_[op];
     for (const RadQuantizerInfo* q : staged_quants) {
         quants_.push_back(QuantRow{ q, p.name });
         /* Register its decoder so every weight reader can decode its schemes. */
@@ -782,6 +786,7 @@ void Registry::close() {
     quants_.clear();
     by_op_.clear();
     schemas_.clear();
+    native_ops_.clear();
     load_errors_.clear();
     clear_selections();
 }

@@ -632,6 +632,18 @@ int rad_op_resolved(RadBuilder* b, rad_op h);
  * library defines, and emits the chain when the answer is 0. Additive export. */
 int rad_op_declared(RadBuilder* b, const char* op);
 
+/* rad_op_declared, counting only kernel libraries that are not a reference implementation
+ * (RadPluginReferenceFn). A reference library (libref) declares host rows so that a host declare
+ * or the host backend resolves an op, but a card needs a device kernel: an optional op whose
+ * device kernel only some builds of a device library carry, and which libref also declares, is
+ * asked about here, so a card whose device library lacks it takes the chain instead of a band
+ * with no device kernel (fatal at declare). The vocabulary counts, not the rows: on the host
+ * backend a device library's device rows are left out at load but its declarations stay, so a
+ * host declare with that library on the search path answers as the card does. Additive export;
+ * a plugin that must load under an older core declares it weak and falls back to
+ * rad_op_declared. */
+int rad_op_declared_native(RadBuilder* b, const char* op);
+
 /* ================================================================== checkpoint name map */
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component

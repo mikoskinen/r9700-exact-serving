@@ -71,6 +71,11 @@ const Plugin* Registry::schema_owner(std::string_view op) const {
     return it == schemas_.end() ? nullptr : plugin(it->second.plugin);
 }
 
+bool Registry::declared_native(std::string_view op) const {
+    auto it = native_ops_.find(std::string(op));
+    return it != native_ops_.end() && it->second > 0;
+}
+
 std::vector<std::string> Registry::op_names() const {
     std::vector<std::string> out;
     out.reserve(schemas_.size());
