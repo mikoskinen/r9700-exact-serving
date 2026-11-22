@@ -360,6 +360,10 @@ private:
     } bgf_;
     std::vector<RadEvent>         bg_gate_, bg_done_;
     int64_t                       bgl_overlap_steps_ = 0;   /* lane-0 steps issued while a lane-1 step was in flight */
+    /* lever BGL stage 2b + RADIANCE_BGL_AHEAD=1 (Qwen loop round 25): lane 0 issues its decode steps ahead (pipelining) beside
+     * lane 1's steps; the steps so issued, and those of them issued while a lane-1 step was in flight */
+    bool                          bgl_ahead_ = false;
+    int64_t                       bgl_ahead_steps_ = 0, bgl_ahead_beside_ = 0;
     double                        bgl_flight_ms_ = 0;       /* lane-1 steps' issue-to-finish ms, summed */
     int  bgl2b_setup();
     int  finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bool pf1_tok, bool t_on);

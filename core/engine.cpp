@@ -1184,6 +1184,19 @@ int Engine::draft_lend_state(uint64_t* changes) const {
 int Engine::issue_ahead(const RadBatch** out) {
     *out = nullptr;
     if (!pipelining_) return RAD_OK;
+    /* lever BGL stage 2b + RADIANCE_BGL_AHEAD=1: lane 0 issues ahead beside lane 1's step on the second Ctx, but not when the loop top
+     * has lane-1 work -- a lane-1 step whose end event has completed (finished there, so its newcomer joins lane 0's next fresh plan;
+     * a step issued ahead copies the plan before it and would leave the newcomer out) or a lent newcomer in lane 1's inbox with lane 1
+     * idle (issued there). Lane 1 itself never issues ahead (its step returns to the loop top before this). */
+    if (bgl_ahead_) {
+        if (cur_sched_ != &sched_) return RAD_OK;
+        if (bgf_.on) {
+            const int q = rad_event_query(bgio_in_ ? step_end_ : bgio_.step_end);
+            if (q != 0) return q < 0 ? q : RAD_OK;
+        } else if (lanes_.inbox_n(1) > 0) {
+            return RAD_OK;
+        }
+    }
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     /* ds41-acc: a confidence gate waits for the query pass here, so the step built next verifies
@@ -1216,6 +1229,10 @@ int Engine::issue_ahead(const RadBatch** out) {
         return st;
     }
     *out = nb;
+    if (bgl_ahead_) {
+        ++bgl_ahead_steps_;
+        if (bgf_.on) { ++bgl_ahead_beside_; ++bgl_overlap_steps_; }
+    }
     return RAD_OK;
 }
 
@@ -1274,7 +1291,16 @@ int Engine::step_loop() {
     if (pp_on()) pipelining_ = false;
     /* qfn-on-ds lever BGL stage 1: lane 1's steps run between lane 0's, so nothing is issued ahead (a step issued ahead is
      * lane 0's, and lane 1's step would have to wait for its commit) */
-    if (bgl1m_) pipelining_ = false;
+    /* lever BGL stage 2b + RADIANCE_BGL_AHEAD=1 (Qwen loop round 25, QUEUE Q5b): lane 1's steps go out on each rank's second Ctx,
+     * so lane 0's step issued ahead orders against nothing of lane 1's; issue_ahead declines where the loop top has lane-1 work. */
+    {
+        const char* ah = std::getenv("RADIANCE_BGL_AHEAD");
+        bgl_ahead_ = bgl2b_ && ah && !std::strcmp(ah, "1");
+    }
+    if (bgl1m_ && !bgl_ahead_) pipelining_ = false;
+    if (bgl_ahead_ && pipelining_)
+        RAD_INFO("lever BGL stage 2b ahead (RADIANCE_BGL_AHEAD=1): lane 0 issues its decode steps ahead beside lane 1's steps on the "
+                 "second Ctx; none while a finished lane-1 step or a lent newcomer waits at the loop top");
     if (oracle_head)
         RAD_WARN("--debug-draft-oracle beside the draft head '%s': no step is issued ahead of its "
                  "commit, so the harness's ids replace the head's proposals before each verify is "
@@ -1641,6 +1667,9 @@ int Engine::step_loop() {
         if (bgl2b_)
             RAD_INFO("lever BGL stage 2b: %lld lane-0 step(s) issued while a lane-1 step was in flight; lane-1 steps %.1f ms issue to "
                      "finish on average", (long long)bgl_overlap_steps_, bgl_steps_ > 0 ? bgl_flight_ms_ / (double)bgl_steps_ : 0.0);
+        if (bgl_ahead_)
+            RAD_INFO("lever BGL stage 2b ahead (RADIANCE_BGL_AHEAD=1): %lld lane-0 step(s) issued ahead, %lld of them while a lane-1 step "
+                     "was in flight", (long long)bgl_ahead_steps_, (long long)bgl_ahead_beside_);
     }
     return RAD_OK;
 }

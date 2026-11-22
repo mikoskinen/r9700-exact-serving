@@ -2248,15 +2248,19 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
     /* runs 0 / 1: stage 1 (lane 1's steps on the rank's own Ctx); run 2: stage 2 WIP -- lane 1's steps on a second Ctx a rank and a
      * second sampler driver, every kernel instance doubled (RADIANCE_AR_SETS=all), still one step at a time */
     /* run 3: stage 2b -- lane 1's step issued whole on the second Ctx and finished by event while lane 0 steps on */
-    for (int k = 0; k < 4; ++k) {
+    /* run 4: stage 2b + RADIANCE_BGL_AHEAD=1 (Qwen loop round 25) -- lane 0 issues its decode steps ahead beside lane 1's */
+    for (int k = 0; k < 5; ++k) {
         Serving one;
         const std::vector<std::string> env = k < 2  ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=1" }
                                            : k == 2 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=2", "RADIANCE_AR_SETS=all" }
-                                                    : std::vector<std::string>{ "RADIANCE_BG_LANE_1M=3", "RADIANCE_AR_SETS=all" };
+                                           : k == 3 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=3", "RADIANCE_AR_SETS=all" }
+                                                    : std::vector<std::string>{ "RADIANCE_BG_LANE_1M=3", "RADIANCE_AR_SETS=all",
+                                                                                "RADIANCE_BGL_AHEAD=1" };
         std::vector<std::string> env2 = env;
         if (k >= 2) if (const char* dv = std::getenv("BGL2_DBG")) env2.push_back(std::string("RADIANCE_BGL2_DBG=") + dv);
         if (k < 2 && std::getenv("BGL2_ONLY")) continue;
         if (k < 3 && std::getenv("BGL3_ONLY")) continue;
+        if (k < 4 && std::getenv("BGL4_ONLY")) continue;
         std::vector<std::string> ext2 = ext;
         if (std::getenv("BGL2_PLACE")) { ext2.push_back("--placement"); ext2.push_back(std::getenv("BGL2_PLACE")); }
         REQUIRE(one.start("", ext2, env2));
@@ -2286,16 +2290,30 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
         CHECK(log.find("lever BGL (RADIANCE_BG_LANE_1M=1") != std::string::npos);
         CHECK((log.find("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank") != std::string::npos) == (k >= 2));
         if (k >= 2) CHECK(log.find("RADIANCE_AR_SETS=all (tp8 loop M6F): ") != std::string::npos);
-        if (k == 3) {
+        if (k >= 3) {
             long long ov = -1;
             static const std::string kOv = "lever BGL stage 2b: ";
             if (const size_t at = log.rfind(kOv); at != std::string::npos) ov = std::atoll(log.c_str() + at + kOv.size());
-            fprintf(stderr, "    BGL run 3 (stage 2b): %lld lane-0 steps issued beside a lane-1 step in flight\n", ov);
+            fprintf(stderr, "    BGL run %d (stage 2b): %lld lane-0 steps issued beside a lane-1 step in flight\n", k, ov);
             CHECK(ov >= 0);
             /* qfn-on-ds F65: the second Ctx asks for its CU keep (default 8) at bring-up; the host backend has no CUs and says so */
             CHECK(log.find("F65 CU keep: the backend has no CU masks") != std::string::npos);
         }
         if (k == 2) CHECK(log.find("F65 CU keep") == std::string::npos);   /* =2 runs one step at a time: no keep */
+        /* run 4: the ahead form engaged (its start line) and lane 0 issued steps ahead; runs 0-3 issue none */
+        {
+            long long ah = -1, beside = -1;
+            static const std::string kAh = "lever BGL stage 2b ahead (RADIANCE_BGL_AHEAD=1): ";
+            if (const size_t at = log.rfind(kAh); at != std::string::npos)
+                (void)std::sscanf(log.c_str() + at + kAh.size(), "%lld lane-0 step(s) issued ahead, %lld", &ah, &beside);
+            if (k == 4) {
+                fprintf(stderr, "    BGL run 4 (stage 2b ahead): %lld lane-0 steps issued ahead, %lld beside a lane-1 step\n", ah, beside);
+                CHECK(log.find("lane 0 issues its decode steps ahead beside lane 1's steps") != std::string::npos);
+                CHECK(ah > 0);
+            } else {
+                CHECK(log.find(kAh) == std::string::npos);
+            }
+        }
         CHECK(lent > 0);
         CHECK(steps > 0 && steps <= lent);
         CHECK(rows >= 680);
