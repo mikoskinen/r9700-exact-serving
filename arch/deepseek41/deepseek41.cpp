@@ -503,6 +503,7 @@ struct Dsp {
     bool on = false;
     int base = 0, n_stage = 0;            /* stages at absolute layers base .. base + n_stage - 1 */
     int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
+    int dtk = 0;                          /* lever DTK (RADIANCE_DS41_DSPARK_TOPK): the top-k it set, 0 = the container's */
     int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
     bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
     bool wil = false;                     /* lever WIL (dsp_wil_env): the routed experts as moe_gemm_mxil (tile-interleaved) */
@@ -5334,6 +5335,27 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     }
     d.n_expert = gi(meta, "dspark.expert_count", c.n_expert);
     d.top_k = gi(meta, "dspark.expert_used_count", c.top_k);
+    /* Lever DTK (DRAFTER track round 97; rule B for the PROPOSALS only: the trunk verifies, its text does not depend on
+     * it): RADIANCE_DS41_DSPARK_TOPK=K (1 .. the container's top-k, 3) routes each DSpark stage's MoE over its K best
+     * experts -- the router's own selection at top_k K, weights renormalised over the K picked as for any top-k
+     * (expert_weights_norm), so the stage's output keeps its scale. Fewer slots and fewer live experts a stage: the
+     * routed bytes follow the live experts (one card, pfs order F at the served widths, 16 seqs: 1,035 us -> 850-892
+     * at the live counts a top-2 router leaves, 8 seqs 1,011 -> 830-890). Its price is the drafter's acceptance:
+     * read it beside the pass us. Unset / another value: the container's top-k. Every op downstream takes top_k as
+     * a parameter (router 1..32, the MXFP4 / GLU rows >= 1). */
+    if (const char* e = std::getenv("RADIANCE_DS41_DSPARK_TOPK"); e && *e) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 1 && v < d.top_k) {
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever DTK (RADIANCE_DS41_DSPARK_TOPK=%ld): the DSpark stages route over "
+                                "their top %ld of %lld experts a token (the container's top-%lld; proposals only, the trunk "
+                                "verifies)\n", v, v, (long long)d.n_expert, (long long)d.top_k);
+            d.dtk = (int)v;
+            d.top_k = v;
+        } else if (ctx->rank == 0 && !ctx->shape_probe && v != d.top_k)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_TOPK=%s is not 1 .. %lld: lever DTK not applied "
+                            "(the container's top-%lld)\n", e, (long long)d.top_k - 1, (long long)d.top_k);
+    }
     d.rank = gi(meta, "dspark.markov_rank", 0);
     d.noise = gi(meta, "dspark.noise_token_id", -1);
     /* The walk's candidates from the head's top: 32, the most the walk takes (the container states 16, its converter's
