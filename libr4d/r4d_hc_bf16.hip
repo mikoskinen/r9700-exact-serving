@@ -4505,13 +4505,14 @@ static bool hc_write_vec(long rows) {
  * see hc_ss_on), bits 4-5 the codes stage's groups a wave (W2, hc_quant_rows_g_kernel: 0 one, 1 two, 2 four, 3 five);
  * bits 6-10 the bi_dec kernel-A' forms (G16, PF2 column split, G16p, scales once, G16q); bits 11-12 (qfn-on-ds lever B3R)
  * kernel B3 under bi_dec past 16 rows with 1 (0, today), 2 (1), 4 (2) or every (3) 16-row group a block (b3r_gpb); bit 13
- * (qfn-on-ds lever HWC) hc_write in its chained forms (hc_write_chain). -1 until the environment is read. */
+ * (qfn-on-ds lever HWC) hc_write in its chained forms (hc_write_chain); bit 14 (qfn-on-ds PF probe HCF, Qwen loop round 28: TIMING
+ * ONLY, wrong bytes) a decode (bi_dec) read of more than 16 rows reads only its first 16. -1 until the environment is read. */
 static std::atomic<int> g_hc_readv{-1};
 static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 16383) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 32767) : 0;   /* bits 0-13 + bit 14 (PF probe HCF) */
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
@@ -7701,6 +7702,12 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     if (HN > kHcLdsMaxHN) return R4D_NO(RAD_E_SHAPE);
     /* A workgroup owns 128 channels and their scale group, so n must be whole groups. */
     if (n % kUpTB) return R4D_NO(RAD_E_SHAPE);
+    /* qfn-on-ds PF probe HCF (Qwen loop round 28, QUEUE Q56's upper bound; hc_readv bit 14 = 16384, in process): a decode
+     * read (bi_dec) of more than 16 rows reads only its FIRST 16 -- the rows past them keep the x / codes / gains of an earlier
+     * step: WRONG BYTES, timing only. A step's time with every decode read at its 16-row cost is the most any rows-cheap form
+     * of the read (W_down / W_up read once a step for every 16-row group) can take off: today the read runs 3.5 / 5.4 / 9.6 ms a
+     * c8 / c16 / c32 trunk pass (prof5) against a ~1 ms weight floor. Prefill reads (no bi_dec) are untouched. */
+    if ((hc_readv() & 16384) && rows > 16 && r4d_geti_or(a, "bi_dec", 0) != 0) rows = 16;
 
     const long long lr = r4d_geti_or(a, "lowrank", 0);
     if (lr <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -8351,7 +8358,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 16383) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained) */
+        if (value < 0 || value > 32767) return -1;   /* bit 6: G16; 7: the PF2 column split; 8: G16 two tiles a block; 9: + scales once; 10: four tiles; 11-12: B3R; 13: HWC (hc_write chained); 14: PF probe HCF (timing only) */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
