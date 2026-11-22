@@ -1547,6 +1547,56 @@ extern "C" int r4d_ar_lane_blocks_set(int blocks) {
     g_ar_lane_blocks.store(blocks, std::memory_order_relaxed);
     return 1;
 }
+/* qfn-on-ds lever LSK (Qwen loop round 27, QUEUE Q51; rows lane5 / lane6 / lanm1): the lane form's SECOND pair, taken by a
+ * launch whose op declares `lane_kind` 1 (qwen4exp's SP-serial ops under RADIANCE_FN4_SPSER_LANE=1: MIXED and serial prefill
+ * steps), so lone pipelined prefill and MIXED steps can run different lane forms. A per-step flip of the first pair would race
+ * the four rank threads issuing ahead (a block-count mismatch across ranks = a hang); a declared param is fixed per op, and
+ * these values change only between steps with every rank thread parked (rad_fn4_switch), as the first pair's. 0 = follow
+ * the first pair (today); the same values the first pair takes. -1 until read (RADIANCE_FN4_AR_LANE_THREADS_S / _BLOCKS_S). */
+static std::atomic<int> g_ar_lane_threads_s{-1};
+static std::atomic<int> g_ar_lane_blocks_s{-1};
+static int ar_lane_threads_s() {
+    int v = g_ar_lane_threads_s.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_LANE_THREADS_S");
+        int t = (e && *e) ? std::atoi(e) : 0;
+        if (t != 256 && t != 512 && t != 1024) t = 0;
+        int want = -1;
+        g_ar_lane_threads_s.compare_exchange_strong(want, t, std::memory_order_relaxed);
+        v = g_ar_lane_threads_s.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+static int ar_lane_blocks_s() {
+    int v = g_ar_lane_blocks_s.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_LANE_BLOCKS_S");
+        int b = (e && *e) ? std::atoi(e) : 0;
+        if (b < 0 || b > 24 || (b > 2 && (b % 4))) b = 0;
+        int want = -1;
+        g_ar_lane_blocks_s.compare_exchange_strong(want, b, std::memory_order_relaxed);
+        v = g_ar_lane_blocks_s.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_lane_threads_s_set(int threads) {
+    if (threads != 0 && threads != 256 && threads != 512 && threads != 1024) return -1;
+    g_ar_lane_threads_s.store(threads, std::memory_order_relaxed);
+    return 1;
+}
+extern "C" int r4d_ar_lane_blocks_s_set(int blocks) {
+    if (blocks < 0 || blocks > 24 || (blocks > 2 && (blocks % 4))) return -1;
+    g_ar_lane_blocks_s.store(blocks, std::memory_order_relaxed);
+    return 1;
+}
+/* The lane form of one `overlap` 1 launch: the second pair where its op declares lane_kind 1 and the pair is set, else the
+ * first; 0 = the resolved tunable's (the caller keeps c.nthreads / c.nblocks). */
+static void ar_lane_form(const RadArgs* a, int* threads, int* blocks) {
+    const bool s = r4d_geti_or(a, "lane_kind", 0) == 1;
+    const int ts = s ? ar_lane_threads_s() : 0, bs = s ? ar_lane_blocks_s() : 0;
+    *threads = ts > 0 ? ts : ar_lane_threads();
+    *blocks = bs > 0 ? bs : ar_lane_blocks();
+}
 
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
@@ -1615,9 +1665,9 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
     /* qfn-on-ds: the Qwen line's fn4 PFF fence forms, its lane block shape and its SDMA route (all off unless switched) */
     ar_fence_apply(a, &c, op == 2 || op == 3);   /* fn4 PFF: the raw halves push through r4d_ar_push16 */
     if (r4d_geti_or(a, "overlap", 0) == 1) {
-        const int lt = ar_lane_threads();
+        int lt = 0, lb = 0;
+        ar_lane_form(a, &lt, &lb);   /* lever LSK: lane_kind 1 -> the second pair where set */
         if (lt > 0) c.nthreads = lt;
-        const int lb = ar_lane_blocks();
         if (lb > 0) c.nblocks = lb < c.in->max_blocks ? lb : c.in->max_blocks;
     }
     if (c.nthreads % 32) return RAD_E_INVAL;

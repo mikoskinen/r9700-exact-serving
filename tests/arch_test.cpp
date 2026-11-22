@@ -13516,6 +13516,99 @@ TEST(flashnext_hcp_reads_a_prefill_segment_past_the_first_interval_at_a_full_pie
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds lever LSK (Qwen loop round 27, QUEUE Q51; rows lane5 / lane6 / lanm1): with RADIANCE_FN4_SPSER_LANE=1 SP-serial's
+ * steps (a MIXED step: four decode sequences of 4 rows + a 500-row chunk at 4,096; a lone 1,170-row serial prefill) issue every
+ * reduce_scatter_rows / all_gather_rows through ops declaring lane_kind 1 -- libr4d then launches them with the lane form's
+ * second pair -- while a pipelined step (2,048 + 1,792 at 10,240) issues none with it. Everything else is the same issue list
+ * (op name, rows) as without the env, rank by rank. Negative control: without the env no op declares lane_kind (MIXED included). */
+TEST(flashnext_lsk_sp_serial_collectives_declare_lane_kind_1_and_pipelined_do_not) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    struct Out { std::vector<std::pair<std::string, int64_t>> list; int coll = 0, lk1 = 0, spser = 0; bool fail = true; };
+    auto run = [&](const std::vector<int>& dq, int pq, int32_t ctx0, bool lane, int rank) -> Out {
+        Out o;
+        if (lane) setenv("RADIANCE_FN4_SPSER_LANE", "1", 1); else unsetenv("RADIANCE_FN4_SPSER_LANE");
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        unsetenv("RADIANCE_FN4_SPSER_LANE");
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) return o;
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        CHECK(m.spser_ok);
+        CHECK_EQ(m.ss_rs != 0, lane);
+        CHECK_EQ(m.ss_ag != 0, lane);
+        CHECK_EQ(m.ss_agh != 0, lane);
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_hcbi_flag().store(5);
+        qwen4exp_fp8::fn4_spser_flag().store(1);
+        qwen4exp_fp8::fn4_sproute_flag().store(512);
+        const auto pf = kit(b, dq, { pq }, ctx0);
+        pf->b.positions_h = pf->pos.data();
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_spser_flag().store(0);
+        qwen4exp_fp8::fn4_hcbi_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        o.fail = !c.step_fail.empty();
+        o.spser = m.spser_noted;   /* step_serial_sp ran (its run count), else 0 */
+        for (const RecIssue& i : c.issues) {
+            const RecOp* op = b.op_of(i.op);
+            if (!op) continue;
+            o.list.push_back({ op->op, i.n });
+            if (op->op != "reduce_scatter_rows" && op->op != "all_gather_rows") continue;
+            ++o.coll;
+            for (const RecParam& q : op->p) if (q.key == "lane_kind" && q.ival == 1) ++o.lk1;
+        }
+        return o;
+    };
+    for (int rank = 0; rank < 4; ++rank) {
+        /* a MIXED step and a lone 267-row serial prefill tail (at 14,080): SP-serial both; every rows collective through
+         * lane_kind 1 with the env, none without */
+        for (const auto& shape : { std::make_pair(std::vector<int>{ 4, 4, 4, 4 }, 500), std::make_pair(std::vector<int>{}, 267) }) {
+            const int32_t at = shape.first.empty() ? 14080 : 4096;
+            const Out off = run(shape.first, shape.second, at, false, rank), on = run(shape.first, shape.second, at, true, rank);
+            CHECK(!off.fail);
+            CHECK(!on.fail);
+            CHECK_EQ(off.spser, 1);
+            CHECK_EQ(on.spser, 1);
+            CHECK(off.coll > 0);
+            CHECK_EQ(off.lk1, 0);
+            CHECK_EQ(on.coll, off.coll);
+            CHECK_EQ(on.lk1, on.coll);
+            CHECK(on.list == off.list);
+        }
+        {   /* a pipelined step: its collectives keep the first pair (no lane_kind), the same list with the env */
+            const Out off = run({}, 2048 + 1792, 10240, false, rank), on = run({}, 2048 + 1792, 10240, true, rank);
+            CHECK(!off.fail);
+            CHECK(!on.fail);
+            CHECK_EQ(on.spser, 0);
+            CHECK(off.coll > 0);
+            CHECK_EQ(on.coll, off.coll);
+            CHECK_EQ(on.lk1, 0);
+            CHECK(on.list == off.list);
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's

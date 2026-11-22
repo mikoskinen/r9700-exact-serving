@@ -8367,6 +8367,8 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "kvs_vic")) return r4d_kv_vic_set(value);   /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md) */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
+    if (!std::strcmp(name, "ar_lanethreads_s")) return r4d_ar_lane_threads_s_set(value);   /* qfn-on-ds lever LSK */
+    if (!std::strcmp(name, "ar_laneblocks_s")) return r4d_ar_lane_blocks_s_set(value);     /* qfn-on-ds lever LSK */
     if (!std::strcmp(name, "rg_tail")) return r4d_rg_tail_set(value);   /* qfn-on-ds lever RGT (r4d_moe.hip) */
     if (!std::strcmp(name, "hc_pinpf2")) {   /* fn4 SP-serial: pinned parts below kPf2MinRows through PF2 */
         if (value < 0 || value > 1) return -1;

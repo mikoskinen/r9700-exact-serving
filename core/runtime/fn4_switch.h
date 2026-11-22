@@ -909,6 +909,12 @@
  *                   every start -- when a step's decode entries carry proposals of two depths (the context-limit cut beside
  *                   full-depth rows, a newcomer drafted in another cycle), every one is cut to the shallowest (cap_rows, the
  *                   cut draft_dmask already takes); 0 today (mixed depths planned as drafted)        RADIANCE_FN4_DRAFT_UNI
+ *   ar_lanethreads_s / ar_laneblocks_s  libr4d (rad_fn4_switch; qfn-on-ds lever LSK, Qwen loop round 27, QUEUE Q51): the lane
+ *                   form's SECOND pair (the values ar_lanethreads / ar_laneblocks take), used by the rows collectives whose op
+ *                   declares lane_kind 1 -- qwen4exp's SP-serial ops, declared on their own only with RADIANCE_FN4_SPSER_LANE=1
+ *                   at start (MIXED and serial prefill steps); lone pipelined prefill keeps the first pair. 0 = the first
+ *                   pair's value (today); the bytes do not depend on either pair       RADIANCE_FN4_AR_LANE_THREADS_S
+ *                                                                                    RADIANCE_FN4_AR_LANE_BLOCKS_S
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -959,6 +965,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kAqlChi,   /* qfn-on-ds lever CHI (Qwen loop round 8, COORD 05:43): core/device, chained records without the packet fences */
               kExl3Drz,  /* qfn-on-ds lever DRZ (Qwen loop round 13): exl3r4d, the prefill band's ZERO entries write nothing */
               kDraftUni,   /* qfn-on-ds Qwen loop round 14 (F42 / Q33): the scheduler, one draft depth a step at every start */
+              kArLaneThreadsS, kArLaneBlocksS,   /* qfn-on-ds lever LSK (Qwen loop round 27, Q51): libr4d, the lane form's second pair */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it

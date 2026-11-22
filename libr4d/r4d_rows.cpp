@@ -931,6 +931,10 @@ static const RadParamSpec pRowsColl[] = {
      * streams, 4 x 5120 a row) names the all-reduce's bound, so it rides that instance: a shard of ceil(rows / 4) rows
      * of 4 x 5120 fits a slot sized for rows x 5120; the launch checks the shard against the slot */
     { "bound",      RAD_P_INT, RAD_OPTIONAL },
+    /* qfn-on-ds lever LSK (Qwen loop round 27, QUEUE Q51): 1 = the launch at `overlap` 1 takes the lane form's SECOND pair
+     * (switches ar_laneblocks_s / ar_lanethreads_s; 0 there = the first pair's) -- qwen4exp's SP-serial ops (MIXED and
+     * serial prefill steps) under RADIANCE_FN4_SPSER_LANE=1; the shards and each element's rank fold do not depend on it */
+    { "lane_kind",  RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oRowsColl[] = {
     { "x", RAD_OPD_INOUT, 0 },

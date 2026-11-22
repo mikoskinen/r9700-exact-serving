@@ -290,6 +290,13 @@ struct Model {
     bool      spser_ok = false;
     int64_t   spser_rows = 0;
     int       spser_noted = 0;
+    /* qfn-on-ds lever LSK (Qwen loop round 27, QUEUE Q51; RADIANCE_FN4_SPSER_LANE=1 at start): SP-serial's OWN three
+     * collectives, sp_rs / sp_ag / sp_agh's twins with lane_kind 1 -- libr4d launches them with the lane form's second pair
+     * (switches ar_laneblocks_s / ar_lanethreads_s), so MIXED / serial steps and lone pipelined prefill can run different
+     * lane forms (rows lane5 / lane6: 12 x 256 -0.40..-0.49 % a cold prompt; lanm1: the MIXED step +0.8..+1.4 % at it).
+     * The same params otherwise, so libr4d serves them from the same instances (no scratch). 0 = step_serial_sp takes
+     * the shared ops (today). */
+    rad_op    ss_rs = 0, ss_ag = 0, ss_agh = 0;
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -1983,6 +1990,33 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.spser_rows = 128LL * tmax;
         m.spser_ok = ok && tmax >= 2 && !m.layers.empty() &&
                      m.sp_agh_rows >= std::min<int64_t>(T, m.spser_rows);   /* fn4 KVCAP C1: a run fits the gather */
+        /* lever LSK: SP-serial's own collectives with lane_kind 1 (every param else = the shared op's: the same libr4d
+         * instance); a library that does not take the param leaves them 0 (the shared ops, today) */
+        if (m.spser_ok && fn4_env_on("RADIANCE_FN4_SPSER_LANE")) {
+            m.ss_rs = rw(b, RAD_OP(b, "reduce_scatter_rows",
+                             RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, T * g.n_embd),
+                                        RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", 1),
+                                        RAD_INT("overlap", 1), RAD_INT("lane_kind", 1)),
+                             RAD_NOWEIGHTS),
+                         {m.a_x.x}, {m.a_x.x});
+            m.ss_ag = rw(b, RAD_OP(b, "all_gather_rows",
+                             RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, T * g.n_embd),
+                                        RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", 1),
+                                        RAD_INT("overlap", 1), RAD_INT("lane_kind", 1)),
+                             RAD_NOWEIGHTS),
+                         {m.a_x.x}, {m.a_x.x});
+            m.ss_agh = rw(b, RAD_OP(b, "all_gather_rows",
+                              RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, m.sp_agh_rows * HN),
+                                         RAD_STR("dtype", g.dtype), RAD_INT("row", HN), RAD_INT("raw", 1),
+                                         RAD_INT("overlap", 1), RAD_INT("lane_kind", 1)),
+                              RAD_NOWEIGHTS),
+                          {m.b_h}, {m.b_h});
+            if (!(m.ss_rs && m.ss_ag && m.ss_agh)) m.ss_rs = m.ss_ag = m.ss_agh = 0;
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: qwen4exp: lever LSK (RADIANCE_FN4_SPSER_LANE): SP-serial's own collectives %s "
+                                "(lane_kind 1: libr4d's lane pair ar_laneblocks_s / ar_lanethreads_s, 0 there = the first "
+                                "pair's)\n", m.ss_rs ? "declared" : "NOT served -- the shared ops stay");
+        }
         if (g.rank == 0 && !ctx->shape_probe)
             fprintf(stderr, "radiance: qwen4exp: fn4 SP-serial %s (RADIANCE_FN4_SPSERIAL; switch sp_serial picks it a serial "
                             "step: prefill segments up to %lld rows, K split pinned to the segment's row tiles)\n",
@@ -3171,8 +3205,10 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
     const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : g.max_tok;
-    auto rs = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, m.sp_rs, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
-    auto ag = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, m.sp_ag, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
+    /* lever LSK: SP-serial's own collectives (lane_kind 1) where declared, else the shared ops */
+    const rad_op o_rs = m.ss_rs ? m.ss_rs : m.sp_rs, o_ag = m.ss_ag ? m.ss_ag : m.sp_ag, o_agh = m.ss_agh ? m.ss_agh : m.sp_agh;
+    auto rs = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, o_rs, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
+    auto ag = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, o_ag, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
     auto codes = [&](const HyperConn& h, int64_t a, int64_t n) {
         for (int64_t r0 = a; r0 < a + n; r0 += band) h.codes(c, r0, std::min(band, a + n - r0));
     };
@@ -3315,7 +3351,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     for (int k = 0; k < sp.nrun; ++k)
         on1(true, [&] {
             if (!sp_agh_fits(c, m, sp.run[k].n)) return;   /* fn4 KVCAP C1 */
-            RAD_ISSUE_N(c, m.sp_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE);
+            RAD_ISSUE_N(c, o_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE);
         });
     wait1();
     bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* the gathered wide stream (BI tracer under RADIANCE_FN4_BITRACE_SP) */
