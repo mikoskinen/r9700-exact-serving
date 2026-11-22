@@ -54,6 +54,7 @@ struct Server::StreamState {
     bool opened = false;
     bool done_sent = false;
     bool released = false;
+    std::string rpf_body;   /* lever RPF (Server::rpf_): the request's body, for its warm request; empty when off */
 };
 
 /* The failure message for the client: the failing component's sentence and the status. A failed
