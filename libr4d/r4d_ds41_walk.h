@@ -12,5 +12,8 @@
 
 int r4d_rad_dspark_walk_step(const RadArgs*, RadStream);
 int r4d_shape_dspark_walk_step(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+/* lever WSP (DRAFTER track round 84): step 0 of the WMMA form in two parts */
+int r4d_rad_dspark_walk_part(const RadArgs*, RadStream);
+int r4d_shape_dspark_walk_part(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 #endif

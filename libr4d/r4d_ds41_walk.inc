@@ -22,6 +22,19 @@ static const RadConstraint cDs41Walk[] = {
     C_GE("n_vocab", 1), C_GE("N", 0), C_GE("vocab_off", 0), C_GE("world", 1), C_LE("world", 64),
     C_IN("dtype", "f32"),
 };
+/* lever WSP (DRAFTER track round 84): dspark_walk_part, the WMMA form's step 0 in two parts */
+static const RadParamSpec pDs41WalkPart[] = {
+    P_INT("M"), P_INT("part"), P_INT("steps"), P_INT("rank"), P_INT("n_vocab"), P_INT("N"), P_INT("vocab_off"),
+    P_INTO("anchor_stride"), P_STR("dtype"),
+};
+static const RadOperandSpec oDs41WalkPart[] = {
+    { "logits", RAD_OPD_IN, 1 },     { "anchor", RAD_OPD_IN, 1 }, { "pred", RAD_OPD_WEIGHT, 0 },
+    { "succ", RAD_OPD_WEIGHT, 0 },   { "acc", RAD_OPD_INOUT, 0 }, { "keys", RAD_OPD_INOUT, 1 },
+};
+static const RadConstraint cDs41WalkPart[] = {
+    C_GE("M", 1), C_GE("part", 1), C_LE("part", 2), C_GE("steps", 1), C_GE("rank", 256), C_LE("rank", 256), C_GE("n_vocab", 1),
+    C_GE("N", 1), C_GE("vocab_off", 0), C_IN("dtype", "f32"),
+};
 
 #elif defined(R4D_DS41_SCHEMAS)
 
@@ -34,6 +47,11 @@ SCHEMA("dspark_walk_step", pDs41Walk, oDs41Walk,
        "best max-ed into keys[s] (the u64 of a 16-byte slot, an f32 [M, 4] plane, zeroed before). step = steps only merges the "
        "last token. `form` (default 0) picks how a block reads succ (1: through LDS as whole lines); the bits are the "
        "same."),
+SCHEMA("dspark_walk_part", pDs41WalkPart, oDs41WalkPart,
+       "dspark_walk_step's step 0 in two parts (lever WSP), the WMMA form (rank 256) only: part 1 stores the products "
+       "sum_r pred[anchor][r] * succ[vocab_off + j][r] of every sequence and shard column (the WMMA form's accumulator, f32) in "
+       "acc [M, N] (and, keys given, zeros in all its [rows, 4] slots: the walk's fill); part 2 keys logits[s * steps][j] + acc[s][j] and max-es the shard's best into keys[s] (pre-zeroed) as step "
+       "0 does. The same keys as dspark_walk_step's step 0 in the WMMA form, bit for bit."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -49,5 +67,16 @@ SCHEMA("dspark_walk_step", pDs41Walk, oDs41Walk,
   ROW(cDs41Walk), NOTUNE,
   nullptr, nullptr, r4d_rad_dspark_walk_step, nullptr, nullptr, nullptr,
   r4d_shape_dspark_walk_step },
+{ "dspark_walk_part_f32", "dspark_walk_part", "dflash",
+  "lever WSP: the WMMA walk's step 0 split at its product -- part 1 (anchors' pred rows x the shard's succ rows, 16 WMMAs a "
+  "16-column tile, acc stored f32) can run before the head; part 2 (a thread a column, logits + acc keyed, one atomicMax a "
+  "block and sequence) after it",
+  "rank 256 (the WMMA form), vocab_off + N <= n_vocab, succ / pred 16-byte aligned, acc [M, >= N] f32, keys [M, 4] f32 slots "
+  "zeroed before part 2; refused unless RADIANCE_DS41_WALK_WM=1 (the steps' form)",
+  "f32 logits / acc, bf16 pred / succ (WMMA bf16 x bf16 -> f32 in the WMMA form's K order), u64 keys in 16-byte slots",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDs41WalkPart), NOTUNE,
+  nullptr, nullptr, r4d_rad_dspark_walk_part, nullptr, nullptr, nullptr,
+  r4d_shape_dspark_walk_part },
 
 #endif

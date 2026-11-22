@@ -448,6 +448,100 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_wm_kernel(
     }
 }
 
+/* Lever WSP (DRAFTER track round 84, 22.11.2026; op dspark_walk_part): the WMMA form's step 0 in two launches. Step 0's
+ * predecessor is the anchor -- the pass's own input token, known before the head -- so its product pred[anchor] . succ^T need not
+ * wait for the logits. PART 1 (dspark_walk_wm_pre_kernel) runs, per 16-column tile, the WMMA form's 16 WMMAs on the same A (the
+ * anchors' pred rows, zeros past ng / for an id outside [0, V)) and B (the tile's succ rows) in the same K order, and stores each
+ * product C[i] (f32, the accumulator as it leaves the last WMMA) in acc [S, N] at [s][v]; it reads no logits and writes no key.
+ * PART 2 (dspark_walk_wm_add_kernel), behind the head, keys score = logits[s * steps][v] + acc[s][v] (the WMMA form's one f32 add,
+ * the same two operands) and max-es each sequence's best into keys (pre-zeroed), as the WMMA form's step 0 does. The same C bits,
+ * the same add, an order-free max: step 0's keys bit for bit; step 0 writes no token (tokens[s][l - 1] is written from step 1). */
+__global__ __launch_bounds__(kWalkThreads) void dspark_walk_wm_pre_kernel(
+    const int* __restrict__ anchor, long astride, const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
+    float* __restrict__ acc, long apitch, float* __restrict__ kz, long kzpitch, int kzrows, int S, int V, int N, int voff) {
+    R4D_IKA_ENTRY();
+    __shared__ int sprev[16];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, nl = lane & 15, h = lane >> 4;
+    const int ntile = (N + 15) >> 4;
+    /* the walk's key slots (the fill's [kzrows, 4] f32 zeros, the same bytes), when given: one 16-byte store a slot */
+    for (int r = blockIdx.x * kWalkThreads + tid; r < kzrows; r += gridDim.x * kWalkThreads)
+        *(r4d_u32x4*)(kz + (long)r * kzpitch) = r4d_u32x4{ 0u, 0u, 0u, 0u };
+    for (int g0 = 0; g0 < S; g0 += 16) {
+        const int ng = S - g0 < 16 ? S - g0 : 16;
+        if (tid < ng) sprev[tid] = anchor[(long)(g0 + tid) * astride];
+        __syncthreads();
+        /* A: this lane's sequence row (nl), its half h, all 16 K-steps (the WMMA form's af) */
+        r4d_u32x4 af[16];
+        {
+            const int p = nl < ng ? sprev[nl] : -1;
+            const bool ok = p >= 0 && p < V;
+            const r4d_u16* pr = pred + (long)(ok ? p : 0) * kWmR + 128 * h;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                r4d_u32x4 z = { 0u, 0u, 0u, 0u };
+                if (ok) z = *(const r4d_u32x4*)(pr + 8 * j);
+                af[j] = z;
+            }
+        }
+        for (int t = blockIdx.x * kWalkWaves + wave; t < ntile; t += gridDim.x * kWalkWaves) {
+            const int v = t * 16 + nl;
+            const bool vl = v < N;
+            const r4d_u16* sr = succ + (long)(voff + (vl ? v : 0)) * kWmR + 128 * h;
+            r4d_u32x4 bf[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) bf[j] = *(const r4d_u32x4*)(sr + 8 * j);
+            walk_v8f c = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(walk_v8bf, af[j]), __builtin_bit_cast(walk_v8bf, bf[j]), c);
+            /* D lane L: column (vocabulary) L % 16, rows (sequences) 8 (L / 16) + i */
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int sl = 8 * h + i;
+                if (vl && sl < ng) acc[(long)(g0 + sl) * apitch + v] = c[i];
+            }
+        }
+        __syncthreads();   /* sprev is the next group's */
+    }
+}
+
+/* PART 2: a thread a column of the shard, every sequence of a 16-group from registers (its logits and its product loaded first),
+ * each sequence's best by a wave max, then the block's, then one atomicMax a (block, sequence): the WMMA form's keys. */
+__global__ __launch_bounds__(kWalkThreads) void dspark_walk_wm_add_kernel(
+    const float* __restrict__ logits, long lpitch, const float* __restrict__ acc, long apitch,
+    unsigned long long* __restrict__ keys, long kpitch, int S, int steps, int N, int voff) { R4D_IKA_ENTRY();
+    __shared__ unsigned long long sbest[16 * kWalkWaves];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int v = blockIdx.x * kWalkThreads + tid;
+    const bool vl = v < N;
+    for (int g0 = 0; g0 < S; g0 += 16) {
+        const int ng = S - g0 < 16 ? S - g0 : 16;
+        float lg[16], ac[16];
+#pragma unroll
+        for (int sl = 0; sl < 16; ++sl) {
+            const bool on = vl && sl < ng;
+            lg[sl] = on ? logits[(long)((g0 + sl) * steps) * lpitch + v] : 0.0f;
+            ac[sl] = on ? acc[(long)(g0 + sl) * apitch + v] : 0.0f;
+        }
+#pragma unroll
+        for (int sl = 0; sl < 16; ++sl) {
+            if (sl < ng) {
+                unsigned long long k = 0ull;
+                if (vl) k = walk_key(lg[sl] + ac[sl], voff + v);
+                k = walk_wave_max(k);
+                if (lane == 0) sbest[sl * kWalkWaves + wave] = k;
+            }
+        }
+        __syncthreads();
+        if (tid < ng) {
+            unsigned long long k = 0ull;
+            for (int w = 0; w < kWalkWaves; ++w) k = walk_umax(k, sbest[tid * kWalkWaves + w]);
+            if (k) atomicMax(&keys[(long)(g0 + tid) * kpitch], k);
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 /* ------------------------------------------------------------------ plugin entry */
@@ -583,5 +677,62 @@ extern "C" int r4d_rad_dspark_walk_step(const RadArgs* a, RadStream stream) {
                            (const r4d_u16*)pred->data, (const r4d_u16*)succ->data, ks, (long)kpitch,
                            (int*)tokens->data, (long)tpitch, (int)S, (int)step, (int)steps, (int)R, (int)V, (int)N,
                            (int)voff);
+    return R4D_RAW((int)hipGetLastError());
+}
+
+/* Lever WSP (DRAFTER track round 84): op dspark_walk_part, the WMMA form's step 0 in two parts (the kernels' note above).
+ * part 1: anchor, pred, succ -> acc [M, >= N] f32 (the products of step 0) and, when keys is given, zeros in its [rows, 4] f32
+ * slots (the walk's fill, the same bytes: one launch fewer); part 2: logits, acc -> keys (step 0's keys, the slots pre-zeroed). Only the WMMA form (rank 256) has parts; with RADIANCE_DS41_WALK_WM off the op is refused (its step 0
+ * would not be the steps' form). */
+enum { WP_LOGITS = 0, WP_ANCHOR, WP_PRED, WP_SUCC, WP_ACC, WP_KEYS };
+extern "C" int r4d_rad_dspark_walk_part(const RadArgs* a, RadStream stream) {
+    const RadTensor* logits = r4d_opt(a, WP_LOGITS);
+    const RadTensor* anchor = r4d_opt(a, WP_ANCHOR);
+    const RadTensor* pred = r4d_opt(a, WP_PRED);
+    const RadTensor* succ = r4d_opt(a, WP_SUCC);
+    const RadTensor* acc = r4d_opt(a, WP_ACC);
+    const RadTensor* keys = r4d_opt(a, WP_KEYS);
+    const long long part = r4d_geti_or(a, "part", 0), steps = r4d_geti_or(a, "steps", 0);
+    const long long R = r4d_geti_or(a, "rank", 0), V = r4d_geti_or(a, "n_vocab", 0);
+    const long long N = r4d_geti_or(a, "N", 0), voff = r4d_geti_or(a, "vocab_off", 0);
+    const long long astride = r4d_geti_or(a, "anchor_stride", 1);
+    if ((part != 1 && part != 2) || R != kWmR || steps < 1 || steps > INT_MAX || V < 1 || V > INT_MAX - 1 || N < 1 || voff < 0 ||
+        voff + N > V || astride < 1)
+        return R4D_NO(RAD_E_INVAL);
+    if (!g_walk_wm) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (!acc || !acc->data || acc->dtype != RAD_F32 || acc->rank != 2 || acc->shape[1] < N) return R4D_NO(RAD_E_SHAPE);
+    const long long S = acc->shape[0], apitch = r4d_row_pitch(acc);
+    if (S < 1 || S > INT_MAX / steps || apitch < N) return R4D_NO(RAD_E_SHAPE);
+    if (part == 1) {
+        if (!anchor || !pred || !succ || !anchor->data || !pred->data || !succ->data) return R4D_NO(RAD_E_INVAL);
+        if (anchor->dtype != RAD_I32 || !r4d_contig(anchor) || r4d_numel(anchor) < (S - 1) * astride + 1) return R4D_NO(RAD_E_SHAPE);
+        if (pred->dtype != RAD_BF16 || succ->dtype != RAD_BF16 || !r4d_contig(pred) || !r4d_contig(succ) || r4d_numel(pred) < V * R ||
+            r4d_numel(succ) < V * R || ((uintptr_t)succ->data & 15) || ((uintptr_t)pred->data & 15))
+            return R4D_NO(RAD_E_SHAPE);
+        /* keys given: part 1 also writes the fill's zeros into its [rows, 4] f32 slots (16-byte aligned rows) */
+        long long kzp = 0, kzr = 0;
+        if (keys && keys->data) {
+            if (keys->dtype != RAD_F32 || keys->rank != 2 || keys->shape[1] < 4 || (kzp = r4d_row_pitch(keys)) < 4 || (kzp & 3) ||
+                ((uintptr_t)keys->data & 15) || keys->shape[0] > INT_MAX)
+                return R4D_NO(RAD_E_SHAPE);
+            kzr = keys->shape[0];
+        }
+        const int tpw = g_walk_tpw;
+        const unsigned wb = (unsigned)(((N + 15) / 16 + kWalkWaves * tpw - 1) / (kWalkWaves * tpw));
+        hipLaunchKernelGGL(dspark_walk_wm_pre_kernel, dim3(wb), dim3(kWalkThreads), 0, (hipStream_t)stream,
+                           (const int*)anchor->data, (long)astride, (const r4d_u16*)pred->data, (const r4d_u16*)succ->data,
+                           (float*)acc->data, (long)apitch, kzr ? (float*)keys->data : nullptr, (long)kzp, (int)kzr, (int)S, (int)V,
+                           (int)N, (int)voff);
+        return R4D_RAW((int)hipGetLastError());
+    }
+    long long kpitch = 0, lpitch = 0;
+    if ((kpitch = wk_u64_plane(keys, S, 2)) < 0) return R4D_NO(RAD_E_SHAPE);
+    if (!logits || !logits->data || logits->dtype != RAD_F32 || logits->rank != 2 || logits->shape[0] < S * steps ||
+        logits->shape[1] < N || (lpitch = r4d_row_pitch(logits)) < N)
+        return R4D_NO(RAD_E_SHAPE);
+    const unsigned blocks = (unsigned)((N + kWalkThreads - 1) / kWalkThreads);
+    hipLaunchKernelGGL(dspark_walk_wm_add_kernel, dim3(blocks), dim3(kWalkThreads), 0, (hipStream_t)stream,
+                       (const float*)logits->data, (long)lpitch, (const float*)acc->data, (long)apitch,
+                       (unsigned long long*)keys->data, (long)kpitch, (int)S, (int)steps, (int)N, (int)voff);
     return R4D_RAW((int)hipGetLastError());
 }

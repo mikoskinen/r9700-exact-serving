@@ -535,6 +535,15 @@ struct Dsp {
      * own block whose head the engine cut to the first H rows of each block (n_out = sequences x H); the same keys
      * planes and gather as wstep, steps 0 .. H - 1 of them. Empty unless asked. */
     std::vector<std::vector<rad_op>> wcut;
+    /* DRAFTER track round 84, lever WSP (RADIANCE_DS41_WSP=1 with RADIANCE_DS41_WALK_WM=1 declares; fn4 dspark_walk 3 = 1 + WSP):
+     * the WMMA walk's step 0 in two parts (libr4d dspark_walk_part). wpre (part 1: the anchors' products pred[anchor] . succ^T of
+     * the rank's shard into wacc [wseqs, shard] f32, and the fill's zeros into wkeys) is issued right behind stage 0's attention
+     * all-reduce, unordered beside it; wadd (part 2: logits + wacc keyed into step 0's slots) replaces step 0 behind the head.
+     * wacc and wkeys PERSIST under WSP (no transient shares their bytes: the part-1 dispatch has no hazard on an op in flight).
+     * wpre at the drafter's block's anchor pitch (the full block and the DHD cut), wadd at steps = block, wcut_add[H] at H. */
+    rad_buf wacc = 0;
+    rad_op wpre = 0, wadd = 0;
+    std::vector<rad_op> wcut_add;
     /* DRAFTER track round 57, lever DHS (RADIANCE_DS41_DSPARK_HS=1 declares; fn4 dspark_hs 0 / 1 in process): at a DHD-cut
      * query pass (n_out = S x H, H < block, the W1 cut walk) the LAST stage's post-attention ops run on the S x H head rows
      * only -- hs_go gathers the attention output rows by out_ids into d.q (dead past the last attention), hs_gh the streams
@@ -584,6 +593,7 @@ struct Dsp {
         rad_op poff = 0, select = 0, wmarkov = 0, conf = 0;
         std::vector<rad_op> attn, wstep, sstep;
         std::vector<rad_op> attn_q;   /* lever DQR: each stage's fused form at the short block's window (0: not declared) */
+        rad_op wpre = 0, wadd = 0;    /* lever WSP: step 0's parts at the short block (anchor pitch S, steps S) */
     };
     std::vector<int64_t> sblks;   /* the env's lengths, in its order */
     std::vector<Short> sh;        /* the declared sets (empty: none, or not served -- sbwhy) */
@@ -2396,6 +2406,19 @@ static bool dph_env() {
     return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
 }
 static std::atomic<long long> g_dph_passes{0};   /* lever DPH (round 68): the first-pass line */
+/* Lever WSP (DRAFTER track round 84, 22.11.2026): the WMMA walk's step 0 in two parts (Dsp::wpre / wadd). Declared where
+ * RADIANCE_DS41_WSP=1 AND libr4d's RADIANCE_DS41_WALK_WM=1 (the steps' WMMA form: part 1's products are that form's accumulators,
+ * so step 0 then keys the same bits) are set at the first declare, on a W1 walk of world > 1 at rank 256; the switch "dspark_walk"
+ * then also takes 3 = 1 + WSP (the same tokens: part 1 runs the WMMA form's 16 WMMAs a tile on the same operands in the same order
+ * and stores the accumulator, part 2 adds the same logits with the same f32 add, the max is order-free). The declare sets 3 where
+ * the start value was 1. Process-wide, as the switches above. */
+static bool wsp_env() {
+    const char* q = std::getenv("RADIANCE_DS41_WSP");
+    const char* w = std::getenv("RADIANCE_DS41_WALK_WM");
+    return q && !std::strcmp(q, "1") && w && !std::strcmp(w, "1");
+}
+static std::atomic<int> g_sw_walk3_ok{0};
+static std::atomic<long long> g_wsp_passes{0};   /* the first-pass line */
 static void walk_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_DSPARK_WALK");
@@ -3268,7 +3291,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value >= 1 && value <= k->max && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
-               (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+               (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ||
+               (value == 3 && g_sw_walk_ok.load(std::memory_order_relaxed) && g_sw_walk3_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 511 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
@@ -5588,6 +5612,18 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
 
+/* Lever WSP (round 84): one dspark_walk_part (part 1: the anchors' products into wacc + the keys' zeros; part 2: logits + wacc
+ * into step 0's slots) at `steps` / the anchor pitch `astr`; 0 when not declared or no kernel serves it. */
+static rad_op wsp_part(RadBuilder* b, Model& m, const Geom& g, int pt, int64_t steps, int64_t astr) {
+    auto& d = m.dsp;
+    const std::vector<RadParam> ps = { RAD_RANGE("M", 1, d.wseqs), RAD_INT("part", pt), RAD_INT("steps", steps), RAD_INT("rank", d.rank),
+                                       RAD_INT("n_vocab", m.c.n_vocab), RAD_INT("N", g.n_vocab), RAD_INT("vocab_off", g.vocab_off),
+                                       RAD_INT("anchor_stride", astr), RAD_STR("dtype", "f32") };
+    const rad_op w = pt == 1 ? op(b, "dspark_walk_part", ps, { d.mk1, d.mk2 }, {}, { d.wacc, d.wkeys })
+                             : op(b, "dspark_walk_part", ps, { d.mk1, d.mk2 }, { d.logits, d.wacc }, { d.wkeys });
+    return w && rad_op_resolved(b, w) ? w : (rad_op)0;
+}
+
 /* Everything of the drafter past the trunk's head (declaration order is the buffer planner's
  * liveness: the drafter's passes run after the whole trunk step, as arch/llama_fp8 declares its own). */
 static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
@@ -6008,7 +6044,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             wok = false;   /* no loaded kernel plugin serves it (libr4d does): today's walk only */
         } else if (g.world > 1) {
             /* 16-byte key slots (ds41_walk_geom.h): the card's all-gather moves whole 16-byte words a row. */
-            d.wkeys = decl_b(b, nm.f("dspark_walk_keys"), RAD_F32, { KR, ds41walk::keys_cols() });
+            /* lever WSP: PERSIST (its part 1 writes the slots beside stage 0's all-reduce: no transient may share them) */
+            const bool wspd = wsp_env() && d.rank == 256;
+            d.wkeys = decl_b(b, nm.f("dspark_walk_keys"), RAD_F32, { KR, ds41walk::keys_cols() },
+                             wspd ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT);
             d.wgath = decl_b(b, nm.f("dspark_walk_keys_all"), RAD_F32, { KR, ds41walk::gath_cols(g.world) });
             d.wfill = op(b, "fill", { RAD_RANGE("M", 1, KR), RAD_INT("n", ds41walk::keys_cols()), RAD_STR("dtype", "f32"),
                                       RAD_F64("value", 0.0) },
@@ -6058,6 +6097,30 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 rad_note(b, "DSpark lever DHD: the W1 walk %sdeclared at head depths 1 .. %lld (RADIANCE_DRAFT_HEAD_CUT)",
                          cok ? "" : "NOT ", (long long)(d.block - 1));
             }
+            /* lever WSP (round 84): step 0's two parts at the drafter's block (and each DHD depth's part 2) */
+            if (wspd) {
+                d.wacc = decl_b(b, nm.f("dspark_walk_step0_products"), RAD_F32, { d.wseqs, g.n_vocab }, RAD_BUF_PERSIST);
+                const auto part = [&](int pt, int64_t steps, int64_t astr) { return wsp_part(b, m, g, pt, steps, astr); };
+                bool pok = d.wacc != 0;
+                if (pok) d.wpre = part(1, d.block, d.block);
+                if (pok) d.wadd = part(2, d.block, d.block);
+                pok = pok && d.wpre && d.wadd;
+                if (pok && !d.wcut.empty()) {
+                    d.wcut_add.assign((size_t)d.block, 0);
+                    for (int64_t H = 1; H < d.block && pok; ++H) pok = (d.wcut_add[(size_t)H] = part(2, H, d.block)) != 0;
+                }
+                if (!pok) {
+                    d.wpre = d.wadd = 0;
+                    d.wcut_add.clear();
+                }
+                rad_note(b, "DSpark lever WSP: the walk's step 0 in two parts %sdeclared (part 1 behind stage 0's attention all-reduce)",
+                         pok ? "" : "NOT ");
+                if (ctx->rank == 0 && !ctx->shape_probe)
+                    fprintf(stderr, "radiance: deepseek41: lever WSP: the W1 walk's step 0 %s (dspark_walk_part: part 1 = the anchors' "
+                                    "products + the keys' zeros beside stage 0's attention all-reduce, part 2 = logits + products "
+                                    "behind the head; fn4 dspark_walk 3 = 1 + WSP)\n",
+                            pok ? "declared in two parts" : "NOT declared in two parts (no kernel serves dspark_walk_part)");
+            }
             wok = wok && d.wkeys && d.wgath && d.wfill && d.wag && rad_op_resolved(b, d.wfill) && rad_op_resolved(b, d.wag);
         } else {
             const int64_t tiles = (c.n_vocab + 63) / 64;
@@ -6072,9 +6135,16 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         if (wok) {
             g_sw_walk_ok.store(1, std::memory_order_relaxed);
             if (!d.wstep2.empty()) g_sw_walk2_ok.store(1, std::memory_order_relaxed);
+            if (d.wpre && d.wadd) {   /* lever WSP: 3 takes; a start at 1 goes to 3 */
+                g_sw_walk3_ok.store(1, std::memory_order_relaxed);
+                int one = 1;
+                g_sw_walk.compare_exchange_strong(one, 3, std::memory_order_relaxed);
+            }
         } else {
             /* Anything declared stays unissued: the switch keeps refusing 1 and the walk is today's. */
             d.wfill = d.wag = d.wmarkov = 0;
+            d.wpre = d.wadd = 0;
+            d.wcut_add.clear();
             d.wstep.clear();
             d.wstep2.clear();
             rad_note(b, "DSpark lever W1 NOT declared: no kernel serves %s here; the top-%lld walk only",
@@ -6251,6 +6321,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                     { d.mk1, d.mk2 }, { d.logits, d.wgath, d.wkeys }, { d.wkeys, d.tokens });
                 if (!w || !rad_op_resolved(b, w)) sbwhy = "dspark_walk_step at the short block: no kernel serves it";
                 z.wstep.push_back(w);
+            }
+            /* lever WSP: step 0's parts at SB (anchor pitch SB, steps SB); none declared -> the short block keeps step 0 whole */
+            if (!sbwhy && d.wpre && d.wadd) {
+                z.wpre = wsp_part(b, m, g, 1, SB, SB);
+                z.wadd = wsp_part(b, m, g, 2, SB, SB);
+                if (!z.wpre || !z.wadd) z.wpre = z.wadd = 0;
             }
         } else if (!sbwhy && d.wmarkov) {
             z.wmarkov = op(b, "dflash_markov_greedy_f32",
@@ -9087,6 +9163,25 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     /* lever DPH (round 68; g_sw_dmr's comment, + 16): the last stage's post_f + contract + fnorm as one op (a function of the
      * switches and the declare alone: the same on every pass; nothing in it is a collective) */
     const bool dph = dph_now() && dmr3 && d.pcn_h;
+    /* lever WSP (round 84): this pass's walk takes step 0 in two parts where dspark_walk is 3 and the walk below is W1's greedy
+     * walk at the pass's block (or a DHD cut) with the parts declared -- the same predicate as the walk's own choice there (the
+     * batch, the block and the switches): wsp_kind 1 = the cut walk, 2 = the block's walk; 0 = step 0 whole, as before. */
+    rad_op wsp_pre = 0, wsp_add = 0;
+    int wsp_kind = 0;
+    if (g_sw_walk.load(std::memory_order_relaxed) == 3 && batch->n_out > 0 && S <= d.wseqs && g.world > 1 && d.wfill) {
+        const int64_t N0 = batch->n_out;
+        const bool smp0 = !(lo ? lo->sstep : d.sstep).empty() && ds41_switch("draft_sample") >= 1 && N0 == S * blk && S <= d.sseqs;
+        const int64_t hb0 = !lo && N0 % S == 0 ? N0 / S : 0;
+        const bool cut0 = !smp0 && hb0 >= 1 && hb0 < blk && (size_t)hb0 < d.wcut.size() && !d.wcut[(size_t)hb0].empty();
+        if (cut0) {
+            if ((size_t)hb0 < d.wcut_add.size() && d.wcut_add[(size_t)hb0]) { wsp_pre = d.wpre; wsp_add = d.wcut_add[(size_t)hb0]; wsp_kind = 1; }
+        } else if (!smp0 && N0 == S * blk && !(lo ? lo->wmarkov : d.wmarkov) && (lo ? !lo->wstep.empty() : !d.wstep.empty())) {
+            wsp_pre = lo ? lo->wpre : d.wpre;
+            wsp_add = lo ? lo->wadd : d.wadd;
+            wsp_kind = 2;
+        }
+        if (!wsp_pre || !wsp_add) { wsp_pre = wsp_add = 0; wsp_kind = 0; }
+    }
     for (const auto& L : d.st) {
         const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
         const Layer* nx = &L != &d.st.back() ? &L + 1 : nullptr;
@@ -9174,6 +9269,16 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             lin_issue(x, m, L.o_b, Tq, brows(d.oa, Tq), L.wo_b, brows(d.attn_out, Tq));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, Tq * D, brows(d.attn_out, Tq), RAD_NONE);
+        if (wsp_pre && si == 0) {   /* lever WSP: part 1 beside stage 0's attention all-reduce (its operands: the anchors, the walk's
+                                     * weights, PERSIST wacc / wkeys -- no hazard on an op in flight, so it goes unordered) */
+            const int64_t KR = ds41walk::plane_rows(blk, d.wseqs);
+            RAD_ISSUE_N(x, wsp_pre, S, RAD_NONE, praw(batch->token_ids, RAD_I32, T), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wacc, S),
+                        brows(d.wkeys, KR));
+            if (g.rank == 0 && g_wsp_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+                fprintf(stderr, "radiance: deepseek41: lever WSP: first query pass issued with the walk's step 0 in two parts (%lld "
+                                "sequences x %lld, %s; counted at issue: a recorded pass once)\n",
+                        (long long)S, (long long)blk, wsp_kind == 1 ? "a DHD cut walk" : "the block's walk");
+        }
         const bool pf = dmr3 && L.pcn_f;
         if (pf)   /* post_a, col_f and norm_f in one (the trunk's pcn_f) */
             RAD_ISSUE_N(x, L.pcn_f, Tq, brows(d.attn_out, Tq), brows(hA, Tq), brows(d.post, Tq), brows(d.comb, Tq),
@@ -9266,12 +9371,17 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         const int64_t WS = d.wseqs, KC = ds41walk::keys_cols(), GW = ds41walk::gath_cols(g.world);
         const int64_t KR = ds41walk::plane_rows(blk, WS);
         const std::vector<rad_op>& wst = d.wcut[(size_t)hb];
-        RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
+        const bool wsp = wsp_kind == 1 && wsp_add == d.wcut_add[(size_t)hb];   /* lever WSP: the keys zeroed and step 0's products made */
+        if (!wsp) RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
         for (int64_t l = 0; l < hb; ++l) {
             const int64_t r0 = ds41walk::step_row(l, WS);
-            RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
-                        l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
-                        RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
+            if (wsp && l == 0)
+                RAD_ISSUE_N(x, wsp_add, S, brows(d.logits, N), RAD_NONE, RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wacc, S),
+                            brow_slice(d.wkeys, r0, S, KC));
+            else
+                RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
+                            l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
+                            RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
             RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));
         }
         RAD_ISSUE_N(x, wst[(size_t)hb], S, brows(d.logits, N), anchor,
@@ -9300,12 +9410,17 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         const int64_t KR = ds41walk::plane_rows(blk, WS);
         /* the scoring steps: W1b's form 1 while dspark_walk is 2 at the drafter's own block; the short block's form 0 */
         const std::vector<rad_op>& wst = lo ? lo->wstep : (wsw == 2 && !d.wstep2.empty() ? d.wstep2 : d.wstep);
-        RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
+        const bool wsp = wsp_kind == 2 && wsp_add == (lo ? lo->wadd : d.wadd);   /* lever WSP: keys zeroed, products made */
+        if (!wsp) RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
         for (int64_t l = 0; l < blk; ++l) {
             const int64_t r0 = ds41walk::step_row(l, WS);
-            RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
-                        l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
-                        RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
+            if (wsp && l == 0)
+                RAD_ISSUE_N(x, wsp_add, S, brows(d.logits, N), RAD_NONE, RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wacc, S),
+                            brow_slice(d.wkeys, r0, S, KC));
+            else
+                RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
+                            l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
+                            RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
             RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));
         }
         RAD_ISSUE_N(x, (lo ? lo->wstep : d.wstep)[(size_t)blk], S, brows(d.logits, N), anchor,

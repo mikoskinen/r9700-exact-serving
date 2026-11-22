@@ -22,3 +22,21 @@ extern "C" int r4d_shape_dspark_walk_step(const RadParam* p, int n_p, int operan
     };
     R4D_PICK(l);
 }
+
+/* lever WSP (DRAFTER track round 84): dspark_walk_part, in schema order: logits [M * steps, N] f32 (part 2), anchor (part 1),
+ * pred / succ [n_vocab, rank] bf16, acc [M, N] f32, keys [M, 4] (part 2). */
+extern "C" int r4d_shape_dspark_walk_part(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), steps = pi(p, n_p, "steps"), R = pi(p, n_p, "rank");
+    const int64_t V = pi(p, n_p, "n_vocab"), N = pi(p, n_p, "N"), voff = pi(p, n_p, "vocab_off", 0);
+    const int64_t astr = pi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || N <= 0 || voff < 0 || voff + N > V || astr < 1) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, M * steps, N),           /* logits, this rank's shard */
+        opd_idx((M - 1) * astr + 1, 0, V),              /* anchor */
+        opd((uint32_t)RAD_BF16, V, R),                  /* pred */
+        opd((uint32_t)RAD_BF16, V, R),                  /* succ */
+        opd((uint32_t)RAD_F32, M, N),                   /* acc */
+        opd((uint32_t)RAD_F32, M, 4),                   /* keys, one slot a sequence */
+    };
+    R4D_PICK(l);
+}
