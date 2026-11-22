@@ -2310,6 +2310,9 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
                 fprintf(stderr, "    BGL run 4 (stage 2b ahead): %lld lane-0 steps issued ahead, %lld beside a lane-1 step\n", ah, beside);
                 CHECK(log.find("lane 0 issues its decode steps ahead beside lane 1's steps") != std::string::npos);
                 CHECK(ah > 0);
+                /* the host backend runs a pass at issue, so lane 1's end event has completed before lane 0's next issue_ahead: the
+                 * decline on a finished lane-1 step leaves none beside it (without the decline: 118 of 194 in the mutation run) */
+                CHECK_EQ(beside, 0);
             } else {
                 CHECK(log.find(kAh) == std::string::npos);
             }
