@@ -1,0 +1,60 @@
+I control vectors: not loaded (no --control-vector); a request that asks for one is refused
+radiance: qwen4exp: fn4 SP-hc declared (RADIANCE_FN4_SPHC; switch hc_sp picks it a pipelined prefill step)
+radiance: qwen4exp: fn4 SP-serial declared (RADIANCE_FN4_SPSERIAL; switch sp_serial picks it a serial step: prefill segments up to 2048 rows, K split pinned to the segment's row tiles)
+radiance: qwen4exp: fn4 SP-hc declared (RADIANCE_FN4_SPHC; switch hc_sp picks it a pipelined prefill step)
+W activation arena: no level for 256-token steps on rank 0 -- the sizing declare failed: invalid argument
+W activation arena: no level for 1024-token steps on rank 0 -- the sizing declare failed: invalid argument
+W activation arena: no level for 2048-token steps on rank 0 -- the sizing declare failed: invalid argument
+W activation arena: no level for 4096-token steps on rank 0 -- the sizing declare failed: invalid argument
+I placement: token embedding (303.12 MiB a rank) ram (default): pinned in host memory and read over the link in place, so its VRAM goes to the KV cache and the experts
+I kv: the pool backs 17% of the worst case (32 sequences all at 262144 tokens), 5.6 full-length sessions; a larger --host-pool-mib gives the cache more
+  already held       616.81 MiB   measured: driver context, code objects, anything else resident
+  activation arena     1.84 GiB   computed from the buffer plan
+  step staging       156.84 MiB   the step batch's block tables and media staging, and the
+  hardware queues    106.04 MiB   3 a card at 35.35 MiB each, measured: the engine's streams
+  --gpu-headroom-mib 108.00 MiB   left unclaimed on purpose
+  claimable           29.04 GiB
+  static weights       2.66 GiB   off the top: every rank's own shard, and not a share of anything
+  elastic             26.38 GiB   no lender: the experts first, the cache at least one full-length sequence
+    experts           14.47 GiB   55% of it -- the whole expert plane is resident, so more would do nothing
+    kv cache          11.91 GiB   45% of it -- 17% backing of the 32 x 262144 worst case: 5.6 full-length
+  unclaimed          108.45 MiB   the headroom, the unusable above, and what MiB rounding
+I load: 181686 weights, 69.51 GiB placed from 64.46 GiB of container read
+W[0] this device has no virtual memory management, so the KV cache holds its whole carve and the expert slab has nothing to grow into. The experts were given the card first and the cache one full-length sequence.
+    kv_attn        full    13 layers  block    4 tok  page 26.00 KiB   364539 blocks =  9.04 GiB  (1458156 tokens)
+    kv_gdn_state   linear  36 layers  state 27.00 MiB       64 slots =  1.69 GiB
+    kv_gdn_conv    conv    36 layers  state 1.23 MiB       32 slots = 39.38 MiB
+    kv_qsa_tail    linear  13 layers  state 26.00 KiB       64 slots =  1.62 MiB
+    kv_ple_tok     conv     1 layers  state     24 B       32 slots =     768 B
+    kv_ple_conv    conv     1 layers  state 260.00 KiB       32 slots =  8.12 MiB
+    kv_qsa_bkey    full    13 layers  block    4 tok  page 3.25 KiB   364539 blocks =  1.13 GiB  (1458156 tokens)
+    pool at 0x707e65800000, 11.90 GiB; groups at +0..+12782128896
+  later publisher's bytes win where no snapshot rests on the first copy: a cached entry is replaced by a publisher whose own snapshots rest on its copy, so a hit restores what its snapshot was computed from
+I[0] second lane: its stream built at start (6.5 ms on rank 0), adopted by the first step that takes lane 1 (RADIANCE_FN4_LANE_EAGER=0 builds it there instead)
+I[0] arena: 1.72 GiB device + 121.88 MiB scratch + 0 B for the second lane = 1.84 GiB, charged to the VRAM budget before it was split
+I[1] arena: 1.72 GiB device + 121.88 MiB scratch + 0 B for the second lane = 1.84 GiB, charged to the VRAM budget before it was split
+I[2] arena: 1.72 GiB device + 121.88 MiB scratch + 0 B for the second lane = 1.84 GiB, charged to the VRAM budget before it was split
+I[3] arena: 1.72 GiB device + 121.88 MiB scratch + 0 B for the second lane = 1.84 GiB, charged to the VRAM budget before it was split
+I kv: the cache can grow to 11.90 GiB a card -- 1458156 tokens of context, 5.6 sessions at 262144 -- with every block it lends the experts taken back; 1.74 GiB of that is per-sequence state, and nothing is lent: it is all the cache's
+I device allocations: 5896 totalling 123.49 GiB, of which 116.14 GiB is the two pools -- the rest is the activation arena and the step staging. Anything on the card past this is the driver or a kernel plugin's own hipMalloc, which this cannot see.
+I[0] card 0 settled at 261.18 MiB free against 264.84 MiB (the 108.00 MiB --gpu-headroom-mib and 156.84 MiB kept for the step staging and for what is built on first use): 3.67 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 104.33 MiB is left for first launches
+I[1] card 1 settled at 261.22 MiB free against 264.84 MiB (the 108.00 MiB --gpu-headroom-mib and 156.84 MiB kept for the step staging and for what is built on first use): 3.62 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 104.38 MiB is left for first launches
+I[2] card 2 settled at 253.21 MiB free against 264.84 MiB (the 108.00 MiB --gpu-headroom-mib and 156.84 MiB kept for the step staging and for what is built on first use): 11.63 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 96.37 MiB is left for first launches
+I[3] card 3 settled at 261.21 MiB free against 264.84 MiB (the 108.00 MiB --gpu-headroom-mib and 156.84 MiB kept for the step staging and for what is built on first use): 3.63 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 104.37 MiB is left for first launches
+I   --gpu-headroom-mib                 108                                         [command line]
+I                                        the table is 303.12 MiB a rank: pinned in host memory and read over the link in place, so its VRAM goes to the KV cache and the experts
+I   vram split                         weights 17.13 GiB (experts 14.47 GiB of it), KV cache 11.91 GiB, a card
+I                                          already held       616.81 MiB   measured: driver context, code objects, anything else resident
+I                                          activation arena     1.84 GiB   computed from the buffer plan
+I                                          step staging       156.84 MiB   the step batch's block tables and media staging, and the
+I                                          hardware queues    106.04 MiB   3 a card at 35.35 MiB each, measured: the engine's streams
+I                                          --gpu-headroom-mib 108.00 MiB   left unclaimed on purpose
+I                                          claimable           29.04 GiB
+I                                          static weights       2.66 GiB   off the top: every rank's own shard, and not a share of anything
+I                                          elastic             26.38 GiB   no lender: the experts first, the cache at least one full-length sequence
+I                                            experts           14.47 GiB   55% of it -- the whole expert plane is resident, so more would do nothing
+I                                            kv cache          11.91 GiB   45% of it -- 17% backing of the 32 x 262144 worst case: 5.6 full-length
+I                                          unclaimed          108.45 MiB   the headroom, the unusable above, and what MiB rounding
+I                                        the host pool holds the 303.12 MiB the placement flags put there (the token embedding, the encoder towers, the drafter's experts) beside the weights placed in it
+I   kv cache                           11.90 GiB a card: 1458156 tokens, 5.6 sessions at 262144
+I                                        1.74 GiB of it is per-sequence state; nothing is lent: it is all the cache's

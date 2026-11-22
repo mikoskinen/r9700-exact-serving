@@ -1,0 +1,1 @@
+all 28 switches set from run/qwen/switches-run.json

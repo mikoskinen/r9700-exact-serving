@@ -1,0 +1,17 @@
+a1 vs /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/ms11/id/a1.jsonl (another run: a note): IDENTICAL: 20 of 20 answers
+a1 vs the published line's a1 (232; a note): IDENTICAL: 20 of 20 answers
+long alone vs /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/tif1/id/lA.jsonl (another run: a note): long alone vs /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/tif1/id/lA.jsonl (another run: a note): IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+long alone vs the published line's alone (qmix14 P1; a note): long alone vs the published line's alone (qmix14 P1; a note): DIFFERENT 8 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens) -- 8(2128 tok):text@10 9(2659 tok):text@97 10(3481 tok):text@240 11(5934 tok):logprobs
+short set beside 7 streams + a fresh 8192-token prefill a probe vs this run's a1: IDENTICAL: 20 of 20 answers
+long prompts beside 7 streams vs this run's alone: long prompts beside 7 streams vs this run's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+short set beside 15 streams + a fresh 16384-token prefill a probe vs this run's a1: IDENTICAL: 20 of 20 answers
+long prompts beside 15 streams vs this run's alone: long prompts beside 15 streams vs this run's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+short set beside 23 streams + a fresh 12288-token prefill a probe vs this run's a1: IDENTICAL: 20 of 20 answers
+long prompts beside 23 streams vs this run's alone: long prompts beside 23 streams vs this run's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+short set beside 31 streams + a fresh 16384-token prefill a probe vs this run's a1: IDENTICAL: 20 of 20 answers
+long prompts beside 31 streams vs this run's alone: long prompts beside 31 streams vs this run's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+a2 (alone again) vs this run's a1: IDENTICAL: 20 of 20 answers
+siblings s11hit vs s11cold (ms11's nonce): IDENTICAL 4 / 4 (keys head,s0,s1,s2; first differing char {}; cached [0, 0, 0, 0] vs [0, 10240, 10240, 10240]; gen [384, 64, 64, 64] vs [384, 64, 64, 64])
+siblings s11b15 vs s11cold (ms11's nonce): IDENTICAL 4 / 4 (keys head,s0,s1,s2; first differing char {}; cached [0, 0, 0, 0] vs [0, 10240, 10240, 10240]; gen [384, 64, 64, 64] vs [384, 64, 64, 64])
+siblings s11b28 vs s11cold (ms11's nonce): IDENTICAL 4 / 4 (keys head,s0,s1,s2; first differing char {}; cached [0, 0, 0, 0] vs [0, 10240, 10240, 10240]; gen [384, 64, 64, 64] vs [384, 64, 64, 64])
+siblings s11cold vs tif1's tcold (another start): DIFFERENT 1 / 4 (keys head,s0,s1,s2; first differing char {"s0": 34, "s1": 17, "s2": 217}; cached [0, 0, 0, 0] vs [0, 0, 0, 0]; gen [384, 64, 64, 64] vs [384, 64, 64, 64])

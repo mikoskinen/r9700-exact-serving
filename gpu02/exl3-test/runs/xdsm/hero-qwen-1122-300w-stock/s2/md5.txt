@@ -1,0 +1,16 @@
+a8458144e6fb203cdbdec7600a9b0ec9  /home/mikoskinen/gpu/qwen-port/loop/kit/qlq.sh
+1243f062b55bc82c3657b37dcf78bd1f  /home/mikoskinen/gpu/qwen-port/loop/kit/lq-lib.sh
+35da2b0459c1da8de96ae1021f9b25f9  /home/mikoskinen/gpu/qwen-port/loop/kit/qsib.py
+b96b7a45f4a67256f665939a90c9a741  /home/mikoskinen/gpu/ds41/tp8-s4/kit/oracle.py
+09f85d5635943ebc8e8791f94824dead  /home/mikoskinen/gpu/qwen-port/loop/kit/qwin.py
+8b8e1094e86dd56ceb74a57f07a2f19a  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/fnharness/mbt2.py
+ee7d9663e3cd7a228a08db682ae98479  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/fn-loadid.py
+8ab59adc3d73a0ba3c8cc5a9c3bad43c  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/abblocks2.py
+0dff112f9ee5dfb7002e8e528432032e  /home/mikoskinen/gpu/ds41/exl3-test/queue/tools/greedyset.py
+4916076fdde7309a14050807fb009b53  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/qmix14/qx-longid.py
+fc7fccb49c47641ec6f6abe4463668cc  /home/mikoskinen/gpu/ds41/mb.py
+7fa1052b2ad75d893ffee0adc0ae7373  /home/mikoskinen/gpu/ds41/ds41_tests.py
+8d06a4eebdaae47d4779067cc89a3876  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/hero300b/repo/run/qwen/qwen.env
+261866088e6c1493315bfcbeeedc73ef  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/hero300b/repo/run/qwen/switches.json
+4ddb68366d80ee616f2c62d53a3f4e95  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/hero300b/repo/run/qwen/switches-run.json
+8ef84cf7652b07937dc430d6721201b3  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/qloop/hero300b/repo/run/switches.sh
