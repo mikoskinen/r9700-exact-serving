@@ -168,6 +168,7 @@ struct Plugin {
     int (*tl_hc_reset)() = nullptr;
     int (*tl_hc_read)(unsigned long long*, int, int) = nullptr;
     void (*occ_hc)(int) = nullptr;         /* optional (qfn-on-ds lever HCO: r4d_hc_occ) */
+    void (*x_hc)(int) = nullptr;           /* optional (qfn-on-ds lever HCX: r4d_hc_x) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -253,6 +254,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->tl_hc_reset = (int (*)())dlsym(pl->h, "r4d_hc_tl_reset");
     pl->tl_hc_read = (int (*)(unsigned long long*, int, int))dlsym(pl->h, "r4d_hc_tl_read");
     pl->occ_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_occ");
+    pl->x_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -25491,6 +25493,10 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     pl.readv_hc(rv);
     pl.norm_hc_wave(1);
     pl.pf2_stages_hc(31);
+    /* lever HCX: every line up to the HC_X one below reads today's kernels (the env would turn libr4d's form on) */
+    const char* xe = std::getenv("RADIANCE_FN4_HC_X");
+    const int xarm = xe && *xe ? std::atoi(xe) : 0;
+    if (pl.x_hc) pl.x_hc(0);
     auto launch = [&](int) { (void)r->launch(&a, (RadStream)hs); };
     /* the bytes: plain vs TL (outputs poisoned before each) */
     auto grab = [&](bool tl, std::vector<uint8_t>& o) {
@@ -25630,6 +25636,38 @@ static void hc_tl_perf(const Plugin& pl, int64_t M, int reps) {
     if (!gapab.empty())
         std::printf("HCTL M=%lld %s: A' last block out -> B3 first block in %.2f us (p50 %.2f, min %.2f)\n", (long long)M,
                     g_cold > 0 ? "cold" : "warm", mean(gapab), pct(gapab, 0.5), pct(gapab, 0.0));
+    /* qfn-on-ds lever HCX (RADIANCE_FN4_HC_X = the arm: 4 / 5 / 10 W_down tiles a block of kernel A'): the arm's bytes against
+     * today's (HC_X 0 = G16p from 32 rows, G16 below), then A' alone and the whole read, today / arm / today / arm (the order
+     * cancels a drift), each st_time_us of 50 launches (warm, or --cold N's flush before each) */
+    if (xarm && pl.x_hc) {
+        std::vector<uint8_t> oref, ox;
+        pl.x_hc(0);
+        const bool okr = grab(false, oref);
+        pl.x_hc(xarm);
+        const bool okx = grab(false, ox);
+        size_t d3 = 0;
+        if (okr && okx) for (size_t i = 0; i < oref.size() && i < ox.size(); ++i) d3 += oref[i] != ox[i];
+        std::printf("HCTL M=%lld HC_X %d vs today's kernels (HC_X 0): %s\n", (long long)M, xarm,
+                    !(okr && okx) ? "launch failed" : d3 ? fmt("%zu bytes differ", d3).c_str() : "every output byte identical");
+        double ta[2][2] = { { 0, 0 }, { 0, 0 } }, tw[2][2] = { { 0, 0 }, { 0, 0 } };
+        for (int rep = 0; rep < 2; ++rep)
+            for (int arm2 = 0; arm2 < 2; ++arm2) {
+                pl.x_hc(arm2 ? xarm : 0);
+                pl.pf2_stages_hc(3);
+                ta[arm2][rep] = st_time_us(launch, 50, hs);
+                pl.pf2_stages_hc(31);
+                tw[arm2][rep] = st_time_us(launch, 50, hs);
+            }
+        const double a0 = (ta[0][0] + ta[0][1]) / 2, a1 = (ta[1][0] + ta[1][1]) / 2;
+        const double w0 = (tw[0][0] + tw[0][1]) / 2, w1 = (tw[1][0] + tw[1][1]) / 2;
+        std::printf("HCTL M=%lld %s HC_X %d: A' alone %.2f -> %.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f), whole read %.2f -> "
+                    "%.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f)\n", (long long)M, g_cold > 0 ? "cold" : "warm", xarm,
+                    a0, a1, a0 > 0 ? 100.0 * (a1 - a0) / a0 : 0.0, ta[0][0], ta[0][1], ta[1][0], ta[1][1],
+                    w0, w1, w0 > 0 ? 100.0 * (w1 - w0) / w0 : 0.0, tw[0][0], tw[0][1], tw[1][0], tw[1][1]);
+        pl.x_hc(0);
+        pl.pf2_stages_hc(31);
+        diff += d3;
+    }
     pl.readv_hc(0);
     pl.norm_hc_wave(0);
     (void)hipStreamDestroy(hs);
@@ -43479,6 +43517,8 @@ static void usage(void) {
                 "  --perfhctl M [reps]:  the bi_dec decode hc_read (hc_readv 331: A' G16 / G16p, B3) at M rows\n"
                 "             (16..256) with every block's phase timeline (r4d_hc_tl): span, block latency,\n"
                 "             blocks in flight, per-WGP residency, rounds, phase us; bytes vs the plain launch.\n"
+                "             RADIANCE_FN4_HC_X=4|5|10 adds lever HCX's arm: bytes vs today's kernels, A' alone and the\n"
+                "             whole read today / arm x2.\n"
                 "  --perfrg M [iters]:  the Qwen tp4 decode router (router_gemm_topk_scatter_inv at 512\n"
                 "             experts, K 2560, top 10, 128 local, shared gate) against its parts alone, timed.\n"
                 "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
