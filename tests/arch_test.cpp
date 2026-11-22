@@ -13609,6 +13609,113 @@ TEST(flashnext_lsk_sp_serial_collectives_declare_lane_kind_1_and_pipelined_do_no
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds PF probe QSP (Qwen loop round 27; sp_route bit 16384, lever QRS's bound): a prefill step of more than 256 rows issues
+ * every qsa_score / qsa_select pair twice, back to back with the same operands (the second rewrites the same bytes), and nothing
+ * else changes; a step of <= 256 rows (a MIXED step of 4 x 4 decode rows + a 200-row chunk) is unchanged. Pipelined 2,048 + 1,792
+ * at 10,240 (the windowed path) and a lone 1,170-row serial prefill (the plain path). Negative control: the bit off = today. */
+TEST(flashnext_qsp_issues_a_prefill_steps_qsa_score_and_select_twice) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    struct Iss { std::string op; int64_t n; std::vector<RadOperand> a; };
+    auto run = [&](const std::vector<int>& dq, int pq, int32_t ctx0, int sprv) -> std::vector<Iss> {
+        const int rank = 2;
+        std::vector<Iss> o;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) return o;
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_hcbi_flag().store(5);
+        qwen4exp_fp8::fn4_spser_flag().store(1);
+        qwen4exp_fp8::fn4_sproute_flag().store(sprv);
+        rad::arch::fn4_qsaprobe_flag().store((sprv & 16384) ? 1 : 0);   /* as the plugin's sp_route switch sets it */
+        const auto pf = kit(b, dq, { pq }, ctx0);
+        pf->b.positions_h = pf->pos.data();
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        rad::arch::fn4_qsaprobe_flag().store(0);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_spser_flag().store(0);
+        qwen4exp_fp8::fn4_hcbi_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        CHECK(c.step_fail.empty());
+        for (const RecIssue& i : c.issues) {
+            const RecOp* op = b.op_of(i.op);
+            if (op) o.push_back({ op->op, i.n, i.opd });
+        }
+        return o;
+    };
+    auto same_args = [](const std::vector<RadOperand>& x, const std::vector<RadOperand>& y) {   /* within one run */
+        if (x.size() != y.size()) return false;
+        for (size_t k = 0; k < x.size(); ++k) {
+            const RadOperand &p = x[k], &q = y[k];
+            if (p.kind != q.kind || p.dtype != q.dtype || p.handle != q.handle || p.raw != q.raw || p.offset != q.offset ||
+                p.rows != q.rows || p.cols != q.cols)
+                return false;
+        }
+        return true;
+    };
+    /* the probe list = the base list (op, rows) with every qsa_score / qsa_select pair repeated right after itself with the
+     * first pair's operands (compared inside the probe run: batch pointers differ between runs) */
+    auto doubled = [&](const std::vector<Iss>& base, const std::vector<Iss>& pr, int* pairs, int* singles) -> bool {
+        size_t j = 0;
+        *pairs = 0;
+        *singles = 0;
+        for (size_t i = 0; i < base.size(); ++i) {
+            if (j >= pr.size() || pr[j].op != base[i].op || pr[j].n != base[i].n) return false;
+            ++j;
+            if (base[i].op == "qsa_select" && i > 0 && base[i - 1].op == "qsa_score") {
+                const bool rep = j >= 2 && j + 1 < pr.size() && pr[j].op == "qsa_score" && pr[j + 1].op == "qsa_select" &&
+                                 same_args(pr[j].a, pr[j - 2].a) && same_args(pr[j + 1].a, pr[j - 1].a);
+                if (rep) { j += 2; ++*pairs; } else ++*singles;
+            }
+        }
+        return j == pr.size();
+    };
+    const int base_bits = 512;   /* PSP on (BEST's sp_route carries it) */
+    for (const auto& sh : { std::make_tuple(std::vector<int>{}, 2048 + 1792, 10240), std::make_tuple(std::vector<int>{}, 1170, 0) }) {
+        const auto a = run(std::get<0>(sh), std::get<1>(sh), std::get<2>(sh), base_bits);
+        const auto b2 = run(std::get<0>(sh), std::get<1>(sh), std::get<2>(sh), base_bits | 16384);
+        const auto a2 = run(std::get<0>(sh), std::get<1>(sh), std::get<2>(sh), base_bits);
+        int pairs = -1, singles = -1, p0 = -1, s0 = -1;
+        CHECK(doubled(a, b2, &pairs, &singles));
+        CHECK(pairs > 0);
+        CHECK_EQ(singles, 0);
+        CHECK_EQ(a.size() + 2 * (size_t)pairs, b2.size());
+        CHECK(doubled(a, a2, &p0, &s0));   /* the bit off again = today */
+        CHECK_EQ(p0, 0);
+        CHECK_EQ(s0, pairs);
+        CHECK_EQ(a.size(), a2.size());
+    }
+    {   /* a <= 256-row MIXED step: unchanged */
+        const auto a = run({ 4, 4, 4, 4 }, 200, 4096, base_bits), b2 = run({ 4, 4, 4, 4 }, 200, 4096, base_bits | 16384);
+        int pairs = -1, singles = -1;
+        CHECK(doubled(a, b2, &pairs, &singles));
+        CHECK_EQ(pairs, 0);
+        CHECK(singles > 0);
+        CHECK_EQ(a.size(), b2.size());
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's

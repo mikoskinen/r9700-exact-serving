@@ -39,6 +39,14 @@ inline std::atomic<int>& fn4_qsasplit_flag() {
                                    return v < 0 ? 0 : v > 3 ? 3 : v; }()};
     return f;
 }
+/* qfn-on-ds PF probe QSP (Qwen loop round 27, lever QRS's bound; sp_route bit 16384 through the plugin's switch): a prefill
+ * step's (more than 256 rows) score + select issued TWICE -- the second pair rewrites the score plane and the selection from
+ * the same inputs, so the same bytes; the step's added time is one copy's marginal cost on the compute lane, the bound of
+ * scoring and selecting a quarter of the rows a rank (every rank today scores and selects every row of the step). */
+inline std::atomic<int>& fn4_qsaprobe_flag() {
+    static std::atomic<int> f{0};
+    return f;
+}
 inline int fn4_qsasplit_declared() {
     static const int d = [] { const char* e = std::getenv("RADIANCE_FN4_QSA_SPLIT");
                               return (e && *e && std::atoi(e) > 0) ? 3 : 0; }();
@@ -517,7 +525,9 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                               "its window bounds (RadBuildCtx::max_mixed_tok)");
             return;
         }
+        const int reps = (T > 256 && fn4_qsaprobe_flag().load(std::memory_order_relaxed)) ? 2 : 1;   /* PF probe QSP */
         for (int64_t w0 = 0;;) {
+          for (int rep = 0; rep < reps; ++rep) {
             RAD_ISSUE_N(c_, op_score, PR,
                         brow_slice(w.q, w0, PR, qw), kv_cache(kv_bk, layer),
                         praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
@@ -530,11 +540,14 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                         praw(win_cu, RAD_I32, 2),
                         brow_slice(w.sel, w0, PR, c.topk + 1), brow_slice(w.nsel, w0, PR, 1),
                         brow_slice(w.sequ, w0, PR, 1));
+          }
             if (w0 + PR >= T) break;
             w0 = w0 + PR + PR <= T ? w0 + PR : T - PR;
         }
         return;
     }
+    const int reps = (T > 256 && fn4_qsaprobe_flag().load(std::memory_order_relaxed)) ? 2 : 1;   /* PF probe QSP */
+    for (int rep = 0; rep < reps; ++rep) {
     RAD_ISSUE_N(c_, op_score, T,
                 brows(w.q, T), kv_cache(kv_bk, layer),
                 praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
@@ -546,6 +559,7 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 brows(w.nc, S), praw(batch->positions, RAD_I32, T),
                 praw(batch->cu_seqlens, RAD_I32, S + 1),
                 brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+    }
 
     /* RADIANCE_DEBUG_QSA: prints the first few selections (nc, nsel, sequ, leading sel and score
      * entries) to tell a divergence from intended dropping (`nc` above `topk`). Synchronises the
