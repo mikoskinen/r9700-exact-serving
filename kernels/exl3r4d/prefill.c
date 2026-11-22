@@ -68,6 +68,14 @@ __attribute__((visibility("default"))) int rad_host_pool_ranges(int rank, int n,
  * today's kernels. Independent of exl3_x3d (the decode band's). */
 static volatile int g_fn4_x3d_pf = 0;
 int exl3r4d_fn4_x3d_pf(void) { return g_fn4_x3d_pf; }
+/* SWK (tp8 loop DECODE round 64, QUEUE X12, 22.11.2026; rule B, its own reference): fn4 switch "exl3_x6w" (core switch 117, X6w's,
+ * whose per-row dots were dropped: value 1 is refused here) 2 / 3 -- the decode band's X3D-F / K25U kernels (gate_up G3 + down U4
+ * at K = 2.5, both at K = 2) with the K loop's WMMA pairs as gfx1201's 2:4 sparse v_swmmac_f32_16x16x32_f16, each token's K over
+ * two sparse-A rows (8 tokens a pass), the two rows' sums added once and moved into the WMMA's D layout (exl3r4d.hip moe_pass SW
+ * 2; 3 = the other index nibble order): a token's bytes depend on its own activations and the weights alone; they differ from the
+ * WMMA form's by the f32 sum order. 0 at start = today's kernels. */
+static volatile int g_fn4_x6w = 0;
+int exl3r4d_fn4_x6w(void) { return g_fn4_x6w; }
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
  * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
@@ -78,6 +86,7 @@ __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int
                value == 108 ? 1 : -1;
     if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 31 ? 1 : -1;   /* lever XR; SPEED-C 8 .. 31 */
     if (!strcmp(name, "exl3_x3d_pf")) return value == 0 || value == 1 ? 1 : -1;   /* A10 (tp8 loop PX1) */
+    if (!strcmp(name, "exl3_x6w")) return value == 0 || value == 2 || value == 3 ? 1 : -1;   /* SWK (tp8 loop X12); X6w's 1 not here */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
@@ -87,6 +96,7 @@ __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int 
     if (!strcmp(name, "exl3_dng")) g_fn4_dng = value;
     if (!strcmp(name, "exl3_xr")) g_fn4_xr = value;
     if (!strcmp(name, "exl3_x3d_pf")) g_fn4_x3d_pf = value;
+    if (!strcmp(name, "exl3_x6w")) g_fn4_x6w = value;
     return 1;
 }
 __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* applied) {
@@ -95,6 +105,7 @@ __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* 
     if (!strcmp(name, "exl3_dng")) { *applied = g_fn4_dng; return 1; }
     if (!strcmp(name, "exl3_xr")) { *applied = g_fn4_xr; return 1; }
     if (!strcmp(name, "exl3_x3d_pf")) { *applied = g_fn4_x3d_pf; return 1; }
+    if (!strcmp(name, "exl3_x6w")) { *applied = g_fn4_x6w; return 1; }
     return 0;
 }
 #if EXL3R4D_ROUTEDUMP

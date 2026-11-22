@@ -190,6 +190,9 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #define EXL3R4D_SWK_BLK (EXL3R4D_SWK == 2 ? 8 : 16)  // so a timing-only build can carry the real form's pass count (9-16 rows decode twice)
 #endif
 static_assert(EXL3R4D_SWK != 2 || EXL3R4D_SWK_BLK == 8, "SWK 2: 8 tokens a pass (two A rows a token)");
+// SW (the form of ONE instance, a template argument of moe_pass and the x3d / k25 kernels, so one build holds the served kernels and
+// the SWK twins that fn4 exl3_x6w 2 / 3 picks at launch): 0 served, 1 timing pairs, 2 the real form, 3 = 2 with the other nibble order.
+#define EXL3R4D_SWK_T (EXL3R4D_SWK == 2 && EXL3R4D_SWK_IDXSWAP ? 3 : EXL3R4D_SWK)
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -883,7 +886,7 @@ static __device__ bool xs_combine(const Exl3r4dGemm& p, v8f (&acc)[NPW], int uni
 // sum_k x_k in each column); before the split-K reduction each sum becomes acc kinv + kbias accx -- the affine codebook
 // applied to the f32 sum instead of each weight's f16 rounding (linear, so a split's partials fold alone and add).
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false, int PFO = 0,
-          bool XSM = false, bool X3D = false, int K25 = K25_OFF, bool FOLD = false>
+          bool XSM = false, bool X3D = false, int K25 = K25_OFF, bool FOLD = false, int SW = EXL3R4D_SWK_T>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
                                                 int wsub = 0, int xsn = 1, int xsl = 0, int xunit = 0) {
@@ -912,7 +915,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   const int vl = RAW ? (int)blockIdx.x * p.tpw + col_local * NPW : col_local * NPW;
   // non-RAW: local tile 0 .. 8 MATS - 1 of this 128-column block; RAW: a tile of the [MATS][ntiles] space
   const int mat = RAW ? vl / ntiles : vl / 8, nt0 = RAW ? vl % ntiles : cb * 8 + vl % 8;
-  const int chunk = APREP ? p.chunk : (X3D || K25 != K25_OFF) ? EXL3R4D_SWK_BLK : EXL3_BLOCK;   // SWK_BLK: 16 = served
+  const int chunk = APREP ? p.chunk : (X3D || K25 != K25_OFF) ? (SW >= 2 ? 8 : EXL3R4D_SWK_BLK) : EXL3_BLOCK;   // SWK_BLK: 16 = served
 
   // This lane's row of the 16-row block: in the run or not, and live (sorted_tok >= 0) or dropped. The load is
   // unconditional (clamped to the chunk's first row, which is in the run).
@@ -1097,7 +1100,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     }
     const int arow = in_run ? row : rc;
     avo = (unsigned)(((size_t)arow * p.xr_pitch + 4 * h) * 2);
-    if constexpr (EXL3R4D_SWK == 2 && (X3D || K25 != K25_OFF)) {
+    if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) {
       const int ta = nl & 7, ra = ta < chunk && rc + ta < r1 ? rc + ta : rc;
       swk_avo = (unsigned)(((size_t)ra * p.xr_pitch + 4 * h + 2 * (nl >> 3)) * 2);
     }
@@ -1127,11 +1130,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   [[maybe_unused]] float vacc[NPW][16];
   [[maybe_unused]] const int nrv = min(chunk, r1 - rc);
   [[maybe_unused]] float vacc4[NPW][4];   // X6w VDOT 3: one 4-row window's dots
-  static_assert(!(EXL3R4D_SWK && EXL3R4D_X6_VDOT), "SWK: the WMMA K loop only (VDOT 0)");
+  static_assert(!(SW && EXL3R4D_X6_VDOT), "SWK: the WMMA K loop only (VDOT 0)");
   [[maybe_unused]] v8h swk_prev[NPW];   // SWK (TIMING ONLY): the even k-step's decoded fragments, multiplied with the odd step's
   // SWK 1: a lane-made index VGPR (timing only); SWK 2: row nl < 8 keeps K 4g + 0 / 1 of each 4-group, row 8 + t keeps 4g + 2 / 3
-  [[maybe_unused]] const int swk_idx = EXL3R4D_SWK == 2 ? (int)((nl >> 3) ? (EXL3R4D_SWK_IDXSWAP ? 0xBBBBBBBBu : 0xEEEEEEEEu)
-                                                                        : (EXL3R4D_SWK_IDXSWAP ? 0x11111111u : 0x44444444u))
+  [[maybe_unused]] const int swk_idx = SW >= 2 ? (int)((nl >> 3) ? (SW == 3 ? 0xBBBBBBBBu : 0xEEEEEEEEu)
+                                                              : (SW == 3 ? 0x11111111u : 0x44444444u))
                                                         : (int)((lane & 1) ? 0xEEEEEEEEu : 0x44444444u);
   if constexpr (EXL3R4D_X6_VDOT && (X3D || K25 != K25_OFF)) {
 #pragma unroll
@@ -1304,7 +1307,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
               W_[j][r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x] + j * WORDS * 4, so_, kAux); \
         }                                                                            \
       }                                                                              \
-      if constexpr (EXL3R4D_SWK == 2 && (X3D || K25 != K25_OFF)) { /* SWK 2: four dwords 16 B apart */ \
+      if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) { /* SWK 2: four dwords 16 B apart */ \
         union { unsigned u[4]; v8h f; } x_;                                          \
         const unsigned sa_ = ((unsigned)(ks) & ~1u) * 32u;                           \
         _Pragma("unroll") for (int q_ = 0; q_ < 4; q_++)                             \
@@ -1349,15 +1352,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
       if constexpr (EXL3R4D_X6_VDOT == 3) x6w_vdotw<NPW, 4>(wfs_, A_, vacc4, nrv, rg_); /* X6w: a window's dots */ \
       else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
-      else if constexpr (EXL3R4D_SWK) { /* SWK: the even step's fragments wait for the odd step's (u = the step's parity) */ \
+      else if constexpr (SW) { /* SWK: the even step's fragments wait for the odd step's (u = the step's parity) */ \
         if ((u & 1) == 0) { _Pragma("unroll") for (int j = 0; j < NPW; j++) swk_prev[j] = wfs_[j]; }                \
         else swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                         \
       }                                                                              \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
-      if constexpr (EXL3R4D_X6_SGB == 1 && EXL3R4D_SWK) { /* SWK under the served pin: loads, decode, then the pair's SWMMACs */ \
-        __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + (EXL3R4D_SWK == 2 ? 4 : 2), 0); \
+      if constexpr (EXL3R4D_X6_SGB == 1 && SW) { /* SWK under the served pin: loads, decode, then the pair's SWMMACs */ \
+        __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + (SW >= 2 ? 4 : 2), 0); \
         __builtin_amdgcn_sched_group_barrier(0x002, 32 * NPW, 0);                   \
         if (u & 1) __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);             \
       } else if constexpr (EXL3R4D_X6_SGB == 1 && !EXL3R4D_X6_VDOT) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
@@ -1387,7 +1390,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else decode_frags_k25<NPW, FOLD>(r0_, r1_, wfs_);                              \
       if constexpr (EXL3R4D_X6_VDOT == 3) x6w_vdotw<NPW, 4>(wfs_, A_, vacc4, nrv, rg_); /* X6w: a window's dots */ \
       else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
-      else if constexpr (EXL3R4D_SWK) { /* SWK: as the X3D path */                 \
+      else if constexpr (SW) { /* SWK: as the X3D path */                 \
         if ((u & 1) == 0) { _Pragma("unroll") for (int j = 0; j < NPW; j++) swk_prev[j] = wfs_[j]; }                \
         else swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                         \
       }                                                                              \
@@ -1481,13 +1484,13 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   } else {
     [[maybe_unused]] constexpr int rg_ = 0;
     EXL3_KLOOP();
-    if constexpr (EXL3R4D_SWK == 1 && (X3D || K25 != K25_OFF)) {   // SWK: an odd kps's last (even) step has no partner: one dense WMMA
+    if constexpr (SW == 1 && (X3D || K25 != K25_OFF)) {   // SWK: an odd kps's last (even) step has no partner: one dense WMMA
       static_assert(PF % 2 == 0, "SWK: the step's parity is u's (ks advances by an even PF)");
       if (kps & 1) {
 #pragma unroll
         for (int j = 0; j < NPW; j++) acc[j] = mma(swk_prev[j], ab[0], acc[j]);
       }
-    } else if constexpr (EXL3R4D_SWK == 2 && (X3D || K25 != K25_OFF)) {   // SWK 2: the unpaired last step against zeros (0 x 0 = +0)
+    } else if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) {   // SWK 2: the unpaired last step against zeros (0 x 0 = +0)
       static_assert(PF % 2 == 0, "SWK: the step's parity is u's (ks advances by an even PF)");
       if (kps & 1) {
         union { unsigned u[4]; v8h f; } x_;
@@ -1566,7 +1569,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     }
   }
   if (SK > 1) splitk_reduce<NPW>(acc, lds, col_local, ksplit, SK, lane);
-  if constexpr (EXL3R4D_SWK == 2 && (X3D || K25 != K25_OFF)) swk_to_dlayout<NPW>(acc, lane);   // SWK 2: rows -> tokens
+  if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) swk_to_dlayout<NPW>(acc, lane);   // SWK 2: rows -> tokens
   if constexpr (XSM) {
     if (xsn > 1 && !xs_combine<NPW>(p, acc, xunit, xsl)) return;   // the first slice leaves; the second sums
   }
@@ -1769,7 +1772,7 @@ static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 16, "x3d pads 
 template <int G>
 static __device__ __forceinline__ int spb_cb(int g) { return G == 1 ? (int)blockIdx.x : (int)blockIdx.x * G + g; }
 // X5 (FOLD, fn4 exl3_x3d 5): the same kernel with the codebook fold (moe_pass FOLD).
-template <int MATS, int G = 1, bool FOLD = false>
+template <int MATS, int G = 1, bool FOLD = false, int SW = EXL3R4D_SWK_T>   // SW: lever SWK's form (moe_pass SW; fn4 exl3_x6w 2 / 3)
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "X3D-F: down's E2 grouping is not ported");
   static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
@@ -1799,8 +1802,8 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
       if (G == 1) return;
       continue;
     }
-    for (int rc = run.r0; rc < run.r1; rc += EXL3R4D_SWK_BLK)
-      moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true, K25_OFF, FOLD>(p, w, rc, run.r1, lds, tk0,
+    for (int rc = run.r0; rc < run.r1; rc += (SW >= 2 ? 8 : EXL3R4D_SWK_BLK))
+      moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true, K25_OFF, FOLD, SW>(p, w, rc, run.r1, lds, tk0,
                                                                          G == 1 ? -1 : cb);
   }
 }
@@ -1809,7 +1812,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
 // exactly (prep kernel rows, no DNW, EXL3R4D_DNG 1) except moe_pass's K25 mode (gate_up K25_G3 / K25_G2D / K25_UB96, down
 // K25_U4). exl3r4d_launch_gemm takes them only when the argument block's x3d is 2 .. 4 (fill(): bits 2.5 and the fn4
 // switch exl3_x3d at 2 / 3 / 4), so with the switch at 0 or 1 no launch reaches them.
-template <int MATS, int MODE, int G = 1, bool FOLD = false>   // G: SPB-G (above exl3r4d_gemm_x3d_kernel), the down only; FOLD: X5
+template <int MATS, int MODE, int G = 1, bool FOLD = false, int SW = EXL3R4D_SWK_T>   // G: SPB-G (above exl3r4d_gemm_x3d_kernel), the down only; FOLD: X5; SW: SWK
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_kernel(Exl3r4dGemm p) { R4D_IKA_ENTRY();
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "K25U: down's E2 grouping is not ported");
   static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
@@ -1839,8 +1842,8 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_
       if (G == 1) return;
       continue;
     }
-    for (int rc = run.r0; rc < run.r1; rc += EXL3R4D_SWK_BLK)
-      moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE, FOLD>(p, w, rc, run.r1, lds, tk0,
+    for (int rc = run.r0; rc < run.r1; rc += (SW >= 2 ? 8 : EXL3R4D_SWK_BLK))
+      moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE, FOLD, SW>(p, w, rc, run.r1, lds, tk0,
                                                                                          G == 1 ? -1 : cb);
   }
 }
@@ -4370,6 +4373,28 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
          : a->x3d == 3 ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G2D>
                        : (const void*)exl3r4d_gemm_k25_kernel<2, K25_UB96>;
       if (!gate_up && sg > 1) gks.x = (unsigned)((a->y_cols / 128 + sg - 1) / sg);
+    }
+    // SWK (fn4 exl3_x6w 2 / 3; tp8 DECODE round 64, QUEUE X12; rule B, its own reference): the SW 2 / 3 twins of the kernels chosen
+    // above -- the X3D-F (K = 2, x3d 1..4) and K25U (K = 2.5: gate_up G3 at x3d 2, down U4 at 2..4) K loops as gfx1201's 2:4 sparse
+    // v_swmmac_f32_16x16x32_f16 with each token's K over two A rows, 8 tokens a pass (moe_pass SW 2; 3 = the other index nibble
+    // order). Same grid, block, LDS and arguments; the down at SPB-G 1 / 2. Everything else keeps its kernel: the fold (x3d 5 / 6),
+    // K25U G2D / UB96, SPB-G 4 / 8, SPB-P (returned above), the prefill band. 0 at start = no launch changes.
+    {
+      const int swk = exl3r4d_fn4_x6w();
+      if ((swk == 2 || swk == 3) && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2)) {
+        if (bits == 2 && a->x3d >= 1 && a->x3d <= 4)
+          kf = swk == 2 ? (gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2, 1, false, 2>
+                           : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2, false, 2> : (const void*)exl3r4d_gemm_x3d_kernel<1, 1, false, 2>)
+                        : (gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2, 1, false, 3>
+                           : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2, false, 3> : (const void*)exl3r4d_gemm_x3d_kernel<1, 1, false, 3>);
+        else if (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4 && (!gate_up || a->x3d == 2))
+          kf = swk == 2 ? (gate_up ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3, 1, false, 2>
+                           : sg == 2 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 2, false, 2>
+                                     : (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 1, false, 2>)
+                        : (gate_up ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3, 1, false, 3>
+                           : sg == 2 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 2, false, 3>
+                                     : (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 1, false, 3>);
+      }
     }
     if (hipLaunchKernel(kf, gks, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
       return RAD_E_DEVICE;
