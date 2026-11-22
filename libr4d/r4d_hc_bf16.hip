@@ -3059,6 +3059,50 @@ void hc_g_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__
         scaleout[(r0 + tid) * kHcMax + c] = __frsqrt_rn(ss / (float)kHcGN + eps);
     }
 }
+/* qfn-on-ds lever HCX (Qwen loop round 34): the chained twins of bit 9's two launches (the scale kernel's body unchanged between
+ * the wait and the done), so bit 9 is taken under `chain` too -- BEST runs every decode read chained (RADIANCE_FN4_CHAIN=1), where
+ * the bit-9 branch required !chain and never ran: stk3's 'with chains on its gain is gone' read an unengaged arm. */
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_g_scale(const unsigned short* __restrict__ h, float* __restrict__ scaleout, long hrow, float eps, long rows) {
+    r4d_chain_wait();
+    __shared__ float s_part[kWaves][16];
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int c = (int)blockIdx.x;
+    const long r0 = (long)blockIdx.y * 16;
+    const int  rr = (int)(rows - r0 < 16 ? rows - r0 : 16);
+    h += r0 * hrow;
+    for (int r = 0; r < rr; ++r) {
+        const unsigned short* hr = h + (long)r * hrow + (long)c * kHcGN;
+        uint32_t hv[kHcGPer];
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) hv[p] = bfw(hr + tid + (long)p * kThreads);
+        float acc = 0.0f;
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
+        acc = wave_sum(acc);
+        if (lane == 0) s_part[wave][r] = acc;
+    }
+    __syncthreads();
+    if (tid < rr) {
+        float ss = 0.0f;
+        for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
+        scaleout[(r0 + tid) * kHcMax + c] = __frsqrt_rn(ss / (float)kHcGN + eps);
+    }
+    r4d_chain_done();
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_read_g16pp_down(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                 const unsigned char* __restrict__ downv, long dld,
+                                 const unsigned short* __restrict__ injw,
+                                 unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                 float* __restrict__ scaleout, float* __restrict__ part,
+                                 unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                                 float eps, float wadd, int ntd, long rows) {
+    hc_read_g16p_down_body<RG, true, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                           hrow, irow, eps, wadd, ntd, rows);
+    r4d_chain_done();
+}
 template <int RG>
 __global__ __launch_bounds__(kThreads)
 void hc_read_g16pp_down_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
@@ -3220,7 +3264,7 @@ void r4dchain_hc_read_g16p_down(const unsigned short* __restrict__ h, const floa
  * over its 320-wide slice with the same group-scale folds, the waves' partials summed 0..7 ascending from 0, the streams' by the
  * tile's last block 0..3 ascending; the norm = G16p's loop), so every output byte is G16p's = G16's = form G's at every height:
  * no reference change, and a floor (RADIANCE_FN4_HC_X_MIN) moves no answer. */
-template <int RG, bool CH, int NTS>
+template <int RG, bool CH, int NTS, bool PRE = false>
 __device__ __forceinline__ void hc_read_g16x_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -3290,7 +3334,12 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
     for (int p = 0; p < kHcGPer; ++p) sW[tid + p * kThreads] = w[(long)c * kHcGN + tid + (long)p * kThreads];
     if constexpr (CH) r4d_chain_wait();
 
-    /* ---- the grouped norm: G16p's loop (= form G's sums) */
+    /* ---- the grouped norm: G16p's loop (= form G's sums); PRE (hc_readv bit 9): already in scaleout, from hc_g_scale_kernel's
+     * same sums (G16pp's read) */
+    if constexpr (PRE) {
+        if (tid < RG) s_scale[tid] = scaleout[(long)(tid < rr ? tid : rr - 1) * kHcMax + c];
+        __syncthreads();
+    } else {
     for (int r = 0; r < RG; ++r) {
         const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
         uint32_t hv[kHcGPer];
@@ -3310,6 +3359,7 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
         if (pb == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
     }
     __syncthreads();
+    }
 
     const int  rowl = col < rr ? col : rr - 1;
     const float scl = s_scale[rowl];
@@ -3437,13 +3487,13 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
                      float* __restrict__ scaleout, float* __restrict__ part, unsigned int* __restrict__ tctr, long lr,  \
                      long hrow, long irow, float eps, float wadd, int ntd, long rows
 #define HC_G16X_ARGS h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows
-template <int RG, int NTS>
+template <int RG, int NTS, bool PRE = false>
 __global__ __launch_bounds__(kThreads) void hc_read_g16x_down_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
-    hc_read_g16x_down_body<RG, false, NTS>(HC_G16X_ARGS);
+    hc_read_g16x_down_body<RG, false, NTS, PRE>(HC_G16X_ARGS);
 }
-template <int RG, int NTS>
+template <int RG, int NTS, bool PRE = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_read_g16x_down(HC_G16X_DECL) {
-    hc_read_g16x_down_body<RG, true, NTS>(HC_G16X_ARGS);
+    hc_read_g16x_down_body<RG, true, NTS, PRE>(HC_G16X_ARGS);
     r4d_chain_done();
 }
 
@@ -8385,15 +8435,23 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         fc_add(kFcG16x, (long)rows, bidec);
         const int nts = hc_x();
         const dim3 gx((unsigned)((hcg_nt / nts + 1) * hc), (unsigned)hcg_gy);
-#define HC_X_K(NTS_)                                                                             \
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16x_down<16, NTS_> : &hc_read_g16x_down_kernel<16, NTS_>), \
+        /* with bit 9 (from RADIANCE_FN4_HC_PRE_MIN rows): the norm scales once a (stream, group) first (G16pp's), the blocks read them */
+        const bool xpre = (hc_readv() & 512) != 0 && rows >= hc_pre_min();
+        if (xpre)
+            emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_g_scale : &hc_g_scale_kernel), dim3((unsigned)hc, (unsigned)hcg_gy),
+                               dim3(kThreads), 0, (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
+#define HC_X_K(NTS_, PRE_)                                                                       \
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16x_down<16, NTS_, PRE_> : &hc_read_g16x_down_kernel<16, NTS_, PRE_>), \
                            gx, dim3(kThreads), 0,                                                \
                            (const unsigned short*)h->data, (const float*)w->data,                \
                            (const unsigned char*)down->data, (long)dld,                          \
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,  \
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd, \
                            (int)hcg_nt, (long)rows)
-        if (nts == 4) HC_X_K(4); else if (nts == 5) HC_X_K(5); else HC_X_K(10);
+        if (emit_rc == RAD_OK) {
+            if (xpre) { if (nts == 4) HC_X_K(4, true); else if (nts == 5) HC_X_K(5, true); else HC_X_K(10, true); }
+            else      { if (nts == 4) HC_X_K(4, false); else if (nts == 5) HC_X_K(5, false); else HC_X_K(10, false); }
+        }
 #undef HC_X_K
     } else if (hcg && g16 && (hc_readv() & 1024) != 0 && (hcg_nt % 4) == 0 && !hcg_ch && rows >= 32) {
         /* fn4 hc_readv bit 10: G16 with FOUR tiles a block (the inject tile alone), unchained */
@@ -8405,13 +8463,14 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                            (int)hcg_nt, (long)rows);
-    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch && rows >= hc_pre_min()) {
-        /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them */
+    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && rows >= hc_pre_min()) {
+        /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them; chained under `chain`
+         * (qfn-on-ds round 34: the twins r4dchain_hc_g_scale / r4dchain_hc_read_g16pp_down; before, !chain kept it off in BEST) */
         fc_add(kFcG16pp, (long)rows, bidec);
-        emit_rc = R4D_EMIT(s, &hc_g_scale_kernel, dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_g_scale : &hc_g_scale_kernel), dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
         if (emit_rc == RAD_OK)
-            emit_rc = R4D_EMIT(s, &hc_read_g16pp_down_kernel<16>,
+            emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16pp_down<16> : &hc_read_g16pp_down_kernel<16>),
                                dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                                (const unsigned short*)h->data, (const float*)w->data,
                                (const unsigned char*)down->data, (long)dld,
