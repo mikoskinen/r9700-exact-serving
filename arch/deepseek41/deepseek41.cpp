@@ -361,6 +361,12 @@ struct Layer {
     /* lever DQR (DRAFTER track round 69; the DSpark stages only): q_rope + attn as ONE libr4d attn_sparse_sink_dqr at out_rope 0
      * (0 where not declared) */
     rad_op attn_q = 0;
+    /* lever PFX (DRAFTER track round 85; the DSpark stages only; dspark_mhr + 256): ONE libr4d `prefetch` of this stage's
+     * attention weights (wq_a, wkv, wq_b, wo_a's groups: ~30 MB at the stage's q8_0; the op's w .. w7), issued right behind the
+     * all-reduce in front of the stage (the embedding's for stage 0, the previous stage's MoE all-reduce else); 0 where not
+     * declared */
+    rad_op dpfx = 0;
+    std::vector<rad_weight> dpfx_w;
     /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): ar_attn declared a second time at `overlap` 1 (the narrow launch beside
      * compute) for piece 0 of a pipelined pass; 0 otherwise */
     rad_op ar_attn_ov = 0;
@@ -2312,9 +2318,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dg = gq && gq[0] == '1' && !gq[1] ? 128 : 0;
         if (gq && *gq && !dg && std::strcmp(gq, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_EMG=%s is not 0 / 1: lever EMG not declared\n", gq);
+        const char* pz = std::getenv("RADIANCE_DS41_DSPARK_PFX");   /* lever PFX (round 85): 1 = on at start, 0 = declared, off */
+        const int dz = pz && pz[0] == '1' && !pz[1] ? 256 : 0;
+        if (pz && *pz && !dz && std::strcmp(pz, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_PFX=%s is not 0 / 1: lever PFX not declared\n", pz);
         int unread = -1;
         g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk |
-                                                     dg);
+                                                     dg | dz);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2332,6 +2342,29 @@ static bool dkp_env() {
 static std::atomic<int> g_dkp_ok{0}, g_dkp_bad{0};   /* lever DKP: declared on a rank / a rank of this process could not */
 static std::atomic<long long> g_dkp_passes{0};       /* lever DKP: the first-pass line */
 static bool emg_now() { return (dmr_raw() & 128) != 0; }  /* lever EMG (round 74) */
+/* Lever PFX (DRAFTER track 22.11.2026 round 85; Layer::dpfx; dspark_mhr + 256, start env RADIANCE_DS41_DSPARK_PFX=1 adds it to the
+ * start value, =0 declares the reads with the bit off; unset declares nothing): at a DSpark query pass each stage's attention
+ * weights (wq_a, wkv, wq_b, wo_a: 29.8 MB a stage at q8_0) are read into L2 / the 64 MiB on-die cache by libr4d `prefetch` right
+ * behind the all-reduce in front of the stage (the embedding's for stage 0, the previous stage's MoE all-reduce else), on the
+ * same queue: the reads name no buffer, so they play unordered beside the collective while the card's memory is idle, and the
+ * stage's first dependent dispatch waits for them. The stage's dense calls then stream those weights from the cache. Reads
+ * only: every byte the pass writes is today's (rule A). drafter/kit/mes/pfx.cpp (one R9700, a 53-us all-reduce stand-in,
+ * cold weight sets, Q8IL forms): q_a + kv / q_b / o_a / o_b chain 102.5 -> 86.6 us at 32 rows, 101.9 -> 86.3 at 24, 107.7 ->
+ * 97.7 at 40; the reads must fit the window (each us past it is paid; o_b's 11 MB is left out for that). */
+static bool pfx_now() { return (dmr_raw() & 256) != 0; }
+static bool pfx_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_PFX");
+    return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
+}
+static std::atomic<long long> g_pfx_passes{0};   /* the first-pass line */
+static void dpfx_issue(RadCtx* x, const Layer& L) {
+    if (!L.dpfx) return;
+    RadOperand o[8];
+    const size_t n = std::min<size_t>(8, L.dpfx_w.size());
+    for (size_t i = 0; i < n; ++i) o[i] = RAD_W(L.dpfx_w[i]);
+    rad_issue(x, L.dpfx, o, (int)n, RAD_N_BATCH);
+}
+static void dpfx_after_ar(RadCtx* x, void* a) { dpfx_issue(x, *(const Layer*)a); }
 /* lever EMG: declared only where the start env names it 0 / 1 (an unset start declares the published program) */
 static bool emg_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_EMG");
@@ -3224,7 +3257,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 255 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 511 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -6295,6 +6328,39 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                     hs_now(), d.hs_ok ? "declared" : "NOT declared: ", why ? why : "");
     }
 
+    /* Lever PFX (Layer::dpfx, pfx_now's comment): a `prefetch` of each stage's attention weights where a library serves the op
+     * and the deployment did not turn the reads off (--weight-prefetch off); none (the host backend: libref serves no
+     * `prefetch`) -> the bit reads nothing (no stage has reads to issue). */
+    if (pfx_env() && !m.zero && !ctx->shape_probe) {
+        size_t nw = 0, nd = 0;
+        const bool lib = rad_op_declared(b, "prefetch") && !ctx->weight_prefetch_off;
+        static const char* const kBytes[8] = { "bytes", "bytes1", "bytes2", "bytes3", "bytes4", "bytes5", "bytes6", "bytes7" };
+        for (auto& L : d.st) {
+            L.dpfx = 0;
+            L.dpfx_w.clear();
+            for (rad_weight w : { L.wq_a, L.wkv, L.wq_b })
+                if (w) L.dpfx_w.push_back(w);
+            for (rad_weight w : L.wo_a)
+                if (w) L.dpfx_w.push_back(w);
+            if (L.dpfx_w.size() > 8) L.dpfx_w.resize(8);
+            nw += L.dpfx_w.size();
+            if (!lib || L.dpfx_w.empty()) continue;
+            /* the whole weights: the kernel clamps each read to what its tensor states (libr4d before round 85 takes one weight a
+             * launch: the op then does not resolve here and the stage reads nothing) */
+            std::vector<RadParam> ps;
+            for (size_t i = 0; i < L.dpfx_w.size(); ++i) ps.push_back(RAD_INT(kBytes[i], (int64_t)64 << 20));
+            const rad_op h = rad_decl_op(b, "prefetch", ps.data(), (int)ps.size(), L.dpfx_w.data(), (int)L.dpfx_w.size());
+            if (h && rad_op_resolved(b, h)) { L.dpfx = h; nd += L.dpfx_w.size(); }
+        }
+        rad_note(b, "DSpark lever PFX (RADIANCE_DS41_DSPARK_PFX): %zu of %zu stage attention weight reads declared%s", nd, nw,
+                 lib ? "" : " (no `prefetch` here, or --weight-prefetch off)");
+        if (ctx->rank == 0)
+            fprintf(stderr, "radiance: deepseek41: DSpark lever PFX (RADIANCE_DS41_DSPARK_PFX, fn4 dspark_mhr + 256, now %s): %zu of %zu "
+                            "stage attention weight reads declared (wq_a, wkv, wq_b, wo_a: one prefetch a stage, behind the all-reduce "
+                            "before it)%s\n",
+                    pfx_now() ? "on" : "off", nd, nw, lib ? "" : " -- no library serves `prefetch` here, or --weight-prefetch off");
+    }
+
     /* Lever DQR (Layer::attn_q, g_sw_dmr's comment + 32): declared beside each stage's attention above; one line here */
     if (dqr_env() && !m.zero) {
         size_t nq = 0, nzq = 0, nz = 0;
@@ -8936,10 +9002,20 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const bool dpr = dpr_now() && !m.zero && g.world > 1 && d.embed_ar && (ek < 0 || d.ema_x) && dspark_arf() < 2 &&
                      !d.st.empty() && !(dmr_now() >= 3 && d.st[0].pcn_a);
     RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
+    /* lever PFX (round 85; pfx_now's comment): this pass reads each stage's attention weights behind the all-reduce before it */
+    const bool pfx = pfx_now() && !m.zero && g.world > 1;
+    const bool pfx0 = pfx && !d.st.empty() && d.st[0].dpfx;
+    if (pfx && g.rank == 0 && g_pfx_passes.fetch_add(1, std::memory_order_relaxed) == 0) {
+        size_t n = 0;
+        for (const auto& L : d.st) n += L.dpfx ? L.dpfx_w.size() : 0;
+        fprintf(stderr, "radiance: deepseek41: lever PFX: first query pass issued with %zu stage attention weight reads behind the "
+                        "all-reduces before the stages (%lld rows; counted at issue: a recorded pass once)\n", n, (long long)T);
+    }
     if (ek >= 0) {
         const int64_t o = ek * d.Q;
         RAD_ISSUE_N(x, d.ema_g, S + 1, brows(d.x, T), brow_slice(d.ema_ia, o, S + 1, 1), brows(d.xa, S + 1));
         RAD_ISSUE_N(x, d.ema_ar, (S + 1) * D, brows(d.xa, S + 1), RAD_NONE);
+        if (pfx0) dpfx_issue(x, d.st[0]);   /* lever PFX: stage 0's attention weights beside the embedding's all-reduce */
         void* h0p = d.ema_eh && emg_now() && !g_emg_bad.load(std::memory_order_relaxed) ? rad_buf_ptr(x, d.h0) : nullptr;
         if (h0p) {   /* lever EMG (round 74): h0 [T, hc x D] packed = [hc x T, D] rows; ie4[hc r + i] = ie[r] */
             RAD_ISSUE_N(x, d.ema_eh, c.hc * T, brows(d.xa, S + 1), brow_slice(d.ema_ie4, o * c.hc, c.hc * T, 1),
@@ -8958,6 +9034,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                     (long long)(S + 1), (long long)T, (long long)S, (long long)blk);
     } else {
         if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
+        if (d.embed_ar && pfx0) dpfx_issue(x, d.st[0]);   /* lever PFX: as on the EMA pass */
         for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
     }
     if (dpr && g.rank == 0 && g_dpr_passes.fetch_add(1, std::memory_order_relaxed) == 0)
@@ -9106,8 +9183,17 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             MoeFP8::Beside bs;
             bs.fn = dsp_mix_f_beside;
             bs.arg = &mb;
+            if (pfx && nx && nx->dpfx) {   /* lever PFX: the next stage's attention weights beside this MoE all-reduce */
+                bs.after_ar = dpfx_after_ar;
+                bs.after_arg = (void*)nx;
+            }
             if (Tq != T) L.moe.step_rows(x, Tq, &bs);   /* lever DHS: the block over its first N rows */
             else L.moe.step(x, batch, bs);
+        } else if (pfx && nx && nx->dpfx) {   /* lever PFX: as in the dmr branch, nothing beside the routed gate_up */
+            MoeFP8::Beside bs;
+            bs.after_ar = dpfx_after_ar;
+            bs.after_arg = (void*)nx;
+            L.moe.step(x, batch, bs);
         } else {
             L.moe.step(x, batch);
         }

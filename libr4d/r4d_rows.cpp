@@ -961,9 +961,13 @@ static const RadOperandSpec oKvLenTrim[] = {
 /* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
 static const RadParamSpec pPrefetch[] = {
     { "bytes", RAD_P_INT, RAD_REQUIRED },
+    /* DRAFTER track round 85 (lever PFX): w1 .. w7's bytes, read by the same launch (absent / 0: that weight not read) */
+    P_INTO("bytes1"), P_INTO("bytes2"), P_INTO("bytes3"), P_INTO("bytes4"), P_INTO("bytes5"), P_INTO("bytes6"), P_INTO("bytes7"),
 };
 static const RadOperandSpec oPrefetch[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
+    { "w1", RAD_OPD_WEIGHT, 1 }, { "w2", RAD_OPD_WEIGHT, 1 }, { "w3", RAD_OPD_WEIGHT, 1 }, { "w4", RAD_OPD_WEIGHT, 1 },
+    { "w5", RAD_OPD_WEIGHT, 1 }, { "w6", RAD_OPD_WEIGHT, 1 }, { "w7", RAD_OPD_WEIGHT, 1 },
 };
 /* `pb1` and `pb2` are ParoQuant's, read by the mxfp4a8 rows and the 4- and 5-bit asymmetric rows
  * (w5a16, w4a16_asym, w4a8i8_asym, w5a8i8): weight rows [0, pb1), [pb1, pb2) and [pb2, N) each
@@ -3907,7 +3911,7 @@ static const RadOpSchema kSchemas[] = {
            "slice alone."),
     SCHEMA("prefetch", pPrefetch, oPrefetch,
            "read a weight's leading bytes so they are in the cache when the next kernel streams "
-           "them; writes nothing."),
+           "them; writes nothing. w1 .. w7 (bytes1 .. bytes7) are read by the same launch."),
     SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
            "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
            "q, k and v projections, in one dispatch; v from the raw k under v_from_k. n_head 0 "
