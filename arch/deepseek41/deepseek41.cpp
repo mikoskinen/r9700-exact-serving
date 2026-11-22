@@ -376,6 +376,9 @@ struct Layer {
      * are gemm_nt_q over the pairs */
     rad_op a8_xq = 0, a8_oq = 0;
     std::vector<rad_op> a8_bq;
+    /* lever A8D fold (round 94): DOF's rope_rows_roundtrip with quant_act_i8g's codes of the stored row into o_a's pair (libr4d
+     * rope_rows_roundtrip_i8g, = o_f then a8_oq to the byte); 0 where no library serves it (an older libr4d: o_f + a8_oq) */
+    rad_op o_f8 = 0;
     /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): ar_attn declared a second time at `overlap` 1 (the narrow launch beside
      * compute) for piece 0 of a pipelined pass; 0 otherwise */
     rad_op ar_attn_ov = 0;
@@ -5697,6 +5700,12 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
             const char* me = std::getenv("RADIANCE_DS41_DSPARK_MHR");
             L.o_f = me && me[0] >= '5' && me[0] <= '7' && !me[1]   /* 6 / 7 (round 59) include 5 */
                         ? rope_rt(b, m, Q, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", d.o, m.cs_a) : 0;
+            if (L.o_f && a8)   /* lever A8D fold (round 94): o_f + a8_oq as one op, beside them */
+                L.o_f8 = fused(b, "rope_rows_roundtrip_i8g",
+                               { RAD_RANGE("M", 1, Q), RAD_INT("n_head", g.n_head), RAD_INT("head_dim", hd), RAD_INT("rot", c.rope),
+                                 RAD_INT("off", hd - c.rope), RAD_STR("mode", "gptj"), RAD_INT("inverse", 1), RAD_INT("block", 32),
+                                 RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16") },
+                               {}, { d.o, m.cs_a }, { d.o, d.a8oq, d.a8os });
         }
         /* lever DQR (dspark_mhr + 32, round 69): q_rope + attn as ONE attn_sparse_sink_dqr, beside them; declared
          * only at the start env RADIANCE_DS41_DSPARK_DQR with lever DAW (its wm_from 1: the WMMA form at every height, the only
@@ -9550,7 +9559,12 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                 RAD_ISSUE_N(x, lo ? lo->attn[si] : L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
                             praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                             RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
-            if (dof && L.o_f) {   /* lever DOF: the trunk's o_f form and operands (its issue in step()) */
+            /* lever A8D fold: o's int8 pair from o_f's pass where the quantiser would read d.o's T rows (not the last stage under
+             * DHS: its o_a reads the gathered head rows) */
+            const bool of8 = a8 && dof && L.o_f8 && !(hs && !nx);
+            if (of8) {
+                RAD_ISSUE_N(x, L.o_f8, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos, brows(d.a8oq, T), brows(d.a8os, T));
+            } else if (dof && L.o_f) {   /* lever DOF: the trunk's o_f form and operands (its issue in step()) */
                 RAD_ISSUE_N(x, L.o_f, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
             } else {
                 RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
@@ -9568,7 +9582,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             const int64_t gd = HD / m.gr;
             if (a8) {   /* lever A8D: o's pair (ob's Tq rows), the groups, each group's quantiser into o_b's pair */
                 const int64_t G = RAD_FP8_BLOCK;
-                RAD_ISSUE_N(x, L.a8_oq, Tq, brows(ob, Tq), brows(d.a8oq, Tq), brows(d.a8os, Tq));
+                if (!of8) RAD_ISSUE_N(x, L.a8_oq, Tq, brows(ob, Tq), brows(d.a8oq, Tq), brows(d.a8os, Tq));
                 for (int j = 0; j < m.gr; ++j)
                     a8_gemm_issue(x, m, L.o_a[(size_t)j], Tq, { d.a8oq, HD, j * gd, gd }, { d.a8os, HD / G, j * gd / G, gd / G },
                                   L.wo_a[(size_t)j], { d.a8oa[(size_t)j], c.o_rank, 0, c.o_rank });

@@ -24,6 +24,7 @@
 #include "r4d_ds41_f32pf.h"   /* lever SPD-F: ds41_f32dec's router form (rgs_emit) */
 #include "r4d_ds41_pcn.h"
 #include "r4d_ds41_qrt.h"
+#include "r4d_q8.h"      /* lever A8D (DRAFTER round 94): rope_rt8q_kernel's int8 codes = quant_act_i8g's */
 #include "r4d_gemm_f32_tile.h"
 #include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
@@ -2853,6 +2854,74 @@ __global__ __launch_bounds__(256) void rope_rt8_kernel(uint16_t* x, long xp, int
         if (in) *(uint4*)(row + c8) = make_uint4(o[0], o[1], o[2], o[3]);
     }
 }
+/* Lever A8D (DRAFTER track round 94): rope_rt8_kernel (the same values and stores of x) with quant_act_i8g's int8 codes of the
+ * STORED row on its pass: 16 threads = one 128-column group (r4d_xor_max<16> of their 8-column maxima of the stored bf16 values),
+ * scale amax * (1 / 127) (1 for an all-zero group), codes q8_pack4<true> (r4d_q8.h: rint of the clamped value times 1 / scale) --
+ * the codes and scales quant_act_i8g writes over x afterwards, to the byte; the group's first thread stores its scale. Needs
+ * n % 128 == 0 (whole groups in or out of `in` together). */
+__global__ __launch_bounds__(256) void rope_rt8q_kernel(uint16_t* x, long xp, int n, long rows, FzRope r, int fmt, int sc,
+                                                        signed char* __restrict__ q, long qp, float* __restrict__ s, long sp) {
+    R4D_IKA_ENTRY();
+    const int c8 = (blockIdx.x * 256 + threadIdx.x) * 8;
+    const bool in = c8 < n;
+    const int hh = c8 / r.hd, d8 = c8 - hh * r.hd - r.off;
+    for (long m = blockIdx.y; m < rows; m += gridDim.y) {
+        uint16_t* row = x + m * xp;
+        const uint4 w = in ? *(const uint4*)(row + c8) : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t ww[4] = { w.x, w.y, w.z, w.w };
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            v[2 * e] = ds_bf((uint16_t)(ww[e] & 0xffffu));
+            v[2 * e + 1] = ds_bf((uint16_t)(ww[e] >> 16));
+        }
+        const long p = r.pos[m * r.ps];
+        if (p >= 0 && p < r.tab_rows) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int d = d8 + 2 * e;
+                if (in && d >= 0 && d < 2 * r.half) {
+                    const int i = d >> 1;
+                    const float c = r.cs[p * r.cp + (long)i * r.cst];
+                    const float sn = r.sign * r.cs[p * r.cp + (long)(r.half + i) * r.cst];
+                    const float va = v[2 * e], vb = v[2 * e + 1];
+                    v[2 * e] = ds_bf(ds_bf16(va * c - vb * sn));
+                    v[2 * e + 1] = ds_bf(ds_bf16(va * sn + vb * c));
+                }
+            }
+        }
+        float a = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float t = fabsf(v[e]);
+            t = t == t ? t : 0.0f;
+            a = fmaxf(a, t);
+        }
+        const float amax = r4d_xor_max<4>(a);
+        const float bs = block_scale(amax, fmt, sc);
+        uint16_t h[8];
+        float st[8];
+        float qm = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            h[e] = ds_bf16(roundtrip(v[e], bs, fmt));
+            st[e] = ds_bf(h[e]);
+            qm = fmaxf(qm, fabsf(st[e]));
+        }
+        if (in)
+            *(uint4*)(row + c8) = make_uint4((uint32_t)h[0] | ((uint32_t)h[1] << 16), (uint32_t)h[2] | ((uint32_t)h[3] << 16),
+                                             (uint32_t)h[4] | ((uint32_t)h[5] << 16), (uint32_t)h[6] | ((uint32_t)h[7] << 16));
+        qm = r4d_xor_max<16>(qm);
+        const float qs = qm > 0.0f ? qm * (1.0f / q8_top<true>()) : 1.0f;
+        const float inv = 1.0f / qs;
+        if (in) {
+            *(uint2*)(q + m * qp + c8) = make_uint2(q8_pack4<true>(st[0], st[1], st[2], st[3], inv),
+                                                    q8_pack4<true>(st[4], st[5], st[6], st[7], inv));
+            if ((threadIdx.x & 15u) == 0u) s[m * sp + c8 / 128] = qs;
+        }
+    }
+}
+
 int rope8_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_ROPE8");
@@ -3179,6 +3248,32 @@ int norm_rope_rt_kv_body_w1k(const RadArgs* a, RadStream stream) { return norm_r
 /* x [M, n_head*head_dim] in place, cos_sin, positions. The lane-group form needs a gptj pair on
  * one wave's even/odd lanes (head_dim and off even, the row's constraints) and a power-of-two block
  * up to 32; any other geometry runs rope_rows then quant_roundtrip as two launches, the same bits. */
+/* lever A8D (round 94): rope_rows_roundtrip + quant_act_i8g's codes of the stored row (rope_rt8q_kernel); operands x, cos_sin,
+ * positions, q [M, n] int8, scale [M, n / 128] f32. Only the eight-columns-a-thread form at block 32, gptj, n % 128 == 0 and 16-byte
+ * x rows / 8-byte q rows (the DSpark stage's attention output: 16 or 64 heads x 512 per rank); anything else refused. */
+int rope_rt_i8g_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 5 || !a->t[0].data || !a->t[1].data || !a->t[2].data || !a->t[3].data || !a->t[4].data) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2], &qt = a->t[3], &st = a->t[4];
+    if (x.rank != 2 || x.shape[0] < 1 || qt.rank != 2 || st.rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long M = (long)x.shape[0];
+    FzRope r;
+    const int rc = fz_rope_args(a, x, cs, pos, M, &r);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const long n = (long)r.hd * (r.pairs / r.half);
+    int fmt, sc;
+    if (!fz_quant_fmt(a, &fmt, &sc)) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (r4d_geti_or(a, "block", 0) != 32 || n % 128 || !r.gptj || (r.hd & 7) || (r.off & 1)) return R4D_NO(RAD_E_SHAPE);
+    if (qt.dtype != RAD_I8 || st.dtype != RAD_F32 || qt.shape[0] < M || qt.shape[1] != n || st.shape[0] < M || st.shape[1] != n / 128 ||
+        qt.stride[1] != 1 || st.stride[1] != 1)
+        return R4D_NO(RAD_E_SHAPE);
+    uint16_t* xd = (uint16_t*)x.data;
+    const long xp = (long)x.stride[0], qp = (long)qt.stride[0], sp = (long)st.stride[0];
+    if (xp % 8 || x.stride[1] != 1 || ((uintptr_t)xd & 15u) || qp % 8 || ((uintptr_t)qt.data & 7u)) return R4D_NO(RAD_E_STRIDE);
+    const unsigned gx8 = (unsigned)((n / 8 + 255) / 256);
+    const dim3 g8(gx8, ds_dodge_gy(gx8, grid_rows(M), 8));
+    return R4D_EMIT(stream, rope_rt8q_kernel, g8, dim3(256), 0, xd, xp, (int)n, M, r, fmt, sc, (signed char*)qt.data, qp,
+                    (float*)st.data, sp);
+}
 int rope_rt_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
@@ -3791,6 +3886,9 @@ extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kv_store(const RadArgs* a, RadStre
 extern "C" void r4d_rope8_pin(int v) { g_rope8_pin.store(v < 0 ? -1 : (v ? 1 : 0), std::memory_order_relaxed); }
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
     return rope_rt_body(a, s);
+}
+extern "C" int r4d_rad_rope_rows_roundtrip_i8g(const RadArgs* a, RadStream s) {   /* lever A8D (DRAFTER round 94) */
+    return rope_rt_i8g_body(a, s);
 }
 extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return collapse_norm_body(a, s);

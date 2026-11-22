@@ -222,6 +222,14 @@ static const RadOperandSpec oDs41RopeRt[] = {
 static const RadConstraint cDs41RopeRtFp8[] = {
     C_DS41_ROPE, C_IN("format", "fp8_e4m3"), C_IN("scale", "ue8m0 f32"),
 };
+/* lever A8D (DRAFTER round 94): rope_rows_roundtrip + quant_act_i8g's int8 codes of the stored row */
+static const RadOperandSpec oDs41RopeRtI8g[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "cos_sin", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
+    { "q", RAD_OPD_OUT, 0 },   { "scale", RAD_OPD_OUT, 0 },
+};
+static const RadConstraint cDs41RopeRtI8g[] = {
+    C_DS41_ROPE, C_IN("format", "fp8_e4m3"), C_IN("scale", "ue8m0 f32"), C_IN("mode", "gptj"), C_GE("block", 32), C_LE("block", 32),
+};
 static const RadConstraint cDs41RopeRtFp4[] = {
     C_DS41_ROPE, C_IN("format", "fp4_e2m1"), C_IN("scale", "ue8m0 e4m3"),
 };
@@ -350,6 +358,9 @@ static const RadConstraint cDs41PcnMix[] = {
     SCHEMA("rope_rows_roundtrip", pDs41RopeRt, oDs41RopeRt,
            "rope_rows then quant_roundtrip over the n_head * head_dim columns of x, in place: x as the "
            "two ops leave it, each step rounded to dtype where that op stores."),
+    SCHEMA("rope_rows_roundtrip_i8g", pDs41RopeRt, oDs41RopeRtI8g,
+           "rope_rows_roundtrip, then quant_act_i8g (group 128) of the x it leaves into q / scale: x, q and scale as "
+           "the two ops leave them."),
     SCHEMA("mhc_collapse_rmsnorm", pDs41CollapseNorm, oDs41CollapseNorm,
            "mhc_collapse (h, pre -> x), then rmsnorm (x, w -> y): x and y as the two ops leave them, x "
            "rounded to dtype before the norm reads it."),
@@ -501,6 +512,12 @@ static const RadConstraint cDs41PcnMix[] = {
   "bf16 x, f32 cos_sin, i32 positions", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41RopeRtFp8),
   NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip, nullptr, nullptr, nullptr,
   r4d_shape_rope_rows_roundtrip, nullptr, r4d_fuse_rope_rows_roundtrip },
+{ "rope_rows_roundtrip_i8g_bf16", "rope_rows_roundtrip_i8g", "attn",
+  "rope_rows_roundtrip's eight-columns-a-thread form with quant_act_i8g's codes of the stored row on its pass (lever A8D)",
+  "any M; gptj, block 32, E4M3 / ue8m0, n_head * head_dim a multiple of 128, head_dim a multiple of 8, 16-byte x rows",
+  "bf16 x in place, f32 cos_sin, i32 positions, int8 q with an f32 scale per (row, 128)", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDs41RopeRtI8g), NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_rope_rows_roundtrip_i8g, nullptr, nullptr },
 { "rope_rows_roundtrip_fp4_bf16", "rope_rows_roundtrip", "attn",
   "rope_rows then an e2m1 quant_roundtrip, in place, in one pass",
   "any M; a thread a column, the gptj partner by a lane shuffle (head_dim and off even, block a "

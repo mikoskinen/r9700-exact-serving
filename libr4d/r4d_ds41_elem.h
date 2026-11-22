@@ -32,6 +32,7 @@ int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream stream);
 /* rmsnorm_rope_roundtrip + kv_store of its row (lever K1 fold c) */
 int r4d_rad_rmsnorm_rope_roundtrip_kv_store(const RadArgs* a, RadStream stream);
 int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream stream);
+int r4d_rad_rope_rows_roundtrip_i8g(const RadArgs* a, RadStream stream);   /* lever A8D */
 int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 /* lever DPH (DRAFTER track round 68): the same op with the norm in rmsnorm_bf16's 256-lane partition (the chain's bytes) */
@@ -63,6 +64,7 @@ int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand, RadOp
 int r4d_shape_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_rmsnorm_rope_roundtrip_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r4d_shape_rope_rows_roundtrip_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);   /* lever A8D */
 int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_mhc_post_collapse_rmsnorm_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out);

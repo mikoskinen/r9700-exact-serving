@@ -238,6 +238,19 @@ extern "C" int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int ope
     R4D_PICK(l);
 }
 
+/* lever A8D (DRAFTER round 94): rope_rows_roundtrip's operands + q [M, n] int8 and scale [M, n / 128] f32 (n % 128 == 0) */
+extern "C" int r4d_shape_rope_rows_roundtrip_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 3) return r4d_shape_rope_rows_roundtrip(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");
+    if (M <= 0 || nh < 1 || hd < 2 || (nh * hd) % 128) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_I8, M, nh * hd),            /* q */
+        opd((uint32_t)RAD_F32, M, nh * hd / 128),     /* scale */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand,
                                               RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
