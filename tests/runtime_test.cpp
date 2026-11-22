@@ -3366,4 +3366,103 @@ TEST(the_loader_reads_which_kernels_fetch_their_own_rows) {
     CHECK(plain > 0);
 }
 
+/* tp8 loop M6F (RADIANCE_AR_SETS=2), qfn-on-ds Q5b S0 form: a collective issued from a Ctx at pass slot 1 (set_ar_set) takes its
+ * row's second instance (Resolved::instance1), so a pass on a rank's second Ctx never shares an instance's slots and flags with
+ * one on the first; at slot 0 -- on EITHER lane: the Qwen line's lane 1 is a pass's own comm lane -- and for a row without a
+ * second instance, the launch sees the first instance as before. */
+static void* g_inst_seen[1] = { nullptr };
+static int k_inst_seen(const RadArgs* a, RadStream s) {
+    g_inst_seen[0] = a->instance;
+    return record("inst", a, s);
+}
+
+TEST(a_collective_from_pass_slot_1_takes_its_second_instance_set) {
+    static int set0 = 0, set1 = 1;
+    for (int with1 = 0; with1 < 2; ++with1) {
+        Fixture f;
+        f.P.scratch_bytes = kScrBytes;
+        f.P.scratch_regions = 2;
+        rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        rad_op ar = f.add_op("all_reduce", "M", { 8192 }, { k_inst_seen }, { "inst" }, nullptr, {});
+        rad::Resolved& r = f.P.ops[ar].bands[0].dom[RAD_DOMAIN_DEVICE];
+        r.instance = &set0;
+        r.instance1 = with1 ? &set1 : nullptr;
+        CHECK_OK(f.start());
+        int k = 0;
+        for (int slot = 0; slot < 2; ++slot)
+            for (int lane = 0; lane < 2; ++lane) {
+                g_inst_seen[0] = nullptr;
+                f.ctx.set_ar_set(slot);
+                CHECK_OK(f.step(4, 4 * with1 + k++, [&](Ctx& c) {
+                    RadOperand opd[1] = { RAD_B(x) };
+                    CHECK_OK(c.set_lane(lane));
+                    CHECK_OK(c.issue(ar, opd, 1, RAD_N_BATCH));
+                    CHECK_OK(c.set_lane(0));
+                }));
+                CHECK_OK(rad_stream_sync(f.ctx.stream()));
+                CHECK(g_inst_seen[0] == (void*)(slot == 1 && with1 ? &set1 : &set0));
+            }
+        f.ctx.set_ar_set(0);
+        CHECK_EQ(f.ctx.ar_set1_issues(), with1 ? 2LL : 0LL);
+    }
+}
+
+/* Registry::init_instance_set: a collective row's init() again with the frozen geometry plus ar_set = set (the instance
+ * lands in Resolved::instance1 and is finalised with the rest); a row that is not a collective gets none and no call. */
+static int g_init_calls = 0;
+static long long g_init_set = -1;
+static int g_inst_storage[4];
+static int k_init_rec(const RadParam* p, int n_p, int, int, void** out) {
+    ++g_init_calls;
+    g_init_set = 0;
+    for (int i = 0; i < n_p; ++i)
+        if (p[i].key && !std::strcmp(p[i].key, "ar_set") && p[i].kind == RAD_P_INT) g_init_set = p[i].ival;
+    *out = &g_inst_storage[g_init_set > 0 ? 1 : 0];
+    return RAD_OK;
+}
+static int g_fini_calls = 0;
+static void k_fini_rec(void*) { ++g_fini_calls; }
+
+TEST(init_instance_set_passes_ar_set_to_a_collective_rows_init_only) {
+    RadKernelInfo ki{};
+    ki.name = "ar_test";
+    ki.op = "all_reduce";
+    ki.family = "test";
+    ki.domain = RAD_DOMAIN_DEVICE;
+    ki.init = k_init_rec;
+    ki.fini = k_fini_rec;
+    for (int coll = 0; coll < 2; ++coll) {
+        g_init_calls = 0;
+        g_fini_calls = 0;
+        g_init_set = -1;
+        {
+            rad::Registry reg;
+            rad::KernelRow kr{};
+            kr.info = &ki;
+            kr.plugin = "fake";
+            kr.collective = coll != 0;
+            rad::Resolved r;
+            r.row = &kr;
+            r.geom.set_i("numel", 1024);
+            r.geom.set_i("world_size", 2);
+            CHECK_OK(reg.init_instance(r, 0, 2));
+            CHECK_EQ(g_init_set, 0LL);
+            CHECK(r.instance == (void*)&g_inst_storage[0]);
+            CHECK_OK(reg.init_instance_set(r, 0, 2, 1));
+            if (coll) {
+                CHECK_EQ(g_init_calls, 2);
+                CHECK_EQ(g_init_set, 1LL);
+                CHECK(r.instance1 == (void*)&g_inst_storage[1]);
+                CHECK_EQ(reg.n_instances(), (size_t)2);
+            } else {
+                CHECK_EQ(g_init_calls, 1);
+                CHECK(r.instance1 == nullptr);
+                CHECK_EQ(reg.n_instances(), (size_t)1);
+            }
+            reg.fini_instances();
+            CHECK_EQ(g_fini_calls, coll ? 2 : 1);
+        }
+    }
+}
+
 RAD_TEST_MAIN_HOST_KARGS()

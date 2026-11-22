@@ -68,6 +68,10 @@ struct IssuePlan {
     int              gate_n_p = 0;
     /* Resolved::ranged_div: an issued value this does not divide is refused. 0 for most rows. */
     int64_t          ranged_div = 0;
+    /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance, taken in place of args.instance by an
+     * issue from a Ctx whose pass slot is 1 (qfn-on-ds Q5b S0: Ctx::set_ar_set; the DS side branch picked it by lane 1)
+     * (Resolved::instance1); null for every other row and without the env. */
+    void*            instance1 = nullptr;
 };
 
 /* Per declared op. Trivially copyable: it holds offsets into two flat Ctx-owned arrays (bucket
@@ -292,6 +296,13 @@ public:
      * the constraints on a second lane. */
     RadStream       cur_stream() const { return lane_ ? lane1_ : stream_; }
     int             lane()       const { return lane_; }
+    long long       ar_set1_issues() const { return ar_set1_issues_; }   /* tp8 loop M6F */
+    /* qfn-on-ds Q5b S0 (Qwen loop round 22): the pass slot whose collective set this Ctx's issues take -- 0 = the first set
+     * (every pass today), 1 = the second (Resolved::instance1 where RADIANCE_AR_SETS=2 built it): a newcomer's prefill pass on a
+     * rank's second Ctx beside its decode passes. By slot, not by lane: the Qwen line's lane 1 is a pass's own comm lane
+     * (step_pipelined's on1, the delta net's a|b at decode), whose collectives belong to the pass's set. */
+    int             ar_set() const { return ar_set_; }
+    void            set_ar_set(int s) { ar_set_ = s == 1 ? 1 : 0; }
     int             set_lane(int lane);
     /* Builds the second stream and its events on first use; free when no lane is asked for. */
     int             lane_init();
@@ -794,6 +805,9 @@ private:
      * every step that does not ask for lane 1 runs exactly the single-lane path (lane_join, pass_key). */
     RadStream lane1_spare_ = nullptr;
     int       lane_       = 0;
+    /* tp8 loop M6F: collectives issued with the row's second instance set (RADIANCE_AR_SETS=2) */
+    long long ar_set1_issues_ = 0;
+    int       ar_set_ = 0;   /* qfn-on-ds Q5b S0: this Ctx's pass slot (set_ar_set) */
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
     /* fn4 PF marks (16.11.2026, qwen/prefill): lane_join(from, 0x100 + k) records mark k on lane `from`'s stream at its
      * current tail; lane_join(0x200 + k, to) makes lane `to` wait for that point only (not for everything issued on the

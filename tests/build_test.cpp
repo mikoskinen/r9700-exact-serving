@@ -331,6 +331,106 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     CHECK_EQ(plan_level(full, grew, 256, &lv, &why), RAD_E_STATE);
 }
 
+/* tp8 loop M6F step (b): a level packed at the arena's TOP (a decode pass on lane 0) and a level packed from the fixed region
+ * (a BG pass on lane 1) share no byte when both fit, keep the fixed region where it was, and each holds its own transients
+ * apart; a top level that would reach into the fixed region is refused. */
+TEST(a_top_level_and_a_bottom_level_share_no_byte) {
+    auto mk = [](int64_t rows) {
+        Program p;
+        p.buffers.emplace_back();
+        p.ops.resize(6);
+        auto rowbuf = [&](const char* n, int64_t w, int32_t lo, int32_t hi) {
+            BufferInfo b = make_buf(n, rows * w, RAD_BUF_TRANSIENT, lo, hi);
+            b.decl.rank = 2;
+            b.decl.shape[0] = rows;
+            b.decl.shape[1] = w;
+            return b;
+        };
+        p.buffers.push_back(rowbuf("x", 256, 1, 2));
+        p.buffers.push_back(rowbuf("y", 512, 2, 4));
+        p.buffers.push_back(rowbuf("z", 256, 3, 5));
+        p.buffers.push_back(make_buf("state", 4096, RAD_BUF_PERSIST, -1, -1));
+        return p;
+    };
+    Program full = mk(2048);
+    CHECK_OK(plan_buffers(full));
+    std::string why;
+    ArenaLevel dec, bg;
+    CHECK_OK(plan_level(full, mk(64), 64, &dec, &why, /*top=*/true));
+    CHECK_OK(plan_level(full, mk(1024), 1024, &bg, &why));
+    CHECK(dec.top && !bg.top);
+    CHECK_EQ(bg.begin, full.arena_fixed_bytes);
+    CHECK(dec.end <= full.arena_bytes);
+    CHECK(bg.end <= dec.begin);   /* the two passes' transients never meet */
+    CHECK_EQ(dec.offset[4], full.buffers[4].arena_offset);   /* the fixed region stays */
+    for (int i = 1; i <= 3; ++i) {
+        CHECK(dec.offset[(size_t)i] >= dec.begin);
+        CHECK(dec.offset[(size_t)i] + buffer_bytes(dec.decl[(size_t)i]) <= dec.end);
+        CHECK(bg.offset[(size_t)i] + buffer_bytes(bg.decl[(size_t)i]) <= dec.begin);
+    }
+    CHECK(dec.offset[2] + buffer_bytes(dec.decl[2]) <= dec.offset[3] ||
+          dec.offset[3] + buffer_bytes(dec.decl[3]) <= dec.offset[2]);
+    /* the same rows packed at the bottom: the same packed size, another place */
+    ArenaLevel low;
+    CHECK_OK(plan_level(full, mk(64), 64, &low, &why));
+    CHECK_EQ(low.end - low.begin, dec.end - dec.begin);
+    CHECK(low.begin < dec.begin);
+    /* the full rows at the top fill the whole transient region: still in bounds; a probe larger than the plan is refused */
+    ArenaLevel all;
+    CHECK_OK(plan_level(full, mk(2048), 2048, &all, &why, true));
+    CHECK(all.begin >= full.arena_fixed_bytes && all.end <= full.arena_bytes);
+    CHECK_EQ(plan_level(full, mk(4096), 4096, &all, &why, true), RAD_E_STATE);
+}
+
+TEST(a_bg_level_shifted_above_the_decode_rung_shares_no_byte_and_keeps_the_top_free) {
+    /* tp8 loop M6F (b), DECODE round 18: the follower's BG level moved above its largest decode rung (shift_level), not
+     * packed at the arena's top: the expert slab's loan grows down from the top */
+    auto mk = [](int64_t rows) {
+        Program p;
+        p.buffers.emplace_back();
+        p.ops.resize(6);
+        auto rowbuf = [&](const char* n, int64_t w, int32_t lo, int32_t hi) {
+            BufferInfo b = make_buf(n, rows * w, RAD_BUF_TRANSIENT, lo, hi);
+            b.decl.rank = 2;
+            b.decl.shape[0] = rows;
+            b.decl.shape[1] = w;
+            return b;
+        };
+        p.buffers.push_back(rowbuf("x", 256, 1, 2));
+        p.buffers.push_back(rowbuf("y", 512, 2, 4));
+        p.buffers.push_back(rowbuf("z", 256, 3, 5));
+        p.buffers.push_back(make_buf("state", 4096, RAD_BUF_PERSIST, -1, -1));
+        return p;
+    };
+    Program full = mk(4096);
+    CHECK_OK(plan_buffers(full));
+    std::string why;
+    ArenaLevel dec, bg, sh;
+    CHECK_OK(plan_level(full, mk(256), 256, &dec, &why));
+    CHECK_OK(plan_level(full, mk(2048), 2048, &bg, &why));
+    CHECK_EQ(bg.begin, full.arena_fixed_bytes);
+    CHECK(bg.end > dec.begin);   /* as packed, the two overlap */
+    CHECK_OK(shift_level(bg, dec.end, full.arena_fixed_bytes, full.arena_bytes, &sh, &why));
+    CHECK(sh.begin >= dec.end && sh.begin % 256 == 0);
+    CHECK_EQ(sh.end - sh.begin, bg.end - bg.begin);
+    CHECK(sh.end <= full.arena_bytes);
+    CHECK_EQ(sh.offset[4], full.buffers[4].arena_offset);   /* the persistent buffer stays */
+    for (int i = 1; i <= 3; ++i) {
+        CHECK_EQ(sh.offset[(size_t)i] - sh.begin, bg.offset[(size_t)i] - bg.begin);   /* the same packing, moved */
+        CHECK(sh.offset[(size_t)i] >= dec.end);
+        for (int j = 1; j <= 3; ++j)   /* no BG transient meets a decode-rung transient */
+            CHECK(sh.offset[(size_t)i] >= dec.offset[(size_t)j] + buffer_bytes(dec.decl[(size_t)j]) ||
+                  dec.offset[(size_t)j] >= sh.offset[(size_t)i] + buffer_bytes(sh.decl[(size_t)i]));
+    }
+    /* the loan's room above it is the arena past sh.end; past the arena or into the fixed region is refused, a top level too */
+    CHECK_EQ(shift_level(bg, full.arena_bytes - (bg.end - bg.begin) + 1, full.arena_fixed_bytes, full.arena_bytes, &sh, &why),
+             RAD_E_STATE);
+    CHECK_EQ(shift_level(bg, full.arena_fixed_bytes - 256, full.arena_fixed_bytes, full.arena_bytes, &sh, &why), RAD_E_STATE);
+    ArenaLevel top;
+    CHECK_OK(plan_level(full, mk(64), 64, &top, &why, /*top=*/true));
+    CHECK_EQ(shift_level(top, dec.end, full.arena_fixed_bytes, full.arena_bytes, &sh, &why), RAD_E_STATE);
+}
+
 /* tp8 loop FINDINGS F43: a buffer read AFTER the step (deepseek41's engram_tokens: lever TI patches a snapshot's CONV
  * window from it behind the pass) must outlive its last declared use. As a transient whose last use comes early (the
  * pipeline follower's layer 14 at W(10,32)) the packer lays a later-born transient over it at the full plan and at a

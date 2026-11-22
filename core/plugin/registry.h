@@ -292,6 +292,9 @@ public:
      * rank and world size, off the hot path: e.g. libr4d's all-reduce sets up peer signal buffers
      * and IPC handles here. A negative return aborts startup; the caller names the kernel. */
     int  init_instance(Resolved& r, int rank, int world_size);
+    /* tp8 loop M6F: a collective row's second instance (Resolved::instance1), init() with the frozen geometry plus
+     * `ar_set` = set, for passes issued on a rank's second stream (RADIANCE_AR_SETS=2; Builder::finish_instances). */
+    int  init_instance_set(Resolved& r, int rank, int world_size, int set);
     void fini_instances();
     size_t n_instances() const;
 

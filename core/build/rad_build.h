@@ -71,6 +71,11 @@ int plan_buffers(Program& p, BufPlanReport* rep = nullptr);
 struct ArenaLevel {
     int64_t rows = 0;
     int64_t end = 0;
+    /* The first byte of the level's transients: the fixed region's end, or for a level packed at the arena's top (tp8 loop
+     * M6F step (b): a decode pass on lane 0 beside a BG pass on lane 1, which keeps a level below it) arena_bytes less its
+     * packed size. */
+    int64_t begin = 0;
+    bool    top = false;
     std::vector<int64_t>    offset;
     std::vector<RadBufDecl> decl;
 };
@@ -78,7 +83,16 @@ struct ArenaLevel {
  * in `why`, unless both declares describe the same buffers with only fewer rows; otherwise they
  * cannot share the real plan's fixed region and kernels. */
 int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLevel* out,
-               std::string* why);
+               std::string* why, bool top = false);
+
+/* tp8 loop M6F step (b), DECODE round 18: `lv` (a level packed from the fixed region's end) moved so its transients start
+ * at `begin` (kBufAlign-aligned up), the persistent / host buffers where they are. The follower's BG levels sit ABOVE the
+ * largest decode rung this way (a BG pass on lane 1 and a decode pass on lane 0 then share no transient byte), and below
+ * the arena's top, where the expert slab's loan grows down from (LoanStrip top = the arena's end) -- a level packed at the
+ * top (plan_level's `top`) would sit inside that loan. Refused (RAD_E_STATE, `why`) when it would start inside the fixed
+ * region or end past arena_bytes. */
+int shift_level(const ArenaLevel& lv, int64_t begin, int64_t arena_fixed_bytes, int64_t arena_bytes,
+                ArenaLevel* out, std::string* why);
 
 /* Whether `rows` may be the activation arena's decode rung (lever VA "arena",
  * RADIANCE_DS41_ARENA_DECODE_ROWS) below a ladder whose first rung is `lo`; the reason in `why`

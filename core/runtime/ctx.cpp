@@ -476,6 +476,7 @@ int Ctx::bind_ops() {
                     ip.args.scratch       = arena_.scratch();
                     ip.args.scratch_bytes = r.scratch_bytes;
                     ip.args.instance      = r.instance;
+                    ip.instance1          = r.instance1;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
                     ip.args.wgp_count     = wgp_count_;

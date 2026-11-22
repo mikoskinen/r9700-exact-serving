@@ -484,6 +484,29 @@ int Registry::init_instance(Resolved& r, int rank, int world_size) {
     return RAD_OK;
 }
 
+int Registry::init_instance_set(Resolved& r, int rank, int world_size, int set) {
+    if (!r.row || !r.row->info || set <= 0) return RAD_E_INVAL;
+    const RadKernelInfo* k = r.row->info;
+    if (!k->init || !r.row->collective) { r.instance1 = nullptr; return RAD_OK; }
+    std::vector<RadParam> ps(r.geom.params(), r.geom.params() + r.geom.n_params());
+    RadParam s{};
+    s.key = "ar_set";
+    s.kind = RAD_P_INT;
+    s.ival = set;
+    ps.push_back(s);
+    void* inst = nullptr;
+    const int st = k->init(ps.data(), (int)ps.size(), rank, world_size, &inst);
+    if (st < 0) {
+        RAD_ERR("kernel '%s' (%s) failed to initialise its instance set %d for %s: %s", k->name, r.row->plugin.c_str(),
+                set, r.geom.str().c_str(), rad_strerror(st));
+        return st;
+    }
+    r.instance1 = inst;
+    std::lock_guard<std::mutex> lk(mu_);
+    instances_.emplace_back(k, inst);
+    return RAD_OK;
+}
+
 void Registry::fini_instances() {
     std::vector<std::pair<const RadKernelInfo*, void*>> take;
     {

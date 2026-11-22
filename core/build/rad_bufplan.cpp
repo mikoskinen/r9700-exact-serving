@@ -150,7 +150,7 @@ int plan_buffers(Program& p, BufPlanReport* rep) {
 /* ------------------------------------------------------------------ a smaller step's plan */
 
 int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLevel* out,
-               std::string* why) {
+               std::string* why, bool top) {
     auto refuse = [&](const std::string& w) {
         if (why) *why = w;
         return RAD_E_STATE;
@@ -204,16 +204,43 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
     }
 
     const int64_t tr_end = pack(transient);
-    for (const Item& it : transient) lv.offset[it.idx] = full.arena_fixed_bytes + it.off;
-    lv.end = full.arena_fixed_bytes + tr_end;
-    if (lv.end > full.arena_bytes)
+    /* tp8 loop M6F step (b): `top` packs the same transients against the arena's end instead of the fixed region's, so a
+     * pass at this level and one at a level below `begin` never share a byte (kBufAlign-aligned: arena_bytes is) */
+    lv.top = top;
+    lv.begin = top ? (full.arena_bytes - tr_end) / kBufAlign * kBufAlign : full.arena_fixed_bytes;
+    for (const Item& it : transient) lv.offset[it.idx] = lv.begin + it.off;
+    lv.end = lv.begin + tr_end;
+    if (lv.end > full.arena_bytes || lv.begin < full.arena_fixed_bytes)
         return refuse(fmt("packing the smaller buffers took %lld bytes, more than the full plan's "
-                          "%lld", (long long)lv.end, (long long)full.arena_bytes));
+                          "%lld", (long long)(full.arena_fixed_bytes + tr_end), (long long)full.arena_bytes));
     *out = std::move(lv);
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ the decode rung's rows */
+
+int shift_level(const ArenaLevel& lv, int64_t begin, int64_t arena_fixed_bytes, int64_t arena_bytes,
+                ArenaLevel* out, std::string* why) {
+    const int64_t at = (begin + kBufAlign - 1) / kBufAlign * kBufAlign;
+    const int64_t size = lv.end - lv.begin;
+    if (lv.top || lv.begin != arena_fixed_bytes || size < 0 || at < arena_fixed_bytes || at + size > arena_bytes) {
+        if (why)
+            *why = fmt("a %lld-row level of %lld bytes cannot start at %lld (the fixed region ends at %lld, the arena at %lld%s)",
+                       (long long)lv.rows, (long long)size, (long long)at, (long long)arena_fixed_bytes,
+                       (long long)arena_bytes, lv.top || lv.begin != arena_fixed_bytes ? "; not a bottom level" : "");
+        return RAD_E_STATE;
+    }
+    ArenaLevel s = lv;
+    const int64_t d = at - lv.begin;
+    for (size_t i = 0; i < s.offset.size(); ++i)
+        if (s.offset[i] >= lv.begin && s.offset[i] < lv.end && s.decl[i].kind == RAD_BUF_TRANSIENT &&
+            s.decl[i].domain != RAD_DOMAIN_HOST)
+            s.offset[i] += d;
+    s.begin = at;
+    s.end = at + size;
+    *out = std::move(s);
+    return RAD_OK;
+}
 
 /* Lever VA "arena" (RADIANCE_DS41_ARENA_DECODE_ROWS, Engine::probe_arena_levels): the decode rung's
  * rows, from kArenaDecodeRowsMin to kArenaDecodeRowsMax and below the ladder's first rung `lo`.

@@ -1133,6 +1133,16 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             la = &gate_args;
         }
     }
+    /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective issued from the second pass slot takes the row's second instance set,
+     * so a pass on a rank's second Ctx never shares an instance's slots with one on the first (qfn-on-ds Q5b S0: by the
+     * Ctx's slot, ar_set_, not by lane 1 -- the Qwen line's lane 1 carries a pass's own collectives) */
+    RadArgs set_args;
+    if (ip.instance1 && ar_set_ == 1) {
+        set_args = *la;
+        set_args.instance = ip.instance1;
+        la = &set_args;
+        ++ar_set1_issues_;
+    }
 
     int s;
     if (profiling_ && dom == RAD_DOMAIN_HOST) {

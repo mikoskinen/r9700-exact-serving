@@ -529,15 +529,21 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
  *
  * The rendezvous stays symmetric because every rank declares the same graph in the same order:
  * the Nth all-reduce misses the cache on every rank or on none. */
+/* `set` (tp8 loop M6F, the core's second collective instance set): the geometry's `ar_set` parameter, 0 when absent --
+ * the core inits a collective row a second time with ar_set 1 for passes issued on its second stream, so two passes in
+ * flight on two streams never share a slot's parity or flags (the sharing argument above holds a stream at a time).
+ * Every rank inits set 1 in the same declared order, so the rendezvous stays symmetric. */
 struct CacheKey {
     int       rank, world, dtype;
     long long numel;
     int       host;
+    int       set = 0;
     bool operator==(const CacheKey& o) const {
         return rank == o.rank && world == o.world && dtype == o.dtype && numel == o.numel &&
-               host == o.host;
+               host == o.host && set == o.set;
     }
 };
+int ar_set_of(const RadParam* p, int n_p) { return (int)pgeti_hi(p, n_p, "ar_set", 0); }
 
 struct CacheSlot {
     CacheKey key;
@@ -616,7 +622,7 @@ static int ar_init(const RadParam* p, int n_p, int rank, int world, int host, vo
     if (numel <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, dt, numel, host }, &in);
+    int rc = acquire(CacheKey{ rank, world, dt, numel, host, ar_set_of(p, n_p) }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -643,7 +649,7 @@ static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, int ho
     if (M <= 0 || K <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K, host }, &in);
+    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K, host, ar_set_of(p, n_p) }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -1658,7 +1664,7 @@ extern "C" int r4d_rad_sp_rows_init(const RadParam* p, int n_p, int rank, int wo
     const long long bound = pgeti_hi(p, n_p, "bound", numel);
     if (numel <= 0 || bound <= 0) return RAD_E_INVAL;
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, dt, bound, 0 }, &in);
+    int rc = acquire(CacheKey{ rank, world, dt, bound, 0, ar_set_of(p, n_p) }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -1680,7 +1686,7 @@ extern "C" int r4d_rad_sp_rows_f32_init(const RadParam* p, int n_p, int rank, in
     const long long bound = pgeti_hi(p, n_p, "bound", numel);
     if (numel <= 0 || bound <= 0) return RAD_E_INVAL;
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, 0, 2 * bound, 0 }, &in);
+    int rc = acquire(CacheKey{ rank, world, 0, 2 * bound, 0, ar_set_of(p, n_p) }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;

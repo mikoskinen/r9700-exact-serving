@@ -73,6 +73,9 @@ struct KernelRow {
 struct Resolved {
     const KernelRow* row = nullptr;
     void*            instance = nullptr;
+    /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance (its own scratch, flags and sequence
+     * counters: `ar_set` 1), taken by a pass issued on the rank's second stream; null otherwise. */
+    void*            instance1 = nullptr;
     /* The frozen geometry, including the tuned axes, so RadArgs.p carries them and the kernel
      * reads `sk` with rad_args_geti() like `M`. There is no variant index. */
     Geometry         geom;

@@ -49,7 +49,12 @@ struct Group {
     uint32_t     dt  [REF_MAX_RANKS] = {};
 };
 
-static Group& group() { static Group g; return g; }
+/* tp8 loop M6F: a second group for the core's second collective instance set (geometry `ar_set` 1): the passes issued on
+ * a rank's second stream pair among themselves, in their own order, never with a first-stream collective. Set 0 is the
+ * group every collective used before; an op reaches its set's group through its instance (null: set 0). */
+enum { REF_SETS = 2 };
+static Group& group(int set = 0) { static Group g[REF_SETS]; return g[set > 0 && set < REF_SETS ? set : 0]; }
+static Group& group_of(const RadArgs* a) { return a && a->instance ? *(Group*)a->instance : group(); }
 
 /* How long a rank waits for its peers. A collective must block, but an unbounded wait would turn a
  * mismatched call sequence into a silent hang; the engine exits non-zero instead (spec §17). 30 s is
@@ -77,10 +82,9 @@ static bool barrier(Group& g) {
 /* The world size is fixed while it is in use: while an initialised instance is alive or a rank is
  * mid-collective. Otherwise the next join may state another one, so a process can run one group
  * after another (a re-initialised engine, a test). `member` counts an init, which fini releases. */
-static int join(int rank, int world, bool member) {
+static int join(Group& g, int rank, int world, bool member) {
     if (world <= 0 || world > REF_MAX_RANKS) return RAD_E_UNSUPPORTED;
     if (rank < 0 || rank >= world) return RAD_E_INVAL;
-    Group& g = group();
     std::lock_guard<std::mutex> lk(g.m);
     if (g.world == 0 || (g.members == 0 && g.arrived == 0)) g.world = world;
     else if (g.world != world) return RAD_E_INVAL;
@@ -90,10 +94,9 @@ static int join(int rank, int world, bool member) {
 
 /* Publishes this rank's input and waits until every rank has published a matching one. Peers read
  * each other's input as `nel` contiguous elements, since only the pointer is published. */
-static int publish(int rank, int world, const RadTensor* x, int64_t nel) {
+static int publish(Group& g, int rank, int world, const RadTensor* x, int64_t nel) {
     if (!rad_tensor_is_contiguous(x)) return RAD_E_STRIDE;
-    RAD_REF_TRY(join(rank, world, false));
-    Group& g = group();
+    RAD_REF_TRY(join(g, rank, world, false));
     {
         std::lock_guard<std::mutex> lk(g.m);
         g.slot[rank] = x->data;
@@ -126,17 +129,21 @@ int ref_collective_init(const RadParam* p, int n_p, int rank, int world_size,
     for (int i = 0; i < n_p; ++i)
         if (p[i].key && std::strcmp(p[i].key, "world_size") == 0 && p[i].kind == RAD_P_INT)
             ws = (int)p[i].ival;
+    int set = 0;
+    for (int i = 0; i < n_p; ++i)
+        if (p[i].key && std::strcmp(p[i].key, "ar_set") == 0 && p[i].kind == RAD_P_INT) set = (int)p[i].ival;
+    if (set < 0 || set >= REF_SETS) return RAD_E_INVAL;
     if (out) *out = nullptr;
     if (ws <= 1) return RAD_OK;
-    RAD_REF_TRY(join(rank, ws, true));
-    if (out) *out = &group();
+    RAD_REF_TRY(join(group(set), rank, ws, true));
+    if (out) *out = &group(set);
     return RAD_OK;
 }
 
 /* Pairs with an init that joined (its instance is the group); one that did not has none. */
 void ref_collective_fini(void* inst) {
     if (!inst) return;
-    Group& g = group();
+    Group& g = *(Group*)inst;
     std::lock_guard<std::mutex> lk(g.m);
     if (g.members > 0) --g.members;
 }
@@ -172,8 +179,8 @@ int ref_all_reduce(const RadArgs* a, RadStream) {
         if (y) for (int64_t i = 0; i < nel; ++i) stt(y, offlin(y, i), ldt(x, offlin(x, i)));
         return RAD_OK;
     }
-    RAD_REF_TRY(publish(a->rank, world, x, nel));
-    Group& g = group();
+    Group& g = group_of(a);
+    RAD_REF_TRY(publish(g, a->rank, world, x, nel));
     float* acc = staging(a, nel);
     for (int64_t i = 0; i < nel; ++i) {
         float s = 0.0f;
@@ -214,8 +221,8 @@ int ref_all_gather(const RadArgs* a, RadStream) {
         return RAD_OK;
     }
 
-    RAD_REF_TRY(publish(a->rank, world, x, nel));
-    Group& g = group();
+    Group& g = group_of(a);
+    RAD_REF_TRY(publish(g, a->rank, world, x, nel));
     /* Placement. `row` absent (or the whole message) is plain concatenation; present, it is
      * row-interleaved, x [rows][row] into y [rows][world][row], the form the vocab-parallel
      * candidate merge reads (one row of candidates per sampled position at one stride). */
@@ -281,8 +288,8 @@ int ref_reduce_scatter_rows(const RadArgs* a, RadStream) {
     int world = 1;
     RAD_REF_TRY(rows_args(a, &x, &nel, &rows, &row, &world));
     if (world <= 1) return RAD_OK;
-    RAD_REF_TRY(publish(a->rank, world, x, nel));
-    Group& g = group();
+    Group& g = group_of(a);
+    RAD_REF_TRY(publish(g, a->rank, world, x, nel));
     int64_t lo = 0, hi = 0;
     shard_of(a->rank, rows, world, &lo, &hi);
     const int64_t i0 = lo * row, n = (hi - lo) * row;
@@ -306,8 +313,8 @@ int ref_all_gather_rows(const RadArgs* a, RadStream) {
     if (world <= 1) return RAD_OK;
     const int64_t esz = rad_dtype_bytes(x->dtype, 1);
     if (esz <= 0) return RAD_E_DTYPE;
-    RAD_REF_TRY(publish(a->rank, world, x, nel));
-    Group& g = group();
+    Group& g = group_of(a);
+    RAD_REF_TRY(publish(g, a->rank, world, x, nel));
     /* rank r writes only its peers' rows of its own x, which no peer reads (each reads only the owner's rows) */
     for (int r = 0; r < world; ++r) {
         if (r == a->rank) continue;

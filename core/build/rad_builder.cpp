@@ -594,17 +594,35 @@ void Builder::resolve_bands(OpInfo& oi) {
     }
 }
 
+/* tp8 loop M6F: RADIANCE_AR_SETS=2 (read once) gives every collective row a second instance (Resolved::instance1) for passes
+ * issued on a rank's second stream, so a BG body there and a decode pass on stream 0 never share an instance's slots;
+ * unset or anything else: one set, as before. */
+static int ar_sets() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_AR_SETS");
+        return e && e[0] == '2' && !e[1] ? 2 : 1;
+    }();
+    return v;
+}
+
 /* init() once per resolved instance (op, band, domain), after the whole graph has resolved
  * (spec §2.1; see rad_build.h). A negative init means the kernel refused an instance it matched:
  * the band becomes a miss reported here rather than at the first launch. */
 void Builder::finish_instances() {
+    int sets1 = 0;   /* tp8 loop M6F: collective rows given a second instance set */
     for (size_t i = 1; i < prog_.ops.size(); ++i) {
         OpInfo& oi = prog_.ops[i];
         for (Band& b : oi.bands) {
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance set, right after the first, so every
+                 * rank builds both in the same declared order */
+                if (s >= 0 && ar_sets() >= 2 && r.row->collective && !prog_.ctx.shape_probe) {
+                    s = reg_.init_instance_set(r, prog_.ctx.rank, prog_.ctx.world_size, 1);
+                    sets1 += s >= 0 && r.instance1 ? 1 : 0;
+                }
                 if (s >= 0) continue;
 
                 err(s, "%s: kernel %s matched %s and then its init() refused the instance: %s",
@@ -617,6 +635,9 @@ void Builder::finish_instances() {
             }
         }
     }
+    if (sets1 > 0 && prog_.ctx.rank == 0)
+        RAD_INFO("RADIANCE_AR_SETS=2 (tp8 loop M6F): %d collective instance(s) have a second set, taken by passes issued from "
+                 "a rank's second pass slot (Ctx::set_ar_set 1; qfn-on-ds Q5b S0)", sets1);
 }
 
 /* Hand each tune request the instance finish_instances() made for its kernel: a collective's
