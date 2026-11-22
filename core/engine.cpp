@@ -312,7 +312,10 @@ Engine::~Engine() {
      * landing in a freed arena is a GPU memory fault. */
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
-    for (auto& r : ranks_) r->ctx.shutdown();
+    for (auto& r : ranks_) {
+        r->ctx.shutdown();
+        if (r->bg_ready) r->bg_ctx.shutdown();   /* qfn-on-ds lever BGL stage 2 */
+    }
     /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
      * since a pass reads them. Safe after a failed bring-up. */
     for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
@@ -799,7 +802,7 @@ void Engine::missl_close() {
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
     MissRank* const ml = missl_ ? missl_->rank(index) : nullptr;
-    if (r.ctx.bind_thread() < 0) {
+    if (r.ctx.bind_thread() < 0 || (r.bg_ready && r.bg_ctx.bind_thread() < 0)) {
         RAD_ERR("rank %d: could not bind its device", index);
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
     }
@@ -880,12 +883,12 @@ void Engine::rank_loop(int index) {
                     tip_row = 0;
                 }
             }
-            int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            int s = what == kIssueSampler ? RAD_OK : r.cx().run_step(b);
             if (tip_row > 0) (void)fn4::tip_set(index, 0, nullptr, nullptr);
             if (hiss) hiss_t1_ = rad_mono_ns();
             if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
-                RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
+                RAD_ERR("rank %d step %d: %s", index, b->step, r.cx().step_error());
                 step_status_.store(s, std::memory_order_release);
             } else if (b->n_out > 0 && what != kIssueModel && what != kIssueFollower) {
                 /* Wait for the scheduler's sampler staging, which runs while the device executes
@@ -901,7 +904,7 @@ void Engine::rank_loop(int index) {
                 if (bst >= 0) {
                     /* The scored rows first: the sampler may rewrite a row in place. */
                     if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
-                    if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
+                    if (s >= 0) s = r.smp().run(&r.cx(), r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
@@ -1326,6 +1329,10 @@ int Engine::step_loop() {
         if (bgl1m_ && !issued) {
             const int lane = lanes_.inbox_n(1) > 0 ? 1 : 0;
             lanes_.set_planners({ 1 - lane });
+            /* stage 2 (WIP, serial): every rank's first Ctx drained before a lane-1 step starts on its second -- a block the commit
+             * just freed may still be written behind a lane-0 step on a follower rank (one stream orders that today) */
+            if (lane == 1 && ranks_[0]->bg_ready)
+                for (auto& rk : ranks_) (void)rk->ctx.sync_all();
             lane_select(lane);
         }
         if (issued) lsched().promote_next();
@@ -1352,7 +1359,7 @@ int Engine::step_loop() {
              * may be what blocks the next admission. Drain the streams first so no in-flight pass
              * still reads them. */
             if (sched_.has_deferred()) {
-                for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
+                for (auto& rk : ranks_) (void)rad_stream_sync(rk->cx().stream());
                 sched_.release_deferred();
             }
             tier_tick();
@@ -1412,9 +1419,9 @@ int Engine::step_loop() {
                 if (!rq) continue;
                 bool failed = false;
                 for (auto& rk : ranks_) {
-                    if (rk->sampler.has_request(rq->id)) continue;
+                    if (rk->smp().has_request(rq->id)) continue;
                     std::string err;
-                    if (rk->sampler.begin_request(rq->id, rq->sp, &err) < 0) {
+                    if (rk->smp().begin_request(rq->id, rq->sp, &err) < 0) {
                         RAD_ERR("sampler: request %llu could not be started: %s; cancelling it",
                                 (unsigned long long)rq->id, err.c_str());
                         failed = true;
@@ -1422,11 +1429,11 @@ int Engine::step_loop() {
                     }
                 }
                 if (failed) {
-                    for (auto& rk : ranks_) rk->sampler.end_request(rq->id);
+                    for (auto& rk : ranks_) rk->smp().end_request(rq->id);
                     cancel.push_back(rq->id);
                     continue;
                 }
-                rq->speculation_fixed = ranks_[0]->sampler.speculation_fixed(rq->id);
+                rq->speculation_fixed = ranks_[0]->smp().speculation_fixed(rq->id);
             }
             if (t_on) phase_mark(PH_BEGIN);
             /* Lever SD: a prompt-lookup proposal (the hybrid's, or the lookup filling an empty one) was not drawn
@@ -1437,15 +1444,15 @@ int Engine::step_loop() {
                     if (!e.produces_token || !e.ngram || e.n_spec <= 0) continue;
                     ++couple_n_lookup_;
                     for (auto& rk : ranks_) {
-                        const int cs = rk->sampler.set_mtp_couple(e.seq, nullptr, 0);
+                        const int cs = rk->smp().set_mtp_couple(e.seq, nullptr, 0);
                         if (cs < 0 && cs != RAD_E_NOTFOUND) return cs;
                     }
                 }
             for (auto& rk : ranks_) {
-                const int s = rk->sampler.build_step(so.reqs, b->step);
+                const int s = rk->smp().build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
                 /* A request the sampler could not serve is cancelled; the step goes on. */
-                for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);
+                for (uint64_t id : rk->smp().take_failed()) cancel.push_back(id);
             }
             if (t_on) phase_mark(PH_BUILD);
         }
@@ -1605,7 +1612,7 @@ int Engine::step_loop() {
         }
 
         /* Buffer probe after the trunk step; drafters dump after their own passes. */
-        dump_buffers(ranks_[0]->ctx, b->step);
+        dump_buffers(ranks_[0]->cx(), b->step);
 
         /* --profile-ops also prints during the run. Counters are cumulative, so each dump covers
          * the run so far. Every 32 steps by default (RADIANCE_PROFILE_EVERY): per-op timing
@@ -1617,7 +1624,7 @@ int Engine::step_loop() {
             return n > 0 ? n : 32;
         }();
         if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0) {
-            for (auto& rk : ranks_) rk->ctx.dump_profile();
+            for (auto& rk : ranks_) rk->cx().dump_profile();
             /* RADIANCE_DEBUG_MISS_LOG: which step this table set stands behind. */
             if (missl_) missl_->profile_mark(b->step, false);
         }
@@ -1633,8 +1640,8 @@ int Engine::step_loop() {
             std::string ids;
             const int64_t n = std::min<int64_t>(b->n_tok, 32);
             std::vector<int32_t> host((size_t)n);
-            if (rad_memcpy_async(host.data(), b->token_ids, n * 4, ranks_[0]->ctx.stream()) >= 0 &&
-                rad_stream_sync(ranks_[0]->ctx.stream()) >= 0) {
+            if (rad_memcpy_async(host.data(), b->token_ids, n * 4, ranks_[0]->cx().stream()) >= 0 &&
+                rad_stream_sync(ranks_[0]->cx().stream()) >= 0) {
                 for (int64_t i = 0; i < n; ++i) ids += fmt("%s%d", i ? " " : "", host[(size_t)i]);
                 RAD_TRACE("step %d in: [%s%s]", b->step, ids.c_str(),
                           b->n_tok > n ? " ..." : "");
@@ -1695,7 +1702,12 @@ int Engine::step_loop() {
         lsched().publish(/*idle=*/false);
         /* lever BGL: back to lane 0 between steps (the HTTP side's reads go to the lane set; lane_select only names the lane the
          * step loop works on) */
-        if (bgl1m_ && cur_sched_ != &sched_) lane_select(0);
+        if (bgl1m_ && cur_sched_ != &sched_) {
+            /* stage 2 (WIP, serial): the lane-1 step drained on every rank's second Ctx before lane 0 reads its newcomer */
+            if (ranks_[0]->bg_ready)
+                for (auto& rk : ranks_) (void)rk->bg_ctx.sync_all();
+            lane_select(0);
+        }
 
         /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
          * shows up in `collect`, the step's only host synchronisation. */
@@ -1740,28 +1752,28 @@ int Engine::collect_issue(StepOut& so, bool fence) {
     so.early = false;
     if (so.n_rows <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
-    void* src = r0.ctx.buf_ptr(r0.tok_buf);
+    void* src = r0.cx().buf_ptr(r0.tok_buf);
     if (!src) {
         RAD_ERR("the sampler's token buffer has no address -- it was declared but never planned");
         return RAD_E_STATE;
     }
     so.rb = readback_.reserve(so.n_rows);
     if (!so.rb) return RAD_E_NOMEM;
-    RAD_TRY(rad_memcpy_async(so.rb, src, (int64_t)so.n_rows * 4, r0.ctx.stream()));
+    RAD_TRY(rad_memcpy_async(so.rb, src, (int64_t)so.n_rows * 4, r0.cx().stream()));
 
     /* The first logits row at -vv, the only direct view of the forward pass's output (rad-kbench
      * checks single ops, not whole layers). */
     const int64_t nv = meta_.n_vocab;
     if ((int)log_level() >= (int)Log::Trace && nv > 0) {
-        void* lp = r0.ctx.buf_ptr(r0.program.logits_buf);
+        void* lp = r0.cx().buf_ptr(r0.program.logits_buf);
         if (lp) {
             so.lg.resize((size_t)nv);
-            rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.ctx.stream());
+            rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.cx().stream());
         }
         return RAD_OK;
     }
     if (fence && early_ids_) {
-        RAD_TRY(rad_event_record(tok_end_, r0.ctx.stream()));
+        RAD_TRY(rad_event_record(tok_end_, r0.cx().stream()));
         so.early = true;
     }
     return RAD_OK;
@@ -1794,7 +1806,7 @@ int Engine::stream_probe_issue(const RadBatch* b) {
         /* Zeroed, so a group whose first copy has not landed reads as no calls yet. */
         std::memset(stream_ctl_p_, 0, n * 16 * sizeof(int32_t));
     }
-    RadStream st = ranks_[0]->ctx.stream();
+    RadStream st = ranks_[0]->cx().stream();
     for (size_t i = 0; i < n; ++i) {
         const RadKVStream* sv = b->kv[i].stream;
         if (!sv || !sv->ctl) continue;
@@ -1815,7 +1827,7 @@ int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request
     if (!b || !stream_ctl_p_ || b->n_kv_groups <= 0) return RAD_OK;
     const size_t n = (size_t)b->n_kv_groups;
     if (stream_prev_.size() < n) stream_prev_.assign(n, StreamRead{});
-    RadStream st = ranks_[0]->ctx.stream();
+    RadStream st = ranks_[0]->cx().stream();
     bool       overflowed = false;
     std::string overflow_why;
     for (size_t i = 0; i < n; ++i) {
@@ -1883,7 +1895,7 @@ void Engine::stream_report(const char* when, const StreamRead& r, const StreamRe
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
     if (embedding_) RAD_TRY(collect_pooled_issue(b, so));
     else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(so));
-    return rad_event_record(step_end_, ranks_[0]->ctx.stream());
+    return rad_event_record(step_end_, ranks_[0]->cx().stream());
 }
 
 /* Issue the copy of an embedding step's pooled rows (the first n_seq) into pinned memory on rank
@@ -1891,14 +1903,14 @@ int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
 int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
     if (b->n_seq <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
-    const void* src = r0.ctx.buf_ptr(r0.program.pooled_buf);
+    const void* src = r0.cx().buf_ptr(r0.program.pooled_buf);
     if (!src) {
         RAD_ERR("the pooled output was declared but never planned");
         return RAD_E_STATE;
     }
     return rad_memcpy_async(pooled_host_, src,
                             (int64_t)b->n_seq * pooled_dim_ * (int64_t)sizeof(float),
-                            r0.ctx.stream());
+                            r0.cx().stream());
 }
 
 /* Hand each sequence's vector to its sink, and set eos for every sequence so the commit finishes
@@ -1958,7 +1970,7 @@ int Engine::restore_checkpoints() {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                 const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
                                                         (int)ckpt_slots_.size(),
-                                                        e.ckpt_restore, rk->ctx.stream(),
+                                                        e.ckpt_restore, rk->cx().stream(),
                                                         &ckpt_win_);
                 if (s < 0) {
                     RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
@@ -2038,7 +2050,7 @@ int Engine::save_checkpoints() {
                                     st = RAD_E_STATE;
                                     break;
                                 }
-                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->ctx.stream());
+                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->cx().stream());
                             }
                         }
                         t.row = 0; t.ck = -1;
@@ -2073,7 +2085,7 @@ int Engine::save_checkpoints() {
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                     const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
                                                          (int)ckpt_slots_.size(),
-                                                         e.ckpt_slot, rk->ctx.stream(),
+                                                         e.ckpt_slot, rk->cx().stream(),
                                                          &ckpt_win_);
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
@@ -2093,7 +2105,7 @@ int Engine::save_checkpoints() {
                             return RAD_E_STATE;
                         }
                         const int ps = rk->kv.checkpoint_patch_conv(
-                            e.ckpt_slot, (const char*)ids + (first - ctx) * 4, ctx, rk->ctx.stream());
+                            e.ckpt_slot, (const char*)ids + (first - ctx) * 4, ctx, rk->cx().stream());
                         if (ps < 0) {
                             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
                             return ps;
@@ -2115,7 +2127,7 @@ int Engine::tip_stage(void* u, int group, int layer, void* stream) {
     TipRank* t = static_cast<TipRank*>(u);
     if (!t || !t->e || t->row <= 0 || t->ck < 0) return RAD_E_STATE;
     Rank& rk = *t->e->ranks_[(size_t)t->rank];
-    const int64_t li = rk.ctx.kv_layer_index((rad_kvgroup)group, layer);
+    const int64_t li = rk.cx().kv_layer_index((rad_kvgroup)group, layer);
     if (group < 0 || (size_t)group >= t->slots.size() || t->slots[(size_t)group] < 0 || li < 0 ||
         (size_t)li >= t->staged[(size_t)group].size()) {
         ++t->fail;
@@ -2188,7 +2200,7 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
     bool host_failed = false;
     int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
-        const int64_t width = rk->sampler.config().n_vocab_local;
+        const int64_t width = rk->smp().config().n_vocab_local;
         /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
         int64_t rows = n;
         if (score_only_) {
@@ -2216,8 +2228,8 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
 }
 
 int Engine::issue_scored_rows(Rank& r) {
-    const int64_t width = r.sampler.config().n_vocab_local;
-    char* const logits = static_cast<char*>(r.ctx.buf_ptr(r.program.logits_buf));
+    const int64_t width = r.smp().config().n_vocab_local;
+    char* const logits = static_cast<char*>(r.cx().buf_ptr(r.program.logits_buf));
     if (!logits || !r.score_host) return RAD_E_STATE;
     if (score_only_) {
         /* The plugin left the hidden rows and ran no lm_head: read back each scored row's hidden
@@ -2225,23 +2237,23 @@ int Engine::issue_scored_rows(Rank& r) {
          * about to read, so the token it draws (and the caller discards) is drawn from defined
          * values. One rank (BatchBuilder). */
         const int64_t rb = score_embd_ * (int64_t)sizeof(uint16_t);
-        const char* hid = static_cast<const char*>(r.ctx.buf_ptr(r.program.score_hidden));
-        const char* tab = static_cast<const char*>(r.ctx.weight_ptr(r.program.score_table));
+        const char* hid = static_cast<const char*>(r.cx().buf_ptr(r.program.score_hidden));
+        const char* tab = static_cast<const char*>(r.cx().weight_ptr(r.program.score_table));
         if (!hid || !tab) return RAD_E_STATE;
         char* host = reinterpret_cast<char*>(r.score_host);
         const int64_t n = (int64_t)score_rows_.size();
         for (int64_t k = 0; k < n; ++k)
             RAD_TRY(rad_memcpy_async(host + k * rb, hid + (int64_t)score_rows_[(size_t)k].first * rb,
-                                     rb, r.ctx.stream()));
+                                     rb, r.cx().stream()));
         for (size_t j = 0; j < score_ids_.size(); ++j)
             RAD_TRY(rad_memcpy_async(host + (n + (int64_t)j) * rb, tab + (int64_t)score_ids_[j] * rb,
-                                     rb, r.ctx.stream()));
-        return rad_memset_async(logits, 0, n * width * (int64_t)sizeof(float), r.ctx.stream());
+                                     rb, r.cx().stream()));
+        return rad_memset_async(logits, 0, n * width * (int64_t)sizeof(float), r.cx().stream());
     }
     for (size_t k = 0; k < score_rows_.size(); ++k)
         RAD_TRY(rad_memcpy_async(r.score_host + (int64_t)k * width,
                                  logits + (int64_t)score_rows_[k].first * width * 4,
-                                 width * 4, r.ctx.stream()));
+                                 width * 4, r.cx().stream()));
     return RAD_OK;
 }
 
@@ -2288,7 +2300,7 @@ int Engine::collect_scored_rows() {
         for (size_t j = 0; j < ts.tokens.size(); ++j) {
             const int64_t t = ts.tokens[j];
             for (auto& rk : ranks_) {
-                const SamplerConfig& sc = rk->sampler.config();
+                const SamplerConfig& sc = rk->smp().config();
                 if (t < sc.vocab_off || t >= sc.vocab_off + sc.n_vocab_local) continue;
                 ts.logits[j] = rk->score_host[(int64_t)k * sc.n_vocab_local + (t - sc.vocab_off)];
                 break;
@@ -2307,7 +2319,7 @@ int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at) {
     if (at < 0) at = row;
     if (row < 0 || row >= so.n_rows || at >= so.n_rows) return RAD_E_STATE;
     TokenLogprobs& lp = so.lp[(size_t)at];
-    const int s = ranks_[0]->sampler.logprobs_for(row, token, &lp);
+    const int s = ranks_[0]->smp().logprobs_for(row, token, &lp);
     if (s == RAD_E_INVAL) { lp = TokenLogprobs{}; return RAD_OK; }
     return s;
 }
@@ -2409,7 +2421,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             if (e.req)
                 for (auto& rk : ranks_)
                     for (int32_t j = 0; j <= acc; ++j) {
-                        const int as = rk->sampler.accept_token(e.req->id, out[j]);
+                        const int as = rk->smp().accept_token(e.req->id, out[j]);
                         /* A parse that outgrew the grammar's bounds fails the request at its next
                          * mask; not an engine defect. */
                         if (as == RAD_E_FULL || as == RAD_E_NOMEM)
@@ -2433,7 +2445,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
          * its own automaton. */
         if (e.req)
-            for (auto& rk : ranks_) rk->sampler.accept_token(e.req->id, so.token[i]);
+            for (auto& rk : ranks_) rk->smp().accept_token(e.req->id, so.token[i]);
     }
 
     /* Update may_speculate here, because a lazy grammar becomes constraining inside accept_token
@@ -2442,7 +2454,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         const StepEntry& e = plan.e[i];
         if (!e.req) continue;
         Request* r = const_cast<Request*>(e.req);
-        r->may_speculate = ranks_[0]->sampler.allows_speculation(r->id);
+        r->may_speculate = ranks_[0]->smp().allows_speculation(r->id);
     }
     return RAD_OK;
 }
@@ -2844,11 +2856,11 @@ void Engine::drain_completed() {
     /* Taken, not read: HTTP cancels append to the list, and nothing else consumes it, so each id
      * is seen exactly once. */
     sched_.take_completed(&done_);
-    for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+    for (uint64_t id : done_) for (auto& rk : ranks_) { rk->sampler.end_request(id); if (rk->bg_ready) rk->bg_sampler.end_request(id); }
     /* tp8 S5: every lane's (none on one lane) */
     for (auto& ls : lane_sched_) {
         ls->take_completed(&done_);
-        for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+        for (uint64_t id : done_) for (auto& rk : ranks_) { rk->sampler.end_request(id); if (rk->bg_ready) rk->bg_sampler.end_request(id); }
     }
 }
 
@@ -3127,6 +3139,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                     (long long)cfg_.max_seqs);
             return RAD_E_INVAL;
         }
+        if (LaneSet::bg1m2_env()) {
+            const char* as = std::getenv("RADIANCE_AR_SETS");
+            if (!as || std::strcmp(as, "all")) {
+                RAD_ERR("RADIANCE_BG_LANE_1M=2 (lever BGL stage 2) needs RADIANCE_AR_SETS=all: a kernel instance holding device "
+                        "counters must not be shared by the two Ctx");
+                return RAD_E_INVAL;
+            }
+        }
         n_lanes_ = 2;
         bgl1m_ = true;
     }
@@ -3207,7 +3227,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         for (auto& ls : lane_sched_) ls->set_tail_inner_capable(ti_capable_);   /* tp8 S5 */
     }
 
-    for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
+    for (auto& r : ranks_) {
+        r->sampler.attach_vocab(vocab_view_.get());
+        if (r->bg_ready) r->bg_sampler.attach_vocab(vocab_view_.get());   /* qfn-on-ds lever BGL stage 2 */
+    }
 
     if (const int xs = xstats_open(); xs < 0) return xs;
     (void)missl_open();

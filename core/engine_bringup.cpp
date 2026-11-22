@@ -2329,6 +2329,9 @@ int Engine::plan() {
                 if (pages > 0 && page > 0) f.host_reserve = (int64_t)pages * page / 8;
             }
             arena_plan_bytes(r->program, nullptr, &f.arena);
+            /* qfn-on-ds lever BGL stage 2: lane 1's Ctx owns a second arena of the full plan (Qwen's sizing declare refuses the
+             * smaller levels under SP-hc today: STATE 22.11. 06:45) */
+            if (!pp_on() && LaneSet::bg1m2_env()) f.arena *= 2;
             f.statics = wf.statics;
             f.experts = wf.experts;
             wfs.push_back(wf);
@@ -4906,7 +4909,25 @@ int Engine::start() {
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
+        if (const char* dv = std::getenv("RADIANCE_BGL2_DBG"); dv && dv[0] == '4') d.record_passes = false;   /* WIP isolation: no tapes */
         RAD_TRY(r->ctx.init(d));
+        /* qfn-on-ds lever BGL stage 2: lane 1's Ctx, the same program / pools / plugin step, its own streams and arena, issuing
+         * from pass slot 1 (S0: the second collective / instance set) */
+        if (!pp_on() && LaneSet::bg1m2_env()) {
+            RAD_TRY(r->bg_ctx.init(d));
+            r->bg_ctx.set_ar_set(1);
+            RAD_TRY(r->bg_sampler.clone_from(r->sampler));
+            r->bg_ready = true;
+            if (const char* dv = std::getenv("RADIANCE_BGL2_DBG"); dv && *dv) {
+                r->dbg_sp = dv[0] != '1' && dv[0] != '3';
+                r->dbg_cx = dv[0] != '2';
+                if (dv[0] == '3') r->bg_ctx.set_ar_set(0);   /* WIP isolation: the second Ctx on the first instance set */
+            }
+            if (r->index == 0)
+                RAD_INFO("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank for lane 1's steps, its own streams and a "
+                         "second %s arena (the full plan), issuing from pass slot 1 (RADIANCE_AR_SETS=%s)",
+                         humanb(r->program.arena_bytes).c_str(), std::getenv("RADIANCE_AR_SETS") ? std::getenv("RADIANCE_AR_SETS") : "unset");
+        }
 
         /* The mover orders every transfer against the kernels reading its slot via an event on the
          * compute stream (Mover::record_gate), which exists only after Ctx::init. Bound even for a

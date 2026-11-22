@@ -294,7 +294,7 @@ public:
     int  init_instance(Resolved& r, int rank, int world_size);
     /* tp8 loop M6F: a collective row's second instance (Resolved::instance1), init() with the frozen geometry plus
      * `ar_set` = set, for passes issued on a rank's second stream (RADIANCE_AR_SETS=2; Builder::finish_instances). */
-    int  init_instance_set(Resolved& r, int rank, int world_size, int set);
+    int  init_instance_set(Resolved& r, int rank, int world_size, int set, bool any_row = false);   /* any_row: lever BGL stage 2 */
     void fini_instances();
     size_t n_instances() const;
 

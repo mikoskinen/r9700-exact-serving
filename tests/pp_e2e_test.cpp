@@ -2245,9 +2245,18 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
         ref_log = one.lead.output();
     }
     CHECK(ref_log.find("lever BGL") == std::string::npos);
-    for (int k = 0; k < 2; ++k) {
+    /* runs 0 / 1: stage 1 (lane 1's steps on the rank's own Ctx); run 2: stage 2 WIP -- lane 1's steps on a second Ctx a rank and a
+     * second sampler driver, every kernel instance doubled (RADIANCE_AR_SETS=all), still one step at a time */
+    for (int k = 0; k < 3; ++k) {
         Serving one;
-        REQUIRE(one.start("", ext, { "RADIANCE_BG_LANE_1M=1" }));
+        const std::vector<std::string> env = k < 2 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=1" }
+                                                   : std::vector<std::string>{ "RADIANCE_BG_LANE_1M=2", "RADIANCE_AR_SETS=all" };
+        std::vector<std::string> env2 = env;
+        if (k == 2) if (const char* dv = std::getenv("BGL2_DBG")) env2.push_back(std::string("RADIANCE_BGL2_DBG=") + dv);
+        if (k < 2 && std::getenv("BGL2_ONLY")) continue;
+        std::vector<std::string> ext2 = ext;
+        if (std::getenv("BGL2_PLACE")) { ext2.push_back("--placement"); ext2.push_back(std::getenv("BGL2_PLACE")); }
+        REQUIRE(one.start("", ext2, env2));
         const std::vector<std::vector<int32_t>> got = split_set(one.port);
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
@@ -2256,7 +2265,11 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
         int differ = 0;
         for (size_t i = 0; i < ref.size(); ++i) {
             CHECK(!ref[i].empty());
-            if (ref[i] != got[i]) ++differ;
+            if (ref[i] == got[i]) continue;
+            ++differ;
+            size_t at = 0;
+            while (at < ref[i].size() && at < got[i].size() && ref[i][at] == got[i][at]) ++at;
+            fprintf(stderr, "    BGL run %d: request %zu differs from token %zu (of %zu / %zu)\n", k, i, at, ref[i].size(), got[i].size());
         }
         long long lent = -1, rows = -1, steps = -1;
         static const std::string kTag = "lever BGL: ";
@@ -2268,6 +2281,8 @@ TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "%s\n", tail(log, 30).c_str());
         CHECK(log.find("lever BGL (RADIANCE_BG_LANE_1M=1") != std::string::npos);
+        CHECK((log.find("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank") != std::string::npos) == (k == 2));
+        if (k == 2) CHECK(log.find("RADIANCE_AR_SETS=all (tp8 loop M6F): ") != std::string::npos);
         CHECK(lent > 0);
         CHECK(steps > 0 && steps <= lent);
         CHECK(rows >= 680);

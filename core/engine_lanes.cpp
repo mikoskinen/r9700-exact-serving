@@ -306,6 +306,9 @@ void Engine::pf1_finish(const RadBatch* b, uint64_t t_collect, bool tok) {
 void Engine::lane_select(int l) {
     cur_sched_ = &sched_of(l);
     issue_sched_.store(cur_sched_, std::memory_order_release);
+    /* qfn-on-ds lever BGL stage 2: lane 1's steps on each rank's second Ctx / sampler (the ranks are parked here) */
+    if (bgl1m_)
+        for (auto& rk : ranks_) rk->use_bg = l == 1 && rk->bg_ready;
 }
 
 void Engine::pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1) {
@@ -317,9 +320,14 @@ void Engine::pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_
 int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lane_sched_.clear();
     std::vector<Scheduler*> all{ &sched_ };
+    /* qfn-on-ds lever BGL stage 2: lane 1's builder stages its batches on the second Ctx's stream, which its passes run on -- on
+     * the first Ctx's stream the upload is unordered against the pass (the WIP's intermittent differences, pp_e2e bgl run 2) */
+    std::vector<BatchBuilder::RankIO> rio1 = rio;
+    for (size_t i = 0; i < rio1.size() && i < ranks_.size(); ++i)
+        if (ranks_[i]->bg_ready) rio1[i].stream = ranks_[i]->bg_ctx.stream();
     for (int l = 1; l < n_lanes_; ++l) {
         auto s = std::make_unique<Scheduler>(sched_, l, n_lanes_, &lanes_);
-        RAD_TRY(s->init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+        RAD_TRY(s->init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), l == 1 && bgl1m_ ? rio1 : rio, &geo_));
         s->set_eog(sched_.eog_ids());
         all.push_back(s.get());
         lane_sched_.push_back(std::move(s));
@@ -332,7 +340,10 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     /* tp8 dev D4: under RADIANCE_PP_CTXSKIP_LANES=1 the ring is one region a lane (ctxskip_setup), so the skip is taken */
     if (!(ctxs_.ready && ctxs_.lanes > 1)) fn4::ctxskip_refuse_lanes();
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
-    for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
+    for (auto& rk : ranks_) {
+        rk->ctx.set_tape_lanes(n_lanes_);
+        if (rk->bg_ready) rk->bg_ctx.set_tape_lanes(n_lanes_);   /* qfn-on-ds lever BGL stage 2 */
+    }
     /* lane l holds cards [l * S / N, (l + 1) * S / N) (Scheduler::init) */
     const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_, least = cfg_.max_seqs / n_lanes_;
     RAD_INFO("two-node pipeline: %d lanes, each a scheduler with its own step slab on every card and at most %lld "

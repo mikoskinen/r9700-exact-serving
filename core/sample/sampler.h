@@ -143,6 +143,10 @@ public:
      * missing-list (spec §3.1). An unresolved op is not a declare failure; check_request refuses
      * the requests that need it, by name. */
     int declare(RadBuilder* b, const SamplerConfig& cfg);
+    /* qfn-on-ds lever BGL stage 2: a second driver over `o`'s declared ops and buffers (the buffers resolve per Ctx, so on a second
+     * Ctx they are that Ctx's) with pinned staging of its own -- lane 1's steps stage here while lane 0's stage in `o`. Per-request
+     * state (grammar, DRY) is this driver's own: begin_request here for what it samples. Call after `o.declare`. */
+    int clone_from(const Sampler& o);
 
     /* The vocabulary the grammar backends walk. Set after the tokeniser loads, before the first
      * request. */

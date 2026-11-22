@@ -290,6 +290,13 @@ public:
     int             wgp_count() const { return wgp_count_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
+    /* qfn-on-ds lever BGL stage 2 (WIP): every stream this Ctx issues on, drained (the compute stream and the second lane's) */
+    int             sync_all() const {
+        int s = stream_ ? rad_stream_sync(stream_) : 0;
+        if (s >= 0 && lane1_) s = rad_stream_sync(lane1_);
+        if (s >= 0 && lane1_spare_) s = rad_stream_sync(lane1_spare_);
+        return s;
+    }
     Program*        program()    const { return program_; }
 
     /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for

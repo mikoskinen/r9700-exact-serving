@@ -130,6 +130,51 @@ static int64_t rows_for(const SamplerConfig& c) {
 
 /* ================================================================== declare */
 
+/* qfn-on-ds lever BGL stage 2: see sampler.h */
+int Sampler::clone_from(const Sampler& o) {
+    if (!o.declared_ || declared_) return RAD_E_STATE;
+    cfg_ = o.cfg_;
+    vocab_ = o.vocab_;
+    couple_ = o.couple_;
+    mask_words_ = o.mask_words_;
+    mask_full_.assign(o.mask_full_.size(), 0u);
+    op_penalties_ = o.op_penalties_;
+    op_dry_ = o.op_dry_;
+    op_ngram_ban_ = o.op_ngram_ban_;
+    op_temp_ = o.op_temp_;
+    op_temp_late_ = o.op_temp_late_;
+    op_mask_ = o.op_mask_;
+    op_topk_ = o.op_topk_;
+    op_topp_ = o.op_topp_;
+    op_minp_ = o.op_minp_;
+    op_typical_ = o.op_typical_;
+    op_xtc_ = o.op_xtc_;
+    op_pick_ = o.op_pick_;
+    op_argmax_ = o.op_argmax_;
+    op_allgather_ = o.op_allgather_;
+    op_merge_ = o.op_merge_;
+    op_couple_ = o.op_couple_;
+    op_logprobs_ = o.op_logprobs_;
+    op_lp_gather_ = o.op_lp_gather_;
+    buf_params_ = o.buf_params_;
+    buf_params_late_ = o.buf_params_late_;
+    buf_hist_ = o.buf_hist_;
+    buf_brk_ = o.buf_brk_;
+    buf_ngram_ = o.buf_ngram_;
+    buf_ngram_wl_ = o.buf_ngram_wl_;
+    buf_mask_ = o.buf_mask_;
+    buf_cand_i_ = o.buf_cand_i_;
+    buf_cand_v_ = o.buf_cand_v_;
+    buf_gather_ = o.buf_gather_;
+    buf_pairs_ = o.buf_pairs_;
+    buf_lp_ = o.buf_lp_;
+    buf_lp_g_ = o.buf_lp_g_;
+    buf_couple_ = o.buf_couple_;
+    RAD_TRY(stage_alloc());
+    declared_ = true;
+    return RAD_OK;
+}
+
 int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     if (!b) return RAD_E_INVAL;
     if (cfg.n_vocab <= 0 || cfg.max_seqs <= 0) {

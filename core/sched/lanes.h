@@ -155,6 +155,9 @@ public:
      * (Engine::step_loop), so it changes composition only (a newcomer's prompt in a lone step instead of a MIXED one);
      * stage 2 issues them on a second Ctx a rank beside lane 0's decode steps. Off by default. */
     static bool bg1m_env();
+    /* RADIANCE_BG_LANE_1M=2: stage 2 -- as 1, plus a second Ctx a rank for lane 1's steps (Rank::bg_ctx; WIP: built and budgeted,
+     * the loop does not issue on it yet) */
+    static bool bg1m2_env();
     /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N, 1 .. 256; with BG lanes, the same value on both nodes): a BG lane's step slab carves
      * its block tables for N rows instead of --max-num-seqs (each row --max-model-len wide: at 32 x 1 M that is ~512 MiB a card
      * a lane, the whole of a BG lane's slab), and lane_split_bg lends into a BG lane only while its inbox holds fewer than N
