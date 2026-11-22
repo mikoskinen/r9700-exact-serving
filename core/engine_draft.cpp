@@ -817,7 +817,11 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = lsched().set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        int rc = lsched().set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        /* qfn-on-ds lever BGL: a newcomer the BG lane ran whole drafts for its home's next step (the request is there) */
+        if (rc == RAD_E_NOTFOUND && bgl1m_)
+            if (Scheduler* o = lanes_.owner(seq); o && o != &lsched())
+                rc = o->set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }

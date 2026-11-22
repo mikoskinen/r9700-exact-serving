@@ -428,10 +428,10 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); lanes_.bg_hold_ms() <= 0 && bh && *bh)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%s is not taken: %s (tp8 dev D11)", bh,
                  lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 1 .. 60000 ms");
-    if (lanes_.bg_lane() == 1)
+    if (lanes_.bg_lane() == 1 && !bgl1m_)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE leaves ONE decode lane at --pp-lanes %d: decode steps no longer overlap on "
                  "the two nodes (use --pp-lanes %d)", n_lanes_, n_lanes_ + 1);
-    if (const char* rf = std::getenv("RADIANCE_PP_READY_FIRST"); lanes_.bg_lane() >= 0 && !(rf && !std::strcmp(rf, "1")))
+    if (const char* rf = std::getenv("RADIANCE_PP_READY_FIRST"); lanes_.bg_lane() >= 0 && !bgl1m_ && !(rf && !std::strcmp(rf, "1")))
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE without RADIANCE_PP_READY_FIRST=1: a decode lane's tail waits behind a BG "
                  "step's in the leader's order (tp8 dev M8)");
     if (lanes_.lend_split())
@@ -464,6 +464,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "before the snapshot, at checkpoint-interval boundaries (RADIANCE_PP_SPAN_INNER=1, tp8 loop P14)%s",
                  !lanes_.span_on() || lanes_.span_short() > 0 || lanes_.span_tail() > 0
                      ? "" : " -- inactive: RADIANCE_PP_SPAN=0, _SPAN_SHORT or _SPAN_TAIL names those cuts");
+    if (bgl1m_)   /* qfn-on-ds lever BGL */
+        RAD_INFO("lever BGL (RADIANCE_BG_LANE_1M=1, Qwen loop Q5b S1 stage 1): two lanes on ONE machine -- lane 0 holds every "
+                 "sequence, lane 1 is the background prefill lane (tp8 dev M8): a newcomer planned whole beside decode rows is lent "
+                 "whole to it and runs in a lane-1 step of its own (its first token and its drafter's history there), lane 0's step "
+                 "going out with its decode rows alone; stage 1 runs lane 1's steps on the same queue between lane 0's, nothing "
+                 "issued ahead (a composition change only)");
     return RAD_OK;
 }
 

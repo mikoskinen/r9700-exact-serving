@@ -5467,9 +5467,13 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         cu += e.n_tokens;
 
         if ((int)serial_.size() >= max) continue;
-        if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
-        SchedReq& s = *reqs_[(size_t)e.slot];
-        if (!s.req || s.req->state != ReqState::Running || !s.running) continue;
+        /* qfn-on-ds lever BGL: a piece another lane lent this one (a newcomer the BG lane runs whole) owes its history here --
+         * this step holds its rows' hidden states -- and drafts from its first token; its SchedReq is its home's */
+        SchedReq* sh = e.home >= 0 ? home_req(e.home, e.seq) : nullptr;
+        if (e.home >= 0 && !sh) continue;
+        if (!sh && (e.slot < 0 || (size_t)e.slot >= reqs_.size())) continue;
+        SchedReq& s = sh ? *sh : *reqs_[(size_t)e.slot];
+        if (!s.req || s.req->state != ReqState::Running || (!s.running && !sh)) continue;
         Request& r = *s.req;
 
         /* The verified positions are the entry's last 1 + n_spec. Round 1 continues from the last
@@ -5534,6 +5538,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.lead       = (int32_t)lead;
         m.base_pos   = head_max;
         m.draft_idx  = can_draft ? n_draft_rows : -1;
+        m.home       = e.home;   /* qfn-on-ds lever BGL */
         serial_.push_back(m);
 
         if (can_draft) {
@@ -5586,6 +5591,7 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         e.req      = rq;
         e.seq      = m.seq;
         e.slot     = m.slot;
+        e.home     = m.home;   /* qfn-on-ds lever BGL: a lent entry's history / rounds, its request in the home's table */
         e.card     = m.card;
         e.n_tokens = round == 0 ? m.hist_n : 1;
         /* A round's position is the card's; the host stages the furthest it can be, which every
@@ -5645,8 +5651,11 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
 void Scheduler::serial_end(int rounds_done) {
     std::lock_guard<std::mutex> lk(mu_);
     for (const SerialSeq& m : serial_) {
-        if (m.slot < 0 || (size_t)m.slot >= reqs_.size()) continue;
-        SchedReq& s = *reqs_[(size_t)m.slot];
+        /* qfn-on-ds lever BGL: a lent entry's watermark is its home's */
+        SchedReq* sh = m.home >= 0 ? home_req(m.home, m.seq) : nullptr;
+        if (m.home >= 0 && !sh) continue;
+        if (!sh && (m.slot < 0 || (size_t)m.slot >= reqs_.size())) continue;
+        SchedReq& s = sh ? *sh : *reqs_[(size_t)m.slot];
         if (!s.req || s.req->id != m.seq) continue;
         const int64_t filled = m.dev ? s.req->n_computed
                                      : m.hist_pos + m.hist_n;
@@ -5828,7 +5837,21 @@ int Scheduler::parse_short_tiers(const char* s, std::vector<std::pair<int64_t, i
 }
 
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
-const Request* Scheduler::serial_req(const SerialSeq& m) const { return live_req(m.slot, m.seq); }
+const Request* Scheduler::serial_req(const SerialSeq& m) const {
+    if (m.home >= 0) {   /* qfn-on-ds lever BGL: a lent entry's request lives in its home lane */
+        const SchedReq* s = home_req(m.home, m.seq);
+        return s && s->req && s->req->id == m.seq ? s->req.get() : nullptr;
+    }
+    return live_req(m.slot, m.seq);
+}
+SchedReq* Scheduler::home_req(int home, uint64_t seq) const {
+    if (!lanes_ || home < 0 || home == lane_) return nullptr;
+    const Scheduler* h = lanes_->lane(home);
+    if (!h) return nullptr;
+    const auto it = h->by_id_.find(seq);
+    if (it == h->by_id_.end() || (size_t)it->second >= h->reqs_.size()) return nullptr;
+    return h->reqs_[(size_t)it->second].get();
+}
 
 const RadBatch* Scheduler::block_context(int step) {
     std::lock_guard<std::mutex> lk(mu_);

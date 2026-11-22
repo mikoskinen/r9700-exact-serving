@@ -1250,6 +1250,8 @@ private:
         /* The furthest position round 1 can write at: the verify step's last position, reached
          * when every draft is accepted. The card knows the real one; this bounds it. */
         int64_t        base_pos = 0;
+        /* qfn-on-ds lever BGL: a lent entry's home lane (its SchedReq is there, slot -1 here); -1 for this lane's own */
+        int8_t         home = -1;
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
@@ -1450,6 +1452,9 @@ private:
     /* The live Request behind a snapshot row, or null if it went away. */
     const Request* block_req(const BlockSeq& d) const;
     const Request* serial_req(const SerialSeq& m) const;
+    /* qfn-on-ds lever BGL: the SchedReq of a lent entry (StepEntry::home >= 0) in its home lane's table, or null; the lanes'
+     * one lock held */
+    SchedReq*      home_req(int home, uint64_t seq) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     bool preempt_back();                                      /* true: the victim published its prefix */

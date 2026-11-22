@@ -333,6 +333,10 @@ private:
     std::vector<std::unique_ptr<Scheduler>> lane_sched_;
     LaneSet                       lanes_;
     int                           n_lanes_ = 1;
+    /* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1): lanes on ONE machine -- lane 0 every sequence, lane 1 M8's BG lane whose
+     * steps the step loop runs between lane 0's (stage 1: one queue; Engine::step_loop) */
+    bool                          bgl1m_ = false;
+    int64_t                       bgl_steps_ = 0;   /* lane-1 steps run (lever BGL) */
     Scheduler*                    cur_sched_ = &sched_;
     std::atomic<Scheduler*>       issue_sched_{ &sched_ };
     Scheduler& lsched() { return *cur_sched_; }

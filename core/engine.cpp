@@ -1269,6 +1269,9 @@ int Engine::step_loop() {
      * one committed: a step issued ahead takes its rows from the leader's cards, which the follower
      * does not have (engine_node.cpp). */
     if (pp_on()) pipelining_ = false;
+    /* qfn-on-ds lever BGL stage 1: lane 1's steps run between lane 0's, so nothing is issued ahead (a step issued ahead is
+     * lane 0's, and lane 1's step would have to wait for its commit) */
+    if (bgl1m_) pipelining_ = false;
     if (oracle_head)
         RAD_WARN("--debug-draft-oracle beside the draft head '%s': no step is issued ahead of its "
                  "commit, so the harness's ids replace the head's proposals before each verify is "
@@ -1318,14 +1321,29 @@ int Engine::step_loop() {
         const bool issued = ahead != nullptr;
         const RadBatch* b = ahead;
         ahead = nullptr;
-        if (issued) sched_.promote_next();
-        else        b = sched_.step();
+        /* qfn-on-ds lever BGL: lane 1 (the BG lane) steps when lane 0 lent it a newcomer; else lane 0, which may lend the next
+         * one to lane 1 (the planners: lane 1 plans before lane 0 plans again) */
+        if (bgl1m_ && !issued) {
+            const int lane = lanes_.inbox_n(1) > 0 ? 1 : 0;
+            lanes_.set_planners({ 1 - lane });
+            lane_select(lane);
+        }
+        if (issued) lsched().promote_next();
+        else        b = lsched().step();
+        if (b && bgl1m_ && cur_sched_ != &sched_) ++bgl_steps_;
+        if (!b && bgl1m_ && cur_sched_ != &sched_) {
+            /* the BG lane planned nothing from its inbox (its newcomer was cancelled): back to lane 0 */
+            lanes_.set_planners({ 1 });
+            lane_select(0);
+            b = sched_.step();
+        }
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
             drain_completed();
             sched_.publish(/*idle=*/true);
+            if (bgl1m_) sched_of(1).publish(/*idle=*/true);   /* lever BGL: the lanes' sum is what /metrics reads */
             /* Work is waiting only on the encoder: loop immediately. */
             if (sched_.encodes_pending()) { idle = 0; continue; }
             /* Release deferred by the last step. A request cancelled while a drafter pass was being
@@ -1352,7 +1370,7 @@ int Engine::step_loop() {
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
-        const StepPlan& plan = sched_.plan();
+        const StepPlan& plan = lsched().plan();
         /* qfn-on-ds RADIANCE_PF_TIMELINE: this step is a lone prefill chunk with its prompt's first token (the plan is b's here) */
         const bool pf1_tok = pf_tl_ && b->phase == RAD_PHASE_PREFILL && plan.e.size() == 1 && plan.e[0].is_prefill &&
                              plan.e[0].produces_token;
@@ -1636,7 +1654,7 @@ int Engine::step_loop() {
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
         kv_test_before_commit(plan, so, b->step, ranks_);
 #endif
-        st = sched_.commit(res);
+        st = lsched().commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
         pf1_finish(b, pf1_f0, pf1_tok);   /* qfn-on-ds RADIANCE_PF_TIMELINE: a prompt's line at its first token */
@@ -1667,14 +1685,17 @@ int Engine::step_loop() {
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
-        sched_.step_finished();
+        lsched().step_finished();
         tier_tick();
         loan_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
         drain_completed();
-        sched_.publish(/*idle=*/false);
+        lsched().publish(/*idle=*/false);
+        /* lever BGL: back to lane 0 between steps (the HTTP side's reads go to the lane set; lane_select only names the lane the
+         * step loop works on) */
+        if (bgl1m_ && cur_sched_ != &sched_) lane_select(0);
 
         /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
          * shows up in `collect`, the step's only host synchronisation. */
@@ -1695,6 +1716,13 @@ int Engine::step_loop() {
                 phase_n_ = 0;
             }
         }
+    }
+    if (bgl1m_) {   /* qfn-on-ds lever BGL: what the BG lane took (the test side reads this line at the stop) */
+        const LaneSet::Counts c = lanes_.counts();
+        RAD_INFO("lever BGL: %lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s); kept home: a prefix restore "
+                 "%lld, no room %lld, not a planner %lld", (long long)c.bg, (long long)c.bg_rows, (long long)bgl_steps_,
+                 (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
+                 (long long)c.bg_skip[LaneSet::kBgOrder]);
     }
     return RAD_OK;
 }
@@ -3087,11 +3115,26 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else {
+    /* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1, Qwen loop round 24): two lanes on one machine, lane 1 the BG lane */
+    if (!pp_on() && LaneSet::bg1m_env()) {
+        if (embedding_ || cfg_.kld() || cfg_.calib() || block_drafting() || tree_ || cfg_.draft_coupling) {
+            RAD_ERR("RADIANCE_BG_LANE_1M=1 (lever BGL): a text model with a serial drafter or none, not an embedding model, "
+                    "the KL / calibration modes, a block drafter, a tree drafter or --draft-coupling");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (cfg_.max_seqs < 2) {
+            RAD_ERR("RADIANCE_BG_LANE_1M=1 (lever BGL): --max-num-seqs %lld leaves no card for the decode lane",
+                    (long long)cfg_.max_seqs);
+            return RAD_E_INVAL;
+        }
+        n_lanes_ = 2;
+        bgl1m_ = true;
+    }
     /* tp8 S5: lane 0 takes its share of the cards before init */
-    if (pp_on() && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);
+    if ((pp_on() || bgl1m_) && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
     /* tp8 S5: the other lanes' schedulers (engine_lanes.cpp) */
-    if (pp_on() && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
+    if ((pp_on() || bgl1m_) && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
     /* tp8 S4: the rings, the second rendezvous and the link's threads. */
     if (pp_on()) {
         if (embedding_ || generator) {

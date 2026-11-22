@@ -2227,6 +2227,53 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1, Qwen loop Q5b S1 stage 1): ONE process, two lanes -- lane 0 every sequence,
+ * lane 1 M8's BG lane whose steps run between lane 0's -- serves one process's tokens: the newcomers that arrive beside decoders
+ * are lent whole to lane 1 (the stop line counts them), everything else is a composition change. Negative control: the same
+ * process without the variable says nothing of BGL and lends nothing. */
+TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    std::string ref_log;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        ref_log = one.lead.output();
+    }
+    CHECK(ref_log.find("lever BGL") == std::string::npos);
+    for (int k = 0; k < 2; ++k) {
+        Serving one;
+        REQUIRE(one.start("", ext, { "RADIANCE_BG_LANE_1M=1" }));
+        const std::vector<std::vector<int32_t>> got = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        const std::string log = one.lead.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long lent = -1, rows = -1, steps = -1;
+        static const std::string kTag = "lever BGL: ";
+        if (const size_t at = log.rfind(kTag); at != std::string::npos)
+            (void)std::sscanf(log.c_str() + at + kTag.size(), "%lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s)",
+                              &lent, &rows, &steps);
+        fprintf(stderr, "    BGL run %d: %d of %zu requests differ; %lld newcomers lent whole (%lld rows), %lld BG steps\n", k, differ,
+                ref.size(), lent, rows, steps);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "%s\n", tail(log, 30).c_str());
+        CHECK(log.find("lever BGL (RADIANCE_BG_LANE_1M=1") != std::string::npos);
+        CHECK(lent > 0);
+        CHECK(steps > 0 && steps <= lent);
+        CHECK(rows >= 680);
+    }
+}
+
 /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2 + RADIANCE_PP_NODE_IDLE_S=1 on both nodes): the node-idle time BY STRETCH -- with a BG
  * step in flight or without -- beside D8's line, with newcomers lent whole to a BG lane (3 lanes, BG_LANE=1, W(1,3), the
  * follower's one-layer segments): every request's tokens are one process's; each node's run line is D8's (the same text, so

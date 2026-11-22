@@ -2389,11 +2389,13 @@ int Engine::plan() {
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             /* tp8 S5: every lane of a two-node pipeline has a builder (a slab) of its own */
-            if (pp_on() && cfg_.pp_lanes_now() > 1 && !r->program.is_generator() && !r->program.is_audio_generator() &&
+            /* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1): one machine's two lanes, a slab each */
+            const bool bgl1m = !pp_on() && LaneSet::bg1m_env();
+            if (((pp_on() && cfg_.pp_lanes_now() > 1) || bgl1m) && !r->program.is_generator() && !r->program.is_audio_generator() &&
                 !r->program.is_video_generator() && !r->program.is_shape_generator()) {
                 /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N with RADIANCE_PP_BG_LANE=k): the k BG lanes' slabs carve N block-table
                  * rows (Scheduler::init); the other lanes' as before. Unset: every lane's slab, today. */
-                const int nl = cfg_.pp_lanes_now(), kbg = LaneSet::bg_env() < nl ? LaneSet::bg_env() : 0;
+                const int nl = bgl1m ? 2 : cfg_.pp_lanes_now(), kbg = LaneSet::bg_env() < nl ? LaneSet::bg_env() : 0;
                 const int64_t bgr = LaneSet::bg_rows_env(), lm = LaneSet::lane_rows_env(), one = f.staging;
                 int64_t sum = 0;
                 for (int l = 0; l < nl; ++l) {   /* each lane's slab at the rows Scheduler::init gives it */

@@ -80,8 +80,14 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     }
 }
 
+bool LaneSet::bg1m_env() {   /* qfn-on-ds lever BGL */
+    const char* v = std::getenv("RADIANCE_BG_LANE_1M");
+    return v && !std::strcmp(v, "1");
+}
+
 int LaneSet::bg_env() {
     const char* v = std::getenv("RADIANCE_PP_BG_LANE");
+    if ((!v || !*v) && bg1m_env()) return 1;   /* qfn-on-ds lever BGL: one machine's lane 1 */
     if (!v || !*v) return 0;
     char* end = nullptr;
     const long k = std::strtol(v, &end, 10);
