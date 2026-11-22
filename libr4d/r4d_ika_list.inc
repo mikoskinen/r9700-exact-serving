@@ -97,6 +97,7 @@
     "pcn_mix_k2_kernel",
     "pcn_words_kernel",
     "post_collapse_norm_kernel",
+    "post_collapse_norm_q8_kernel",   /* lever A8D fold (c), DRAFTER round 95: post_collapse_norm_kernel's entry (R4D_IKA_ENTRY first) */
     "quant_group8_kernel",
     "quant_group_kernel",
     "quant_serial_kernel",
