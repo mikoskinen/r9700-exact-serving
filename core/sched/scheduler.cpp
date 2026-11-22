@@ -1994,9 +1994,12 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
          * whose last span chunk crossed into a new one resumes at the earlier prompt's last piece start (its TIP snapshot), and
          * runs to that cold piece's end (plan_chunk's off-grid rule) as its own cold run cuts it */
         const int64_t I = geo_.checkpoint_interval;
-        if (I > 0 && fn4::resume_cold() >= 2 && w > I) {
-            for (int64_t p = n + I; p < n + w; p += I) out->push_back(p);
-        } else if (ck > n && ck < n + w && I > 0 && (ck - n) % I == 0) {
+        /* (only a chunk's LAST piece start: a hit there runs one piece alone, the form tip0 / tip5 read exact; a resume with two
+         * or more of the cold chunk's pieces after it ran them in a narrower pipelined step and differed: tip5's siblings) */
+        const int64_t lastp = I > 0 && w > I ? n + (w - 1) / I * I : -1;
+        if (lastp > n && fn4::resume_cold() >= 2) {
+            out->push_back(lastp);
+        } else if (ck > n && ck < n + w && I > 0 && (ck - n) % I == 0 && n + w - ck <= I) {
             out->push_back(ck);
         }
         n += w;
@@ -2069,8 +2072,10 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         const bool ti = fine > 0 && tail_inner_sw_ > 0 && tail > n_computed && tail < n_target &&
                         n_computed + want == n_target && n_target - n_computed <= ti_limit_ && !geo_.on_grid(tail) &&
                         (span_now_ || geo_.shared_tok <= 0 || n_target - n_computed <= geo_.shared_tok) &&
-                        /* lever TIP: only at the start of one of the chunk's pieces, where the plugin stages its rows */
-                        (!tail_inner_pieces_ || (I > 0 && (tail - n_computed) % I == 0));
+                        /* lever TIP: only at the start of the chunk's LAST piece, where the plugin stages its rows -- a hit there
+                         * runs that one piece alone (test tip5: a tail one piece earlier, the last piece under kTailMinPiece rows, gave
+                         * sibling hits running two pieces that differ from their cold, 3 / 4); elsewhere cut as lever G cuts */
+                        (!tail_inner_pieces_ || (I > 0 && (tail - n_computed) % I == 0 && n_target - tail <= I));
         if (ti) {
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (tail > n_computed && n_computed + want >= tail) {
