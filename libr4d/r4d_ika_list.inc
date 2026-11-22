@@ -112,6 +112,7 @@
     "rope_kernel",
     "rope_rows_kernel",
     "rope_rt8_kernel",
+    "rope_rt8q_kernel",
     "rope_rt_kernel",
     "router_gemm_rowkey_kernel",
     "router_gemm_rowsel_kernel",
