@@ -190,6 +190,14 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #define EXL3R4D_SWK_BLK (EXL3R4D_SWK == 2 ? 8 : 16)  // so a timing-only build can carry the real form's pass count (9-16 rows decode twice)
 #endif
 static_assert(EXL3R4D_SWK != 2 || EXL3R4D_SWK_BLK == 8, "SWK 2: 8 tokens a pass (two A rows a token)");
+#ifndef EXL3R4D_SWK_DMOVE  // SWK 2's D-layout move (tp8 DECODE round 66, QUEUE X14): 0 = the ds_bpermute pulls + __shfl_xor butterflies
+#define EXL3R4D_SWK_DMOVE 0  // (round 64's form); 1 = the same data moves on VALU lane ops -- the pulls as v_permlane16_var + v_permlanex16_var
+#endif                       // (one select VGPR), the butterflies' exchanges as DPP (quad_perm [1,0,3,2] / [2,3,0,1], row_xmask:4) -- the same
+                             // adds (IEEE commutative: the same bits); 9 = NO move (TIMING ONLY, wrong outputs: the move's cost bound)
+#ifndef EXL3R4D_SWK_ABOUND   // SWK 2 (tp8 DECODE round 66, QUEUE X14): 1 = the compressed A fragment made from registers instead of its four
+#define EXL3R4D_SWK_ABOUND 0 // b32 loads a 32-deep step (TIMING ONLY, wrong outputs: the real form's A-load cost bound); 0 = the loads
+#endif
+static_assert(EXL3R4D_SWK_DMOVE == 0 || EXL3R4D_SWK_DMOVE == 1 || EXL3R4D_SWK_DMOVE == 9, "SWK_DMOVE: 0 / 1 / 9");
 // SW (the form of ONE instance, a template argument of moe_pass and the x3d / k25 kernels, so one build holds the served kernels and
 // the SWK twins that fn4 exl3_x6w 2 / 3 picks at launch): 0 served, 1 timing pairs, 2 the real form, 3 = 2 with the other nibble order.
 #define EXL3R4D_SWK_T (EXL3R4D_SWK == 2 && EXL3R4D_SWK_IDXSWAP ? 3 : EXL3R4D_SWK)
@@ -857,6 +865,50 @@ static __device__ __forceinline__ void swk_to_dlayout(v8f (&acc)[NPW], int lane)
     for (int e = 0; e < 8; e++) acc[j][e] = R[e];
   }
 }
+// EXL3R4D_SWK_DMOVE 1 (tp8 DECODE round 66, QUEUE X14): swk_to_dlayout's data moves without the LDS crossbar. (1) the pulls: target
+// lane i < 8 adds its own value (row t, column i: first) and row 1's lane i (row 8 + t: second); target lane 16 + i adds row 0's lane
+// 8 + i (first) and row 1's lane 24 + i (second) -- one select VGPR sel = (lane & 7) | 8 (lane >> 4 & 1) serves v_permlanex16_var (the
+// other 16-lane row's lane sel) and v_permlane16_var (this row's lane sel): own-row + other-row, i.e. first + second on lanes 0..7 and
+// second + first on lanes 16..23 (IEEE addition is commutative: the bits of round 64's form). (2) each butterfly exchange is a DPP
+// move inside the 8-lane group (xor 1 / 2 = quad_perm, xor 4 = row_xmask:4), the selects unchanged.
+template <int B>
+static __device__ __forceinline__ float swk_xor_dpp(float v) {
+  constexpr int ctrl = B == 1 ? 0xB1 : B == 2 ? 0x4E : 0x164;   // quad_perm [1,0,3,2] / [2,3,0,1] / row_xmask:4
+  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), ctrl, 0xF, 0xF, false));
+}
+template <int B>
+static __device__ __forceinline__ void swk_stage_dpp(float (&R)[8]) {
+  constexpr unsigned hi = B == 4 ? 0xF0F0F0F0u : B == 2 ? 0xCCCCCCCCu : 0xAAAAAAAAu;   // lanes whose bit B is set
+#pragma unroll
+  for (int r = 0; r < 8; r++) {
+    if (r & B) continue;
+    const float send = swk_sel(R[r | B], R[r], hi);
+    const float recv = swk_xor_dpp<B>(send);
+    const float lo_r = R[r], hi_r = R[r | B];
+    R[r] = swk_sel(lo_r, recv, hi);
+    R[r | B] = swk_sel(recv, hi_r, hi);
+  }
+}
+template <int NPW>
+static __device__ __forceinline__ void swk_to_dlayout_dpp(v8f (&acc)[NPW], int lane) {
+  const unsigned sel = (unsigned)((lane & 7) | (((lane >> 4) & 1) << 3));
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    float R[8];
+#pragma unroll
+    for (int v = 0; v < 8; v++) {
+      const unsigned a = (unsigned)__float_as_int(acc[j][v]);   // __float_as_int: see swk_to_dlayout
+      const unsigned o = __builtin_amdgcn_permlane16_var(a, a, sel, false, false);    // this row's lane sel
+      const unsigned x = __builtin_amdgcn_permlanex16_var(a, a, sel, false, false);   // the other row's lane sel
+      R[v] = __int_as_float((int)o) + __int_as_float((int)x);
+    }
+    swk_stage_dpp<4>(R);
+    swk_stage_dpp<2>(R);
+    swk_stage_dpp<1>(R);
+#pragma unroll
+    for (int e = 0; e < 8; e++) acc[j][e] = R[e];
+  }
+}
 static __device__ __forceinline__ v8f x4_mma(v8h wf, v8h af, v8f c) {
 #if EXL3R4D_ABLATE_MMA
   union { v8h f; unsigned u[4]; } w, a;
@@ -1323,7 +1375,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
         union { unsigned u[4]; v8h f; } x_;                                          \
         const unsigned sa_ = ((unsigned)(ks) & ~1u) * 32u;                           \
         _Pragma("unroll") for (int q_ = 0; q_ < 4; q_++)                             \
-          x_.u[q_] = __builtin_amdgcn_raw_buffer_load_b32(ars, swk_avo + 16u * (unsigned)q_, sa_, 0); \
+          x_.u[q_] = EXL3R4D_SWK_ABOUND ? (sa_ * 0x3C003C00u + swk_avo + (unsigned)q_) /* bound: no load */ \
+                                        : __builtin_amdgcn_raw_buffer_load_b32(ars, swk_avo + 16u * (unsigned)q_, sa_, 0); \
         A_ = x_.f;                                                                   \
       } else if constexpr (EXL3R4D_ABLATE_ALOAD) {                                   \
         union { unsigned u[4]; v8h f; } ab_;                                         \
@@ -1581,7 +1634,10 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     }
   }
   if (SK > 1) splitk_reduce<NPW>(acc, lds, col_local, ksplit, SK, lane);
-  if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) swk_to_dlayout<NPW>(acc, lane);   // SWK 2: rows -> tokens
+  if constexpr (SW >= 2 && (X3D || K25 != K25_OFF)) {   // SWK 2: rows -> tokens (EXL3R4D_SWK_DMOVE: 0 LDS form, 1 lane-op form, 9 none)
+    if constexpr (EXL3R4D_SWK_DMOVE == 1) swk_to_dlayout_dpp<NPW>(acc, lane);
+    else if constexpr (EXL3R4D_SWK_DMOVE == 0) swk_to_dlayout<NPW>(acc, lane);
+  }
   if constexpr (XSM) {
     if (xsn > 1 && !xs_combine<NPW>(p, acc, xunit, xsl)) return;   // the first slice leaves; the second sums
   }
