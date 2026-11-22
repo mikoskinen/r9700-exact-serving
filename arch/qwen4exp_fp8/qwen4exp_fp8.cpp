@@ -367,6 +367,16 @@ struct Model {
     rad_op op_x1 = 0, op_x2 = 0;
     int  pp_parts = 0;
     int64_t pp_row = 0;
+    /* Qwen tp8 S6 (Qwen loop round 32; the DS line's tp8 dev M4 in llama_fp8's form): RADIANCE_PP_SEG_LAYERS=k on the follower
+     * with --pp-lanes > 1 -- its [h, t) in segments of k layers, other lanes' passes between them (the core's follower loop).
+     * At a boundary s the segment before it saves this rank's wide stream (every row as this rank holds it: an SP form's
+     * quarter rows and the rest as they are) into the rank's own ring buffer after layer s - 1's writes, and the segment from s
+     * takes it back and reads layer s as the pass reads it after a write it cannot hand its scales (the stage ops' loop mode:
+     * card memory, no link, no gather). seg_b: the boundaries, ascending, in (h, t); unset: empty, nothing declared or issued. */
+    std::vector<int32_t> seg_b;
+    std::vector<rad_op>  seg_save, seg_load;
+    rad_buf seg_ring = 0;
+    int64_t seg_ring_bytes = 0;
 };
 
 static Model g_model[MAX_RANKS];
@@ -381,6 +391,15 @@ static int64_t lr_after(const Model& m, int64_t l) {
 /* Qwen tp8 S2: the embedding, the stream's entry, the final mixer, lm_head and the MTP head -- one machine, a proxy node, or
  * the leader of the two-node pipeline (never its follower) */
 static bool lr_shell(const Model& m) { return !m.pp || m.pp_rank == 0; }
+/* Qwen tp8 S6: the core's bound on a node's segments (RADIANCE_PP_SEG_MAX, default 16 = 15 boundaries; tp8 loop D33) */
+static int pp_seg_cap() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_PP_SEG_MAX");
+        const int n = e && *e ? std::atoi(e) : 16;
+        return std::min(std::max(n, 2), (int)RAD_PP_MAX_SEGS);
+    }();
+    return v;
+}
 
 /* qfn-on-ds lever TIP (Qwen loop round 21; RADIANCE_FN4_TIP=1 at start, the engine's too): a prompt's tail snapshot at the
  * START OF THE LAST PIECE of its last pipelined prefill step, taken inside the step instead of cutting the step there (lever
@@ -1081,6 +1100,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.pp_rank = pp.rank;
             m.pp_h = pp.cut_h;
             m.pp_t = pp.cut_t;
+            /* Qwen tp8 S6: the follower's segment boundaries -- every k-th layer after h, at most RADIANCE_PP_SEG_MAX - 1 (the
+             * core's bound, default 15). Any layer is one: what crosses a cut is the wide stream alone (S3a), on one node too. */
+            const char* sk = std::getenv("RADIANCE_PP_SEG_LAYERS");
+            const int k = sk && *sk ? std::atoi(sk) : 0;
+            if (m.pp_rank == 1 && k > 0 && pp.lanes > 1)
+                for (int x = m.pp_h + k; x < m.pp_t && (int)m.seg_b.size() < pp_seg_cap() - 1; x += k) m.seg_b.push_back(x);
         } else if (rad::arch::qfnlayers::parse(std::getenv("RADIANCE_FN4_LAYERS"), std::getenv("RADIANCE_FN4_LAYERS_MODE"),
                                                (int)g.n_layer, &m.lr, &err) < 0) {
             fprintf(stderr, "radiance: qwen4exp: %s\n", err.c_str());
@@ -1891,9 +1916,35 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         else      rad_op_writes(b, h, pp_bufs.data(), (int)pp_bufs.size());
         return h;
     };
+    /* Qwen tp8 S6: this rank's segment ring buffer (the loop-mode header, the wide stream at max_tok rows, the trailer; kept
+     * across the passes run between two segments) and each boundary's save / restore, declared where they are issued (the
+     * save after layer s - 1, the restore before layer s) */
+    if (m.pp && !m.seg_b.empty()) {
+        m.seg_ring_bytes = RAD_PP_RING_HDR + (int64_t)rad_pp_align((uint64_t)(g.max_tok * m.pp_row)) + RAD_PP_TRAILER;
+        m.seg_ring = decl_b(b, nm.f("pp_segring"), RAD_U8, {m.seg_ring_bytes}, RAD_BUF_PERSIST);
+        m.seg_save.assign(m.seg_b.size(), 0);
+        m.seg_load.assign(m.seg_b.size(), 0);
+    }
+    auto seg_op = [&](bool save) {
+        rad_op h = RAD_OP(b, save ? "stage_send" : "stage_recv",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", 2), RAD_INT("parts", m.pp_parts),
+                                     RAD_INT("loop", 1)),
+                          RAD_NOWEIGHTS);
+        if (h == RAD_NULL_HANDLE) return h;
+        if (save) rad_op_reads(b, h, pp_bufs.data(), (int)pp_bufs.size());
+        else      rad_op_writes(b, h, pp_bufs.data(), (int)pp_bufs.size());
+        return h;
+    };
     for (int64_t l = 0; l < g.n_layer; ++l) {
         Layer& lay = m.layers[(size_t)l];
         if (m.pp && m.pp_rank == 1 && l == m.lr_first) m.op_x1 = pp_stage(false, RAD_PP_X1);   /* the follower takes X1 */
+        for (size_t k = 0; k < m.seg_b.size(); ++k)                                            /* Qwen tp8 S6 */
+            if (m.seg_b[k] == (int32_t)l && (!(m.seg_save[k] = seg_op(true)) || !(m.seg_load[k] = seg_op(false)))) {
+                fprintf(stderr, "radiance: qwen4exp: RADIANCE_PP_SEG_LAYERS: the segment boundary at layer %lld did not declare "
+                                "(no stage_send / stage_recv in loop mode: a kernel library without the two-node pipeline's "
+                                "stage ops)\n", (long long)l);
+                return RAD_E_UNSUPPORTED;
+            }
         if (m.pp && m.pp_rank == 0 && l == m.pp_t) {                                           /* the leader's cut */
             m.op_x1 = pp_stage(true, RAD_PP_X1);
             m.op_x2 = pp_stage(false, RAD_PP_X2);
@@ -2267,6 +2318,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "the stage ops: libr4d r4d_stage.hip, libref ref_stage.cpp)\n");
             return RAD_E_UNSUPPORTED;
         }
+        /* Qwen tp8 S6: the follower's segment boundaries, for the core's follower loop (every rank, every declare) */
+        if (!m.seg_b.empty()) {
+            std::string bs;
+            for (int32_t x : m.seg_b) bs += (bs.empty() ? "" : ", ") + std::to_string(x);
+            rad_note(b, "two-node pipeline (Qwen tp8 S6, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments at "
+                        "layers %s of W(%d,%d), each boundary's wide stream saved and restored on this rank (a %lld-byte ring "
+                        "buffer, loop mode)", bs.c_str(), m.pp_h, m.pp_t, (long long)m.seg_ring_bytes);
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: qwen4exp: two-node pipeline (Qwen tp8 S6, RADIANCE_PP_SEG_LAYERS): the follower's "
+                                "passes may run in segments at layers %s of W(%d,%d), each boundary's wide stream saved and "
+                                "restored on this rank (a %lld-byte ring buffer, loop mode; no gather)\n", bs.c_str(), m.pp_h,
+                        m.pp_t, (long long)m.seg_ring_bytes);
+            rad_pp_declare_segments(m.seg_b.data(), (int)m.seg_b.size());
+        }
     }
 
     /* ---- the 97th connection: no write half, no fp8 copy. It produces the bf16 hidden state the
@@ -2596,6 +2661,11 @@ struct PpPass {
     bool on = false;
     bool head = true, tail = true;
     RadPpInfo info{};
+    /* Qwen tp8 S6: the follower's layers this part issues, [s0, s1) of its [h, t): the whole pass, or a segment the core
+     * asked for (RAD_PP_PART_SEG) -- X1's receive only where s0 = h, else boundary s0's restore; X2's send only where s1 = t,
+     * else boundary s1's save */
+    int  s0 = 0, s1 = 0;
+    bool seg_in = false, seg_out = false;
 };
 static PpPass pp_pass(const Model& m) {
     PpPass p;
@@ -2605,7 +2675,34 @@ static PpPass pp_pass(const Model& m) {
     const int part = m.pp_rank == 0 ? p.info.part : RAD_PP_PART_WHOLE;
     p.head = part != RAD_PP_PART_TAIL;
     p.tail = part != RAD_PP_PART_HEAD;
+    p.s0 = m.pp_h;
+    p.s1 = m.pp_t;
+    if (m.pp_rank == 1 && p.info.part == RAD_PP_PART_SEG && !m.seg_b.empty()) {
+        p.s0 = p.info.seg_l0;
+        p.s1 = p.info.seg_l1;
+        p.seg_in = p.s0 != m.pp_h;
+        p.seg_out = p.s1 != m.pp_t;
+    }
     return p;
+}
+/* Qwen tp8 S6: a part's layers are a segment this node declared: [h, t) or bounded by its boundaries */
+static bool pp_seg_ok(const Model& m, const PpPass& pp) {
+    auto is_b = [&](int s) { return std::find(m.seg_b.begin(), m.seg_b.end(), (int32_t)s) != m.seg_b.end(); };
+    return pp.s0 < pp.s1 && pp.s0 >= m.pp_h && pp.s1 <= m.pp_t && (pp.s0 == m.pp_h || is_b(pp.s0)) &&
+           (pp.s1 == m.pp_t || is_b(pp.s1));
+}
+/* Qwen tp8 S6: boundary s's save (after layer s - 1's writes) or restore (before layer s's read): this rank's wide stream,
+ * every row of the step as this rank holds it, into / out of its own ring buffer (the stage ops' loop mode) */
+static bool pp_seg_io(RadCtx* c, const Model& m, int64_t s, bool save, int64_t T) {
+    for (size_t k = 0; k < m.seg_b.size(); ++k) {
+        if (m.seg_b[k] != (int32_t)s) continue;
+        const rad_op op = save ? m.seg_save[k] : m.seg_load[k];
+        if (!op || !m.seg_ring) break;
+        RAD_ISSUE(c, op, brows(m.seg_ring, m.seg_ring_bytes), brows(m.b_h, T));
+        return true;
+    }
+    rad_step_fail(c, "qwen4exp: two-node pipeline (Qwen tp8 S6): a segment boundary this node did not declare");
+    return false;
 }
 /* One crossing's stage op over the wide stream's T rows (the receiver's read recomputes the hc_ss scales: same bits) */
 static bool pp_cross(RadCtx* c, const Model& m, const PpPass& pp, rad_op op, int ring, int64_t T) {
@@ -2917,7 +3014,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (m.ple_layer >= 0) m.ple.ids(c, batch, tipp);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
-    } else if (m.pp_rank == 1 && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) {
+    } else if (m.pp_rank == 1 && !(pp.seg_in ? pp_seg_io(c, m, pp.s0, false, T)      /* Qwen tp8 S6: boundary s0's restore */
+                                             : pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T))) {
         return;
     }
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
@@ -2943,10 +3041,30 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
 
     const int64_t n = (int64_t)m.layers.size();
-    /* Qwen tp8 S1: the first layer this node holds (0 without ranges); S3b: a leader's tail part starts at X2's receive + t */
-    const int64_t l0 = lead_tail_only ? (int64_t)m.pp_t : (int64_t)m.lr_first;
+    /* Qwen tp8 S1: the first layer this node holds (0 without ranges); S3b: a leader's tail part starts at X2's receive + t;
+     * S6: a follower's segment at s0 */
+    const bool fol = pp.on && m.pp_rank == 1;
+    const int64_t l0 = lead_tail_only ? (int64_t)m.pp_t : fol ? (int64_t)pp.s0 : (int64_t)m.lr_first;
     if (lead_tail_only && !pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T)) return;
-    if (n > 0) {
+    if (n > 0 && pp.seg_in) {
+        /* Qwen tp8 S6: a segment from boundary s0 -- each rank's wide stream as its save left it (an SP piece's quarter rows
+         * this rank wrote, the rest as they were), read as the pass reads a layer after a write that hands it no scales (the
+         * PLE's form below: every piece's read on this rank's rows, an SP piece's block input gathered and coded): the same
+         * ops on the same bytes as the read layer s0 - 1's writes would have issued; the read computes the norm scales itself,
+         * the same bits as the write's (docs/OPS.md `ss`); no gather of the stream at the boundary */
+        const HyperConn& h0 = m.layers[(size_t)l0].hc_mix;
+        const bool sp0 = lsp(l0);
+        for (int64_t p = 0; p < K; ++p) {
+            if (sp_pm(p, sp0)) hrm(h0, p, false, sp0); else bi_read(c, m, h0, T, r0(p), rn(p));
+            bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)l0, false);
+            if (sp_pm(p, sp0)) on1(true, [&] { ag_p(p); });
+        }
+        if (sp0) {
+            wait1();
+            for (int64_t p = 0; p < K; ++p)
+                if (sp_pm(p, sp0)) h0.codes(c, r0(p), rn(p));
+        }
+    } else if (n > 0) {
         if (m.ple_layer == l0) { m.ple.step(c, batch, tipp); bt_pt(c, m, m.b_h, 0, T, "ple", (int)l0); }
         for (int64_t p = 0; p < K; ++p) {
             bi_read(c, m, m.layers[(size_t)l0].hc_mix, T, r0(p), rn(p));
@@ -2960,6 +3078,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     for (int64_t li = 0; li < n; ++li) {
         if (!lr_held(m, li)) continue;   /* Qwen tp8 S1: another node's layer (the stream passes on) */
         if (lead_tail_only && li < m.pp_t) continue;   /* Qwen tp8 S3b: the head part ran these */
+        if (fol && (li < pp.s0 || li >= pp.s1)) continue;   /* Qwen tp8 S6: another segment's layer */
         const Layer& l = m.layers[(size_t)li];
         const int64_t lnx = lr_after(m, li);   /* the next layer this node runs (li + 1 without ranges), -1 after the last */
         spL = lsp(li);
@@ -3259,6 +3378,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const bool ple_next = nx && lnx == m.ple_layer;
         /* Qwen tp8 S3b: the leader's cut (layer h - 1 -> t): the writes, then X1 out and X2 in, then layer t's piece reads */
         const bool cut = pp.on && m.pp_rank == 0 && lnx == m.pp_t;
+        /* Qwen tp8 S6: the follower's segment ends at boundary s1 after this layer's writes (each rank its rows): the save */
+        const bool seg_end = fol && pp.seg_out && lnx == pp.s1;
         for (int64_t p = 0; p < K; ++p) {
             if (pp_mark && p == K - 2) { waitm(15); pp_mark = false; }   /* P2S: piece K - 2's reduce-scatter */
             if (p == K - 1) wait1();
@@ -3266,7 +3387,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             /* The projection of this piece, before the next layer reads it. */
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_ffn", (int)li);
-            if (nx && !ple_next && !cut) {
+            if (nx && !ple_next && !cut && !seg_end) {
                 if (sp_pm(p, spN)) hrm(nx->hc_mix, p, ss_ffn && !projected, spN);
                 else bi_read(c, m, nx->hc_mix, T, hq0m(p, spN), hqnm(p, spN), ss_ffn && !projected);
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)lnx, false);   /* lane 1 holds the last piece's rows only */
@@ -3290,6 +3411,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)lnx, false);
             }
             continue;
+        }
+        if (seg_end) {   /* every write on lane 0 and lane 1 joined (the last write waited); nothing of lane 1 after it */
+            if (nowait) rad_lane_join(c, 1, 0);
+            pp_seg_io(c, m, pp.s1, true, T);
+            return;
         }
         if (ple_next) {
             m.ple.step(c, batch, tipp);
@@ -3355,19 +3481,22 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
-    } else if (m.pp_rank == 1 && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) {
+    } else if (m.pp_rank == 1 && !(pp.seg_in ? pp_seg_io(c, m, pp.s0, false, T)      /* Qwen tp8 S6: boundary s0's restore */
+                                             : pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T))) {
         return;
     }
 
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
-    /* fn4 W1b: whether the stream's last change was a write that stored the norm scales for its rows. */
+    /* fn4 W1b: whether the stream's last change was a write that stored the norm scales for its rows. (Qwen tp8 S6: a
+     * segment's first read after its restore computes them itself, the same bits) */
     bool ss_ok = false;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         /* Qwen tp8 S1: another node's layer -- the stream passes on (the write's norm scales stay its rows', as a crossing
          * that carries them) */
         if (!lr_held(m, li)) continue;
+        if (pp.on && m.pp_rank == 1 && (li < pp.s0 || li >= pp.s1)) continue;   /* Qwen tp8 S6: another segment's layer */
         if (pp.on && m.pp_rank == 0) {   /* Qwen tp8 S3a: the leader's parts */
             if (li < m.pp_h && !pp.head) continue;
             if (li == m.pp_t) {   /* the cut: X1 out after layer h - 1's write, X2 in before layer t's read */
@@ -3418,8 +3547,11 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         bt_pt(c, m, m.b_h, 0, T, "h_ffn", (int)li);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
-    /* Qwen tp8 S3a: the follower's result back to the leader after its last layer's write */
-    if (pp.on && m.pp_rank == 1) pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T);
+    /* Qwen tp8 S3a: the follower's result back to the leader after its last layer's write (S6: a segment's end, its save) */
+    if (pp.on && m.pp_rank == 1) {
+        if (pp.seg_out) pp_seg_io(c, m, pp.s1, true, T);
+        else            pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T);
+    }
 }
 
 /* ============================== fn4 SP-serial (14.11.2026) ==============================
@@ -3568,7 +3700,8 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     wait1();
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
-    } else if (m.pp_rank == 1 && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) {
+    } else if (m.pp_rank == 1 && !(pp.seg_in ? pp_seg_io(c, m, pp.s0, false, T)      /* Qwen tp8 S6: boundary s0's restore */
+                                             : pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T))) {
         return;
     }
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
@@ -3685,9 +3818,32 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     /* The first read on every row: nothing is reduced before it, every rank holds the whole embedding. (Qwen tp8 S1: the
      * first layer this node holds; a proxy's synthetic boundary input) */
     /* (Qwen tp8 S3b-SP: a leader's tail part reads layer t first, from X2's whole rows) */
-    const int64_t l0 = lead_tail_only ? (int64_t)m.pp_t : (int64_t)m.lr_first;
+    const bool fol = pp.on && m.pp_rank == 1;
+    const int64_t l0 = lead_tail_only ? (int64_t)m.pp_t : fol ? (int64_t)pp.s0 : (int64_t)m.lr_first;
+    if (pp.seg_in) {
+        /* Qwen tp8 S6: a segment from boundary s0 -- each rank's wide stream as its save left it (its run rows written, the
+         * rest as they were): layer s0's read as conn() issues it after layer s0 - 1's write on this rank's rows of each run,
+         * the block input gathered and coded on every row; the read computes the norm scales itself (the same bits as the
+         * write's, docs/OPS.md `ss`); no gather of the stream at the boundary */
+        const HyperConn& h0 = m.layers[(size_t)l0].hc_mix;
+        if (sp.nrun == 1) {
+            rd(h0, sp.run[0], false);
+            ag(sp.run[0]);
+            codes(h0, 0, T);
+        } else {   /* conn()'s two-run order without the reduce-scatters and the writes */
+            rd(h0, sp.run[0], false);
+            on1(true, [&] { ag(sp.run[0]); });
+            rd(h0, sp.run[1], false);
+            wait1();
+            on1(true, [&] { ag(sp.run[1]); });
+            codes(h0, sp.run[0].r0, sp.run[0].n);
+            wait1();
+            codes(h0, sp.run[1].r0, sp.run[1].n);
+        }
+    } else {
     if (m.ple_layer == l0) m.ple.step(c, batch);
     bi_read_pieces(c, m, m.layers[(size_t)l0].hc_mix, T, false);
+    }
     /* the wide stream's runs gathered raw on every rank (exact): before the output mixer / the MTP head, and before a crossing
      * (stage_send copies rank `sender`'s rows, and each rank wrote only its run rows) */
     auto gather_h = [&] {
@@ -3701,11 +3857,14 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     for (int64_t li = 0; li < nl; ++li) {
         if (!lr_held(m, li)) continue;   /* Qwen tp8 S1: another node's layer (the stream passes on) */
         if (lead_tail_only && li < m.pp_t) continue;   /* Qwen tp8 S3b-SP: the head part ran these */
+        if (fol && (li < pp.s0 || li >= pp.s1)) continue;   /* Qwen tp8 S6: another segment's layer */
         const Layer& l = m.layers[(size_t)li];
         const int64_t lnx = lr_after(m, li);   /* the next layer this node runs, -1 after the last */
         /* Qwen tp8 S3b-SP: the leader's cut (layer h - 1 -> t): the write on this rank's rows, the gather, X1 out, X2 in,
          * layer t's read on every row (as the step's first read) */
         const bool cut = pp.on && m.pp_rank == 0 && lnx == m.pp_t;
+        /* Qwen tp8 S6: the follower's segment ends at boundary s1 after this layer's write on this rank's rows: the save */
+        const bool seg_end = fol && pp.seg_out && lnx == pp.s1;
         if (cut && li < spl0) {
             rad_step_fail(c, "qwen4exp: two-node pipeline (Qwen tp8 S3b-SP): the cut after a layer SP-serial runs replicated "
                              "(before the PLE's) is not built");
@@ -3739,8 +3898,12 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
         l.mlp.route_report(c);
         if (m.bt.on) { bt_moe(c, m, T, (int)li); bt_pt(c, m, m.a_x.x, 0, T, "moe_part", (int)li); }   /* routing, shared arm, partial */
-        conn(l.hc_ffn, lnx >= 0 && !cut ? &m.layers[(size_t)lnx].hc_mix : nullptr,
+        conn(l.hc_ffn, lnx >= 0 && !cut && !seg_end ? &m.layers[(size_t)lnx].hc_mix : nullptr,
              [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); }, m.bt.on ? "h_ffn" : nullptr, (int)li);
+        if (seg_end) {   /* (two runs: conn joined lane 1 after the last write) */
+            pp_seg_io(c, m, pp.s1, true, T);
+            return;
+        }
         if (cut) {
             if (pp.head) {
                 gather_h();
@@ -3768,6 +3931,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (pp.on && (batch->enc || (m.pp_rank == 1 && batch->draft_pass != 0) || g_tipr[rad_rank(c)].row > 0)) {
         rad_step_fail(c, "qwen4exp: two-node pipeline (Qwen tp8 S3a): an encoder pass, a drafter pass on the follower or a "
                          "snapshot inside a step is not built");
+        return;
+    }
+    /* Qwen tp8 S6: a follower segment the core asked for must be one this node declared; the leader's segments (the DS
+     * line's M9, RADIANCE_PP_LEAD_SEG) are not built here, so the leader declares no boundary and is never sent one */
+    if (pp.on && m.pp_rank == 1 && !pp_seg_ok(m, pp)) {
+        rad_step_fail(c, "qwen4exp: two-node pipeline (Qwen tp8 S6): a segment of layers this node did not declare");
+        return;
+    }
+    if (pp.on && m.pp_rank == 0 && (pp.info.part == RAD_PP_PART_SEG || pp.info.seg_l1 > 0)) {
+        rad_step_fail(c, "qwen4exp: two-node pipeline (Qwen tp8 S6): a leader segment (RADIANCE_PP_LEAD_SEG) is not built");
         return;
     }
 

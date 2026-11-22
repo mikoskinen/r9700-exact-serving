@@ -13976,7 +13976,8 @@ TEST(flashnext_layers_ranges_parse_pairs_and_crossing_bytes) {
 /* Qwen tp8 S2 (Qwen loop round 30): this test binary links no core, so the pipeline's weak entry points are faked here -- off
  * (one machine: rad_pp_query answers nodes 1) unless a case turns them on; the crossings a declare names are recorded. */
 namespace {
-struct FakePp { bool on = false; RadPpInfo info{}; int64_t row[RAD_PP_N_RINGS] = {}; int parts[RAD_PP_N_RINGS] = {}; };
+struct FakePp { bool on = false; RadPpInfo info{}; int64_t row[RAD_PP_N_RINGS] = {}; int parts[RAD_PP_N_RINGS] = {};
+                std::vector<int32_t> segs; int seg_calls = 0; };
 FakePp& fake_pp() { static FakePp f; return f; }
 }  /* namespace */
 extern "C" int rad_pp_info(RadPpInfo* out) {
@@ -13986,6 +13987,11 @@ extern "C" int rad_pp_info(RadPpInfo* out) {
 }
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
     if (ring >= 0 && ring < RAD_PP_N_RINGS) { fake_pp().row[ring] = row_bytes; fake_pp().parts[ring] = parts; }
+}
+/* Qwen tp8 S6 (round 32): the segment boundaries a declare names (the last call wins, as the core's) */
+extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
+    fake_pp().segs.assign(bounds, bounds + (n > 0 ? n : 0));
+    ++fake_pp().seg_calls;
 }
 
 /* Qwen tp8 S2: a node of the two-node pipeline (--pp-nodes 2 --pp-rank r --pp-cut h,t; here the fake rad_pp_info) declares its
@@ -14335,6 +14341,266 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
             }
             f.on = false;
         }
+    unsetenv("RADIANCE_FN4_HC_SS");
+    fake_pp() = FakePp{};
+}
+
+/* Qwen tp8 S6 (Qwen loop round 32; the DS line's tp8 dev M4): RADIANCE_PP_SEG_LAYERS=k on the follower of W(2, 6) (the
+ * eight-layer fixture, four ranks, --pp-lanes 2 in the fake): k 1 declares the boundaries 3, 4, 5 and k 2 the boundary 4
+ * (rad_pp_segments; a PERSIST ring buffer a rank = the loop-mode header + 20,480 B x max_tok + the trailer; a save and a
+ * restore a boundary in loop mode); the leader with the same env and a one-lane follower declare none. Every form a follower
+ * pass takes -- serial (decode, two prompts, MIXED), a spanned start's pipelined 3,840-row prefill (SP-hc under hc_sp 2 + P2S +
+ * PSP) and MIXED SP-serial (one run, two halves) -- issued as its segments [2, s1) .. [sn, 6): each segment runs only its
+ * layers; X1's receive is the first issue of the first segment only, X2's send the last issue of the last only; a later
+ * segment's first issue is its boundary's restore and an earlier one's last issue its boundary's save (loop mode, lane 0, the
+ * ring buffer + the step's rows of h_wide); no all_gather of h_wide before a save (each rank its own bytes); every segment
+ * lints clean and reads no PERSIST / DERIVED buffer it did not write first but the ring its restore reads (lane safety:
+ * other lanes' passes run between two segments); and the segments together issue the weight-reading ops of the whole pass,
+ * each as often (op, weights, operand rows), so no layer's work is lost or doubled at a boundary. A segment of an undeclared
+ * boundary and a leader segment are refused. */
+TEST(flashnext_pp_segments_save_and_restore_the_stream) {
+    setenv("RADIANCE_FN4_HC_SS", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int NL = 8;
+    static RadPpRing rings[RAD_PP_N_RINGS];
+    auto layer_of = [](const std::string& name) { return name.rfind("blk.", 0) == 0 ? std::atoi(name.c_str() + 4) : -1; };
+    auto param = [](const RecOp* o, const char* key) -> long long {
+        for (const RecParam& q : o->p) if (q.key == key) return q.ival;
+        return -1;
+    };
+    /* the weight-reading issues of a pass as (op, weights, operand rows) keys, counted */
+    auto wkeys = [&](const RadBuilder& b, const RadCtx& c, std::map<std::string, int>* acc) {
+        for (const RecIssue& is : c.issues) {
+            const RecOp* o = b.op_of(is.op);
+            if (!o || o->w.empty()) continue;
+            std::string key = o->op;
+            for (rad_weight w : o->w) key += "|" + std::to_string((long long)w);
+            /* (a connection read's last operand is the write's handed norm scales, `ss`: a read after a boundary's restore
+             * computes them itself -- the same bits, docs/OPS.md `ss` -- so the key leaves that operand out) */
+            const size_t nopd = o->op.rfind("hc_read", 0) == 0 && !is.opd.empty() ? is.opd.size() - 1 : is.opd.size();
+            for (size_t j = 0; j < nopd; ++j) key += "/" + std::to_string((long long)is.opd[j].offset) + ":" +
+                                                    std::to_string((long long)is.opd[j].rows);
+            ++(*acc)[key];
+        }
+    };
+    for (int span : { 0, 1 })
+        for (int k : { 1, 2 })
+            for (int rank = 0; rank < 4; ++rank) {
+                if (span) {
+                    setenv("RADIANCE_FN4_SPHC", "1", 1);
+                    setenv("RADIANCE_FN4_P2X", "1", 1);
+                    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+                    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+                }
+                setenv("RADIANCE_PP_SEG_LAYERS", k == 1 ? "1" : "2", 1);
+                const std::vector<int32_t> want = k == 1 ? std::vector<int32_t>{ 3, 4, 5 } : std::vector<int32_t>{ 4 };
+                FakePp& f = fake_pp();
+                f = FakePp{};
+                f.on = true;
+                f.info.nodes = 2; f.info.rank = 1; f.info.cut_h = 2; f.info.cut_t = 6; f.info.lanes = 2;
+                f.info.part = RAD_PP_PART_WHOLE;
+                for (int x = 0; x < RAD_PP_N_RINGS; ++x) f.info.ring[x] = &rings[x];
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                RadBuildCtx ctx = q4_ctx(rank, 4);
+                if (span) { ctx.max_tok = 8192; ctx.max_mixed_tok = 2048; }
+                REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+                qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+                REQUIRE(m.pp && m.pp_rank == 1);
+                CHECK(m.seg_b == want);
+                CHECK(f.segs == want);
+                REQUIRE(m.seg_ring != 0);
+                CHECK_EQ(b.bufs[m.seg_ring - 1].d.kind, (int)RAD_BUF_PERSIST);
+                CHECK_EQ(m.seg_ring_bytes, (int64_t)(RAD_PP_RING_HDR + ctx.max_tok * 20480 + RAD_PP_TRAILER));
+                REQUIRE_EQ(m.seg_save.size(), want.size());
+                for (size_t i = 0; i < want.size(); ++i) {
+                    REQUIRE(m.seg_save[i] && m.seg_load[i]);
+                    const RecOp* so = b.op_of(m.seg_save[i]);
+                    const RecOp* lo = b.op_of(m.seg_load[i]);
+                    CHECK(so->op == "stage_send" && lo->op == "stage_recv");
+                    CHECK_EQ(param(so, "loop"), 1LL);
+                    CHECK_EQ(param(lo, "loop"), 1LL);
+                    CHECK_EQ(param(so, "ring"), 2LL);
+                    CHECK(std::find(so->reads.begin(), so->reads.end(), m.b_h) != so->reads.end());
+                    CHECK(std::find(lo->writes.begin(), lo->writes.end(), m.b_h) != lo->writes.end());
+                }
+                if (span) {
+                    REQUIRE(m.pipe_on);
+                    qwen4exp_fp8::fn4_sp_flag().store(2);
+                    qwen4exp_fp8::fn4_pair_flag().store(1);
+                    qwen4exp_fp8::fn4_hcbi_flag().store(5);
+                    qwen4exp_fp8::fn4_spser_flag().store(1);
+                    qwen4exp_fp8::fn4_sproute_flag().store(512);
+                }
+                /* the segments of W(2, 6) at the declared boundaries, and (k 1) at a subset of them (the core's pp_seg_set,
+                 * tp8 loop D33: a segment then spans a boundary it does not stop at) */
+                std::vector<std::vector<std::pair<int, int>>> segsets;
+                for (const std::vector<int32_t>& cut : k == 1 ? std::vector<std::vector<int32_t>>{ want, { 4 } }
+                                                              : std::vector<std::vector<int32_t>>{ want }) {
+                    std::vector<std::pair<int, int>> segs;
+                    int a = 2;
+                    for (int32_t x : cut) { segs.emplace_back(a, x); a = x; }
+                    segs.emplace_back(a, 6);
+                    segsets.push_back(segs);
+                }
+                struct Shape { std::vector<int> dq, pq; int ctxv; int spser; };
+                std::vector<Shape> shapes;
+                if (span) shapes = { { {}, { 2048 + 1792 }, 10240, 1 }, { { 4, 4, 4, 4 }, { 500 }, 4096, 1 },
+                                     { { 4, 4, 4, 4 }, { 1000 }, 4096, 2 } };
+                else      shapes = { { { 1, 1, 1, 1 }, {}, 0, 0 }, { {}, { 64, 64 }, 9000, 0 }, { { 4, 4 }, { 100 }, 9000, 0 } };
+                for (const Shape& sh : shapes) {
+                    if (span) qwen4exp_fp8::fn4_spser_flag().store(sh.spser);
+                    const auto kt = kit(b, sh.dq, sh.pq, sh.pq.empty() ? 0 : sh.ctxv);
+                    kt->b.positions_h = kt->pos.data();
+                    const int64_t T = kt->b.n_tok;
+                    /* the whole pass */
+                    f.info.part = RAD_PP_PART_WHOLE; f.info.seg_l0 = 0; f.info.seg_l1 = 0;
+                    m.spser_noted = 0;
+                    std::map<std::string, int> whole;
+                    {
+                        const auto v = run_passes(b, qwen4exp_fp8::step, { kt.get() }, rank, 4);
+                        CHECK_PASSES(b, v);
+                        wkeys(b, *v[0], &whole);
+                        if (span && !sh.dq.empty()) CHECK_EQ(m.spser_noted, sh.spser);   /* the MIXED step ran SP-serial */
+                    }
+                    for (const std::vector<std::pair<int, int>>& segs : segsets) {
+                    std::map<std::string, int> parts;
+                    for (size_t si = 0; si < segs.size(); ++si) {
+                        const int s0 = segs[si].first, s1 = segs[si].second;
+                        f.info.part = RAD_PP_PART_SEG; f.info.seg_l0 = s0; f.info.seg_l1 = s1;
+                        m.spser_noted = 0;
+                        const auto v = run_passes(b, qwen4exp_fp8::step, { kt.get() }, rank, 4);
+                        CHECK_PASSES(b, v);
+                        CHECK(v[0]->step_fail.empty());
+                        const RadCtx& c = *v[0];
+                        wkeys(b, c, &parts);
+                        std::set<int> layers;
+                        int first_stage = -1, last_stage = -1, n_x1 = 0, n_x2 = 0, n_load = 0, n_save = 0, agh_before_save = 0;
+                        for (size_t i = 0; i < c.issues.size(); ++i) {
+                            const RecOp* o = b.op_of(c.issues[i].op);
+                            if (!o) continue;
+                            for (rad_weight w : o->w)
+                                if (w && w <= b.weights.size()) {
+                                    const int l = layer_of(b.weights[w - 1].name);
+                                    if (l >= 0 && l < NL) layers.insert(l);
+                                }
+                            if (o->op == "all_gather_rows" && std::find(o->reads.begin(), o->reads.end(), m.b_h) != o->reads.end())
+                                ++agh_before_save;
+                            if (o->op != "stage_send" && o->op != "stage_recv") continue;
+                            if (first_stage < 0) first_stage = (int)i;
+                            last_stage = (int)i;
+                            CHECK_EQ(c.issues[i].lane, 0);
+                            const long long ring = param(o, "ring"), loop = param(o, "loop");
+                            if (loop == 1) {
+                                CHECK_EQ(ring, 2LL);
+                                CHECK_EQ((int)c.issues[i].opd.size(), 2);   /* the ring buffer + h_wide's step rows */
+                                if (c.issues[i].opd.size() == 2) {
+                                    CHECK_EQ(c.issues[i].opd[0].handle, (uint32_t)m.seg_ring);
+                                    CHECK_EQ(c.issues[i].opd[1].rows, T);
+                                }
+                                if (o->op == "stage_recv") { ++n_load; CHECK_EQ(i, (size_t)0); }   /* the restore goes first */
+                                else { ++n_save; CHECK_EQ(i, c.issues.size() - 1); }                 /* the save last */
+                            } else if (o->op == "stage_recv") {
+                                CHECK_EQ(ring, (long long)RAD_PP_X1);
+                                ++n_x1;
+                            } else {
+                                CHECK_EQ(ring, (long long)RAD_PP_X2);
+                                ++n_x2;
+                                CHECK_EQ(i, c.issues.size() - 1);
+                            }
+                        }
+                        std::set<int> want_l;
+                        for (int l = s0; l < s1; ++l) want_l.insert(l);
+                        CHECK(layers == want_l);
+                        CHECK_EQ(n_x1, s0 == 2 ? 1 : 0);
+                        CHECK_EQ(n_load, s0 == 2 ? 0 : 1);
+                        CHECK_EQ(n_x2, s1 == 6 ? 1 : 0);
+                        CHECK_EQ(n_save, s1 == 6 ? 0 : 1);
+                        if (s1 < 6) CHECK_EQ(agh_before_save, 0);   /* each rank saves its own rows: no gather at a boundary */
+                        CHECK(first_stage >= 0 && last_stage >= first_stage);
+                        /* lane safety: nothing PERSIST / DERIVED read before this segment wrote it, but the ring its restore reads */
+                        std::set<rad_buf> wr;
+                        std::vector<std::string> early;
+                        for (size_t i = 0; i < c.issues.size(); ++i) {
+                            const RecOp* o = b.op_of(c.issues[i].op);
+                            if (!o) continue;
+                            for (rad_buf h : o->reads)
+                                if (h && h <= b.bufs.size() && !wr.count(h) && b.bufs[h - 1].d.kind != RAD_BUF_TRANSIENT &&
+                                    !(h == m.seg_ring && o->op == "stage_recv" && i == 0))
+                                    early.push_back(b.bufs[h - 1].name + " by " + o->op);
+                            for (rad_buf h : o->writes) wr.insert(h);
+                        }
+                        CHECK(early.empty());
+                        if (!early.empty() && rank == 0)
+                            fprintf(stderr, "    k %d span %d [%d, %d) T %lld reads first: %s\n", k, span, s0, s1, (long long)T,
+                                    early[0].c_str());
+                    }
+                    CHECK(parts == whole);   /* every layer's work once, at the same rows */
+                    if (parts != whole && rank == 0) {
+                        int shown = 0;
+                        for (const auto& kv : whole)
+                            if (parts[kv.first] != kv.second && shown++ < 4)
+                                fprintf(stderr, "    k %d span %d T %lld: whole %d x vs segments %d x %s\n", k, span, (long long)T,
+                                        kv.second, parts[kv.first], kv.first.c_str());
+                        for (const auto& kv : parts)
+                            if (!whole.count(kv.first) && shown++ < 8)
+                                fprintf(stderr, "    k %d span %d T %lld: segments only %d x %s\n", k, span, (long long)T, kv.second,
+                                        kv.first.c_str());
+                    }
+                    }   /* segsets */
+                }
+                /* a segment the follower did not declare, and a leader segment: refused */
+                {
+                    const auto kt = kit(b, { 4, 4 }, { 100 }, 9000);
+                    kt->b.positions_h = kt->pos.data();
+                    /* (k 1: past t; k 2: layer 3 is no boundary. A segment may span several boundaries: the core's
+                     * pp_seg_set picks a subset, tp8 loop D33) */
+                    f.info.part = RAD_PP_PART_SEG; f.info.seg_l0 = k == 1 ? 3 : 2; f.info.seg_l1 = k == 1 ? 7 : 3;
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { kt.get() }, rank, 4);
+                    CHECK(!v[0]->step_fail.empty());
+                }
+                if (span) {
+                    qwen4exp_fp8::fn4_sproute_flag().store(0);
+                    qwen4exp_fp8::fn4_spser_flag().store(0);
+                    qwen4exp_fp8::fn4_hcbi_flag().store(0);
+                    qwen4exp_fp8::fn4_pair_flag().store(0);
+                    qwen4exp_fp8::fn4_sp_flag().store(0);
+                    rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+                    m.pipe_cu_h = nullptr;
+                    m.pipe_cu_tried = false;
+                    unsetenv("RADIANCE_FN4_SPSERIAL");
+                    unsetenv("RADIANCE_FN4_SPHC");
+                    unsetenv("RADIANCE_FN4_P2X");
+                    unsetenv("RADIANCE_FN4_GATHER_INV");
+                }
+                f.on = false;
+            }
+    /* controls: the leader with the env, and a follower of one lane, declare no boundary (and name none) */
+    for (int arm : { 0, 1 }) {
+        FakePp& f = fake_pp();
+        f = FakePp{};
+        f.on = true;
+        f.info.nodes = 2; f.info.rank = arm == 0 ? 0 : 1; f.info.cut_h = 2; f.info.cut_t = 6; f.info.lanes = arm == 0 ? 2 : 1;
+        for (int x = 0; x < RAD_PP_N_RINGS; ++x) f.info.ring[x] = &rings[x];
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(0, 4);
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+        CHECK(m.seg_b.empty());
+        CHECK(m.seg_ring == 0);
+        CHECK_EQ(f.seg_calls, 0);
+        if (arm == 0) {   /* a leader segment (the DS line's M9) is not built: refused */
+            const auto kt = kit(b, { 4, 4 }, { 100 }, 9000);
+            kt->b.positions_h = kt->pos.data();
+            f.info.part = RAD_PP_PART_HEAD; f.info.seg_l0 = 0; f.info.seg_l1 = 1;
+            const auto v = run_passes(b, qwen4exp_fp8::step, { kt.get() }, 0, 4);
+            CHECK(!v[0]->step_fail.empty());
+        }
+        f.on = false;
+    }
+    unsetenv("RADIANCE_PP_SEG_LAYERS");
     unsetenv("RADIANCE_FN4_HC_SS");
     fake_pp() = FakePp{};
 }
