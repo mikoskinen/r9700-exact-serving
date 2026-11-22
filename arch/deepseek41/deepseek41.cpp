@@ -9520,7 +9520,9 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                               { d.q, HD, 0, HD });
                 if (g.rank == 0 && si == 0 && g_a8d_passes.fetch_add(1, std::memory_order_relaxed) == 0)
                     fprintf(stderr, "radiance: deepseek41: lever A8D: first query pass issued with the stages' attention linears "
-                                    "on the int8 pairs at %lld rows (counted at issue: a recorded pass once)\n", (long long)T);
+                                    "on the int8 pairs at %lld rows; o's pair %s (counted at issue: a recorded pass once)\n", (long long)T,
+                            dof && L.o_f8 ? "from rope_rows_roundtrip_i8g (fold a)" : dof ? "by quant_act_i8g after o_f (no library serves "
+                            "rope_rows_roundtrip_i8g)" : "by quant_act_i8g (DOF off)");
             } else {
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
             else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
