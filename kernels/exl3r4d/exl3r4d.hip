@@ -4479,10 +4479,16 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     // SWK x X5F (tp8 DECODE round 67, QUEUE X15): exl3_x6w 4 = 2 + the fold's twins (FOLD + SW 2) where exl3_x3d 5 picked the fold
     // (x3d 5 at K = 2, 6 at K = 2.5); at 2 / 3 the fold keeps its own kernel (as before).
     {
+      // 5 (X15b, slot s7 COORD 14:16): the per-K form -- the fold's twins at K = 2 only; at K = 2.5 (x3d 6) SWK's own G3 / U4 twins
+      // (the fold's K2.5 twins measured +6.8..+7.9 % a layer-chain over SWK alone in slot s6, +5.2 % even with the pre-pass two rows a time)
       const int swk0 = exl3r4d_fn4_x6w();
-      const bool fsw = swk0 == 4;
+      const bool fsw = swk0 == 4 || swk0 == 5;
       const int swk = fsw ? 2 : swk0;
-      if (fsw && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2) && ((bits == 2 && a->x3d == 5) || (bits == EXL3R4D_K25 && a->x3d == 6))) {
+      if (swk0 == 5 && bits == EXL3R4D_K25 && a->x3d == 6 && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2)) {
+        kf = gate_up ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3, 1, false, 2>
+           : sg == 2 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 2, false, 2>
+                     : (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 1, false, 2>;
+      } else if (fsw && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2) && ((bits == 2 && a->x3d == 5) || (bits == EXL3R4D_K25 && a->x3d == 6))) {
         if (bits == 2)
           kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2, 1, true, 2>
              : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2, true, 2> : (const void*)exl3r4d_gemm_x3d_kernel<1, 1, true, 2>;

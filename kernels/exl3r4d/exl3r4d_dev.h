@@ -84,7 +84,7 @@ int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream);
 int exl3r4d_fn4_dng(void);   /* SPB-G: the fn4 switch exl3_dng 0 / 2 / 4 / 8 (prefill.c), 0 at start */
 int exl3r4d_fn4_x3d(void);   /* X3D-F / K25U: the fn4 switch exl3_x3d (prefill.c) 0 .. 4, 0 at start */
 int exl3r4d_fn4_x3d_pf(void);   /* A10: the fn4 switch exl3_x3d_pf (prefill.c), 0 at start -- the M > 16 band's K = 2 GEMM */
-int exl3r4d_fn4_x6w(void);   /* SWK: the fn4 switch exl3_x6w (prefill.c) 0 / 2 / 3 / 4 (X15: + the fold's twins), 0 at start -- the decode band's 2:4 sparse WMMA form */
+int exl3r4d_fn4_x6w(void);   /* SWK: the fn4 switch exl3_x6w (prefill.c) 0 / 2 / 3 / 4 (X15: + the fold's twins) / 5 (X15b: at K = 2 only), 0 at start -- the decode band's 2:4 sparse WMMA form */
 int exl3r4d_launch_prep4(const Exl3r4dGemm4* a, int gate_up, void* stream);
 int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void* stream, int grid2d);
 int exl3r4d_launch_prep_form4(const Exl3r4dGemm4* a, int gate_up, void* stream, int grid2d);
