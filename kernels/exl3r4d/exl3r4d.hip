@@ -163,6 +163,9 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #ifndef EXL3R4D_X6_PRE  // X6 next step (tp8 DECODE round 60, QUEUE X6u): the X5_SUM 3 pre-pass; 0 = as served (one row at a time,
 #define EXL3R4D_X6_PRE 0  // one load a k-step); 1 = no pre-pass (TIMING ONLY, wrong output: its upper bound); 2 = two rows at a time with
 #endif                    // four loads a row issued before their dots (each row's dot order and butterfly unchanged: the same bits)
+#ifndef EXL3R4D_X6_VDOT  // X6w (tp8 DECODE round 61, QUEUE X6w): 1 = the X3D / K25U K loops' WMMAs replaced by per-row VALU dots -- each
+#define EXL3R4D_X6_VDOT 0   // live row of the run broadcast in its lane half (v_permlane16, 4 dwords) and 4 x NPW v_dot2_f32_f16 into the row's
+#endif                      // own f32 accumulator; TIMING ONLY (the accumulators are folded into acc unordered: wrong outputs). 0 = served.
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -697,6 +700,32 @@ static __device__ __forceinline__ void decode_frags_k25(const unsigned (&R0)[NPW
     out[j] = x8.f;
   }
 }
+// X6w (EXL3R4D_X6_VDOT 1, TIMING ONLY): a k-step's dots without the WMMA -- lane l (column l % 16, k half l / 16) holds its 8
+// decoded weights; each of the run's nrv rows' 8 activations of the same k positions sit in lane 16 (l / 16) + r of the B
+// fragment, broadcast to the lane half by v_permlane16 (selector nibbles all r), then 4 v_dot2_f32_f16 a tile into vacc[j][r].
+template <int NPW>
+static __device__ __forceinline__ void x6w_vdot(const v8h (&wf)[NPW], v8h af, float (&vacc)[NPW][16], int nrv) {
+  union { v8h f; unsigned u[4]; } a;
+  a.f = af;
+  union { v8h f; v2h h[4]; } w[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) w[j].f = wf[j];
+#pragma unroll
+  for (int r = 0; r < 16; r++) {
+    if (r < nrv) {   // wave-uniform: the run's rows
+      const unsigned sel = 0x11111111u * (unsigned)r;
+      v2h xb[4];
+#pragma unroll
+      for (int q = 0; q < 4; q++)
+        xb[q] = __builtin_bit_cast(v2h, (unsigned)__builtin_amdgcn_permlane16(a.u[q], a.u[q], sel, sel, false, false));
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int q = 0; q < 4; q++) vacc[j][r] = __builtin_amdgcn_fdot2(w[j].h[q], xb[q], vacc[j][r], false);
+    }
+  }
+}
+
 // X4 reading helpers (EXL3R4D_ABLATE_MMA / _DEC above; off = mma() and the decodes exactly as before).
 template <int NPW>
 static __device__ __forceinline__ void x4_raw_frags(const unsigned (&a)[NPW], const unsigned (&b)[NPW], v8h (&out)[NPW]) {
@@ -983,6 +1012,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   v8f acc[NPW];
 #pragma unroll
   for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+  // X6w (EXL3R4D_X6_VDOT 1, TIMING ONLY): the run's rows' own dot accumulators
+  [[maybe_unused]] float vacc[NPW][16];
+  [[maybe_unused]] const int nrv = min(chunk, r1 - rc);
+  if constexpr (EXL3R4D_X6_VDOT && (X3D || K25 != K25_OFF)) {
+#pragma unroll
+    for (int j = 0; j < NPW; j++)
+#pragma unroll
+      for (int r = 0; r < 16; r++) vacc[j][r] = 0.f;
+  }
   static_assert(!FOLD || ((X3D || K25 != K25_OFF) && !RAW && !APREP && STAGED == 0 && !XSM),
                 "X5: the fold is built for the X3D / K25U K loops only");
   [[maybe_unused]] v8f accx = (v8f)(0.f);   // X5 (FOLD): every row's sum of this split's activations, in each column
@@ -1185,10 +1223,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       v8h wfs_[NPW];                                                                 \
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(x0_, x1_, wfs_);           \
       else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
-      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
+      if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
+      else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
-      if constexpr (EXL3R4D_X6_SGB == 1) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
+      if constexpr (EXL3R4D_X6_SGB == 1 && !EXL3R4D_X6_VDOT) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
         __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + 2, 0);                \
         __builtin_amdgcn_sched_group_barrier(0x002, 32 * NPW, 0);                   \
         __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);                        \
@@ -1213,7 +1252,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       v8h wfs_[NPW];                                                                 \
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(r0_, r1_, wfs_);           \
       else decode_frags_k25<NPW, FOLD>(r0_, r1_, wfs_);                              \
-      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
+      if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
+      else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
       break;                                                                         \
@@ -1281,6 +1321,12 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   if (acc[0][0] == 12345.678f) *(int*)p.y = 1;
   return;
 #endif
+  if constexpr (EXL3R4D_X6_VDOT && (X3D || K25 != K25_OFF)) {   // X6w, TIMING ONLY: keep the dots live (wrong outputs)
+#pragma unroll
+    for (int j = 0; j < NPW; j++)
+#pragma unroll
+      for (int r = 0; r < 16; r++) acc[j][r & 7] += vacc[j][r];
+  }
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
   if constexpr (FOLD) {   // X5: sum_k (S kinv + kbias) x_k = kinv (sum_k S x_k) + kbias (sum_k x_k), this split's k-steps
     const float ki = x5_kinv(), kb = x5_kbias();
