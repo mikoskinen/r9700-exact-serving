@@ -6045,7 +6045,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         } else if (g.world > 1) {
             /* 16-byte key slots (ds41_walk_geom.h): the card's all-gather moves whole 16-byte words a row. */
             /* lever WSP: PERSIST (its part 1 writes the slots beside stage 0's all-reduce: no transient may share them) */
-            const bool wspd = wsp_env() && d.rank == 256;
+            const bool wspd = wsp_env() && d.rank == 256 && rad_op_declared(b, "dspark_walk_part");   /* an op with no schema stops a start */
             d.wkeys = decl_b(b, nm.f("dspark_walk_keys"), RAD_F32, { KR, ds41walk::keys_cols() },
                              wspd ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT);
             d.wgath = decl_b(b, nm.f("dspark_walk_keys_all"), RAD_F32, { KR, ds41walk::gath_cols(g.world) });
@@ -6120,6 +6120,9 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                     "products + the keys' zeros beside stage 0's attention all-reduce, part 2 = logits + products "
                                     "behind the head; fn4 dspark_walk 3 = 1 + WSP)\n",
                             pok ? "declared in two parts" : "NOT declared in two parts (no kernel serves dspark_walk_part)");
+            } else if (wsp_env() && ctx->rank == 0 && !ctx->shape_probe) {
+                fprintf(stderr, "radiance: deepseek41: lever WSP: RADIANCE_DS41_WSP=1 but %s: step 0 stays whole (dspark_walk 3 refused)\n",
+                        d.rank != 256 ? "the walk's rank is not 256" : "no loaded kernel plugin has the op dspark_walk_part");
             }
             wok = wok && d.wkeys && d.wgath && d.wfill && d.wag && rad_op_resolved(b, d.wfill) && rad_op_resolved(b, d.wag);
         } else {
