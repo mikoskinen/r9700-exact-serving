@@ -2365,6 +2365,95 @@ TEST(ckw_aql_cik_n_plays_a_cik_record_wider_than_n_lanes_as_the_ika_kernel_it_al
     CHECK(o[1].chain && !o[1].ordered);
 }
 
+/* tp8 loop W39 (DECODE round 69, review of the DRAFTER's lever CKW): the width bound on CKO's random tapes. With fn4 aql_cik N (cik_max N)
+ * a mix of chained narrow CIK records and unchained wide ones (and plain / named chained records, overlaps, completion signals, CRD /
+ * CRB) must keep the recording's proof (0 violations, 0 hangs); a bound at or above every record's width = aql_cik 1, packet for
+ * packet; the bound must change decisions on some tapes. Mutant: a record the bound plays unchained still counted in the queue's
+ * chain_issued (its kernel adds nothing with its record off) -> later targets the counter never reaches: hangs. */
+TEST(w39_ckw_random_tapes_keep_the_recordings_proof_and_a_bound_over_every_width_plays_aql_cik_1s_packets) {
+    using namespace w37;
+    uint64_t x = 0xD1B54A32D192ED03ull;
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    int bad = 0, tapes = 0, changed = 0, unchained_by_bound = 0, same_max = 0, bad_mut = 0;
+    for (int t = 0; t < 4000; ++t) {
+        const int n = 4 + (int)(rnd() % 28);
+        std::vector<PlayRec> tape;
+        std::vector<double> dur;
+        uint64_t widest = 0;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t c = rnd() % 10;   /* 0-5 a CIK record, 6-7 a plain kernel, 8-9 a named chained form (lanes off) */
+            const uint64_t w = (rnd() % 4 == 0) ? 1 + rnd() % 65536 : 1 + rnd() % 64;   /* lanes: mostly narrow, some wide */
+            PlayRec r = rec(c < 6 || c >= 8, c < 6, (rnd() % 3) != 0 && i > 0, w);
+            r.done = (rnd() % 23) == 0;
+            if (r.lanes) widest = std::max(widest, w);
+            tape.push_back(r);
+            dur.push_back((double)(1 + rnd() % 100));
+        }
+        PlayKnobs k1;
+        k1.cik_live = true;
+        k1.cik_on = true;
+        k1.crd = (t % 5 == 0) ? 2 : 0;
+        k1.crb = (t % 7 == 0) ? 64 : 0;
+        PlayKnobs kn = k1;
+        kn.cik_max = 2 + rnd() % 128;   /* aql_cik N, N >= 2 */
+        std::vector<PlayOut> o1, on;
+        bad += violations(tape, dur, kn, true, &on);
+        (void)violations(tape, dur, k1, true, &o1);
+        bool diff = false;
+        for (size_t i = 0; i < on.size(); ++i) {
+            diff = diff || on[i].chain != o1[i].chain || on[i].ordered != o1[i].ordered || on[i].target != o1[i].target;
+            unchained_by_bound += tape[i].lanes && o1[i].chain && !on[i].chain;
+        }
+        changed += diff;
+        /* a bound at the tape's widest CIK record = aql_cik 1's packets */
+        PlayKnobs kw = k1;
+        kw.cik_max = std::max<uint64_t>(2, widest);
+        std::vector<PlayOut> ow;
+        bad += violations(tape, dur, kw, true, &ow);
+        bool same = true;
+        for (size_t i = 0; i < ow.size(); ++i)
+            same = same && ow[i].chain == o1[i].chain && ow[i].ordered == o1[i].ordered && ow[i].target == o1[i].target;
+        same_max += same;
+        /* mutant: the bound's unchained records counted in chain_issued */
+        {
+            PlayQ q;
+            std::vector<double> launch(tape.size()), done(tape.size());
+            std::vector<PlayOut> om(tape.size());
+            for (size_t i = 0; i < tape.size(); ++i) {
+                om[i] = rad::aql::play_order(q, tape[i], kn);
+                double l = i ? launch[i - 1] : 0.0;
+                if (om[i].ordered) for (size_t j = 0; j < i; ++j) l = std::max(l, done[j]);
+                launch[i] = l;
+                double b = l;
+                if (om[i].chain && om[i].target > 0) {
+                    std::vector<std::pair<double, uint64_t>> c;
+                    for (size_t j = 0; j < i; ++j) if (om[j].chain) c.push_back({ done[j], tape[j].adds });
+                    std::sort(c.begin(), c.end());
+                    uint64_t sum = 0;
+                    double at = -1.0;
+                    for (const auto& y : c) { sum += y.second; if (sum >= om[i].target) { at = y.first; break; } }
+                    if (at < 0) { ++bad_mut; at = 1e30; }
+                    b = std::max(b, at);
+                }
+                done[i] = b + dur[i];
+                PlayOut adv = om[i];
+                const bool cut = tape[i].chain_ok && tape[i].lanes && tape[i].adds > kn.cik_max;
+                rad::aql::play_advance(q, tape[i], adv, kn);
+                if (cut) q.chain_issued += tape[i].adds;   /* the mutant's count */
+            }
+        }
+        ++tapes;
+    }
+    fprintf(stderr, "    %d random tapes under aql_cik N (N 2..129): %d violations / hangs; the bound changed the packets of %d tapes "
+                    "(%d CIK records unchained by it); a bound at the widest record = aql_cik 1 in %d / %d; mutant (unchained records "
+                    "counted) %d hangs\n", tapes, bad, changed, unchained_by_bound, same_max, tapes, bad_mut);
+    CHECK_EQ(bad, 0);
+    CHECK(changed > 0);
+    CHECK(unchained_by_bound > 0);
+    CHECK_EQ(same_max, tapes);
+    CHECK(bad_mut > 0);
+}
+
 TEST(w37_cko_random_tapes_keep_the_recordings_proof_and_cik_off_plays_the_packets_of_before) {
     using namespace w37;
     uint64_t x = 0x9E3779B97F4A7C15ull;
