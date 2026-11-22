@@ -254,6 +254,7 @@ struct Model {
     bool      pipe_noted = false;
     bool      nowait_noted = false;   /* PF probe NOWAIT (sp_route bit 256) said once */
     bool      psp_noted = false;      /* lever PSP (sp_route bit 512) said once */
+    bool      gpf_noted = false;      /* lever GPF (sp_route bit 4096) said once */
     int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted; P2S: 1000 (mode + 1) + layers paired */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
@@ -2515,6 +2516,20 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * prefill sequence in two pieces. */
     const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL
                        ? pcu : nullptr;
+    /* qfn-on-ds lever GPF (Qwen loop round 22, sp_route bit 4096; test tip5's sibling hits): that two-piece path projects
+     * each piece alone, so a second piece of <= 64 rows (libr4d's narrow band) takes gemm_nt_q m16's split-K arithmetic for
+     * the delta net's in-projection and gemm_nt m16 for its a|b, where a step of three or more pieces (the cold run of the
+     * same rows) projects them inside its T-row tiled launch: a hit resuming one piece before a short last piece answered
+     * otherwise than its cold. On: the piece path only where the second piece is wider than the band (ArPieces::min_last);
+     * a (R, <= 64) step runs the delta net whole, as K >= 3 does. Changes the bytes of such steps only (T in (R, R + 64]). */
+    const bool gpf = (fn4_sproute_flag().load(std::memory_order_relaxed) & 4096) != 0;
+    if (gpf && gcu && T - R <= kBiNarrowRows && !m.gpf_noted && g.rank == 0) {
+        m.gpf_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: lever GPF (sp_route bit 4096): a %lld-row step's last piece of %lld rows is in the "
+                        "narrow band, so its delta net runs whole (the projections over all %lld rows, as a step of three "
+                        "pieces), not a piece at a time\n",
+                (long long)T, (long long)(T - R), (long long)T);
+    }
 
     const int64_t n = (int64_t)m.layers.size();
     if (n > 0) {
@@ -2565,6 +2580,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         if (pmk_l) { ms.mk = &mk; ms.rows = R; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
+        if (gpf) pc.min_last = kBiNarrowRows;   /* lever GPF: a (R, <= 64)-row step's mixer runs whole, as at K >= 3 */
         /* fn4 PF-ORDER (sp_route bit 32, with the marks): a delta-net layer hands only piece 0's reduction; the step issues
          * the others beside the pieces' connections (ar_mix below), so the second lane takes piece 0's gather before
          * piece 1's and 2's mixer reductions instead of after them (the delta net hands every piece at its very end) */
@@ -3559,7 +3575,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 4095) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes) */
+        if (value < 0 || value > 8191) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes), 4096: lever GPF (a two-piece step's mixer a piece at a time only where its last piece is wider than 64 rows; other bytes for (R, <= 64)-row steps) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);

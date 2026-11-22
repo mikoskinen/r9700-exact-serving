@@ -1997,9 +1997,15 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
         /* (only a chunk's LAST piece start: a hit there runs one piece alone, the form tip0 / tip5 read exact; a resume with two
          * or more of the cold chunk's pieces after it ran them in a narrower pipelined step and differed: tip5's siblings) */
         const int64_t lastp = I > 0 && w > I ? n + (w - 1) / I * I : -1;
-        if (lastp > n && fn4::resume_cold() >= 2) {
+        /* resume_cold 3 (Qwen loop round 22, with lever GPF = sp_route bit 4096 on the plugin): every piece start of a spanned
+         * chunk again (R48c's form) and an inside snapshot at any piece start -- a hit then runs two or more of the cold chunk's
+         * pieces in a narrower step, which GPF makes take the cold step's arithmetic for a <= 64-row last piece */
+        const bool every = fn4::resume_cold() >= 3;
+        if (every && I > 0 && w > I) {
+            for (int64_t p = n + I; p < n + w; p += I) out->push_back(p);
+        } else if (lastp > n && fn4::resume_cold() >= 2) {
             out->push_back(lastp);
-        } else if (ck > n && ck < n + w && I > 0 && (ck - n) % I == 0 && n + w - ck <= I) {
+        } else if (ck > n && ck < n + w && I > 0 && (ck - n) % I == 0 && (every || n + w - ck <= I)) {
             out->push_back(ck);
         }
         n += w;
@@ -2075,7 +2081,10 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
                         /* lever TIP: only at the start of the chunk's LAST piece, where the plugin stages its rows -- a hit there
                          * runs that one piece alone (test tip5: a tail one piece earlier, the last piece under kTailMinPiece rows, gave
                          * sibling hits running two pieces that differ from their cold, 3 / 4); elsewhere cut as lever G cuts */
-                        (!tail_inner_pieces_ || (I > 0 && (tail - n_computed) % I == 0 && n_target - tail <= I));
+                        (!tail_inner_pieces_ ||
+                         (I > 0 && (tail - n_computed) % I == 0 && (n_target - tail <= I || tail_inner_sw_ >= 2)));
+        /* (sched_tail_inner 2, Qwen loop round 22: any piece start again, R48e's rule -- for lever GPF's read: a tail one piece
+         * before a last piece under kTailMinPiece rows is taken inside, and its hit runs two pieces) */
         if (ti) {
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (tail > n_computed && n_computed + want >= tail) {

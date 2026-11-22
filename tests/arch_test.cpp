@@ -13198,6 +13198,97 @@ TEST(flashnext_tip_stages_every_state_row_between_its_ops_two_launches) {
     unsetenv("RADIANCE_FN4_TIP");
 }
 
+/* qfn-on-ds lever GPF (Qwen loop round 22, sp_route bit 4096): a pipelined step of one sequence in TWO pieces runs the delta
+ * net a piece at a time (its piece path: the in-projection, the a|b GEMM, convolution, solve and scan per piece), so a second
+ * piece inside libr4d's narrow band (<= 64 rows) projects alone where a three-piece step of the same rows projects them in its
+ * T-row launch (test tip5: a hit resuming one piece before an 11-row last piece answered otherwise than its cold). With the
+ * bit, a (2048, <= 64) step runs the delta net whole: ONE convolution a layer and no in-projection / a|b launch of the last
+ * piece's rows; at 65 rows the piece path stays (two convolutions a layer, as without the bit); a three-piece step issues the
+ * same list with and without it. Negative control: the bit off issues the piece path at 11 and 64 rows. No step fails. */
+TEST(flashnext_gpf_runs_a_two_piece_step_whole_when_its_last_piece_is_narrow) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    struct Out { int64_t conv = 0, conv_last = 0, gemm_last = 0, gemmq_last = 0; std::vector<std::pair<std::string, int64_t>> list; };
+    auto run = [&](int64_t T, bool gpf) -> Out {
+        const int rank = 1;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        Out o;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) return o;
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        CHECK(m.pipe_on);
+        if (!m.pipe_on) return o;
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_sproute_flag().store(gpf ? 512 | 4096 : 512);
+        const auto pf = kit(b, {}, { (int)T }, 8192);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        CHECK(c.step_fail.empty());
+        const int64_t last = T - (T - 1) / 2048 * 2048;
+        for (const RecIssue& i : c.issues) {
+            const RecOp* op = b.op_of(i.op);
+            if (!op) continue;
+            o.list.push_back({ op->op, i.n });
+            if (op->op == "gdn_conv_prep") { ++o.conv; o.conv_last += i.n == last; }
+            if (op->op == "gemm_nt" && i.n == last) ++o.gemm_last;
+            if (op->op == "gemm_nt_q" && i.n == last) ++o.gemmq_last;
+        }
+        return o;
+    };
+    int64_t n_gdn = 0;
+    {
+        MetaKV mk2 = q4_small();
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(1, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, mk2.meta(), &ctx); }), RAD_OK);
+        for (const auto& l : qwen4exp_fp8::g_model[1].layers) n_gdn += l.full ? 0 : 1;
+    }
+    REQUIRE(n_gdn > 0);
+    for (int64_t T : { 2048 + 11, 2048 + 64 }) {
+        const Out off = run(T, false), on = run(T, true);
+        CHECK_EQ(off.conv, 2 * n_gdn);                 /* the control: the piece path, two convolutions a layer */
+        CHECK_EQ(off.conv_last, n_gdn);
+        CHECK_EQ(on.conv, n_gdn);                      /* GPF: one a layer, over the whole step */
+        CHECK_EQ(on.conv_last, (int64_t)0);
+        CHECK_EQ(off.gemm_last - on.gemm_last, n_gdn);     /* the a|b GEMM of the last piece's rows alone: gone */
+        CHECK_EQ(off.gemmq_last - on.gemmq_last, n_gdn);   /* the in-projection of the last piece's rows alone: gone */
+    }
+    {
+        const Out off = run(2048 + 65, false), on = run(2048 + 65, true);   /* above the band: the piece path either way */
+        CHECK_EQ(on.conv, 2 * n_gdn);
+        CHECK(on.list == off.list);
+    }
+    {
+        const Out off = run(4096 + 11, false), on = run(4096 + 11, true);   /* three pieces: whole either way */
+        CHECK_EQ(on.conv, n_gdn);
+        CHECK(on.list == off.list);
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's

@@ -177,7 +177,7 @@ struct GdnFP8 {
     /* Whether step() with `own_ar` false runs the whole block a piece at a time over `pieces`
      * (its piece path), asked by a caller that must know before it commits to a schedule. */
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
-        return pieces && pieces->cu && pieces->cuts(batch->n_tok) &&
+        return pieces && pieces->cu && pieces->cuts(batch->n_tok) && pieces->last_ok(batch->n_tok) &&
                batch->n_tok <= 2 * pieces->rows && (ext_in || pieces->in_ready) && !op_add &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL;
     }

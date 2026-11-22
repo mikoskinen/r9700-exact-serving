@@ -356,7 +356,15 @@ struct ArPieces {
     /* fn4 PF-ORDER (qwen/prefill): the most pieces the block hands; the caller issues the rest's reductions itself (a
      * piece not handed is one the caller's `handed` count says it must issue) */
     int64_t max_hand = (int64_t)1 << 62;
+    /* qfn-on-ds lever GPF (Qwen loop round 22, sp_route bit 4096): a block's two-piece path (the projections a piece at a
+     * time) only where the second piece has MORE than this many rows. A piece at or under libr4d's narrow band (64 rows:
+     * gemm_nt_q m16 with its split-K, gemm_nt m16 / m64) projected alone takes other arithmetic than the same rows inside the
+     * whole step's prefill-height launch (gemm_i8a8_tiled / gemm_bf16_nt_m64 over T rows), so the rows of a (2048, 11) step
+     * would differ from the same rows of a (2048, 2048, 11) step; above the band both launches are the tiled form. 0 =
+     * today (any second piece). */
+    int64_t min_last = 0;
     bool cuts(int64_t T) const { return done && rows > 0 && T > rows; }
+    bool last_ok(int64_t T) const { return T - rows > min_last; }
     void hand(int64_t r0, int64_t n) { if (handed >= max_hand) return; done(u, r0, n); ++handed; }
 };
 

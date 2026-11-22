@@ -324,7 +324,7 @@ struct AttnGatedFP8 {
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
         const int64_t T = batch->n_tok;
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
-        return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
+        return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) && pieces->last_ok(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
                !(T <= qk_fuse_now(fused_rows)) && batch->positions && !rope_mixed(batch) &&

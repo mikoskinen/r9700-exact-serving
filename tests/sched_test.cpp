@@ -1003,6 +1003,76 @@ TEST(lever_tip_a_hit_resumes_at_the_inner_piece_start_snapshot_under_resume_cold
     rad::fn4::apply_pending(1, da);
 }
 
+/* qfn-on-ds lever GPF's scheduler half (Qwen loop round 22): sched_tail_inner 2 takes lever TI's snapshot inside the last chunk
+ * at ANY of its piece starts (R48e's rule), so a tail one piece before a last piece under kTailMinPiece rows is taken inside
+ * instead of cut; resume_cold 3 lists every piece start of a spanned chunk (R48c's rule), so a hit there resumes at it and runs
+ * the cold chunk's last TWO pieces in one step. Interval 256, budget 1024, span 4 (chunks [0, 256), [256, 1280), then whole):
+ * a 1812-token prompt's last chunk [1280, 1812) = 256 + 256 + 20 rows (the 14,347-token siblings' 2,048 + 2,048 + 11 at this
+ * scale) -> lever G's tail 1536 is the start of its second piece, the last being 20 rows; a 1556-token prompt's [1280, 1556) =
+ * 256 + 20: its tail is the chunk start (nothing inside either way). Controls: sched_tail_inner 1 cuts at 1536 (R48f: only the
+ * last piece start goes inside), resume_cold 2 steps a hit at 1536 back to 1280 (only the last piece start 1792 and the
+ * chunk starts are resume points). */
+TEST(lever_gpf_tail_inner_2_and_resume_cold_3_take_any_piece_start) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
+    auto go = [&](int ti, int rc, int64_t lin, int n) {
+        CHECK(rad::fn4::request("resume_cold", rc, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", 256, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+        Fixture f;
+        f.build(4096, 64, 1024);          /* interval 256, budget 1024 */
+        f.cfg.prefill_span = 4;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+        if (lin > 0) {
+            f.pc.seed(n);
+            f.pc.lin = lin;
+            f.pc.src = 3;
+        }
+        const uint64_t a = f.submit(n, 2);
+        Run o;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {
+                    if (o.resumed < 0) o.resumed = e.ctx_len;
+                    o.pc.push_back({ (int64_t)e.ctx_len, e.n_tokens });
+                    if (e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) o.inner = e.ctx_len + e.ckpt_tok + 1;
+                }
+            f.commit_plain();
+        }
+        return o;
+    };
+    const Run c1 = go(1, 1, 0, 1812);                      /* R48f: the tail one piece before the last is cut */
+    REQUIRE(c1.pc.size() >= 2);
+    CHECK_EQ(c1.inner, (int64_t)-1);
+    CHECK_EQ(c1.pc.back().first, (int64_t)1536);
+    CHECK_EQ(c1.pc.back().second, (int32_t)276);
+    const Run c2 = go(2, 1, 0, 1812);                      /* tail_inner 2: inside, the chunk whole */
+    REQUIRE(!c2.pc.empty());
+    CHECK_EQ(c2.inner, (int64_t)1536);
+    CHECK_EQ(c2.pc.back().first, (int64_t)1280);
+    CHECK_EQ(c2.pc.back().second, (int32_t)532);
+    const Run h3 = go(2, 3, 1536, 1812);                   /* resume_cold 3: the hit resumes at the inner snapshot */
+    CHECK_EQ(h3.resumed, (int64_t)1536);
+    REQUIRE(!h3.pc.empty());
+    CHECK_EQ(h3.pc.front().second, (int32_t)276);          /* the cold chunk's last two pieces in one step */
+    const Run h2 = go(2, 2, 1536, 1812);                   /* resume_cold 2: not a resume point -> the chunk start */
+    CHECK_EQ(h2.resumed, (int64_t)1280);
+    const Run h3m = go(2, 3, 1024, 1812);                  /* resume_cold 3: a mid piece start of the chunk too */
+    CHECK_EQ(h3m.resumed, (int64_t)1024);
+    const Run s1 = go(2, 3, 0, 1556);                      /* tail on the chunk start: nothing inside */
+    CHECK_EQ(s1.inner, (int64_t)-1);
+    CHECK(rad::fn4::request("sched_tail_inner", 3, &err) == false);   /* range 0..2 */
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
 /* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes
  * one interval a step, and a longer one spans through to its last intervals. */
 TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
@@ -13968,10 +14038,11 @@ struct TiSwitch {
 };
 }  // namespace
 
+/* (Qwen loop round 22: 2 = 1 and, under lever TIP, any piece start of the last chunk -- lever GPF's scheduler half) */
 TEST(lever_ti_the_switch_takes_0_and_1_and_starts_off) {
     std::string err;
-    for (int v : { 0, 1 }) CHECK(fn4::check("sched_tail_inner", v, &err));
-    for (int v : { -1, 2, 512 }) {
+    for (int v : { 0, 1, 2 }) CHECK(fn4::check("sched_tail_inner", v, &err));
+    for (int v : { -1, 3, 512 }) {
         CHECK(!fn4::check("sched_tail_inner", v, &err));
         CHECK(err.find("sched_tail_inner takes 0") != std::string::npos);
     }
