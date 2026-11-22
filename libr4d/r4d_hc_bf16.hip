@@ -8937,7 +8937,10 @@ extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
-extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 8191), std::memory_order_relaxed); }
+/* r4d_selftest's setter. Qwen loop round 36 (FINDINGS DEV answer, slot h2): it kept bits 0-12 only (v & 8191, round 1's range), so
+ * every bench arm that set bit 13+ through it ran with the bit off -- slot h2's lever SSB cells (bit 17) all read 'ss not read'.
+ * Now the switch's own range (0..262143); the engine's path (r4d_fn4_switch_fn / RADIANCE_FN4_HC_READV) always had it. */
+extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 262143), std::memory_order_relaxed); }
 /* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
  * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
  * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
