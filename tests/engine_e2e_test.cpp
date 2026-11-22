@@ -4261,9 +4261,38 @@ TEST(p30t_twin_sidecar_entries_stand_beside_the_container) {
     REQUIRE(handmade(d / "both.rad", { "output.weight", "output.weight#pf" }));
     a[1] = d / "t4";
     Ran t4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both.rad") });
-    CHECK(t4.status == 0);
+    /* (the zero head replacing output.weight is then refused for llama's mapped tier: a separate rule; the open itself passes) */
     CHECK(has(t4.log, "1 of them beside a base this sidecar replaces (lever A8K)"));
     CHECK(!has(t4.log, "a weight is replaced or twinned, not both"));
+    /* served: blk.0.attn_qkv made in its place (mix.rad's --requant round trip of the container's codes) + its twin kept from a
+     * first file -> llama.rad's numbers (llama never asks for the twin) */
+    const int st3 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "qtw.rad", "--requant", "--twin", "blk.0.attn_qkv.*", "--quant",
+                                "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st3 != 0) fprintf(stderr, "    rad-sidecar --twin (qkv) exited %d:\n%s\n", st3, tail(slog).c_str());
+    REQUIRE_EQ(st3, 0);
+    const int st4 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "both2.rad", "--requant", "--keep", d / "qtw.rad", "--quant",
+                                "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" },
+                              engine_env(), &slog);
+    if (st4 != 0) fprintf(stderr, "    rad-sidecar --keep (qkv twin) exited %d:\n%s\n", st4, tail(slog).c_str());
+    REQUIRE_EQ(st4, 0);
+    {
+        rad::RadFile bf;
+        REQUIRE_EQ(bf.open((d / "both2.rad").c_str()), 0);
+        CHECK_EQ(bf.entry_count(), (int64_t)2);
+        CHECK(bf.find("blk.0.attn_qkv.weight") != nullptr);
+        CHECK(bf.find("blk.0.attn_qkv.weight#pf") != nullptr);
+    }
+    a[1] = d / "t5";
+    Ran t5 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "both2.rad") });
+    REQUIRE_RAN(t5);
+    CHECK(has(t5.log, "1 of them beside a base this sidecar replaces (lever A8K)"));
+    {
+        std::string why;
+        const bool same = same_recording(ref0, d / "t5", &why);
+        if (!same) fprintf(stderr, "    a replaced qkv + its twin vs llama.rad: %s\n", why.c_str());
+        CHECK(same);
+    }
 }
 
 /* ================================================================== lever G: the tail grid (ds41-tailgrid) */
