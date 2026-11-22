@@ -6992,6 +6992,9 @@ TEST(preemption_by_recompute_on_the_pipeline_serves_one_process_tokens) {
         if (only && !std::strstr(a.name, only)) continue;
         std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
         if (a.best) env = cat(env, kBest);
+        /* tp8 loop F84: BEST's shape names every preemption and its recompute's resume (RADIANCE_SCHED_PREEMPT_LOG=1, a log line only);
+         * the other arms run without it (no such line) */
+        if (a.best) env.push_back("RADIANCE_SCHED_PREEMPT_LOG=1");
         const std::vector<std::string> ex = preempt_shape(a.lanes);
         /* the device size: bisect [64, 512) MiB on the pair's own pool (each probe a start and a stop) */
         auto pool_at = [&](int mib) -> long long {
@@ -7048,6 +7051,21 @@ TEST(preemption_by_recompute_on_the_pipeline_serves_one_process_tokens) {
         fprintf(stderr, "    PREEMPTION %-26s W(%s): pool %lld tokens (%d MiB), %.0f preemption(s); %d of %zu requests differ from one "
                         "process (%d empty = failed: %lld 'could not be admitted' lines); KV-copy checks %lld, %lld differ%s\n",
                 a.name, a.cut, pool_in(llog), hi, pre, differ, ref.size(), empty, failed, checks, kdiff, notowner ? " (NOT the owner's bytes)" : "");
+        /* tp8 loop F84: one line a preemption (lanes' metrics sum the same events) and the recomputes' resume lines */
+        auto count_of = [&](const char* key) {
+            long long n = 0;
+            for (size_t at = llog.find(key); at != std::string::npos; at = llog.find(key, at + 1)) ++n;
+            return n;
+        };
+        const long long f84p = count_of("preempted by recompute (tp8 loop F84)"), f84r = count_of("re-admitted after preemption (tp8 loop F84)");
+        fprintf(stderr, "    F84 lines: %lld preempted, %lld re-admitted (log %s)\n", f84p, f84r, a.best ? "on" : "off");
+        if (a.best) {
+            CHECK_EQ(f84p, (long long)pre);
+            CHECK(f84r >= 1);
+            CHECK(llog.find("[") != std::string::npos);
+        } else {
+            CHECK_EQ(f84p + f84r, 0);
+        }
         CHECK(pre > 0);
         CHECK_EQ(differ, 0);
         CHECK(!notowner);

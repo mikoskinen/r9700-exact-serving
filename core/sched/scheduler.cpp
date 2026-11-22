@@ -2538,6 +2538,21 @@ int64_t Scheduler::interleave_steps() const {
 }
 
 /* ------------------------------------------------------------------ preemption */
+/* tp8 loop F84 (RADIANCE_SCHED_PREEMPT_LOG=1; a log line only): every preemption by recompute and its re-admission's resume, with
+ * the request's first 16 prompt token ids (a client's prompt is named by its head: kit/f84ids.py matches them with /tokenize) */
+static bool preempt_log_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("RADIANCE_SCHED_PREEMPT_LOG");
+        return v && !std::strcmp(v, "1");
+    }();
+    return on;
+}
+static std::string prompt_head_ids(const Request& r) {
+    std::string o;
+    for (size_t i = 0; i < r.prompt.size() && i < 16; ++i) o += (i ? " " : "") + std::to_string(r.prompt[i]);
+    return o;
+}
+
 bool Scheduler::preempt_back() {
     int32_t slot = running_.back();
     SchedReq& s = *reqs_[(size_t)slot];
@@ -2545,6 +2560,7 @@ bool Scheduler::preempt_back() {
     /* tp8 S5: a piece of its prompt runs in another lane's step: its blocks stay (the callers then
      * wait a step); never on one lane */
     if (s.lent > 0) { lane_preempt_refused_ = true; return false; }
+    const int64_t f84_computed = r.n_computed;   /* tp8 loop F84 */
 
     /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
      * is the tail of its token sequence, so it simply re-prefills prompt ++ output. What it computed
@@ -2574,6 +2590,11 @@ bool Scheduler::preempt_back() {
     running_.pop_back();
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
     ++m_.preemptions;
+    if (preempt_log_on())   /* tp8 loop F84 */
+        RAD_INFO("scheduler: request %llu preempted by recompute (tp8 loop F84): prompt %zu tokens [%s], %zu output tokens, %lld rows "
+                 "computed (%s), its recompute = prompt ++ output %lld rows", (unsigned long long)r.id, r.prompt.size(),
+                 prompt_head_ids(r).c_str(), r.output.size(), (long long)f84_computed, published ? "published" : "not published",
+                 (long long)s.seq_len());
     return published;
 }
 
@@ -2893,6 +2914,13 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
                       (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
+        if (preempt_log_on() && r.state == ReqState::Preempted)   /* tp8 loop F84: where a recompute resumes */
+            RAD_INFO("scheduler: request %llu re-admitted after preemption (tp8 loop F84): prompt ++ output %lld rows (%zu output), "
+                     "its hit %lld attention rows (snapshot %lld), resumes at %lld%s; the rows from there on are re-prefilled",
+                     (unsigned long long)r.id, (long long)s.seq_len(), r.output.size(), (long long)h.n_attn_tokens,
+                     (long long)h.n_linear_tokens, (long long)(cr_at > 0 ? cr_from : reuse),
+                     cr_at > 0 ? fmt(" (PSK-CR: the global KV adopted up to %lld, a cone replay from %lld)", (long long)cr_at,
+                                     (long long)cr_from).c_str() : "");
         if (cr_at > 0) {   /* lever PSK-CR: from `cr_from`, nothing restored; the cache supplied up to `cr_at` */
             r.n_computed = (int32_t)cr_from;
             r.n_cached = (int32_t)cr_at;
