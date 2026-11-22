@@ -834,9 +834,10 @@ static __device__ __forceinline__ void swk_to_dlayout(v8f (&acc)[NPW], int lane)
     float R[8];
 #pragma unroll
     for (int v = 0; v < 8; v++) {
-      const int a = __builtin_bit_cast(int, acc[j][v]);
-      R[v] = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute(4 * sa, a)) +
-             __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute(4 * sb, a));
+      // __float_as_int, not __builtin_bit_cast(int, acc[j][v]): on an ext_vector element the latter reads element 0 for every v
+      // in this compiler (the DRAFTER's round-91 note; SWK 2 at 3602fc5a pulled acc[j][0] eight times: its census had 2 pulls a tile)
+      const int a = __float_as_int(acc[j][v]);
+      R[v] = __int_as_float(__builtin_amdgcn_ds_bpermute(4 * sa, a)) + __int_as_float(__builtin_amdgcn_ds_bpermute(4 * sb, a));
     }
     swk_stage<4>(R);   // lane bit b <-> register bit b, b = 4, 2, 1
     swk_stage<2>(R);
