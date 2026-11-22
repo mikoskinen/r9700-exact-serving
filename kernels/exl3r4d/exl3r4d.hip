@@ -201,6 +201,9 @@ static_assert(EXL3R4D_SWK != 2 || EXL3R4D_SWK_BLK == 8, "SWK 2: 8 tokens a pass 
 #define EXL3R4D_SWK_ABOUND 0 // b32 loads a 32-deep step (TIMING ONLY, wrong outputs: the real form's A-load cost bound); 0 = the loads
 #endif
 static_assert(EXL3R4D_SWK_DMOVE == 0 || EXL3R4D_SWK_DMOVE == 1 || EXL3R4D_SWK_DMOVE == 2 || EXL3R4D_SWK_DMOVE == 9, "SWK_DMOVE: 0 / 1 / 2 / 9");
+#ifndef EXL3R4D_X15_ABL   // SWK x X5F (tp8 DECODE round 67, QUEUE X15) bisect: 1 = the fold's SW 2 twins WITHOUT the fold epilogue (TIMING ONLY,
+#define EXL3R4D_X15_ABL 0 // wrong outputs: the epilogue's share of the fold twins' cost); 0 = the real form
+#endif
 // SW (the form of ONE instance, a template argument of moe_pass and the x3d / k25 kernels, so one build holds the served kernels and
 // the SWK twins that fn4 exl3_x6w 2 / 3 picks at launch): 0 served, 1 timing pairs, 2 the real form, 3 = 2 with the other nibble order.
 #define EXL3R4D_SWK_T (EXL3R4D_SWK == 2 && EXL3R4D_SWK_IDXSWAP ? 3 : EXL3R4D_SWK)
@@ -1624,6 +1627,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       // kbias term goes to the first half only (the second half's addend +0): y = (D1 kinv + kbias xs) + D2 kinv after the move's
       // first + second. A token's bytes depend on its own activations and the weights alone (rule B, its own reference).
       static_assert(EXL3R4D_X5_SUM == 3, "SWK x X5F: the pre-pass sums (X6 S2) only");
+#if EXL3R4D_X15_ABL   // X15 bisect (tp8 DECODE round 67, slot s7): TIMING ONLY (wrong outputs) -- no fold epilogue in the SW 2 twins
+      if (acc[0][0] == 12345.678f) acc[0][1] = xsum;   // keep the pre-pass's sum live
+#else
       const bool first = lane < 16;
       float kx[8];
 #pragma unroll
@@ -1635,6 +1641,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       for (int j = 0; j < NPW; j++)
 #pragma unroll
         for (int v = 0; v < 8; v++) acc[j][v] = __builtin_fmaf(acc[j][v], ki, kx[v]);
+#endif
     } else if constexpr (EXL3R4D_X5_SUM == 3) {   // X6 S2: the pre-pass's sum of this lane's row
 #pragma unroll
       for (int j = 0; j < NPW; j++)
