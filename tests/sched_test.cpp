@@ -1066,7 +1066,91 @@ TEST(lever_gpf_tail_inner_2_and_resume_cold_3_take_any_piece_start) {
     CHECK_EQ(h3m.resumed, (int64_t)1024);
     const Run s1 = go(2, 3, 0, 1556);                      /* tail on the chunk start: nothing inside */
     CHECK_EQ(s1.inner, (int64_t)-1);
-    CHECK(rad::fn4::request("sched_tail_inner", 3, &err) == false);   /* range 0..2 */
+    CHECK(rad::fn4::request("sched_tail_inner", 4, &err) == false);   /* range 0..3 (3: lever TIF, round 23) */
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
+/* qfn-on-ds lever TIF (Qwen loop round 23, sched_tail_inner 3 under lever TIP; QUEUE Q44): lever G's fine tail (grid 128 at
+ * interval 256 here; 256 at 2,048 on the card) taken INSIDE the last piece of a pipelined last chunk -- the chunk runs whole,
+ * no cut -- and listed as a resume point with every fine-grid row of a spanned chunk's last piece that leaves >= 128 rows.
+ * A last piece under 128 rows cuts at the fine tail (lever G); a last chunk of one interval keeps the grid's own tail (no
+ * cut). Controls: sched_tail_inner 1 (R48f) cuts at the fine tail; resume_cold without the TIF latch steps a hit back. */
+TEST(lever_tif_takes_the_fine_tail_inside_the_last_piece_and_resumes_there) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
+    auto go = [&](int ti, int rc, int64_t lin, int n) {
+        CHECK(rad::fn4::request("resume_cold", rc, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", 128, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+        Fixture f;
+        f.build(4096, 64, 1024);          /* interval 256, budget 1024 */
+        f.cfg.prefill_span = 4;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+        if (lin > 0) {
+            f.pc.seed(n);
+            f.pc.lin = lin;
+            f.pc.src = 3;
+        }
+        const uint64_t a = f.submit(n, 2);
+        Run o;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {
+                    if (o.resumed < 0) o.resumed = e.ctx_len;
+                    o.pc.push_back({ (int64_t)e.ctx_len, e.n_tokens });
+                    if (e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) o.inner = e.ctx_len + e.ckpt_tok + 1;
+                }
+            f.commit_plain();
+        }
+        return o;
+    };
+    /* 1,792 tokens: last chunk [1,280, 1,792) = 256 + 256; the fine tail 1,664 lies inside the last piece [1,536, 1,792) */
+    const Run c3 = go(3, 2, 0, 1792);
+    REQUIRE(!c3.pc.empty());
+    CHECK_EQ(c3.inner, (int64_t)1664);                     /* inside, the chunk whole */
+    CHECK_EQ(c3.pc.back().first, (int64_t)1280);
+    CHECK_EQ(c3.pc.back().second, (int32_t)512);
+    const Run c1 = go(1, 2, 0, 1792);                      /* control (R48f): the fine tail off a piece start is cut */
+    REQUIRE(!c1.pc.empty());
+    CHECK_EQ(c1.inner, (int64_t)-1);
+    CHECK_EQ(c1.pc.back().first, (int64_t)1664);
+    CHECK_EQ(c1.pc.back().second, (int32_t)128);
+    /* 1,812 tokens: last piece [1,792, 1,812) of 20 rows: the fine tail 1,664 is in the piece before -> lever G's cut */
+    const Run s3 = go(3, 2, 0, 1812);
+    REQUIRE(!s3.pc.empty());
+    CHECK_EQ(s3.inner, (int64_t)-1);
+    CHECK_EQ(s3.pc.back().first, (int64_t)1664);
+    CHECK_EQ(s3.pc.back().second, (int32_t)148);
+    /* 1,536 tokens: last chunk [1,280, 1,536) of one interval -> the grid's own tail, no cut (control at 1: the cut at 1,408) */
+    const Run l3 = go(3, 2, 0, 1536);
+    REQUIRE(!l3.pc.empty());
+    CHECK_EQ(l3.inner, (int64_t)-1);
+    CHECK_EQ(l3.pc.back().first, (int64_t)1280);
+    CHECK_EQ(l3.pc.back().second, (int32_t)256);
+    const Run l1 = go(1, 2, 0, 1536);
+    REQUIRE(!l1.pc.empty());
+    CHECK_EQ(l1.pc.back().first, (int64_t)1408);
+    /* hits: at its own inside tail (1,792 resumes at 1,664 and runs 128 rows); a sibling of 1,900 tokens whose last piece is
+     * short (cut at its fine tail 1,664) resumes there and runs 236; a snapshot off the fine grid steps back to the last
+     * piece start */
+    const Run h3 = go(3, 2, 1664, 1792);
+    CHECK_EQ(h3.resumed, (int64_t)1664);
+    REQUIRE(!h3.pc.empty());
+    CHECK_EQ(h3.pc.front().second, (int32_t)128);
+    const Run hs = go(3, 2, 1664, 1900);
+    CHECK_EQ(hs.resumed, (int64_t)1664);
+    REQUIRE(!hs.pc.empty());
+    CHECK_EQ(hs.pc.front().second, (int32_t)236);
+    const Run hx = go(3, 2, 1728, 1792);
+    CHECK_EQ(hx.resumed, (int64_t)1536);
     CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
     CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
     CHECK(rad::fn4::request("resume_cold", 0, &err));
@@ -14038,11 +14122,12 @@ struct TiSwitch {
 };
 }  // namespace
 
-/* (Qwen loop round 22: 2 = 1 and, under lever TIP, any piece start of the last chunk -- lever GPF's scheduler half) */
+/* (Qwen loop round 22: 2 = 1 and, under lever TIP, any piece start of the last chunk -- lever GPF's scheduler half;
+ * round 23: 3 = 2 and lever TIF, the fine tail inside a pipelined last chunk's last piece) */
 TEST(lever_ti_the_switch_takes_0_and_1_and_starts_off) {
     std::string err;
-    for (int v : { 0, 1, 2 }) CHECK(fn4::check("sched_tail_inner", v, &err));
-    for (int v : { -1, 3, 512 }) {
+    for (int v : { 0, 1, 2, 3 }) CHECK(fn4::check("sched_tail_inner", v, &err));
+    for (int v : { -1, 4, 512 }) {
         CHECK(!fn4::check("sched_tail_inner", v, &err));
         CHECK(err.find("sched_tail_inner takes 0") != std::string::npos);
     }

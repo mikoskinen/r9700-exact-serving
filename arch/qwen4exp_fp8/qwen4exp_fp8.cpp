@@ -352,8 +352,8 @@ struct TipRank {
     int64_t   row = 0;
     int     (*stage)(void*, int, int, void*) = nullptr;
     void*     u = nullptr;
-    int32_t*  ring_h = nullptr;   /* 64 x {0, row}: a slot is rewritten 64 TIP steps after its copy was issued */
-    int32_t*  cu_d = nullptr;     /* {0, row, T} on the card */
+    int32_t*  ring_h = nullptr;   /* 64 x {0, row, R, row}: a slot is rewritten 64 TIP steps after its copy was issued */
+    int32_t*  cu_d = nullptr;     /* {0, row, T, R, row} on the card (lever TIF: cu_d + 3 = piece 1 up to the row) */
     int64_t   k = 0;
     bool      tried = false;
     bool      noted = false;
@@ -371,35 +371,44 @@ static bool tip_stage_for(RadCtx* c, const RadBatch* batch, const Model& m, TipS
     TipRank& t = g_tipr[rk];
     if (t.row <= 0) return true;
     const int64_t T = batch->n_tok, R = m.pass_rows;
-    if (batch->n_seq != 1 || batch->phase != RAD_PHASE_PREFILL || batch->draft_pass != 0 || R <= 0 || t.row % R != 0 ||
-        t.row >= T || !t.stage) {
+    /* lever TIF (Qwen loop round 23): also a 64-aligned row inside the step's LAST piece (the delta net's scan chunks and the
+     * PLE's windows hand on there as at a piece start; the scheduler plans it under sched_tail_inner 3) */
+    const bool tif_row = R > 0 && t.row % 64 == 0 && t.row > (T - 1) / R * R && T > R;
+    if (batch->n_seq != 1 || batch->phase != RAD_PHASE_PREFILL || batch->draft_pass != 0 || R <= 0 ||
+        (t.row % R != 0 && !tif_row) || t.row >= T || !t.stage) {
         char why[256];
         snprintf(why, sizeof why, "qwen4exp: lever TIP: a snapshot at row %lld of a %lld-row step (%lld sequences, phase %d) "
-                                  "is not the start of a piece of a pipelined prefill step of one sequence (pieces of %lld)",
+                                  "is neither the start of a piece nor a 64-aligned row of the last piece of a pipelined "
+                                  "prefill step of one sequence (pieces of %lld)",
                  (long long)t.row, (long long)T, (long long)batch->n_seq, batch->phase, (long long)R);
         rad_step_fail(c, why);
         return false;
     }
     if (!t.tried) {
         t.tried = true;
-        t.ring_h = (int32_t*)rad_dev_alloc(64 * 2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
-        t.cu_d = (int32_t*)rad_dev_alloc(4 * sizeof(int32_t), RAD_MEM_DEVICE);
+        t.ring_h = (int32_t*)rad_dev_alloc(64 * 4 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        t.cu_d = (int32_t*)rad_dev_alloc(8 * sizeof(int32_t), RAD_MEM_DEVICE);
     }
     if (!t.ring_h || !t.cu_d) {
         rad_step_fail(c, "qwen4exp: lever TIP: no pinned / device memory for the snapshot row's bounds");
         return false;
     }
-    int32_t* h = t.ring_h + 2 * (t.k++ % 64);
+    /* {0, row} -> cu_d[0..1], the step's T -> cu_d[2], and (lever TIF) {R, row} -> cu_d[3..4] */
+    int32_t* h = t.ring_h + 4 * (t.k++ % 64);
     h[0] = 0;
     h[1] = (int32_t)t.row;
+    h[2] = (int32_t)R;
+    h[3] = (int32_t)t.row;
     const RadStream s = rad_stream(c);
     if (rad_memcpy_async(t.cu_d, h, 2 * sizeof(int32_t), s) != RAD_OK ||
-        rad_memcpy_async(t.cu_d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK) {
+        rad_memcpy_async(t.cu_d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK ||
+        rad_memcpy_async(t.cu_d + 3, h + 2, 2 * sizeof(int32_t), s) != RAD_OK) {
         rad_step_fail(c, "qwen4exp: lever TIP: the snapshot row's bounds could not be uploaded");
         return false;
     }
     out->row = t.row;
     out->cu = t.cu_d;
+    out->cu_in = t.cu_d + 3;
     out->stage = t.stage;
     out->u = t.u;
     if (!t.noted && rk == 0) {
@@ -466,9 +475,9 @@ static void bi_segments(Model& m, const RadBatch* batch) {
             m.hcp_pos0.push_back(m.bi_cut[i] >= td ? (int64_t)batch->positions_h[m.bi_cut[i]] : -1);
 }
 /* lever HCP (Qwen loop round 23, sp_route bit 8192; QUEUE Q44 lever TIF's premise): libr4d's hc_read splits the down product's
- * K by the launch's row tiles (r4d_hc_bf16.hip hc_down_kchunk: a 2,038 / 2,048-row read 2 ways, 1,200 rows 3, 267 rows 9), so a
- * prompt's rows read inside a 1,792-row last piece, a 2,038-row last piece or a 267-row tail step sum K in three orders, and
- * every row after differs -- the reason a prefix hit is exact only where the cold run cut its chunk (resume_cold), and lever
+ * K by the launch's row tiles (r4d_hc_bf16.hip hc_down_kchunk; at lowrank 320 / HN 10,240: 2 ways from 1,537 rows, 3 at
+ * 1,025-1,536, 4 at 769-1,024, 9 at 257-384, 13 at 129-256), so a prompt's rows read inside a 1,200-row last piece, a full
+ * piece or a 267-row tail step sum K in three orders, and every row after differs -- the reason a prefix hit is exact only where the cold run cut its chunk (resume_cold), and lever
  * G's 256 cut moves the cold's bytes (g2k1 / tip0: lA 9 / 12). HCP reads every prefill segment that starts past the prompt's
  * first interval (its first position >= a pass's rows) and has more than 64 rows (the 128-row tile, kTileMinRows) through
  * op_read_sp: kc_rows = the full piece's rows (16 tiles), the split a full piece reads with today, whatever the segment's,

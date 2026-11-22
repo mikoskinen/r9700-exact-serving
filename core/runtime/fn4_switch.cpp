@@ -1612,11 +1612,13 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kSchedTailInner) {    /* lever TI (ds41-pf2): the scheduler's, read at every step it plans */
-        if (v < 0 || v > 2) {
+        if (v < 0 || v > 3) {
             if (err) *err = "sched_tail_inner takes 0 (off: lever G's fine tail snapshot cuts the prompt's last chunk there), 1 "
                             "(the snapshot is taken inside the last chunk, which runs whole; needs a plugin serving "
-                            "rad_ckpt_conv_src where the model keeps a CONV window) or 2 (1, and under lever TIP at any piece "
-                            "start of the chunk, not only its last)";
+                            "rad_ckpt_conv_src where the model keeps a CONV window), 2 (1, and under lever TIP at any piece "
+                            "start of the chunk, not only its last) or 3 (2, and under lever TIP lever TIF: the fine tail inside the "
+                            "LAST piece of a pipelined last chunk at any row of the grid; a short last piece cuts there; a last chunk "
+                            "of one piece keeps the resume grid's own tail)";
             return false;
         }
         return true;

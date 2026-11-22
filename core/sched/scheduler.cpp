@@ -2008,6 +2008,16 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
         } else if (ck > n && ck < n + w && I > 0 && (ck - n) % I == 0 && (every || n + w - ck <= I)) {
             out->push_back(ck);
         }
+        /* lever TIF (Request::tail_grid & kTifBit; with lever HCP): every fine-grid row inside a spanned chunk's LAST piece
+         * that leaves >= kTailMinPiece rows to the chunk's end -- a hit there runs [row, chunk end) as one lone step inside
+         * that one cold piece (plan_chunk's off-grid rule: to the span's end or the prompt's), each row read at a full
+         * piece's K split as the cold read it: the prompt's own TIF tail (taken inside), another prompt's TIF tail on a
+         * sibling's or a longer turn's last piece (warm turn 2 at its predecessor's tail), a crossing turn's earlier span */
+        if ((r.tail_grid & kTifBit) && I > 0 && w > I && lastp > n) {
+            const int64_t F = r.tail_grid & ~(int64_t)kTifBit;
+            if (F > 0)
+                for (int64_t p = (lastp / F + 1) * F; p + kTailMinPiece <= n + w; p += F) out->push_back(p);
+        }
         n += w;
         if (n < end) out->push_back(n);
     }
@@ -2082,7 +2092,12 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
                          * runs that one piece alone (test tip5: a tail one piece earlier, the last piece under kTailMinPiece rows, gave
                          * sibling hits running two pieces that differ from their cold, 3 / 4); elsewhere cut as lever G cuts */
                         (!tail_inner_pieces_ ||
-                         (I > 0 && (tail - n_computed) % I == 0 && (n_target - tail <= I || tail_inner_sw_ >= 2)));
+                         (I > 0 && (tail - n_computed) % I == 0 && (n_target - tail <= I || tail_inner_sw_ >= 2)) ||
+                         /* lever TIF (sched_tail_inner 3, latched in the request: kTifBit): any row of the fine grid inside the
+                          * chunk's LAST piece of a pipelined chunk (the plugin stages there: TIP's split launches at a 64-aligned
+                          * row; lever HCP keeps a row's bytes off its piece shape) */
+                         ((fine & kTifBit) != 0 && I > 0 && n_target - n_computed > I &&
+                          tail >= n_computed + (n_target - n_computed - 1) / I * I));
         /* (sched_tail_inner 2, Qwen loop round 22: any piece start again, R48e's rule -- for lever GPF's read: a tail one piece
          * before a last piece under kTailMinPiece rows is taken inside, and its hit runs two pieces) */
         if (ti) {
@@ -2296,8 +2311,20 @@ int64_t Scheduler::tail_checkpoint(int64_t target, int64_t fine) const {
          * 128 .. 127 + F old rows instead of 1 .. grid. From the first interval on, as the rule below. Else that rule. */
         const int64_t margin = geo_.window_ckpt ? std::max<int64_t>(Q, 16) : 1;
         const int64_t g = geo_.grid_floor(target - margin);
-        const int64_t f = target > kTailMinPiece ? (target - kTailMinPiece) / fine * fine : 0;
-        if (f > std::max<int64_t>(g, 0) && (geo_.window_ckpt ? f >= I : f > I)) return f;
+        /* lever TIF (Request::tail_grid & kTifBit): F is the grid without the bit */
+        const bool tif = (fine & kTifBit) != 0;
+        const int64_t F = fine & ~(int64_t)kTifBit;
+        const int64_t f = target > kTailMinPiece && F > 0 ? (target - kTailMinPiece) / F * F : 0;
+        /* Lever TIF (qfn-on-ds, Qwen loop round 23; QUEUE Q44): the fine tail where the prompt's last chunk [g, target) is
+         * pipelined (more than one interval: lever TIP stages a row inside it) -- inside its last piece when it lies there
+         * (plan_chunk takes it inside, no cut), else (a last piece under kTailMinPiece rows) lever G's cut; a last chunk
+         * of one interval is a lone step TIP cannot stage in, so it keeps the resume grid's own tail (its start: no cut,
+         * as lever TIP at grid I has it). Exact with lever HCP (sp_route bit 8192): a row's piece shape no longer moves it. */
+        if (tif && g > 0 && I > 0 && target - g <= I) {
+            /* the exact rule below */
+        } else if (f > std::max<int64_t>(g, 0) && (geo_.window_ckpt ? f >= I : f > I)) {
+            return f;
+        }
     }
     if (geo_.exact) {
         /* --prefix-resume exact: where the prompt's last chunk starts on the resume grid, so an
@@ -2835,6 +2862,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             !(kv_ && kv_->has_runtime_window(r.id))) {
             r.tail_grid = (int32_t)tail_grid_now();
             if (r.tail_grid > 0) { ++tg_n_[0]; tg_seen_ = true; }
+            /* lever TIF (sched_tail_inner 3 under lever TIP): latched with the grid (kTifBit), see tail_checkpoint */
+            if (r.tail_grid > 0 && tail_inner_sw_ >= 3 && tail_inner_pieces_) r.tail_grid |= kTifBit;
         }
     }
     /* lever PSK design 2: the request's targets (latched again below on every admission path; the same values) --

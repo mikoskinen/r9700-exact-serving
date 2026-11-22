@@ -457,22 +457,37 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             in.step(c, w.h, w.in.x, T, r0, n);
             RAD_ISSUE_N(c, op_ab, n, brow_slice(w.h.x, r0, n, g.n_embd), RAD_W(w_ab),
                         brow_slice(w.ab, r0, n, 2 * H));
-            RAD_ISSUE_N(c, op_conv_prep, n,
-                        bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log),
-                        RAD_W(w_dt_bias), kv_cache(kv_conv, layer), praw(cu, RAD_I32, 2),
-                        bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
-                        praw(cv_idx, RAD_I32, 1), praw(batch->positions + r0, RAD_I32, 1),
-                        brows(w.q, T), brows(w.k, T), brows(w.v, T),
-                        brows(w.gdec, T), brows(w.beta, T));
-            RAD_ISSUE_N(c, op_kkt, n,
-                        brows(w.k, T), brows(w.beta, T), brows(w.gdec, T),
-                        praw(cu, RAD_I32, 2), brows(w.kkt, T));
-            RAD_ISSUE_N(c, op_scan, n,
-                        brows(w.q, T), brows(w.k, T), brows(w.v, T), brows(w.kkt, T),
-                        brows(w.gdec, T), brows(w.beta, T),
-                        kv_cache(kv_state, layer), praw(cu, RAD_I32, 2),
-                        brows(w.o.x, T), kv_cache(kv_state, layer),
-                        praw2(st_idx, RAD_I32, 1, st_w));
+            /* the convolution, solve and scan over rows [cu[0], cu[1]) of the step (k rows), the first row's position as its
+             * context */
+            auto state_ops = [&](const int32_t* pc, int64_t k, const int32_t* pos0) {
+                RAD_ISSUE_N(c, op_conv_prep, k,
+                            bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log),
+                            RAD_W(w_dt_bias), kv_cache(kv_conv, layer), praw(pc, RAD_I32, 2),
+                            bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
+                            praw(cv_idx, RAD_I32, 1), praw(pos0, RAD_I32, 1),
+                            brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                            brows(w.gdec, T), brows(w.beta, T));
+                RAD_ISSUE_N(c, op_kkt, k,
+                            brows(w.k, T), brows(w.beta, T), brows(w.gdec, T),
+                            praw(pc, RAD_I32, 2), brows(w.kkt, T));
+                RAD_ISSUE_N(c, op_scan, k,
+                            brows(w.q, T), brows(w.k, T), brows(w.v, T), brows(w.kkt, T),
+                            brows(w.gdec, T), brows(w.beta, T),
+                            kv_cache(kv_state, layer), praw(pc, RAD_I32, 2),
+                            brows(w.o.x, T), kv_cache(kv_state, layer),
+                            praw2(st_idx, RAD_I32, 1, st_w));
+            };
+            /* lever TIF: a snapshot row inside piece 1 -- its state ops over [R, row) and [row, T), the rows staged between
+             * them (64-aligned from the piece start: the scan's chunks are the piece's own) */
+            const bool in1 = p == 1 && tip && tip->on() && tip->cu_in && tip->row > pieces->rows && tip->row < T;
+            if (!in1) {
+                state_ops(cu, n, batch->positions + r0);
+            } else {
+                state_ops(tip->cu_in, tip->row - r0, batch->positions + r0);
+                tip->put(c, kv_state, layer);
+                tip->put(c, kv_conv, layer);
+                state_ops(tip->cu + 1, T - tip->row, batch->positions + tip->row);
+            }
             /* lever TIP: the state and window as piece 0 leaves them, before piece 1's convolution rewrites the window */
             if (p == 0 && tip && tip->on() && tip->row == pieces->rows) {
                 tip->put(c, kv_state, layer);

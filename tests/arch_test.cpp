@@ -13198,6 +13198,111 @@ TEST(flashnext_tip_stages_every_state_row_between_its_ops_two_launches) {
     unsetenv("RADIANCE_FN4_TIP");
 }
 
+/* qfn-on-ds lever TIF (Qwen loop round 23, sched_tail_inner 3): lever TIP's inside snapshot at a 64-aligned row INSIDE the step's
+ * last piece (lever G's 256-grid tail), not only at a piece start. A two-piece step (2,048 + 512) splits piece 1's delta-net
+ * state ops at the row (the piece path: conv / solve / scan over [2,048, row) then [row, T), the rows staged between them); a
+ * three-piece step (2,048 + 2,048 + 1,024) splits its whole-T launches at the row as TIP does; the PLE's windows split at the
+ * row. Every other issue is the no-row control's. Negative controls: a row inside the last piece off the 64 grid and a row
+ * inside an earlier piece fail the step with the lever's reason and stage nothing. */
+TEST(flashnext_tif_stages_a_row_inside_the_last_piece) {
+    setenv("RADIANCE_FN4_TIP", "1", 1);
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int64_t T : { 2560, 5120 }) {
+        const int64_t L = (T - 1) / 2048 * 2048, row = L + 256;
+        std::map<std::pair<std::string, int64_t>, int64_t> ctl;
+        for (int arm : { 0, 1, 2, 3 }) {   /* 0: no row; 1: the TIF row; 2: off the 64 grid (refused); 3: in an earlier piece (refused) */
+            const int rank = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            ctx.max_tok = 8192;
+            ctx.max_mixed_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.pipe_on);
+            qwen4exp_fp8::fn4_sp_flag().store(2);
+            qwen4exp_fp8::fn4_pair_flag().store(1);
+            qwen4exp_fp8::fn4_sproute_flag().store(512 | 8192);
+            tipt::st.clear();
+            const int64_t r = arm == 1 ? row : arm == 2 ? row + 32 : 1024;
+            if (arm) CHECK_EQ(qwen4exp_fp8::tip_set(rank, r, &tipt::cb, nullptr), 1);
+            const auto pf = kit(b, {}, { (int)T }, 8192);
+            pf->b.positions_h = pf->pos.data();
+            const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+            CHECK_EQ(qwen4exp_fp8::tip_set(rank, 0, nullptr, nullptr), 1);
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            const RadCtx& c = *v[0];
+            if (arm >= 2) {                                   /* the negative controls */
+                CHECK(!c.step_fail.empty());
+                CHECK(c.step_fail.find("lever TIP") != std::string::npos);
+                CHECK(tipt::st.empty());
+                continue;
+            }
+            CHECK_PASSES(b, v);
+            CHECK(c.step_fail.empty());
+            int64_t n_gdn = 0;
+            for (const auto& l : m.layers) n_gdn += l.full ? 0 : 1;
+            REQUIRE(n_gdn > 0);
+            auto opname = [&](size_t i) { const RecOp* o = b.op_of(c.issues[i].op); return o ? o->op : std::string("?"); };
+            static const char* kState[] = { "gdn_conv_prep", "gdn_kkt_solve", "gdn_chunk_scan", "ngram_ids", "ple_conv" };
+            auto state_op = [&](const std::string& o) { for (const char* k : kState) if (o == k) return true; return false; };
+            std::map<std::pair<std::string, int64_t>, int64_t> other;
+            int64_t convs = 0;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const std::string o = opname(i);
+                if (o == "gdn_conv_prep") ++convs;
+                if (state_op(o)) continue;
+                ++other[{ o, c.issues[i].n }];
+            }
+            const bool two = T <= 4096;                        /* the two-piece path: piece 0, then piece 1 (split under TIF) */
+            if (arm == 0) {
+                CHECK(tipt::st.empty());
+                CHECK_EQ(convs, (two ? 2 : 1) * n_gdn);
+                ctl = other;
+                continue;
+            }
+            CHECK(other == ctl);                               /* nothing but the state ops changed */
+            CHECK_EQ(convs, (two ? 3 : 2) * n_gdn);            /* one more launch a layer: the split at the row */
+            const int64_t want = 2 * n_gdn + (m.ple_layer >= 0 ? 2 : 0);
+            CHECK_EQ((int64_t)tipt::st.size(), want);
+            std::map<std::pair<int, int>, int> seen;
+            for (const tipt::St& s2 : tipt::st) {
+                ++seen[{ s2.group, s2.layer }];
+                REQUIRE(s2.at > 0 && s2.at < c.issues.size());
+                const std::string before = opname(s2.at - 1);
+                const bool gdn = s2.group == (int)m.kv_state || s2.group == (int)m.kv_conv;
+                if (gdn) {
+                    CHECK_EQ(before, std::string("gdn_chunk_scan"));
+                    CHECK_EQ(c.issues[s2.at - 1].n, two ? row - 2048 : row);   /* [R, row) on the piece path, [0, row) whole */
+                } else {
+                    CHECK(before == "ngram_ids" || before == "ple_conv");
+                    CHECK_EQ(c.issues[s2.at - 1].n, row);
+                }
+                size_t j = s2.at;
+                while (j < c.issues.size() && opname(j) != (gdn ? std::string("gdn_conv_prep") : before)) ++j;
+                REQUIRE(j < c.issues.size());
+                CHECK_EQ(c.issues[j].n, T - row);              /* the next of its kind: [row, T) */
+            }
+            for (const auto& kv : seen) CHECK_EQ(kv.second, 1);
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+    unsetenv("RADIANCE_FN4_TIP");
+}
+
 /* qfn-on-ds lever GPF (Qwen loop round 22, sp_route bit 4096): a pipelined step of one sequence in TWO pieces runs the delta
  * net a piece at a time (its piece path: the in-projection, the a|b GEMM, convolution, solve and scan per piece), so a second
  * piece inside libr4d's narrow band (<= 64 rows) projects alone where a three-piece step of the same rows projects them in its
@@ -13290,7 +13395,7 @@ TEST(flashnext_gpf_runs_a_two_piece_step_whole_when_its_last_piece_is_narrow) {
 }
 
 /* qfn-on-ds lever HCP (Qwen loop round 23, sp_route bit 8192; QUEUE Q44 lever TIF's premise): libr4d's hc_read splits K by the
- * launch's row tiles, so a row read inside a 1,792-row last piece, a 2,038-row one or a 267-row tail step sums in three orders.
+ * launch's row tiles, so a row read inside a 1,200-row last piece, a full piece or a 267-row tail step sums in three orders.
  * With the bit every connection read of a prefill segment that starts past the prompt's first interval (position >= a pass)
  * and has more than 64 rows goes through op_read_sp (kc_rows = the full piece's rows): the same issues, row counts and order,
  * only the op handle moves from op_read / op_read_kt[t] to op_read_sp -- a two-piece step (2,048 + 1,792 at 10,240, PSP on),

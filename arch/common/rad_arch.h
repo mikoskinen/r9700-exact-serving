@@ -1135,6 +1135,9 @@ inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, 
 struct TipStage {
     int64_t        row = 0;
     const int32_t* cu = nullptr;
+    /* lever TIF (Qwen loop round 23): {R, row} on the card, for a row inside the SECOND piece of a two-piece step (the delta
+     * net's piece path splits that piece's state ops at the row); null where the plugin did not upload it */
+    const int32_t* cu_in = nullptr;
     int  (*stage)(void* u, int group, int layer, void* stream) = nullptr;
     void* u = nullptr;
     bool on() const { return row > 0 && cu && stage; }

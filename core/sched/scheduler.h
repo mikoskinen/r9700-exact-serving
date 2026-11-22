@@ -739,6 +739,10 @@ public:
     /* The fewest rows lever G leaves in a prompt's last piece and in the piece before it: option D's floor (kBiMinPiece
      * in scheduler.cpp), the row count above which no kernel form of the line depends on a piece's rows. */
     static constexpr int64_t kTailMinPiece = 128;
+    /* Lever TIF (qfn-on-ds, Qwen loop round 23; sched_tail_inner 3 under lever TIP): a request admitted then latches its tail
+     * grid with this bit (Request::tail_grid = F | kTifBit), so tail_checkpoint plans its fine tail by the TIF rule at
+     * every call (the last chunk's shape decides inside / cut / none) whatever the switch reads later. */
+    static constexpr int32_t kTifBit = 1 << 30;
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
