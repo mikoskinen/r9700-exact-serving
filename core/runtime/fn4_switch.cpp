@@ -1854,14 +1854,15 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kAqlCik) {            /* tp8 loop W9: the AQL backend's, read at every live issue / played packet of a chain-capable kernel */
-        if (v != 0 && v != 1) {
-            if (err) *err = "aql_cik takes 0 (a chain-capable kernel issues and plays as the IKA kernel it also is: its record off) or 1 "
-                            "(lever CIK: it waits in-kernel on its queue's counter and adds a lane at its exit; tp8 loop W9)";
+        if (v < 0) {
+            if (err) *err = "aql_cik takes 0 (a chain-capable kernel issues and plays as the IKA kernel it also is: its record off), 1 "
+                            "(lever CIK: it waits in-kernel on its queue's counter and adds a lane at its exit; tp8 loop W9) or N >= 2 "
+                            "(lever CKW, DRAFTER round 108: CIK for dispatches of at most N work-items, wider ones as IKA kernels)";
             return false;
         }
-        if (v == 1 && env_aql_cik() == 0) {
-            if (err) *err = "aql_cik 1 needs RADIANCE_AQL_CIK=1 or 2 at start (which kernels are chain-capable is read at their first "
-                            "launch; unset here: tp8 loop W9)";
+        if (v >= 1 && env_aql_cik() == 0) {
+            if (err) *err = "aql_cik " + std::to_string(v) + " needs RADIANCE_AQL_CIK=1 or 2 at start (which kernels are chain-capable is "
+                            "read at their first launch; unset here: tp8 loop W9)";
             return false;
         }
         return true;

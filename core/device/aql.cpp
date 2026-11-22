@@ -599,6 +599,15 @@ bool cik_on() {
 /* tp8 loop W9 (fn4 aql_cik = core switch 113): whether a chain-capable kernel (KernelRec::cik) chains NOW -- lever CIK on at start and
  * the switch at 1 (its start value where RADIANCE_AQL_CIK=1 / 2); at 0 it issues and plays as the IKA kernel it also is (record off). */
 bool cik_live() { return cik_on() && rad::fn4::aql_cik() >= 1; }
+/* Lever CKW (DRAFTER track round 108): fn4 aql_cik N >= 2 = lever CIK with an in-process width bound -- a chain-capable dispatch of
+ * more than N work-items issues and plays as the IKA kernel it also is (its record off), as RADIANCE_AQL_CIK_LANES=N does from the
+ * start (whose bound a recording keeps); 1 = no in-process bound. Why (drafter/kit/mes/ikh14.cpp, xeon GPU1, r108a-c): one queue's
+ * chained run of WIDE memory-bound kernels delays IKA work on another queue by +3..+15 % (its blocks wait on the counter in wave
+ * slots the other queue needs), while small chained kernels keep CIK's gain (-0.76 us a 16 x 256 link at a bound of 8,192). */
+uint64_t cik_max_live() {
+    const int v = rad::fn4::aql_cik();
+    return v >= 2 ? (uint64_t)v : UINT64_MAX;
+}
 
 /* Lever CTA (DRAFTER track round 63): start env RADIANCE_AQL_CTA=1, read only while lever CIK is on. A chained record that plays
  * WITH its barrier bit (target 0 under CIK: behind a plain kernel, the first of a run) reads its arguments and its record from a
@@ -1586,7 +1595,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
                            n <= RAD_CHAIN_KARG_OFF;
     /* tp8 loop W9: fn4 aql_cik 0 -- a chain-capable kernel issues as the IKA kernel it also is; a tape records the capability and
      * its plays read the switch (PlayRun::put) */
-    const bool chain = chain_cap && (!k->cik || cik_live());
+    const bool chain = chain_cap && (!k->cik || (cik_live() && (uint64_t)(gx * gy * gz) <= cik_max_live()));
     if (k->cik) {   /* tp8 loop R48: CIK's counts (live chained / kept unchained by the bound) */
         CikTl& c = cik_tl();
         const int64_t lanes = (int64_t)(gx * gy * gz);
@@ -1594,7 +1603,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
             cik_bump(c.live, 1);
             cik_bump(c.live_lanes, lanes);
             if ((uint64_t)lanes > c.widest.load(std::memory_order_relaxed)) c.widest.store((uint64_t)lanes, std::memory_order_relaxed);
-        } else if (wide) {
+        } else if (wide || (chain_cap && cik_live())) {   /* the start's bound, or lever CKW's in process */
             cik_bump(c.wide, 1);
             cik_bump(c.wide_lanes, lanes);
         }
@@ -1749,7 +1758,7 @@ struct PlayRun {
          *    free up, unevenly: drafter/kit/mes/ikh11.cpp (xeon GPU2, r64c, 64 x 256 kernels with a tiny chained kernel every third):
          *    up to 5 blocks of one kernel on one WGP (2 when ordered or uniform), its body tail 3.5-4.2 us vs 2.3-2.6. Lever CRB
          *    (RADIANCE_AQL_CRB=B): the same with the run's blocks as the measure. */
-        const PlayKnobs knobs{ cik_live(), cik_on(), crd_cap(), crb_cap() };
+        const PlayKnobs knobs{ cik_live(), cik_on(), crd_cap(), crb_cap(), cik_max_live() };
         PlayRec rec;
         rec.chain_ok = r.chain && tape && s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
         rec.lanes = r.lanes != 0;

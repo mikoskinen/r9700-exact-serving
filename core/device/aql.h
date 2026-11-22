@@ -213,6 +213,8 @@ struct PlayKnobs {
     bool     cik_on = false;    /* RADIANCE_AQL_CIK=1 (an ordered chained record names target 0) */
     int      crd = 0;           /* lever CRD's cap (0 = none) */
     uint64_t crb = 0;           /* lever CRB's cap (0 = none) */
+    uint64_t cik_max = UINT64_MAX;  /* lever CKW (DRAFTER round 108): fn4 aql_cik N >= 2 -- a CIK record of more than N lanes plays
+                                     * unchained (as the IKA kernel it also is); RADIANCE_AQL_CIK_LANES's bound in process */
 };
 struct PlayOut {
     bool     chain = false, ordered = false;
@@ -225,6 +227,7 @@ inline PlayOut play_order(const PlayQ& q, const PlayRec& r, const PlayKnobs& k) 
     if (r.chain_ok) {
         o.chain = true;
         if (r.lanes && !k.cik_live) o.chain = false;   /* tp8 loop W9: aql_cik 0 plays a CIK record as the IKA kernel it also is */
+        if (r.lanes && r.adds > k.cik_max) o.chain = false;   /* lever CKW: wider than aql_cik N lanes -> as an IKA kernel */
         if (o.chain && r.overlap && q.ahead && !r.foreign && !r.done) o.ahead_chain = true;
         else if (r.lanes && r.overlap && !r.foreign && !r.done) o.chain = false;   /* lever CIK: an overlap record plays unchained */
     }

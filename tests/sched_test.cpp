@@ -17089,12 +17089,16 @@ TEST(aql_cik_the_switch_takes_0_1_needs_its_env_and_follows) {
     CHECK_EQ(fn4::aql_cik(), 0);
     CHECK(fn4::state_json().find("\"aql_cik\": 0") != std::string::npos);
     CHECK(fn4::check("aql_cik", 0, &err));
-    for (int v : { -1, 2, 3, 256 }) {
+    for (int v : { -1, -256 }) {
         CHECK(!fn4::check("aql_cik", v, &err));
         CHECK(err.find("aql_cik takes 0") != std::string::npos);
     }
     CHECK(!fn4::check("aql_cik", 1, &err));
     CHECK(err.find("aql_cik 1 needs RADIANCE_AQL_CIK=1 or 2") != std::string::npos);
+    for (int v : { 2, 3, 8192 }) {   /* lever CKW (DRAFTER round 108): N >= 2 = CIK's width bound in process, also needs the env */
+        CHECK(!fn4::check("aql_cik", v, &err));
+        CHECK(err.find("aql_cik " + std::to_string(v) + " needs RADIANCE_AQL_CIK=1 or 2") != std::string::npos);
+    }
     CHECK(!DstSwitches::set("aql_cik", 1));
     CHECK_EQ(fn4::aql_cik(), 0);
     CHECK(DstSwitches::set("aql_cik", 0));
