@@ -1329,8 +1329,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       for (int r = 0; r < 16; r++) acc[j][r & 7] += vacc[j][r];
   }
   // X6w VDOT 2 (rule B, its own reference): the rows' dots into the WMMA's D layout -- a row's two half sums joined in one
-  // order (h 0's first, swap16), then lane L (row L % 16, half H) element e takes column 8 H + e of its row from lane 8 H + e
-  // (ds_bpermute); a row's bytes depend on its own activations and the weights alone (no other row, no row count).
+  // order (h 0's first: permlanex16), then lane L (row L % 16, half H) element e takes column 8 H + e of its row from lane
+  // 8 H + e of its own 16-lane row (two v_permlane16 + a select: VALU only, no LDS round trip); a row's bytes depend on its own activations and the weights alone (no other row, no row count).
   if constexpr (EXL3R4D_X6_VDOT == 2 && (X3D || K25 != K25_OFF)) {
     const int hh = lane >> 4;
 #pragma unroll
@@ -1338,12 +1338,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       if (r < nrv) {   // wave-uniform
 #pragma unroll
         for (int j = 0; j < NPW; j++) {
-          const float o = swap16(vacc[j][r]);
-          const float full = hh ? o + vacc[j][r] : vacc[j][r] + o;
+          const int vi = __builtin_bit_cast(int, vacc[j][r]);
+          const float o = __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(vi, vi, 0x76543210, (int)0xFEDCBA98, false, false));
+          const float full = hh ? o + vacc[j][r] : vacc[j][r] + o;   /* the halves swapped: p0 + p1 on both */
+          const int fi = __builtin_bit_cast(int, full);
 #pragma unroll
-          for (int e = 0; e < 8; e++) {
-            const float t = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((8 * hh + e) * 4, __builtin_bit_cast(int, full)));
-            if ((lane & 15) == r) acc[j][e] = t;
+          for (int e = 0; e < 8; e++) {   /* VALU only: lane e (half 0) and lane 8 + e (half 1) of each 16-lane row */
+            const int a0 = __builtin_amdgcn_permlane16(fi, fi, 0x11111111u * (unsigned)e, 0x11111111u * (unsigned)e, false, false);
+            const int a1 = __builtin_amdgcn_permlane16(fi, fi, 0x11111111u * (unsigned)(8 + e), 0x11111111u * (unsigned)(8 + e), false, false);
+            if ((lane & 15) == r) acc[j][e] = __builtin_bit_cast(float, hh ? a1 : a0);
           }
         }
       }
