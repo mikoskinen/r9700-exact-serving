@@ -52,6 +52,15 @@ extern "C" int r4d_mx_tl_read(unsigned long long* out, int max);
 extern "C" void r4d_mx_wpe(int ab, int pd);
 #endif
 static int g_tl = 0;   /* --tl N: N passes of the item timeline after an IL form's timing */
+/* --glu LIMIT (DRAFTER round 91, lever GSE): each gate_up call also as libr4d's moe_gemm_mxil_glu entry (swiglu_clamped in the
+ * gate_up's epilogue, y [T, N / 2]) against drafter_mx 7's gate_up + a swiglu_clamped_kernel (r4d_glm.hip's expression, compiled
+ * here with libr4d's flags), every output byte compared (as routed, and with every 3rd live slot dropped); timed cold (--flush
+ * before the gate_up only: the swiglu reads its input warm, as served). */
+extern "C" int r4d_rad_moe_mxil_glu(const RadArgs* a, RadStream s);
+#ifdef R4D_GLU_DBG
+extern "C" void r4d_mx_glu_dbg(int v);
+#endif
+static double g_glu = 0;
 void r4d_mx_mr_set(int on);
 /* The a8 arms (COORDINATOR 19:52): libr4d's moe_gemm_mxfp4a8 (r4d_moe_mxfp4.hip body(): canonical planes, E2M1 codes as exact
  * E4M3 bytes, fp8 WMMA, the E8M0 and the activation scales folded in f32 a 32-group) on activations quantised by
@@ -76,6 +85,7 @@ static RadTensor T(void* d, uint32_t dt, std::vector<int64_t> shape) {
 }
 static RadParam PI(const char* k, long long v) { RadParam p; std::memset(&p, 0, sizeof(p)); p.key = k; p.kind = RAD_P_INT; p.ival = v; return p; }
 static RadParam PS(const char* k, const char* v) { RadParam p; std::memset(&p, 0, sizeof(p)); p.key = k; p.kind = RAD_P_STR; p.sval = v; return p; }
+static RadParam PF(const char* k, double v) { RadParam p; std::memset(&p, 0, sizeof(p)); p.key = k; p.kind = RAD_P_F64; p.dval = v; return p; }
 
 /* ---- routing */
 struct Route { std::vector<int32_t> sorted, off; int64_t live = 0, experts = 0, rmax = 0; };
@@ -144,6 +154,20 @@ static Route route_live(int64_t tokens, int64_t L) {
     for (int64_t i = 0; i < tokens * kTopK; ++i) cnt[(size_t)((i % L) * kE / L)]++;
     for (int64_t e = 0; e < kE; ++e) off[(size_t)e + 1] = off[(size_t)e] + cnt[(size_t)e];
     return route_counts(off, tokens);
+}
+/* round 91: swiglu_clamped_kernel (libr4d r4d_glm.hip) and r4d_common.h's f32_to_bf16 / bf16_to_f32, word for word */
+__device__ __forceinline__ uint16_t dbench_f2bf(float f) {
+    uint32_t u = __builtin_bit_cast(uint32_t, f);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+__device__ __forceinline__ float dbench_bf2f(uint16_t h) { return __builtin_bit_cast(float, (uint32_t)h << 16); }
+__global__ void dbench_swiglu_ref(const uint16_t* gu, uint16_t* y, long gp, long yp, int n, float limit) {
+    const long r = blockIdx.x;
+    const int i = blockIdx.y * 256 + threadIdx.x;
+    if (i >= n) return;
+    const float g = fminf(dbench_bf2f(gu[r * gp + i]), limit);
+    const float u = fminf(fmaxf(dbench_bf2f(gu[r * gp + n + i]), -limit), limit);
+    y[r * yp + i] = dbench_f2bf((g / (1.0f + expf(-g))) * u);
 }
 /* the flush (round 87): a READ of the buffer (a D2D copy's dirty lines would be written back inside the next call's window) */
 __global__ void dbench_flush_read(const uint4* p, size_t n, uint32_t* sink) {
@@ -485,6 +509,112 @@ static void tl_report(std::vector<Call>& calls, hipStream_t s, int passes, doubl
 }
 #endif
 
+/* round 91 (lever GSE): see --glu */
+static int glu_bench(std::vector<Call>& calls, hipStream_t s, int iters) {
+    Form f7{ "mx7il", -13, 0, 0, 0, 0, 0 };
+    apply_form(f7);
+    const float lim = (float)g_glu;
+    const size_t flb = (size_t)g_flush_mb << 20;
+    void* fa = nullptr; void* fb = nullptr;
+    if (flb) { CK(hipMalloc(&fa, flb)); CK(hipMalloc(&fb, 64)); CK(hipMemset(fa, 0x5a, flb)); CK(hipDeviceSynchronize()); }
+    int fails = 0;
+    double sgu = 0, ssw = 0, sglu = 0;
+    for (auto& c : calls) {
+        if (c.p != 0) continue;
+        const int64_t N = kProj[0].N, W = N / 2, TR = (int64_t)c.rt.sorted.size();
+        c.ts[1].data = c.wi; c.a.t = c.ts.data();
+        void *yref = nullptr, *yg = nullptr;
+        CK(hipMalloc(&yref, (size_t)(TR * W) * 2)); CK(hipMalloc(&yg, (size_t)(TR * W) * 2));
+        std::vector<RadTensor> tg = c.ts; tg[4] = T(yg, RAD_BF16, { TR, W });
+        std::vector<RadParam> pg = c.ps; pg.push_back(PF("limit", g_glu));
+        RadArgs ag{}; ag.t = tg.data(); ag.n_t = (int)tg.size(); ag.p = pg.data(); ag.n_p = (int)pg.size(); ag.world_size = 1;
+        auto ref = [&]() {
+            const int rc = c.launch(s);
+            dbench_swiglu_ref<<<dim3((unsigned)TR, (unsigned)((W + 255) / 256)), dim3(256), 0, s>>>((const uint16_t*)c.y, (uint16_t*)yref, (long)N, (long)W, (int)W, lim);
+            return rc;
+        };
+        std::string form = "?";
+        int diff = 0; long long nd = 0;
+        for (int v = 0; v < 2; ++v) {
+            std::vector<int32_t> so = c.rt.sorted;
+            if (v == 1) { int64_t k = 0; for (auto& x : so) if (x >= 0 && (k++ % 3) == 2) x = -1; }
+            void* dso = nullptr; CK(hipMalloc(&dso, so.size() * 4)); CK(hipMemcpy(dso, so.data(), so.size() * 4, hipMemcpyHostToDevice));
+            void* keep = c.ts[2].data; c.ts[2].data = dso; tg[2].data = dso; c.a.t = c.ts.data(); ag.t = tg.data();
+            CK(hipMemset(yref, 0xff, (size_t)(TR * W) * 2)); CK(hipMemset(yg, 0xee, (size_t)(TR * W) * 2));
+            const int r1 = ref(); const int r2 = r4d_rad_moe_mxil_glu(&ag, (RadStream)s);
+            CK(hipStreamSynchronize(s));
+            if (v == 0) form = r4d_mx_mr_last();
+            std::vector<uint16_t> a((size_t)(TR * W)), b((size_t)(TR * W));
+            CK(hipMemcpy(a.data(), yref, a.size() * 2, hipMemcpyDeviceToHost)); CK(hipMemcpy(b.data(), yg, b.size() * 2, hipMemcpyDeviceToHost));
+            long long d = 0; for (size_t i = 0; i < a.size(); ++i) d += a[i] != b[i];
+#ifdef R4D_GLU_DBG
+            if (v == 0 && getenv("GLU_DEBUG")) {
+                std::vector<uint16_t> gu((size_t)(TR * N)); CK(hipMemcpy(gu.data(), c.y, gu.size() * 2, hipMemcpyDeviceToHost));
+                void* yd = nullptr; CK(hipMalloc(&yd, gu.size() * 2));
+                for (int dbg = 3; dbg >= 2; --dbg) {
+                    r4d_mx_glu_dbg(dbg);
+                    std::vector<RadTensor> t2 = tg; t2[4] = T(yd, RAD_BF16, { TR, W }); t2[4].stride[0] = N;
+                    RadArgs a2 = ag; a2.t = t2.data();
+                    CK(hipMemset(yd, 0xff, gu.size() * 2));
+                    const int rc = r4d_rad_moe_mxil_glu(&a2, (RadStream)s); CK(hipStreamSynchronize(s));
+                    std::vector<uint16_t> o(gu.size()); CK(hipMemcpy(o.data(), yd, o.size() * 2, hipMemcpyDeviceToHost));
+                    long long dg = 0, du = 0; std::vector<long long> br((size_t)TR, 0);
+                    for (int64_t r = 0; r < TR; ++r) for (int64_t q = 0; q < N; ++q) { const size_t i = (size_t)(r * N + q); if (o[i] != gu[i]) { (q < W ? dg : du)++; br[(size_t)r]++; } }
+                    std::printf("    dbg %d rc %d: gate cols differ %lld, up cols differ %lld; by row:", dbg, rc, dg, du);
+                    for (int64_t r = 0; r < std::min<int64_t>(TR, 24); ++r) std::printf(" %lld", br[(size_t)r]);
+                    std::printf("\n");
+                    int shown = 0;
+                    for (int64_t r = 0; r < TR && shown < 6; ++r) for (int64_t q = 0; q < N && shown < 6; ++q) { const size_t i = (size_t)(r * N + q); if (o[i] != gu[i]) { ++shown; std::printf("      r %lld col %lld: ref %04x got %04x\n", (long long)r, (long long)q, gu[i], o[i]); } }
+                }
+                r4d_mx_glu_dbg(0); hipFree(yd);
+            }
+#endif
+            if (d && getenv("GLU_DEBUG")) {   /* where they differ: by column mod 64, by row, the first values */
+                std::vector<long long> bc(64, 0), br((size_t)TR, 0); int shown = 0;
+                std::vector<uint16_t> gu((size_t)(TR * N)); CK(hipMemcpy(gu.data(), c.y, gu.size() * 2, hipMemcpyDeviceToHost));
+                for (int64_t r = 0; r < TR; ++r) for (int64_t q = 0; q < W; ++q) { const size_t i = (size_t)(r * W + q); if (a[i] != b[i]) { bc[(size_t)(q % 64)]++; br[(size_t)r]++;
+                    if (shown++ < 12) std::printf("    r %lld c %lld slot %d: ref %04x got %04x (gate %04x up %04x)\n", (long long)r, (long long)q, so[(size_t)r], a[i], b[i], gu[(size_t)(r * N + q)], gu[(size_t)(r * N + W + q)]); } }
+                std::printf("    by col%%64:"); for (int q = 0; q < 64; ++q) std::printf(" %lld", bc[(size_t)q]); std::printf("\n    by row:");
+                for (int64_t r = 0; r < TR; ++r) std::printf(" %lld", br[(size_t)r]); std::printf("\n");
+            }
+            if (r1 || r2 || d) ++diff;
+            nd += d;
+            if (r1 || r2) std::printf("  glu s%d variant %d: rc ref %d glu %d\n", c.stage, v, r1, r2);
+            c.ts[2].data = keep; tg[2].data = keep; c.a.t = c.ts.data(); ag.t = tg.data();
+            hipFree(dso);
+        }
+        fails += diff;
+        /* timing: [flush] gate_up | swiglu   vs   [flush] glu */
+        std::vector<float> tgu, tsw, tgl;
+        for (int w = 0; w < 3; ++w) { ref(); r4d_rad_moe_mxil_glu(&ag, (RadStream)s); }
+        CK(hipStreamSynchronize(s));
+        for (int it = 0; it < iters; ++it) {
+            hipEvent_t e[5]; for (auto& x : e) CK(hipEventCreate(&x));
+            if (flb) dbench_flush_read<<<dim3(1024), dim3(256), 0, s>>>((const uint4*)fa, flb / 16, (uint32_t*)fb);
+            CK(hipEventRecord(e[0], s)); c.launch(s); CK(hipEventRecord(e[1], s));
+            dbench_swiglu_ref<<<dim3((unsigned)TR, (unsigned)((W + 255) / 256)), dim3(256), 0, s>>>((const uint16_t*)c.y, (uint16_t*)yref, (long)N, (long)W, (int)W, lim);
+            CK(hipEventRecord(e[2], s));
+            if (flb) dbench_flush_read<<<dim3(1024), dim3(256), 0, s>>>((const uint4*)fa, flb / 16, (uint32_t*)fb);
+            CK(hipEventRecord(e[3], s)); r4d_rad_moe_mxil_glu(&ag, (RadStream)s); CK(hipEventRecord(e[4], s));
+            CK(hipStreamSynchronize(s));
+            float m0 = 0, m1 = 0, m2 = 0;
+            CK(hipEventElapsedTime(&m0, e[0], e[1])); CK(hipEventElapsedTime(&m1, e[1], e[2])); CK(hipEventElapsedTime(&m2, e[3], e[4]));
+            tgu.push_back(m0 * 1000.f); tsw.push_back(m1 * 1000.f); tgl.push_back(m2 * 1000.f);
+            for (auto& x : e) hipEventDestroy(x);
+        }
+        auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return (double)v[v.size() / 2]; };
+        const double a0 = med(tgu), a1 = med(tsw), a2 = med(tgl);
+        sgu += a0; ssw += a1; sglu += a2;
+        std::printf("  glu s%d (live %lld experts, %lld slots): gate_up %.1f + swiglu %.1f = %.1f us vs GLU %.1f us (%+.1f) | bytes vs the pair %s (%lld values differ over 2 routings) | %s\n",
+                    c.stage, (long long)c.rt.experts, (long long)c.rt.live, a0, a1, a0 + a1, a2, a2 - a0 - a1, diff ? "DIFFER" : "IDENTICAL", nd, form.c_str());
+        hipFree(yref); hipFree(yg);
+        c.ts[1].data = c.wn; c.a.t = c.ts.data();
+    }
+    std::printf("  GLUSUM gate_up %.1f + swiglu %.1f = %.1f us vs GLU %.1f us a pass (%+.1f)\n", sgu, ssw, sgu + ssw, sglu, sglu - sgu - ssw);
+    if (fa) { hipFree(fa); hipFree(fb); }
+    return fails;
+}
+
 int main(int argc, char** argv) {
     std::string toks = "40,80", forms = "stock,rule", route = "synth";
     int iters = 30, rec_stride = 2, stages = 3, cap = 0, gemv_order = 0;
@@ -516,6 +646,7 @@ int main(int argc, char** argv) {
         else if (a == "--quad") quad = 1;
         else if (a == "--tl") g_tl = std::atoi(nx().c_str());
         else if (a == "--flush") g_flush_mb = std::atoll(nx().c_str());
+        else if (a == "--glu") g_glu = std::atof(nx().c_str());
 #ifdef R4D_XM_TL
         else if (a == "--wpe") { const int ab = std::atoi(nx().c_str()); const int pd = std::atoi(nx().c_str()); r4d_mx_wpe(ab, pd); }
 #endif
@@ -849,6 +980,7 @@ int main(int argc, char** argv) {
 #endif
             std::fflush(stdout);
         }
+        if (g_glu > 0) fails += glu_bench(calls, s, iters);
         apply_form(fl[0]);
         for (auto& c : calls) { hipFree(c.ts[0].data); hipFree(c.ts[2].data); hipFree(c.ts[3].data); hipFree(c.y); if (c.aq) hipFree(c.aq); if (c.as) hipFree(c.as); }
     }

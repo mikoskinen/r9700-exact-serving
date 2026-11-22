@@ -128,6 +128,10 @@ static const int64_t kMoeShexpLaneRows = 64;
  * ordered gather waits ~10 us past the routed down for it (loop FINDINGS DRAFTER 21:59 addendum, lq198 leader stamps);
  * issued first it runs at the routed down's start. The same ops over the same operands: the bytes do not move. */
 static const int kMoeSdfBit = 4;
+/* Lever GSE (DRAFTER track 22.11.2026 round 91; deepseek41's DSpark drafter MoE word g_dsp_sdf, dspark_mhr + 512): with the
+ * routed gate_up's GLU form declared (Config::expert_ggml_glu, MoeFP8::op_gu_glu) this bit issues it -- the gate_up writes the
+ * down's input (swiglu_clamped in its epilogue) and the swiglu_clamped launch is left out; the same bytes into the down. */
+static const int kMoeGluBit = 8;
 
 struct MoeFP8 {
     struct Config {
@@ -322,6 +326,11 @@ struct MoeFP8 {
          * drafter, RADIANCE_DS41_DSPARK_WIL=1): "moe_gemm_mxil", the same values over libr4d's tile-interleaved
          * stored form (its own layout hook, so these weights are read by that op alone). */
         const char* expert_ggml_op = nullptr;
+        /* Lever GSE (DRAFTER track round 91; deepseek41's DSpark drafter, RADIANCE_DS41_GSE=1 with WIL): also declare the routed
+         * gate_up as this op ("moe_gemm_mxil_glu": swiglu_clamped in the GEMM's epilogue, writing the down's input `eff`) beside
+         * the pair, for MXFP4 gate_ups under expert_ggml_op with swiglu_limit > 0 (not swiglu_step) where a loaded library
+         * declares it; a pass issues it when its shexp_lane word carries kMoeGluBit. Null: the pair only (as published). */
+        const char* expert_ggml_glu = nullptr;
         /* The routed experts are IQR trellis planes (r4d_iqr.h; format 11): `moe_gemm_iqr` over one
          * table in expert order, the codes/trellis/mad planes and the kRowF32 scale pair. */
         int     expert_iqr   = 0;
@@ -484,6 +493,7 @@ struct MoeFP8 {
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
     rad_op op_gu = 0, op_dn = 0, op_gather = 0;
+    rad_op op_gu_glu = 0;   /* lever GSE (Config::expert_ggml_glu): the routed gate_up writing w.eff (swiglu_clamped inside) */
     /* Config::exl3_dk_rows (lever P): the decode-band-bytes ops over 17 .. dk_rows tokens, 0 where not declared or not
      * served. dk_takes: a pass of `rows` tokens may be issued with them (pass's `dk`). */
     rad_op op_gu_dk = 0, op_dn_dk = 0;
@@ -1392,6 +1402,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         };
         op_gu = rw(b, grouped(0, gu * c.n_ff_exp, g.n_embd, "token", w_gu.data()),
                    {w.h.x, w.sorted, w.eoff}, {w.egu});
+        /* lever GSE: the GLU form beside the pair (the same weight tables and layout hooks as expert_ggml_op's) */
+        if (gg && c.expert_ggml_glu && c.expert_ggml_op && gu == 2 && ggml_ty[0] && !strcmp(ggml_ty[0], "mxfp4") &&
+            c.swiglu_limit > 0 && !c.swiglu_step && rad_op_declared(b, c.expert_ggml_glu)) {
+            op_gu_glu = rw(b, rad_decl_op(b, c.expert_ggml_glu,
+                                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", gu * c.n_ff_exp),
+                                                     RAD_INT("K", g.n_embd), RAD_INT("n_expert", ne),
+                                                     RAD_INT("top_k", c.top_k), RAD_STR("a_order", "token"),
+                                                     RAD_STR("type", ggml_ty[0]), RAD_STR("dtype", "bf16"),
+                                                     RAD_F64("limit", c.swiglu_limit)),
+                                          w_gu.data(), (int)ne),
+                           {w.h.x, w.sorted, w.eoff}, {w.eff.x});
+            if (!op_gu_glu) return RAD_E_INVAL;
+        }
         /* silu(gate) * up into the bf16 plane the down GEMM reads, regardless of the trunk's format
          * (rad_fp8.h: GateQuantFP8). */
         Geom gx = g;
@@ -2556,6 +2579,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * recorded, so nothing overlaps them there today). Same ops, same operands, joined in front of the gather as at 1. */
     const int sl_w = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
     const int sl_v = sl_w & 3;   /* tp8 loop D42: bit 2 is SDF (kMoeSdfBit), not a lane form */
+    /* lever GSE: bit 3 (kMoeGluBit) issues the GLU gate_up where it was declared (bf16-activation GGUF experts only) */
+    const bool glu_now = op_gu_glu && (sl_w & kMoeGluBit) && act_bf16() && !c.expert_exl3 && !c.expert_iqr;
     /* tp8 loop P30t: a twin pass's shared arm stays on lane 0 (its int8 quantiser writes the block input's pair) */
     const bool sh_twin = shared && sh_tw && twin_now && twin_now();
     const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && ((r0 == 0 && rows == T) || (piece && sl_v == 2)) &&
@@ -2702,6 +2727,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     RAD_WTAB(w_gu[0], ne), RAD_WTAB(w_gus[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
+    else if (glu_now)   /* lever GSE: the gate_up writes the down's input; no swiglu below */
+        RAD_ISSUE_N(c_, op_gu_glu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                    RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
+                    brows(w.eff.x, rows * k));
     else if (act_bf16())
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
@@ -2728,7 +2757,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (beside && beside->fn && r0 == 0) beside->fn(c_, beside->arg);
     if (c.expert_iqr)
         gq_iqr.step(c_, w.egu, rows * k, 0, rows * k);
-    else if (!c.expert_exl3)   /* EXL3: inside gate_up */
+    else if (!c.expert_exl3 && !glu_now)   /* EXL3: inside gate_up; lever GSE: inside the GLU gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !lane1 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
     /* The shared arm's down: after the routed down and the protected experts (as before), or with SDF right here

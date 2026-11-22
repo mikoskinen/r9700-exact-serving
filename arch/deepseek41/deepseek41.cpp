@@ -480,6 +480,7 @@ struct Dsp {
     int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
     bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
     bool wil = false;                     /* lever WIL (dsp_wil_env): the routed experts as moe_gemm_mxil (tile-interleaved) */
+    bool gse = false;                     /* lever GSE (gse_env): the routed gate_up's GLU form declared beside the pair */
     int64_t ff_rank = 0;                  /* the routed experts' intermediate width on this rank (DEP: n_ff / world) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
@@ -2332,9 +2333,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dz = pz && pz[0] == '1' && !pz[1] ? 256 : 0;
         if (pz && *pz && !dz && std::strcmp(pz, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_PFX=%s is not 0 / 1: lever PFX not declared\n", pz);
+        const char* gz = std::getenv("RADIANCE_DS41_GSE");   /* lever GSE (round 91): 1 = on at start, 0 = declared, off */
+        const int dgz = gz && gz[0] == '1' && !gz[1] ? 512 : 0;
+        if (gz && *gz && !dgz && std::strcmp(gz, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_GSE=%s is not 0 / 1: lever GSE not declared\n", gz);
         int unread = -1;
         g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk |
-                                                     dg | dz);
+                                                     dg | dz | dgz);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2363,6 +2368,19 @@ static bool emg_now() { return (dmr_raw() & 128) != 0; }  /* lever EMG (round 74
  * chain 115.6 -> 89.6 us at 32 rows, 120.5 -> 99.7 at 40. o_b's 11 MB is left out: 40.9 MB (~66 us) would run past a
  * 53-59 us window into the stage's own dense calls (a read beside a dense call slowed it 14.8 -> 36.7 us). */
 static bool pfx_now() { return (dmr_raw() & 256) != 0; }
+/* Lever GSE (DRAFTER track 22.11.2026 round 91; dspark_mhr + 512, start env RADIANCE_DS41_GSE=1 declares it and sets the bit, =0
+ * declares it off; needs lever WIL and a library serving moe_gemm_mxil_glu, i.e. libr4d from round 91): each stage's routed gate_up
+ * as moe_gemm_mxil_glu -- swiglu_clamped in the GEMM's epilogue, the down's input written directly, one launch fewer a stage.
+ * Exact (rule A): drafter/tools dbench --glu, every byte of the down's input IDENTICAL to moe_gemm_mxil + swiglu_clamped (live 47 /
+ * 34 / 21 and 42 / 33 / 20, lq168 rec 1608 quads, synthetic 32 / 40 / 80 tokens, as routed and with every 3rd slot dropped). One
+ * R9700 (drafter/kit/mes/pfs.cpp, the stage MoE windows played as served): 16 sequences 1,049.0 -> 1,044.7 us a pass (-4.3),
+ * 8 sequences 1,027.6 -> 1,023.9 (-3.7); per op the GLU gate_up +0.6..+2.6 us a call and the swiglu (7.7-8.0 us) gone. */
+static bool gse_now() { return (dmr_raw() & 512) != 0; }
+static int gse_env() {
+    const char* q = std::getenv("RADIANCE_DS41_GSE");
+    if (!q || !*q) return 0;
+    return !std::strcmp(q, "0") || !std::strcmp(q, "1") ? 1 : -1;
+}
 static bool pfx_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_PFX");
     return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
@@ -3293,7 +3311,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ||
                (value == 3 && g_sw_walk_ok.load(std::memory_order_relaxed) && g_sw_walk3_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 511 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 1023 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -5368,6 +5386,28 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
             fprintf(stderr, "radiance: deepseek41: lever WIL (RADIANCE_DS41_DSPARK_WIL): the DSpark drafter's routed MXFP4 experts "
                             "as moe_gemm_mxil (tile-interleaved weights; drafter_mx 5's operations and bytes)\n");
     }
+    d.gse = false;
+    if (gse_env() < 0) {   /* lever GSE */
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_GSE=%s is not 0 / 1\n", std::getenv("RADIANCE_DS41_GSE"));
+        return RAD_E_INVAL;
+    }
+    if (gse_env() > 0) {
+        if (!d.wil || !rad_op_declared(b, "moe_gemm_mxil_glu")) {
+            rad_note(b, "lever GSE (RADIANCE_DS41_GSE): %s -- not declared", !d.wil ? "needs lever WIL (RADIANCE_DS41_DSPARK_WIL=1)"
+                                                                                : "no loaded kernel plugin serves moe_gemm_mxil_glu");
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever GSE (RADIANCE_DS41_GSE) not declared: %s\n",
+                        !d.wil ? "needs lever WIL" : "no loaded kernel plugin serves moe_gemm_mxil_glu");
+        } else {
+            d.gse = true;
+            rad_note(b, "DSpark drafter routed gate_up's GLU form declared (lever GSE, RADIANCE_DS41_GSE; dspark_mhr + 512 issues it): "
+                        "moe_gemm_mxil_glu");
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever GSE (RADIANCE_DS41_GSE=%s): the DSpark drafter's routed gate_up also as "
+                                "moe_gemm_mxil_glu (swiglu_clamped in its epilogue), issued at dspark_mhr + 512 (%s at start)\n",
+                        std::getenv("RADIANCE_DS41_GSE"), gse_now() ? "on" : "off");
+        }
+    }
     if (dsp_rf_env() < 0) {   /* lever DRF */
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_RF=%s is not 0 / off or 1 / on\n", std::getenv("RADIANCE_DS41_DSPARK_RF"));
         return RAD_E_INVAL;
@@ -5556,6 +5596,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.n_ff_exp = d.dep ? d.ff_rank : c.n_ff;   /* lever DEP: this rank's slice (MoeFP8's even ROW / COL shard) */
     /* lever WIL: moe_gemm_mxil serves up to 512 tokens a call (drafter_mx's bound); a larger drafter block keeps moe_gemm_ggml */
     if (d.wil && Q <= 512) s.cfg.expert_ggml_op = "moe_gemm_mxil";
+    if (d.gse && s.cfg.expert_ggml_op) s.cfg.expert_ggml_glu = "moe_gemm_mxil_glu";   /* lever GSE: declared beside the pair */
     else if (d.wil && l == d.base)
         rad_note(b, "lever WIL: the drafter's %lld rows exceed moe_gemm_mxil's 512: moe_gemm_ggml kept", (long long)Q);
     s.cfg.n_ff_shared = g.n_ff;
@@ -9063,7 +9104,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     }
 
     /* lever SDD (dspark_mhr 6): the stages' MoE read this word at their issue below (the same value on every rank) */
-    g_dsp_sdf.store(dmr_now() >= 6 ? kMoeSdfBit : 0, std::memory_order_relaxed);
+    g_dsp_sdf.store((dmr_now() >= 6 ? kMoeSdfBit : 0) | (gse_now() ? kMoeGluBit : 0), std::memory_order_relaxed);   /* + lever GSE */
     /* lever EMA (dspark_mhr 7): the plane of this pass's block, where every rank declared it (a function of the pass key and
      * the switches; the all-reduce's shape is the same on every rank) */
     int64_t ek = -1;

@@ -36,10 +36,15 @@
 #include "r4d_plugin.h"
 #include "r4d_ds41_mxfp4_mr.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+
+/* lever GSE (DRAFTER round 91): the IL gate_up with swiglu_clamped in its epilogue (r4d_ds41_mxfp4_mr.hip; declared here, not in
+ * r4d_ds41_mxfp4_mr.h, so r4d_ds41_ggml.hip -- which includes that header -- is not rebuilt for it) */
+int r4d_mx_mr_moe_il_glu(RadStream s, const R4dMxMrCall& c, float limit);
 
 namespace {
 
@@ -772,7 +777,7 @@ int g_mx_gemv_all = 0;
 
 /* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. `il` (lever WIL, moe_gemm_mxil):
  * the weight is in the tile-interleaved layout its row stores, served by the IL forms alone (r4d_mx_mr_moe_il). */
-int mx_moe(const RadArgs* a, RadStream s, bool gemv, bool il = false) {
+int mx_moe(const RadArgs* a, RadStream s, bool gemv, bool il = false, bool glu = false) {
     if (g_mx_gemv_all) gemv = true;
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
@@ -789,7 +794,10 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv, bool il = false) {
         K > 0x7fffffffLL)
         return R4D_NO(RAD_E_SHAPE);
     if (A_->rank != 2 || A_->dtype != RAD_BF16 || A_->shape[1] != K || !mx_inner1(A_)) return R4D_NO(RAD_E_SHAPE);
-    if (Y->rank != 2 || Y->dtype != RAD_BF16 || Y->shape[1] != N || !mx_inner1(Y)) return R4D_NO(RAD_E_SHAPE);
+    /* lever GSE: y is the down's input, [T, N / 2] = swiglu_clamped(gate rows [0, N / 2), up rows [N / 2, N)) */
+    const long long NY = glu ? N / 2 : N;
+    if (glu && (!il || N % 16)) return R4D_NO(RAD_E_SHAPE);
+    if (Y->rank != 2 || Y->dtype != RAD_BF16 || Y->shape[1] != NY || !mx_inner1(Y)) return R4D_NO(RAD_E_SHAPE);
     const long long T = Y->shape[0], AR = A_->shape[0];
     if (T <= 0 || AR <= 0 || T > 0x7fffffffLL || AR > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
     if ((so->dtype != RAD_I32 && so->dtype != RAD_U32) || (of->dtype != RAD_I32 && of->dtype != RAD_U32) ||
@@ -813,7 +821,7 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv, bool il = false) {
     } else {
         return R4D_NO(RAD_E_DTYPE);
     }
-    const long long x_ld = AR > 1 ? A_->stride[0] : K, y_ld = T > 1 ? Y->stride[0] : N;
+    const long long x_ld = AR > 1 ? A_->stride[0] : K, y_ld = T > 1 ? Y->stride[0] : NY;
     const long long tb = mx_r16(mx_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
@@ -826,6 +834,12 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv, bool il = false) {
                              table ? nullptr : (const uint8_t*)W->data, table ? (const uint8_t* const*)W->data : nullptr,
                              w_ld, w_es, (uint16_t*)Y->data, y_ld, (const int32_t*)so->data, (const int32_t*)of->data,
                              (int)T, (int)N, (int)K, (int)ne, (int)top_k, a_sorted ? 1 : 0, (int)tokens, false };
+        if (glu) {
+            const double lim = r4d_getf(a, "limit", 0);
+            if (!(lim > 0) || !std::isfinite(lim)) return R4D_NO(RAD_E_INVAL);
+            const int mg = r4d_mx_mr_moe_il_glu(s, c, (float)lim);
+            return mg != R4D_MX_MR_DECLINE ? mg : R4D_NO(RAD_E_SHAPE);
+        }
         const int mr = r4d_mx_mr_moe_il(s, c);
         return mr != R4D_MX_MR_DECLINE ? mr : R4D_NO(RAD_E_SHAPE);
     }
@@ -896,6 +910,8 @@ extern "C" int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs* a, RadStream s) { retu
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs* a, RadStream s) { return mx_moe(a, s, true); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_moe(a, s, false); }
 extern "C" int r4d_rad_moe_mxil(const RadArgs* a, RadStream s) { return mx_moe(a, s, false, true); }
+/* lever GSE: moe_gemm_mxil's gate_up with swiglu_clamped (param `limit`) in its epilogue, y [T, N / 2] */
+extern "C" int r4d_rad_moe_mxil_glu(const RadArgs* a, RadStream s) { return mx_moe(a, s, false, true, true); }
 extern "C" void r4d_mx_gemv_order(int on) { g_mx_gemv_all = on ? 1 : 0; }
 
 #endif  /* R4D_MX_BLOCKS_ONLY */

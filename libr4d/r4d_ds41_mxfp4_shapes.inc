@@ -43,3 +43,22 @@ extern "C" int r4d_shape_moe_gemm_mxfp4(const RadParam* p, int n_p, int operand,
     };
     R4D_PICK(l);
 }
+
+/* lever GSE (DRAFTER round 91): moe_gemm_mxil_glu -- moe_gemm_mxil's operands with y [M x top_k, N / 2] (the swiglu's output) */
+extern "C" int r4d_shape_moe_gemm_mxil_glu(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    const int64_t ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
+    if (!ds41_mx_type(p, n_p) || M <= 0 || N <= 0 || N % 16 || K <= 0 || K % 32 || ne <= 0 || k <= 0)
+        return RAD_E_UNSUPPORTED;
+    const char* ord = r4d_pgets(p, n_p, "a_order");
+    const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, AR, K),                                                   /* a -- see a_order */
+        opd((uint32_t)RAD_F32, ne, N, K),                                /* w, the logical form (gate rows, then up rows) */
+        opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),   /* sorted_tok */
+        opd_idx(ne + 1, 0, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX), /* expert_offset */
+        opd(D, M * k, N / 2),                                            /* y = swiglu_clamped(gate, up), sorted order */
+    };
+    R4D_PICK(l);
+}

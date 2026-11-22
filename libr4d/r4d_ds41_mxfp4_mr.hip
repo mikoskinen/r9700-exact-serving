@@ -77,6 +77,7 @@ struct MxMrArgs {
     int nrg;                             /* row groups an expert */
     int live_cap;                        /* live-expert entries in LDS */
     int live_off, x_off;                 /* LDS byte offsets (the value table at 0) */
+    float glu_limit;                     /* lever GSE (xm_wm_kernel GLU 1): swiglu_clamped's limit; y is [T, N / 2] */
 };
 
 /* ------------------------------------------------------------------ work items */
@@ -179,6 +180,14 @@ __device__ __forceinline__ void xm_zero(const MxMrArgs& A, int r0, int mc, int n
     for (int idx = (int)threadIdx.x; idx < mc * A.RB; idx += (int)blockDim.x) {
         const int m = idx / A.RB, n = n0 + (idx - m * A.RB);
         if (n < A.N) mx_put(A.y + (long long)(r0 + m) * A.y_ld + n, 0.0f);
+    }
+}
+/* lever GSE: the same for the GLU form's output columns [c0, c0 + RB / 2) of N / 2 (swiglu_clamped of a zero gate and up is 0) */
+__device__ __forceinline__ void xm_zero_glu(const MxMrArgs& A, int r0, int mc, int c0) {
+    const int RH = A.RB >> 1, NH = A.N >> 1;
+    for (int idx = (int)threadIdx.x; idx < mc * RH; idx += (int)blockDim.x) {
+        const int m = idx / RH, n = c0 + (idx - m * RH);
+        if (n < NH) mx_put(A.y + (long long)(r0 + m) * A.y_ld + n, 0.0f);
     }
 }
 
@@ -735,7 +744,16 @@ __device__ __forceinline__ void xm_tl_put(unsigned long long tin, unsigned long 
 #define XM_TL_IDLE(AB) do { } while (0)
 #endif
 
-template <int WR, int NT, int PD, int AB = 0, int IL = 0>   /* AB: bench ablations (outputs differ): 1 no WMMA / fma, 2 no decode, 4 no staging; 8 the item timeline,
+/* GLU (lever GSE, DRAFTER track 22.11.2026 round 91): the gate_up's swiglu_clamped in the epilogue -- y is [T, N / 2] and holds
+ * swiglu_clamped(gate, up) of the gate rows [0, N / 2) and up rows [N / 2, N), the activation the down reads. A wave's 16 WMMA
+ * columns are 8 gate rows (lanes nl 0..7) and their 8 up rows (nl 8..15), output columns RB / 2 an item (8 a wave): each lane
+ * reads ITS row's 8 code bytes and scale from the row's IL tile (the slot row % 16, not nl), so every column's operands, WMMAs,
+ * fmas and order are the IL form's for that row (rule A: a column's sum never mixes with another column). The gate lane takes
+ * the up lane's 8 sums (DPP row_xmask 8), rounds both as mx_put stores them (bf16_hi_rne_nan) and applies swiglu_clamped_kernel's
+ * expression (r4d_glm.hip: g = fminf(gate, limit), u = fminf(fmaxf(up, -limit), limit), f32_to_bf16((g / (1 + expf(-g))) * u))
+ * -- the bytes the gate_up + swiglu_clamped pair writes into the down's input; a dead row is 0 (the pair's swiglu of 0 and 0).
+ * IL, WR 1, NT 1 and lever WCN's loop only. */
+template <int WR, int NT, int PD, int AB = 0, int IL = 0, int GLU = 0>   /* AB: bench ablations (outputs differ): 1 no WMMA / fma, 2 no decode, 4 no staging; 8 the item timeline,
                                                               16 / 32 the compiler asked for 12 / 16 waves a SIMD (same outputs) */
 __global__ __launch_bounds__(kXmThreads) __attribute__((amdgpu_waves_per_eu((AB & 16) ? 12 : (AB & 32) ? 16 : 1)))
 void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
@@ -743,6 +761,7 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
     constexpr int MT = 16 * NT;
     /* lever WCN (round 87) on the IL forms; AB bit 64 (bench) keeps the loop before it for an in-process A / B */
     constexpr bool WCN = IL != 0 && (AB & 64) == 0;
+    static_assert(GLU == 0 || (WCN && WR == 1 && NT == 1 && (AB & 7) == 0), "GLU: lever WCN's IL WR 1 NT 1 form");
     XM_TL_IN(AB)
     R4D_DYN_LDS(r4d_u32x4, xm_lds);
     uint8_t* const smem = (uint8_t*)xm_lds;
@@ -772,14 +791,19 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
             if (bal) ml = m0 + 32 - __builtin_clz(bal);
         }
         ml = __builtin_amdgcn_readfirstlane(ml);
+        /* GLU: this lane's output column cg (8 a wave) and weight row (the gate row cg or its up row N / 2 + cg) */
+        const int cg = GLU ? rg * (A.RB >> 1) + wave * 8 + (nl & 7) : 0;
         if (ml == 0) {
-            xm_zero(A, r0, mc, n0);
+            if constexpr (GLU != 0) xm_zero_glu(A, r0, mc, rg * (A.RB >> 1));
+            else xm_zero(A, r0, mc, n0);
             XM_TL_PUT(AB, it, e);
             continue;
         }
         const int nt = (ml + 15) >> 4;
         const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
-        const int nw = n0 + wave * 16 * WR + nl;          /* this lane's weight rows nw + 16 r */
+        const int nw = GLU ? (nl < 8 ? cg : (A.N >> 1) + cg) : n0 + wave * 16 * WR + nl;   /* this lane's weight rows nw + 16 r */
+        /* the row's slot in its IL tile (GLU; else nl, as n0 and the wave's rows start on a tile) and the lane of its code bytes */
+        const int sl = GLU ? (min(nw, A.N - 1) & 15) : nl, ll = GLU ? sl + 16 * h : lane;
         const uint8_t* wr[WR];
 #pragma unroll
         for (int r = 0; r < WR; ++r)
@@ -806,11 +830,11 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
 #pragma unroll
                 for (int r = 0; r < WR; ++r) {
                     const uint8_t* tp = wr[r] + (long long)bc * kXmIlTile;
-                    const uint64_t v = *(mx_gu64)(const void*)(tp + 8 * lane);
+                    const uint64_t v = *(mx_gu64)(const void*)(tp + 8 * ll);
                     rw[r][0] = (uint32_t)v; rw[r][1] = (uint32_t)(v >> 32);
                     /* the scale's aligned word, its byte taken where the block is computed (a byte load became a d16
                      * partial write, and a shift here waits for the load) */
-                    rw[r][2] = *(mx_gu32)(const void*)(tp + 256 + (nl & ~3));
+                    rw[r][2] = *(mx_gu32)(const void*)(tp + 256 + (sl & ~3));
                 }
                 return;
             }
@@ -840,7 +864,7 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
                 const r4d_u32x4 w = rw[r];
                 if constexpr (WCN) {
                     q0[r] = w[0]; q1[r] = w[1];
-                    d[r] = mx_e8m0_half((w[2] >> (8 * (nl & 3))) & 0xffu);
+                    d[r] = mx_e8m0_half((w[2] >> (8 * (sl & 3))) & 0xffu);
                 } else if constexpr (IL != 0) {
                     q0[r] = w[0]; q1[r] = w[1];
                     d[r] = mx_e8m0_half(w[2]);
@@ -952,6 +976,50 @@ void xm_wm_kernel(MxMrArgs A) { R4D_IKA_ENTRY();
                 for (int k = 0; k < PD; ++k)
                     if (bb + k >= b0 && bb + k < b1) block(bb + k, xs + (bb + k - b0) * NT * 1024, raw[k]);
             }
+        }
+#ifdef R4D_GLU_DBG
+        if constexpr (GLU == 3) {   /* debug: every lane's own sums at its weight row (y [T, N]) */
+            for (int i = 0; i < 8; ++i) { const int m = 8 * h + i; if (m < mc) mx_put(A.y + (long long)(r0 + m) * A.y_ld + min(nw, A.N - 1), acc[0][0][i]); }
+            continue;
+        }
+        if constexpr (GLU == 2) {   /* debug: the gate lane's gate and DPP'd up at their rows (y [T, N]) */
+            float up[8];
+            for (int i = 0; i < 8; ++i)
+                up[i] = __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(acc[0][0][i]), 0x168, 0xF, 0xF, true));
+            if (nl < 8 && cg < (A.N >> 1))
+                for (int i = 0; i < 8; ++i) { const int m = 8 * h + i; if (m < mc) { mx_put(A.y + (long long)(r0 + m) * A.y_ld + cg, acc[0][0][i]); mx_put(A.y + (long long)(r0 + m) * A.y_ld + (A.N >> 1) + cg, up[i]); } }
+            continue;
+        }
+#endif
+        if constexpr (GLU == 1) {
+            /* lever GSE: lane nl < 8 holds the gate sums of rows 8 h + i, lane nl + 8 the up sums of the same rows. (__float_as_int, not
+             * __builtin_bit_cast on the vector element: with the latter this clang read element 0 for every i -- one v_mov_b32_dpp for
+             * all eight, r91 asm) */
+            float up[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                up[i] = __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(acc[0][0][i]), 0x168, 0xF, 0xF, true));
+            if (nl < 8 && cg < (A.N >> 1)) {
+                const float lim = A.glu_limit;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int m = 8 * h + i;
+                    if (m < mc) {
+                        const bool live = mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) >= 0;
+                        uint16_t o = 0;   /* a dead row: the pair's gate and up 0, swiglu_clamped 0 */
+                        if (live) {
+                            const float gt = bf16_to_f32((uint16_t)(bf16_hi_rne_nan(acc[0][0][i]) >> 16));
+                            const float ut = bf16_to_f32((uint16_t)(bf16_hi_rne_nan(up[i]) >> 16));
+                            const float g = fminf(gt, lim);
+                            const float u = fminf(fmaxf(ut, -lim), lim);
+                            o = f32_to_bf16((g / (1.0f + expf(-g))) * u);
+                        }
+                        A.y[(long long)(r0 + m) * A.y_ld + cg] = o;
+                    }
+                }
+            }
+            XM_TL_PUT(AB, it, e);
+            continue;
         }
 #pragma unroll
         for (int r = 0; r < WR; ++r) {
@@ -1779,8 +1847,13 @@ int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
 void r4d_mx_mr_set(int on) { g_xm_on = on >= 2 && on <= 8 ? on : (on ? 1 : 0); }   /* 8 (round 87): 7 without lever WCN */
 int r4d_mx_mr_get() { return g_xm_on; }
 
+#ifdef R4D_GLU_DBG
+int g_glu_dbg = 0;
+extern "C" void r4d_mx_glu_dbg(int v) { g_glu_dbg = v; }
+#endif
 /* The WMMA form's launch (rule B): WR 16-row weight tiles a wave, segments of up to 16 NT rows, WN waves a block. */
-static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap, int il = g_xm_il) {
+static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, int AB, int WN, int gridcap, int il = g_xm_il,
+                     float glu = 0.0f) {
 #ifdef R4D_XM_TL
     /* bench (round 87, the tail oracle): the IL form's ablations at PD 4 / 9 (AB 4 no staging, 6 + no decode, 7 loads only) */
     const bool il_ab = il && WR == 1 && NT == 1 && (PD == 4 || PD == 9) && (AB == 4 || AB == 6 || AB == 7);
@@ -1797,6 +1870,7 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
     A.NS = A.UK;
     A.RB = WN * 16 * WR;
     A.nrg = (c.N + A.RB - 1) / A.RB;
+    A.glu_limit = glu;
     const long long sb = (long long)NT * 1024;   /* bytes a block of the segment's tiles */
     long long SS = (g_xm_wm_slab > 0 ? g_xm_wm_slab : 16384) / sb;
     if (SS < 1) SS = 1;
@@ -1816,6 +1890,16 @@ static int xm_wm_moe(RadStream s, const R4dMxMrCall& c, int WR, int NT, int PD, 
     if (il) {   /* lever WIL: 16-row groups, so N % 16 == 0; WR 1 NT 1 only */
         if (WR != 1 || NT != 1 || (AB != 0 && !il_ab) || c.N % 16) return R4D_MX_MR_DECLINE;
         std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-IL WR1 NT1 PD%d AB%d WN%d SS%d RB%d grid %lld lds %lld", PD, AB, WN, A.SS, A.RB, grid, lds);
+        if (glu > 0.0f) {   /* lever GSE: lever WCN's gate_up (drafter_mx 7's kernel) with swiglu_clamped in its epilogue */
+            if (AB != 0 || c.N % 16 || (c.N >> 1) % 8) return R4D_MX_MR_DECLINE;
+            std::snprintf(g_xm_last, sizeof g_xm_last, "wmma-IL-GLU WR1 NT1 PD4 WCN WN%d SS%d RB%d grid %lld lds %lld", WN, A.SS, A.RB, grid, lds);
+#ifdef R4D_GLU_DBG
+            if (g_glu_dbg == 2) return R4D_EMIT(s, (xm_wm_kernel<1, 1, 4, 16, 1, 2>), dim3((unsigned)grid), dim3(32u * WN), (unsigned)lds, A);
+            if (g_glu_dbg == 3) return R4D_EMIT(s, (xm_wm_kernel<1, 1, 4, 16, 1, 3>), dim3((unsigned)grid), dim3(32u * WN), (unsigned)lds, A);
+#endif
+            return R4D_EMIT(s, (xm_wm_kernel<1, 1, 4, 16, 1, 1>), dim3(xm_pg_grid(xm_wm_kernel<1, 1, 4, 16, 1, 1>, (unsigned)grid, 32u * WN, (unsigned)lds)),
+                            dim3(32u * WN), (unsigned)lds, A);
+        }
 #ifdef R4D_XM_TL
         if (il_ab) {
 #define XM_WAB(pd, ab) if (PD == pd && AB == ab) return R4D_EMIT(s, (xm_wm_kernel<1, 1, pd, ab, 1>), dim3((unsigned)grid), dim3(32u * WN), (unsigned)lds, A);
@@ -2033,6 +2117,16 @@ int r4d_mx_mr_moe_il(RadStream s, const R4dMxMrCall& c) {
         if (t != R4D_MX_MR_DECLINE) return t;
     }
     return xm_wm_moe(s, c, 1, 1, 9, 0, 8, 0, 1);
+}
+
+/* Lever GSE's serving entry (moe_gemm_mxil_glu, r4d_ds41_mxfp4.hip): r4d_mx_mr_moe_il's gate_up (K >= 2048) with swiglu_clamped in
+ * the epilogue, c.y [T, N / 2] (y_ld its row stride), limit > 0; lever WCN's kernel whatever drafter_mx is. Declines K below 2048
+ * (the sequential-tile form has no GLU) -- the caller's error, as for r4d_mx_mr_moe_il. */
+int r4d_mx_mr_moe_il_glu(RadStream s, const R4dMxMrCall& c, float limit) {
+    if (c.tokens < 1 || c.tokens > kXmMaxTokens || c.T < 1 || c.N < 16 || c.N % 16 || c.K < 2048 || c.K % 32 || c.n_expert < 1 ||
+        !(limit > 0.0f))
+        return R4D_MX_MR_DECLINE;
+    return xm_wm_moe(s, c, 1, 1, 9, 0, 8, 0, 1, limit);
 }
 
 /* r4d_mx_mr_pin (bench / test hook, r4d_selftest --mxcheck / --perfmx): on 0 clears the pin (the switch decides),

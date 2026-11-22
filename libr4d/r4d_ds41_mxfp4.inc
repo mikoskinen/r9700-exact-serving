@@ -35,6 +35,19 @@ static const RadConstraint cDs41MxIl[] = {
     C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
     C_IN("type", "mxfp4"), C_IN("dtype", "bf16"),
 };
+/* moe_gemm_mxil_glu (lever GSE, DRAFTER track round 91): moe_gemm_mxil's gate_up form (K from 2048) with swiglu_clamped in its
+ * epilogue -- N is the gate_up's (gate rows then up rows), y [M x top_k, N / 2]; libr4d only. Its parameters are moe_gemm_ggml's
+ * and swiglu_clamped's limit. Entry and operand description live in r4d_ds41_mxfp4.hip / r4d_ds41_mxfp4_shapes.inc, declared
+ * here (not in r4d_ds41_mxfp4.h, which r4d_plugin.h carries into every unit). */
+static const RadConstraint cDs41MxIlGlu[] = {
+    C_GE("M", 1), C_LE("M", 512), C_GE("N", 32), C_DIV("N", 16), C_GE("K", 2048), C_DIV("K", 32),
+    C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
+    C_IN("type", "mxfp4"), C_IN("dtype", "bf16"),
+};
+static const RadParamSpec pDs41MxIlGlu[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"),
+    P_STR("a_order"), P_STR("type"), P_STR("dtype"), P_F64("limit") };
+extern "C" int r4d_rad_moe_mxil_glu(const RadArgs*, RadStream);
+extern "C" int r4d_shape_moe_gemm_mxil_glu(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 #elif defined(R4D_DS41_SCHEMAS)
 
@@ -45,6 +58,11 @@ SCHEMA("moe_gemm_mxil", pDs41MoeGemmGgml, oDs41MoeGemmGgml,
        "16-row x 1-block tiles of 272 bytes, the native blocks' bytes moved): the same values and arithmetic as "
        "moe_gemm_ggml under drafter_mx 2 / 4 / 5 (rule B against the stock kernels), so its outputs are those forms' "
        "byte for byte. The DSpark drafter's routed experts under RADIANCE_DS41_DSPARK_WIL=1."),
+SCHEMA("moe_gemm_mxil_glu", pDs41MxIlGlu, oDs41MoeGemmGgml,
+       "moe_gemm_mxil's gate_up (gate rows [0, N / 2), up rows [N / 2, N), the same tile-interleaved stored form and layout "
+       "hooks) with swiglu_clamped (limit) applied in the GEMM's epilogue: y [M x top_k, N / 2] holds the bytes moe_gemm_mxil "
+       "followed by swiglu_clamped would write into the down projection's input (lever GSE). The DSpark drafter's routed "
+       "gate_up under RADIANCE_DS41_DSPARK_WIL=1 + RADIANCE_DS41_GSE=1."),
 
 #elif defined(R4D_DS41_ROWS)
 #if defined(R4D_HAVE_GGML)
@@ -91,6 +109,15 @@ SCHEMA("moe_gemm_mxil", pDs41MoeGemmGgml, oDs41MoeGemmGgml,
   RAD_DOMAIN_DEVICE, 58, ROW(cDs41MxIl), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_mxil, nullptr,
   r4d_ds41_mxil_layout, r4d_ds41_mxil_relayout, r4d_shape_moe_gemm_mxfp4, r4d_ds41_mxil_unrelayout },
+{ "moe_gemm_mxil_glu_wmma", "moe_gemm_mxil_glu", "moe",
+  "moe_gemm_mxil_wmma's gate_up kernel (lever WCN's loop) with a wave's 16 WMMA columns as 8 gate rows and their 8 up rows, "
+  "each lane reading its row from the row's tile-interleaved group; the gate lane takes the up sums by DPP and stores "
+  "swiglu_clamped of the two bf16-rounded values (lever GSE)",
+  "M 1..512 tokens, N a multiple of 16 (the gate_up's), K from 2048, a multiple of 32, up to 1024 experts", "bf16 a and y "
+  "(y [T, N / 2]); mxfp4 experts stored tile-interleaved (table or stacked), i32 routing, f64 limit > 0",
+  RAD_DOMAIN_DEVICE, 58, ROW(cDs41MxIlGlu), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_mxil_glu, nullptr,
+  r4d_ds41_mxil_layout, r4d_ds41_mxil_relayout, r4d_shape_moe_gemm_mxil_glu, r4d_ds41_mxil_unrelayout },
 
 #undef R4D_DS41_MX_HOOKS
 #endif  /* R4D_HAVE_GGML */
