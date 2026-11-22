@@ -1729,43 +1729,47 @@ struct PlayRun {
         /* A chained record plays from this queue's own argument slot, where its chain record goes:
          * the tape's copy is shared by every play, and the next step's play may be written while
          * this one runs. */
-        bool chain = false;
-        /* Lever CKO (a): an overlap record behind a record that went out ahead (Stream::ahead) -- chained, waiting for every chained
-         * lane issued before that record (its recorded in-flight set starts there), or, where it cannot wait in-kernel, ordered. */
-        bool ahead_chain = false;
-        if (r.chain && tape) {
-            chain = s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
-            /* tp8 loop W9: fn4 aql_cik 0 -- a chain-capable record plays as the IKA kernel it also is (unchained, from the tape's copy) */
-            if (r.lanes && !cik_live()) chain = false;
-            if (chain && r.overlap && s->ahead && !foreign && !done.handle) ahead_chain = true;
-            /* Lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's
-             * copy (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel. */
-            else if (r.lanes && r.overlap && !foreign && !done.handle) chain = false;
-        }
-        /* A dispatch carrying a record keeps the bit: its completion must cover everything before
-         * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
-         * on this queue waits in its prologue instead. */
-        bool ordered = foreign || !r.overlap || done.handle;
-        /* Lever CKO (a): behind a record that went out ahead, an overlap record that does not wait in-kernel keeps its bit. */
-        if (!ordered && s->ahead && !ahead_chain) {
-            ordered = true;
-            cik_bump(cik_tl().cko_order, 1);
-        }
+        /* The record's ordering (tp8 loop W37: the decision is rad::aql::play_order in aql.h, a pure function the host test drives;
+         * its rules, in its order):
+         *  - chain: a chain-capable record with a tape plays chained when the queue has a counter and its arguments leave room for the
+         *    record; tp8 loop W9: fn4 aql_cik 0 -- a CIK record plays as the IKA kernel it also is (unchained, from the tape's copy);
+         *    lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's copy
+         *    (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel; lever CKO (a): except
+         *    behind a record that went out ahead (Stream::ahead), where it plays chained to every chained lane issued before that
+         *    record (its recorded in-flight set starts there).
+         *  - ordered: a dispatch carrying a record keeps the bit (its completion must cover everything before it on the queue, which
+         *    an unordered dispatch's does not); lever CKO (a): behind a record that went out ahead, an overlap record that does not
+         *    wait in-kernel keeps its bit. A chained kernel behind another chained one on this queue waits in its prologue instead --
+         *    not while a plain packet may still run: a played plain kernel the overlap analysis let start early (it touched nothing in
+         *    flight) adds nothing to the counter, so a chained kernel that reads its output and sits behind a chained one (a cache
+         *    read beside a collective, say) would wait for the chained blocks only.
+         *  - Lever CRD (DRAFTER round 64, RADIANCE_AQL_CRD=D): at most D unordered chained packets in a row -- the next keeps its
+         *    barrier bit (and so, under CIK, plays as an ordered target-0 record). Unbounded, a queue of chained kernels runs ahead
+         *    until the card's wave slots are full of blocks waiting on the counter, and the next wide kernel's blocks land where slots
+         *    free up, unevenly: drafter/kit/mes/ikh11.cpp (xeon GPU2, r64c, 64 x 256 kernels with a tiny chained kernel every third):
+         *    up to 5 blocks of one kernel on one WGP (2 when ordered or uniform), its body tail 3.5-4.2 us vs 2.3-2.6. Lever CRB
+         *    (RADIANCE_AQL_CRB=B): the same with the run's blocks as the measure. */
+        const PlayKnobs knobs{ cik_live(), cik_on(), crd_cap(), crb_cap() };
+        PlayRec rec;
+        rec.chain_ok = r.chain && tape && s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
+        rec.lanes = r.lanes != 0;
+        rec.overlap = r.overlap != 0;
+        rec.foreign = foreign;
+        rec.done = done.handle != 0;
+        rec.adds = r.lanes ? lanes_of(p) : blocks_of(p);
+        rec.blocks = blocks_of(&r.pkt);
+        PlayQ pq;
+        pq.prev_chained = s->prev_chained;
+        pq.plain_inflight = s->plain_inflight;
+        pq.ahead = s->ahead;
+        pq.ahead_base = s->ahead_base;
+        pq.chain_issued = s->chain_issued;
+        pq.chain_run = s->chain_run;
+        pq.chain_run_blocks = s->chain_run_blocks;
+        const PlayOut po = play_order(pq, rec, knobs);
+        const bool chain = po.chain, ahead_chain = po.ahead_chain, ordered = po.ordered;
+        if (po.cko_order) cik_bump(cik_tl().cko_order, 1);
         if (ahead_chain) cik_bump(cik_tl().cko_chain, 1);
-        /* Not while a plain packet may still run: a played plain kernel the overlap analysis let
-         * start early (it touched nothing in flight) adds nothing to the counter, so a chained
-         * kernel that reads its output and sits behind a chained one (a cache read beside a
-         * collective, say) would wait for the chained blocks only. */
-        if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
-        /* Lever CRD (DRAFTER round 64, RADIANCE_AQL_CRD=D): at most D unordered chained packets in a row -- the next keeps its barrier
-         * bit (and so, under CIK, plays as an ordered target-0 record). Unbounded, a queue of chained kernels runs ahead until the card's
-         * wave slots are full of blocks waiting on the counter, and the next wide kernel's blocks land where slots free up, unevenly:
-         * drafter/kit/mes/ikh11.cpp (xeon GPU2, r64c, 64 x 256 kernels with a tiny chained kernel every third): up to 5 blocks of one
-         * kernel on one WGP (2 when ordered or uniform), its body tail 3.5-4.2 us vs 2.3-2.6. */
-        if (chain && !ordered && crd_cap() && s->chain_run >= crd_cap()) ordered = true;
-        /* Lever CRB (RADIANCE_AQL_CRB=B): the same with the run's blocks as the measure -- the next chained packet keeps its bit when the
-         * unordered run's blocks with its own would exceed B. */
-        if (chain && !ordered && crb_cap() && s->chain_run_blocks + blocks_of(&r.pkt) > crb_cap()) ordered = true;
         /* Lever CTA: an ordered chained record (target 0) plays from its block in the tape's copy (constant record), else from
          * the queue's slot with the record written now. */
         const bool cta = chain && ordered && r.karg_t0 && cta_on();
@@ -1776,7 +1780,7 @@ struct PlayRun {
             } else {
                 std::memcpy(slot, tape->karg_host.data() + r.karg_off, r.karg_len);
                 p->kernarg_address = slot;
-                chain_record(s, slot, true, ordered, ahead_chain && !ordered);
+                chain_record(s, slot, true, ordered, ahead_chain && !ordered);   /* = po.target (play_order) */
             }
         }
         int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
@@ -1815,7 +1819,7 @@ struct PlayRun {
          * runs it after everything before has completed, the invalidation the recording's acquire-rule window took that record's
          * acquire for (lines read by the kernels before it and written behind it can sit in a scalar cache past an early acquire).
          * The records in between wait in-kernel (a chained wait empties its WGP's scalar cache) or keep their bit (a). */
-        if (ordered && s->ahead && acq == HSA_FENCE_SCOPE_NONE && !aql_acq_none_()) {
+        if (play_keep_acquire(ordered, s->ahead, acq == HSA_FENCE_SCOPE_NONE, aql_acq_none_())) {
             acq = HSA_FENCE_SCOPE_AGENT;
             cik_bump(cik_tl().cko_acq, 1);
         }
@@ -1828,21 +1832,22 @@ struct PlayRun {
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
-        /* Lever CKO: a recorded ordering point that went out unordered (a chained kernel behind a chained one) goes ahead; a
-         * barrier-bit packet ends it. */
-        if (ordered) s->ahead = false;
-        else if (chain && !r.overlap) { s->ahead = true; s->ahead_base = s->chain_issued; }
-        if (chain) s->chain_issued += r.lanes ? lanes_of(p) : blocks_of(p);
+        /* The queue's state after it (play_advance): lever CKO -- a recorded ordering point that went out unordered (a chained kernel
+         * behind a chained one) goes ahead, a barrier-bit packet ends it; the counter, the chained run, a plain packet in flight. */
+        play_advance(pq, rec, po, knobs);
+        s->ahead = pq.ahead;
+        s->ahead_base = pq.ahead_base;
+        s->chain_issued = pq.chain_issued;
         if (chain && r.lanes) {   /* tp8 loop R48: CIK's counts */
             CikTl& c = cik_tl();
             cik_bump(c.played, 1);
             cik_bump(c.played_lanes, (int64_t)lanes_of(p));
             if ((++c.tick & 255u) == 0) cik_line();
         }
-        s->prev_chained = chain;
-        s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
-        s->chain_run = ordered ? 0 : s->chain_run + 1;
-        s->chain_run_blocks = ordered ? 0 : s->chain_run_blocks + (crb_cap() ? blocks_of(&r.pkt) : 0);
+        s->prev_chained = pq.prev_chained;
+        s->plain_inflight = pq.plain_inflight;
+        s->chain_run = pq.chain_run;
+        s->chain_run_blocks = pq.chain_run_blocks;
         s->wr = idx + 1;
         next = idx + 1;
         *out_idx = idx;

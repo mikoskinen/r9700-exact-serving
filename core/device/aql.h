@@ -183,6 +183,76 @@ inline bool ika_play_mark(bool live, bool noacq, bool noacq_ika, bool ika, bool 
  * its waves ended), and only on a packet no record or ride completes (that signal orders other queues / the host after it). */
 inline bool ika_play_release_none(bool live, bool ika, bool completes) { return live && ika && !completes; }
 
+/* tp8 loop W37 (DECODE round 68, review of the DRAFTER's lever CKO, round 105): how ONE played record goes out on its queue --
+ * PlayRun::put's ordering decision as a pure function, so the host can drive tapes through it (tests/device_test). `q` = the queue's
+ * state before the record (Stream's fields of the same names), `r` the record's facts, `k` the switches as put() reads them.
+ *   chain    the record plays chained (its chain record on, from the queue's argument slot)
+ *   ordered  its packet keeps the barrier bit (starts behind everything before it on the queue)
+ *   target   its chained wait's target: 0 = none (an ordered record under CIK), else the counter value it polls for
+ * Lever CIK plays a recorded-ORDERED chained record behind a chained one unordered (it waits in-kernel for the chained lanes before
+ * it); lever CKO keeps the recording's proof behind such a record (`ahead`): an overlap record (proved independent of the packets
+ * from the last ordered record on, NOT of those before it) chains to the counter before that record (`ahead_base`) or, where it
+ * cannot wait in-kernel, keeps its barrier bit; play_keep_acquire (b) keeps the first barrier-bit packet's acquire behind it. */
+struct PlayQ {
+    bool     prev_chained = false, plain_inflight = false, ahead = false;
+    uint64_t ahead_base = 0, chain_issued = 0;
+    int      chain_run = 0;
+    uint64_t chain_run_blocks = 0;
+};
+struct PlayRec {
+    bool     chain_ok = false;  /* a chain-capable record with a tape, the queue's counter, room for the record in its arguments */
+    bool     lanes = false;     /* a lever CIK record (adds its lanes; aql_cik 0 plays it unchained) */
+    bool     overlap = false;   /* Ctx::haz_mark: touches nothing in flight since the last ordered record */
+    bool     foreign = false;   /* the first packet behind packets this thread did not play */
+    bool     done = false;      /* carries a completion signal (a record or a ride) */
+    uint64_t adds = 0;          /* what it adds to the counter when chained: lanes (CIK) or blocks */
+    uint64_t blocks = 0;        /* its blocks (lever CRB's measure) */
+};
+struct PlayKnobs {
+    bool     cik_live = false;  /* lever CIK at play (RADIANCE_AQL_CIK=1 and fn4 aql_cik >= 1) */
+    bool     cik_on = false;    /* RADIANCE_AQL_CIK=1 (an ordered chained record names target 0) */
+    int      crd = 0;           /* lever CRD's cap (0 = none) */
+    uint64_t crb = 0;           /* lever CRB's cap (0 = none) */
+};
+struct PlayOut {
+    bool     chain = false, ordered = false;
+    bool     ahead_chain = false;  /* lever CKO (a): chained to ahead_base */
+    bool     cko_order = false;    /* lever CKO (a): an overlap record that kept its bit behind a record that went ahead */
+    uint64_t target = 0;
+};
+inline PlayOut play_order(const PlayQ& q, const PlayRec& r, const PlayKnobs& k) {
+    PlayOut o;
+    if (r.chain_ok) {
+        o.chain = true;
+        if (r.lanes && !k.cik_live) o.chain = false;   /* tp8 loop W9: aql_cik 0 plays a CIK record as the IKA kernel it also is */
+        if (o.chain && r.overlap && q.ahead && !r.foreign && !r.done) o.ahead_chain = true;
+        else if (r.lanes && r.overlap && !r.foreign && !r.done) o.chain = false;   /* lever CIK: an overlap record plays unchained */
+    }
+    o.ordered = r.foreign || !r.overlap || r.done;
+    if (!o.ordered && q.ahead && !o.ahead_chain) { o.ordered = true; o.cko_order = true; }
+    if (o.chain && q.prev_chained && !q.plain_inflight && !r.foreign && !r.done) o.ordered = false;
+    if (o.chain && !o.ordered && k.crd && q.chain_run >= k.crd) o.ordered = true;
+    if (o.chain && !o.ordered && k.crb && q.chain_run_blocks + r.blocks > k.crb) o.ordered = true;
+    o.target = (o.ordered && k.cik_on) ? 0 : (o.ahead_chain && !o.ordered) ? q.ahead_base : q.chain_issued;
+    return o;
+}
+/* The queue's state after the record went out as `o` (PlayRun::put's tail). */
+inline void play_advance(PlayQ& q, const PlayRec& r, const PlayOut& o, const PlayKnobs& k) {
+    if (o.ordered) q.ahead = false;
+    else if (o.chain && !r.overlap) { q.ahead = true; q.ahead_base = q.chain_issued; }
+    if (o.chain) q.chain_issued += r.adds;
+    q.prev_chained = o.chain;
+    q.plain_inflight = o.ordered ? !o.chain : q.plain_inflight || !o.chain;
+    q.chain_run = o.ordered ? 0 : q.chain_run + 1;
+    q.chain_run_blocks = o.ordered ? 0 : q.chain_run_blocks + (k.crb ? r.blocks : 0);
+}
+/* Lever CKO (b): a barrier-bit packet behind a record that went ahead keeps an agent-scope acquire the IKA / rule marks dropped
+ * (unless RADIANCE_AQL_ACQ=none, the unsafe experiment): it runs after everything before it ended, the invalidation the recording's
+ * acquire-rule window took the ahead record's acquire for. Returns whether the dropped acquire comes back. */
+inline bool play_keep_acquire(bool ordered, bool ahead, bool acq_dropped, bool acq_none_mode) {
+    return ordered && ahead && acq_dropped && !acq_none_mode;
+}
+
 /* tp8 loop R48 (PREFILL round 48) -- lever CIK's width bound. A chain-capable IKA kernel (libr4d R4D_IKA_CHAIN, DRAFTER round
  * 62) adds to its queue's ONE chain counter at every lane's exit: one atomic add a wave, all on one address. A decode dispatch
  * is a few thousand waves; a prefill chunk's per-row kernels are hundreds of thousands (quant_group_kernel over 4,096 rows x

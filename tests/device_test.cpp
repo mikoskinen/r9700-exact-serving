@@ -2216,4 +2216,177 @@ TEST(cikx_libr4d_lists_exactly_the_kernels_that_keep_the_plain_entry) {
             nochain.size(), xdefs.size(), files_x, cfiles.size());
 }
 
+/* tp8 loop W37 (DECODE round 68): the DRAFTER's lever CKO (round 105; the pair's lq235-b7 DEFECT -- lever CIK not exact, not
+ * repeatable) on the host. rad::aql::play_order / play_advance are PlayRun::put's ordering decision (core/device/aql.cpp calls them).
+ * A tape is played through them into a small packet-processor model: packets launch in queue order, a barrier-bit packet after
+ * everything before it has completed, a chained body after the counter (the adds of the completed chained packets) reaches its
+ * target; each body runs a random time. The recording's proof (Ctx::haz_mark) is the requirement: a recorded-ordered record needs
+ * every record before it complete when its body starts, an overlap record every record before the last recorded-ordered one.
+ * The decision before CKO (pre_cko below, a copy of 37331ee7's rules) is the negative control: it must break the requirement on
+ * the tape the DRAFTER named and on random tapes; CKO must never. Also: CKO's rules on the named tape one by one, its acquire
+ * rule (b), and with CIK off (aql_cik 0) every packet = the decision before CKO. */
+namespace w37 {
+using rad::aql::PlayKnobs;
+using rad::aql::PlayOut;
+using rad::aql::PlayQ;
+using rad::aql::PlayRec;
+PlayOut pre_cko(const PlayQ& q, const PlayRec& r, const PlayKnobs& k) {
+    PlayOut o;
+    if (r.chain_ok) {
+        o.chain = true;
+        if (r.lanes && r.overlap && !r.foreign && !r.done) o.chain = false;
+        if (r.lanes && !k.cik_live) o.chain = false;
+    }
+    o.ordered = r.foreign || !r.overlap || r.done;
+    if (o.chain && q.prev_chained && !q.plain_inflight && !r.foreign && !r.done) o.ordered = false;
+    if (o.chain && !o.ordered && k.crd && q.chain_run >= k.crd) o.ordered = true;
+    if (o.chain && !o.ordered && k.crb && q.chain_run_blocks + r.blocks > k.crb) o.ordered = true;
+    o.target = (o.ordered && k.cik_on) ? 0 : q.chain_issued;
+    return o;
+}
+void pre_advance(PlayQ& q, const PlayRec& r, const PlayOut& o, const PlayKnobs& k) {
+    if (o.chain) q.chain_issued += r.adds;
+    q.prev_chained = o.chain;
+    q.plain_inflight = o.ordered ? !o.chain : q.plain_inflight || !o.chain;
+    q.chain_run = o.ordered ? 0 : q.chain_run + 1;
+    q.chain_run_blocks = o.ordered ? 0 : q.chain_run_blocks + (k.crb ? r.blocks : 0);
+}
+struct Played { PlayOut o; };
+/* Plays `tape` (one queue, from a fresh state) and returns how many records start a body before a record the recording needs
+ * complete; `dur` = each record's body time. `cko` picks the decision. Deadlocks (a target the counter never reaches) count too. */
+int violations(const std::vector<PlayRec>& tape, const std::vector<double>& dur, const PlayKnobs& k, bool cko,
+               std::vector<PlayOut>* outs = nullptr) {
+    PlayQ q;
+    const size_t n = tape.size();
+    std::vector<double> launch(n), start(n), done(n);
+    std::vector<PlayOut> o(n);
+    int bad = 0;
+    size_t last_ord = 0;   /* the last recorded-ordered record (its index; 0 = the tape's start) */
+    for (size_t i = 0; i < n; ++i) {
+        o[i] = cko ? rad::aql::play_order(q, tape[i], k) : pre_cko(q, tape[i], k);
+        double l = i ? launch[i - 1] : 0.0;
+        if (o[i].ordered) for (size_t j = 0; j < i; ++j) l = std::max(l, done[j]);
+        launch[i] = l;
+        double b = l;
+        if (o[i].chain && o[i].target > 0) {   /* the counter reaches the target: the adds of completed chained packets before it */
+            std::vector<std::pair<double, uint64_t>> c;
+            for (size_t j = 0; j < i; ++j) if (o[j].chain) c.push_back({ done[j], tape[j].adds });
+            std::sort(c.begin(), c.end());
+            uint64_t sum = 0;
+            double at = -1.0;
+            for (const auto& x : c) { sum += x.second; if (sum >= o[i].target) { at = x.first; break; } }
+            if (at < 0) { ++bad; at = 1e30; }   /* never reached: a hang */
+            b = std::max(b, at);
+        }
+        start[i] = b;
+        done[i] = b + dur[i];
+        const size_t need = tape[i].overlap ? last_ord : i;   /* records [0, need) must be complete at its body's start */
+        for (size_t j = 0; j < need; ++j)
+            if (done[j] > start[i]) { ++bad; break; }
+        if (!tape[i].overlap) last_ord = i;
+        if (cko) rad::aql::play_advance(q, tape[i], o[i], k);
+        else pre_advance(q, tape[i], o[i], k);
+    }
+    if (outs) *outs = o;
+    return bad;
+}
+PlayRec rec(bool chain_ok, bool lanes, bool overlap, uint64_t adds) {
+    PlayRec r;
+    r.chain_ok = chain_ok;
+    r.lanes = lanes;
+    r.overlap = overlap;
+    r.adds = adds;
+    r.blocks = adds;
+    return r;
+}
+}  // namespace w37
+
+TEST(w37_cko_an_overlap_record_behind_a_chained_record_that_went_ahead_waits_for_every_lane_before_it) {
+    using namespace w37;
+    PlayKnobs k;
+    k.cik_live = true;
+    k.cik_on = true;
+    /* The DRAFTER's tape: A chained (recorded ordered, the first: barrier bit), B chained (recorded ordered, behind a chained one:
+     * goes out unordered, waits in-kernel for A), O an overlap CIK record (proved independent of B only), A runs long. */
+    const std::vector<PlayRec> tape = { rec(true, true, false, 100), rec(true, true, false, 50), rec(true, true, true, 20) };
+    const std::vector<double> dur = { 100.0, 1.0, 1.0 };
+    std::vector<PlayOut> o, p;
+    CHECK_EQ(violations(tape, dur, k, true, &o), 0);
+    CHECK_EQ(violations(tape, dur, k, false, &p), 1);   /* before CKO: O starts while A runs (the lq235-b7 class) */
+    CHECK(o[0].chain && o[0].ordered && o[0].target == 0);
+    CHECK(o[1].chain && !o[1].ordered && o[1].target == 100);
+    CHECK(o[2].chain && !o[2].ordered && o[2].ahead_chain && o[2].target == 100);   /* chained to the counter before B */
+    CHECK(!p[2].chain && !p[2].ordered);                                           /* before: unchained, unordered, no wait */
+    /* (a) one that cannot wait in-kernel (plain, or a CIK record at aql_cik 0) keeps its barrier bit behind B */
+    const std::vector<PlayRec> plain = { rec(true, true, false, 100), rec(true, true, false, 50), rec(false, false, true, 0) };
+    CHECK_EQ(violations(plain, dur, k, true, &o), 0);
+    CHECK_EQ(violations(plain, dur, k, false, &p), 1);
+    CHECK(o[2].ordered && o[2].cko_order && !o[2].chain);
+    CHECK(!p[2].ordered);
+    /* a barrier-bit packet ends it: behind an ordered plain record the next overlap CIK record plays as before CKO */
+    const std::vector<PlayRec> ends = { rec(true, true, false, 100), rec(true, true, false, 50), rec(false, false, false, 0),
+                                        rec(true, true, true, 20) };
+    const std::vector<double> d4 = { 100.0, 1.0, 1.0, 1.0 };
+    CHECK_EQ(violations(ends, d4, k, true, &o), 0);
+    CHECK(!o[3].chain && !o[3].ordered && !o[3].ahead_chain);
+    /* (b) the first barrier-bit packet behind a record that went ahead keeps a dropped acquire; not without one, not when none was
+     * dropped, and RADIANCE_AQL_ACQ=none (the unsafe experiment) stays as asked */
+    CHECK(rad::aql::play_keep_acquire(true, true, true, false));
+    CHECK(!rad::aql::play_keep_acquire(true, false, true, false));
+    CHECK(!rad::aql::play_keep_acquire(false, true, true, false));
+    CHECK(!rad::aql::play_keep_acquire(true, true, false, false));
+    CHECK(!rad::aql::play_keep_acquire(true, true, true, true));
+}
+
+TEST(w37_cko_random_tapes_keep_the_recordings_proof_and_cik_off_plays_the_packets_of_before) {
+    using namespace w37;
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    int bad_cko = 0, bad_pre = 0, tapes = 0, ahead_chained = 0, kept = 0, same_off = 0, off_n = 0;
+    for (int t = 0; t < 4000; ++t) {
+        const int n = 4 + (int)(rnd() % 28);
+        std::vector<PlayRec> tape;
+        std::vector<double> dur;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t c = rnd() % 10;   /* 0-5 a CIK record, 6-7 a plain kernel, 8-9 a named chained form (lanes off) */
+            PlayRec r = rec(c < 6 || c >= 8, c < 6, (rnd() % 3) != 0 && i > 0, 1 + rnd() % 64);
+            r.done = (rnd() % 23) == 0;
+            tape.push_back(r);
+            dur.push_back((double)(1 + rnd() % 100));
+        }
+        PlayKnobs k;
+        k.cik_live = true;
+        k.cik_on = true;
+        k.crd = (t % 5 == 0) ? 2 : 0;
+        k.crb = (t % 7 == 0) ? 64 : 0;
+        std::vector<PlayOut> o;
+        bad_cko += violations(tape, dur, k, true, &o);
+        bad_pre += violations(tape, dur, k, false);
+        for (const PlayOut& y : o) { ahead_chained += y.ahead_chain; kept += y.cko_order; }
+        ++tapes;
+        /* aql_cik 0, the DeepSeek line (no named chained form chains: 'chained launches: off'): the decision before CKO, packet for
+         * packet (CKO's own claim: no record goes ahead) */
+        PlayKnobs off = k;
+        off.cik_live = false;
+        std::vector<PlayRec> cik_only;
+        for (PlayRec r : tape) { if (r.chain_ok && !r.lanes) r.chain_ok = false; cik_only.push_back(r); }
+        std::vector<PlayOut> a, b;
+        (void)violations(cik_only, dur, off, true, &a);
+        (void)violations(cik_only, dur, off, false, &b);
+        bool same = true;
+        for (size_t i = 0; i < a.size(); ++i)
+            same = same && a[i].chain == b[i].chain && a[i].ordered == b[i].ordered && a[i].target == b[i].target;
+        same_off += same;
+        ++off_n;
+    }
+    fprintf(stderr, "    %d random tapes: CKO %d violations, the decision before CKO %d (negative control); %d overlap records chained to "
+                    "the ahead base, %d kept their bit; aql_cik 0: %d / %d tapes = the packets before CKO\n",
+            tapes, bad_cko, bad_pre, ahead_chained, kept, same_off, off_n);
+    CHECK_EQ(bad_cko, 0);
+    CHECK(bad_pre > 0);
+    CHECK(ahead_chained > 0);
+    CHECK(kept > 0);
+    CHECK_EQ(same_off, off_n);
+}
+
 RAD_TEST_MAIN_HOST_KARGS()
