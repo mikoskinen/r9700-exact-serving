@@ -1157,6 +1157,89 @@ TEST(lever_tif_takes_the_fine_tail_inside_the_last_piece_and_resumes_there) {
     rad::fn4::apply_pending(1, da);
 }
 
+/* F71 (qfn-on-ds, Qwen loop round 26; sched_tail_inner 4): on the card a lone resume step of exactly 128 rows took the
+ * BI-wide forms (fused router / prologues up to AND including 128 rows) where the cold run's same rows ran inside a wider
+ * piece -- u7s1 t9's hit at its own TIF tail (128 rows) != cold, a 142-row one = cold. Under 4 every TIF inside snapshot
+ * leaves more than 128 rows, and every hit the scheduler resumes at a point that is not a step start of the cold run runs
+ * a first step of more than 128 rows -- over every prompt length 1,281 .. 2,600 (tails 1 .. 2,048 rows past the first
+ * interval). Negative control: under 3 the same sweep finds the 128-row inside tails (1,792 here: TIF's own case). */
+TEST(f71_tif_strict_leaves_every_lone_resume_step_more_than_128_rows) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
+    auto go = [&](int ti, int64_t lin, int n) {
+        CHECK(rad::fn4::request("resume_cold", 2, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", 128, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+        Fixture f;
+        f.build(4096, 64, 1024);          /* interval 256, budget 1024 */
+        f.cfg.prefill_span = 4;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+        if (lin > 0) {
+            f.pc.seed(n);
+            f.pc.lin = lin;
+            f.pc.src = 3;
+        }
+        const uint64_t a = f.submit(n, 2);
+        Run o;
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {
+                    if (o.resumed < 0) o.resumed = e.ctx_len;
+                    o.pc.push_back({ (int64_t)e.ctx_len, e.n_tokens });
+                    if (e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) o.inner = e.ctx_len + e.ckpt_tok + 1;
+                }
+            f.commit_plain();
+        }
+        return o;
+    };
+    int inside4 = 0, short4 = 0, hits4 = 0, bad4 = 0, short3 = 0, bad3 = 0;
+    for (int n = 1281; n <= 2600; ++n) {
+        const Run c = go(4, 0, n);
+        if (c.inner >= 0) { ++inside4; if (n - c.inner <= 128) ++short4; }
+        const Run c3 = go(3, 0, n);
+        if (c3.inner >= 0 && n - c3.inner <= 128) ++short3;
+        if (n % 5) continue;
+        /* hits at every 128-grid point of the prompt's last 640 rows */
+        for (int64_t lin = ((n - 640) / 128 + 1) * 128; lin < n; lin += 128) {
+            if (lin <= 0) continue;
+            const Run h = go(4, lin, n);
+            if (h.resumed != lin || h.pc.empty()) continue;
+            ++hits4;
+            bool cold_start = false;
+            for (const auto& st : c.pc) cold_start |= st.first == lin;
+            if (!cold_start && h.pc.front().second <= 128) ++bad4;
+        }
+        /* the same hits under 3 (negative control of the hit check) */
+        for (int64_t lin = ((n - 640) / 128 + 1) * 128; lin < n; lin += 128) {
+            if (lin <= 0) continue;
+            const Run h = go(3, lin, n);
+            if (h.resumed != lin || h.pc.empty()) continue;
+            bool cold_start = false;
+            for (const auto& st : c3.pc) cold_start |= st.first == lin;
+            if (!cold_start && h.pc.front().second <= 128) ++bad3;
+        }
+    }
+    CHECK(inside4 > 100);      /* the rule still takes inside tails */
+    CHECK_EQ(short4, 0);       /* none leaves 128 rows or fewer */
+    CHECK(hits4 > 100);
+    CHECK_EQ(bad4, 0);         /* no hit off a cold step start runs a first step of <= 128 rows */
+    CHECK(short3 > 0);         /* negative control: sched_tail_inner 3 has them (1,792 -> 1,664, 128 rows) */
+    CHECK(bad3 > 0);           /* ... and hits of 128 rows off a cold step start */
+    fprintf(stderr, "f71: inside 4 %d (<= 128 left: %d), hits 4 %d (<= 128-row first step off a cold start: %d); under 3: "
+                    "inside <= 128 left %d, such hits %d\n", inside4, short4, hits4, bad4, short3, bad3);
+    const Run x = go(4, 0, 1792);
+    CHECK_EQ(x.inner, (int64_t)1536);   /* 256 rows left, not 128 */
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
 /* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes
  * one interval a step, and a longer one spans through to its last intervals. */
 TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {

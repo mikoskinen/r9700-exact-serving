@@ -743,6 +743,15 @@ public:
      * grid with this bit (Request::tail_grid = F | kTifBit), so tail_checkpoint plans its fine tail by the TIF rule at
      * every call (the last chunk's shape decides inside / cut / none) whatever the switch reads later. */
     static constexpr int32_t kTifBit = 1 << 30;
+    /* F71 (qfn-on-ds, Qwen loop round 26; sched_tail_inner 4 = 3 + this, latched with kTifBit): every TIF inside snapshot and
+     * every TIF / off-grid resume point leaves MORE than kTailMinPiece rows to its end (kTailMinPiece + 1). The Qwen line's
+     * BI-wide forms (rad_fp8.h kBiWideRows = 128: bit 4 the fused router, bit 8 the fused attention / QSA prologues) run up
+     * to AND INCLUDING 128 rows, so a lone 128-row resume step took them where the cold run's same rows, inside a wider
+     * piece, took the tiled forms (F71: u7s1 t9's 128-row hit != cold, u14s0 t11's 142-row hit = cold). */
+    static constexpr int32_t kTifStrictBit = 1 << 29;
+    /* the fewest rows a TIF point leaves under the request's latched grid (kTailMinPiece, + 1 with kTifStrictBit) */
+    static int64_t tail_min_of(int64_t fine) { return (fine & kTifStrictBit) ? kTailMinPiece + 1 : kTailMinPiece; }
+    static int64_t tail_grid_f(int64_t fine) { return fine & ~(int64_t)(kTifBit | kTifStrictBit); }
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;

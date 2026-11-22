@@ -2014,9 +2014,10 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
          * piece's K split as the cold read it: the prompt's own TIF tail (taken inside), another prompt's TIF tail on a
          * sibling's or a longer turn's last piece (warm turn 2 at its predecessor's tail), a crossing turn's earlier span */
         if ((r.tail_grid & kTifBit) && I > 0 && w > I && lastp > n) {
-            const int64_t F = r.tail_grid & ~(int64_t)kTifBit;
+            const int64_t F = tail_grid_f(r.tail_grid);
+            const int64_t tm = tail_min_of(r.tail_grid);   /* F71: + 1 under sched_tail_inner 4 */
             if (F > 0)
-                for (int64_t p = (lastp / F + 1) * F; p + kTailMinPiece <= n + w; p += F) out->push_back(p);
+                for (int64_t p = (lastp / F + 1) * F; p + tm <= n + w; p += F) out->push_back(p);
         }
         n += w;
         if (n < end) out->push_back(n);
@@ -2313,8 +2314,9 @@ int64_t Scheduler::tail_checkpoint(int64_t target, int64_t fine) const {
         const int64_t g = geo_.grid_floor(target - margin);
         /* lever TIF (Request::tail_grid & kTifBit): F is the grid without the bit */
         const bool tif = (fine & kTifBit) != 0;
-        const int64_t F = fine & ~(int64_t)kTifBit;
-        const int64_t f = target > kTailMinPiece && F > 0 ? (target - kTailMinPiece) / F * F : 0;
+        const int64_t F = tail_grid_f(fine);
+        const int64_t tm = tail_min_of(fine);   /* F71: + 1 under sched_tail_inner 4 */
+        const int64_t f = target > tm && F > 0 ? (target - tm) / F * F : 0;
         /* Lever TIF (qfn-on-ds, Qwen loop round 23; QUEUE Q44): the fine tail where the prompt's last chunk [g, target) is
          * pipelined (more than one interval: lever TIP stages a row inside it) -- inside its last piece when it lies there
          * (plan_chunk takes it inside, no cut), else (a last piece under kTailMinPiece rows) lever G's cut; a last chunk
@@ -2864,6 +2866,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             if (r.tail_grid > 0) { ++tg_n_[0]; tg_seen_ = true; }
             /* lever TIF (sched_tail_inner 3 under lever TIP): latched with the grid (kTifBit), see tail_checkpoint */
             if (r.tail_grid > 0 && tail_inner_sw_ >= 3 && tail_inner_pieces_) r.tail_grid |= kTifBit;
+            /* F71 (sched_tail_inner 4): TIF with every point leaving more than kTailMinPiece rows, latched alike */
+            if ((r.tail_grid & kTifBit) && tail_inner_sw_ >= 4) r.tail_grid |= kTifStrictBit;
         }
     }
     /* lever PSK design 2: the request's targets (latched again below on every admission path; the same values) --
@@ -2928,7 +2932,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * cached one can. Only once the lever has latched in this process. */
         if (tg_seen_ && geo_.exact && h.checkpoint_slot >= 0 && h.n_linear_tokens > 0 &&
             !geo_.on_grid(h.n_linear_tokens) &&
-            (int64_t)r.prompt.size() - h.n_linear_tokens < kTailMinPiece) {
+            (int64_t)r.prompt.size() - h.n_linear_tokens <
+                ((r.tail_grid & kTifStrictBit) || tail_inner_sw_ >= 4 ? kTailMinPiece + 1 : kTailMinPiece)) {   /* F71 */
             h.n_linear_tokens = 0;
             h.checkpoint_slot = -1;
             ++tg_n_[7];
@@ -3118,9 +3123,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             if (f != tail_checkpoint(N, 0)) {
                 const int64_t start = cr_at > 0 ? cr_at : reuse;
                 const int64_t keep = r.checkpoint_at > 0 ? r.checkpoint_at / geo_.quantum * geo_.quantum : 0;
-                const bool near_start = start < f && f - start < kTailMinPiece;
+                const int64_t tm = tail_min_of(r.tail_grid);   /* F71: + 1 under sched_tail_inner 4 */
+                const bool near_start = start < f && f - start < tm;
                 const bool near_keep = keep > 0 && keep != f && keep < N &&
-                                       (keep > f ? keep - f : f - keep) < kTailMinPiece;
+                                       (keep > f ? keep - f : f - keep) < tm;
                 if (near_start || near_keep) {
                     r.tail_grid = 0;
                     ++tg_n_[7];
