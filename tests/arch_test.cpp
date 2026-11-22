@@ -21,6 +21,7 @@
 #include "../arch/qwen35_bf16/qwen35_bf16.cpp"
 /* The production architecture, for its sizing declare (RadBuildCtx::shape_probe). */
 #include "../arch/qwen4exp_fp8/qwen4exp_fp8.cpp"
+#include "../arch/qwen4exp_fp8/qfn_layers.h"   /* Qwen tp8 S1: a node's layer ranges (host arithmetic) */
 /* The LLaMA family, for how it reads its rotary scaling. */
 #include "../arch/llama_fp8/llama_fp8.cpp"
 /* LFM2, for its own layer schedule and short convolution. */
@@ -13917,6 +13918,59 @@ TEST(flashnext_qrs_scores_a_quarter_window_a_rank_and_gathers_the_selections) {
     unsetenv("RADIANCE_FN4_SPHC");
     unsetenv("RADIANCE_FN4_P2X");
     unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
+/* Qwen tp8 step S1 (Qwen loop round 29, COORD 15:05, FINDINGS DEV note 15:28): arch/qwen4exp_fp8/qfn_layers.h -- a node's trunk-layer
+ * ranges (RADIANCE_FN4_LAYERS / _MODE), host arithmetic only: the parse (merged adjacent ranges, every layer = the published engine,
+ * malformed / overlapping / out-of-range refused), the leader (holds the last layer), a strict node's pair W(h, t) with the PLE layer
+ * below h (refused when the crossing would need token ids), and the crossing's row bytes (Flash-Next: 20,480 B + the hc_ss scales). */
+TEST(flashnext_layers_ranges_parse_pairs_and_crossing_bytes) {
+    namespace L = rad::arch::qfnlayers;
+    const int n = 48, ple = 1;   /* Flash-Next: 48 trunk layers, the PLE table at layer 1 (0-based; qwen4exp ple_layer) */
+    L::Spec s;
+    std::string err;
+    CHECK_EQ(L::parse(nullptr, nullptr, n, &s, &err), 0);
+    CHECK(!s.on);
+    CHECK(s.held(0) && s.held(47));
+    CHECK_EQ(L::parse("0:48", "proxy", n, &s, &err), 0);   /* every layer = the published engine */
+    CHECK(!s.on);
+    CHECK_EQ(L::parse("0:24,24:48", nullptr, n, &s, &err), 0);   /* adjacent ranges merge: every layer */
+    CHECK(!s.on);
+    CHECK_EQ(L::parse("0:2,26:48", "strict", n, &s, &err), 0);
+    CHECK(s.on && s.strict && s.leader);
+    CHECK_EQ(s.n_own, 24);
+    CHECK(s.text == "0:2,26:48");
+    CHECK(s.held(0) && s.held(1) && !s.held(2) && !s.held(25) && s.held(26) && s.held(47));
+    int h = -1, t = -1;
+    CHECK_EQ(L::pair_of(s, n, ple, &h, &t, &err), 0);
+    CHECK_EQ(h, 2);
+    CHECK_EQ(t, 26);
+    CHECK_EQ(L::parse("2:26", "strict", n, &s, &err), 0);
+    CHECK(s.on && !s.leader && s.first == 2 && s.last == 25);
+    CHECK_EQ(L::pair_of(s, n, ple, &h, &t, &err), 0);
+    CHECK_EQ(h, 2);
+    CHECK_EQ(t, 26);
+    /* negative controls: the PLE layer past the cut, a leader without layer 0, a two-range follower, a proxy spec */
+    CHECK_EQ(L::parse("0:1,26:48", "strict", n, &s, &err), 0);
+    CHECK_EQ(L::pair_of(s, n, ple, &h, &t, &err), -1);
+    CHECK(err.find("PLE layer 1") != std::string::npos);
+    CHECK_EQ(L::parse("1:2,26:48", "strict", n, &s, &err), 0);
+    CHECK_EQ(L::pair_of(s, n, ple, &h, &t, &err), -1);
+    CHECK_EQ(L::parse("2:10,12:20", "strict", n, &s, &err), 0);
+    CHECK_EQ(L::pair_of(s, n, ple, &h, &t, &err), -1);
+    CHECK_EQ(L::parse("24:48", nullptr, n, &s, &err), 0);
+    CHECK(s.on && !s.strict && s.leader);
+    CHECK_EQ(L::pair_of(s, n, ple, &h, &t, &err), -1);
+    /* malformed / overlapping / out of range */
+    for (const char* bad : { "0:49", "5:5", "10:2", "0:10,5:20", "0:10,", "a:b", "0-10", "0:10;20:30", ":4" }) {
+        err.clear();
+        CHECK_EQ(L::parse(bad, nullptr, n, &s, &err), -1);
+        CHECK(!err.empty());
+    }
+    CHECK_EQ(L::parse("0:24", "fast", n, &s, &err), -1);
+    /* the crossing row: 4 streams x 2,560 bf16 = 20,480 B; with the hc_ss scales + 16 B */
+    CHECK_EQ(L::crossing_row_bytes(4, 2560, false), (int64_t)20480);
+    CHECK_EQ(L::crossing_row_bytes(4, 2560, true), (int64_t)20496);
 }
 
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
