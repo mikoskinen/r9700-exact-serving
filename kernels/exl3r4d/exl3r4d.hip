@@ -166,6 +166,7 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #ifndef EXL3R4D_X6_VDOT  // X6w (tp8 DECODE round 61, QUEUE X6w): 1 = the X3D / K25U K loops' WMMAs replaced by per-row VALU dots -- each
 #define EXL3R4D_X6_VDOT 0   // live row of the run broadcast in its lane half (v_permlane16, 4 dwords) and 4 x NPW v_dot2_f32_f16 into the row's
 #endif                      // own f32 accumulator; TIMING ONLY (the accumulators are folded into acc unordered: wrong outputs). 0 = served.
+                            // 2 = the same dots with real outputs (the rows' sums moved into the D layout at the loop's end): rule B.
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -1321,11 +1322,32 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   if (acc[0][0] == 12345.678f) *(int*)p.y = 1;
   return;
 #endif
-  if constexpr (EXL3R4D_X6_VDOT && (X3D || K25 != K25_OFF)) {   // X6w, TIMING ONLY: keep the dots live (wrong outputs)
+  if constexpr (EXL3R4D_X6_VDOT == 1 && (X3D || K25 != K25_OFF)) {   // X6w, TIMING ONLY: keep the dots live (wrong outputs)
 #pragma unroll
     for (int j = 0; j < NPW; j++)
 #pragma unroll
       for (int r = 0; r < 16; r++) acc[j][r & 7] += vacc[j][r];
+  }
+  // X6w VDOT 2 (rule B, its own reference): the rows' dots into the WMMA's D layout -- a row's two half sums joined in one
+  // order (h 0's first, swap16), then lane L (row L % 16, half H) element e takes column 8 H + e of its row from lane 8 H + e
+  // (ds_bpermute); a row's bytes depend on its own activations and the weights alone (no other row, no row count).
+  if constexpr (EXL3R4D_X6_VDOT == 2 && (X3D || K25 != K25_OFF)) {
+    const int hh = lane >> 4;
+#pragma unroll
+    for (int r = 0; r < 16; r++) {
+      if (r < nrv) {   // wave-uniform
+#pragma unroll
+        for (int j = 0; j < NPW; j++) {
+          const float o = swap16(vacc[j][r]);
+          const float full = hh ? o + vacc[j][r] : vacc[j][r] + o;
+#pragma unroll
+          for (int e = 0; e < 8; e++) {
+            const float t = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((8 * hh + e) * 4, __builtin_bit_cast(int, full)));
+            if ((lane & 15) == r) acc[j][e] = t;
+          }
+        }
+      }
+    }
   }
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
   if constexpr (FOLD) {   // X5: sum_k (S kinv + kbias) x_k = kinv (sum_k S x_k) + kbias (sum_k x_k), this split's k-steps
