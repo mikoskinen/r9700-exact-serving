@@ -570,7 +570,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
                   ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f
-                  ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk)
+                  ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk ds41a8f)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -625,6 +625,7 @@ else()
                 ${R4D_EMU}/test_ds41wcn.cpp
                 ${R4D_EMU}/test_ds41glu.cpp
                 ${R4D_EMU}/test_ds41tsk.cpp
+                ${R4D_EMU}/test_ds41a8f.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -664,7 +665,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd ds41p30f ds41tw ds41dph ds41dqr ds41biw ds41wcn ds41glu ds41tsk ds41a8f)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -729,6 +730,9 @@ if(R4D_EMU_BUILT)
   # Lever TSK (served ds41_tsk 2): the compressing layers' decode-band attention in key chunks + merge -- batch invariance
   # (a row alone / in another pass = inside the pass), determinism, ds41_tsk 2 / 3 = 1, packed = bf16, the declines.
   set_tests_properties(r4d_emu_ds41tsk PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # Lever A8D fold (a) (DRAFTER round 94; DECODE review round 65 = QUEUE W32b): rope_rows_roundtrip_i8g against
+  # rope_rows_roundtrip + quant_act_i8g, byte for byte (x, codes, scales).
+  set_tests_properties(r4d_emu_ds41a8f PROPERTIES LABELS "r4d_emu" TIMEOUT 1500)
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)
