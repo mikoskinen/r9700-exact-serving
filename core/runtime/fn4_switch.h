@@ -662,7 +662,12 @@
  *                   activations and the weights alone, NOT the WMMA form's bytes -- rule B (user 18.11.; COORDINATOR 02:43
  *                   22.11.: its own reference, deterministic and the same alone and beside load). -1 when no loaded object serves
  *                   it (an exl3r4d before ds41-x6w-rt). A plugin switch: a pipeline's follower takes it from its leader.
- *   pp_tband        engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
+ *                   X6w was dropped (QUEUE X6w-S); the same switch carries lever SWK (tp8 loop DECODE round 64 = QUEUE X12; plugin
+ *                   ds41-swk 3602fc5a, which refuses 1): 2 -- the same kernels with the K loop's WMMA pairs as gfx1201's 2:4 sparse
+ *                   v_swmmac_f32_16x16x32_f16, each token's K over two sparse-A rows, 8 tokens a pass, the rows' sums added once
+ *                   and moved into the WMMA's D layout (rule B, its own reference); 3 -- 2 with the other index nibble order (the
+ *                   card decides which of 2 / 3 is the right one; the wrong one is far off, not a rounding).
+ *   pp_tband       engine, the two-node LEADER (tp8 loop D39, the TAIL band; 97 here, after exl3_x3d_pf): 1 -- a BG lane's step of
  *                   fresh prompts runs as a tail band pass (the follower over [h, t - j) + layer t - j's key chain, the leader's tail
  *                   from t - j); 0 -- such a step runs W(h, t)'s (the band layer stays declared on the leader, so the KV pool is the
  *                   same in both arms); 2 (tp8 loop D39b) -- 1 + a step of prompt rows only on ANY lane (a lone cold prompt plans
