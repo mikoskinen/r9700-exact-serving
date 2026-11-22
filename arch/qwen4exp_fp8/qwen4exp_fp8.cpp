@@ -2545,10 +2545,41 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * including the embedding's; none carries an arrival counter; and the one buffer it touches is out
  * of the sharing pool (declare). The collectives there are declared at `overlap` 1, whose rows
  * leave the CUs to the work beside them. */
+/* Qwen tp8 S3a (Qwen loop round 30, WIP): this pass's part of the two-node pipeline (abi/rad_pp.h, read at issue as
+ * llama_fp8 :1007-1013): the leader issues its HEAD ([0, h) up to and including X1's send), its TAIL (from X2's receive:
+ * [t, n) + the mixer and the head) or both (one lane: the whole pass); the follower always its whole pass (X1's receive,
+ * [h, t), X2's send). Off (one machine, a proxy): head and tail. */
+struct PpPass {
+    bool on = false;
+    bool head = true, tail = true;
+    RadPpInfo info{};
+};
+static PpPass pp_pass(const Model& m) {
+    PpPass p;
+    if (!m.pp) return p;
+    p.on = true;
+    p.info = rad_pp_query();
+    const int part = m.pp_rank == 0 ? p.info.part : RAD_PP_PART_WHOLE;
+    p.head = part != RAD_PP_PART_TAIL;
+    p.tail = part != RAD_PP_PART_HEAD;
+    return p;
+}
+/* One crossing's stage op over the wide stream's T rows (the receiver's read recomputes the hc_ss scales: same bits) */
+static bool pp_cross(RadCtx* c, const Model& m, const PpPass& pp, rad_op op, int ring, int64_t T) {
+    RadPpRing* rg = ring >= 0 && ring < RAD_PP_N_RINGS ? pp.info.ring[ring] : nullptr;
+    if (!rg || !op) {
+        rad_step_fail(c, "qwen4exp: two-node pipeline: the core set up no ring for this crossing (or the stage op is not declared)");
+        return false;
+    }
+    RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_h, T));
+    return true;
+}
+
 static bool pipelined(const Model& m, int64_t T) {
     const int64_t R = m.pass_rows;
     if (!m.pipe_on || R <= 0 || T <= R) return false;
-    if (m.moecfg.calib || dbg_resid_on() || !m.op_embed_ar) return false;
+    /* (Qwen tp8 S3b: a pipeline follower has no embedding, so no embedding all-reduce: its step starts at X1's receive) */
+    if (m.moecfg.calib || dbg_resid_on() || (!m.op_embed_ar && !(m.pp && m.pp_rank == 1))) return false;
     for (const Layer& l : m.layers) {
         if (!lr_held(m, &l - m.layers.data())) continue;   /* Qwen tp8 S1: another node's layer */
         if (!(l.full ? l.attn.issues_ar(T) : l.gdn.issues_ar(T))) return false;
@@ -2692,7 +2723,7 @@ static bool sp_agh_fits(RadCtx* c, const Model& m, int64_t rows) {
     return false;
 }
 
-static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const PpPass& pp = PpPass{}) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, R = m.pass_rows;
     const int64_t K = (T + R - 1) / R;
@@ -2705,7 +2736,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     /* qfn-on-ds lever PSP (sp_route bit 512, below): also an odd piece count -- pairs (0, 1), (2, 3), .. and the last piece
      * single (the loop's paired(); moe_pair 4's tail runs the same mix of joint and single passes) */
     const bool psp_k = (fn4_sproute_flag().load(std::memory_order_relaxed) & 512) != 0;
-    const bool pair_sp = pmode > 0 && m.sp_on && g.world == 4 && fn4_sp_flag().load(std::memory_order_relaxed) == 2 &&
+    /* (Qwen tp8 S3b: a pipeline node runs no SP form yet -- the crossing needs the whole stream on the sending rank) */
+    const bool pair_sp = pmode > 0 && m.sp_on && !pp.on && g.world == 4 && fn4_sp_flag().load(std::memory_order_relaxed) == 2 &&
                          K >= 2 && (K % 2 == 0 || psp_k) && (pmode == 3 || m.moecfg.rows >= 2 * R);
     const bool pair_on = pmode > 0 && pmode < 3 && !pair_sp && K == 2 && m.moecfg.rows >= T;
     /* fn4 SP-hc: sp, the real sequence-parallel residual (reduce-scatter, the connections on this rank's quarter, the
@@ -2713,12 +2745,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * piece takes SP when it has kSpMinRows rows; its quarter is the reduce-scatter's shard: q = ceil(rn / world),
      * rows [r0 + min(rank q, rn), r0 + min((rank + 1) q, rn)). */
     const int  spv = fn4_sp_flag().load(std::memory_order_relaxed);
-    const bool sp  = m.sp_on && g.world == 4 && !pair_on && spv > 0;
+    const bool sp  = m.sp_on && g.world == 4 && !pair_on && spv > 0 && !pp.on;
     /* hc_sp 2 (12.11.2026): SP's issue order software-pipelined -- piece p + 1's connections beside piece p's all-gather and
      * piece p + 1's all-gather beside piece p's codes and MoE (hc_sp 1 waits on every gather right after issuing it: three
      * of four a layer on lane 0's path at two pieces). The same ops on the same rows: only the order of issue moves. */
     const bool spo = sp && spv == 2;
-    const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
+    const bool spp = !sp && !pp.on && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
     /* fn4 PF marks (16.11.2026, qwen/prefill; sp_route bit 8): in the hc_sp 2 order, lane 0 waits for the one collective
      * an op reads (piece p's mixer reduction before its connection write; piece p's gathers before its codes) instead of
      * everything the second lane holds. The same ops on the same rows; only where lane 0 waits moves. */
@@ -2829,6 +2861,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (!tip_stage_for(c, batch, m, &tip)) return;
     const TipStage* tipp = tip.on() ? &tip : nullptr;
 
+    /* Qwen tp8 S3b: the embedding .. the stream's entry are the leader's head; the follower starts at X1's receive */
+    const bool lead_tail_only = pp.on && m.pp_rank == 0 && !pp.head;
+    if (!pp.on || (m.pp_rank == 0 && pp.head)) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
@@ -2838,6 +2873,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (m.ple_layer >= 0) m.ple.ids(c, batch, tipp);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
+    } else if (m.pp_rank == 1 && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) {
+        return;
+    }
     if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
@@ -2861,7 +2899,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
 
     const int64_t n = (int64_t)m.layers.size();
-    const int64_t l0 = m.lr_first;   /* Qwen tp8 S1: the first layer this node holds (0 without ranges) */
+    /* Qwen tp8 S1: the first layer this node holds (0 without ranges); S3b: a leader's tail part starts at X2's receive + t */
+    const int64_t l0 = lead_tail_only ? (int64_t)m.pp_t : (int64_t)m.lr_first;
+    if (lead_tail_only && !pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T)) return;
     if (n > 0) {
         if (m.ple_layer == l0) { m.ple.step(c, batch, tipp); bt_pt(c, m, m.b_h, 0, T, "ple", (int)l0); }
         for (int64_t p = 0; p < K; ++p) {
@@ -2875,6 +2915,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const char* p2s_why = nullptr;
     for (int64_t li = 0; li < n; ++li) {
         if (!lr_held(m, li)) continue;   /* Qwen tp8 S1: another node's layer (the stream passes on) */
+        if (lead_tail_only && li < m.pp_t) continue;   /* Qwen tp8 S3b: the head part ran these */
         const Layer& l = m.layers[(size_t)li];
         const int64_t lnx = lr_after(m, li);   /* the next layer this node runs (li + 1 without ranges), -1 after the last */
         spL = lsp(li);
@@ -3172,6 +3213,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
          * every row of the stream before the next layer reads it, so there the reads wait. */
         const Layer* nx = lnx >= 0 ? &m.layers[(size_t)lnx] : nullptr;   /* (Qwen tp8 S1: the next held layer) */
         const bool ple_next = nx && lnx == m.ple_layer;
+        /* Qwen tp8 S3b: the leader's cut (layer h - 1 -> t): the writes, then X1 out and X2 in, then layer t's piece reads */
+        const bool cut = pp.on && m.pp_rank == 0 && lnx == m.pp_t;
         for (int64_t p = 0; p < K; ++p) {
             if (pp_mark && p == K - 2) { waitm(15); pp_mark = false; }   /* P2S: piece K - 2's reduce-scatter */
             if (p == K - 1) wait1();
@@ -3179,12 +3222,22 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             /* The projection of this piece, before the next layer reads it. */
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_ffn", (int)li);
-            if (nx && !ple_next) {
+            if (nx && !ple_next && !cut) {
                 if (sp_pm(p, spN)) hrm(nx->hc_mix, p, ss_ffn && !projected, spN);
                 else bi_read(c, m, nx->hc_mix, T, hq0m(p, spN), hqnm(p, spN), ss_ffn && !projected);
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)lnx, false);   /* lane 1 holds the last piece's rows only */
                 if (sp_pm(p, spN)) on1(true, [&] { ag_p(p); });   /* fn4 SP-hc: the next block's input, every quarter */
             }
+        }
+        if (cut) {   /* every write on lane 0 and lane 1 joined (the last write waited): the whole stream on every rank */
+            if (pp.head && !pp_cross(c, m, pp, m.op_x1, RAD_PP_X1, T)) return;
+            if (!pp.tail) return;
+            if (!pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T)) return;
+            for (int64_t p = 0; p < K; ++p) {
+                bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
+                bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)lnx, false);
+            }
+            continue;
         }
         if (ple_next) {
             m.ple.step(c, batch, tipp);
@@ -3226,40 +3279,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         wait1();
     }
     if (nowait) rad_lane_join(c, 1, 0);   /* PF probe NOWAIT: the step's one wait for lane 1 */
+    /* Qwen tp8 S3b: the follower's result back after its last layer's writes (the last waited for lane 1) */
+    if (pp.on && m.pp_rank == 1) pp_cross(c, m, pp, m.op_x2, RAD_PP_X2, T);
 }
 
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
  * other where step_pipelined's conditions do not hold. */
-/* Qwen tp8 S3a (Qwen loop round 30, WIP): this pass's part of the two-node pipeline (abi/rad_pp.h, read at issue as
- * llama_fp8 :1007-1013): the leader issues its HEAD ([0, h) up to and including X1's send), its TAIL (from X2's receive:
- * [t, n) + the mixer and the head) or both (one lane: the whole pass); the follower always its whole pass (X1's receive,
- * [h, t), X2's send). Off (one machine, a proxy): head and tail. */
-struct PpPass {
-    bool on = false;
-    bool head = true, tail = true;
-    RadPpInfo info{};
-};
-static PpPass pp_pass(const Model& m) {
-    PpPass p;
-    if (!m.pp) return p;
-    p.on = true;
-    p.info = rad_pp_query();
-    const int part = m.pp_rank == 0 ? p.info.part : RAD_PP_PART_WHOLE;
-    p.head = part != RAD_PP_PART_TAIL;
-    p.tail = part != RAD_PP_PART_HEAD;
-    return p;
-}
-/* One crossing's stage op over the wide stream's T rows (the receiver's read recomputes the hc_ss scales: same bits) */
-static bool pp_cross(RadCtx* c, const Model& m, const PpPass& pp, rad_op op, int ring, int64_t T) {
-    RadPpRing* rg = ring >= 0 && ring < RAD_PP_N_RINGS ? pp.info.ring[ring] : nullptr;
-    if (!rg || !op) {
-        rad_step_fail(c, "qwen4exp: two-node pipeline: the core set up no ring for this crossing (or the stage op is not declared)");
-        return false;
-    }
-    RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_h, T));
-    return true;
-}
-
 static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const PpPass& pp = PpPass{}) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
@@ -3709,7 +3734,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
     if (pp.on) {   /* Qwen tp8 S3a: a pipeline node's part, serial; the mixer and the head after the leader's tail only */
-        step_serial(c, batch, m, pcu, pp);
+        if (pipelined(m, T)) step_pipelined(c, batch, m, pcu, pp);   /* Qwen tp8 S3b: the pipelined form by part */
+        else                 step_serial(c, batch, m, pcu, pp);
         if (!(m.pp_rank == 0 && pp.tail)) {   /* the follower, or a head part: nothing after its send */
             bt_flush(c, m, batch);
             bi_cuts() = BiCuts{};
@@ -3721,7 +3747,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
     else                               step_serial(c, batch, m, pcu);
 
-    if ((pp.on || !pipelined(m, T)) && !sp.nrun) bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* step_serial's wide stream (step_serial_sp: its own) */
+    if (!pipelined(m, T) && !sp.nrun) bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* step_serial's wide stream (step_serial_sp: its own) */
     bi_read_pieces(c, m, m.mixer, T);
     bt_pt(c, m, m.a_x.x, 0, T, "final", -1);
 
