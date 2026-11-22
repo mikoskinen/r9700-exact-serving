@@ -5744,8 +5744,9 @@ TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     struct Arm { int lanes; int bg; const char* cut; const char* val; };
+    /* tp8 loop D78: "2" = D60's line + 'release + ship' by part (two arms: 2 lanes and BEST's shape); "3" is refused by name */
     for (const Arm a : { Arm{ 2, -1, "1,3", "1" }, Arm{ 3, -1, "0,3", "1" }, Arm{ 4, 2, "1,3", "1" }, Arm{ 2, -1, "1,3", nullptr },
-                         Arm{ 2, -1, "1,3", "2" } }) {
+                         Arm{ 2, -1, "1,3", "3" }, Arm{ 2, -1, "1,3", "2" }, Arm{ 4, 2, "1,3", "2" } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back("RADIANCE_PP_BGRATE_LINE_S=1");
         if (a.val) env.push_back(std::string("RADIANCE_PP_POST_PHASES=") + a.val);
@@ -5799,7 +5800,30 @@ TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
                 m[0], m[1], ended, m[2], m[3], m[4], m[5], m[6], m[7], m[8], sum_host, m[9], sum_all, x2w);
         CHECK_EQ(differ, 0);
         CHECK(accepted > 0);
-        if (a.val && !std::strcmp(a.val, "1")) {
+        /* tp8 loop D78: the release + ship split's run line (POST_PHASES=2 only) */
+        const char* r78 = "release + ship by part over the run (tp8 loop D78): ";
+        long long rn = -1;
+        double rp[14] = {}, rm8[14] = {}, rdq = -1, rbytes = -1, rsum = -1;
+        int got_r = 0;
+        if (const size_t at = llog.rfind(r78); at != std::string::npos)
+            got_r = std::sscanf(llog.c_str() + at + std::strlen(r78),
+                                "%lld decode heads; p50 / mean ms -- the lane loop after the plan %lf / %lf, select + clears %lf / %lf, the "
+                                "fn4 switches %lf / %lf, psk_release %lf / %lf, the draft lend / W %lf / %lf, the arena %lf / %lf, the ranks' "
+                                "kv.follow %lf / %lf, kvstream runs + bound %lf / %lf, checkpoint restores %lf / %lf, the band choice %lf / "
+                                "%lf, the drafter builds sent %lf / %lf (%lf a head), the frame made %lf / %lf (%lf bytes a head), the frame "
+                                "sent %lf / %lf, the notes %lf / %lf; their mean sum %lf",
+                                &rn, &rp[0], &rm8[0], &rp[1], &rm8[1], &rp[2], &rm8[2], &rp[3], &rm8[3], &rp[4], &rm8[4], &rp[5], &rm8[5],
+                                &rp[6], &rm8[6], &rp[7], &rm8[7], &rp[8], &rm8[8], &rp[9], &rm8[9], &rp[10], &rm8[10], &rdq, &rp[11],
+                                &rm8[11], &rbytes, &rp[12], &rm8[12], &rp[13], &rm8[13], &rsum);
+        double rparts = 0;
+        for (int k = 0; k < 14; ++k) rparts += rm8[k];
+        const bool any78 = llog.find("(tp8 loop D78)") != std::string::npos;
+        if (a.val && !std::strcmp(a.val, "2"))
+            fprintf(stderr, "    D78: %lld heads, mean ms loop %.3f sel %.3f sw %.3f psk %.3f lend %.3f arena %.3f follow %.3f kvs %.3f restore "
+                            "%.3f band %.3f draftq %.3f (%.2f a head) frame %.3f (%.0f B) send %.3f notes %.3f; sum %.2f (parts %.2f) vs D60 "
+                            "release + ship %.2f\n", rn, rm8[0], rm8[1], rm8[2], rm8[3], rm8[4], rm8[5], rm8[6], rm8[7], rm8[8], rm8[9], rm8[10],
+                    rdq, rm8[11], rbytes, rm8[12], rm8[13], rsum, rparts, m[6]);
+        if (a.val && (!std::strcmp(a.val, "1") || !std::strcmp(a.val, "2"))) {
             CHECK_EQ(got_n, 24);
             CHECK(n > 0);
             CHECK(wins > 0);
@@ -5809,9 +5833,24 @@ TEST(d60_post_phases_line_on_the_drafted_pipeline_keeps_one_process_tokens) {
             CHECK(std::fabs(sum_host - m[8]) <= 0.04);
             CHECK(m[9] + 0.01 >= m[8]);
             if (got_n != 24) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+            if (!std::strcmp(a.val, "2")) {   /* tp8 loop D78 */
+                CHECK_EQ(got_r, 32);
+                CHECK_EQ(rn, n);                          /* every closed chain's head was split */
+                for (int k = 0; k < 14; ++k) CHECK(rm8[k] >= 0 && rp[k] >= 0);
+                CHECK(std::fabs(rparts - rsum) <= 0.08);  /* 14 means printed to 0.01 ms */
+                CHECK(std::fabs(rsum - m[6]) <= 0.02);    /* = D60's release + ship (the same chains, both from t[6] -> t[7]) */
+                CHECK(rdq >= 0);                           /* the drafter builds a head (printed) */
+                CHECK(rbytes > 0);
+                const bool win78 = llog.find("release + ship by part over the last ") != std::string::npos;
+                CHECK(win78);
+                if (got_r != 32) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+            } else {
+                CHECK(!any78);                             /* level 1: D60's line only */
+            }
         } else {
-            CHECK(!any);   /* no D60 phase line (a value other than 1: the refusal's warning only) */
-            if (a.val) CHECK(llog.find("RADIANCE_PP_POST_PHASES=2 is not taken") != std::string::npos);
+            CHECK(!any);   /* no D60 phase line (a value other than 1 / 2: the refusal's warning only) */
+            CHECK(!any78);
+            if (a.val) CHECK(llog.find("RADIANCE_PP_POST_PHASES=3 is not taken") != std::string::npos);
         }
     }
 }

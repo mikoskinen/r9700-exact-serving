@@ -442,10 +442,30 @@ private:
         Acc      win, run;
         int64_t  win_drop = 0, run_drop = 0;   /* chains opened and not closed (the lane's plan found nothing, a BG step's head) */
         uint64_t win_t0 = 0;
+        /* tp8 loop D78 (RADIANCE_PP_POST_PHASES=2): D60's 'release + ship' (t[6] plan end -> t[7] shipped) by part -- each part's END
+         * mark on the engine thread: the lane loop after the plan, select + clears, the fn4 switches, psk_release, the draft lend / W,
+         * the arena, the ranks' kv.follow, kvstream runs + bound (prepare_release), checkpoint restores, the band choice, the drafter
+         * builds sent, the frame made, the frame sent (pp_ship), the notes up to the ship mark. The parts telescope to t[7] - t[6]. */
+        enum { kRLoop, kRSel, kRSw, kRPsk, kRLend, kRArena, kRFollow, kRKvs, kRRestore, kRBand, kRDraftQ, kRFrame, kRSend, kRNote, kRN };
+        struct RAcc {
+            int64_t  n = 0, draft_frames = 0, frame_bytes = 0;
+            double   ms[kRN] = {};
+            uint32_t hist[kRN][kBins] = {};
+            double   p50(int k) const;
+        };
+        int      level = 1;
+        uint64_t rm[kRN] = {};                          /* the head being issued */
+        int64_t  rm_draft = 0, rm_bytes = 0;
+        uint64_t rl[RAD_PP_MAX_LANES][kRN] = {};        /* its lane's copy at the ship mark, read at the chain's close */
+        int64_t  rl_draft[RAD_PP_MAX_LANES] = {}, rl_bytes[RAD_PP_MAX_LANES] = {};
+        bool     rl_on[RAD_PP_MAX_LANES] = {};
+        RAcc     rwin, rrun;
     };
     std::unique_ptr<PostPhases> pph_;
+    uint64_t*   pph_rm_ = nullptr;                   /* tp8 loop D78: PostPhases::rm while a decode head with an open chain issues */
     void        pph_close(int lane);                 /* after the lane's head was issued */
     std::string pph_text(const PostPhases::Acc& a, int64_t drops, const char* when, double window_s) const;
+    std::string pph_rtext(const PostPhases::RAcc& a, const char* when) const;   /* tp8 loop D78 */
     bool       pp_closed_ = false;
     /* tp8 dev D10 round 2: the step being shipped was issued ahead of its lane's collect (its frame's flags bit 1): its X1
      * lands only after the leader's tail of the step before it, so the follower issues its pass once X1 has landed */

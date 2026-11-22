@@ -1017,6 +1017,10 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
         }
         ++pp_builds_shipped_;
     }
+    if (pph_rm_ && pph_) {   /* tp8 loop D78: the drafter builds sent (a log mark only) */
+        pph_->rm_draft += (int64_t)pp_draft_q_.size();
+        pph_rm_[PostPhases::kRDraftQ] = rad_mono_ns();
+    }
     pp_draft_q_.clear();
     /* tp8 S6 (RADIANCE_PP_KV_CHECK=N): every N trunk steps, the copied KV layers' CRCs after the last
      * one, before this step's frame (the follower compares them after its own last step) */
@@ -1027,8 +1031,13 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
     const char* span = nullptr;
     int64_t n = 0;
     RAD_TRY(pp_frame(b, run, &head, &span, &n, lane));
+    if (pph_rm_ && pph_) {   /* tp8 loop D78 */
+        pph_->rm_bytes += (int64_t)head.size() + n;
+        pph_rm_[PostPhases::kRFrame] = rad_mono_ns();
+    }
     const int st = pp_link_->send2(net::kStep, (uint64_t)b->step, run ? 1 : 0, head.data(), (int64_t)head.size(),
                                    span, n);
+    if (pph_rm_) pph_rm_[PostPhases::kRSend] = rad_mono_ns();   /* tp8 loop D78 */
     if (st < 0) return st;
     ++pp_builds_shipped_;
     if (run) {
