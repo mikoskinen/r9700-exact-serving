@@ -626,6 +626,8 @@
  *                   records the capability; a change bumps the epoch anyway). The plugins' named chained forms (RADIANCE_AQL_CIK=2)
  *                   are chosen at start and do not follow it. Unset: 1 where RADIANCE_AQL_CIK=1 / 2 at start, else 0; 1 needs that env
  *                   (which kernels are chain-capable is read at their first launch). Rule A: the launch-order mechanism only.
+ *                   Lever CKW (DRAFTER round 108): N >= 2 = 1 for dispatches of at most N work-items only; a wider chain-capable
+ *                   dispatch issues and plays as the IKA kernel it also is (RADIANCE_AQL_CIK_LANES=N's bound, in process).
  *   host_slack      core, BOTH nodes (tp8 loop D63, DECODE round 51; 114 here, after aql_cik): the TIMER SLACK of the host threads
  *                   that poll the pipeline's critical path with short sleeps -- the lane loops' naps (fn4::nap_us where host_spin
  *                   leaves them sleeping), the link's send proxy (its scan of the send rings after 64 idle scans), the verbs
@@ -1050,7 +1052,8 @@ int  aql_ika();
 /* tp8 loop D61 (host_spin): the switch once set, else RADIANCE_HOST_SPIN at start (0 = every wait blocks at once, as before). */
 int  host_spin();
 /* tp8 loop W9 (aql_cik): the switch once set, else 1 where RADIANCE_AQL_CIK=1 / 2 at start (0 = off); read at every live issue and
- * played packet of a chain-capable kernel (rad::aql's dispatch / PlayRun::put, with lever CIK on). */
+ * played packet of a chain-capable kernel (rad::aql's dispatch / PlayRun::put, with lever CIK on). Lever CKW (DRAFTER round 108):
+ * N >= 2 = CIK for dispatches of at most N work-items only (wider ones issue / play as IKA kernels). */
 int  aql_cik();
 /* The sites host_spin's M names (bits); kSpinAll = every site. */
 static constexpr int kSpinBarrier = 1, kSpinDrafterEnd = 2, kSpinFrame = 4, kSpinNap = 8, kSpinAll = 15;

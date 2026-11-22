@@ -2338,6 +2338,33 @@ TEST(w37_cko_an_overlap_record_behind_a_chained_record_that_went_ahead_waits_for
     CHECK(!rad::aql::play_keep_acquire(true, true, true, true));
 }
 
+TEST(ckw_aql_cik_n_plays_a_cik_record_wider_than_n_lanes_as_the_ika_kernel_it_also_is) {
+    using namespace w37;
+    PlayKnobs k;
+    k.cik_live = true;
+    k.cik_on = true;
+    /* lever CKW (DRAFTER round 108): fn4 aql_cik 8192 = cik_max 8192. A (narrow, chained, the first: barrier bit), W (wide CIK
+     * record, 65,536 lanes: plays unchained = ordered, as an IKA kernel), B (narrow, behind W: the first of a new run, target 0). */
+    k.cik_max = 8192;
+    const std::vector<PlayRec> tape = { rec(true, true, false, 4096), rec(true, true, false, 65536), rec(true, true, false, 64),
+                                        rec(true, true, false, 64) };
+    const std::vector<double> dur = { 5.0, 20.0, 1.0, 1.0 };
+    std::vector<PlayOut> o;
+    CHECK_EQ(violations(tape, dur, k, true, &o), 0);
+    CHECK(o[0].chain && o[0].ordered && o[0].target == 0);
+    CHECK(!o[1].chain && o[1].ordered);
+    CHECK(o[2].chain && o[2].ordered && o[2].target == 0);
+    CHECK(o[3].chain && !o[3].ordered);
+    /* no bound (aql_cik 1): W chains behind A */
+    k.cik_max = UINT64_MAX;
+    CHECK_EQ(violations(tape, dur, k, true, &o), 0);
+    CHECK(o[1].chain && !o[1].ordered);
+    /* a bound at W's width keeps it chained (at most N) */
+    k.cik_max = 65536;
+    CHECK_EQ(violations(tape, dur, k, true, &o), 0);
+    CHECK(o[1].chain && !o[1].ordered);
+}
+
 TEST(w37_cko_random_tapes_keep_the_recordings_proof_and_cik_off_plays_the_packets_of_before) {
     using namespace w37;
     uint64_t x = 0x9E3779B97F4A7C15ull;
