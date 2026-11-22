@@ -481,6 +481,7 @@ struct Dsp {
     bool dep = false;                     /* lever DEP (dsp_dep_env): every expert on every rank as a width slice */
     bool wil = false;                     /* lever WIL (dsp_wil_env): the routed experts as moe_gemm_mxil (tile-interleaved) */
     bool gse = false;                     /* lever GSE (gse_env): the routed gate_up's GLU form declared beside the pair */
+    bool dsf = false;                     /* lever DSF on GSE (dsf_env, round 92): the shared arm's fold e declared beside GSE */
     int64_t ff_rank = 0;                  /* the routed experts' intermediate width on this rank (DEP: n_ff / world) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
@@ -2337,9 +2338,13 @@ static int dmr_raw() {   /* the switch's value: level (v & 7) + lever DPR's bit 
         const int dgz = gz && gz[0] == '1' && !gz[1] ? 512 : 0;
         if (gz && *gz && !dgz && std::strcmp(gz, "0"))
             fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_GSE=%s is not 0 / 1: lever GSE not declared\n", gz);
+        const char* fz = std::getenv("RADIANCE_DS41_DSPARK_DSF");   /* lever DSF on GSE (round 92): 1 = on at start, 0 = declared, off */
+        const int dfz = fz && fz[0] == '1' && !fz[1] ? 1024 : 0;
+        if (fz && *fz && !dfz && std::strcmp(fz, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DSF=%s is not 0 / 1: lever DSF not declared\n", fz);
         int unread = -1;
         g_sw_dmr.compare_exchange_strong(unread, (e && e[0] >= '1' && e[0] <= '7' && !e[1] ? e[0] - '0' : 0) | dp | dq | dr | dk |
-                                                     dg | dz | dgz);
+                                                     dg | dz | dgz | dfz);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2381,6 +2386,31 @@ static int gse_env() {
     if (!q || !*q) return 0;
     return !std::strcmp(q, "0") || !std::strcmp(q, "1") ? 1 : -1;
 }
+/* Lever DSF on GSE (DRAFTER track 22.11.2026 round 92; dspark_mhr + 1024, start env RADIANCE_DS41_DSPARK_DSF=1 declares it and sets
+ * the bit, =0 declares it off; declared only beside lever GSE (RADIANCE_DS41_GSE=0 / 1 declared) on the stages whose routed gate_up has
+ * the GLU form, and issued only while the GSE bit (512) and SDD's level (6..7) are on too): each stage's SHARED clamped SwiGLU folded
+ * into the shared down (the trunk's lever K1 fold e, MoeFP8 op_swfold = swiglu_clamped_gemm_nt_ggml, through the drafter MoE's own
+ * swfold_live word g_dsp_swf), issued at SDD's place right ahead of the routed down. Why: on the served tape (haz_mark: a dispatch that
+ * reads a buffer written since the last ordered one is ordered) GSE leaves the stage MoE three levels after the gate_up's --
+ * [GLU gate_up | fill | shared gate_up | mix split] -> mix finish (O) -> shared swiglu (O) -> [shared down | routed down] -- and lq231's
+ * stamps show the shared swiglu ending last before the downs in 100 % of c16 / c8 passes. With the fold the shared arm has no
+ * in-flight producer after the ordered mix finish (its gate_up ended before it), nor has the routed down (its GLU gate_up did), so
+ * both downs go unordered right behind the mix finish: one level (a launch + its ordered gap) fewer a stage. (Round 60's DSF, the fold
+ * BEHIND the routed down without GSE, lost: the routed down's persistent grid held the slots; ahead of it with the routed swiglu still
+ * in flight (pfs order E) the ordered routed down waits for the whole fold: +37 us -- hence GSE first.) Exact (rule A): the fold's
+ * bytes are its two launches' (r4d_selftest --wmkroute, fold e q8_0 5120 x 512 / 768 at M 1..130 under ds41_wmk 14 = BEST's: h and y
+ * = swiglu_clamped_bf16 then gemm_nt_ggml under the switch; drafter/kit/mes/pfs.cpp orders B / F vs S: every output identical).
+ * One R9700 (pfs order F = these levels, 300 plays x 4 rounds x 2, libr4d 77d71b47): 16 sequences GSE 1,050.7 / 1,051.7 -> + DSF
+ * 1,035.0 / 1,035.6 us a pass, 8 sequences 1,028.9 / 1,033.2 -> 1,012.0 / 1,012.7 (the fold ordered behind the mix finish, order B,
+ * 1,045.8 / 1,047.0 and 1,018.4 / 1,023.3: the unordered fold also starts beside the finish). */
+static bool dsf_now() { return (dmr_raw() & 1024) != 0; }
+static int dsf_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_DSF");
+    if (!q || !*q) return 0;
+    return !std::strcmp(q, "0") || !std::strcmp(q, "1") ? 1 : -1;
+}
+static std::atomic<int> g_dsp_swf{0};   /* lever DSF on GSE: the DSpark MoE's swfold_live word (1 / 0; set at each query pass) */
+static std::atomic<long long> g_dsf_passes{0};   /* the first-pass line */
 static bool pfx_env() {
     const char* q = std::getenv("RADIANCE_DS41_DSPARK_PFX");
     return q && (!std::strcmp(q, "0") || !std::strcmp(q, "1"));
@@ -3311,7 +3341,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ||
                (value == 3 && g_sw_walk_ok.load(std::memory_order_relaxed) && g_sw_walk3_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 1023 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE) */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 2047 ? 1 : -1;   /* lever DMR (2: + fold c; 3: + pcn; 4: + DML; 5: + DOF; 6: + SDD; 7: + EMA; + 8: lever DPR; + 16: lever DPH; + 32: lever DQR; + 64: lever DKP; + 128: lever EMG; + 256: lever PFX; + 512: lever GSE; + 1024: lever DSF on GSE) */
     if (!std::strcmp(name, "dspark_hs"))   /* lever DHS: refused at 1 only where a rank tried its declare and failed; a node
                                               * that never declared it (the pipeline's follower: no drafter) takes the value and
                                               * issues as before (rad_fn4_value reports what the issue reads: hs_now) */
@@ -3450,7 +3480,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         return 1;
     }
     if (!std::strcmp(name, "dspark_mhr")) {
-        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) */
+        *applied = dmr_raw();   /* level + lever DPR's bit (round 67) + lever DPH's (round 68) + lever DQR's (round 69) + DKP's (round 72) + EMG's (round 74) + PFX / GSE / DSF (rounds 85 / 91 / 92) */
         return 1;
     }
     if (!std::strcmp(name, "dspark_hs")) {
@@ -5408,6 +5438,29 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                         std::getenv("RADIANCE_DS41_GSE"), gse_now() ? "on" : "off");
         }
     }
+    d.dsf = false;
+    if (dsf_env() < 0) {   /* lever DSF on GSE (round 92) */
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_DSF=%s is not 0 / 1\n", std::getenv("RADIANCE_DS41_DSPARK_DSF"));
+        return RAD_E_INVAL;
+    }
+    if (dsf_env() > 0) {
+        if (!d.gse || !rad_op_declared(b, "swiglu_clamped_gemm_nt_ggml")) {
+            rad_note(b, "lever DSF (RADIANCE_DS41_DSPARK_DSF): %s -- not declared",
+                     !d.gse ? "needs lever GSE declared (RADIANCE_DS41_GSE=0 / 1)" : "no loaded kernel plugin serves swiglu_clamped_gemm_nt_ggml");
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever DSF (RADIANCE_DS41_DSPARK_DSF) not declared: %s\n",
+                        !d.gse ? "needs lever GSE declared" : "no loaded kernel plugin serves swiglu_clamped_gemm_nt_ggml");
+        } else {
+            d.dsf = true;
+            rad_note(b, "DSpark drafter shared arm's fold e declared (lever DSF on GSE, RADIANCE_DS41_DSPARK_DSF; dspark_mhr + 1024 issues "
+                        "it with + 512 and level 6..7): swiglu_clamped_gemm_nt_ggml");
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: lever DSF (RADIANCE_DS41_DSPARK_DSF=%s): the DSpark drafter's shared swiglu + down "
+                                "also as swiglu_clamped_gemm_nt_ggml, issued ahead of the routed down at dspark_mhr + 1024 with GSE's "
+                                "+ 512 and level 6..7 (%s at start)\n",
+                        std::getenv("RADIANCE_DS41_DSPARK_DSF"), dsf_now() ? "on" : "off");
+        }
+    }
     if (dsp_rf_env() < 0) {   /* lever DRF */
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_RF=%s is not 0 / off or 1 / on\n", std::getenv("RADIANCE_DS41_DSPARK_RF"));
         return RAD_E_INVAL;
@@ -5599,6 +5652,9 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     else if (d.wil && l == d.base)
         rad_note(b, "lever WIL: the drafter's %lld rows exceed moe_gemm_mxil's 512: moe_gemm_ggml kept", (long long)Q);
     if (d.gse && s.cfg.expert_ggml_op) s.cfg.expert_ggml_glu = "moe_gemm_mxil_glu";   /* lever GSE: declared beside the pair */
+    /* lever DSF on GSE (round 92): fold e only where the stage's gate_up has the GLU form (else the fold would sit ahead of an
+     * ordered routed down behind the routed swiglu: pfs order E, +37 us) */
+    s.cfg.shared_swfold = d.dsf && s.cfg.expert_ggml_glu && g.n_ff > 0 ? 1 : 0;
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;
@@ -5630,6 +5686,12 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
     /* lever SDD (dspark_mhr 6): the drafter's own word, never a lane form (low bits 0) -- kMoeSdfBit or 0, set by dsp_query */
     L.moe.shexp_lane = &g_dsp_sdf;
+    /* lever DSF on GSE (round 92): the drafter's own fold e word, 1 / 0 set by dsp_query (the trunk's ds41_swfold never reaches it) */
+    if (s.cfg.shared_swfold) {
+        L.moe.swfold_live = &g_dsp_swf;
+        if (!L.moe.op_swfold)
+            rad_note(b, "lever DSF: the drafter's MoE layer %d has no swiglu_clamped_gemm_nt_ggml form: its shared arm keeps two launches", l);
+    }
     L.moe.rr1_live = &g_sw_rr1;   /* lever RR1: the trunk's switch */
     L.moe.rr1_count = g_rr1_count;
     g_sw_rr1_ok.store(1, std::memory_order_relaxed);
@@ -9105,6 +9167,14 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
 
     /* lever SDD (dspark_mhr 6): the stages' MoE read this word at their issue below (the same value on every rank) */
     g_dsp_sdf.store((dmr_now() >= 6 ? kMoeSdfBit : 0) | (gse_now() ? kMoeGluBit : 0), std::memory_order_relaxed);   /* + lever GSE */
+    /* lever DSF on GSE (round 92): the fold at SDD's place (ahead of the routed down) only with GSE's GLU gate_up issued */
+    {
+        const int swf = d.dsf && dsf_now() && gse_now() && dmr_now() >= 6 ? 1 : 0;
+        g_dsp_swf.store(swf, std::memory_order_relaxed);
+        if (swf && g_dsf_passes.fetch_add(1, std::memory_order_relaxed) == 0 && !m.zero && g.rank == 0)
+            fprintf(stderr, "radiance: deepseek41: lever DSF on GSE: first DSpark query pass with the shared arm's fold e (dspark_mhr %d)\n",
+                    dmr_raw());
+    }
     /* lever EMA (dspark_mhr 7): the plane of this pass's block, where every rank declared it (a function of the pass key and
      * the switches; the all-reduce's shape is the same on every rank) */
     int64_t ek = -1;
