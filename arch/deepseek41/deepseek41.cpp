@@ -9171,6 +9171,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
      * batch, the block and the switches): wsp_kind 1 = the cut walk, 2 = the block's walk; 0 = step 0 whole, as before. */
     rad_op wsp_pre = 0, wsp_add = 0;
     int wsp_kind = 0;
+    bool wsp_l1 = false;   /* round 85: part 1 went on lane 1 (part 2 joins it back) */
     if (g_sw_walk.load(std::memory_order_relaxed) == 3 && batch->n_out > 0 && S <= d.wseqs && g.world > 1 && d.wfill) {
         const int64_t N0 = batch->n_out;
         const bool smp0 = !(lo ? lo->sstep : d.sstep).empty() && ds41_switch("draft_sample") >= 1 && N0 == S * blk && S <= d.sseqs;
@@ -9271,17 +9272,23 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             if (dml) mix_a();   /* lever DML: beside o_a, o_b unordered behind its finish (step()'s `late`) */
             lin_issue(x, m, L.o_b, Tq, brows(d.oa, Tq), L.wo_b, brows(d.attn_out, Tq));
         }
-        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, Tq * D, brows(d.attn_out, Tq), RAD_NONE);
-        if (wsp_pre && si == 0) {   /* lever WSP: part 1 beside stage 0's attention all-reduce (its operands: the anchors, the walk's
-                                     * weights, PERSIST wacc / wkeys -- no hazard on an op in flight, so it goes unordered) */
+        if (wsp_pre && si == 0) {   /* lever WSP: part 1 beside stage 0's attention all-reduce on LANE 1, issued right before it
+                                     * behind a join from lane 0 (round 85, DECODE NOTE 03:16: issued behind the opaque all-reduce
+                                     * on lane 0 it keeps its barrier bit and starts when the collective has finished). Its
+                                     * operands: the anchors, the walk's weights, PERSIST wacc / wkeys (no collective, no counter,
+                                     * no transient: the lane rules); part 2 joins lane 1 back first. A lane that cannot be taken:
+                                     * part 1 on lane 0, as before. */
             const int64_t KR = ds41walk::plane_rows(blk, d.wseqs);
+            wsp_l1 = rad_lane_join(x, 0, 1) == RAD_OK && rad_lane(x, 1) == RAD_OK;
             RAD_ISSUE_N(x, wsp_pre, S, RAD_NONE, praw(batch->token_ids, RAD_I32, T), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wacc, S),
                         brows(d.wkeys, KR));
+            rad_lane(x, 0);
             if (g.rank == 0 && g_wsp_passes.fetch_add(1, std::memory_order_relaxed) == 0)
                 fprintf(stderr, "radiance: deepseek41: lever WSP: first query pass issued with the walk's step 0 in two parts (%lld "
-                                "sequences x %lld, %s; counted at issue: a recorded pass once)\n",
-                        (long long)S, (long long)blk, wsp_kind == 1 ? "a DHD cut walk" : "the block's walk");
+                                "sequences x %lld, %s, part 1 on lane %d; counted at issue: a recorded pass once)\n",
+                        (long long)S, (long long)blk, wsp_kind == 1 ? "a DHD cut walk" : "the block's walk", wsp_l1 ? 1 : 0);
         }
+        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, Tq * D, brows(d.attn_out, Tq), RAD_NONE);
         const bool pf = dmr3 && L.pcn_f;
         if (pf)   /* post_a, col_f and norm_f in one (the trunk's pcn_f) */
             RAD_ISSUE_N(x, L.pcn_f, Tq, brows(d.attn_out, Tq), brows(hA, Tq), brows(d.post, Tq), brows(d.comb, Tq),
@@ -9375,6 +9382,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         const int64_t KR = ds41walk::plane_rows(blk, WS);
         const std::vector<rad_op>& wst = d.wcut[(size_t)hb];
         const bool wsp = wsp_kind == 1 && wsp_add == d.wcut_add[(size_t)hb];   /* lever WSP: the keys zeroed and step 0's products made */
+        if (wsp_l1) rad_lane_join(x, 1, 0);   /* part 1's acc / keys on lane 1: in front of part 2 (and of any fill of the keys) */
         if (!wsp) RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
         for (int64_t l = 0; l < hb; ++l) {
             const int64_t r0 = ds41walk::step_row(l, WS);
@@ -9414,6 +9422,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         /* the scoring steps: W1b's form 1 while dspark_walk is 2 at the drafter's own block; the short block's form 0 */
         const std::vector<rad_op>& wst = lo ? lo->wstep : (wsw == 2 && !d.wstep2.empty() ? d.wstep2 : d.wstep);
         const bool wsp = wsp_kind == 2 && wsp_add == (lo ? lo->wadd : d.wadd);   /* lever WSP: keys zeroed, products made */
+        if (wsp_l1) rad_lane_join(x, 1, 0);   /* part 1's acc / keys on lane 1: in front of part 2 (and of any fill of the keys) */
         if (!wsp) RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
         for (int64_t l = 0; l < blk; ++l) {
             const int64_t r0 = ds41walk::step_row(l, WS);
