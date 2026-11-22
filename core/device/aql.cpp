@@ -632,6 +632,9 @@ uint64_t cik_lanes_max() {
 struct CikTl {
     std::atomic<int64_t>  live{0}, live_lanes{0}, wide{0}, wide_lanes{0}, played{0}, played_lanes{0};
     std::atomic<uint64_t> widest{0};
+    /* lever CKO (DRAFTER round 105): overlap records played chained to the ahead base (a), overlap records that kept their bit behind
+     * a record that went out ahead (a), barrier-bit packets that kept their acquire behind one (b) */
+    std::atomic<int64_t>  cko_chain{0}, cko_order{0}, cko_acq{0};
     uint32_t              tick = 0;
 };
 std::mutex            g_cik_tl_mu;
@@ -655,7 +658,7 @@ void cik_line() {
     int64_t n = next_ms.load(std::memory_order_relaxed);
     if (now < n || !next_ms.compare_exchange_strong(n, now + 60000, std::memory_order_relaxed)) return;
     if (n == 0) return;   /* the first call arms the minute */
-    int64_t live = 0, live_lanes = 0, wide = 0, wide_lanes = 0, played = 0, played_lanes = 0;
+    int64_t live = 0, live_lanes = 0, wide = 0, wide_lanes = 0, played = 0, played_lanes = 0, ck_c = 0, ck_o = 0, ck_a = 0;
     uint64_t widest = 0;
     {
         std::lock_guard<std::mutex> lk(g_cik_tl_mu);
@@ -667,6 +670,9 @@ void cik_line() {
             played += c->played.load(std::memory_order_relaxed);
             played_lanes += c->played_lanes.load(std::memory_order_relaxed);
             widest = std::max(widest, c->widest.load(std::memory_order_relaxed));
+            ck_c += c->cko_chain.load(std::memory_order_relaxed);
+            ck_o += c->cko_order.load(std::memory_order_relaxed);
+            ck_a += c->cko_acq.load(std::memory_order_relaxed);
         }
     }
     const uint64_t b = cik_lanes_max();
@@ -675,6 +681,10 @@ void cik_line() {
                  "by the bound (%lld work-items; bound %s), %lld chained tape plays (%lld work-items) (tp8 loop R48)\n",
                  (long long)live, (long long)live_lanes, (unsigned long long)widest, (long long)wide, (long long)wide_lanes,
                  b == UINT64_MAX ? "none" : std::to_string(b).c_str(), (long long)played, (long long)played_lanes);
+    std::fprintf(stderr,
+                 "aql: CKO since start: behind a chained record that went out ahead of its recorded order, %lld overlap records played "
+                 "chained to the counter before it, %lld kept their barrier bit, %lld barrier-bit packets kept their acquire (DRAFTER "
+                 "round 105)\n", (long long)ck_c, (long long)ck_o, (long long)ck_a);
 }
 
 /* Lever CBL (DRAFTER track round 64): fn4 aql_ika 3 with lever CIK on -- core's device-local copies and fills (aql_blit.hip) launch their
@@ -926,6 +936,16 @@ struct Stream {
      * launched since the last packet whose barrier bit held it behind everything before. A chained
      * kernel's wait covers only chained blocks, so while this is set the next one keeps its bit. */
     bool            plain_inflight = false;
+    /* Lever CKO (DRAFTER round 105; the pair's lq235-b7 DEFECT: lever CIK not exact, not repeatable): a played record the recording
+     * ORDERED (Ctx::haz_mark: everything before it has finished, a new in-flight set starts at it) that went out UNORDERED as a
+     * chained kernel behind a chained one (PlayRun::put) launches while the kernels before it still run, so two of the recording's
+     * assumptions at it fail for the packets behind it: (a) an overlap record behind it was proved independent of the packets from
+     * it on only -- not of those before it, which may still run when its packet starts; (b) its packet acquire (the start of an
+     * acquire-rule window) ran before those kernels ended, so a scalar-cache line they read and the next ones wrote may survive it.
+     * Set while such a record may run with no barrier-bit packet since; `ahead_base` = chain_issued before the latest one (every
+     * chained lane issued before it: with no plain packet in flight there, the counter reaching it = all of them done). */
+    bool            ahead = false;
+    uint64_t        ahead_base = 0;
     /* Lever CRD (DRAFTER round 64): unordered packets since this queue's last ordered one (a played plain overlap record counts too:
      * it runs ahead as well); the cap applies to chained packets only. */
     int             chain_run = 0;
@@ -1461,12 +1481,13 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
 
 /* The chain record of a chained launch (RadKernelChainFn) at `slot`: wait for every chained
  * block issued before it on `s`. `on` false writes a record no kernel accepts. */
-inline void chain_record(Stream* s, char* slot, bool on, bool ordered = false) {
+inline void chain_record(Stream* s, char* slot, bool on, bool ordered = false, bool to_ahead_base = false) {
     uint64_t rec[4];
     rec[0] = on ? RAD_CHAIN_MAGIC : 0;
     /* Lever CIK (DRAFTER round 62): a chained kernel issued WITH its barrier bit starts behind everything before it, so its record
-     * names target 0 (r4d_chain_wait: no poll) -- only under RADIANCE_AQL_CIK=1, else the record as before. */
-    rec[1] = (ordered && cik_on()) ? 0 : s->chain_issued;
+     * names target 0 (r4d_chain_wait: no poll) -- only under RADIANCE_AQL_CIK=1, else the record as before. Lever CKO (a): an
+     * overlap record behind a record that went out ahead waits for every chained lane issued before that record (Stream::ahead). */
+    rec[1] = (ordered && cik_on()) ? 0 : to_ahead_base ? s->ahead_base : s->chain_issued;
     rec[2] = (uint64_t)(uintptr_t)s->chain_ctr;
     rec[3] = rec[0] ^ rec[1] ^ rec[2] ^ RAD_CHAIN_CHECK;
     std::memcpy(slot + RAD_CHAIN_KARG_OFF, rec, sizeof rec);
@@ -1491,6 +1512,7 @@ int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
     if (rc < 0) { s->unlock(); return rc; }
     s->prev_chained = false;
     s->plain_inflight = false;
+    s->ahead = false;   /* lever CKO: a barrier packet (barrier bit) starts behind everything before it */
     s->chain_run = 0;
     s->chain_run_blocks = 0;
     if (out_idx) *out_idx = idx;
@@ -1598,6 +1620,10 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     if (!keep && crb_cap() && s->chain_run_blocks + blocks_of(p) > crb_cap()) keep = true;
     s->chain_run = keep ? 0 : s->chain_run + 1;
     s->chain_run_blocks = keep ? 0 : s->chain_run_blocks + blocks_of(p);
+    /* Lever CKO: an issued (live) packet is ordered unless it is a chained kernel behind a chained one; the latter goes ahead (a
+     * played overlap record behind it must not take it for an ordering point: PlayRun::put) */
+    if (keep) s->ahead = false;
+    else { s->ahead = true; s->ahead_base = s->chain_issued; }
     if (k->chained || k->cikcap) chain_record(s, slot, chain, keep);
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
     if (chain) s->chain_issued += k->cik ? lanes_of(p) : blocks_of(p);
@@ -1704,18 +1730,28 @@ struct PlayRun {
          * the tape's copy is shared by every play, and the next step's play may be written while
          * this one runs. */
         bool chain = false;
+        /* Lever CKO (a): an overlap record behind a record that went out ahead (Stream::ahead) -- chained, waiting for every chained
+         * lane issued before that record (its recorded in-flight set starts there), or, where it cannot wait in-kernel, ordered. */
+        bool ahead_chain = false;
         if (r.chain && tape) {
             chain = s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
-            /* Lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's
-             * copy (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel. */
-            if (r.lanes && r.overlap && !foreign && !done.handle) chain = false;
             /* tp8 loop W9: fn4 aql_cik 0 -- a chain-capable record plays as the IKA kernel it also is (unchained, from the tape's copy) */
             if (r.lanes && !cik_live()) chain = false;
+            if (chain && r.overlap && s->ahead && !foreign && !done.handle) ahead_chain = true;
+            /* Lever CIK: an overlap record (it touches nothing in flight) keeps its overlap -- played unchained, from the tape's
+             * copy (whose tail no chain record check accepts), so it neither waits nor counts, as a plain kernel. */
+            else if (r.lanes && r.overlap && !foreign && !done.handle) chain = false;
         }
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
          * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
          * on this queue waits in its prologue instead. */
         bool ordered = foreign || !r.overlap || done.handle;
+        /* Lever CKO (a): behind a record that went out ahead, an overlap record that does not wait in-kernel keeps its bit. */
+        if (!ordered && s->ahead && !ahead_chain) {
+            ordered = true;
+            cik_bump(cik_tl().cko_order, 1);
+        }
+        if (ahead_chain) cik_bump(cik_tl().cko_chain, 1);
         /* Not while a plain packet may still run: a played plain kernel the overlap analysis let
          * start early (it touched nothing in flight) adds nothing to the counter, so a chained
          * kernel that reads its output and sits behind a chained one (a cache read beside a
@@ -1740,7 +1776,7 @@ struct PlayRun {
             } else {
                 std::memcpy(slot, tape->karg_host.data() + r.karg_off, r.karg_len);
                 p->kernarg_address = slot;
-                chain_record(s, slot, true, ordered);
+                chain_record(s, slot, true, ordered, ahead_chain && !ordered);
             }
         }
         int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
@@ -1775,6 +1811,14 @@ struct PlayRun {
         if (rel == HSA_FENCE_SCOPE_AGENT && ika_play_release_none(ika_live, r.ika != 0, done.handle != 0))
             rel = HSA_FENCE_SCOPE_NONE;
         if (rel < rel_min) rel = rel_min;
+        /* Lever CKO (b): the first barrier-bit packet behind a record that went out ahead keeps its acquire -- the packet processor
+         * runs it after everything before has completed, the invalidation the recording's acquire-rule window took that record's
+         * acquire for (lines read by the kernels before it and written behind it can sit in a scalar cache past an early acquire).
+         * The records in between wait in-kernel (a chained wait empties its WGP's scalar cache) or keep their bit (a). */
+        if (ordered && s->ahead && acq == HSA_FENCE_SCOPE_NONE && !aql_acq_none_()) {
+            acq = HSA_FENCE_SCOPE_AGENT;
+            cik_bump(cik_tl().cko_acq, 1);
+        }
         if (stamp) {
             stamp->ordered = ordered;
             stamp->chained = chain;
@@ -1784,6 +1828,10 @@ struct PlayRun {
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
+        /* Lever CKO: a recorded ordering point that went out unordered (a chained kernel behind a chained one) goes ahead; a
+         * barrier-bit packet ends it. */
+        if (ordered) s->ahead = false;
+        else if (chain && !r.overlap) { s->ahead = true; s->ahead_base = s->chain_issued; }
         if (chain) s->chain_issued += r.lanes ? lanes_of(p) : blocks_of(p);
         if (chain && r.lanes) {   /* tp8 loop R48: CIK's counts */
             CikTl& c = cik_tl();
