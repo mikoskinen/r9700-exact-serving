@@ -30,6 +30,7 @@
 #include "r4d_emit.h"
 #include "r4d_chain.h"
 #include "r4d_fp8_wmma.h"
+#include "r4d_q8.h"      /* lever A8D fold (b) (DRAFTER round 95): QOUT finisher = quant_act_i8g's codes */
 
 #include <algorithm>
 #include <atomic>
@@ -179,8 +180,13 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
 /* The body. gemm_fp8a8_kernel and its chained form r4dchain_gemm_fp8a8 (r4d_chain.h) wrap it
  * after it: its blocks return early (an empty K slice, the finisher's losers), and every block of
  * a chained launch must still count itself in. */
+/* QOUT (lever A8D fold (b), DRAFTER round 95; gemm_i8a8_pairq_kernel only): the split finisher writes quant_act_i8g's int8
+ * codes + f32 scale per (row, 128) of the bf16 C it would have stored (C itself is not written), into Q / Sc at pitches q_ld /
+ * s_ld; `y_ld` is then the grid.x of ONE weight (two weights share the launch: blocks >= y_ld are the second one's, their m0
+ * counted from there; the arrival counters stay per launch block). The launcher guarantees a split, FM a multiple of 128 and
+ * N a multiple of FM, so a wave's 32 lanes x 4 values in the finisher are exactly one token's 128-column group. */
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
-          bool GATED = false, bool I8 = false, bool BIAS = false>
+          bool GATED = false, bool I8 = false, bool BIAS = false, bool QOUT = false>
 __device__ __forceinline__ void gemm_fp8a8_body(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
@@ -209,7 +215,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
     const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
     if (kbeg >= kend) return;
 
-    const uint32_t m0 = blockIdx.x * FM;
+    const uint32_t m0 = (QOUT ? (blockIdx.x >= y_ld ? blockIdx.x - y_ld : blockIdx.x) : blockIdx.x) * FM;
     const uint32_t n0 = blockIdx.y * FN;
     // Wave grid MW(M) x 1(N): a wave owns 16 A rows and all FN B rows.
     const uint32_t wm = wave * 16u, wn = 0;
@@ -224,6 +230,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
     static_assert(!GATED || (MW % 2u) == 0u, "the gated fold splits the waves in half");
     static_assert(!(GATED && I8), "the gated epilogue quantises to E4M3 and has no int8 form");
     static_assert(!BIAS || (!GATED && !I8), "the bias epilogue is the fp8 narrow tile's");
+    static_assert(!QOUT || (I8 && !GATED && !BIAS && (FM % 128u) == 0u), "QOUT: the int8 split finisher of whole 128-row groups");
 
     f8v raw[NT], out[NT];
 #pragma unroll
@@ -640,7 +647,52 @@ __device__ __forceinline__ void gemm_fp8a8_body(
              * each element from 0.0f in ascending z, so they are bit-identical. */
             const uint32_t nr = rhi - rlo;
             const size_t zs = (size_t)rows * nb;
-            if ((rows & 3u) == 0u && (nr & 3u) == 0u && ((uintptr_t)C & 7u) == 0u
+            if constexpr (QOUT) {
+                /* The vectorised walk below with the bf16 store replaced by quant_act_i8g's pass over the stored values: a
+                 * wave's idx are 32 consecutive values from a multiple of 32 and nq a multiple of 32, so a wave holds one
+                 * token's whole group (lane l its columns 4l..4l+3, the standalone quantiser's map) and the idx < total test
+                 * is wave-uniform. Values: bf16x2_rne of the same sums (C's bits), read back as f32 -- the quantiser's input. */
+                constexpr uint32_t kFinU = 4;
+                const uint32_t nq = nr / 4u, total = nq * nb;
+                for (uint32_t b = tid; b < total; b += kFinU * MW * kWave) {
+                    size_t o[kFinU];
+                    float4 acc[kFinU];
+#pragma unroll
+                    for (uint32_t u = 0; u < kFinU; ++u) {
+                        const uint32_t idx = b + u * MW * kWave;
+                        o[u] = idx < total ? (size_t)(idx / nq) * rows + rlo + (idx % nq) * 4u : 0u;
+                        acc[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                    for (uint32_t z = 0; z < gridDim.z; ++z) {
+                        float4 v[kFinU];
+#pragma unroll
+                        for (uint32_t u = 0; u < kFinU; ++u)
+                            v[u] = b + u * MW * kWave < total ? *(const float4*)(w0 + z * zs + o[u])
+                                                              : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+                        for (uint32_t u = 0; u < kFinU; ++u) {
+                            acc[u].x += v[u].x; acc[u].y += v[u].y;
+                            acc[u].z += v[u].z; acc[u].w += v[u].w;
+                        }
+                    }
+#pragma unroll
+                    for (uint32_t u = 0; u < kFinU; ++u) {
+                        const uint32_t idx = b + u * MW * kWave;
+                        if (idx >= total) continue;
+                        const uint32_t w01 = bf16x2_rne(acc[u].x, acc[u].y), w23 = bf16x2_rne(acc[u].z, acc[u].w);
+                        const float q0 = __uint_as_float(w01 << 16), q1 = __uint_as_float(w01 & 0xFFFF0000u);
+                        const float q2 = __uint_as_float(w23 << 16), q3 = __uint_as_float(w23 & 0xFFFF0000u);
+                        float mx = 0.0f;
+                        mx = fmaxf(mx, fabsf(q0)); mx = fmaxf(mx, fabsf(q1));
+                        mx = fmaxf(mx, fabsf(q2)); mx = fmaxf(mx, fabsf(q3));
+                        mx = r4d_wave_max(mx);
+                        const float sc = mx > 0.0f ? mx * (1.0f / q8_top<true>()) : 1.0f;
+                        const uint32_t tok = idx / nq, col = rlo + (idx % nq) * 4u;
+                        if ((idx & 31u) == 0u) Sc[(size_t)tok * s_ld + col / 128u] = sc;
+                        *(uint32_t*)(Q + (size_t)tok * q_ld + col) = q8_pack4<true>(q0, q1, q2, q3, 1.0f / sc);
+                    }
+                }
+            } else if ((rows & 3u) == 0u && (nr & 3u) == 0u && ((uintptr_t)C & 7u) == 0u
                 && ((uintptr_t)Y & 15u) == 0u) {
                 constexpr uint32_t kFinU = 4;
                 const uint32_t nq = nr / 4u, total = nq * nb;
@@ -719,6 +771,25 @@ void r4dchain_gemm_fp8a8(
     r4d_chain_done();
 }
 #undef R4D_F8K_ARGS
+/* lever A8D fold (b) (DRAFTER round 95): two int8 GEMMs of one shape [N, K] over two K windows of one activation pair
+ * (b_goff bytes / s_goff scales apart), each split K exactly as gemm_i8a8_nt_m16 splits it alone, in ONE launch (blocks
+ * [0, gxg) the first weight, [gxg, 2 gxg) the second), with the QOUT finisher writing quant_act_i8g's codes of each output into
+ * its columns of one pair (q_goff columns apart) -- the DSpark o_a groups + o_b's quantisers. y_goff: the second weight's
+ * partial planes. */
+template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK>
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, true, false))
+void gemm_i8a8_pairq_kernel(
+    const uint8_t* __restrict__ A0, const void* __restrict__ Sa0, const uint8_t* __restrict__ A1, const void* __restrict__ Sa1,
+    const uint8_t* __restrict__ Bp, const float* __restrict__ Sb, float* __restrict__ Y, unsigned int* __restrict__ Ctr,
+    uint32_t rows, uint32_t cols, uint32_t nb, uint32_t a_ld, uint32_t b_ld, uint32_t sa_ld, uint32_t sb_ld, uint32_t ck,
+    uint8_t* __restrict__ Q, float* __restrict__ Sc, uint32_t q_ld, uint32_t s_ld, uint32_t gxg, uint32_t b_goff,
+    uint32_t s_goff, uint32_t y_goff, uint32_t q_goff) {
+    const bool g = blockIdx.x >= gxg;
+    gemm_fp8a8_body<Full, NT, MW, FK, false, true, false, true>(
+        g ? A1 : A0, g ? Sa1 : Sa0, Bp + (g ? b_goff : 0u), Sb + (g ? s_goff : 0u), Y + (g ? (size_t)y_goff : (size_t)0),
+        nullptr, Ctr, rows, cols, nb, a_ld, b_ld, sa_ld, sb_ld, ck, Q + (g ? q_goff : 0u), Sc + (g ? q_goff / 128u : 0u),
+        nullptr, q_ld, s_ld, gxg, nullptr, 0u);
+}
 
 // Sum the split-K partials into bf16 C, in fixed z order with no atomics. Latency bound, so eight
 // loads are issued before their adds; the order of the adds is unchanged.
@@ -1674,6 +1745,86 @@ extern "C" int r4d_rad_gemm_i8a8_m16(const RadArgs* a, RadStream stream) {
         (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, true,
         (int)r4d_geti_or(a, "split_n", 0), r4d_geti_or(a, "chain", 0) != 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* ---- lever A8D fold (b) (DRAFTER round 95): gemm_nt_q_pair_i8g = two gemm_nt_q i8a8 of one shape [N, K] over the two K
+ * windows of one activation pair, each output then quant_act_i8g (group 128) into its N columns of one int8 pair -- ONE launch
+ * (gemm_i8a8_pairq_kernel). Every output is gemm_i8a8_nt_m16's sum at the same split (narrow_ksplit of (N, K, M): the planes
+ * gemm_nt_q sums alone, in its z order) and the standalone quantiser's codes of its bf16 rounding, so q / scale are the bytes
+ * of gemm_nt_q + quant_act_i8g; MW is fixed at 8 (a block owns one 128-row group; MW changes no bits). Operands: [0] a int8
+ * [M, 2K], [1] a_scale f32 [M, 2K / 128], [2] b0 / [4] b1 i8 [N, K] (fragment order, layout_i8_block's), [3] b0_scale / [5]
+ * b1_scale bf16 [N, K / 128] (tile-major), [6] q int8 [M, 2N], [7] scale f32 [M, 2N / 128]; params M (<= 64), N (a multiple
+ * of 128), K (a multiple of 256, >= 512, N / 16 < kSplitTarget: always split), group 128. */
+namespace {
+struct PairQGeom { long long M, N, K; uint32_t ck, ksplit; };
+int pairq_geom(long long M, long long N, long long K, PairQGeom* g) {
+    g->M = M; g->N = N; g->K = K; g->ck = 0; g->ksplit = 0;
+    if (M < 1 || M > 64 || N < 128 || N % 128 || K < 512 || K % (long long)kFKNarrow) return RAD_E_SHAPE;
+    g->ksplit = narrow_ksplit((uint32_t)N, (uint32_t)K, (uint32_t)M, &g->ck);
+    return g->ksplit >= 2 && g->ck ? RAD_OK : RAD_E_SHAPE;
+}
+}  // namespace
+
+extern "C" int64_t r4d_rad_gemm_nt_q_pair_i8g_scratch(const RadArgs* a) {
+    PairQGeom g;
+    if (pairq_geom(r4d_geti_or(a, "M", 0), r4d_geti_or(a, "N", 0), r4d_geti_or(a, "K", 0), &g) != RAD_OK) return 0;
+    return (int64_t)2 * g.ksplit * g.M * g.N * (int64_t)sizeof(float);
+}
+
+extern "C" int r4d_rad_gemm_nt_q_pair_i8g(const RadArgs* a, RadStream stream) {
+    const RadTensor* x = r4d_opt(a, 0); const RadTensor* xs = r4d_opt(a, 1);
+    const RadTensor* b0 = r4d_opt(a, 2); const RadTensor* s0 = r4d_opt(a, 3);
+    const RadTensor* b1 = r4d_opt(a, 4); const RadTensor* s1 = r4d_opt(a, 5);
+    const RadTensor* q = r4d_opt(a, 6); const RadTensor* sc = r4d_opt(a, 7);
+    if (!x || !xs || !b0 || !s0 || !b1 || !s1 || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "group", 128) != 128) return R4D_NO(RAD_E_SHAPE);
+    PairQGeom g;
+    if (pairq_geom(r4d_geti_or(a, "M", 0), r4d_geti_or(a, "N", 0), r4d_geti_or(a, "K", 0), &g) != RAD_OK)
+        return R4D_NO(RAD_E_SHAPE);
+    const long long M = g.M, N = g.N, K = g.K, nkb = K / 128;
+    if (x->dtype != RAD_I8 || xs->dtype != RAD_F32 || b0->dtype != RAD_I8 || b1->dtype != RAD_I8 || s0->dtype != RAD_BF16 ||
+        s1->dtype != RAD_BF16 || q->dtype != RAD_I8 || sc->dtype != RAD_F32)
+        return R4D_NO(RAD_E_DTYPE);
+    if (x->rank != 2 || xs->rank != 2 || q->rank != 2 || sc->rank != 2 || b0->rank != 2 || b1->rank != 2 || s0->rank != 2 ||
+        s1->rank != 2)
+        return R4D_NO(RAD_E_SHAPE);
+    if (x->shape[0] != M || x->shape[1] != 2 * K || xs->shape[0] != M || xs->shape[1] != 2 * nkb || q->shape[0] != M ||
+        q->shape[1] != 2 * N || sc->shape[0] != M || sc->shape[1] != 2 * N / 128 || b0->shape[0] != N || b0->shape[1] != K ||
+        b1->shape[0] != N || b1->shape[1] != K || s0->shape[0] != N || s0->shape[1] != nkb || s1->shape[0] != N ||
+        s1->shape[1] != nkb)
+        return R4D_NO(RAD_E_SHAPE);
+    const long long ap = r4d_row_pitch(x), asp = r4d_row_pitch(xs), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    const long long wp0 = r4d_row_pitch(b0), wp1 = r4d_row_pitch(b1), wsp0 = r4d_row_pitch(s0), wsp1 = r4d_row_pitch(s1);
+    if (ap < 0 || asp < 0 || qp < 0 || sp < 0 || wp0 < 0 || wsp0 < 0 || wp0 != wp1 || wsp0 != wsp1) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(b0->data, 16) || !r4d_aligned(b1->data, 16) || !r4d_aligned(q->data, 4) ||
+        (qp & 3))
+        return R4D_NO(RAD_E_ALIGN);
+    const long long need = 2LL * g.ksplit * M * N * (long long)sizeof(float);
+    if (!a->scratch || (long long)a->scratch_bytes < need || !r4d_aligned(a->scratch, 16)) return R4D_NO(RAD_E_SHAPE);
+    constexpr uint32_t mw = 8u, fm = mw * 16u;
+    const uint32_t gx = (uint32_t)N / fm;
+    if (2u * gx > kMaxCtr) return R4D_NO(RAD_E_SHAPE);
+    unsigned int* const ctr = split_ctr(stream, q->data);
+    if (!ctr) return R4D_NO(RAD_E_DEVICE);
+    const uint32_t nt = (M > 48) ? 4u : ((M > 32) ? 3u : ((M > 16) ? 2u : 1u));
+    const bool full = (M % (long long)(nt * 16u)) == 0;   /* N % 128 == 0 and K % 128 == 0 by the geometry */
+    const dim3 grid(2u * gx, 1u, g.ksplit);
+    const uint32_t ygo = (uint32_t)(g.ksplit * M * N);
+    int rc = RAD_OK;
+#define R4D_PQ(f, nt_)                                                                                                  \
+    rc = R4D_EMIT(stream, (gemm_i8a8_pairq_kernel<f, nt_, 8u, kFKNarrow>), grid, dim3(mw * kWave), 0,                 \
+                  (const uint8_t*)b0->data, (const void*)s0->data, (const uint8_t*)b1->data, (const void*)s1->data,     \
+                  (const uint8_t*)x->data, (const float*)xs->data, (float*)a->scratch, ctr, (uint32_t)N, (uint32_t)K,   \
+                  (uint32_t)M, (uint32_t)wp0, (uint32_t)ap, (uint32_t)wsp0, (uint32_t)asp, g.ck, (uint8_t*)q->data,      \
+                  (float*)sc->data, (uint32_t)qp, (uint32_t)sp, gx, (uint32_t)K, (uint32_t)nkb, ygo, (uint32_t)N)
+#define R4D_PQ_NT(f)                                                                                                    \
+    do { if (nt == 4u) R4D_PQ(f, 4u); else if (nt == 3u) R4D_PQ(f, 3u); else if (nt == 2u) R4D_PQ(f, 2u);              \
+         else R4D_PQ(f, 1u); } while (0)
+    if (full) R4D_PQ_NT(true); else R4D_PQ_NT(false);
+#undef R4D_PQ_NT
+#undef R4D_PQ
+    if (rc != RAD_OK || hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    return RAD_OK;
 }
 
 extern "C" int r4d_rad_gemm_i8a8_tiled(const RadArgs* a, RadStream s) {

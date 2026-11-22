@@ -379,6 +379,10 @@ struct Layer {
     /* lever A8D fold (round 94): DOF's rope_rows_roundtrip with quant_act_i8g's codes of the stored row into o_a's pair (libr4d
      * rope_rows_roundtrip_i8g, = o_f then a8_oq to the byte); 0 where no library serves it (an older libr4d: o_f + a8_oq) */
     rad_op o_f8 = 0;
+    /* lever A8D fold (b) (round 95): the o_a pair + its two quantisers into o_b's pair as ONE op (libr4d gemm_nt_q_pair_i8g:
+     * both groups in one launch, each split K as alone, the split finisher writing quant_act_i8g's codes; = o_a + a8_bq to the
+     * byte); 0 where no library serves it, two groups are not the model's, or RADIANCE_DS41_DSPARK_A8B=0 */
+    rad_op o_ap = 0;
     /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): ar_attn declared a second time at `overlap` 1 (the narrow launch beside
      * compute) for piece 0 of a pipelined pass; 0 otherwise */
     rad_op ar_attn_ov = 0;
@@ -2443,6 +2447,15 @@ static int a8d_env() {
     return !std::strcmp(q, "1") ? 1 : !std::strcmp(q, "0") ? 0 : -1;
 }
 static std::atomic<long long> g_a8d_passes{0};   /* the first-pass line */
+/* Lever A8D fold (b) (DRAFTER track round 95; Layer::o_ap): RADIANCE_DS41_DSPARK_A8B=0 keeps the o_a groups + their quantisers as
+ * four ops (round 94's form, the same bytes); unset / 1 declares the pair op where a library serves it. Oracle (one card, pfx
+ * order O vs E, 32 / 40 rows): -6.3 / -5.2 us a stage; the groups' finishers as two launches into one pair would be ORDERED by
+ * haz_mark (a column window's span covers the other's: pfx T +2.6 / +6.4 us), hence one launch. */
+static int a8b_env() {
+    const char* q = std::getenv("RADIANCE_DS41_DSPARK_A8B");
+    if (!q || !*q) return 1;
+    return !std::strcmp(q, "1") ? 1 : !std::strcmp(q, "0") ? 0 : -1;
+}
 static std::atomic<int> g_dsp_swf{0};   /* lever DSF on GSE: the DSpark MoE's swfold_live word (1 / 0; set at each query pass) */
 static std::atomic<long long> g_dsf_passes{0};   /* the first-pass line */
 static bool pfx_env() {
@@ -5718,6 +5731,11 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                 L.o_a.push_back(iqr_gemm(b, m, Q, L.wo_a[(size_t)j], c.o_rank, gd, d.a8oq, d.a8os, d.a8oa[(size_t)j]));
             for (int j = 0; j < m.gr; ++j) L.a8_bq.push_back(a8_quant(b, Q, c.o_rank, d.a8oa[(size_t)j], d.a8bq, d.a8bs));
             L.o_b = iqr_gemm(b, m, Q, L.wo_b, D, m.gr * c.o_rank, d.a8bq, d.a8bs, d.attn_out);
+            if (m.gr == 2 && a8b_env() > 0)   /* fold (b): beside them, issued in their place */
+                L.o_ap = fused(b, "gemm_nt_q_pair_i8g",
+                               { RAD_RANGE("M", 1, std::min<int64_t>(Q, kA8Rows)), RAD_INT("N", c.o_rank), RAD_INT("K", gd),
+                                 RAD_INT("group", (int64_t)RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8") },
+                               { L.wo_a[0], m.wsc.at(L.wo_a[0]), L.wo_a[1], m.wsc.at(L.wo_a[1]) }, { d.a8oq, d.a8os }, { d.a8bq, d.a8bs });
             bool ok = L.a8_oq != 0 && L.kv_g != 0;
             for (int j = 0; j < m.gr; ++j) ok = ok && L.o_a[(size_t)j] && L.a8_bq[(size_t)j];
             if (!ok) return RAD_E_INVAL;
@@ -5916,6 +5934,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     d.a8d = false;
     if (a8d_env() < 0) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_A8D=%s is not 0 / 1\n", std::getenv("RADIANCE_DS41_DSPARK_A8D"));
+        return RAD_E_INVAL;
+    }
+    if (a8b_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_A8B=%s is not 0 / 1\n", std::getenv("RADIANCE_DS41_DSPARK_A8B"));
         return RAD_E_INVAL;
     }
     if (!m.zero) {
@@ -9520,9 +9542,12 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                               { d.q, HD, 0, HD });
                 if (g.rank == 0 && si == 0 && g_a8d_passes.fetch_add(1, std::memory_order_relaxed) == 0)
                     fprintf(stderr, "radiance: deepseek41: lever A8D: first query pass issued with the stages' attention linears "
-                                    "on the int8 pairs at %lld rows; o's pair %s (counted at issue: a recorded pass once)\n", (long long)T,
+                                    "on the int8 pairs at %lld rows; o's pair %s; o_a + o_b's pair %s (counted at issue: a recorded pass "
+                                    "once)\n", (long long)T,
                             dof && L.o_f8 ? "from rope_rows_roundtrip_i8g (fold a)" : dof ? "by quant_act_i8g after o_f (no library serves "
-                            "rope_rows_roundtrip_i8g)" : "by quant_act_i8g (DOF off)");
+                            "rope_rows_roundtrip_i8g)" : "by quant_act_i8g (DOF off)",
+                            L.o_ap ? "as gemm_nt_q_pair_i8g (fold b)" : a8b_env() > 0 ? "as 2 GEMMs + 2 quantisers (no library serves "
+                            "gemm_nt_q_pair_i8g)" : "as 2 GEMMs + 2 quantisers (RADIANCE_DS41_DSPARK_A8B=0)");
             } else {
             if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
             else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
@@ -9585,12 +9610,22 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             if (a8) {   /* lever A8D: o's pair (ob's Tq rows), the groups, each group's quantiser into o_b's pair */
                 const int64_t G = RAD_FP8_BLOCK;
                 if (!of8) RAD_ISSUE_N(x, L.a8_oq, Tq, brows(ob, Tq), brows(d.a8oq, Tq), brows(d.a8os, Tq));
+                if (L.o_ap) {   /* fold (b): the pair op in <= kA8Rows-row launches (its row: M <= 64) */
+                    const int64_t ok = m.gr * c.o_rank;
+                    for (int64_t r0 = 0; r0 < Tq; r0 += kA8Rows) {
+                        const int64_t n = std::min<int64_t>(kA8Rows, Tq - r0);
+                        RAD_ISSUE_N(x, L.o_ap, n, a8v({ d.a8oq, HD, 0, HD }, r0, n), a8v({ d.a8os, HD / G, 0, HD / G }, r0, n),
+                                    RAD_W(L.wo_a[0]), RAD_W(m.wsc.at(L.wo_a[0])), RAD_W(L.wo_a[1]), RAD_W(m.wsc.at(L.wo_a[1])),
+                                    a8v({ d.a8bq, ok, 0, ok }, r0, n), a8v({ d.a8bs, ok / G, 0, ok / G }, r0, n));
+                    }
+                } else {
                 for (int j = 0; j < m.gr; ++j)
                     a8_gemm_issue(x, m, L.o_a[(size_t)j], Tq, { d.a8oq, HD, j * gd, gd }, { d.a8os, HD / G, j * gd / G, gd / G },
                                   L.wo_a[(size_t)j], { d.a8oa[(size_t)j], c.o_rank, 0, c.o_rank });
                 for (int j = 0; j < m.gr; ++j)
                     RAD_ISSUE_N(x, L.a8_bq[(size_t)j], Tq, brows(d.a8oa[(size_t)j], Tq),
                                 bcol(d.a8bq, j * c.o_rank, c.o_rank, Tq), bcol(d.a8bs, j * c.o_rank / G, c.o_rank / G, Tq));
+                }
             } else if (gq_oa_on(L, Tq))   /* lever 1U-GQ */
                 gq_oa_issue(x, m, L, Tq, bcol(ob, 0, gd, Tq), bcol(ob, gd, gd, Tq), bcol(d.oa, 0, c.o_rank, Tq),
                             bcol(d.oa, c.o_rank, c.o_rank, Tq));

@@ -274,6 +274,36 @@ static const RadConstraint cDs41PcnMix[] = {
     C_IN("dtype", "bf16"),
 };
 
+/* lever A8D fold (b) (DRAFTER round 95): gemm_nt_q_pair_i8g (r4d_gemm_fp8a8.hip) -- declared here, beside its row, so no
+ * header every unit includes changes. Its weights are the i8a8 views gemm_i8a8_nt_m16 lays out (layout_i8_block, tags
+ * r4d.i8.w.frag64 / r4d.i8.s.t16): b1 / b1_scale (operands 4 / 5) ask that hook as gemm_nt_q's b / b_scale (2 / 3). */
+extern "C" int r4d_rad_gemm_nt_q_pair_i8g(const RadArgs* a, RadStream stream);
+extern "C" int64_t r4d_rad_gemm_nt_q_pair_i8g_scratch(const RadArgs* a);
+static int pairq_gemm_opd(int operand) { return operand == 4 ? 2 : operand == 5 ? 3 : operand <= 3 ? operand : 6; }
+static int r4d_pairq_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                            const RadTensor* pl, int n, RadLayout* out) {
+    return r4d_rad_layout_i8_block(p, n_p, pairq_gemm_opd(operand), enc, sel, pl, n, out);
+}
+static int r4d_pairq_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                              const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+    return r4d_rad_relayout_i8_block(p, n_p, pairq_gemm_opd(operand), enc, sel, pl, n, dst, dst_bytes);
+}
+static int r4d_pairq_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                                const void* src, int64_t src_bytes, const RadTensor* pl, int n) {
+    return r4d_rad_unrelayout_i8_block(p, n_p, pairq_gemm_opd(operand), enc, sel, src, src_bytes, pl, n);
+}
+static const RadParamSpec pDs41PairQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype") };
+static const RadOperandSpec oDs41PairQ[] = {
+    { "a", RAD_OPD_IN, 0 },       { "a_scale", RAD_OPD_IN, 0 },
+    { "b0", RAD_OPD_WEIGHT, 0 },  { "b0_scale", RAD_OPD_WEIGHT, 0 },
+    { "b1", RAD_OPD_WEIGHT, 0 },  { "b1_scale", RAD_OPD_WEIGHT, 0 },
+    { "q", RAD_OPD_OUT, 0 },      { "scale", RAD_OPD_OUT, 0 },
+};
+static const RadConstraint cDs41PairQ[] = {
+    C_GE("M", 1), C_LE("M", 64), C_DIV("N", 128), C_GE("N", 128), C_LE("N", 1920), C_DIV("K", 256), C_GE("K", 512),
+    C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "i8a8"),
+};
+
 #elif defined(R4D_DS41_SCHEMAS)
 
     SCHEMA("bi_rowhash", pBiRowHash, oBiRowHash,
@@ -386,6 +416,10 @@ static const RadConstraint cDs41PcnMix[] = {
            "(fn, scale, base -> pre_o, post, comb): every output as the two ops leave them. post and comb are read "
            "as the post's gates and then written as the mix's. A sublayer's output into the next connection's "
            "collapse, norm and gates in one op (DeepSeek-V4.1's attention connection, lever M1)."),
+    SCHEMA("gemm_nt_q_pair_i8g", pDs41PairQ, oDs41PairQ,
+           "two gemm_nt_q (dtype i8a8) of one shape: y_j = a[:, j K .. (j + 1) K] @ dequant(b_j)^T with a_scale's "
+           "columns of that window, j = 0, 1; then quant_act_i8g (group 128) of each bf16 y_j into q's columns j N .. "
+           "(j + 1) N and scale's j N / 128 ..: q and scale as the four ops leave them (y is not kept)."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -581,5 +615,13 @@ static const RadConstraint cDs41PcnMix[] = {
   "bf16 x, h, out, xc and y, f32 post, comb, pre, w, fn, scale, base and pre_o", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41PcnMix), NOTUNE, nullptr, nullptr, r4d_rad_mhc_post_collapse_rmsnorm_mix,
   r4d_rad_mhc_post_collapse_rmsnorm_mix_scratch, nullptr, nullptr, r4d_shape_mhc_post_collapse_rmsnorm_mix },
+{ "gemm_i8a8_pairq_m16", "gemm_nt_q_pair_i8g", "gemm",
+  "gemm_i8a8_nt_m16 over both weights in ONE launch (blocks [0, N/128) the first, the rest the second), each split K as it "
+  "splits alone, its finisher writing quant_act_i8g's codes of the bf16 sums into the pair (lever A8D fold b)",
+  "M <= 64; N a multiple of 128 below 2048 (always split); K a multiple of 256, at least 512; MW 8",
+  "i8 a with an f32 scale per (row, 128 K), i8 b_j with a bf16 scale per row per 128 K (fragment order), int8 q with an f32 "
+  "scale per (row, 128)", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDs41PairQ), NOTUNE, nullptr, nullptr, r4d_rad_gemm_nt_q_pair_i8g, r4d_rad_gemm_nt_q_pair_i8g_scratch,
+  r4d_pairq_layout, r4d_pairq_relayout, nullptr, r4d_pairq_unrelayout },
 
 #endif
