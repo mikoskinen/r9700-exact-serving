@@ -62,33 +62,33 @@ give the same answers alone, all at once, one at a time beside 16 decode streams
 7,772-token prefill 0.5 s into each probe, and alone again at the end. At both settings these answers
 equal the stored alone answers in `ref-alone.jsonl` [S1][S2].
 
-### Qwen Flash-Next (EXL3 4.05 bpw), 15.11.2026
+### Qwen Flash-Next (EXL3 4.05 bpw), 22.11.2026
 
 | load point | stock 300 W [S19] | 210 W [S20] | target | how it was measured |
 |---|---|---|---|---|
-| mb c1 | 268.7 tok/s | 265.0 tok/s | (none) | gens window of 2, mean of 8 blocks: four a start, two starts |
-| mb c4 | 635.0 tok/s | 607.1 tok/s | (none) | the same |
-| mb c8 | 849.4 tok/s | 810.0 tok/s | (none) | the same |
-| mb c16 | 1122.6 tok/s | 1075.4 tok/s | >= 1000 | the same |
-| mb c24 | 1249.1 tok/s | 1182.6 tok/s | (none) | the same |
-| mb c32 | 1344.8 tok/s | 1284.4 tok/s | (none) | the same |
-| prefill 16k (15,536 tokens) | 9,419 tok/s, TTFT 1.65 s | 9,089 tok/s, TTFT 1.71 s | (none) | the second start's first cold read, prompt tokens divided by the TTFT |
-| prefill 64k (53,800 tokens) | 9,541 tok/s, TTFT 5.64 s | 9,217 tok/s, TTFT 5.84 s | (none) | the same |
-| prefill 128k (119,540 tokens) | 9,395 tok/s, TTFT 12.72 s | 9,094 tok/s, TTFT 13.15 s | (none) | the same |
+| mb c1 | 294.7 tok/s | 283.4 tok/s | (none) | gens window of 2, mean of 8 blocks: four a start, two starts |
+| mb c4 | 654.2 tok/s | 610.7 tok/s | (none) | the same |
+| mb c8 | 899.7 tok/s | 859.1 tok/s | (none) | the same |
+| mb c16 | 1162.9 tok/s | 1108.2 tok/s | >= 1000 | the same |
+| mb c24 | 1289.1 tok/s | 1232.0 tok/s | (none) | the same |
+| mb c32 | 1385.8 tok/s | 1325.8 tok/s | (none) | the same |
+| prefill 16k (15,536 tokens) | 10,498 tok/s, TTFT 1.48 s | 10,216 tok/s, TTFT 1.52 s | (none) | the second start's first cold read, prompt tokens divided by the TTFT |
+| prefill 64k (53,800 tokens) | 10,465 tok/s, TTFT 5.14 s | 10,205 tok/s, TTFT 5.27 s | (none) | the same |
+| prefill 128k (119,540 tokens) | 10,313 tok/s, TTFT 11.59 s | 10,043 tok/s, TTFT 11.90 s | (none) | the same |
 
-The c16 target is met at both settings [S3], and 10,000 tok/s prefill is the next goal.
+The c16 target is met at both settings [S3], and prefill is above 10,000 tok/s at every depth.
 
-Each column comes from two server starts of the image 25d00d1e8131
-(`ghcr.io/mikoskinen/r9700-exact-serving:qwen-4f74a8fa`) with the README's `docker run` command, the
+Each column comes from two server starts of the image be5001de0254
+(`ghcr.io/mikoskinen/r9700-exact-serving:qwen-ff94ef27`) with the README's `docker run` command, the
 rank order the README gives in `ROCR_VISIBLE_DEVICES`, and `run/switches.sh`. The cards cool to 45 °C
-or less before each column. The stock column sets every card to the values of `run/power.sh 300` and
-checks that every card reports them. Six seconds later the fan guard lowers the flat fan value from
-90 to 88 %, and 30 minutes later to 86 % [S19][S17]. In every start the 13 runtime switches read back
-as expected before the decode blocks and at the end. The 20 short identity probes give the same
-answers alone in both starts, one at a time beside 7, 15, 23 and 31 decode streams with a fresh
-8,192- to 16,384-token prefill into each probe, and alone again at the end. The 12 long prompts of 372
-to 5,934 tokens give the same answers alone in both starts and beside 7, 15, 23 and 31 decode streams
-[S19][S20].
+or less before each start. The stock column sets every card to the values of `run/power.sh 300`, and
+every start reads back 300 W and 0 mV on every card. Seconds after the setting the fan guard lowers
+the flat fan value from 90 to 88 %, and 30 minutes later to 86 % [S19]. In every start the 28 runtime
+switches read back as expected before each decode block and at the end. The 20 short identity probes
+give the same answers alone in both starts, one at a time beside 7, 15, 23 and 31 decode streams with
+a fresh 8,192- to 16,384-token prefill into each probe, and alone again at the end. The 12 long prompts
+of 372 to 5,934 tokens give the same answers alone in both starts and beside 7, 15, 23 and 31 decode
+streams [S19][S20].
 
 ## Quality doesn't degrade
 
@@ -112,10 +112,10 @@ Each candidate change goes through the following checks:
      ~8k-token prefill 0.5 s into every probe. 160 of 160 identical to the answers alone and to the
      stored answers, 1,084 background requests with 0 errors, over 32.9 minutes of load windows. The
      soak runs in the 210 W start after its speed sections [S18].
-   - Qwen, 15.11.2026: 4 cycles beside 7, 15, 23 and 31 decode streams, with a fresh 8,192- to
+   - Qwen, 22.11.2026: 4 cycles beside 7, 15, 23 and 31 decode streams, with a fresh 8,192- to
      16,384-token prefill into every probe, each cycle with the 20 short and the 12 long prompts. 100 of
      100 short answers (the alone read after the cycles included) and 48 of 48 long answers identical,
-     over 692 s at stock 300 W and 718 s at 210 W [S19][S20].
+     over 668 s at stock 300 W and 694 s at 210 W [S19][S20].
 4. **Engagement:** before an A/B result is read, the run must prove that the lever actually ran: the
    switch values are read back and the per-form call counters are checked [S10].
 
@@ -307,8 +307,8 @@ its own history.
 | branch prefix | upstream | contents |
 |---|---|---|
 | `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 136 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit d3874235, which `deepseek/current` contains. |
-| `qwen/` | radiance main (451b136) | 28 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen images are built from engine commits 4f74a8fa (the results) and 30903db6 (the Claude Code commands), which `qwen/current` contains. |
-| `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 29 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, and both Qwen images use `exl3/fn4-dual`. |
+| `qwen/` | radiance main (451b136) | 29 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen images are built from engine commits ff94ef27 (the results, `qwen/qfn-on-ds`) and 30903db6 (the Claude Code commands), which `qwen/current` contains. |
+| `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 31 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, the Qwen image of the results uses `exl3/qfn-x3gd` and the Qwen Claude Code image `exl3/fn4-dual`. |
 
 Upstream release tags carry the same prefixes, for example `radiance/v1.15.1` and `exl3/v1.3.0`. The registry
 names branches without the prefix. A branch name alone doesn't tell whether its lever was adopted.
@@ -364,8 +364,8 @@ Line numbers refer to the copies in this repository (`docs/`), as of 13.11.2026.
 - [S16] docs/LEVERS.md:150 (DeepSeek targets, context 1M).
 - [S17] gpu02/exl3-test/runs/log-extract/od-changes-lines-261-292.txt (lines 261-292 of the gpu02 power and fan change log: the stock setting of each stock column, the fan guard's steps from 90 to 88 % and, in the Qwen column, to 86 % on every card, and the restore after each column), gpu02/host/fanguard.sh:5-6 (the 2 % step down).
 - [S18] gpu02/exl3-test/runs/xdsm/hero-ds-1115-210w/: identity.txt:8-23 (the eight soak cycles against the answers alone and against the stored answers, 20 of 20 each), marks.jsonl (the start and end of each soak window, 32.9 minutes in total), run.log:84-109 and id/soak-*.txt (streams, prefill offset and tokens, background requests and errors of each cycle).
-- [S19] gpu02/exl3-test/runs/xdsm/hero-qwen-1115-300w-stock/ (the two stock 300 W starts): s1/blocks.jsonl.gz and s2/blocks.jsonl.gz (the decode blocks with labels `*-decN` and their `tps` field, and the prefill blocks with the label `*-pf`, whose `pf` field has the prompt tokens and the TTFT of each depth, where the cell is the first `*-s2-pf` row), run.log:2 (the power setting read back on every card), :3 (the cool-down) and :52-76 (the soak cycles), s1/ and s2/ (each start's check-answer.json, settle.txt, switches-sh.txt, docker-inspect.json, the switch read-backs in fn/ and every answer file in id/), identity.txt (every identity compare), switches-run.json and repo/run/ (the switch and env files the starts used), ../hero-qwen-1115-300w-stock.out, target docs/LEVERS.md:14.
-- [S20] gpu02/exl3-test/runs/xdsm/hero-qwen-1115-210w/ (the two 210 W starts), with the same files as [S19], except that run.log:1-2 have the caps and offsets read back before the column.
+- [S19] gpu02/exl3-test/runs/xdsm/hero-qwen-1122-300w-stock/ (the two stock 300 W starts, s1/ and s2/): mb.jsonl of each start (the decode blocks and their `agg_dec_tps` field, where a cell is the mean of the first four blocks at that load in both starts), s2/blocks.jsonl:1 (the first prefill block, label `*-pf`, whose `pf` field has the prompt tokens, the TTFT and the tok/s of each depth), run.log:1 of each start (the cap, voltage offset and fan curve read back on every card), its COOL line (the cool-down), its `mb` lines and IDENTITY lines (every cell and identity compare), s2/run.log:42-61 (the soak cycles) and :130 (the fan guard's step to 86 %), each start's check-answer.json, start-lines.txt, switches-sh.txt, docker-inspect.json, the switch read-backs in fn/, every answer file in id/ and identity.txt, want-switches.json and repo/run/ (the switch and env files the starts used), target docs/LEVERS.md:14.
+- [S20] gpu02/exl3-test/runs/xdsm/hero-qwen-1122-210w/ (the two 210 W starts), with the same files as [S19], except the fan guard line.
 - [H0] gpu02/host/hostfacts-20261113.txt (CPU, board, RAM, cards), gpu02/bench/runs/rocm-bw/gpu02-8x64-1102-1632.txt (the 8 x 64 GB set).
 - [H1] docs/hardware-tuning-gpu02.md, which cites every number in the hardware table to a raw file in gpu02/bench/runs/, a script in gpu02/host/, LEVERS.md or R9700-CAPABILITIES-20261112.md. A few numbers (CPU read, the address map, the TP2 c16 for the CPU swap, the fan tests, the 8-agent pair replay, the Threadripper link-width lesson) come only from the original Finnish results logs, which aren't published, and the doc says so per number.
 - [M1] docs/TESTING.md:119. [M2] docs/TESTING.md:120. [M3] docs/TESTING.md:121. [M4] docs/TESTING.md:59, :119.

@@ -3,9 +3,8 @@
 This repository is written for AI coding agents more than for people. Hand it to your agent when you
 set up or tune a similar system.
 
-Update 15.11.2026: DeepSeek splits every routed expert across the four cards and keeps 4.2 full
-1M-token sessions in its KV cache, and Qwen gives identical answers under load up to 32 concurrent
-requests, long prompts included.
+Update 22.11.2026: Qwen prefills 16k- to 128k-token prompts at over 10,000 tok/s and decodes 1,326
+tok/s at 32 concurrent requests on 210 W cards, and its answers stay identical under load.
 
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
 AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
@@ -32,15 +31,15 @@ voltage offset, and the everyday setting caps each card at 210 W with a -50 mV v
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 request | 107 prose / 187 code | 103 prose / 177 code | 269 | 265 |
-| 4 requests | 247 | 227 | 635 | 607 |
-| 8 requests | 305 | 282 | 849 | 810 |
-| 16 requests | 346 | 319 | 1,123 | 1,075 |
-| 24 requests | 375 | 342 | 1,249 | 1,183 |
-| 32 requests | 415 | 378 | 1,345 | 1,284 |
-| Prefill 16k | 4,480 | 4,640 | 9,420 | 9,090 |
-| Prefill 64k | 5,980 | 5,800 | 9,540 | 9,220 |
-| Prefill 128k | 6,330 | 5,810 | 9,400 | 9,090 |
+| 1 request | 107 prose / 187 code | 103 prose / 177 code | 295 | 283 |
+| 4 requests | 247 | 227 | 654 | 611 |
+| 8 requests | 305 | 282 | 900 | 859 |
+| 16 requests | 346 | 319 | 1,163 | 1,108 |
+| 24 requests | 375 | 342 | 1,289 | 1,232 |
+| 32 requests | 415 | 378 | 1,386 | 1,326 |
+| Prefill 16k | 4,480 | 4,640 | 10,500 | 10,220 |
+| Prefill 64k | 5,980 | 5,800 | 10,470 | 10,200 |
+| Prefill 128k | 6,330 | 5,810 | 10,310 | 10,040 |
 
 ## Run it
 
@@ -79,22 +78,27 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/qwen.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-4f74a8fa \
+  -e RADIANCE_FN4_LANE_EAGER=1 -e RADIANCE_SCHED_PUB_PROMPT=1 -e RADIANCE_FN4_X3GD_HI=32 \
+  -e RADIANCE_FN4_CHAIN=1 -e RADIANCE_FN4_SP_PLE=1 -e RADIANCE_FN4_GNQ8=1 -e RADIANCE_FN4_RESUME_COLD=1 \
+  -e RADIANCE_SCHED_TAIL_GRID=2048 -e RADIANCE_FN4_DRAFT_UNI=1 -e RADIANCE_FN4_P2X=1 \
+  -e RADIANCE_FN4_DRZ_KEEP=prot -e RADIANCE_FN4_MSP=1 -e RADIANCE_FN4_TIP=1 \
+  -e RADIANCE_FN4_QSA_SPLIT=1 -e RADIANCE_FN4_QSA_SPLIT_MIN=8192 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-ff94ef27 \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
   --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
-  --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume exact \
   --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
   --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
-  --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
   --thinking-token-budget 16000 --default-max-tokens 32768
-run/switches.sh run/qwen/switches.json
+run/switches.sh run/qwen/switches-ff94ef27.json
 ```
 
 The server is ready in about two minutes. [run/switches.sh](run/switches.sh) waits for it, then sets
 the runtime switches of the batch-invariant kernel set and checks that each one took effect. The
 result runs on gpu02 also set the rank order with `ROCR_VISIBLE_DEVICES`, putting the cards at PCI
-bus 03, c3, 84 and 48 on ranks 0 to 3.
+bus 03, c4, 83 and 48 on ranks 0 to 3.
 
 ### Qwen for Claude Code
 
@@ -496,8 +500,9 @@ The `main` branch has:
   [DeepSeek on two machines](#deepseek-on-two-machines).
 
 The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
-`deepseek/current` with `exl3/current`, and both Qwen images from `qwen/current` with `exl3/fn4-dual`
-compiled with `-DEXL3R4D_DZ=2`. The two-machine image was built from `deepseek/ds41-pp-dev` with
+`deepseek/current` with `exl3/current`, the Qwen image in [Qwen](#qwen) from `qwen/qfn-on-ds` with
+`exl3/qfn-x3gd`, and the Qwen Claude Code image from `qwen/fn4-x3-qsasp` with `exl3/fn4-dual` compiled
+with `-DEXL3R4D_DZ=2`. The two-machine image was built from `deepseek/ds41-pp-dev` with
 `exl3/ds41-x7-route` compiled with `-DEXL3R4D_X6_SGB=1 -DEXL3R4D_X5_SUM=3` (HIP) and
 `-DEXL3R4D_DK_MAX=64` (C). Every other branch is a single experiment or an earlier build, kept for
 the record.
