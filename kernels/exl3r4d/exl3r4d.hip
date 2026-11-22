@@ -1309,63 +1309,70 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     }                                                                                \
   } while (0)
 
-  // X6w VDOT 3: the K loop once a 4-row window of the run (rows rg_ .. rg_ + 3; one pass at <= 4 rows); otherwise once
-  const int rg_end_ = EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF) ? nrv : 1;
-  for (int rg_ = 0; rg_ < rg_end_; rg_ += 4) {
-  if constexpr (EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF)) {
-#pragma unroll
-    for (int j = 0; j < NPW; j++)
-#pragma unroll
-      for (int r = 0; r < 4; r++) vacc4[j][r] = 0.f;
-  }
-  // Loads are unconditional (the step index clamps to the last one): with a branch around the prefetch, the
-  // compiler cannot count the loads in flight on the join and waits for ALL of them before the next WMMA, which
+  // X6w VDOT 3: the K loop once a 4-row window of the run (rows rg_ .. rg_ + 3; one pass at <= 4 rows); every other build runs it
+  // once with no wrapper (the served code). Loads are unconditional (the step index clamps to the last one): with a branch around
+  // the prefetch, the compiler cannot count the loads in flight on the join and waits for ALL of them before the next WMMA, which
   // serialized the prefetch with the math every other step (exl3_moe_wmma.hip:714-716; FACTS-exl3 trap 11).
-#pragma unroll
-  for (int u = 0; u < PF - 1; u++) {
-    if constexpr (APREP && EXL3R4D_EW) {
+#define EXL3_KLOOP()                                                                     \
+  do {                                                                               \
+  _Pragma("unroll") \
+    for (int u = 0; u < PF - 1; u++) { \
+      if constexpr (APREP && EXL3R4D_EW) { \
+  _Pragma("unroll") \
+        for (int j = 0; j < NPW; j++) \
+  _Pragma("unroll") \
+          for (int r = 0; r < 2; r++) \
+  _Pragma("unroll") \
+            for (int x = 0; x < NW; x++) wb[u][j][r][x] = ew[u][j][r][x]; \
+        ab[u] = frag_lds(alds + aoff + (u < kps ? u : kps - 1) * 16); \
+      } else { \
+        EXL3_LOAD(u < kps ? u : kps - 1, wb[u], ab[u]); \
+      } \
+    } \
+    int ks = 0; \
+    for (; ks + PF <= kps; ks += PF) { \
+  _Pragma("unroll") \
+      for (int u = 0; u < PF; u++) { \
+        const int ls = ks + u + PF - 1 < kps ? ks + u + PF - 1 : kps - 1; \
+        EXL3_LOAD(ls, wb[(u + PF - 1) % PF], ab[(u + PF - 1) % PF]); \
+        EXL3_COMPUTE(wb[u], ab[u]); \
+      } \
+    } \
+  _Pragma("unroll") \
+    for (int u = 0; u < PF - 1; u++) /* the last kps % PF steps, already loaded into stages 0.. */ \
+      if (ks + u < kps) EXL3_COMPUTE(wb[u], ab[u]); \
+  } while (0)
+  if constexpr (EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF)) {
+    for (int rg_ = 0; rg_ < nrv; rg_ += 4) {
 #pragma unroll
       for (int j = 0; j < NPW; j++)
 #pragma unroll
-        for (int r = 0; r < 2; r++)
+        for (int r = 0; r < 4; r++) vacc4[j][r] = 0.f;
+      EXL3_KLOOP();
+      {   // the window's rows into the D layout (VDOT 2's move)
+        const int hh = lane >> 4;
 #pragma unroll
-          for (int x = 0; x < NW; x++) wb[u][j][r][x] = ew[u][j][r][x];
-      ab[u] = frag_lds(alds + aoff + (u < kps ? u : kps - 1) * 16);
-    } else {
-      EXL3_LOAD(u < kps ? u : kps - 1, wb[u], ab[u]);
-    }
-  }
-  int ks = 0;
-  for (; ks + PF <= kps; ks += PF) {
+        for (int r = 0; r < 4; r++) {
+          if (rg_ + r < nrv) {   // wave-uniform
 #pragma unroll
-    for (int u = 0; u < PF; u++) {
-      const int ls = ks + u + PF - 1 < kps ? ks + u + PF - 1 : kps - 1;
-      EXL3_LOAD(ls, wb[(u + PF - 1) % PF], ab[(u + PF - 1) % PF]);
-      EXL3_COMPUTE(wb[u], ab[u]);
-    }
-  }
+            for (int j = 0; j < NPW; j++) {
+              const float o = swap16(vacc4[j][r]);
+              const float full = hh ? o + vacc4[j][r] : vacc4[j][r] + o;
 #pragma unroll
-  for (int u = 0; u < PF - 1; u++)  // the last kps % PF steps, already loaded into stages 0..
-    if (ks + u < kps) EXL3_COMPUTE(wb[u], ab[u]);
-  if constexpr (EXL3R4D_X6_VDOT == 3 && (X3D || K25 != K25_OFF)) {   // the window's rows into the D layout (VDOT 2's move)
-    const int hh = lane >> 4;
-#pragma unroll
-    for (int r = 0; r < 4; r++) {
-      if (rg_ + r < nrv) {   // wave-uniform
-#pragma unroll
-        for (int j = 0; j < NPW; j++) {
-          const float o = swap16(vacc4[j][r]);
-          const float full = hh ? o + vacc4[j][r] : vacc4[j][r] + o;
-#pragma unroll
-          for (int e = 0; e < 8; e++) {
-            const float t = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((8 * hh + e) * 4, __builtin_bit_cast(int, full)));
-            if ((lane & 15) == rg_ + r) acc[j][e] = t;
+              for (int e = 0; e < 8; e++) {
+                const float t = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((8 * hh + e) * 4, __builtin_bit_cast(int, full)));
+                if ((lane & 15) == rg_ + r) acc[j][e] = t;
+              }
+            }
           }
         }
       }
     }
+  } else {
+    [[maybe_unused]] constexpr int rg_ = 0;
+    EXL3_KLOOP();
   }
-  }   // X6w VDOT 3's windows
+#undef EXL3_KLOOP
 #undef EXL3_LOAD
 #undef EXL3_COMPUTE
 #undef WOFF_
