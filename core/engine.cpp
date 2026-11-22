@@ -904,7 +904,9 @@ int Engine::prepare_release(const RadBatch* b, bool switches) {
             }
         }
     }
+    if (pph_rm_) pph_rm_[PostPhases::kRSw] = rad_mono_ns();   /* tp8 loop D78: the switches' end (a log mark only) */
     psk_release(b);
+    if (pph_rm_) pph_rm_[PostPhases::kRPsk] = rad_mono_ns();
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
      * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
     if (dl_capable_) {
@@ -919,10 +921,12 @@ int Engine::prepare_release(const RadBatch* b, bool switches) {
     /* Lever Z0-W: the drafter's query-pass weights lent while the slab's lend is wanted and this step runs no
      * head; recalled (and copied back) before a step whose head runs. Every rank thread is parked. */
     if (const int ws = draft_w_step(); ws < 0) return ws;
+    if (pph_rm_) pph_rm_[PostPhases::kRLend] = rad_mono_ns();   /* tp8 loop D78 */
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
     sahb_note();
+    if (pph_rm_) pph_rm_[PostPhases::kRArena] = rad_mono_ns();   /* tp8 loop D78 */
     /* Grow the followers' pools to match rank 0's before the step's block table is used:
      * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
      * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
@@ -933,11 +937,13 @@ int Engine::prepare_release(const RadBatch* b, bool switches) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    if (pph_rm_) pph_rm_[PostPhases::kRFollow] = rad_mono_ns();   /* tp8 loop D78 */
     /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
      * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
      * parked, so no allocation races the read. */
     kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
+    if (pph_rm_) pph_rm_[PostPhases::kRKvs] = rad_mono_ns();   /* tp8 loop D78 */
     return RAD_OK;
 }
 

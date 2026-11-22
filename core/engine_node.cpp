@@ -1007,10 +1007,10 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     return RAD_OK;
 }
 
-int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
+/* The drafter builds since the last frame, in their order (each names its lane in its header: the follower replays it into that
+ * lane's builder before that lane's next trunk step) -- pp_ship's first part, and (tp8 loop D79) a lane's drafter wait's. */
+int Engine::pp_draft_flush() {
     if (!pp_link_) return RAD_OK;
-    /* The drafter builds since the last trunk step, in their order, before this one (each names its
-     * lane in its header: the follower replays it into that lane's builder). */
     for (auto& [step, dlane, fr] : pp_draft_q_) {
         (void)dlane;
         if (const int st = pp_link_->send(net::kStep, (uint64_t)step, 0, fr.data(), (int64_t)fr.size()); st < 0) {
@@ -1019,7 +1019,17 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
         }
         ++pp_builds_shipped_;
     }
+    if (pph_rm_ && pph_) pph_->rm_draft += (int64_t)pp_draft_q_.size();   /* tp8 loop D78: sent on the head's path */
     pp_draft_q_.clear();
+    return RAD_OK;
+}
+
+int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
+    if (!pp_link_) return RAD_OK;
+    /* The drafter builds since the last trunk step, in their order, before this one (each names its
+     * lane in its header: the follower replays it into that lane's builder). */
+    RAD_TRY(pp_draft_flush());
+    if (pph_rm_) pph_rm_[PostPhases::kRDraftQ] = rad_mono_ns();   /* tp8 loop D78: the drafter builds sent (a log mark only) */
     /* tp8 S6 (RADIANCE_PP_KV_CHECK=N): every N trunk steps, the copied KV layers' CRCs after the last
      * one, before this step's frame (the follower compares them after its own last step) */
     if (run && pp_kv_check_every_ > 0 && pp_steps_shipped_ > 0 && pp_steps_shipped_ % pp_kv_check_every_ == 0 &&
@@ -1029,8 +1039,13 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
     const char* span = nullptr;
     int64_t n = 0;
     RAD_TRY(pp_frame(b, run, &head, &span, &n, lane));
+    if (pph_rm_ && pph_) {   /* tp8 loop D78 */
+        pph_->rm_bytes += (int64_t)head.size() + n;
+        pph_rm_[PostPhases::kRFrame] = rad_mono_ns();
+    }
     const int st = pp_link_->send2(net::kStep, (uint64_t)b->step, run ? 1 : 0, head.data(), (int64_t)head.size(),
                                    span, n);
+    if (pph_rm_) pph_rm_[PostPhases::kRSend] = rad_mono_ns();   /* tp8 loop D78 */
     if (st < 0) return st;
     ++pp_builds_shipped_;
     if (run) {
@@ -1048,15 +1063,7 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
 int Engine::pp_ship_hold(const RadBatch* b, int lane) {
     if (!pp_link_) return RAD_OK;
     if (lane < 0 || lane >= RAD_PP_MAX_LANES) return RAD_E_INVAL;
-    for (auto& [step, dlane, fr] : pp_draft_q_) {
-        (void)dlane;
-        if (const int st = pp_link_->send(net::kStep, (uint64_t)step, 0, fr.data(), (int64_t)fr.size()); st < 0) {
-            pp_draft_q_.clear();
-            return st;
-        }
-        ++pp_builds_shipped_;
-    }
-    pp_draft_q_.clear();
+    RAD_TRY(pp_draft_flush());
     PpHeld& h = pp_held_[lane];
     const char* span = nullptr;
     int64_t n = 0;

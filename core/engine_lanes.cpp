@@ -419,6 +419,13 @@ void Engine::dch_note_head(int lane, const RadBatch* b) {
     }
     const uint64_t shipped = rad_mono_ns();
     if (pph_ && pph_->t[lane][0]) pph_->t[lane][7] = shipped;   /* tp8 loop D60: release + ship done */
+    if (pph_ && pph_rm_ == pph_->rm && pph_->t[lane][0]) {   /* tp8 loop D78: this head's parts, read at the chain's close */
+        pph_->rm[PostPhases::kRNote] = shipped;
+        for (int k = 0; k < PostPhases::kRN; ++k) pph_->rl[lane][k] = pph_->rm[k];
+        pph_->rl_draft[lane] = pph_->rm_draft;
+        pph_->rl_bytes[lane] = pph_->rm_bytes;
+        pph_->rl_on[lane] = true;
+    }
     const double g = (double)(shipped - dch_collect_ns_[lane]) / 1e6;
     dch_collect_ns_[lane] = 0;
     ++dch_n_;
@@ -486,7 +493,53 @@ void Engine::pph_close(int lane) {
     v[PostPhases::kAll]    = d(t[0], now);
     pph_->win.add(v, pph_->dend[lane], pph_->x2w[lane]);
     pph_->run.add(v, pph_->dend[lane], pph_->x2w[lane]);
+    if (pph_->rl_on[lane]) {   /* tp8 loop D78: release + ship by part, telescoping from the plan's end t[6] to the ship mark t[7] */
+        pph_->rl_on[lane] = false;
+        const uint64_t* m = pph_->rl[lane];
+        double r[PostPhases::kRN];
+        uint64_t prev = t[6];
+        for (int k = 0; k < PostPhases::kRN; ++k) {
+            const uint64_t mk = k == PostPhases::kRNote ? t[7] : std::min(std::max(m[k], prev), t[7]);   /* a mark not set = no time */
+            r[k] = d(prev, mk);
+            prev = mk;
+        }
+        for (PostPhases::RAcc* a : { &pph_->rwin, &pph_->rrun }) {
+            ++a->n;
+            a->draft_frames += pph_->rl_draft[lane];
+            a->frame_bytes += pph_->rl_bytes[lane];
+            for (int k = 0; k < PostPhases::kRN; ++k) {
+                a->ms[k] += r[k];
+                ++a->hist[k][std::min<size_t>(PostPhases::kBins - 1, (size_t)std::max(0.0, r[k] * 100.0))];
+            }
+        }
+    }
     for (int k = 0; k < 8; ++k) t[k] = 0;
+}
+double Engine::PostPhases::RAcc::p50(int k) const {
+    int64_t acc = 0;
+    for (int i = 0; i < kBins; ++i) {
+        acc += hist[k][i];
+        if (n > 0 && 2 * acc >= n) return (double)i / 100.0 + 0.005;
+    }
+    return 0;
+}
+/* tp8 loop D78: the D60 line's 'release + ship' by part (POST_PHASES=2) */
+std::string Engine::pph_rtext(const PostPhases::RAcc& a, const char* when) const {
+    const double n = a.n > 0 ? (double)a.n : 1.0;
+    auto pm = [&](int k) { return fmt("%.2f / %.2f", a.p50(k), a.ms[k] / n); };
+    double sum = 0;
+    for (int k = 0; k < PostPhases::kRN; ++k) sum += a.ms[k] / n;
+    return fmt("two-node pipeline: the leader's release + ship by part%s (tp8 loop D78): %lld decode heads; p50 / mean ms -- the lane loop "
+               "after the plan %s, select + clears %s, the fn4 switches %s, psk_release %s, the draft lend / W %s, the arena %s, the "
+               "ranks' kv.follow %s, kvstream runs + bound %s, checkpoint restores %s, the band choice %s, the drafter builds sent %s "
+               "(%.2f a head), the frame made %s (%.0f bytes a head), the frame sent %s, the notes %s; their mean sum %.2f ms (= release "
+               "+ ship)",
+               when, (long long)a.n, pm(PostPhases::kRLoop).c_str(), pm(PostPhases::kRSel).c_str(), pm(PostPhases::kRSw).c_str(),
+               pm(PostPhases::kRPsk).c_str(), pm(PostPhases::kRLend).c_str(), pm(PostPhases::kRArena).c_str(),
+               pm(PostPhases::kRFollow).c_str(), pm(PostPhases::kRKvs).c_str(), pm(PostPhases::kRRestore).c_str(),
+               pm(PostPhases::kRBand).c_str(), pm(PostPhases::kRDraftQ).c_str(), (double)a.draft_frames / n,
+               pm(PostPhases::kRFrame).c_str(), (double)a.frame_bytes / n, pm(PostPhases::kRSend).c_str(),
+               pm(PostPhases::kRNote).c_str(), sum);
 }
 std::string Engine::pph_text(const PostPhases::Acc& a, int64_t drops, const char* when, double window_s) const {
     const double n = a.n > 0 ? (double)a.n : 1.0;
@@ -702,6 +755,18 @@ void Engine::pp_rband_note(int lane, int rband, int rkeys) {
 }
 
 int Engine::lane_head(int lane, const RadBatch* b) {
+    /* tp8 loop D78 (RADIANCE_PP_POST_PHASES=2): a decode head whose lane's chain is open marks its release + ship by part (log
+     * only; every return below drops the marks) */
+    struct RmOff {
+        uint64_t*& p;
+        ~RmOff() { p = nullptr; }
+    } rm_off{ pph_rm_ };
+    if (pph_ && pph_->level >= 2 && lane >= 0 && lane < RAD_PP_MAX_LANES && pph_->t[lane][0] && b && b->phase == RAD_PHASE_DECODE) {
+        for (uint64_t& x : pph_->rm) x = 0;
+        pph_->rm_draft = pph_->rm_bytes = 0;
+        pph_->rm[PostPhases::kRLoop] = rad_mono_ns();
+        pph_rm_ = pph_->rm;
+    }
     lane_select(lane);
     /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1): this chunk's head, bracketed on rank 0's stream */
     const StepEntry* pfe = pf_tl_ ? pf_entry(b, lsched().plan()) : nullptr;
@@ -710,6 +775,7 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     /* tp8 loop D36: the band the lane loop chose for this step, if it chose one (taken first: every return below is a failure) */
     const int band_pre = pp_band_pre_;
     pp_band_pre_ = -1;
+    if (pph_rm_) pph_rm_[PostPhases::kRSel] = rad_mono_ns();   /* tp8 loop D78 */
     if (const int ps = prepare_release(b); ps < 0) return ps;
     if (!pp_trunk_pending_[lane]) {
         RAD_ERR("two-node pipeline: lane %d's step %d was released without its build", lane, b->step);
@@ -719,6 +785,7 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     /* tp8 S6: a prefix hit's snapshot restores, on this node's streams before the head (the follower runs them from
      * the frame before its pass); the tail reads the restored state on the same stream */
     RAD_TRY(restore_checkpoints());
+    if (pph_rm_) pph_rm_[PostPhases::kRRestore] = rad_mono_ns();   /* tp8 loop D78 */
     /* tp8 loop P28: the frame says so; the head runs [0, h + k) */
     const int band = band_pre >= 0 ? band_pre : pp_band_step(lane, b);
     /* tp8 loop D39: a tail band (never beside a head band); the frame says so, the lane keeps j for its tail part */
@@ -726,6 +793,7 @@ int Engine::lane_head(int lane, const RadBatch* b) {
     /* tp8 loop P41: a reverse pass (never beside a band / tail band); the frame says so */
     int rkeys = 0;   /* step 5: X1 in the keys form */
     const int rband = band > 0 || tband > 0 ? 0 : pp_rband_step(lane, b, &rkeys);
+    if (pph_rm_) pph_rm_[PostPhases::kRBand] = rad_mono_ns();   /* tp8 loop D78 */
     pp_ship_band_ = band;
     pp_ship_tband_ = tband;
     pp_ship_rband_ = rband;
@@ -1511,15 +1579,32 @@ int Engine::step_loop_lanes() {
     /* tp8 loop D60 (RADIANCE_PP_POST_PHASES=1, this node = the leader): D35's chain by phase, a line at RADIANCE_PP_BGRATE_LINE_S's period
      * (the window since the last one) and one over the run; timestamps on the engine thread only -- no step, issue or byte changes */
     pph_.reset();
-    if (const char* v = std::getenv("RADIANCE_PP_POST_PHASES"); v && *v && std::strcmp(v, "0") != 0) {
+    /* tp8 loop D79 (RADIANCE_PP_DRAFT_SHIP=1, the leader of a pipeline): the drafter builds out at the drafter wait; unset / 0 = at
+     * the next head (pp_ship) as before */
+    pp_draft_ship_ = false;
+    pp_dship_n_ = pp_dship_builds_ = 0;
+    pp_dship_ms_ = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_DRAFT_SHIP"); v && *v && std::strcmp(v, "0") != 0) {
         if (!std::strcmp(v, "1") && pp_link_) {
+            pp_draft_ship_ = true;
+            RAD_INFO("two-node pipeline: RADIANCE_PP_DRAFT_SHIP=1 -- a lane's drafter builds go to the follower while the host waits for "
+                     "the drafter's passes on the card, not on the next head's path (tp8 loop D79; the link's message order unchanged)");
+        } else {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_DRAFT_SHIP=%s is not taken: 1 (the leader of a pipeline) or unset (tp8 loop D79)", v);
+        }
+    }
+    if (const char* v = std::getenv("RADIANCE_PP_POST_PHASES"); v && *v && std::strcmp(v, "0") != 0) {
+        if ((!std::strcmp(v, "1") || !std::strcmp(v, "2")) && pp_link_) {
             pph_ = std::make_unique<PostPhases>();
             pph_->win_t0 = rad_mono_ns();
-            RAD_INFO("two-node pipeline: RADIANCE_PP_POST_PHASES=1 -- the leader host's path from a decode lane's collect to its next "
-                     "decode head's issue, by phase, every %llu s and over the run (tp8 loop D60; a log line only)",
-                     (unsigned long long)(bgr_every / 1000000000ull));
+            pph_->level = v[0] - '0';
+            RAD_INFO("two-node pipeline: RADIANCE_PP_POST_PHASES=%s -- the leader host's path from a decode lane's collect to its next "
+                     "decode head's issue, by phase%s, every %llu s and over the run (tp8 loop D60%s; a log line only)", v,
+                     pph_->level >= 2 ? ", and its release + ship by part" : "", (unsigned long long)(bgr_every / 1000000000ull),
+                     pph_->level >= 2 ? " + D78" : "");
         } else {
-            RAD_WARN("two-node pipeline: RADIANCE_PP_POST_PHASES=%s is not taken: 1 (the leader of a pipeline) or unset (tp8 loop D60)", v);
+            RAD_WARN("two-node pipeline: RADIANCE_PP_POST_PHASES=%s is not taken: 1 / 2 (the leader of a pipeline) or unset (tp8 loop "
+                     "D60 / D78)", v);
         }
     }
     auto bgr_line = [&](const char* when) {
@@ -2213,6 +2298,10 @@ int Engine::step_loop_lanes() {
                 if (pph_) {   /* tp8 loop D60: the window since the last line */
                     const double ws = (double)(now - pph_->win_t0) / 1e9;
                     RAD_INFO("%s", pph_text(pph_->win, pph_->win_drop, fmt(" over the last %.1f s", ws).c_str(), ws).c_str());
+                    if (pph_->level >= 2) {   /* tp8 loop D78 */
+                        RAD_INFO("%s", pph_rtext(pph_->rwin, fmt(" over the last %.1f s", ws).c_str()).c_str());
+                        pph_->rwin = PostPhases::RAcc{};
+                    }
                     pph_->win = PostPhases::Acc{};
                     pph_->win_drop = 0;
                     pph_->win_t0 = now;
@@ -2321,6 +2410,10 @@ int Engine::step_loop_lanes() {
     if (pp_link_ && dch_n_ > 0)                /* tp8 loop D35 */
         RAD_INFO("two-node pipeline: decode chain on the leader host over the run (tp8 loop D35): %s", dch_text().c_str());
     if (pph_) RAD_INFO("%s", pph_text(pph_->run, pph_->run_drop, " over the run", 0).c_str());   /* tp8 loop D60 */
+    if (pph_ && pph_->level >= 2) RAD_INFO("%s", pph_rtext(pph_->rrun, " over the run").c_str());   /* tp8 loop D78 */
+    if (pp_draft_ship_)   /* tp8 loop D79 */
+        RAD_INFO("two-node pipeline: drafter builds shipped at the drafter wait over the run (tp8 loop D79): %lld flushes, %lld builds, "
+                 "%.3f ms a flush", (long long)pp_dship_n_, (long long)pp_dship_builds_, pp_dship_n_ ? pp_dship_ms_ / (double)pp_dship_n_ : 0.0);
     if (pp_tband_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as tail band passes (RADIANCE_PP_TAIL_BAND=1, tp8 loop D39); "
                                "%lld fresh BG steps ran W(h, t)'s under fn4 pp_tband 0; %lld of the tail band passes carried a later chunk "
                                "(pp_tband 2, D39b)", (long long)pp_tband_n_, (long long)pp_tband_off_n_, (long long)pp_tband_cont_n_);
@@ -2709,6 +2802,15 @@ int Engine::lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on
     if (pph_on) {   /* tp8 loop D60: the commit's end; whether the drafter's passes had ended by now (no wait owed: ended) */
         pph_->t[lane][1] = rad_mono_ns();
         pph_->dend[lane] = !so.early || rad_event_query(step_end_) == 1;
+    }
+    /* tp8 loop D79 (RADIANCE_PP_DRAFT_SHIP=1): the drafter builds this lane's tail queued (and any other lane's still queued) go out
+     * now, in the host's wait for the drafter's passes, not on the next head's path; the same messages in the same order */
+    if (pp_draft_ship_ && so.early && !pp_draft_q_.empty()) {
+        const uint64_t s0 = rad_mono_ns();
+        pp_dship_builds_ += (int64_t)pp_draft_q_.size();
+        RAD_TRY(pp_draft_flush());
+        ++pp_dship_n_;
+        pp_dship_ms_ += (double)(rad_mono_ns() - s0) / 1e6;
     }
     if (so.early) {
         /* tp8 loop D61 (host_spin site 2): spin on the drafter's end first, then block as before (a no-op wait when it ended) */
