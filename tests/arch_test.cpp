@@ -13716,6 +13716,209 @@ TEST(flashnext_qsp_issues_a_prefill_steps_qsa_score_and_select_twice) {
     unsetenv("RADIANCE_FN4_GATHER_INV");
 }
 
+/* qfn-on-ds lever QRS (Qwen loop round 29, QUEUE Q53; sp_route bit 32768, RADIANCE_FN4_QRS=1 declares): in the windowed path (a
+ * pipelined step wider than the 2,048-row score plane) rank r issues each window's qsa_score / qsa_select over ITS quarter only --
+ * rows [w0 + r q, +q), q = 512, at those rows' query rows and positions, cu {0, q} = the step bounds' [4, 5] -- into the window's
+ * staging slot, then on lane 1 behind lane 0 (a join 0 -> 1) three all_gather ops place the quarters into the window's sel / nsel /
+ * sequ rows; lane 0 joins lane 1 before the attention. Checked on all four ranks for 2,048 + 1,792 (two windows, the second
+ * overlapping at 1,792), 4 x 2,048 (four windows) and 2,048 + 1,791 (the overlapping window at 1,791 is not 16-byte aligned in
+ * sel: today's whole window behind a join): the four quarters cover every window, the gathers pass libr4d's admission arithmetic
+ * (y = 4 x numel(x), both ends 16-byte aligned), and every other issue is today's in today's order. Controls: the bit without the
+ * declare = today; the bit off = today; a 1,170-row plain step and a <= 256-row MIXED step unchanged; mutation control: the
+ * coverage check over rank 0's quarters taken for every rank fails. */
+TEST(flashnext_qrs_scores_a_quarter_window_a_rank_and_gathers_the_selections) {
+    setenv("RADIANCE_FN4_SPHC", "1", 1);
+    setenv("RADIANCE_FN4_P2X", "1", 1);
+    setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+    setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    struct Iss { std::string op; int64_t n; std::vector<RadOperand> a; int lane; size_t idx; };
+    struct Out { std::vector<Iss> list; std::vector<RecJoin> joins; const int32_t* pos = nullptr; rad_buf sel = 0, nsel = 0,
+                 sequ = 0, qsel = 0, qnsel = 0, qsequ = 0, q = 0; int64_t lw = 0, qw = 0; bool fail = false; };
+    auto run = [&](const std::vector<int>& dq, int pq, int32_t ctx0, int sprv, bool decl, int rank) -> Out {
+        Out o;
+        if (decl) setenv("RADIANCE_FN4_QRS", "1", 1); else unsetenv("RADIANCE_FN4_QRS");
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(rank, 4);
+        ctx.max_tok = 8192;
+        ctx.max_mixed_tok = 2048;
+        const int drc = stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(drc, RAD_OK);
+        if (drc != RAD_OK) { o.fail = true; return o; }
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        o.sel = m.qsaw.sel; o.nsel = m.qsaw.nsel; o.sequ = m.qsaw.sequ;
+        o.qsel = m.qsaw.qrs_sel; o.qnsel = m.qsaw.qrs_nsel; o.qsequ = m.qsaw.qrs_sequ; o.q = m.qsaw.q;
+        o.lw = m.qsacfg.topk + 1;
+        o.qw = m.qsacfg.heads * m.qsacfg.head_dim;
+        qwen4exp_fp8::fn4_sp_flag().store(2);
+        qwen4exp_fp8::fn4_pair_flag().store(1);
+        qwen4exp_fp8::fn4_hcbi_flag().store(5);
+        qwen4exp_fp8::fn4_spser_flag().store(1);
+        qwen4exp_fp8::fn4_sproute_flag().store(sprv);
+        rad::arch::fn4_qrs_flag().store((sprv & 32768) ? 1 : 0);   /* as the plugin's sp_route switch sets it */
+        const auto pf = kit(b, dq, { pq }, ctx0);
+        pf->b.positions_h = pf->pos.data();
+        o.pos = pf->b.positions;
+        const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, 4);
+        rad::arch::fn4_qrs_flag().store(0);
+        qwen4exp_fp8::fn4_sproute_flag().store(0);
+        qwen4exp_fp8::fn4_spser_flag().store(0);
+        qwen4exp_fp8::fn4_hcbi_flag().store(0);
+        qwen4exp_fp8::fn4_pair_flag().store(0);
+        qwen4exp_fp8::fn4_sp_flag().store(0);
+        rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = nullptr;
+        m.pipe_cu_tried = false;
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        o.fail = !c.step_fail.empty();
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            const RecOp* op = b.op_of(c.issues[i].op);
+            if (op) o.list.push_back({ op->op, c.issues[i].n, c.issues[i].opd, c.issues[i].lane, i });
+        }
+        o.joins = c.joins;
+        unsetenv("RADIANCE_FN4_QRS");
+        return o;
+    };
+    auto names = [](const Out& o, bool drop_qsa) {
+        std::vector<std::pair<std::string, int64_t>> l;
+        for (const Iss& i : o.list)
+            if (!drop_qsa || (i.op != "qsa_score" && i.op != "qsa_select" && i.op != "all_gather")) l.push_back({ i.op, i.n });
+        return l;
+    };
+    auto has_join = [](const Out& o, size_t at, int from, int to) {
+        for (const RecJoin& j : o.joins) if (j.at == at && j.from == from && j.to == to) return true;
+        return false;
+    };
+    /* One rank's QRS windows read from its list: per window (in issue order) the first row of the rank's quarter, the window's
+     * first row (the gather's y), or -1 for a whole window; false on any shape / lane / join / admission mismatch. */
+    struct Win { int64_t m0 = -1, w0 = -1, whole = 0; };
+    auto windows = [&](const Out& o, int rank, int64_t T, std::vector<Win>* ws) -> bool {
+        const int64_t q = 512, PR = 2048;
+        ws->clear();
+        int64_t k = 0;
+        for (size_t i = 0; i < o.list.size(); ++i) {
+            const Iss& a = o.list[i];
+            if (a.op != "qsa_score") continue;
+            if (a.n == PR && T > PR) {   /* a whole window (or today's form) */
+                if (i + 1 >= o.list.size() || o.list[i + 1].op != "qsa_select" || o.list[i + 1].n != PR) return false;
+                Win w; w.whole = 1; w.w0 = a.a[0].offset / o.qw; ws->push_back(w);
+                k = 0;   /* a whole window is its layer's last (only the overlapping last window can be unaligned) */
+                continue;
+            }
+            if (a.n != q) continue;   /* another score (the MTP head's plain path etc.) */
+            if (i + 4 >= o.list.size()) return false;
+            const Iss &se = o.list[i + 1], &g0 = o.list[i + 2], &g1 = o.list[i + 3], &g2 = o.list[i + 4];
+            if (se.op != "qsa_select" || se.n != q || g0.op != "all_gather" || g1.op != "all_gather" || g2.op != "all_gather")
+                return false;
+            if (a.lane != 0 || se.lane != 0 || g0.lane != 1 || g1.lane != 1 || g2.lane != 1) return false;
+            if (!has_join(o, g0.idx, 0, 1)) return false;   /* behind lane 0's select */
+            Win w;
+            w.m0 = a.a[0].offset / o.qw;   /* the score's query rows */
+            if (a.a[0].offset % o.qw || a.a[0].rows != q) return false;
+            if ((w.m0 % q) != 0 && T % PR == 0) return false;
+            /* the select: positions + m0, cu {0, q} (the bounds' [4, 5]), its outputs in staging slot k */
+            if ((const int32_t*)se.a[3].raw - o.pos != w.m0) return false;
+            if (se.a[5].handle != o.qsel || se.a[5].offset != k * q * o.lw || se.a[5].rows != q) return false;
+            if (se.a[6].handle != o.qnsel || se.a[6].offset != k * q || se.a[7].handle != o.qsequ || se.a[7].offset != k * q)
+                return false;
+            /* the gathers: x = the slot, y = the window's rows; libr4d's admission (r4d_ar_gather_admit.h): numel(y) =
+             * 4 numel(x), both ends 16-byte aligned (i32 words) */
+            if (g0.a[0].handle != o.qsel || g0.a[0].offset != k * q * o.lw || g0.a[0].rows != q) return false;
+            if (g0.a[1].handle != o.sel || g0.a[1].rows != PR || g0.a[1].offset % o.lw) return false;
+            w.w0 = g0.a[1].offset / o.lw;
+            if (w.m0 != w.w0 + rank * q) return false;
+            if ((g0.a[1].offset * 4) % 16 || (g0.a[0].offset * 4) % 16) return false;
+            if (g1.a[0].handle != o.qnsel || g1.a[0].offset != k * q || g1.a[1].handle != o.nsel || g1.a[1].offset != w.w0 ||
+                g1.a[1].rows != PR)
+                return false;
+            if (g2.a[0].handle != o.qsequ || g2.a[0].offset != k * q || g2.a[1].handle != o.sequ || g2.a[1].offset != w.w0 ||
+                g2.a[1].rows != PR)
+                return false;
+            if ((g1.a[1].offset * 4) % 16 || (g2.a[1].offset * 4) % 16) return false;
+            /* lane 0 joins lane 1 before anything after the layer's last window reads sel */
+            ws->push_back(w);
+            ++k;
+            const bool last = !(i + 5 < o.list.size() && o.list[i + 5].op == "qsa_score" &&
+                                (o.list[i + 5].n == q || o.list[i + 5].n == PR));
+            if (last) { if (!has_join(o, g2.idx + 1, 1, 0)) return false; k = 0; }
+        }
+        return true;
+    };
+    /* every quarter window's rows covered once by the four ranks (the windows in the same order on every rank) */
+    auto covers = [](const std::vector<std::vector<Win>>& per_rank) -> bool {
+        const size_t n = per_rank[0].size();
+        for (const auto& w : per_rank) if (w.size() != n) return false;
+        for (size_t i = 0; i < n; ++i) {
+            if (per_rank[0][i].whole) { for (const auto& w : per_rank) if (!w[i].whole || w[i].w0 != per_rank[0][i].w0) return false; continue; }
+            std::vector<int> hit(2048, 0);
+            for (const auto& w : per_rank) {
+                if (w[i].whole || w[i].w0 != per_rank[0][i].w0) return false;
+                for (int64_t r = w[i].m0; r < w[i].m0 + 512; ++r) {
+                    const int64_t at = r - w[i].w0;
+                    if (at < 0 || at >= 2048) return false;
+                    ++hit[(size_t)at];
+                }
+            }
+            for (int h : hit) if (h != 1) return false;
+        }
+        return true;
+    };
+    const int base_bits = 512;   /* PSP on (BEST's sp_route carries it) */
+    struct Shape { int pq; int32_t ctx0; int quarter_wins; int whole_wins; };
+    for (const Shape& sh : { Shape{ 2048 + 1792, 10240, 2, 0 }, Shape{ 4 * 2048, 16384, 4, 0 }, Shape{ 2048 + 1791, 10240, 1, 1 } }) {
+        std::vector<std::vector<Win>> per_rank(4), mutated(4);
+        for (int rank = 0; rank < 4; ++rank) {
+            const Out a = run({}, sh.pq, sh.ctx0, base_bits, true, rank);
+            const Out qr = run({}, sh.pq, sh.ctx0, base_bits | 32768, true, rank);
+            const Out nd = run({}, sh.pq, sh.ctx0, base_bits | 32768, false, rank);   /* the bit without the declare */
+            const Out z = run({}, sh.pq, sh.ctx0, base_bits, false, rank);            /* today's declare, bit off */
+            CHECK(!a.fail);
+            CHECK(!qr.fail);
+            CHECK(!nd.fail);
+            CHECK(qr.qsel != 0);
+            CHECK_EQ(nd.qsel, 0u);
+            CHECK(names(nd, false) == names(z, false));   /* inert without the declare */
+            CHECK(names(a, false) == names(z, false));    /* the declare alone issues today's list */
+            CHECK(names(qr, true) == names(a, true));     /* every other issue: today's, in today's order */
+            std::vector<Win> wa;
+            CHECK(windows(a, rank, sh.pq, &wa));
+            for (const Win& w : wa) CHECK(w.whole);       /* today: whole windows only */
+            CHECK(windows(qr, rank, sh.pq, &per_rank[(size_t)rank]));
+            int quarters = 0, wholes = 0;
+            for (const Win& w : per_rank[(size_t)rank]) (w.whole ? wholes : quarters)++;
+            CHECK(quarters > 0);
+            CHECK_EQ(quarters % sh.quarter_wins, 0);       /* the trunk's QSA layers (+ the head's), quarter_wins each */
+            CHECK_EQ(wholes * sh.quarter_wins, quarters * sh.whole_wins);
+            /* the gathers are the step's only lane-1 issues beside today's (whose lane-1 issues are kept) */
+            int g = 0;
+            for (const Iss& i : qr.list) if (i.op == "all_gather") ++g;
+            CHECK_EQ(g, 3 * quarters);
+        }
+        CHECK(covers(per_rank));
+        for (int rank = 0; rank < 4; ++rank) mutated[(size_t)rank] = per_rank[0];
+        CHECK(!covers(mutated));   /* mutation control: rank 0's quarters for every rank leave 3 / 4 of each window */
+    }
+    {   /* a 1,170-row plain step and a <= 256-row MIXED step: unchanged by the bit */
+        for (const auto& sh : { std::make_tuple(std::vector<int>{}, 1170, 0), std::make_tuple(std::vector<int>{ 4, 4, 4, 4 }, 200, 4096) }) {
+            const Out a = run(std::get<0>(sh), std::get<1>(sh), std::get<2>(sh), base_bits, true, 2);
+            const Out qr = run(std::get<0>(sh), std::get<1>(sh), std::get<2>(sh), base_bits | 32768, true, 2);
+            CHECK(!a.fail);
+            CHECK(!qr.fail);
+            CHECK(names(a, false) == names(qr, false));
+            int g = 0;
+            for (const Iss& i : qr.list) if (i.op == "all_gather") ++g;
+            CHECK_EQ(g, 0);
+        }
+    }
+    unsetenv("RADIANCE_FN4_SPSERIAL");
+    unsetenv("RADIANCE_FN4_SPHC");
+    unsetenv("RADIANCE_FN4_P2X");
+    unsetenv("RADIANCE_FN4_GATHER_INV");
+}
+
 /* qfn-on-ds lever MSP (Qwen loop round 20): a prompt's mid-chunk MTP history pass of four read pieces (8,192 rows at a 2,048-row
  * read piece, no drafting rows) under RADIANCE_FN4_MSP=1 and sp_route bit 1024 runs the head's per-row work on this rank's piece
  * only -- the gather of the trunk's rows and mtp_enter at 2,048 rows over rows [r x 2,048, + 2,048), the attention connection's

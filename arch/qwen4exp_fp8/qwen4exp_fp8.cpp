@@ -1421,8 +1421,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * fixed region under every transient, and one more alignment unit there moves every
      * activation by 256 bytes, which on Flash-Next at four ranks slows the MoE gather by 73 % and
      * a prefill by 3 %. Every step that reads it rewrites it (pipe_bounds). */
-    if (m.span_on)
-        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
+    if (m.span_on)   /* lever QRS (RADIANCE_FN4_QRS=1): + {0, pass / 4} at [4, 5], a rank's quarter window (rad_qsa.h) */
+        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {(fn4_qrs_declared() && g.world == 4) ? 6 : 4});
     /* Under a span every connection reads a step wider than a pass a pass at a time
      * (HyperConn::read_pieces, and the pipelined step's own reads), so the reads are declared no
      * wider than a pass and their scratch is sized for that band. */
@@ -1517,6 +1517,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         fn4_qsasplit_flag().load(), (long long)rows, (long long)m.qsacfg.split_min,
                         (long long)(rows * 8 * lw * 4 / 1024), (long long)(g.world > 1 ? rows * lw * 4 / 1024 : 0),
                         (long long)(g.world > 1 ? rows * g.world * lw * 4 / 1024 : 0));
+        }
+        /* qfn-on-ds lever QRS (Qwen loop round 29, QUEUE Q53; arch/common/rad_qsa.h fn4_qrs_flag): a rank's quarter of each
+         * score-plane window, staged a window a slot and gathered on the second lane -- declared only when the start asks
+         * (RADIANCE_FN4_QRS=1) and a step can be wider than the plane (a span); sp_route bit 32768 turns it on in process. */
+        if (fn4_qrs_declared() && g.world == 4 && m.b_pipe_cu && m.qsacfg.plane_rows > 0 &&
+            m.qsacfg.plane_rows % g.world == 0 && m.qsacfg.topk > 0) {
+            const int64_t q = m.qsacfg.plane_rows / g.world;
+            const int64_t wins = (g.max_tok + m.qsacfg.plane_rows - 1) / m.qsacfg.plane_rows;
+            m.qsacfg.qrs_rows = q;
+            m.qsacfg.qrs_wins = wins;
+            m.qsaw.qrs_sel  = decl_b(b, nm.f("qsa_qrs_sel"),  RAD_I32, { wins * q, m.qsacfg.topk + 1 });
+            m.qsaw.qrs_nsel = decl_b(b, nm.f("qsa_qrs_nsel"), RAD_I32, { wins * q });
+            m.qsaw.qrs_sequ = decl_b(b, nm.f("qsa_qrs_sequ"), RAD_I32, { wins * q });
+            if (!m.qsaw.qrs_sel || !m.qsaw.qrs_nsel || !m.qsaw.qrs_sequ) return RAD_E_INVAL;
+            /* the gathers run on the second lane: every buffer they touch is live for the program (rad_buf_concurrent) */
+            for (rad_buf cb : { m.qsaw.qrs_sel, m.qsaw.qrs_nsel, m.qsaw.qrs_sequ, m.qsaw.sel, m.qsaw.nsel, m.qsaw.sequ })
+                RAD_ARCH_TRY(rad_buf_concurrent(b, cb));
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: qwen4exp: lever QRS declared (RADIANCE_FN4_QRS; sp_route bit 32768): a step wider "
+                                "than the %lld-row score plane scores and selects %lld rows a rank a window and gathers the "
+                                "selections on the second lane; staging %lld KiB a card for %lld windows\n",
+                        (long long)m.qsacfg.plane_rows, (long long)q,
+                        (long long)(wins * q * (m.qsacfg.topk + 3) * 4 / 1024), (long long)wins);
         }
     }
 
@@ -2370,10 +2393,12 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     if (!m.b_pipe_cu) return nullptr;
     if (!m.pipe_cu_tried) {
         m.pipe_cu_tried = true;
-        m.pipe_cu_h = (int32_t*)rad_dev_alloc(2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        m.pipe_cu_h = (int32_t*)rad_dev_alloc(4 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
         if (m.pipe_cu_h) {
             m.pipe_cu_h[0] = 0;
             m.pipe_cu_h[1] = (int32_t)m.pass_rows;
+            m.pipe_cu_h[2] = 0;                                   /* lever QRS: a rank's quarter window {0, q} */
+            m.pipe_cu_h[3] = (int32_t)m.qsacfg.qrs_rows;
         } else if (m.g.rank == 0) {
             fprintf(stderr, "radiance: qwen4exp: no pinned host memory for the window bounds; a "
                             "step wider than a pass cannot run\n");
@@ -2386,6 +2411,8 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
         if (rad_memcpy_async(d, m.pipe_cu_h, 2 * sizeof(int32_t), s) != RAD_OK ||
             rad_memcpy_async(d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK)
             return nullptr;
+        if (m.qsacfg.qrs_rows > 0 && rad_memcpy_async(d + 4, m.pipe_cu_h + 2, 2 * sizeof(int32_t), s) != RAD_OK)
+            return nullptr;   /* lever QRS's {0, q} (declared {6} under RADIANCE_FN4_QRS) */
     }
     return d;
 }
@@ -3689,12 +3716,13 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 32767) return -1;   /* 16384: PF probe QSP (a > 256-row step's QSA score + select twice; the same bytes; lever QRS's bound); 8192: lever HCP (a prefill segment past the first interval reads its connections at a full piece's K split, op_read_sp; other bytes for partial pieces / tail and hit steps); bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes), 4096: lever GPF (a two-piece step's mixer a piece at a time only where its last piece is wider than 64 rows; other bytes for (R, <= 64)-row steps) */
+        if (value < 0 || value > 65535) return -1;   /* 32768: lever QRS (the QSA indexer's windows a quarter a rank + gathers; the same bytes; RADIANCE_FN4_QRS=1 declares); 16384: PF probe QSP (a > 256-row step's QSA score + select twice; the same bytes; lever QRS's bound); 8192: lever HCP (a prefill segment past the first interval reads its connections at a full piece's K split, op_read_sp; other bytes for partial pieces / tail and hit steps); bit 16: SPO-tail, 32: PF-ORDER, 64: PF probe ATP (attention twice), 128: PF probe X3P (EXL3 experts twice), 256: PF probe NOWAIT (lane 0 never waits for lane 1 in a pipelined step; wrong bytes), 512: lever PSP (the partial last piece SP + P2S's partial pair; the same bytes), 1024: lever MSP (a mid-chunk MTP history pass's per-row work a piece a rank + the block input gathered; the same bytes; RADIANCE_FN4_MSP=1 declares), 2048: with 1024, MSP's embedding by a raw reduce-scatter onto the rank's piece instead of the all-reduce (the same bytes), 4096: lever GPF (a two-piece step's mixer a piece at a time only where its last piece is wider than 64 rows; other bytes for (R, <= 64)-row steps) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);
         rad::arch::fn4_x3probe_flag().store((value & 128) ? 1 : 0, std::memory_order_relaxed);
         rad::arch::fn4_qsaprobe_flag().store((value & 16384) ? 1 : 0, std::memory_order_relaxed);   /* PF probe QSP */
+        rad::arch::fn4_qrs_flag().store((value & 32768) ? 1 : 0, std::memory_order_relaxed);       /* lever QRS */
         return 1;
     }
     if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */

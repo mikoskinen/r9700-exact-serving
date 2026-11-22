@@ -47,6 +47,25 @@ inline std::atomic<int>& fn4_qsaprobe_flag() {
     static std::atomic<int> f{0};
     return f;
 }
+/* qfn-on-ds lever QRS (Qwen loop round 29, QUEUE Q53; sp_route bit 32768 through the plugin's switch, RADIANCE_FN4_QRS=1 at
+ * start declares it): in the windowed path (a step wider than the score plane, one sequence) every rank scores and selects only
+ * its QUARTER of each window -- rows [w0 + r q, +q), q = plane_rows / 4, a sequence of its own rows (cu {0, q}) at those rows'
+ * positions -- into a per-window staging slot, and three all_gather ops on the second lane (behind lane 0's select) place the
+ * four quarters' sel / nsel / sequ rows into every rank's window rows; lane 0 waits for lane 1 before the attention reads them.
+ * A row's score and selection read only its query, its position and the step's block keys / block table / complete-block count
+ * (the windowed path already treats a window as a sequence of its own rows, and libr4d's score / select arithmetic a row does not
+ * depend on the launch's rows: qsa_score_mx's tiles, qsa_select_wide one workgroup a row from 65 rows on), so the bytes are
+ * today's. A window whose rows are not 16-byte aligned in sel (w0 % 4 != 0: only the overlapping last window of a step whose
+ * rows are not a multiple of 4) runs today's whole-window form behind a join (it writes sel rows the previous window's gathers
+ * place). 0 = today. */
+inline std::atomic<int>& fn4_qrs_flag() {
+    static std::atomic<int> f{0};
+    return f;
+}
+inline bool fn4_qrs_declared() {   /* read at declare only (not cached: a host test declares with and without it) */
+    const char* e = std::getenv("RADIANCE_FN4_QRS");
+    return e && *e && *e != '0';
+}
 inline int fn4_qsasplit_declared() {
     static const int d = [] { const char* e = std::getenv("RADIANCE_FN4_QSA_SPLIT");
                               return (e && *e && std::atoi(e) > 0) ? 3 : 0; }();
@@ -102,6 +121,10 @@ struct QsaIndexer {
         int         split      = 0;
         int64_t     split_rows = 0;
         int64_t     split_min  = 0;
+        /* lever QRS (fn4_qrs_flag): a rank's rows of a window (plane_rows / world), and the windows a step can have (the
+         * staging slots); 0 = not declared. The caller's `win_cu` then carries {0, qrs_rows} at [4, 5]. */
+        int64_t     qrs_rows   = 0;
+        int64_t     qrs_wins   = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -143,6 +166,9 @@ struct QsaIndexer {
         /* fn4 qsa_split: candidate lists (r4d_qsa_part.h, LW = 4 + 2 topk words): `qlist` [split_rows, 8 LW] a query's
          * chunks, `qpart` [split_rows, LW] this rank's list, `qgath` [split_rows, world LW] every rank's after the gather. */
         rad_buf qlist = 0, qpart = 0, qgath = 0;
+        /* lever QRS: a rank's quarter of each window before the gather, one slot a window: [qrs_wins * qrs_rows, topk + 1]
+         * and [qrs_wins * qrs_rows] i32 twice */
+        rad_buf qrs_sel = 0, qrs_nsel = 0, qrs_sequ = 0;
     };
 
     Geom       g{};
@@ -159,6 +185,9 @@ struct QsaIndexer {
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0;
     /* fn4 qsa_split: the rank's score and part, the gather, the one-card part, the merge */
     rad_op      op_score_part = 0, op_selp = 0, op_qgath = 0, op_selp1 = 0, op_selm = 0;
+    /* lever QRS: the window's sel rows, and its nsel / sequ rows (one op, issued twice) */
+    rad_op      op_qrs_gsel = 0, op_qrs_grow = 0;
+    bool qrs_on() const { return op_qrs_gsel && op_qrs_grow && c.qrs_rows > 0 && c.qrs_wins > 0; }
 
     bool on() const { return op_rope != 0; }
 
@@ -355,6 +384,25 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         }
     }
 
+    /* lever QRS: declared only when the start asked for it (the graph and buffers otherwise today's) */
+    if (c.qrs_rows > 0 && c.qrs_wins > 0 && c.emit_sel && g.world == 4 && c.plane_rows == g.world * c.qrs_rows &&
+        w.qrs_sel && w.qrs_nsel && w.qrs_sequ) {
+        op_qrs_gsel = rw(b, RAD_OP(b, "all_gather",
+                            RAD_PARAMS(RAD_INT("world_size", g.world), RAD_INT("numel", c.qrs_rows * (c.topk + 1)),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                        {w.qrs_sel}, {w.sel});
+        op_qrs_grow = rw(b, RAD_OP(b, "all_gather",
+                            RAD_PARAMS(RAD_INT("world_size", g.world), RAD_INT("numel", c.qrs_rows),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                        {w.qrs_nsel, w.qrs_sequ}, {w.nsel, w.sequ});
+        if (!op_qrs_gsel || !op_qrs_grow) return RAD_E_INVAL;
+        /* the select writes a quarter window's rows into the staging slots */
+        const rad_buf st[3] = { w.qrs_sel, w.qrs_nsel, w.qrs_sequ };
+        RAD_ARCH_TRY(rad_op_writes(b, op_select, st, 3));
+    }
+
     /* When the attention group streams, the attention block resolves `sel` to ring slots after its
      * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
     return RAD_OK;
@@ -523,6 +571,58 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
         if (S != 1 || !win_cu) {
             rad_step_fail(c_, "qsa: a step wider than the score plane must be one sequence with "
                               "its window bounds (RadBuildCtx::max_mixed_tok)");
+            return;
+        }
+        /* lever QRS (fn4_qrs_flag): this rank's quarter of each window, gathered on the second lane */
+        if (qrs_on() && fn4_qrs_flag().load(std::memory_order_relaxed) && PR == g.world * c.qrs_rows &&
+            (T + PR - 1) / PR <= c.qrs_wins) {
+            const int64_t q = c.qrs_rows, r = g.rank, lw = c.topk + 1;
+            const int32_t* qcu = win_cu + 4;   /* {0, q} (the caller's bounds, Config::qrs_rows) */
+            int64_t k = 0, prev_end = 0;
+            for (int64_t w0 = 0;; ++k) {
+                /* a whole window over rows the previous window's gathers place (on lane 1): after them. A quarter window
+                 * writes only its own staging slot (and the score plane, lane 0's alone), so it needs no join. */
+                if ((w0 % 4) && w0 < prev_end) rad_lane_join(c_, 1, 0);
+                if (w0 % 4) {
+                    /* today's whole window (sel rows of this window are not 16-byte aligned for a gather) */
+                    RAD_ISSUE_N(c_, op_score, PR,
+                                brow_slice(w.q, w0, PR, qw), kv_cache(kv_bk, layer),
+                                praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                                praw(win_cu, RAD_I32, 2), brows(w.nc, S),
+                                bcol_at(w.score, 0, c.max_blocks, 0, live, PR));
+                    RAD_ISSUE_N(c_, op_select, PR,
+                                bcol_at(w.score, 0, c.max_blocks, 0, live, PR),
+                                praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                                brows(w.nc, S), praw(batch->positions + w0, RAD_I32, PR),
+                                praw(win_cu, RAD_I32, 2),
+                                brow_slice(w.sel, w0, PR, lw), brow_slice(w.nsel, w0, PR, 1),
+                                brow_slice(w.sequ, w0, PR, 1));
+                } else {
+                    const int64_t m0 = w0 + r * q;   /* this rank's rows */
+                    RAD_ISSUE_N(c_, op_score, q,
+                                brow_slice(w.q, m0, q, qw), kv_cache(kv_bk, layer),
+                                praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                                praw(qcu, RAD_I32, 2), brows(w.nc, S),
+                                bcol_at(w.score, 0, c.max_blocks, 0, live, q));
+                    RAD_ISSUE_N(c_, op_select, q,
+                                bcol_at(w.score, 0, c.max_blocks, 0, live, q),
+                                praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                                brows(w.nc, S), praw(batch->positions + m0, RAD_I32, q),
+                                praw(qcu, RAD_I32, 2),
+                                brow_slice(w.qrs_sel, k * q, q, lw), brow_slice(w.qrs_nsel, k * q, q, 1),
+                                brow_slice(w.qrs_sequ, k * q, q, 1));
+                    rad_lane(c_, 1);
+                    rad_lane_join(c_, 0, 1);   /* behind this rank's select */
+                    RAD_ISSUE(c_, op_qrs_gsel, brow_slice(w.qrs_sel, k * q, q, lw), brow_slice(w.sel, w0, PR, lw));
+                    RAD_ISSUE(c_, op_qrs_grow, brow_slice(w.qrs_nsel, k * q, q, 1), brow_slice(w.nsel, w0, PR, 1));
+                    RAD_ISSUE(c_, op_qrs_grow, brow_slice(w.qrs_sequ, k * q, q, 1), brow_slice(w.sequ, w0, PR, 1));
+                    rad_lane(c_, 0);
+                }
+                prev_end = w0 + PR;
+                if (w0 + PR >= T) break;
+                w0 = w0 + PR + PR <= T ? w0 + PR : T - PR;
+            }
+            rad_lane_join(c_, 1, 0);   /* the attention reads every row */
             return;
         }
         const int reps = (T > 256 && fn4_qsaprobe_flag().load(std::memory_order_relaxed)) ? 2 : 1;   /* PF probe QSP */
