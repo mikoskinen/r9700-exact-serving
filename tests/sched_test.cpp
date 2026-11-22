@@ -1066,7 +1066,7 @@ TEST(lever_gpf_tail_inner_2_and_resume_cold_3_take_any_piece_start) {
     CHECK_EQ(h3m.resumed, (int64_t)1024);
     const Run s1 = go(2, 3, 0, 1556);                      /* tail on the chunk start: nothing inside */
     CHECK_EQ(s1.inner, (int64_t)-1);
-    CHECK(rad::fn4::request("sched_tail_inner", 4, &err) == false);   /* range 0..3 (3: lever TIF, round 23) */
+    CHECK(rad::fn4::request("sched_tail_inner", 5, &err) == false);   /* range 0..4 (3: lever TIF, round 23; 4: F71, round 26) */
     CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
     CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
     CHECK(rad::fn4::request("resume_cold", 0, &err));
@@ -14209,8 +14209,8 @@ struct TiSwitch {
  * round 23: 3 = 2 and lever TIF, the fine tail inside a pipelined last chunk's last piece) */
 TEST(lever_ti_the_switch_takes_0_and_1_and_starts_off) {
     std::string err;
-    for (int v : { 0, 1, 2, 3 }) CHECK(fn4::check("sched_tail_inner", v, &err));
-    for (int v : { -1, 4, 512 }) {
+    for (int v : { 0, 1, 2, 3, 4 }) CHECK(fn4::check("sched_tail_inner", v, &err));   /* 4: F71 (Qwen loop round 26) */
+    for (int v : { -1, 5, 512 }) {
         CHECK(!fn4::check("sched_tail_inner", v, &err));
         CHECK(err.find("sched_tail_inner takes 0") != std::string::npos);
     }
