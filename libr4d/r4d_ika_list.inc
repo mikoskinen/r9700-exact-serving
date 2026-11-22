@@ -62,6 +62,7 @@
     "gemm_8a8_gated_prefill_kernel",
     "gemm_8a8_prefill_kernel",
     "gemm_fp8a8_kernel",
+    "gemm_fp8a8_pp_kernel",
     "gemm_nt_f32_tile_kernel",
     "gg_embed_kernel",
     "gg_gemv_kernel",

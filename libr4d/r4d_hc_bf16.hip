@@ -8998,6 +8998,7 @@ extern "C" int r4d_hc_tl_read(unsigned long long* out, int region, int max) {
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */
 extern "C" int r4d_ar_sdma_set(int on);   /* fn4 SDMA-AR (r4d_ar_entry.hip) */
 extern "C" int r4d_rg_tail_set(int value);   /* qfn-on-ds lever RGT (r4d_moe.hip): the router's ranking per row tile */
+extern "C" void r4d_gemm_fp8a8_pin_pp(int v);   /* qfn-on-ds lever F8P (r4d_gemm_fp8a8.hip): -1 the env, 0 off, 1 on */
 /* qfn-on-ds: the Qwen line's libr4d switches, reached through libr4d's one rad_fn4_switch (r4d_ds41_ggml.hip), which takes
  * the ds41 line's names first and hands every other name here. */
 extern "C" void r4d_fn4_fc_dump_if_on() { if (fc_on()) fc_dump(); }
@@ -9026,6 +9027,11 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "ar_lanethreads_s")) return r4d_ar_lane_threads_s_set(value);   /* qfn-on-ds lever LSK */
     if (!std::strcmp(name, "ar_laneblocks_s")) return r4d_ar_lane_blocks_s_set(value);     /* qfn-on-ds lever LSK */
     if (!std::strcmp(name, "rg_tail")) return r4d_rg_tail_set(value);   /* qfn-on-ds lever RGT (r4d_moe.hip) */
+    if (!std::strcmp(name, "f8_pp")) {   /* qfn-on-ds lever F8P (r4d_gemm_fp8a8.hip): 0 today's int8 narrow tile, 1 its twin */
+        if (value < 0 || value > 1) return -1;
+        r4d_gemm_fp8a8_pin_pp(value);
+        return 1;
+    }
     if (!std::strcmp(name, "hc_pinpf2")) {   /* fn4 SP-serial: pinned parts below kPf2MinRows through PF2 */
         if (value < 0 || value > 1) return -1;
         g_hc_pinpf2.store(value, std::memory_order_relaxed);

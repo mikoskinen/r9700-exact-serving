@@ -51,7 +51,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "att_bi", "arw_rows", "hc_spprobe", "hc_sp", "mtp_flat", "ar_sdma",
                                         "bi_wide", "sp_serial", "hc_pinpf2", "resume_cold", "preempt_keep", "kvs_bi",
                                         "kvs_vic", "qsa_split", "sp_ple", "ar_fence", "sp_route", "rg_tail", "gnq8", "draft_dmask", "aql_chi", "exl3_drz", "draft_uni",
-                                        "ar_lanethreads_s", "ar_laneblocks_s" };
+                                        "ar_lanethreads_s", "ar_laneblocks_s", "f8_pp" };
 /* The Qwen line's switches' start variables (that line's kEnv, for its own switches), and its start-value rule: unset /
  * empty / 0 -> 0, a number > 1 as given, anything else 1 -- as the plugins read the same variables. */
 const char* const kEnvQ[kSwitches - kQwenFirst] = {
@@ -65,7 +65,7 @@ const char* const kEnvQ[kSwitches - kQwenFirst] = {
     "RADIANCE_FN4_PREEMPT_KEEP", "RADIANCE_FN4_KVS_BI", "RADIANCE_FN4_KVS_VIC", "RADIANCE_FN4_QSA_SPLIT",
     "RADIANCE_FN4_SP_PLE", "RADIANCE_FN4_AR_FENCE", "RADIANCE_FN4_SP_ROUTE", "RADIANCE_FN4_RG_TAIL",
     "RADIANCE_FN4_GNQ8", "RADIANCE_FN4_DRAFT_DMASK", "RADIANCE_FN4_AQL_CHI", "RADIANCE_FN4_X3DRZ",
-    "RADIANCE_FN4_DRAFT_UNI", "RADIANCE_FN4_AR_LANE_THREADS_S", "RADIANCE_FN4_AR_LANE_BLOCKS_S" };
+    "RADIANCE_FN4_DRAFT_UNI", "RADIANCE_FN4_AR_LANE_THREADS_S", "RADIANCE_FN4_AR_LANE_BLOCKS_S", "RADIANCE_FN4_F8_PP" };
 int env_val(const char* k) {
     const char* v = k ? std::getenv(k) : nullptr;
     if (!(v && *v && *v != '0')) return 0;
@@ -1021,7 +1021,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
                         "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, epoch_bump) and the Qwen line's ("
-                        "no_route, gather_inv, hc_fusedown, hc_normwave, hc_writevec, hc_readv, ar_lanethreads, hc_upmix, ar_laneblocks, exl3_pfprep, exl3_mapshare, exl3_gd, moe_pair, exl3_dz, exl3_bi, exl3_dual, hc_bi, bi_seg, att_bi, arw_rows, hc_spprobe, hc_sp, mtp_flat, ar_sdma, bi_wide, sp_serial, hc_pinpf2, resume_cold, preempt_keep, kvs_bi, kvs_vic, qsa_split, sp_ple, ar_fence, sp_route, rg_tail, gnq8, draft_dmask, aql_chi, exl3_drz, draft_uni, ar_lanethreads_s, ar_laneblocks_s)";
+                        "no_route, gather_inv, hc_fusedown, hc_normwave, hc_writevec, hc_readv, ar_lanethreads, hc_upmix, ar_laneblocks, exl3_pfprep, exl3_mapshare, exl3_gd, moe_pair, exl3_dz, exl3_bi, exl3_dual, hc_bi, bi_seg, att_bi, arw_rows, hc_spprobe, hc_sp, mtp_flat, ar_sdma, bi_wide, sp_serial, hc_pinpf2, resume_cold, preempt_keep, kvs_bi, kvs_vic, qsa_split, sp_ple, ar_fence, sp_route, rg_tail, gnq8, draft_dmask, aql_chi, exl3_drz, draft_uni, ar_lanethreads_s, ar_laneblocks_s, f8_pp)";
         return false;
     }
     State& s = st();

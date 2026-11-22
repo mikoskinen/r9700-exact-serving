@@ -29327,6 +29327,112 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
     }
 }
 
+/* --perff8p N K M [iters] (qfn-on-ds, Qwen loop round 37, lever F8P = QUEUE Q66): the int8 narrow decode GEMM the Qwen trunk
+ * runs (gemm_i8a8_nt_m16_dec = gemm_nt_q_dec: GDN in / out, attention, shared down) today vs F8P's twin (two weight K tiles in
+ * flight a wave; r4d_gemm_fp8a8_pin_pp 0 / 1) at one rank shape, in one process:
+ *   bytes    one launch each on copy 0 of the weight: every output byte of the twin vs today; the dispatched function of each
+ *            arm (must differ: the twin ran); a control (one weight byte changed under the twin must move the output)
+ *   time     A B B A, us a launch: the weight rotated over enough copies to pass the last-level cache (perf_row's form: a decode
+ *            step reads each weight once), back to back; with --cold MB each launch alone after a flush (median)
+ * Operands are seeded bytes (the comparison needs only that both launches read the same bytes). */
+static const void* last_dispatch(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, int* rc);
+static void f8p_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
+    void (*pin_pp)(int) = (void (*)(int))dlsym(pl.h, "r4d_gemm_fp8a8_pin_pp");
+    const RadKernelInfo* r = find(pl, "gemm_i8a8_nt_m16_dec");
+    if (!pin_pp || !r || !pl.record) { std::printf("F8P: r4d_gemm_fp8a8_pin_pp / gemm_i8a8_nt_m16_dec / record absent\n"); ++g_fail; return; }
+    if (N % 16 || K % 128 || M < 1 || M > 512 || iters < 1) {
+        std::printf("--perff8p: N a multiple of 16, K of 128, M 1..512, iters > 0\n");
+        return;
+    }
+    const int64_t sk = K / 128;
+    const size_t wbytes = (size_t)(N * K);
+    int copies = (int)(((size_t)768 << 20) / wbytes) + 1;
+    if (copies > 64) copies = 64;
+    void* d_w  = dalloc(wbytes * (size_t)copies);
+    void* d_ws = dalloc((size_t)(N * sk) * 2);
+    void* d_a  = dalloc((size_t)(M * K));
+    void* d_as = dalloc((size_t)(M * sk) * 4);
+    void* d_y0 = dalloc((size_t)(M * N) * 2);
+    void* d_y1 = dalloc((size_t)(M * N) * 2);
+    void* d_y2 = dalloc((size_t)(M * N) * 2);
+    if (!d_w || !d_ws || !d_a || !d_as || !d_y0 || !d_y1 || !d_y2) { std::printf("--perff8p: hipMalloc failed\n"); ++g_fail; return; }
+    auto mixh = [](uint32_t x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; };
+    {
+        std::vector<int8_t> w(wbytes), a((size_t)(M * K));
+        for (size_t i = 0; i < w.size(); ++i) w[i] = (int8_t)((int)(mixh((uint32_t)i * 2u + 0x5bd1e995u) % 255u) - 127);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = (int8_t)((int)(mixh((uint32_t)i * 2u + 1u) % 255u) - 127);
+        std::vector<uint16_t> ws((size_t)(N * sk));
+        for (size_t i = 0; i < ws.size(); ++i)
+            ws[i] = h_to_bf16(std::ldexp(1.0f + (mixh((uint32_t)i + 5u) & 127u) / 128.0f, -(int)(mixh((uint32_t)i + 7u) % 7u) - 6));
+        std::vector<float> as((size_t)(M * sk));
+        for (size_t i = 0; i < as.size(); ++i)
+            as[i] = std::ldexp(1.0f + (mixh((uint32_t)i + 77u) & 255u) / 256.0f, -(int)(mixh((uint32_t)i + 99u) % 9u) - 7);
+        for (int c = 0; c < copies; ++c) st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
+        st_memcpy(d_a, a.data(), a.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_ws, ws.data(), ws.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_as, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    }
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, sk }), T(d_w, RAD_I8, { N, K }), T(d_ws, RAD_BF16, { N, sk }),
+        T(d_y0, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(nullptr, RAD_U8, { 1 }) };
+    absent(ts[5]); absent(ts[6]);
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof a);
+    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    const std::string tag = fmt("F8P N=%lld K=%lld M=%lld", (long long)N, (long long)K, (long long)M);
+    /* bytes */
+    int rc0 = 0, rc1 = 0, rc2 = 0;
+    pin_pp(0); ts[4].data = d_y0; const void* f0 = last_dispatch(pl, r, a, &rc0);
+    pin_pp(1); ts[4].data = d_y1; const void* f1 = last_dispatch(pl, r, a, &rc1);
+    st_stream_sync(nullptr);
+    std::vector<uint16_t> y0((size_t)(M * N)), y1((size_t)(M * N)), y2((size_t)(M * N));
+    st_memcpy(y0.data(), d_y0, y0.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(y1.data(), d_y1, y1.size() * 2, hipMemcpyDeviceToHost);
+    size_t d01 = 0;
+    for (size_t i = 0; i < y0.size(); ++i) d01 += y0[i] != y1[i];
+    /* control: weight byte 0 of copy 0 changed (one tile row of the first wave), the twin again */
+    int8_t b0 = 0;
+    st_memcpy(&b0, d_w, 1, hipMemcpyDeviceToHost);
+    const int8_t b1 = (int8_t)(b0 == 100 ? 101 : 100);
+    st_memcpy(d_w, &b1, 1, hipMemcpyHostToDevice);
+    ts[4].data = d_y2; const void* f2 = last_dispatch(pl, r, a, &rc2);
+    st_stream_sync(nullptr);
+    st_memcpy(d_w, &b0, 1, hipMemcpyHostToDevice);
+    st_memcpy(y2.data(), d_y2, y2.size() * 2, hipMemcpyDeviceToHost);
+    size_t d12 = 0;
+    for (size_t i = 0; i < y1.size(); ++i) d12 += y1[i] != y2[i];
+    ok((tag + " rc").c_str(), rc0 == 0 && rc1 == 0 && rc2 == 0, fmt("rc %d / %d / %d", rc0, rc1, rc2));
+    ok((tag + " the twin dispatched (function differs from today's)").c_str(), f0 && f1 && f0 != f1 && f1 == f2,
+       fmt("%p / %p / %p", f0, f1, f2));
+    ok((tag + " every output byte identical (twin vs today)").c_str(), d01 == 0, fmt("%zu of %zu differ", d01, y0.size()));
+    ok((tag + " control: a changed weight byte moves the twin's output").c_str(), d12 > 0, fmt("%zu differ", d12));
+    std::printf("%s bytes: %s (%zu of %zu differ), control %zu differ, dispatch today %p twin %p\n", tag.c_str(),
+                d01 == 0 ? "every output byte identical" : "DIFFER", d01, y0.size(), d12, f0, f1);
+    /* time: A B B A */
+    ts[4].data = d_y0;
+    double t[4];
+    const int arm[4] = { 0, 1, 1, 0 };
+    for (int k = 0; k < 4; ++k) {
+        pin_pp(arm[k]);
+        t[k] = st_time_us([&](int i) {
+            ts[2].data = (uint8_t*)d_w + (size_t)(i % copies) * wbytes;
+            r->launch(&a, nullptr);
+        }, iters, nullptr);
+    }
+    pin_pp(-1);
+    ts[2].data = d_w;
+    const double ta = 0.5 * (t[0] + t[3]), tb = 0.5 * (t[1] + t[2]);
+    std::printf("%s %s %.1f MiB weight x %d copies, %d iters: today %.2f / %.2f us, F8P %.2f / %.2f us -> %.2f vs %.2f us "
+                "(%+.1f %%), weight %.0f -> %.0f GB/s\n", tag.c_str(), g_cold > 0 ? "cold" : "stream", (double)wbytes / (1 << 20),
+                copies, iters, t[0], t[3], t[1], t[2], ta, tb, 100.0 * (tb / ta - 1.0), (double)wbytes / (ta * 1e3),
+                (double)wbytes / (tb * 1e3));
+}
+
 /* The 8-bit trunk GEMMs side by side at one shape, each with its useful TFLOP/s: block E4M3 W8A8
  * (the fp8 trunk), the int8 W8A8 tiled kernel, and the fp8 kernels' int8 twins (gemm_i8a8_*); at
  * M <= 64 also the two narrow rows. Operands hold constants (timing does not depend on values). */
@@ -43773,7 +43879,7 @@ int main(int argc, char** argv) {
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
     int perf_it = 50, perf_w2 = 0, perf_w4 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0,
-        perf_q = 0, perf_mx = 0, perf_wpa = 0, perf_vocab = 0, perf_iqr = 0;
+        perf_q = 0, perf_mx = 0, perf_wpa = 0, perf_vocab = 0, perf_iqr = 0, perf_f8p = 0;
     const char* vocab_spec = nullptr;
     bool bicf = false; const char* bif_c = nullptr; const char* bif_m = nullptr;   /* --bicheck-fn4 (fn4 BI, the Qwen line) */
     long long perf_pb1 = 0;
@@ -43949,6 +44055,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--perfw4: positive N in 16s, K in 128s, M 1..64, iters > 0\n");
                 return 2;
             }
+        } else if (!std::strcmp(argv[i], "--perff8p")) {
+            /* qfn-on-ds lever F8P: the int8 narrow decode GEMM today vs its two-tiles-in-flight twin (f8p_perf) */
+            if (i + 3 >= argc) { usage(); return 2; }
+            perf_f8p = 1;
+            perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfw8")) {
             if (i + 3 >= argc) { usage(); return 2; }
             perf_w8 = 1;
@@ -44766,6 +44880,7 @@ int main(int argc, char** argv) {
         else if (perf_w4) w5a16_perf(pl, 4, perf_m, perf_n, perf_k, perf_it,
                                     perf_w4 == 2 ? RAD_BF16 : RAD_F16);
         else if (perf_w8) w8_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        else if (perf_f8p) f8p_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w2) w2_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else         fp8_perf(pl, perf_n, perf_k, perf_m, perf_it);
         dfree_all();

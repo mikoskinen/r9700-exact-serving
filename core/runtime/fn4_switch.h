@@ -924,6 +924,9 @@
  *                   at start (MIXED and serial prefill steps); lone pipelined prefill keeps the first pair. 0 = the first
  *                   pair's value (today); the bytes do not depend on either pair       RADIANCE_FN4_AR_LANE_THREADS_S
  *                                                                                    RADIANCE_FN4_AR_LANE_BLOCKS_S
+ *   f8_pp           libr4d (rad_fn4_switch; qfn-on-ds lever F8P, Qwen loop round 37, QUEUE Q66): 1 = the int8 narrow decode
+ *                   GEMM (gemm_nt_q / gemm_nt_q_dec at MW 4-16: GDN in / out, attention, shared down) runs its twin with two
+ *                   weight K tiles in flight a wave; the same bytes; 0 today                        RADIANCE_FN4_F8_PP
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -975,6 +978,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kExl3Drz,  /* qfn-on-ds lever DRZ (Qwen loop round 13): exl3r4d, the prefill band's ZERO entries write nothing */
               kDraftUni,   /* qfn-on-ds Qwen loop round 14 (F42 / Q33): the scheduler, one draft depth a step at every start */
               kArLaneThreadsS, kArLaneBlocksS,   /* qfn-on-ds lever LSK (Qwen loop round 27, Q51): libr4d, the lane form's second pair */
+              kF8Pp,     /* qfn-on-ds lever F8P (Qwen loop round 37, Q66): libr4d, the int8 narrow decode GEMM's two-tiles-in-flight twin */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
