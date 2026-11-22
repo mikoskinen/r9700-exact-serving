@@ -73,7 +73,10 @@ int exl3r4d_fn4_x3d_pf(void) { return g_fn4_x3d_pf; }
  * at K = 2.5, both at K = 2) with the K loop's WMMA pairs as gfx1201's 2:4 sparse v_swmmac_f32_16x16x32_f16, each token's K over
  * two sparse-A rows (8 tokens a pass), the two rows' sums added once and moved into the WMMA's D layout (exl3r4d.hip moe_pass SW
  * 2; 3 = the other index nibble order): a token's bytes depend on its own activations and the weights alone; they differ from the
- * WMMA form's by the f32 sum order. 0 at start = today's kernels. */
+ * WMMA form's by the f32 sum order. 0 at start = today's kernels.
+ * 4 (tp8 loop DECODE round 67, QUEUE X15): 2 + the codebook fold's twins -- where exl3_x3d 5 picks the fold (X5F: x3d 5 at K = 2,
+ * 6 at K = 2.5), its kernels with the same sparse K loop over the integer codes S and the fold applied in SWK's row layout before
+ * the split-K sum (rule B, its own reference); elsewhere 4 = 2. At 2 / 3 the fold keeps its own WMMA kernel. */
 static volatile int g_fn4_x6w = 0;
 int exl3r4d_fn4_x6w(void) { return g_fn4_x6w; }
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
@@ -86,7 +89,7 @@ __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int
                value == 108 ? 1 : -1;
     if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 31 ? 1 : -1;   /* lever XR; SPEED-C 8 .. 31 */
     if (!strcmp(name, "exl3_x3d_pf")) return value == 0 || value == 1 ? 1 : -1;   /* A10 (tp8 loop PX1) */
-    if (!strcmp(name, "exl3_x6w")) return value == 0 || value == 2 || value == 3 ? 1 : -1;   /* SWK (tp8 loop X12); X6w's 1 not here */
+    if (!strcmp(name, "exl3_x6w")) return value == 0 || value == 2 || value == 3 || value == 4 ? 1 : -1;   /* SWK (tp8 loop X12; 4 = X15: + the fold's twins); X6w's 1 not here */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {

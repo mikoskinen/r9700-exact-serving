@@ -1617,7 +1617,25 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
   if constexpr (FOLD) {   // X5: sum_k (S kinv + kbias) x_k = kinv (sum_k S x_k) + kbias (sum_k x_k), this split's k-steps
     const float ki = x5_kinv(), kb = x5_kbias();
-    if constexpr (EXL3R4D_X5_SUM == 3) {   // X6 S2: the pre-pass's sum of this lane's row
+    if constexpr (SW >= 2) {
+      // SWK x X5F (tp8 DECODE round 67, QUEUE X15; fn4 exl3_x6w 4 at exl3_x3d 5): the fold in SWK's ROW layout, before the split-K
+      // sum and the D move -- lane (h, n) acc[j][v] = sparse row 8 h + v = token v's first (h 0) / second (h 1) K half at column n,
+      // so token v's pre-pass sum comes from lane v (v_readlane: lanes v and 16 + v hold it, X6 S2's 'lane nl keeps its row's'); the
+      // kbias term goes to the first half only (the second half's addend +0): y = (D1 kinv + kbias xs) + D2 kinv after the move's
+      // first + second. A token's bytes depend on its own activations and the weights alone (rule B, its own reference).
+      static_assert(EXL3R4D_X5_SUM == 3, "SWK x X5F: the pre-pass sums (X6 S2) only");
+      const bool first = lane < 16;
+      float kx[8];
+#pragma unroll
+      for (int v = 0; v < 8; v++) {
+        const float xs = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(xsum), v));
+        kx[v] = first ? kb * xs : 0.f;
+      }
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int v = 0; v < 8; v++) acc[j][v] = __builtin_fmaf(acc[j][v], ki, kx[v]);
+    } else if constexpr (EXL3R4D_X5_SUM == 3) {   // X6 S2: the pre-pass's sum of this lane's row
 #pragma unroll
       for (int j = 0; j < NPW; j++)
 #pragma unroll
@@ -4451,9 +4469,21 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     // v_swmmac_f32_16x16x32_f16 with each token's K over two A rows, 8 tokens a pass (moe_pass SW 2; 3 = the other index nibble
     // order). Same grid, block, LDS and arguments; the down at SPB-G 1 / 2. Everything else keeps its kernel: the fold (x3d 5 / 6),
     // K25U G2D / UB96, SPB-G 4 / 8, SPB-P (returned above), the prefill band. 0 at start = no launch changes.
+    // SWK x X5F (tp8 DECODE round 67, QUEUE X15): exl3_x6w 4 = 2 + the fold's twins (FOLD + SW 2) where exl3_x3d 5 picked the fold
+    // (x3d 5 at K = 2, 6 at K = 2.5); at 2 / 3 the fold keeps its own kernel (as before).
     {
-      const int swk = exl3r4d_fn4_x6w();
-      if ((swk == 2 || swk == 3) && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2)) {
+      const int swk0 = exl3r4d_fn4_x6w();
+      const bool fsw = swk0 == 4;
+      const int swk = fsw ? 2 : swk0;
+      if (fsw && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2) && ((bits == 2 && a->x3d == 5) || (bits == EXL3R4D_K25 && a->x3d == 6))) {
+        if (bits == 2)
+          kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2, 1, true, 2>
+             : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2, true, 2> : (const void*)exl3r4d_gemm_x3d_kernel<1, 1, true, 2>;
+        else
+          kf = gate_up ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3, 1, true, 2>
+             : sg == 2 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 2, true, 2>
+                       : (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 1, true, 2>;
+      } else if ((swk == 2 || swk == 3) && !gscr && dngk == 1 && (gate_up || sg == 1 || sg == 2)) {
         if (bits == 2 && a->x3d >= 1 && a->x3d <= 4)
           kf = swk == 2 ? (gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2, 1, false, 2>
                            : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2, false, 2> : (const void*)exl3r4d_gemm_x3d_kernel<1, 1, false, 2>)
