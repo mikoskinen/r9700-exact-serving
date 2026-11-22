@@ -792,6 +792,14 @@ struct Model {
     /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the step's plane of ones for every MoE layer's ungated shared
      * gate (mw.sgate), filled once at the step's start while the ds41_onefill switch is 1; 0 = not declared. */
     rad_op sone = 0;
+    /* Lever TEG (round 83; teg_declared()'s comment): the expand as one gather_rows over h0's [hc x T, D] rows by teg_idx, layer
+     * 0's collapse from the one-hot plane teg_pre; planes for teg_rows rows (teg_host: idx then the plane's f32 words), copied
+     * once (teg_up) */
+    rad_op teg_g = 0;
+    rad_buf teg_idx = 0, teg_pre = 0;
+    int64_t teg_rows = 0;
+    bool teg_up = false;
+    std::vector<int32_t> teg_host;
     rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
     rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
     rad_op cn_fin_w = 0, pcn_fin_w = 0;   /* lever BIW: their _w1k twins (Layer::pcn_a_w), or 0 */
@@ -2853,6 +2861,34 @@ static bool egl_declared() {
     return g_egl_env.load(std::memory_order_relaxed) == 1;
 }
 static bool egl_now() { return g_egl_ok.load(std::memory_order_relaxed) && (g_sw_e2.load(std::memory_order_relaxed) & 4); }
+/* Lever TEG (DRAFTER track 22.11.2026 round 83): the trunk prologue's hc expand -- c.hc casts of xcol into h0's strips, one
+ * dependent dispatch each (lq208 pair leader c16: 4 x aql_copy2d16 at 54.8-68.9 us after the embedding's all-reduce, ~4.3 us
+ * a dispatch, then pre0 / pre1 on the two queues) -- as ONE gather_rows over h0 seen as [hc x T, D] rows by a constant index
+ * plane (row hc t + i <- xcol row t: lever EMG's form in the drafter), and layer 0's attention collapse reading a constant
+ * one-hot plane [T, hc] = (1, 0, .., 0) in place of pre_f, so the pre0 / pre1 fills (pre_f's one-hot rows, every pass) are not
+ * issued: pre_f has no other reader before layer 0's mix_f writes it. Both planes are functions of the row alone: PERSIST,
+ * copied once from host memory by the first pass that issues the form (keyed 0 there: issued live, not recorded -- lever
+ * EUP's rule), read-only after. Exact (rule A): the gather copies the bf16 rows the casts copy; the plane holds the fills'
+ * f32 words (+0.0f, 1.0f); layer 0's collapse is the same kernel on the same values. Passes of <= kTegRows rows only (a prompt
+ * chunk above issues as before). Declared by RADIANCE_DS41_TEG=1 (start value on) where this node's prologue feeds layer 0
+ * (one machine, the pipeline's leader); fn4 ds41_e2 BIT 4 (values 16..31) switches it in process; a node without that
+ * prologue (the follower) takes the bit and issues as before. */
+static constexpr int64_t kTegRows = 256;
+static std::atomic<int> g_teg_env{-2}, g_teg_ok{0}, g_teg_bad{0}, g_teg_noted{0};
+static std::atomic<long long> g_teg_passes{0};
+static thread_local bool t_teg = false;   /* this pass issued TEG's prologue: layer 0's collapse reads the one-hot plane */
+static bool teg_declared() {
+    if (g_teg_env.load(std::memory_order_relaxed) == -2) {
+        const char* e = std::getenv("RADIANCE_DS41_TEG");
+        int unread = -2;
+        g_teg_env.compare_exchange_strong(unread, e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : -1);
+    }
+    return g_teg_env.load(std::memory_order_relaxed) == 1;
+}
+static bool teg_now() {
+    return g_teg_ok.load(std::memory_order_relaxed) && !g_teg_bad.load(std::memory_order_relaxed) &&
+           (g_sw_e2.load(std::memory_order_relaxed) & 16);
+}
 /* Lever FUSE-R (ds41-fuse, 13.11.2026; zzzaql's AQL-stamped c8 on int14: gemm_nt_f32_tile -> router_scored 173 us and
  * router_scored -> scatter_small 172 us of dependent-launch gaps a decode step, both on the critical path): the trunk MoE
  * layers' router chain in fewer launches, each form the stock code with only the launch boundaries removed (libr4d
@@ -3214,10 +3250,12 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_gq"))   /* lever 1U-GQ */
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 (bit 0) + lever FCS (bit 1) + lever EGL (bit 2): each bit needs its declare */
-        return value >= 0 && value <= 15 && (!(value & 1) || g_sw_e2_ok.load(std::memory_order_relaxed)) &&
+        return value >= 0 && value <= 31 && (!(value & 1) || g_sw_e2_ok.load(std::memory_order_relaxed)) &&
                        (!(value & 2) || g_fcs_ok.load(std::memory_order_relaxed)) &&
-                       (!(value & 12) || egl_declared()) ? 1 : -1;   /* EGL (bit 2; bit 3: its token-id ops stay on lane 0): a node
-                                                                        * with no Engram layer takes it and issues as before */
+                       (!(value & 12) || egl_declared()) &&   /* EGL (bit 2; bit 3: its token-id ops stay on lane 0): a node
+                                                                 * with no Engram layer takes it and issues as before */
+                       (!(value & 16) || (teg_declared() && !g_teg_bad.load(std::memory_order_relaxed))) ? 1 : -1;   /* lever
+                                                                 * TEG (bit 4): a node without the prologue takes it */
     if (!std::strcmp(name, "ds41_prefetch"))   /* tp8 loop D24: >= 1 needs the reads declared */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_pf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_moe1"))   /* lever P: 1 needs the dk ops declared at some trunk layer */
@@ -3336,8 +3374,9 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         *applied = gq_now();
         return 1;
     }
-    if (!std::strcmp(name, "ds41_e2")) {   /* bit 0 E2, bit 1 FCS, bit 2 EGL, bit 3 EGL's token-id ops on lane 0: what the issue reads */
-        *applied = (e2_now() ? 1 : 0) | (fcs_now() ? 2 : 0) | (egl_now() ? 4 | (g_sw_e2.load(std::memory_order_relaxed) & 8) : 0);
+    if (!std::strcmp(name, "ds41_e2")) {   /* bit 0 E2, bit 1 FCS, bit 2 EGL, bit 3 EGL's token-id ops on lane 0, bit 4 TEG: what the issue reads */
+        *applied = (e2_now() ? 1 : 0) | (fcs_now() ? 2 : 0) | (egl_now() ? 4 | (g_sw_e2.load(std::memory_order_relaxed) & 8) : 0) |
+                   (teg_now() ? 16 : 0);
         return 1;
     }
     if (!std::strcmp(name, "ds41_moe1")) {   /* what the issue reads: 0 where nothing was declared */
@@ -7466,6 +7505,37 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.pre1 = op(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
                              RAD_F64("value", 1.0) },
                 {}, {}, { m.pre_f });
+    /* lever TEG (round 83): where this node issues the prologue and holds layer 0 (its collapse is pre_f's first reader) */
+    if (teg_declared() && !(m.pp && m.pp_rank == 1 && m.pp_h > 0) && m.lr.held(0) && c.hc >= 2) {
+        const int64_t R = std::min<int64_t>(T, kTegRows);
+        m.teg_idx = decl_b(b, nm.f("teg_expand_idx"), RAD_I32, { c.hc * R, 1 }, RAD_BUF_PERSIST);
+        m.teg_pre = decl_b(b, nm.f("teg_pre_one"), RAD_F32, { R, c.hc }, RAD_BUF_PERSIST);
+        if (m.teg_idx && m.teg_pre)
+            m.teg_g = op(b, "gather_rows", { RAD_RANGE("M", 1, c.hc * R), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
+                         { m.xcol, m.teg_idx }, { m.h0 });
+        if (m.teg_g) {
+            m.teg_rows = R;
+            m.bp[m.teg_pre] = c.hc;
+            /* idx[hc t + i] = t; the plane's rows (1.0f, +0.0f, ..) as their f32 words (the fills' values) */
+            m.teg_host.assign((size_t)(2 * c.hc * R), 0);
+            const float one = 1.0f;
+            int32_t one_w = 0;
+            std::memcpy(&one_w, &one, 4);
+            for (int64_t r = 0; r < c.hc * R; ++r) m.teg_host[(size_t)r] = (int32_t)(r / c.hc);
+            for (int64_t t = 0; t < R; ++t) m.teg_host[(size_t)(c.hc * R + t * c.hc)] = one_w;
+            if (!ctx->shape_probe && !g_teg_ok.exchange(1, std::memory_order_relaxed))
+                g_sw_e2.fetch_or(16, std::memory_order_relaxed);   /* the start value: on */
+        } else {
+            m.teg_idx = m.teg_pre = 0;
+            if (!ctx->shape_probe) g_teg_bad.store(1, std::memory_order_relaxed);
+        }
+        if (!ctx->shape_probe && ctx->rank == 0 && !g_teg_noted.exchange(1, std::memory_order_relaxed))
+            fprintf(stderr, "radiance: deepseek41: lever TEG (ds41_e2 bit 4, RADIANCE_DS41_TEG) %s: the prologue's %lld expand "
+                            "casts as one gather_rows and layer 0's collapse from a constant one-hot plane (no pre0 / pre1) at "
+                            "passes of <= %lld rows\n",
+                    m.teg_g ? "declared" : "NOT declared (an op or buffer could not be declared)", (long long)c.hc,
+                    (long long)R);
+    }
     /* tp8 loop P20 round 2 (RADIANCE_DS41_SPHC): the rows collectives, raw (exact), in place, each over its buffer -- the
      * attention output's and the MoE delta's reduce-scatter, the normed inputs' all-gathers (row D), the streams' all-gather
      * (row hc x D, `bound` the all-reduce's T x D: the same instance); none where any does not resolve */
@@ -10226,9 +10296,39 @@ static bool egl_gather(RadCtx* x, Model& m, const Layer& L, int64_t T, RadOperan
     }
     return true;
 }
+/* lever TEG (round 83): a pass's planes are owed (the first pass that would issue the form copies them: keyed 0) */
+static bool teg_pending(const Model& m, int64_t T) { return m.teg_g && !m.teg_up && T <= m.teg_rows && teg_now(); }
+/* lever TEG: the prologue's expand as one gather (layer 0's collapse then reads teg_pre: t_teg); false = issue today's casts
+ * and fills (TEG off, not declared here, a pass above teg_rows, or the planes could not be copied: owed to the next pass) */
+static bool teg_issue(RadCtx* x, Model& m, int64_t T) {
+    t_teg = false;
+    if (!m.teg_g || T <= 0 || T > m.teg_rows || !teg_now()) return false;
+    const auto& c = m.c;
+    if (!m.teg_up) {
+        const int64_t ni = c.hc * m.teg_rows;
+        void* pi = rad_buf_ptr(x, m.teg_idx);
+        void* pp = rad_buf_ptr(x, m.teg_pre);
+        if (!pi || !pp || rad_memcpy_async(pi, m.teg_host.data(), (size_t)ni * 4, rad_stream(x)) < 0 ||
+            rad_memcpy_async(pp, m.teg_host.data() + ni, (size_t)ni * 4, rad_stream(x)) < 0 || rad_stream_sync(rad_stream(x)) < 0)
+            return false;
+        m.teg_up = true;
+    }
+    void* h0p = rad_buf_ptr(x, m.h0);
+    if (!h0p) return false;
+    /* h0 [T, hc x D] packed = [hc x T, D] rows; idx[hc t + i] = t (a raw view of h0's own pointer, as lever EMG) */
+    RAD_ISSUE_N(x, m.teg_g, c.hc * T, brows(m.xcol, T), brow_slice(m.teg_idx, 0, c.hc * T, 1),
+                praw2(h0p, RAD_BF16, c.hc * T, c.n_embd));
+    t_teg = true;
+    if (m.g.rank == 0 && g_teg_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+        fprintf(stderr, "radiance: deepseek41: lever TEG: first trunk pass (%lld rows) issued with the expand as one gather_rows "
+                        "of %lld rows, no pre0 / pre1 (counted at issue: a recorded pass once)\n",
+                (long long)T, (long long)(c.hc * T));
+    return true;
+}
 
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     PflScope pfl(x, m, batch, sg);   /* tp8 loop P42: RADIANCE_DS41_PF_LAYERS (rank 0, a lone planned prefill pass) */
+    t_teg = false;   /* lever TEG: set only by this pass's own prologue */
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start (each part of a lane step's pass too) */
     const int pfb = pf_bits(batch);   /* tp8 loop D24: 0 = no weight reads beside the all-reduces */
     pf_pass_note(x, batch, pfb);
@@ -10531,7 +10631,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         !pp_cross(x, m, batch, RAD_PP_X1, 0, T))
         return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
-    if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
+    if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0) && !teg_issue(x, m, T)) {   /* lever TEG: one gather, no fills */
         for (int64_t i = 0; i < c.hc; ++i)
             RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
         RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
@@ -11182,11 +11282,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         };
         /* the collapse (+ norm: a fused norm, by segment within its 32-row width); lever PSK-L20: at the split layer over
          * the step's own segments, the uncut pass's launches -- xn on every row is the compressor's input */
+        /* lever TEG: layer 0 after this pass's TEG prologue reads the one-hot plane (the same f32 words pre0 / pre1 wrote) */
+        const rad_buf pre_c = t_teg && l == 0 && m.teg_pre ? m.teg_pre : m.pre_f;
         const auto cn_a = [&](int64_t r0, int64_t n) {
-            RAD_ISSUE_N(x, L.cn_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
+            RAD_ISSUE_N(x, L.cn_a, n, R(m.h0, r0, n), R(pre_c, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
         };
         const auto col_a = [&](int64_t r0, int64_t n) {
-            RAD_ISSUE_N(x, L.col_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n));
+            RAD_ISSUE_N(x, L.col_a, n, R(m.h0, r0, n), R(pre_c, r0, n), R(m.xcol, r0, n));
         };
         if (L.cn_a && sp_l) {   /* tp8 loop P20: this rank's quarter; xn gathered before the attention reads it */
             with_rows(sp0, spn, [&] { rows(kBiNorm, cn_a); });
@@ -11196,7 +11298,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             else if (L.cn_a_w)   /* lever BIW: a decode segment above kBiNorm rows as one _w1k launch */
                 nrows(L.cn_a_w, [&](int64_t r0, int64_t n, bool w) {
                     if (!w) return cn_a(r0, n);
-                    RAD_ISSUE_N(x, L.cn_a_w, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm),
+                    RAD_ISSUE_N(x, L.cn_a_w, n, R(m.h0, r0, n), R(pre_c, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm),
                                 R(m.xn, r0, n));
                 });
             else rows(kBiNorm, cn_a);
@@ -12260,6 +12362,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
+    t_teg = false;   /* lever TEG: set only by this pass's own prologue */
     /* tp8 S3: a strict node is this node's part of a two-node engine; run as one only by the pipeline (tp8 S4) */
     if (m.lr.on && m.lr.strict && !m.pp) {
         rad_step_fail(x, "deepseek41: RADIANCE_DS41_LAYERS_MODE=strict declares this node's part of a two-node engine "
@@ -12403,7 +12506,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         !pp_cross(x, m, batch, RAD_PP_X1, 0, T))
         return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
-    if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
+    if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0) && !teg_issue(x, m, T)) {   /* lever TEG: one gather, no fills */
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
@@ -12544,12 +12647,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
                             RAD_W(L.hc_a_base), Rs(m.pre_a), Rs(m.post), Rs(m.comb));
             });
         };
+        /* lever TEG: layer 0 after this pass's TEG prologue reads the one-hot plane (the same f32 words pre0 / pre1 wrote) */
+        const rad_buf pre_c = t_teg && l == 0 && m.teg_pre ? m.teg_pre : m.pre_f;
         const auto col_a = [&] {
             if (L.cn_a)
-                RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(pre_c, T), brows(m.xcol, T),
                             RAD_W(L.attn_norm), brows(m.xn, T));
             else if (L.col_a)   /* 0 under pcn_a: issued for the previous post_f */
-                RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+                RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(pre_c, T), brows(m.xcol, T));
         };
         col_a();
         if (!late) mix_a();
@@ -13085,6 +13190,13 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
                         (long long)b->n_tok);
             return 0;
         }
+    }
+    /* DRAFTER round 83, lever TEG: the trunk pass that copies TEG's two constant planes (the first that issues the form on this
+     * rank) is issued live, not recorded (EUP's rule: a pageable copy would refuse its key for the process) */
+    if (b && b->draft_pass == 0 && c) {
+        const int r = rad_rank(c);
+        if (r >= 0 && r < rad::arch::MAX_RANKS && deepseek41::models[r] && deepseek41::teg_pending(*deepseek41::models[r], b->n_tok))
+            return 0;
     }
     /* Lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is shaped by its targets, which no key holds: not
      * recorded */
