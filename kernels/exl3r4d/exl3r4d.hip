@@ -201,6 +201,9 @@ static_assert(EXL3R4D_SWK != 2 || EXL3R4D_SWK_BLK == 8, "SWK 2: 8 tokens a pass 
 #define EXL3R4D_SWK_ABOUND 0 // b32 loads a 32-deep step (TIMING ONLY, wrong outputs: the real form's A-load cost bound); 0 = the loads
 #endif
 static_assert(EXL3R4D_SWK_DMOVE == 0 || EXL3R4D_SWK_DMOVE == 1 || EXL3R4D_SWK_DMOVE == 2 || EXL3R4D_SWK_DMOVE == 9, "SWK_DMOVE: 0 / 1 / 2 / 9");
+#ifndef EXL3R4D_X15_INSUM   // SWK x X5F (tp8 DECODE round 67, QUEUE X15c): 1 = the fold's SW 2 twins take each token's row sum from the
+#define EXL3R4D_X15_INSUM 0  // compressed A fragments the K loop already loads (x5_dot8 on the odd step, lanes t / t + 8 / t + 16 / t + 24 joined
+#endif                       // after the loop) instead of the X6 S2 pre-pass -- its own bits (another sum order); 0 = the pre-pass (X15 / X15b)
 #ifndef EXL3R4D_X15_ABL   // SWK x X5F (tp8 DECODE round 67, QUEUE X15) bisect: 1 = the fold's SW 2 twins WITHOUT the fold epilogue (TIMING ONLY,
 #define EXL3R4D_X15_ABL 0 // wrong outputs: the epilogue's share of the fold twins' cost); 0 = the real form
 #endif
@@ -1222,7 +1225,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // a + b = b + a); lane nl keeps its row's. A dropped row's xr is zeros (the prep's), a lane past the rows keeps 0 (never
   // stored). Per row and per the launch's split only, as the in-loop forms.
   [[maybe_unused]] float xsum = 0.f;
-  if constexpr (FOLD && EXL3R4D_X5_SUM == 3 && EXL3R4D_X6_PRE == 2) {   // X6u: the same sums, the loads issued ahead
+  if constexpr (FOLD && EXL3R4D_X5_SUM == 3 && EXL3R4D_X6_PRE == 2 && !(SW >= 2 && EXL3R4D_X15_INSUM)) {   // X6u: the same sums, the loads issued ahead
     const int nrows = min(chunk, r1 - rc), nk = kps * 16;
     const v2h one = (v2h){(_Float16)1.0f, (_Float16)1.0f};
     for (int i = 0; i < nrows; i += 2) {   // wave-uniform; an odd last row is summed twice, its copy dropped
@@ -1257,7 +1260,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       if (nl == i) xsum = sa;
       if (i1 != i && nl == i1) xsum = sb;
     }
-  } else if constexpr (FOLD && EXL3R4D_X5_SUM == 3 && EXL3R4D_X6_PRE == 0) {
+  } else if constexpr (FOLD && EXL3R4D_X5_SUM == 3 && EXL3R4D_X6_PRE == 0 && !(SW >= 2 && EXL3R4D_X15_INSUM)) {
     const int nrows = min(chunk, r1 - rc), nk = kps * 16;
     const v2h one = (v2h){(_Float16)1.0f, (_Float16)1.0f};
     for (int i = 0; i < nrows; ++i) {   // wave-uniform
@@ -1425,7 +1428,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
       else if constexpr (SW) { /* SWK: the even step's fragments wait for the odd step's (u = the step's parity) */ \
         if ((u & 1) == 0) { _Pragma("unroll") for (int j = 0; j < NPW; j++) swk_prev[j] = wfs_[j]; }                \
-        else swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                         \
+        else { swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                       \
+               if constexpr (FOLD && EXL3R4D_X15_INSUM) accs = x5_dot8(A_, accs); /* X15c: this lane's part of its token's sum */ } \
       }                                                                              \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
@@ -1463,7 +1467,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else if constexpr (EXL3R4D_X6_VDOT) x6w_vdot<NPW>(wfs_, A_, vacc, nrv); /* X6w: dots, no WMMA */ \
       else if constexpr (SW) { /* SWK: as the X3D path */                 \
         if ((u & 1) == 0) { _Pragma("unroll") for (int j = 0; j < NPW; j++) swk_prev[j] = wfs_[j]; }                \
-        else swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                         \
+        else { swk_pair<NPW>(swk_prev, wfs_, A_, acc, swk_idx);                                                       \
+               if constexpr (FOLD && EXL3R4D_X15_INSUM) accs = x5_dot8(A_, accs); /* X15c: this lane's part of its token's sum */ } \
       }                                                                              \
       else { _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); } \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
@@ -1575,6 +1580,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #pragma unroll
         for (int j = 0; j < NPW; j++) zw[j] = z;
         swk_pair<NPW>(swk_prev, zw, x_.f, acc, swk_idx);
+        if constexpr (FOLD && EXL3R4D_X15_INSUM) accs = x5_dot8(x_.f, accs);   // X15c: the tail's two dwords (+0 for the zeroed two)
       }
     }
   }
@@ -1631,6 +1637,10 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       if (acc[0][0] == 12345.678f) acc[0][1] = xsum;   // keep the pre-pass's sum live
 #else
       const bool first = lane < 16;
+      if constexpr (EXL3R4D_X15_INSUM) {   // X15c: token t's K over lanes t (K 8q + 0 / 1), t + 8 (+ 2 / 3), t + 16 (+ 4 / 5), t + 24 (+ 6 / 7)
+        const float s8 = accs + __shfl_xor(accs, 8, 32);   // one fixed order in every lane: (t) + (t + 8), then (t, t + 8) + (t + 16, t + 24)
+        xsum = s8 + __shfl_xor(s8, 16, 32);
+      }
       float kx[8];
 #pragma unroll
       for (int v = 0; v < 8; v++) {
