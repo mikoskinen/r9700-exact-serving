@@ -947,6 +947,10 @@
  *                   converted, summed and scaled by every thread in every token; the same bytes
  *                   3 = 1 + lever GRP (QUEUE Q80): the A replayed tokens' factor blocks staged into LDS in one batch beside
  *                   the state load instead of one block loaded at the head of each replay step; the same bytes
+ *                   4 = lever QSC (Qwen loop round 47, QUEUE Q84; WITHOUT EPD's deferred epilogue): the T tokens' q / k l2
+ *                   scales once a call (STG's staging after the convolution's barrier: one lane per (token, half) sums its 64
+ *                   squares in the per-row order) instead of every thread summing the same 2 x 64 squares in every token;
+ *                   the same bytes
  *                                                                                                  RADIANCE_GDN_EPD
  *   hc_rf           libr4d (rad_fn4_switch; qfn-on-ds lever HRF, Qwen loop round 44): N = from N (>= 32) rows the bi_dec read's
  *                   served HXS form (A' on the write's scales, NTS 4, XLB 3; B3X with B3E + B3D) runs as ONE launch, hc_read_hrf:
@@ -959,7 +963,9 @@
  *                   M > 16 prefill band), 2 = the head's attention and feed-forward connection reads through the bi_dec twin
  *                   (HyperConn::read_bd) up to its declared rows; 4 (libr4d, lever MTE) = mtp_enter at RADIANCE_FN4_MTE_MIN (8)..128
  *                   tokens in a split-K prefill form (both products one launch, K in RADIANCE_FN4_MTE_SK (4) pieces, a fixed-order sum;
- *                   other bytes than today's mtp_enter, drafts only); 0 today
+ *                   other bytes than today's mtp_enter, drafts only); 8 (libr4d, lever W2K, round 47) = the w2a8 draft head's
+ *                   untuned GEMM at sk 4 / nt 0 where DFlash2's SK-8 pin cannot divide K (the Qwen head, K 2,560; slot w1's
+ *                   best point; other bytes, drafts only); 0 today
  *                                                                                                  RADIANCE_FN4_MTP_DEC
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),

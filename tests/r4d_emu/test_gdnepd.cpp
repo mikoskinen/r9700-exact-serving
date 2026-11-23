@@ -1,7 +1,8 @@
 /* tests/r4d_emu: qfn-on-ds lever EPD (Qwen loop round 41, QUEUE Q78) on the host SIMT emulator -- the GDN decode update with
  * the convolution folded in (gdn_conv_recurrent_update / _had, anchor state, fp32) with its per-token epilogue (row norm, bf16
  * output, the out projection's codes + scales) deferred past the token loop (r4d_gdn_epd(1)) against today's form
- * (r4d_gdn_epd(0)), byte for byte -- and lever QKS (round 41, QUEUE Q79; r4d_gdn_epd(2): EPD + each token's normalised q / k staged once):
+ * (r4d_gdn_epd(0)), byte for byte -- and lever QKS (round 41, QUEUE Q79; r4d_gdn_epd(2): EPD + each token's normalised q / k staged once),
+ * lever GRP (r4d_gdn_epd(3)) and lever QSC (round 47, QUEUE Q84; r4d_gdn_epd(4), WITHOUT EPD: the q / k scales once a call):
  *   o (bf16), the codes (E4M3 = NORM 1, int8 = NORM 2, had_quant_act_i8g's rotated int8 = NORM 3) and their scales, the whole
  *   recurrent state pool (anchor and factor slots) and the conv state, over TWO steps (the second replays the factors the
  *   first wrote);
@@ -179,8 +180,8 @@ int main() {
     const int64_t real = s.cu[(size_t)N - 1];
     for (int form : { 3, 2, 1 }) {
         const char* fn = form == 3 ? "had (NORM 3, rotated int8)" : form == 2 ? "int8 (NORM 2)" : "E4M3 (NORM 1)";
-        Run a, b, c, q, g;
-        init(a, s, form); init(b, s, form); init(c, s, form); init(q, s, form); init(g, s, form);
+        Run a, b, c, q, g, z;
+        init(a, s, form); init(b, s, form); init(c, s, form); init(q, s, form); init(g, s, form); init(z, s, form);
         std::string why;
         long long moved_o = 0;
         for (int st = 0; st < 2 && why.empty(); ++st) {
@@ -202,9 +203,14 @@ int main() {
             r4d_gdn_epd(3);
             const int rg = step(g, s, form, st, -1);
             const long long l5 = r4d_gdn_epd_launches();
+            /* lever QSC (round 47, QUEUE Q84): gdn_epd 4 */
+            r4d_gdn_epd(4);
+            const int rz = step(z, s, form, st, -1);
+            const long long l6 = r4d_gdn_epd_launches();
             r4d_gdn_epd(-1);
-            if (ra || rb || rc || rq || rg) { why = fmt("step %d rc %d / %d / %d / %d / %d", st, ra, rb, rc, rq, rg); break; }
+            if (ra || rb || rc || rq || rg || rz) { why = fmt("step %d rc %d / %d / %d / %d / %d / %d", st, ra, rb, rc, rq, rg, rz); break; }
             check(l5 == l4 + 1, fmt("%s step %d: dispatch (EPD launches +%lld GRP)", fn, st, l5 - l4));
+            check(l6 == l5 + 1, fmt("%s step %d: dispatch (EPD launches +%lld QSC)", fn, st, l6 - l5));
             check(l1 == l0 && l2 == l1 + 1 && l4 == l3 + 1, fmt("%s step %d: dispatch (EPD launches +%lld unset, +%lld EPD, +%lld QKS)", fn, st,
                                                                l1 - l0, l2 - l1, l4 - l3));
             const std::string d = cmp(a, b, real);
@@ -213,13 +219,15 @@ int main() {
             if (!dq.empty()) { why = fmt("step %d (QKS): %s", st, dq.c_str()); break; }
             const std::string dg = cmp(a, g, real);
             if (!dg.empty()) { why = fmt("step %d (GRP): %s", st, dg.c_str()); break; }
+            const std::string dz = cmp(a, z, real);
+            if (!dz.empty()) { why = fmt("step %d (QSC): %s", st, dz.c_str()); break; }
             for (auto v : a.o) moved_o += v != 0;
             if (st == 0) {
                 const std::string dc = cmp(a, c, real);
                 check(!dc.empty(), fmt("%s NEGATIVE CONTROL: one changed gate element is seen (%s)", fn, dc.c_str()));
             }
         }
-        check(why.empty() && moved_o > 0, fmt("%s: EPD, EPD + QKS and EPD + GRP = today's form, every byte, two steps (o non-zero %lld)", fn, moved_o), why);
+        check(why.empty() && moved_o > 0, fmt("%s: EPD, EPD + QKS, EPD + GRP and QSC = today's form, every byte, two steps (o non-zero %lld)", fn, moved_o), why);
     }
     std::printf("r4d_emu_gdnepd: %d cases, %d failed\n", g_cases, g_fail);
     return g_fail ? 1 : 0;

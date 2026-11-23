@@ -86,7 +86,7 @@ inline std::atomic<int>& fn4_mtpflat_flag() { static std::atomic<int> f{0}; retu
  * 222.7 us where the trunk's fused chain takes ~165 at 32 rows, three connection reads in op_read's tiled forms 113.2 us where
  * the trunk's bi_dec read takes ~26.7 a read): the head's draft passes in the trunk's decode forms. Drafts only -- the trunk
  * verifies every draft greedily on batch-invariant rows, so a draft's bytes move acceptance (tokens a step), never an answer.
- * A mask (fn4 switch mtp_dec 0..7, bit 4 libr4d's lever MTE; RADIANCE_FN4_MTP_DEC at start, the core's start-value rule):
+ * A mask (fn4 switch mtp_dec 0..15, bits 4 / 8 libr4d's levers MTE / W2K; RADIANCE_FN4_MTP_DEC at start, the core's start-value rule):
  *   1  the head's MoE is told one row a sequence (MoeFP8::set_qmax(1); every pass that reaches it -- a history pass's round-1
  *      rows (draft_out_ids) or a later round -- carries one row a drafting sequence), so its 17..RADIANCE_FN4_X3GD_HI-row
  *      passes take the fused EXL3 decode chain (lever X3GD's rule) instead of the split M > 16 band; unset: INT32_MAX (today)

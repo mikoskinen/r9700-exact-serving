@@ -253,22 +253,39 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * (state, factors, the raw output `on`, parked in sonT) and the row norm, the bf16 output, the out projection's codes and
    * scales of all T tokens follow the loop in two barriers (and, at NORM 3, one rotation per wave in parallel) instead of
    * two to four barriers inside every token. Each token's values are the same expressions in the same order: the same bytes. */
-  static_assert(!EPD || (CV && NORM && ANC && VS == 1 && STG == 0), "EPD: the folded decode shape (T <= RU_CVT), fused norm, anchor");
-  __shared__ float sonT[EPD ? RU_CVT * RU_V : 1];         // per (token, row): the raw output before the norm
-  __shared__ float sobT[EPD ? RU_CVT * RU_V : 1];         // per (token, row): bf2f of the stored bf16 output
-  __shared__ float swnT[EPD ? RU_CVT * (THR / 32) : 1];   // per (token, wave): the norm's partial sum of squares
-  __shared__ float swaT[EPD ? RU_CVT * (THR / 32) : 1];   // per (token, wave): NORM 1 / 2's partial amax
+  /* qfn-on-ds QUEUE Q84 read (Qwen loop round 47, BENCH ONLY): EPD's high bits (EPD >> 4 = ABL) are timing ablations of the served
+   * form (EPDF 0), reachable only through the bench hook r4d_gdn_epd(16 x ABL) -- never the engine (the core switch gdn_epd and
+   * RADIANCE_GDN_EPD stay 0..3); each removes one phase of the call to price it, so its bytes are NOT the update's:
+   *   ABL 1  the token loop's q / k l2 norms (the two 64-term sums, the exchanges, the rsqrt; qs = scale, ks = 1, the scaling kept)
+   *   ABL 2  the token loop's epilogue reductions (row norm and amax: their lane exchanges, LDS partials and four barriers a token;
+   *          the bf16 output, codes at a fixed scale and the scale store kept)
+   *   ABL 4  the token loop's recurrence (decay, S k, the update, S q: 4 x 64 FMAs a token; q / k kept live, no instruction)
+   *   ABL 8  the replay of the accepted tokens (their factor loads and recurrence; the anchor is still stored)
+   * EPDF 0 and ABL 0 are today's instances, text for text.
+   * qfn-on-ds lever QSC (Qwen loop round 47, QUEUE Q84; EPD == 4, gdn_epd 4): the folded form's q / k l2 scales computed ONCE a call
+   * -- STG's staging (one lane per (token, half) sums its 64 squares in the per-row order, one lane per token closes the two scales)
+   * after the convolution's barrier -- instead of every one of the 256 threads summing the same 2 x 64 squares in every token; the
+   * token loop reads the two scales from LDS. The same sums, order and expressions as the per-row path (STG's note): the same bytes.
+   * EPI = EPDF & 3 is lever EPD's epilogue form (1 EPD, 2 + QKS, 3 + GRP); QSC = EPDF & 4. */
+  constexpr int EPDF = EPD & 15, ABL = EPD >> 4, EPI = EPDF & 3;
+  constexpr bool QSC = (EPDF & 4) != 0;
+  static_assert(!ABL || EPDF == 0, "the Q84 ablations are of the served form (EPD 0)");
+  static_assert(!EPDF || (CV && NORM && ANC && VS == 1 && STG == 0), "EPD: the folded decode shape (T <= RU_CVT), fused norm, anchor");
+  __shared__ float sonT[EPI ? RU_CVT * RU_V : 1];         // per (token, row): the raw output before the norm
+  __shared__ float sobT[EPI ? RU_CVT * RU_V : 1];         // per (token, row): bf2f of the stored bf16 output
+  __shared__ float swnT[EPI ? RU_CVT * (THR / 32) : 1];   // per (token, wave): the norm's partial sum of squares
+  __shared__ float swaT[EPI ? RU_CVT * (THR / 32) : 1];   // per (token, wave): NORM 1 / 2's partial amax
   /* qfn-on-ds lever QKS (Qwen loop round 41, QUEUE Q79; EPD == 2 = EPD + QKS): each token's l2-normalised q and k staged ONCE in LDS as f32
    * (the per-(token, half) sums by 2T lanes in the per-row order, the scale and each element's product by one thread) instead of every one of the
    * 256 threads converting, summing and scaling the same 128 + 128 values in every token; the loop loads the f32 products. The same bytes. */
-  __shared__ float sqk[EPD == 2 ? RU_CVT * 2 * RU_K : 1];  // per token: normalised q [128] then k [128]
-  __shared__ float sqp[EPD == 2 ? RU_CVT * 4 : 1];         // per (token, half): sum q^2, sum k^2
+  __shared__ float sqk[EPI == 2 ? RU_CVT * 2 * RU_K : 1];  // per token: normalised q [128] then k [128]
+  __shared__ float sqp[EPI == 2 ? RU_CVT * 4 : 1];         // per (token, half): sum q^2, sum k^2
   /* qfn-on-ds lever GRP (Qwen loop round 41, QUEUE Q80; EPD == 3 = EPD + GRP): the A accepted tokens' replay factor blocks staged into LDS
    * at once, beside the state load, instead of one token's block loaded from memory at the head of each replay step (a chain of A memory
    * latencies that grows with load: slot g1's replay step 4.5-9 us at 24-32 sequences, 0.05-0.5 us at 1-16); the replay reads the same values. */
-  __shared__ __attribute__((aligned(16))) float sfr[EPD == 3 ? RU_CVT * RU_FSTR : 4];
-  __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
-  __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
+  __shared__ __attribute__((aligned(16))) float sfr[EPI == 3 ? RU_CVT * RU_FSTR : 4];
+  __shared__ float spart[(STG || QSC) ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
+  __shared__ float sscl [(STG || QSC) ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
   const int bos = cu[n], T = cu[n + 1] - bos;
   // With ANC, T == 0 is valid: it folds the previous step's accepted prefix into the anchor before
@@ -434,7 +451,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
 
   /* lever GRP: the replay's factor blocks into LDS in one batch (nacc is uniform a workgroup; above RU_CVT the memory path as today) */
   bool grp_lds = false;
-  if constexpr (EPD == 3) {
+  if constexpr (EPI == 3) {
     grp_lds = nacc <= RU_CVT;
     if (grp_lds) {
       static_assert(RU_FSTR % 4 == 0, "whole float4s a factor block");
@@ -450,8 +467,8 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   }
 
   if (ANC) {
-    for (int t = 0; t < nacc; ++t) {
-      const ST* f = (EPD == 3 && grp_lds ? (const ST*)sfr : fr) + (size_t)t * RU_FSTR;
+    for (int t = 0; t < ((ABL & 8) ? 0 : nacc); ++t) {   /* ABL 8 (bench only): no replay */
+      const ST* f = (EPI == 3 && grp_lds ? (const ST*)sfr : fr) + (size_t)t * RU_FSTR;
       float kk[RU_HK];
 #pragma unroll
       for (int j = 0; j < RU_HK; j += 8) ru_load8<0, SDT>(&kk[j], f + grp * RU_K + k0 + j);
@@ -533,10 +550,45 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     if (G > 1 && tid == 0)
       arrived = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED,
                                        __HIP_MEMORY_SCOPE_AGENT);
+    /* lever QSC: the T tokens' q / k scales, once -- STG's staging over the convolution's LDS rows (the same per-lane sums in the
+     * per-row order, own half + the other half, the same scale expressions): the same values each row computed in its loop */
+    if constexpr (QSC) {
+      if (tid < 2 * T) {
+        const int ut = tid >> 1, uk0 = (tid & 1) * RU_HK;
+        const unsigned short* qp = cvq + ut * RU_K + uk0;
+        const unsigned short* kp = cvk + ut * RU_K + uk0;
+        float ssq = 0.0f, ssk = 0.0f;
+#pragma unroll
+        for (int j = 0; j < RU_HK; j += 8) {
+          const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
+          const unsigned short* aq = (const unsigned short*)&wq;
+          const unsigned short* ak = (const unsigned short*)&wk;
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const float fq = bf2f(aq[e]), fk = bf2f(ak[e]);
+            ssq += fq * fq; ssk += fk * fk;
+          }
+        }
+        spart[tid * 2] = ssq;
+        spart[tid * 2 + 1] = ssk;
+      }
+      __syncthreads();
+      if (tid < T) {
+#if defined(R4D_EMU_QSC_MUTATE)   /* r4d_emu_gdnepd's mutation build only: q's other half read from k's column */
+        const float ssq = spart[tid * 4]     + spart[tid * 4 + 3];
+#else
+        const float ssq = spart[tid * 4]     + spart[tid * 4 + 2];
+#endif
+        const float ssk = spart[tid * 4 + 1] + spart[tid * 4 + 3];
+        sscl[tid * 2]     = __frsqrt_rn(ssq + 1e-6f) * scale;
+        sscl[tid * 2 + 1] = __frsqrt_rn(ssk + 1e-6f);
+      }
+      __syncthreads();
+    }
   }
 
   /* lever QKS: the T tokens' normalised q / k, once (the per-row path's own sums, order and expressions -- see sqk) */
-  if constexpr (EPD == 2) {
+  if constexpr (EPI == 2) {
     if (tid < 2 * T) {
       const int ut = tid >> 1, uk0 = (tid & 1) * RU_HK;
       const unsigned short* qp = cvq + ut * RU_K + uk0;
@@ -614,7 +666,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
 
     float qq[RU_HK], kk[RU_HK];
-    if constexpr (EPD == 2) {   /* lever QKS: the token's normalised q / k, staged once */
+    if constexpr (EPI == 2) {   /* lever QKS: the token's normalised q / k, staged once */
       const float* fq = sqk + t * 2 * RU_K + k0;
 #pragma unroll
       for (int j = 0; j < RU_HK; j += 4) {
@@ -633,8 +685,10 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
 
     // l2 norms: 64 in-lane terms, then one exchange with the lane holding the other half
     float qs, ks;
-    if (STG) {
+    if (STG || QSC) {   /* lever QSC: the call's staged scales */
       qs = sscl[t * 2]; ks = sscl[t * 2 + 1];
+    } else if constexpr ((ABL & 1) != 0) {   /* ABL 1 (bench only): no l2 norms */
+      qs = scale; ks = 1.0f;
     } else {
       float sq = 0.0f, sk = 0.0f;
 #pragma unroll
@@ -654,8 +708,17 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     const float eg  = __expf(g);
 
     float dot = 0.0f;
+    if constexpr ((ABL & 4) != 0) {   /* ABL 4 (bench only): no recurrence; q / k kept live without an instruction */
+#pragma unroll
+      for (int j = 0; j < RU_HK; ++j) {
+#if !defined(R4D_EMU_HOST)
+        asm volatile("" :: "v"(qq[j]), "v"(kk[j]));
+#endif
+      }
+    } else {
 #pragma unroll
     for (int j = 0; j < RU_HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
+    }
     dot += r4d_xor_lane<1>(dot);
 
     const float vraw = bf2f(CV ? cvv[t * RU_V + row] : v[((size_t)tok * H + hv) * RU_V + row]);
@@ -697,13 +760,25 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     }
 
     float on = 0.0f;
+    if constexpr ((ABL & 4) != 0) {
+      on = u * qq[0];
+    } else {
 #pragma unroll
     for (int j = 0; j < RU_HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
+    }
     on += r4d_xor_lane<1>(on);
 
     /* lever EPD: only the raw output here; its epilogue after the loop (both lanes of a pair hold the same sum) */
-    if constexpr (EPD) {
+    if constexpr (EPI) {
       if (half == 0) sonT[t * RU_V + row] = on;
+    } else if constexpr ((ABL & 2) != 0) {   /* ABL 2 (bench only): no epilogue reductions, codes at a fixed scale */
+      const unsigned short ob = f2bf(on);
+      if (half == 0) o[((size_t)tok * H + hv) * RU_V + row] = ob;
+      if ((NORM == 1 || NORM == 2) && oq) {
+        if (tid == 0) os[(size_t)tok * os_ld + hv] = 1.0f;
+        if (half == 0)
+          oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = (unsigned char)(int)rintf(fminf(fmaxf(bf2f(ob), -127.0f), 127.0f));
+      }
     } else {
     if (NORM) {
       // sum of squares over the row: one channel per thread pair, 16 per wave
@@ -802,7 +877,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * squares by the same lane exchanges and the eight wave partials summed ascending, the same scale, gate and bf16 output, the
    * same rotation / amax and codes -- so the same bytes; the tokens' reductions share two barriers, and at NORM 3 wave w rotates
    * tokens w, w + 8 (one wave rotated every token, between barriers, before). */
-  if constexpr (EPD) {
+  if constexpr (EPI) {
     constexpr int NWV = THR / 32;
     const int wv = tid >> 5, ln = tid & 31;
     for (int t = 0; t < T; ++t) {
@@ -1156,8 +1231,10 @@ static int ru_epd() {
   if (b >= 0) return b;
   static const int v = [] {
     const char* e = getenv("RADIANCE_GDN_EPD");
-    const int on = (e && e[0] >= '1' && e[0] <= '3' && e[1] == '\0') ? e[0] - '0' : 0;
-    if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=%d): the GDN decode update's per-token norm / output / "
+    const int on = (e && e[0] >= '1' && e[0] <= '4' && e[1] == '\0') ? e[0] - '0' : 0;
+    if (on == 4) fprintf(stderr, "radiance: libr4d: lever QSC (RADIANCE_GDN_EPD=4): the GDN decode update's q / k l2 scales once a call "
+                                 "(staged after the convolution) instead of in every token by every row; the same bytes\n");
+    else if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=%d): the GDN decode update's per-token norm / output / "
                             "codes after its token loop (two barriers a call instead of two to four a token)%s; the same bytes\n", on,
                     on == 2 ? " + lever QKS (each token's normalised q / k staged once in LDS)"
                             : on == 3 ? " + lever GRP (the replay's factor blocks staged into LDS at once)" : "");
@@ -1165,7 +1242,13 @@ static int ru_epd() {
   }();
   return v;
 }
-extern "C" void r4d_gdn_epd(int on) { g_ru_epd_bench.store(on < 0 ? -1 : (on > 3 ? 3 : on), std::memory_order_relaxed); }
+/* (round 47, QUEUE Q84 read, BENCH ONLY) 16 x ABL for ABL in {1, 2, 3, 4, 8, 15} = the served form's timing ablations (the kernel's ABL
+ * note; NOT the update's bytes); the core switch gdn_epd (0..3) and RADIANCE_GDN_EPD never reach them */
+static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15; }
+extern "C" void r4d_gdn_epd(int on) {
+  const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on > 4 ? 4 : on);
+  g_ru_epd_bench.store(v, std::memory_order_relaxed);
+}
 /* lever EPD's dispatch proof for the bench / host test: launches that took the EPD instance since the process started */
 static std::atomic<long long> g_ru_epd_launches{0};
 extern "C" long long r4d_gdn_epd_launches() { return g_ru_epd_launches.load(std::memory_order_relaxed); }
@@ -1174,6 +1257,33 @@ extern "C" long long r4d_gdn_epd_launches() { return g_ru_epd_launches.load(std:
  * changes */
 static std::atomic<int> g_ru_dyn_lds{0};
 extern "C" void r4d_gdn_dyn_lds(int bytes) { g_ru_dyn_lds.store(bytes < 0 ? 0 : (bytes > 49152 ? 49152 : bytes), std::memory_order_relaxed); }
+
+/* The Q84 ablation instances (bench only): the served combination alone -- int8 codes (NM 2), anchor, fp32 state, bf16 conv
+ * weights -- plain launch, NT as the call's; every other combination keeps today's form (no instance). */
+template <int NM, int NTC, int ANCC, int SDTC, int CVC>
+static bool ru_abl_launch(int abl, dim3 grid, dim3 blk, unsigned dyn_lds, RadStream stream, const void* a, const void* b,
+                          long ab_stride, const void* A_log, const void* dt_bias, void* state, long st_slot, long st_head,
+                          void* o, void* oq, void* os, long oq_pitch, long os_ld, const void* cu, const void* sidx,
+                          long sidx_stride, const void* nacc, const void* z, long z_pitch, const void* nw, float neps,
+                          int nact, int H, int Hg, float scale, float thr, const RuConv& cv) {
+  if constexpr (NM == 2 && ANCC == 1 && SDTC == 0 && CVC == 1) {
+#define RU_ABL(A) case A:                                                                         \
+    hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, 16 * A>), grid, blk, dyn_lds, \
+                       (hipStream_t)stream, nullptr, nullptr, nullptr, a, b, ab_stride, (const float*)A_log,             \
+                       (const float*)dt_bias, (float*)state, st_slot, st_head, (unsigned short*)o, (unsigned char*)oq,    \
+                       (float*)os, oq_pitch, os_ld, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc,      \
+                       (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg, scale, thr, cv);           \
+    return true;
+    switch (abl) { RU_ABL(1) RU_ABL(2) RU_ABL(3) RU_ABL(4) RU_ABL(8) RU_ABL(15) default: return false; }
+#undef RU_ABL
+  } else {
+    (void)abl; (void)grid; (void)blk; (void)dyn_lds; (void)stream; (void)a; (void)b; (void)ab_stride; (void)A_log; (void)dt_bias;
+    (void)state; (void)st_slot; (void)st_head; (void)o; (void)oq; (void)os; (void)oq_pitch; (void)os_ld; (void)cu; (void)sidx;
+    (void)sidx_stride; (void)nacc; (void)z; (void)z_pitch; (void)nw; (void)neps; (void)nact; (void)H; (void)Hg; (void)scale;
+    (void)thr; (void)cv;
+    return false;
+  }
+}
 
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
@@ -1195,7 +1305,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
   /* lever EPD: anchor + fp32 state only (its instances); every other form unchanged */
-  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS, 3 EPD + GRP */
+  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS, 3 EPD + GRP, 4 QSC (round 47); 16 x ABL bench only */
   if (epd) g_ru_epd_launches.fetch_add(1, std::memory_order_relaxed);
   const unsigned dyn_lds = (unsigned)g_ru_dyn_lds.load(std::memory_order_relaxed);   /* bench only (Q13 read); 0 = today */
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
@@ -1203,9 +1313,14 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
        else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  do { if ((ANCC) && !(SDTC) && epd == 3) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 3 : 0)); \
+  do { if (epd >= 16 && ru_abl_launch<NM, NTC, ANCC, SDTC, CVC>(epd >> 4, grid, blk, dyn_lds, stream, a, b, ab_stride, A_log, \
+                                                             dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, \
+                                                             sidx, sidx_stride, nacc, z, z_pitch, nw, neps, nact, H, Hg,    \
+                                                             scale, thr, cv)) break;                                        \
+       if ((ANCC) && !(SDTC) && epd == 3) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 3 : 0)); \
        else if ((ANCC) && !(SDTC) && epd == 2) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 2 : 0)); \
-       else if ((ANCC) && !(SDTC) && epd) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
+       else if ((ANCC) && !(SDTC) && epd == 1) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
+       else if ((ANCC) && !(SDTC) && epd == 4) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 4 : 0)); \
        else                               RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, 0); } while (0)
 #define RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, EPC)                                           \
   hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, EPC> \

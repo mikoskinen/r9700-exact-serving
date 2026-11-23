@@ -85,9 +85,9 @@ int qwen_hi(int i) {
          : i == kExl3Drz ? 7 : i == kResumeCold ? 3   /* resume_cold 2: + a spanned chunk's last piece start (lever TIP); 3: every piece start (with lever GPF) */
          : i == kHcB3xP ? 4096   /* lever B3P (Qwen loop round 39): the row floor of B3X's group-pair form, 0 off */
          : i == kHcXLb ? 3   /* lever XLB's mask (Qwen loop round 38): bit 1 the LDS-only tile barrier, bit 2 the own-tile scale fold */
-         : i == kGdnEpd ? 3   /* lever EPD (Qwen loop round 41): 1 the GDN update's deferred epilogue, 2 + lever QKS, 3 + lever GRP */
+         : i == kGdnEpd ? 4   /* lever EPD (Qwen loop round 41): 1 the GDN update's deferred epilogue, 2 + lever QKS, 3 + lever GRP; 4 lever QSC (round 47): the q / k scales once a call */
          : i == kHcRf ? 4096   /* lever HRF (Qwen loop round 44): the row floor of the HXS read's one-launch form, 0 off */
-         : i == kMtpDec ? 7   /* levers MTD / MTE (Qwen loop round 45): the MTP draft passes' decode forms, bit 1 the EXL3 chain, bit 2 the bi_dec reads (the plugins), bit 4 mtp_enter's split-K form (libr4d) */
+         : i == kMtpDec ? 15   /* levers MTD / MTE / W2K (Qwen loop rounds 45 / 47): the MTP draft passes' decode forms, bit 1 the EXL3 chain, bit 2 the bi_dec reads (the plugins), bit 4 mtp_enter's split-K form, bit 8 the w2a8 draft head at sk 4 / nt 0 (libr4d) */
          : 1;   /* exl3_drz 4..7: DRZ's reading values (exl3r4d accepts 0, 1, 4..7; F43); rg_tail 0..4095: rows + 256 x lever
                     RGU's form (libr4d refuses a row field above 128 and KU code 3, Qwen loop round 36) */
 }

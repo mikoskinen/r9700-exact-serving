@@ -8824,19 +8824,24 @@ constexpr long kMteMaxRows = 128;
 static std::atomic<int> g_mtp_dec{-1};
 static std::atomic<int> g_mte_bench{-1};
 extern "C" void r4d_mte_bench(int v) { g_mte_bench.store(v, std::memory_order_relaxed); }
-static bool mte_on() {
-    const int b = g_mte_bench.load(std::memory_order_relaxed);
-    if (b >= 0) return (b & 4) != 0;
+/* The switch's value as this library holds it (the start env until the first POST). Also read by r4d_gemm_w2a8_nt.hip (bit 8,
+ * lever W2K, Qwen loop round 47): r4d_mtp_dec_bits(). */
+extern "C" int r4d_mtp_dec_bits(void) {
     int v = g_mtp_dec.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_MTP_DEC");
         int n = 0;
         if (e && *e && *e != '0') { n = std::atoi(e); n = n > 1 ? n : 1; }
         int expect = -1;
-        g_mtp_dec.compare_exchange_strong(expect, n & 7, std::memory_order_relaxed);
+        g_mtp_dec.compare_exchange_strong(expect, n & 15, std::memory_order_relaxed);
         v = g_mtp_dec.load(std::memory_order_relaxed);
     }
-    return (v & 4) != 0;
+    return v;
+}
+static bool mte_on() {
+    const int b = g_mte_bench.load(std::memory_order_relaxed);
+    if (b >= 0) return (b & 4) != 0;
+    return (r4d_mtp_dec_bits() & 4) != 0;
 }
 static long long mte_sk(long long n) {
     static const int v = [] {
@@ -10071,23 +10076,31 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     }
     if (!std::strcmp(name, "gdn_epd")) {   /* qfn-on-ds lever EPD (round 41, r4d_gdn_recurrent_update_*.hip): the GDN update's epilogue after its loop;
                                             * 2 = + lever QKS (each token's normalised q / k staged once in LDS) */
-        if (value < 0 || value > 3) return -1;   /* 3 = EPD + lever GRP (round 41, QUEUE Q80) */
+        if (value < 0 || value > 4) return -1;   /* 3 = EPD + lever GRP (round 41, QUEUE Q80); 4 = lever QSC (round 47, QUEUE Q84) */
         r4d_gdn_epd(value);
         static std::atomic<int> said{0};
-        if (value >= 1 && said.exchange(value) != value)
+        if (value == 4 && said.exchange(value) != value)
+            std::fprintf(stderr, "radiance: libr4d: lever QSC (gdn_epd 4): the GDN decode update's q / k l2 scales once a call, not in "
+                                 "every token by every row (the same bytes)\n");
+        else if (value >= 1 && said.exchange(value) != value)
             std::fprintf(stderr, "radiance: libr4d: lever EPD (gdn_epd %d): the GDN decode update's per-token norm / output / codes after its "
                                  "token loop%s (the same bytes)\n", value, value == 2 ? " + lever QKS (q / k normalised once a token)"
                                  : value == 3 ? " + lever GRP (the replay's factor blocks staged at once)" : "");
         return 1;
     }
     if (!std::strcmp(name, "mtp_dec")) {   /* qfn-on-ds lever MTE (round 45): bit 4 = mtp_enter's split-K form at a draft pass's tokens
-                                            * (bits 1 / 2 are the architecture's, lever MTD) */
-        if (value < 0 || value > 7) return -1;
+                                            * (bits 1 / 2 are the architecture's, lever MTD); bit 8 = lever W2K (round 47,
+                                            * r4d_gemm_w2a8_nt.hip): the draft head's w2a8 GEMM at sk 4 / nt 0 where DFlash2's pin
+                                            * cannot divide K */
+        if (value < 0 || value > 15) return -1;
         g_mtp_dec.store(value, std::memory_order_relaxed);
-        static std::atomic<int> said{0};
+        static std::atomic<int> said{0}, said8{0};
         if ((value & 4) && said.exchange(1) == 0)
             std::fprintf(stderr, "radiance: libr4d: lever MTE (mtp_dec bit 4): mtp_enter at %ld..%ld tokens in the split-K prefill form "
                                  "(drafts only)\n", mte_min(), kMteMaxRows);
+        if ((value & 8) && said8.exchange(1) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever W2K (mtp_dec bit 8): the w2a8 draft head at sk 4 / nt 0 where K %% 1024 != 0 "
+                                 "(drafts only)\n");
         return 1;
     }
     if (!std::strcmp(name, "hc_rf")) {   /* qfn-on-ds lever HRF (round 44): the HXS read's A' + B3X as one launch from N rows, 0 off */

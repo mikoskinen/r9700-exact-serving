@@ -26559,10 +26559,21 @@ static void gdnr_bench(const Plugin& pl, int iters) {
     const int lds_b = std::atoi(envs("R4D_SELFTEST_GDN_LDS", "0").c_str());   /* the residency arm's dynamic LDS bytes (0: none) */
     /* lever QKS (round 41, QUEUE Q79): R4D_SELFTEST_GDN_QKS=1 adds the arm EPD + QKS (r4d_gdn_epd(2)) to the bytes and the timing */
     const int qks = std::atoi(envs("R4D_SELFTEST_GDN_QKS", "0").c_str()) ? 1 : 0;
-    /* (round 41, QUEUE Q80) R4D_SELFTEST_GDN_ARM3 = the third arm's gdn_epd level (2 QKS, 3 GRP; R4D_SELFTEST_GDN_QKS=1 = 2) */
+    /* (round 41, QUEUE Q80) R4D_SELFTEST_GDN_ARM3 = the third arm's gdn_epd level (2 QKS, 3 GRP; R4D_SELFTEST_GDN_QKS=1 = 2; round 47:
+     * 4 = lever QSC, the q / k scales once a call, WITHOUT EPD -- its timing line reads against today) */
     const int a3 = qks ? 2 : std::atoi(envs("R4D_SELFTEST_GDN_ARM3", "0").c_str());
-    const int x3 = (a3 == 2 || a3 == 3) ? 1 : 0;
-    const char* x3n = a3 == 3 ? "GRP" : "QKS";
+    const int x3 = (a3 == 2 || a3 == 3 || a3 == 4) ? 1 : 0;
+    const char* x3n = a3 == 3 ? "GRP" : a3 == 4 ? "QSC" : "QKS";
+    /* (round 47, QUEUE Q84 read) R4D_SELFTEST_GDN_ABL = a list from {1, 2, 3, 4, 8, 15}: the served form's (form 2: int8 codes, anchor,
+     * fp32 state) phase ablations through the hook r4d_gdn_epd(16 x ABL) -- 1 no q / k l2 norms in the token loop, 2 no epilogue
+     * reductions (row norm + amax, four barriers a token), 4 no recurrence (4 x 64 FMAs a token), 8 no replay of the accepted tokens,
+     * 3 = 1 + 2, 15 = all four. Timing only (an ablation's bytes are not the update's): today / each arm / today / each arm on copy 1. */
+    std::vector<int> AB;
+    for (int v : ints(envs("R4D_SELFTEST_GDN_ABL", "")))
+        if (v == 1 || v == 2 || v == 3 || v == 4 || v == 8 || v == 15) AB.push_back(v);
+        else std::printf("GDNR: R4D_SELFTEST_GDN_ABL value %d is not an ablation (1, 2, 3, 4, 8, 15) -- left out\n", v);
+    auto abl_name = [](int v) { return v == 1 ? "no-qk-norms" : v == 2 ? "no-epilogue-reductions" : v == 4 ? "no-recurrence"
+                                     : v == 8 ? "no-replay" : v == 3 ? "no-norms+no-epilogue" : "all-four"; };
     const int64_t K = 128, V = 128, H = 12, Hg = 4, W = 4, MQ = 8, SL = W - 2 + MQ, COLS = 6;
     const int64_t CONV = 2 * Hg * K + H * V, INW = CONV + H * V;
     std::printf("GDNR: rank shape H %lld Hg %lld K %lld V %lld conv %lld, iters %d, %s\n", (long long)H, (long long)Hg, (long long)K,
@@ -26645,14 +26656,14 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                             std::vector<uint8_t> P(c.n), Q(c.n);
                             st_memcpy(P.data(), c.a, c.n, hipMemcpyDeviceToHost); st_memcpy(Q.data(), c.b, c.n, hipMemcpyDeviceToHost);
                             size_t d = 0; for (size_t i = 0; i < c.n; ++i) d += P[i] != Q[i];
-                            if (d) { why = fmt("%s%s differs in %zu of %zu bytes", c2 == 2 ? (a3 == 3 ? "GRP: " : "QKS: ") : "", c.w, d, c.n); break; }
+                            if (d) { why = fmt("%s%s differs in %zu of %zu bytes", c2 == 2 ? (a3 == 3 ? "GRP: " : a3 == 4 ? "QSC: " : "QKS: ") : "", c.w, d, c.n); break; }
                         }
                     }
                     std::printf("GDNR %s: EPD%s vs today, two steps: %s; EPD launches +%lld today / +%lld EPD%s (want 0 / 2%s)\n", cell.c_str(),
-                                x3 ? fmt(" and EPD + %s", x3n).c_str() : "",
+                                x3 ? fmt(a3 == 4 ? " and %s" : " and EPD + %s", x3n).c_str() : "",
                                 why.empty() ? "every output byte identical (o, codes, scales, state pool, conv state)" : why.c_str(), dl[0], dl[1],
                                 x3 ? fmt(" / +%lld %s", dl[2], x3n).c_str() : "", x3 ? " / 2" : "");
-                    ok(fmt("GDNR %s: lever EPD%s byte-identical and dispatched", cell.c_str(), x3 ? fmt(" + %s", x3n).c_str() : "").c_str(),
+                    ok(fmt("GDNR %s: lever EPD%s byte-identical and dispatched", cell.c_str(), x3 ? fmt(a3 == 4 ? " and %s" : " + %s", x3n).c_str() : "").c_str(),
                        why.empty() && dl[0] == 0 && dl[1] == 2 && (!x3 || dl[2] == 2), why);
                 }
                 /* (2) time: copy 0, step 0's inputs, today / EPD / today / EPD (+ / today at R4D_SELFTEST_GDN_LDS bytes of dynamic LDS:
@@ -26680,7 +26691,11 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                             t0, t[0][0], t[0][1], mb, t0 > 0 ? mb * 1e3 / t0 : 0.0,
                             has_epd ? fmt(", EPD %.2f us (%+.2f us, %+.1f %%; reps %.2f / %.2f)", t1, t1 - t0, t0 > 0 ? 100.0 * (t1 - t0) / t0 : 0.0,
                                           t[1][0], t[1][1]).c_str() : "");
-                if (has_epd && x3) {
+                if (has_epd && x3 && a3 == 4) {   /* lever QSC (round 47): against today */
+                    const double t2 = (t[2][0] + t[2][1]) / 2;
+                    std::printf("GDNR %s %s qsc: today %.2f us, QSC %.2f us (%+.2f us, %+.1f %% vs today; reps %.2f / %.2f)\n", cell.c_str(),
+                                g_cold > 0 ? "cold" : "warm", t0, t2, t2 - t0, t0 > 0 ? 100.0 * (t2 - t0) / t0 : 0.0, t[2][0], t[2][1]);
+                } else if (has_epd && x3) {
                     const double t2 = (t[2][0] + t[2][1]) / 2;
                     std::printf("GDNR %s %s %s: EPD %.2f us, EPD + %s %.2f us (%+.2f us vs EPD, %+.1f %% vs today; reps %.2f / %.2f)\n", cell.c_str(),
                                 g_cold > 0 ? "cold" : "warm", a3 == 3 ? "grp" : "qks", t1, x3n, t2, t2 - t1, t0 > 0 ? 100.0 * (t2 - t0) / t0 : 0.0,
@@ -26690,6 +26705,28 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                     const double t2 = (t[3][0] + t[3][1]) / 2;
                     std::printf("GDNR %s %s residency: today %.2f us, today + %d B dynamic LDS %.2f us (x%.3f; reps %.2f / %.2f)\n", cell.c_str(),
                                 g_cold > 0 ? "cold" : "warm", t0, lds_b, t2, t0 > 0 ? t2 / t0 : 0.0, t[3][0], t[3][1]);
+                }
+                /* (round 47, QUEUE Q84 read) the served form's phase ablations, copy 1 (copy 0's timing above is untouched) */
+                if (has_epd && !AB.empty() && form == 2) {
+                    std::vector<RadTensor> tb; RadArgs ab; args(1, 0, tb, ab);
+                    auto launch_b = [&](int) { (void)r->launch(&ab, (RadStream) nullptr); };
+                    std::vector<double> ta(AB.size() + 1, 0.0), tr0(AB.size() + 1, 0.0), tr1(AB.size() + 1, 0.0);
+                    const long long n0 = pl.gdn_epd_n();
+                    for (int rep = 0; rep < 2; ++rep)
+                        for (size_t i = 0; i <= AB.size(); ++i) {
+                            pl.gdn_epd(i == 0 ? 0 : 16 * AB[i - 1]);
+                            const double u = st_time_us(launch_b, iters, (hipStream_t) nullptr);
+                            (rep ? tr1 : tr0)[i] = u;
+                            ta[i] += u / 2;
+                        }
+                    pl.gdn_epd(-1);
+                    const long long nab = pl.gdn_epd_n() - n0;
+                    std::string line = fmt("GDNR %s %s ablations (timing only): today %.2f us (reps %.2f / %.2f)", cell.c_str(),
+                                           g_cold > 0 ? "cold" : "warm", ta[0], tr0[0], tr1[0]);
+                    for (size_t i = 0; i < AB.size(); ++i)
+                        line += fmt("; %s %.2f us (%+.2f us, %+.1f %%; reps %.2f / %.2f)", abl_name(AB[i]), ta[i + 1], ta[i + 1] - ta[0],
+                                    ta[0] > 0 ? 100.0 * (ta[i + 1] - ta[0]) / ta[0] : 0.0, tr0[i + 1], tr1[i + 1]);
+                    std::printf("%s; ablation launches %lld\n", line.c_str(), nab);
                 }
                 dfree_all();
             }

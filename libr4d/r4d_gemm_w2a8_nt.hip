@@ -33,7 +33,9 @@
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 
 #define R4D_GEMM_W2A8_KPB   128      // K per packed block: 8 k steps, 16 bytes per lane
@@ -271,6 +273,30 @@ void r4d_gemm_w2a8_nt(long a, long ascale, long wq, long ws, long asum, long c,
 
 int r4d_gemm_w2a8_nt_group(void) { return R4D_GEMM_W2A8_GROUP; }
 
+/* qfn-on-ds lever W2K (Qwen loop round 47, QUEUE Q87; bit 8 of the Qwen switch mtp_dec, r4d_hc_bf16.hip holds it): the Qwen MTP
+ * draft head (N 62,080 a rank, K 2,560) cannot take DFlash2's SK-8 pin (K % (8 x 128) != 0), so today pick_sk answers the
+ * largest legal split (10 at M > 16, 20 at M <= 16) with the non-temporal weight loads. Xeon GPU2 slot w1 (FINDINGS DEV note 15:20
+ * 23.11.) timed every legal tune point at that shape: sk 4 / nt 0 (MB / NPW as today: the pin's 2 / 4 at M > 16, 1 / 1 below)
+ * is at or within 0.8 us of the best at every M -- M 32 110.1 -> 90.5, M 24 108.1 -> 88.0, M 16 80.5 -> 76.0, M 8 78.3 -> 72.7,
+ * M 1 75.9 -> 69.3 us. Under the bit, an UNTUNED call (sk, nt, mb at their defaults) whose K the pin cannot divide takes
+ * sk 4 / nt 0; DFlash2's K 5,120 (the pin divides it) and every tuned point stay as today. Other bytes than today's split
+ * (drafts only: the trunk verifies greedily), the same bytes on every call. */
+extern "C" int r4d_mtp_dec_bits(void);
+static void w2k_apply(const RadArgs* a, long long K, int unit, Cfg* c) {
+    if (!(r4d_mtp_dec_bits() & 8)) return;
+    R4dGemmCfg cv;
+    r4d_cfg_gemm(a, &cv);
+    if (cv.sk > 0 || cv.nt != 1 || cv.mb > 0) return;                       /* a tuned point: as named */
+    if (unit <= 0 || K % (8LL * unit) == 0) return;                          /* the SK-8 pin applies (DFlash2) */
+    if (K % (4LL * unit) || c->wv * 4 * 32 > block_bound(BR_W2A8, c->mb, c->npw)) return;
+    static std::atomic<int> said{0};
+    if (said.exchange(1) == 0)
+        std::fprintf(stderr, "radiance: libr4d: lever W2K (mtp_dec bit 8): first w2a8 draft head at K %lld: sk %d nt %d -> sk 4 nt 0 "
+                             "(mb %d npw %d; drafts only)\n", K, c->sk, c->nt, c->mb, c->npw);
+    c->sk = 4;
+    c->nt = 0;
+}
+
 // ============================================================== the plugin ABI entry points
 //
 // The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
@@ -286,6 +312,7 @@ extern "C" int r4d_rad_gemm_w2a8(const RadArgs* a, RadStream s) {
     Cfg c;
     rc = cfg_for(a, g.K, g.M, group, BR_W2A8, &c);
     if (rc != RAD_OK) return rc;
+    w2k_apply(a, g.K, group, &c);
     if (c.mb < 1 || c.mb > 4) return R4D_NO(RAD_E_SHAPE);
     if (c.npw != 1 && c.npw != 2 && c.npw != 4) return R4D_NO(RAD_E_SHAPE);
     R4D_TRY("gemm_w2a8_nt",
