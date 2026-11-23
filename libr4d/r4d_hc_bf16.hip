@@ -8833,7 +8833,7 @@ extern "C" int r4d_mtp_dec_bits(void) {
         int n = 0;
         if (e && *e && *e != '0') { n = std::atoi(e); n = n > 1 ? n : 1; }
         int expect = -1;
-        g_mtp_dec.compare_exchange_strong(expect, n & 15, std::memory_order_relaxed);
+        g_mtp_dec.compare_exchange_strong(expect, n & 31, std::memory_order_relaxed);
         v = g_mtp_dec.load(std::memory_order_relaxed);
     }
     return v;
@@ -10096,16 +10096,17 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "mtp_dec")) {   /* qfn-on-ds lever MTE (round 45): bit 4 = mtp_enter's split-K form at a draft pass's tokens
                                             * (bits 1 / 2 are the architecture's, lever MTD); bit 8 = lever W2K (round 47,
                                             * r4d_gemm_w2a8_nt.hip): the draft head's w2a8 GEMM at sk 4 / nt 0 where DFlash2's pin
-                                            * cannot divide K */
-        if (value < 0 || value > 15) return -1;
+                                            * cannot divide K; bit 16 = lever W2N (round 49): with bit 8, the same split with
+                                            * the non-temporal weight loads kept (nt 1) */
+        if (value < 0 || value > 31) return -1;
         g_mtp_dec.store(value, std::memory_order_relaxed);
         static std::atomic<int> said{0}, said8{0};
         if ((value & 4) && said.exchange(1) == 0)
             std::fprintf(stderr, "radiance: libr4d: lever MTE (mtp_dec bit 4): mtp_enter at %ld..%ld tokens in the split-K prefill form "
                                  "(drafts only)\n", mte_min(), kMteMaxRows);
         if ((value & 8) && said8.exchange(1) == 0)
-            std::fprintf(stderr, "radiance: libr4d: lever W2K (mtp_dec bit 8): the w2a8 draft head at sk 4 / nt 0 where K %% 1024 != 0 "
-                                 "(drafts only)\n");
+            std::fprintf(stderr, "radiance: libr4d: lever W2K (mtp_dec bit 8): the w2a8 draft head at sk 4 / nt %d where K %% 1024 != 0 "
+                                 "(drafts only%s)\n", (value & 16) ? 1 : 0, (value & 16) ? "; lever W2N, bit 16: the non-temporal loads kept" : "");
         return 1;
     }
     if (!std::strcmp(name, "hc_rf")) {   /* qfn-on-ds lever HRF (round 44): the HXS read's A' + B3X as one launch from N rows, 0 off */

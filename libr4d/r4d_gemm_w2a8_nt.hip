@@ -280,7 +280,11 @@ int r4d_gemm_w2a8_nt_group(void) { return R4D_GEMM_W2A8_GROUP; }
  * is at or within 0.8 us of the best at every M -- M 32 110.1 -> 90.5, M 24 108.1 -> 88.0, M 16 80.5 -> 76.0, M 8 78.3 -> 72.7,
  * M 1 75.9 -> 69.3 us. Under the bit, an UNTUNED call (sk, nt, mb at their defaults) whose K the pin cannot divide takes
  * sk 4 / nt 0; DFlash2's K 5,120 (the pin divides it) and every tuned point stay as today. Other bytes than today's split
- * (drafts only: the trunk verifies greedily), the same bytes on every call. */
+ * (drafts only: the trunk verifies greedily), the same bytes on every call.
+ * Lever W2N (Qwen loop round 49; bit 16 with bit 8): sk 4 with nt 1 -- today's non-temporal weight loads kept. Line 109 (l109a):
+ * mtp_dec 15 cost +0.22 ms a c1 step (every X above every A) where slot w1's cold single launch said -6.6 us a pass: nt 0 reads the
+ * head's 40 MB a rank (3 passes a step) through the 64 MB last-level cache, evicting the trunk's warm lines; w1 timed sk 4 / nt 1
+ * within 0.3 us of nt 0 at M 1 and 1.6-3.1 us above it at M 24 / 32. The same split as W2K: the same bytes. */
 extern "C" int r4d_mtp_dec_bits(void);
 static void w2k_apply(const RadArgs* a, long long K, int unit, Cfg* c) {
     if (!(r4d_mtp_dec_bits() & 8)) return;
@@ -291,10 +295,10 @@ static void w2k_apply(const RadArgs* a, long long K, int unit, Cfg* c) {
     if (K % (4LL * unit) || c->wv * 4 * 32 > block_bound(BR_W2A8, c->mb, c->npw)) return;
     static std::atomic<int> said{0};
     if (said.exchange(1) == 0)
-        std::fprintf(stderr, "radiance: libr4d: lever W2K (mtp_dec bit 8): first w2a8 draft head at K %lld: sk %d nt %d -> sk 4 nt 0 "
-                             "(mb %d npw %d; drafts only)\n", K, c->sk, c->nt, c->mb, c->npw);
+        std::fprintf(stderr, "radiance: libr4d: lever W2K (mtp_dec bit 8): first w2a8 draft head at K %lld: sk %d nt %d -> sk 4 nt %d "
+                             "(mb %d npw %d; drafts only)\n", K, c->sk, c->nt, (r4d_mtp_dec_bits() & 16) ? 1 : 0, c->mb, c->npw);
     c->sk = 4;
-    c->nt = 0;
+    c->nt = (r4d_mtp_dec_bits() & 16) ? 1 : 0;   /* lever W2N (bit 16): the non-temporal weight loads kept */
 }
 
 // ============================================================== the plugin ABI entry points

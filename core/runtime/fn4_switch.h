@@ -969,7 +969,9 @@
  *                   tokens in a split-K prefill form (both products one launch, K in RADIANCE_FN4_MTE_SK (4) pieces, a fixed-order sum;
  *                   other bytes than today's mtp_enter, drafts only); 8 (libr4d, lever W2K, round 47) = the w2a8 draft head's
  *                   untuned GEMM at sk 4 / nt 0 where DFlash2's SK-8 pin cannot divide K (the Qwen head, K 2,560; slot w1's
- *                   best point; other bytes, drafts only); 0 today
+ *                   best point; other bytes, drafts only); 16 (libr4d, lever W2N, round 49) = with 8, the head keeps its non-temporal weight
+ *                   loads (sk 4 / nt 1: line 109's c1 cost of nt 0, a 40 MB temporal read a pass through the 64 MB last-level cache;
+ *                   the same split, so W2K's bytes); 0 today
  *                                                                                                  RADIANCE_FN4_MTP_DEC
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),

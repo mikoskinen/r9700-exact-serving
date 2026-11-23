@@ -48,7 +48,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (std::strcmp(name, "mtp_dec") == 0) {   /* qfn-on-ds lever MTD (Qwen loop round 45): the MTP draft passes' decode forms (rad_block_mtp_hc.h) */
-        if (value < 0 || value > 15) return -1;   /* bits 4 / 8: libr4d's (levers MTE / W2K) */
+        if (value < 0 || value > 31) return -1;   /* bits 4 / 8 / 16: libr4d's (levers MTE / W2K / W2N) */
         rad::arch::fn4_mtpdec_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
