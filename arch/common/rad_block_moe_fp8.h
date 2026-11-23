@@ -169,13 +169,10 @@ constexpr int64_t kX3ProbeRows = 512;
  * sequence of the step has at most 16 rows (the step's max_q_len, set_qmax) -- exactly the rows fn4 BI-dual's bi_band
  * gives the M <= 16 band's arithmetic in today's M > 16 launch, so each row keeps its band. Unset / out of range = 16
  * (today's declare). */
-inline int64_t fn4_x3gd_hi_env() {
-    static const int64_t v = [] {
-        const char* e = std::getenv("RADIANCE_FN4_X3GD_HI");
-        const long n = e && *e ? std::strtol(e, nullptr, 10) : 16;
-        return (int64_t)(n >= 17 && n <= 32 ? n : 16);
-    }();
-    return v;
+inline int64_t fn4_x3gd_hi_env() {   /* read at every declare (twice a layer), so a host test can set it (Qwen loop round 45) */
+    const char* e = std::getenv("RADIANCE_FN4_X3GD_HI");
+    const long n = e && *e ? std::strtol(e, nullptr, 10) : 16;
+    return (int64_t)(n >= 17 && n <= 32 ? n : 16);
 }
 /* qfn-on-ds lever DRZ-K (Qwen loop round 18, FINDINGS F49 / F51): DRZ (exl3_drz 1) moves answers only through the layers that
  * keep protected bf16 experts (BITRACE: h_ffn of L34 / L44 / L46 / L47 first, never L00-L33; `rad-info --recipe`: exactly

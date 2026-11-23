@@ -4325,6 +4325,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (name && std::strcmp(name, "mtp_dec") == 0) {   /* qfn-on-ds lever MTD: the MTP draft passes' decode forms (rad_block_mtp_hc.h) */
+        if (value < 0 || value > 3) return -1;
+        rad::arch::fn4_mtpdec_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (name && std::strcmp(name, "sp_ple") == 0) {   /* fn4 SP-PLE (qwen/SP-SERIAL-EXACT.md): SP-hc keeps the layers before the PLE's replicated */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);

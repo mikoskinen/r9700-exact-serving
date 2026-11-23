@@ -952,6 +952,13 @@
  *                   served HXS form (A' on the write's scales, NTS 4, XLB 3; B3X with B3E + B3D) runs as ONE launch, hc_read_hrf:
  *                   role by ticket, a row group's B3X blocks wait for that group's A' blocks only; the same bytes; 0 today
  *                                                                                                  RADIANCE_FN4_HC_RF
+ *   mtp_dec         qwen4exp (rad_fn4_switch; qfn-on-ds lever MTD, Qwen loop round 45, QUEUE Q85): the MTP head's draft passes
+ *                   in the trunk's decode forms (drafts only: the trunk verifies every draft greedily on batch-invariant rows, so
+ *                   a draft's bytes move acceptance, never an answer); a mask: 1 = the head's MoE told one row a sequence
+ *                   (MoeFP8::set_qmax(1): its 17..RADIANCE_FN4_X3GD_HI-row passes take the fused EXL3 decode chain, not the
+ *                   M > 16 prefill band), 2 = the head's attention and feed-forward connection reads through the bi_dec twin
+ *                   (HyperConn::read_bd) up to its declared rows; 0 today
+ *                                                                                                  RADIANCE_FN4_MTP_DEC
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -1009,6 +1016,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kHcB3xD,   /* qfn-on-ds lever B3D (Qwen loop round 40, Q74): libr4d, B3X's d rows padded in LDS (no bank conflict) */
               kGdnEpd,   /* qfn-on-ds lever EPD (Qwen loop round 41, Q78): libr4d, the GDN decode update's epilogue after its token loop */
               kHcRf,     /* qfn-on-ds lever HRF (Qwen loop round 44): libr4d, the HXS hc read's A' + B3X as one launch, a row group at a time */
+              kMtpDec,   /* qfn-on-ds lever MTD (Qwen loop round 45, Q85): qwen4exp, the MTP head's draft passes in the trunk's decode forms */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it

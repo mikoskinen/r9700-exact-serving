@@ -47,6 +47,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "mtp_dec") == 0) {   /* qfn-on-ds lever MTD (Qwen loop round 45): the MTP draft passes' decode forms (rad_block_mtp_hc.h) */
+        if (value < 0 || value > 3) return -1;
+        rad::arch::fn4_mtpdec_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "sp_serial") == 0) {   /* fn4 SP-serial: a serial step's prefill rows sequence-parallel (RADIANCE_FN4_SPSERIAL declares; 2 halves on lane 1) */
         if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_spser_env()) return -1;

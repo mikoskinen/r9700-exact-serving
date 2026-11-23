@@ -14957,6 +14957,131 @@ TEST(flashnext_msp_runs_a_mid_chunk_history_pass_a_piece_a_rank) {
     unsetenv("RADIANCE_FN4_SPHC");
 }
 
+/* qfn-on-ds lever MTD (Qwen loop round 45, QUEUE Q85; fn4 switch mtp_dec 0..3, RADIANCE_FN4_MTP_DEC): the MTP head's draft passes
+ * in the trunk's decode forms. Flash-Next with E4M3 mixing and EXL3 experts, RADIANCE_FN4_BIDEC=1 and RADIANCE_FN4_X3GD_HI=32 at
+ * declare, exl3_gd 1, four ranks: a 20-sequence decode step (one row each) with its history pass (20 rows, round 1 on every
+ * row) and round 2 (20 rows), and a 20 x 4-row verify with its history pass (80 rows, round 1 on 20). Under each mask:
+ *  - bit 1: the head's MoE issues its fused chain (op_x3gd, moe_exl3_gate_up_down) at 20 drafting rows instead of the split
+ *    gate_up + down (off: the split pair, today: 20 rows > 16 with the step's qmax unset) -- its 20 > 16 rows are only
+ *    reachable through the head's qmax, so the check fails without the set_qmax line;
+ *  - bit 2: the head's attention and feed-forward connections issue op_read_bd over the pass's rows (from row 0, in the
+ *    twin's pieces) where the rows fit its declared bd_rows, op_read otherwise; the final read (mixer) keeps op_read;
+ *  - nothing else moves: with the substituted handles mapped back, every pass's (op, rows) list = mask 0's, and every trunk
+ *    pass = mask 0's handle for handle. Mask 0 a second time = the first (the flag is the only state). */
+TEST(flashnext_mtd_draft_passes_take_the_trunks_decode_forms) {
+    using namespace rad::arch;
+    setenv("RADIANCE_FN4_BIDEC", "1", 1);
+    setenv("RADIANCE_FN4_X3GD_HI", "32", 1);
+    RadEncoding gu{}, dn{};
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 1, &gu), RAD_OK);
+    REQUIRE_EQ(exl3_encoding_make(4, EXL3_CB_MUL1, 0, &dn), RAD_OK);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    struct Iss { rad_op op; int64_t n; };
+    const int gd0 = fn4_exl3_gd_flag().load(), mtd0 = fn4_mtpdec_flag().load();
+    for (int rank = 0; rank < 4; rank += 3) {
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() }, { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+                   { "ffn_gate_up_exps", gu }, { "ffn_down_exps", dn } };
+        RadBuildCtx ctx = q4_ctx(rank, 4, 32);
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+        qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+        REQUIRE(m.have_mtp);
+        const MoeFP8& hm = m.mtp.mlp;
+        REQUIRE_EQ(hm.c.expert_exl3, 1);
+        REQUIRE(hm.op_x3gd != 0u);
+        CHECK_EQ(hm.x3gd_hi, (int64_t)32);
+        CHECK_EQ(hm.x3gd_hi16, (int64_t)16);
+        REQUIRE(m.mtp.hc_attn.op_read_bd != 0u && m.mtp.hc_mlp.op_read_bd != 0u);
+        CHECK(m.mtp.hc_attn.mix_e4m3 && m.mtp.hc_mlp.mix_e4m3);
+        const int64_t bdr = m.mtp.hc_attn.bd_rows;
+        fn4_exl3_gd_flag().store(1);
+        /* each pass's (op, rows): passes 0-2 = decode, its history pass, round 2; 3-4 = verify, its history pass */
+        auto run = [&](int mask) {
+            fn4_mtpdec_flag().store(mask);
+            const auto dec = kit(b, std::vector<int>(20, 1), {});
+            const auto his = history_pass(b, *dec);
+            const auto r2 = round_pass(b, 20, 2);
+            const auto ver = kit(b, std::vector<int>(20, 4), {});
+            const auto hv = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { dec.get(), his.get(), r2.get(), ver.get(), hv.get() }, rank, 4);
+            CHECK_PASSES(b, v);
+            std::vector<std::vector<Iss>> o;
+            const int64_t nt[5] = { dec->b.n_tok, his->b.n_tok, r2->b.n_tok, ver->b.n_tok, hv->b.n_tok };
+            for (size_t p = 0; p < v.size(); ++p) {
+                CHECK(v[p]->step_fail.empty());
+                o.emplace_back();
+                for (const RecIssue& i : v[p]->issues) o.back().push_back({ i.op, i.n == RAD_N_BATCH ? nt[p] : i.n });
+            }
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
+            return o;
+        };
+        const auto base = run(0);
+        REQUIRE_EQ(base.size(), (size_t)5);
+        const int64_t prows[5] = { 20, 20, 20, 80, 80 };   /* the head's attention read rows (passes 1, 2, 4) */
+        for (int mask : { 1, 2, 3, 0 }) {
+            const auto got = run(mask);
+            REQUIRE_EQ(got.size(), base.size());
+            for (size_t p = 0; p < got.size(); ++p) {
+                const bool head = p == 1 || p == 2 || p == 4;
+                int64_t x3gd = 0, split = 0, rbd_a = 0, rbd_m = 0, rd_a = 0, rd_m = 0, rd_out = 0;
+                std::vector<Iss> mapped;
+                for (const Iss& i : got[p]) {
+                    Iss q = i;
+                    if (i.op == hm.op_x3gd) { ++x3gd; CHECK_EQ(i.n, (int64_t)20); continue; }   /* stands in for gate_up + down */
+                    if (i.op == hm.op_gu || i.op == hm.op_dn) ++split;
+                    if (i.op == m.mtp.hc_attn.op_read_bd) { ++rbd_a; q.op = m.mtp.hc_attn.op_read; }
+                    if (i.op == m.mtp.hc_mlp.op_read_bd) { ++rbd_m; q.op = m.mtp.hc_mlp.op_read; }
+                    if (i.op == m.mtp.hc_attn.op_read) ++rd_a;
+                    if (i.op == m.mtp.hc_mlp.op_read) ++rd_m;
+                    if (i.op == m.mtp.mixer.op_read) ++rd_out;
+                    mapped.push_back(q);
+                }
+                if (!head) {   /* a trunk pass: handle for handle */
+                    CHECK_EQ(got[p].size(), base[p].size());
+                    for (size_t k = 0; k < std::min(got[p].size(), base[p].size()); ++k) {
+                        CHECK_EQ(got[p][k].op, base[p][k].op);
+                        CHECK_EQ(got[p][k].n, base[p][k].n);
+                    }
+                    continue;
+                }
+                const bool chain = (mask & 1) != 0;
+                const bool bd = (mask & 2) != 0 && prows[p] <= bdr;
+                CHECK_EQ(x3gd, chain ? (int64_t)1 : (int64_t)0);
+                CHECK_EQ(split, chain ? (int64_t)0 : (int64_t)2);
+                CHECK_EQ(rbd_a, bd ? (int64_t)1 : (int64_t)0);
+                CHECK_EQ(rd_a, bd ? (int64_t)0 : (int64_t)1);
+                CHECK_EQ(rbd_m, (mask & 2) ? (int64_t)1 : (int64_t)0);   /* 20 drafting rows: always within the twin */
+                CHECK_EQ(rd_m, (mask & 2) ? (int64_t)0 : (int64_t)1);
+                CHECK_EQ(rd_out, (int64_t)1);
+                /* with the chain mapped back to the split pair at its place, the list = mask 0's */
+                std::vector<Iss> want;
+                for (const Iss& i : base[p]) want.push_back(i);
+                if (chain) {   /* mask 0's list without its head gate_up / down = the mapped list */
+                    std::vector<Iss> w2;
+                    for (const Iss& i : want) if (i.op != hm.op_gu && i.op != hm.op_dn) w2.push_back(i);
+                    want.swap(w2);
+                }
+                CHECK_EQ(mapped.size(), want.size());
+                for (size_t k = 0; k < std::min(mapped.size(), want.size()); ++k) {
+                    CHECK_EQ(mapped[k].op, want[k].op);
+                    CHECK_EQ(mapped[k].n, want[k].n);
+                }
+            }
+            if (mask == 0)   /* the flag is the only state: mask 0 again = the first */
+                for (size_t p = 0; p < got.size(); ++p) CHECK_EQ(got[p].size(), base[p].size());
+        }
+        CHECK_EQ(hm.step_qmax, INT32_MAX);   /* the last run was mask 0 */
+    }
+    fn4_exl3_gd_flag().store(gd0);
+    fn4_mtpdec_flag().store(mtd0);
+    unsetenv("RADIANCE_FN4_X3GD_HI");
+    unsetenv("RADIANCE_FN4_BIDEC");
+}
+
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */
 
 namespace {
