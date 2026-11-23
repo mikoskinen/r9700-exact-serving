@@ -255,7 +255,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * two to four barriers inside every token. Each token's values are the same expressions in the same order: the same bytes. */
   /* qfn-on-ds QUEUE Q84 read (Qwen loop round 47, BENCH ONLY): EPD's high bits (EPD >> 4 = ABL) are timing ablations of the served
    * form (EPDF 0), reachable only through the bench hook r4d_gdn_epd(16 x ABL) -- never the engine (the core switch gdn_epd and
-   * RADIANCE_GDN_EPD stay 0..3); each removes one phase of the call to price it, so its bytes are NOT the update's:
+   * RADIANCE_GDN_EPD stay 0..4); each removes one phase of the call to price it, so its bytes are NOT the update's:
    *   ABL 1  the token loop's q / k l2 norms (the two 64-term sums, the exchanges, the rsqrt; qs = scale, ks = 1, the scaling kept)
    *   ABL 2  the token loop's epilogue reductions (row norm and amax: their lane exchanges, LDS partials and four barriers a token;
    *          the bf16 output, codes at a fixed scale and the scale store kept)
@@ -1243,7 +1243,7 @@ static int ru_epd() {
   return v;
 }
 /* (round 47, QUEUE Q84 read, BENCH ONLY) 16 x ABL for ABL in {1, 2, 3, 4, 8, 15} = the served form's timing ablations (the kernel's ABL
- * note; NOT the update's bytes); the core switch gdn_epd (0..3) and RADIANCE_GDN_EPD never reach them */
+ * note; NOT the update's bytes); the core switch gdn_epd (0..4) and RADIANCE_GDN_EPD never reach them */
 static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15; }
 extern "C" void r4d_gdn_epd(int on) {
   const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on > 4 ? 4 : on);
