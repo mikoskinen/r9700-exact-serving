@@ -5263,6 +5263,9 @@ static std::atomic<int> g_hc_tl{0};
 /* qfn-on-ds round 39 (QUEUE Q70, bench only): r4d_hc_ab(mask) = the served HXS + LE read's ablation copies, unchained launches only --
  * bits 0-1 A' (1 no N arithmetic, 2 no W_down conversion), bits 2-3 B3X (4 no W_up conversion, 8 the sigmoid by rcp). 0 = none. */
 static std::atomic<int> g_hc_ab{0};
+/* qfn-on-ds round 39 (QUEUE Q70, bench only): r4d_hc_tl_lds(bytes) = dynamic LDS added to the served form's TL launches, so fewer blocks
+ * fit a WGP (128 KB of LDS a WGP: + 37,000 B -> 2 of A' (26,704 B static) or B3X (22,528 B) instead of the VGPR-bound 3). 0 = none. */
+static std::atomic<int> g_hc_tl_lds{0};
 /* qfn-on-ds lever HCO: RADIANCE_FN4_HC_OCC bit mask (read once; r4d_hc_occ sets it): 1 A' G16p, 2 B3 at 16-row groups in their
  * occupancy instances (hc_read_g16p_down_o_kernel / hc_up_w_o_kernel); 4 A' G16 / G16p with the norm rows' loads ahead
  * (hc_g_norm_rows_np; with 1: G16p's onp instance). 0 / unset = today's kernels. -1 until read. */
@@ -8865,7 +8868,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                    : ab == 1 ? &hc_read_g16x_down_ab_kernel<16, 4, 3, 1>
                                    : ab == 2 ? &hc_read_g16x_down_ab_kernel<16, 4, 3, 2>
                                              : &hc_read_g16x_down_ab_kernel<16, 4, 3, 3>;
-                    emit_rc = R4D_EMIT(s, fn, gx, dim3(kThreads), 0,
+                    emit_rc = R4D_EMIT(s, fn, gx, dim3(kThreads), tl ? (uint32_t)g_hc_tl_lds.load(std::memory_order_relaxed) : 0u,
                                        (const unsigned short*)h->data, (const float*)w->data,
                                        (const unsigned char*)down->data, (long)dld,
                                        (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
@@ -9008,7 +9011,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            : b3ab == 1 ? &hc_up_wx_ab_kernel<16, true, 2>
                            : b3ab == 2 ? &hc_up_wx_ab_kernel<16, true, 4>
                                        : &hc_up_wx_ab_kernel<16, true, 6>;
-            emit_rc = R4D_EMIT(s, fn, dim3((unsigned)(n / kUpTB), (unsigned)((rows + 15) / 16)), dim3(kThreads), 0,
+            const uint32_t tlds = g_hc_tl.load(std::memory_order_relaxed) ? (uint32_t)g_hc_tl_lds.load(std::memory_order_relaxed) : 0u;
+            emit_rc = R4D_EMIT(s, fn, dim3((unsigned)(n / kUpTB), (unsigned)((rows + 15) / 16)), dim3(kThreads), tlds,
                                (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,
                                (const unsigned short*)h->data, (const float*)w->data,
                                (const float*)scale, (unsigned short*)x->data,
@@ -9148,6 +9152,8 @@ extern "C" void r4d_hc_x_lb(int m) { g_hc_x_lb_bench.store(m < 0 ? -1 : (m & 3),
 extern "C" void r4d_hc_b3x_e(int on) { g_hc_b3x_e_bench.store(on < 0 ? -1 : (on > 0 ? 1 : 0), std::memory_order_relaxed); }
 /* qfn-on-ds round 39 (QUEUE Q70, bench hook): the served HXS + LE read's ablation copies (g_hc_ab's note); 0 = none */
 extern "C" void r4d_hc_ab(int m) { g_hc_ab.store(m < 0 ? 0 : (m & 15), std::memory_order_relaxed); }
+/* qfn-on-ds round 39 (QUEUE Q70, bench hook): dynamic LDS bytes on the served form's TL launches (0..38,000) */
+extern "C" void r4d_hc_tl_lds(int b) { g_hc_tl_lds.store(b < 0 ? 0 : (b > 38000 ? 38000 : b), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3X (bench / test hook): kernel B3 as hc_up_wx on (1) without hc_readv bit 16, or off (0) */
 extern "C" void r4d_hc_b3x(int on) { g_hc_b3x_bench.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {

@@ -174,6 +174,7 @@ struct Plugin {
     void (*xlb_hc)(int) = nullptr;         /* optional (qfn-on-ds lever XLB: r4d_hc_x_lb, mask 0..3) */
     void (*b3e_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3E: r4d_hc_b3x_e) */
     void (*ab_hc)(int) = nullptr;          /* optional (qfn-on-ds round 39, Q70: r4d_hc_ab, the served read's ablation copies) */
+    void (*tl_lds_hc)(int) = nullptr;      /* optional (qfn-on-ds round 39, Q70: r4d_hc_tl_lds, dynamic LDS on the TL launches) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -264,6 +265,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->xlb_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x_lb");
     pl->b3e_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_e");
     pl->ab_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_ab");
+    pl->tl_lds_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_tl_lds");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -26287,7 +26289,8 @@ static void hc_ss_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
  * by its WGP CO-RESIDENCY = the time-weighted mean count of blocks resident on its WGP during its life (itself included). A phase
  * whose time grows with the co-residency is bound by what the WGP's waves share (issue, LDS, the CU's memory path); a flat one by
  * its own latency chain. */
-static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_once, hipStream_t hs, int reps, long long M) {
+static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_once, hipStream_t hs, int reps, long long M,
+                         const char* occ = "") {
     struct Rec { unsigned long long w[8]; };
     std::vector<Rec> rec[2];
     std::vector<double> span[2], fly_mean[2], gapab;
@@ -26372,7 +26375,8 @@ static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_onc
     static const char* const kAn[4] = { "prologue + chain + scales", "N + tile 0", "tiles 1-3 + partials + fence", "atomic + finish" };
     static const int kBf[5] = { 0, 1, 4, 2, 3 }, kBt[5] = { 1, 4, 2, 3, 5 };
     static const char* const kBn[5] = { "operands + d stage", "pass 0 (wave 0)", "pass 1 (wave 0)", "barrier", "quantise" };
-    const char* const cm = g_cold > 0 ? "cold" : "warm";
+    const std::string cms = std::string(g_cold > 0 ? "cold" : "warm") + occ;   /* occ "2w": the TL launches LDS-limited to 2 blocks a WGP */
+    const char* const cm = cms.c_str();
     for (int g = 0; g < 2; ++g) {
         if (rec[g].empty()) { std::printf("HXT M=%lld %s %s: no records\n", M, cm, g ? "B3X" : "A'"); continue; }
         const int np = g ? 5 : 4;
@@ -26557,7 +26561,16 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
             arm_set(true);
             g.reset();
             if (g.rw->launch(&g.aw, (RadStream)g.hs) == RAD_OK && st_stream_sync(g.hs) == hipSuccess)
+            {
                 hxt_timeline(pl, [&]() { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, g.hs, 20, (long long)M);
+                /* the same with 37,000 B of dynamic LDS on both TL launches: 2 blocks a WGP instead of 3 -- a block's time against
+                 * how many share its WGP, with the round structure changed on purpose (r4d_hc_tl_lds) */
+                if (pl.tl_lds_hc) {
+                    pl.tl_lds_hc(37000);
+                    hxt_timeline(pl, [&]() { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, g.hs, 20, (long long)M, "2w");
+                    pl.tl_lds_hc(0);
+                }
+            }
             /* (3) the ablations */
             for (const int ab : { 1, 2, 3, 4, 8, 12, 15 }) {
                 std::vector<uint8_t> oab;
