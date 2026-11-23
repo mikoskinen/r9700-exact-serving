@@ -940,6 +940,10 @@
  *   hc_b3x_d        libr4d (rad_fn4_switch; qfn-on-ds lever B3D, Qwen loop round 40, QUEUE Q74): 1 = kernel B3X (B3E's form) with
  *                   its d rows padded by 8 bf16 in LDS, so the d fragment reads leave a 4-way bank conflict; the same bytes;
  *                   0 today                                                                        RADIANCE_FN4_HC_B3X_D
+ *   gdn_epd         libr4d (rad_fn4_switch; qfn-on-ds lever EPD, Qwen loop round 41, QUEUE Q78): 1 = the GDN decode update (conv
+ *                   fold, anchor fp32 state) runs its per-token row norm, bf16 output and the out projection's codes + scales after
+ *                   its token loop (two barriers a call, no spill) instead of inside every token; the same bytes; 0 today
+ *                                                                                                  RADIANCE_GDN_EPD
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -995,6 +999,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kHcXLb, kHcB3xE,   /* qfn-on-ds levers XLB / B3E (Qwen loop round 38, Q67 / Q68): libr4d, the HXS hc read's load streams */
               kHcB3xP,   /* qfn-on-ds lever B3P (Qwen loop round 39, Q71): libr4d, B3X with a pair of 16-row groups a block */
               kHcB3xD,   /* qfn-on-ds lever B3D (Qwen loop round 40, Q74): libr4d, B3X's d rows padded in LDS (no bank conflict) */
+              kGdnEpd,   /* qfn-on-ds lever EPD (Qwen loop round 41, Q78): libr4d, the GDN decode update's epilogue after its token loop */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it

@@ -9602,6 +9602,7 @@ extern "C" int r4d_hc_tl_read(unsigned long long* out, int region, int max) {
 extern "C" int r4d_ar_sdma_set(int on);   /* fn4 SDMA-AR (r4d_ar_entry.hip) */
 extern "C" int r4d_rg_tail_set(int value);   /* qfn-on-ds lever RGT (r4d_moe.hip): the router's ranking per row tile */
 extern "C" void r4d_gemm_fp8a8_pin_pp(int v);   /* qfn-on-ds lever F8P (r4d_gemm_fp8a8.hip): -1 the env, 0 off, 1 on */
+extern "C" void r4d_gdn_epd(int on);   /* qfn-on-ds lever EPD (r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip): -1 the env */
 /* qfn-on-ds: the Qwen line's libr4d switches, reached through libr4d's one rad_fn4_switch (r4d_ds41_ggml.hip), which takes
  * the ds41 line's names first and hands every other name here. */
 extern "C" void r4d_fn4_fc_dump_if_on() { if (fc_on()) fc_dump(); }
@@ -9646,6 +9647,15 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
         static std::atomic<int> said{0};
         if (value == 1 && said.exchange(1) == 0)
             std::fprintf(stderr, "radiance: libr4d: lever B3D (hc_b3x_d 1): B3X's d rows in LDS padded by 8 bf16 (the same bytes)\n");
+        return 1;
+    }
+    if (!std::strcmp(name, "gdn_epd")) {   /* qfn-on-ds lever EPD (round 41, r4d_gdn_recurrent_update_*.hip): the GDN update's epilogue after its loop */
+        if (value < 0 || value > 1) return -1;
+        r4d_gdn_epd(value);
+        static std::atomic<int> said{0};
+        if (value == 1 && said.exchange(1) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever EPD (gdn_epd 1): the GDN decode update's per-token norm / output / codes after its "
+                                 "token loop (the same bytes)\n");
         return 1;
     }
     if (!std::strcmp(name, "hc_b3x_p")) {   /* qfn-on-ds lever B3P (round 39): B3X's group-pair form from N rows, 0 off */
