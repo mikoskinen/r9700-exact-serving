@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -274,8 +275,21 @@ public:
     void set_drafter_floor(int64_t tokens);
     /* qfn-on-ds F72 (Qwen loop round 27; RADIANCE_PREFIX_UNREST=1 at start, off = today): insert() retires a publisher's
      * own snapshots that rest on an entry the cache keeps another publisher's copy of (see Stats::unrested). Tests set it. */
-    void set_unrest(bool on) { unrest_ = on; }
-    bool unrest() const { return unrest_; }
+    void set_unrest(bool on) { unrest_ = on ? 1 : 0; }
+    bool unrest() const { return unrest_ != 0; }
+    /* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; RADIANCE_PREFIX_UNREST=2): the same rule, but an entry whose kept copy
+     * holds the same BYTES as this request's own (every cached group, every layer, every rank: same_bytes_fn) is no
+     * conflict -- the request's snapshots rest on bytes equal to the cache's, so they stay; the rule retires only from the
+     * first entry whose copies differ (or that cannot be compared: off the card, no comparer installed). 1 = F72's rule
+     * as written, 0 = off. Tests set it. */
+    void set_unrest_mode(int mode) { unrest_ = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+    int  unrest_mode() const { return unrest_; }
+    /* Installed by the engine under RADIANCE_PREFIX_UNREST=2: `a` and `b` are `n` entries' block ids, entry-major in
+     * entry_groups() order (n * entry_groups().size() ids each); returns how many LEADING entries hold the same bytes in
+     * a's and b's blocks on every rank, every layer of every cached group (n when all do), negative on a failure (then
+     * nothing counts as equal). Called inside insert() on the step thread under the scheduler's lock, only where the F72
+     * rule would retire snapshots. Empty: mode 2 retires as mode 1 does. */
+    std::function<int64_t(const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n)> same_bytes_fn;
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
@@ -467,6 +481,9 @@ public:
          * publisher's bytes (pinned under another snapshot, or read by a live sequence, so republish could not take it): a
          * hit would resume their state over bytes they were not computed from. */
         int64_t unrested = 0;
+        /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): entries whose two copies were compared at an F72 conflict, how many of
+         * them held the same bytes (the request's snapshots stayed over them), and the inserts that found a difference. */
+        int64_t unrest_compared = 0, unrest_equal = 0, unrest_differ = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -572,7 +589,9 @@ private:
     std::vector<int32_t> per_;            /* blocks of groups_[i] an entry holds */
     std::vector<int32_t> entry_groups_;   /* the group of each of an entry's blocks */
     bool        has_linear_ = false;
-    bool        unrest_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST"); return e && *e && *e != '0'; }();
+    /* 0 off, 1 F72's rule, 2 F79's (compare the copies' bytes first); any other non-zero value is 1, as before */
+    int         unrest_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST");
+                               return !(e && *e && *e != '0') ? 0 : (e[0] == '2' && e[1] == 0) ? 2 : 1; }();
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;
     mutable std::list<BlockHash> lru_;    /* front = oldest; resident entries only */

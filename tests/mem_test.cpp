@@ -5032,6 +5032,109 @@ TEST(f72_a_snapshot_is_not_resumed_over_another_publishers_copy_of_its_head) {
     }
 }
 
+/* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; AgentX c32 agx5): under F72's rule every session of a multi-session
+ * load whose shared system prompt another session published first lost every snapshot (entry 0 pinned under the first
+ * session's snapshots). RADIANCE_PREFIX_UNREST=2 asks the engine's comparer (same_bytes_fn) whether the two copies of
+ * each conflicting entry hold the same bytes, and retires only from the first entry whose copies differ. F72's two
+ * reasons a copy stays (a live reader; pinned), the comparer's answers all-equal / first-differs / one-equal / failure,
+ * no comparer installed, and the rule as written (mode 1) as the control. All equal must also pin the kept copies: the
+ * request's snapshots rest on bytes equal to them, so a later publisher may not replace them. */
+TEST(f79_a_snapshot_stays_over_another_publishers_copy_holding_the_same_bytes) {
+    /* answer: -2 = no comparer installed, -1 = the comparer fails, otherwise the leading equal entries it reports
+     * (99 = all); mode 1 = F72's rule as written (the control) */
+    struct Arm { int mode; int answer; };
+    for (int reason : { 0, 1 }) {          /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+        for (const Arm arm : { Arm{ 1, 99 }, Arm{ 2, 99 }, Arm{ 2, 0 }, Arm{ 2, 1 }, Arm{ 2, -1 }, Arm{ 2, -2 } }) {
+            TierFixture x;
+            CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            x.f.pc.set_unrest_mode(arm.mode);
+            CHECK_EQ(x.f.pc.unrest_mode(), arm.mode);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            std::vector<int32_t> theirs;
+            if (reason == 1) {
+                const auto okeys = chain_of(other);
+                CHECK_OK(x.f.kv.add_sequence(1));
+                CHECK_OK(x.f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(x.f, 1, okeys, 16);
+                std::vector<std::vector<int32_t>> bt;
+                for (int32_t g : x.f.pc.cached_groups()) bt.push_back(x.f.kv.block_table(1, g));
+                theirs = bt[0];
+                CHECK_OK(x.f.pc.insert(1, other, {}, bt, (int64_t)other.size()));
+                x.f.kv.free_sequence(1);
+            } else {
+                publish(x.f, 1, other, (int64_t)other.size());
+                theirs = x.f.kv.block_table(1, G_FULL);
+            }
+            CHECK_OK(x.f.kv.add_sequence(2));
+            CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+            ckpt_at(x.f, 2, keys, 320);
+            int calls = 0;
+            int64_t asked = -1;
+            const size_t W = x.f.pc.entry_groups().size();
+            if (arm.answer != -2)
+                x.f.pc.same_bytes_fn = [&](const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n) -> int64_t {
+                    ++calls;
+                    asked = n;
+                    CHECK_EQ(a.size(), (size_t)n * W);
+                    CHECK_EQ(b.size(), (size_t)n * W);
+                    CHECK_EQ(a[0], theirs[0]);                  /* the kept copy first, this request's second */
+                    CHECK_EQ(b[0], mine[0]);
+                    if (n > 1) { CHECK_EQ(a[W], theirs[1]); CHECK_EQ(b[W], mine[1]); }
+                    return arm.answer == 99 ? n : arm.answer;
+                };
+            CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+            const int64_t conflicts = reason ? 1 : 2;           /* under the pin entry 1 is republished, not a conflict */
+            CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 0ll);
+            const bool asks = arm.mode == 2 && arm.answer != -2;
+            CHECK_EQ(calls, asks ? 1 : 0);
+            if (asks) { CHECK_EQ(asked, conflicts); }
+            const int64_t equal = !asks ? 0 : arm.answer == 99 ? conflicts : std::max<int64_t>(0, std::min<int64_t>(arm.answer, conflicts));
+            CHECK_EQ(x.f.pc.stats().unrest_compared, asks ? conflicts : 0ll);
+            CHECK_EQ(x.f.pc.stats().unrest_equal, equal);
+            const bool stays = equal == conflicts;              /* no copy differs: the snapshot at 320 stays */
+            CHECK_EQ(x.f.pc.stats().unrest_differ, asks && !stays ? 1ll : 0ll);
+            std::vector<std::vector<int32_t>> hit;
+            const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+            REQUIRE(hit.size() == 1u && hit[0].size() >= 2u);
+            CHECK(hit[0][0] != mine[0]);                        /* the cache's head stays the other publisher's */
+            CHECK_EQ(hit[0][0], theirs[0]);
+            const auto left = x.f.pc.checkpoints(2);
+            if (stays) {
+                CHECK_EQ(h.n_linear_tokens, 320);
+                CHECK_EQ(x.f.pc.stats().unrested, 0ll);
+                CHECK(std::find(left.begin(), left.end(), (int64_t)320) != left.end());
+            } else {
+                /* F72 as written: from the first copy that differs (or every one, when nothing could be compared) */
+                CHECK_EQ(h.n_linear_tokens, reason ? 16 : 0);
+                CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+                CHECK(std::find(left.begin(), left.end(), (int64_t)320) == left.end());
+            }
+            if (reason == 0) x.f.kv.free_sequence(1);
+            x.f.kv.free_sequence(2);
+            /* A third publisher with its own copy of the head and a snapshot over it, nothing live on the head now: the
+             * entries that held equal bytes are pinned (the second request's snapshot rests on them), so they keep the
+             * first copy; without the pin (live reader, F72 retired) republish takes them. */
+            if (reason == 0) {
+                x.f.pc.same_bytes_fn = nullptr;
+                x.f.pc.set_unrest_mode(0);
+                const int64_t before = x.f.pc.stats().republished;
+                CHECK_OK(x.f.kv.add_sequence(3));
+                CHECK_OK(x.f.kv.ensure(3, (int64_t)prompt.size()));
+                const std::vector<int32_t> third = x.f.kv.block_table(3, G_FULL);
+                ckpt_at(x.f, 3, keys, 32);
+                CHECK_OK(x.f.pc.insert(3, prompt, {}, { third }, 32));
+                CHECK_EQ(x.f.pc.stats().republished - before, conflicts - equal);   /* the pinned ones stay */
+                x.f.kv.free_sequence(3);
+            }
+        }
+    }
+}
+
 TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
     /* The old copy goes only when nothing else reads it: a running sequence that adopted the
      * short request's head may have snapshots of its own resting on it. */

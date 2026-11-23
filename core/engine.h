@@ -494,6 +494,9 @@ private:
     void pp_kv_check_send();
     int  pp_kv_check_recv(const std::vector<uint8_t>& body, uint64_t step);
     int  pp_kv_crc(int32_t group, int32_t slot, int64_t top, uint32_t* crc, int64_t* bytes);
+    /* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; RADIANCE_PREFIX_UNREST=2): PrefixCache::same_bytes_fn -- how many
+     * leading entries of `a` and `b` hold the same bytes on every rank, every layer of every cached group (engine.cpp). */
+    int64_t prefix_same_bytes(const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n);
     int  pp_kv_check_every_ = 0;
     int64_t pp_kv_checks_ = 0, pp_kv_bad_ = 0;
     /* tp8 loop P37 (RADIANCE_PP_KV_CHECK_DEFER=1, with RADIANCE_PP_KV_CHECK=N): under lanes a due check waits for a round

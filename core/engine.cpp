@@ -3078,6 +3078,101 @@ void Engine::expire_tick(uint64_t now_ns) {
     (void)pc.expire(now_ns, (uint64_t)cfg_.prefix_cache_ttl * 1000000000ull);
 }
 
+/* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; RADIANCE_PREFIX_UNREST=2): PrefixCache::same_bytes_fn. How many leading
+ * entries of `a` and `b` (n entries' block ids each, entry-major in the cache's entry_groups() order) hold the same bytes
+ * on every rank, in every layer of every cached group; -1 on a failure (then nothing counts as equal, and the F72 rule
+ * retires as it always did). A streamed group's rows are its pinned host mirror, read in place. A resident group's
+ * fragments come to the host in runs of consecutive block ids, every layer in one 2-D copy a run and side, on the mover's
+ * transfer stream (the compute stream on a rank without one), a chunk of entries at a time. Both copies are finished
+ * when this runs: the cache's was published by an earlier request, and this request publishes its blocks after the step
+ * that wrote them was collected; a copy still in flight could only read as different, never as equal. */
+int64_t Engine::prefix_same_bytes(const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n) {
+    if (n <= 0) return 0;
+    const std::vector<int32_t>& cg = ranks_[0]->prefix.entry_groups();
+    const size_t W = cg.size();
+    if (W == 0 || a.size() < (size_t)n * W || b.size() < (size_t)n * W) return -1;
+    int64_t eq = n;
+    constexpr int64_t kChunk = 2048;             /* entries a host buffer holds, every layer */
+    std::vector<char> ha, hb;
+    std::vector<std::pair<int64_t, int64_t>> runs;   /* (first entry, entries) of consecutive ids, one side */
+    int st = RAD_OK;
+    for (auto& r : ranks_) {
+        for (size_t k = 0; k < W && eq > 0 && st == RAD_OK; ++k) {
+            const KVGroupPlan* p = r->kv.plan(cg[k]);
+            if (!p) { st = RAD_E_STATE; break; }
+            if (p->zero || !p->paged()) continue;    /* no bytes of this group on this rank */
+            const int64_t L = std::max<int64_t>(1, p->n_layers);
+            auto bad_id = [&](int32_t x) { return x < 0 || (int64_t)x >= p->n_blocks; };
+            if (p->streamed()) {
+                const RadKVStream* v = r->kv.stream_view(cg[k]);
+                if (!v || !v->host || v->block_bytes <= 0) { st = RAD_E_STATE; break; }
+                for (int64_t i = 0; i < eq; ++i) {
+                    const int32_t x = a[(size_t)i * W + k], y = b[(size_t)i * W + k];
+                    if (x == y) continue;
+                    if (bad_id(x) || bad_id(y)) { eq = i; break; }
+                    bool same = true;
+                    for (int64_t l = 0; l < L && same; ++l) {
+                        const uint8_t* lb = v->host + l * v->host_layer_stride;
+                        same = std::memcmp(lb + (int64_t)x * v->block_bytes, lb + (int64_t)y * v->block_bytes,
+                                           (size_t)v->block_bytes) == 0;
+                    }
+                    if (!same) { eq = i; break; }
+                }
+                continue;
+            }
+            const int64_t frag = p->layer_bytes_per_block(), stride = p->layer_stride();
+            const char* base = static_cast<const char*>(p->base);
+            if (!base || frag <= 0) { st = RAD_E_STATE; break; }
+            if ((st = rad_dev_set(r->device)) != RAD_OK) break;
+            RadStream s = r->mover.transfer_stream();
+            if (!s) s = r->ctx.stream();
+            for (int64_t c0 = 0; c0 < eq && st == RAD_OK; c0 += kChunk) {
+                const int64_t cn = std::min<int64_t>(kChunk, eq - c0);
+                ha.resize((size_t)(L * cn * frag));
+                hb.resize((size_t)(L * cn * frag));
+                for (int side = 0; side < 2 && st == RAD_OK; ++side) {
+                    const std::vector<int32_t>& ids = side ? b : a;
+                    char* h = side ? hb.data() : ha.data();
+                    runs.clear();
+                    for (int64_t i = c0; i < c0 + cn; ++i) {
+                        const int32_t x = ids[(size_t)i * W + k];
+                        if (bad_id(x)) { st = RAD_E_INVAL; break; }
+                        if (!runs.empty() && ids[(size_t)(runs.back().first + runs.back().second - 1) * W + k] + 1 == x)
+                            ++runs.back().second;
+                        else
+                            runs.push_back({ i, 1 });
+                    }
+                    /* layer l of entry i lands at h + l * cn * frag + (i - c0) * frag */
+                    for (size_t q = 0; q < runs.size() && st == RAD_OK; ++q) {
+                        const int64_t i0 = runs[q].first, m = runs[q].second;
+                        const int32_t id0 = ids[(size_t)i0 * W + k];
+                        st = rad_memcpy_2d_async(h + (i0 - c0) * frag, cn * frag, base + (int64_t)id0 * frag, stride,
+                                                 m * frag, L, s);
+                    }
+                }
+                if (st == RAD_OK) st = rad_stream_sync(s);
+                if (st != RAD_OK) break;
+                for (int64_t i = c0; i < c0 + cn; ++i) {
+                    bool same = true;
+                    for (int64_t l = 0; l < L && same; ++l) {
+                        const int64_t off = l * cn * frag + (i - c0) * frag;
+                        same = std::memcmp(ha.data() + off, hb.data() + off, (size_t)frag) == 0;
+                    }
+                    if (!same) { eq = i; break; }
+                }
+            }
+        }
+        if (st != RAD_OK || eq == 0) break;
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    if (st != RAD_OK) {
+        RAD_WARN("prefix cache: comparing %lld entries' two copies failed (%s): F72's rule retires as written",
+                 (long long)n, rad_strerror(st));
+        return -1;
+    }
+    return eq;
+}
+
 bool Engine::flush_copies() {
     if (!pump_ || !ranks_[0]->tierx.enabled()) return false;
     TierPump& P = *pump_;
@@ -3342,6 +3437,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * without it, or the other way round. Zero with no vector loaded, and then every chain hashes
      * exactly as it did before the feature existed. */
     static_cast<PCBinding<PrefixCache>*>(pc_iface_.get())->salt_id = cvec_salt_;
+    /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): the comparer F72's rule asks before it retires a publisher's snapshots
+     * over an entry the cache keeps another copy of (PrefixCache::same_bytes_fn). Called inside insert(), on the step
+     * thread under the scheduler's lock, like restore_fn below. */
+    if (ranks_[0]->prefix.unrest_mode() == 2) {
+        ranks_[0]->prefix.same_bytes_fn = [this](const std::vector<int32_t>& a, const std::vector<int32_t>& b,
+                                                 int64_t n) { return prefix_same_bytes(a, b, n); };
+        RAD_INFO("prefix cache: RADIANCE_PREFIX_UNREST=2 (Qwen loop F79) -- a publisher's snapshots over an entry the cache "
+                 "keeps another publisher's copy of are retired only from the first entry whose two copies' bytes differ "
+                 "(every rank, every layer of every cached group, compared at the publish)");
+    }
     /* The restore path, installed only when the tiers are on. The scheduler calls it before the
      * admission lookup without knowing about tiers, so it is a callable rather than an include in
      * core/sched.

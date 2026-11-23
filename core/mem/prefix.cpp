@@ -466,6 +466,10 @@ int PrefixCache::insert(uint64_t session,
      * publisher's snapshot, or one republish() cannot move (a live sequence reads it, a copy out, off the card). This
      * request's snapshots deeper on the chain were computed from ITS copy, so they go (retire_unrested below). */
     int64_t kept_b = -1;
+    /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): the conflicts on the card before kept_b, compared by their bytes after the
+     * walk -- each one's entry, the cache's blocks and this request's, entry-major in entry_groups_ order. */
+    std::vector<int64_t> cmp_b;
+    std::vector<int32_t> cmp_kept, cmp_own;
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
@@ -483,8 +487,18 @@ int PrefixCache::insert(uint64_t session,
         if (it != map_.end() && (it->second.in_lru || has_linear_)) {
             if (b < under && !it->second.pinned && republish(h, it->second, blocks, b, now))
                 ++taken;
-            else if (unrest_ && b < under && kept_b < 0 && !(it->second.in_lru && holds_own(it->second, blocks, b)))
-                kept_b = b;                                                /* F72 */
+            else if (unrest_ && b < under && kept_b < 0 && !(it->second.in_lru && holds_own(it->second, blocks, b))) {
+                /* F79: under mode 2 a copy on the card is compared below; the first one that cannot be is F72's */
+                if (unrest_ == 2 && same_bytes_fn && it->second.in_lru &&
+                    it->second.blocks.size() == entry_groups_.size()) {
+                    cmp_b.push_back(b);
+                    cmp_kept.insert(cmp_kept.end(), it->second.blocks.begin(), it->second.blocks.end());
+                    for (size_t g = 0; g < groups_.size(); ++g)
+                        for (int32_t j = 0; j < per_[g]; ++j) cmp_own.push_back(blocks[g][(size_t)(b * per_[g] + j)]);
+                } else {
+                    kept_b = b;                                            /* F72 */
+                }
+            }
             continue;                                                      /* touched below */
         }
         if (it != map_.end()) {
@@ -521,6 +535,34 @@ int PrefixCache::insert(uint64_t session,
     }
     /* Deepest first, as in lookup: the first block ends most recent. */
     for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);
+    /* F79: the kept copies on the card that hold this request's bytes are no conflict; the first that differs is kept_b
+     * (it lies before any uncomparable one, where the walk stopped collecting). The equal ones are pinned: this request's
+     * snapshots rest on bytes equal to them, so no later publisher may replace them (republish skips a pinned entry). */
+    if (!cmp_b.empty()) {
+        const int64_t n = (int64_t)cmp_b.size();
+        const uint64_t t0 = rad_mono_ns();
+        int64_t eq = same_bytes_fn(cmp_kept, cmp_own, n);
+        const double ms = (double)(rad_mono_ns() - t0) / 1e6;
+        eq = std::max<int64_t>(0, std::min<int64_t>(eq, n));
+        stats_.unrest_compared += n;
+        stats_.unrest_equal += eq;
+        if (eq < n) {
+            ++stats_.unrest_differ;
+            kept_b = cmp_b[(size_t)eq];
+        }
+        for (int64_t i = 0; i < eq; ++i) {
+            auto it = map_.find(hs[(size_t)cmp_b[(size_t)i]]);
+            if (it != map_.end()) it->second.pinned = true;
+        }
+        if (eq < n)
+            RAD_INFO("prefix cache: session %llu: %lld of %lld cached entries another publisher keeps hold this request's "
+                     "bytes (compared in %.1f ms); entry %lld (token %lld) differs", (unsigned long long)session,
+                     (long long)eq, (long long)n, ms, (long long)kept_b, (long long)(kept_b * block_size_));
+        else
+            RAD_INFO("prefix cache: session %llu: all %lld cached entries another publisher keeps hold this request's "
+                     "bytes (compared in %.1f ms): its snapshots stay%s", (unsigned long long)session, (long long)n, ms,
+                     kept_b >= 0 ? " up to the first copy that cannot be compared" : "");
+    }
     /* F72: no snapshot of this request stays deeper than an entry the cache holds another copy of; nothing then rests on
      * this request's copies past that entry, so they are not pinned below either. */
     if (kept_b >= 0) {
