@@ -3440,7 +3440,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): the comparer F72's rule asks before it retires a publisher's snapshots
      * over an entry the cache keeps another copy of (PrefixCache::same_bytes_fn). Called inside insert(), on the step
      * thread under the scheduler's lock, like restore_fn below. */
-    if (ranks_[0]->prefix.unrest_mode() == 2) {
+    /* Not on a two-node pipeline: the other node's layers are not here to compare, so mode 2 retires as mode 1 there. */
+    if (ranks_[0]->prefix.unrest_mode() == 2 && cfg_.pp_nodes > 1) {
+        RAD_WARN("prefix cache: RADIANCE_PREFIX_UNREST=2 compares the copies on this node only; on a two-node pipeline it "
+                 "retires as =1 does");
+    } else if (ranks_[0]->prefix.unrest_mode() == 2) {
         ranks_[0]->prefix.same_bytes_fn = [this](const std::vector<int32_t>& a, const std::vector<int32_t>& b,
                                                  int64_t n) { return prefix_same_bytes(a, b, n); };
         RAD_INFO("prefix cache: RADIANCE_PREFIX_UNREST=2 (Qwen loop F79) -- a publisher's snapshots over an entry the cache "
