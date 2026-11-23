@@ -9119,6 +9119,16 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "ar_lanethreads_s")) return r4d_ar_lane_threads_s_set(value);   /* qfn-on-ds lever LSK */
     if (!std::strcmp(name, "ar_laneblocks_s")) return r4d_ar_lane_blocks_s_set(value);     /* qfn-on-ds lever LSK */
     if (!std::strcmp(name, "rg_tail")) return r4d_rg_tail_set(value);   /* qfn-on-ds lever RGT (r4d_moe.hip) */
+    if (!std::strcmp(name, "hc_x_lb")) {   /* qfn-on-ds lever XLB: HCX's PRE form at NTS 4, mask 0..3 */
+        if (value < 0 || value > 3) return -1;
+        r4d_hc_x_lb(value);
+        return 1;
+    }
+    if (!std::strcmp(name, "hc_b3x_e")) {   /* qfn-on-ds lever B3E: B3X's batched pass-epilogue operands */
+        if (value < 0 || value > 1) return -1;
+        r4d_hc_b3x_e(value);
+        return 1;
+    }
     if (!std::strcmp(name, "f8_pp")) {   /* qfn-on-ds lever F8P (r4d_gemm_fp8a8.hip): 0 today's int8 narrow tile, 1 its twin */
         if (value < 0 || value > 1) return -1;
         r4d_gemm_fp8a8_pin_pp(value);

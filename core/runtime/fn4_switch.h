@@ -927,6 +927,13 @@
  *   f8_pp           libr4d (rad_fn4_switch; qfn-on-ds lever F8P, Qwen loop round 37, QUEUE Q66): 1 = the int8 narrow decode
  *                   GEMM (gemm_nt_q / gemm_nt_q_dec at MW 4-16: GDN in / out, attention, shared down) runs its twin with two
  *                   weight K tiles in flight a wave; the same bytes; 0 today                        RADIANCE_FN4_F8_PP
+ *   hc_x_lb         libr4d (rad_fn4_switch; qfn-on-ds lever XLB, Qwen loop round 38, QUEUE Q67): a mask 0..3 for the bi_dec
+ *                   hc read's kernel A' in HCX's PRE form at 4 tiles a block (the hero's HXS): bit 1 an LDS-only barrier at
+ *                   each W_down tile boundary, bit 2 the group-scale fold on its own tile's scales (no mid-tile loadcnt 0);
+ *                   the same bytes; 0 today                                                       RADIANCE_FN4_HC_X_LB
+ *   hc_b3x_e        libr4d (rad_fn4_switch; qfn-on-ds lever B3E, Qwen loop round 38, QUEUE Q68): 1 = kernel B3X's pass
+ *                   epilogue operands issued as one batch in the pass's last quarter step; the same bytes; 0 today
+ *                                                                                                  RADIANCE_FN4_HC_B3X_E
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -979,6 +986,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftUni,   /* qfn-on-ds Qwen loop round 14 (F42 / Q33): the scheduler, one draft depth a step at every start */
               kArLaneThreadsS, kArLaneBlocksS,   /* qfn-on-ds lever LSK (Qwen loop round 27, Q51): libr4d, the lane form's second pair */
               kF8Pp,     /* qfn-on-ds lever F8P (Qwen loop round 37, Q66): libr4d, the int8 narrow decode GEMM's two-tiles-in-flight twin */
+              kHcXLb, kHcB3xE,   /* qfn-on-ds levers XLB / B3E (Qwen loop round 38, Q67 / Q68): libr4d, the HXS hc read's load streams */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
