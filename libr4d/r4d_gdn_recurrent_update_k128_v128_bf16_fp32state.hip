@@ -258,6 +258,11 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   __shared__ float sobT[EPD ? RU_CVT * RU_V : 1];         // per (token, row): bf2f of the stored bf16 output
   __shared__ float swnT[EPD ? RU_CVT * (THR / 32) : 1];   // per (token, wave): the norm's partial sum of squares
   __shared__ float swaT[EPD ? RU_CVT * (THR / 32) : 1];   // per (token, wave): NORM 1 / 2's partial amax
+  /* qfn-on-ds lever QKS (Qwen loop round 41, QUEUE Q79; EPD == 2 = EPD + QKS): each token's l2-normalised q and k staged ONCE in LDS as f32
+   * (the per-(token, half) sums by 2T lanes in the per-row order, the scale and each element's product by one thread) instead of every one of the
+   * 256 threads converting, summing and scaling the same 128 + 128 values in every token; the loop loads the f32 products. The same bytes. */
+  __shared__ float sqk[EPD >= 2 ? RU_CVT * 2 * RU_K : 1];  // per token: normalised q [128] then k [128]
+  __shared__ float sqp[EPD >= 2 ? RU_CVT * 4 : 1];         // per (token, half): sum q^2, sum k^2
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -509,6 +514,45 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
                                        __HIP_MEMORY_SCOPE_AGENT);
   }
 
+  /* lever QKS: the T tokens' normalised q / k, once (the per-row path's own sums, order and expressions -- see sqk) */
+  if constexpr (EPD >= 2) {
+    if (tid < 2 * T) {
+      const int ut = tid >> 1, uk0 = (tid & 1) * RU_HK;
+      const unsigned short* qp = cvq + ut * RU_K + uk0;
+      const unsigned short* kp = cvk + ut * RU_K + uk0;
+      float ssq = 0.0f, ssk = 0.0f;
+#pragma unroll
+      for (int j = 0; j < RU_HK; j += 8) {
+        const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
+        const unsigned short* aq = (const unsigned short*)&wq;
+        const unsigned short* ak = (const unsigned short*)&wk;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const float fq = bf2f(aq[e]), fk = bf2f(ak[e]);
+          ssq += fq * fq; ssk += fk * fk;
+        }
+      }
+      sqp[tid * 2] = ssq;
+      sqp[tid * 2 + 1] = ssk;
+    }
+    __syncthreads();
+    {
+      const int e = tid & (RU_K - 1);
+      const bool isk = tid >= RU_K;
+      for (int t = 0; t < T; ++t) {
+        /* the pair's exchange: own half + the other half, either lane the same sum (an IEEE add commutes) */
+        const float ss = sqp[(t * 2) * 2 + (isk ? 1 : 0)] + sqp[(t * 2 + 1) * 2 + (isk ? 1 : 0)];
+#if defined(R4D_EMU_QKS_MUTATE)   /* r4d_emu_gdnepd's mutation build only: k scaled by `scale` too */
+        const float sc = __frsqrt_rn(ss + 1e-6f) * scale;
+#else
+        const float sc = isk ? __frsqrt_rn(ss + 1e-6f) : __frsqrt_rn(ss + 1e-6f) * scale;
+#endif
+        sqk[t * 2 * RU_K + (isk ? RU_K : 0) + e] = bf2f(isk ? cvk[t * RU_K + e] : cvq[t * RU_K + e]) * sc;
+      }
+    }
+    __syncthreads();
+  }
+
   const float alog = __expf(a_log_h);
 
   if (STG) {
@@ -549,6 +593,14 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
 
     float qq[RU_HK], kk[RU_HK];
+    if constexpr (EPD >= 2) {   /* lever QKS: the token's normalised q / k, staged once */
+      const float* fq = sqk + t * 2 * RU_K + k0;
+#pragma unroll
+      for (int j = 0; j < RU_HK; j += 4) {
+        *(float4*)&qq[j] = *(const float4*)(fq + j);
+        *(float4*)&kk[j] = *(const float4*)(fq + RU_K + j);
+      }
+    } else {
 #pragma unroll
     for (int j = 0; j < RU_HK; j += 8) {
       const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
@@ -572,6 +624,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     }
 #pragma unroll
     for (int j = 0; j < RU_HK; ++j) { qq[j] *= qs; kk[j] *= ks; }
+    }   /* !QKS */
 
     const float ra  = CV ? sab[t]     : ru_ab<ABF16>(av, (size_t)tok * ab_stride + hv);
     const float rb  = CV ? sab[T + t] : ru_ab<ABF16>(bv, (size_t)tok * ab_stride + hv);
@@ -1075,19 +1128,21 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
  * fp32 state) with its per-token epilogue -- row norm, bf16 output, the out projection's codes and scales -- deferred past the token
  * loop (the kernel's EPD note); the same bytes. The bench / switch hook r4d_gdn_epd(0 / 1) overrides the env (-1 = the env). */
 static std::atomic<int> g_ru_epd_bench{-1};
-static bool ru_epd() {
+/* (round 41, QUEUE Q79) 2 = EPD + lever QKS (each token's normalised q / k staged once in LDS as f32; the same bytes) */
+static int ru_epd() {
   const int b = g_ru_epd_bench.load(std::memory_order_relaxed);
-  if (b >= 0) return b == 1;
-  static const bool v = [] {
+  if (b >= 0) return b;
+  static const int v = [] {
     const char* e = getenv("RADIANCE_GDN_EPD");
-    const bool on = e && e[0] == '1' && e[1] == '\0';
-    if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=1): the GDN decode update's per-token norm / output / "
-                            "codes after its token loop (two barriers a call instead of two to four a token; the same bytes)\n");
+    const int on = (e && (e[0] == '1' || e[0] == '2') && e[1] == '\0') ? e[0] - '0' : 0;
+    if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=%d): the GDN decode update's per-token norm / output / "
+                            "codes after its token loop (two barriers a call instead of two to four a token)%s; the same bytes\n", on,
+                    on == 2 ? " + lever QKS (each token's normalised q / k staged once in LDS)" : "");
     return on;
   }();
   return v;
 }
-extern "C" void r4d_gdn_epd(int on) { g_ru_epd_bench.store(on < 0 ? -1 : (on > 0 ? 1 : 0), std::memory_order_relaxed); }
+extern "C" void r4d_gdn_epd(int on) { g_ru_epd_bench.store(on < 0 ? -1 : (on > 2 ? 2 : on), std::memory_order_relaxed); }
 /* lever EPD's dispatch proof for the bench / host test: launches that took the EPD instance since the process started */
 static std::atomic<long long> g_ru_epd_launches{0};
 extern "C" long long r4d_gdn_epd_launches() { return g_ru_epd_launches.load(std::memory_order_relaxed); }
@@ -1117,7 +1172,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
   /* lever EPD: anchor + fp32 state only (its instances); every other form unchanged */
-  const bool epd = anc && !sdt && ru_epd();
+  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS */
   if (epd) g_ru_epd_launches.fetch_add(1, std::memory_order_relaxed);
   const unsigned dyn_lds = (unsigned)g_ru_dyn_lds.load(std::memory_order_relaxed);   /* bench only (Q13 read); 0 = today */
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
@@ -1125,8 +1180,9 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
        else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  do { if ((ANCC) && !(SDTC) && epd) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
-       else                          RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, 0); } while (0)
+  do { if ((ANCC) && !(SDTC) && epd == 2) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 2 : 0)); \
+       else if ((ANCC) && !(SDTC) && epd) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
+       else                               RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, 0); } while (0)
 #define RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, EPC)                                           \
   hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, EPC> \
                                   : &r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, EPC>), \

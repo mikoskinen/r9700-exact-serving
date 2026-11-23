@@ -85,6 +85,7 @@ int qwen_hi(int i) {
          : i == kExl3Drz ? 7 : i == kResumeCold ? 3   /* resume_cold 2: + a spanned chunk's last piece start (lever TIP); 3: every piece start (with lever GPF) */
          : i == kHcB3xP ? 4096   /* lever B3P (Qwen loop round 39): the row floor of B3X's group-pair form, 0 off */
          : i == kHcXLb ? 3   /* lever XLB's mask (Qwen loop round 38): bit 1 the LDS-only tile barrier, bit 2 the own-tile scale fold */
+         : i == kGdnEpd ? 2   /* lever EPD (Qwen loop round 41): 1 the GDN update's deferred epilogue, 2 + lever QKS */
          : 1;   /* exl3_drz 4..7: DRZ's reading values (exl3r4d accepts 0, 1, 4..7; F43); rg_tail 0..4095: rows + 256 x lever
                     RGU's form (libr4d refuses a row field above 128 and KU code 3, Qwen loop round 36) */
 }

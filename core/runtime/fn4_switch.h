@@ -943,6 +943,8 @@
  *   gdn_epd         libr4d (rad_fn4_switch; qfn-on-ds lever EPD, Qwen loop round 41, QUEUE Q78): 1 = the GDN decode update (conv
  *                   fold, anchor fp32 state) runs its per-token row norm, bf16 output and the out projection's codes + scales after
  *                   its token loop (two barriers a call, no spill) instead of inside every token; the same bytes; 0 today
+ *                   2 = 1 + lever QKS (QUEUE Q79): each token's l2-normalised q and k staged once in LDS as f32 instead of
+ *                   converted, summed and scaled by every thread in every token; the same bytes
  *                                                                                                  RADIANCE_GDN_EPD
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
