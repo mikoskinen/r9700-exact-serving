@@ -3087,6 +3087,75 @@ void Engine::clear_fresh_states() {
 
 namespace { void install_follower_stop_signals(); }
 
+/* qfn hero image (Qwen loop round 26, COORD 10:35): the image's runtime switch values -- the file RADIANCE_IMAGE_SWITCHES names,
+ * else radiance_home + "/switches.json"; no file = nothing (today). The same body POST /admin/fn4 takes ({"<switch>": n, ...};
+ * "epoch_bump" skipped), every key checked before any is queued, queued for the first step exactly as a POST right after start
+ * is (the published start's switches.sh). A refused key stops the start with the reason: an image whose defaults do not take
+ * would serve something else than it says. */
+int Engine::image_switch_defaults() {
+    std::string path;
+    if (const char* e = std::getenv("RADIANCE_IMAGE_SWITCHES")) {
+        if (!*e) return RAD_OK;
+        path = e;
+    } else {
+        path = cfg_.radiance_home + "/switches.json";
+    }
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return RAD_OK;
+    std::string body;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) body.append(buf, n);
+    std::fclose(f);
+    std::vector<std::pair<std::string, int>> sets;
+    std::string list;
+    /* a flat {"name": int|bool, ...} object: no nesting, no strings as values */
+    size_t i = body.find('{');
+    while (i != std::string::npos) {
+        const size_t q0 = body.find('"', i);
+        if (q0 == std::string::npos) break;
+        const size_t q1 = body.find('"', q0 + 1);
+        const size_t c = q1 == std::string::npos ? q1 : body.find(':', q1);
+        if (c == std::string::npos) break;
+        size_t v = body.find_first_not_of(" \t\r\n", c + 1);
+        if (v == std::string::npos) break;
+        const std::string k = body.substr(q0 + 1, q1 - q0 - 1);
+        int val = 0;
+        size_t e = v;
+        if (body.compare(v, 4, "true") == 0) { val = 1; e = v + 4; }
+        else if (body.compare(v, 5, "false") == 0) { val = 0; e = v + 5; }
+        else {
+            char* end = nullptr;
+            const long x = std::strtol(body.c_str() + v, &end, 10);
+            if (end == body.c_str() + v) {
+                RAD_ERR("image defaults: %s: switch '%s' has no integer or boolean value", path.c_str(), k.c_str());
+                return RAD_E_INVAL;
+            }
+            val = (int)x;
+            e = (size_t)(end - body.c_str());
+        }
+        if (k != "epoch_bump") {
+            std::string why;
+            if (!fn4::check(k, val, &why)) {
+                RAD_ERR("image defaults: %s: switch '%s' = %d refused: %s", path.c_str(), k.c_str(), val, why.c_str());
+                return RAD_E_INVAL;
+            }
+            sets.emplace_back(k, val);
+            list += (list.empty() ? "" : ", ") + k + " " + std::to_string(val);
+        }
+        i = body.find(',', e);
+    }
+    for (const auto& kv : sets) {
+        std::string why;
+        if (!fn4::request(kv.first, kv.second, &why)) {
+            RAD_ERR("image defaults: %s: switch '%s' = %d not queued: %s", path.c_str(), kv.first.c_str(), kv.second, why.c_str());
+            return RAD_E_INVAL;
+        }
+    }
+    RAD_INFO("image defaults (%s): %zu switches queued for the first step [%s]", path.c_str(), sets.size(), list.c_str());
+    return RAD_OK;
+}
+
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
@@ -3356,6 +3425,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
     /* tp8 S5: the other lanes' schedulers (engine_lanes.cpp) */
     if ((pp_on() || bgl1m_) && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
+    /* qfn hero image: the image's switch values, queued for the first step. After the schedulers' init (Qwen loop round 44, FINDINGS
+     * F76): fn4::check refuses the drafter's switches (draft_dcap / draft_dcap_n / ...) until Scheduler::init has registered its drafter
+     * (fn4::draft_register, core/sched/scheduler.cpp), so at serve()'s top the hero image R60 stopped on its own draft_dcap 3. */
+    if (int r = image_switch_defaults(); r < 0) return r;
     /* tp8 S4: the rings, the second rendezvous and the link's threads. */
     if (pp_on()) {
         if (embedding_ || generator) {

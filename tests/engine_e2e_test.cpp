@@ -1740,6 +1740,40 @@ TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
     }
 }
 
+/* The hero image's switches.json (RADIANCE_IMAGE_SWITCHES) is queued after the scheduler registers its drafter (Qwen loop round 44,
+ * FINDINGS F76): a drafter switch in it -- draft_dcap, which fn4::check refuses until Scheduler::init's fn4::draft_register -- is
+ * taken, not a stopped start ('no scheduler has registered a drafter' was R60's startup stop), and reads back after a request. */
+TEST(image_switch_defaults_take_a_drafter_switch_after_the_scheduler_registers) {
+    REQUIRE(world().ok);
+    const std::string path = "/tmp/f76-switches-" + std::to_string((long)::getpid()) + ".json";
+    {
+        FILE* f = std::fopen(path.c_str(), "w");
+        REQUIRE(f != nullptr);
+        std::fputs("{\"draft_dcap\": 3, \"draft_dcap_n\": 107}\n", f);
+        std::fclose(f);
+    }
+    Server s;
+    const bool up = s.start(world().qwen35_spec, { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" },
+                            { "RADIANCE_IMAGE_SWITCHES=" + path });
+    const std::string log = s.output();
+    CHECK(up);
+    CHECK(!has(log, "no scheduler has registered a drafter"));
+    CHECK(has(log, "2 switches queued for the first step [draft_dcap 3, draft_dcap_n 107]"));
+    if (up) {
+        int status = 0;
+        (void)post(s.port, "/completion", completion(repetitive_prompt(), 8), &status);
+        CHECK_EQ(status, 200);
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        const json j = json::parse(out, nullptr, false);
+        CHECK_EQ(j.value(json::json_pointer("/switches/draft_dcap"), -1), 3);
+        CHECK_EQ(j.value(json::json_pointer("/switches/draft_dcap_n"), -1), 107);
+        CHECK_EQ(s.stop(), 0);
+    }
+    std::remove(path.c_str());
+}
+
 /* Sampling draws each position's random number from (seed, position), so a seeded request repeats
  * exactly, and speculation, which accepts a draft only where the sampler at that coordinate would
  * have drawn it, gives the same tokens as plain decoding. Another seed must give other tokens, or
