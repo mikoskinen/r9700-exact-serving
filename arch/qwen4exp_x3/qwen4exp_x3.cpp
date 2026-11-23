@@ -64,11 +64,18 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen4exp_fp8's step_pipelined; RADIANCE_FN4_SP_ROUTE declares) */
-        if (value < 0 || value > 16383) return -1;   /* 8192: lever HCP (qwen4exp_fp8's connection reads: a prefill segment past the first interval at a full piece's K split); 4096: lever GPF (qwen4exp_fp8's step_pipelined: a (R, <= 64)-row step's mixer whole, ArPieces::min_last); 2048 (with 1024): MSP's embedding by a raw reduce-scatter; 1024: lever MSP (qwen4exp_fp8's MTP history pass a piece a rank, rad_block_mtp_hc.h step_msp; RADIANCE_FN4_MSP=1 declares); 512: lever PSP (qwen4exp_fp8's step_pipelined: the partial last piece SP); bits 2 / 4: PF probes, 8: PF marks, 16: SPO-tail, 32: PF-ORDER (qwen4exp_fp8's step_pipelined), 64: PF probe ATP (a prefill step's gated sparse attention twice, rad_block_attn_gated_fp8.h), 128: PF probe X3P (a prefill-height pass's EXL3 experts twice, rad_block_moe_fp8.h), 256: PF probe NOWAIT (qwen4exp_fp8's step_pipelined: lane 0 never waits for lane 1; wrong bytes) */
+        if (value < 0 || value > 65535) return -1;   /* 32768: lever QRS, 16384: PF probe QSP (Qwen loop round 42, test row qrs1: this range was 0..16383); 8192: lever HCP (qwen4exp_fp8's connection reads: a prefill segment past the first interval at a full piece's K split); 4096: lever GPF (qwen4exp_fp8's step_pipelined: a (R, <= 64)-row step's mixer whole, ArPieces::min_last); 2048 (with 1024): MSP's embedding by a raw reduce-scatter; 1024: lever MSP (qwen4exp_fp8's MTP history pass a piece a rank, rad_block_mtp_hc.h step_msp; RADIANCE_FN4_MSP=1 declares); 512: lever PSP (qwen4exp_fp8's step_pipelined: the partial last piece SP); bits 2 / 4: PF probes, 8: PF marks, 16: SPO-tail, 32: PF-ORDER (qwen4exp_fp8's step_pipelined), 64: PF probe ATP (a prefill step's gated sparse attention twice, rad_block_attn_gated_fp8.h), 128: PF probe X3P (a prefill-height pass's EXL3 experts twice, rad_block_moe_fp8.h), 256: PF probe NOWAIT (qwen4exp_fp8's step_pipelined: lane 0 never waits for lane 1; wrong bytes) */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         rad::arch::fn4_attprobe_flag().store((value & 64) ? 1 : 0, std::memory_order_relaxed);
         rad::arch::fn4_x3probe_flag().store((value & 128) ? 1 : 0, std::memory_order_relaxed);
+        /* Qwen loop round 42 (test row qrs1: 'sp_route -> 28160 refused (1 plugin(s) took it)'): the two bits qwen4exp_fp8's
+         * own handler has served since round 27 / 29. The EXL3 model runs THIS plugin, and its 0..16383 range refused every
+         * POST with bit 14 or 15 (the core takes a plugin switch only when no plugin refuses), so QSP / QRS never reached the
+         * served model. The stores are here as well as in qwen4exp_fp8's handler: this unit includes qwen4exp_fp8.cpp, and
+         * the flags (rad_qsa.h, function-local statics) are one object a process only while the loader unifies them. */
+        rad::arch::fn4_qsaprobe_flag().store((value & 16384) ? 1 : 0, std::memory_order_relaxed);   /* PF probe QSP */
+        rad::arch::fn4_qrs_flag().store((value & 32768) ? 1 : 0, std::memory_order_relaxed);       /* lever QRS */
         return 1;
     }
     if (std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */
