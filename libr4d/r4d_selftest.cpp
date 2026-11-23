@@ -26534,6 +26534,146 @@ static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_onc
                     pct(gapab, 0.5), pct(gapab, 0.0));
 }
 
+/* qfn-on-ds QUEUE Q105 read (Qwen loop round 53): --perfkvres [calls] -- kv_resolve at the AgentX streamed form's rank shape: ONE
+ * layer's ring of S slots of 2,048 B, full (slot s holds block s, heats 0..3 by an LCG), block ids over B (their rows in a pinned
+ * host mirror), M rows x 513 selected blocks a call, a fraction MISS of each row outside the ring, the rest drawn from what the ring
+ * holds after the previous call (the state carries over call to call, as the engine's does). kvs_vic on (the AgentX start).
+ * Per cell (M, MISS, kvs_flat): 3 warm calls, then `calls` calls on the stamped instance (r4d_kv_stamp_set: thread 0's wall
+ * clock at the phase ends) and `calls` on the served one (event time only, the stamps' own cost). Prints per cell the call's
+ * claims / placed, event us p50 (stamped / served) and per-phase us p50. Env: R4D_SELFTEST_KVRES_S (82080), _B (393216),
+ * _M ("5,20,64"), _MISS ("0,0.02,0.05"), _FLAT ("0,1"). The question it answers: what holds the ~73 us a call at 5 rows that
+ * lever KVF does not touch (rider R1 / agx6: 73.0 us at 5 rows, 140.7 at ~20, 286.4 at 64). */
+static void kvres_bench(const Plugin& pl, int calls) {
+    if (calls < 1) calls = 30;
+    const RadKernelInfo* r = find(pl, "kv_resolve_i32");
+    auto stamp_set = (int (*)(int))dlsym(pl.h, "r4d_kv_stamp_set");
+    auto flat_set = (int (*)(int))dlsym(pl.h, "r4d_kv_flat_set");
+    auto vic_set = (int (*)(int))dlsym(pl.h, "r4d_kv_vic_set");
+    if (!r || !stamp_set || !flat_set || !vic_set) {
+        std::printf("--perfkvres: kv_resolve_i32 / r4d_kv_stamp_set / r4d_kv_flat_set / r4d_kv_vic_set absent\n"); ++g_fail; return; }
+    auto envll = [](const char* k, long long d) { const char* e = std::getenv(k); return e && *e ? std::atoll(e) : d; };
+    auto envlist = [](const char* k, const char* d) {
+        const char* e = std::getenv(k); std::string v = e && *e ? e : d; std::vector<double> out;
+        for (size_t a = 0; a < v.size();) { size_t b = v.find(',', a); if (b == std::string::npos) b = v.size();
+            out.push_back(std::atof(v.substr(a, b - a).c_str())); a = b + 1; }
+        return out; };
+    const int64_t S = envll("R4D_SELFTEST_KVRES_S", 82080), B = envll("R4D_SELFTEST_KVRES_B", 393216);
+    const int64_t P = 513, BB = 2048;
+    const std::vector<double> Ms = envlist("R4D_SELFTEST_KVRES_M", "5,20,64"), MISS = envlist("R4D_SELFTEST_KVRES_MISS", "0,0.02,0.05"),
+                              FL = envlist("R4D_SELFTEST_KVRES_FLAT", "0,1");
+    int64_t Mmax = 1;
+    for (double m : Ms) Mmax = std::max<int64_t>(Mmax, (int64_t)m);
+    int khz = 0;
+    (void)hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, 0);
+    const double us_tick = khz > 0 ? 1000.0 / (double)khz : 0.01;
+    std::printf("KVRES ring %lld slots x %lld B, %lld block ids, pitch %lld, wall clock %d kHz, %d calls a cell\n", (long long)S,
+                (long long)BB, (long long)B, (long long)P, khz, calls);
+    void* host = nullptr;
+    if (hipHostMalloc(&host, (size_t)(B * BB), hipHostMallocDefault) != hipSuccess || !host) {
+        std::printf("--perfkvres: pinned mirror of %lld MiB refused\n", (long long)(B * BB >> 20)); ++g_fail; return; }
+    std::memset(host, 0x5a, (size_t)(B * BB));
+    vic_set(1);
+    for (double fl : FL) {
+        flat_set(fl > 0.5 ? 1 : 0);
+        for (double mm : Ms) {
+            const int64_t M = (int64_t)mm;
+            for (double mf : MISS) {
+                /* a fresh full ring for every cell */
+                std::vector<int32_t> res((size_t)B, -1), sblk((size_t)S), sst((size_t)(2 * S), 0);
+                uint64_t lcg = 0x9e3779b97f4a7c15ull ^ (uint64_t)(M * 131 + (int64_t)(mf * 1000));
+                auto rnd = [&]() { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(lcg >> 33); };
+                for (int64_t q = 0; q < S; ++q) { sblk[(size_t)q] = (int32_t)q; res[(size_t)q] = (int32_t)q; sst[(size_t)(2 * q + 1)] = (int32_t)(rnd() & 3); }
+                const size_t bytes[8] = { (size_t)(M * P) * 4, (size_t)M * 4, (size_t)B * 4, (size_t)S * 4, (size_t)(2 * S) * 4, 16 * 4, 0,
+                                          (size_t)(S * BB) };
+                void* d[8] = {};
+                for (int i = 0; i < 8; ++i) if (i != 6) { d[i] = dalloc(bytes[i]); if (!d[i]) { std::printf("--perfkvres: alloc\n"); ++g_fail; (void)hipHostFree(host); return; } }
+                d[6] = host;
+                st_memcpy(d[2], res.data(), bytes[2], hipMemcpyHostToDevice);
+                st_memcpy(d[3], sblk.data(), bytes[3], hipMemcpyHostToDevice);
+                st_memcpy(d[4], sst.data(), bytes[4], hipMemcpyHostToDevice);
+                const std::vector<std::vector<int64_t>> shapes = { { M, P }, { M }, { B }, { S }, { S, 2 }, { 16 }, { B, BB }, { S, BB } };
+                const uint32_t dts[8] = { RAD_I32, RAD_I32, RAD_I32, RAD_I32, RAD_I32, RAD_I32, RAD_U8, RAD_U8 };
+                std::vector<RadTensor> td;
+                for (int i = 0; i < 8; ++i) td.push_back(T(d[i], dts[i], shapes[(size_t)i]));
+                std::vector<RadParam> ps = { PI("M", M), PI("blocks", B), PI("slots", S), PI("sel_pitch", P), PI("block_bytes", BB) };
+                RadArgs ad{};
+                ad.t = td.data(); ad.n_t = 8; ad.p = ps.data(); ad.n_p = 5; ad.world_size = 1;
+                const int64_t need = r->scratch ? r->scratch(&ad) : 0;
+                ad.scratch_bytes = need + 512;
+                ad.scratch = dalloc((size_t)ad.scratch_bytes);
+                const size_t st_off = (size_t)(((need + 7) / 8) * 8);   /* = kv_st_base: past the victim list, 8-aligned */
+                std::vector<int32_t> sel((size_t)(M * P)), nsel((size_t)M, (int32_t)P);
+                std::vector<char> seen((size_t)B, 0);
+                hipEvent_t e0, e1;
+                st_ev_create(&e0); st_ev_create(&e1);
+                std::vector<double> ev_st, ev_sv;
+                std::vector<std::vector<double>> ph(14);
+                std::vector<double> nclaims, nplaced;
+                bool bad = false;
+                for (int k = 0; k < 3 + 2 * calls && !bad; ++k) {
+                    const bool stamped = k >= 3 && k < 3 + calls;
+                    /* the selection from the ring's current holding: read both maps back (outside the timed call) */
+                    st_memcpy(sblk.data(), d[3], bytes[3], hipMemcpyDeviceToHost);
+                    st_memcpy(res.data(), d[2], bytes[2], hipMemcpyDeviceToHost);
+                    for (int64_t q = 0; q < M; ++q) {
+                        std::fill(seen.begin(), seen.end(), 0);   /* distinct within a row */
+                        const int64_t nm = (int64_t)(mf * (double)P + 0.5);
+                        for (int64_t i = 0; i < P; ++i) {
+                            int32_t b = -1;
+                            for (int t = 0; t < 64 && b < 0; ++t) {
+                                if (i < nm) { const int32_t c = (int32_t)(rnd() % (uint32_t)B); if (res[(size_t)c] < 0 && !seen[(size_t)c]) b = c; }
+                                else { const int32_t c = sblk[(size_t)(rnd() % (uint32_t)S)]; if (c >= 0 && !seen[(size_t)c]) b = c; }
+                            }
+                            if (b < 0) b = (int32_t)((q * P + i) % B);
+                            seen[(size_t)b] = 1;
+                            sel[(size_t)(q * P + i)] = b;
+                        }
+                    }
+                    st_memcpy(d[0], sel.data(), bytes[0], hipMemcpyHostToDevice);
+                    st_memcpy(d[1], nsel.data(), bytes[1], hipMemcpyHostToDevice);
+                    stamp_set(stamped ? 1 : 0);
+                    st_stream_sync(nullptr);
+                    st_ev_record(e0, nullptr);
+                    const int rc = r->launch(&ad, nullptr);
+                    st_ev_record(e1, nullptr);
+                    st_ev_sync(e1);
+                    if (rc != RAD_OK) { std::printf("--perfkvres: launch rc %d at M %lld\n", rc, (long long)M); ++g_fail; bad = true; break; }
+                    float ms = 0.f;
+                    st_ev_elapsed(&ms, e0, e1);
+                    if (k < 3) continue;
+                    if (!stamped) { ev_sv.push_back(ms * 1000.0); continue; }
+                    ev_st.push_back(ms * 1000.0);
+                    unsigned long long kst[24] = {};
+                    st_memcpy(kst, (char*)ad.scratch + st_off, sizeof kst, hipMemcpyDeviceToHost);
+                    nclaims.push_back((double)kst[16]);
+                    nplaced.push_back((double)kst[18]);
+                    /* each phase from the last stamp written before it (a phase not run = 0 us) */
+                    unsigned long long prev = kst[0];
+                    for (int j = 1; j < 14; ++j) {
+                        if (kst[j] == 0 || kst[j] < prev) { ph[(size_t)j].push_back(0.0); continue; }
+                        ph[(size_t)j].push_back((double)(kst[j] - prev) * us_tick);
+                        prev = kst[j];
+                    }
+                    ph[0].push_back((double)(kst[13] - kst[0]) * us_tick);
+                }
+                stamp_set(0);
+                st_ev_destroy(e0); st_ev_destroy(e1);
+                auto p50 = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+                static const char* const nm[14] = { "in-kernel", "epoch", "lookups", "sort", "free3b", "list4a", "step4", "chk4b", "rot4b",
+                                                    "end4b", "revert", "copies", "rewrite", "tail" };
+                std::string phs;
+                for (int j = 1; j < 14; ++j) phs += fmt(" %s %.1f", nm[j], p50(ph[(size_t)j]));
+                std::printf("KVRES flat %d M %lld miss %.3f: claims p50 %.0f placed %.0f | call us p50 stamped %.1f served %.1f | in-kernel %.1f |%s\n",
+                            fl > 0.5 ? 1 : 0, (long long)M, mf, p50(nclaims), p50(nplaced), p50(ev_st), p50(ev_sv), p50(ph[0]), phs.c_str());
+                dfree_all();
+                if (bad) { (void)hipHostFree(host); return; }
+            }
+        }
+    }
+    flat_set(0);
+    (void)hipHostFree(host);
+}
+
 /* qfn-on-ds QUEUE Q13 read + lever EPD (Qwen loop round 41, QUEUE Q78): --perfgdnr [iters] -- the GDN decode update as Flash-Next tp4
  * serves it (gdn_conv_recurrent_update_had: the conv folded in, anchor state in fp32, had_quant_act_i8g's rotated int8 codes; the
  * rank shape 12 value heads / 4 key heads, 128 x 128 state, conv width 4; the engine's state_index layout: columns 0-2 the anchor
@@ -44372,6 +44512,7 @@ static void usage(void) {
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
                 "  --perfhcq M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at 1 / 2 / 4 / 5\n"
                 "             groups a wave (fn4 W2), and from 512 rows PF2's codes stage alone.\n"
+                "  --perfkvres [calls]: kv_resolve's phases (stamped instance) at the AgentX ring (82,080 slots full), M 5 / 20 / 64 x 513, misses 0 / 2 / 5 %%\n"
                 "  --perfgdnr [iters]: the served GDN decode update (conv fold, anchor, had codes) at the Flash-Next tp4 rank shape over\n"
                 "      sequences x tokens x replayed tokens (R4D_SELFTEST_GDN_N / _TA / _FORMS): lever EPD bytes + time (round 41)\n"
                 "  --perfhcssb M [iters]: hc_write + the bi_dec hc read (331 | 8) at M rows: lever SSB (bit 17,\n"
@@ -44578,6 +44719,7 @@ int main(int argc, char** argv) {
     int hcs_it = 50;
     long long hcssb_m = 0;   /* --perfhcssb (qfn-on-ds lever SSB, round 35) */
     int gdnr_on = 0, gdnr_it = 0;   /* --perfgdnr (qfn-on-ds Q13 read + lever EPD, round 41) */
+    int kvres_on = 0, kvres_it = 0;   /* --perfkvres (qfn-on-ds Q105 read, round 53) */
     int hcssb_it = 50;
     long long hcq_m = 0;
     int hcq_it = 50;
@@ -45052,6 +45194,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcq_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcq_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfkvres")) {
+            /* qfn-on-ds QUEUE Q105 read (round 53): kv_resolve's phases at the AgentX ring */
+            kvres_on = 1;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) kvres_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfgdnr")) {
             /* qfn-on-ds Q13 read + lever EPD (round 41): the served GDN decode update over sequences x tokens x replayed tokens */
             gdnr_on = 1;
@@ -45220,6 +45366,16 @@ int main(int argc, char** argv) {
         skip("gated residual codes-stage timing (W2)", "built without HIP");
 #endif
         return 0;
+    }
+    if (kvres_on) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        kvres_bench(pl, kvres_it);
+        dfree_all();
+#else
+        skip("kv_resolve phase bench (Q105)", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (gdnr_on) {
         if (!load(&pl, path)) return 1;
