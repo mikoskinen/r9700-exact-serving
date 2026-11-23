@@ -2642,6 +2642,22 @@ template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_up_wx_tleo_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_wx_body<RG, false, I8, true, true>(R4D_HCW_ARGS);
 }
+/* qfn-on-ds round 40 (QUEUE Q77): HCO2's B3X at 8 waves a SIMD WITH lever B3D's padded d rows (hc_occ bit 16 + hc_b3x_d 1). Slot d1: once the
+ * LDS conflict was gone, B3X's block time still grew less than its residency (7.49 us at ~2 a WGP, 9.91 at ~3 = +13 % throughput a WGP from
+ * the 3rd block), so a 4th block may pay where o1's (conflict-bound) did not. The same bytes. */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_up_wx_od_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_wx_body<RG, false, I8, false, true, 0, 8>(R4D_HCW_ARGS);
+}
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void r4dchain_hc_up_wx_od(R4D_HCW_PARAMS) {
+    hc_up_wx_body<RG, true, I8, false, true, 0, 8>(R4D_HCW_ARGS);
+    r4d_chain_done();
+}
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8, 8))) void hc_up_wx_tleod_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_wx_body<RG, false, I8, true, true, 0, 8>(R4D_HCW_ARGS);
+}
 
 /* qfn-on-ds lever B3P (Qwen loop round 39, QUEUE Q71; RADIANCE_FN4_HC_B3X_P = the row floor, 0 = off): kernel B3X with a PAIR of
  * 16-row groups a block -- each W_up fragment is loaded and converted (e4m3 -> bf16) once and goes into BOTH groups' WMMAs. Why
@@ -9369,7 +9385,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         if (hc_b3x_e() && i8 && !hcg_ch && (b3ab || g_hc_tl.load(std::memory_order_relaxed))) {
             /* round 39: the served B3X (E) form's timeline copy (r4d_hc_tl) or ablation copies (r4d_hc_ab), int8 codes, unchained */
             auto* const fn = g_hc_tl.load(std::memory_order_relaxed)
-                               ? ((hc_occ() & 16) ? &hc_up_wx_tleo_kernel<16, true>   /* HCO2 */
+                               ? ((hc_occ() & 16) ? (hc_b3x_d() ? &hc_up_wx_tleod_kernel<16, true> : &hc_up_wx_tleo_kernel<16, true>)   /* HCO2 (+ B3D) */
                                   : hc_b3x_d() ? &hc_up_wx_tled_kernel<16, true> : &hc_up_wx_tle_kernel<16, true>)   /* B3D */
                            : b3ab == 1 ? &hc_up_wx_ab_kernel<16, true, 2>
                            : b3ab == 2 ? &hc_up_wx_ab_kernel<16, true, 4>
@@ -9404,7 +9420,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         if (hc_b3x_e() && (hc_occ() & 16)) {
             /* lever HCO2 (round 40, QUEUE Q73): the served B3X (B3E's form) at 8 waves a SIMD; the same bytes */
 #define HC_UPWXO_K(I8_)                                                                          \
-            R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_wx_o<16, I8_> : &hc_up_wx_o_kernel<16, I8_>),            \
+            R4D_EMIT(s, (hc_b3x_d() ? (hcg_ch ? &r4dchain_hc_up_wx_od<16, I8_> : &hc_up_wx_od_kernel<16, I8_>)   /* + B3D (Q77) */ \
+                         : (hcg_ch ? &r4dchain_hc_up_wx_o<16, I8_> : &hc_up_wx_o_kernel<16, I8_>)),            \
                      dim3((unsigned)(n / kUpTB), (unsigned)((rows + 15) / 16)), dim3(kThreads), 0,    \
                      (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,          \
                      (const unsigned short*)h->data, (const float*)w->data,                          \
