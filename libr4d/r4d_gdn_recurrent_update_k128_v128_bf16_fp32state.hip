@@ -223,6 +223,28 @@ __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const HT* hi
     if (t < T) sp[(size_t)(t + NH) * cs_tok] = (unsigned short)xs[t];
 }
 
+/* qfn-on-ds round 48 (QUEUE Q84 / Q90 follow-up, BENCH ONLY): the served update's per-workgroup timeline -- ABL 16 (EPD 256, reachable
+ * only through r4d_gdn_epd(256)) is the served form (ABL's other bits 0) with thread 0 stamping the 100 MHz wall clock at the call's phase
+ * boundaries into g_ru_tlp[workgroup][k] (r4d_gdn_tl allocates it; 8 bytes of module memory otherwise): k 0 entry, 1 prologue loads
+ * issued, 2 state slot resolved (sidx -> marker -> sidx[acol]), 3 replay + anchor store + barrier, 4 convolution (+ barrier) done = the
+ * token loop's start, 5 + t token t done, 13 after the loop / EPD's epilogue, 14 end of the last arriver's conv-state rewrite. Stamps
+ * write a separate buffer only: the update's own bytes are today's. */
+constexpr int kRuTlMax = 512, kRuTlW = 16;
+__device__ unsigned long long* g_ru_tlp;
+template <bool TL>
+__device__ __forceinline__ void ru_tl(int k) {
+  if constexpr (TL) {
+    unsigned long long* const tb = g_ru_tlp;
+    if (threadIdx.x != 0 || !tb) return;
+    const unsigned b = blockIdx.y * gridDim.x + blockIdx.x;
+#ifndef R4D_EMU_HOST   /* tests/r4d_emu: no wall clock on the host; the stamps are the bench's only */
+    if (b < (unsigned)kRuTlMax) tb[(unsigned long long)b * kRuTlW + k] = (unsigned long long)wall_clock64();
+#else
+    (void)b; (void)k;
+#endif
+  }
+}
+
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
           int CV = 0, int EPD = 0>
 __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsigned short* __restrict__ q,
@@ -280,6 +302,8 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * ~15 dependent memory round trips before the state is touched (slot a1: the call less its four phases is 17.1 us at one sequence,
    * x7 its state bytes). The same 16-bit values into the same arithmetic and stores: the same bytes. */
   constexpr bool ZX = (EPDF & 8) != 0;
+  constexpr bool TLS = (ABL & 16) != 0;   /* round 48: the bench's timeline instance (ru_tl's note) */
+  ru_tl<TLS>(0);
   using HT = std::conditional_t<ZX, uint32_t, unsigned short>;
   static_assert(!ABL || EPDF == 0, "the Q84 ablations are of the served form (EPD 0)");
   static_assert(!EPDF || (CV && NORM && ANC && VS == 1 && STG == 0), "EPD: the folded decode shape (T <= RU_CVT), fused norm, anchor");
@@ -427,6 +451,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     }
   }
 
+  ru_tl<TLS>(1);
   // Without ANC the initial state is the one the last accepted token wrote; with ANC there is one
   // state per sequence and the accepted prefix is replayed onto it below.
   const int nacc = naccept ? naccept[n] : 1;
@@ -491,6 +516,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   const int si = sidx[(size_t)n * sidx_stride + (ANC ? acol : (nacc - 1))];
   // A negative slot is padding; 0 is a real slot.
   if (si < 0) return;
+  ru_tl<TLS>(2);
   /* Fixed 32-row group (see RU_FSTR), uniform per wave for any VS (a wave is 16 consecutive rows
    * from a multiple of 16). readfirstlane makes the factor addresses scalar instead of 64-bit
    * VGPR offsets live across the token loop. */
@@ -563,6 +589,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
       fb2[RU_MARK_OFF] = (ST)3.0f;
     }
   }
+  ru_tl<TLS>(3);
   if (empty) return;
 
   if constexpr (CV) {
@@ -717,6 +744,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     __syncthreads();
   }
 
+  ru_tl<TLS>(4);
   for (int t = 0; t < T; ++t) {
     const int tok = bos + t;
     const unsigned short* qp = CV ? cvq + t * RU_K + k0 : q + ((size_t)tok * Hg + hk) * RU_K + k0;
@@ -928,6 +956,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
         for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
       }
     }
+    if (t < RU_CVT) ru_tl<TLS>(5 + t);
   }
 
   /* lever EPD: the T tokens' epilogues after the loop. Per token the loop's own expressions in its order -- the row's sum of
@@ -1016,6 +1045,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     }
   }
 
+  ru_tl<TLS>(13);
   if constexpr (CV) {
     // The last arriving reader rewrites the key head's q and k channels. The count was taken
     // before the token loop, hiding its latency.
@@ -1037,6 +1067,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     for (int t = 0; t < RU_CVT; ++t)
       rx[t] = t < T ? cvh[(CS - 1 + t) * THR + tid] : (unsigned short)0;
     ru_conv_rewrite(spa, rh, rx, T, cv.cs_tok);
+    ru_tl<TLS>(14);
   }
 }
 
@@ -1305,7 +1336,34 @@ static int ru_epd() {
 }
 /* (round 47, QUEUE Q84 read, BENCH ONLY) 16 x ABL for ABL in {1, 2, 3, 4, 8, 15} = the served form's timing ablations (the kernel's ABL
  * note; NOT the update's bytes); the core switch gdn_epd (0..4) and RADIANCE_GDN_EPD never reach them */
-static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15; }
+static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15 || abl == 16; }
+/* (round 48, bench only) ABL 16 = the served form with the per-workgroup timeline (ru_tl's note): r4d_gdn_tl(1) allocates the stamp
+ * buffer, r4d_gdn_tl_reset zeroes it, r4d_gdn_tl_read copies [workgroup][kRuTlW] words back */
+static unsigned long long* g_ru_tl_buf = nullptr;
+#ifndef R4D_EMU_HOST
+extern "C" int r4d_gdn_tl(int on) {
+  if (on && !g_ru_tl_buf) {
+    void* p = nullptr;
+    const size_t bytes = (size_t)kRuTlMax * kRuTlW * sizeof(unsigned long long);
+    if (hipMalloc(&p, bytes) != hipSuccess) return -1;
+    if (hipMemset(p, 0, bytes) != hipSuccess || hipMemcpyToSymbol(HIP_SYMBOL(g_ru_tlp), &p, sizeof p) != hipSuccess) {
+      (void)hipFree(p); return -1;
+    }
+    g_ru_tl_buf = (unsigned long long*)p;
+  }
+  return g_ru_tl_buf ? 0 : -1;
+}
+extern "C" int r4d_gdn_tl_reset() {
+  if (!g_ru_tl_buf) return -1;
+  return hipMemset(g_ru_tl_buf, 0, (size_t)kRuTlMax * kRuTlW * sizeof(unsigned long long)) == hipSuccess &&
+         hipDeviceSynchronize() == hipSuccess ? 0 : -1;
+}
+extern "C" int r4d_gdn_tl_read(unsigned long long* out, int max) {
+  if (!g_ru_tl_buf || max <= 0) return -1;
+  const int nb = max < kRuTlMax ? max : kRuTlMax;
+  return hipMemcpy(out, g_ru_tl_buf, (size_t)nb * kRuTlW * sizeof(unsigned long long), hipMemcpyDeviceToHost) == hipSuccess ? nb : -1;
+}
+#endif   /* !R4D_EMU_HOST */
 extern "C" void r4d_gdn_epd(int on) {
   const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on == 8 || on == 12) ? on : (on > 4 ? 4 : on);
   g_ru_epd_bench.store(v, std::memory_order_relaxed);
@@ -1335,7 +1393,7 @@ static bool ru_abl_launch(int abl, dim3 grid, dim3 blk, unsigned dyn_lds, RadStr
                        (float*)os, oq_pitch, os_ld, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc,      \
                        (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg, scale, thr, cv);           \
     return true;
-    switch (abl) { RU_ABL(1) RU_ABL(2) RU_ABL(3) RU_ABL(4) RU_ABL(8) RU_ABL(15) default: return false; }
+    switch (abl) { RU_ABL(1) RU_ABL(2) RU_ABL(3) RU_ABL(4) RU_ABL(8) RU_ABL(15) RU_ABL(16) default: return false; }
 #undef RU_ABL
   } else {
     (void)abl; (void)grid; (void)blk; (void)dyn_lds; (void)stream; (void)a; (void)b; (void)ab_stride; (void)A_log; (void)dt_bias;

@@ -26575,6 +26575,18 @@ static void gdnr_bench(const Plugin& pl, int iters) {
         else std::printf("GDNR: R4D_SELFTEST_GDN_ABL value %d is not an ablation (1, 2, 3, 4, 8, 15) -- left out\n", v);
     auto abl_name = [](int v) { return v == 1 ? "no-qk-norms" : v == 2 ? "no-epilogue-reductions" : v == 4 ? "no-recurrence"
                                      : v == 8 ? "no-replay" : v == 3 ? "no-norms+no-epilogue" : "all-four"; };
+    /* (round 48) R4D_SELFTEST_GDN_TL=1: the served form's per-workgroup timeline (libr4d ABL 16 = r4d_gdn_epd(256): thread 0 stamps the
+     * wall clock at the call's phase boundaries; the update's bytes are today's), R4D_SELFTEST_GDN_TLREPS single launches a cell */
+    const int tl_on = std::atoi(envs("R4D_SELFTEST_GDN_TL", "0").c_str()) ? 1 : 0;
+    const int tlreps = std::max(1, std::atoi(envs("R4D_SELFTEST_GDN_TLREPS", "20").c_str()));
+    int (*tl_set)(int) = (int (*)(int))dlsym(pl.h, "r4d_gdn_tl");
+    int (*tl_reset)() = (int (*)())dlsym(pl.h, "r4d_gdn_tl_reset");
+    int (*tl_read)(unsigned long long*, int) = (int (*)(unsigned long long*, int))dlsym(pl.h, "r4d_gdn_tl_read");
+    int wc_khz = 0;
+    (void)hipDeviceGetAttribute(&wc_khz, hipDeviceAttributeWallClockRate, 0);
+    if (tl_on && (!tl_set || !tl_reset || !tl_read || tl_set(1) != 0 || wc_khz <= 0)) {
+        std::printf("GDNR: no r4d_gdn_tl hooks / buffer / wall clock rate (%d kHz) -- no timeline\n", wc_khz); }
+    const bool tl_ok = tl_on && tl_set && tl_reset && tl_read && wc_khz > 0;
     const int64_t K = 128, V = 128, H = 12, Hg = 4, W = 4, MQ = 8, SL = W - 2 + MQ, COLS = 6;
     const int64_t CONV = 2 * Hg * K + H * V, INW = CONV + H * V;
     std::printf("GDNR: rank shape H %lld Hg %lld K %lld V %lld conv %lld, iters %d, %s\n", (long long)H, (long long)Hg, (long long)K,
@@ -26729,6 +26741,45 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                         line += fmt("; %s %.2f us (%+.2f us, %+.1f %%; reps %.2f / %.2f)", abl_name(AB[i]), ta[i + 1], ta[i + 1] - ta[0],
                                     ta[0] > 0 ? 100.0 * (ta[i + 1] - ta[0]) / ta[0] : 0.0, tr0[i + 1], tr1[i + 1]);
                     std::printf("%s; ablation launches %lld\n", line.c_str(), nab);
+                }
+                /* (round 48) the served form's per-workgroup timeline, copy 1: tlreps single launches (cold: each after the flush), each
+                 * workgroup's stamps relative to its own entry stamp, means over workgroups x launches; + the spread of the entries and the
+                 * span first entry -> last stamp */
+                if (tl_ok && has_epd && form == 2) {
+                    std::vector<RadTensor> tt; RadArgs at; args(1, 0, tt, at);
+                    auto launch_t = [&](int) { (void)r->launch(&at, (RadStream) nullptr); };
+                    const int nwg = (int)(N * H) < 512 ? (int)(N * H) : 512;
+                    std::vector<double> sum(16, 0.0); std::vector<long> cnt(16, 0);
+                    double span = 0.0, skew = 0.0; int got = 0;
+                    std::vector<unsigned long long> buf((size_t)512 * 16);
+                    const long long n0 = pl.gdn_epd_n();
+                    pl.gdn_epd(256);
+                    for (int rep = 0; rep < tlreps; ++rep) {
+                        if (tl_reset() != 0) break;
+                        (void)st_time_us(launch_t, 1, (hipStream_t) nullptr);
+                        st_stream_sync(nullptr);
+                        const int nb = tl_read(buf.data(), nwg);
+                        if (nb <= 0) break;
+                        unsigned long long t0min = ~0ull, t0max = 0, tend = 0;
+                        for (int b = 0; b < nb; ++b) {
+                            const unsigned long long* w = &buf[(size_t)b * 16];
+                            if (!w[0]) continue;
+                            t0min = std::min(t0min, w[0]); t0max = std::max(t0max, w[0]);
+                            for (int k = 1; k < 16; ++k)
+                                if (w[k] && w[k] >= w[0]) { sum[(size_t)k] += (double)(w[k] - w[0]); ++cnt[(size_t)k]; tend = std::max(tend, w[k]); }
+                        }
+                        if (t0min != ~0ull && tend >= t0min) { span += (double)(tend - t0min); skew += (double)(t0max - t0min); ++got; }
+                    }
+                    pl.gdn_epd(-1);
+                    const double us = 1000.0 / (double)wc_khz;   /* us a tick */
+                    static const char* const knm[16] = { "entry", "prologue-issued", "slot-resolved", "replay+anchor", "conv-done", "tok0", "tok1",
+                                                         "tok2", "tok3", "tok4", "tok5", "tok6", "tok7", "loop-end", "rewrite-end", "-" };
+                    std::string line = fmt("GDNR %s %s TL (us from each workgroup's entry, mean over %d launches x %d workgroups; launches %lld):",
+                                           cell.c_str(), g_cold > 0 ? "cold" : "warm", got, nwg, pl.gdn_epd_n() - n0);
+                    for (int k = 1; k < 15; ++k)
+                        if (cnt[(size_t)k]) line += fmt(" %s %.2f", knm[k], sum[(size_t)k] / (double)cnt[(size_t)k] * us);
+                    if (got) line += fmt("; entry spread %.2f us, span first entry -> last stamp %.2f us", skew / got * us, span / got * us);
+                    std::printf("%s\n", line.c_str());
                 }
                 dfree_all();
             }
