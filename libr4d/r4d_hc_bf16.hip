@@ -3454,7 +3454,7 @@ void r4dchain_hc_read_g16p_down(const unsigned short* __restrict__ h, const floa
  * over its 320-wide slice with the same group-scale folds, the waves' partials summed 0..7 ascending from 0, the streams' by the
  * tile's last block 0..3 ascending; the norm = G16p's loop), so every output byte is G16p's = G16's = form G's at every height:
  * no reference change, and a floor (RADIANCE_FN4_HC_X_MIN) moves no answer. */
-template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false>
+template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false, int LB = 0>
 __device__ __forceinline__ void hc_read_g16x_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -3497,6 +3497,16 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
     float wsb[2][3];
 #pragma unroll
     for (int b = 0; b < 2; ++b) wsb[b][0] = wsb[b][1] = wsb[b][2] = 0.0f;
+    /* lever XLB bit 2 (qfn-on-ds round 38; RADIANCE_FN4_HC_X_LB & 2): the group scales as one array per tile parity instead of wsb[2][3].
+     * The fold's wsb[u & 1][gi] (gi a runtime group index) is lowered as ONE six-way select over both tiles' scales (ISA of the served HXS
+     * kernel: v_cndmask over all six) -- and tile u + 1's three scales are loaded at tile u's chunk 5 with its chunk 0, so the select
+     * waits s_wait_loadcnt 0x0 there: every tile drains the whole W_down ring mid-tile. Per parity, a tile's fold selects among its own
+     * three, loaded a tile earlier; the same value into the same fmaf: the same bytes. */
+    float wse[3] = { 0.0f, 0.0f, 0.0f }, wso[3] = { 0.0f, 0.0f, 0.0f };
+    auto wsc = [&](int u, int gi) -> float {
+        if constexpr ((LB & 2) != 0) return (u & 1) ? wso[gi] : wse[gi];
+        else return wsb[u & 1][gi];
+    };
     auto ld_chunk = [&](int t) {
         const int u = t / NC, j = t % NC;
         long k = (long)tile_of(u) * kHcGTile + col;
@@ -3506,7 +3516,14 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
         if (j == 0) {
             const float* sr = (const float*)(row + HN);
 #pragma unroll
-            for (int i = 0; i < 3; ++i) wsb[u & 1][i] = sr[g0 + i < NG ? g0 + i : NG - 1];
+            for (int i = 0; i < 3; ++i) {
+                if constexpr ((LB & 2) != 0) {
+                    const float v = sr[g0 + i < NG ? g0 + i : NG - 1];
+                    if (u & 1) wso[i] = v; else wse[i] = v;
+                } else {
+                    wsb[u & 1][i] = sr[g0 + i < NG ? g0 + i : NG - 1];
+                }
+            }
         }
     };
     const unsigned short* irw = injw + (long)(col < hc ? col : hc - 1) * HN;
@@ -3613,7 +3630,7 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
                 const int g = (int)((kslice + 32 * j) / r4d_hc8::kDownGroup - g0);
                 if (g != gi) {
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) { P[e] = fmaf(D[e], wsb[u & 1][gi], P[e]); D[e] = 0.0f; }
+                    for (int e = 0; e < 8; ++e) { P[e] = fmaf(D[e], wsc(u, gi), P[e]); D[e] = 0.0f; }
                     gi = g;
                 }
                 const uint4 wq = wr[t % RING];
@@ -3621,10 +3638,15 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
                 D = mma(A1[j], hcg_e4m3_v8bf(wq.z, wq.w), D);
             }
 #pragma unroll
-            for (int e = 0; e < 8; ++e) P[e] = fmaf(D[e], wsb[u & 1][gi], P[e]);
+            for (int e = 0; e < 8; ++e) P[e] = fmaf(D[e], wsc(u, gi), P[e]);
 #pragma unroll
             for (int e = 0; e < 8; ++e) s_red[u & 1][wave][col][8 * hh + e] = P[e];
-            __syncthreads();
+            /* lever XLB (qfn-on-ds round 38, QUEUE Q67; RADIANCE_FN4_HC_X_LB=1): this barrier publishes s_red (LDS) only -- put_part
+             * reads it, writes `part` with no fence (the block's one __threadfence follows the loop) and tile u + 2 writes s_red[u & 1]
+             * after tile u + 1's barrier -- so an LDS-only barrier is enough, and it leaves the ring's next-tile W_down chunks in
+             * flight (__syncthreads = an all-space fence: s_wait_loadcnt 0 here, a drained ring at each of the NTS - 1 boundaries).
+             * The same loads, WMMAs and sums in the same order: the same bytes. */
+            if constexpr ((LB & 1) != 0) hc_lds_barrier(); else __syncthreads();
             if (u == 0) hc_tl_put<TL>(0, 3);
             put_part(u);
         }
@@ -3696,13 +3718,13 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
                      float* __restrict__ scaleout, float* __restrict__ part, unsigned int* __restrict__ tctr, long lr,  \
                      long hrow, long irow, float eps, float wadd, int ntd, long rows
 #define HC_G16X_ARGS h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows
-template <int RG, int NTS, bool PRE = false, bool NPX = false>
+template <int RG, int NTS, bool PRE = false, bool NPX = false, int LB = 0>
 __global__ __launch_bounds__(kThreads) void hc_read_g16x_down_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
-    hc_read_g16x_down_body<RG, false, NTS, PRE, false, NPX>(HC_G16X_ARGS);
+    hc_read_g16x_down_body<RG, false, NTS, PRE, false, NPX, LB>(HC_G16X_ARGS);
 }
-template <int RG, int NTS, bool PRE = false, bool NPX = false>
+template <int RG, int NTS, bool PRE = false, bool NPX = false, int LB = 0>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_read_g16x_down(HC_G16X_DECL) {
-    hc_read_g16x_down_body<RG, true, NTS, PRE, false, NPX>(HC_G16X_ARGS);
+    hc_read_g16x_down_body<RG, true, NTS, PRE, false, NPX, LB>(HC_G16X_ARGS);
     r4d_chain_done();
 }
 /* qfn-on-ds round 35 (bench only, r4d_hc_tl): HCX with the phase timeline, region 0 -- stamps after the norm's two barriers, tile 0's
@@ -5220,6 +5242,24 @@ static bool hc_x_np() {
         if (on) std::fprintf(stderr, "radiance: libr4d: lever HCX's NPX arm (RADIANCE_FN4_HC_X_NP): the norm rows' loads four rows ahead "
                                      "after the chain wait (the same bytes)\n");
         return on;
+    }();
+    return v;
+}
+/* qfn-on-ds lever XLB (Qwen loop round 38, QUEUE Q67): RADIANCE_FN4_HC_X_LB = 1 / 2 / 3 (a mask, read once) = HCX's PRE form at NTS 4
+ * (the hero's HXS: lever SSB's scales, RADIANCE_FN4_HC_X=4) with the W_down ring kept in flight: bit 1 an LDS-only barrier at each
+ * tile boundary, bit 2 the group-scale fold reading only its own tile's scales (no mid-tile s_wait_loadcnt 0); the same bytes. The
+ * bench hook r4d_hc_x_lb(0..3) overrides the env (-1 = the env). Other NTS / forms: today's. */
+static std::atomic<int> g_hc_x_lb_bench{-1};
+static int hc_x_lb() {
+    const int b = g_hc_x_lb_bench.load(std::memory_order_relaxed);
+    if (b >= 0) return b & 3;
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_X_LB");
+        const int m = (e && e[0] >= '0' && e[0] <= '3' && e[1] == '\0') ? e[0] - '0' : 0;
+        if (m) std::fprintf(stderr, "radiance: libr4d: lever XLB (RADIANCE_FN4_HC_X_LB=%d): HCX's PRE form at 4 tiles a block keeps its W_down "
+                                    "ring in flight -- %s%s%s (the same bytes)\n", m, (m & 1) ? "LDS-only tile barriers" : "",
+                     (m & 3) == 3 ? " + " : "", (m & 2) ? "the group-scale fold on its own tile's scales" : "");
+        return m;
     }();
     return v;
 }
@@ -8708,10 +8748,10 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         if (xpre && !ssb_in)
             emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_g_scale : &hc_g_scale_kernel), dim3((unsigned)hc, (unsigned)hcg_gy),
                                dim3(kThreads), 0, (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
-#define HC_X_K(NTS_, PRE_, NPX_)                                                                 \
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16x_down<16, NTS_, PRE_, NPX_>          \
+#define HC_X_K(NTS_, PRE_, NPX_, LB_)                                                            \
+        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16x_down<16, NTS_, PRE_, NPX_, LB_>     \
                                : (!PRE_ && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_read_g16x_down_tl_kernel<16, NTS_, NPX_> \
-                               : &hc_read_g16x_down_kernel<16, NTS_, PRE_, NPX_>), \
+                               : &hc_read_g16x_down_kernel<16, NTS_, PRE_, NPX_, LB_>), \
                            gx, dim3(kThreads), 0,                                                \
                            (const unsigned short*)h->data, (const float*)w->data,                \
                            (const unsigned char*)down->data, (long)dld,                          \
@@ -8720,9 +8760,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (int)hcg_nt, (long)rows)
         if (emit_rc == RAD_OK) {
             const bool xnp = hc_x_np();
-            if (xpre)     { if (nts == 4) HC_X_K(4, true, false); else if (nts == 5) HC_X_K(5, true, false); else HC_X_K(10, true, false); }
-            else if (xnp) { if (nts == 4) HC_X_K(4, false, true); else if (nts == 5) HC_X_K(5, false, true); else HC_X_K(10, false, true); }
-            else          { if (nts == 4) HC_X_K(4, false, false); else if (nts == 5) HC_X_K(5, false, false); else HC_X_K(10, false, false); }
+            const int xlb = (xpre && nts == 4) ? hc_x_lb() : 0;   /* lever XLB (bits 1 / 2) */
+            if (xlb == 1) HC_X_K(4, true, false, 1);
+            else if (xlb == 2) HC_X_K(4, true, false, 2);
+            else if (xlb == 3) HC_X_K(4, true, false, 3);
+            else if (xpre) { if (nts == 4) HC_X_K(4, true, false, 0); else if (nts == 5) HC_X_K(5, true, false, 0); else HC_X_K(10, true, false, 0); }
+            else if (xnp)  { if (nts == 4) HC_X_K(4, false, true, 0); else if (nts == 5) HC_X_K(5, false, true, 0); else HC_X_K(10, false, true, 0); }
+            else           { if (nts == 4) HC_X_K(4, false, false, 0); else if (nts == 5) HC_X_K(5, false, false, 0); else HC_X_K(10, false, false, 0); }
         }
 #undef HC_X_K
     } else if (hcg && g16 && (hc_readv() & 1024) != 0 && (hcg_nt % 4) == 0 && !hcg_ch && rows >= 32) {
@@ -8970,6 +9014,9 @@ constexpr size_t kHcTlBytes = (size_t)2 * kHcTlMax * kHcTlW * sizeof(unsigned lo
 extern "C" void r4d_hc_occ(int m) { g_hc_occ.store(m < 0 ? 0 : (m & 7), std::memory_order_relaxed); }
 /* qfn-on-ds lever HCX (bench / test hook): kernel A' with NTS tiles a block on (4, 5, 10) without hc_readv bit 15, or off (else) */
 extern "C" void r4d_hc_x(int m) { g_hc_x_bench.store(hc_x_ok(m), std::memory_order_relaxed); }
+/* qfn-on-ds lever XLB (bench / test hook): HCX's PRE form at NTS 4, mask 0..3 (bit 1 LDS-only tile barriers, bit 2 the own-tile scale
+ * fold), -1 = the env */
+extern "C" void r4d_hc_x_lb(int m) { g_hc_x_lb_bench.store(m < 0 ? -1 : (m & 3), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3X (bench / test hook): kernel B3 as hc_up_wx on (1) without hc_readv bit 16, or off (0) */
 extern "C" void r4d_hc_b3x(int on) { g_hc_b3x_bench.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
