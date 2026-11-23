@@ -815,7 +815,9 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
         std::vector<int32_t> pc;
         for (int k = 0; k < 40 && f.sch.step(); ++k) {
             for (const StepEntry& e : f.sch.plan().e)
-                if (e.seq == a && e.is_prefill) pc.push_back(e.n_tokens);
+                if (e.seq == a && e.is_prefill) {   /* position, rows and the snapshot row of each piece */
+                    pc.push_back(e.ctx_len); pc.push_back(e.n_tokens); pc.push_back(e.ckpt_tok);
+                }
             f.commit_plain();
         }
         return pc;
@@ -850,8 +852,11 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
                 if (e.is_prefill) any_pf = true; else any_dec = true;
             }
             o.mixed += any_pf && any_dec;    /* a prefill piece beside a decode row: a staged pass of every sequence */
+            for (const StepEntry& e : p.e)
+                if (e.seq == a && e.is_prefill) {
+                    o.got.push_back(e.ctx_len); o.got.push_back(e.n_tokens); o.got.push_back(e.ckpt_tok);
+                }
             if (a_tok > 0) {
-                o.got.push_back(a_tok);
                 if (p.e.size() == 1) ++o.lone; else ++o.shared;
             }
             if (has_c && p.e.size() > 1) ++o.c_shared;
@@ -860,7 +865,7 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
             last_lone = (a_tok > 0 || has_c) && p.e.size() == 1;
             f.commit_plain();
             /* a short newcomer once a's prompt is done: it fits beside d's row under 6 */
-            if (!c && o.got.size() >= 3 && !a_tok) {
+            if (!c && o.got.size() >= 9 && !a_tok) {
                 auto rc = f.request(100, 2);
                 for (int i = 0; i < 100; ++i) rc->prompt[(size_t)i] = 50000 + i;
                 c = f.add(std::move(rc));
@@ -871,14 +876,14 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
         return o;
     };
     const std::vector<int32_t> ref = pieces_alone();
-    CHECK(ref.size() >= 3);
+    CHECK(ref.size() >= 9);               /* three pieces or more: (position, rows, snapshot row) each */
     const Out six = run(6);
     const Out five = run(5);
-    CHECK(six.got == ref);                /* the control: alone's pieces under 6 ... */
+    CHECK(six.got == ref);                /* the control: alone's pieces (positions, rows, snapshots) under 6 ... */
     CHECK(six.shared >= 1);               /* ... one of them beside d's row */
     CHECK(six.mixed >= 1);
     CHECK(six.c_done && six.c_shared >= 1);   /* the newcomer beside d's row */
-    CHECK(five.got == ref);               /* 5: the same pieces (alone's) */
+    CHECK(five.got == ref);               /* 5: the same pieces (alone's), snapshot rows included */
     CHECK_EQ(five.shared, 0);             /* every piece in a step of its own */
     CHECK_EQ(five.mixed, 0);              /* no step ever mixes a prefill piece with a decode row */
     CHECK(five.c_done);
