@@ -9604,6 +9604,14 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
         r4d_hc_b3x_e(value);
         return 1;
     }
+    if (!std::strcmp(name, "hc_b3x_d")) {   /* qfn-on-ds lever B3D (round 40): B3X's d rows padded in LDS */
+        if (value < 0 || value > 1) return -1;
+        r4d_hc_b3x_d(value);
+        static std::atomic<int> said{0};
+        if (value == 1 && said.exchange(1) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever B3D (hc_b3x_d 1): B3X's d rows in LDS padded by 8 bf16 (the same bytes)\n");
+        return 1;
+    }
     if (!std::strcmp(name, "hc_b3x_p")) {   /* qfn-on-ds lever B3P (round 39): B3X's group-pair form from N rows, 0 off */
         if (value < 0 || value > 4096) return -1;
         r4d_hc_b3x_p(value);

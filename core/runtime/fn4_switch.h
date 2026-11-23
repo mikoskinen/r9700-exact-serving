@@ -937,6 +937,9 @@
  *   hc_b3x_p        libr4d (rad_fn4_switch; qfn-on-ds lever B3P, Qwen loop round 39, QUEUE Q71): N = kernel B3X with a pair
  *                   of 16-row groups a block (each W_up fragment loaded and converted once for both) at reads of >= N rows
  *                   (N < 32 taken as 32); the same bytes; 0 today                                  RADIANCE_FN4_HC_B3X_P
+ *   hc_b3x_d        libr4d (rad_fn4_switch; qfn-on-ds lever B3D, Qwen loop round 40, QUEUE Q74): 1 = kernel B3X (B3E's form) with
+ *                   its d rows padded by 8 bf16 in LDS, so the d fragment reads leave a 4-way bank conflict; the same bytes;
+ *                   0 today                                                                        RADIANCE_FN4_HC_B3X_D
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -991,6 +994,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kF8Pp,     /* qfn-on-ds lever F8P (Qwen loop round 37, Q66): libr4d, the int8 narrow decode GEMM's two-tiles-in-flight twin */
               kHcXLb, kHcB3xE,   /* qfn-on-ds levers XLB / B3E (Qwen loop round 38, Q67 / Q68): libr4d, the HXS hc read's load streams */
               kHcB3xP,   /* qfn-on-ds lever B3P (Qwen loop round 39, Q71): libr4d, B3X with a pair of 16-row groups a block */
+              kHcB3xD,   /* qfn-on-ds lever B3D (Qwen loop round 40, Q74): libr4d, B3X's d rows padded in LDS (no bank conflict) */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
