@@ -26459,6 +26459,10 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
      * reference keeps XLB / B3E too (the served HXS + LE form), so the arm differs from it by B3P / HCX_ARM alone */
     const int parm = envi("R4D_SELFTEST_B3P", 0), xarm2 = envi("R4D_SELFTEST_HCX_ARM", 0), refle = envi("R4D_SELFTEST_REFLE", 0) ? 1 : 0;
     if (parm && !pl.b3p_hc) { skip(nm.c_str(), "no r4d_hc_b3x_p"); return; }
+    /* round 40 (QUEUE Q73, lever HCO2): R4D_SELFTEST_OCC=mask = the arm's r4d_hc_occ (8: the served A' at 8 waves a SIMD, 16: the
+     * served B3X at 8 waves a SIMD); the reference keeps 0 */
+    const int oarm = envi("R4D_SELFTEST_OCC", 0) & 24;
+    if (oarm && !pl.occ_hc) { skip(nm.c_str(), "no r4d_hc_occ"); return; }
     pl.norm_hc_wave(1); pl.write_hc_vec(1); pl.pf2_stages_hc(31);
     g.set(true, false);
     auto arm_set = [&](bool on) {
@@ -26469,6 +26473,7 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
         if (pl.xlb_hc) pl.xlb_hc(on || refle ? lbarm : 0);
         if (pl.b3e_hc) pl.b3e_hc(on || refle ? earm : 0);
         if (pl.b3p_hc) pl.b3p_hc(on ? parm : 0);
+        if (oarm) pl.occ_hc(on ? oarm : 0);
     };
     auto outs = [&](std::vector<uint8_t>& o) {
         o.clear();
@@ -26509,15 +26514,17 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     size_t fdiff = 0;
     for (size_t i = 0; i < f0.size() && i < f1.size(); ++i) fdiff += f0[i] != f1[i];
     if (f0.size() != f1.size()) fdiff += 100;
-    const size_t fwant = (size_t)(((lbarm && !refle) || (xarm2 && xarm2 != xarm)) ? 1 : 0) + (size_t)(((earm && !refle) || parm) ? 1 : 0);
+    const size_t fwant = (size_t)(((lbarm && !refle) || (xarm2 && xarm2 != xarm) || (oarm & 8)) ? 1 : 0)
+                       + (size_t)(((earm && !refle) || parm || (oarm & 16)) ? 1 : 0);
     if (fwant && refx) {
         std::printf("SSB M=%lld XLB dispatch: %zu / %zu read functions differ from the reference (%s)\n", (long long)M, fdiff, f1.size(),
                     pl.record ? (fdiff == fwant ? "the twin(s) ran" : "NOT the expected count") : "no record hook");
         ok(fmt("SSB M=%lld XLB %d B3E %d: the arm's read dispatches its twin(s) (%zu function(s) differ)", (long long)M, lbarm, earm, fwant).c_str(),
            !pl.record || fdiff == fwant, fmt("%zu differ", fdiff));
     }
-    if (parm || xarm2)
-        std::printf("SSB M=%lld arm: B3P %d HCX_ARM %d over %s\n", (long long)M, parm, xarm2, refle ? "the served HXS + LE form" : "the reference");
+    if (parm || xarm2 || oarm)
+        std::printf("SSB M=%lld arm: B3P %d HCX_ARM %d OCC %d over %s\n", (long long)M, parm, xarm2, oarm,
+                    refle ? "the served HXS + LE form" : "the reference");
     std::printf("SSB M=%lld SSB %d HC_X %d B3X %d XLB %d B3E %d vs reference (%s): %s; control (ss x 2 after the write): %s\n",
                 (long long)M, sarm, xarm, barm, lbarm, earm, refx ? (refle ? "the same form with B3P / HCX_ARM off" : "the same with XLB / B3E off") : "bit 17 off, HC_X 0, B3X 0",
                 !okb ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical",
@@ -26550,7 +26557,9 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
      * and the whole read, form / arm / form / arm. Arms (r4d_hc_ab): 1 A' no N arithmetic, 2 A' no W_down conversion, 3 both,
      * 4 B3X no W_up conversion, 8 B3X sigmoid by rcp, 12 both, 15 all four. */
     size_t hxt_bad = 0;
-    if (envi("R4D_SELFTEST_HXT", 0) && okb && okt) {
+    /* round 40: R4D_SELFTEST_HXT=2 = the TL bytes check + the timeline of the ARM's form only (no 2-blocks-a-WGP lines, no ablations) */
+    const int hxtm = envi("R4D_SELFTEST_HXT", 0);
+    if (hxtm && okb && okt) {
         if (!pl.tl_hc || !pl.tl_hc_reset || !pl.tl_hc_read || !pl.ab_hc || sarm == 0 || xarm != 4 || !barm || lbarm != 3 || !earm) {
             std::printf("HXT M=%lld: needs the hooks and the served form (SSB 1, HC_X 4, B3X 1, XLB 3, B3E 1): skipped\n", (long long)M);
         } else {
@@ -26575,14 +26584,15 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
                 hxt_timeline(pl, [&]() { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, g.hs, 20, (long long)M);
                 /* the same with 37,000 B of dynamic LDS on both TL launches: 2 blocks a WGP instead of 3 -- a block's time against
                  * how many share its WGP, with the round structure changed on purpose (r4d_hc_tl_lds) */
-                if (pl.tl_lds_hc) {
+                if (pl.tl_lds_hc && hxtm != 2) {
                     pl.tl_lds_hc(37000);
                     hxt_timeline(pl, [&]() { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, g.hs, 20, (long long)M, "2w");
                     pl.tl_lds_hc(0);
                 }
             }
-            /* (3) the ablations */
+            /* (3) the ablations (not under HXT=2) */
             for (const int ab : { 1, 2, 3, 4, 8, 12, 15 }) {
+                if (hxtm == 2) break;
                 std::vector<uint8_t> oab;
                 std::vector<const void*> fab;
                 pl.ab_hc(ab);
@@ -26626,6 +26636,7 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     if (pl.xlb_hc) pl.xlb_hc(-1);
     if (pl.b3e_hc) pl.b3e_hc(-1);
     if (pl.b3p_hc) pl.b3p_hc(-1);
+    if (oarm) pl.occ_hc(0);
     pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0); pl.pf2_stages_hc(31);
     ok(nm.c_str(), okb && okt && diff == 0 && (sarm == 0 || dctl > 0),
        !okb || !okt ? "launch failed" : diff ? "the arm's bytes differ" : (sarm && !dctl) ? "the control did not move: A' did not read ss" : "");
