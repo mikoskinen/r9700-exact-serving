@@ -26699,7 +26699,7 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     if (f0.size() != f1.size()) fdiff += 100;
     const size_t fwant = (size_t)(((lbarm && !refle) || (xarm2 && xarm2 != xarm) || (oarm & 8)) ? 1 : 0)
                        + (size_t)(((earm && !refle) || parm || (oarm & 16) || darm) ? 1 : 0);
-    if (fwant && refx) {
+    if (fwant && refx && !harm) {   /* round 44: under lever HRF the arm's read is one function (its own check below) */
         std::printf("SSB M=%lld XLB dispatch: %zu / %zu read functions differ from the reference (%s)\n", (long long)M, fdiff, f1.size(),
                     pl.record ? (fdiff == fwant ? "the twin(s) ran" : "NOT the expected count") : "no record hook");
         ok(fmt("SSB M=%lld XLB %d B3E %d: the arm's read dispatches its twin(s) (%zu function(s) differ)", (long long)M, lbarm, earm, fwant).c_str(),
