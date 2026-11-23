@@ -391,6 +391,11 @@ struct TimingsOut {
     double  predicted_ms = 0.0;
     int64_t draft_n = 0, draft_n_accepted = 0;
     double  ttft_ms = -1.0, total_ms = -1.0;   /* < 0: the body's arrival is not known */
+    /* The per-request speculative-decoding record (RADIANCE_SPEC_DECODE_METRICS=1: vLLM's metrics.speculative_decoding,
+     * which AgentX's harness reads): verify steps with drafts, the most drafts one carried, steps by accepted count. */
+    int64_t spec_steps = 0;
+    int32_t spec_max = 0;
+    int64_t spec_hist[17] = {};
 };
 
 /* qfn-on-ds lever RPF (reply prefill ahead; Qwen loop round 26, QUEUE Q47): the body of the warm request that prefills a

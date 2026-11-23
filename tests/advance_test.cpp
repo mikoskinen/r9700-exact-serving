@@ -11,6 +11,7 @@
 #include "sched/advance_impl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -299,6 +300,131 @@ TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
     CHECK(branched > 1000);
     CHECK(deep > 100);
     CHECK(cut_cases > 100);
+}
+
+/* ================================================================== RADIANCE_DRAFT_FORCE_AL */
+
+/* The value's two spellings and its refusals (sched/force_al.h fal_parse): one AL for every depth, or DEPTH:AL pairs
+ * with every unlisted depth reading the largest listed one below it (the smallest listed one below the first). */
+TEST(force_al_parses_one_al_or_depth_pairs_and_refuses_the_rest) {
+    ForceAl f;
+    std::string why, desc;
+    CHECK(fal_parse("2.47", &f, &why, &desc));
+    CHECK_EQ(f.on, 1);
+    CHECK_EQ(desc, std::string("every depth: 2.47"));
+    for (int d = 1; d < kFalDepths; ++d) CHECK_EQ(f.m[d], fal_fixed(2.47));
+    CHECK(fal_parse("1:1.65,2:2.06,3:2.32,4:2.47", &f, &why, &desc));
+    CHECK_EQ(desc, std::string("1: 1.65, 2: 2.06, 3: 2.32, 4: 2.47"));
+    CHECK_EQ(f.m[1], fal_fixed(1.65));
+    CHECK_EQ(f.m[3], fal_fixed(2.32));
+    CHECK_EQ(f.m[4], fal_fixed(2.47));
+    CHECK_EQ(f.m[9], fal_fixed(2.47));               /* past the last listed depth: its AL */
+    CHECK(fal_parse("3:2.32,4:2.47", &f, &why, &desc));
+    CHECK_EQ(f.m[1], fal_fixed(2.32));               /* below the first listed depth: the first's */
+    CHECK_EQ(f.m[2], fal_fixed(2.32));
+    CHECK_EQ(f.m[0], 0u);
+    for (const char* bad : { "", "0.9", "66", "abc", "2.47x", "4:5.1", "0:1.5", "17:2", "2:2,2:2.1", "2:", ":2", "2;2.0" })
+        CHECK(!fal_parse(bad, &f, &why, &desc));
+    CHECK_EQ(fal_fixed(2.47) >> 24, 1u);
+    CHECK_EQ(fal_fixed(1.0), 0u);
+}
+
+/* The card's forced acceptance is the host's (Engine::collect_step: accept_forced over fal_count's draw, then the cut
+ * over the EMITTED tokens): for any drafts, targets, stop tokens, keys and slots, a row's StepSlot holds the host's count
+ * and the token after it -- the draft itself where a forced draft is the stop token. The engine refuses a step where the
+ * two disagree. Seeded; a failure prints the case. */
+TEST(the_cards_forced_acceptance_is_the_hosts_with_the_cut_over_the_emitted_tokens) {
+    ForceAl f;
+    std::string why;
+    CHECK(fal_parse("1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:3.1,8:4.4", &f, &why, nullptr));
+    uint32_t rng = 0xfa1ce5u;
+    int bad = 0, cut_on_draft = 0, forced_wrong = 0;
+    for (int c = 0; c < 10000 && !bad; ++c) {
+        Slab s(ADV_ACCEPT);
+        s.a.fal = f;
+        s.a.fal.key = lcg(rng);
+        s.a.fal.seed = 0x51ed5eedu;
+        int n_eog = 0;
+        int32_t eog_ids[3];
+        for (int32_t t : { 2, 3, 8 }) if (lcg(rng) % 4 == 0) eog_ids[n_eog++] = t;
+        for (int j = 0; j < n_eog; ++j) s.eog[j] = eog_ids[j];
+        s.a.n_eog = n_eog;
+        auto is_eog = [&](int32_t t) { return std::find(eog_ids, eog_ids + n_eog, t) != eog_ids + n_eog; };
+        const int n_rows = 1 + (int)(lcg(rng) % 4);
+        int k = 0, out_row = 0;
+        struct Want { int card, acc, tok, head, hrow; } want[4];
+        for (int i = 0; i < n_rows; ++i) {
+            const int n_spec = (int)(lcg(rng) % 9);
+            const int ctx = (int)(lcg(rng) % 1000);
+            const int card = (i + c) % Slab::kSeq;   /* rows name distinct slots, moving with the case */
+            s.row(i, true, k, 1 + n_spec, ctx, card, k, out_row, n_spec);
+            int32_t draft[8] = {}, target[9] = {};
+            s.w[Slab::TOK + k] = 50;
+            for (int j = 0; j < n_spec; ++j) { draft[j] = 1 + (int32_t)(lcg(rng) % 9); s.w[Slab::TOK + k + 1 + j] = draft[j]; }
+            for (int j = 0; j <= n_spec; ++j) { target[j] = 1 + (int32_t)(lcg(rng) % 9); s.src[out_row + j] = target[j]; }
+            int32_t out[9] = {}, acc = -1;
+            const int32_t n = fal_count(s.a.fal, s.a.fal.key, card, n_spec);
+            CHECK_OK(accept_forced(draft, n_spec, target, n, out, &acc));
+            const int32_t cut = accept_cut_at_eog(out, acc, is_eog);
+            cut_on_draft += cut < acc;
+            for (int j = 0; j < cut; ++j) forced_wrong += draft[j] != target[j];
+            want[i] = { card, cut, out[cut], ctx + cut, k + cut };
+            out_row += 1 + n_spec;
+            k += 1 + n_spec;
+        }
+        s.run();
+        for (int i = 0; i < n_rows && !bad; ++i) {
+            const StepSlot& S = s.st[want[i].card];
+            const bool ok = S.acc == want[i].acc && S.tok[0] == want[i].tok && S.n_acc == want[i].acc + 1 &&
+                            S.head == want[i].head && S.ctx == want[i].head + 1 && S.hrow == want[i].hrow;
+            if (!ok) {
+                bad = 1;
+                CHECK(ok);
+                std::fprintf(stderr, "    case %d, row %d: card acc %d tok %d head %d; host acc %d tok %d head %d\n", c, i,
+                             S.acc, S.tok[0], S.head, want[i].acc, want[i].tok, want[i].head);
+            }
+        }
+    }
+    CHECK_EQ(bad, 0);
+    CHECK(cut_on_draft > 100);    /* a forced draft that is a stop token ends the run on the card too */
+    CHECK(forced_wrong > 1000);   /* the forced count accepts drafts the target did not draw */
+}
+
+/* The forced count's mean is AL - 1 at every depth of the golden Qwen curve (thinking on, SPEED-Bench coding; AgentX):
+ * 10,000 verifies a depth on the card's acceptance, over keys that step by one and four slots, with drafts that never
+ * equal the target (the agreement rule would accept none). Within 1 % of the AL, and only floor(AL - 1) or one more a
+ * verify (vLLM's minimum-variance schedule). Negative control: the same rows without `fal.on` accept nothing. */
+TEST(the_forced_acceptance_length_is_the_golden_one_within_a_percent_over_ten_thousand_verifies) {
+    ForceAl f;
+    std::string why;
+    CHECK(fal_parse("1:1.65,2:2.06,3:2.32,4:2.47", &f, &why, nullptr));
+    f.seed = 0x51ed5eedu;
+    const double golden[5] = { 0, 1.65, 2.06, 2.32, 2.47 };
+    for (int d = 1; d <= 4; ++d) {
+        int64_t sum = 0, off = 0, natural = 0;
+        const int lo = (int)std::floor(golden[d] - 1.0);
+        for (int c = 0; c < 10000; ++c) {
+            for (int arm = 0; arm < 2; ++arm) {
+                Slab s(ADV_ACCEPT);
+                if (arm == 0) { s.a.fal = f; s.a.fal.key = 1000u + (uint32_t)(c / 4); }
+                const int card = c % 4;
+                s.row(0, true, 0, 1 + d, 100, card, 0, 0, d);
+                s.w[Slab::TOK] = 50;
+                for (int j = 0; j < d; ++j) s.w[Slab::TOK + 1 + j] = 7;     /* drafts 7, targets 9: never agree */
+                for (int j = 0; j <= d; ++j) s.src[j] = 9;
+                s.run();
+                const int acc = s.st[card].acc;
+                if (arm == 0) { sum += acc; off += acc != lo && acc != lo + 1; }
+                else natural += acc;
+            }
+        }
+        const double al = 1.0 + (double)sum / 10000.0;
+        std::fprintf(stderr, "    depth %d: realized AL %.4f over 10,000 verifies, golden %.2f (%+.2f %%)\n", d, al, golden[d],
+                     100.0 * (al - golden[d]) / golden[d]);
+        CHECK(std::fabs(al - golden[d]) <= 0.01 * golden[d]);
+        CHECK_EQ(off, 0);
+        CHECK_EQ(natural, 0);
+    }
 }
 
 /* ================================================================== ADV_TRUNK */

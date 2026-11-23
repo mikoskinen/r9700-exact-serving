@@ -901,6 +901,9 @@ TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t receiv
         t.predicted_n      += produced;
         t.draft_n          += s.n_drafted();
         t.draft_n_accepted += s.n_draft_accepted();
+        t.spec_steps       += s.n_spec_steps();
+        t.spec_max          = std::max(t.spec_max, s.n_spec_max());
+        for (int j = 0; j < Sink::kSpecHist; ++j) t.spec_hist[j] += s.n_spec_hist(j);
         const int64_t tf = s.t_first_token_ns();
         if (tf < 0) continue;
         t.valid = true;

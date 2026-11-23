@@ -675,12 +675,14 @@ int Sampler::accept_token(uint64_t req_id, int32_t token) {
 bool Sampler::allows_speculation(uint64_t req_id) const {
     auto it = seqs_.find(req_id);
     if (it == seqs_.end() || !it->second.grammar) return true;
+    if (no_spec_grammar_ && it->second.grammar->constrains()) return false;   /* RADIANCE_DRAFT_FORCE_AL */
     return !it->second.grammar->constrains() || it->second.grammar->can_speculate();
 }
 
 bool Sampler::speculation_fixed(uint64_t req_id) const {
     auto it = seqs_.find(req_id);
-    return it != seqs_.end() && (!it->second.grammar || it->second.grammar->can_speculate());
+    return it != seqs_.end() &&
+           (!it->second.grammar || (!no_spec_grammar_ && it->second.grammar->can_speculate()));
 }
 
 /* ================================================================== the step path */

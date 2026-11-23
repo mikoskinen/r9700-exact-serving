@@ -128,6 +128,12 @@ void Sink::add_drafts(int32_t n, int32_t accepted) {
     n_draft_.store(n_draft_.load(std::memory_order_relaxed) + n, std::memory_order_release);
     n_draft_acc_.store(n_draft_acc_.load(std::memory_order_relaxed) + accepted,
                        std::memory_order_release);
+    if (n > 0) {
+        const int j = accepted < 0 ? 0 : accepted < kSpecHist ? accepted : kSpecHist - 1;
+        spec_hist_[j].store(spec_hist_[j].load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        if (n > n_spec_max_.load(std::memory_order_relaxed)) n_spec_max_.store(n, std::memory_order_release);
+        n_spec_steps_.store(n_spec_steps_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
 }
 
 size_t Sink::read(SinkToken* out, size_t max, SinkAlt* alts) {

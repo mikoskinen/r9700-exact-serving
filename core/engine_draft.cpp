@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -582,6 +583,26 @@ bool Engine::serial_drafting() const {
     return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
 }
 
+/* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h): the realized acceptance length by the verify's draft count, beside the
+ * target the table gives at that depth (E[min(floor(m) + B(frac), d)] + 1); every 16,384 verifies and at the stop. The
+ * end-of-generation cut over the emitted tokens is the only thing that takes a row below its draw. */
+void Engine::fal_note(bool final_line) {
+    std::string t;
+    int64_t n = 0, a = 0;
+    for (int d = 1; d < (int)kFalDepths; ++d) {
+        if (!fal_n_[d]) continue;
+        const double m = (double)fal_.m[d] / 16777216.0, base = std::floor(m);
+        const double want = 1.0 + (base >= d ? (double)d : m);
+        t += fmt("%sdepth %d: %lld verifies, AL %.4f (target %.4f)", t.empty() ? "" : "; ", d, (long long)fal_n_[d],
+                 1.0 + (double)fal_a_[d] / (double)fal_n_[d], want);
+        n += fal_n_[d];
+        a += fal_a_[d];
+    }
+    RAD_INFO("RADIANCE_DRAFT_FORCE_AL (measurement only)%s: %lld verifies, AL %.4f, %lld cut below their draw by a stop "
+             "token -- %s", final_line ? " at the stop" : "", (long long)n, n ? 1.0 + (double)a / (double)n : 0.0,
+             (long long)fal_cut_, t.empty() ? "none drafted" : t.c_str());
+}
+
 /* One advance on every rank against the scheduler's latest build, over its first `rows` rows
  * when given, else all. */
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
@@ -594,6 +615,8 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.st    = rk.step_slots;
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
+        /* RADIANCE_DRAFT_FORCE_AL: the acceptance only, with the key collect_step draws with (fal_arm). */
+        if (mode == ADV_ACCEPT && fal_.on) { a.fal = fal_; a.fal.key = fal_key_; }
         if (from_proposal) {
             /* This rank's own handle: a buffer handle indexes the program that declared it, and a
              * plugin may declare a different buffer list on each rank (DeepSeek-V4.1's drafter
@@ -677,6 +700,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
+    fal_arm((uint32_t)step, so);   /* RADIANCE_DRAFT_FORCE_AL's draw key for this step's ADV_ACCEPT and collect */
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -1098,6 +1122,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     /* The gate's counts belong to the proposal they cut: a new drafter cycle forgets them. */
     if (conf_buf_ || conf_dbg_) lsched().draft_conf_begin();
 
+    fal_arm((uint32_t)step, so);   /* RADIANCE_DRAFT_FORCE_AL's draw key for this step's ADV_ACCEPT and collect */
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* A tree's accepted path into place in the trunk's cache, against the same build (the step
      * just accepted), before any later pass reads it. */

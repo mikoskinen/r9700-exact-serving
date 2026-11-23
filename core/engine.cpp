@@ -1703,6 +1703,7 @@ int Engine::step_loop() {
         if (st < 0) return fail_loop(st);
         if (const int fs = finish_step(b, so, plan, pf1_tok, t_on); fs < 0) return fail_loop(fs);
     }
+    if (fal_.on) fal_note(true);   /* RADIANCE_DRAFT_FORCE_AL: the realized AL by depth at the stop */
     if (bgl1m_) {   /* qfn-on-ds lever BGL: what the BG lane took (the test side reads this line at the stop) */
         const LaneSet::Counts c = lanes_.counts();
         RAD_INFO("lever BGL: %lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s); kept home: a prefix restore "
@@ -2586,10 +2587,16 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
              * tree), as the card's acceptance does; `path` names the accepted nodes. */
             int32_t path[RAD_SCHED_MAX_SPEC] = { 0 };
             const bool tree = plan.spec_is_tree;
+            int32_t fal_drawn = -1;   /* RADIANCE_DRAFT_FORCE_AL: the draw's count before the cut */
             if (tree)
                 RAD_TRY(accept_tree(e.draft, e.draft_parent, e.n_spec,
                                     &so.rows[(size_t)so.first_row[i]], out, path, &acc));
-            else
+            else if (fal_.on) {
+                /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only): the card's count from the same draw
+                 * (its ADV_ACCEPT ran with so.fal_key; without one, nothing on the card to agree with: the step). */
+                fal_drawn = fal_count(fal_, so.fal_has ? so.fal_key : (uint32_t)b->step, e.card, e.n_spec);
+                RAD_TRY(accept_forced(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], fal_drawn, out, &acc));
+            } else
                 RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out,
                                       &acc));
 
@@ -2602,6 +2609,13 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
             so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+            if (fal_drawn >= 0) {
+                const int dq = e.n_spec < (int32_t)kFalDepths ? e.n_spec : (int32_t)kFalDepths - 1;
+                ++fal_n_[dq];
+                fal_a_[dq] += acc;
+                fal_cut_ += acc < fal_drawn;
+                if ((++fal_rows_ & 16383) == 0) fal_note(false);
+            }
             if (tree) {
                 if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
                 for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
@@ -2646,6 +2660,8 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         if (e.req)
             for (auto& rk : ranks_) rk->smp().accept_token(e.req->id, so.token[i]);
     }
+
+    so.fal_has = false;   /* RADIANCE_DRAFT_FORCE_AL: the next step's ADV_ACCEPT arms its own key */
 
     /* Update may_speculate here, because a lazy grammar becomes constraining inside accept_token
      * above; a stale value would give a constrained request a draft the sampler refuses. */

@@ -24,6 +24,7 @@
 
 #include "rad_device.h"
 #include "draft.h"
+#include "force_al.h"
 
 namespace rad {
 
@@ -160,6 +161,9 @@ struct AdvanceArgs {
     /* ADV_COMPACT: every paged group's cache on this rank. */
     AdvPool pool[kAdvMaxPools] = {};
     int32_t n_pool = 0;
+    /* ADV_ACCEPT under RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only): a chain verify accepts
+     * fal_count(...) drafts instead of the agreed ones; `fal.on` 0 (every other mode, and unset) = the agreement rule. */
+    ForceAl fal;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */

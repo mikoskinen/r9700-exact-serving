@@ -134,6 +134,12 @@ public:
 
     int64_t n_drafted() const        { return n_draft_.load(std::memory_order_acquire); }
     int64_t n_draft_accepted() const { return n_draft_acc_.load(std::memory_order_acquire); }
+    /* Verify steps that carried drafts, the most drafts one carried, and how many accepted exactly j (j < kSpecHist; more
+     * counts in the last bucket): the per-request speculative-decoding record (RADIANCE_SPEC_DECODE_METRICS, oai.cpp). */
+    static constexpr int kSpecHist = 17;
+    int64_t n_spec_steps() const     { return n_spec_steps_.load(std::memory_order_acquire); }
+    int32_t n_spec_max() const       { return n_spec_max_.load(std::memory_order_acquire); }
+    int64_t n_spec_hist(int j) const { return spec_hist_[j].load(std::memory_order_acquire); }
 
     int64_t n_produced() const { return (int64_t)head_.load(std::memory_order_acquire); }
     int32_t n_prompt() const { return n_prompt_.load(std::memory_order_acquire); }
@@ -175,6 +181,9 @@ private:
     std::atomic<int64_t>  t_admit_{-1};
     std::atomic<int64_t>  n_draft_{0};
     std::atomic<int64_t>  n_draft_acc_{0};
+    std::atomic<int64_t>  n_spec_steps_{0};
+    std::atomic<int32_t>  n_spec_max_{0};
+    std::atomic<int64_t>  spec_hist_[kSpecHist] = {};
     int64_t               t_start_ns_ = 0;
 
     std::atomic<int32_t>  n_prompt_{0};

@@ -183,6 +183,10 @@ public:
     /* Whether allows_speculation's answer can no longer change. It changes only when a grammar
      * whose backend cannot rewind starts to constrain (on a commit). */
     bool speculation_fixed(uint64_t req_id) const;
+    /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only): a forced count would accept drafts the grammar
+     * forbids, so while it is set a request whose grammar constrains drafts nothing (and none with a grammar is
+     * issued ahead: its answer can change at any commit). */
+    void set_no_spec_under_grammar(bool on) { no_spec_grammar_ = on; }
     /* --draft-coupling: bind the per-round states of the linear draft just published, `n` of
      * them (0 clears). Each must name this request, the round it belongs to, and a `draw.mode` the
      * row actually ran. RAD_E_NOTFOUND for a request already ended here. */
@@ -329,6 +333,7 @@ private:
     rad_buf buf_couple_  = RAD_NULL_HANDLE;   /* [rows, RAD_MTP_COUPLE_STATE_WORDS], flag only */
     RadMtpCoupleState* couple_stage_ = nullptr;   /* pinned, one row per sampled position */
     bool    couple_      = false;   /* --draft-coupling */
+    bool    no_spec_grammar_ = false;   /* RADIANCE_DRAFT_FORCE_AL: no drafts under a constraining grammar */
     bool    any_couple_  = false;   /* does any row this step carry a bound state? */
     CoupleBuild couple_build_{};    /* what the last build_step staged, for the evidence line */
     int64_t couple_issued_step_ = -1;   /* step whose verify op run() last issued */

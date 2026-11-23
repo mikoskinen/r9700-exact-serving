@@ -311,6 +311,10 @@ private:
         /* [n_seq][RAD_SCHED_MAX_SPEC] on a tree step (StepPlan::spec_is_tree): each entry's
          * accepted nodes in commit order (accept_tree's path). Empty on a chain step. */
         std::vector<int32_t> path;
+        /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h): the draw key the step's ADV_ACCEPT ran with (its RadBatch::step),
+         * which collect_step reads so the host's forced count is the card's; fal_has false = no ADV_ACCEPT was issued. */
+        uint32_t             fal_key = 0;
+        bool                 fal_has = false;
     };
 
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
@@ -794,6 +798,17 @@ private:
     void clear_fresh_states();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
+    /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h; Qwen loop round 46, QUEUE Q88): MEASUREMENT ONLY -- a chain verify
+     * accepts AL - 1 drafts on average (vLLM's minimum-variance schedule) instead of the agreed ones. fal_.on 0 = unset.
+     * fal_key_ is the step number the next ADV_ACCEPT draws with (set by issue_*_drafter from the step, also stored in
+     * its StepOut); fal_n_ / fal_a_ count verifies and forced drafts by the row's draft count (the host's, after the
+     * cut), fal_cut_ the verifies a stop token cut below their draw; logged every 16,384 verifies and at the stop. */
+    ForceAl  fal_{};
+    uint32_t fal_key_ = 0;
+    int64_t  fal_n_[kFalDepths] = {}, fal_a_[kFalDepths] = {}, fal_rows_ = 0, fal_cut_ = 0;
+    void     fal_note(bool final_line);
+    /* Before an ADV_ACCEPT: the key it and the step's collect_step draw with. */
+    void     fal_arm(uint32_t step, StepOut& so) { fal_key_ = step; so.fal_key = step; so.fal_has = true; }
     int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */

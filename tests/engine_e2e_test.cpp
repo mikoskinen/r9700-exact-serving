@@ -2299,6 +2299,121 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
     CHECK(has(s.output(), "draft trees: not asked"));
 }
 
+/* RADIANCE_DRAFT_FORCE_AL (core/sched/force_al.h; Qwen loop round 46, QUEUE Q88: AgentX's synthetic acceptance),
+ * MEASUREMENT ONLY. DFlash2's block head drafts 7 a step and the forced table sets the acceptance length: the card's
+ * acceptance (here the host backend running sched/advance_impl.h, positioning every draft pass and the step issued
+ * ahead) and the host's collect agree on every forced count with four sequences in flight (the engine refuses a step
+ * where they do not, and the reply would be short or the server would stop), the realized AL at depth 7 is the
+ * table's within 3 % over the run, the text is not the plain run's (drafts the target did not draw are emitted), the
+ * tree-capable head proposes a chain under it, and a value out of range stops the start. Prompt lookup without a head
+ * serves under it too. Unset, every other test in this file is the control. */
+TEST(force_al_sets_the_acceptance_length_and_the_card_agrees_with_the_host) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(300 + i, 60 + 29 * i));
+    std::vector<int32_t> plain0;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache" }));
+        plain0 = tokens_of(post(s.port, "/completion", completion(prompts[0], 64)));
+        /* Unset RADIANCE_SPEC_DECODE_METRICS: no record on the OpenAI body. */
+        const json v = post(s.port, "/v1/completions",
+                            json{ { "prompt", prompts[1] }, { "max_tokens", 32 }, { "ignore_eos", true } });
+        CHECK(v.is_object() && v.contains("choices") && !v.contains("metrics"));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE_EQ(plain0.size(), (size_t)64);
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4" },
+                    { "RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:2.9",
+                      "RADIANCE_SPEC_DECODE_METRICS=1" }));
+    {
+        /* vLLM's per-request record (metrics.speculative_decoding) with the invariants AgentX's harness checks. */
+        const json v = post(s.port, "/v1/completions",
+                            json{ { "prompt", prompts[1] }, { "max_tokens", 96 }, { "ignore_eos", true } });
+        const json m = v.is_object() ? v.value("metrics", json::object()).value("speculative_decoding", json::object())
+                                     : json::object();
+        CHECK(m.contains("acceptance_histogram") && m["acceptance_histogram"].is_array());
+        const int64_t steps = m.value("num_spec_steps", (int64_t)-1), drafts = m.value("num_draft_tokens", (int64_t)-1),
+                      acc = m.value("num_accepted_draft_tokens", (int64_t)-1), k = m.value("num_spec_tokens", (int64_t)-1);
+        int64_t hs = 0, hw = 0;
+        if (m.contains("acceptance_histogram"))
+            for (size_t j = 0; j < m["acceptance_histogram"].size(); ++j) {
+                hs += m["acceptance_histogram"][j].get<int64_t>();
+                hw += (int64_t)j * m["acceptance_histogram"][j].get<int64_t>();
+            }
+        fprintf(stderr, "    spec record: %s\n", m.dump().c_str());
+        CHECK(steps > 10);
+        CHECK_EQ(k, 7);
+        CHECK_EQ(m.contains("acceptance_histogram") ? (int64_t)m["acceptance_histogram"].size() : -1, k + 1);
+        CHECK_EQ(hs, steps);
+        CHECK_EQ(hw, acc);
+        CHECK(acc > 0 && acc <= drafts);
+        CHECK(std::fabs(m.value("mean_acceptance_length", 0.0) - (1.0 + (double)acc / (double)std::max<int64_t>(steps, 1))) < 1e-9);
+    }
+    int64_t drafted = 0, accepted = 0;
+    std::vector<int32_t> forced0;
+    for (int round = 0; round < 3; ++round) {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 160).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const json r = json::parse(body, nullptr, false);
+            const std::vector<int32_t> t = tokens_of(r);
+            CHECK_EQ(t.size(), (size_t)160);
+            drafted += std::max<int64_t>(timing(r, "draft_n"), 0);
+            accepted += std::max<int64_t>(timing(r, "draft_n_accepted"), 0);
+            if (round == 0 && i == 0) forced0 = t;
+        }
+    }
+    CHECK_EQ(s.stop(), 0);
+    const std::string log = s.output();
+    CHECK(has(log, "RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:2.9: MEASUREMENT ONLY"));
+    CHECK(has(log, "draft trees: not asked -- RADIANCE_DRAFT_FORCE_AL"));
+    CHECK(!has(log, "the card accepted"));
+    /* The stop line's depth-7 entry: "depth 7: N verifies, AL x (target 2.9000)". */
+    const size_t at = log.find("RADIANCE_DRAFT_FORCE_AL (measurement only) at the stop");
+    CHECK(at != std::string::npos);
+    long long n7 = 0;
+    double al7 = 0, want7 = 0;
+    if (at != std::string::npos) {
+        const size_t d7 = log.find("depth 7: ", at);
+        CHECK(d7 != std::string::npos);
+        if (d7 != std::string::npos)
+            CHECK_EQ(std::sscanf(log.c_str() + d7, "depth 7: %lld verifies, AL %lf (target %lf)", &n7, &al7, &want7), 3);
+    }
+    if (at != std::string::npos)
+        fprintf(stderr, "    %s\n", log.substr(at, log.find('\n', at) - at).c_str());
+    fprintf(stderr, "    dflash2 forced: depth 7 %lld verifies, AL %.4f (target %.4f); drafted %lld, accepted %lld\n", n7,
+            al7, want7, (long long)drafted, (long long)accepted);
+    CHECK(n7 >= 200);
+    CHECK(std::fabs(want7 - 2.9) < 1e-6);
+    CHECK(std::fabs(al7 - 2.9) <= 0.03 * 2.9);
+    CHECK(accepted > 0);
+    REQUIRE(forced0.size() >= 64);
+    CHECK(!std::equal(plain0.begin(), plain0.end(), forced0.begin()));
+    {
+        Server bad;
+        CHECK(!bad.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache" },
+                         { "RADIANCE_DRAFT_FORCE_AL=4:6.0" }));
+        CHECK(has(bad.output(), "is not DEPTH:AL"));
+    }
+    {
+        Server pl;
+        REQUIRE(pl.start(world().qwen35_spec, { "--spec-ngram", "4", "--no-prefix-cache" },
+                         { "RADIANCE_DRAFT_FORCE_AL=2.47" }));
+        int status = 0;
+        const json r = post(pl.port, "/completion", completion(repetitive_prompt(), 48), &status);
+        CHECK_EQ(status, 200);
+        CHECK_EQ(tokens_of(r).size(), (size_t)48);
+        CHECK_EQ(pl.stop(), 0);
+        CHECK(has(pl.output(), "RADIANCE_DRAFT_FORCE_AL=2.47: MEASUREMENT ONLY"));
+        CHECK(!has(pl.output(), "the card accepted"));
+    }
+}
+
 /* ds41-acc's confidence gate (dspark_conf; core/sched/draft_conf.h) on DFlash2's block head, with
  * the test source of logits (RADIANCE_DEBUG_DRAFT_CONF: a hashed logit a proposal, so the gate cuts
  * some sequences to nothing, some to a prefix, some not at all): the gate waits for the query pass

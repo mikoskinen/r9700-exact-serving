@@ -2163,8 +2163,10 @@ int Engine::step_loop_lanes() {
                 lane_select(lane);
                 /* the card's acceptance of this step, which ADV_TRUNK continues from: a block or serial drafter ran it
                  * behind the sampler (issue_*_drafter); without a drafter only a pipelining engine does */
-                if (!block_drafting() && !serial_drafting() && !pipelining_)
+                if (!block_drafting() && !serial_drafting() && !pipelining_) {
+                    fal_arm((uint32_t)b->step, so);   /* RADIANCE_DRAFT_FORCE_AL: this ADV_ACCEPT's draw key = collect's */
                     if (const int ac = advance_all(ADV_ACCEPT, 0, false); ac < 0) return fail_loop(ac);
+                }
                 nb = lsched().step_next();
                 if (!nb) ++ia_why[kIaNext];
                 if (nb) {

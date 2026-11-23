@@ -1469,6 +1469,14 @@ int Engine::declare() {
             RAD_INFO("draft trees: not asked -- %s", why);
             decide("draft trees", "not asked", why);
         }
+        if (const char* fv = std::getenv("RADIANCE_DRAFT_FORCE_AL");
+            draft_tree_ && fv && *fv && std::strcmp(fv, "0")) {
+            /* Qwen loop round 46 (QUEUE Q88): the forced acceptance covers a chain verify only (measurement only). */
+            draft_tree_ = false;
+            const char* why = "RADIANCE_DRAFT_FORCE_AL forces a chain verify's acceptance (measurement only)";
+            RAD_INFO("draft trees: not asked -- %s", why);
+            decide("draft trees", "not asked", why);
+        }
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
@@ -1875,6 +1883,48 @@ int Engine::declare() {
                      "its own block of %lld runs its head on the first D rows of each block, D = the head depth in force (no "
                      "cut while draft_sample >= 1, at a short block, or before the first depth is chosen)",
                      drafter_name_.c_str(), (long long)drafter_.block);
+        }
+    }
+    /* RADIANCE_DRAFT_FORCE_AL (core/sched/force_al.h; Qwen loop round 46, QUEUE Q88, COORD 13:17 23.11.: AgentX's
+     * synthetic acceptance): MEASUREMENT ONLY -- a chain verify accepts AL - 1 drafts on average instead of the agreed
+     * ones; never a served form. Unset (or empty / "0"), nothing here or on the step path changes. */
+    fal_ = ForceAl{};
+    if (const char* v = std::getenv("RADIANCE_DRAFT_FORCE_AL"); v && *v && std::strcmp(v, "0")) {
+        ForceAl f;
+        std::string why, desc;
+        if (!fal_parse(v, &f, &why, &desc)) {
+            RAD_ERR("RADIANCE_DRAFT_FORCE_AL=%s: %s (one AL for every depth, e.g. 2.47, or DEPTH:AL pairs, e.g. "
+                    "1:1.65,2:2.06,3:2.32,4:2.47)", v, why.c_str());
+            return RAD_E_INVAL;
+        }
+        if (tree_) {
+            RAD_ERR("RADIANCE_DRAFT_FORCE_AL=%s: drafter '%s' proposes trees; the forced acceptance covers a chain "
+                    "verify only", v, drafter_name_.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        if (cfg_.pp_nodes > 1) {
+            RAD_ERR("RADIANCE_DRAFT_FORCE_AL=%s: not covered on a two-node pipeline (both nodes' cards would have to "
+                    "draw alike; one machine only)", v);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (drafter_.kind == RAD_DRAFT_NONE && cfg_.spec_ngram <= 0) {
+            RAD_WARN("RADIANCE_DRAFT_FORCE_AL=%s: this deployment drafts nothing (--num-speculative-tokens 0); ignored", v);
+        } else {
+            if (const char* sd = std::getenv("RADIANCE_DRAFT_FORCE_SEED"); sd && *sd)
+                f.seed = (uint32_t)std::strtoul(sd, nullptr, 0);
+            else
+                f.seed = 0x51ed5eedu;
+            fal_ = f;
+            for (auto& rk : ranks_) {
+                rk->sampler.set_no_spec_under_grammar(true);
+                rk->bg_sampler.set_no_spec_under_grammar(true);
+            }
+            RAD_WARN("RADIANCE_DRAFT_FORCE_AL=%s: MEASUREMENT ONLY, the answers are not the model's -- a chain verify of d "
+                     "drafts accepts floor(AL - 1) of them and one more with probability frac(AL - 1) (vLLM's "
+                     "minimum-variance schedule; at most d), as drafted, then the target's token after them; the draw "
+                     "hashes (step, sequence slot, seed 0x%08x). AL by the verify's draft count: %s. A request whose "
+                     "grammar constrains drafts nothing. The realized AL is logged every 16,384 verifies and at the stop",
+                     v, f.seed, desc.c_str());
         }
     }
     if (tree_)
