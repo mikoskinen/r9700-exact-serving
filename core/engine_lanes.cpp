@@ -376,6 +376,27 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lanes_.init(all);
     /* tp8 M56: at W(h > 0, t) the leader's head part runs layers [0, h) and writes their state (lanes.h) */
     lanes_.set_head_state(cfg_.pp_cut_h > 0);
+    /* qfn-on-ds Qwen tp8 S7b (round 43): RADIANCE_PP_HEAD_SNAP=1 on the leader -- a chunk-END snapshot's head-layer rows are
+     * staged inside the chunk's HEAD part (rank_loop -> the plugin's rad_tip_set row -1 -> Engine::head_stage), so the
+     * scheduler lends such chunks (LaneSet::snap_holds); unset = today word for word */
+    head_snap_ = false;
+    if (pp_leader() && cfg_.pp_cut_h > 0) {
+        const char* hs = std::getenv("RADIANCE_PP_HEAD_SNAP");
+        if (hs && hs[0] == '1' && hs[1] == '\0') {
+            if (ranks_[0]->kv.has_window_snapshot()) {
+                RAD_ERR("two-node pipeline (Qwen tp8 S7b): RADIANCE_PP_HEAD_SNAP=1 takes a program whose snapshots are state rows "
+                        "only; this one keeps window rows -- unset it");
+                return RAD_E_UNSUPPORTED;
+            }
+            head_snap_ = true;
+            hs_.assign(ranks_.size(), HsRank{});
+            for (size_t i = 0; i < hs_.size(); ++i) { hs_[i].e = this; hs_[i].rank = (int)i; }
+            lanes_.set_head_snap(true);
+            RAD_INFO("two-node pipeline (Qwen tp8 S7b, RADIANCE_PP_HEAD_SNAP=1): a chunk-end snapshot's layers [0, %d) are "
+                     "staged inside the chunk's head part, so the lanes lend snapshot-taking chunks of a cold prompt "
+                     "(a snapshot inside a chunk still holds its sequence)", cfg_.pp_cut_h);
+        }
+    }
     /* tp8 S5 review: draft_ctxskip=1 refused by name under lanes (fn4), not accepted and left off: a run kit
      * that reads its switches back drops it instead of stopping on a value that differs */
     /* tp8 dev D4: under RADIANCE_PP_CTXSKIP_LANES=1 the ring is one region a lane (ctxskip_setup), so the skip is taken */

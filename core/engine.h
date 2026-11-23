@@ -1077,6 +1077,32 @@ private:
     /* The step's TIP snapshot (an entry whose snapshot lies inside it, on the only prefill sequence): its row in the step,
      * or 0 (none); `e` the entry. */
     int64_t tip_row_of(const StepPlan& plan, const StepEntry** e) const;
+    /* qfn-on-ds Qwen tp8 S7b (round 43; RADIANCE_PP_HEAD_SNAP=1 on a leader at W(h > 0, t), engine_lanes.cpp lanes_init): a
+     * chunk-END snapshot's head layers [0, h) staged inside the chunk's HEAD part -- the rank thread names it to the plugin
+     * around the head issue (rank_loop: rad_tip_set row -1), the plugin hands every head layer's state rows to head_stage
+     * before X1's send, which copies them into the snapshot's checkpoint slot of every such entry of the issue; the entry
+     * waits in `done` (another lane's head may be issued before its save) and save_checkpoints saves the rest of its rows
+     * (the tail layers, as the step leaves them). One HsRank a rank. */
+    struct HsEntry {
+        uint64_t seq = 0;
+        int32_t  ck = -1;
+        std::vector<int32_t> slots;                /* the sequence's state slot a group (state_slots_of) */
+        std::vector<std::vector<uint8_t>> staged;  /* [group][layer row] */
+        int64_t  rows = 0;
+    };
+    struct HsRank {
+        Engine* e = nullptr;
+        int     rank = 0;
+        int     fail = 0;
+        std::vector<HsEntry> cur;    /* this head issue's entries (head_stage copies each one's row) */
+        std::vector<HsEntry> done;   /* staged, waiting for their save */
+    };
+    bool     head_snap_ = false;
+    std::vector<HsRank> hs_;
+    std::mutex hs_mu_;
+    uint64_t hs_saves_ = 0, hs_rows_ = 0;
+    static int head_stage(void* u, int group, int layer, void* stream);
+    bool     pp_head_now() const;   /* the pass the ranks issue now is a leader's HEAD part (engine_node.cpp) */
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;

@@ -421,6 +421,15 @@ struct TipRank {
     bool      noted = false;
 };
 static TipRank g_tipr[MAX_RANKS];
+/* qfn-on-ds Qwen tp8 S7b (round 43; RADIANCE_PP_HEAD_SNAP=1 on the leader, core Engine::head_stage): the engine names "a chunk-end
+ * snapshot in this HEAD part" with rad_tip_set row -1; pp_cross hands every head layer's state rows to `stage` before X1's send
+ * (the rows the step-end save would read for layers [0, h) had no other lane's head run after this one), and the pass is never
+ * recorded while it is named (pass_key). */
+struct HeadSnapRank {
+    int  (*stage)(void*, int, int, void*) = nullptr;
+    void* u = nullptr;
+};
+static HeadSnapRank g_hsr[MAX_RANKS];
 static bool fn4_tip_env() {
     static const bool on = fn4_env_on("RADIANCE_FN4_TIP");
     return on;
@@ -2711,6 +2720,23 @@ static bool pp_cross(RadCtx* c, const Model& m, const PpPass& pp, rad_op op, int
         rad_step_fail(c, "qwen4exp: two-node pipeline: the core set up no ring for this crossing (or the stage op is not declared)");
         return false;
     }
+    /* Qwen tp8 S7b: the head layers' state rows into the chunk-end snapshot, before X1 leaves (every head layer's writes joined:
+     * each form joins lane 1 before its X1) -- a failed copy is counted by the engine, which refuses that snapshot's save */
+    if (ring == RAD_PP_X1 && m.pp_rank == 0 && pp.head) {
+        const HeadSnapRank& hs = g_hsr[rad_rank(c)];
+        if (hs.stage) {
+            const RadStream st = rad_stream(c);
+            for (int64_t l = 0; l < m.pp_h && l < (int64_t)m.layers.size(); ++l)
+                if (!m.layers[(size_t)l].full) {
+                    (void)hs.stage(hs.u, (int)m.kv_state, (int)l, st);
+                    (void)hs.stage(hs.u, (int)m.kv_conv, (int)l, st);
+                }
+            if (m.ple_layer >= 0 && m.ple_layer < m.pp_h) {
+                (void)hs.stage(hs.u, (int)m.ple.kv_tok, (int)m.ple_layer, st);
+                (void)hs.stage(hs.u, (int)m.ple.kv_conv, (int)m.ple_layer, st);
+            }
+        }
+    }
     RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_h, T));
     return true;
 }
@@ -4052,6 +4078,7 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     /* lever TIP: a step with a snapshot inside issues per its row (two launches a state op and staging calls), which no key
      * carries: never recorded, never a replay */
     if (g_tipr[rad_rank(c)].row > 0) return 0;
+    if (g_hsr[rad_rank(c)].stage) return 0;   /* Qwen tp8 S7b: a head part that stages a snapshot's rows */
     if (batch->enc) return 1;
     /* Mixed batches split the query rows into decode and prefill subsets before attention; the
      * whole-batch host summary cannot key those subset geometries exactly. */
@@ -4188,7 +4215,20 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
  * prefill. rad_tip_free lists the stateful groups a resume at a piece start does not read (the QSA tail ring), which the
  * engine saves as the step leaves them. */
 int tip_set(int rank, long long row, int (*stage)(void*, int, int, void*), void* u) {
-    if (rank < 0 || rank >= MAX_RANKS || !fn4_tip_env()) return -1;
+    if (rank < 0 || rank >= MAX_RANKS) return -1;
+    /* Qwen tp8 S7b: row -1 = a chunk-end snapshot staged in this leader's HEAD part (pp_cross); a head layer with attention keeps
+     * a QSA tail ring this does not stage: refused */
+    if (row == -1) {
+        const Model& m = g_model[rank];
+        if (!m.pp || m.pp_rank != 0 || m.pp_h <= 0 || !stage) return -1;
+        for (int64_t l = 0; l < m.pp_h && l < (int64_t)m.layers.size(); ++l)
+            if (m.layers[(size_t)l].full) return -1;
+        g_hsr[rank].stage = stage;
+        g_hsr[rank].u = u;
+        return 1;
+    }
+    if (row == 0) g_hsr[rank] = HeadSnapRank{};
+    if (!fn4_tip_env()) return -1;
     if (!g_model[rank].pipe_on && row != 0) return -1;
     TipRank& t = g_tipr[rank];
     t.row = row > 0 ? (int64_t)row : 0;

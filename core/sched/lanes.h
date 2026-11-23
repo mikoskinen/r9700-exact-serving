@@ -319,6 +319,14 @@ public:
      * (the next chunk's head would rewrite the layers [0, h) state the snapshot copies behind the tail). */
     void set_head_state(bool on) { head_state_ = on; }
     bool head_state() const { return head_state_; }
+    /* qfn-on-ds Qwen tp8 S7b (round 43; RADIANCE_PP_HEAD_SNAP=1 on the leader, Engine::head_stage): the leader stages a
+     * chunk-END snapshot's head-layer rows inside the chunk's HEAD part, so such a chunk no longer holds its sequence; a
+     * snapshot inside a chunk (lever TI / TIP) still does. */
+    void set_head_snap(bool on) { head_snap_ = on; }
+    bool head_snap() const { return head_snap_; }
+    bool snap_holds(int64_t ckpt_tok, int64_t n_tokens) const {
+        return head_state_ && (!head_snap_ || ckpt_tok < n_tokens - 1);
+    }
 
     struct Piece {
         int       home = -1;
@@ -445,6 +453,7 @@ private:
     int64_t hold_steps_ = 0, hold_reqs_ = 0, hold_lent_ = 0, hold_home_ = 0, hold_us_ = 0, hold_max_us_ = 0;
     int64_t split_min_ = 128;
     bool    head_state_ = false;
+    bool    head_snap_ = false;    /* Qwen tp8 S7b */
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;
     int64_t why_[kWhyN] = {};
     std::string broken_;

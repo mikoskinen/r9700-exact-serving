@@ -14345,6 +14345,124 @@ TEST(flashnext_pp_parts_issue_the_crossings_at_the_cut) {
     fake_pp() = FakePp{};
 }
 
+/* qfn-on-ds Qwen tp8 S7b (Qwen loop round 43; RADIANCE_PP_HEAD_SNAP=1, core Engine::head_stage): the engine names a chunk-end
+ * snapshot in a leader's HEAD part with rad_tip_set row -1; the HEAD part (serial steps and a spanned start's pipelined prefill,
+ * the published SP switches on) then hands every head layer's state rows -- kv_state + kv_conv of each delta-net layer below
+ * h, and the PLE layer's two windows when it lies there -- to the callback exactly once each, right before X1's send (the
+ * callback sees the issue count of the send). Negative controls: unnamed -> no call;
+ * the TAIL part and the follower -> no call; row -1 on the follower is refused. */
+namespace hst {
+struct St { int group, layer; size_t at; };
+std::vector<St> st;
+int cb(void*, int g, int l, void* s) { st.push_back({ g, l, ((RadCtx*)s)->issues.size() }); return 0; }
+}  // namespace hst
+TEST(flashnext_pp_head_snap_stages_the_head_layers_before_x1) {
+    setenv("RADIANCE_FN4_HC_SS", "1", 1);
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    static RadPpRing rings[RAD_PP_N_RINGS];
+    int named_calls = 0, passes_named = 0;
+    for (int span : { 0, 1 })
+        for (int arm : { 0, 1, 2, 3 }) {   /* 0: leader HEAD unnamed (control), 1: leader HEAD named, 2: leader TAIL named, 3: follower */
+            const int rank = 1, node = arm == 3 ? 1 : 0;
+            if (span) {
+                setenv("RADIANCE_FN4_SPHC", "1", 1);
+                setenv("RADIANCE_FN4_P2X", "1", 1);
+                setenv("RADIANCE_FN4_GATHER_INV", "1", 1);
+                setenv("RADIANCE_FN4_SPSERIAL", "1", 1);
+            }
+            FakePp& f = fake_pp();
+            f = FakePp{};
+            f.on = true;
+            f.info.nodes = 2; f.info.rank = node; f.info.cut_h = 2; f.info.cut_t = 6; f.info.lanes = node == 0 ? 2 : 1;
+            f.info.part = arm == 2 ? RAD_PP_PART_TAIL : node == 0 ? RAD_PP_PART_HEAD : RAD_PP_PART_WHOLE;
+            for (int k = 0; k < RAD_PP_N_RINGS; ++k) f.info.ring[k] = &rings[k];
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, 4);
+            if (span) { ctx.max_tok = 8192; ctx.max_mixed_tok = 2048; }
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }), RAD_OK);
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            REQUIRE(m.pp);
+            if (span) {
+                qwen4exp_fp8::fn4_sp_flag().store(2);
+                qwen4exp_fp8::fn4_pair_flag().store(1);
+                qwen4exp_fp8::fn4_hcbi_flag().store(5);
+                qwen4exp_fp8::fn4_spser_flag().store(1);
+                qwen4exp_fp8::fn4_sproute_flag().store(512);
+            }
+            const bool named = arm >= 1;
+            if (named) {
+                const int got = qwen4exp_fp8::tip_set(rank, -1, &hst::cb, nullptr);
+                CHECK_EQ(got, node == 0 ? 1 : -1);   /* the follower refuses: its head is the leader's */
+            }
+            /* the state rows the head part must stage: every delta-net layer below h, and the PLE layer's two windows there */
+            std::set<std::pair<int, int>> want;
+            for (int64_t l = 0; l < 2; ++l)
+                if (!m.layers[(size_t)l].full) { want.insert({ (int)m.kv_state, (int)l }); want.insert({ (int)m.kv_conv, (int)l }); }
+            if (m.ple_layer >= 0 && m.ple_layer < 2) {
+                want.insert({ (int)m.ple.kv_tok, (int)m.ple_layer });
+                want.insert({ (int)m.ple.kv_conv, (int)m.ple_layer });
+            }
+            CHECK(!want.empty());
+            std::vector<std::pair<std::vector<int>, std::vector<int>>> shapes;
+            if (span) shapes = { { {}, { 2048 + 1792 } }, { { 4, 4, 4, 4 }, { 500 } } };
+            else      shapes = { { {}, { 64, 64 } }, { { 4, 4 }, { 100 } } };
+            for (const auto& dq_pq : shapes) {
+                const bool pf = dq_pq.first.empty();
+                const auto k = kit(b, dq_pq.first, dq_pq.second, span ? (pf ? 10240 : 4096) : 9000);
+                k->b.positions_h = k->pos.data();
+                hst::st.clear();
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, 4);
+                CHECK_PASSES(b, v);
+                CHECK(v[0]->step_fail.empty());
+                const RadCtx& c = *v[0];
+                int i_send1 = -1;
+                for (size_t i = 0; i < c.issues.size(); ++i) {
+                    const RecOp* o = b.op_of(c.issues[i].op);
+                    if (!o || o->op != "stage_send") continue;
+                    int ring = -1;
+                    for (const RecParam& q : o->p) if (q.key == "ring") ring = (int)q.ival;
+                    if (ring == RAD_PP_X1) i_send1 = (int)i;
+                }
+                if (arm == 1) {
+                    REQUIRE(i_send1 >= 0);
+                    std::set<std::pair<int, int>> got;
+                    for (const hst::St& x : hst::st) {
+                        CHECK(got.insert({ x.group, x.layer }).second);   /* each row once */
+                        CHECK_EQ(x.at, (size_t)i_send1);                   /* right before X1's send */
+                    }
+                    CHECK(got == want);
+                    named_calls += (int)hst::st.size();
+                    ++passes_named;
+                } else {
+                    CHECK(hst::st.empty());   /* unnamed, the TAIL part, the follower: nothing staged */
+                }
+            }
+            (void)qwen4exp_fp8::tip_set(rank, 0, nullptr, nullptr);   /* clears the head snapshot's callback */
+            qwen4exp_fp8::fn4_sproute_flag().store(0);
+            qwen4exp_fp8::fn4_spser_flag().store(0);
+            qwen4exp_fp8::fn4_hcbi_flag().store(0);
+            qwen4exp_fp8::fn4_pair_flag().store(0);
+            qwen4exp_fp8::fn4_sp_flag().store(0);
+            if (span) {
+                unsetenv("RADIANCE_FN4_SPHC");
+                unsetenv("RADIANCE_FN4_P2X");
+                unsetenv("RADIANCE_FN4_GATHER_INV");
+                unsetenv("RADIANCE_FN4_SPSERIAL");
+                rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+                m.pipe_cu_h = nullptr;
+                m.pipe_cu_tried = false;
+            }
+            f.on = false;
+        }
+    CHECK_EQ(passes_named, 4);
+    CHECK(named_calls > 0);
+    fprintf(stderr, "    S7b: %d named head passes staged %d state rows, each right before X1's send\n", passes_named, named_calls);
+    unsetenv("RADIANCE_FN4_HC_SS");
+    fake_pp() = FakePp{};
+}
+
 /* Qwen tp8 S6 (Qwen loop round 32; the DS line's tp8 dev M4): RADIANCE_PP_SEG_LAYERS=k on the follower of W(2, 6) (the
  * eight-layer fixture, four ranks, --pp-lanes 2 in the fake): k 1 declares the boundaries 3, 4, 5 and k 2 the boundary 4
  * (rad_pp_segments; a PERSIST ring buffer a rank = the loop-mode header + 20,480 B x max_tok + the trailer; a save and a

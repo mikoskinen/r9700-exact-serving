@@ -883,8 +883,53 @@ void Engine::rank_loop(int index) {
                     tip_row = 0;
                 }
             }
+            /* qfn-on-ds Qwen tp8 S7b: a leader's HEAD part of a step whose entries take a snapshot at their chunk's END
+             * (RADIANCE_PP_HEAD_SNAP=1): the plugin stages their head layers' rows before X1's send (head_stage) */
+            bool hs_named = false;
+            if (head_snap_ && what == kIssueModel && b->draft_pass == 0 && b->enc == 0 && tip_row == 0 &&
+                (size_t)index < hs_.size() && pp_head_now()) {
+                const StepPlan* hp = &issue_sched_.load(std::memory_order_acquire)->plan();
+                HsRank& h = hs_[(size_t)index];
+                h.cur.clear();
+                h.fail = 0;
+                if (hp->n_tok == b->n_tok) {
+                    const KVManager& kv = r.kv;
+                    for (const StepEntry& e : hp->e) {
+                        if (e.ckpt_slot < 0 || e.ckpt_tok < 0 || e.ckpt_tok != e.n_tokens - 1) continue;
+                        HsEntry x;
+                        x.seq = e.seq;
+                        x.ck = e.ckpt_slot;
+                        if (!state_slots_of(e.seq, &x.slots)) continue;
+                        x.slots.resize((size_t)kv.n_groups(), -1);
+                        x.staged.assign((size_t)kv.n_groups(), {});
+                        for (int32_t g = 0; g < kv.n_groups(); ++g) {
+                            const KVGroupPlan* p = kv.plan(g);
+                            if (!p || !p->stateful()) continue;
+                            x.staged[(size_t)g].assign((size_t)std::max<int64_t>(p->n_layers, 0), 0);
+                        }
+                        h.cur.push_back(std::move(x));
+                    }
+                }
+                if (!h.cur.empty()) {
+                    if (fn4::tip_set(index, -1, &Engine::head_stage, &h) <= 0) {
+                        RAD_ERR("rank %d step %d: Qwen tp8 S7b: the plugin refused the head part's snapshot staging "
+                                "(RADIANCE_PP_HEAD_SNAP=1 needs a cut whose head layers hold no attention)", index, b->step);
+                        step_status_.store(RAD_E_STATE, std::memory_order_release);
+                        h.cur.clear();
+                    } else {
+                        hs_named = true;
+                    }
+                }
+            }
             int s = what == kIssueSampler ? RAD_OK : r.cx().run_step(b);
             if (tip_row > 0) (void)fn4::tip_set(index, 0, nullptr, nullptr);
+            if (hs_named) {
+                (void)fn4::tip_set(index, 0, nullptr, nullptr);
+                HsRank& h = hs_[(size_t)index];
+                std::lock_guard<std::mutex> lk(hs_mu_);
+                for (HsEntry& x : h.cur) h.done.push_back(std::move(x));
+                h.cur.clear();
+            }
             if (hiss) hiss_t1_ = rad_mono_ns();
             if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
@@ -2150,6 +2195,55 @@ int Engine::save_checkpoints() {
                              (unsigned long long)tip_[0].rows, (unsigned long long)tip_saves_);
                     continue;
                 }
+                /* qfn-on-ds Qwen tp8 S7b (RADIANCE_PP_HEAD_SNAP=1, a leader): a chunk-end snapshot whose head layers' rows its HEAD
+                 * part staged (head_stage); the rest -- the tail layers, which no other lane's pass wrote since -- saved as the step
+                 * leaves them. Not staged in its head part: refused (the head layers' state may be another chunk's by now). */
+                if (head_snap_ && !inside) {
+                    for (auto& rk : ranks_) {
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        HsEntry x;
+                        bool found = false;
+                        {
+                            std::lock_guard<std::mutex> lk(hs_mu_);
+                            std::vector<HsEntry>& dn = hs_[(size_t)rk->index].done;
+                            for (size_t i = 0; i < dn.size(); ++i)
+                                if (dn[i].seq == e.seq && dn[i].ck == e.ckpt_slot) {
+                                    x = std::move(dn[i]);
+                                    dn.erase(dn.begin() + (ptrdiff_t)i);
+                                    found = true;
+                                    break;
+                                }
+                        }
+                        int st = RAD_OK;
+                        if (!found || x.rows <= 0) {
+                            RAD_ERR("rank %d: Qwen tp8 S7b: sequence %llu's snapshot (slot %d, position %lld) was not staged in its head "
+                                    "part; the head layers' state may be a later chunk's", rk->index, (unsigned long long)e.seq,
+                                    (int)e.ckpt_slot, (long long)(e.ctx_len + e.ckpt_tok + 1));
+                            st = RAD_E_STATE;
+                        }
+                        const KVManager& kv = rk->kv;
+                        for (int32_t g = 0; st >= 0 && g < kv.n_groups(); ++g) {
+                            const KVGroupPlan* p = kv.plan(g);
+                            if (!p || !p->stateful()) continue;
+                            for (int64_t l = 0; st >= 0 && l < p->n_layers; ++l) {
+                                if ((size_t)g < x.staged.size() && (size_t)l < x.staged[(size_t)g].size() &&
+                                    x.staged[(size_t)g][(size_t)l]) continue;
+                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->cx().stream());
+                            }
+                        }
+                        if (st < 0) {
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return st;
+                        }
+                        hs_rows_ += (uint64_t)x.rows;
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    if (++hs_saves_ == 1 || hs_saves_ % 256 == 0)
+                        RAD_INFO("Qwen tp8 S7b: %llu chunk-end snapshots saved with their head layers staged in the head part "
+                                 "(%llu head rows staged over the ranks)", (unsigned long long)hs_saves_,
+                                 (unsigned long long)hs_rows_);
+                    continue;
+                }
                 int64_t row0 = 0;
                 if (inside) {
                     if (!ti_capable_ && ranks_[0]->kv.has_conv_state()) {
@@ -2220,6 +2314,29 @@ int Engine::tip_stage(void* u, int group, int layer, void* stream) {
     if (s < 0) { ++t->fail; return s; }
     t->staged[(size_t)group][(size_t)li] = 1;
     ++t->rows;
+    return RAD_OK;
+}
+
+/* qfn-on-ds Qwen tp8 S7b: the plugin's staging callback in a leader's HEAD part (rad_tip_set row -1), on the rank's thread
+ * inside its issue: copy (group, model layer)'s state row of every chunk-end snapshot entry of the issue into its slot. */
+int Engine::head_stage(void* u, int group, int layer, void* stream) {
+    HsRank* h = static_cast<HsRank*>(u);
+    if (!h || !h->e || h->cur.empty()) return RAD_E_STATE;
+    Rank& rk = *h->e->ranks_[(size_t)h->rank];
+    const int64_t li = rk.cx().kv_layer_index((rad_kvgroup)group, layer);
+    for (HsEntry& x : h->cur) {
+        if (group < 0 || (size_t)group >= x.slots.size() || x.slots[(size_t)group] < 0 || li < 0 ||
+            (size_t)li >= x.staged[(size_t)group].size()) {
+            ++h->fail;
+            RAD_ERR("rank %d: Qwen tp8 S7b: no state row for group %d layer %d (layer row %lld)", h->rank, group, layer,
+                    (long long)li);
+            return RAD_E_STATE;
+        }
+        const int s = rk.kv.stage_state_row((int32_t)group, (int32_t)li, x.slots[(size_t)group], x.ck, (RadStream)stream);
+        if (s < 0) { ++h->fail; return s; }
+        x.staged[(size_t)group][(size_t)li] = 1;
+        ++x.rows;
+    }
     return RAD_OK;
 }
 
