@@ -390,6 +390,46 @@ TEST(the_cards_forced_acceptance_is_the_hosts_with_the_cut_over_the_emitted_toke
     CHECK(forced_wrong > 1000);   /* the forced count accepts drafts the target did not draw */
 }
 
+/* RADIANCE_DRAFT_FORCE_AL_CUT=0 (ForceAl::nocut): no cut inside a forced verify -- the card keeps every drawn draft and
+ * the token after them, stop tokens or not, as the host does (collect_step skips accept_cut_at_eog). Every draft a stop
+ * token here, so the cut form would end every verify at 0. Seeded. */
+TEST(the_forced_acceptance_without_the_cut_keeps_every_drawn_draft_on_the_card_and_the_host) {
+    ForceAl f;
+    std::string why;
+    CHECK(fal_parse("1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:3.1,8:4.4", &f, &why, nullptr));
+    f.nocut = 1;
+    uint32_t rng = 0xc0ffeeu;
+    int bad = 0;
+    int64_t kept = 0;
+    for (int c = 0; c < 4000 && !bad; ++c) {
+        Slab s(ADV_ACCEPT);
+        s.a.fal = f;
+        s.a.fal.key = lcg(rng);
+        s.set_eog({ 2, 3 });
+        const int n_spec = 1 + (int)(lcg(rng) % 8);
+        const int card = c % Slab::kSeq;
+        s.row(0, true, 0, 1 + n_spec, 500, card, 0, 0, n_spec);
+        int32_t draft[8] = {}, target[9] = {};
+        s.w[Slab::TOK] = 50;
+        for (int j = 0; j < n_spec; ++j) { draft[j] = 2 + (int32_t)(lcg(rng) % 2); s.w[Slab::TOK + 1 + j] = draft[j]; }
+        for (int j = 0; j <= n_spec; ++j) { target[j] = 4 + (int32_t)(lcg(rng) % 5); s.src[j] = target[j]; }
+        int32_t out[9] = {}, acc = -1;
+        const int32_t n = fal_count(s.a.fal, s.a.fal.key, card, n_spec);
+        CHECK_OK(accept_forced(draft, n_spec, target, n, out, &acc));
+        s.run();
+        const StepSlot& S = s.st[card];
+        if (!(S.acc == acc && S.acc == n && S.tok[0] == out[acc] && S.tok[0] == target[n] && S.head == 500 + n)) {
+            bad = 1;
+            CHECK(false);
+            std::fprintf(stderr, "    case %d: card acc %d tok %d; host acc %d tok %d (drawn %d)\n", c, S.acc, S.tok[0], acc,
+                         out[acc], n);
+        }
+        kept += n;
+    }
+    CHECK_EQ(bad, 0);
+    CHECK(kept > 4000);   /* drafts that are all stop tokens were kept */
+}
+
 /* The forced count's mean is AL - 1 at every depth of the golden Qwen curve (thinking on, SPEED-Bench coding; AgentX):
  * 10,000 verifies a depth on the card's acceptance, over keys that step by one and four slots, with drafts that never
  * equal the target (the agreement rule would accept none). Within 1 % of the AL, and only floor(AL - 1) or one more a

@@ -167,8 +167,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
              * target's token after them; the cut over those emitted tokens, as Engine::collect_step cuts them. */
             const int32_t f = fal_count(a.fal, a.fal.key, slot, aux);
             acc = f;
-            for (int32_t j = 0; j <= f; ++j)
-                if (adv_is_eog(a, j < f ? d[j] : y[j])) { acc = j; break; }
+            if (!a.fal.nocut)
+                for (int32_t j = 0; j <= f; ++j)
+                    if (adv_is_eog(a, j < f ? d[j] : y[j])) { acc = j; break; }
             last = acc < f ? d[acc] : y[acc];
         } else {
             while (acc < aux && d[acc] == y[acc]) ++acc;

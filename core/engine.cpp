@@ -2603,8 +2603,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
-            acc = accept_cut_at_eog(out, acc,
-                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
+            if (fal_drawn < 0 || !fal_.nocut)   /* RADIANCE_DRAFT_FORCE_AL_CUT=0: every drawn draft counts */
+                acc = accept_cut_at_eog(out, acc,
+                                        [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];

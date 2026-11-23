@@ -2395,6 +2395,27 @@ TEST(force_al_sets_the_acceptance_length_and_the_card_agrees_with_the_host) {
     REQUIRE(forced0.size() >= 64);
     CHECK(!std::equal(plain0.begin(), plain0.end(), forced0.begin()));
     {
+        /* RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify; card = host still, 0 cuts counted. */
+        Server nc;
+        REQUIRE(nc.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4" },
+                         { "RADIANCE_DRAFT_FORCE_AL=7:2.9", "RADIANCE_DRAFT_FORCE_AL_CUT=0" }));
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(nc.port, "POST", "/completion", completion(prompts[(size_t)i], 160).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            CHECK_EQ(tokens_of(json::parse(body, nullptr, false)).size(), (size_t)160);
+        }
+        CHECK_EQ(nc.stop(), 0);
+        const std::string ln = nc.output();
+        CHECK(has(ln, "RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify"));
+        CHECK(has(ln, ", 0 cut below their draw by a stop token -- depth 7: "));
+        CHECK(!has(ln, "the card accepted"));
+        const size_t z = ln.find("RADIANCE_DRAFT_FORCE_AL (measurement only) at the stop");
+        if (z != std::string::npos) fprintf(stderr, "    %s\n", ln.substr(z, ln.find('\n', z) - z).c_str());
+    }
+    {
         Server bad;
         CHECK(!bad.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache" },
                          { "RADIANCE_DRAFT_FORCE_AL=4:6.0" }));

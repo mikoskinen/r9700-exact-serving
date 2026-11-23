@@ -42,7 +42,10 @@ struct ForceAl {
     uint32_t seed = 0;
     uint32_t key = 0;                  /* the verify step's number (RadBatch::step), set per ADV_ACCEPT */
     uint32_t m[kFalDepths] = {};       /* AL - 1 for a verify of d drafts, fixed point 8.24 */
-    uint32_t pad = 0;
+    /* RADIANCE_DRAFT_FORCE_AL_CUT=0: no end-of-generation cut inside a forced verify -- every drawn draft counts, as vLLM
+     * counts its synthetic acceptance (a stop token emitted inside the step does not end it; for requests with ignore_eos,
+     * as AgentX sends, nothing else differs). 0 = the cut over the emitted tokens (the default). */
+    int32_t  nocut = 0;
 };
 
 RAD_FAL_FN uint32_t fal_mix(uint32_t x) {

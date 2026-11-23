@@ -1914,6 +1914,7 @@ int Engine::declare() {
                 f.seed = (uint32_t)std::strtoul(sd, nullptr, 0);
             else
                 f.seed = 0x51ed5eedu;
+            if (const char* ct = std::getenv("RADIANCE_DRAFT_FORCE_AL_CUT"); ct && !std::strcmp(ct, "0")) f.nocut = 1;
             fal_ = f;
             for (auto& rk : ranks_) {
                 rk->sampler.set_no_spec_under_grammar(true);
@@ -1922,9 +1923,12 @@ int Engine::declare() {
             RAD_WARN("RADIANCE_DRAFT_FORCE_AL=%s: MEASUREMENT ONLY, the answers are not the model's -- a chain verify of d "
                      "drafts accepts floor(AL - 1) of them and one more with probability frac(AL - 1) (vLLM's "
                      "minimum-variance schedule; at most d), as drafted, then the target's token after them; the draw "
-                     "hashes (step, sequence slot, seed 0x%08x). AL by the verify's draft count: %s. A request whose "
-                     "grammar constrains drafts nothing. The realized AL is logged every 16,384 verifies and at the stop",
-                     v, f.seed, desc.c_str());
+                     "hashes (step, sequence slot, seed 0x%08x). AL by the verify's draft count: %s. %s A request "
+                     "whose grammar constrains drafts nothing. The realized AL is logged every 16,384 verifies and at the stop",
+                     v, f.seed, desc.c_str(),
+                     f.nocut ? "RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify (every drawn draft "
+                               "counts, as vLLM counts; a stop token inside the step does not end it)."
+                             : "A stop token among the emitted tokens ends the verify there (the cut is counted).");
         }
     }
     if (tree_)
