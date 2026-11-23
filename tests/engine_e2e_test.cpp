@@ -1993,6 +1993,55 @@ TEST(concurrent_requests_return_what_each_returns_alone) {
     }
 }
 
+/* qfn-on-ds Q92 (FINDINGS F78): lever AGR (RADIANCE_SCHED_ADMIT_GATE=3) and the step-host timer (RADIANCE_LOG_STEP_HOST=0, a line every
+ * step) on a hybrid model with the prefix cache on: four prompts at once return what each returns alone (admission order only, no byte),
+ * the start line names the switch, and every planned step prints its host split with the scheduler's part and AGR's counters. */
+TEST(agr_and_the_step_host_line_keep_the_text) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(500 + i, 70 + 29 * i));
+    std::vector<std::vector<int32_t>> alone;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        for (const auto& p : prompts) alone.push_back(tokens_of(post(s.port, "/completion", completion(p, 40))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().qwen35, { "--num-speculative-tokens", "4", "--max-num-seqs", "4" },
+                    { "RADIANCE_SCHED_ADMIT_GATE=3", "RADIANCE_LOG_STEP_HOST=0", "RADIANCE_LOG=info" }));
+    Call calls[4];
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[i], 40).dump()));
+    for (int i = 0; i < 4; ++i) {
+        std::string body;
+        CHECK_EQ(calls[i].read(&body), 200);
+        const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+        CHECK_EQ(t.size(), (size_t)40);
+        if (t != alone[(size_t)i])
+            fprintf(stderr, "    prompt %d\n    alone    %s\n    AGR 3    %s\n", i, show(alone[(size_t)i]).c_str(), show(t).c_str());
+        CHECK(t == alone[(size_t)i]);
+    }
+    CHECK_EQ(s.stop(), 0);
+    const std::string log = s.output();
+    size_t lines = 0, with_sched = 0;
+    for (size_t a = 0; (a = log.find("step-host ", a)) != std::string::npos; ++a) {
+        ++lines;
+        const size_t e = log.find('\n', a);
+        const std::string line = log.substr(a, e == std::string::npos ? std::string::npos : e - a);
+        if (line.find("| sched ") != std::string::npos && line.find("agr refused ") != std::string::npos &&
+            line.find("collect ") != std::string::npos)
+            ++with_sched;
+    }
+    const size_t f = log.find("step-host ");
+    fprintf(stderr, "    step-host lines %zu (%zu with the scheduler's part); the first:\n      %s\n", lines, with_sched,
+            f == std::string::npos ? "-" : log.substr(f, log.find('\n', f) - f).c_str());
+    CHECK(log.find("RADIANCE_SCHED_ADMIT_GATE=3 (qfn-on-ds Q92") != std::string::npos);
+    CHECK(log.find("RADIANCE_LOG_STEP_HOST=0 (qfn-on-ds Q92)") != std::string::npos);
+    CHECK(lines >= 40);
+    CHECK_EQ(with_sched, lines);
+}
+
 /* A prompt that shares a head with an earlier one resumes from the prefix cache: attention from
  * the cached blocks, the gated delta net from the linear-state checkpoint the earlier request wrote
  * at the end of the shared head, never from that request's later state. The reply, and every
