@@ -26745,7 +26745,16 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                 /* (round 48) the served form's per-workgroup timeline, copy 1: tlreps single launches (cold: each after the flush), each
                  * workgroup's stamps relative to its own entry stamp, means over workgroups x launches; + the spread of the entries and the
                  * span first entry -> last stamp */
-                if (tl_ok && has_epd && form == 2) {
+                /* (round 49, QUEUE Q84 residency read) R4D_SELFTEST_GDN_TLQSC=1 adds the ENTRY / END stamps only (libr4d ABL 32; the full
+                 * timeline's stamps cost QSC's instance 23 VGPRs) of today's form (r4d_gdn_epd(512), 'TLE') and of lever QSC's instance
+                 * (r4d_gdn_epd(516), 'TLE-QSC': 0 spilled dwords, ~230 VGPRs = 6 waves a SIMD by the compiler vs today's 5), and with
+                 * R4D_SELFTEST_GDN_LDS > 0 today's entry / end stamps at that dynamic LDS ('TLE-LDS': fewer resident a WGP): the entry
+                 * spread at N 8 / 16 says how many workgroups each form has resident at once */
+                const int tlqsc = std::atoi(envs("R4D_SELFTEST_GDN_TLQSC", "0").c_str()) ? 1 : 0;
+                for (int tarm = 0; tarm < 4 && tl_ok && has_epd && form == 2; ++tarm) {
+                    if ((tarm == 1 || tarm == 2) && !tlqsc) continue;
+                    if (tarm == 3 && !(tlqsc && lds_b > 0 && pl.gdn_lds)) continue;
+                    const char* const tag = tarm == 0 ? "TL" : tarm == 1 ? "TLE" : tarm == 2 ? "TLE-QSC" : "TLE-LDS";
                     std::vector<RadTensor> tt; RadArgs at; args(1, 0, tt, at);
                     auto launch_t = [&](int) { (void)r->launch(&at, (RadStream) nullptr); };
                     const int nwg = (int)(N * H) < 512 ? (int)(N * H) : 512;
@@ -26753,7 +26762,8 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                     double span = 0.0, skew = 0.0; int got = 0;
                     std::vector<unsigned long long> buf((size_t)512 * 16);
                     const long long n0 = pl.gdn_epd_n();
-                    pl.gdn_epd(256);
+                    pl.gdn_epd(tarm == 0 ? 256 : tarm == 2 ? 516 : 512);
+                    if (tarm == 3) pl.gdn_lds(lds_b);
                     for (int rep = 0; rep < tlreps; ++rep) {
                         if (tl_reset() != 0) break;
                         (void)st_time_us(launch_t, 1, (hipStream_t) nullptr);
@@ -26771,11 +26781,13 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                         if (t0min != ~0ull && tend >= t0min) { span += (double)(tend - t0min); skew += (double)(t0max - t0min); ++got; }
                     }
                     pl.gdn_epd(-1);
+                    if (tarm == 3) pl.gdn_lds(0);
                     const double us = 1000.0 / (double)wc_khz;   /* us a tick */
                     static const char* const knm[16] = { "entry", "prologue-issued", "slot-resolved", "replay+anchor", "conv-done", "tok0", "tok1",
                                                          "tok2", "tok3", "tok4", "tok5", "tok6", "tok7", "loop-end", "rewrite-end", "-" };
-                    std::string line = fmt("GDNR %s %s TL (us from each workgroup's entry, mean over %d launches x %d workgroups; launches %lld):",
-                                           cell.c_str(), g_cold > 0 ? "cold" : "warm", got, nwg, pl.gdn_epd_n() - n0);
+                    std::string line = fmt("GDNR %s %s %s%s (us from each workgroup's entry, mean over %d launches x %d workgroups; launches %lld):",
+                                           cell.c_str(), g_cold > 0 ? "cold" : "warm", tag, tarm == 3 ? fmt("%d", lds_b).c_str() : "", got, nwg,
+                                           pl.gdn_epd_n() - n0);
                     for (int k = 1; k < 15; ++k)
                         if (cnt[(size_t)k]) line += fmt(" %s %.2f", knm[k], sum[(size_t)k] / (double)cnt[(size_t)k] * us);
                     if (got) line += fmt("; entry spread %.2f us, span first entry -> last stamp %.2f us", skew / got * us, span / got * us);

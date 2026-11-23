@@ -245,6 +245,24 @@ __device__ __forceinline__ void ru_tl(int k) {
   }
 }
 
+/* round 49 (bench only, ABL 32): the entry clock read into a register, written later by ru_tl_put */
+template <bool TL>
+__device__ __forceinline__ unsigned long long ru_tl_now() {
+#ifndef R4D_EMU_HOST
+  if constexpr (TL) return (unsigned long long)wall_clock64();
+#endif
+  return 0ull;
+}
+template <bool TL>
+__device__ __forceinline__ void ru_tl_put(int k, unsigned long long v) {
+  if constexpr (TL) {
+    unsigned long long* const tb = g_ru_tlp;
+    if (threadIdx.x != 0 || !tb) return;
+    const unsigned b = blockIdx.y * gridDim.x + blockIdx.x;
+    if (b < (unsigned)kRuTlMax) tb[(unsigned long long)b * kRuTlW + k] = v;
+  }
+}
+
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
           int CV = 0, int EPD = 0>
 __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsigned short* __restrict__ q,
@@ -303,9 +321,16 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * x7 its state bytes). The same 16-bit values into the same arithmetic and stores: the same bytes. */
   constexpr bool ZX = (EPDF & 8) != 0;
   constexpr bool TLS = (ABL & 16) != 0;   /* round 48: the bench's timeline instance (ru_tl's note) */
+  /* round 49 (QUEUE Q84 residency read): ABL 32 = the ENTRY and END stamps only -- the entry clock kept in a register and written with
+   * the loop-end stamp after the token loop (k 0 and 13), and k 14 after the rewrite: a stamp STORE before the body cost QSC's instance
+   * 23 VGPRs (230 -> 253, past the 240 of 6 waves a SIMD; a store through an unknown pointer orders the body's loads), so the residency
+   * read takes this light form on both: EPD 512 = today's served form, EPD 516 = lever QSC's (EPDF 4) */
+  constexpr bool TLE = !TLS && (ABL & 32) != 0;
   ru_tl<TLS>(0);
+  unsigned long long tle0 = 0;
+  if constexpr (TLE) tle0 = ru_tl_now<TLE>();
   using HT = std::conditional_t<ZX, uint32_t, unsigned short>;
-  static_assert(!ABL || EPDF == 0, "the Q84 ablations are of the served form (EPD 0)");
+  static_assert(!ABL || EPDF == 0 || (ABL == 32 && EPDF == 4), "the Q84 ablations are of the served form (EPD 0); TLE also on QSC");
   static_assert(!EPDF || (CV && NORM && ANC && VS == 1 && STG == 0), "EPD: the folded decode shape (T <= RU_CVT), fused norm, anchor");
   __shared__ float sonT[EPI ? RU_CVT * RU_V : 1];         // per (token, row): the raw output before the norm
   __shared__ float sobT[EPI ? RU_CVT * RU_V : 1];         // per (token, row): bf2f of the stored bf16 output
@@ -1046,6 +1071,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   }
 
   ru_tl<TLS>(13);
+  if constexpr (TLE) { ru_tl_put<TLE>(0, tle0); ru_tl<TLE>(13); }
   if constexpr (CV) {
     // The last arriving reader rewrites the key head's q and k channels. The count was taken
     // before the token loop, hiding its latency.
@@ -1067,7 +1093,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     for (int t = 0; t < RU_CVT; ++t)
       rx[t] = t < T ? cvh[(CS - 1 + t) * THR + tid] : (unsigned short)0;
     ru_conv_rewrite(spa, rh, rx, T, cv.cs_tok);
-    ru_tl<TLS>(14);
+    ru_tl<TLS || TLE>(14);
   }
 }
 
@@ -1336,7 +1362,7 @@ static int ru_epd() {
 }
 /* (round 47, QUEUE Q84 read, BENCH ONLY) 16 x ABL for ABL in {1, 2, 3, 4, 8, 15} = the served form's timing ablations (the kernel's ABL
  * note; NOT the update's bytes); the core switch gdn_epd (0..4) and RADIANCE_GDN_EPD never reach them */
-static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15 || abl == 16; }
+static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15 || abl == 16 || abl == 32; }
 /* (round 48, bench only) ABL 16 = the served form with the per-workgroup timeline (ru_tl's note): r4d_gdn_tl(1) allocates the stamp
  * buffer, r4d_gdn_tl_reset zeroes it, r4d_gdn_tl_read copies [workgroup][kRuTlW] words back */
 static unsigned long long* g_ru_tl_buf = nullptr;
@@ -1365,7 +1391,8 @@ extern "C" int r4d_gdn_tl_read(unsigned long long* out, int max) {
 }
 #endif   /* !R4D_EMU_HOST */
 extern "C" void r4d_gdn_epd(int on) {
-  const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on == 8 || on == 12) ? on : (on > 4 ? 4 : on);
+  const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on == 516 || on == 8 || on == 12) ? on
+              : (on > 4 ? 4 : on);   /* 512 / 516 (round 49, bench only) = the entry / end stamps on today's / QSC's instance */
   g_ru_epd_bench.store(v, std::memory_order_relaxed);
 }
 /* lever EPD's dispatch proof for the bench / host test: launches that took the EPD instance since the process started */
@@ -1393,10 +1420,33 @@ static bool ru_abl_launch(int abl, dim3 grid, dim3 blk, unsigned dyn_lds, RadStr
                        (float*)os, oq_pitch, os_ld, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc,      \
                        (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg, scale, thr, cv);           \
     return true;
-    switch (abl) { RU_ABL(1) RU_ABL(2) RU_ABL(3) RU_ABL(4) RU_ABL(8) RU_ABL(15) RU_ABL(16) default: return false; }
+    switch (abl) { RU_ABL(1) RU_ABL(2) RU_ABL(3) RU_ABL(4) RU_ABL(8) RU_ABL(15) RU_ABL(16) RU_ABL(32) default: return false; }
 #undef RU_ABL
   } else {
     (void)abl; (void)grid; (void)blk; (void)dyn_lds; (void)stream; (void)a; (void)b; (void)ab_stride; (void)A_log; (void)dt_bias;
+    (void)state; (void)st_slot; (void)st_head; (void)o; (void)oq; (void)os; (void)oq_pitch; (void)os_ld; (void)cu; (void)sidx;
+    (void)sidx_stride; (void)nacc; (void)z; (void)z_pitch; (void)nw; (void)neps; (void)nact; (void)H; (void)Hg; (void)scale;
+    (void)thr; (void)cv;
+    return false;
+  }
+}
+/* round 49 (bench only): epd 516 = the entry / end stamps (ABL 32) on lever QSC's instance (EPDF 4: the q / k scales once a call, 0
+ * spilled dwords); the served combination alone, plain launch, as ru_abl_launch */
+template <int NM, int NTC, int ANCC, int SDTC, int CVC>
+static bool ru_tlq_launch(dim3 grid, dim3 blk, unsigned dyn_lds, RadStream stream, const void* a, const void* b,
+                          long ab_stride, const void* A_log, const void* dt_bias, void* state, long st_slot, long st_head,
+                          void* o, void* oq, void* os, long oq_pitch, long os_ld, const void* cu, const void* sidx,
+                          long sidx_stride, const void* nacc, const void* z, long z_pitch, const void* nw, float neps,
+                          int nact, int H, int Hg, float scale, float thr, const RuConv& cv) {
+  if constexpr (NM == 2 && ANCC == 1 && SDTC == 0 && CVC == 1) {
+    hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, 516>), grid, blk, dyn_lds,
+                       (hipStream_t)stream, nullptr, nullptr, nullptr, a, b, ab_stride, (const float*)A_log,
+                       (const float*)dt_bias, (float*)state, st_slot, st_head, (unsigned short*)o, (unsigned char*)oq,
+                       (float*)os, oq_pitch, os_ld, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc,
+                       (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg, scale, thr, cv);
+    return true;
+  } else {
+    (void)grid; (void)blk; (void)dyn_lds; (void)stream; (void)a; (void)b; (void)ab_stride; (void)A_log; (void)dt_bias;
     (void)state; (void)st_slot; (void)st_head; (void)o; (void)oq; (void)os; (void)oq_pitch; (void)os_ld; (void)cu; (void)sidx;
     (void)sidx_stride; (void)nacc; (void)z; (void)z_pitch; (void)nw; (void)neps; (void)nact; (void)H; (void)Hg; (void)scale;
     (void)thr; (void)cv;
@@ -1432,7 +1482,11 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
        else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  do { if (epd >= 16 && ru_abl_launch<NM, NTC, ANCC, SDTC, CVC>(epd >> 4, grid, blk, dyn_lds, stream, a, b, ab_stride, A_log, \
+  do { if (epd == 516 && ru_tlq_launch<NM, NTC, ANCC, SDTC, CVC>(grid, blk, dyn_lds, stream, a, b, ab_stride, A_log, dt_bias, \
+                                                                  state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, \
+                                                                  sidx_stride, nacc, z, z_pitch, nw, neps, nact, H, Hg, scale,    \
+                                                                  thr, cv)) break;                                                \
+       if (epd >= 16 && epd != 516 && ru_abl_launch<NM, NTC, ANCC, SDTC, CVC>(epd >> 4, grid, blk, dyn_lds, stream, a, b, ab_stride, A_log, \
                                                              dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, \
                                                              sidx, sidx_stride, nacc, z, z_pitch, nw, neps, nact, H, Hg,    \
                                                              scale, thr, cv)) break;                                        \
