@@ -2174,7 +2174,10 @@ __device__ __forceinline__ void hc_tl_end(int region, unsigned flags) {
     }
 }
 
-template <int RG, bool CH, bool I8, bool TL = false>
+/* qfn-on-ds lever B3D below 32 rows (Qwen loop round 40, QUEUE Q75): PD = bf16 elements of padding after each d row in LDS (0 = today),
+ * hc_up_wx_body's PD note word for word: lane (col, hh) reads row min(col, rows - 1) of a 640 B pitch = 32 mod 64 banks -> up to 4-way
+ * conflicts on every d fragment read; PD 8 = 36 mod 64. Only the LDS layout moves: the same bytes. */
+template <int RG, bool CH, bool I8, bool TL = false, int PD = 0>
 __device__ __forceinline__ void hc_up_w_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
@@ -2184,7 +2187,7 @@ __device__ __forceinline__ void hc_up_w_body(
     float wadd) {
     constexpr int hc = 4;
     constexpr int kLr = 320, kQ = kLr / 4, kStepsQ = kQ / 16;              /* 80 codes, 5 steps a quarter */
-    __shared__ __attribute__((aligned(16))) unsigned short sd[RG * kLr];  /* d [RG][lr] */
+    __shared__ __attribute__((aligned(16))) unsigned short sd[RG * (kLr + PD)];  /* d [RG][lr (+ PD)] */
     __shared__ float s_usc[kWaves][16][4];
     __shared__ unsigned s_arrived;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
@@ -2240,7 +2243,8 @@ __device__ __forceinline__ void hc_up_w_body(
 #pragma unroll
     for (int i = 0; i < (kD8 + kThreads - 1) / kThreads; ++i) {
         const int k = tid + i * kThreads;
-        if (k < kD8) ((uint4*)sd)[k] = dq[i];
+        if constexpr (PD == 0) { if (k < kD8) ((uint4*)sd)[k] = dq[i]; }
+        else { if (k < kD8) *(uint4*)(sd + (long)(k / (kLr / 8)) * (kLr + PD) + 8 * (k % (kLr / 8))) = dq[i]; }   /* lever B3D (Q75) */
     }
     float Npre[2][4];
 #pragma unroll
@@ -2255,7 +2259,7 @@ __device__ __forceinline__ void hc_up_w_body(
     float U[8];
 #pragma unroll
     for (int e = 0; e < 8; ++e) U[e] = 0.0f;
-    const unsigned short* dr = sd + (long)rr * kLr + 40 * hh;
+    const unsigned short* dr = sd + (long)rr * (kLr + PD) + 40 * hh;
 #pragma unroll
     for (int qq = 0; qq < 4; ++qq) {
         v8f D = {};
@@ -2349,6 +2353,17 @@ template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) void hc_up_w_tl_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     asm volatile("" ::: "v117");
     hc_up_w_body<RG, false, I8, true>(R4D_HCW_ARGS);
+}
+/* qfn-on-ds lever B3D below 32 rows (Qwen loop round 40, QUEUE Q75; RADIANCE_FN4_HC_B3X_D=1 / fn4 hc_b3x_d 1): kernel B3 with d's LDS rows
+ * padded by 8 bf16 (hc_up_w_body's PD note), plain and chained; the same bytes */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) void hc_up_w_d_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_w_body<RG, false, I8, false, 8>(R4D_HCW_ARGS);
+}
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) void r4dchain_hc_up_w_d(R4D_HCW_PARAMS) {
+    hc_up_w_body<RG, true, I8, false, 8>(R4D_HCW_ARGS);
+    r4d_chain_done();
 }
 /* (no timeline copy of HCO bit 2's B3: at the 16-waves budget the stamped body spills 18 VGPRs; under r4d_hc_tl B3 stays today's) */
 
@@ -5680,8 +5695,9 @@ static bool hc_b3x_e() {
     return v;
 }
 /* qfn-on-ds lever B3D (Qwen loop round 40, QUEUE Q74): RADIANCE_FN4_HC_B3X_D=1 (read once) = the served B3X (B3E's form) with d's LDS
- * rows padded by 8 bf16 (hc_up_wx_d_kernel; no 4-way bank conflict on the d fragment reads); the same bytes. Only where B3E's form runs.
- * The bench hook r4d_hc_b3x_d(0 / 1) overrides the env (-1 = the env). */
+ * rows padded by 8 bf16 (hc_up_wx_d_kernel; no 4-way bank conflict on the d fragment reads); the same bytes. Where B3E's form runs, and
+ * (QUEUE Q75) in the bi_dec read's kernel B3 below 32 rows (hc_up_w_d_kernel). The bench hook r4d_hc_b3x_d(0 / 1) overrides the env (-1 =
+ * the env). */
 static std::atomic<int> g_hc_b3x_d_bench{-1};
 static bool hc_b3x_d() {
     const int b = g_hc_b3x_d_bench.load(std::memory_order_relaxed);
@@ -9425,10 +9441,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 #undef HC_UPW_GB
     } else if (hcw) {
         unsigned int* const qctr = q ? mctr : nullptr;
+        /* lever B3D below 32 rows (round 40, QUEUE Q75): the bi_dec read's B3 with padded d rows under the same switch as B3X's */
+        const bool b3d_lo = bidec && hc_b3x_d();
 #define HC_UPW_K(RG_, I8_)                                                                       \
-        emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_>                                 \
+        emit_rc = R4D_EMIT(s, (hcg_ch ? (b3d_lo ? &r4dchain_hc_up_w_d<RG_, I8_> : &r4dchain_hc_up_w<RG_, I8_>) \
                                : (RG_ == 16 && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_up_w_tl_kernel<16, I8_> \
                                : (RG_ == 16 && (hc_occ() & 2)) ? &hc_up_w_o_kernel<16, I8_>     \
+                               : b3d_lo ? &hc_up_w_d_kernel<RG_, I8_>                           \
                                : &hc_up_w_kernel<RG_, I8_>),                                     \
                            dim3((unsigned)(n / kHcBCh), (unsigned)((rows + RG_ - 1) / RG_)),    \
                            dim3(kThreads), 0,                                                     \

@@ -26435,7 +26435,9 @@ static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_onc
 static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     const std::string nm = fmt("hc_write + bi_dec hc_read at M=%lld: lever SSB (hc_readv bit 17) byte-identical", (long long)M);
     if (!pl.readv_hc || !pl.norm_hc_wave || !pl.write_hc_vec || !pl.pf2_stages_hc) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
-    if (M < 32 || M > 256) { std::printf("--perfhcssb: 32 <= M <= 256\n"); return; }
+    /* round 40 (QUEUE Q75): with R4D_SELFTEST_SSB=0 (no ss control) the bench runs below 32 rows too -- the bi_dec read's kernel B3 */
+    { const char* se = std::getenv("R4D_SELFTEST_SSB"); const bool nossb = se && *se && std::atoi(se) == 0;
+      if (M < (nossb ? 1 : 32) || M > 256) { std::printf("--perfhcssb: %d <= M <= 256\n", nossb ? 1 : 32); return; } }
     if (iters < 1) iters = 50;
     if (pl.release_hc_ctr) pl.release_hc_ctr();
     HcSsRig g;
