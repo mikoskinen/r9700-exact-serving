@@ -796,6 +796,97 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     rad::fn4::apply_pending(1, da);
 }
 
+/* Qwen loop round 51 (AgentX c32 arm BI5, READY 'AGX ARMS addendum 2'): under BI chunking 5 no step carries a prefill piece
+ * beside a decode row. With a streamed KV group a step that does is a staged pass (kvstream/bind.cpp kv_pass_view: n_tok >
+ * decode rows) and kvstream_step_runs stages EVERY sequence's history one layer at a time from the host mirror -- agx4's
+ * MIXED steps (a ~1k-row tail beside 31 decoding sequences) took 1.27 s each. The same scenario as the chunking-6 case above:
+ * under 5 the prompt runs in alone's pieces, every piece in a step of its own (the one that fits beside the decode rows
+ * under 6 included), the decode rows the step after each, and a short newcomer that fits beside them is admitted alone too.
+ * CONTROL: the chunking-6 case above, where that piece shares the decode rows' step. */
+TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    auto pieces_alone = [&]() {
+        Fixture f;
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(1000, 2);
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) pc.push_back(e.n_tokens);
+            f.commit_plain();
+        }
+        return pc;
+    };
+    struct Out { std::vector<int32_t> got; int lone = 0, shared = 0, mixed = 0, d_steps = 0, after_lone_d = 0, c_shared = 0;
+                 bool c_done = false; };
+    auto run = [&](int bic) {
+        CHECK(rad::fn4::request("sched_bi_chunk", bic, &err));
+        rad::fn4::apply_pending(0, da);
+        CHECK_EQ(rad::fn4::sched_bi_chunk(), bic);
+        Out o;
+        Fixture f;
+        f.build();
+        f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        auto rd = f.request(100, 300);
+        for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;   /* no prefix shared with `a` */
+        rd->ignore_eos = true;
+        const uint64_t d = f.add(std::move(rd));
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+        const uint64_t a = f.submit(1000, 2);
+        bool last_lone = false;
+        uint64_t c = 0;
+        for (int k = 0; k < 80 && f.sch.step(); ++k) {
+            const StepPlan& p = f.sch.plan();
+            int32_t a_tok = 0;
+            bool has_d = false, any_pf = false, any_dec = false, has_c = false;
+            for (const StepEntry& e : p.e) {
+                if (e.seq == a && e.is_prefill) a_tok = e.n_tokens;
+                if (e.seq == d) has_d = true;
+                if (c && e.seq == c && e.is_prefill) has_c = true;
+                if (e.is_prefill) any_pf = true; else any_dec = true;
+            }
+            o.mixed += any_pf && any_dec;    /* a prefill piece beside a decode row: a staged pass of every sequence */
+            if (a_tok > 0) {
+                o.got.push_back(a_tok);
+                if (p.e.size() == 1) ++o.lone; else ++o.shared;
+            }
+            if (has_c && p.e.size() > 1) ++o.c_shared;
+            if (has_c) o.c_done = true;
+            if (has_d) { ++o.d_steps; if (last_lone) ++o.after_lone_d; }
+            last_lone = (a_tok > 0 || has_c) && p.e.size() == 1;
+            f.commit_plain();
+            /* a short newcomer once a's prompt is done: it fits beside d's row under 6 */
+            if (!c && o.got.size() >= 3 && !a_tok) {
+                auto rc = f.request(100, 2);
+                for (int i = 0; i < 100; ++i) rc->prompt[(size_t)i] = 50000 + i;
+                c = f.add(std::move(rc));
+            }
+        }
+        CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+        rad::fn4::apply_pending(1, da);
+        return o;
+    };
+    const std::vector<int32_t> ref = pieces_alone();
+    CHECK(ref.size() >= 3);
+    const Out six = run(6);
+    const Out five = run(5);
+    CHECK(six.got == ref);                /* the control: alone's pieces under 6 ... */
+    CHECK(six.shared >= 1);               /* ... one of them beside d's row */
+    CHECK(six.mixed >= 1);
+    CHECK(six.c_done && six.c_shared >= 1);   /* the newcomer beside d's row */
+    CHECK(five.got == ref);               /* 5: the same pieces (alone's) */
+    CHECK_EQ(five.shared, 0);             /* every piece in a step of its own */
+    CHECK_EQ(five.mixed, 0);              /* no step ever mixes a prefill piece with a decode row */
+    CHECK(five.c_done);
+    CHECK_EQ(five.c_shared, 0);           /* the newcomer alone too */
+    CHECK_EQ(five.after_lone_d, five.lone + 1);   /* every lone step (a's + c's) is followed by the decode rows' */
+    CHECK(five.d_steps >= 10);
+}
+
 /* qfn-on-ds Q18 (Qwen loop round 4, FINDINGS F11): RADIANCE_SCHED_BI_ONE_PF=1 under BI chunking 6. Two short prompts that both
  * fit beside a decoding request's rows: without the env (the control) they share a step; with it no step carries two prefill
  * sequences, both prompts still finish, each in its alone pieces (one piece of 100 rows here), and the decoding request keeps
