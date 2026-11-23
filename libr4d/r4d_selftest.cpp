@@ -171,6 +171,7 @@ struct Plugin {
     void (*x_hc)(int) = nullptr;           /* optional (qfn-on-ds lever HCX: r4d_hc_x) */
     void (*b3x_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3X: r4d_hc_b3x) */
     void (*xlb_hc)(int) = nullptr;         /* optional (qfn-on-ds lever XLB: r4d_hc_x_lb, mask 0..3) */
+    void (*b3e_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3E: r4d_hc_b3x_e) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -259,6 +260,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->x_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x");
     pl->b3x_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x");
     pl->xlb_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x_lb");
+    pl->b3e_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_e");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -26303,7 +26305,10 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
      * group-scale fold on its own tile's scales (bit 2); R4D_SELFTEST_REFX=1 = the reference is the arm's own SSB / HC_X / B3X with XLB
      * off (one process A B A B on the lever alone, the controls as before) */
     const int lbarm = envi("R4D_SELFTEST_XLB", 0) & 3, refx = envi("R4D_SELFTEST_REFX", 0) ? 1 : 0;
+    /* lever B3E (round 38): R4D_SELFTEST_B3E=1 = the arm's B3X with its pass-epilogue operands batched */
+    const int earm = envi("R4D_SELFTEST_B3E", 0) ? 1 : 0;
     if (lbarm && !pl.xlb_hc) { skip(nm.c_str(), "no r4d_hc_x_lb"); return; }
+    if (earm && !pl.b3e_hc) { skip(nm.c_str(), "no r4d_hc_b3x_e"); return; }
     pl.norm_hc_wave(1); pl.write_hc_vec(1); pl.pf2_stages_hc(31);
     g.set(true, false);
     auto arm_set = [&](bool on) {
@@ -26312,6 +26317,7 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
         if (pl.x_hc) pl.x_hc(base ? xarm : 0);
         if (pl.b3x_hc) pl.b3x_hc(base ? barm : 0);
         if (pl.xlb_hc) pl.xlb_hc(on ? lbarm : 0);
+        if (pl.b3e_hc) pl.b3e_hc(on ? earm : 0);
     };
     auto outs = [&](std::vector<uint8_t>& o) {
         o.clear();
@@ -26348,18 +26354,19 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
         for (size_t i = 0; i < o0.size() && i < o1.size(); ++i) diff += o0[i] != o1[i];
         for (size_t i = 0; i < o0.size() && i < oc.size(); ++i) dctl += o0[i] != oc[i];
     }
-    /* XLB under REFX: the arm must dispatch another A' function than the reference (the LB twin ran), every other the same */
+    /* XLB / B3E under REFX: the arm must dispatch another A' (XLB) and / or B3X (B3E) function than the reference, every other the same */
     size_t fdiff = 0;
     for (size_t i = 0; i < f0.size() && i < f1.size(); ++i) fdiff += f0[i] != f1[i];
     if (f0.size() != f1.size()) fdiff += 100;
-    if (lbarm && refx) {
+    const size_t fwant = (size_t)(lbarm ? 1 : 0) + (size_t)(earm ? 1 : 0);
+    if (fwant && refx) {
         std::printf("SSB M=%lld XLB dispatch: %zu / %zu read functions differ from the reference (%s)\n", (long long)M, fdiff, f1.size(),
-                    pl.record ? (fdiff == 1 ? "the LB twin ran" : "NOT the expected one") : "no record hook");
-        ok(fmt("SSB M=%lld XLB: the arm's read dispatches the LB twin (one function differs)", (long long)M).c_str(), !pl.record || fdiff == 1,
-           fmt("%zu differ", fdiff));
+                    pl.record ? (fdiff == fwant ? "the twin(s) ran" : "NOT the expected count") : "no record hook");
+        ok(fmt("SSB M=%lld XLB %d B3E %d: the arm's read dispatches its twin(s) (%zu function(s) differ)", (long long)M, lbarm, earm, fwant).c_str(),
+           !pl.record || fdiff == fwant, fmt("%zu differ", fdiff));
     }
-    std::printf("SSB M=%lld SSB %d HC_X %d B3X %d XLB %d vs reference (%s): %s; control (ss x 2 after the write): %s\n",
-                (long long)M, sarm, xarm, barm, lbarm, refx ? "the same with XLB off" : "bit 17 off, HC_X 0, B3X 0",
+    std::printf("SSB M=%lld SSB %d HC_X %d B3X %d XLB %d B3E %d vs reference (%s): %s; control (ss x 2 after the write): %s\n",
+                (long long)M, sarm, xarm, barm, lbarm, earm, refx ? "the same with XLB / B3E off" : "bit 17 off, HC_X 0, B3X 0",
                 !okb ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical",
                 !okb ? "--" : dctl ? fmt("%zu bytes differ (A' read ss)", dctl).c_str() : "identical (ss not read)");
     /* timing: one write (h, ss in place), then the read alone; reads leave h and ss as they are */
@@ -26379,13 +26386,14 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
         }
     const double a0 = (ta[0][0] + ta[0][1]) / 2, a1 = (ta[1][0] + ta[1][1]) / 2;
     const double w0 = (tw[0][0] + tw[0][1]) / 2, w1 = (tw[1][0] + tw[1][1]) / 2;
-    std::printf("SSB M=%lld %s SSB %d HC_X %d B3X %d XLB %d REFX %d: A' alone %.2f -> %.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f), "
+    std::printf("SSB M=%lld %s SSB %d HC_X %d B3X %d XLB %d B3E %d REFX %d: A' alone %.2f -> %.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f), "
                 "whole read %.2f -> %.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f)\n", (long long)M, g_cold > 0 ? "cold" : "warm", sarm,
-                xarm, barm, lbarm, refx,
+                xarm, barm, lbarm, earm, refx,
                 a0, a1, a0 > 0 ? 100.0 * (a1 - a0) / a0 : 0.0, ta[0][0], ta[0][1], ta[1][0], ta[1][1],
                 w0, w1, w0 > 0 ? 100.0 * (w1 - w0) / w0 : 0.0, tw[0][0], tw[0][1], tw[1][0], tw[1][1]);
     arm_set(false);
     if (pl.xlb_hc) pl.xlb_hc(-1);
+    if (pl.b3e_hc) pl.b3e_hc(-1);
     pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0); pl.pf2_stages_hc(31);
     ok(nm.c_str(), okb && okt && diff == 0 && (sarm == 0 || dctl > 0),
        !okb || !okt ? "launch failed" : diff ? "the arm's bytes differ" : (sarm && !dctl) ? "the control did not move: A' did not read ss" : "");

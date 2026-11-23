@@ -2360,7 +2360,7 @@ __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) voi
  * four re-reads x and quantises). Per (row, channel) the arithmetic is hc_up_w_body's word for word (the same W_up rows / halves,
  * quarter folds, d columns, Npre, sigmoid, mix and 1/4; the quantiser's same reads of the same bf16 x values, wave max, scale,
  * pack and rotation), so every output byte (x, q, qs, rq, rqs) is B3's at every height. */
-template <int RG, bool CH, bool I8, bool TL = false>
+template <int RG, bool CH, bool I8, bool TL = false, bool E = false>
 __device__ __forceinline__ void hc_up_wx_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
@@ -2437,6 +2437,25 @@ __device__ __forceinline__ void hc_up_wx_body(
 
     const unsigned short* dr = sd + (long)rr * kLr + 40 * hh;
     const float inv_hc = 1.0f / (float)hc;
+    /* lever B3E (qfn-on-ds round 38; RADIANCE_FN4_HC_B3X_E=1): the pass epilogue's operands -- per sub-tile this lane's 8 norm weights
+     * and 4 h words -- issued as ONE batch during the pass's last quarter step, ahead of the next pass's W_up prefetch. Today's
+     * epilogue loads them one or two at a time with s_wait_loadcnt 0x0 after each (ISA: ~10 serial round trips a pass, each also
+     * draining the next pass's W_up prefetch issued just before). The same values (w + wadd at the same point), the same arithmetic in
+     * the same order: the same bytes. */
+    float ewv[kPass][hc][2];
+    uint32_t ehv[kPass][hc];
+    auto epi_load = [&](int hf) __attribute__((always_inline)) {
+#pragma unroll
+        for (int sb = 0; sb < kPass; ++sb) {
+            const long iw = iw_of(kPass * hf + sb);
+#pragma unroll
+            for (int c = 0; c < hc; ++c) {
+#pragma unroll
+                for (int a = 0; a < 2; ++a) ewv[sb][c][a] = w[(long)c * n + iw + 2 * hh + a];
+                ehv[sb][c] = *(const uint32_t*)(h + (long)rr * hrow + (long)c * n + iw + 2 * hh);
+            }
+        }
+    };
 #pragma unroll
     for (int hf = 0; hf < kSub / kPass; ++hf) {
         /* round 35 timeline (TL only): word 4 = wave 0 at pass 1's start (pass 0 = word 1 -> 4, pass 1 = word 4 -> 2) */
@@ -2453,6 +2472,7 @@ __device__ __forceinline__ void hc_up_wx_body(
             const int t = hf * 4 + qq;
             /* the scheduler keeps each step's loads in their step (unpinned, it hoists all eight steps' and spills) */
             __builtin_amdgcn_sched_barrier(0);
+            if constexpr (E) { if (qq == 3) epi_load(hf); }   /* lever B3E: before the next pass's prefetch, so its waits leave that in flight */
             if (t + 1 < kSteps) load_t(t + 1);
             v8f D[kPass];
 #pragma unroll
@@ -2479,9 +2499,15 @@ __device__ __forceinline__ void hc_up_wx_body(
             uint32_t hv2[4];
 #pragma unroll
             for (int c = 0; c < hc; ++c) {
+                if constexpr (E) {
+#pragma unroll
+                    for (int a = 0; a < 2; ++a) wv[a][c] = ewv[sb][c][a] + wadd;
+                    hv2[c] = ehv[sb][c];
+                } else {
 #pragma unroll
                 for (int a = 0; a < 2; ++a) wv[a][c] = w[(long)c * n + iw + 2 * hh + a] + wadd;
                 hv2[c] = *(const uint32_t*)(h + (long)rr * hrow + (long)c * n + iw + 2 * hh);
+                }
             }
             float Npre[2][4];
 #pragma unroll
@@ -2526,9 +2552,9 @@ __device__ __forceinline__ void hc_up_wx_body(
     }
     hc_tl_end<TL>(1, 1u);
 }
-template <int RG, bool I8>
+template <int RG, bool I8, bool E = false>
 __global__ __launch_bounds__(kThreads) void hc_up_wx_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
-    hc_up_wx_body<RG, false, I8>(R4D_HCW_ARGS);
+    hc_up_wx_body<RG, false, I8, false, E>(R4D_HCW_ARGS);
 }
 /* qfn-on-ds round 35 (bench only, r4d_hc_tl): B3X with the phase timeline, region 1 (words 0 start, 1 d staged, 4 pass 1 start
  * (wave 0), 2 passes done (thread 0), 3 the quantiser's barrier, 5 end) */
@@ -2536,9 +2562,9 @@ template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) void hc_up_wx_tl_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_wx_body<RG, false, I8, true>(R4D_HCW_ARGS);
 }
-template <int RG, bool I8>
+template <int RG, bool I8, bool E = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_wx(R4D_HCW_PARAMS) {
-    hc_up_wx_body<RG, true, I8>(R4D_HCW_ARGS);
+    hc_up_wx_body<RG, true, I8, false, E>(R4D_HCW_ARGS);
     r4d_chain_done();
 }
 
@@ -5294,6 +5320,22 @@ static int hc_b3x_min() {
         const char* e = std::getenv("RADIANCE_FN4_HC_B3X_MIN");
         const int n = (e && *e) ? std::atoi(e) : 0;
         return n > 0 ? n : 32;
+    }();
+    return v;
+}
+/* qfn-on-ds lever B3E (Qwen loop round 38): RADIANCE_FN4_HC_B3X_E=1 (read once) = B3X's pass epilogue operands as one batch in the pass's
+ * last quarter step (no serial s_wait_loadcnt 0 chain, the next pass's W_up prefetch left in flight); the same bytes. The bench hook
+ * r4d_hc_b3x_e(0 / 1) overrides the env (-1 = the env). */
+static std::atomic<int> g_hc_b3x_e_bench{-1};
+static bool hc_b3x_e() {
+    const int b = g_hc_b3x_e_bench.load(std::memory_order_relaxed);
+    if (b >= 0) return b == 1;
+    static const bool v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_B3X_E");
+        const bool on = e && e[0] == '1' && e[1] == '\0';
+        if (on) std::fprintf(stderr, "radiance: libr4d: lever B3E (RADIANCE_FN4_HC_B3X_E): B3X's pass epilogue operands issued as one batch "
+                                     "in the pass's last quarter step (the same bytes)\n");
+        return on;
     }();
     return v;
 }
@@ -8879,10 +8921,10 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         /* qfn-on-ds lever B3X (hc_readv bit 16): kernel B3 with a whole 128-channel quantiser group a block; the same bytes */
         unsigned int* const qctr = q ? mctr : nullptr;
         fc_add(kFcB3X, (long)rows, bidec);
-#define HC_UPWX_K(I8_)                                                                           \
-        R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_wx<16, I8_>                                         \
-                     : g_hc_tl.load(std::memory_order_relaxed) ? &hc_up_wx_tl_kernel<16, I8_>       \
-                     : &hc_up_wx_kernel<16, I8_>),                                                  \
+#define HC_UPWX_K(I8_, E_)                                                                       \
+        R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_wx<16, I8_, E_>                                     \
+                     : (!E_ && g_hc_tl.load(std::memory_order_relaxed)) ? &hc_up_wx_tl_kernel<16, I8_> \
+                     : &hc_up_wx_kernel<16, I8_, E_>),                                              \
                  dim3((unsigned)(n / kUpTB), (unsigned)((rows + 15) / 16)), dim3(kThreads), 0,    \
                  (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,          \
                  (const unsigned short*)h->data, (const float*)w->data,                          \
@@ -8892,7 +8934,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                  rq ? (float*)rqs->data : nullptr, qctr, (long)rows, (long)n, (long)lr,           \
                  (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,                     \
                  (long)rsrow, wadd)
-        emit_rc = i8 ? HC_UPWX_K(true) : HC_UPWX_K(false);
+        if (hc_b3x_e()) emit_rc = i8 ? HC_UPWX_K(true, true) : HC_UPWX_K(false, true);   /* lever B3E */
+        else            emit_rc = i8 ? HC_UPWX_K(true, false) : HC_UPWX_K(false, false);
 #undef HC_UPWX_K
     } else if (hcw && bidec && rows > 16 && !hcg_ch && b3r_gpb(rows) > 1) {
         /* qfn-on-ds lever B3R (hc_readv bits 11-12): B3 with GPB 16-row groups a block, W_up loaded once a block */
@@ -9017,6 +9060,8 @@ extern "C" void r4d_hc_x(int m) { g_hc_x_bench.store(hc_x_ok(m), std::memory_ord
 /* qfn-on-ds lever XLB (bench / test hook): HCX's PRE form at NTS 4, mask 0..3 (bit 1 LDS-only tile barriers, bit 2 the own-tile scale
  * fold), -1 = the env */
 extern "C" void r4d_hc_x_lb(int m) { g_hc_x_lb_bench.store(m < 0 ? -1 : (m & 3), std::memory_order_relaxed); }
+/* qfn-on-ds lever B3E (bench / test hook): B3X's batched pass-epilogue operands on (1) / off (0), -1 = the env */
+extern "C" void r4d_hc_b3x_e(int on) { g_hc_b3x_e_bench.store(on < 0 ? -1 : (on > 0 ? 1 : 0), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3X (bench / test hook): kernel B3 as hc_up_wx on (1) without hc_readv bit 16, or off (0) */
 extern "C" void r4d_hc_b3x(int on) { g_hc_b3x_bench.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
