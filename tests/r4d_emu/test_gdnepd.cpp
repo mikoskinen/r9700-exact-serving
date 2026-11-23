@@ -179,8 +179,8 @@ int main() {
     const int64_t real = s.cu[(size_t)N - 1];
     for (int form : { 3, 2, 1 }) {
         const char* fn = form == 3 ? "had (NORM 3, rotated int8)" : form == 2 ? "int8 (NORM 2)" : "E4M3 (NORM 1)";
-        Run a, b, c, q;
-        init(a, s, form); init(b, s, form); init(c, s, form); init(q, s, form);
+        Run a, b, c, q, g;
+        init(a, s, form); init(b, s, form); init(c, s, form); init(q, s, form); init(g, s, form);
         std::string why;
         long long moved_o = 0;
         for (int st = 0; st < 2 && why.empty(); ++st) {
@@ -198,21 +198,28 @@ int main() {
             const long long l3 = r4d_gdn_epd_launches();
             const int rq = step(q, s, form, st, -1);
             const long long l4 = r4d_gdn_epd_launches();
+            /* lever GRP (round 41, QUEUE Q80): EPD level 3 */
+            r4d_gdn_epd(3);
+            const int rg = step(g, s, form, st, -1);
+            const long long l5 = r4d_gdn_epd_launches();
             r4d_gdn_epd(-1);
-            if (ra || rb || rc || rq) { why = fmt("step %d rc %d / %d / %d / %d", st, ra, rb, rc, rq); break; }
+            if (ra || rb || rc || rq || rg) { why = fmt("step %d rc %d / %d / %d / %d / %d", st, ra, rb, rc, rq, rg); break; }
+            check(l5 == l4 + 1, fmt("%s step %d: dispatch (EPD launches +%lld GRP)", fn, st, l5 - l4));
             check(l1 == l0 && l2 == l1 + 1 && l4 == l3 + 1, fmt("%s step %d: dispatch (EPD launches +%lld unset, +%lld EPD, +%lld QKS)", fn, st,
                                                                l1 - l0, l2 - l1, l4 - l3));
             const std::string d = cmp(a, b, real);
             if (!d.empty()) { why = fmt("step %d: %s", st, d.c_str()); break; }
             const std::string dq = cmp(a, q, real);
             if (!dq.empty()) { why = fmt("step %d (QKS): %s", st, dq.c_str()); break; }
+            const std::string dg = cmp(a, g, real);
+            if (!dg.empty()) { why = fmt("step %d (GRP): %s", st, dg.c_str()); break; }
             for (auto v : a.o) moved_o += v != 0;
             if (st == 0) {
                 const std::string dc = cmp(a, c, real);
                 check(!dc.empty(), fmt("%s NEGATIVE CONTROL: one changed gate element is seen (%s)", fn, dc.c_str()));
             }
         }
-        check(why.empty() && moved_o > 0, fmt("%s: EPD and EPD + QKS = today's form, every byte, two steps (o non-zero %lld)", fn, moved_o), why);
+        check(why.empty() && moved_o > 0, fmt("%s: EPD, EPD + QKS and EPD + GRP = today's form, every byte, two steps (o non-zero %lld)", fn, moved_o), why);
     }
     std::printf("r4d_emu_gdnepd: %d cases, %d failed\n", g_cases, g_fail);
     return g_fail ? 1 : 0;

@@ -945,6 +945,8 @@
  *                   its token loop (two barriers a call, no spill) instead of inside every token; the same bytes; 0 today
  *                   2 = 1 + lever QKS (QUEUE Q79): each token's l2-normalised q and k staged once in LDS as f32 instead of
  *                   converted, summed and scaled by every thread in every token; the same bytes
+ *                   3 = 1 + lever GRP (QUEUE Q80): the A replayed tokens' factor blocks staged into LDS in one batch beside
+ *                   the state load instead of one block loaded at the head of each replay step; the same bytes
  *                                                                                                  RADIANCE_GDN_EPD
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),

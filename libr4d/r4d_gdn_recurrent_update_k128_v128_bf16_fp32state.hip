@@ -261,8 +261,12 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   /* qfn-on-ds lever QKS (Qwen loop round 41, QUEUE Q79; EPD == 2 = EPD + QKS): each token's l2-normalised q and k staged ONCE in LDS as f32
    * (the per-(token, half) sums by 2T lanes in the per-row order, the scale and each element's product by one thread) instead of every one of the
    * 256 threads converting, summing and scaling the same 128 + 128 values in every token; the loop loads the f32 products. The same bytes. */
-  __shared__ float sqk[EPD >= 2 ? RU_CVT * 2 * RU_K : 1];  // per token: normalised q [128] then k [128]
-  __shared__ float sqp[EPD >= 2 ? RU_CVT * 4 : 1];         // per (token, half): sum q^2, sum k^2
+  __shared__ float sqk[EPD == 2 ? RU_CVT * 2 * RU_K : 1];  // per token: normalised q [128] then k [128]
+  __shared__ float sqp[EPD == 2 ? RU_CVT * 4 : 1];         // per (token, half): sum q^2, sum k^2
+  /* qfn-on-ds lever GRP (Qwen loop round 41, QUEUE Q80; EPD == 3 = EPD + GRP): the A accepted tokens' replay factor blocks staged into LDS
+   * at once, beside the state load, instead of one token's block loaded from memory at the head of each replay step (a chain of A memory
+   * latencies that grows with load: slot g1's replay step 4.5-9 us at 24-32 sequences, 0.05-0.5 us at 1-16); the replay reads the same values. */
+  __shared__ __attribute__((aligned(16))) float sfr[EPD == 3 ? RU_CVT * RU_FSTR : 4];
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -428,9 +432,26 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     for (int j = 0; j < RU_HK; j += 8) ru_load8<NT, SDT>(&h[j], p + j);
   }
 
+  /* lever GRP: the replay's factor blocks into LDS in one batch (nacc is uniform a workgroup; above RU_CVT the memory path as today) */
+  bool grp_lds = false;
+  if constexpr (EPD == 3) {
+    grp_lds = nacc <= RU_CVT;
+    if (grp_lds) {
+      static_assert(RU_FSTR % 4 == 0, "whole float4s a factor block");
+#if defined(R4D_EMU_GRP_MUTATE)   /* r4d_emu_gdnepd's mutation build only: the last float4 of the batch left out */
+      const int nv4 = nacc * (RU_FSTR / 4) - 1;
+#else
+      const int nv4 = nacc * (RU_FSTR / 4);
+#endif
+      for (int i = tid; i < nv4; i += THR)
+        *(float4*)(sfr + 4 * i) = *(const float4*)((const float*)fr + 4 * (size_t)i);
+      __syncthreads();
+    }
+  }
+
   if (ANC) {
     for (int t = 0; t < nacc; ++t) {
-      const ST* f = fr + (size_t)t * RU_FSTR;
+      const ST* f = (EPD == 3 && grp_lds ? (const ST*)sfr : fr) + (size_t)t * RU_FSTR;
       float kk[RU_HK];
 #pragma unroll
       for (int j = 0; j < RU_HK; j += 8) ru_load8<0, SDT>(&kk[j], f + grp * RU_K + k0 + j);
@@ -515,7 +536,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   }
 
   /* lever QKS: the T tokens' normalised q / k, once (the per-row path's own sums, order and expressions -- see sqk) */
-  if constexpr (EPD >= 2) {
+  if constexpr (EPD == 2) {
     if (tid < 2 * T) {
       const int ut = tid >> 1, uk0 = (tid & 1) * RU_HK;
       const unsigned short* qp = cvq + ut * RU_K + uk0;
@@ -593,7 +614,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
 
     float qq[RU_HK], kk[RU_HK];
-    if constexpr (EPD >= 2) {   /* lever QKS: the token's normalised q / k, staged once */
+    if constexpr (EPD == 2) {   /* lever QKS: the token's normalised q / k, staged once */
       const float* fq = sqk + t * 2 * RU_K + k0;
 #pragma unroll
       for (int j = 0; j < RU_HK; j += 4) {
@@ -1128,21 +1149,23 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
  * fp32 state) with its per-token epilogue -- row norm, bf16 output, the out projection's codes and scales -- deferred past the token
  * loop (the kernel's EPD note); the same bytes. The bench / switch hook r4d_gdn_epd(0 / 1) overrides the env (-1 = the env). */
 static std::atomic<int> g_ru_epd_bench{-1};
-/* (round 41, QUEUE Q79) 2 = EPD + lever QKS (each token's normalised q / k staged once in LDS as f32; the same bytes) */
+/* (round 41, QUEUE Q79) 2 = EPD + lever QKS (each token's normalised q / k staged once in LDS as f32; the same bytes); (QUEUE Q80) 3 = EPD +
+ * lever GRP (the replay's factor blocks staged into LDS at once; the same bytes) */
 static int ru_epd() {
   const int b = g_ru_epd_bench.load(std::memory_order_relaxed);
   if (b >= 0) return b;
   static const int v = [] {
     const char* e = getenv("RADIANCE_GDN_EPD");
-    const int on = (e && (e[0] == '1' || e[0] == '2') && e[1] == '\0') ? e[0] - '0' : 0;
+    const int on = (e && e[0] >= '1' && e[0] <= '3' && e[1] == '\0') ? e[0] - '0' : 0;
     if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=%d): the GDN decode update's per-token norm / output / "
                             "codes after its token loop (two barriers a call instead of two to four a token)%s; the same bytes\n", on,
-                    on == 2 ? " + lever QKS (each token's normalised q / k staged once in LDS)" : "");
+                    on == 2 ? " + lever QKS (each token's normalised q / k staged once in LDS)"
+                            : on == 3 ? " + lever GRP (the replay's factor blocks staged into LDS at once)" : "");
     return on;
   }();
   return v;
 }
-extern "C" void r4d_gdn_epd(int on) { g_ru_epd_bench.store(on < 0 ? -1 : (on > 2 ? 2 : on), std::memory_order_relaxed); }
+extern "C" void r4d_gdn_epd(int on) { g_ru_epd_bench.store(on < 0 ? -1 : (on > 3 ? 3 : on), std::memory_order_relaxed); }
 /* lever EPD's dispatch proof for the bench / host test: launches that took the EPD instance since the process started */
 static std::atomic<long long> g_ru_epd_launches{0};
 extern "C" long long r4d_gdn_epd_launches() { return g_ru_epd_launches.load(std::memory_order_relaxed); }
@@ -1172,7 +1195,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
   /* lever EPD: anchor + fp32 state only (its instances); every other form unchanged */
-  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS */
+  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS, 3 EPD + GRP */
   if (epd) g_ru_epd_launches.fetch_add(1, std::memory_order_relaxed);
   const unsigned dyn_lds = (unsigned)g_ru_dyn_lds.load(std::memory_order_relaxed);   /* bench only (Q13 read); 0 = today */
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
@@ -1180,7 +1203,8 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
        else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  do { if ((ANCC) && !(SDTC) && epd == 2) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 2 : 0)); \
+  do { if ((ANCC) && !(SDTC) && epd == 3) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 3 : 0)); \
+       else if ((ANCC) && !(SDTC) && epd == 2) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 2 : 0)); \
        else if ((ANCC) && !(SDTC) && epd) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
        else                               RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, 0); } while (0)
 #define RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, EPC)                                           \

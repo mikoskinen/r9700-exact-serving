@@ -9651,12 +9651,13 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     }
     if (!std::strcmp(name, "gdn_epd")) {   /* qfn-on-ds lever EPD (round 41, r4d_gdn_recurrent_update_*.hip): the GDN update's epilogue after its loop;
                                             * 2 = + lever QKS (each token's normalised q / k staged once in LDS) */
-        if (value < 0 || value > 2) return -1;
+        if (value < 0 || value > 3) return -1;   /* 3 = EPD + lever GRP (round 41, QUEUE Q80) */
         r4d_gdn_epd(value);
         static std::atomic<int> said{0};
         if (value >= 1 && said.exchange(value) != value)
             std::fprintf(stderr, "radiance: libr4d: lever EPD (gdn_epd %d): the GDN decode update's per-token norm / output / codes after its "
-                                 "token loop%s (the same bytes)\n", value, value == 2 ? " + lever QKS (q / k normalised once a token)" : "");
+                                 "token loop%s (the same bytes)\n", value, value == 2 ? " + lever QKS (q / k normalised once a token)"
+                                 : value == 3 ? " + lever GRP (the replay's factor blocks staged at once)" : "");
         return 1;
     }
     if (!std::strcmp(name, "hc_b3x_p")) {   /* qfn-on-ds lever B3P (round 39): B3X's group-pair form from N rows, 0 off */
