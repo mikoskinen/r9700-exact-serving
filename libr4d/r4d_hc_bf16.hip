@@ -1343,7 +1343,11 @@ __device__ __forceinline__ void hc_rot_group(float* v, int lane, unsigned char* 
  * block has published `d` and the scales. */
 /* Tickets, A blocks done, B blocks past the wait; then decode form G's tile counters. */
 constexpr unsigned kHcGTilesMax = 192;   /* tiles x row groups */
-constexpr unsigned kHcSyncCtr = 3 + kHcGTilesMax;
+/* qfn-on-ds lever HRF (Qwen loop round 44): behind the tile counters, hc_read_hrf's own -- [0] tickets, [1] blocks finished, [2 + g]
+ * row group g's kernel A' blocks done (g < kHcHrfGroups); the last block to finish clears them for the next launch on the stream. */
+constexpr unsigned kHcHrfGroups = 14;
+constexpr unsigned kHcHrfCtr = 2 + kHcHrfGroups;
+constexpr unsigned kHcSyncCtr = 3 + kHcGTilesMax + kHcHrfCtr;
 
 __device__ __forceinline__ void hc_role_wait(unsigned int* __restrict__ sync, unsigned na,
                                              unsigned nb_all) {
@@ -2382,26 +2386,48 @@ __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_w_d(R4D_HCW_PARAMS) {
  * fragment read is lane (col, hh) at row col: a 320-element row = 640 B = 160 dwords = 32 mod 64 banks, so in each 8-lane quarter of a
  * ds_load_b128 four lanes share one 4-bank set (a 4-way conflict on all 40 reads a wave); PD 8 = 164 dwords = 36 mod 64 puts the 8
  * lanes on 8 distinct sets. Only the LDS layout moves: the same values into the same WMMAs in the same order -> the same bytes. */
-template <int RG, bool CH, bool I8, bool TL = false, bool E = false, int AB = 0, int PD = 0>
+/* qfn-on-ds lever HRF (Qwen loop round 44): TK = the block's (x, y) from the caller (tkx, tky: hc_read_hrf's ticket) and, after the
+ * W_up prologue, a wait for its own row group's kernel A' blocks (gw reaching gwn, hc_hrf_wait) instead of the chained form's wait;
+ * false in every other instance (the same code). */
+__device__ __forceinline__ void hc_hrf_wait(const unsigned int* __restrict__ gw, unsigned gwn);
+/* lever HRF: a TK instance keeps its LDS arrays in the launch's dynamic LDS at these byte offsets (one role a block, so the A' and
+ * B3X layouts share it; hc_read_hrf launches with kHrfLds bytes) -- the static arrays of a TK instance shrink to one element */
+extern __shared__ __attribute__((aligned(16))) unsigned char hc_hrf_dyn[];
+constexpr unsigned kHrfA16(unsigned b) { return (b + 15u) & ~15u; }
+constexpr unsigned kHrfARed   = kHrfA16(4u * 2560u);                          /* A': sW [kHcGN] f32 at 0 */
+constexpr unsigned kHrfAPart  = kHrfARed + kHrfA16(4u * 2u * 8u * 16u * 16u);  /* s_red [2][kWaves][16][16] */
+constexpr unsigned kHrfAScale = kHrfAPart + kHrfA16(4u * 8u * 16u);           /* s_part [kWaves][16] */
+constexpr unsigned kHrfALast  = kHrfAScale + kHrfA16(4u * 16u);               /* s_scale [16] */
+constexpr unsigned kHrfAEnd   = kHrfALast + kHrfA16(4u * 16u);                /* s_last [<= 16] */
+constexpr unsigned kHrfBUsc   = kHrfA16(2u * 16u * (320u + 8u));              /* B3X: sd [16][320 + 8] bf16 at 0 */
+constexpr unsigned kHrfBSx    = kHrfBUsc + kHrfA16(4u * 4u * 8u * 16u * 4u);  /* s_usc [kSub][kWaves][16][4] */
+constexpr unsigned kHrfBEnd   = kHrfBSx + kHrfA16(2u * 16u * 128u);           /* sx [16][kUpTB] bf16 */
+constexpr unsigned kHrfLds    = kHrfAEnd > kHrfBEnd ? kHrfAEnd : kHrfBEnd;
+template <int RG, bool CH, bool I8, bool TL = false, bool E = false, int AB = 0, int PD = 0, bool TK = false>
 __device__ __forceinline__ void hc_up_wx_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
     unsigned short* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ qs,
     unsigned char* __restrict__ rq, float* __restrict__ rqs, unsigned int* __restrict__ ctr,
     long rows, long n, long lr, long hrow, long xrow, long qrow, long srow, long rqrow, long rsrow,
-    float wadd) {
+    float wadd, int tkx = 0, int tky = 0, const unsigned int* __restrict__ gw = nullptr, unsigned gwn = 0) {
     (void)ctr;
     constexpr int hc = 4;
     constexpr int kLr = 320, kQ = kLr / 4, kStepsQ = kQ / 16;
     constexpr int kSub = kUpTB / kHcBCh;                                  /* 4 sub-tiles of 4 channels a wave */
-    __shared__ __attribute__((aligned(16))) unsigned short sd[RG * (kLr + PD)];  /* d [RG][lr (+ PD)] */
-    __shared__ float s_usc[kSub][kWaves][16][4];
-    __shared__ __attribute__((aligned(16))) unsigned short sx[RG][kUpTB]; /* this block's x rows (the quantiser's input) */
+    __shared__ __attribute__((aligned(16))) unsigned short sd_s[TK ? 8 : RG * (kLr + PD)];  /* d [RG][lr (+ PD)] */
+    __shared__ float s_usc_s[TK ? 1 : kSub][kWaves][16][4];
+    __shared__ __attribute__((aligned(16))) unsigned short sx_s[TK ? 1 : RG][kUpTB]; /* this block's x rows (the quantiser's input) */
+    /* lever HRF: a TK instance's arrays in the dynamic LDS (kHrfB*; RG 16, PD 8 there) */
+    static_assert(!TK || (RG == 16 && PD == 8 && kSub == 4 && kLr == 320), "lever HRF's B3X layout");
+    unsigned short* const sd = TK ? (unsigned short*)hc_hrf_dyn : sd_s;
+    float (*const s_usc)[kWaves][16][4] = TK ? (float (*)[kWaves][16][4])(hc_hrf_dyn + kHrfBUsc) : s_usc_s;
+    unsigned short (*const sx)[kUpTB] = TK ? (unsigned short (*)[kUpTB])(hc_hrf_dyn + kHrfBSx) : sx_s;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     hc_tl_put<TL>(1, 0);
     const int col = lane & 15, hh = lane >> 4;
-    const long i0 = (long)blockIdx.x * kUpTB;
-    const long r0 = (long)blockIdx.y * RG;
+    const long i0 = TK ? (long)tkx * kUpTB : (long)blockIdx.x * kUpTB;
+    const long r0 = TK ? (long)tky * RG : (long)blockIdx.y * RG;
     rows = rows - r0 < RG ? rows - r0 : RG;
     dbuf += r0 * kLr;
     h += r0 * hrow;
@@ -2436,6 +2462,7 @@ __device__ __forceinline__ void hc_up_wx_body(
         }
     }
     if constexpr (CH) r4d_chain_wait();
+    if constexpr (TK) hc_hrf_wait(gw, gwn);   /* lever HRF: this row group's d is written (its A' blocks done) */
 
     /* ---- one batch: d (uint4, contiguous rows) into LDS */
     constexpr int kD8 = RG * kLr / 8;
@@ -3796,35 +3823,44 @@ void r4dchain_hc_read_g16p_down(const unsigned short* __restrict__ h, const floa
  * every engine instance = no instruction changes): bit 1 = N's fragments are h's raw words (no norm weight load, scale multiply or
  * bf16 rounding: the N build's VALU removed), bit 2 = W_down's e4m3 words go into the WMMA as raw bf16 bits (no e4m3 -> bf16
  * conversion). r4d_hc_ab picks them for r4d_selftest --perfhcssb's HXT cells. */
-template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false, int LB = 0, int AB = 0>
+/* qfn-on-ds lever HRF (Qwen loop round 44): TK = the block's (x, y) come from the caller (tkx, tky: hc_read_hrf's ticket) instead of
+ * blockIdx; false in every other instance (the same code). */
+template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false, int LB = 0, int AB = 0, bool TK = false>
 __device__ __forceinline__ void hc_read_g16x_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
     unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
     float* __restrict__ scaleout, float* __restrict__ part, unsigned int* __restrict__ tctr,
-    long lr, long hrow, long irow, float eps, float wadd, int ntd, long rows) {
-    __shared__ float sW[kHcGN];
-    __shared__ float s_red[2][kWaves][16][16];
-    __shared__ float s_part[kWaves][RG];
-    __shared__ float s_scale[RG];
-    __shared__ unsigned s_last[NTS];
+    long lr, long hrow, long irow, float eps, float wadd, int ntd, long rows, int tkx = 0, int tky = 0) {
+    __shared__ float sW_s[TK ? 1 : kHcGN];
+    __shared__ float s_red_s[TK ? 1 : 2][kWaves][16][16];
+    __shared__ float s_part_s[TK ? 1 : kWaves][RG];
+    __shared__ float s_scale_s[TK ? 1 : RG];
+    __shared__ unsigned s_last_s[TK ? 1 : NTS];
+    /* lever HRF: a TK instance's arrays in the dynamic LDS (kHrfA*) */
+    static_assert(!TK || (RG == 16 && NTS <= 16 && kWaves == 8 && kHcGN == 2560), "lever HRF's A' layout");
+    float* const sW = TK ? (float*)hc_hrf_dyn : sW_s;
+    float (*const s_red)[kWaves][16][16] = TK ? (float (*)[kWaves][16][16])(hc_hrf_dyn + kHrfARed) : s_red_s;
+    float (*const s_part)[RG] = TK ? (float (*)[RG])(hc_hrf_dyn + kHrfAPart) : s_part_s;
+    float* const s_scale = TK ? (float*)(hc_hrf_dyn + kHrfAScale) : s_scale_s;
+    unsigned* const s_last = TK ? (unsigned*)(hc_hrf_dyn + kHrfALast) : s_last_s;
     constexpr int  hc = 4;
     constexpr long HN = hc * kHcGN;
     constexpr long NG = HN / r4d_hc8::kDownGroup;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     hc_tl_put<TL>(0, 0);
-    const int pb = (int)blockIdx.x / hc, c = (int)blockIdx.x % hc;
+    const int pb = TK ? tkx / hc : (int)blockIdx.x / hc, c = TK ? tkx % hc : (int)blockIdx.x % hc;
     const int nsets = ntd / NTS;
     const bool itile = pb == nsets;
     const int nt_here = itile ? 1 : NTS;
-    const long r0 = (long)blockIdx.y * RG;
+    const long r0 = TK ? (long)tky * RG : (long)blockIdx.y * RG;
     const int  rr = (int)(rows - r0 < RG ? rows - r0 : RG);
     h += r0 * hrow;
     dout += r0 * lr;
     if (inj) inj += r0 * irow;
     if (scaleout) scaleout += r0 * kHcMax;
-    part += (long)blockIdx.y * (ntd + 1) * hc * RG * kHcGTile;
-    tctr += (long)blockIdx.y * (ntd + 1);
+    part += (TK ? (long)tky : (long)blockIdx.y) * (ntd + 1) * hc * RG * kHcGTile;
+    tctr += (TK ? (long)tky : (long)blockIdx.y) * (ntd + 1);
     const int col = lane & 15, hh = lane >> 4;
     const long kslice = (long)c * kHcGN + (long)wave * kHcGSlice;
     const long kl = kslice + 16 * hh;
@@ -4147,6 +4183,83 @@ void r4dchain_hc_read_g16_down(const unsigned short* __restrict__ h, const float
     r4d_chain_done();
 }
 
+
+/* ============================================================== lever HRF: the HXS read's A' and B3X as one grid, a row group at a time
+ *
+ * qfn-on-ds lever HRF (Qwen loop round 44; RADIANCE_FN4_HC_RF = the row floor, fn4 switch hc_rf): the served bi_dec read from 32 rows is
+ * two launches -- kernel A' (HXS: hc_read_g16x_down, 24 blocks a 16-row group) and kernel B3X (B3D: hc_up_wx, 20 blocks a group) -- with
+ * the kernel boundary as the barrier between them. But B3X's blocks of row group g read only group g's `d` (and the write's scales, `h`
+ * and the weights, all ready before the read starts): nothing of the other groups. pbs1's stamps (c32, 128 rows): A' 37.1 us after its
+ * predecessor, then B3X 19.6 us after A''s last block; A''s 192 blocks run 2.6 rounds of 96 slots, so the last round's slots idle while
+ * its last blocks finish, and B3X's 160 blocks start only after that (slot t1: 5.1 us between A''s last block and B3X's first unchained).
+ * Here one launch holds both: a block's role comes from a ticket (lever F's rule: every A' ticket is handed out before any B3X ticket, so
+ * the blocks a B3X block waits for are resident -- no deadlock, no co-residency assumed), A' tickets in group order, and a B3X block of
+ * group g waits only for group g's 24 A' blocks (hc_hrf_wait), so the first groups' up products run in the slots A''s last round leaves.
+ * Each block runs the served body word for word (hc_read_g16x_down_body<16, 4, PRE, LB 3>, hc_up_wx_body<16, E, PD 8>) on its ticket's
+ * (x, y): every output byte is the two launches'. The chained form waits for its predecessor before the ticket (a ticket never races a
+ * previous launch's reset); the last block to finish clears the counters (one stream: launches never overlap past the chain). */
+__device__ __forceinline__ void hc_hrf_wait(const unsigned int* __restrict__ gw, unsigned gwn) {
+    if (threadIdx.x == 0) {
+        const unsigned long t0 = wall_clock64();
+        /* relaxed while polling, acquired once after (as hc_role_wait) */
+        while (__hip_atomic_load(gw, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < gwn) {
+            __builtin_amdgcn_s_sleep(1);
+            if (wall_clock64() - t0 > 50000000ull) __builtin_trap();   /* 0.5 s: a counter fault, never a stale `d` */
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   /* every wave: a workgroup's waves can sit on both CUs of a WGP */
+}
+#define HC_HRF_DECL const unsigned short* __restrict__ h, const float* __restrict__ w,                                   \
+                    const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,          \
+                    unsigned short* __restrict__ dbuf, unsigned short* __restrict__ inj, float* __restrict__ scale,     \
+                    float* __restrict__ part, unsigned int* __restrict__ tctr, long lr, long hrow, long irow, float eps, \
+                    float wadd, int ntd, long rows, const unsigned char* __restrict__ upv, long uld,                    \
+                    unsigned short* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ qs,              \
+                    unsigned char* __restrict__ rq, float* __restrict__ rqs, unsigned int* __restrict__ qctr, long n,   \
+                    long xrow, long qrow, long srow, long rqrow, long rsrow, unsigned int* __restrict__ hrf,            \
+                    unsigned na, unsigned gxa, unsigned gxb, unsigned nag, unsigned tot
+#define HC_HRF_ARGS h, w, downv, dld, injw, dbuf, inj, scale, part, tctr, lr, hrow, irow, eps, wadd, ntd, rows, upv, uld, x, q, qs, rq, \
+                    rqs, qctr, n, xrow, qrow, srow, rqrow, rsrow, hrf, na, gxa, gxb, nag, tot
+template <bool I8, bool CH>
+__device__ __forceinline__ void hc_read_hrf_body(HC_HRF_DECL) {
+    if constexpr (CH) r4d_chain_wait();
+    __shared__ unsigned s_tk;
+    if (threadIdx.x == 0) s_tk = __hip_atomic_fetch_add(&hrf[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    const unsigned tk = s_tk;
+    if (tk < na) {
+        const int gy = (int)(tk / gxa), gx = (int)(tk % gxa);
+        hc_read_g16x_down_body<16, false, 4, true, false, false, 3, 0, true>(h, w, downv, dld, injw, dbuf, inj, scale, part, tctr, lr,
+                                                                          hrow, irow, eps, wadd, ntd, rows, gx, gy);
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) __hip_atomic_fetch_add(&hrf[2 + gy], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+        const unsigned b = tk - na;
+        const int gy = (int)(b / gxb), gx = (int)(b % gxb);
+        hc_up_wx_body<16, false, I8, false, true, 0, 8, true>(upv, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, qctr, rows, n, lr, hrow,
+                                                               xrow, qrow, srow, rqrow, rsrow, wadd, gx, gy, &hrf[2 + gy], nag);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && __hip_atomic_fetch_add(&hrf[1], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1u == tot) {
+        const unsigned ng = (unsigned)((rows + 15) / 16);
+        __hip_atomic_store(&hrf[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(&hrf[1], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        for (unsigned g = 0; g < ng && g < kHcHrfGroups; ++g)
+            __hip_atomic_store(&hrf[2 + g], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+template <bool I8>
+__global__ __launch_bounds__(kThreads) void hc_read_hrf_kernel(HC_HRF_DECL) { R4D_IKA_ENTRY();
+    hc_read_hrf_body<I8, false>(HC_HRF_ARGS);
+}
+template <bool I8>
+__global__ __launch_bounds__(kThreads) void r4dchain_hc_read_hrf(HC_HRF_DECL) {
+    hc_read_hrf_body<I8, true>(HC_HRF_ARGS);
+    r4d_chain_done();
+}
 
 /* ============================================================== hc_read, A and B in one grid
  *
@@ -5740,6 +5853,24 @@ static int hc_b3x_p() {
         if (n != 0 && n < 32) n = 32;
         if (n > 0) std::fprintf(stderr, "radiance: libr4d: lever B3P (RADIANCE_FN4_HC_B3X_P=%d): kernel B3X with a pair of 16-row groups "
                                         "a block from %d rows -- each W_up fragment loaded and converted once for both (the same bytes)\n", n, n);
+        return n < 0 ? 0 : n;
+    }();
+    return v;
+}
+/* qfn-on-ds lever HRF (Qwen loop round 44): RADIANCE_FN4_HC_RF=N (read once) = the served HXS read (A' HXS + LE, B3X B3E + B3D, from
+ * the write's scales) as ONE launch, hc_read_hrf, at bi_dec reads of >= N rows (N >= 32; 0 / unset = off): B3X's blocks of a row group
+ * start when that group's A' blocks are done instead of after the whole A' grid; the same bytes. The fn4 switch hc_rf / bench hook
+ * r4d_hc_rf(N) overrides the env (-1 = the env). */
+static std::atomic<int> g_hc_rf_bench{-1};
+static int hc_rf() {
+    const int b = g_hc_rf_bench.load(std::memory_order_relaxed);
+    if (b >= 0) return b;
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_RF");
+        int n = (e && *e) ? std::atoi(e) : 0;
+        if (n != 0 && n < 32) n = 32;
+        if (n > 0) std::fprintf(stderr, "radiance: libr4d: lever HRF (RADIANCE_FN4_HC_RF=%d): the HXS hc read's A' and B3X as one launch from "
+                                        "%d rows -- a row group's up product starts when its own A' blocks are done (the same bytes)\n", n, n);
         return n < 0 ? 0 : n;
     }();
     return v;
@@ -9161,6 +9292,15 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     const RadTensor* const ssb_in = (bidec && !bidec_r && hcg && g16 && rows >= 32 && (hc_readv() & 131072) != 0
                                      && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0)
                                         ? hc_ss_operand(r4d_opt(a, HCR_SS), (long)rows) : nullptr;
+    /* lever HRF (round 44): the served HXS read (A' with the write's scales, NTS 4, XLB 3; B3X with B3E + B3D) as ONE launch at the
+     * B3X emission below; A''s leaf records it instead of launching. Only where both served forms would run, unchained-bench forms off. */
+    const int  hrf_min = hc_rf();
+    const bool hrf_go = hrf_min > 0 && rows >= hrf_min && ssb_in != nullptr && hcw && hc_b3x() && rows >= hc_b3x_min()
+                        && (n % kUpTB) == 0 && hc_b3x_e() && hc_b3x_d() && !(hc_occ() & 24)
+                        && !(hc_b3x_p() > 0 && rows >= hc_b3x_p() && rows > 16) && g_hc_ab.load(std::memory_order_relaxed) == 0
+                        && g_hc_tl.load(std::memory_order_relaxed) == 0
+                        && (g_hc_pf2_stages.load(std::memory_order_relaxed) & 10) == 10 && hcg_gy <= (long)kHcHrfGroups;
+    bool hrf_defer = false;
     if (ssb_in) {
         scale = (float*)ssb_in->data;
         static const bool said = [] {
@@ -9234,7 +9374,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                        (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
                                        scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                                        (int)hcg_nt, (long)rows);
-                } else HC_X_K(4, true, false, 3);
+                } else if (hrf_go) hrf_defer = true;   /* lever HRF: A' runs inside hc_read_hrf, launched at B3X's place */
+                else HC_X_K(4, true, false, 3);
             }
             else if (xpre) { if (nts == 4) HC_X_K(4, true, false, 0); else if (nts == 5) HC_X_K(5, true, false, 0); else HC_X_K(10, true, false, 0); }
             else if (xnp)  { if (nts == 4) HC_X_K(4, false, true, 0); else if (nts == 5) HC_X_K(5, false, true, 0); else HC_X_K(10, false, true, 0); }
@@ -9345,6 +9486,29 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     }
     if (bidec && !bidec_r && (!fused || (n / kUpTB) * ((rows + 15) / 16) > (long long)kMaxMixCtr)) return R4D_NO(RAD_E_SHAPE);
     if (bidec_r && !fused) return R4D_NO(RAD_E_SHAPE);
+    if (hrf_defer) {
+        /* lever HRF (round 44): A' (HXS, PRE, XLB 3) and B3X (B3E + B3D) in one grid: tickets [0, na) A' in group order, then B3X; a
+         * B3X block waits for its group's gxa A' blocks; counters behind the tile counters (kHcHrfCtr) */
+        unsigned int* const qctr = q ? mctr : nullptr;
+        unsigned int* const hrf = hcg_ctr + kHcGTilesMax;
+        const unsigned gxa = (unsigned)((hcg_nt / 4 + 1) * hc), gxb = (unsigned)(n / kUpTB);
+        const unsigned na = gxa * (unsigned)hcg_gy, nb = gxb * (unsigned)((rows + 15) / 16);
+        fc_add(kFcB3X, (long)rows, bidec);
+#define HC_HRF_K(I8_)                                                                            \
+        R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_hrf<I8_> : &hc_read_hrf_kernel<I8_>), dim3(na + nb), dim3(kThreads), kHrfLds, \
+                 (const unsigned short*)h->data, (const float*)w->data, (const unsigned char*)down->data, (long)dld,        \
+                 (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data, scale, hcg_part, hcg_ctr, (long)lr,  \
+                 (long)hrow, (long)irow, eps, wadd, (int)hcg_nt, (long)rows, (const unsigned char*)up->data, (long)uld,     \
+                 (unsigned short*)x->data, q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,          \
+                 rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr, qctr, (long)n, (long)xrow,     \
+                 (long)qrow, (long)srow, (long)rqrow, (long)rsrow, hrf, na, gxa, gxb, gxa, na + nb)
+        emit_rc = i8 ? HC_HRF_K(true) : HC_HRF_K(false);
+#undef HC_HRF_K
+        static std::atomic<int> said{0};
+        if (said.exchange(1) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever HRF: first fused HXS read at %ld rows (%u A' + %u B3X blocks, %s)\n", (long)rows,
+                         na, nb, hcg_ch ? "chained" : "plain");
+    } else
     if (hcw && bidec && !(g_hc_pf2_stages.load(std::memory_order_relaxed) & 8)) {
         /* fn4 test hook (timing only): under bi_dec, mask bit 3 off skips kernel B3 */
     } else if (hcw && bidec && hc_b3x() && rows >= hc_b3x_min() && (n % kUpTB) == 0) {
@@ -9573,6 +9737,8 @@ extern "C" void r4d_hc_ab(int m) { g_hc_ab.store(m < 0 ? 0 : (m & 15), std::memo
 extern "C" void r4d_hc_tl_lds(int b) { g_hc_tl_lds.store(b < 0 ? 0 : (b > 38000 ? 38000 : b), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3P (bench / test hook): B3X's pair form from N rows (0 off), -1 = the env */
 extern "C" void r4d_hc_b3x_p(int nrows) { g_hc_b3x_p_bench.store(nrows < 0 ? -1 : (nrows > 0 && nrows < 32 ? 32 : nrows), std::memory_order_relaxed); }
+/* qfn-on-ds lever HRF (bench / test hook, round 44): the fused HXS read from N rows (0 off), -1 = the env */
+extern "C" void r4d_hc_rf(int nrows) { g_hc_rf_bench.store(nrows < 0 ? -1 : (nrows > 0 && nrows < 32 ? 32 : nrows), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3X (bench / test hook): kernel B3 as hc_up_wx on (1) without hc_readv bit 16, or off (0) */
 extern "C" void r4d_hc_b3x(int on) { g_hc_b3x_bench.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
@@ -9658,6 +9824,15 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
             std::fprintf(stderr, "radiance: libr4d: lever EPD (gdn_epd %d): the GDN decode update's per-token norm / output / codes after its "
                                  "token loop%s (the same bytes)\n", value, value == 2 ? " + lever QKS (q / k normalised once a token)"
                                  : value == 3 ? " + lever GRP (the replay's factor blocks staged at once)" : "");
+        return 1;
+    }
+    if (!std::strcmp(name, "hc_rf")) {   /* qfn-on-ds lever HRF (round 44): the HXS read's A' + B3X as one launch from N rows, 0 off */
+        if (value < 0 || value > 4096) return -1;
+        r4d_hc_rf(value);
+        static std::atomic<int> said{0};
+        if (value > 0 && said.exchange(1) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever HRF (hc_rf %d): the HXS hc read's A' and B3X as one launch, a row group's up "
+                                 "product after its own A' blocks (the same bytes)\n", value);
         return 1;
     }
     if (!std::strcmp(name, "hc_b3x_p")) {   /* qfn-on-ds lever B3P (round 39): B3X's group-pair form from N rows, 0 off */

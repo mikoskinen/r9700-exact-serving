@@ -279,7 +279,7 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
  * round 3), bi_seg 0..3, sp_route 0..65535 (bits 1024 / 2048: lever MSP, loop round 20; 4096: lever GPF, round 22; 8192: lever HCP,
  * round 23; 16384: PF probe QSP, round 27; 32768: lever QRS, round 29), ar_laneblocks_s 0..24 / ar_lanethreads_s 0..1024 (lever LSK, round 27), resume_cold
  * 0..3 (2 / 3: lever TIP's resume points, rounds 21 / 22), rg_tail 0..4095 (rows + 256 x lever RGU's form, round 36), f8_pp 0..1
- * (lever F8P, round 37), hc_x_lb 0..3 / hc_b3x_e 0..1 (levers XLB / B3E, round 38), hc_b3x_p 0..4096 (lever B3P, round 39), hc_b3x_d 0..1 (lever B3D, round 40), gdn_epd 0..3 (levers EPD / QKS / GRP, round 41) -- and
+ * (lever F8P, round 37), hc_x_lb 0..3 / hc_b3x_e 0..1 (levers XLB / B3E, round 38), hc_b3x_p 0..4096 (lever B3P, round 39), hc_b3x_d 0..1 (lever B3D, round 40), gdn_epd 0..3 (levers EPD / QKS / GRP, round 41), hc_rf 0..4096 (lever HRF, round 44) -- and
  * refuses one past each, naming the range; a refused value is never queued. */
 TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
@@ -288,7 +288,7 @@ TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     struct R { const char* name; int hi; };
     for (const R& r : { R{ "hc_readv", 262143 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 65535 }, R{ "resume_cold", 3 },
                       R{ "ar_laneblocks_s", 24 }, R{ "ar_lanethreads_s", 1024 }, R{ "rg_tail", 4095 },
-                      R{ "f8_pp", 1 }, R{ "hc_x_lb", 3 }, R{ "hc_b3x_e", 1 }, R{ "hc_b3x_p", 4096 }, R{ "hc_b3x_d", 1 }, R{ "gdn_epd", 3 } }) {
+                      R{ "f8_pp", 1 }, R{ "hc_x_lb", 3 }, R{ "hc_b3x_e", 1 }, R{ "hc_b3x_p", 4096 }, R{ "hc_b3x_d", 1 }, R{ "gdn_epd", 3 }, R{ "hc_rf", 4096 } }) {
         const int i = fn4::switch_index(r.name);
         REQUIRE(i >= 0);
         fn4::requests(n0.data(), v0.data());

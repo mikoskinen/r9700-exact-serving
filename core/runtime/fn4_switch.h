@@ -948,6 +948,10 @@
  *                   3 = 1 + lever GRP (QUEUE Q80): the A replayed tokens' factor blocks staged into LDS in one batch beside
  *                   the state load instead of one block loaded at the head of each replay step; the same bytes
  *                                                                                                  RADIANCE_GDN_EPD
+ *   hc_rf           libr4d (rad_fn4_switch; qfn-on-ds lever HRF, Qwen loop round 44): N = from N (>= 32) rows the bi_dec read's
+ *                   served HXS form (A' on the write's scales, NTS 4, XLB 3; B3X with B3E + B3D) runs as ONE launch, hc_read_hrf:
+ *                   role by ticket, a row group's B3X blocks wait for that group's A' blocks only; the same bytes; 0 today
+ *                                                                                                  RADIANCE_FN4_HC_RF
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -1004,6 +1008,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kHcB3xP,   /* qfn-on-ds lever B3P (Qwen loop round 39, Q71): libr4d, B3X with a pair of 16-row groups a block */
               kHcB3xD,   /* qfn-on-ds lever B3D (Qwen loop round 40, Q74): libr4d, B3X's d rows padded in LDS (no bank conflict) */
               kGdnEpd,   /* qfn-on-ds lever EPD (Qwen loop round 41, Q78): libr4d, the GDN decode update's epilogue after its token loop */
+              kHcRf,     /* qfn-on-ds lever HRF (Qwen loop round 44): libr4d, the HXS hc read's A' + B3X as one launch, a row group at a time */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it

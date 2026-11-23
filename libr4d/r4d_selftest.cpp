@@ -180,6 +180,7 @@ struct Plugin {
     void (*ab_hc)(int) = nullptr;          /* optional (qfn-on-ds round 39, Q70: r4d_hc_ab, the served read's ablation copies) */
     void (*tl_lds_hc)(int) = nullptr;      /* optional (qfn-on-ds round 39, Q70: r4d_hc_tl_lds, dynamic LDS on the TL launches) */
     void (*b3p_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3P, round 39, Q71: r4d_hc_b3x_p, the row floor; 0 off) */
+    void (*hrf_hc)(int) = nullptr;         /* optional (qfn-on-ds lever HRF, round 44: r4d_hc_rf, the row floor; 0 off) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -276,6 +277,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->ab_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_ab");
     pl->tl_lds_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_tl_lds");
     pl->b3p_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_p");
+    pl->hrf_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_rf");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -26637,6 +26639,11 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     /* round 40 (QUEUE Q74, lever B3D): R4D_SELFTEST_B3D=1 = the arm's B3X with d's LDS rows padded (B3E's form only); the reference 0 */
     const int darm = envi("R4D_SELFTEST_B3D", 0) ? 1 : 0;
     if (darm && !pl.b3d_hc) { skip(nm.c_str(), "no r4d_hc_b3x_d"); return; }
+    /* round 44 (lever HRF): R4D_SELFTEST_HRF=N = the arm's read as ONE launch (hc_read_hrf) from N rows; with R4D_SELFTEST_REFLE=1 +
+     * R4D_SELFTEST_B3D=1 + HC_X 4 + XLB 3 + B3E 1 + B3X 1 the reference is the served HXS + LE + D pair and the arm differs by HRF alone */
+    const int harm = envi("R4D_SELFTEST_HRF", 0);
+    if (harm && !pl.hrf_hc) { skip(nm.c_str(), "no r4d_hc_rf"); return; }
+    if (harm && pl.b3d_hc) pl.b3d_hc(darm);
     pl.norm_hc_wave(1); pl.write_hc_vec(1); pl.pf2_stages_hc(31);
     g.set(true, false);
     auto arm_set = [&](bool on) {
@@ -26648,7 +26655,8 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
         if (pl.b3e_hc) pl.b3e_hc(on || refle ? earm : 0);
         if (pl.b3p_hc) pl.b3p_hc(on ? parm : 0);
         if (oarm) pl.occ_hc(on ? oarm : 0);
-        if (pl.b3d_hc) pl.b3d_hc(on ? darm : 0);
+        if (pl.b3d_hc) pl.b3d_hc(on || (harm && refle) ? darm : 0);
+        if (pl.hrf_hc) pl.hrf_hc(on ? harm : 0);
     };
     auto outs = [&](std::vector<uint8_t>& o) {
         o.clear();
@@ -26700,6 +26708,13 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     if (parm || xarm2 || oarm || darm)
         std::printf("SSB M=%lld arm: B3P %d HCX_ARM %d OCC %d B3D %d over %s\n", (long long)M, parm, xarm2, oarm, darm,
                     refle ? "the served HXS + LE form" : "the reference");
+    if (harm) {   /* lever HRF: the arm's read is ONE function where the reference's is A' + B3X */
+        const bool one = pl.record && f0.size() == 2 && f1.size() == 1;
+        std::printf("SSB M=%lld HRF %d dispatch: reference %zu read functions, arm %zu (%s)\n", (long long)M, harm, f0.size(), f1.size(),
+                    !pl.record ? "no record hook" : one ? "the fused read ran" : M < harm ? "below the floor: the pair" : "NOT the fused read");
+        ok(fmt("SSB M=%lld HRF %d: the arm's read is one launch where the reference's is two", (long long)M, harm).c_str(),
+           !pl.record || M < harm || one, fmt("%zu -> %zu", f0.size(), f1.size()));
+    }
     std::printf("SSB M=%lld SSB %d HC_X %d B3X %d XLB %d B3E %d vs reference (%s): %s; control (ss x 2 after the write): %s\n",
                 (long long)M, sarm, xarm, barm, lbarm, earm, refx ? (refle ? "the same form with B3P / HCX_ARM off" : "the same with XLB / B3E off") : "bit 17 off, HC_X 0, B3X 0",
                 !okb ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical",
