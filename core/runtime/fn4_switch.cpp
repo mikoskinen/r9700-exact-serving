@@ -1896,16 +1896,31 @@ bool apply_pending(int step, int* sched) {
             /* Every loaded object exporting the hook is asked; none taking it, or one refusing, leaves the
              * value as it was. What is reported afterwards is what the plugins say they apply. */
             find_hooks(s);
+            /* qfn-on-ds (Qwen loop round 43, FINDINGS F75 test note 09:50): the value the core keeps, read BEFORE any plugin is
+             * asked (a plugin's own value hook would already say the new one) */
+            const int kept = reported(s, i);
             handled = 0;
             bool refused = false;
-            for (const Hooks& k : s.hooks) {
-                const int r = k.sw(kNames[i], v);
-                if (r > 0) ++handled;
+            uint64_t took = 0;   /* the hooks that applied v (bit = index in s.hooks; past 64 hooks none is tracked) */
+            for (size_t h = 0; h < s.hooks.size(); ++h) {
+                const int r = s.hooks[h].sw(kNames[i], v);
+                if (r > 0) { ++handled; if (h < 64) took |= 1ull << h; }
                 if (r < 0) refused = true;
             }
             if (refused || handled == 0) {
-                RAD_WARN("fn4: %s -> %d at step %d refused (%d plugin(s) took it%s); unchanged", kNames[i], v, step,
-                         handled, i == kGatherInv ? "; gather_inv needs RADIANCE_FN4_SWITCHABLE=1 at start" : "");
+                /* A plugin that took v before another refused it applies v while the core keeps (and reports) the old value,
+                 * and a later POST of that old value never reaches the plugins (unchanged values are skipped above): qrs3's
+                 * refused sp_route 28160 left qwen4exp_fp8's QSP flag set through 'sp_route 11776'. The takers get the kept
+                 * value back; a value the core never held (-1: a start value only the plugins know) is left as before. */
+                int back = 0;
+                if (took && kept >= 0)
+                    for (size_t h = 0; h < s.hooks.size() && h < 64; ++h)
+                        if ((took >> h) & 1ull) back += s.hooks[h].sw(kNames[i], kept) > 0;
+                RAD_WARN("fn4: %s -> %d at step %d refused (%d plugin(s) took it%s); unchanged%s", kNames[i], v, step,
+                         handled, i == kGatherInv ? "; gather_inv needs RADIANCE_FN4_SWITCHABLE=1 at start" : "",
+                         took ? (kept >= 0 ? fmt(" (%d of them handed %d back)", back, kept).c_str()
+                                           : " (the core holds no value to hand back)")
+                              : "");
                 continue;
             }
             if (qwen_switch(i)) {
