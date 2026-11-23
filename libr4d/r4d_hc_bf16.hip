@@ -2590,6 +2590,227 @@ __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_wx(R4D_HCW_PARAMS) {
     r4d_chain_done();
 }
 
+/* qfn-on-ds lever B3P (Qwen loop round 39, QUEUE Q71; RADIANCE_FN4_HC_B3X_P = the row floor, 0 = off): kernel B3X with a PAIR of
+ * 16-row groups a block -- each W_up fragment is loaded and converted (e4m3 -> bf16) once and goes into BOTH groups' WMMAs. Why
+ * (slot t1, FINDINGS DEV note 04:25): at 128 rows B3X's block time grows with the blocks sharing its WGP (9.40 us at ~2 a WGP,
+ * 14.86 at ~3; pass phases 3.74 -> 5.82 us) while removing its VALU work (the W_up conversion, the sigmoid's division) bought
+ * only 1.6 us of 64.5 -- a shared memory path, not issue: per read the 160 blocks re-read the whole W_up (3.3 MB) once a 16-row
+ * group (26 MB of L2 traffic at 128 rows); a pair halves that and the block count (160 -> 80: one round instead of 1.95).
+ * Per row everything is hc_up_wx_body's (E off): the same quarter chains of five WMMAs with the same W fragment and the same d
+ * fragment, the same scale folds, sigmoid, mix, narrowing and quantiser on the same values in the same order -> every output
+ * byte = B3X's = B3's. The second group's d rows past `rows` are staged as zeros and its stores guarded, as B3X's own tail. */
+template <int RG, bool CH, bool I8>
+__device__ __forceinline__ void hc_up_wxp_body(
+    const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
+    const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
+    unsigned short* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ qs,
+    unsigned char* __restrict__ rq, float* __restrict__ rqs, unsigned int* __restrict__ ctr,
+    long rows, long n, long lr, long hrow, long xrow, long qrow, long srow, long rqrow, long rsrow,
+    float wadd) {
+    (void)ctr; (void)lr;
+    constexpr int hc = 4, GP = 2;
+    constexpr int kLr = 320, kQ = kLr / 4, kStepsQ = kQ / 16;
+    constexpr int kSub = kUpTB / kHcBCh;                                       /* 4 sub-tiles of 4 channels a wave */
+    __shared__ __attribute__((aligned(16))) unsigned short sd[GP * RG * kLr];  /* d [GP][RG][lr] */
+    __shared__ float s_usc[kSub][kWaves][16][4];
+    __shared__ __attribute__((aligned(16))) unsigned short sx[GP * RG][kUpTB]; /* the pair's x rows (the quantiser's input) */
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int col = lane & 15, hh = lane >> 4;
+    const long i0 = (long)blockIdx.x * kUpTB;
+    const long r0 = (long)blockIdx.y * (GP * RG);
+    const long prows = rows - r0 < GP * RG ? rows - r0 : GP * RG;              /* the pair's rows, 1..2 RG */
+    const long gr0 = prows < RG ? prows : RG, gr1 = prows - gr0;               /* group 0 / group 1 rows (gr1 may be 0) */
+    dbuf += r0 * kLr;
+    h += r0 * hrow;
+    scalein += r0 * kHcMax;
+    x += r0 * xrow;
+    if (q) { q += r0 * qrow; qs += r0 * srow; }
+    if (rq) { rq += r0 * rqrow; rqs += r0 * rsrow; }
+    auto iw_of = [&](int sbt) -> long { return i0 + (long)kHcBCh * sbt + 4 * wave; };
+
+    /* one sub-tile a pass (B3X: two): with two groups, two sub-tiles' accumulators + the next step's W_up spilled (20 VGPRs);
+     * each sub-tile's chain is the same either way (its five-step quarters, its folds) */
+    constexpr int kPass = 1, kSteps = (kSub / kPass) * 4;
+    constexpr int kRing = 3;   /* W_up steps in flight: this one + two ahead (B3X: one ahead; a step here is half B3X's bytes) */
+    uint2 wq[kRing][kPass][kStepsQ];
+    auto load_t = [&](int t) {
+        const int hf = t / 4, qq = t % 4;
+#pragma unroll
+        for (int sb = 0; sb < kPass; ++sb) {
+            const unsigned char* wr = upv + ((long)(col & 3) * n + iw_of(kPass * hf + sb) + (col >> 2)) * uld;
+#pragma unroll
+            for (int st = 0; st < kStepsQ; ++st) wq[t % kRing][sb][st] = *(const uint2*)(wr + qq * kQ + 40 * hh + 8 * st);
+        }
+    };
+    load_t(0);
+    load_t(1);
+    if (hh == 0) {
+#pragma unroll
+        for (int sbt = 0; sbt < kSub; ++sbt) {
+            const unsigned char* wr = upv + ((long)(col & 3) * n + iw_of(sbt) + (col >> 2)) * uld;
+#pragma unroll
+            for (int qq = 0; qq < 4; ++qq) s_usc[sbt][wave][col][qq] = ((const float*)(wr + kLr))[qq];
+        }
+    }
+    if constexpr (CH) r4d_chain_wait();
+
+    /* ---- one batch: both groups' d (uint4, contiguous rows of the pair) into LDS, rows past the pair as zeros */
+    constexpr int kD8 = GP * RG * kLr / 8;
+    uint4 dq[(kD8 + kThreads - 1) / kThreads];
+#pragma unroll
+    for (int i = 0; i < (kD8 + kThreads - 1) / kThreads; ++i) {
+        const int k = tid + i * kThreads;
+        dq[i] = k < kD8 && k < (int)prows * (kLr / 8) ? ((const uint4*)dbuf)[k] : make_uint4(0u, 0u, 0u, 0u);
+    }
+    /* this lane's row of the pair, per group (B3X's clamp within the group; an empty second group reads group 0's row: unused) */
+    const int rr0 = col < (int)gr0 ? col : (int)gr0 - 1;
+    const int rrg[GP] = { rr0, gr1 > 0 ? RG + (col < (int)gr1 ? col : (int)gr1 - 1) : rr0 };
+    float sc[GP][4];
+#pragma unroll
+    for (int g = 0; g < GP; ++g)
+#pragma unroll
+        for (int c = 0; c < hc; ++c) sc[g][c] = scalein[(long)rrg[g] * kHcMax + c];
+#pragma unroll
+    for (int i = 0; i < (kD8 + kThreads - 1) / kThreads; ++i) {
+        const int k = tid + i * kThreads;
+        if (k < kD8) ((uint4*)sd)[k] = dq[i];
+    }
+    __syncthreads();
+
+    const unsigned short* dr0 = sd + (long)rrg[0] * kLr + 40 * hh;
+    const unsigned short* dr1 = sd + (long)rrg[1] * kLr + 40 * hh;
+    const float inv_hc = 1.0f / (float)hc;
+    /* the sub-tile epilogue's operands (lever B3E's form): its 8 norm weights and both groups' 4 h words, issued at the third quarter
+     * step BEFORE the ring's next two W_up steps, so the epilogue's waits leave those in flight (the plain issue order drained them) */
+    static_assert(kPass == 1, "the epilogue batch below is per sub-tile");
+    float ewv[hc][2];
+    uint32_t ehv[GP][hc];
+    auto epi_load = [&](int hf) __attribute__((always_inline)) {
+        const long iw = iw_of(hf);
+#pragma unroll
+        for (int c = 0; c < hc; ++c) {
+#pragma unroll
+            for (int a = 0; a < 2; ++a) ewv[c][a] = w[(long)c * n + iw + 2 * hh + a];
+#pragma unroll
+            for (int g = 0; g < GP; ++g) ehv[g][c] = *(const uint32_t*)(h + (long)rrg[g] * hrow + (long)c * n + iw + 2 * hh);
+        }
+    };
+#pragma unroll
+    for (int hf = 0; hf < kSub / kPass; ++hf) {
+        float U[GP][kPass][8];
+#pragma unroll
+        for (int g = 0; g < GP; ++g)
+#pragma unroll
+            for (int sb = 0; sb < kPass; ++sb)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) U[g][sb][e] = 0.0f;
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq) {
+            const int t = hf * 4 + qq;
+            __builtin_amdgcn_sched_barrier(0);
+            if (qq == 2) epi_load(hf);
+            if (t + 2 < kSteps) load_t(t + 2);
+            v8f D[GP][kPass];
+#pragma unroll
+            for (int g = 0; g < GP; ++g)
+#pragma unroll
+                for (int sb = 0; sb < kPass; ++sb) D[g][sb] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            /* the two groups' d fragments one k-step ahead (pinned: unpinned, the compiler hoists a quarter's ten LDS loads = 40 VGPRs
+             * and spills) */
+            uint4 nb0 = *(const uint4*)(dr0 + qq * kQ), nb1 = *(const uint4*)(dr1 + qq * kQ);
+#pragma unroll
+            for (int st = 0; st < kStepsQ; ++st) {
+                __builtin_amdgcn_sched_barrier(0);
+                const uint4 b0 = nb0, b1 = nb1;
+                if (st + 1 < kStepsQ) {
+                    nb0 = *(const uint4*)(dr0 + qq * kQ + 8 * (st + 1));
+                    nb1 = *(const uint4*)(dr1 + qq * kQ + 8 * (st + 1));
+                }
+                const v8bf B0 = hcg_v8bf(b0.x, b0.y, b0.z, b0.w);
+                const v8bf B1 = hcg_v8bf(b1.x, b1.y, b1.z, b1.w);
+#pragma unroll
+                for (int sb = 0; sb < kPass; ++sb) {
+                    const v8bf A = hcg_e4m3_v8bf(wq[t % kRing][sb][st].x, wq[t % kRing][sb][st].y);   /* once for both groups */
+                    D[0][sb] = mma(A, B0, D[0][sb]);
+                    D[1][sb] = mma(A, B1, D[1][sb]);
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < GP; ++g)
+#pragma unroll
+                for (int sb = 0; sb < kPass; ++sb)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) U[g][sb][e] = fmaf(D[g][sb][e], s_usc[kPass * hf + sb][wave][8 * hh + e][qq], U[g][sb][e]);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int sb = 0; sb < kPass; ++sb) {
+            const long iw = iw_of(kPass * hf + sb);
+            float wv[2][4];
+#pragma unroll
+            for (int c = 0; c < hc; ++c)
+#pragma unroll
+                for (int a = 0; a < 2; ++a) wv[a][c] = ewv[c][a] + wadd;
+#pragma unroll
+            for (int g = 0; g < GP; ++g) {
+                const long grows = g ? gr1 : gr0;
+                uint32_t hv2[4];
+#pragma unroll
+                for (int c = 0; c < hc; ++c) hv2[c] = ehv[g][c];
+                float Npre[2][4];
+#pragma unroll
+                for (int c = 0; c < hc; ++c)
+#pragma unroll
+                    for (int a = 0; a < 2; ++a)
+                        Npre[a][c] = nbf(bfw_f(a ? (hv2[c] >> 16) : (hv2[c] & 0xffffu)) * sc[g][c] * wv[a][c]);
+                /* the mix in every lane (a lane past the group's rows works on its clamped row; only the stores are guarded): with the
+                 * whole mix under the guard the compiler sank the h words' loads into it, behind a wait that drained the W_up ring */
+                float acc[2];
+#pragma unroll
+                for (int a = 0; a < 2; ++a) {
+                    acc[a] = 0.0f;
+#pragma unroll
+                    for (int c = 0; c < hc; ++c) acc[a] += nbf(sigmoidf_(U[g][sb][4 * a + c])) * Npre[a][c];
+                    acc[a] *= inv_hc;
+                }
+                const uint32_t xv = f2bf2(acc[0], acc[1]);
+                asm volatile("" :: "v"(xv));   /* xv materialised here, outside the guard: keeps the mix (and its loads) from sinking into it */
+                if (col < RG && col < grows) {
+                    *(uint32_t*)(x + (long)(g * RG + col) * xrow + iw + 2 * hh) = xv;
+                    *(uint32_t*)(&sx[g * RG + col][iw - i0 + 2 * hh]) = xv;
+                }
+            }
+        }
+    }
+    if (!q) return;
+
+    /* ---- the 128-channel group = this block: quantise the pair's rows from LDS (B3X's code on the same values) */
+    __syncthreads();
+    const long base = i0;
+    for (int r = wave; r < GP * RG && r < prows; r += kWaves) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = bf2f(sx[r][lane * 4 + j]);
+        float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+        m = r4d_wave_max(m);
+        const float scq = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
+        const float inv = 1.0f / scq;
+        if (lane == 0) qs[(long)r * srow + base / kUpTB] = scq;
+        const uint32_t pk = q8_pack4<I8>(v[0], v[1], v[2], v[3], inv);
+        *(unsigned*)(q + (long)r * qrow + base + lane * 4) = (unsigned)pk;
+        if (rq) hc_rot_group(v, lane, rq + (long)r * rqrow + base, rqs + (long)r * rsrow + base / kUpTB);
+    }
+}
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) void hc_up_wxp_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_wxp_body<RG, false, I8>(R4D_HCW_ARGS);
+}
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) void r4dchain_hc_up_wxp(R4D_HCW_PARAMS) {
+    hc_up_wxp_body<RG, true, I8>(R4D_HCW_ARGS);
+    r4d_chain_done();
+}
+
 /* qfn-on-ds lever B3R (Qwen loop round 1, 20.11.2026; hc_readv bits 11-12): kernel B3 under bi_dec with GPB 16-row
  * groups a block instead of one. The constant operands -- this lane's W_up row halves, their quarter scales, the norm
  * weights -- load ONCE a block (today: once a 16-row group, so a 128-row read loads W_up's 3.28 MB eight times); then the
@@ -5390,6 +5611,23 @@ static bool hc_b3x_e() {
         if (on) std::fprintf(stderr, "radiance: libr4d: lever B3E (RADIANCE_FN4_HC_B3X_E): B3X's pass epilogue operands issued as one batch "
                                      "in the pass's last quarter step (the same bytes)\n");
         return on;
+    }();
+    return v;
+}
+/* qfn-on-ds lever B3P (Qwen loop round 39, QUEUE Q71): RADIANCE_FN4_HC_B3X_P=N (read once) = kernel B3X with a pair of 16-row groups a
+ * block (hc_up_wxp) at reads of >= N rows (N >= 32; 0 / unset = off); the same bytes as B3X. The fn4 switch hc_b3x_p / bench hook
+ * r4d_hc_b3x_p(N) overrides the env (-1 = the env). Where it runs it replaces B3E's form (B3P has no batched-epilogue variant). */
+static std::atomic<int> g_hc_b3x_p_bench{-1};
+static int hc_b3x_p() {
+    const int b = g_hc_b3x_p_bench.load(std::memory_order_relaxed);
+    if (b >= 0) return b;
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_HC_B3X_P");
+        int n = (e && *e) ? std::atoi(e) : 0;
+        if (n != 0 && n < 32) n = 32;
+        if (n > 0) std::fprintf(stderr, "radiance: libr4d: lever B3P (RADIANCE_FN4_HC_B3X_P=%d): kernel B3X with a pair of 16-row groups "
+                                        "a block from %d rows -- each W_up fragment loaded and converted once for both (the same bytes)\n", n, n);
+        return n < 0 ? 0 : n;
     }();
     return v;
 }
@@ -9005,6 +9243,23 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                  (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,                     \
                  (long)rsrow, wadd)
         const int b3ab = (g_hc_ab.load(std::memory_order_relaxed) >> 2) & 3;   /* round 39 (QUEUE Q70, bench only) */
+        const int b3p = hc_b3x_p();
+        if (b3p > 0 && rows >= b3p && rows > 16) {
+            /* qfn-on-ds lever B3P (round 39, QUEUE Q71): a pair of 16-row groups a block; the same bytes */
+#define HC_UPWXP_K(I8_)                                                                          \
+            R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_wxp<16, I8_> : &hc_up_wxp_kernel<16, I8_>),            \
+                     dim3((unsigned)(n / kUpTB), (unsigned)((rows + 31) / 32)), dim3(kThreads), 0,    \
+                     (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,          \
+                     (const unsigned short*)h->data, (const float*)w->data,                          \
+                     (const float*)scale, (unsigned short*)x->data,                                   \
+                     q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,           \
+                     rq ? (unsigned char*)rq->data : nullptr,                                         \
+                     rq ? (float*)rqs->data : nullptr, qctr, (long)rows, (long)n, (long)lr,           \
+                     (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,                     \
+                     (long)rsrow, wadd)
+            emit_rc = i8 ? HC_UPWXP_K(true) : HC_UPWXP_K(false);
+#undef HC_UPWXP_K
+        } else
         if (hc_b3x_e() && i8 && !hcg_ch && (b3ab || g_hc_tl.load(std::memory_order_relaxed))) {
             /* round 39: the served B3X (E) form's timeline copy (r4d_hc_tl) or ablation copies (r4d_hc_ab), int8 codes, unchained */
             auto* const fn = g_hc_tl.load(std::memory_order_relaxed) ? &hc_up_wx_tle_kernel<16, true>
@@ -9154,6 +9409,8 @@ extern "C" void r4d_hc_b3x_e(int on) { g_hc_b3x_e_bench.store(on < 0 ? -1 : (on 
 extern "C" void r4d_hc_ab(int m) { g_hc_ab.store(m < 0 ? 0 : (m & 15), std::memory_order_relaxed); }
 /* qfn-on-ds round 39 (QUEUE Q70, bench hook): dynamic LDS bytes on the served form's TL launches (0..38,000) */
 extern "C" void r4d_hc_tl_lds(int b) { g_hc_tl_lds.store(b < 0 ? 0 : (b > 38000 ? 38000 : b), std::memory_order_relaxed); }
+/* qfn-on-ds lever B3P (bench / test hook): B3X's pair form from N rows (0 off), -1 = the env */
+extern "C" void r4d_hc_b3x_p(int nrows) { g_hc_b3x_p_bench.store(nrows < 0 ? -1 : (nrows > 0 && nrows < 32 ? 32 : nrows), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3X (bench / test hook): kernel B3 as hc_up_wx on (1) without hc_readv bit 16, or off (0) */
 extern "C" void r4d_hc_b3x(int on) { g_hc_b3x_bench.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
@@ -9219,6 +9476,11 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "hc_b3x_e")) {   /* qfn-on-ds lever B3E: B3X's batched pass-epilogue operands */
         if (value < 0 || value > 1) return -1;
         r4d_hc_b3x_e(value);
+        return 1;
+    }
+    if (!std::strcmp(name, "hc_b3x_p")) {   /* qfn-on-ds lever B3P (round 39): B3X's group-pair form from N rows, 0 off */
+        if (value < 0 || value > 4096) return -1;
+        r4d_hc_b3x_p(value);
         return 1;
     }
     if (!std::strcmp(name, "f8_pp")) {   /* qfn-on-ds lever F8P (r4d_gemm_fp8a8.hip): 0 today's int8 narrow tile, 1 its twin */
