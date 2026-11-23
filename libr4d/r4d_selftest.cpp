@@ -73,6 +73,7 @@ extern "C" {
 #include <random>
 #include <string>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -172,6 +173,7 @@ struct Plugin {
     void (*b3x_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3X: r4d_hc_b3x) */
     void (*xlb_hc)(int) = nullptr;         /* optional (qfn-on-ds lever XLB: r4d_hc_x_lb, mask 0..3) */
     void (*b3e_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3E: r4d_hc_b3x_e) */
+    void (*ab_hc)(int) = nullptr;          /* optional (qfn-on-ds round 39, Q70: r4d_hc_ab, the served read's ablation copies) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
@@ -261,6 +263,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->b3x_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x");
     pl->xlb_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x_lb");
     pl->b3e_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_e");
+    pl->ab_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_ab");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
@@ -26278,6 +26281,142 @@ static void hc_ss_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     ok(nm.c_str(), true);
 }
 
+/* qfn-on-ds round 39 (QUEUE Q70): the served HXS + LE read's OCCUPANCY-AWARE phase timeline -- `reps` reads with the TL copies
+ * (r4d_hc_tl: hc_read_g16x_down_tlp_kernel<16, 4, 3> region 0, hc_up_wx_tle_kernel<16, int8> region 1), per region: span, block
+ * latency, in flight, blocks resident on one WGP (HW_ID1 bits 10-20), rounds, each phase's mean, and the same per block bucketed
+ * by its WGP CO-RESIDENCY = the time-weighted mean count of blocks resident on its WGP during its life (itself included). A phase
+ * whose time grows with the co-residency is bound by what the WGP's waves share (issue, LDS, the CU's memory path); a flat one by
+ * its own latency chain. */
+static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_once, hipStream_t hs, int reps, long long M) {
+    struct Rec { unsigned long long w[8]; };
+    std::vector<Rec> rec[2];
+    std::vector<double> span[2], fly_mean[2], gapab;
+    std::vector<int> fly_max[2], wgp_max[2], wgps[2], nblk[2];
+    std::vector<double> cores[2];   /* per record, its co-residency */
+    std::vector<unsigned long long> buf((size_t)2048 * 8);
+    pl.tl_hc(1);
+    for (int rep = 0; rep < reps; ++rep) {
+        if (pl.tl_hc_reset() != 0) { std::printf("HXT M=%lld: r4d_hc_tl_reset failed\n", M); pl.tl_hc(0); return; }
+        read_once();
+        (void)st_stream_sync(hs);
+        unsigned long long a_end = 0, b_start = ~0ull;
+        for (int g = 0; g < 2; ++g) {
+            const int got = pl.tl_hc_read(buf.data(), g, 2048);
+            if (got <= 0) continue;
+            std::vector<Rec> rr;
+            for (int b = 0; b < got; ++b) {
+                Rec e;
+                std::memcpy(e.w, buf.data() + (size_t)b * 8, sizeof(e.w));
+                if (e.w[0] && e.w[5] && e.w[5] >= e.w[0]) rr.push_back(e);
+            }
+            if (rr.empty()) continue;
+            unsigned long long t0 = ~0ull, t1 = 0;
+            for (const Rec& e : rr) { t0 = std::min(t0, e.w[0]); t1 = std::max(t1, e.w[5]); }
+            if (g == 0) a_end = t1; else b_start = t0;
+            span[g].push_back((double)(t1 - t0) / 100.0);
+            nblk[g].push_back((int)rr.size());
+            std::vector<std::pair<unsigned long long, int>> ev;
+            std::map<unsigned, std::vector<std::pair<unsigned long long, int>>> per;
+            double lat = 0;
+            for (const Rec& e : rr) {
+                ev.push_back({ e.w[0], 1 }); ev.push_back({ e.w[5], -1 });
+                const unsigned wgp = (unsigned)((e.w[7] >> 32) >> 10) & 0x7ffu;
+                per[wgp].push_back({ e.w[0], 1 }); per[wgp].push_back({ e.w[5], -1 });
+                lat += (double)(e.w[5] - e.w[0]);
+            }
+            auto sorted = [](std::vector<std::pair<unsigned long long, int>> v) {
+                std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.first != y.first ? x.first < y.first : x.second < y.second; });
+                return v;
+            };
+            auto sweep = [&](const std::vector<std::pair<unsigned long long, int>>& v0) {
+                const auto v = sorted(v0);
+                int c = 0, m = 0;
+                for (const auto& p : v) { c += p.second; m = std::max(m, c); }
+                return m;
+            };
+            fly_max[g].push_back(sweep(ev));
+            int wm = 0;
+            std::map<unsigned, std::vector<std::pair<unsigned long long, int>>> per_sorted;
+            for (auto& kv : per) { wm = std::max(wm, sweep(kv.second)); per_sorted[kv.first] = sorted(kv.second); }
+            wgp_max[g].push_back(wm);
+            wgps[g].push_back((int)per.size());
+            fly_mean[g].push_back(t1 > t0 ? lat / (double)(t1 - t0) : 0.0);
+            /* each block's co-residency: integrate its WGP's resident count over [start, end) */
+            for (const Rec& e : rr) {
+                const unsigned wgp = (unsigned)((e.w[7] >> 32) >> 10) & 0x7ffu;
+                const auto& v = per_sorted[wgp];
+                const unsigned long long s0 = e.w[0], s1 = e.w[5];
+                double integ = 0; int c = 0; unsigned long long tprev = 0; bool started = false, done = false;
+                for (const auto& p : v) {
+                    if (p.first > s0 && started) {
+                        const unsigned long long a = std::max(tprev, s0), b = std::min(p.first, s1);
+                        if (b > a) integ += (double)c * (double)(b - a);
+                    }
+                    if (p.first >= s1 && started) { done = true; break; }
+                    c += p.second; tprev = p.first; started = true;
+                }
+                if (!done && started && tprev < s1) { const unsigned long long a = std::max(tprev, s0); if (s1 > a) integ += (double)c * (double)(s1 - a); }
+                cores[g].push_back(s1 > s0 ? integ / (double)(s1 - s0) : 1.0);
+                rec[g].push_back(e);
+            }
+        }
+        if (a_end && b_start != ~0ull) gapab.push_back(((double)b_start - (double)a_end) / 100.0);
+    }
+    pl.tl_hc(0);
+    auto mean = [](const std::vector<double>& v) { double s = 0; for (double x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size(); };
+    auto meani = [](const std::vector<int>& v) { double s = 0; for (int x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size(); };
+    auto maxi = [](const std::vector<int>& v) { int m = 0; for (int x : v) m = std::max(m, x); return m; };
+    auto pct = [](std::vector<double> v, double q) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[(size_t)std::min<double>((double)v.size() - 1, q * (double)v.size())]; };
+    /* phases: A' (PRE: words 1 = 2 after the scales' barrier) 0->2, 2->3, 3->4, 4->5; B3X 0->1, 1->4, 4->2, 2->3, 3->5 */
+    static const int kAf[4] = { 0, 2, 3, 4 }, kAt[4] = { 2, 3, 4, 5 };
+    static const char* const kAn[4] = { "prologue + chain + scales", "N + tile 0", "tiles 1-3 + partials + fence", "atomic + finish" };
+    static const int kBf[5] = { 0, 1, 4, 2, 3 }, kBt[5] = { 1, 4, 2, 3, 5 };
+    static const char* const kBn[5] = { "operands + d stage", "pass 0 (wave 0)", "pass 1 (wave 0)", "barrier", "quantise" };
+    const char* const cm = g_cold > 0 ? "cold" : "warm";
+    for (int g = 0; g < 2; ++g) {
+        if (rec[g].empty()) { std::printf("HXT M=%lld %s %s: no records\n", M, cm, g ? "B3X" : "A'"); continue; }
+        const int np = g ? 5 : 4;
+        const int* fr = g ? kBf : kAf; const int* to = g ? kBt : kAt; const char* const* nmz = g ? kBn : kAn;
+        auto phase = [&](const Rec& e, int k) -> double {
+            const unsigned long long a = e.w[fr[k]], b = e.w[to[k]];
+            return (a && b && b >= a) ? (double)(b - a) / 100.0 : -1.0;
+        };
+        std::vector<double> lat;
+        for (const Rec& e : rec[g]) lat.push_back((double)(e.w[5] - e.w[0]) / 100.0);
+        const double lm = mean(lat);
+        std::string ph;
+        for (int k = 0; k < np; ++k) {
+            std::vector<double> d;
+            for (const Rec& e : rec[g]) { const double x = phase(e, k); if (x >= 0) d.push_back(x); }
+            ph += fmt("%s%s %.2f (p90 %.2f)", k ? ", " : "", nmz[k], mean(d), pct(d, 0.9));
+        }
+        std::printf("HXT M=%lld %s %s (%s, %.0f blocks a launch, %d reps): span %.2f us, block %.2f us (p50 %.2f, p90 %.2f), in flight mean %.1f "
+                    "max %d, one WGP max %d (%.0f WGPs), rounds %.2f, co-residency mean %.2f | phase us: %s\n", M, cm, g ? "B3X" : "A'",
+                    g ? "hc_up_wx_tle<16, int8>" : "hc_read_g16x_down_tlp<16, 4, 3>", meani(nblk[g]), reps, mean(span[g]), lm, pct(lat, 0.5),
+                    pct(lat, 0.9), mean(fly_mean[g]), maxi(fly_max[g]), maxi(wgp_max[g]), meani(wgps[g]), lm > 0 ? mean(span[g]) / lm : 0.0,
+                    mean(cores[g]), ph.c_str());
+        /* by co-residency bucket: < 1.5, 1.5-2.5, 2.5-3.5, >= 3.5 */
+        for (int bk = 0; bk < 4; ++bk) {
+            std::vector<double> bl; std::vector<std::vector<double>> bp((size_t)np);
+            for (size_t i = 0; i < rec[g].size(); ++i) {
+                const double c = cores[g][i];
+                const int b = c < 1.5 ? 0 : c < 2.5 ? 1 : c < 3.5 ? 2 : 3;
+                if (b != bk) continue;
+                bl.push_back(lat[i]);
+                for (int k = 0; k < np; ++k) { const double x = phase(rec[g][i], k); if (x >= 0) bp[(size_t)k].push_back(x); }
+            }
+            if (bl.empty()) continue;
+            std::string pb;
+            for (int k = 0; k < np; ++k) pb += fmt("%s%.2f", k ? " / " : "", mean(bp[(size_t)k]));
+            std::printf("HXT M=%lld %s %s co-res %s: %.1f blocks a launch, block %.2f us | phases %s\n", M, cm, g ? "B3X" : "A'",
+                        bk == 0 ? "~1" : bk == 1 ? "~2" : bk == 2 ? "~3" : "4+", (double)bl.size() / (double)reps, mean(bl), pb.c_str());
+        }
+    }
+    if (!gapab.empty())
+        std::printf("HXT M=%lld %s: A' last block out -> B3X first block in %.2f us (p50 %.2f, min %.2f)\n", M, cm, mean(gapab),
+                    pct(gapab, 0.5), pct(gapab, 0.0));
+}
+
 /* qfn-on-ds lever SSB (Qwen loop round 35, hc_readv bit 17): --perfhcssb M [iters] -- the decode pair as the hero start runs it
  * at M (>= 32) rows: hc_write with `ss` (bit 3, the eight-wide form) and then the bi_dec hc read (hc_readv 331 | 8: A' G16p, B3
  * in 16-row groups), the read handed the write's `ss`. Reference = bit 17 off, HC_X 0, B3X 0 (A' runs its own norm pass and
@@ -26391,6 +26530,75 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
                 xarm, barm, lbarm, earm, refx,
                 a0, a1, a0 > 0 ? 100.0 * (a1 - a0) / a0 : 0.0, ta[0][0], ta[0][1], ta[1][0], ta[1][1],
                 w0, w1, w0 > 0 ? 100.0 * (w1 - w0) / w0 : 0.0, tw[0][0], tw[0][1], tw[1][0], tw[1][1]);
+    /* round 39 (QUEUE Q70): R4D_SELFTEST_HXT=1 on the served form (SSB + HC_X 4 + B3X + XLB 3 + B3E 1) -- (1) its TL copies: bytes vs
+     * the plain launch (MUST be identical) + dispatch (2 functions differ); (2) the occupancy-aware timeline (hxt_timeline);
+     * (3) the UPPER-BOUND ablations (wrong bytes, timing only): each arm's bytes MUST differ from the form's (it ran), then A' alone
+     * and the whole read, form / arm / form / arm. Arms (r4d_hc_ab): 1 A' no N arithmetic, 2 A' no W_down conversion, 3 both,
+     * 4 B3X no W_up conversion, 8 B3X sigmoid by rcp, 12 both, 15 all four. */
+    size_t hxt_bad = 0;
+    if (envi("R4D_SELFTEST_HXT", 0) && okb && okt) {
+        if (!pl.tl_hc || !pl.tl_hc_reset || !pl.tl_hc_read || !pl.ab_hc || sarm == 0 || xarm != 4 || !barm || lbarm != 3 || !earm) {
+            std::printf("HXT M=%lld: needs the hooks and the served form (SSB 1, HC_X 4, B3X 1, XLB 3, B3E 1): skipped\n", (long long)M);
+        } else {
+            std::vector<uint8_t> otl;
+            std::vector<const void*> ftl;
+            pl.tl_hc(1);
+            const bool okl = grab(true, false, otl, &ftl);
+            pl.tl_hc(0);
+            size_t dl = 0, fl = 0;
+            if (okl) for (size_t i = 0; i < o1.size() && i < otl.size(); ++i) dl += o1[i] != otl[i];
+            for (size_t i = 0; i < f1.size() && i < ftl.size(); ++i) fl += f1[i] != ftl[i];
+            std::printf("HXT M=%lld timeline copies vs the form's plain launch: %s; dispatch %zu / %zu functions differ (%s)\n", (long long)M,
+                        !okl ? "launch failed" : dl ? fmt("%zu bytes differ", dl).c_str() : "every output byte identical", fl, ftl.size(),
+                        fl == 2 ? "both TL copies ran" : "NOT 2");
+            hxt_bad += (!okl || dl) ? 1 : 0;
+            hxt_bad += (pl.record && fl != 2) ? 1 : 0;
+            /* (2) the timeline: one write, then the reads */
+            arm_set(true);
+            g.reset();
+            if (g.rw->launch(&g.aw, (RadStream)g.hs) == RAD_OK && st_stream_sync(g.hs) == hipSuccess)
+                hxt_timeline(pl, [&]() { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, g.hs, 20, (long long)M);
+            /* (3) the ablations */
+            for (const int ab : { 1, 2, 3, 4, 8, 12, 15 }) {
+                std::vector<uint8_t> oab;
+                std::vector<const void*> fab;
+                pl.ab_hc(ab);
+                const bool oka = grab(true, false, oab, &fab);
+                pl.ab_hc(0);
+                size_t da = 0, fa = 0;
+                if (oka) for (size_t i = 0; i < o1.size() && i < oab.size(); ++i) da += o1[i] != oab[i];
+                for (size_t i = 0; i < f1.size() && i < fab.size(); ++i) fa += f1[i] != fab[i];
+                const size_t fw = (size_t)((ab & 3) ? 1 : 0) + (size_t)((ab & 12) ? 1 : 0);
+                /* engaged = its copy dispatched (the record hook); without the hook, its bytes moved (an rcp sigmoid can round alike) */
+                const bool ran = pl.record ? fa == fw : da > 0;
+                hxt_bad += (!oka || !ran) ? 1 : 0;
+                double xa[2][2] = { { 0, 0 }, { 0, 0 } }, xw[2][2] = { { 0, 0 }, { 0, 0 } };
+                arm_set(true);
+                g.reset();
+                bool okw = g.rw->launch(&g.aw, (RadStream)g.hs) == RAD_OK && st_stream_sync(g.hs) == hipSuccess;
+                for (int rep = 0; rep < 2 && okw; ++rep)
+                    for (int a2 = 0; a2 < 2; ++a2) {
+                        pl.ab_hc(a2 ? ab : 0);
+                        pl.pf2_stages_hc(3);
+                        xa[a2][rep] = st_time_us(launch, iters, g.hs);
+                        pl.pf2_stages_hc(31);
+                        xw[a2][rep] = st_time_us(launch, iters, g.hs);
+                    }
+                pl.ab_hc(0);
+                const double b0 = (xa[0][0] + xa[0][1]) / 2, b1 = (xa[1][0] + xa[1][1]) / 2;
+                const double v0 = (xw[0][0] + xw[0][1]) / 2, v1 = (xw[1][0] + xw[1][1]) / 2;
+                std::printf("HXT M=%lld %s ablation %d (%s%s%s%s): bytes %s (%s), dispatch %zu differ (want %zu); A' alone %.2f -> %.2f us "
+                            "(%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f), whole read %.2f -> %.2f us (%+.1f %%; reps %.2f / %.2f -> %.2f / %.2f)\n",
+                            (long long)M, g_cold > 0 ? "cold" : "warm", ab, (ab & 1) ? "A' no N arithmetic; " : "",
+                            (ab & 2) ? "A' no W_down conversion; " : "", (ab & 4) ? "B3X no W_up conversion; " : "", (ab & 8) ? "B3X sigmoid by rcp" : "",
+                            !oka ? "launch failed" : fmt("%zu differ", da).c_str(), ran ? "the ablation ran" : "NOT ENGAGED", fa, fw,
+                            b0, b1, b0 > 0 ? 100.0 * (b1 - b0) / b0 : 0.0, xa[0][0], xa[0][1], xa[1][0], xa[1][1],
+                            v0, v1, v0 > 0 ? 100.0 * (v1 - v0) / v0 : 0.0, xw[0][0], xw[0][1], xw[1][0], xw[1][1]);
+            }
+            ok(fmt("HXT M=%lld: timeline copies byte-identical + every ablation engaged", (long long)M).c_str(), hxt_bad == 0,
+               fmt("%zu checks failed", hxt_bad));
+        }
+    }
     arm_set(false);
     if (pl.xlb_hc) pl.xlb_hc(-1);
     if (pl.b3e_hc) pl.b3e_hc(-1);

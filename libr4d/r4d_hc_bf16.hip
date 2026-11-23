@@ -2360,7 +2360,10 @@ __global__ __launch_bounds__(kThreads) __attribute__((amdgpu_num_vgpr(118))) voi
  * four re-reads x and quantises). Per (row, channel) the arithmetic is hc_up_w_body's word for word (the same W_up rows / halves,
  * quarter folds, d columns, Npre, sigmoid, mix and 1/4; the quantiser's same reads of the same bf16 x values, wave max, scale,
  * pack and rotation), so every output byte (x, q, qs, rq, rqs) is B3's at every height. */
-template <int RG, bool CH, bool I8, bool TL = false, bool E = false>
+/* qfn-on-ds round 39 (QUEUE Q70, bench only): AB = an UPPER-BOUND ablation of the served B3X (E) form (wrong bytes, timing only; 0 in
+ * every engine instance): bit 2 = W_up's e4m3 words into the WMMA as raw bf16 bits (no conversion), bit 4 = the gate's sigmoid as
+ * v_rcp_f32 of (1 + exp) instead of the IEEE division (div_scale / div_fmas / div_fixup chain). */
+template <int RG, bool CH, bool I8, bool TL = false, bool E = false, int AB = 0>
 __device__ __forceinline__ void hc_up_wx_body(
     const unsigned char* __restrict__ upv, long uld, const unsigned short* __restrict__ dbuf,
     const unsigned short* __restrict__ h, const float* __restrict__ w, const float* __restrict__ scalein,
@@ -2482,8 +2485,12 @@ __device__ __forceinline__ void hc_up_wx_body(
                 const uint4 b = *(const uint4*)(dr + qq * kQ + 8 * st);
                 const v8bf B = hcg_v8bf(b.x, b.y, b.z, b.w);
 #pragma unroll
-                for (int sb = 0; sb < kPass; ++sb)
+                for (int sb = 0; sb < kPass; ++sb) {
+                    if constexpr ((AB & 2) != 0)   /* ablation (bench only): no e4m3 -> bf16 conversion */
+                        D[sb] = mma(hcg_v8bf(wq[t % 2][sb][st].x, wq[t % 2][sb][st].y, wq[t % 2][sb][st].x, wq[t % 2][sb][st].y), B, D[sb]);
+                    else
                     D[sb] = mma(hcg_e4m3_v8bf(wq[t % 2][sb][st].x, wq[t % 2][sb][st].y), B, D[sb]);
+                }
             }
 #pragma unroll
             for (int sb = 0; sb < kPass; ++sb)
@@ -2521,7 +2528,12 @@ __device__ __forceinline__ void hc_up_wx_body(
                 for (int a = 0; a < 2; ++a) {
                     acc[a] = 0.0f;
 #pragma unroll
-                    for (int c = 0; c < hc; ++c) acc[a] += nbf(sigmoidf_(U[sb][4 * a + c])) * Npre[a][c];
+                    for (int c = 0; c < hc; ++c) {
+                        if constexpr ((AB & 4) != 0)   /* ablation (bench only): rcp instead of the IEEE division */
+                            acc[a] += nbf(__builtin_amdgcn_rcpf(1.0f + __expf(-U[sb][4 * a + c]))) * Npre[a][c];
+                        else
+                        acc[a] += nbf(sigmoidf_(U[sb][4 * a + c])) * Npre[a][c];
+                    }
                     acc[a] *= inv_hc;
                 }
                 const uint32_t xv = f2bf2(acc[0], acc[1]);
@@ -2561,6 +2573,16 @@ __global__ __launch_bounds__(kThreads) void hc_up_wx_kernel(R4D_HCW_PARAMS) { R4
 template <int RG, bool I8>
 __global__ __launch_bounds__(kThreads) void hc_up_wx_tl_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
     hc_up_wx_body<RG, false, I8, true>(R4D_HCW_ARGS);
+}
+/* qfn-on-ds round 39 (QUEUE Q70, bench only, r4d_hc_tl / r4d_hc_ab): the served B3X form (E, lever B3E) with the phase timeline, and
+ * its ablation copies AB */
+template <int RG, bool I8>
+__global__ __launch_bounds__(kThreads) void hc_up_wx_tle_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_wx_body<RG, false, I8, true, true>(R4D_HCW_ARGS);
+}
+template <int RG, bool I8, int AB>
+__global__ __launch_bounds__(kThreads) void hc_up_wx_ab_kernel(R4D_HCW_PARAMS) { R4D_IKA_ENTRY();
+    hc_up_wx_body<RG, false, I8, false, true, AB>(R4D_HCW_ARGS);
 }
 template <int RG, bool I8, bool E = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_hc_up_wx(R4D_HCW_PARAMS) {
@@ -3480,7 +3502,11 @@ void r4dchain_hc_read_g16p_down(const unsigned short* __restrict__ h, const floa
  * over its 320-wide slice with the same group-scale folds, the waves' partials summed 0..7 ascending from 0, the streams' by the
  * tile's last block 0..3 ascending; the norm = G16p's loop), so every output byte is G16p's = G16's = form G's at every height:
  * no reference change, and a floor (RADIANCE_FN4_HC_X_MIN) moves no answer. */
-template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false, int LB = 0>
+/* qfn-on-ds round 39 (QUEUE Q70, bench only): AB = an UPPER-BOUND ablation of the served HXS + LE A' (wrong bytes, timing only; 0 in
+ * every engine instance = no instruction changes): bit 1 = N's fragments are h's raw words (no norm weight load, scale multiply or
+ * bf16 rounding: the N build's VALU removed), bit 2 = W_down's e4m3 words go into the WMMA as raw bf16 bits (no e4m3 -> bf16
+ * conversion). r4d_hc_ab picks them for r4d_selftest --perfhcssb's HXT cells. */
+template <int RG, bool CH, int NTS, bool PRE = false, bool TL = false, bool NPX = false, int LB = 0, int AB = 0>
 __device__ __forceinline__ void hc_read_g16x_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -3626,10 +3652,17 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
     v8bf A0[kHcGChunks], A1[kHcGChunks];
 #pragma unroll
     for (int j = 0; j < kHcGChunks; ++j) {
+        if constexpr ((AB & 1) != 0) {   /* ablation (bench only): raw h words, no N arithmetic */
+            const uint4 a0 = *(const uint4*)(hrw + e0 + 32 * j);
+            const uint4 a1 = *(const uint4*)(hrw + e0 + 32 * j + 8);
+            A0[j] = hcg_v8bf(a0.x, a0.y, a0.z, a0.w);
+            A1[j] = hcg_v8bf(a1.x, a1.y, a1.z, a1.w);
+        } else {
         const uint4 a0 = nb8(e0 + 32 * j);
         const uint4 a1 = nb8(e0 + 32 * j + 8);
         A0[j] = hcg_v8bf(a0.x, a0.y, a0.z, a0.w);
         A1[j] = hcg_v8bf(a1.x, a1.y, a1.z, a1.w);
+        }
     }
     const long pstride = (long)RG * kHcGTile;
     /* the waves' partials of tile u (s_red[u & 1]) in ascending wave order into the tile's stream slot */
@@ -3660,8 +3693,13 @@ __device__ __forceinline__ void hc_read_g16x_down_body(
                     gi = g;
                 }
                 const uint4 wq = wr[t % RING];
+                if constexpr ((AB & 2) != 0) {   /* ablation (bench only): no e4m3 -> bf16 conversion */
+                    D = mma(A0[j], hcg_v8bf(wq.x, wq.y, wq.z, wq.w), D);
+                    D = mma(A1[j], hcg_v8bf(wq.x, wq.y, wq.z, wq.w), D);   /* the same quad: no moves */
+                } else {
                 D = mma(A0[j], hcg_e4m3_v8bf(wq.x, wq.y), D);
                 D = mma(A1[j], hcg_e4m3_v8bf(wq.z, wq.w), D);
+                }
             }
 #pragma unroll
             for (int e = 0; e < 8; ++e) P[e] = fmaf(D[e], wsc(u, gi), P[e]);
@@ -3758,6 +3796,16 @@ __global__ __launch_bounds__(kThreads) void r4dchain_hc_read_g16x_down(HC_G16X_D
 template <int RG, int NTS, bool NPX = false>
 __global__ __launch_bounds__(kThreads) void hc_read_g16x_down_tl_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
     hc_read_g16x_down_body<RG, false, NTS, false, true, NPX>(HC_G16X_ARGS);
+}
+/* qfn-on-ds round 39 (QUEUE Q70, bench only, r4d_hc_tl / r4d_hc_ab): the served HXS + LE A' (PRE, LB) with the phase timeline
+ * (words 0 start, 1 = 2 the scales read, 3 tile 0's barrier, 4 the partials' fence + barrier, 5 end), and its ablation copies AB */
+template <int RG, int NTS, int LB>
+__global__ __launch_bounds__(kThreads) void hc_read_g16x_down_tlp_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
+    hc_read_g16x_down_body<RG, false, NTS, true, true, false, LB>(HC_G16X_ARGS);
+}
+template <int RG, int NTS, int LB, int AB>
+__global__ __launch_bounds__(kThreads) void hc_read_g16x_down_ab_kernel(HC_G16X_DECL) { R4D_IKA_ENTRY();
+    hc_read_g16x_down_body<RG, false, NTS, true, false, false, LB, AB>(HC_G16X_ARGS);
 }
 
 template <int RG>
@@ -5212,6 +5260,9 @@ static void fc_add(int f, long rows, bool bd) {
 static std::atomic<int> g_hc_pf2_stages{31};
 /* qfn-on-ds Q17 (bench only): r4d_hc_tl(1) = the bi_dec read's A' (G16 / G16p) and B3 (16-row groups) launch their TL copies */
 static std::atomic<int> g_hc_tl{0};
+/* qfn-on-ds round 39 (QUEUE Q70, bench only): r4d_hc_ab(mask) = the served HXS + LE read's ablation copies, unchained launches only --
+ * bits 0-1 A' (1 no N arithmetic, 2 no W_down conversion), bits 2-3 B3X (4 no W_up conversion, 8 the sigmoid by rcp). 0 = none. */
+static std::atomic<int> g_hc_ab{0};
 /* qfn-on-ds lever HCO: RADIANCE_FN4_HC_OCC bit mask (read once; r4d_hc_occ sets it): 1 A' G16p, 2 B3 at 16-row groups in their
  * occupancy instances (hc_read_g16p_down_o_kernel / hc_up_w_o_kernel); 4 A' G16 / G16p with the norm rows' loads ahead
  * (hc_g_norm_rows_np; with 1: G16p's onp instance). 0 / unset = today's kernels. -1 until read. */
@@ -8805,7 +8856,23 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
             const int xlb = (xpre && nts == 4) ? hc_x_lb() : 0;   /* lever XLB (bits 1 / 2) */
             if (xlb == 1) HC_X_K(4, true, false, 1);
             else if (xlb == 2) HC_X_K(4, true, false, 2);
-            else if (xlb == 3) HC_X_K(4, true, false, 3);
+            else if (xlb == 3) {
+                /* round 39 (QUEUE Q70, bench only, unchained): the served form's timeline copy (r4d_hc_tl) or ablation copies (r4d_hc_ab) */
+                const int ab = g_hc_ab.load(std::memory_order_relaxed) & 3;
+                const bool tl = g_hc_tl.load(std::memory_order_relaxed) != 0;
+                if (!hcg_ch && (tl || ab)) {
+                    auto* const fn = tl ? &hc_read_g16x_down_tlp_kernel<16, 4, 3>
+                                   : ab == 1 ? &hc_read_g16x_down_ab_kernel<16, 4, 3, 1>
+                                   : ab == 2 ? &hc_read_g16x_down_ab_kernel<16, 4, 3, 2>
+                                             : &hc_read_g16x_down_ab_kernel<16, 4, 3, 3>;
+                    emit_rc = R4D_EMIT(s, fn, gx, dim3(kThreads), 0,
+                                       (const unsigned short*)h->data, (const float*)w->data,
+                                       (const unsigned char*)down->data, (long)dld,
+                                       (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
+                                       scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
+                                       (int)hcg_nt, (long)rows);
+                } else HC_X_K(4, true, false, 3);
+            }
             else if (xpre) { if (nts == 4) HC_X_K(4, true, false, 0); else if (nts == 5) HC_X_K(5, true, false, 0); else HC_X_K(10, true, false, 0); }
             else if (xnp)  { if (nts == 4) HC_X_K(4, false, true, 0); else if (nts == 5) HC_X_K(5, false, true, 0); else HC_X_K(10, false, true, 0); }
             else           { if (nts == 4) HC_X_K(4, false, false, 0); else if (nts == 5) HC_X_K(5, false, false, 0); else HC_X_K(10, false, false, 0); }
@@ -8934,6 +9001,23 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                  rq ? (float*)rqs->data : nullptr, qctr, (long)rows, (long)n, (long)lr,           \
                  (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,                     \
                  (long)rsrow, wadd)
+        const int b3ab = (g_hc_ab.load(std::memory_order_relaxed) >> 2) & 3;   /* round 39 (QUEUE Q70, bench only) */
+        if (hc_b3x_e() && i8 && !hcg_ch && (b3ab || g_hc_tl.load(std::memory_order_relaxed))) {
+            /* round 39: the served B3X (E) form's timeline copy (r4d_hc_tl) or ablation copies (r4d_hc_ab), int8 codes, unchained */
+            auto* const fn = g_hc_tl.load(std::memory_order_relaxed) ? &hc_up_wx_tle_kernel<16, true>
+                           : b3ab == 1 ? &hc_up_wx_ab_kernel<16, true, 2>
+                           : b3ab == 2 ? &hc_up_wx_ab_kernel<16, true, 4>
+                                       : &hc_up_wx_ab_kernel<16, true, 6>;
+            emit_rc = R4D_EMIT(s, fn, dim3((unsigned)(n / kUpTB), (unsigned)((rows + 15) / 16)), dim3(kThreads), 0,
+                               (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf,
+                               (const unsigned short*)h->data, (const float*)w->data,
+                               (const float*)scale, (unsigned short*)x->data,
+                               q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,
+                               rq ? (unsigned char*)rq->data : nullptr,
+                               rq ? (float*)rqs->data : nullptr, qctr, (long)rows, (long)n, (long)lr,
+                               (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,
+                               (long)rsrow, wadd);
+        } else
         if (hc_b3x_e()) emit_rc = i8 ? HC_UPWX_K(true, true) : HC_UPWX_K(false, true);   /* lever B3E */
         else            emit_rc = i8 ? HC_UPWX_K(true, false) : HC_UPWX_K(false, false);
 #undef HC_UPWX_K
@@ -9062,6 +9146,8 @@ extern "C" void r4d_hc_x(int m) { g_hc_x_bench.store(hc_x_ok(m), std::memory_ord
 extern "C" void r4d_hc_x_lb(int m) { g_hc_x_lb_bench.store(m < 0 ? -1 : (m & 3), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3E (bench / test hook): B3X's batched pass-epilogue operands on (1) / off (0), -1 = the env */
 extern "C" void r4d_hc_b3x_e(int on) { g_hc_b3x_e_bench.store(on < 0 ? -1 : (on > 0 ? 1 : 0), std::memory_order_relaxed); }
+/* qfn-on-ds round 39 (QUEUE Q70, bench hook): the served HXS + LE read's ablation copies (g_hc_ab's note); 0 = none */
+extern "C" void r4d_hc_ab(int m) { g_hc_ab.store(m < 0 ? 0 : (m & 15), std::memory_order_relaxed); }
 /* qfn-on-ds lever B3X (bench / test hook): kernel B3 as hc_up_wx on (1) without hc_readv bit 16, or off (0) */
 extern "C" void r4d_hc_b3x(int on) { g_hc_b3x_bench.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_tl(int on) {
