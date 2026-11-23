@@ -4760,6 +4760,107 @@ static void router_gemm_fused_case(const Plugin& pl) {
     rg->fini(inst);
 }
 
+/* qfn-on-ds lever MTE (Qwen loop round 45, QUEUE Q85): --perfmte [iters] -- the MTP head's mtp_enter (row mtp_enter_e4m3) at
+ * Flash-Next's shape (n 2560, hc 4, ngroup 4, wadd 1, E4M3 fc rows with f32 group scales) at 8 / 16 / 24 / 32 / 48 / 64 / 96 / 128
+ * tokens: today's form (the tiled kernel below 32 tokens, the prefill products from 32) against lever MTE (libr4d's bench hook
+ * r4d_mte_bench(4); the split from RADIANCE_FN4_MTE_SK, default 4; from RADIANCE_FN4_MTE_MIN tokens, default 8), each warm or
+ * --cold, the scratch sized as the engine's band (M 8192). Bytes: MTE twice = the same bytes (determinism, outputs poisoned
+ * before each run) and MTE against today's form: differing bf16 elements and the largest |difference| relative to the largest
+ * |today| (other bytes by design: the K sum in pieces; drafts only). A FAIL line = MTE is not deterministic or not near. */
+static void mte_perf(const Plugin& pl, int iters) {
+    if (iters <= 0) iters = 200;
+    const RadKernelInfo* r = find(pl, "mtp_enter_e4m3");
+    auto hook = (void (*)(int))dlsym(pl.h, "r4d_mte_bench");
+    if (!r || !hook) { std::printf("--perfmte: row mtp_enter_e4m3 or r4d_mte_bench absent\n"); ++g_fail; return; }
+    const int64_t n = 2560, hc = 4, HN = n * hc, TM = 128;
+    const int64_t fld = r4d_hc8::row_bytes(n, r4d_hc8::kDownGroup);
+    uint64_t rs64 = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { rs64 ^= rs64 << 13; rs64 ^= rs64 >> 7; rs64 ^= rs64 << 17; return rs64; };
+    auto uni = [&](float lo, float hi) { return lo + (hi - lo) * (float)((rnd() >> 40) & 0xFFFFFFu) * (1.0f / 16777216.0f); };
+    std::vector<uint16_t> hh((size_t)(TM * HN)), he((size_t)(TM * n));
+    for (auto& v : hh) v = h_to_bf16(uni(-2.0f, 2.0f));
+    for (auto& v : he) v = h_to_bf16(uni(-1.0f, 1.0f));
+    std::vector<float> hwh((size_t)HN), hwe((size_t)n);
+    for (auto& v : hwh) v = uni(-0.5f, 0.5f);   /* wadd 1: gains around 1 */
+    for (auto& v : hwe) v = uni(-0.5f, 0.5f);
+    std::vector<uint8_t> hfc((size_t)(n * fld)), hfe((size_t)(n * fld));
+    for (auto* m : { &hfc, &hfe })
+        for (int64_t row = 0; row < n; ++row) {
+            uint8_t* p = m->data() + row * fld;
+            for (int64_t k = 0; k < n; ++k) p[k] = (uint8_t)((rnd() & 0x80u) | (rnd() % 0x58u));   /* |v| < 2^4, no NaN */
+            float* sc = (float*)(p + n);
+            for (int64_t g = 0; g < n / r4d_hc8::kDownGroup; ++g) sc[g] = uni(0.002f, 0.004f);
+        }
+    void* d_h = dalloc(hh.size() * 2); void* d_e = dalloc(he.size() * 2);
+    void* d_wh = dalloc(hwh.size() * 4); void* d_we = dalloc(hwe.size() * 4);
+    void* d_fc = dalloc(hfc.size()); void* d_fe = dalloc(hfe.size()); void* d_x = dalloc((size_t)(TM * HN * 2));
+    if (!d_h || !d_e || !d_wh || !d_we || !d_fc || !d_fe || !d_x) { std::printf("--perfmte: hipMalloc failed\n"); ++g_fail; return; }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_e, he.data(), he.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_wh, hwh.data(), hwh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_we, hwe.data(), hwe.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_fc, hfc.data(), hfc.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_fe, hfe.data(), hfe.size(), hipMemcpyHostToDevice);
+    std::vector<RadParam> ps = { PI("M", 8192), PI("n", n), PI("hc", hc), PF("eps", 1e-6), PS("dtype", "bf16"), PF("wadd", 1.0),
+                                 PI("ngroup", hc), PS("fc", "e4m3") };
+    void* scratch = nullptr;
+    int64_t scratch_bytes = 0;
+    {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        scratch_bytes = r->scratch ? r->scratch(&a) : 0;
+        if (scratch_bytes > 0) scratch = dalloc((size_t)scratch_bytes);
+    }
+    std::printf("mtp_enter at Flash-Next's shape (n 2560, hc 4, E4M3 fc), today vs lever MTE (RADIANCE_FN4_MTE_SK %s, _MIN %s), %s, "
+                "%d launches; scratch %lld MiB (the M 8192 band's)\n",
+                std::getenv("RADIANCE_FN4_MTE_SK") ? std::getenv("RADIANCE_FN4_MTE_SK") : "unset (4)",
+                std::getenv("RADIANCE_FN4_MTE_MIN") ? std::getenv("RADIANCE_FN4_MTE_MIN") : "unset (8)",
+                g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str() : "warm (back to back, mean)", iters,
+                (long long)(scratch_bytes >> 20));
+    for (int64_t Tk : { 8, 16, 24, 32, 48, 64, 96, 128 }) {
+        std::vector<RadTensor> ts = { T(d_h, RAD_BF16, { Tk, HN }), T(d_e, RAD_BF16, { Tk, n }), T(d_wh, RAD_F32, { HN }),
+                                      T(d_we, RAD_F32, { n }), T(d_fc, RAD_F8E4M3, { n, n }), T(d_fe, RAD_F8E4M3, { n, n }),
+                                      T(d_x, RAD_BF16, { Tk, HN }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        a.scratch = scratch; a.scratch_bytes = scratch_bytes;
+        auto grab = [&](int arm, std::vector<uint16_t>& out) -> bool {
+            hook(arm);
+            st_memset(d_x, 0x5a, (size_t)(Tk * HN * 2));
+            int rc = r->launch(&a, nullptr);
+            if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+            if (rc != RAD_OK) { std::printf("  T %3lld arm %d refused (rc %d)\n", (long long)Tk, arm, rc); ++g_fail; return false; }
+            out.resize((size_t)(Tk * HN));
+            st_memcpy(out.data(), d_x, out.size() * 2, hipMemcpyDeviceToHost);
+            return true;
+        };
+        std::vector<uint16_t> x0, x1, x2;
+        if (!grab(0, x0) || !grab(4, x1) || !grab(4, x2)) continue;
+        int64_t nd12 = 0, nd01 = 0;
+        double mx = 0.0, md = 0.0;
+        for (size_t i = 0; i < x0.size(); ++i) {
+            nd12 += x1[i] != x2[i];
+            nd01 += x0[i] != x1[i];
+            const double v0 = h_bf16(x0[i]), v1 = h_bf16(x1[i]);
+            mx = std::max(mx, std::fabs(v0));
+            md = std::max(md, std::fabs(v1 - v0));
+        }
+        hook(0);
+        const double t0 = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        hook(4);
+        const double t1 = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        hook(-1);
+        const bool det = nd12 == 0, near = mx > 0.0 && md <= 0.02 * mx;
+        std::printf("  T %3lld tokens: today %8.1f us, MTE %8.1f us (%+7.1f us, %+6.1f %%); MTE twice %lld / %lld differ%s; MTE vs today "
+                    "%lld differ, max |diff| %.4g of max |today| %.4g%s\n",
+                    (long long)Tk, t0, t1, t1 - t0, t0 > 0 ? 100.0 * (t1 - t0) / t0 : 0.0, (long long)nd12, (long long)x0.size(),
+                    det ? "" : "  FAIL (not deterministic)", (long long)nd01, md, mx, near ? "" : "  FAIL (not near)");
+        if (!det || !near) ++g_fail;
+    }
+}
+
 /* qfn-on-ds (Qwen loop round 2, 20.11.2026): --perfrg M [iters] -- the Qwen tp4 decode router at M token rows, timed in its
  * parts. The engine runs router_gemm_topk_scatter_inv (one launch: the router GEMM over every block, the shared gate as one
  * more block, then the selection and sort in the last-arriving block) at 14.4 / 19.0 / 47.2 us a call at 32 / 64 / 128 rows
@@ -44433,6 +44534,7 @@ int main(int argc, char** argv) {
     long long rt_m = 0;
     int rt_it = 200;
     long long rg_m = 0;   /* --perfrg */
+    int mte_on_arg = 0, mte_it = 0;   /* --perfmte */
     long long hctl_m = 0; int hctl_reps = 20;   /* --perfhctl (qfn-on-ds Q17) */
     int rg_it = 200;
     long long mf_m = 0;
@@ -44682,6 +44784,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hctl_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hctl_reps = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfmte")) {
+            /* qfn-on-ds lever MTE: mtp_enter today vs the split-K form at 8-128 tokens (mte_perf) */
+            mte_on_arg = 1;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mte_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfrg")) {
             /* qfn-on-ds: the Qwen tp4 decode router's parts at M rows (router_rg_perf) */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -45153,6 +45259,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("hc_read timeline", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+    if (mte_on_arg) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        mte_perf(pl, mte_it);
+        dfree_all();
+#else
+        skip("mtp_enter timing", "built without HIP");
 #endif
         return g_fail ? 1 : 0;
     }

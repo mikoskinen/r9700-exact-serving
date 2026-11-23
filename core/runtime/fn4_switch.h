@@ -957,7 +957,9 @@
  *                   a draft's bytes move acceptance, never an answer); a mask: 1 = the head's MoE told one row a sequence
  *                   (MoeFP8::set_qmax(1): its 17..RADIANCE_FN4_X3GD_HI-row passes take the fused EXL3 decode chain, not the
  *                   M > 16 prefill band), 2 = the head's attention and feed-forward connection reads through the bi_dec twin
- *                   (HyperConn::read_bd) up to its declared rows; 0 today
+ *                   (HyperConn::read_bd) up to its declared rows; 4 (libr4d, lever MTE) = mtp_enter at RADIANCE_FN4_MTE_MIN (8)..128
+ *                   tokens in a split-K prefill form (both products one launch, K in RADIANCE_FN4_MTE_SK (4) pieces, a fixed-order sum;
+ *                   other bytes than today's mtp_enter, drafts only); 0 today
  *                                                                                                  RADIANCE_FN4_MTP_DEC
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),

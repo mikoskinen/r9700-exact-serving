@@ -8246,6 +8246,180 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
             }
         }
 }
+/* qfn-on-ds lever MTE (Qwen loop round 45, QUEUE Q85; fn4 switch mtp_dec bit 4, RADIANCE_FN4_MTP_DEC): the prefill form's two
+ * products at a draft pass's few tokens. pbs1 (c32, 32-row draft pass): mtp_enter 135.3 us for 13.1 MB of E4M3 weight (a ~21 us
+ * floor at 640 GB/s): each product is n / 128 = 20 blocks, each walking all 40 K tiles of 64 one after another with one tile in
+ * flight -- a latency chain, not a bandwidth bound. Here both products run in ONE launch (grid.y: the embedding product's row
+ * tiles, then the stream product's) with K split SK ways over grid.z: block (x, y, z) walks K tiles [z kc, (z + 1) kc) with
+ * mtp_prefill_gemm_kernel's staging, prefetch and WMMA order word for word and writes its f32 tile to `part` (z-major); then
+ * mtp_prefill_sk_reduce_kernel sums each output's SK stream partials and SK embedding partials in ascending z and rounds once
+ * into x. Other bytes than the one-chain form's (the K sum in SK pieces): drafts only -- the trunk verifies every draft. The
+ * same bytes on every call (no atomics, a fixed order). */
+template <bool F8>
+__global__ __launch_bounds__(kThreads)
+void mtp_prefill_gemm_sk_kernel(const unsigned short* __restrict__ h, long hrow,
+                                const unsigned short* __restrict__ e, long erow,
+                                const float* __restrict__ wh, const float* __restrict__ we,
+                                const float* __restrict__ rs, const float* __restrict__ re,
+                                const void* __restrict__ fchv, const void* __restrict__ fcev, long fld,
+                                float* __restrict__ part, long rows, long n, int hc, float wadd,
+                                int ye, long kc) {
+    constexpr int BM = 2 * MP_TM * 16, BN = 4 * MP_TN * 16;
+    constexpr int CPR = MP_BK / 8;
+    constexpr int AL = BM * CPR / kThreads, WL = BN * CPR / kThreads;
+    static_assert(BM * CPR % kThreads == 0 && BN * CPR % kThreads == 0, "whole chunks");
+    __shared__ __attribute__((aligned(16))) unsigned short sA[BM * MP_PITCH];
+    __shared__ __attribute__((aligned(16))) unsigned short sW[BN * MP_PITCH];
+
+    const bool epass = (int)blockIdx.y < ye;   /* uniform a block */
+    const unsigned short* src = epass ? e : h;
+    const long srow = epass ? erow : hrow;
+    const float* gain = epass ? we : wh;
+    const float* rscale = epass ? re : rs;
+    const void* fcv = epass ? fcev : fchv;
+    const long R = rows * (long)hc;
+    const long Mr = epass ? rows : R;
+    /* part: [SK][rows + R][n] f32, the embedding product's rows first */
+    float* pz = part + ((long)blockIdx.z * (rows + R) + (epass ? 0 : rows)) * n;
+
+    const int  tid = threadIdx.x, wave = tid / kWave, lane = tid & (kWave - 1);
+    const int  wm = wave / 4, wn = wave % 4;
+    const long m0 = (long)(epass ? (int)blockIdx.y : (int)blockIdx.y - ye) * BM, n0 = (long)blockIdx.x * BN;
+
+    const unsigned short* asrc[AL];
+    const float* again[AL];
+    float asc[AL];
+    unsigned short* adst[AL];
+#pragma unroll
+    for (int i = 0; i < AL; ++i) {
+        const int  c = tid + kThreads * i, r = c / CPR, k8 = (c % CPR) * 8;
+        const long gr = m0 + r < Mr ? m0 + r : Mr - 1;
+        const long t = epass ? gr : gr / hc, kk = epass ? 0 : gr % hc;
+        asrc[i]  = src + t * srow + kk * n + k8;
+        again[i] = gain + kk * n + k8;
+        asc[i]   = rscale[gr];
+        adst[i]  = sA + r * MP_PITCH + k8;
+    }
+    const unsigned char* wrow[WL];
+    const unsigned short* wsrc[WL];
+    unsigned short* wdst[WL];
+    int wk8[WL];
+#pragma unroll
+    for (int i = 0; i < WL; ++i) {
+        const int  c = tid + kThreads * i, r = c / CPR, k8 = (c % CPR) * 8;
+        const long gj = n0 + r < n ? n0 + r : n - 1;
+        wrow[i] = (const unsigned char*)fcv + gj * fld;
+        wsrc[i] = (const unsigned short*)fcv + gj * n + k8;
+        wk8[i]  = k8;
+        wdst[i] = sW + r * MP_PITCH + k8;
+    }
+
+    const unsigned short* fa = sA + (wm * MP_TM * 16 + (lane & 15)) * MP_PITCH + 4 * (lane >> 4);
+    const unsigned short* fw = sW + (wn * MP_TN * 16 + (lane & 15)) * MP_PITCH + 4 * (lane >> 4);
+
+    v8f acc[MP_TM][MP_TN];
+#pragma unroll
+    for (int i = 0; i < MP_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < MP_TN; ++j) acc[i][j] = (v8f)(0.f);
+
+    uint4  ra[AL];
+    float4 rg0[AL], rg1[AL];
+    uint2  rc[WL];
+    float  rsc[WL];
+    r4d_u32x4 rw[WL];
+    auto fetch = [&](long k0) {
+#pragma unroll
+        for (int i = 0; i < AL; ++i) {
+            ra[i]  = *(const uint4*)(asrc[i] + k0);
+            rg0[i] = *(const float4*)(again[i] + k0);
+            rg1[i] = *(const float4*)(again[i] + k0 + 4);
+        }
+#pragma unroll
+        for (int i = 0; i < WL; ++i) {
+            if constexpr (F8) {
+                const long k = k0 + wk8[i];
+                rc[i]  = *(const uint2*)(wrow[i] + k);
+                rsc[i] = ((const float*)(wrow[i] + n))[k / r4d_hc8::kDownGroup];
+            } else {
+                rw[i] = *(const r4d_u32x4*)(wsrc[i] + k0);
+            }
+        }
+    };
+    const long nk = n / MP_BK;
+    const long kt0 = (long)blockIdx.z * kc, kt1 = kt0 + kc < nk ? kt0 + kc : nk;
+    if (kt0 < kt1) fetch(kt0 * MP_BK);
+    for (long kt = kt0; kt < kt1; ++kt) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < AL; ++i) {
+            float f8v[8];
+            bf8_f(ra[i], f8v);
+            const float g[8] = { rg0[i].x, rg0[i].y, rg0[i].z, rg0[i].w,
+                                 rg1[i].x, rg1[i].y, rg1[i].z, rg1[i].w };
+#pragma unroll
+            for (int q = 0; q < 8; ++q) f8v[q] = f8v[q] * asc[i] * (g[q] + wadd);
+            *(uint4*)adst[i] = f2bf8(f8v);
+        }
+#pragma unroll
+        for (int i = 0; i < WL; ++i) {
+            if constexpr (F8) {
+                float f[8];
+                e4m3x8(rc[i].x, rc[i].y, f);
+#pragma unroll
+                for (int q = 0; q < 8; ++q) f[q] = f[q] * rsc[i];
+                *(uint4*)wdst[i] = f2bf8(f);
+            } else {
+                *(r4d_u32x4*)wdst[i] = rw[i];
+            }
+        }
+        __syncthreads();
+        if (kt + 1 < kt1) fetch((kt + 1) * MP_BK);
+#pragma unroll
+        for (int s = 0; s < MP_BK / 16; ++s) {
+            v8bf af[MP_TM], bf[MP_TN];
+#pragma unroll
+            for (int i = 0; i < MP_TM; ++i) af[i] = fragP(fa + i * 16 * MP_PITCH + s * 16);
+#pragma unroll
+            for (int j = 0; j < MP_TN; ++j) bf[j] = fragP(fw + j * 16 * MP_PITCH + s * 16);
+#pragma unroll
+            for (int i = 0; i < MP_TM; ++i)
+#pragma unroll
+                for (int j = 0; j < MP_TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < MP_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < MP_TN; ++j) {
+            const long col = n0 + (wn * MP_TN + j) * 16 + (lane & 15);
+            const long mb  = m0 + (wm * MP_TM + i) * 16 + 8 * (lane >> 4);
+            if (col >= n) continue;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const long m = mb + q;
+                if (m < Mr) pz[m * n + col] = acc[i][j][q];
+            }
+        }
+}
+
+/* Lever MTE's sum: x[(t, k)][c] = bf16(sum_z stream_z[(t, k)][c] + sum_z emb_z[t][c]), z ascending, one rounding (the one-chain
+ * form's single rounding of acc + eterm). One thread an output element. */
+__global__ __launch_bounds__(kThreads)
+void mtp_prefill_sk_reduce_kernel(const float* __restrict__ part, unsigned short* __restrict__ x,
+                                  long rows, long n, int hc, int sk, long xrow) {
+    const long R = rows * (long)hc;
+    const long i = (long)blockIdx.x * kThreads + threadIdx.x;
+    if (i >= R * n) return;
+    const long m = i / n, col = i % n, t = m / hc, kk = m % hc;
+    const long zs = (rows + R) * n;
+    float hs = 0.0f, es = 0.0f;
+    for (int z = 0; z < sk; ++z) {
+        es += part[z * zs + t * n + col];
+        hs += part[z * zs + (rows + m) * n + col];
+    }
+    x[t * xrow + kk * n + col] = f2bf(hs + es);
+}
 #undef MP_BK
 #undef MP_PITCH
 #undef MP_TM
@@ -8642,6 +8816,52 @@ extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
 
 enum { MTE_H = 0, MTE_E, MTE_WH, MTE_WE, MTE_FCH, MTE_FCE, MTE_X };
 
+/* qfn-on-ds lever MTE (Qwen loop round 45): bit 4 of the Qwen switch mtp_dec (the architecture takes bits 1 / 2, this library
+ * bit 4; RADIANCE_FN4_MTP_DEC at start, the core's start-value rule); RADIANCE_FN4_MTE_SK = the K split (2..10, default 4),
+ * RADIANCE_FN4_MTE_MIN = the fewest tokens it takes (default 8; a band without scratch keeps today's form); the bench hook
+ * r4d_mte_bench(v) overrides the switch (-1 = the switch). */
+constexpr long kMteMaxRows = 128;
+static std::atomic<int> g_mtp_dec{-1};
+static std::atomic<int> g_mte_bench{-1};
+extern "C" void r4d_mte_bench(int v) { g_mte_bench.store(v, std::memory_order_relaxed); }
+static bool mte_on() {
+    const int b = g_mte_bench.load(std::memory_order_relaxed);
+    if (b >= 0) return (b & 4) != 0;
+    int v = g_mtp_dec.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_MTP_DEC");
+        int n = 0;
+        if (e && *e && *e != '0') { n = std::atoi(e); n = n > 1 ? n : 1; }
+        int expect = -1;
+        g_mtp_dec.compare_exchange_strong(expect, n & 7, std::memory_order_relaxed);
+        v = g_mtp_dec.load(std::memory_order_relaxed);
+    }
+    return (v & 4) != 0;
+}
+static long long mte_sk(long long n) {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_MTE_SK");
+        const int k = e && *e ? std::atoi(e) : 4;
+        return k >= 2 && k <= 10 ? k : 4;
+    }();
+    const long long nk = n / 64;
+    return v < nk ? v : nk;
+}
+static long mte_min() {
+    static const long v = [] {
+        const char* e = std::getenv("RADIANCE_FN4_MTE_MIN");
+        const long k = e && *e ? std::atol(e) : 8;
+        return k >= 1 ? k : 8;
+    }();
+    return v;
+}
+static void mte_note(long long rows, long long sk) {
+    static std::atomic<int> said{0};
+    if (said.exchange(1) == 0)
+        std::fprintf(stderr, "radiance: libr4d: lever MTE (mtp_dec bit 4): first split-K mtp_enter at %lld tokens (K in %lld pieces, "
+                             "one launch for both products + the sum; drafts only)\n", rows, sk);
+}
+
 extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* h   = r4d_opt(a, MTE_H);
@@ -8710,6 +8930,40 @@ extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
      * E4M3 dot): the per-row kernel's advantage is its transposed LDS layout, which codes cannot
      * use. A shape the tile cannot take is refused. */
     if (f8 && !tileable) return R4D_NO(RAD_E_SHAPE);
+    /* qfn-on-ds lever MTE (mtp_dec bit 4): a draft pass's few tokens through the split-K prefill products, where the scratch
+     * holds the partials (the band's scratch is sized at its ceiling, so a band below kMtpPrefillRows has none: today's form) */
+    if (tileable && mte_on() && rows >= mte_min() && rows <= kMteMaxRows) {
+        const long long sk = mte_sk(n);
+        auto al = [](long long b) { return (b + 255) & ~255LL; };
+        const long long need = al(R * 4) + al(rows * 4) + al((long long)sk * (rows + R) * n * 4);
+        if (sk > 1 && a->scratch && a->scratch_bytes >= need) {
+            float* rs = (float*)a->scratch;
+            float* re = (float*)((unsigned char*)a->scratch + al(R * 4));
+            float* pt = (float*)((unsigned char*)a->scratch + al(R * 4) + al(rows * 4));
+            const unsigned sb = (unsigned)((R + rows + kWaves - 1) / kWaves);
+            hipLaunchKernelGGL(mtp_prefill_scale_kernel, dim3(sb), dim3(kThreads), 0, (hipStream_t)stream,
+                               (const unsigned short*)h->data, (const unsigned short*)e->data, rs, re,
+                               (long)rows, (long)n, (int)hc, ngroup == 1 ? 1 : 0, eps, (long)hrow, (long)erow);
+            const int ye = (int)((rows + 127) / 128), yh = (int)((R + 127) / 128);
+            const long kc = (n / 64 + sk - 1) / sk;
+            const dim3 gg((unsigned)((n + 127) / 128), (unsigned)(ye + yh), (unsigned)sk);
+            if (f8)
+                hipLaunchKernelGGL(mtp_prefill_gemm_sk_kernel<true>, gg, dim3(kThreads), 0, (hipStream_t)stream,
+                                   (const unsigned short*)h->data, (long)hrow, (const unsigned short*)e->data, (long)erow,
+                                   (const float*)wh->data, (const float*)we->data, rs, re, (const void*)fch->data,
+                                   (const void*)fce->data, (long)fld, pt, (long)rows, (long)n, (int)hc, wadd, ye, kc);
+            else
+                hipLaunchKernelGGL(mtp_prefill_gemm_sk_kernel<false>, gg, dim3(kThreads), 0, (hipStream_t)stream,
+                                   (const unsigned short*)h->data, (long)hrow, (const unsigned short*)e->data, (long)erow,
+                                   (const float*)wh->data, (const float*)we->data, rs, re, (const void*)fch->data,
+                                   (const void*)fce->data, (long)fld, pt, (long)rows, (long)n, (int)hc, wadd, ye, kc);
+            hipLaunchKernelGGL(mtp_prefill_sk_reduce_kernel, dim3((unsigned)((R * n + kThreads - 1) / kThreads)), dim3(kThreads), 0,
+                               (hipStream_t)stream, (const float*)pt, (unsigned short*)x->data, (long)rows, (long)n, (int)hc,
+                               (int)sk, (long)xrow);
+            mte_note(rows, sk);
+            return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+        }
+    }
     /* The prefill form from kMtpPrefillRows tokens, on its scratch; it accepts every shape the
      * tile does. */
     if (rows >= kMtpPrefillRows && tileable) {
@@ -9824,6 +10078,16 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
             std::fprintf(stderr, "radiance: libr4d: lever EPD (gdn_epd %d): the GDN decode update's per-token norm / output / codes after its "
                                  "token loop%s (the same bytes)\n", value, value == 2 ? " + lever QKS (q / k normalised once a token)"
                                  : value == 3 ? " + lever GRP (the replay's factor blocks staged at once)" : "");
+        return 1;
+    }
+    if (!std::strcmp(name, "mtp_dec")) {   /* qfn-on-ds lever MTE (round 45): bit 4 = mtp_enter's split-K form at a draft pass's tokens
+                                            * (bits 1 / 2 are the architecture's, lever MTD) */
+        if (value < 0 || value > 7) return -1;
+        g_mtp_dec.store(value, std::memory_order_relaxed);
+        static std::atomic<int> said{0};
+        if ((value & 4) && said.exchange(1) == 0)
+            std::fprintf(stderr, "radiance: libr4d: lever MTE (mtp_dec bit 4): mtp_enter at %ld..%ld tokens in the split-K prefill form "
+                                 "(drafts only)\n", mte_min(), kMteMaxRows);
         return 1;
     }
     if (!std::strcmp(name, "hc_rf")) {   /* qfn-on-ds lever HRF (round 44): the HXS read's A' + B3X as one launch from N rows, 0 off */
