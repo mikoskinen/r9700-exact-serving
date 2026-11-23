@@ -173,6 +173,7 @@ struct Plugin {
     void (*b3x_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3X: r4d_hc_b3x) */
     void (*xlb_hc)(int) = nullptr;         /* optional (qfn-on-ds lever XLB: r4d_hc_x_lb, mask 0..3) */
     void (*b3e_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3E: r4d_hc_b3x_e) */
+    void (*b3d_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3D: r4d_hc_b3x_d) */
     void (*ab_hc)(int) = nullptr;          /* optional (qfn-on-ds round 39, Q70: r4d_hc_ab, the served read's ablation copies) */
     void (*tl_lds_hc)(int) = nullptr;      /* optional (qfn-on-ds round 39, Q70: r4d_hc_tl_lds, dynamic LDS on the TL launches) */
     void (*b3p_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3P, round 39, Q71: r4d_hc_b3x_p, the row floor; 0 off) */
@@ -265,6 +266,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->b3x_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x");
     pl->xlb_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x_lb");
     pl->b3e_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_e");
+    pl->b3d_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_d");
     pl->ab_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_ab");
     pl->tl_lds_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_tl_lds");
     pl->b3p_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_p");
@@ -26463,6 +26465,9 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
      * served B3X at 8 waves a SIMD); the reference keeps 0 */
     const int oarm = envi("R4D_SELFTEST_OCC", 0) & 24;
     if (oarm && !pl.occ_hc) { skip(nm.c_str(), "no r4d_hc_occ"); return; }
+    /* round 40 (QUEUE Q74, lever B3D): R4D_SELFTEST_B3D=1 = the arm's B3X with d's LDS rows padded (B3E's form only); the reference 0 */
+    const int darm = envi("R4D_SELFTEST_B3D", 0) ? 1 : 0;
+    if (darm && !pl.b3d_hc) { skip(nm.c_str(), "no r4d_hc_b3x_d"); return; }
     pl.norm_hc_wave(1); pl.write_hc_vec(1); pl.pf2_stages_hc(31);
     g.set(true, false);
     auto arm_set = [&](bool on) {
@@ -26474,6 +26479,7 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
         if (pl.b3e_hc) pl.b3e_hc(on || refle ? earm : 0);
         if (pl.b3p_hc) pl.b3p_hc(on ? parm : 0);
         if (oarm) pl.occ_hc(on ? oarm : 0);
+        if (pl.b3d_hc) pl.b3d_hc(on ? darm : 0);
     };
     auto outs = [&](std::vector<uint8_t>& o) {
         o.clear();
@@ -26515,15 +26521,15 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     for (size_t i = 0; i < f0.size() && i < f1.size(); ++i) fdiff += f0[i] != f1[i];
     if (f0.size() != f1.size()) fdiff += 100;
     const size_t fwant = (size_t)(((lbarm && !refle) || (xarm2 && xarm2 != xarm) || (oarm & 8)) ? 1 : 0)
-                       + (size_t)(((earm && !refle) || parm || (oarm & 16)) ? 1 : 0);
+                       + (size_t)(((earm && !refle) || parm || (oarm & 16) || darm) ? 1 : 0);
     if (fwant && refx) {
         std::printf("SSB M=%lld XLB dispatch: %zu / %zu read functions differ from the reference (%s)\n", (long long)M, fdiff, f1.size(),
                     pl.record ? (fdiff == fwant ? "the twin(s) ran" : "NOT the expected count") : "no record hook");
         ok(fmt("SSB M=%lld XLB %d B3E %d: the arm's read dispatches its twin(s) (%zu function(s) differ)", (long long)M, lbarm, earm, fwant).c_str(),
            !pl.record || fdiff == fwant, fmt("%zu differ", fdiff));
     }
-    if (parm || xarm2 || oarm)
-        std::printf("SSB M=%lld arm: B3P %d HCX_ARM %d OCC %d over %s\n", (long long)M, parm, xarm2, oarm,
+    if (parm || xarm2 || oarm || darm)
+        std::printf("SSB M=%lld arm: B3P %d HCX_ARM %d OCC %d B3D %d over %s\n", (long long)M, parm, xarm2, oarm, darm,
                     refle ? "the served HXS + LE form" : "the reference");
     std::printf("SSB M=%lld SSB %d HC_X %d B3X %d XLB %d B3E %d vs reference (%s): %s; control (ss x 2 after the write): %s\n",
                 (long long)M, sarm, xarm, barm, lbarm, earm, refx ? (refle ? "the same form with B3P / HCX_ARM off" : "the same with XLB / B3E off") : "bit 17 off, HC_X 0, B3X 0",
@@ -26637,6 +26643,7 @@ static void hc_ssb_bench(const Plugin& pl, int64_t M, int iters) {
     if (pl.b3e_hc) pl.b3e_hc(-1);
     if (pl.b3p_hc) pl.b3p_hc(-1);
     if (oarm) pl.occ_hc(0);
+    if (pl.b3d_hc) pl.b3d_hc(-1);
     pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0); pl.pf2_stages_hc(31);
     ok(nm.c_str(), okb && okt && diff == 0 && (sarm == 0 || dctl > 0),
        !okb || !okt ? "launch failed" : diff ? "the arm's bytes differ" : (sarm && !dctl) ? "the control did not move: A' did not read ss" : "");
