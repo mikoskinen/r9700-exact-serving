@@ -36,6 +36,8 @@
 #include "r4d_chain.h"
 #include "r4d_q8.h"         // the 8-bit codes the folded quantiser writes: E4M3 or int8
 #include "r4d_fwht.h"       // NORM 3: had_quant_act_i8g's rotation before the int8 codes
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -219,7 +221,7 @@ __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsign
 }
 
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
+          int CV = 0, int EPD = 0>
 __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsigned short* __restrict__ q,
                                      const unsigned short* __restrict__ k,
                                      const unsigned short* __restrict__ v,
@@ -247,6 +249,15 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
   __shared__ float wsum[THR / 32];
   __shared__ float srot[NORM == 3 ? RU_V : 1];      // NORM 3: the row's bf16 output, for the rotation
+  /* qfn-on-ds lever EPD (Qwen loop round 41, QUEUE Q78): the epilogue deferred -- the token loop keeps only the recurrence
+   * (state, factors, the raw output `on`, parked in sonT) and the row norm, the bf16 output, the out projection's codes and
+   * scales of all T tokens follow the loop in two barriers (and, at NORM 3, one rotation per wave in parallel) instead of
+   * two to four barriers inside every token. Each token's values are the same expressions in the same order: the same bytes. */
+  static_assert(!EPD || (CV && NORM && ANC && VS == 1 && STG == 0), "EPD: the folded decode shape (T <= RU_CVT), fused norm, anchor");
+  __shared__ float sonT[EPD ? RU_CVT * RU_V : 1];         // per (token, row): the raw output before the norm
+  __shared__ float sobT[EPD ? RU_CVT * RU_V : 1];         // per (token, row): bf2f of the stored bf16 output
+  __shared__ float swnT[EPD ? RU_CVT * (THR / 32) : 1];   // per (token, wave): the norm's partial sum of squares
+  __shared__ float swaT[EPD ? RU_CVT * (THR / 32) : 1];   // per (token, wave): NORM 1 / 2's partial amax
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -616,6 +627,10 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     for (int j = 0; j < RU_HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
     on += r4d_xor_lane<1>(on);
 
+    /* lever EPD: only the raw output here; its epilogue after the loop (both lanes of a pair hold the same sum) */
+    if constexpr (EPD) {
+      if (half == 0) sonT[t * RU_V + row] = on;
+    } else {
     if (NORM) {
       // sum of squares over the row: one channel per thread pair, 16 per wave
       float sq = (half == 0) ? on * on : 0.0f;
@@ -694,6 +709,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
       }
       __syncthreads();               // wsum is reused by the next token
     }
+    }   /* !EPD */
 
     if (!ANC) {
       const int so = sidx[(size_t)n * sidx_stride + t];
@@ -704,6 +720,92 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
               + (size_t)row * RU_K + k0;
 #pragma unroll
         for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
+      }
+    }
+  }
+
+  /* lever EPD: the T tokens' epilogues after the loop. Per token the loop's own expressions in its order -- the row's sum of
+   * squares by the same lane exchanges and the eight wave partials summed ascending, the same scale, gate and bf16 output, the
+   * same rotation / amax and codes -- so the same bytes; the tokens' reductions share two barriers, and at NORM 3 wave w rotates
+   * tokens w, w + 8 (one wave rotated every token, between barriers, before). */
+  if constexpr (EPD) {
+    constexpr int NWV = THR / 32;
+    const int wv = tid >> 5, ln = tid & 31;
+    for (int t = 0; t < T; ++t) {
+      const float on = sonT[t * RU_V + row];
+#if defined(R4D_EMU_EPD_MUTATE)   /* r4d_emu_gdnepd's mutation build only: both lanes of a row pair counted in the norm */
+      float sq = on * on;
+#else
+      float sq = (half == 0) ? on * on : 0.0f;
+#endif
+      sq += r4d_xor_lane<16>(sq); sq += r4d_xor_lane<8>(sq); sq += r4d_xor_lane<4>(sq);
+      sq += r4d_xor_lane<2>(sq);  sq += r4d_xor_lane<1>(sq);
+      if (ln == 0) swnT[t * NWV + wv] = sq;
+    }
+    __syncthreads();
+    for (int t = 0; t < T; ++t) {
+      const int tok = bos + t;
+      float on = sonT[t * RU_V + row];
+      float tot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < NWV; ++i) tot += swnT[t * NWV + i];
+      const float sc = __frsqrt_rn(tot * (1.0f / RU_V) + neps);
+      const unsigned short zr = szg[t * RU_V + row];
+      on *= sc * nw[row] * ru_act(bf2f(zr), nact);
+      const unsigned short ob = f2bf(on);
+      if (half == 0) {
+        o[((size_t)tok * H + hv) * RU_V + row] = ob;
+        sobT[t * RU_V + row] = bf2f(ob);
+      }
+      if constexpr (NORM == 1 || NORM == 2) {
+        const float ov = bf2f(ob);
+        float mv = (half == 0) ? fabsf(ov) : 0.0f;
+        mv = fmaxf(mv, r4d_xor_lane<16>(mv)); mv = fmaxf(mv, r4d_xor_lane<8>(mv));
+        mv = fmaxf(mv, r4d_xor_lane<4>(mv));  mv = fmaxf(mv, r4d_xor_lane<2>(mv));
+        mv = fmaxf(mv, r4d_xor_lane<1>(mv));
+        if (ln == 0) swaT[t * NWV + wv] = mv;
+      }
+    }
+    if (oq) {
+      __syncthreads();
+      if constexpr (NORM == 3) {
+        for (int t = wv; t < T; t += NWV) {
+          const int tok = bos + t;
+          float rv[4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) rv[j] = sobT[t * RU_V + 4 * ln + j];
+          r4d_fwht_wave<128>(rv, ln);
+          float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+          m = r4d_wave_max(m);
+          const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+          if (ln == 0) os[(size_t)tok * os_ld + hv] = qs;
+          const float inv = 1.0f / qs;
+          uint32_t pk = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+          *(uint32_t*)(oq + (size_t)tok * oq_pitch + (size_t)hv * RU_V + 4 * ln) = pk;
+        }
+      } else {
+        for (int t = 0; t < T; ++t) {
+          const int tok = bos + t;
+          float amax = 0.0f;
+#pragma unroll
+          for (int i = 0; i < NWV; ++i) amax = fmaxf(amax, swaT[t * NWV + i]);
+          const float qs = amax > 0.0f ? amax * (1.0f / q8_top<NORM == 2>()) : 1.0f;
+          if (tid == 0) os[(size_t)tok * os_ld + hv] = qs;
+          if (half == 0) {
+            const float ov = sobT[t * RU_V + row];
+            unsigned char code;
+            if constexpr (NORM == 2) {
+              code = (unsigned char)(int)rintf(fminf(fmaxf(ov * (1.0f / qs), -127.0f), 127.0f));
+            } else {
+              const float cv = fminf(fmaxf(ov * (1.0f / qs), -448.0f), 448.0f);
+              code = (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(cv, cv, 0, false) & 0xff);
+            }
+            oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = code;
+          }
+        }
       }
     }
   }
@@ -734,7 +836,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
 
 /* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
+          int CV = 0, int EPD = 0>
 __global__ __launch_bounds__(RU_V / VS * 2)
 void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                      const unsigned short* __restrict__ k,
@@ -757,10 +859,10 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                      const float* __restrict__ nw, float neps, int nact,
                                      int H, int Hg, float scale, float sp_thr,
                                      const RuConv cv) { R4D_IKA_ENTRY();
-    r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
+    r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV, EPD>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
 }
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
+          int CV = 0, int EPD = 0>
 __global__ __launch_bounds__(RU_V / VS * 2)
 void r4dchain_gdn_recurrent_update(const unsigned short* __restrict__ q,
                                      const unsigned short* __restrict__ k,
@@ -784,7 +886,7 @@ void r4dchain_gdn_recurrent_update(const unsigned short* __restrict__ q,
                                      int H, int Hg, float scale, float sp_thr,
                                      const RuConv cv) {
     r4d_chain_wait();
-    r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
+    r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV, EPD>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
     r4d_chain_done();
 }
 
@@ -969,6 +1071,32 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
   return kept;
 }
 
+/* qfn-on-ds lever EPD (Qwen loop round 41, QUEUE Q78): RADIANCE_GDN_EPD=1 (read once) = the folded decode update (anchor state,
+ * fp32 state) with its per-token epilogue -- row norm, bf16 output, the out projection's codes and scales -- deferred past the token
+ * loop (the kernel's EPD note); the same bytes. The bench / switch hook r4d_gdn_epd(0 / 1) overrides the env (-1 = the env). */
+static std::atomic<int> g_ru_epd_bench{-1};
+static bool ru_epd() {
+  const int b = g_ru_epd_bench.load(std::memory_order_relaxed);
+  if (b >= 0) return b == 1;
+  static const bool v = [] {
+    const char* e = getenv("RADIANCE_GDN_EPD");
+    const bool on = e && e[0] == '1' && e[1] == '\0';
+    if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=1): the GDN decode update's per-token norm / output / "
+                            "codes after its token loop (two barriers a call instead of two to four a token; the same bytes)\n");
+    return on;
+  }();
+  return v;
+}
+extern "C" void r4d_gdn_epd(int on) { g_ru_epd_bench.store(on < 0 ? -1 : (on > 0 ? 1 : 0), std::memory_order_relaxed); }
+/* lever EPD's dispatch proof for the bench / host test: launches that took the EPD instance since the process started */
+static std::atomic<long long> g_ru_epd_launches{0};
+extern "C" long long r4d_gdn_epd_launches() { return g_ru_epd_launches.load(std::memory_order_relaxed); }
+/* qfn-on-ds QUEUE Q13 read (round 41, bench only): dynamic LDS bytes on the folded update's launch (0 = today), to read its time against
+ * workgroups resident a WGP (~13.7 KB static: 32 KB more leaves 2 a WGP where the VGPRs allow 3); the kernel declares none, so no result
+ * changes */
+static std::atomic<int> g_ru_dyn_lds{0};
+extern "C" void r4d_gdn_dyn_lds(int bytes) { g_ru_dyn_lds.store(bytes < 0 ? 0 : (bytes > 49152 ? 49152 : bytes), std::memory_order_relaxed); }
+
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
 // factor-block bounds are as in ru_update_launch. `w_f32` is the conv weight's type. `oq_i8`:
@@ -988,14 +1116,21 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const long flood = (long)N * slots_written * st_slot * (sdt ? 2 : 4);
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
+  /* lever EPD: anchor + fp32 state only (its instances); every other form unchanged */
+  const bool epd = anc && !sdt && ru_epd();
+  if (epd) g_ru_epd_launches.fetch_add(1, std::memory_order_relaxed);
+  const unsigned dyn_lds = (unsigned)g_ru_dyn_lds.load(std::memory_order_relaxed);   /* bench only (Q13 read); 0 = today */
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
   do { if (oq_i8 == 2) RC_LAUNCH_NM(3, NTC, ANCC, SDTC, CVC);                                  \
        else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
        else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<1, NM, 1, NTC, ANCC, 0, SDTC, CVC> \
-                                  : &r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC>), \
-                     grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
+  do { if ((ANCC) && !(SDTC) && epd) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
+       else                          RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, 0); } while (0)
+#define RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, EPC)                                           \
+  hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, EPC> \
+                                  : &r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, EPC>), \
+                     grid, blk, dyn_lds, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
                      (unsigned char*)oq, (float*)os, oq_pitch, os_ld, (const int*)cu,          \
@@ -1014,6 +1149,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #undef RC_PICKNT
 #undef RC_LAUNCH
 #undef RC_LAUNCH_NM
+#undef RC_LAUNCH_EP
   return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

@@ -174,6 +174,9 @@ struct Plugin {
     void (*xlb_hc)(int) = nullptr;         /* optional (qfn-on-ds lever XLB: r4d_hc_x_lb, mask 0..3) */
     void (*b3e_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3E: r4d_hc_b3x_e) */
     void (*b3d_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3D: r4d_hc_b3x_d) */
+    void (*gdn_epd)(int) = nullptr;        /* optional (qfn-on-ds lever EPD: r4d_gdn_epd, -1 the env) */
+    long long (*gdn_epd_n)() = nullptr;    /* optional (qfn-on-ds lever EPD: r4d_gdn_epd_launches) */
+    void (*gdn_lds)(int) = nullptr;        /* optional (qfn-on-ds Q13 read: r4d_gdn_dyn_lds, bench only) */
     void (*ab_hc)(int) = nullptr;          /* optional (qfn-on-ds round 39, Q70: r4d_hc_ab, the served read's ablation copies) */
     void (*tl_lds_hc)(int) = nullptr;      /* optional (qfn-on-ds round 39, Q70: r4d_hc_tl_lds, dynamic LDS on the TL launches) */
     void (*b3p_hc)(int) = nullptr;         /* optional (qfn-on-ds lever B3P, round 39, Q71: r4d_hc_b3x_p, the row floor; 0 off) */
@@ -267,6 +270,9 @@ static bool load(Plugin* pl, const char* path) {
     pl->xlb_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_x_lb");
     pl->b3e_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_e");
     pl->b3d_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_d");
+    pl->gdn_epd = (void (*)(int))dlsym(pl->h, "r4d_gdn_epd");
+    pl->gdn_epd_n = (long long (*)())dlsym(pl->h, "r4d_gdn_epd_launches");
+    pl->gdn_lds = (void (*)(int))dlsym(pl->h, "r4d_gdn_dyn_lds");
     pl->ab_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_ab");
     pl->tl_lds_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_tl_lds");
     pl->b3p_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_b3x_p");
@@ -26425,6 +26431,152 @@ static void hxt_timeline(const Plugin& pl, const std::function<void()>& read_onc
                     pct(gapab, 0.5), pct(gapab, 0.0));
 }
 
+/* qfn-on-ds QUEUE Q13 read + lever EPD (Qwen loop round 41, QUEUE Q78): --perfgdnr [iters] -- the GDN decode update as Flash-Next tp4
+ * serves it (gdn_conv_recurrent_update_had: the conv folded in, anchor state in fp32, had_quant_act_i8g's rotated int8 codes; the
+ * rank shape 12 value heads / 4 key heads, 128 x 128 state, conv width 4; the engine's state_index layout: columns 0-2 the anchor
+ * slot n, 3-5 the factor slot n + N) over N sequences x T tokens a sequence x A accepted tokens replayed a call.
+ * Cells: R4D_SELFTEST_GDN_N (default "1,4,8,16,24,32"), R4D_SELFTEST_GDN_TA = T:A pairs (default "4:3,4:1,1:1,5:4,8:4"),
+ * R4D_SELFTEST_GDN_FORMS (default "3,2": 3 had / NORM 3, 2 int8 / NORM 2, 1 E4M3 / NORM 1). Each cell: (1) lever EPD's bytes --
+ * two copies from the same inputs, today's form and EPD, two steps (the second replays the first's factors): o, codes, scales,
+ * the whole state pool and the conv state MUST be identical; the EPD launch count +1 a call under EPD, +0 without; (2) time a call,
+ * today / EPD / today / EPD, iters launches each (warm, or cold under --cold), and the state traffic's rate (one 64 KB read + one
+ * 64 KB write a (sequence, head)). */
+static void gdnr_bench(const Plugin& pl, int iters) {
+    if (iters < 1) iters = 50;
+    const RadKernelInfo* rh = find(pl, "gdn_conv_recurrent_update_had_k128_v128_bf16");
+    const RadKernelInfo* rp = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
+    if (!rh || !rp) { std::printf("--perfgdnr: a gdn_conv_recurrent_update row is absent\n"); ++g_fail; return; }
+    const bool has_epd = pl.gdn_epd && pl.gdn_epd_n;
+    if (!has_epd) std::printf("GDNR: no r4d_gdn_epd in this libr4d -- today's form only\n");
+    auto envs = [](const char* k, const char* d) { const char* e = std::getenv(k); return std::string(e && *e ? e : d); };
+    auto ints = [](const std::string& s) { std::vector<int> v; for (const char* p = s.c_str(); *p;) { v.push_back((int)std::strtol(p, (char**)&p, 10)); while (*p == ',' || *p == ' ' || *p == ':') ++p; } return v; };
+    const std::vector<int> Ns = ints(envs("R4D_SELFTEST_GDN_N", "1,4,8,16,24,32"));
+    const std::vector<int> TA = ints(envs("R4D_SELFTEST_GDN_TA", "4:3,4:1,1:1,5:4,8:4"));
+    const std::vector<int> FM = ints(envs("R4D_SELFTEST_GDN_FORMS", "3,2"));
+    const int lds_b = std::atoi(envs("R4D_SELFTEST_GDN_LDS", "0").c_str());   /* the residency arm's dynamic LDS bytes (0: none) */
+    const int64_t K = 128, V = 128, H = 12, Hg = 4, W = 4, MQ = 8, SL = W - 2 + MQ, COLS = 6;
+    const int64_t CONV = 2 * Hg * K + H * V, INW = CONV + H * V;
+    std::printf("GDNR: rank shape H %lld Hg %lld K %lld V %lld conv %lld, iters %d, %s\n", (long long)H, (long long)Hg, (long long)K,
+                (long long)V, (long long)W, iters, g_cold > 0 ? fmt("cold (%lld MiB flush)", (long long)(g_cold >> 20)).c_str() : "warm");
+    for (int form : FM)
+        for (int N : Ns)
+            for (size_t ti = 0; ti + 1 < TA.size(); ti += 2) {
+                const int Tq = TA[ti], A = TA[ti + 1];
+                if (N < 1 || Tq < 1 || Tq > MQ || A < 1 || A > MQ || form < 1 || form > 3) continue;
+                const RadKernelInfo* r = form == 3 ? rh : rp;
+                const int64_t Td = (int64_t)N * Tq, SS = 2 * (int64_t)N, CS = N;
+                uint32_t seed = 0x6d2b79f5u ^ (uint32_t)(N * 131 + Tq * 17 + A * 7 + form);
+                auto rnd = [&seed]() { seed = st_mix32(seed + 0x9e3779b9u); return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f; };
+                std::vector<uint16_t> hw((size_t)(CONV * W)), hcs((size_t)(CS * CONV * SL)), hx[2], hab[2];
+                for (auto& e : hw) e = h_to_bf16(0.5f * rnd());
+                for (auto& e : hcs) e = h_to_bf16(rnd());
+                for (int st = 0; st < 2; ++st) {
+                    hx[st].resize((size_t)(Td * INW)); for (auto& e : hx[st]) e = h_to_bf16(rnd());
+                    hab[st].resize((size_t)(Td * 2 * H)); for (auto& e : hab[st]) e = h_to_bf16(rnd());
+                }
+                std::vector<float> hst((size_t)(SS * H * V * K), 0.0f), halog((size_t)H), hdtb((size_t)H), hnw((size_t)V);
+                for (int64_t i = 0; i < (int64_t)N * H * V * K; ++i) hst[(size_t)i] = 0.1f * rnd();   /* anchor slots; factor slots zero */
+                for (int64_t h = 0; h < H; ++h) { halog[(size_t)h] = -2.0f + 0.25f * (float)h; hdtb[(size_t)h] = -1.0f + 0.5f * (float)(h % 5); }
+                for (auto& e : hnw) e = 1.0f + 0.25f * rnd();
+                std::vector<int32_t> cu(1, 0), sidx((size_t)(N * COLS)), nacc((size_t)N, A), cidx((size_t)N);
+                for (int n = 0; n < N; ++n) {
+                    cu.push_back((int32_t)((n + 1) * Tq)); cidx[(size_t)n] = n;
+                    for (int64_t c = 0; c < COLS; ++c) sidx[(size_t)(n * COLS + c)] = (int32_t)(n + (c * 2 / COLS) * N);
+                }
+                auto dev = [&](const void* h, size_t b) { void* d = dalloc(b); if (d && h) st_memcpy(d, h, b, hipMemcpyHostToDevice); return d; };
+                const size_t st_b = hst.size() * 4, cs_b = hcs.size() * 2, o_b = (size_t)(Td * H * V) * 2, oq_b = (size_t)(Td * H * V), os_b = (size_t)(Td * H) * 4;
+                void* d_x[2] = { dev(hx[0].data(), hx[0].size() * 2), dev(hx[1].data(), hx[1].size() * 2) };
+                void* d_ab[2] = { dev(hab[0].data(), hab[0].size() * 2), dev(hab[1].data(), hab[1].size() * 2) };
+                void* d_w = dev(hw.data(), hw.size() * 2);
+                void* d_al = dev(halog.data(), halog.size() * 4); void* d_dt = dev(hdtb.data(), hdtb.size() * 4);
+                void* d_nw = dev(hnw.data(), hnw.size() * 4);
+                void* d_cu = dev(cu.data(), cu.size() * 4); void* d_si = dev(sidx.data(), sidx.size() * 4);
+                void* d_na = dev(nacc.data(), nacc.size() * 4); void* d_ci = dev(cidx.data(), cidx.size() * 4);
+                void* d_st[2]; void* d_cs[2]; void* d_o[2]; void* d_oq[2]; void* d_os[2];
+                for (int i = 0; i < 2; ++i) { d_st[i] = dev(hst.data(), st_b); d_cs[i] = dev(hcs.data(), cs_b); d_o[i] = dev(nullptr, o_b);
+                                              d_oq[i] = dev(nullptr, oq_b); d_os[i] = dev(nullptr, os_b); }
+                if (!d_x[1] || !d_os[1] || !d_ci) { std::printf("--perfgdnr: hipMalloc failed at N %d\n", N); ++g_fail; dfree_all(); return; }
+                auto view = [](void* base, uint32_t dt, int64_t rows, int64_t cols, int64_t pitch, int64_t col0) {
+                    RadTensor t = T((char*)base + (size_t)col0 * esz(dt), dt, { rows, cols }); t.stride[0] = pitch; return t; };
+                RadTensor none; std::memset(&none, 0, sizeof(none));
+                std::vector<RadParam> pf = { PI("q_len", MQ), PI("head_k", K), PI("head_v", V), PI("n_head_v", H), PF("scale", 0.088388),
+                                             PF("eps", 1e-6), PS("act", "silu"), PS("state_form", "anchor"), PI("conv_width", W) };
+                /* copy c, step st (inputs d_x[st] / d_ab[st]) */
+                auto args = [&](int c, int st, std::vector<RadTensor>& ts, RadArgs& a) {
+                    ts = { view(d_x[st], RAD_BF16, Td, CONV, INW, 0), T(d_w, RAD_BF16, { CONV, W }), none, T(d_cs[c], RAD_BF16, { CS, CONV, SL }),
+                           T(d_ci, RAD_I32, { N }), view(d_ab[st], RAD_BF16, Td, H, 2 * H, 0), view(d_ab[st], RAD_BF16, Td, H, 2 * H, H),
+                           T(d_al, RAD_F32, { H }), T(d_dt, RAD_F32, { H }), T(d_st[c], RAD_F32, { SS, H, V, K }), T(d_si, RAD_I32, { N, COLS }),
+                           T(d_na, RAD_I32, { N }), T(d_cu, RAD_I32, { N + 1 }), view(d_x[st], RAD_BF16, Td, H * V, INW, CONV),
+                           T(d_nw, RAD_F32, { V }), T(d_o[c], RAD_BF16, { Td, H, V }), T(d_oq[c], form == 1 ? RAD_F8E4M3 : RAD_I8, { Td, H * V }),
+                           T(d_os[c], RAD_F32, { Td, H }) };
+                    std::memset(&a, 0, sizeof(a));
+                    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = pf.data(); a.n_p = (int)pf.size(); a.world_size = 1;
+                };
+                const std::string cell = fmt("form %d N %d T %d A %d", form, N, Tq, A);
+                /* (1) bytes */
+                std::string why;
+                long long dl[2] = { 0, 0 };
+                if (has_epd)
+                    for (int st = 0; st < 2 && why.empty(); ++st)
+                        for (int c = 0; c < 2 && why.empty(); ++c) {
+                            pl.gdn_epd(c);
+                            std::vector<RadTensor> ts; RadArgs a; args(c, st, ts, a);
+                            const long long n0 = pl.gdn_epd_n();
+                            const int rc = r->launch(&a, (RadStream) nullptr);
+                            if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) why = fmt("step %d copy %d rc %d", st, c, rc);
+                            dl[c] += pl.gdn_epd_n() - n0;
+                        }
+                if (has_epd) {
+                    pl.gdn_epd(-1);
+                    if (why.empty()) {
+                        const struct { const char* w; void* a; void* b; size_t n; } cmp[] = {
+                            { "o", d_o[0], d_o[1], o_b }, { "codes", d_oq[0], d_oq[1], oq_b }, { "scales", d_os[0], d_os[1], os_b },
+                            { "state", d_st[0], d_st[1], st_b }, { "conv_state", d_cs[0], d_cs[1], cs_b } };
+                        for (const auto& c : cmp) {
+                            std::vector<uint8_t> P(c.n), Q(c.n);
+                            st_memcpy(P.data(), c.a, c.n, hipMemcpyDeviceToHost); st_memcpy(Q.data(), c.b, c.n, hipMemcpyDeviceToHost);
+                            size_t d = 0; for (size_t i = 0; i < c.n; ++i) d += P[i] != Q[i];
+                            if (d) { why = fmt("%s differs in %zu of %zu bytes", c.w, d, c.n); break; }
+                        }
+                    }
+                    std::printf("GDNR %s: EPD vs today, two steps: %s; EPD launches +%lld today / +%lld EPD (want 0 / 2)\n", cell.c_str(),
+                                why.empty() ? "every output byte identical (o, codes, scales, state pool, conv state)" : why.c_str(), dl[0], dl[1]);
+                    ok(fmt("GDNR %s: lever EPD byte-identical and dispatched", cell.c_str()).c_str(), why.empty() && dl[0] == 0 && dl[1] == 2, why);
+                }
+                /* (2) time: copy 0, step 0's inputs, today / EPD / today / EPD (+ / today at R4D_SELFTEST_GDN_LDS bytes of dynamic LDS:
+                 * fewer workgroups resident a WGP, the residency read) */
+                std::vector<RadTensor> ts; RadArgs a; args(0, 0, ts, a);
+                auto launch = [&](int) { (void)r->launch(&a, (RadStream) nullptr); };
+                double t[3][2] = { { 0, 0 }, { 0, 0 }, { 0, 0 } };
+                const int arms = has_epd ? 2 : 1;
+                for (int rep = 0; rep < 2; ++rep) {
+                    for (int e = 0; e < arms; ++e) {
+                        if (has_epd) pl.gdn_epd(e);
+                        t[e][rep] = st_time_us(launch, iters, (hipStream_t) nullptr);
+                    }
+                    if (lds_b > 0 && pl.gdn_lds) {
+                        if (has_epd) pl.gdn_epd(0);
+                        pl.gdn_lds(lds_b);
+                        t[2][rep] = st_time_us(launch, iters, (hipStream_t) nullptr);
+                        pl.gdn_lds(0);
+                    }
+                }
+                if (has_epd) pl.gdn_epd(-1);
+                const double t0 = (t[0][0] + t[0][1]) / 2, t1 = (t[1][0] + t[1][1]) / 2;
+                const double mb = (double)N * H * 2.0 * V * K * 4.0 / 1e6;   /* the state's read + write a call */
+                std::printf("GDNR %s %s: today %.2f us (reps %.2f / %.2f, state %.2f MB = %.0f GB/s)%s\n", cell.c_str(), g_cold > 0 ? "cold" : "warm",
+                            t0, t[0][0], t[0][1], mb, t0 > 0 ? mb * 1e3 / t0 : 0.0,
+                            has_epd ? fmt(", EPD %.2f us (%+.2f us, %+.1f %%; reps %.2f / %.2f)", t1, t1 - t0, t0 > 0 ? 100.0 * (t1 - t0) / t0 : 0.0,
+                                          t[1][0], t[1][1]).c_str() : "");
+                if (lds_b > 0 && pl.gdn_lds) {
+                    const double t2 = (t[2][0] + t[2][1]) / 2;
+                    std::printf("GDNR %s %s residency: today %.2f us, today + %d B dynamic LDS %.2f us (x%.3f; reps %.2f / %.2f)\n", cell.c_str(),
+                                g_cold > 0 ? "cold" : "warm", t0, lds_b, t2, t0 > 0 ? t2 / t0 : 0.0, t[2][0], t[2][1]);
+                }
+                dfree_all();
+            }
+}
+
 /* qfn-on-ds lever SSB (Qwen loop round 35, hc_readv bit 17): --perfhcssb M [iters] -- the decode pair as the hero start runs it
  * at M (>= 32) rows: hc_write with `ss` (bit 3, the eight-wide form) and then the bi_dec hc read (hc_readv 331 | 8: A' G16p, B3
  * in 16-row groups), the read handed the write's `ss`. Reference = bit 17 off, HC_X 0, B3X 0 (A' runs its own norm pass and
@@ -43987,6 +44139,8 @@ static void usage(void) {
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
                 "  --perfhcq M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at 1 / 2 / 4 / 5\n"
                 "             groups a wave (fn4 W2), and from 512 rows PF2's codes stage alone.\n"
+                "  --perfgdnr [iters]: the served GDN decode update (conv fold, anchor, had codes) at the Flash-Next tp4 rank shape over\n"
+                "      sequences x tokens x replayed tokens (R4D_SELFTEST_GDN_N / _TA / _FORMS): lever EPD bytes + time (round 41)\n"
                 "  --perfhcssb M [iters]: hc_write + the bi_dec hc read (331 | 8) at M rows: lever SSB (bit 17,\n"
                 "             A' on the write's scales) + RADIANCE_FN4_HC_X / R4D_SELFTEST_B3X arms vs the reference: bytes,\n"
                 "             a spoiled-scales control, A' alone and the whole read (R4D_SELFTEST_SSB=0: SSB off).\n"
@@ -44190,6 +44344,7 @@ int main(int argc, char** argv) {
     long long hcs_m = 0;
     int hcs_it = 50;
     long long hcssb_m = 0;   /* --perfhcssb (qfn-on-ds lever SSB, round 35) */
+    int gdnr_on = 0, gdnr_it = 0;   /* --perfgdnr (qfn-on-ds Q13 read + lever EPD, round 41) */
     int hcssb_it = 50;
     long long hcq_m = 0;
     int hcq_it = 50;
@@ -44659,6 +44814,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcq_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcq_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfgdnr")) {
+            /* qfn-on-ds Q13 read + lever EPD (round 41): the served GDN decode update over sequences x tokens x replayed tokens */
+            gdnr_on = 1;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gdnr_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcssb")) {
             /* qfn-on-ds lever SSB: the write + bi_dec read pair, A' on the write's scales (hc_readv bit 17) */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -44823,6 +44982,16 @@ int main(int argc, char** argv) {
         skip("gated residual codes-stage timing (W2)", "built without HIP");
 #endif
         return 0;
+    }
+    if (gdnr_on) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        gdnr_bench(pl, gdnr_it);
+        dfree_all();
+#else
+        skip("GDN decode update bench (lever EPD)", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (hcssb_m) {
         if (!load(&pl, path)) return 1;
