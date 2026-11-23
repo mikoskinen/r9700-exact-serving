@@ -801,17 +801,34 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
  * decode rows) and kvstream_step_runs stages EVERY sequence's history one layer at a time from the host mirror -- agx4's
  * MIXED steps (a ~1k-row tail beside 31 decoding sequences) took 1.27 s each. The same scenario as the chunking-6 case above:
  * under 5 the prompt runs in alone's pieces, every piece in a step of its own (the one that fits beside the decode rows
- * under 6 included), the decode rows the step after each, and a short newcomer that fits beside them is admitted alone too.
- * CONTROL: the chunking-6 case above, where that piece shares the decode rows' step. */
+ * under 6 included), the decode rows the step after each, and a short newcomer that fits beside them is admitted alone too;
+ * each piece's position, rows and snapshot row = alone's, also under the AgentX forms' tail levers (the hero's grid 0 / inner 3,
+ * arm TG256's grid 256 / inner 4 with lever TI's snapshot inside the last chunk; resume_cold 2) on a 1700-token prompt.
+ * CONTROL: chunking 6 in the same run, where that piece and the newcomer share the decode rows' step. */
 TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
     std::string err;
     int da[rad::fn4::kSwitches];
-    auto pieces_alone = [&]() {
-        Fixture f;
+    /* the tail levers as the AgentX forms set them: the hero's grid 0 / inner 3 and arm TG256's grid 256 / inner 4 (lever TI's
+     * snapshot inside a last chunk that then runs whole), under resume_cold 2 */
+    int len = 1000;
+    auto tails = [&](int grid, int ti) {
+        CHECK(rad::fn4::request("resume_cold", grid || ti ? 2 : 0, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", grid, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+    };
+    auto fixture = [&](Fixture& f) {
         f.build();                        /* interval 256, budget 512 */
         f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
         CHECK_OK(f.start());
-        const uint64_t a = f.submit(1000, 2);
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+    };
+    auto pieces_alone = [&]() {
+        Fixture f;
+        fixture(f);
+        const uint64_t a = f.submit(len, 2);
         std::vector<int32_t> pc;
         for (int k = 0; k < 40 && f.sch.step(); ++k) {
             for (const StepEntry& e : f.sch.plan().e)
@@ -830,15 +847,13 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
         CHECK_EQ(rad::fn4::sched_bi_chunk(), bic);
         Out o;
         Fixture f;
-        f.build();
-        f.cfg.prefill_span = 2;
-        CHECK_OK(f.start());
+        fixture(f);
         auto rd = f.request(100, 300);
         for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;   /* no prefix shared with `a` */
         rd->ignore_eos = true;
         const uint64_t d = f.add(std::move(rd));
         for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
-        const uint64_t a = f.submit(1000, 2);
+        const uint64_t a = f.submit(len, 2);
         bool last_lone = false;
         uint64_t c = 0;
         for (int k = 0; k < 80 && f.sch.step(); ++k) {
@@ -890,6 +905,28 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
     CHECK_EQ(five.c_shared, 0);           /* the newcomer alone too */
     CHECK_EQ(five.after_lone_d, five.lone + 1);   /* every lone step (a's + c's) is followed by the decode rows' */
     CHECK(five.d_steps >= 10);
+    /* The same under the tail levers (a 1700-token prompt: its last chunk [1280, 1700) runs whole with a snapshot inside under
+     * inner 3 / 4): 5 = alone's pieces and snapshot rows, nothing mixed; 6 = alone's too (the control for the pieces). */
+    for (const int gt : { 0 * 1000 + 3, 256 * 1000 + 4 }) {
+        tails(gt / 1000, gt % 1000);
+        len = 1700;
+        const std::vector<int32_t> rt = pieces_alone();
+        CHECK(rt.size() >= 9);
+        bool inner = false;               /* grid 256: the case covers lever TI, a snapshot inside a piece (grid 0 takes none) */
+        for (size_t q = 0; q + 2 < rt.size(); q += 3) inner = inner || (rt[q + 2] >= 0 && rt[q + 2] < rt[q + 1] - 1);
+        CHECK_EQ(inner, gt / 1000 > 0);
+        const Out s6 = run(6);
+        const Out s5 = run(5);
+        CHECK(s6.got == rt);
+        CHECK(s5.got == rt);
+        CHECK_EQ(s5.shared, 0);
+        CHECK_EQ(s5.mixed, 0);
+        CHECK_EQ(s5.c_shared, 0);
+        CHECK(s5.c_done);
+        CHECK_EQ(s5.after_lone_d, s5.lone + 1);
+    }
+    tails(0, 0);
+    len = 1000;
 }
 
 /* qfn-on-ds Q18 (Qwen loop round 4, FINDINGS F11): RADIANCE_SCHED_BI_ONE_PF=1 under BI chunking 6. Two short prompts that both
