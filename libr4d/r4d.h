@@ -796,6 +796,7 @@ int r4d_ar_xpush_set(int on);
  * 8 = lever FAS (qfn-on-ds round 15): the drain-1 fence at every four-rank size */
 int r4d_ar_fence_set(int v);
 int r4d_kv_vic_set(int on);   /* fn4 kvs_vic: kv_resolve victims by compaction (1) or serially (0) */
+int r4d_kv_flat_set(int on);   /* fn4 kvs_flat: kv_resolve steps 2 / 7 over the flat entry space (1) or by rows (0) */
 // fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
 // (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.
 int r4d_ar_lane_blocks_set(int blocks);

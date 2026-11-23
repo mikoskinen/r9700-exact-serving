@@ -182,6 +182,24 @@ __device__ __forceinline__ int kv_compact_rot(int h0, int slots, int* out, int c
     return total;
 }
 
+/* fn4 kvs_flat (Qwen loop round 52, QUEUE Q101; rad_fn4_switch("kvs_flat"), RADIANCE_FN4_KVS_FLAT at start; 0 = today):
+ * steps 2 and 7 over the flat entry space, kFlatU entries a thread in flight. The entry's block, or -1 when the entry is
+ * past the launch, past its row's nsel, or names no block of the id space (the row loop's `continue`s). */
+constexpr int kFlatU = 8;
+__device__ __forceinline__ int kv_flat_block(const int32_t* __restrict__ sel, const int32_t* __restrict__ nsel,
+                                             int e, int E, int pitch, int blocks) {
+    if (e >= E) return -1;
+    /* 32-bit: the shim takes this form only while M * pitch fits an int */
+    const int q = (int)((unsigned)e / (unsigned)pitch), i = e - q * pitch;
+    int n = nsel[q];
+    if (n < 0) n = 0;
+    if (n > pitch) n = pitch;
+    if (i >= n) return -1;
+    const int b = sel[e];
+    return (unsigned)b < (unsigned)blocks ? b : -1;
+}
+
+template <bool Flat>
 __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     int32_t* __restrict__ sel, const int32_t* __restrict__ nsel,
     int32_t* __restrict__ res, int32_t* __restrict__ slot_block,
@@ -225,6 +243,55 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
 
     /* ---- 2. one lookup per entry; the map is its own set ---- */
     int lookups = 0, hits = 0;
+    if constexpr (Flat) {
+        /* fn4 kvs_flat (Qwen loop round 52): the same lookups over the flat entry space e = q * pitch + i, every thread
+         * busy and kFlatU entries a thread in flight -- their selection loads, then their map loads, then their stamps /
+         * claims, then the heat bumps and list appends. Today's loop runs row by row, one entry a thread a row, so at 64
+         * rows x 513 only 513 of 1,024 threads work and each walks 64 dependent load -> atomic chains. Every outcome is
+         * the row loop's: the map is the set (one CAS wins a block), a slot's first stamper alone bumps its heat (two
+         * entries of one thread on one slot: its atomics to one address land in program order), and the claim list is
+         * sorted in step 3, so the order of claims never reaches the placement. An entry cache value read before a
+         * same-thread claim reads -1 where the row loop read -2; step 7 reads the map for both. */
+        const int E = M * pitch;
+        for (int base = tid; base < E; base += kThreads * kFlatU) {
+            int bb[kFlatU], ss[kFlatU], ox[kFlatU], oc[kFlatU];
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) bb[u] = kv_flat_block(sel, nsel, base + u * kThreads, E, pitch, blocks);
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) ss[u] = bb[u] >= 0 ? res[bb[u]] : -3;
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) {
+                ox[u] = epoch;
+                oc[u] = 0;
+                if (bb[u] < 0) continue;
+                const int s = ss[u];
+                if (ecache > 0) s_ent[base + u * kThreads] = s;
+                if (s >= 0 && s < slots) ox[u] = atomicExch(&slot_state[(size_t)s * sst_ld], epoch);
+                else if (s == -1) oc[u] = atomicCAS(&res[bb[u]], -1, -2);
+            }
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) {
+                if (bb[u] < 0) continue;
+                const int s = ss[u];
+                if (s >= 0 && s < slots) {
+                    if (ox[u] != epoch) {
+                        slot_state[(size_t)s * sst_ld + 1] = kv_heat_up(slot_state[(size_t)s * sst_ld + 1]);
+                        ++hits;
+                    }
+                } else if (s == -1 && oc[u] == -1) {
+                    const int k = atomicAdd(&s_claims, 1);
+                    if (k < cap) s_list[k] = bb[u];
+                }
+            }
+        }
+        if (tid == 0)
+            for (int q = 0; q < M; ++q) {
+                int n = nsel[q];
+                if (n < 0) n = 0;
+                if (n > pitch) n = pitch;
+                lookups += n;
+            }
+    } else
     for (int q = 0; q < M; ++q) {
         int n = nsel[q];
         if (n < 0) n = 0;
@@ -685,6 +752,27 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     }
 
     /* ---- 7. the rewrite: every valid entry becomes the slot holding its block ---- */
+    if constexpr (Flat) {
+        /* fn4 kvs_flat: the same rewrite over the flat entry space, kFlatU entries a thread in flight (each entry is its own
+         * thread's: sel[e] is read and written by one thread, as below). */
+        const int E = M * pitch;
+        for (int base = tid; base < E; base += kThreads * kFlatU) {
+            int bb[kFlatU], sv[kFlatU];
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) bb[u] = kv_flat_block(sel, nsel, base + u * kThreads, E, pitch, blocks);
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) {
+                sv[u] = -1;
+                if (bb[u] < 0) continue;
+                int s = ecache > 0 ? s_ent[base + u * kThreads] : -1;
+                if (s < 0) s = res[bb[u]];
+                sv[u] = s;
+            }
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u)
+                if (bb[u] >= 0) sel[base + u * kThreads] = sv[u] >= 0 ? sv[u] : 0;
+        }
+    } else {
     for (int q = 0; q < M; ++q) {
         int n = nsel[q];
         if (n < 0) n = 0;
@@ -699,6 +787,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             if (s < 0) s = res[b];
             sel[e] = s >= 0 ? s : 0;
         }
+    }
     }
 
     /* The union: the distinct slots this call hit or filled, plus the claims it could not place. */
@@ -737,7 +826,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
 static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, long slot_state,
                                long ctl, long host, long cache, long miss_block, long miss_slot,
                                int M, int blocks, int slots, int pitch, int bbytes, int sst_ld,
-                               int vic, RadStream stream) {
+                               int vic, int flat, RadStream stream) {
     if (!sel || !nsel || !res || !slot_block || !slot_state || !ctl || !host || !cache ||
         !miss_block || !miss_slot)
         return R4D_NO(RAD_E_INVAL);
@@ -752,7 +841,16 @@ static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, l
      * its 513, a wide prefill does not and step 7 reads the map. */
     const long long entries = (long long)M * pitch;
     const int ecache = entries <= (long long)(room - cap) ? (int)entries : 0;
-    return R4D_EMIT(stream, kv_resolve_kernel, dim3(1), dim3(kThreads),
+    /* fn4 kvs_flat: steps 2 and 7 over the flat entry space (the kernel's note at kv_flat_block), 32-bit entry indices:
+     * a launch whose M * pitch passes them keeps the row loops (none does: max_tok x 513) */
+    if (flat && entries + (long long)kThreads * kFlatU <= (long long)INT32_MAX)
+        return R4D_EMIT(stream, (kv_resolve_kernel<true>), dim3(1), dim3(kThreads),
+                        (uint32_t)(cap + ecache) * sizeof(int),
+                        (int32_t*)sel, (const int32_t*)nsel, (int32_t*)res, (int32_t*)slot_block,
+                        (int32_t*)slot_state, (int32_t*)ctl, (const uint8_t*)host, (uint8_t*)cache,
+                        (int32_t*)miss_block, (int32_t*)miss_slot, M, blocks, slots, pitch,
+                        bbytes, sst_ld, cap, ecache, vic);
+    return R4D_EMIT(stream, (kv_resolve_kernel<false>), dim3(1), dim3(kThreads),
                     (uint32_t)(cap + ecache) * sizeof(int),
                     (int32_t*)sel, (const int32_t*)nsel, (int32_t*)res, (int32_t*)slot_block,
                     (int32_t*)slot_state, (int32_t*)ctl, (const uint8_t*)host, (uint8_t*)cache,
@@ -792,6 +890,27 @@ static int kv_vic(const RadArgs* a) {
 extern "C" int r4d_kv_vic_set(int on) {
     if (on < 0 || on > 1) return -1;
     g_kv_vic.store(on, std::memory_order_relaxed);
+    return 1;
+}
+
+/* fn4 kvs_flat (Qwen loop round 52, QUEUE Q101; RADIANCE_FN4_KVS_FLAT, rad_fn4_switch("kvs_flat")): 1 = steps 2 and 7 over
+ * the flat entry space (kv_resolve_kernel<true>), 0 = today's row loops. The same placement, maps, counters and rewritten
+ * selection either way (libref's). A launch parameter `flat` overrides it (the host emulator's tests). */
+static std::atomic<int> g_kv_flat{-1};
+static int kv_flat(const RadArgs* a) {
+    int v = g_kv_flat.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_KVS_FLAT");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_kv_flat.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_kv_flat.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "flat", v) ? 1 : 0;
+}
+extern "C" int r4d_kv_flat_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_kv_flat.store(on, std::memory_order_relaxed);
     return 1;
 }
 
@@ -868,7 +987,7 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
                                r4d_addr(st), r4d_addr(ct), r4d_addr(ho), r4d_addr(ca),
                                (long)(uintptr_t)miss_block, (long)(uintptr_t)miss_slot,
                                (int)M, (int)blocks, (int)slots, (int)pitch, (int)bbytes,
-                               (int)st->stride[0], kv_vic(a), stream);
+                               (int)st->stride[0], kv_vic(a), kv_flat(a), stream);
 }
 
 /* `next_pow2(slots)` block ids (a wide launch sorts its claims here), then `slots` slots, then `slots` ids of victim

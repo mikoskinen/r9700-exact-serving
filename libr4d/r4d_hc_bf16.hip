@@ -10051,6 +10051,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) return r4d_ar_xpush_set(value);   /* fn4 RSF */
     if (!std::strcmp(name, "ar_fence")) return r4d_ar_fence_set(value);   /* fn4 PFF (qwen/prefill) */
     if (!std::strcmp(name, "kvs_vic")) return r4d_kv_vic_set(value);   /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md) */
+    if (!std::strcmp(name, "kvs_flat")) return r4d_kv_flat_set(value);   /* qfn-on-ds lever KVF (Qwen loop round 52, Q101) */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
     if (!std::strcmp(name, "ar_lanethreads_s")) return r4d_ar_lane_threads_s_set(value);   /* qfn-on-ds lever LSK */

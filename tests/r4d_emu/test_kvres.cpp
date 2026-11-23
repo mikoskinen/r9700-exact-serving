@@ -210,10 +210,12 @@ void ref_resolve(Fix& f) {
 /* The device entry point over a fixture. Its scratch is the row's `next_pow2(slots)` miss-list ids
  * (the list is sorted there when a launch is too wide for the shared claim list) then `slots`
  * slots. */
+int g_flat = 0;   /* fn4 kvs_flat (Qwen loop round 52): the launch parameter `flat` every fixture runs with */
 int dev_resolve(Fix& f) {
     int64_t nlist = 1;
     while (nlist < f.slots) nlist <<= 1;
-    std::vector<int32_t> scratch((size_t)(nlist + f.slots), 0);
+    /* nlist ids, `slots` slots, `slots` ids of kvs_vic's victim list (r4d_rad_kv_resolve_scratch) */
+    std::vector<int32_t> scratch((size_t)(nlist + 2 * f.slots), 0);
     RadTensor t[8] = { tens(f.sel.data(), RAD_I32, { f.M, f.pitch }),
                        tens(f.nsel.data(), RAD_I32, { f.M }),
                        tens(f.res.data(), RAD_I32, { f.blocks }),
@@ -222,17 +224,18 @@ int dev_resolve(Fix& f) {
                        tens(f.ctl.data(), RAD_I32, { 16 }),
                        tens(f.host.data(), RAD_U8, { f.blocks, f.bbytes }),
                        tens(f.pool.data(), RAD_U8, { f.slots, f.bbytes }) };
-    RadParam p[5]{};
+    RadParam p[6]{};
     p[0] = { "M", RAD_P_INT, f.M };
     p[1] = { "blocks", RAD_P_INT, f.blocks };
     p[2] = { "slots", RAD_P_INT, f.slots };
     p[3] = { "sel_pitch", RAD_P_INT, f.pitch };
     p[4] = { "block_bytes", RAD_P_INT, f.bbytes };
+    p[5] = { "flat", RAD_P_INT, g_flat };
     RadArgs a{};
     a.t = t;
     a.n_t = 8;
     a.p = p;
-    a.n_p = 5;
+    a.n_p = 6;
     a.scratch = scratch.data();
     a.scratch_bytes = (int64_t)scratch.size() * 4;
     return r4d_rad_kv_resolve(&a, nullptr);
@@ -301,8 +304,64 @@ void fill_claims(Fix& f, int64_t first, int64_t n, int64_t per_row) {
     }
 }
 
+/* fn4 kvs_flat (Qwen loop round 52): `calls` launches in a row on one carried state (the maps, heats, hand, ring and
+ * counters of call c are call c+1's input), every operand compared with libref's after each call. The selection of call
+ * c: 64 rows = 16 sequences x 4 verify rows (the AgentX 32-sequence step's two launches a layer); sequence j owns blocks
+ * [j * span, (j + 1) * span); row r of it names 513 distinct ids of that range drawn from a W-wide window that drifts by `drift`
+ * a call, rows of one sequence overlapping (the same block named by up to four rows, several in one thread's flat entries),
+ * nsel 513 except one short row a call. The ring (`slots`) is smaller than a call's union after a few calls, so later
+ * calls hit, miss, evict by CLOCK and bump heats. */
+int check_calls(const char* name, int64_t slots, int64_t span, int64_t W, int64_t drift, int calls) {
+    const int64_t M = 64, pitch = 513, seqs = 16, blocks = seqs * span;
+    Fix dev;
+    dev.shape(M, blocks, slots, pitch, 16);
+    Fix ref = dev;
+    uint32_t rng = 12345u;
+    auto nxt = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    for (int c = 0; c < calls; ++c) {
+        std::fill(dev.sel.begin(), dev.sel.end(), -1);
+        for (int64_t q = 0; q < M; ++q) {
+            const int64_t j = q / 4, lo = j * span + (c * drift) % (span - W - 1);
+            int64_t n = pitch;
+            if (q == (c * 7) % M) n = 100 + c;   /* one short row a call */
+            /* n distinct ids from [lo, lo + W): a stride walk from a random start (W and 7 coprime: distinct) */
+            const int64_t st = (int64_t)(nxt() % W);
+            for (int64_t i = 0; i < n; ++i) dev.sel[(size_t)(q * pitch + i)] = (int32_t)(lo + (st + 7 * i) % W);
+            dev.nsel[(size_t)q] = (int32_t)n;
+        }
+        ref.sel = dev.sel;
+        ref.nsel = dev.nsel;
+        ref_resolve(ref);
+        const int rc = dev_resolve(dev);
+        if (rc != RAD_OK) {
+            std::printf("  FAIL %-42s call %d refused (%d)\n", name, c, rc);
+            return 1;
+        }
+        size_t bad = 0;
+        bad += mismatch(dev.sel, ref.sel, "sel", name);
+        bad += mismatch(dev.res, ref.res, "res", name);
+        bad += mismatch(dev.sblk, ref.sblk, "slot_block", name);
+        bad += mismatch(dev.sst, ref.sst, "slot_state", name);
+        bad += mismatch(dev.ctl, ref.ctl, "ctl", name);
+        bad += mismatch_bytes(dev.pool, ref.pool, "kv_cache", name);
+        if (bad) {
+            std::printf("  FAIL %-42s at call %d\n", name, c);
+            return 1;
+        }
+    }
+    std::printf("  ok   %-42s %d calls, last %lld claims, %lld placed, union max %d\n", name, calls, (long long)ref.ctl[12],
+                (long long)ref.ctl[2], ref.ctl[10]);
+    return 0;
+}
+
 int run_all() {
     int fails = 0, cases = 0;
+    ++cases;
+    /* a call's union <= 16 x 600 = 9,600 ids: a 12,000-slot ring fills over the drifting calls, then evicts by CLOCK */
+    fails += check_calls("64 x 513, 16 sequences, warm ring 8 calls", 12000, 2000, 600, 37, 8);
+    ++cases;
+    /* 8,192 slots under a call's union of up to 16 x 1,100 = 17,600 ids: the overflow path too */
+    fails += check_calls("64 x 513, a ring under one call's union", 8192, 3000, 1100, 211, 4);
     ++cases;
     {
         Fix f;
@@ -502,6 +561,10 @@ int run_all() {
 }  /* namespace */
 
 int main() {
-    const int fails = run_all();
+    std::printf("kvs_flat 0 (the row loops)\n");
+    int fails = run_all();
+    g_flat = 1;
+    std::printf("kvs_flat 1 (steps 2 / 7 over the flat entry space)\n");
+    fails += run_all();
     return fails;
 }

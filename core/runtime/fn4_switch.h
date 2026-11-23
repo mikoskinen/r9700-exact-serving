@@ -973,6 +973,12 @@
  *                   loads (sk 4 / nt 1: line 109's c1 cost of nt 0, a 40 MB temporal read a pass through the 64 MB last-level cache;
  *                   the same split, so W2K's bytes); 0 today
  *                                                                                                  RADIANCE_FN4_MTP_DEC
+ *   kvs_flat        libr4d (qfn-on-ds lever KVF, Qwen loop round 52, QUEUE Q101): kv_resolve (a streamed KV group's residency
+ *                   map, ONE workgroup a launch) runs its lookups (step 2) and its rewrite (step 7) over the flat entry space,
+ *                   every thread busy and 8 entries a thread in flight, instead of row by row (one entry a thread a row: at 64
+ *                   rows x 513 half the threads idle and each walks 64 dependent load -> atomic chains); the same placement, maps,
+ *                   counters and rewritten selection (libref's); 0 today
+ *                                                                                                  RADIANCE_FN4_KVS_FLAT
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -1031,6 +1037,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kGdnEpd,   /* qfn-on-ds lever EPD (Qwen loop round 41, Q78): libr4d, the GDN decode update's epilogue after its token loop */
               kHcRf,     /* qfn-on-ds lever HRF (Qwen loop round 44): libr4d, the HXS hc read's A' + B3X as one launch, a row group at a time */
               kMtpDec,   /* qfn-on-ds lever MTD (Qwen loop round 45, Q85): qwen4exp, the MTP head's draft passes in the trunk's decode forms */
+              kKvsFlat,  /* qfn-on-ds lever KVF (Qwen loop round 52, Q101): libr4d, kv_resolve's lookups / rewrite over the flat entry space */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
