@@ -10076,10 +10076,15 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     }
     if (!std::strcmp(name, "gdn_epd")) {   /* qfn-on-ds lever EPD (round 41, r4d_gdn_recurrent_update_*.hip): the GDN update's epilogue after its loop;
                                             * 2 = + lever QKS (each token's normalised q / k staged once in LDS) */
-        if (value < 0 || value > 4) return -1;   /* 3 = EPD + lever GRP (round 41, QUEUE Q80); 4 = lever QSC (round 47, QUEUE Q84) */
+        /* 3 = EPD + lever GRP (round 41, QUEUE Q80); 4 = lever QSC (round 47, QUEUE Q84); 8 = lever ZXL, 12 = QSC + ZXL (round 48,
+         * QUEUE Q90: the prologue's 16-bit loads in whole registers, issued together); 5..7 / 9..11 have no instance: refused */
+        if (value < 0 || value > 12 || (value > 4 && value != 8 && value != 12)) return -1;
         r4d_gdn_epd(value);
         static std::atomic<int> said{0};
-        if (value == 4 && said.exchange(value) != value)
+        if (value >= 8 && said.exchange(value) != value)
+            std::fprintf(stderr, "radiance: libr4d: lever ZXL (gdn_epd %d): the GDN decode update's prologue 16-bit loads in whole registers, "
+                                 "issued together%s (the same bytes)\n", value, value == 12 ? " + lever QSC" : "");
+        else if (value == 4 && said.exchange(value) != value)
             std::fprintf(stderr, "radiance: libr4d: lever QSC (gdn_epd 4): the GDN decode update's q / k l2 scales once a call, not in "
                                  "every token by every row (the same bytes)\n");
         else if (value >= 1 && said.exchange(value) != value)

@@ -180,8 +180,9 @@ int main() {
     const int64_t real = s.cu[(size_t)N - 1];
     for (int form : { 3, 2, 1 }) {
         const char* fn = form == 3 ? "had (NORM 3, rotated int8)" : form == 2 ? "int8 (NORM 2)" : "E4M3 (NORM 1)";
-        Run a, b, c, q, g, z;
+        Run a, b, c, q, g, z, x, y;
         init(a, s, form); init(b, s, form); init(c, s, form); init(q, s, form); init(g, s, form); init(z, s, form);
+        init(x, s, form); init(y, s, form);
         std::string why;
         long long moved_o = 0;
         for (int st = 0; st < 2 && why.empty(); ++st) {
@@ -207,10 +208,19 @@ int main() {
             r4d_gdn_epd(4);
             const int rz = step(z, s, form, st, -1);
             const long long l6 = r4d_gdn_epd_launches();
+            /* lever ZXL (round 48, QUEUE Q90): gdn_epd 8 (today + the prologue's 16-bit loads in whole registers), 12 (QSC + ZXL) */
+            r4d_gdn_epd(8);
+            const int rx = step(x, s, form, st, -1);
+            const long long l7 = r4d_gdn_epd_launches();
+            r4d_gdn_epd(12);
+            const int ry = step(y, s, form, st, -1);
+            const long long l8 = r4d_gdn_epd_launches();
             r4d_gdn_epd(-1);
-            if (ra || rb || rc || rq || rg || rz) { why = fmt("step %d rc %d / %d / %d / %d / %d / %d", st, ra, rb, rc, rq, rg, rz); break; }
+            if (ra || rb || rc || rq || rg || rz || rx || ry) {
+                why = fmt("step %d rc %d / %d / %d / %d / %d / %d / %d / %d", st, ra, rb, rc, rq, rg, rz, rx, ry); break; }
             check(l5 == l4 + 1, fmt("%s step %d: dispatch (EPD launches +%lld GRP)", fn, st, l5 - l4));
             check(l6 == l5 + 1, fmt("%s step %d: dispatch (EPD launches +%lld QSC)", fn, st, l6 - l5));
+            check(l7 == l6 + 1 && l8 == l7 + 1, fmt("%s step %d: dispatch (EPD launches +%lld ZXL, +%lld QSC + ZXL)", fn, st, l7 - l6, l8 - l7));
             check(l1 == l0 && l2 == l1 + 1 && l4 == l3 + 1, fmt("%s step %d: dispatch (EPD launches +%lld unset, +%lld EPD, +%lld QKS)", fn, st,
                                                                l1 - l0, l2 - l1, l4 - l3));
             const std::string d = cmp(a, b, real);
@@ -221,13 +231,17 @@ int main() {
             if (!dg.empty()) { why = fmt("step %d (GRP): %s", st, dg.c_str()); break; }
             const std::string dz = cmp(a, z, real);
             if (!dz.empty()) { why = fmt("step %d (QSC): %s", st, dz.c_str()); break; }
+            const std::string dx = cmp(a, x, real);
+            if (!dx.empty()) { why = fmt("step %d (ZXL): %s", st, dx.c_str()); break; }
+            const std::string dy = cmp(a, y, real);
+            if (!dy.empty()) { why = fmt("step %d (QSC + ZXL): %s", st, dy.c_str()); break; }
             for (auto v : a.o) moved_o += v != 0;
             if (st == 0) {
                 const std::string dc = cmp(a, c, real);
                 check(!dc.empty(), fmt("%s NEGATIVE CONTROL: one changed gate element is seen (%s)", fn, dc.c_str()));
             }
         }
-        check(why.empty() && moved_o > 0, fmt("%s: EPD, EPD + QKS, EPD + GRP and QSC = today's form, every byte, two steps (o non-zero %lld)", fn, moved_o), why);
+        check(why.empty() && moved_o > 0, fmt("%s: EPD, EPD + QKS, EPD + GRP, QSC, ZXL and QSC + ZXL = today's form, every byte, two steps (o non-zero %lld)", fn, moved_o), why);
     }
     std::printf("r4d_emu_gdnepd: %d cases, %d failed\n", g_cases, g_fail);
     return g_fail ? 1 : 0;

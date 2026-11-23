@@ -951,6 +951,10 @@
  *                   scales once a call (STG's staging after the convolution's barrier: one lane per (token, half) sums its 64
  *                   squares in the per-row order) instead of every thread summing the same 2 x 64 squares in every token;
  *                   the same bytes
+ *                   8 = lever ZXL (Qwen loop round 48, QUEUE Q90): today's update with its prologue's 16-bit loads (conv
+ *                   inputs, history taps, bias, a / b, gate rows) each in a whole register, issued together, instead of packed
+ *                   two to a VGPR (every d16_hi load waited for its other half: a chain of memory round trips before the state
+ *                   load); the same bytes. 12 = 4 + 8. libr4d refuses 5..7 and 9..11
  *                                                                                                  RADIANCE_GDN_EPD
  *   hc_rf           libr4d (rad_fn4_switch; qfn-on-ds lever HRF, Qwen loop round 44): N = from N (>= 32) rows the bi_dec read's
  *                   served HXS form (A' on the write's scales, NTS 4, XLB 3; B3X with B3E + B3D) runs as ONE launch, hc_read_hrf:

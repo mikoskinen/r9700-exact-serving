@@ -210,14 +210,17 @@ struct RuConv {
 // A channel's conv state rewritten as gdn_conv_update does: shifted by one, the old history's
 // tail then this step's tokens. The launcher requires the window split to be R4D_GDN_CONV_W - 2,
 // so these are the same stores.
-__device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsigned short* hist,
-                                                const unsigned short* xs, int T, long cs_tok) {
+/* HT: unsigned short (today) or uint32_t (lever ZXL: the same 16-bit values held zero-extended in whole registers); the stores
+ * write the same 16 bits either way. */
+template <class HT>
+__device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const HT* hist,
+                                                const HT* xs, int T, long cs_tok) {
   constexpr int NH = R4D_GDN_CONV_W - 2;
 #pragma unroll
-  for (int i = 0; i < NH; ++i) sp[(size_t)i * cs_tok] = hist[i + 1];
+  for (int i = 0; i < NH; ++i) sp[(size_t)i * cs_tok] = (unsigned short)hist[i + 1];
 #pragma unroll
   for (int t = 0; t < RU_CVT; ++t)
-    if (t < T) sp[(size_t)(t + NH) * cs_tok] = xs[t];
+    if (t < T) sp[(size_t)(t + NH) * cs_tok] = (unsigned short)xs[t];
 }
 
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
@@ -269,6 +272,15 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * EPI = EPDF & 3 is lever EPD's epilogue form (1 EPD, 2 + QKS, 3 + GRP); QSC = EPDF & 4. */
   constexpr int EPDF = EPD & 15, ABL = EPD >> 4, EPI = EPDF & 3;
   constexpr bool QSC = (EPDF & 4) != 0;
+  /* qfn-on-ds lever ZXL (Qwen loop round 48, QUEUE Q90; EPD bit 8, gdn_epd 8 / 12): the folded prologue's 16-bit global loads (the
+   * convolution's inputs, history taps and bias, the a / b factor, the output gate rows) each into a WHOLE register, zero-extended
+   * (ldg_u16 = global_load_u16), and issued together: rows past the call's T read row T - 1 (values never used), the bias from a
+   * valid address when there is none (selected away). Today they are unsigned shorts packed two to a VGPR, so every
+   * global_load_d16_hi_b16 waits (s_wait_loadcnt 0x0) for the d16 load of the other half -- in the served instance a chain of
+   * ~15 dependent memory round trips before the state is touched (slot a1: the call less its four phases is 17.1 us at one sequence,
+   * x7 its state bytes). The same 16-bit values into the same arithmetic and stores: the same bytes. */
+  constexpr bool ZX = (EPDF & 8) != 0;
+  using HT = std::conditional_t<ZX, uint32_t, unsigned short>;
   static_assert(!ABL || EPDF == 0, "the Q84 ablations are of the served form (EPD 0)");
   static_assert(!EPDF || (CV && NORM && ANC && VS == 1 && STG == 0), "EPD: the folded decode shape (T <= RU_CVT), fused norm, anchor");
   __shared__ float sonT[EPI ? RU_CVT * RU_V : 1];         // per (token, row): the raw output before the norm
@@ -319,10 +331,10 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   __shared__ float sab[CV ? 2 * RU_CVT : 1];
   __shared__ unsigned short szg[CV ? RU_CVT * RU_V : 1];
   float ca_b = 0.0f;
-  unsigned short czg[ZPT];
+  HT czg[ZPT];
   const int G = H / Hg;                                 // workgroups that read one key head
   float cwa[CW], cwb[CW], cba = 0.0f, cbb = 0.0f;
-  unsigned short cha[CS], chb[CS], cxa[RU_CVT], cxb[RU_CVT];
+  HT cha[CS], chb[CS], cxa[RU_CVT], cxb[RU_CVT];
   unsigned short* spa = nullptr;
   unsigned short* spb = nullptr;
   unsigned int arrived = 0;
@@ -338,6 +350,48 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
       using CWT = std::conditional_t<CV == 2, float, unsigned short>;
       const CWT* const cw = (const CWT*)cv.w;
       const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
+      if constexpr (ZX) {
+        /* lever ZXL: every 16-bit load first, each into its own register; conversions after (the same values) */
+        static_assert(ABF16, "lever ZXL: the folded decode form's bf16 a / b");
+#pragma unroll
+#if defined(R4D_EMU_ZXL_MUTATE)   /* r4d_emu_gdnepd's mutation build only: token t's q|k conv input from row t + 1 */
+        for (int t = 0; t < RU_CVT; ++t) cxa[t] = ldg_u16(xr + (size_t)(t + 1 < T ? t + 1 : T - 1) * cv.xpitch + ca);
+#else
+        for (int t = 0; t < RU_CVT; ++t) cxa[t] = ldg_u16(xr + (size_t)(t < T ? t : T - 1) * cv.xpitch + ca);
+#endif
+        const cp_taps<CWT> w4a = *(const cp_taps<CWT>*)(cw + (size_t)ca * CW);
+        const uint32_t bra = ldg_u16(cv.b ? cv.b + ca : xr + ca);
+        spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
+#pragma unroll
+        for (int i = 0; i < CS; ++i) cha[i] = ldg_u16(spa + (size_t)(off + i) * cv.cs_tok);
+        uint32_t brb = 0;
+        cp_taps<CWT> w4b = w4a;
+        if (tid < RU_V) {
+#pragma unroll
+          for (int t = 0; t < RU_CVT; ++t) cxb[t] = ldg_u16(xr + (size_t)(t < T ? t : T - 1) * cv.xpitch + cb);
+          w4b = *(const cp_taps<CWT>*)(cw + (size_t)cb * CW);
+          brb = ldg_u16(cv.b ? cv.b + cb : xr + cb);
+          spb = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)cb * cv.cs_dim;
+#pragma unroll
+          for (int i = 0; i < CS; ++i) chb[i] = ldg_u16(spb + (size_t)(off + i) * cv.cs_tok);
+        }
+        /* a (tid < T) or b (T <= tid < 2T) of this call's tokens; other lanes read a's first row (unused) */
+        const int abr = tid < T ? tid : (tid < 2 * T ? tid - T : 0);
+        const unsigned short* const abp = (const unsigned short*)(tid >= T && tid < 2 * T ? bv : av);
+        const uint32_t abw = ldg_u16(abp + (size_t)(bos + abr) * ab_stride + hv);
+#pragma unroll
+        for (int i = 0; i < ZPT; ++i) {
+          const int zi = tid + i * THR, zc = zi < T * RU_V ? zi : T * RU_V - 1;
+          czg[i] = ldg_u16(zg + (size_t)(bos + zc / RU_V) * zg_pitch + (size_t)hv * RU_V + (zc % RU_V));
+        }
+        cwa[0] = cp_tap(w4a.x); cwa[1] = cp_tap(w4a.y); cwa[2] = cp_tap(w4a.z); cwa[3] = cp_tap(w4a.w);
+        if (cv.b) cba = bf2f((unsigned short)bra);
+        if (tid < RU_V) {
+          cwb[0] = cp_tap(w4b.x); cwb[1] = cp_tap(w4b.y); cwb[2] = cp_tap(w4b.z); cwb[3] = cp_tap(w4b.w);
+          if (cv.b) cbb = bf2f((unsigned short)brb);
+        }
+        if (tid < 2 * T) ca_b = bf2f((unsigned short)abw);
+      } else {
 #pragma unroll
       for (int t = 0; t < RU_CVT; ++t)
         if (t < T) cxa[t] = xr[(size_t)t * cv.xpitch + ca];
@@ -368,6 +422,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
         const int zi = tid + i * THR;
         if (zi < T * RU_V)
           czg[i] = zg[(size_t)(bos + zi / RU_V) * zg_pitch + (size_t)hv * RU_V + (zi % RU_V)];
+      }
       }
     }
   }
@@ -441,6 +496,8 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
    * VGPR offsets live across the token loop. */
   const int grp = __builtin_amdgcn_readfirstlane(row >> 5);
 
+  /* (lever ZXL, round 48: issuing these 16 loads from column 1 before the marker -> sidx[acol] chain was tried -- the compiler issues
+   * them after the two scalar loads whatever the source order (memory clobber, sched_barrier): not kept) */
   float h[RU_HK];
   {
     const ST* p = state + (size_t)si * st_slot + (size_t)hv * st_head
@@ -510,15 +567,15 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
 
   if constexpr (CV) {
     // gdn_conv_update's token body, one channel per thread, into LDS instead of q, k and v.
-    auto conv = [&](const float* wt, float bs, const unsigned short* hist,
-                    const unsigned short* xs, unsigned short* dst) {
+    auto conv = [&](const float* wt, float bs, const HT* hist,
+                    const HT* xs, unsigned short* dst) {
       float win[CW];
 #pragma unroll
-      for (int i = 0; i < CS; ++i) win[i] = bf2f(hist[i]);
+      for (int i = 0; i < CS; ++i) win[i] = bf2f((unsigned short)hist[i]);
 #pragma unroll
       for (int t = 0; t < RU_CVT; ++t) {
         if (t < T) {
-          win[CW - 1] = bf2f(xs[t]);
+          win[CW - 1] = bf2f((unsigned short)xs[t]);
           float acc = bs;
 #pragma unroll
           for (int i = 0; i < CW; ++i) acc += wt[i] * win[i];
@@ -530,10 +587,10 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     };
     conv(cwa, cba, cha, cxa, (tid < RU_K ? cvq : cvk) + (tid & (RU_K - 1)));
 #pragma unroll
-    for (int i = 1; i < CS; ++i) cvh[(i - 1) * THR + tid] = cha[i];
+    for (int i = 1; i < CS; ++i) cvh[(i - 1) * THR + tid] = (unsigned short)cha[i];
 #pragma unroll
     for (int t = 0; t < RU_CVT; ++t)
-      if (t < T) cvh[(CS - 1 + t) * THR + tid] = cxa[t];
+      if (t < T) cvh[(CS - 1 + t) * THR + tid] = (unsigned short)cxa[t];
     if (tid < RU_V) {
       conv(cwb, cbb, chb, cxb, cvv + tid);
       ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
@@ -542,7 +599,7 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
 #pragma unroll
     for (int i = 0; i < ZPT; ++i) {
       const int zi = tid + i * THR;
-      if (zi < T * RU_V) szg[zi] = czg[i];
+      if (zi < T * RU_V) szg[zi] = (unsigned short)czg[i];
     }
     // All history is consumed (taps are in LDS), so after the barrier this workgroup no longer
     // reads the key head's conv state and may arrive on the counter.
@@ -1231,8 +1288,12 @@ static int ru_epd() {
   if (b >= 0) return b;
   static const int v = [] {
     const char* e = getenv("RADIANCE_GDN_EPD");
-    const int on = (e && e[0] >= '1' && e[0] <= '4' && e[1] == '\0') ? e[0] - '0' : 0;
-    if (on == 4) fprintf(stderr, "radiance: libr4d: lever QSC (RADIANCE_GDN_EPD=4): the GDN decode update's q / k l2 scales once a call "
+    /* 1..4, or 8 / 12 (lever ZXL, round 48: today's form / QSC with the prologue's 16-bit loads in whole registers) */
+    const int pv = e ? atoi(e) : 0;
+    const int on = ((pv >= 1 && pv <= 4) || pv == 8 || pv == 12) ? pv : 0;
+    if (on >= 8) fprintf(stderr, "radiance: libr4d: lever ZXL (RADIANCE_GDN_EPD=%d): the GDN decode update's prologue 16-bit loads in whole "
+                                 "registers, issued together%s; the same bytes\n", on, on == 12 ? " + lever QSC (q / k scales once a call)" : "");
+    else if (on == 4) fprintf(stderr, "radiance: libr4d: lever QSC (RADIANCE_GDN_EPD=4): the GDN decode update's q / k l2 scales once a call "
                                  "(staged after the convolution) instead of in every token by every row; the same bytes\n");
     else if (on) fprintf(stderr, "radiance: libr4d: lever EPD (RADIANCE_GDN_EPD=%d): the GDN decode update's per-token norm / output / "
                             "codes after its token loop (two barriers a call instead of two to four a token)%s; the same bytes\n", on,
@@ -1246,7 +1307,7 @@ static int ru_epd() {
  * note; NOT the update's bytes); the core switch gdn_epd (0..4) and RADIANCE_GDN_EPD never reach them */
 static bool ru_abl_ok(int abl) { return abl == 1 || abl == 2 || abl == 3 || abl == 4 || abl == 8 || abl == 15; }
 extern "C" void r4d_gdn_epd(int on) {
-  const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on > 4 ? 4 : on);
+  const int v = on < 0 ? -1 : (on >= 16 && (on & 15) == 0 && ru_abl_ok(on >> 4)) ? on : (on == 8 || on == 12) ? on : (on > 4 ? 4 : on);
   g_ru_epd_bench.store(v, std::memory_order_relaxed);
 }
 /* lever EPD's dispatch proof for the bench / host test: launches that took the EPD instance since the process started */
@@ -1305,7 +1366,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
   /* lever EPD: anchor + fp32 state only (its instances); every other form unchanged */
-  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS, 3 EPD + GRP, 4 QSC (round 47); 16 x ABL bench only */
+  const int epd = (anc && !sdt) ? ru_epd() : 0;   /* 1 EPD, 2 EPD + QKS, 3 EPD + GRP, 4 QSC (round 47); 8 ZXL, 12 QSC + ZXL (round 48); 16 x ABL bench only */
   if (epd) g_ru_epd_launches.fetch_add(1, std::memory_order_relaxed);
   const unsigned dyn_lds = (unsigned)g_ru_dyn_lds.load(std::memory_order_relaxed);   /* bench only (Q13 read); 0 = today */
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
@@ -1321,6 +1382,8 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if ((ANCC) && !(SDTC) && epd == 2) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 2 : 0)); \
        else if ((ANCC) && !(SDTC) && epd == 1) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 1 : 0)); \
        else if ((ANCC) && !(SDTC) && epd == 4) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 4 : 0)); \
+       else if ((ANCC) && !(SDTC) && epd == 8) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 8 : 0)); \
+       else if ((ANCC) && !(SDTC) && epd == 12) RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, ((ANCC) && !(SDTC) ? 12 : 0)); \
        else                               RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, 0); } while (0)
 #define RC_LAUNCH_EP(NM, NTC, ANCC, SDTC, CVC, EPC)                                           \
   hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, EPC> \

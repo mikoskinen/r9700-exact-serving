@@ -26561,9 +26561,10 @@ static void gdnr_bench(const Plugin& pl, int iters) {
     const int qks = std::atoi(envs("R4D_SELFTEST_GDN_QKS", "0").c_str()) ? 1 : 0;
     /* (round 41, QUEUE Q80) R4D_SELFTEST_GDN_ARM3 = the third arm's gdn_epd level (2 QKS, 3 GRP; R4D_SELFTEST_GDN_QKS=1 = 2; round 47:
      * 4 = lever QSC, the q / k scales once a call, WITHOUT EPD -- its timing line reads against today) */
+    /* (round 48, QUEUE Q90) 8 = lever ZXL (the prologue's 16-bit loads in whole registers), 12 = QSC + ZXL: against today, as QSC */
     const int a3 = qks ? 2 : std::atoi(envs("R4D_SELFTEST_GDN_ARM3", "0").c_str());
-    const int x3 = (a3 == 2 || a3 == 3 || a3 == 4) ? 1 : 0;
-    const char* x3n = a3 == 3 ? "GRP" : a3 == 4 ? "QSC" : "QKS";
+    const int x3 = (a3 == 2 || a3 == 3 || a3 == 4 || a3 == 8 || a3 == 12) ? 1 : 0;
+    const char* x3n = a3 == 3 ? "GRP" : a3 == 4 ? "QSC" : a3 == 8 ? "ZXL" : a3 == 12 ? "QSC+ZXL" : "QKS";
     /* (round 47, QUEUE Q84 read) R4D_SELFTEST_GDN_ABL = a list from {1, 2, 3, 4, 8, 15}: the served form's (form 2: int8 codes, anchor,
      * fp32 state) phase ablations through the hook r4d_gdn_epd(16 x ABL) -- 1 no q / k l2 norms in the token loop, 2 no epilogue
      * reductions (row norm + amax, four barriers a token), 4 no recurrence (4 x 64 FMAs a token), 8 no replay of the accepted tokens,
@@ -26656,14 +26657,14 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                             std::vector<uint8_t> P(c.n), Q(c.n);
                             st_memcpy(P.data(), c.a, c.n, hipMemcpyDeviceToHost); st_memcpy(Q.data(), c.b, c.n, hipMemcpyDeviceToHost);
                             size_t d = 0; for (size_t i = 0; i < c.n; ++i) d += P[i] != Q[i];
-                            if (d) { why = fmt("%s%s differs in %zu of %zu bytes", c2 == 2 ? (a3 == 3 ? "GRP: " : a3 == 4 ? "QSC: " : "QKS: ") : "", c.w, d, c.n); break; }
+                            if (d) { why = fmt("%s%s differs in %zu of %zu bytes", c2 == 2 ? fmt("%s: ", x3n).c_str() : "", c.w, d, c.n); break; }
                         }
                     }
                     std::printf("GDNR %s: EPD%s vs today, two steps: %s; EPD launches +%lld today / +%lld EPD%s (want 0 / 2%s)\n", cell.c_str(),
-                                x3 ? fmt(a3 == 4 ? " and %s" : " and EPD + %s", x3n).c_str() : "",
+                                x3 ? fmt(a3 >= 4 ? " and %s" : " and EPD + %s", x3n).c_str() : "",
                                 why.empty() ? "every output byte identical (o, codes, scales, state pool, conv state)" : why.c_str(), dl[0], dl[1],
                                 x3 ? fmt(" / +%lld %s", dl[2], x3n).c_str() : "", x3 ? " / 2" : "");
-                    ok(fmt("GDNR %s: lever EPD%s byte-identical and dispatched", cell.c_str(), x3 ? fmt(a3 == 4 ? " and %s" : " + %s", x3n).c_str() : "").c_str(),
+                    ok(fmt("GDNR %s: lever EPD%s byte-identical and dispatched", cell.c_str(), x3 ? fmt(a3 >= 4 ? " and %s" : " + %s", x3n).c_str() : "").c_str(),
                        why.empty() && dl[0] == 0 && dl[1] == 2 && (!x3 || dl[2] == 2), why);
                 }
                 /* (2) time: copy 0, step 0's inputs, today / EPD / today / EPD (+ / today at R4D_SELFTEST_GDN_LDS bytes of dynamic LDS:
@@ -26691,10 +26692,11 @@ static void gdnr_bench(const Plugin& pl, int iters) {
                             t0, t[0][0], t[0][1], mb, t0 > 0 ? mb * 1e3 / t0 : 0.0,
                             has_epd ? fmt(", EPD %.2f us (%+.2f us, %+.1f %%; reps %.2f / %.2f)", t1, t1 - t0, t0 > 0 ? 100.0 * (t1 - t0) / t0 : 0.0,
                                           t[1][0], t[1][1]).c_str() : "");
-                if (has_epd && x3 && a3 == 4) {   /* lever QSC (round 47): against today */
+                if (has_epd && x3 && a3 >= 4) {   /* levers QSC (round 47) / ZXL (round 48): against today */
                     const double t2 = (t[2][0] + t[2][1]) / 2;
-                    std::printf("GDNR %s %s qsc: today %.2f us, QSC %.2f us (%+.2f us, %+.1f %% vs today; reps %.2f / %.2f)\n", cell.c_str(),
-                                g_cold > 0 ? "cold" : "warm", t0, t2, t2 - t0, t0 > 0 ? 100.0 * (t2 - t0) / t0 : 0.0, t[2][0], t[2][1]);
+                    std::printf("GDNR %s %s %s: today %.2f us, %s %.2f us (%+.2f us, %+.1f %% vs today; reps %.2f / %.2f)\n", cell.c_str(),
+                                g_cold > 0 ? "cold" : "warm", a3 == 4 ? "qsc" : a3 == 8 ? "zxl" : "qsczxl", t0, x3n, t2, t2 - t0,
+                                t0 > 0 ? 100.0 * (t2 - t0) / t0 : 0.0, t[2][0], t[2][1]);
                 } else if (has_epd && x3) {
                     const double t2 = (t[2][0] + t[2][1]) / 2;
                     std::printf("GDNR %s %s %s: EPD %.2f us, EPD + %s %.2f us (%+.2f us vs EPD, %+.1f %% vs today; reps %.2f / %.2f)\n", cell.c_str(),
