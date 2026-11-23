@@ -1283,8 +1283,41 @@ int Engine::issue_ahead(const RadBatch** out) {
 
 void Engine::phase_mark(int p) {
     const auto now = std::chrono::steady_clock::now();
-    phase_us_[p] += std::chrono::duration<double, std::micro>(now - phase_t_).count();
+    const double us = std::chrono::duration<double, std::micro>(now - phase_t_).count();
+    phase_us_[p] += us;
+    phase_step_us_[p] += us;   /* qfn-on-ds Q92: this step's, for RADIANCE_LOG_STEP_HOST (zeroed by step_host_line) */
     phase_t_ = now;
+}
+
+/* qfn-on-ds Q92 (FINDINGS F78): RADIANCE_LOG_STEP_HOST's line for a step of at least step_host_ms_ -- where the step
+ * thread's time went between this step's plan and the next: the engine's phases (plan = the scheduler's step() and what
+ * precedes it; collect = the device wait), the scheduler's own split of plan (its lock wait, the admission walk, the
+ * restores, every prefix-cache eviction by call site), and the tail after the draft (tier pump, the ticks, publish). */
+void Engine::step_host_line(const RadBatch* b) {
+    double tot = 0;
+    for (int i = 0; i < PH_N; ++i) tot += phase_step_us_[i];
+    if (tot / 1000.0 >= step_host_ms_) {
+        const Scheduler::HostNote& h = lsched().host_note();
+        static const char* const site[Scheduler::kEvSites] = { "prewait", "gate", "ensure", "overdue", "grow", "noa" };
+        std::string ev;
+        for (int k = 0; k < Scheduler::kEvSites; ++k)
+            if (h.ev_n[k] > 0)
+                ev += fmt(" %s %lld/%lld/%.2f", site[k], (long long)h.ev_n[k], (long long)h.ev_got[k], h.ev_ms[k]);
+        RAD_INFO("step-host %d %s: %.2f ms = plan %.2f begin %.2f build %.2f pre %.2f ranks %.2f save %.2f collect %.2f "
+                 "commit %.2f draft+tail %.2f (tier %.2f ticks %.2f publish %.2f) | sched %.2f ms: lock %.2f walk %.2f asked %lld "
+                 "restores %lld / %.2f ms; evict calls/entries/ms:%s | waiting %lld running %lld | agr refused %lld stops %lld "
+                 "on %lld",
+                 b ? b->step : -1, !b ? "-" : b->phase == RAD_PHASE_PREFILL ? "prefill" : b->phase == RAD_PHASE_DECODE ? "decode" : "MIXED",
+                 tot / 1000.0, phase_step_us_[PH_PLAN] / 1000.0, phase_step_us_[PH_BEGIN] / 1000.0,
+                 phase_step_us_[PH_BUILD] / 1000.0, phase_step_us_[PH_PRE] / 1000.0, phase_step_us_[PH_RANKS] / 1000.0,
+                 phase_step_us_[PH_SAVE] / 1000.0, phase_step_us_[PH_COLLECT] / 1000.0, phase_step_us_[PH_COMMIT] / 1000.0,
+                 phase_step_us_[PH_DRAFT] / 1000.0, tail_ms_[0], tail_ms_[1], tail_ms_[2],
+                 h.step_ms, h.lock_ms, h.walk_ms, (long long)h.asked, (long long)h.restores, h.restore_ms,
+                 ev.empty() ? " none" : ev.c_str(), (long long)h.waiting, (long long)h.running,
+                 (long long)h.agr[0], (long long)h.agr[1], (long long)h.agr[2]);
+    }
+    for (int i = 0; i < PH_N; ++i) phase_step_us_[i] = 0;
+    tail_ms_[0] = tail_ms_[1] = tail_ms_[2] = 0;
 }
 
 /* Every error exit from the step loop goes through here, which does three things:
@@ -1362,7 +1395,15 @@ int Engine::step_loop() {
                 "ahead, and this server issues none; ask the plugin for a chain", drafter_.name);
         return fail_loop(RAD_E_UNSUPPORTED);
     }
-    const bool t_on = (int)log_level() >= (int)Log::Debug;
+    {   /* qfn-on-ds Q92: RADIANCE_LOG_STEP_HOST=<ms> turns the phase marks on and prints a step's split (step_host_line) */
+        const char* e = std::getenv("RADIANCE_LOG_STEP_HOST");
+        step_host_ms_ = e ? std::max(0.0, std::atof(e)) : -1;
+        if (step_host_ms_ >= 0)
+            RAD_INFO("RADIANCE_LOG_STEP_HOST=%g (qfn-on-ds Q92): a 'step-host' line for every step of at least %g ms -- the "
+                     "engine's phases, the scheduler's lock / admission walk / restores / evictions by site, the step's tail",
+                     step_host_ms_, step_host_ms_);
+    }
+    const bool t_on = (int)log_level() >= (int)Log::Debug || step_host_ms_ >= 0;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     if (std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT")) {
         sched_.set_kv_rollback_test_hook([this](uint64_t seq, int proposals, int accepted,
@@ -1829,13 +1870,22 @@ int Engine::finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bo
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
         lsched().step_finished();
+        const uint64_t th0 = step_host_ms_ >= 0 ? rad_mono_ns() : 0;   /* qfn-on-ds Q92: the tail's split */
         tier_tick();
+        const uint64_t th1 = th0 ? rad_mono_ns() : 0;
         loan_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
+        const uint64_t th2 = th0 ? rad_mono_ns() : 0;
         drain_completed();
         lsched().publish(/*idle=*/false);
+        if (th0) {
+            const uint64_t th3 = rad_mono_ns();
+            tail_ms_[0] = (double)(th1 - th0) / 1e6;
+            tail_ms_[1] = (double)(th2 - th1) / 1e6;
+            tail_ms_[2] = (double)(th3 - th2) / 1e6;
+        }
         /* lever BGL: back to lane 0 between steps (the HTTP side's reads go to the lane set; lane_select only names the lane the
          * step loop works on) */
         if (bgl1m_ && cur_sched_ != &sched_) {
@@ -1849,6 +1899,7 @@ int Engine::finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bo
          * shows up in `collect`, the step's only host synchronisation. */
         if (t_on) {
             phase_mark(PH_DRAFT);
+            if (step_host_ms_ >= 0) step_host_line(b);
             if (++phase_n_ == 128) {
                 double tot = 0;
                 for (int i = 0; i < PH_N; ++i) tot += phase_us_[i];

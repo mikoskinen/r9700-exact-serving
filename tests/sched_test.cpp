@@ -17456,3 +17456,102 @@ TEST(d55_pub_prompt_publishes_at_the_last_chunk_and_d55b_holds_a_sibling_for_its
     fprintf(stderr, "    hold, PUB_PROMPT unset (the hold is off): B planned with A's computed end at %lld, after %d step(s)\n", (long long)at, held);
     CHECK(at < 299);
 }
+
+/* qfn-on-ds Q92 lever AGR (RADIANCE_SCHED_ADMIT_GATE; FINDINGS F78, AgentX c32 agx3): at the pool's ceiling every waiting
+ * fresh prompt was restored from the host tier and THEN refused at the prefill room gate, whose evict rounds dropped the
+ * cache's blocks for a room that could not be made -- every waiting request, every step, nothing admitted. A runner holds
+ * 21 of 40 blocks, the cache 4 more (cache-only, lendable), three 400-token prompts wait (26 blocks each + the runner's
+ * headroom: no eviction can seat one). Unset: 3 restores a step and the gate's evictions. Bit 1: the room counted first
+ * -- no restore, no eviction, the same plan. Bit 2 (3): the walk ends at the first refused prompt (asked once a step).
+ * Controls: a prompt the cache's blocks CAN seat is still restored, evicted for and admitted under bit 1 (the same as
+ * unset); bit 2 keeps a small prompt behind a refused one waiting where unset admits it (the policy, first come first
+ * seated). */
+TEST(agr_a_prompt_no_eviction_can_seat_is_neither_restored_nor_evicted_for) {
+    struct Env { ~Env() { unsetenv("RADIANCE_SCHED_ADMIT_GATE"); unsetenv("RADIANCE_LOG_STEP_HOST"); } } env;
+    struct Out { int64_t restores = 0, evict_calls = 0, evicted = 0, asked = 0, refused = 0, stops = 0, plan_rows = 0;
+                 int b_state = -1, e_state = -1; };
+    /* b_tokens: the waiting prompts' length; small: one more 48-token prompt queued behind them */
+    auto run = [&](const char* mode, int b_tokens, int seed_tokens, bool small, Out* o) {
+        if (mode) setenv("RADIANCE_SCHED_ADMIT_GATE", mode, 1); else unsetenv("RADIANCE_SCHED_ADMIT_GATE");
+        setenv("RADIANCE_LOG_STEP_HOST", "0", 1);
+        Fixture f;
+        f.build(/*blocks=*/40, /*states=*/64);   /* 40 x 16 = 640 tokens */
+        f.cfg.max_seqs = 8;
+        f.cfg.prefill_room_gate = true;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(320, /*max_tokens=*/200, /*priority=*/5);
+        REQUIRE(f.sch.step() != nullptr);           /* A: 320 tokens, one chunk */
+        CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+        f.commit_plain();
+        f.pc.seed(seed_tokens);                      /* cache-only blocks (refcount one): what the gate could evict */
+        f.pc.held = seed_tokens;
+        f.pc.evict_grant = 1 << 20;
+        f.pc.evict_frees = true;
+        f.pc.restores.clear();
+        const uint64_t b = f.submit(b_tokens, 16);
+        uint64_t e = 0;
+        if (b_tokens > 300) { f.submit(b_tokens, 16); f.submit(b_tokens, 16); }
+        if (small) e = f.submit(48, 16);
+        const int64_t ev0 = f.pc.evict_calls;
+        for (int k = 0; k < 4; ++k) {
+            REQUIRE(f.sch.step() != nullptr);
+            o->asked += f.sch.host_note().asked;
+            o->plan_rows += (int64_t)f.sch.plan().e.size();
+            f.commit_plain();
+        }
+        o->restores = (int64_t)f.pc.restores.size();
+        o->evict_calls = f.pc.evict_calls - ev0;
+        o->evicted = f.pc.evicted;
+        o->refused = f.sch.host_note().agr[0];
+        o->stops = f.sch.host_note().agr[1];
+        o->b_state = f.sch.find(b) ? (int)f.sch.find(b)->state : -1;
+        o->e_state = e && f.sch.find(e) ? (int)f.sch.find(e)->state : -1;
+    };
+    Out u, g1, g3;
+    run(nullptr, 400, 64, false, &u);
+    run("1", 400, 64, false, &g1);
+    run("3", 400, 64, false, &g3);
+    fprintf(stderr, "    ceiling, 3 x 400 waiting, 4 steps: unset %lld restores / %lld evict calls / %lld asked; bit 1 %lld / %lld / %lld "
+                    "(refused %lld); 3 %lld / %lld / %lld (stops %lld)\n",
+            (long long)u.restores, (long long)u.evict_calls, (long long)u.asked, (long long)g1.restores,
+            (long long)g1.evict_calls, (long long)g1.asked, (long long)g1.refused, (long long)g3.restores,
+            (long long)g3.evict_calls, (long long)g3.asked, (long long)g3.stops);
+    CHECK_EQ(u.restores, 12);                        /* today: every waiting prompt, every step */
+    CHECK(u.evict_calls >= 12);
+    CHECK_EQ(u.evicted, 4);                           /* the cache's 4 blocks went for nothing */
+    CHECK_EQ(u.b_state, (int)ReqState::Waiting);
+    CHECK_EQ(g1.restores, 0);
+    CHECK_EQ(g1.evict_calls, 0);
+    CHECK_EQ(g1.evicted, 0);                          /* the cache keeps them */
+    CHECK_EQ(g1.refused, 12);
+    CHECK_EQ(g1.b_state, (int)ReqState::Waiting);
+    CHECK_EQ(g1.plan_rows, u.plan_rows);              /* the same steps planned */
+    CHECK_EQ(g3.restores, 0);
+    CHECK_EQ(g3.asked, 4);                            /* one prompt asked a step */
+    CHECK_EQ(g3.stops, 4);
+    CHECK_EQ(g3.plan_rows, u.plan_rows);
+
+    /* control: 256 tokens need 17 + 2 blocks; 12 free + the cache's 8 seat it -- restored, evicted for, admitted */
+    Out cu, c1;
+    run(nullptr, 256, 128, false, &cu);
+    run("1", 256, 128, false, &c1);
+    fprintf(stderr, "    seatable 256 (8 cache blocks): unset %lld restores / %lld evicted / state %d; bit 1 %lld / %lld / %d\n",
+            (long long)cu.restores, (long long)cu.evicted, cu.b_state, (long long)c1.restores, (long long)c1.evicted, c1.b_state);
+    CHECK_EQ(cu.b_state, (int)ReqState::Running);
+    CHECK_EQ(c1.b_state, (int)ReqState::Running);
+    CHECK_EQ(c1.restores, cu.restores);
+    CHECK_EQ(c1.evicted, cu.evicted);
+    CHECK(c1.evicted > 0);
+    CHECK_EQ(c1.plan_rows, cu.plan_rows);
+
+    /* control: a 48-token prompt queued behind the three refused ones -- admitted past them unset and under bit 1, waits
+     * under bit 2 */
+    Out su, s1, s3;
+    run(nullptr, 400, 64, true, &su);
+    run("1", 400, 64, true, &s1);
+    run("3", 400, 64, true, &s3);
+    fprintf(stderr, "    48 tokens behind them: unset state %d, bit 1 %d, 3 %d\n", su.e_state, s1.e_state, s3.e_state);
+    CHECK_EQ(su.e_state, (int)ReqState::Running);
+    CHECK_EQ(s1.e_state, (int)ReqState::Running);
+    CHECK_EQ(s3.e_state, (int)ReqState::Waiting);
+}

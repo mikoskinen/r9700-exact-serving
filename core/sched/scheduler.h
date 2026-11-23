@@ -830,6 +830,23 @@ public:
         for (int k = 0; k < kSrfN; ++k) out[k] = srf_n_[k];
     }
 
+    /* qfn-on-ds Q92 (FINDINGS F78; RADIANCE_LOG_STEP_HOST): the step thread's host time inside the LAST step() by phase,
+     * filled only while the env is set (host_note_on); the engine prints it beside its own phases. `ev_*` by call site
+     * (kEvSite*): every pc_->evict a site made, the ms they took and the entries they freed. `agr` = lever AGR's counters
+     * (RADIANCE_SCHED_ADMIT_GATE), cumulative: [0] fresh prompts refused before any restore or eviction (the room gate
+     * counted first), [1] walks ended at a refused fresh prompt, [2] fresh prompts the early gate let on. Read on the
+     * step thread only (no lock: step() writes it on that thread). */
+    enum { kEvPreWait, kEvGate, kEvEnsure, kEvOverdue, kEvGrow, kEvNoa, kEvSites };
+    struct HostNote {
+        double  step_ms = 0, lock_ms = 0, walk_ms = 0, restore_ms = 0;
+        int64_t asked = 0, restores = 0, waiting = 0, running = 0;
+        int64_t ev_n[kEvSites] = {}, ev_got[kEvSites] = {};
+        double  ev_ms[kEvSites] = {};
+        int64_t agr[3] = {};
+    };
+    bool            host_note_on() const { return hn_on_; }
+    const HostNote& host_note() const { return hn_; }
+
 private:
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     friend class Engine;
@@ -1500,7 +1517,18 @@ private:
      * Admitting only the first chunk leaves the pool short when the prompt reaches 100%, and
      * preempt_back() then throws away the whole prefill. */
     bool fresh_prefill_can_fit(const SchedReq& s) const;
+    /* qfn-on-ds Q92 lever AGR (RADIANCE_SCHED_ADMIT_GATE bit 1): fresh_prefill_can_fit asked BEFORE the restore, with the
+     * blocks only the prefix cache holds counted as room (what the gate's evict rounds could give back) and the prompt's
+     * blocks the pool already holds as its own: false only where no eviction could make room now. */
+    bool fresh_prefill_room_early(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
+    /* qfn-on-ds Q92: lever AGR's mode (bit 1 the early gate, bit 2 a fresh prompt the room gate refuses ends the walk);
+     * the step-host note (hn_on_ = RADIANCE_LOG_STEP_HOST set) and pc_->evict counted by call site into it */
+    int      agr_ = 0;
+    bool     hn_on_ = false;
+    HostNote hn_;
+    int64_t  agr_n_[3] = {};
+    int64_t  pc_evict(int site, int64_t n);
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind

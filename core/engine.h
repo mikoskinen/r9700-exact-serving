@@ -879,6 +879,13 @@ private:
     int    phase_n_ = 0;
     std::chrono::steady_clock::time_point phase_t_{};
     void   phase_mark(int p);
+    /* qfn-on-ds Q92 (FINDINGS F78): RADIANCE_LOG_STEP_HOST=<ms> -- one line a step of at least <ms> (0: every step) with this
+     * step's phases, the scheduler's host note (Scheduler::HostNote) and the step's tail (tier pump, the ticks, the
+     * publish) split; -1 off. engine.cpp's step loop only (not the lanes' loop). */
+    double  phase_step_us_[PH_N] = {};
+    double  step_host_ms_ = -1;
+    double  tail_ms_[3] = {};
+    void    step_host_line(const RadBatch* b);
 
     /* Block driver (spec §10): a context pass mirroring the step just run, then one pass that
      * fills every drafted position at once. DFlash2 has this shape. issue_block_drafter queues
