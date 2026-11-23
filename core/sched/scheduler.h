@@ -247,6 +247,10 @@ public:
         : mu_(lane0.mu_), step_(lane0.step_), lane_(lane), n_lanes_(n_lanes), lanes_(set) {}
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;
+    /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h; Qwen loop round 46, FINDINGS F77): set once at declare while the env is set
+     * (every lane) -- a verify row's ADV_ACCEPT number then carries kAdvAuxKeepEos when its request runs under ignore_eos,
+     * so the card's forced count cuts at a drafted stop token only where that stop would end the request. false = today. */
+    static inline bool fal_eos_bit = false;
     /* Lane 0 of a pipeline with lanes: before init. */
     void set_lanes(int n_lanes, LaneSet* set) { n_lanes_ = n_lanes; lanes_ = set; lane_ = 0; }
     int  lane() const { return lane_; }

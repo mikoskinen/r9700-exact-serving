@@ -338,7 +338,7 @@ TEST(the_cards_forced_acceptance_is_the_hosts_with_the_cut_over_the_emitted_toke
     std::string why;
     CHECK(fal_parse("1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:3.1,8:4.4", &f, &why, nullptr));
     uint32_t rng = 0xfa1ce5u;
-    int bad = 0, cut_on_draft = 0, forced_wrong = 0;
+    int bad = 0, cut_on_draft = 0, forced_wrong = 0, kept_eos = 0;
     for (int c = 0; c < 10000 && !bad; ++c) {
         Slab s(ADV_ACCEPT);
         s.a.fal = f;
@@ -357,7 +357,9 @@ TEST(the_cards_forced_acceptance_is_the_hosts_with_the_cut_over_the_emitted_toke
             const int n_spec = (int)(lcg(rng) % 9);
             const int ctx = (int)(lcg(rng) % 1000);
             const int card = (i + c) % Slab::kSeq;   /* rows name distinct slots, moving with the case */
-            s.row(i, true, k, 1 + n_spec, ctx, card, k, out_row, n_spec);
+            /* F77: a row whose request runs under ignore_eos carries kAdvAuxKeepEos; its drafted stop tokens do not cut */
+            const bool ign = lcg(rng) % 3 == 0;
+            s.row(i, true, k, 1 + n_spec, ctx, card, k, out_row, n_spec | (ign ? (int32_t)kAdvAuxKeepEos : 0));
             int32_t draft[8] = {}, target[9] = {};
             s.w[Slab::TOK + k] = 50;
             for (int j = 0; j < n_spec; ++j) { draft[j] = 1 + (int32_t)(lcg(rng) % 9); s.w[Slab::TOK + k + 1 + j] = draft[j]; }
@@ -365,7 +367,8 @@ TEST(the_cards_forced_acceptance_is_the_hosts_with_the_cut_over_the_emitted_toke
             int32_t out[9] = {}, acc = -1;
             const int32_t n = fal_count(s.a.fal, s.a.fal.key, card, n_spec);
             CHECK_OK(accept_forced(draft, n_spec, target, n, out, &acc));
-            const int32_t cut = accept_cut_at_eog(out, acc, is_eog);
+            const int32_t cut = ign ? acc : accept_cut_at_eog(out, acc, is_eog);
+            kept_eos += ign && accept_cut_at_eog(out, acc, is_eog) < acc;
             cut_on_draft += cut < acc;
             for (int j = 0; j < cut; ++j) forced_wrong += draft[j] != target[j];
             want[i] = { card, cut, out[cut], ctx + cut, k + cut };
@@ -387,6 +390,7 @@ TEST(the_cards_forced_acceptance_is_the_hosts_with_the_cut_over_the_emitted_toke
     }
     CHECK_EQ(bad, 0);
     CHECK(cut_on_draft > 100);    /* a forced draft that is a stop token ends the run on the card too */
+    CHECK(kept_eos > 50);         /* ... unless the request runs under ignore_eos (F77) */
     CHECK(forced_wrong > 1000);   /* the forced count accepts drafts the target did not draw */
 }
 
@@ -464,6 +468,41 @@ TEST(the_forced_acceptance_length_is_the_golden_one_within_a_percent_over_ten_th
         CHECK(std::fabs(al - golden[d]) <= 0.01 * golden[d]);
         CHECK_EQ(off, 0);
         CHECK_EQ(natural, 0);
+    }
+}
+
+/* FINDINGS F77 (AgentX smoke agx1: AL 2.1079 vs 2.47 at depth 4, 32.5 % of verifies cut at a drafted stop token although
+ * every request ran under ignore_eos): on a text whose drafts are ALL stop tokens, a row under ignore_eos (kAdvAuxKeepEos)
+ * realizes the golden AL within 1 % over 10,000 verifies, as a text without stops does; the same rows without the bit
+ * (a request that a stop token ends) accept nothing -- the cut at the first drafted stop, the negative control. */
+TEST(under_ignore_eos_drafted_stop_tokens_keep_the_golden_acceptance_length) {
+    ForceAl f;
+    std::string why;
+    CHECK(fal_parse("1:1.65,2:2.06,3:2.32,4:2.47", &f, &why, nullptr));
+    f.seed = 0x51ed5eedu;
+    const double golden[5] = { 0, 1.65, 2.06, 2.32, 2.47 };
+    for (int d = 1; d <= 4; ++d) {
+        int64_t keep = 0, ends = 0;
+        for (int c = 0; c < 10000; ++c) {
+            for (int arm = 0; arm < 2; ++arm) {
+                Slab s(ADV_ACCEPT);
+                s.a.fal = f;
+                s.a.fal.key = 7000u + (uint32_t)(c / 4);
+                s.set_eog({ 2 });
+                const int card = c % 4;
+                s.row(0, true, 0, 1 + d, 100, card, 0, 0, d | (arm == 0 ? (int32_t)kAdvAuxKeepEos : 0));
+                s.w[Slab::TOK] = 50;
+                for (int j = 0; j < d; ++j) s.w[Slab::TOK + 1 + j] = 2;     /* every draft the stop token */
+                for (int j = 0; j <= d; ++j) s.src[j] = 9;
+                s.run();
+                (arm == 0 ? keep : ends) += s.st[card].acc;
+            }
+        }
+        const double al = 1.0 + (double)keep / 10000.0;
+        std::fprintf(stderr, "    stops drafted, ignore_eos, depth %d: realized AL %.4f, golden %.2f (%+.2f %%); without ignore_eos %.4f\n",
+                     d, al, golden[d], 100.0 * (al - golden[d]) / golden[d], 1.0 + (double)ends / 10000.0);
+        CHECK(std::fabs(al - golden[d]) <= 0.01 * golden[d]);
+        CHECK_EQ(ends, 0);
     }
 }
 

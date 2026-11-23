@@ -70,6 +70,10 @@ enum AdvMode : int32_t {
                        * rejected rows stored nowhere */
 };
 
+/* ADV_ACCEPT's row number under RADIANCE_DRAFT_FORCE_AL (Scheduler::fal_eos_bit): the row's request runs under ignore_eos, so
+ * a drafted stop token does not end it and does not cut its forced count; the draft count is the number without the bit. */
+enum : int32_t { kAdvAuxKeepEos = 1 << 30 };
+
 /* The most paged KV groups one ADV_COMPACT moves (the trunk's sliding and global groups and a
  * drafter's own, with room). */
 enum { kAdvMaxPools = 6 };

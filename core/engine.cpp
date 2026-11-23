@@ -2603,7 +2603,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
-            if (fal_drawn < 0 || !fal_.nocut)   /* RADIANCE_DRAFT_FORCE_AL_CUT=0: every drawn draft counts */
+            /* RADIANCE_DRAFT_FORCE_AL: a drafted stop token cuts the count only where it would end the request -- not under
+             * ignore_eos (the card's row carries kAdvAuxKeepEos), nor with RADIANCE_DRAFT_FORCE_AL_CUT=0 (FINDINGS F77). */
+            if (fal_drawn < 0 || !(fal_.nocut || e.req->ignore_eos))
                 acc = accept_cut_at_eog(out, acc,
                                         [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 

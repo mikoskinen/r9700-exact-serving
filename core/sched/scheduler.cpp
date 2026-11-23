@@ -4578,7 +4578,7 @@ const RadBatch* Scheduler::step() {
         for (StepEntry& e : plan_.e) {
             e.dev_tok = (int32_t)(k + e.n_tokens - 1 - e.n_spec);
             e.dev_out = e.produces_token ? row : -1;
-            e.dev_aux = e.n_spec;
+            e.dev_aux = e.n_spec | (fal_eos_bit && e.req && e.req->ignore_eos ? (int32_t)kAdvAuxKeepEos : 0);
             if (e.produces_token) row += 1 + e.n_spec;
             k += e.n_tokens;
         }
@@ -4961,7 +4961,7 @@ const RadBatch* Scheduler::step_next_locked() {
         for (StepEntry& e : plan_next_.e) {
             e.dev_tok = (int32_t)(k + e.n_tokens - 1 - e.n_spec);
             e.dev_out = row;
-            e.dev_aux = e.n_spec;
+            e.dev_aux = e.n_spec | (fal_eos_bit && e.req && e.req->ignore_eos ? (int32_t)kAdvAuxKeepEos : 0);
             row += 1 + e.n_spec;
             k += e.n_tokens;
         }

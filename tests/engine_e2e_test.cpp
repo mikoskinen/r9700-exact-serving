@@ -2389,6 +2389,8 @@ TEST(force_al_sets_the_acceptance_length_and_the_card_agrees_with_the_host) {
     fprintf(stderr, "    dflash2 forced: depth 7 %lld verifies, AL %.4f (target %.4f); drafted %lld, accepted %lld\n", n7,
             al7, want7, (long long)drafted, (long long)accepted);
     CHECK(n7 >= 200);
+    /* F77: every request here runs under ignore_eos (completion()), so no drafted stop token cuts a count */
+    CHECK(at != std::string::npos && has(log.substr(at, 400), ", 0 cut below their draw by a stop token"));
     CHECK(std::fabs(want7 - 2.9) < 1e-6);
     CHECK(std::fabs(al7 - 2.9) <= 0.03 * 2.9);
     CHECK(accepted > 0);

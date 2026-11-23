@@ -1889,6 +1889,7 @@ int Engine::declare() {
      * synthetic acceptance): MEASUREMENT ONLY -- a chain verify accepts AL - 1 drafts on average instead of the agreed
      * ones; never a served form. Unset (or empty / "0"), nothing here or on the step path changes. */
     fal_ = ForceAl{};
+    Scheduler::fal_eos_bit = false;
     if (const char* v = std::getenv("RADIANCE_DRAFT_FORCE_AL"); v && *v && std::strcmp(v, "0")) {
         ForceAl f;
         std::string why, desc;
@@ -1916,6 +1917,7 @@ int Engine::declare() {
                 f.seed = 0x51ed5eedu;
             if (const char* ct = std::getenv("RADIANCE_DRAFT_FORCE_AL_CUT"); ct && !std::strcmp(ct, "0")) f.nocut = 1;
             fal_ = f;
+            Scheduler::fal_eos_bit = true;   /* F77: a request under ignore_eos is never cut at a drafted stop token */
             for (auto& rk : ranks_) {
                 rk->sampler.set_no_spec_under_grammar(true);
                 rk->bg_sampler.set_no_spec_under_grammar(true);
@@ -1928,7 +1930,8 @@ int Engine::declare() {
                      v, f.seed, desc.c_str(),
                      f.nocut ? "RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify (every drawn draft "
                                "counts, as vLLM counts; a stop token inside the step does not end it)."
-                             : "A stop token among the emitted tokens ends the verify there (the cut is counted).");
+                             : "A stop token among the emitted tokens ends the verify there only where it ends the request (not "
+                               "under ignore_eos; the cut is counted).");
         }
     }
     if (tree_)
