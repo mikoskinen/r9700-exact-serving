@@ -211,6 +211,7 @@ void ref_resolve(Fix& f) {
  * (the list is sorted there when a launch is too wide for the shared claim list) then `slots`
  * slots. */
 int g_flat = 0;   /* fn4 kvs_flat (Qwen loop round 52): the launch parameter `flat` every fixture runs with */
+int g_fix = 0;    /* fn4 kvs_fix (Qwen loop round 54, lever KVX): the launch parameter `fix` every fixture runs with */
 int dev_resolve(Fix& f) {
     int64_t nlist = 1;
     while (nlist < f.slots) nlist <<= 1;
@@ -224,18 +225,19 @@ int dev_resolve(Fix& f) {
                        tens(f.ctl.data(), RAD_I32, { 16 }),
                        tens(f.host.data(), RAD_U8, { f.blocks, f.bbytes }),
                        tens(f.pool.data(), RAD_U8, { f.slots, f.bbytes }) };
-    RadParam p[6]{};
+    RadParam p[7]{};
     p[0] = { "M", RAD_P_INT, f.M };
     p[1] = { "blocks", RAD_P_INT, f.blocks };
     p[2] = { "slots", RAD_P_INT, f.slots };
     p[3] = { "sel_pitch", RAD_P_INT, f.pitch };
     p[4] = { "block_bytes", RAD_P_INT, f.bbytes };
     p[5] = { "flat", RAD_P_INT, g_flat };
+    p[6] = { "fix", RAD_P_INT, g_fix };
     RadArgs a{};
     a.t = t;
     a.n_t = 8;
     a.p = p;
-    a.n_p = 6;
+    a.n_p = 7;
     a.scratch = scratch.data();
     a.scratch_bytes = (int64_t)scratch.size() * 4;
     return r4d_rad_kv_resolve(&a, nullptr);
@@ -554,6 +556,36 @@ int run_all() {
         f.nsel = { 5 };
         fails += check("identity for every miss, hand untouched", f);
     }
+    ++cases;
+    {
+        /* lever KVX (round 54): a 20,000-slot full ring whose only cold slots sit far past the hand (9,001 and 15,003 slots on,
+         * five windows of 4,096 away), four misses: rotation 1 takes the two and halves every other slot's 3 to 1, rotation 2
+         * finds none and halves 1 to 0, rotation 3 takes the first two from the hand. The windowed list must give the same
+         * victims, the same halving reach and the same hand as the full compaction. */
+        Fix f;
+        f.shape(1, 40000, 20000, 8, 8);
+        for (int64_t s = 0; s < 20000; ++s) { f.resident(s, s); f.sst[(size_t)(2 * s + 1)] = 3; }
+        f.ctl[1] = 1234;
+        f.sst[(size_t)(2 * ((1234 + 9001) % 20000) + 1)] = 0;
+        f.sst[(size_t)(2 * ((1234 + 15003) % 20000) + 1)] = 0;
+        f.ctl[0] = 7;
+        f.sel = { 30001, 30002, 30003, 30004, 5, 6 };
+        f.nsel = { 6 };
+        fails += check("KVX: cold slots five windows past the hand, three rotations", f);
+    }
+    ++cases;
+    {
+        /* lever KVX: a heat above 3 (no legal call writes one) keeps step 4b's own check pass, so the serial sweep runs as
+         * without the lever. */
+        Fix f;
+        f.shape(1, 64, 16, 4, 8);
+        for (int64_t s = 0; s < 16; ++s) { f.resident(s, s); f.sst[(size_t)(2 * s + 1)] = (int32_t)(s % 3); }
+        f.sst[(size_t)(2 * 9 + 1)] = 6;
+        f.ctl[1] = 3;
+        f.sel = { 40, 41, 42, 1 };
+        f.nsel = { 4 };
+        fails += check("KVX: a heat above 3 keeps 4b's check pass", f);
+    }
     std::printf("%d of %d fixtures match libref\n", cases - fails, cases);
     return fails ? 1 : 0;
 }
@@ -561,10 +593,14 @@ int run_all() {
 }  /* namespace */
 
 int main() {
-    std::printf("kvs_flat 0 (the row loops)\n");
-    int fails = run_all();
-    g_flat = 1;
-    std::printf("kvs_flat 1 (steps 2 / 7 over the flat entry space)\n");
-    fails += run_all();
+    int fails = 0;
+    for (int fx = 0; fx < 2; ++fx)
+        for (int fl = 0; fl < 2; ++fl) {
+            g_flat = fl;
+            g_fix = fx;
+            std::printf("kvs_flat %d (%s), kvs_fix %d (%s)\n", fl, fl ? "steps 2 / 7 over the flat entry space" : "the row loops",
+                        fx, fx ? "lever KVX: one pass over the ring, windowed CLOCK lists" : "today's passes");
+            fails += run_all();
+        }
     return fails;
 }

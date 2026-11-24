@@ -10031,6 +10031,8 @@ extern "C" void r4d_gdn_epd(int on);   /* qfn-on-ds lever EPD (r4d_gdn_recurrent
 /* qfn-on-ds: the Qwen line's libr4d switches, reached through libr4d's one rad_fn4_switch (r4d_ds41_ggml.hip), which takes
  * the ds41 line's names first and hands every other name here. */
 extern "C" void r4d_fn4_fc_dump_if_on() { if (fc_on()) fc_dump(); }
+/* qfn-on-ds lever KVX (Qwen loop round 54, Q105): r4d_kv_resolve.hip -- declared here, not in r4d.h (a header edit rebuilds every kernel) */
+extern "C" int r4d_kv_fix_set(int on);
 extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value < 0 ? 0 : (value > 2 ? 2 : value), std::memory_order_relaxed); return 1; }
@@ -10052,6 +10054,7 @@ extern "C" int r4d_fn4_switch_fn(const char* name, int value) {
     if (!std::strcmp(name, "ar_fence")) return r4d_ar_fence_set(value);   /* fn4 PFF (qwen/prefill) */
     if (!std::strcmp(name, "kvs_vic")) return r4d_kv_vic_set(value);   /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md) */
     if (!std::strcmp(name, "kvs_flat")) return r4d_kv_flat_set(value);   /* qfn-on-ds lever KVF (Qwen loop round 52, Q101) */
+    if (!std::strcmp(name, "kvs_fix")) return r4d_kv_fix_set(value);   /* qfn-on-ds lever KVX (Qwen loop round 54, Q105) */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
     if (!std::strcmp(name, "ar_lanethreads_s")) return r4d_ar_lane_threads_s_set(value);   /* qfn-on-ds lever LSK */

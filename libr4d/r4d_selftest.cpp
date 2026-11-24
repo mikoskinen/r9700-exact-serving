@@ -26549,6 +26549,8 @@ static void kvres_bench(const Plugin& pl, int calls) {
     auto stamp_set = (int (*)(int))dlsym(pl.h, "r4d_kv_stamp_set");
     auto flat_set = (int (*)(int))dlsym(pl.h, "r4d_kv_flat_set");
     auto vic_set = (int (*)(int))dlsym(pl.h, "r4d_kv_vic_set");
+    /* lever KVX (round 54, QUEUE Q105): R4D_SELFTEST_KVRES_FIX ("0" when this libr4d has no r4d_kv_fix_set) */
+    auto fix_set = (int (*)(int))dlsym(pl.h, "r4d_kv_fix_set");
     if (!r || !stamp_set || !flat_set || !vic_set) {
         std::printf("--perfkvres: kv_resolve_i32 / r4d_kv_stamp_set / r4d_kv_flat_set / r4d_kv_vic_set absent\n"); ++g_fail; return; }
     auto envll = [](const char* k, long long d) { const char* e = std::getenv(k); return e && *e ? std::atoll(e) : d; };
@@ -26560,7 +26562,8 @@ static void kvres_bench(const Plugin& pl, int calls) {
     const int64_t S = envll("R4D_SELFTEST_KVRES_S", 82080), B = envll("R4D_SELFTEST_KVRES_B", 393216);
     const int64_t P = 513, BB = 2048;
     const std::vector<double> Ms = envlist("R4D_SELFTEST_KVRES_M", "5,20,64"), MISS = envlist("R4D_SELFTEST_KVRES_MISS", "0,0.02,0.05"),
-                              FL = envlist("R4D_SELFTEST_KVRES_FLAT", "0,1");
+                              FL = envlist("R4D_SELFTEST_KVRES_FLAT", "0,1"),
+                              FX = fix_set ? envlist("R4D_SELFTEST_KVRES_FIX", "0,1") : std::vector<double>{ 0.0 };
     int64_t Mmax = 1;
     for (double m : Ms) Mmax = std::max<int64_t>(Mmax, (int64_t)m);
     int khz = 0;
@@ -26573,6 +26576,8 @@ static void kvres_bench(const Plugin& pl, int calls) {
         std::printf("--perfkvres: pinned mirror of %lld MiB refused\n", (long long)(B * BB >> 20)); ++g_fail; return; }
     std::memset(host, 0x5a, (size_t)(B * BB));
     vic_set(1);
+    for (double fx : FX) {
+    if (fix_set) fix_set(fx > 0.5 ? 1 : 0);
     for (double fl : FL) {
         flat_set(fl > 0.5 ? 1 : 0);
         for (double mm : Ms) {
@@ -26658,19 +26663,37 @@ static void kvres_bench(const Plugin& pl, int calls) {
                 }
                 stamp_set(0);
                 st_ev_destroy(e0); st_ev_destroy(e1);
+                /* round 54 (lever KVX): the cell's end state -- both maps, the epochs / heats, the control block and the last call's
+                 * rewritten selection -- as one FNV-1a hash: the same (flat, M, miss) cell must print one hash at every fix / flat */
+                uint64_t hsh = 1469598103934665603ull;
+                {
+                    std::vector<int32_t> ctlv(16), selv((size_t)(M * P));
+                    st_memcpy(res.data(), d[2], bytes[2], hipMemcpyDeviceToHost);
+                    st_memcpy(sblk.data(), d[3], bytes[3], hipMemcpyDeviceToHost);
+                    st_memcpy(sst.data(), d[4], bytes[4], hipMemcpyDeviceToHost);
+                    st_memcpy(ctlv.data(), d[5], bytes[5], hipMemcpyDeviceToHost);
+                    st_memcpy(selv.data(), d[0], bytes[0], hipMemcpyDeviceToHost);
+                    auto fnv = [&](const std::vector<int32_t>& v) {
+                        const unsigned char* b = (const unsigned char*)v.data();
+                        for (size_t i = 0; i < v.size() * 4; ++i) { hsh ^= b[i]; hsh *= 1099511628211ull; } };
+                    fnv(res); fnv(sblk); fnv(sst); fnv(ctlv); fnv(selv);
+                }
                 auto p50 = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
                 static const char* const nm[14] = { "in-kernel", "epoch", "lookups", "sort", "free3b", "list4a", "step4", "chk4b", "rot4b",
                                                     "end4b", "revert", "copies", "rewrite", "tail" };
                 std::string phs;
                 for (int j = 1; j < 14; ++j) phs += fmt(" %s %.1f", nm[j], p50(ph[(size_t)j]));
-                std::printf("KVRES flat %d M %lld miss %.3f: claims p50 %.0f placed %.0f | call us p50 stamped %.1f served %.1f | in-kernel %.1f |%s\n",
-                            fl > 0.5 ? 1 : 0, (long long)M, mf, p50(nclaims), p50(nplaced), p50(ev_st), p50(ev_sv), p50(ph[0]), phs.c_str());
+                std::printf("KVRES fix %d flat %d M %lld miss %.3f: claims p50 %.0f placed %.0f | call us p50 stamped %.1f served %.1f | in-kernel %.1f |%s | state %016llx\n",
+                            fx > 0.5 ? 1 : 0, fl > 0.5 ? 1 : 0, (long long)M, mf, p50(nclaims), p50(nplaced), p50(ev_st), p50(ev_sv), p50(ph[0]), phs.c_str(),
+                            (unsigned long long)hsh);
                 dfree_all();
                 if (bad) { (void)hipHostFree(host); return; }
             }
         }
     }
+    }
     flat_set(0);
+    if (fix_set) fix_set(0);
     (void)hipHostFree(host);
 }
 

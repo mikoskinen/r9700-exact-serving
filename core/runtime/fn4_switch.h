@@ -979,6 +979,11 @@
  *                   rows x 513 half the threads idle and each walks 64 dependent load -> atomic chains); the same placement, maps,
  *                   counters and rewritten selection (libref's); 0 today
  *                                                                                                  RADIANCE_FN4_KVS_FLAT
+ *   kvs_fix         libr4d (qfn-on-ds lever KVX, Qwen loop round 54, QUEUE Q105): kv_resolve's passes over EVERY ring slot cut to
+ *                   one -- step 3b's free count also counts step 4b's unstamped slots and their largest heat (4b keeps its pass only
+ *                   after a heat above 3), and 4b's CLOCK rotations list their victims in coalesced windows from the hand, stopping
+ *                   at the window that holds the last one; the same placement, maps, heats, counters and rewritten selection; 0 today
+ *                                                                                                  RADIANCE_FN4_KVS_FIX
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -1038,6 +1043,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kHcRf,     /* qfn-on-ds lever HRF (Qwen loop round 44): libr4d, the HXS hc read's A' + B3X as one launch, a row group at a time */
               kMtpDec,   /* qfn-on-ds lever MTD (Qwen loop round 45, Q85): qwen4exp, the MTP head's draft passes in the trunk's decode forms */
               kKvsFlat,  /* qfn-on-ds lever KVF (Qwen loop round 52, Q101): libr4d, kv_resolve's lookups / rewrite over the flat entry space */
+              kKvsFix,   /* qfn-on-ds lever KVX (Qwen loop round 54, Q105): libr4d, kv_resolve's passes over every ring slot cut to one */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
