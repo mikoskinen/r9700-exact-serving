@@ -282,8 +282,18 @@ public:
      * conflict -- the request's snapshots rest on bytes equal to the cache's, so they stay; the rule retires only from the
      * first entry whose copies differ (or that cannot be compared: off the card, no comparer installed). 1 = F72's rule
      * as written, 0 = off. Tests set it. */
-    void set_unrest_mode(int mode) { unrest_ = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+    void set_unrest_mode(int mode) { unrest_ = mode < 0 ? 0 : mode > 3 ? 3 : mode; }
     int  unrest_mode() const { return unrest_; }
+    /* qfn-on-ds F81 lever UNR3 (Qwen loop round 55, QUEUE Q102; RADIANCE_PREFIX_UNREST=3): nothing is retired and nothing is
+     * compared. Where the cache keeps another publisher's copy of an entry this request's own snapshots rest on, insert()
+     * keeps the request's OWN blocks of every such entry as an overlay held by those snapshots (refcounted, released with
+     * the last one: retire_ckpt); a lookup that resumes one of them hands the overlay's blocks for those entries, so the hit
+     * attends the bytes its state was computed from, whatever made the two copies differ (F81: step shape, decode-written
+     * vs prefilled). A reservation at a snapshot another request computed is refused (its slot keeps that request's state
+     * and overlay). The overlays together hold at most RADIANCE_PREFIX_UNREST3_PCT % (default 10) of the cached pool's
+     * entries: past it the least recently used overlay's snapshots are retired, and an insert that still does not fit
+     * retires as mode 1 does. Tests set the cap with set_unr3_pct. */
+    void set_unr3_pct(int pct) { unr3_pct_ = pct < 0 ? 0 : pct > 100 ? 100 : pct; }
     /* Installed by the engine under RADIANCE_PREFIX_UNREST=2: `a` and `b` are `n` entries' block ids, entry-major in
      * entry_groups() order (n * entry_groups().size() ids each); returns how many LEADING entries hold the same bytes in
      * a's and b's blocks on every rank, every layer of every cached group (n when all do), negative on a failure (then
@@ -484,6 +494,12 @@ public:
         /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): entries whose two copies were compared at an F72 conflict, how many of
          * them held the same bytes (the request's snapshots stayed over them), and the inserts that found a difference. */
         int64_t unrest_compared = 0, unrest_equal = 0, unrest_differ = 0;
+        /* qfn-on-ds F81 UNR3 (RADIANCE_PREFIX_UNREST=3): overlays made, entries put into them, entries the live overlays
+         * hold now (blocks held only by them once the publisher frees: `unr3_fresh`), snapshot attachments, lookups that
+         * resumed an overlay's owner and the entries they took from it, reservations refused at another request's
+         * snapshot, snapshots retired by the cap, inserts the cap sent to F72's rule. */
+        int64_t unr3_overlays = 0, unr3_entries = 0, unr3_live = 0, unr3_fresh = 0, unr3_attached = 0;
+        int64_t unr3_resumed = 0, unr3_substituted = 0, unr3_refused = 0, unr3_capped = 0, unr3_fallback = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -526,7 +542,30 @@ private:
          * planned and the copy after the step that computes it; in between the slot still holds
          * the previous tenant's state and must not be handed out. */
         bool      valid = false;
+        /* UNR3: the overlay (overlays_ key) this snapshot rests on beside the cache's entries, 0 if none */
+        uint64_t  overlay = 0;
     };
+    /* UNR3: a publisher's own copies of entries the cache keeps another copy of. `at` = chain entry indexes, ascending;
+     * `blocks` = at.size() x entry_groups_.size() ids, entry-major in entry_groups_ order, each with one KV reference of
+     * the overlay's; `held_by` = the snapshots attached (one reference each); `fresh` = entries with a block only the
+     * overlay and its publisher held at the insert (the memory it adds, for the cap). */
+    struct Overlay {
+        std::vector<int64_t> at;
+        std::vector<int32_t> blocks;
+        std::vector<BlockHash> held_by;
+        uint64_t owner = 0;
+        int64_t  fresh = 0;
+    };
+    std::unordered_map<uint64_t, Overlay> overlays_;
+    uint64_t next_overlay_ = 0;
+    int unr3_pct_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST3_PCT");
+                         const int v = e && *e ? std::atoi(e) : 10; return v < 0 ? 0 : v > 100 ? 100 : v; }();
+    /* UNR3 helpers: attach / detach one snapshot's reference (the last detach releases the blocks); the cap's room in
+     * entries; retire the least recently used overlays' snapshots until `need` fresh entries fit (false if they cannot). */
+    void unr3_attach(Ckpt& c, const BlockHash& key, uint64_t id);
+    void unr3_detach(Ckpt& c, const BlockHash& key);
+    int64_t unr3_cap() const;
+    bool unr3_make_room(int64_t need, uint64_t keep_owner);
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
@@ -589,9 +628,11 @@ private:
     std::vector<int32_t> per_;            /* blocks of groups_[i] an entry holds */
     std::vector<int32_t> entry_groups_;   /* the group of each of an entry's blocks */
     bool        has_linear_ = false;
-    /* 0 off, 1 F72's rule, 2 F79's (compare the copies' bytes first); any other non-zero value is 1, as before */
+    /* 0 off, 1 F72's rule, 2 F79's (compare the copies' bytes first), 3 UNR3 (keep the request's own copies as an overlay);
+     * any other non-zero value is 1, as before */
     int         unrest_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST");
-                               return !(e && *e && *e != '0') ? 0 : (e[0] == '2' && e[1] == 0) ? 2 : 1; }();
+                               return !(e && *e && *e != '0') ? 0 : (e[0] == '2' && e[1] == 0) ? 2
+                                    : (e[0] == '3' && e[1] == 0) ? 3 : 1; }();
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;
     mutable std::list<BlockHash> lru_;    /* front = oldest; resident entries only */

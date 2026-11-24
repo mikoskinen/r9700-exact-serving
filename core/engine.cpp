@@ -3450,6 +3450,13 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         RAD_INFO("prefix cache: RADIANCE_PREFIX_UNREST=2 (Qwen loop F79) -- a publisher's snapshots over an entry the cache "
                  "keeps another publisher's copy of are retired only from the first entry whose two copies' bytes differ "
                  "(every rank, every layer of every cached group, compared at the publish)");
+    } else if (ranks_[0]->prefix.unrest_mode() == 3) {
+        const char* pe = std::getenv("RADIANCE_PREFIX_UNREST3_PCT");
+        RAD_INFO("prefix cache: RADIANCE_PREFIX_UNREST=3 (Qwen loop F81, lever UNR3) -- where the cache keeps another "
+                 "publisher's copy of an entry a request's snapshots rest on, the request's own copy stays beside it as an "
+                 "overlay of those snapshots and a hit resuming one of them adopts it; no snapshot is retired for it, nothing "
+                 "is compared; overlays capped at %s %% of the cached pool's entries",
+                 pe && *pe ? pe : "10");
     }
     /* The restore path, installed only when the tiers are on. The scheduler calls it before the
      * admission lookup without knowing about tiers, so it is a callable rather than an include in

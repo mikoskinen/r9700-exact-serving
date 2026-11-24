@@ -172,6 +172,7 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     entry_groups_.clear();
     map_.clear(); lru_.clear();
     ck_by_prefix_.clear(); ck_by_session_.clear();
+    overlays_.clear();
     /* set_policy() may override this afterwards. */
     policy_ = make_checkpoint_policy(cfg.checkpoint_policy, checkpoint_interval);
     policy_->set_floor(drafter_floor_);
@@ -413,6 +414,25 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     }
     hit.n_linear_tokens = (int32_t)best->second.pos;
     hit.checkpoint_slot = best->second.slot;
+    /* UNR3: the snapshot rests on its publisher's own copies of entries the cache keeps another copy of -- the hit adopts
+     * those (Scheduler::admit_one adopts up to the snapshot), so it attends the bytes its state was computed from */
+    if (best->second.overlay != 0 && blocks_out) {
+        const auto ov = overlays_.find(best->second.overlay);
+        if (ov != overlays_.end()) {
+            const size_t W = entry_groups_.size();
+            const int64_t upto = std::min<int64_t>(best->second.pos / block_size_, matched);
+            int64_t n = 0;
+            for (size_t i = 0; i < ov->second.at.size(); ++i) {
+                const int64_t b = ov->second.at[i];
+                if (b >= upto) break;                                      /* ascending */
+                for (size_t k = 0, g = 0; g < groups_.size(); ++g)
+                    for (int32_t j = 0; j < per_[g]; ++j, ++k)
+                        (*blocks_out)[g][(size_t)(b * per_[g] + j)] = ov->second.blocks[i * W + k];
+                ++n;
+            }
+            if (n > 0) { ++stats_.unr3_resumed; stats_.unr3_substituted += n; }
+        }
+    }
     best->second.used = best->second.resumed = ++clock_;
     best->second.used_ns = now;
     handed_.push_back(best->first);
@@ -470,6 +490,19 @@ int PrefixCache::insert(uint64_t session,
      * walk -- each one's entry, the cache's blocks and this request's, entry-major in entry_groups_ order. */
     std::vector<int64_t> cmp_b;
     std::vector<int32_t> cmp_kept, cmp_own;
+    /* qfn-on-ds F81 UNR3 (RADIANCE_PREFIX_UNREST=3): how deep this request's own snapshots on the chain reach (committed or
+     * reserved: each rests on its copies below it), and the entries below that whose cached copy is not this request's */
+    int64_t cover = 0;
+    std::vector<int64_t> ov_at;
+    if (unrest_ == 3 && has_linear_)
+        for (const auto& kvp : ck_by_prefix_) {
+            const Ckpt& c = kvp.second;
+            const int64_t p = c.pos;
+            if (c.owner != session || p <= 0 || p % block_size_ != 0 || p / block_size_ > n_full ||
+                hs[(size_t)(p / block_size_ - 1)] != kvp.first)
+                continue;
+            cover = std::max(cover, p / block_size_);
+        }
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
@@ -487,7 +520,10 @@ int PrefixCache::insert(uint64_t session,
         if (it != map_.end() && (it->second.in_lru || has_linear_)) {
             if (b < under && !it->second.pinned && republish(h, it->second, blocks, b, now))
                 ++taken;
-            else if (unrest_ && b < under && kept_b < 0 && !(it->second.in_lru && holds_own(it->second, blocks, b))) {
+            else if (unrest_ == 3) {
+                /* UNR3: every such entry, kept below as this request's own copy beside the cache's */
+                if (b < cover && !(it->second.in_lru && holds_own(it->second, blocks, b))) ov_at.push_back(b);
+            } else if (unrest_ && b < under && kept_b < 0 && !(it->second.in_lru && holds_own(it->second, blocks, b))) {
                 /* F79: under mode 2 a copy on the card is compared below; the first one that cannot be is F72's */
                 if (unrest_ == 2 && same_bytes_fn && it->second.in_lru &&
                     it->second.blocks.size() == entry_groups_.size()) {
@@ -562,6 +598,88 @@ int PrefixCache::insert(uint64_t session,
             RAD_INFO("prefix cache: session %llu: all %lld cached entries another publisher keeps hold this request's "
                      "bytes (compared in %.1f ms): its snapshots stay%s", (unsigned long long)session, (long long)n, ms,
                      kept_b >= 0 ? " up to the first copy that cannot be compared" : "");
+    }
+    /* UNR3: this request's own blocks of those entries become an overlay its snapshots past the first of them hold; a
+     * lookup resuming one of them hands these blocks (lookup). No snapshot to serve: nothing kept. Over the cap, or a
+     * block that cannot be retained: F72's rule from that entry (kept_b), as mode 1. */
+    if (!ov_at.empty()) {
+        const size_t W = entry_groups_.size();
+        std::vector<BlockHash> keys;
+        for (const auto& kvp : ck_by_prefix_) {
+            const Ckpt& c = kvp.second;
+            const int64_t p = c.pos;
+            if (c.owner != session || p <= ov_at.front() * block_size_ || p % block_size_ != 0 || p / block_size_ > n_full ||
+                hs[(size_t)(p / block_size_ - 1)] != kvp.first)
+                continue;
+            keys.push_back(kvp.first);
+        }
+        /* entries with a block only this request holds now: the overlay alone keeps them once it frees (the cap's unit) */
+        int64_t fresh = 0;
+        for (int64_t b : ov_at) {
+            bool f = false;
+            for (size_t g = 0; g < groups_.size() && !f; ++g)
+                for (int32_t j = 0; j < per_[g] && !f; ++j)
+                    f = kv_->block_refcount(groups_[g], blocks[g][(size_t)(b * per_[g] + j)]) <= 1;
+            fresh += f ? 1 : 0;
+        }
+        if (keys.empty()) {
+            /* no snapshot of this request rests on them */
+        } else if (!unr3_make_room(fresh, session)) {
+            kept_b = ov_at.front();
+            ++stats_.unr3_fallback;
+        } else {
+            Overlay o;
+            o.owner = session;
+            o.fresh = fresh;
+            o.at.reserve(ov_at.size());
+            o.blocks.reserve(ov_at.size() * W);
+            for (int64_t b : ov_at) {
+                std::vector<int32_t> mine;
+                if (!retain_entry(blocks, b, &mine)) { kept_b = b; ++stats_.unr3_fallback; break; }
+                o.at.push_back(b);
+                o.blocks.insert(o.blocks.end(), mine.begin(), mine.end());
+            }
+            if (!o.at.empty()) {
+                const uint64_t id = ++next_overlay_;
+                const int64_t n_at = (int64_t)o.at.size(), first = o.at.front();
+                ++stats_.unr3_overlays;
+                stats_.unr3_entries += n_at;
+                stats_.unr3_live += n_at;
+                stats_.unr3_fresh += o.fresh;
+                overlays_.emplace(id, std::move(o));
+                int64_t att = 0;
+                for (const BlockHash& k : keys) {
+                    auto c = ck_by_prefix_.find(k);
+                    if (c == ck_by_prefix_.end()) continue;
+                    /* past the retained run (a refused retain above): F72's rule retires it below */
+                    if (kept_b >= 0 && c->second.pos > kept_b * block_size_) continue;
+                    unr3_attach(c->second, k, id);
+                    ++att;
+                }
+                auto ov = overlays_.find(id);
+                if (ov != overlays_.end() && ov->second.held_by.empty()) {   /* nothing attached: give the blocks back */
+                    for (size_t i = 0; i < ov->second.blocks.size(); ++i)
+                        kv_->release_block(entry_groups_[i % W], ov->second.blocks[i]);
+                    stats_.unr3_live -= n_at;
+                    stats_.unr3_fresh -= ov->second.fresh;
+                    overlays_.erase(ov);
+                }
+                RAD_INFO("prefix cache: session %llu: %lld cached entries (the first at token %lld) keep another publisher's "
+                         "copy; this request's own copies stay beside them for %lld of its snapshots (UNR3 overlay, %lld "
+                         "entries only it holds; the overlays hold %lld entries, %lld fresh, cap %lld; so far %lld hits resumed "
+                         "over an overlay taking %lld entries from it, %lld reservations refused, %lld snapshots capped, %lld "
+                         "inserts to F72)",
+                         (unsigned long long)session, (long long)n_at, (long long)(first * block_size_), (long long)att,
+                         (long long)fresh, (long long)stats_.unr3_live, (long long)stats_.unr3_fresh, (long long)unr3_cap(),
+                         (long long)stats_.unr3_resumed, (long long)stats_.unr3_substituted, (long long)stats_.unr3_refused,
+                         (long long)stats_.unr3_capped, (long long)stats_.unr3_fallback);
+            }
+        }
+        if (kept_b >= 0)
+            RAD_INFO("prefix cache: session %llu: UNR3 overlay of %lld entries (%lld only it holds) not kept past token %lld "
+                     "(cap %lld entries, the overlays hold %lld fresh): F72's rule from there",
+                     (unsigned long long)session, (long long)ov_at.size(), (long long)fresh,
+                     (long long)(kept_b * block_size_), (long long)unr3_cap(), (long long)stats_.unr3_fresh);
     }
     /* F72: no snapshot of this request stays deeper than an entry the cache holds another copy of; nothing then rests on
      * this request's copies past that entry, so they are not pinned below either. */
@@ -1025,6 +1143,14 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     }
     auto existing = ck_by_prefix_.find(prefix);
     if (existing != ck_by_prefix_.end()) {
+        /* UNR3: another request computed this snapshot, and it (with its overlay) rests on that request's copies; a save
+         * of this request's state into its slot would rest on this one's. The slot keeps its state (the same chain's). */
+        if (unrest_ == 3 && existing->second.owner != session) {
+            ++stats_.unr3_refused;
+            RAD_DEBUG("prefix cache: no snapshot at %lld for session %llu: request %llu's stays there (UNR3)",
+                      (long long)pos, (unsigned long long)session, (unsigned long long)existing->second.owner);
+            return RAD_E_FULL;
+        }
         existing->second.used = ++clock_;
         existing->second.used_ns = rad_mono_ns();
         /* Another session's snapshot, this step's save target: retention run by a later
@@ -1159,7 +1285,84 @@ void PrefixCache::retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>
     /* The tiers record the slot for the session view and must stop naming it before it is reused. */
     if (tiers_) tiers_->release_snapshot(it->first);
     if (it->second.slot >= 0) kv_->free_checkpoint(it->second.slot);
+    unr3_detach(it->second, it->first);   /* UNR3: the last snapshot on an overlay releases its blocks */
     ck_by_prefix_.erase(it);
+}
+
+void PrefixCache::unr3_attach(Ckpt& c, const BlockHash& key, uint64_t id) {
+    if (c.overlay == id) return;
+    auto ov = overlays_.find(id);
+    if (ov == overlays_.end()) return;
+    unr3_detach(c, key);
+    c.overlay = id;
+    ov->second.held_by.push_back(key);
+    ++stats_.unr3_attached;
+}
+
+void PrefixCache::unr3_detach(Ckpt& c, const BlockHash& key) {
+    if (c.overlay == 0) return;
+    auto ov = overlays_.find(c.overlay);
+    c.overlay = 0;
+    if (ov == overlays_.end()) return;
+    Overlay& o = ov->second;
+    o.held_by.erase(std::remove(o.held_by.begin(), o.held_by.end(), key), o.held_by.end());
+    if (!o.held_by.empty()) return;
+    const size_t W = entry_groups_.size();
+    for (size_t i = 0; i < o.blocks.size(); ++i) kv_->release_block(entry_groups_[i % W], o.blocks[i]);
+    stats_.unr3_live -= (int64_t)o.at.size();
+    stats_.unr3_fresh -= o.fresh;
+    overlays_.erase(ov);
+}
+
+int64_t PrefixCache::unr3_cap() const {
+    if (!kv_ || groups_.empty() || unr3_pct_ <= 0) return 0;
+    int64_t entries = INT64_MAX;
+    for (size_t i = 0; i < groups_.size(); ++i)
+        entries = std::min<int64_t>(entries, kv_->total_blocks(groups_[i]) / std::max<int32_t>(per_[i], 1));
+    return entries == INT64_MAX ? 0 : entries * unr3_pct_ / 100;
+}
+
+bool PrefixCache::unr3_make_room(int64_t need, uint64_t keep_owner) {
+    if (need <= 0) return true;
+    const int64_t cap = unr3_cap();
+    if (need > cap) return false;
+    while (stats_.unr3_fresh + need > cap) {
+        /* the overlay whose snapshots were used longest ago, none of them handed out or awaiting its save this step;
+         * not this request's own (its snapshots take the new overlay) */
+        uint64_t victim = 0, oldest = UINT64_MAX;
+        for (const auto& kv : overlays_) {
+            const Overlay& o = kv.second;
+            if (o.owner == keep_owner || o.fresh <= 0) continue;
+            uint64_t last = 0;
+            bool busy = false;
+            for (const BlockHash& k : o.held_by) {
+                if (handed(k) || reserved(k)) { busy = true; break; }
+                const auto c = ck_by_prefix_.find(k);
+                if (c != ck_by_prefix_.end()) last = std::max(last, c->second.used);
+            }
+            if (!busy && last < oldest) { oldest = last; victim = kv.first; }
+        }
+        if (victim == 0) return false;
+        const std::vector<BlockHash> keys = overlays_.find(victim)->second.held_by;
+        for (const BlockHash& k : keys) {
+            auto c = ck_by_prefix_.find(k);
+            if (c == ck_by_prefix_.end()) continue;
+            const uint64_t sess = c->second.session;
+            retire_ckpt(c);
+            unindex_ckpt(sess, k);
+            ++stats_.unr3_capped;
+            ++stats_.ckpt_evictions;
+        }
+        /* a key no longer in the index would leave the overlay standing: drop it by hand */
+        auto left = overlays_.find(victim);
+        if (left != overlays_.end()) {
+            Ckpt none;
+            none.overlay = victim;
+            const std::vector<BlockHash> rest = left->second.held_by;
+            for (const BlockHash& k : rest) { none.overlay = victim; unr3_detach(none, k); }
+        }
+    }
+    return true;
 }
 
 bool PrefixCache::is_tip(const Ckpt& c) const {

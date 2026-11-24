@@ -5135,6 +5135,204 @@ TEST(f79_a_snapshot_stays_over_another_publishers_copy_holding_the_same_bytes) {
     }
 }
 
+/* qfn-on-ds F81 lever UNR3 (Qwen loop round 55, QUEUE Q102; AgentX agx15: under UNR2 half the conflicting head copies differ
+ * by step shape, so 1,487 snapshots were retired): RADIANCE_PREFIX_UNREST=3 keeps the publisher's OWN blocks of every entry
+ * the cache keeps another copy of as an overlay held by its snapshots, and a lookup resuming one of those snapshots hands
+ * the overlay's blocks for those entries. F72's two reasons a copy stays (a live reader; pinned) x the modes: 0 (today:
+ * resumes at 320 over the other's head = the negative control of the block check), 1 (F72: retired), 3 (resumes at 320 over
+ * ITS OWN head). Then, under 3: the other publisher's own hit still reads its own copy; the overlay outlives the publisher's
+ * sequence and goes with its last snapshot; a request that resumed the snapshot and publishes deeper carries the same
+ * blocks into its own overlay; a reservation at another request's snapshot is refused (same owner: allowed); the cap (0 %)
+ * sends the insert to F72's rule; a cap the next overlay does not fit under retires the least recently used overlay's
+ * snapshots. */
+TEST(f81_unr3_a_snapshot_resumes_over_its_own_copy_kept_beside_the_caches) {
+    for (int reason : { 0, 1 }) {          /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+        for (int mode : { 0, 1, 3 }) {
+            TierFixture x;
+            CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            x.f.pc.set_unrest_mode(mode);
+            CHECK_EQ(x.f.pc.unrest_mode(), mode);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            const auto okeys = chain_of(other);
+            std::vector<int32_t> theirs;
+            if (reason == 1) {
+                CHECK_OK(x.f.kv.add_sequence(1));
+                CHECK_OK(x.f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(x.f, 1, okeys, 16);
+                std::vector<std::vector<int32_t>> bt;
+                for (int32_t g : x.f.pc.cached_groups()) bt.push_back(x.f.kv.block_table(1, g));
+                theirs = bt[0];
+                CHECK_OK(x.f.pc.insert(1, other, {}, bt, (int64_t)other.size()));
+                x.f.kv.free_sequence(1);
+            } else {
+                publish(x.f, 1, other, (int64_t)other.size());
+                theirs = x.f.kv.block_table(1, G_FULL);
+            }
+            CHECK_OK(x.f.kv.add_sequence(2));
+            CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+            ckpt_at(x.f, 2, keys, 320);
+            CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+            const int64_t conflicts = reason ? 1 : 2;           /* under the pin entry 1 is republished, not a conflict */
+            CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 0ll);
+            std::vector<std::vector<int32_t>> hit;
+            const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+            REQUIRE(hit.size() == 1u && hit[0].size() >= 20u);
+            if (mode == 0) {
+                /* the negative control: resumes at 320 over the other publisher's head (F72's defect) */
+                CHECK_EQ(h.n_linear_tokens, 320);
+                CHECK_EQ(hit[0][0], theirs[0]);
+                CHECK(hit[0][0] != mine[0]);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, 0ll);
+            } else if (mode == 1) {
+                CHECK_EQ(h.n_linear_tokens, reason ? 16 : 0);
+                CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, 0ll);
+            } else {
+                /* UNR3: resumes at 320 over ITS OWN copy of every entry under the snapshot; nothing retired */
+                CHECK_EQ(h.n_linear_tokens, 320);
+                for (int i = 0; i < 20; ++i) CHECK_EQ(hit[0][(size_t)i], mine[(size_t)i]);
+                CHECK_EQ(x.f.pc.stats().unrested, 0ll);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_live, conflicts);
+                CHECK_EQ(x.f.pc.stats().unr3_fresh, conflicts);
+                CHECK_EQ(x.f.pc.stats().unr3_attached, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_resumed, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_substituted, conflicts);
+                /* the cache's entry 0 stays the other's: a lookup of the other prompt (pinned: resumes its own 16) reads it */
+                std::vector<std::vector<int32_t>> oh;
+                const CacheHit h1 = x.f.pc.lookup(other, {}, &oh);
+                REQUIRE(oh.size() == 1u && !oh[0].empty());
+                CHECK_EQ(oh[0][0], theirs[0]);
+                CHECK_EQ(h1.n_linear_tokens, reason ? 16 : 0);
+                /* a reservation at request 2's snapshot by another request is refused; request 2's own is not */
+                int32_t s4 = -1;
+                CHECK_EQ(x.f.pc.reserve_checkpoint(4, 320, keys[19], &s4), RAD_E_FULL);
+                CHECK_EQ(x.f.pc.stats().unr3_refused, 1ll);
+                int32_t s2 = -1;
+                CHECK_OK(x.f.pc.reserve_checkpoint(2, 320, keys[19], &s2));
+                CHECK(s2 >= 0);
+                x.f.pc.commit_checkpoint(keys[19]);
+                /* the overlay outlives the publisher's sequence: its blocks of the conflicting entries stay referenced */
+                if (reason == 0) x.f.kv.free_sequence(1);
+                x.f.kv.free_sequence(2);
+                CHECK_EQ(x.f.kv.block_refcount(G_FULL, mine[0]), 1);
+                /* request 3 resumes request 2's snapshot, adopts what the hit hands (its own head = request 2's copy), goes
+                 * on to 400 with a snapshot there and publishes: its overlay holds the same blocks (no new entry) */
+                x.f.pc.begin_step();
+                std::vector<int32_t> longer = prompt;
+                const auto more = tok_run(12000, 96);
+                longer.insert(longer.end(), more.begin(), more.end());
+                const auto lkeys = chain_of(longer);
+                std::vector<std::vector<int32_t>> h3;
+                const CacheHit hh = x.f.pc.lookup(longer, {}, &h3, nullptr, 3);
+                CHECK_EQ(hh.n_linear_tokens, 320);
+                REQUIRE(h3.size() == 1u && h3[0].size() >= 20u);
+                h3[0].resize(20);
+                CHECK_OK(x.f.kv.add_sequence(3));
+                CHECK_OK(x.f.kv.adopt(3, G_FULL, h3[0], 320));
+                CHECK_OK(x.f.kv.ensure(3, (int64_t)longer.size()));
+                const std::vector<int32_t> t3 = x.f.kv.block_table(3, G_FULL);
+                CHECK_EQ(t3[0], mine[0]);
+                ckpt_at(x.f, 3, lkeys, 400);
+                CHECK_OK(x.f.pc.insert(3, longer, {}, { t3 }, 400));
+                /* live reader gone (reason 0): no snapshot rests on the other's head, so the cache takes request 3's bytes
+                 * (= request 2's overlay blocks) by republish; pinned (reason 1): entry 0 stays the other's and request 3's
+                 * own overlay carries the same block (no new memory) */
+                CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 2ll);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, reason ? 2ll : 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_fresh, conflicts);
+                x.f.kv.free_sequence(3);
+                /* a hit of request 3's chain resumes its 400 over request 2's copy of the head (the overlay or the cache) */
+                x.f.pc.begin_step();
+                std::vector<std::vector<int32_t>> h4;
+                const CacheHit h4h = x.f.pc.lookup(longer, {}, &h4);
+                CHECK_EQ(h4h.n_linear_tokens, 400);
+                REQUIRE(h4.size() == 1u && h4[0].size() >= 25u);
+                CHECK_EQ(h4[0][0], mine[0]);
+                if (reason == 0) { CHECK_EQ(h4[0][1], mine[1]); }
+                x.f.pc.begin_step();
+                x.f.pc.clear();
+                CHECK_EQ(x.f.pc.stats().unr3_live, 0ll);
+                CHECK_EQ(x.f.pc.stats().unr3_fresh, 0ll);
+                CHECK_EQ(x.f.kv.block_refcount(G_FULL, mine[0]), 0);   /* the last snapshot released the overlay */
+                continue;
+            }
+            if (reason == 0) x.f.kv.free_sequence(1);
+            x.f.kv.free_sequence(2);
+        }
+    }
+    /* the cap: 0 % sends the insert to F72's rule (the snapshot at 320 retired, no overlay, the blocks not kept) */
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        x.f.pc.set_unrest_mode(3);
+        x.f.pc.set_unr3_pct(0);
+        const auto prompt = tok_run(7600, 336);
+        const auto keys = chain_of(prompt);
+        std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+        const auto tail = tok_run(9600, 32);
+        other.insert(other.end(), tail.begin(), tail.end());
+        publish(x.f, 1, other, (int64_t)other.size());
+        CHECK_OK(x.f.kv.add_sequence(2));
+        CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+        const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+        ckpt_at(x.f, 2, keys, 320);
+        CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+        CHECK_EQ(x.f.pc.stats().unr3_fallback, 1ll);
+        CHECK_EQ(x.f.pc.stats().unr3_overlays, 0ll);
+        CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+        CHECK_EQ(x.f.pc.lookup(prompt, {}).n_linear_tokens, 0);
+        x.f.kv.free_sequence(2);
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, mine[0]), 0);
+        x.f.kv.free_sequence(1);
+    }
+    /* the cap: 1 % of the pool's entries; a second overlay that does not fit beside the first retires the first's snapshot
+     * (least recently used, not handed out this step) and its blocks go back */
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        x.f.pc.set_unrest_mode(3);
+        x.f.pc.set_unr3_pct(1);
+        const int64_t cap = x.f.kv.total_blocks(G_FULL) / 100;
+        REQUIRE(cap >= 3 && cap <= 18);
+        auto pair = [&](int32_t base, uint64_t o_id, uint64_t r_id, int head_entries, std::vector<int32_t>* own) {
+            const auto prompt = tok_run(base, 336);
+            const auto keys = chain_of(prompt);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 16 * head_entries);
+            const auto tail = tok_run(base + 2000, 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            publish(x.f, o_id, other, (int64_t)other.size());          /* live on the head */
+            CHECK_OK(x.f.kv.add_sequence(r_id));
+            CHECK_OK(x.f.kv.ensure(r_id, (int64_t)prompt.size()));
+            *own = x.f.kv.block_table(r_id, G_FULL);
+            ckpt_at(x.f, r_id, keys, 320);
+            CHECK_OK(x.f.pc.insert(r_id, prompt, {}, { *own }, 320));
+            x.f.kv.free_sequence(r_id);
+        };
+        std::vector<int32_t> a, b;
+        pair(30000, 11, 12, 2, &a);
+        CHECK_EQ(x.f.pc.stats().unr3_fresh, 2ll);
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, a[0]), 1);
+        x.f.pc.begin_step();
+        pair(40000, 13, 14, (int)cap - 1, &b);                       /* 2 + cap - 1 > cap */
+        CHECK_EQ(x.f.pc.stats().unr3_capped, 1ll);
+        CHECK_EQ(x.f.pc.stats().unr3_fallback, 0ll);
+        CHECK_EQ(x.f.pc.stats().unr3_fresh, cap - 1);
+        CHECK_EQ(x.f.pc.stats().unr3_overlays, 2ll);
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, a[0]), 0);            /* the first overlay's blocks went back */
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, b[0]), 1);
+        CHECK_EQ(x.f.pc.lookup(tok_run(30000, 336), {}).n_linear_tokens, 0);
+        CHECK_EQ(x.f.pc.lookup(tok_run(40000, 336), {}).n_linear_tokens, 320);
+        x.f.kv.free_sequence(11);
+        x.f.kv.free_sequence(13);
+    }
+}
+
 TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
     /* The old copy goes only when nothing else reads it: a running sequence that adopted the
      * short request's head may have snapshots of its own resting on it. */

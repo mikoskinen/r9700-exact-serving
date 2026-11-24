@@ -2120,6 +2120,73 @@ TEST(f79_unrest_2_compares_the_two_copies_and_keeps_snapshots_over_equal_bytes) 
     }
 }
 
+/* qfn-on-ds F81 lever UNR3 (Qwen loop round 55, QUEUE Q102; RADIANCE_PREFIX_UNREST=3): the F79 load (two prompts with a
+ * shared 200-token head sent at once, each computing its own copy; the first to publish pins it) -- the second publisher
+ * keeps its own copy of the head as an overlay of its snapshots instead of losing them (no retire line, no compare line),
+ * both re-sends resume deep in their own prompts, the one over the overlay adopting its own head blocks, and every reply
+ * and probability is the cold run's. A third send of the second prompt resumes the re-send's lineage again (its publish
+ * carries the same blocks into its own overlay). */
+TEST(f81_unr3_keeps_the_second_publishers_snapshots_over_its_own_head) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> head = prompt_ids(11, 200);
+    std::vector<int32_t> a = head, b = head;
+    for (int32_t t : prompt_ids(12, 150)) a.push_back(t);
+    for (int32_t t : prompt_ids(13, 170)) b.push_back(t);
+    json cold_a, cold_b;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        cold_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+        cold_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE(cold_a.contains("completion_probabilities"));
+    Server s;
+    REQUIRE(s.start(world().qwen35,
+                    { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--max-num-seqs", "2" },
+                    { "RADIANCE_PREFIX_UNREST=3", "RADIANCE_LOG=info" }));
+    Call ca, cb;
+    REQUIRE(ca.send(s.port, "POST", "/completion", completion(a, 24, 0.0, 0, 3).dump()));
+    REQUIRE(cb.send(s.port, "POST", "/completion", completion(b, 24, 0.0, 0, 3).dump()));
+    std::string ba, bb;
+    CHECK_EQ(ca.read(&ba), 200);
+    CHECK_EQ(cb.read(&bb), 200);
+    const json ra = json::parse(ba, nullptr, false), rb = json::parse(bb, nullptr, false);
+    const json again_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+    const json again_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    const json third_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+    const json third_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    CHECK_EQ(s.stop(), 0);
+    for (const json* r : { &ra, &again_a, &third_a }) {
+        CHECK(tokens_of(*r) == tokens_of(cold_a));
+        CHECK((*r)["completion_probabilities"] == cold_a["completion_probabilities"]);
+    }
+    for (const json* r : { &rb, &again_b, &third_b }) {
+        CHECK(tokens_of(*r) == tokens_of(cold_b));
+        CHECK((*r)["completion_probabilities"] == cold_b["completion_probabilities"]);
+    }
+    const std::string log = s.output();
+    auto count = [&](const char* what) {
+        size_t n = 0;
+        for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++n;
+        return n;
+    };
+    const char* kOv = "this request's own copies stay beside them";
+    const size_t ov = count(kOv), retired = count("keeps another publisher's bytes"), compared = count("hold this request's bytes");
+    const int64_t ca2 = timing(again_a, "cache_n"), cb2 = timing(again_b, "cache_n");
+    const int64_t ca3 = timing(third_a, "cache_n"), cb3 = timing(third_b, "cache_n");
+    const size_t f = log.find(kOv);
+    fprintf(stderr, "    UNREST=3: re-sends cached a %lld / b %lld, third a %lld / b %lld; overlay lines %zu, retire %zu, compare %zu\n"
+                    "      %s\n", (long long)ca2, (long long)cb2, (long long)ca3, (long long)cb3, ov, retired, compared,
+            f == std::string::npos ? "-" : log.substr(log.rfind('\n', f) + 1, log.find('\n', f) - log.rfind('\n', f) - 1).c_str());
+    CHECK(log.find("RADIANCE_PREFIX_UNREST=3 (Qwen loop F81, lever UNR3)") != std::string::npos);
+    CHECK(ov >= 1);                                   /* the second publisher's own head kept beside the cache's */
+    CHECK_EQ(retired, (size_t)0);
+    CHECK_EQ(compared, (size_t)0);
+    CHECK(std::min(ca2, cb2) > 200);                  /* both re-sends resume past the head, in their own prompts */
+    CHECK(std::min(ca3, cb3) > 200);
+}
+
 /* A prompt that shares a head with an earlier one resumes from the prefix cache: attention from
  * the cached blocks, the gated delta net from the linear-state checkpoint the earlier request wrote
  * at the end of the shared head, never from that request's later state. The reply, and every
