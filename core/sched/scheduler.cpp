@@ -291,13 +291,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     }
     {   /* qfn-on-ds Q92 (FINDINGS F78): lever AGR and the step-host note (scheduler.h agr_ / hn_on_) */
         const char* e = std::getenv("RADIANCE_SCHED_ADMIT_GATE");
-        agr_ = e && *e ? (std::atoi(e) & 3) : 0;
+        agr_ = e && *e ? (std::atoi(e) & 7) : 0;
         if (agr_ && lane_ <= 0)
-            RAD_INFO("scheduler: RADIANCE_SCHED_ADMIT_GATE=%d (qfn-on-ds Q92, F78)%s%s", agr_,
+            RAD_INFO("scheduler: RADIANCE_SCHED_ADMIT_GATE=%d (qfn-on-ds Q92, F78)%s%s%s", agr_,
                      (agr_ & 1) ? " -- a fresh prompt's room gate is asked BEFORE its restore (the cache's own blocks counted as "
                                   "room): one no eviction could seat now restores and evicts nothing" : "",
                      (agr_ & 2) ? "; a fresh prompt the room gate refuses ends the step's admission walk (first come, first "
-                                  "seated)" : "");
+                                  "seated)" : "",
+                     (agr_ & 4) ? "; the room gate asks the prefix cache for the entries the prompt is short in one call "
+                                  "(qfn-on-ds Q103 lever GEV, F80), not 256 a round" : "");
         hn_on_ = std::getenv("RADIANCE_LOG_STEP_HOST") != nullptr;
     }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
@@ -3193,9 +3195,24 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
      * and then be preempted at the first decode step, wasting the entire prefill. */
     if (cfg_.prefill_room_gate && r.state != ReqState::Preempted && (int64_t)r.n_computed < (int64_t)r.prompt.size()) {
         int rounds = 0;
-        while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
-               cfg_.prefix_cache && pc_ && pc_evict(kEvGate, kEvictBlocks) > 0)
-            ++rounds;
+        if (agr_ & 4) {
+            /* qfn-on-ds Q103 lever GEV (bit 4; FINDINGS F80): ask for what the prompt is SHORT, not 256 entries a round --
+             * every call walks the LRU from its front past what cannot leave (and may land the whole copy backlog), so
+             * 221 rounds of 256 cost 2.2 s where one ask walks once. A call that frees less (entries a live sequence also
+             * holds) is asked again for the rest; the same bound in entries as the rounds below, the LRU order unchanged. */
+            int64_t asked = 0;
+            const int64_t cap = (int64_t)kEvictRounds * kEvictBlocks;
+            while (!fresh_prefill_can_fit(s) && asked < cap && rounds < kEvictRounds && cfg_.prefix_cache && pc_) {
+                const int64_t want = std::min<int64_t>(std::max<int64_t>(fresh_prefill_short_entries(s), 1), cap - asked);
+                asked += want;
+                ++rounds;
+                if (pc_evict(kEvGate, want) <= 0) break;
+            }
+        } else {
+            while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
+                   cfg_.prefix_cache && pc_ && pc_evict(kEvGate, kEvictBlocks) > 0)
+                ++rounds;
+        }
         if (!fresh_prefill_can_fit(s)) {
             /* A prompt the empty pool cannot hold must not starve the queue: it fails below
              * (spec §17) like the preempted path, rather than waiting forever. */
@@ -3441,6 +3458,45 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
  * The old admission only checked the first chunk; the pool could then refuse at 100% and
  * preempt_back() would hand back the entire prefill's KV, forcing the request to start again
  * at zero. */
+/* qfn-on-ds Q103 lever GEV (RADIANCE_SCHED_ADMIT_GATE bit 4; FINDINGS F80): the prefix-cache ENTRIES the room gate is short
+ * for `s` -- fresh_prefill_can_fit's full-group count past the available blocks, in entries (an entry holds lcm / B blocks of
+ * a cached group with B-token blocks, as trim_prefix_cache counts), the most any full group is short; 0 when the full groups
+ * fit (the stateful groups' slots are no eviction's business). */
+int64_t Scheduler::fresh_prefill_short_entries(const SchedReq& s) const {
+    if (!pc_) return 0;
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len() + 1;
+    int64_t entry = 0;
+    for (int32_t g : pc_->cached_groups()) {
+        const int64_t bs = kvgeom_.g[(size_t)g].block_size;
+        if (bs > 0) entry = entry > 0 ? std::lcm(entry, bs) : bs;
+    }
+    int64_t short_by = 0;
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0 || gg.block_size <= 0) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+        if (need < 0) need = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) continue;
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;
+        }
+        const int64_t blocks = need - kv_->available_blocks((int32_t)g);
+        const int64_t per = std::max<int64_t>(entry > 0 ? entry / gg.block_size : 1, 1);
+        if (blocks > 0) short_by = std::max(short_by, (blocks + per - 1) / per);
+    }
+    return short_by;
+}
+
 bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */

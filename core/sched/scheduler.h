@@ -1521,8 +1521,12 @@ private:
      * blocks only the prefix cache holds counted as room (what the gate's evict rounds could give back) and the prompt's
      * blocks the pool already holds as its own: false only where no eviction could make room now. */
     bool fresh_prefill_room_early(const SchedReq& s) const;
+    /* qfn-on-ds Q103 lever GEV (RADIANCE_SCHED_ADMIT_GATE bit 4; FINDINGS F80): the prefix-cache entries the room gate is
+     * short for a fresh prompt (fresh_prefill_can_fit's full-group count past the available blocks), 0 when they fit */
+    int64_t fresh_prefill_short_entries(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
-    /* qfn-on-ds Q92: lever AGR's mode (bit 1 the early gate, bit 2 a fresh prompt the room gate refuses ends the walk);
+    /* qfn-on-ds Q92: lever AGR's mode (bit 1 the early gate, bit 2 a fresh prompt the room gate refuses ends the walk; bit 4
+     * Q103 lever GEV: the gate asks for its shortfall in one evict call);
      * the step-host note (hn_on_ = RADIANCE_LOG_STEP_HOST set) and pc_->evict counted by call site into it */
     int      agr_ = 0;
     bool     hn_on_ = false;

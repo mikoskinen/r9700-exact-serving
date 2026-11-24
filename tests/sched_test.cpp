@@ -17688,3 +17688,66 @@ TEST(agr_a_prompt_no_eviction_can_seat_is_neither_restored_nor_evicted_for) {
     CHECK_EQ(s1.e_state, (int)ReqState::Running);
     CHECK_EQ(s3.e_state, (int)ReqState::Waiting);
 }
+
+/* qfn-on-ds Q103 lever GEV (RADIANCE_SCHED_ADMIT_GATE bit 4; FINDINGS F80, AgentX agx8 / agx11: a seatable prompt's room-gate
+ * evictions held single steps 1-17 s, 221 calls of 256 entries for 56,576): the gate asks the prefix cache for the entries the
+ * prompt is short in ONE call instead of 256 a round. A runner holds 20 of 2,000 blocks, the cache 1,900 (cache-only), a
+ * 16,000-token prompt needs 1,001 + the runner's headroom: unset = ceil(short / 256) calls of 256 (and up to 255 entries more
+ * than it needs), bit 4 = one call of exactly the shortfall; the prompt admitted in both, the same steps planned. Control: a
+ * prompt that fits asks nothing in either mode. */
+TEST(gev_the_room_gate_asks_the_cache_for_its_shortfall_in_one_call) {
+    struct Env { ~Env() { unsetenv("RADIANCE_SCHED_ADMIT_GATE"); } } env;
+    struct Out { int64_t evict_calls = 0, evicted = 0, plan_rows = 0; int b_state = -1; };
+    auto run = [&](const char* mode, int b_tokens, Out* o) {
+        if (mode) setenv("RADIANCE_SCHED_ADMIT_GATE", mode, 1); else unsetenv("RADIANCE_SCHED_ADMIT_GATE");
+        Fixture f;
+        f.build(/*blocks=*/2000, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/32768);   /* 2,000 x 16 = 32,000 tokens */
+        f.prog.meta.n_ctx_train = 32768;            /* the fixture's 4,096 would refuse the 16,000-token prompt */
+        f.cfg.max_seqs = 8;
+        f.cfg.prefill_room_gate = true;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(320, /*max_tokens=*/200, /*priority=*/5);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+        f.commit_plain();
+        f.pc.seed(1900 * 16);                       /* cache-only blocks the gate can evict */
+        f.pc.held = 1900 * 16;
+        f.pc.evict_grant = 1 << 20;
+        f.pc.evict_frees = true;
+        const uint64_t b = f.submit(b_tokens, 16);
+        const int64_t ev0 = f.pc.evict_calls;
+        for (int k = 0; k < 2; ++k) {
+            REQUIRE(f.sch.step() != nullptr);
+            o->plan_rows += (int64_t)f.sch.plan().e.size();
+            f.commit_plain();
+        }
+        o->evict_calls = f.pc.evict_calls - ev0;
+        o->evicted = f.pc.evicted;
+        o->b_state = f.sch.find(b) ? (int)f.sch.find(b)->state : -1;
+    };
+    Out u, g4, g7;
+    run(nullptr, 16000, &u);
+    run("4", 16000, &g4);
+    run("7", 16000, &g7);
+    fprintf(stderr, "    16,000-token prompt at the ceiling: unset %lld evict calls / %lld entries evicted / state %d; bit 4 %lld / %lld / %d; "
+                    "7 %lld / %lld / %d\n", (long long)u.evict_calls, (long long)u.evicted, u.b_state, (long long)g4.evict_calls,
+            (long long)g4.evicted, g4.b_state, (long long)g7.evict_calls, (long long)g7.evicted, g7.b_state);
+    CHECK_EQ(u.b_state, (int)ReqState::Running);
+    CHECK_EQ(g4.b_state, (int)ReqState::Running);
+    CHECK_EQ(g7.b_state, (int)ReqState::Running);
+    CHECK(u.evict_calls >= 3);                       /* today: rounds of 256 */
+    CHECK_EQ(u.evicted % 256, 0);
+    CHECK_EQ(g4.evict_calls, 1);                     /* one call of the shortfall */
+    CHECK(g4.evicted < u.evicted);                   /* no round-up past the need */
+    CHECK(g4.evicted > u.evicted - 256);
+    CHECK_EQ(g7.evict_calls, 1);
+    CHECK_EQ(g7.evicted, g4.evicted);
+    CHECK_EQ(g4.plan_rows, u.plan_rows);             /* the same steps planned */
+    /* control: a prompt that fits beside the cache asks nothing */
+    Out cu, c4;
+    run(nullptr, 1000, &cu);
+    run("4", 1000, &c4);
+    CHECK_EQ(cu.evict_calls, 0);
+    CHECK_EQ(c4.evict_calls, 0);
+    CHECK_EQ(c4.b_state, (int)ReqState::Running);
+}
