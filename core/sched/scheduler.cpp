@@ -2681,9 +2681,15 @@ bool Scheduler::preempt_back() {
                      (unsigned long long)r.id, no, (long long)r.n_computed, (long long)s.seq_len());
         }
     }
+    /* round 56 KOW (RADIANCE_PREFIX_EXACT bit 2): the request keeps its own blocks of every entry the cache keeps another
+     * publisher's copy of (pub_blocks_ = its tables, as publish_prefix gave them), so its rejoin attends what its states
+     * were computed over; refused -> recomputed */
+    const bool kow = fn4::preempt_keep() > 0 && published && pc_ && (pc_->exact() & 2) != 0;
     if (fn4::preempt_keep() > 0 && published && !r.embed && r.n_computed >= (int64_t)r.prompt.size() &&
-        r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible()) {
+        r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible() &&
+        (!kow || pc_->keep_own(r, pub_blocks_, r.n_computed) >= 0)) {
         const int64_t whole = kv_->preempt_keep(r.id, r.n_computed);
+        if (whole < 0 && kow) pc_->drop_kept(r);
         if (whole >= 0) {
             s.keep_whole = whole;
             r.state = ReqState::Preempted;
@@ -2793,6 +2799,7 @@ int Scheduler::rejoin_kept(SchedReq& s) {
     }
     s.keep_whole = -1;
     s.keep_tries = 0;
+    pc_->drop_kept(r);   /* round 56 KOW: the rejoin holds its own references now */
     r.state = ReqState::Running;
     s.preempted_us = 0;
     s.running = true;
@@ -2804,6 +2811,7 @@ int Scheduler::rejoin_kept(SchedReq& s) {
 
 void Scheduler::unkeep(SchedReq& s) {
     Request& r = *s.req;
+    if (pc_) pc_->drop_kept(r);   /* round 56 KOW */
     if (kv_->has_sequence(r.id)) kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;

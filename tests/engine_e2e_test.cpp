@@ -3417,6 +3417,69 @@ TEST(fn4_preempt_keep_without_a_host_tier_falls_back_to_recompute_cleanly) {
     }
 }
 
+/* qfn-on-ds round 56 (COORD 03:43): the same squeeze with RADIANCE_PREFIX_EXACT=3 (levers EGN + KOW, mem_test egn_... /
+ * kow_... hold the byte cases): the engine names both levers at start, the parks keep / rejoin or recompute through
+ * keep_own / drop_kept, every stream returns its whole length, and the pool ends with no block held by a kept copy (a
+ * fresh request after the squeeze runs alone in a pool the leak would have shrunk). */
+TEST(round56_exact_3_under_preempt_keep_pressure_keeps_the_streams_whole) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(300 + i, 200 + 20 * i));
+    std::vector<std::string> args = { "--num-speculative-tokens", "4" };
+    for (const std::string& a : small_pool_args()) args.push_back(a);
+    args.push_back("--prefix-cache-mib");
+    args.push_back("16");
+    int64_t longest = 0, together = 0;
+    for (const auto& p : prompts) {
+        longest = std::max<int64_t>(longest, (int64_t)p.size() + 64);
+        together += (int64_t)p.size() + 64;
+    }
+    auto pool_at = [&](int mib) -> int64_t {
+        Server probe;
+        probe.quiet = true;
+        if (!probe.start(world().qwen35_kv, args, device_env(mib))) return -1;
+        return pool_tokens(probe.output());
+    };
+    int64_t pool = 0;
+    std::string why;
+    const int mib = small_device(pool_at, longest, together - 40, true, &pool, &why);
+    if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    std::vector<std::string> env = device_env(mib);
+    env.push_back("RADIANCE_FN4_PREEMPT_KEEP=1");
+    env.push_back("RADIANCE_PREFIX_EXACT=3");
+    env.push_back("RADIANCE_LOG=info");
+    Server s;
+    REQUIRE(s.start(world().qwen35_kv, args, env));
+    Call calls[4];
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[i], 64).dump()));
+    for (int i = 0; i < 4; ++i) {
+        std::string body;
+        CHECK_EQ(calls[i].read(&body), 200);
+        CHECK_EQ(tokens_of(json::parse(body, nullptr, false)).size(), (size_t)64);
+    }
+    const double n = metric(s.port, "vllm:num_preemptions_total");
+    /* after the squeeze: one request alone, its whole length (a kept copy left behind would hold blocks for good) */
+    const json after = post(s.port, "/completion", completion(prompt_ids(399, 230), 64));
+    CHECK_EQ(tokens_of(after).size(), (size_t)64);
+    CHECK_EQ(s.stop(), 0);
+    const std::string log = s.output();
+    auto count = [&](const char* what) {
+        size_t k = 0;
+        for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++k;
+        return k;
+    };
+    fprintf(stderr, "    %d MiB, a pool of %lld tokens, preempted %g times; kept %zu, rejoined %zu, recomputed %zu; KOW keep "
+                    "lines %zu, KOW stops %zu, EGN retire lines %zu\n", mib, (long long)pool, n,
+            count("fn4 preempt_keep: request") , count("rejoined at"), count("recomputed"),
+            count("as its own copy (the cache keeps another"), count("rejoins no deeper than entry"),
+            count("(EGN;"));
+    CHECK(log.find("RADIANCE_PREFIX_EXACT=3 (Qwen loop round 56) -- lever EGN") != std::string::npos);
+    CHECK(log.find("-- lever KOW") != std::string::npos);
+    CHECK(n > 0);
+}
+
 /* ================================================================== image generation */
 
 namespace {

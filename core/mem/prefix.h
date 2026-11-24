@@ -294,6 +294,25 @@ public:
      * entries: past it the least recently used overlay's snapshots are retired, and an insert that still does not fit
      * retires as mode 1 does. Tests set the cap with set_unr3_pct. */
     void set_unr3_pct(int pct) { unr3_pct_ = pct < 0 ? 0 : pct > 100 ? 100 : pct; }
+    /* qfn-on-ds round 56 (COORD 03:43, the two every-mode gaps of DEV note 03:26; RADIANCE_PREFIX_EXACT, a bit set, 0 =
+     * today). Bit 1, lever EGN: every entry carries the clock value its bytes were indexed at (born: a new entry, a
+     * republish; a host round trip keeps it), and a snapshot the clock value its owner's publish sealed it at; a snapshot
+     * is never handed out over an entry born after its seal -- an entry evicted while a snapshot rested on it and indexed
+     * again by another publisher holds other bytes (gap (a)) -- and insert() retires such snapshots on its chain. A
+     * reservation at another request's snapshot makes that request its owner, unsealed until its publish. Bit 2, lever
+     * KOW: a request fn4 preempt_keep parks keeps its own blocks of every entry the cache holds another copy of
+     * (keep_own), its rejoin's lookup hands those, and stops at an entry born after the park (gap (b)); drop_kept / release
+     * give them back. Tests set it. */
+    void set_exact(int bits) { exact_ = bits < 0 ? 0 : bits & 3; }
+    int  exact() const { return exact_; }
+    /* KOW (exact bit 2): the request `req` is parked with the first `n_tokens` of `tokens` in whole blocks `blocks` (one
+     * table per cached group, as insert). Keeps a reference on its own blocks of every whole entry the cache holds on the
+     * card as another copy; returns how many entries, negative on a refusal (nothing kept). 0 and nothing kept with bit 2
+     * off. */
+    int64_t keep_own(uint64_t req, const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                     const std::vector<std::vector<int32_t>>& blocks, int64_t n_tokens);
+    /* KOW: give back what keep_own kept for `req` (after its rejoin adopted them, or a recompute). */
+    void drop_kept(uint64_t req);
     /* Installed by the engine under RADIANCE_PREFIX_UNREST=2: `a` and `b` are `n` entries' block ids, entry-major in
      * entry_groups() order (n * entry_groups().size() ids each); returns how many LEADING entries hold the same bytes in
      * a's and b's blocks on every rank, every layer of every cached group (n when all do), negative on a failure (then
@@ -500,6 +519,12 @@ public:
          * snapshot, snapshots retired by the cap, inserts the cap sent to F72's rule. */
         int64_t unr3_overlays = 0, unr3_entries = 0, unr3_live = 0, unr3_fresh = 0, unr3_attached = 0;
         int64_t unr3_resumed = 0, unr3_substituted = 0, unr3_refused = 0, unr3_capped = 0, unr3_fallback = 0;
+        /* round 56 EGN (RADIANCE_PREFIX_EXACT bit 1): snapshots a lookup passed over because an entry under them was born
+         * after their seal, snapshots insert() retired for it, re-reservations that changed a snapshot's owner. KOW (bit 2):
+         * parks that kept own entries, the entries kept, rejoin lookups that took them, and the ones stopped at a re-born
+         * entry. */
+        int64_t egn_skipped = 0, egn_retired = 0, egn_reowned = 0;
+        int64_t kow_parks = 0, kow_entries = 0, kow_substituted = 0, kow_stopped = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -524,6 +549,8 @@ private:
         /* Last hit or publish, monotonic clock. Every path that moves an entry to the LRU's back
          * stamps it, so the list is in this order and expiry stops at the first entry it keeps. */
         uint64_t used_ns = 0;
+        /* EGN: `clock_` when these bytes were indexed (created, or republished); a restore keeps it */
+        uint64_t born = 0;
         std::list<BlockHash>::iterator lru;
     };
     struct Ckpt {
@@ -544,7 +571,28 @@ private:
         bool      valid = false;
         /* UNR3: the overlay (overlays_ key) this snapshot rests on beside the cache's entries, 0 if none */
         uint64_t  overlay = 0;
+        /* EGN: `clock_` at its owner's publish (every entry under it born at or before), 0 = not sealed (not checked);
+         * the request a reservation by another session hands it to at its commit, 0 = none */
+        uint64_t  sealed = 0;
+        uint64_t  next_owner = 0;
     };
+    /* KOW: what keep_own kept for a parked request -- chain entry indexes (ascending), their blocks entry-major in
+     * entry_groups_ order (one reference each), the seal (`clock_` at the park) */
+    struct Kept {
+        std::vector<int64_t> at;
+        std::vector<int32_t> blocks;
+        uint64_t sealed = 0;
+    };
+    std::unordered_map<uint64_t, Kept> kept_;
+    int exact_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_EXACT");
+                      return e && *e ? (std::atoi(e) & 3) : 0; }();
+    /* EGN: whether snapshot `c` may be handed out over the chain entries whose born values are `born` (one per entry,
+     * UINT64_MAX for an entry not in the index) with running maxima `pm` */
+    bool egn_ok(const Ckpt& c, const std::vector<uint64_t>& born, const std::vector<uint64_t>& pm) const;
+    /* EGN: born values of the chain `hs`'s first `n` entries and their running maxima */
+    void egn_borns(const std::vector<BlockHash>& hs, int64_t n, std::vector<uint64_t>* born,
+                   std::vector<uint64_t>* pm) const;
+    mutable std::vector<uint64_t> egn_born_, egn_pm_;   /* lookup's scratch */
     /* UNR3: a publisher's own copies of entries the cache keeps another copy of. `at` = chain entry indexes, ascending;
      * `blocks` = at.size() x entry_groups_.size() ids, entry-major in entry_groups_ order, each with one KV reference of
      * the overlay's; `held_by` = the snapshots attached (one reference each); `fresh` = entries with a block only the
@@ -615,7 +663,8 @@ private:
      * snapshots, a few hundred, rather than the chain's blocks. */
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
     deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit,
-                 const std::vector<int64_t>* at = nullptr) const;
+                 const std::vector<int64_t>* at = nullptr,
+                 const std::vector<uint64_t>* born = nullptr, const std::vector<uint64_t>* pm = nullptr) const;
     static double idle_s(uint64_t used_ns);
 
     KVManager*  kv_ = nullptr;

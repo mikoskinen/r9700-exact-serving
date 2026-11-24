@@ -5333,6 +5333,206 @@ TEST(f81_unr3_a_snapshot_resumes_over_its_own_copy_kept_beside_the_caches) {
     }
 }
 
+/* Every chain entry's block ids as a hit hands them (one cached group here). */
+static std::vector<int32_t> hit_blocks(Fixture& f, const std::vector<int32_t>& prompt, CacheHit* h,
+                                       const HitCap* cap = nullptr, uint64_t session = 0) {
+    std::vector<std::vector<int32_t>> hit;
+    *h = f.pc.lookup(prompt, {}, &hit, cap, session);
+    return hit.empty() ? std::vector<int32_t>{} : hit[0];
+}
+
+/* qfn-on-ds round 56 lever EGN (COORD 03:43 gap (a), DEV note 03:26; RADIANCE_PREFIX_EXACT bit 1). Request 1 computes a
+ * 336-token prompt in its own blocks with snapshots at 160 and 320 and publishes; the pool's pressure erases every entry
+ * (no host copy) while the snapshots stay in the store. Request 2 computes the head again in ITS blocks (another step
+ * shape: other bytes) and publishes it. Today (bits 0, the negative control) a hit resumes request 1's state over request
+ * 2's bytes -- the answer is not the cold one; under EGN no snapshot is handed out over an entry indexed after its owner's
+ * publish, and the publish that re-indexes it retires those it can see on its chain. Two shapes: request 2 publishes the
+ * whole 320 (both stale snapshots on its chain), or only 160 (the one at 320 lies past it) and request 3 adopts that head
+ * and publishes the rest with its own snapshot at 256. A re-reservation at a snapshot hands it to the new saver. */
+TEST(egn_a_snapshot_is_not_resumed_over_an_entry_evicted_under_it_and_indexed_again) {
+    for (int whole : { 1, 0 }) {
+        for (int bits : { 0, 1 }) {
+            Fixture f;
+            CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/6));
+            f.pc.set_exact(bits);
+            CHECK_EQ(f.pc.exact(), bits);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            CHECK_OK(f.kv.add_sequence(1));
+            CHECK_OK(f.kv.ensure(1, (int64_t)prompt.size()));
+            const std::vector<int32_t> first = f.kv.block_table(1, G_FULL);
+            ckpt_at(f, 1, keys, 160);
+            ckpt_at(f, 1, keys, 320);
+            CHECK_OK(f.pc.insert(1, prompt, {}, { first }, 320));
+            f.kv.free_sequence(1);
+            f.pc.begin_step();
+            CHECK_EQ(f.pc.evict_lru(1000), 20ll);                     /* no tiers: every entry erased */
+            CHECK_EQ(f.pc.size(), 0ll);
+            CHECK_EQ(f.pc.checkpoints(1).size(), 2u);                 /* the snapshots stay in the store */
+            CacheHit h;
+            CHECK_EQ(hit_blocks(f, prompt, &h).size(), 0u);           /* nothing reachable yet */
+            CHECK_EQ(h.n_linear_tokens, 0);
+            /* request 2: the head again in its own blocks, its own snapshot at 64 */
+            CHECK_OK(f.kv.add_sequence(2));
+            CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+            ckpt_at(f, 2, keys, 64);
+            CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, whole ? 320 : 160));
+            f.kv.free_sequence(2);
+            f.pc.begin_step();
+            if (whole) {
+                const std::vector<int32_t> got = hit_blocks(f, prompt, &h);
+                REQUIRE(got.size() >= 20u);
+                CHECK_EQ(got[0], mine[0]);                            /* the cache's head is request 2's copy */
+                if (bits == 0) {
+                    CHECK_EQ(h.n_linear_tokens, 320);                 /* request 1's state over request 2's bytes (the gap) */
+                    CHECK_EQ(f.pc.stats().egn_retired, 0ll);
+                } else {
+                    CHECK_EQ(h.n_linear_tokens, 64);                  /* request 2's own snapshot, over its own bytes */
+                    CHECK_EQ(f.pc.stats().egn_retired, 2ll);          /* 160 and 320 retired at request 2's publish */
+                    CHECK_EQ(f.pc.checkpoints(2).size(), 1u);
+                }
+                continue;
+            }
+            /* only 160 published: the snapshot at 160 is on request 2's chain, the one at 320 is not */
+            const std::vector<int32_t> got2 = hit_blocks(f, prompt, &h);
+            REQUIRE(got2.size() >= 10u);
+            CHECK_EQ(h.n_attn_tokens, 160);
+            CHECK_EQ(h.n_linear_tokens, bits ? 64 : 160);
+            CHECK_EQ(f.pc.stats().egn_retired, bits ? 1ll : 0ll);
+            /* request 3 adopts the cached head (request 2's), computes 160..336 in its blocks, snapshot at 256, publishes */
+            f.pc.begin_step();
+            CHECK_OK(f.kv.add_sequence(3));
+            std::vector<int32_t> head(got2.begin(), got2.begin() + 10);
+            CHECK_OK(f.kv.adopt(3, G_FULL, head, 160));
+            CHECK_OK(f.kv.ensure(3, (int64_t)prompt.size()));
+            const std::vector<int32_t> third = f.kv.block_table(3, G_FULL);
+            CHECK_EQ(third[0], mine[0]);
+            ckpt_at(f, 3, keys, 256);
+            CHECK_OK(f.pc.insert(3, prompt, {}, { third }, 320));
+            f.kv.free_sequence(3);
+            f.pc.begin_step();
+            const std::vector<int32_t> got3 = hit_blocks(f, prompt, &h);
+            REQUIRE(got3.size() >= 20u);
+            CHECK_EQ(got3[0], mine[0]);
+            CHECK_EQ(got3[15], third[15]);
+            if (bits == 0) {
+                CHECK_EQ(h.n_linear_tokens, 320);                     /* request 1's 320 over requests 2 + 3's bytes */
+            } else {
+                CHECK_EQ(h.n_linear_tokens, 256);                     /* request 3's own */
+                CHECK_EQ(f.pc.stats().egn_retired, 2ll);              /* + the one at 320 at request 3's publish */
+                /* a re-reservation at the 256 snapshot by request 4 makes it request 4's at the commit (its state then);
+                 * unsealed until request 4 publishes */
+                const int64_t before = f.pc.stats().egn_reowned;
+                ckpt_at(f, 4, keys, 256);
+                CHECK_EQ(f.pc.stats().egn_reowned - before, 1ll);
+                f.pc.begin_step();
+                CHECK_EQ(f.pc.lookup(prompt, {}).n_linear_tokens, 256);
+            }
+        }
+    }
+}
+
+/* qfn-on-ds round 56 lever KOW (COORD 03:43 gap (b), DEV note 03:26; RADIANCE_PREFIX_EXACT bit 2). fn4 preempt_keep parks
+ * a decoding request: it publishes, gives its whole blocks up (KVManager::preempt_keep) and keeps its states, and its
+ * rejoin adopts what a lookup of prompt ++ output hands. (1) Where the cache keeps another publisher's copy of an entry
+ * the request computed itself (that one read by a live sequence, or pinned under its snapshot), today (bits 0, the
+ * negative control) the rejoin adopts the other copy and the request's own blocks went back to the pool at the park;
+ * under KOW keep_own holds the request's own blocks and the rejoin's lookup hands them. (2) An entry evicted while the
+ * request is parked and indexed again by another publisher: today the rejoin adopts the new bytes; under KOW the hit
+ * stops there (the rejoin is refused: recomputed). */
+TEST(kow_a_parked_request_rejoins_over_its_own_copy_and_never_over_bytes_indexed_since) {
+    static const std::vector<int64_t> kNoSnapshot;
+    HitCap cap;
+    cap.tokens = -1;
+    cap.resume_at = &kNoSnapshot;
+    for (int bits : { 0, 2 }) {
+        for (int reason : { 0, 1 }) {      /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+            Fixture f;
+            CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            f.pc.set_exact(bits);
+            const auto prompt = tok_run(7600, 336);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            std::vector<int32_t> theirs;
+            if (reason == 1) {
+                const auto okeys = chain_of(other);
+                CHECK_OK(f.kv.add_sequence(1));
+                CHECK_OK(f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(f, 1, okeys, 16);
+                theirs = f.kv.block_table(1, G_FULL);
+                CHECK_OK(f.pc.insert(1, other, {}, { theirs }, (int64_t)other.size()));
+                f.kv.free_sequence(1);
+            } else {
+                publish(f, 1, other, (int64_t)other.size());
+                theirs = f.kv.block_table(1, G_FULL);
+            }
+            /* request 2 decodes at 320 in its own blocks; the park: publish, keep_own, preempt_keep */
+            CHECK_OK(f.kv.add_sequence(2));
+            CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+            CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, 320));
+            const int64_t kept = f.pc.keep_own(2, prompt, {}, { mine }, 320);
+            CHECK_EQ(kept, bits ? 2ll : 0ll);                         /* entries 0 and 1 keep the other's copy */
+            CHECK_EQ(f.kv.preempt_keep(2, 320), 320ll);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), bits ? 1 : 0);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[2]), 1);       /* the cache's (request 2 published it) */
+            f.pc.begin_step();
+            CacheHit h;
+            std::vector<int32_t> got = hit_blocks(f, prompt, &h, &cap, 2);
+            CHECK_EQ(h.n_attn_tokens, 320);
+            CHECK_EQ(h.n_linear_tokens, 0);
+            REQUIRE(got.size() >= 20u);
+            if (bits == 0) {
+                CHECK_EQ(got[0], theirs[0]);                          /* the gap: its states over the other's bytes */
+                CHECK(got[0] != mine[0]);
+            } else {
+                for (int i = 0; i < 20; ++i) CHECK_EQ(got[(size_t)i], mine[(size_t)i]);
+                CHECK_EQ(f.pc.stats().kow_substituted, 2ll);
+            }
+            got.resize(20);
+            CHECK_OK(f.kv.rejoin(2, G_FULL, got));
+            f.pc.drop_kept(2);
+            /* the rejoined sequence's; the other copy also the cache's (+ its live reader's) */
+            CHECK_EQ(f.kv.block_refcount(G_FULL, got[0]), bits ? 1 : reason == 0 ? 3 : 2);
+            if (reason == 0) f.kv.free_sequence(1);
+            f.kv.free_sequence(2);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), 0);
+        }
+        /* (2) parked with nothing conflicting; the pressure erases its entries; request 3 indexes the same tokens anew */
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        f.pc.set_exact(bits);
+        const auto prompt = tok_run(7600, 336);
+        CHECK_OK(f.kv.add_sequence(2));
+        CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+        const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+        CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, 320));
+        CHECK_EQ(f.pc.keep_own(2, prompt, {}, { mine }, 320), 0ll);
+        CHECK_EQ(f.kv.preempt_keep(2, 320), 320ll);
+        CHECK_EQ(f.pc.evict_lru(1000), 20ll);
+        publish(f, 3, prompt, 320);
+        const std::vector<int32_t> third = f.kv.block_table(3, G_FULL);
+        f.kv.free_sequence(3);
+        f.pc.begin_step();
+        CacheHit h;
+        const std::vector<int32_t> got = hit_blocks(f, prompt, &h, &cap, 2);
+        if (bits == 0) {
+            CHECK_EQ(h.n_attn_tokens, 320);                           /* the gap: request 3's bytes under request 2's states */
+            REQUIRE(!got.empty());
+            CHECK_EQ(got[0], third[0]);
+        } else {
+            CHECK_EQ(h.n_attn_tokens, 0);                             /* stopped at entry 0: the rejoin is refused */
+            CHECK_EQ(f.pc.stats().kow_stopped, 1ll);
+        }
+        /* a lookup without the parked request's session is the ordinary one */
+        CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, &cap).n_attn_tokens, 320);
+        f.pc.release(2);                                              /* finished while parked: gives back what it kept */
+        f.kv.free_sequence(2);
+    }
+}
+
 TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
     /* The old copy goes only when nothing else reads it: a running sequence that adopted the
      * short request's head may have snapshots of its own resting on it. */

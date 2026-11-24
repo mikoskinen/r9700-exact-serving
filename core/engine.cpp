@@ -3458,6 +3458,12 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                  "is compared; overlays capped at %s %% of the cached pool's entries",
                  pe && *pe ? pe : "10");
     }
+    if (const int ex = ranks_[0]->prefix.exact())
+        RAD_INFO("prefix cache: RADIANCE_PREFIX_EXACT=%d (Qwen loop round 56)%s%s", ex,
+                 (ex & 1) ? " -- lever EGN: no snapshot is resumed over an entry indexed again since its owner published "
+                            "(evicted under it, re-published with other bytes); insert retires such snapshots" : "",
+                 (ex & 2) ? " -- lever KOW: a request fn4 preempt_keep parks keeps its own copies of the entries the cache "
+                            "holds another publisher's copy of, and its rejoin stops at an entry indexed again since" : "");
     /* The restore path, installed only when the tiers are on. The scheduler calls it before the
      * admission lookup without knowing about tiers, so it is a callable rather than an include in
      * core/sched.
