@@ -3056,6 +3056,39 @@ TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
     CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
+/* qfn-on-ds lever PCR (Qwen loop round 58; the DS line's RADIANCE_PC_KEEP reserve part, value / 4): the publish trim's free reserve
+ * as a share of the pool -- the case above (group 3 full, 64 blocks of 8, entries of 2 blocks) asks for 8 entries at a quarter
+ * (unset and 0..3 = today), 4 at an eighth (4), 2 at a sixteenth (8), 1 at a thirty-second (12) and makes no trim at none (16). */
+TEST(pcr_the_publish_trims_reserve_follows_rad_pc_keep) {
+    for (const int v : { -1, 0, 3, 4, 8, 12, 16, 19 }) {
+        if (v < 0) unsetenv("RADIANCE_PC_KEEP"); else setenv("RADIANCE_PC_KEEP", std::to_string(v).c_str(), 1);
+        Fixture f;
+        f.build(/*blocks=*/64, /*states=*/64);
+        KVGroupInfo k;
+        k.name = "fine";
+        k.decl.kind = RAD_KV_FULL;
+        k.block_size = 8;
+        f.prog.kv_groups.push_back(k);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 64, 64);
+        f.pc.groups = { 0, 3 };
+        CHECK_OK(f.start());
+        f.pc.evict_grant = 1 << 20;
+        f.submit(160, /*max_tokens=*/1);
+        f.submit(176, /*max_tokens=*/64);
+        f.submit(176, /*max_tokens=*/64);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        const int sel = v > 0 ? std::min(v / 4, 4) : 0;
+        if (sel == 4) {
+            CHECK_EQ((int)f.pc.trims.size(), 0);
+        } else {
+            REQUIRE(f.pc.trims.size() == 1u);
+            CHECK_EQ(f.pc.trims[0], (int64_t)(8 >> sel));
+        }
+    }
+    unsetenv("RADIANCE_PC_KEEP");
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */

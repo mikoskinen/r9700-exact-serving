@@ -302,6 +302,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                                   "(qfn-on-ds Q103 lever GEV, F80), not 256 a round" : "");
         hn_on_ = std::getenv("RADIANCE_LOG_STEP_HOST") != nullptr;
     }
+    {   /* qfn-on-ds lever PCR (Qwen loop round 58): the publish trim's free reserve, the DS line's RADIANCE_PC_KEEP reserve part
+         * (tp8 loop P82 lever PCK, value / 4: 0 a quarter = today, 1 an eighth, 2 a sixteenth, 3 a thirty-second, 4 none); its
+         * retention part (value % 4) is the DS line's switch and not read here (--checkpoint-policy sets retention) */
+        const char* e = std::getenv("RADIANCE_PC_KEEP");
+        const int v = e && *e ? std::atoi(e) : 0;
+        pcr_sel_ = v > 0 ? std::min(v / 4, 4) : 0;
+        if (v > 0 && lane_ <= 0) {
+            static const char* const kName[5] = { "a quarter (today)", "an eighth", "a sixteenth", "a thirty-second",
+                                                  "none (entries leave only where an admission or a growth evicts)" };
+            RAD_INFO("scheduler: RADIANCE_PC_KEEP=%d (qfn-on-ds lever PCR, the DS line's P82 reserve part): the prefix cache's publish "
+                     "trim keeps %s of the KV pool free%s", v, kName[pcr_sel_],
+                     v % 4 ? "; the retention part (value % 4) is not read in this tree: --checkpoint-policy sets it" : "");
+        }
+    }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
         plan_reserved_ = e && !std::strcmp(e, "1");
@@ -1051,11 +1065,15 @@ void Scheduler::trim_prefix_cache() {
         const int64_t bs = kvgeom_.g[(size_t)g].block_size;
         if (bs > 0) entry = entry > 0 ? std::lcm(entry, bs) : bs;
     }
+    /* qfn-on-ds lever PCR (RADIANCE_PC_KEEP / 4, the DS line's P82 R): the reserve as a share of the pool -- a quarter (0, today),
+     * an eighth, a sixteenth, a thirty-second, or none (4: entries go only when an admission or a growth needs the room) */
+    static const int kPcrDiv[5] = { 4, 8, 16, 32, 0 };
+    if (kPcrDiv[pcr_sel_] == 0) return;
     int64_t short_by = 0;
     for (int32_t g : cg) {
         const int64_t total = kv_->total_blocks(g), bs = kvgeom_.g[(size_t)g].block_size;
         if (total <= 0 || bs <= 0) continue;
-        const int64_t reserve = total / 4;          /* a quarter of the pool stays free */
+        const int64_t reserve = total / kPcrDiv[pcr_sel_];   /* a quarter of the pool stays free (lever PCR 0 = today) */
         /* Free against the carve, not free_blocks(): on an elastic pool free_blocks() is bounded
          * by the live mark, so a pool that returned its unused top would read as nearly full and
          * the trim would drain the cache for room the pool can grow back into. */

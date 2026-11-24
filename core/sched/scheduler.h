@@ -1021,6 +1021,7 @@ private:
     int64_t       srb_n_[kSrbN] = {};
     std::function<int64_t()> srb_clock_;
     int64_t       srb_logged_ = 0;
+    int           pcr_sel_ = 0;   /* qfn-on-ds lever PCR: RADIANCE_PC_KEEP / 4 (the publish trim's reserve; 0 = a quarter, today) */
     void          srb_choose(bool admit_possible, int v, int32_t& lone_slot);
 public:
     void          set_srb_clock(std::function<int64_t()> now_us) { srb_clock_ = std::move(now_us); }
