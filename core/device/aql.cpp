@@ -1405,6 +1405,9 @@ struct PlayStamp {
     hsa_signal_t sig{};
     bool         ordered = false;
     bool         chained = false;
+    int8_t       acq = -1;        /* Qwen loop round 62 (RADIANCE_AQL_STAMP_SCOPE): the packet's acquire / release scope */
+    int8_t       rel = -1;
+    char         why = '-';       /* a system acquire's reason: f forced, l lap, e host epoch, ? none of them */
 };
 
 struct PlayRun {
@@ -1488,6 +1491,15 @@ struct PlayRun {
                 chain_record(s, slot, true);
             }
         }
+        /* Qwen loop round 62 (RADIANCE_AQL_STAMP_SCOPE, a stamped play only): why acquire_scope answers what it does, read
+         * before it moves the stream's epoch / lap marks -- forced (the record's own system fence), a lap of half the queue, or
+         * a host epoch (a host wait or host write since the stream's last system acquire). Timing only: nothing below reads it. */
+        char sys_why = '-';
+        if (stamp) {
+            if ((r.fence & kFenceAcquireSystem) != 0) sys_why = 'f';
+            else if ((int64_t)idx - s->last_sys_acq >= (int64_t)(kQueuePackets / 2)) sys_why = 'l';
+            else if (s->epoch != G().host_epoch.load(std::memory_order_acquire)) sys_why = 'e';
+        }
         int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
         /* RADIANCE_AQL_ACQ: unset = every played packet keeps the acquire acquire_scope gives it.
          *   rule, rule-w  a packet haz_mark marked (TapeRec::noacq: no line it reads can be stale) plays its
@@ -1526,6 +1538,9 @@ struct PlayRun {
         if (stamp) {
             stamp->ordered = ordered;
             stamp->chained = chain;
+            stamp->acq = (int8_t)acq;
+            stamp->rel = (int8_t)rel;
+            stamp->why = acq == HSA_FENCE_SCOPE_SYSTEM ? (sys_why == '-' ? '?' : sys_why) : '-';
         }
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
         if (ordered && acq >= HSA_FENCE_SCOPE_AGENT) s->last_oacq = (int64_t)idx;   /* lever CHI */
@@ -2382,11 +2397,19 @@ struct StampRow {
     uint32_t records = 0;           /* the tape's length, which tells kinds of pass apart */
     uint64_t pass = 0;
     uint64_t kernel = 0;
+    int8_t   acq = -1;              /* Qwen loop round 62: PlayStamp's acquire / release scope and system-acquire reason */
+    int8_t   rel = -1;
+    char     why = '-';
 };
 
 struct Stamps {
     std::mutex   mu;
     int          every = 0;
+    /* Qwen loop round 62 (RADIANCE_AQL_STAMP_SCOPE=1): three more columns at the end of every line -- acq, rel (the packet's
+     * acquire / release fence scope as played: 0 none, 1 agent, 2 system) and why (a system acquire's reason: f the record's
+     * own system fence, l a lap of half the queue, e a host epoch = a host wait or host write since the stream's last system
+     * acquire; - otherwise). Unset: the line format as before (other readers parse it by position). */
+    bool         scope = false;
     std::string  path;
     FILE*        out = nullptr;
     bool         out_failed = false;
@@ -2419,6 +2442,12 @@ Stamps& stamps() {
         if (x->every) {
             RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card 0, "
                      "into %s", x->every, x->path.c_str());
+            const char* sc = std::getenv("RADIANCE_AQL_STAMP_SCOPE");   /* Qwen loop round 62: before the drain thread */
+            x->scope = sc && std::atoi(sc) > 0;
+            if (x->scope)
+                RAD_WARN("device: RADIANCE_AQL_STAMP_SCOPE=1 (Qwen loop round 62) -- every line ends with acq,rel,why: the "
+                         "packet's acquire / release scope as played (0 none, 1 agent, 2 system) and a system acquire's "
+                         "reason (f forced, l lap, e host epoch)");
             /* tp8 loop D43: the reading off the plays' thread (the thread never calls stamps(): it is given x) */
             const char* d = std::getenv("RADIANCE_AQL_STAMP_DRAIN");
             x->drain_th = d && std::atoi(d) > 0;
@@ -2446,8 +2475,15 @@ bool stamps_file(Stamps& st) {
     }
     std::fseek(st.out, 0, SEEK_END);
     if (std::ftell(st.out) == 0)
-        std::fputs("pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records\n", st.out);
+        std::fputs(st.scope ? "pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records,acq,rel,why\n"
+                            : "pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records\n", st.out);
     return true;
+}
+
+/* A line's end: play and records, + Qwen loop round 62's scope columns under RADIANCE_AQL_STAMP_SCOPE. */
+void stamps_line_end(const Stamps& st, const StampRow& w) {
+    if (st.scope) std::fprintf(st.out, ",%u,%u,%d,%d,%c\n", w.play, w.records, (int)w.acq, (int)w.rel, w.why);
+    else std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
 }
 
 const std::string& stamps_kernel(Stamps& st, uint64_t obj) {
@@ -2496,7 +2532,7 @@ void stamps_read(Stamps& st, bool wait) {
                      stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
         if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
         else std::fputc(',', st.out);
-        std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+        stamps_line_end(st, w);
         wrote = true;
     }
     if (wrote) std::fflush(st.out);
@@ -2538,7 +2574,7 @@ void stamps_drain_loop(Stamps* sp) {
                          stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
             if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
             else std::fputc(',', st.out);
-            std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+            stamps_line_end(st, w);
         }
         {
             std::lock_guard<std::mutex> lk(st.mu);
@@ -2629,6 +2665,9 @@ struct StampRun {
         if (!w.own) --used;
         w.ordered = ps.ordered;
         w.chained = ps.chained;
+        w.acq = ps.acq;
+        w.rel = ps.rel;
+        w.why = ps.why;
         w.queue = r.s->id;
         w.seq = seq;
         w.play = play;
