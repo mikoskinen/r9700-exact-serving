@@ -5433,6 +5433,61 @@ TEST(egn_a_snapshot_is_not_resumed_over_an_entry_evicted_under_it_and_indexed_ag
     }
 }
 
+/* round 56 EGN beside UNR3 (RADIANCE_PREFIX_EXACT=1 + RADIANCE_PREFIX_UNREST=3): an entry an UNR3 overlay supplies is read from the
+ * overlay, so its cache copy being indexed again (republished) after the snapshot's seal does not make the snapshot stale. F81's
+ * lineage with the other copy's live reader gone: request 2's 320 rests on its overlay for entries 0-1; request 3 resumes it,
+ * publishes deeper and republishes the cache's entry 0-1 with its blocks (= request 2's overlay blocks). Both 320 and 400 must
+ * still resume, over request 2's own head (without the overlay exception in egn_ok the publish of request 3 would retire 320:
+ * its entries 0-1 are born after 320's seal). */
+TEST(egn_keeps_a_snapshot_whose_reindexed_entries_its_unr3_overlay_supplies) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    x.f.pc.set_unrest_mode(3);
+    x.f.pc.set_exact(1);
+    const auto prompt = tok_run(7600, 336);
+    const auto keys = chain_of(prompt);
+    std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+    const auto tail = tok_run(9600, 32);
+    other.insert(other.end(), tail.begin(), tail.end());
+    publish(x.f, 1, other, (int64_t)other.size());                   /* live on the head */
+    CHECK_OK(x.f.kv.add_sequence(2));
+    CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+    const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+    ckpt_at(x.f, 2, keys, 320);
+    CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+    CHECK_EQ(x.f.pc.stats().unr3_overlays, 1ll);
+    x.f.kv.free_sequence(1);
+    x.f.kv.free_sequence(2);
+    x.f.pc.begin_step();
+    std::vector<int32_t> longer = prompt;
+    const auto more = tok_run(12000, 96);
+    longer.insert(longer.end(), more.begin(), more.end());
+    const auto lkeys = chain_of(longer);
+    std::vector<std::vector<int32_t>> h3;
+    CHECK_EQ(x.f.pc.lookup(longer, {}, &h3, nullptr, 3).n_linear_tokens, 320);
+    h3[0].resize(20);
+    CHECK_OK(x.f.kv.add_sequence(3));
+    CHECK_OK(x.f.kv.adopt(3, G_FULL, h3[0], 320));
+    CHECK_OK(x.f.kv.ensure(3, (int64_t)longer.size()));
+    const std::vector<int32_t> t3 = x.f.kv.block_table(3, G_FULL);
+    ckpt_at(x.f, 3, lkeys, 400);
+    CHECK_OK(x.f.pc.insert(3, longer, {}, { t3 }, 400));
+    CHECK_EQ(x.f.pc.stats().republished, 2ll);                        /* entries 0-1 re-indexed with request 2's bytes */
+    x.f.kv.free_sequence(3);
+    CHECK_EQ(x.f.pc.stats().egn_retired, 0ll);
+    x.f.pc.begin_step();
+    std::vector<std::vector<int32_t>> h4;
+    CHECK_EQ(x.f.pc.lookup(longer, {}, &h4).n_linear_tokens, 400);
+    CHECK_EQ(h4[0][0], mine[0]);
+    x.f.pc.begin_step();
+    std::vector<std::vector<int32_t>> h5;
+    CHECK_EQ(x.f.pc.lookup(prompt, {}, &h5).n_linear_tokens, 320);   /* request 2's, over its overlay (= the cache's now) */
+    CHECK_EQ(h5[0][0], mine[0]);
+    CHECK_EQ(x.f.pc.stats().egn_skipped, 0ll);
+    x.f.pc.begin_step();
+    x.f.pc.clear();
+}
+
 /* qfn-on-ds round 56 lever KOW (COORD 03:43 gap (b), DEV note 03:26; RADIANCE_PREFIX_EXACT bit 2). fn4 preempt_keep parks
  * a decoding request: it publishes, gives its whole blocks up (KVManager::preempt_keep) and keeps its states, and its
  * rejoin adopts what a lookup of prompt ++ output hands. (1) Where the cache keeps another publisher's copy of an entry
