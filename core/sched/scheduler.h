@@ -1573,6 +1573,7 @@ private:
      * the step-host note (hn_on_ = RADIANCE_LOG_STEP_HOST set) and pc_->evict counted by call site into it */
     int      agr_ = 0;
     bool     hn_on_ = false;
+    bool     hc_log_ = false;   /* Qwen loop round 61: RADIANCE_LOG_HIT_CUT, one line an admission whose hit is cut */
     HostNote hn_;
     int64_t  agr_n_[3] = {};
     int64_t  pc_evict(int site, int64_t n);

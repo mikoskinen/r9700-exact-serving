@@ -301,6 +301,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      (agr_ & 4) ? "; the room gate asks the prefix cache for the entries the prompt is short in one call "
                                   "(qfn-on-ds Q103 lever GEV, F80), not 256 a round" : "");
         hn_on_ = std::getenv("RADIANCE_LOG_STEP_HOST") != nullptr;
+        /* Qwen loop round 61 (FINDINGS TEST note 10:48: the cache gap is now hit-cut tokens): one line an admission whose
+         * attention hit passes its linear resume -- where the cut tokens sit against the snapshot grid. Log only. */
+        hc_log_ = std::getenv("RADIANCE_LOG_HIT_CUT") != nullptr;
+        if (hc_log_) RAD_INFO("scheduler: RADIANCE_LOG_HIT_CUT -- one 'hit cut' line an admission whose prefix hit "
+                              "resumes below its attention match (log only)");
     }
     {   /* qfn-on-ds lever PCR (Qwen loop round 58): the publish trim's free reserve, the DS line's RADIANCE_PC_KEEP reserve part
          * (tp8 loop P82 lever PCK, value / 4: 0 a quarter = today, 1 an eighth, 2 a sixteenth, 3 a thirty-second, 4 none); its
@@ -3370,6 +3375,20 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             m_.attn_cached_tokens += s.hit_attn;
             m_.linear_cached_tokens += r.n_cached;
             if (s.hit_attn > r.n_cached) m_.hit_cut_tokens += s.hit_attn - r.n_cached;
+            if (hc_log_ && s.hit_attn > r.n_cached) {
+                const int64_t iv = geo_.checkpoint_interval, tg = tail_grid_now();
+                const char* why = s.hit_cut == SchedReq::HitCut::NoSnapshot   ? "no_snapshot"
+                                : s.hit_cut == SchedReq::HitCut::ResumedBelow ? "resumed_below"
+                                : s.hit_cut == SchedReq::HitCut::Window       ? "window"
+                                : s.hit_cut == SchedReq::HitCut::Adopt        ? "adopt"
+                                                                              : "tail";
+                RAD_INFO("hit cut: req %llu prompt %lld hit %lld resumed %lld cut %lld (%s) | resume %% interval %lld = %lld, "
+                         "hit %% interval = %lld, tail grid %lld, hit %% grid = %lld, restore_cut %d",
+                         (unsigned long long)r.id, (long long)r.prompt.size(), (long long)s.hit_attn, (long long)r.n_cached,
+                         (long long)(s.hit_attn - r.n_cached), why, (long long)iv,
+                         (long long)(iv > 0 ? r.n_cached % iv : -1), (long long)(iv > 0 ? s.hit_attn % iv : -1),
+                         (long long)tg, (long long)(tg > 0 ? s.hit_attn % tg : -1), s.restore_cut ? 1 : 0);
+            }
             if (s.restore_cut) ++m_.prefix_restore_cuts;
             switch (s.hit_cut) {
                 case SchedReq::HitCut::NoSnapshot: ++m_.hit_cut_no_snapshot; break;
