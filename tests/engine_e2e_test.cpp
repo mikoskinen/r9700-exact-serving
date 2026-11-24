@@ -3417,6 +3417,75 @@ TEST(fn4_preempt_keep_without_a_host_tier_falls_back_to_recompute_cleanly) {
     }
 }
 
+/* qfn-on-ds round 56 lever EGN at reply level (COORD 03:43 gap (a), FINDINGS DEV note 04:51's card cell on the host backend): a
+ * snapshot whose entries were EVICTED and indexed again by another publisher whose bytes differ (decode-written: the delta net's
+ * recurrent path, not the chunked one). P = 100 ids, Rp its greedy reply, L = P + Rp[:100] + Z. R1 = L on an empty cache (= cold,
+ * snapshots every 64 tokens); a fill turns the small pool over (L's chain erased, its snapshots kept: keep-all, 512 slots); R2 = P
+ * decoding 100 tokens re-indexes [0, 200) (prefill + decode-written); R3 = L. EXACT 0 resumes R1's 192 over R2's bytes; EXACT 1
+ * retires it at R2's publish and R3 resumes R2's own 64. The reply and its probabilities are compared with R1's. */
+TEST(round56_egn_a_snapshot_over_reindexed_decode_written_entries) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> P = prompt_ids(5601, 100), Z = prompt_ids(5602, 100);
+    std::vector<std::string> args = { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--checkpoint-slots", "512",
+                                      "--checkpoint-policy", "keep-all", "--max-num-seqs", "2", "--max-num-batched-tokens", "256",
+                                      "--max-model-len", "512" };
+    auto pool_at = [&](int mib) -> int64_t {
+        Server probe;
+        probe.quiet = true;
+        if (!probe.start(world().qwen35, args, device_env(mib))) return -1;
+        return pool_tokens(probe.output());
+    };
+    int64_t pool = 0;
+    std::string why;
+    const int mib = small_device(pool_at, 1000, 4000, false, &pool, &why);
+    if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    struct Got { int64_t c1 = -1, c2 = -1, c3 = -1; bool r2 = false, tok = false, prob = false; size_t egn = 0; };
+    Got got[2];
+    for (int ex : { 0, 1 }) {
+        std::vector<std::string> env = device_env(mib);
+        env.push_back("RADIANCE_PREFIX_EXACT=" + std::to_string(ex));
+        env.push_back("RADIANCE_LOG=info");
+        Server s;
+        REQUIRE(s.start(world().qwen35, args, env));
+        const json g = post(s.port, "/completion", completion(P, 120));
+        const std::vector<int32_t> Rp = tokens_of(g);
+        REQUIRE(Rp.size() == 120u);
+        std::vector<int32_t> L = P;
+        L.insert(L.end(), Rp.begin(), Rp.begin() + 100);
+        L.insert(L.end(), Z.begin(), Z.end());
+        auto fill = [&](uint64_t base) {
+            for (uint64_t i = 0; i * 400 < 2 * (uint64_t)pool + 400; ++i)
+                (void)post(s.port, "/completion", completion(prompt_ids(base + i, 400), 1));
+        };
+        fill(57000);
+        const json r1 = post(s.port, "/completion", completion(L, 24, 0.0, 0, 3));
+        fill(57100);
+        const json r2 = post(s.port, "/completion", completion(P, 100));
+        const json r3 = post(s.port, "/completion", completion(L, 24, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+        const std::string log = s.output();
+        Got& o = got[ex];
+        o.c1 = timing(r1, "cache_n"); o.c2 = timing(r2, "cache_n"); o.c3 = timing(r3, "cache_n");
+        const std::vector<int32_t> t2 = tokens_of(r2);
+        o.r2 = t2.size() == 100u && std::equal(t2.begin(), t2.end(), Rp.begin());
+        o.tok = tokens_of(r1) == tokens_of(r3);
+        o.prob = r1["completion_probabilities"] == r3["completion_probabilities"];
+        for (size_t at = log.find("(EGN;"); at != std::string::npos; at = log.find("(EGN;", at + 1)) ++o.egn;
+        fprintf(stderr, "    EXACT=%d (%d MiB, pool %lld): cache_n R1 %lld / R2 %lld / R3 %lld; R2 = Rp %d; R3 = R1: tokens %d, "
+                        "probabilities %d; EGN retire lines %zu\n", ex, mib, (long long)pool, (long long)o.c1, (long long)o.c2,
+                (long long)o.c3, (int)o.r2, (int)o.tok, (int)o.prob, o.egn);
+        CHECK(o.r2);                                      /* the re-indexed tokens are L's */
+        CHECK_EQ(o.c1, (int64_t)0);                       /* R1 is the cold run */
+    }
+    CHECK_EQ(got[0].c3, (int64_t)192);                    /* EXACT 0: R1's snapshot over R2's bytes (the gap) */
+    CHECK(!got[0].prob);                                  /* ... and the reply's probabilities are not the cold run's */
+    CHECK_EQ(got[0].egn, (size_t)0);
+    CHECK(got[1].egn >= 1);                               /* EXACT 1: retired at R2's publish */
+    CHECK(got[1].c3 < 192);                               /* R3 resumes no deeper than R2's own snapshot */
+    CHECK(got[1].tok && got[1].prob);                     /* = cold */
+}
+
 /* qfn-on-ds round 56 (COORD 03:43): the same squeeze with RADIANCE_PREFIX_EXACT=3 (levers EGN + KOW, mem_test egn_... /
  * kow_... hold the byte cases): the engine names both levers at start, the parks keep / rejoin or recompute through
  * keep_own / drop_kept, every stream returns its whole length, and the pool ends with no block held by a kept copy (a
