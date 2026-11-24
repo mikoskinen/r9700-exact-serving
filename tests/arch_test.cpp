@@ -2412,14 +2412,20 @@ TEST(a_staged_prefill_copies_each_layer_before_its_attention) {
  * attention launch over the decode rows takes the RING operand (cols -1) behind a kv_resolve of its rows, every launch over
  * the prefill rows the stage (no resolve); the control (answer 2 = today's staged MIXED pass beside the ring) reads every row
  * on the stage and resolves nothing; a riding pass that cannot take the per-sequence launches (att_bi 0) fails the step
- * (fail closed: its decode rows have no staged blocks). */
+ * (fail closed: its decode rows have no staged blocks).
+ * Round 61 (FINDINGS TEST note 10:58, agx38bt's BITRACE): every riding kv_resolve copies a missed block INTO THE RING (its
+ * cache operand cols -1): the pass is staged, so kv_cache() is the stage, and a copy there left the ring slot the maps name
+ * holding its previous block's bytes. Arm 4 = fn4_ride_stagedst_flag 1 (the form before, the negative control): every
+ * riding resolve names the stage. */
 TEST(ride_a_mixed_pass_attends_its_decode_rows_on_the_ring_and_its_prefill_rows_on_the_stage) {
     auto& abf = rad::arch::fn4_attbi_flag();
     auto& kbf = rad::arch::fn4_kvsbi_flag();
-    const int ab0 = abf.load(), kb0 = kbf.load();
-    for (int arm : { 2, 3, 0 }) {
+    auto& rsd = rad::arch::fn4_ride_stagedst_flag();
+    const int ab0 = abf.load(), kb0 = kbf.load(), rs0 = rsd.load();
+    for (int arm : { 2, 3, 4, 0 }) {
         abf.store(arm == 0 ? 0 : 6);
         kbf.store(3);
+        rsd.store(arm == 4 ? 1 : 0);
         RadModelMeta meta = qwen4exp_meta();
         RadBuildCtx c = build_ctx(0, 1);
         c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
@@ -2450,13 +2456,20 @@ TEST(ride_a_mixed_pass_attends_its_decode_rows_on_the_ring_and_its_prefill_rows_
             continue;
         }
         CHECK(ctx.step_fail.empty());
-        int ring = 0, stage = 0, resolves = 0, unresolved_ring = 0, order_bad = 0;
+        int ring = 0, stage = 0, resolves = 0, unresolved_ring = 0, order_bad = 0, res_ring = 0, res_stage = 0;
         bool resolved_since = false;
         int64_t max_ring_q = -1;
         for (size_t i = 0; i < ctx.issues.size(); ++i) {
             const RecOp* o = b.op_of(ctx.issues[i].op);
             if (!o) continue;
-            if (o->op == "kv_resolve") { ++resolves; resolved_since = true; continue; }
+            if (o->op == "kv_resolve") {
+                ++resolves;
+                resolved_since = true;
+                /* its copy destination: the group's KV operand (the last), ring view (cols -1) or the active view */
+                for (const RadOperand& d : ctx.issues[i].opd)
+                    if (d.kind == RAD_OPK_KV && (int)d.handle == attn_gi + 1) { if (d.cols == -1) ++res_ring; else ++res_stage; }
+                continue;
+            }
             if (o->op == "kv_store" || o->op == "kv_store_streamed" || o->op == "qk_norm_rope_gate_kv_store_streamed")
                 continue;
             for (const RadOperand& d : ctx.issues[i].opd) {
@@ -2474,8 +2487,9 @@ TEST(ride_a_mixed_pass_attends_its_decode_rows_on_the_ring_and_its_prefill_rows_
                 break;
             }
         }
-        fprintf(stderr, "    stage answer %d: attention launches on the ring %d, on the stage %d, kv_resolve %d\n",
-                ctx.stage_ret, ring, stage, resolves);
+        fprintf(stderr, "    stage answer %d%s: attention launches on the ring %d, on the stage %d, kv_resolve %d "
+                        "(copies into the ring %d, into the stage %d)\n",
+                ctx.stage_ret, arm == 4 ? " (stagedst 1)" : "", ring, stage, resolves, res_ring, res_stage);
         CHECK(stage > 0);
         if (arm == 2) {
             CHECK_EQ(ring, 0);                                       /* today: every row on the stage */
@@ -2485,10 +2499,18 @@ TEST(ride_a_mixed_pass_attends_its_decode_rows_on_the_ring_and_its_prefill_rows_
             CHECK_EQ(unresolved_ring, 0);                            /* each ring launch behind its rows' resolve */
             CHECK_EQ(resolves, ring);
             CHECK_EQ(order_bad, 0);
+            if (arm == 3) {
+                CHECK_EQ(res_ring, resolves);                        /* a missed block lands in the ring slot the maps name */
+                CHECK_EQ(res_stage, 0);
+            } else {
+                CHECK_EQ(res_stage, resolves);                       /* the defect: the copy lands in the stage */
+                CHECK_EQ(res_ring, 0);
+            }
         }
     }
     abf.store(ab0);
     kbf.store(kb0);
+    rsd.store(rs0);
 }
 
 TEST(qsa_below_the_exact_bound_takes_the_dense_path_without_a_resolve) {

@@ -1336,13 +1336,18 @@ inline RadOperand praw(const void* p, uint32_t dtype, int64_t rows) {
 }
 
 /* kv_resolve over `rows` selection rows (kv_resolve_declare): makes the blocks they name resident
- * in the ring and rewrites `sel` from block ids to ring slots. */
+ * in the ring and rewrites `sel` from block ids to ring slots. A missed block's bytes are copied
+ * from the mirror into the cache operand at its new slot, so that operand must be the RING:
+ * `ring` true names it whatever view the pass is on (kv_cache_ring; a riding pass, lever RIDE, is
+ * staged, and its active view is the stage). Unset = the active view, which on a ring pass is the
+ * ring. */
 inline void kv_resolve_issue(RadCtx* c, rad_op op, const KVStreamLayer& L, RadOperand sel,
-                             RadOperand nsel, rad_kvgroup group, int layer, int64_t rows) {
+                             RadOperand nsel, rad_kvgroup group, int layer, int64_t rows,
+                             bool ring = false) {
     RAD_ISSUE_N(c, op, rows, sel, nsel, praw(L.res, RAD_I32, L.blocks),
                 praw(L.slot_block, RAD_I32, L.slots), praw2(L.slot_state, RAD_I32, L.slots, 2),
                 praw(L.st->ctl, RAD_I32, 16), praw2(L.host, RAD_U8, L.blocks, L.bbytes),
-                kv_cache(group, layer));
+                ring ? kv_cache_ring(group, layer) : kv_cache(group, layer));
 }
 
 /* Rotary positions of a pass, in the two forms consumers take.

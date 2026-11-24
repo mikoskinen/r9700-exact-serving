@@ -98,6 +98,16 @@ inline std::atomic<int>& fn4_kvsbi_flag() {
                                    return v < 0 ? 0 : v > 3 ? 3 : v; }()};
     return f;
 }
+/* lever RIDE's resolve destination (Qwen loop round 61, FINDINGS TEST note 10:58 -- agx38bt's BITRACE: a rider's first
+ * divergence is L03.h_mix at the first row of a block first resolved IN a riding pass): a riding pass is staged, so
+ * kv_cache() names the STAGE, and kv_resolve copied a missed block's mirror bytes to stage row `slot` while its maps named
+ * the RING slot -- the rider (and every later ring pass) attended on that slot's previous bytes. The resolve now names the
+ * ring (kv_cache_ring). RADIANCE_FN4_KVS_RIDE_STAGEDST=1 = the form before (the defect: host case negative control). */
+inline std::atomic<int>& fn4_ride_stagedst_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_KVS_RIDE_STAGEDST");
+                                   return e && *e && *e != '0' ? 1 : 0; }()};
+    return f;
+}
 /* fn4 att_bi 4: the max_ctx_len a step of this one sequence would carry -- core/sched/batch.cpp's
  * `min(bound_bucket(ctx_len, k_bound_tokens), max_ctx_)`, k_bound_tokens 1024, copied (keep the two in step): rounded up
  * to a multiple of 1024, or above 64 to 1/32..1/64 of its power of two where that is coarser; 0 stays 0. */
@@ -936,11 +946,13 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
                          brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows);
     };
-    /* lever RIDE: a decode sequence's rows of a riding pass, on the ring although the layer is staged */
+    /* lever RIDE: a decode sequence's rows of a riding pass, on the ring although the layer is staged -- a missed block is
+     * copied into the RING (the pass's active view is the stage; fn4_ride_stagedst_flag 1 = the defect: into the stage) */
     auto resolve_ring = [&](int64_t off, int64_t rows) {
         if (!res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || rows <= 0) return;
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                         brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows);
+                         brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows,
+                         fn4_ride_stagedst_flag().load(std::memory_order_relaxed) == 0);
     };
     if (ride && (!op_resolve || !res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || !qsa_sel || !qsa_nsel)) {
         rad_step_fail(c, "kv streaming: lever RIDE (RADIANCE_FN4_KVS_RIDE): a riding pass's decode rows need the ring's "
