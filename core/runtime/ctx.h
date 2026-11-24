@@ -25,6 +25,7 @@
 #include "device/device.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <deque>
@@ -656,9 +657,20 @@ private:
     /* tp8 S5: a two-node pipeline node with lanes keeps kTapes a lane (each lane's batch is its own set
      * of recordings, and the leader's lane step two: its head, a few dispatches, and its tail); kTapes
      * everywhere else. */
-    size_t                   tape_cap_   = kTapes;
+    /* qfn-on-ds lever TCAP (Qwen loop Q117; staged round 58, built round 59): RADIANCE_TAPE_CAP=N (8..1024; read when a Ctx is
+     * made) keeps N recorded passes a lane instead of kTapes -- the AgentX decode step after a prefill piece is ISSUED LIVE (the
+     * 50-ms step-host rider on agx23: its ranks phase p50 114.85 ms vs 0.12 for a decode step after a decode), i.e. recorded again,
+     * when the pieces' own tapes and a moved n_seq push its passes out of the 24; a play writes the recorded dispatches, so the
+     * cap moves no byte. Anything else (unset, out of range) = kTapes. */
+    static size_t tape_base() {
+        const char* e = std::getenv("RADIANCE_TAPE_CAP");
+        const long v = e && *e ? std::atol(e) : 0;
+        return v >= 8 && v <= 1024 ? (size_t)v : kTapes;
+    }
+    size_t                   tape_cap_   = tape_base();
 public:
-    void set_tape_lanes(int lanes) { tape_cap_ = kTapes * (size_t)(lanes > 1 ? lanes : 1); }
+    void set_tape_lanes(int lanes) { tape_cap_ = tape_base() * (size_t)(lanes > 1 ? lanes : 1); }
+    size_t tape_cap() const { return tape_cap_; }
 private:
     static constexpr int64_t kAuditPlays = 1024;
 

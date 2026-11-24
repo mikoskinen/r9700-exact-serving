@@ -2547,6 +2547,24 @@ TEST(a_lane_built_mid_step_starts_behind_lane_zero) {
     CHECK_EQ(dev_get(f, f.ctx.buf_ptr(y)), 4242);
 }
 
+/* qfn-on-ds lever TCAP (Qwen loop round 59, Q117): RADIANCE_TAPE_CAP=N keeps N recorded passes a lane (8..1024), read when
+ * the Ctx is made; unset, out of range or not a number = kTapes (24); a lane set multiplies it as before. */
+TEST(qwen_round59_tcap_the_tape_cap_follows_rad_tape_cap) {
+    struct C { const char* v; size_t want; };
+    for (const C c : { C{ nullptr, 24 }, C{ "8", 8 }, C{ "256", 256 }, C{ "1024", 1024 }, C{ "7", 24 }, C{ "2000", 24 },
+                       C{ "abc", 24 }, C{ "", 24 } }) {
+        if (c.v) setenv("RADIANCE_TAPE_CAP", c.v, 1);
+        else unsetenv("RADIANCE_TAPE_CAP");
+        Fixture f;
+        CHECK_EQ(f.ctx.tape_cap(), c.want);
+        f.ctx.set_tape_lanes(2);
+        CHECK_EQ(f.ctx.tape_cap(), 2 * c.want);
+        f.ctx.set_tape_lanes(1);
+        CHECK_EQ(f.ctx.tape_cap(), c.want);
+    }
+    unsetenv("RADIANCE_TAPE_CAP");
+}
+
 /* A calibration tap's gram_accum sums across passes while its plugin counts the summed rows in
  * step; a played pass reissues the sum without calling step. A program holding one records
  * no passes; one without records them wherever the backend can. */
