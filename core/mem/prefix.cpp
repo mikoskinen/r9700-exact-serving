@@ -393,6 +393,16 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     bool departed = false;              /* the prompt goes on where nothing is cached */
     for (; matched < n_full; ++matched) {
         auto it = map_.find(hs[(size_t)matched]);
+        /* round 57 KOW (bit 2): an entry the parked request keeps its own copy of serves from that copy whether or not the
+         * other publisher's entry is still indexed -- evicted, demoted or replaced while the request was parked (engine_e2e
+         * round57_kow_...: B's copy evicted after B closed left A's rejoin 0 of 176 tokens and A recomputed) */
+        if (kp && (it == map_.end() || !it->second.in_lru) &&
+            std::binary_search(kp->at.begin(), kp->at.end(), matched)) {
+            born.push_back(0);
+            pm.push_back(pm.empty() ? 0 : pm.back());
+            ++stats_.kow_unindexed;
+            continue;
+        }
         if (it == map_.end()) { departed = true; break; }
         /* An off-device entry is not a hit: demotion released its blocks and its recorded ids now
          * belong to other sequences. The prefix stops here (also while a promotion is in flight);
@@ -405,8 +415,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         }
     }
 
-    if (departed && matched > 0 && map_.find(hs[(size_t)matched - 1])->second.n_children >= 2)
-        hit.branch_at = (int32_t)(matched * block_size_);
+    if (departed && matched > 0) {
+        const auto pb = map_.find(hs[(size_t)matched - 1]);   /* a KOW-kept entry may be unindexed (above) */
+        if (pb != map_.end() && pb->second.n_children >= 2) hit.branch_at = (int32_t)(matched * block_size_);
+    }
 
     /* KOW: the parked request's state was computed over the bytes the cache held for it at the park (its own, or its kept
      * own copy); the hit stops at the first entry indexed again since (another publisher's bytes) */
@@ -451,7 +463,17 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     for (int64_t b = matched - 1; b >= 0; --b) touch(hs[(size_t)b], now);
     if (blocks_out)
         for (int64_t b = 0; b < matched; ++b) {
-            const Entry& e = map_.find(hs[(size_t)b])->second;
+            const auto f = map_.find(hs[(size_t)b]);
+            if (f == map_.end() || !f->second.in_lru) {
+                /* round 57 KOW: an unindexed entry inside the hit is a kept one (the walk above); its own copy */
+                const size_t W = entry_groups_.size();
+                const size_t i = (size_t)(std::lower_bound(kp->at.begin(), kp->at.end(), b) - kp->at.begin());
+                for (size_t k = 0, g = 0; g < groups_.size(); ++g)
+                    for (int32_t j = 0; j < per_[g]; ++j, ++k)
+                        (*blocks_out)[g].push_back(kp->blocks[i * W + k]);
+                continue;
+            }
+            const Entry& e = f->second;
             for (size_t k = 0, g = 0; g < groups_.size(); ++g)
                 for (int32_t j = 0; j < per_[g]; ++j, ++k)
                     (*blocks_out)[g].push_back(e.blocks[k]);

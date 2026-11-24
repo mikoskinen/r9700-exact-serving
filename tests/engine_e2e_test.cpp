@@ -3549,6 +3549,115 @@ TEST(round56_exact_3_under_preempt_keep_pressure_keeps_the_streams_whole) {
     CHECK(n > 0);
 }
 
+/* qfn-on-ds round 57 lever KOW at REPLY level (COORD 05:36 gap (b); DEV notes 03:26 / 04:28 / 05:01): a decoding request fn4
+ * preempt_keep parks while the cache holds ANOTHER publisher's copy of positions it decoded itself -- a live prompt that is the
+ * same tokens, prefilled -- rejoins over that copy today, so its later tokens attend bytes it did not compute. P = 100 ids, R =
+ * its greedy reply ALONE (160 tokens + probabilities, its own start). Then, on one start a RADIANCE_PREFIX_EXACT value: B = P +
+ * R[:120] (a prompt, published at its last chunk by RADIANCE_SCHED_PUB_PROMPT=1, decoding on), S2 / S3 = 300-id prompts decoding,
+ * and A = P (160 tokens) LAST, so A is running_.back() when the small pool runs out and preempt_back parks it; its kept position
+ * lies in (100, 220) when it parked inside B's copy. EXACT 0: A rejoins over B's prefilled copy of [100, kept) (or recomputes when
+ * that copy is gone) and its probabilities differ from R's; EXACT 2: KOW holds A's own blocks of those entries (keep line), A's
+ * reply = R in tokens and probabilities. */
+TEST(round57_kow_a_parked_decode_rejoins_over_another_publishers_prefilled_copy) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> P = prompt_ids(5701, 100), S2 = prompt_ids(5702, 300), S3 = prompt_ids(5703, 300);
+    const int kRide = 120, kA = 160;
+    std::vector<std::string> args = { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--checkpoint-slots", "512",
+                                      "--checkpoint-policy", "keep-all", "--max-num-seqs", "4", "--max-num-batched-tokens", "256",
+                                      "--max-model-len", "512", "--prefill-interleave", "0" };
+    /* after the four prefills ~220 + 300 + 300 + 100 tokens are held; four decode a token a step: a pool of [1100, 1400) runs
+     * out after A decoded ~45-120 tokens, inside B's copy [100, 220) */
+    auto pool_at = [&](int mib) -> int64_t {
+        Server probe;
+        probe.quiet = true;
+        if (!probe.start(world().qwen35_kv, args, device_env(mib))) return -1;
+        return pool_tokens(probe.output());
+    };
+    int64_t pool = 0;
+    std::string why;
+    const int mib = small_device(pool_at, 1100, 1400, false, &pool, &why);
+    if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    json alone;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35_kv, args, device_env(mib)));
+        alone = post(s.port, "/completion", completion(P, kA, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    const std::vector<int32_t> R = tokens_of(alone);
+    REQUIRE(R.size() == (size_t)kA);
+    std::vector<int32_t> B = P;
+    B.insert(B.end(), R.begin(), R.begin() + kRide);
+    struct Got { bool tok = false, prob = false; int64_t kept_a = -1; size_t kept = 0, rejoined = 0, recomputed = 0, kow = 0, stop = 0;
+                 int first = -1; };
+    Got got[2];
+    for (int ex : { 0, 2 }) {
+        std::vector<std::string> env = device_env(mib);
+        env.push_back("RADIANCE_FN4_PREEMPT_KEEP=1");
+        env.push_back("RADIANCE_SCHED_PUB_PROMPT=1");
+        env.push_back("RADIANCE_PREFIX_EXACT=" + std::to_string(ex));
+        env.push_back("RADIANCE_LOG=info");
+        Server s;
+        REQUIRE(s.start(world().qwen35_kv, args, env));
+        Call cb, c2, c3, ca;
+        REQUIRE(cb.send(s.port, "POST", "/completion", completion(B, 200).dump()));
+        REQUIRE(c2.send(s.port, "POST", "/completion", completion(S2, 200).dump()));
+        REQUIRE(c3.send(s.port, "POST", "/completion", completion(S3, 200).dump()));
+        /* A after the other three are admitted: the newest running request */
+        for (int k = 0; k < 400 && metric(s.port, "vllm:num_requests_running") < 3.0; ++k)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        REQUIRE(ca.send(s.port, "POST", "/completion", completion(P, kA, 0.0, 0, 3).dump()));
+        std::string body;
+        for (Call* c : { &cb, &c2, &c3 }) { CHECK_EQ(c->read(&body), 200); }
+        CHECK_EQ(ca.read(&body), 200);
+        const json a = json::parse(body, nullptr, false);
+        CHECK_EQ(s.stop(), 0);
+        const std::string log = s.output();
+        Got& o = got[ex ? 1 : 0];
+        const std::vector<int32_t> t = tokens_of(a);
+        o.tok = t == R;
+        o.prob = a.is_object() && a.contains("completion_probabilities") &&
+                 a["completion_probabilities"] == alone["completion_probabilities"];
+        for (size_t i = 0; i < t.size() && i < R.size(); ++i) if (t[i] != R[i]) { o.first = (int)i; break; }
+        auto count = [&](const char* what) {
+            size_t k = 0;
+            for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++k;
+            return k;
+        };
+        o.kept = count("fn4 preempt_keep: request"); o.rejoined = count("rejoined at"); o.recomputed = count("preempted by recompute");
+        o.kow = count("as its own copy (the cache keeps another"); o.stop = count("rejoins no deeper than entry");
+        /* A's park: the one kept position inside B's copy (B's own is >= 220, S2 / S3's >= 300) */
+        for (size_t at = log.find(" kept at "); at != std::string::npos; at = log.find(" kept at ", at + 1)) {
+            const long long v = std::atoll(log.c_str() + at + 9);
+            if (v > (long long)P.size() && v < (long long)B.size()) o.kept_a = v;
+        }
+        fprintf(stderr, "    EXACT=%d (%d MiB, pool %lld): A kept at %lld; A = alone: tokens %d (first differing %d), probabilities %d; "
+                        "kept lines %zu, rejoined %zu, by recompute %zu, KOW keep lines %zu, KOW stops %zu\n", ex, mib,
+                (long long)pool, (long long)o.kept_a, (int)o.tok, o.first, (int)o.prob, o.kept, o.rejoined, o.recomputed,
+                o.kow, o.stop);
+        if (std::getenv("RAD_E2E_KOW_LOG") || (ex && !(o.tok && o.prob))) {
+            size_t at = 0;
+            for (int k = 0; k < 120 && at < log.size();) {
+                const size_t e = log.find('\n', at);
+                const std::string line = log.substr(at, e == std::string::npos ? std::string::npos : e - at);
+                if (line.find("preempt_keep") != std::string::npos || line.find("KOW") != std::string::npos ||
+                    line.find("rejoin") != std::string::npos || line.find("EGN") != std::string::npos ||
+                    line.find("req ") != std::string::npos) {
+                    fprintf(stderr, "      | %s\n", line.substr(0, 300).c_str());
+                    ++k;
+                }
+                if (e == std::string::npos) break;
+                at = e + 1;
+            }
+        }
+        CHECK(o.kept_a > 0);                              /* A parked inside B's copy */
+    }
+    CHECK(!got[0].prob);                                  /* EXACT 0: the parked reply is not the alone reply (the gap) */
+    CHECK(got[1].kow >= 1);                               /* EXACT 2: KOW held A's own blocks of B's entries */
+    CHECK(got[1].tok && got[1].prob);                     /* ... and A's reply = alone */
+}
+
 /* ================================================================== image generation */
 
 namespace {

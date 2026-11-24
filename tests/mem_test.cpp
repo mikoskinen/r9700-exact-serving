@@ -5588,6 +5588,53 @@ TEST(kow_a_parked_request_rejoins_over_its_own_copy_and_never_over_bytes_indexed
     }
 }
 
+/* qfn-on-ds round 57 (engine_e2e round57_kow_...'s residual, 2 of 49 runs): KOW keeps the parked request's own copy of every
+ * entry the cache holds another publisher's copy of, but its rejoin's lookup walked the INDEX -- when the other publisher closed
+ * and its entries were evicted during the park, the walk departed at entry 0 although the request held its own blocks of all of
+ * them, so it recomputed (prefill replay: other bytes than its decode). Now a kept entry serves from the request's own copy
+ * whether or not an indexed entry is there. bits 0 = the negative control (no copy kept: nothing to rejoin over). */
+TEST(kow_a_parked_request_rejoins_from_its_own_copy_after_the_other_copy_left_the_index) {
+    static const std::vector<int64_t> kNoSnapshot;
+    HitCap cap;
+    cap.tokens = -1;
+    cap.resume_at = &kNoSnapshot;
+    for (int bits : { 0, 2 }) {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        f.pc.set_exact(bits);
+        const auto prompt = tok_run(7600, 336);
+        const std::vector<int32_t> other(prompt.begin(), prompt.begin() + 320);
+        publish(f, 1, other, 320);                                    /* request 1 live on its copy of all 20 entries */
+        CHECK_OK(f.kv.add_sequence(2));
+        CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+        const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+        CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, 320));
+        CHECK_EQ(f.pc.keep_own(2, prompt, {}, { mine }, 320), bits ? 20ll : 0ll);
+        CHECK_EQ(f.kv.preempt_keep(2, 320), 320ll);
+        f.kv.free_sequence(1);                                        /* the other publisher closes ... */
+        CHECK_EQ(f.pc.evict_lru(1000), 20ll);                         /* ... and its entries leave the index */
+        f.pc.begin_step();
+        CacheHit h;
+        std::vector<int32_t> got = hit_blocks(f, prompt, &h, &cap, 2);
+        if (bits == 0) {
+            CHECK_EQ(h.n_attn_tokens, 0);                             /* nothing to rejoin over: recomputed */
+        } else {
+            CHECK_EQ(h.n_attn_tokens, 320);                           /* the request's own copy, every entry */
+            REQUIRE(got.size() >= 20u);
+            for (int i = 0; i < 20; ++i) CHECK_EQ(got[(size_t)i], mine[(size_t)i]);
+            CHECK_EQ(f.pc.stats().kow_unindexed, 20ll);
+            got.resize(20);
+            CHECK_OK(f.kv.rejoin(2, G_FULL, got));
+            f.pc.drop_kept(2);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), 1);       /* the rejoined sequence's only */
+        }
+        CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, &cap).n_attn_tokens, 0);   /* nothing indexed for anyone else */
+        f.pc.release(2);
+        f.kv.free_sequence(2);
+        CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), 0);
+    }
+}
+
 TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
     /* The old copy goes only when nothing else reads it: a running sequence that adopted the
      * short request's head may have snapshots of its own resting on it. */

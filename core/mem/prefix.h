@@ -525,6 +525,7 @@ public:
          * entry. */
         int64_t egn_skipped = 0, egn_retired = 0, egn_reowned = 0;
         int64_t kow_parks = 0, kow_entries = 0, kow_substituted = 0, kow_stopped = 0;
+        int64_t kow_unindexed = 0;   /* round 57: kept entries served from the own copy with no indexed entry there */
     };
     const Stats& stats() const { return stats_; }
 
