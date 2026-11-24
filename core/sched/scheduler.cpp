@@ -4300,7 +4300,7 @@ const RadBatch* Scheduler::step() {
                 } else {
                     ++tlr_n_[1];
                 }
-                if (tlr_n_[0] + tlr_n_[1] - tlr_logged_ >= 2000 || tlr_n_[0] == 1) {
+                if (tlr_n_[0] + tlr_n_[1] - tlr_logged_ >= 2000 || (tlr && tlr_n_[0] == 1)) {   /* the first ride, then every 2,000 */
                     tlr_logged_ = tlr_n_[0] + tlr_n_[1];
                     RAD_INFO("fn4 sched_bi_ride %lld (Qwen loop lever TLR): %lld prompts' last pieces rode BI5's decode turn, %lld "
                              "left to their lone step (over N rows, no room beside the decoders, or blocks)", (long long)tlr_rows,
