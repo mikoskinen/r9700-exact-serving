@@ -366,6 +366,23 @@ void PrefixCache::touch(const BlockHash& h, uint64_t now_ns) const {
     it->second.used_ns = now_ns;
 }
 
+/* qfn-on-ds lever SRB (Qwen loop round 58): lookup's walk without its effects (prefix.h). */
+int64_t PrefixCache::probe(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm) const {
+    if (!enabled_ || tokens.empty() || block_size_ <= 0) return 0;
+    const int64_t n_full = (int64_t)tokens.size() / block_size_;
+    const std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
+    int64_t matched = 0;
+    for (; matched < n_full; ++matched) {
+        const auto it = map_.find(hs[(size_t)matched]);
+        if (it == map_.end() || !it->second.in_lru) break;
+        if (!same_tokens(it->second, tokens.data() + matched * block_size_)) break;
+    }
+    if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
+    if (!has_linear_) return matched * block_size_;
+    const auto b = deepest_ckpt(hs, matched * block_size_);
+    return b == ck_by_prefix_.end() ? 0 : b->second.pos;
+}
+
 CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
                              const std::vector<MMContentKey>& mm,
                              std::vector<std::vector<int32_t>>* blocks_out,

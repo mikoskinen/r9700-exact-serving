@@ -984,6 +984,13 @@
  *                   after a heat above 3), and 4b's CLOCK rotations list their victims in coalesced windows from the hand, stopping
  *                   at the window that holds the last one; the same placement, maps, heats, counters and rewritten selection; 0 today
  *                                                                                                  RADIANCE_FN4_KVS_FIX
+ *   sched_bi_srpt   scheduler (qfn-on-ds lever SRB, Qwen loop round 58, QUEUE Q113): under sched_bi_chunk 5 the lone prefill step
+ *                   goes to the prompt with the FEWEST ROWS LEFT -- among the running prefills (rows to its prompt's end) and, where
+ *                   an admission is possible, the waiting prompts (rows past the prefix cache's hit, PrefixCache::probe, once a
+ *                   request) -- instead of the first running prefill / the queue's head (FIFO); a prefill whose wait for its next
+ *                   piece reaches N ms (N >= 2) goes first, the longest-waiting first. Only WHEN a piece runs changes: every piece
+ *                   keeps its own position, rows and snapshot row (bytes unchanged). 0 today, 1 on, N >= 2 on with the age bound
+ *                                                                                                  RADIANCE_SCHED_BI_SRPT
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -1044,6 +1051,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kMtpDec,   /* qfn-on-ds lever MTD (Qwen loop round 45, Q85): qwen4exp, the MTP head's draft passes in the trunk's decode forms */
               kKvsFlat,  /* qfn-on-ds lever KVF (Qwen loop round 52, Q101): libr4d, kv_resolve's lookups / rewrite over the flat entry space */
               kKvsFix,   /* qfn-on-ds lever KVX (Qwen loop round 54, Q105): libr4d, kv_resolve's passes over every ring slot cut to one */
+              kSchedBiSrpt,   /* qfn-on-ds lever SRB (Qwen loop round 58, Q113): the scheduler, BI5's lone step by fewest rows left */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
@@ -1067,6 +1075,7 @@ int  kvs_bi();
 int  draft_dmask();                           /* lever DLM: the scheduler's mask of counts (0 = DLH's threshold) */
 int  aql_chi();                               /* lever CHI: chained records play without the packet fences under IKA */
 int  draft_uni();                             /* Q33: one draft depth a step (cap_rows' cut at every start) */
+int  sched_bi_srpt();                         /* lever SRB (round 58): 0 off, 1 fewest rows left first, N >= 2 + an N-ms age bound */
 /* Whether switch i is one of the Qwen line's (kQwenFirst on). */
 inline bool qwen_switch(int i) { return i >= kQwenFirst && i < kSwitches; }
 /* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by

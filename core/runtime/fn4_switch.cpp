@@ -51,7 +51,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "att_bi", "arw_rows", "hc_spprobe", "hc_sp", "mtp_flat", "ar_sdma",
                                         "bi_wide", "sp_serial", "hc_pinpf2", "resume_cold", "preempt_keep", "kvs_bi",
                                         "kvs_vic", "qsa_split", "sp_ple", "ar_fence", "sp_route", "rg_tail", "gnq8", "draft_dmask", "aql_chi", "exl3_drz", "draft_uni",
-                                        "ar_lanethreads_s", "ar_laneblocks_s", "f8_pp", "hc_x_lb", "hc_b3x_e", "hc_b3x_p", "hc_b3x_d", "gdn_epd", "hc_rf", "mtp_dec", "kvs_flat", "kvs_fix" };
+                                        "ar_lanethreads_s", "ar_laneblocks_s", "f8_pp", "hc_x_lb", "hc_b3x_e", "hc_b3x_p", "hc_b3x_d", "gdn_epd", "hc_rf", "mtp_dec", "kvs_flat", "kvs_fix", "sched_bi_srpt" };
 /* The Qwen line's switches' start variables (that line's kEnv, for its own switches), and its start-value rule: unset /
  * empty / 0 -> 0, a number > 1 as given, anything else 1 -- as the plugins read the same variables. */
 const char* const kEnvQ[kSwitches - kQwenFirst] = {
@@ -67,7 +67,8 @@ const char* const kEnvQ[kSwitches - kQwenFirst] = {
     "RADIANCE_FN4_GNQ8", "RADIANCE_FN4_DRAFT_DMASK", "RADIANCE_FN4_AQL_CHI", "RADIANCE_FN4_X3DRZ",
     "RADIANCE_FN4_DRAFT_UNI", "RADIANCE_FN4_AR_LANE_THREADS_S", "RADIANCE_FN4_AR_LANE_BLOCKS_S", "RADIANCE_FN4_F8_PP",
     "RADIANCE_FN4_HC_X_LB", "RADIANCE_FN4_HC_B3X_E", "RADIANCE_FN4_HC_B3X_P", "RADIANCE_FN4_HC_B3X_D",
-    "RADIANCE_GDN_EPD", "RADIANCE_FN4_HC_RF", "RADIANCE_FN4_MTP_DEC", "RADIANCE_FN4_KVS_FLAT", "RADIANCE_FN4_KVS_FIX" };
+    "RADIANCE_GDN_EPD", "RADIANCE_FN4_HC_RF", "RADIANCE_FN4_MTP_DEC", "RADIANCE_FN4_KVS_FLAT", "RADIANCE_FN4_KVS_FIX",
+    "RADIANCE_SCHED_BI_SRPT" };
 int env_val(const char* k) {
     const char* v = k ? std::getenv(k) : nullptr;
     if (!(v && *v && *v != '0')) return 0;
@@ -87,6 +88,7 @@ int qwen_hi(int i) {
          : i == kHcXLb ? 3   /* lever XLB's mask (Qwen loop round 38): bit 1 the LDS-only tile barrier, bit 2 the own-tile scale fold */
          : i == kGdnEpd ? 12   /* lever EPD (Qwen loop round 41): 1 the GDN update's deferred epilogue, 2 + lever QKS, 3 + lever GRP; 4 lever QSC (round 47): the q / k scales once a call; 8 lever ZXL, 12 QSC + ZXL (round 48: the prologue's 16-bit loads in whole registers; libr4d refuses 5..7 / 9..11) */
          : i == kHcRf ? 4096   /* lever HRF (Qwen loop round 44): the row floor of the HXS read's one-launch form, 0 off */
+         : i == kSchedBiSrpt ? 600000   /* lever SRB (Qwen loop round 58): 1 on, N >= 2 on with an N-ms age bound */
          : i == kMtpDec ? 31   /* levers MTD / MTE / W2K / W2N (Qwen loop rounds 45 / 47 / 49): the MTP draft passes' decode forms, bit 1 the EXL3 chain, bit 2 the bi_dec reads (the plugins), bit 4 mtp_enter's split-K form, bit 8 the w2a8 draft head at sk 4 / nt 0, bit 16 with 8: at sk 4 / nt 1 (libr4d) */
          : 1;   /* exl3_drz 4..7: DRZ's reading values (exl3r4d accepts 0, 1, 4..7; F43); rg_tail 0..4095: rows + 256 x lever
                     RGU's form (libr4d refuses a row field above 128 and KU code 3, Qwen loop round 36) */
@@ -119,7 +121,7 @@ bool plugin_switch(int i) {
             * preempt_keep are the core's / read at start). sp_ple is the plugins' (fn4-x3-spx f0c9a4a9, which the merge
             * left out: a POST changed only the core's record, so the step kept the start value; Qwen loop round 10, F11) */
            (qwen_switch(i) && i != kNoRoute && i != kResumeCold && i != kPreemptKeep && i != kDraftDmask &&
-            i != kAqlChi && i != kDraftUni);
+            i != kAqlChi && i != kDraftUni && i != kSchedBiSrpt);
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -540,6 +542,7 @@ int preempt_keep() { return st().val[kPreemptKeep].load(std::memory_order_acquir
 int draft_dmask() { return st().val[kDraftDmask].load(std::memory_order_acquire); }
 int aql_chi() { return st().val[kAqlChi].load(std::memory_order_acquire); }
 int draft_uni() { return st().val[kDraftUni].load(std::memory_order_acquire); }
+int sched_bi_srpt() { return st().val[kSchedBiSrpt].load(std::memory_order_acquire); }
 int kvs_bi() { return st().val[kKvsBi].load(std::memory_order_acquire); }
 int sched_bi_chunk() {
     const int v = st().val[kSchedBiChunk].load(std::memory_order_acquire);
@@ -1028,7 +1031,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
                         "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, draft_cost_age, draft_short_blk, ds41_prefetch, ds41_attn_dec, ds41_sphc, ds41_sphc_attn, ds41_sphc_seg, pp_bg_room, pp_bg_join_ms, ds41_twin, ds41_tsk, draft_head_cut, pp_fol_reserve, pp_lead_seg, pp_seg_set, exl3_x3d_pf, pp_tband, pp_merge, pp_merge_ms, pp_rband, sched_srf, aql_hdp, epoch_bump) and the Qwen line's ("
-                        "no_route, gather_inv, hc_fusedown, hc_normwave, hc_writevec, hc_readv, ar_lanethreads, hc_upmix, ar_laneblocks, exl3_pfprep, exl3_mapshare, exl3_gd, moe_pair, exl3_dz, exl3_bi, exl3_dual, hc_bi, bi_seg, att_bi, arw_rows, hc_spprobe, hc_sp, mtp_flat, ar_sdma, bi_wide, sp_serial, hc_pinpf2, resume_cold, preempt_keep, kvs_bi, kvs_vic, qsa_split, sp_ple, ar_fence, sp_route, rg_tail, gnq8, draft_dmask, aql_chi, exl3_drz, draft_uni, ar_lanethreads_s, ar_laneblocks_s, f8_pp, hc_x_lb, hc_b3x_e, hc_b3x_p, hc_b3x_d, gdn_epd, hc_rf, mtp_dec, kvs_flat, kvs_fix)";
+                        "no_route, gather_inv, hc_fusedown, hc_normwave, hc_writevec, hc_readv, ar_lanethreads, hc_upmix, ar_laneblocks, exl3_pfprep, exl3_mapshare, exl3_gd, moe_pair, exl3_dz, exl3_bi, exl3_dual, hc_bi, bi_seg, att_bi, arw_rows, hc_spprobe, hc_sp, mtp_flat, ar_sdma, bi_wide, sp_serial, hc_pinpf2, resume_cold, preempt_keep, kvs_bi, kvs_vic, qsa_split, sp_ple, ar_fence, sp_route, rg_tail, gnq8, draft_dmask, aql_chi, exl3_drz, draft_uni, ar_lanethreads_s, ar_laneblocks_s, f8_pp, hc_x_lb, hc_b3x_e, hc_b3x_p, hc_b3x_d, gdn_epd, hc_rf, mtp_dec, kvs_flat, kvs_fix, sched_bi_srpt)";
         return false;
     }
     State& s = st();

@@ -201,6 +201,9 @@ struct IPrefixCache {
      * null, ends the hit early (HitCap, core/mem/prefix.h). */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
                             const HitCap* cap) const = 0;
+    /* qfn-on-ds lever SRB (Qwen loop round 58): the tokens a lookup would let `r` skip, as an estimate for the prefill
+     * order -- no effect on the cache (PrefixCache::probe); -1 where the cache cannot say. */
+    virtual int64_t probe(const Request& r) const { (void)r; return -1; }
     /* fn4 preempt_keep (Scheduler::rejoin_kept): while set, lookup and restore key on these tokens -- a kept request's
      * prompt ++ output, which its publish indexed -- instead of the prompt; nullptr goes back to the prompt. */
     virtual void whole_sequence(const std::vector<int32_t>* tokens) { (void)tokens; }
@@ -474,6 +477,10 @@ struct PCBinding final : IPrefixCache {
         media_keys(r, &mm_, salt_id);
         /* r.id: the admission takes its conversation's snapshots over. */
         return m->lookup(seq_ ? *seq_ : r.prompt, mm_, out, cap, r.id);
+    }
+    int64_t probe(const Request& r) const override {
+        media_keys(r, &mm_, salt_id);
+        return m->probe(r.prompt, mm_);
     }
     const std::vector<int32_t>* seq_ = nullptr;
     void whole_sequence(const std::vector<int32_t>* tokens) override { seq_ = tokens; }

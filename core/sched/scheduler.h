@@ -60,6 +60,12 @@ struct SchedReq {
      * the pool (it yielded / waited): until it plans a chunk again it chooses nobody, so the prompts sitting out for it may run
      * (they hold KV this one cannot take from another lane; a pipeline lane preempts only its own). */
     bool     srf_kv = false;
+    /* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58): the rows this waiting prompt would prefill past the
+     * prefix cache's hit (PrefixCache::probe, once; -1 not probed), when the pool last refused its SRB admission (0 never),
+     * and since when a running prefill waits for its next piece (0: it just ran one / not yet seen) */
+    int64_t  srb_est = -1;
+    int64_t  srb_refused_us = 0;
+    int64_t  srb_since_us = 0;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -829,6 +835,14 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         for (int k = 0; k < kSrfN; ++k) out[k] = srf_n_[k];
     }
+    /* qfn-on-ds lever SRB (fn4 sched_bi_srpt): BI5 lone steps it chose, of them a prompt other than FIFO's (a running one or a
+     * waiting one admitted ahead), waiting prompts admitted ahead, choices by the age bound, cache probes, admissions the pool
+     * refused. Takes the lock. */
+    enum { kSrbSteps, kSrbAhead, kSrbAdmitAhead, kSrbAged, kSrbProbe, kSrbRefused, kSrbN };
+    void    srb_counts(int64_t out[kSrbN]) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int k = 0; k < kSrbN; ++k) out[k] = srb_n_[k];
+    }
 
     /* qfn-on-ds Q92 (FINDINGS F78; RADIANCE_LOG_STEP_HOST): the step thread's host time inside the LAST step() by phase,
      * filled only while the env is set (host_note_on); the engine prints it beside its own phases. `ev_*` by call site
@@ -1001,6 +1015,16 @@ private:
                                 bool share = false);
     /* qfn-on-ds: the Qwen line's (fn4-x3-pf) BI chunking 5 / 6, resume_cold and preempt_keep state */
     bool          bi_lone_last_ = false;   /* fn4 BI chunking 5: the last step was a lone prefill step */
+    /* qfn-on-ds lever SRB (fn4 sched_bi_srpt): the waiting prompt this BI5 lone step admits (-1: the queue's head, as
+     * today), the counters (srb_counts), the clock (tests may set it) */
+    int32_t       srb_wslot_ = -1;
+    int64_t       srb_n_[kSrbN] = {};
+    std::function<int64_t()> srb_clock_;
+    int64_t       srb_logged_ = 0;
+    void          srb_choose(bool admit_possible, int v, int32_t& lone_slot);
+public:
+    void          set_srb_clock(std::function<int64_t()> now_us) { srb_clock_ = std::move(now_us); }
+private:
     /* fn4 BI chunking 6 (15.11.2026, qwen/build2/LONGPROMPT.md): the request whose alone piece did not fit beside the
      * last step's other work (0 none) -- it takes the next step alone -- and whether the last step was such a lone step
      * beside decoding sequences (the decode rows then get the next one). */

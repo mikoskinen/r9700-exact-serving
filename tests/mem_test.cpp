@@ -8221,6 +8221,30 @@ TEST(the_bindings_snapshot_key_is_the_chain_the_next_turn_looks_up) {
     CHECK_EQ(h2.checkpoint_slot, -1);
 }
 
+/* qfn-on-ds lever SRB (Qwen loop round 58): IPrefixCache::probe = the tokens the lookup would let the request skip (with linear
+ * state: the deepest snapshot on the hit), with no effect on the cache -- no lookup counted, no snapshot taken over (the next
+ * lookup by another session still finds it), and the same answer twice; a cold prompt probes 0. */
+TEST(srb_probe_is_the_lookups_reusable_tokens_without_its_effects) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    const Request r = turn(7, tok_run(100, 300), tok_run(9000, 40));
+    const int32_t slot = serve_turn(f, b, r, 320);
+    REQUIRE(slot >= 0);
+    const Request next = turn(8, cat(cat(r.prompt, r.output), tok_run(20000, 50)), {});
+    const int64_t lookups = f.pc.stats().lookups;
+    CHECK_EQ(b.probe(next), (int64_t)320);
+    CHECK_EQ(b.probe(next), (int64_t)320);
+    CHECK_EQ(f.pc.stats().lookups, lookups);            /* the probes counted nothing */
+    const CacheHit h = b.lookup(next, nullptr, nullptr);
+    CHECK_EQ(h.n_linear_tokens, 320);
+    CHECK_EQ(h.checkpoint_slot, slot);
+    CHECK_EQ(f.pc.stats().lookups, lookups + 1);
+    CHECK_EQ(b.probe(turn(9, tok_run(40000, 300), {})), (int64_t)0);   /* cold */
+    /* the same prompt with another reply: the prompt's blocks, no snapshot on that chain -> 0 reusable with linear state */
+    CHECK_EQ(b.probe(turn(10, cat(cat(r.prompt, tok_run(30000, 40)), tok_run(20000, 50)), {})), (int64_t)0);
+}
+
 TEST(the_bindings_snapshot_key_carries_the_requests_pictures) {
     Fixture f;
     REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);

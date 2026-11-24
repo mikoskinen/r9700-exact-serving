@@ -929,6 +929,186 @@ TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
     len = 1000;
 }
 
+/* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58, QUEUE Q113; the AgentX c32 budget: a follow-up turn waits behind
+ * every earlier prompt's whole prefill under BI5). Under sched_bi_chunk 5 with a decoding request d: a long prompt L runs, a
+ * short prompt S arrives. CONTROL (sched_bi_srpt 0 = today): S is admitted only after L's last piece. SRB 1: S is admitted at the
+ * next lone step and finishes its prompt before L's next piece; every piece of L and of S = its ALONE piece (position, rows,
+ * snapshot row) in both arms -- only when pieces run changes; no step mixes a piece with a decode row; every lone step is
+ * followed by d's decode step. Age bound (sched_bi_srpt N >= 2, the test clock): a stream of short prompts cannot hold L past
+ * N ms. Probe: a waiting prompt whose cache probe leaves fewer rows than L has left is admitted ahead of L's next piece. */
+TEST(srb_bi5_lone_step_goes_to_the_prompt_with_the_fewest_rows_left) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    auto setsw = [&](const char* n, int v) {
+        CHECK(rad::fn4::request(n, v, &err));
+        rad::fn4::apply_pending(0, da);
+    };
+    auto fixture = [&](Fixture& f) {
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+    };
+    auto distinct = [&](Fixture& f, int n, int max_tokens, int base) {
+        auto r = f.request(n, max_tokens);
+        for (int i = 0; i < n; ++i) r->prompt[(size_t)i] = base + i;
+        return r;
+    };
+    /* each prompt's pieces alone: (position, rows, snapshot row) */
+    auto alone = [&](int n, int base) {
+        setsw("sched_bi_srpt", 0);
+        Fixture f;
+        fixture(f);
+        const uint64_t a = f.add(distinct(f, n, 2, base));
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) { pc.push_back(e.ctx_len); pc.push_back(e.n_tokens); pc.push_back(e.ckpt_tok); }
+            f.commit_plain();
+        }
+        return pc;
+    };
+    setsw("sched_bi_chunk", 5);
+    CHECK_EQ(rad::fn4::sched_bi_chunk(), 5);
+    const std::vector<int32_t> refL = alone(3000, 20000), refS = alone(300, 50000);
+    CHECK(refL.size() >= 3 * 4);
+    CHECK(refS.size() >= 3);
+    struct Out { std::vector<int32_t> gl, gs; int s_first = -1, s_done = -1, l_last = -1, l_pieces_before_s = 0, mixed = 0,
+                 lone = 0, after_lone_d = 0; int64_t c[Scheduler::kSrbN] = {}; };
+    auto run = [&](int srpt) {
+        setsw("sched_bi_srpt", srpt);
+        CHECK_EQ(rad::fn4::sched_bi_srpt(), srpt);
+        Out o;
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 400, 30000); r->ignore_eos = true; return r; }());
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();   /* d decodes */
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t sid = 0;
+        int l_pieces = 0;
+        bool last_lone = false;
+        for (int k = 0; k < 120 && f.sch.step(); ++k) {
+            const StepPlan& p = f.sch.plan();
+            bool any_pf = false, any_dec = false, has_d = false, lone = false;
+            for (const StepEntry& e : p.e) {
+                if (e.is_prefill) any_pf = true; else any_dec = true;
+                if (e.seq == d) has_d = true;
+                if (e.seq == l && e.is_prefill) {
+                    o.gl.push_back(e.ctx_len); o.gl.push_back(e.n_tokens); o.gl.push_back(e.ckpt_tok);
+                    ++l_pieces; o.l_last = k;
+                    if (sid && o.s_done < 0) ++o.l_pieces_before_s;
+                }
+                if (sid && e.seq == sid && e.is_prefill) {
+                    o.gs.push_back(e.ctx_len); o.gs.push_back(e.n_tokens); o.gs.push_back(e.ckpt_tok);
+                    if (o.s_first < 0) o.s_first = k;
+                    if (e.ctx_len + e.n_tokens >= 300) o.s_done = k;
+                }
+            }
+            lone = any_pf && p.e.size() == 1;
+            o.mixed += any_pf && any_dec;
+            o.lone += lone;
+            if (has_d && last_lone) ++o.after_lone_d;
+            last_lone = lone;
+            f.commit_plain();
+            if (!sid && l_pieces == 2) sid = f.add(distinct(f, 300, 2, 50000));   /* S arrives after L's second piece */
+        }
+        f.sch.srb_counts(o.c);
+        return o;
+    };
+    const Out c0 = run(0), c1 = run(1);
+    /* CONTROL: today S waits for L's whole prefill */
+    CHECK(c0.gl == refL);
+    CHECK(c0.gs == refS);
+    CHECK(c0.s_first > c0.l_last);
+    CHECK_EQ(c0.c[Scheduler::kSrbSteps], (int64_t)0);
+    /* SRB: S ahead of L's next piece, the same pieces */
+    CHECK(c1.gl == refL);
+    CHECK(c1.gs == refS);
+    CHECK(c1.s_done >= 0 && c1.s_done < c1.l_last);
+    CHECK_EQ(c1.l_pieces_before_s, 0);        /* no piece of L between S's admission and S's last piece */
+    CHECK(c1.c[Scheduler::kSrbAdmitAhead] >= 1);
+    CHECK(c1.c[Scheduler::kSrbSteps] >= 4);
+    for (const Out* o : { &c0, &c1 }) {
+        CHECK_EQ(o->mixed, 0);
+        CHECK_EQ(o->after_lone_d, o->lone);   /* every lone step is followed by d's decode step */
+    }
+
+    /* Age bound: shorts keep arriving (one each time a short finishes its prompt); with sched_bi_srpt 1 L gets no piece until
+     * they stop, with 40 (ms; the test clock moves 10 ms a step) L gets pieces in between */
+    auto starve = [&](int srpt) {
+        setsw("sched_bi_srpt", srpt);
+        Fixture f;
+        fixture(f);
+        int64_t clk = 1000000;
+        f.sch.set_srb_clock([&clk] { return clk; });
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 600, 30000); r->ignore_eos = true; return r; }());
+        (void)d;
+        for (int k = 0; k < 3 && f.sch.step(); ++k) { f.commit_plain(); clk += 10000; }
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        int l_pieces = 0, shorts = 0, l_during = 0;
+        uint64_t cur = 0;
+        for (int k = 0; k < 160 && f.sch.step(); ++k) {
+            bool cur_done = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) { ++l_pieces; if (shorts > 0 && shorts < 8) ++l_during; }
+                if (cur && e.seq == cur && e.is_prefill && e.ctx_len + e.n_tokens >= 200) cur_done = true;
+            }
+            f.commit_plain();
+            clk += 10000;
+            if (l_pieces >= 1 && shorts < 8 && (cur == 0 || cur_done)) {
+                cur = f.add(distinct(f, 200, 2, 40000 + 300 * shorts));
+                ++shorts;
+            }
+        }
+        int64_t c[Scheduler::kSrbN] = {};
+        f.sch.srb_counts(c);
+        return std::make_pair(l_during, c[Scheduler::kSrbAged]);
+    };
+    const auto s1 = starve(1), s40 = starve(40);
+    CHECK_EQ(s1.first, 0);                    /* without the bound the shorts hold L the whole time */
+    CHECK_EQ(s1.second, (int64_t)0);
+    CHECK(s40.first >= 1);                    /* with it L runs pieces while shorts still arrive */
+    CHECK(s40.second >= 1);
+
+    /* Probe: W's whole prompt (2,600) is longer than L's rows left, its probe leaves 100 -> admitted ahead of L's next piece;
+     * the same W without a probe hit (-1: whole prompt) waits for L */
+    auto probe_case = [&](bool hit) {
+        setsw("sched_bi_srpt", 1);
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 400, 30000); r->ignore_eos = true; return r; }());
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t w = 0;
+        int l_pieces = 0, w_first = -1, l_last = -1;
+        for (int k = 0; k < 120 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) { ++l_pieces; l_last = k; }
+                if (w && e.seq == w && e.is_prefill && w_first < 0) w_first = k;
+            }
+            f.commit_plain();
+            if (!w && l_pieces == 2) {
+                auto r = distinct(f, 2600, 2, 5000);
+                const uint64_t id = r->id;
+                if (hit) f.pc.probe_hit[id] = 2500;
+                w = f.add(std::move(r));
+            }
+        }
+        (void)d;
+        int64_t c[Scheduler::kSrbN] = {};
+        f.sch.srb_counts(c);
+        return std::make_tuple(w_first < l_last, c[Scheduler::kSrbProbe], f.pc.probes);
+    };
+    const auto ph = probe_case(true), pn = probe_case(false);
+    CHECK(std::get<0>(ph));                   /* admitted ahead on its probe */
+    CHECK(std::get<1>(ph) >= 1);
+    CHECK(!std::get<0>(pn));                  /* whole prompt 2,600 > L's rows left: L first */
+    CHECK(std::get<1>(pn) >= 1);
+    CHECK_EQ(std::get<2>(ph), std::get<1>(ph));   /* one probe a request: the scheduler's count = the cache's */
+    setsw("sched_bi_srpt", 0);
+    setsw("sched_bi_chunk", 0);
+}
+
 /* qfn-on-ds Q18 (Qwen loop round 4, FINDINGS F11): RADIANCE_SCHED_BI_ONE_PF=1 under BI chunking 6. Two short prompts that both
  * fit beside a decoding request's rows: without the env (the control) they share a step; with it no step carries two prefill
  * sequences, both prompts still finish, each in its alone pieces (one piece of 100 rows here), and the decoding request keeps

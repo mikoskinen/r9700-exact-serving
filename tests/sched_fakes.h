@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <map>
 #include <vector>
 
 #ifndef SCHED_FAKES_KV_ONLY
@@ -615,6 +616,14 @@ struct FakePC : IPrefixCache {
             }
         }
         return h;
+    }
+    /* qfn-on-ds lever SRB (round 58): IPrefixCache::probe -- the hit a test sets per request id (-1 = the cache cannot say) */
+    std::map<uint64_t, int64_t> probe_hit;
+    mutable int64_t probes = 0;
+    int64_t probe(const Request& r) const override {
+        ++probes;
+        const auto it = probe_hit.find(r.id);
+        return it == probe_hit.end() ? -1 : it->second;
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
     void set_drafter_floor(int64_t tokens) override { drafter_floor = tokens; }

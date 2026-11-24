@@ -3702,6 +3702,87 @@ void Scheduler::srf_choose(bool after_finish) {
     else if (lanes_->inbox_rows_locked(lane_) == 0) srf_wslot_ = pk.slot;
 }
 
+/* ------------------------------------------------------------------ qfn-on-ds lever SRB: BI5's lone step by fewest rows left */
+/* fn4 sched_bi_srpt (Qwen loop round 58, QUEUE Q113; the AgentX c32 budget, STATE 24.11. 07:01): under BI chunking 5 the lone
+ * step takes the first running prefill, and admits the queue's head only when no prefill runs -- so a follow-up turn with a
+ * few thousand rows past its cached prefix waits behind every earlier prompt's whole prefill (agx17: a p50 request waited
+ * 3.16 s before its first piece, a p90 one 15.4 s, of 1.0 / 1.7 s of its own). Here the lone step goes to the prompt with the
+ * fewest rows left: a running prefill by the rows to its prompt's end, a waiting prompt (where an admission is possible) by
+ * the rows past the prefix cache's hit (IPrefixCache::probe, once a request, at most kSrbProbes a step; unprobed = its whole
+ * prompt); ties: a running one, then the lower id. v >= 2: a prompt whose wait for its next piece (a waiting one: since its
+ * arrival, or since the rule first saw it under a test clock) reaches v ms goes first, the longest-waiting first. A preempted / kept / media / embedding request at the queue's
+ * head keeps today's plan (FIFO), as does a lane scheduler. Only WHEN pieces run changes: each piece is planned from its own
+ * request's n_computed as today (its position, rows and snapshot row), and the step stays alone (BI5). */
+void Scheduler::srb_choose(bool admit_possible, int v, int32_t& lone_slot) {
+    static constexpr int kSrbProbes = 2;
+    static constexpr int64_t kSrbRefuseUs = 200000;
+    const int64_t now = srb_clock_ ? srb_clock_() : mono_us();
+    const int64_t age_us = v >= 2 ? (int64_t)v * 1000 : 0;
+    if (admit_possible) {
+        const SchedReq& h = *reqs_[(size_t)waiting_[0]];
+        if (!h.req || h.req->media || h.req->embed || h.keep_whole >= 0 || h.req->state == ReqState::Preempted) return;
+    }
+    struct Pick { int32_t slot = -1; bool waiting = false; int64_t left = 0, since = 0; uint64_t id = 0; };
+    Pick best, aged;
+    auto consider = [&](int32_t slot, bool w, int64_t left, int64_t since, uint64_t id) {
+        if (age_us > 0 && now - since >= age_us &&
+            (aged.slot < 0 || since < aged.since || (since == aged.since && id < aged.id)))
+            aged = Pick{slot, w, left, since, id};
+        if (best.slot < 0 || left < best.left ||
+            (left == best.left && ((!w && best.waiting) || (w == best.waiting && id < best.id))))
+            best = Pick{slot, w, left, since, id};
+    };
+    for (int32_t sl : running_) {
+        SchedReq& q = *reqs_[(size_t)sl];
+        if (!q.req || !q.running) continue;
+        const Request& rr = *q.req;
+        if (!(rr.n_computed < (int64_t)rr.prompt.size() || rr.n_computed + 1 < q.seq_len())) continue;
+        const int64_t goal = std::max<int64_t>((int64_t)rr.prompt.size(), q.seq_len() - 1);
+        if (q.srb_since_us == 0) q.srb_since_us = now;
+        consider(sl, false, std::max<int64_t>(1, goal - rr.n_computed), q.srb_since_us, rr.id);
+    }
+    if (admit_possible) {
+        int probes = 0;
+        for (int32_t w : waiting_) {
+            SchedReq& ws = *reqs_[(size_t)w];
+            if (!ws.req || ws.req->media || ws.req->embed || ws.keep_whole >= 0 || ws.req->state == ReqState::Preempted) continue;
+            if (ws.srb_refused_us != 0 && now - ws.srb_refused_us < kSrbRefuseUs) continue;
+            if (ws.srb_est < 0 && pc_ && probes < kSrbProbes) {
+                ++probes;
+                ++srb_n_[kSrbProbe];
+                const int64_t hit = pc_->probe(*ws.req);
+                ws.srb_est = hit >= 0 ? std::max<int64_t>(1, ws.seq_len() - hit) : ws.seq_len();
+            }
+            const int64_t est = ws.srb_est >= 0 ? ws.srb_est : ws.seq_len();
+            if (ws.srb_since_us == 0) ws.srb_since_us = srb_clock_ || ws.arrived_us <= 0 ? now : ws.arrived_us;
+            consider(w, true, est, ws.srb_since_us, ws.req->id);
+        }
+    }
+    const Pick& p = aged.slot >= 0 ? aged : best;
+    if (p.slot < 0) return;
+    ++srb_n_[kSrbSteps];
+    if (aged.slot >= 0) ++srb_n_[kSrbAged];
+    if (p.waiting) {
+        /* today: a running prefill first, else the queue's head */
+        if (lone_slot >= 0 || p.slot != waiting_[0]) ++srb_n_[kSrbAhead];
+        if (lone_slot >= 0) ++srb_n_[kSrbAdmitAhead];
+        lone_slot = -1;
+        srb_wslot_ = p.slot;
+        reqs_[(size_t)p.slot]->srb_since_us = 0;
+    } else {
+        if (p.slot != lone_slot) ++srb_n_[kSrbAhead];
+        lone_slot = p.slot;
+        reqs_[(size_t)p.slot]->srb_since_us = 0;   /* it runs a piece now: its wait starts again after */
+    }
+    if (srb_n_[kSrbSteps] - srb_logged_ >= 2000) {
+        srb_logged_ = srb_n_[kSrbSteps];
+        RAD_INFO("fn4 sched_bi_srpt %d (Qwen loop lever SRB): %lld lone steps chosen, %lld not FIFO's (%lld waiting prompts "
+                 "admitted ahead of a running prefill), %lld by the age bound, %lld cache probes, %lld admissions refused",
+                 v, (long long)srb_n_[kSrbSteps], (long long)srb_n_[kSrbAhead], (long long)srb_n_[kSrbAdmitAhead],
+                 (long long)srb_n_[kSrbAged], (long long)srb_n_[kSrbProbe], (long long)srb_n_[kSrbRefused]);
+    }
+}
+
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     const uint64_t hn_t0 = hn_on_ ? hn_ns() : 0;   /* qfn-on-ds Q92: the step-host note (RADIANCE_LOG_STEP_HOST) */
@@ -3989,6 +4070,12 @@ const RadBatch* Scheduler::step() {
         }
         const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
                                     (int64_t)running_.size() < cfg_.max_seqs;
+        /* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58): the lone step's prompt by the fewest rows left, a
+         * waiting one admitted ahead where its rows past the cache's hit are fewer (srb_choose); 0 = the FIFO choice above */
+        srb_wslot_ = -1;
+        if (const int srb = fn4::sched_bi_srpt(); srb > 0 && !lanes_ && !(any_dec && bi_lone_last_) &&
+                                                  (bi_lone_slot >= 0 || admit_possible))
+            srb_choose(admit_possible, srb, bi_lone_slot);
         if (any_dec && bi_lone_last_) {
             hold_prefill = true;            /* the decode rows' turn: no prefill, no admission */
             bi_lone_slot = -1;
@@ -3997,7 +4084,7 @@ const RadBatch* Scheduler::step() {
             bi_lone_admit = bi_lone_slot < 0;
             bi_lone_last_ = any_dec;
             const Request* pr = bi_lone_slot >= 0 ? reqs_[(size_t)bi_lone_slot]->req.get()
-                                                  : reqs_[(size_t)waiting_[0]]->req.get();
+                                                  : reqs_[(size_t)(srb_wslot_ >= 0 ? srb_wslot_ : waiting_[0])]->req.get();
             const int64_t plen = pr ? (int64_t)pr->prompt.size() : 0;
             span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || plen >= span_min_);
             budget = span_now_ ? cfg_.max_tok : geo_.shared_tok;
@@ -4493,6 +4580,8 @@ const RadBatch* Scheduler::step() {
             if (noa_disp_ && !s.noa_starved) { ++at; continue; }
             /* tp8 loop P44 (fn4 sched_srf 2): a waiting prompt not ahead of the chosen one keeps its place */
             if (srf_holds(s)) { ++at; continue; }
+            /* qfn-on-ds lever SRB: a lone step that admits ahead asks the chosen prompt only (the rest keep their places) */
+            if (srb_wslot_ >= 0 && slot != srb_wslot_) { ++at; continue; }
             /* tp8 loop D55b (RADIANCE_SCHED_PUB_HOLD_MS): a running sibling is computing this prompt's head -- wait for it */
             if (pub_hold_us_ > 0 && pub_holds(s)) {
                 if (!s.pub_held) { s.pub_held = true; ++pub_hold_n_; }
@@ -4551,6 +4640,11 @@ const RadBatch* Scheduler::step() {
             /* tp8 loop P44: the KV valve for a chosen waiting prompt the pool cannot take now (it chooses nobody until admitted) */
             if (as == RAD_OK) s.srf_kv = false;
             else if (as == kAdmitWait && srf_on_ && slot == srf_wslot_) s.srf_kv = true;
+            /* qfn-on-ds lever SRB: the pool refused the chosen prompt -- the next choices pass it over for a while */
+            if (as != RAD_OK && srb_wslot_ >= 0 && slot == srb_wslot_) {
+                s.srb_refused_us = srb_clock_ ? srb_clock_() : mono_us();
+                ++srb_n_[kSrbRefused];
+            }
             /* lever DST: a request the bypass does not take keeps its place for the next ordinary admission, and the
              * walk asks the one behind it */
             if (bypass && as != RAD_OK) { ++at; continue; }

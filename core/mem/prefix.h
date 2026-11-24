@@ -334,6 +334,10 @@ public:
                     const std::vector<MMContentKey>& mm,
                     std::vector<std::vector<int32_t>>* blocks_out = nullptr,
                     const HitCap* cap = nullptr, uint64_t session = 0) const;
+    /* qfn-on-ds lever SRB (Qwen loop round 58): the tokens a lookup of `tokens` would let a sequence skip today (the whole
+     * entries on the card, backed off by one on a full hit; with recurrent state the deepest snapshot at or below) -- an
+     * ESTIMATE for the scheduler's prefill order: no LRU touch, no counter, no snapshot taken over, nothing handed out. */
+    int64_t probe(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm) const;
 
     /* Publish the whole entries a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */
